@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-coverage-
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Generate coverage summary
+        id: coverage
+        run: |
+          cargo llvm-cov --workspace --json > coverage.json
+
+          COVERAGE=$(jq '.data[0].totals.lines.percent' coverage.json)
+          COVERED=$(jq '.data[0].totals.lines.covered' coverage.json)
+          TOTAL=$(jq '.data[0].totals.lines.count' coverage.json)
+          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+
+          {
+            echo "## Coverage Report"
+            echo ""
+            printf "**Total: %.2f%%** (%d / %d lines)\n" "$COVERAGE" "$COVERED" "$TOTAL"
+            echo ""
+            echo "| File | Coverage | Lines |"
+            echo "|------|----------|-------|"
+            jq -r '.data[0].files[] | select(.summary.lines.count > 0) | "\(.filename | split("/") | .[-2:] | join("/"))|\(.summary.lines.percent)|\(.summary.lines.covered)/\(.summary.lines.count)"' coverage.json | \
+              while IFS='|' read -r file pct lines; do
+                printf "| \`%s\` | %.1f%% | %s |\n" "$file" "$pct" "$lines"
+              done
+          } > coverage-summary.md
+
+      - name: Post coverage comment
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: coverage
+          path: coverage-summary.md
