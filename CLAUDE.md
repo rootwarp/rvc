@@ -53,6 +53,7 @@ cargo test -- --nocapture         # Run with output
 ### Documentation
 - Use `///` for public API documentation
 - Use `//!` for module-level documentation
+- Minimize comments if there is no epecific reasons. Code is the document itself
 - Include examples in doc comments for public functions
 
 ## Testing
