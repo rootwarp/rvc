@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package duty_tracker;
+
+// DutyTracker service for Ethereum validator duty tracking.
+service DutyTracker {
+  // Healthz returns the health status of the duty tracker service.
+  rpc Healthz(HealthzRequest) returns (HealthzResponse);
+}
+
+// HealthzRequest is the request message for the Healthz RPC.
+message HealthzRequest {}
+
+// HealthzResponse is the response message for the Healthz RPC.
+message HealthzResponse {
+  // status indicates whether the service is healthy.
+  bool status = 1;
+}

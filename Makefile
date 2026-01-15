@@ -1,4 +1,4 @@
-.PHONY: build build-release check fmt clippy test clean
+.PHONY: build build-release check fmt clippy test coverage clean
 
 # Build
 build:
@@ -22,10 +22,17 @@ clippy:
 
 # Test
 test:
-	cargo test
+	cargo test --workspace
 
 test-verbose:
 	cargo test -- --nocapture
+
+# Coverage
+coverage:
+	cargo llvm-cov --workspace
+
+coverage-html:
+	cargo llvm-cov --workspace --html
 
 # Clean
 clean:
