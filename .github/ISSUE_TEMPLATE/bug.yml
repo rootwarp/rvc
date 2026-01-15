@@ -1,0 +1,58 @@
+name: Bug Report
+description: Report a bug or unexpected behavior
+title: "bug(...): "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        # Report Bug
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What is the bug? (One sentence)
+      placeholder: "X fails when Y happens"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Behavior
+      description: What actually happens?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to Reproduce
+      description: How can we reproduce this?
+      placeholder: |
+        1. Run `cargo ...`
+        2. Call function X with ...
+        3. Observe error
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Context
+      description: Environment, version, or other relevant details
+      placeholder: |
+        - Rust version:
+        - OS:
+        - Relevant logs:
+    validations:
+      required: false

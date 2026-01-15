@@ -1,0 +1,62 @@
+name: Feature Request
+description: Request a new feature or enhancement
+title: "feat(...): "
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        # Request a new feature implementation
+
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: What do you want to achieve? (One sentence)
+      placeholder: "Enable users to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: background
+    attributes:
+      label: Background
+      description: Why is this needed? What problem does it solve?
+      placeholder: "Currently, ... This causes ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: requirements
+    attributes:
+      label: Requirements
+      description: What must be true when this is done? (Acceptance criteria)
+      placeholder: |
+        - [ ] User can ...
+        - [ ] System should ...
+        - [ ] Error handling for ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: technical-notes
+    attributes:
+      label: Technical Notes
+      description: Any constraints, dependencies, or implementation hints?
+      placeholder: |
+        - Must use existing X module
+        - Consider Y for performance
+        - Reference: docs/...
+    validations:
+      required: false
+
+  - type: textarea
+    id: out-of-scope
+    attributes:
+      label: Out of Scope
+      description: What is explicitly NOT part of this task?
+      placeholder: |
+        - UI changes
+        - Database migration
+    validations:
+      required: false
