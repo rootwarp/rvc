@@ -109,13 +109,25 @@ jobs:
       - name: Generate coverage summary
         id: coverage
         run: |
-          COVERAGE=$(cargo llvm-cov --workspace --json | jq '.data[0].totals.lines.percent')
+          cargo llvm-cov --workspace --json > coverage.json
+
+          COVERAGE=$(jq '.data[0].totals.lines.percent' coverage.json)
+          COVERED=$(jq '.data[0].totals.lines.covered' coverage.json)
+          TOTAL=$(jq '.data[0].totals.lines.count' coverage.json)
           echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
-          echo "## Coverage Report" >> coverage-summary.md
-          echo "" >> coverage-summary.md
-          echo "**Line Coverage: ${COVERAGE}%**" >> coverage-summary.md
-          echo "" >> coverage-summary.md
-          cargo llvm-cov --workspace --text >> coverage-summary.md
+
+          {
+            echo "## Coverage Report"
+            echo ""
+            printf "**Total: %.2f%%** (%d / %d lines)\n" "$COVERAGE" "$COVERED" "$TOTAL"
+            echo ""
+            echo "| File | Coverage | Lines |"
+            echo "|------|----------|-------|"
+            jq -r '.data[0].files[] | select(.summary.lines.count > 0) | "\(.filename | split("/") | .[-2:] | join("/"))|\(.summary.lines.percent)|\(.summary.lines.covered)/\(.summary.lines.count)"' coverage.json | \
+              while IFS='|' read -r file pct lines; do
+                printf "| \`%s\` | %.1f%% | %s |\n" "$file" "$pct" "$lines"
+              done
+          } > coverage-summary.md
 
       - name: Post coverage comment
         uses: marocchino/sticky-pull-request-comment@v2
