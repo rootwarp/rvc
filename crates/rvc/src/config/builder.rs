@@ -570,6 +570,8 @@ impl ServiceBuilder {
             electra_version = %format_version(schedule.electra_fork_version),
             fulu_epoch = schedule.fulu_fork_epoch,
             fulu_version = %format_version(schedule.fulu_fork_version),
+            gloas_epoch = schedule.gloas_fork_epoch,
+            gloas_version = %format_version(schedule.gloas_fork_version),
             "Loaded fork schedule from beacon node"
         );
         Ok(Arc::new(schedule))

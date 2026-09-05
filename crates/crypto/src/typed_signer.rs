@@ -681,4 +681,69 @@ mod tests {
         // Electra epoch — cap at Capella
         assert_eq!(capella_capped_fork_version(55, &schedule), [3, 0, 0, 0]);
     }
+
+    fn dummy_pubkey() -> PublicKey {
+        SecretKey::generate().public_key()
+    }
+
+    #[test]
+    fn test_resolve_gloas_version_returns_gloas() {
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: 70,
+            gloas_fork_version: [0x07, 0, 0, 0],
+        };
+        let fork_info = ForkInfo {
+            previous_version: [6, 0, 0, 0],
+            current_version: [0x07, 0, 0, 0],
+            genesis_validators_root: [0xaa; 32],
+        };
+        let ctx = SignContext::resolve(dummy_pubkey(), fork_info, &schedule).unwrap();
+        assert_eq!(ctx.fork_name, ForkName::Gloas);
+    }
+
+    #[test]
+    fn test_resolve_sentinel_collision_first_matches_fulu() {
+        // When the BN omits both FULU_* and GLOAS_*, two entries() rows carry
+        // [0xFF; 4] and resolve first-matches Fulu — documented, not incidental.
+        // Issue 2.10's conditional fail-closed rule confines this to the
+        // fully-unscheduled case: a scheduled Gloas requires a real version
+        // from both sources.
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [0xFF; 4],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0xFF; 4],
+        };
+        let fork_info = ForkInfo {
+            previous_version: [0xFF; 4],
+            current_version: [0xFF; 4],
+            genesis_validators_root: [0xaa; 32],
+        };
+        let ctx = SignContext::resolve(dummy_pubkey(), fork_info, &schedule).unwrap();
+        assert_eq!(ctx.fork_name, ForkName::Fulu);
+    }
 }

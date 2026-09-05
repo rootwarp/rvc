@@ -226,11 +226,20 @@ pub struct StateResponse<T> {
 /// Response type for the beacon state fork endpoint.
 pub type StateForkResponse = StateResponse<StateFork>;
 
-/// Parses a config/spec response into a `ForkSchedule`.
+/// Parses a `/eth/v1/config/spec` map into a [`ForkSchedule`].
 ///
-/// Extracts fork epoch and version fields from the config spec map.
-/// Version fields are hex-encoded (e.g., "0x00000000") and epoch fields
-/// are decimal strings (e.g., "74240").
+/// Extracts fork epoch and version fields. Version fields are hex-encoded
+/// (e.g. `"0x00000000"`) and epoch fields are decimal strings (e.g. `"74240"`).
+/// `FULU_*` and `GLOAS_*` are optional: a missing key uses the unscheduled
+/// sentinels `u64::MAX` / `[0xFF; 4]`. A present but malformed value is a
+/// parse error naming that key.
+///
+/// There is no `/eth/v1/config/fork_schedule` client method —
+/// [`crate::BeaconClient::get_config_spec`] (`/eth/v1/config/spec`) and
+/// [`crate::BeaconClient::get_fork_schedule`] (which derives from it) are
+/// the only schedule sources. This function is the BN half of the two-source
+/// contract; issue 2.10 reconciles the spec-derived schedule against a local
+/// `rvc-config` pair.
 pub fn parse_fork_schedule(
     spec: &HashMap<String, serde_json::Value>,
 ) -> Result<ForkSchedule, BeaconError> {
@@ -252,8 +261,12 @@ pub fn parse_fork_schedule(
             "FULU_FORK_VERSION",
             [0xFF, 0xFF, 0xFF, 0xFF],
         )?,
-        gloas_fork_epoch: u64::MAX,
-        gloas_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
+        gloas_fork_epoch: parse_epoch_optional(spec, "GLOAS_FORK_EPOCH", u64::MAX)?,
+        gloas_fork_version: parse_version_optional(
+            spec,
+            "GLOAS_FORK_VERSION",
+            [0xFF, 0xFF, 0xFF, 0xFF],
+        )?,
     })
 }
 
@@ -479,6 +492,7 @@ impl SubmitAttestationResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eth_types::ForkName;
     use serde_json::json;
 
     #[test]
@@ -765,6 +779,8 @@ mod tests {
         spec.insert("ELECTRA_FORK_VERSION".to_string(), json!("0x05000000"));
         spec.insert("FULU_FORK_EPOCH".to_string(), json!("18446744073709551615"));
         spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!("18446744073709551615"));
+        spec.insert("GLOAS_FORK_VERSION".to_string(), json!("0x07000000"));
         spec
     }
 
@@ -784,6 +800,10 @@ mod tests {
         assert_eq!(schedule.deneb_fork_version, [4, 0, 0, 0]);
         assert_eq!(schedule.electra_fork_epoch, 364544);
         assert_eq!(schedule.electra_fork_version, [5, 0, 0, 0]);
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.fulu_fork_version, [6, 0, 0, 0]);
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+        assert_eq!(schedule.gloas_fork_version, [7, 0, 0, 0]);
     }
 
     #[test]
@@ -1445,6 +1465,7 @@ mod tests {
         spec.insert("DENEB_FORK_EPOCH".to_string(), json!(269568));
         spec.insert("ELECTRA_FORK_EPOCH".to_string(), json!(364544));
         spec.insert("FULU_FORK_EPOCH".to_string(), json!(18446744073709551615_u64));
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!(18446744073709551615_u64));
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.altair_fork_epoch, 74240);
         assert_eq!(schedule.bellatrix_fork_epoch, 144896);
@@ -1452,6 +1473,7 @@ mod tests {
         assert_eq!(schedule.deneb_fork_epoch, 269568);
         assert_eq!(schedule.electra_fork_epoch, 364544);
         assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
     }
 
     #[test]
@@ -1472,6 +1494,66 @@ mod tests {
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
         assert_eq!(schedule.fulu_fork_version, [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_without_gloas() {
+        let mut spec = mainnet_config_spec();
+        spec.remove("GLOAS_FORK_EPOCH");
+        spec.remove("GLOAS_FORK_VERSION");
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+        assert_eq!(schedule.gloas_fork_version, [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_invalid_gloas_epoch() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!("not_a_number"));
+        let result = parse_fork_schedule(&spec);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("GLOAS_FORK_EPOCH"));
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_invalid_gloas_version() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("GLOAS_FORK_VERSION".to_string(), json!("0xZZZZZZZZ"));
+        let result = parse_fork_schedule(&spec);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("GLOAS_FORK_VERSION"));
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_with_gloas() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("500000"));
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!("600000"));
+        spec.insert("GLOAS_FORK_VERSION".to_string(), json!("0x07000000"));
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.gloas_fork_epoch, 600000);
+        assert_eq!(schedule.gloas_fork_version, [0x07, 0, 0, 0]);
+        assert_eq!(ForkName::from_epoch(600000, &schedule), ForkName::Gloas);
+        assert_eq!(ForkName::from_epoch(599999, &schedule), ForkName::Fulu);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_omitted_fulu_and_gloas_share_version_sentinel() {
+        // Both omitted keys default to [0xFF; 4]. SignContext::resolve first-matches
+        // Fulu for that sentinel (`typed_signer::tests::test_resolve_sentinel_collision_first_matches_fulu`).
+        // Issue 2.10's conditional fail-closed rule confines the collision to the
+        // fully-unscheduled case.
+        let mut spec = mainnet_config_spec();
+        spec.remove("FULU_FORK_EPOCH");
+        spec.remove("FULU_FORK_VERSION");
+        spec.remove("GLOAS_FORK_EPOCH");
+        spec.remove("GLOAS_FORK_VERSION");
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+        assert_eq!(schedule.fulu_fork_version, [0xFF; 4]);
+        assert_eq!(schedule.gloas_fork_version, [0xFF; 4]);
     }
 
     #[test]

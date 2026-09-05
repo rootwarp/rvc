@@ -314,6 +314,8 @@ mod tests {
                     "ELECTRA_FORK_VERSION": "0x05000000",
                     "FULU_FORK_EPOCH": "18446744073709551615",
                     "FULU_FORK_VERSION": "0x06000000",
+                    "GLOAS_FORK_EPOCH": "18446744073709551615",
+                    "GLOAS_FORK_VERSION": "0x07000000",
                     "SECONDS_PER_SLOT": "12",
                     "SLOTS_PER_EPOCH": "32"
                 }

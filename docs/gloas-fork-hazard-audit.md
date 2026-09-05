@@ -62,7 +62,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 665 | 2 | — | test-only | Signing-root fixture zeros index by hand. Not a production guard. | 2.3 |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 673 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 417. | 2.8 |
 | `crates/rvc/src/orchestrator/utils.rs` 163 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the half-open `Electra..Gloas` predicate (2.3 / 2.8). | 2.3 |
-| `bin/rvc/tests/common/mock_bn.rs` 266 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
+| `bin/rvc/tests/common/mock_bn.rs` 268 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
 | `crates/eth-types/src/fork.rs` 152 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
 | `crates/eth-types/src/fork.rs` 170 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
 | `crates/beacon/src/client.rs` 751 | 4 | exhaustive | inherit-intentionally | `VersionedSignedAggregateAndProof` → `Eth-Consensus-Version` `"electra"` / `"fulu"` (header at 768). New enum variant is a compile error; the Gloas header string is Phase 6. | phase-6 |

@@ -245,7 +245,7 @@ const INVENTORY: &[Inv] = &[
     // Class 3
     inv(
         "bin/rvc/tests/common/mock_bn.rs",
-        266,
+        268,
         Class::MatchForkName,
         false,
         "match fork {",
