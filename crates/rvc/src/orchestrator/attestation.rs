@@ -317,12 +317,12 @@ where
         })?;
 
         let fork_name = ForkName::from_epoch(target_epoch, &self.config.fork_schedule);
-        let is_electra = utils::zeroes_committee_index(fork_name);
+        let uses_electra_wire = utils::uses_electra_attestation_wire(fork_name);
 
         debug!(
             validator_index = %validator_index,
             fork_name = ?fork_name,
-            is_electra = is_electra,
+            uses_electra_wire = uses_electra_wire,
             target_epoch = target_epoch,
             "Fork derived for attestation"
         );
@@ -409,11 +409,13 @@ where
 
         let sig_hex = format!("0x{}", hex::encode(signature.to_bytes()));
 
-        // Electra and Fulu share SingleAttestation + EIP-7549 index-zeroing;
-        // only the VersionedAttestation constructor differs.
-        let versioned = if is_electra {
+        // Electra+ shares SingleAttestation; EIP-7549 index-zeroing is
+        // Electra..Gloas only. The Fulu vs Electra constructor is Phase 6.
+        let versioned = if uses_electra_wire {
             let mut single_data = beacon_attestation_data.clone();
-            single_data.index = "0".to_string();
+            if utils::zeroes_committee_index(fork_name) {
+                single_data.index = "0".to_string();
+            }
             let single = SingleAttestation {
                 committee_index,
                 attester_index,

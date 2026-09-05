@@ -834,9 +834,21 @@ fn mainnet_shaped_fork_schedule() -> Arc<ForkSchedule> {
     })
 }
 
+const B1_DENEB_EPOCH: u64 = 269568;
 const B1_ELECTRA_EPOCH: u64 = 364544;
 const B1_FULU_EPOCH: u64 = 500000;
+const B1_GLOAS_EPOCH: u64 = 600000;
 const B1_GVR: Root = [0xaa; 32];
+
+fn gloas_capable_fork_schedule() -> Arc<ForkSchedule> {
+    let mut schedule = (*mainnet_shaped_fork_schedule()).clone();
+    schedule.gloas_fork_epoch = B1_GLOAS_EPOCH;
+    Arc::new(schedule)
+}
+
+fn is_fulu_wrapper_fork(fork: ForkName) -> bool {
+    fork == ForkName::Fulu || fork == ForkName::Gloas
+}
 
 /// B1 (D18): Electra and Fulu still zero `data.index` through the attestation
 /// call sites (`from_epoch` → signing via `convert_and_normalize` and
@@ -990,5 +1002,337 @@ async fn test_aggregation_still_zeroes_index_at_electra_and_fulu() {
 
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
         orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    }
+}
+
+async fn mount_attestation_mocks_with_bn_index(
+    mock_server: &wiremock::MockServer,
+    slot: u64,
+    pubkey_hex: &str,
+    bn_index: &str,
+) {
+    use wiremock::matchers::{method, path, path_regex, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let epoch = slot / SLOTS_PER_EPOCH;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey_hex,
+                "validator_index": "42",
+                "committee_index": "3",
+                "committee_length": "8",
+                "committees_at_slot": "4",
+                "validator_committee_index": "2",
+                "slot": slot.to_string()
+            }]
+        })))
+        .mount(mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/attestation_data"))
+        .and(query_param("slot", slot.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "slot": slot.to_string(),
+                "index": bn_index,
+                "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "source": {
+                    "epoch": (epoch.saturating_sub(1)).to_string(),
+                    "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                },
+                "target": {
+                    "epoch": epoch.to_string(),
+                    "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                }
+            }
+        })))
+        .mount(mock_server)
+        .await;
+}
+
+fn expected_attestation_data(slot: u64, epoch: u64, index: u64) -> eth_types::AttestationData {
+    eth_types::AttestationData {
+        slot,
+        index,
+        beacon_block_root: [0x11; 32],
+        source: eth_types::Checkpoint { epoch: epoch.saturating_sub(1), root: [0x22; 32] },
+        target: eth_types::Checkpoint { epoch, root: [0x33; 32] },
+    }
+}
+
+/// Submission path: BN `data.index` is preserved at Gloas (EMPTY=0 and FULL=1)
+/// and zeroed at Electra and Fulu. Forks are resolved via `from_epoch`.
+#[tokio::test]
+async fn test_submission_preserves_index_at_gloas_zeroes_at_electra_and_fulu() {
+    use crypto::{signing_root_for, DutyRef, Signature, SigningCtx};
+
+    let schedule = gloas_capable_fork_schedule();
+    let cases = [
+        ("electra", B1_ELECTRA_EPOCH, ForkName::Electra, "1", "0"),
+        ("fulu", B1_FULU_EPOCH, ForkName::Fulu, "1", "0"),
+        ("gloas-empty", B1_GLOAS_EPOCH, ForkName::Gloas, "0", "0"),
+        ("gloas-full", B1_GLOAS_EPOCH, ForkName::Gloas, "1", "1"),
+    ];
+
+    for (label, epoch, expected_fork, bn_index, submitted_index) in cases {
+        let fork_name = ForkName::from_epoch(epoch, &schedule);
+        assert_eq!(fork_name, expected_fork, "{label}: from_epoch on finite schedule");
+
+        let slot = epoch * SLOTS_PER_EPOCH;
+        let mock_server = wiremock::MockServer::start().await;
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator_with_schedule(
+                &mock_server.uri(),
+                slot,
+                schedule.clone(),
+            )
+            .await;
+        mount_attestation_mocks_with_bn_index(&mock_server, slot, &pubkey_hex, bn_index).await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "{label} attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1, "{label}: one submission");
+        let att = match &captured[0] {
+            VersionedAttestation::Electra(atts) => {
+                assert_eq!(expected_fork, ForkName::Electra, "{label}: Electra wrapper");
+                assert_eq!(atts.len(), 1);
+                &atts[0]
+            }
+            VersionedAttestation::Fulu(atts) => {
+                assert!(
+                    is_fulu_wrapper_fork(expected_fork),
+                    "{label}: Fulu wrapper (Gloas inherits >= Fulu until Phase 6)"
+                );
+                assert_eq!(atts.len(), 1);
+                &atts[0]
+            }
+            other => panic!(
+                "{label}: expected Electra+ SingleAttestation, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        };
+        assert_eq!(
+            att.data.index, submitted_index,
+            "{label}: submission-path SingleAttestation.data.index must equal \
+             {submitted_index} (BN data.index was {bn_index})"
+        );
+
+        let signed = utils::convert_attestation_data(&att.data).unwrap();
+        assert_eq!(
+            signed.index,
+            submitted_index.parse::<u64>().unwrap(),
+            "{label}: signed AttestationData.index must match the submitted value"
+        );
+
+        let pk_bytes = hex::decode(pubkey_hex.trim_start_matches("0x")).expect("pubkey hex");
+        let pk = PublicKey::from_bytes(&pk_bytes).expect("pubkey");
+        let sig_bytes = hex::decode(att.signature.trim_start_matches("0x")).expect("sig hex");
+        let sig = Signature::from_bytes(&sig_bytes).expect("signature");
+        let ctx = SigningCtx { fork_schedule: schedule.as_ref(), genesis_validators_root: B1_GVR };
+        let root = signing_root_for(&DutyRef::Attestation(&signed), &ctx);
+        sig.verify(&pk, &root).unwrap_or_else(|e| {
+            panic!("{label}: signature must verify over submitted index={submitted_index}: {e}")
+        });
+
+        if submitted_index != "0" {
+            let zeroed = eth_types::AttestationData { index: 0, ..signed.clone() };
+            let zeroed_signing = signing_root_for(&DutyRef::Attestation(&zeroed), &ctx);
+            assert!(
+                sig.verify(&pk, &zeroed_signing).is_err(),
+                "{label}: signature must not verify over a zeroed index"
+            );
+        }
+    }
+}
+
+/// Table over Deneb/Electra/Fulu/Gloas: Electra+ wrapper + `committee_index`
+/// query (aggregate `:297` / `:334`) at Electra onward, pre-Electra at Deneb.
+#[tokio::test]
+async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let schedule = gloas_capable_fork_schedule();
+    // (label, epoch, fork, bn_index, submitted_index, query_index, electra_wire)
+    let cases = [
+        ("deneb", B1_DENEB_EPOCH, ForkName::Deneb, "3", "3", 3u64, false),
+        ("electra", B1_ELECTRA_EPOCH, ForkName::Electra, "3", "0", 0, true),
+        ("fulu", B1_FULU_EPOCH, ForkName::Fulu, "3", "0", 0, true),
+        ("gloas-empty", B1_GLOAS_EPOCH, ForkName::Gloas, "0", "0", 0, true),
+        ("gloas-full", B1_GLOAS_EPOCH, ForkName::Gloas, "1", "1", 1, true),
+    ];
+
+    for (label, epoch, expected_fork, bn_index, submitted_index, query_index, electra_wire) in cases
+    {
+        let fork_name = ForkName::from_epoch(epoch, &schedule);
+        assert_eq!(fork_name, expected_fork, "{label}: from_epoch on finite schedule");
+        assert_eq!(
+            utils::uses_electra_attestation_wire(fork_name),
+            electra_wire,
+            "{label}: Electra+ wire predicate"
+        );
+
+        let slot = epoch * SLOTS_PER_EPOCH;
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator_with_schedule(
+                &mock_server.uri(),
+                slot,
+                schedule.clone(),
+            )
+            .await;
+        mount_attestation_mocks_with_bn_index(&mock_server, slot, &pubkey_hex, bn_index).await;
+
+        let expected_root = format!(
+            "0x{}",
+            hex::encode(expected_attestation_data(slot, epoch, query_index).tree_hash_root().0)
+        );
+
+        let mut aggregate_mock = Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(query_param("slot", slot.to_string()))
+            .and(query_param("attestation_data_root", expected_root.as_str()));
+        if electra_wire {
+            aggregate_mock = aggregate_mock.and(query_param("committee_index", "3"));
+        }
+        let aggregate_body = if electra_wire {
+            serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xff01",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": query_index.to_string(),
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": epoch.saturating_sub(1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "committee_bits": "0x0800000000000000"
+                }
+            })
+        } else {
+            serde_json::json!({
+                "data": {
+                    "aggregation_bits": "0xff01",
+                    "data": {
+                        "slot": slot.to_string(),
+                        "index": query_index.to_string(),
+                        "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                        "source": {
+                            "epoch": epoch.saturating_sub(1).to_string(),
+                            "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                        },
+                        "target": {
+                            "epoch": epoch.to_string(),
+                            "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                        }
+                    },
+                    "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            })
+        };
+        aggregate_mock
+            .respond_with(ResponseTemplate::new(200).set_body_json(aggregate_body))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let submit_v1 = if electra_wire {
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/validator/aggregate_and_proofs"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+        } else {
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/validator/aggregate_and_proofs"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+        };
+        submit_v1.mount(&mock_server).await;
+
+        let submit_v2 = if electra_wire {
+            Mock::given(method("POST"))
+                .and(path("/eth/v2/validator/aggregate_and_proofs"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+        } else {
+            Mock::given(method("POST"))
+                .and(path("/eth/v2/validator/aggregate_and_proofs"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+        };
+        submit_v2.mount(&mock_server).await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        let results = orchestrator.process_slot(slot).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].success, "{label} attestation should succeed: {:?}", results[0].error);
+
+        let captured = capturing.captured();
+        assert_eq!(captured.len(), 1, "{label}: one attestation submission");
+        match &captured[0] {
+            VersionedAttestation::PreElectra(atts) => {
+                assert!(!electra_wire, "{label}: pre-Electra wrapper only at Deneb");
+                assert_eq!(atts.len(), 1);
+                assert_eq!(atts[0].data.index, submitted_index, "{label}: pre-Electra data.index");
+            }
+            VersionedAttestation::Electra(atts) => {
+                assert!(electra_wire, "{label}: Electra SingleAttestation");
+                assert_eq!(expected_fork, ForkName::Electra, "{label}: Electra wrapper");
+                assert_eq!(atts.len(), 1);
+                assert_eq!(atts[0].data.index, submitted_index);
+            }
+            VersionedAttestation::Fulu(atts) => {
+                assert!(electra_wire, "{label}: Fulu SingleAttestation is Electra+ wire");
+                assert!(
+                    is_fulu_wrapper_fork(expected_fork),
+                    "{label}: Fulu wrapper at Fulu and Gloas (Phase 6 owns Gloas variant)"
+                );
+                assert_eq!(atts.len(), 1);
+                assert_eq!(atts[0].data.index, submitted_index);
+            }
+        }
+
+        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+
+        let requests = mock_server.received_requests().await.unwrap();
+        let aggregate_requests: Vec<_> = requests
+            .iter()
+            .filter(|r| {
+                r.url.path() == "/eth/v1/validator/aggregate_attestation"
+                    && r.method == wiremock::http::Method::GET
+            })
+            .collect();
+        assert!(!aggregate_requests.is_empty(), "{label}: expected aggregate_attestation request");
+        for req in &aggregate_requests {
+            let query = req.url.query().unwrap_or("");
+            if electra_wire {
+                assert!(
+                    query.contains("committee_index=3"),
+                    "{label}: Electra+ aggregate branch must pass committee_index, got: {query}"
+                );
+            } else {
+                assert!(
+                    !query.contains("committee_index"),
+                    "{label}: Deneb aggregate must not include committee_index, got: {query}"
+                );
+            }
+        }
     }
 }

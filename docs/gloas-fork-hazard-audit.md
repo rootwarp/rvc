@@ -37,12 +37,12 @@ Line numbers were opened on `feature/216-fork-hazard-audit` after 2.1
 
 | Class | Count |
 |-------|------:|
-| 1 `>= ForkName::X` | 6 |
+| 1 `>= ForkName::X` | 7 |
 | 2 `.index = 0` | 6 |
 | 3 `match ForkName` | 3 |
 | 4 string-literal dispatch | 6 |
 | 5 `.entries()` | 6 |
-| **Total** | **27** |
+| **Total** | **28** |
 
 Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 
@@ -54,13 +54,14 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/crypto/src/signing_root.rs` 286 | 1 | — | inherit-intentionally | Test mirror of 228 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
 | `crates/rvc/src/orchestrator/aggregation.rs` 88 | 1 | — | decided-not-inherited | `>= Fulu` picks the `"fulu"` submit label. Gloas must not inherit; Phase 6 owns the versioned-wrapper choice. One of three production `>= Fulu` sites (plan cited four). | phase-6 |
 | `crates/rvc/src/orchestrator/aggregation.rs` 130 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedSignedAggregateAndProof::Fulu`. Same Phase-6 verdict as 88. | phase-6 |
-| `crates/rvc/src/orchestrator/attestation.rs` 423 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedAttestation::Fulu`. Phase 6; do not inherit via open-ended `>=`. | phase-6 |
-| `crates/rvc/src/orchestrator/attestation.rs` 416 | 2 | — | must-bound | Submission-path `SingleAttestation.data.index = "0"` inside the `is_electra` branch (now `zeroes_committee_index`). 2.8 moves it onto the zeroing predicate so Gloas preserves the BN value. | 2.8 |
+| `crates/rvc/src/orchestrator/attestation.rs` 425 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedAttestation::Fulu`. Phase 6; do not inherit via open-ended `>=`. | phase-6 |
+| `crates/rvc/src/orchestrator/utils.rs` 144 | 1 | — | inherit-intentionally | `uses_electra_attestation_wire`: open-ended `>= Electra` so Gloas (and later forks) keep the Electra+ wire. Index zeroing is the separate `zeroes_committee_index` (`Electra..Gloas`). | 2.8 |
+| `crates/rvc/src/orchestrator/attestation.rs` 417 | 2 | — | must-bound | Submission-path `SingleAttestation.data.index = "0"` inside `zeroes_committee_index`, not the Electra+ wrapper branch, so Gloas preserves the BN value. | 2.8 |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 513 | 2 | — | test-only | Test applies `index = 0` when local `is_electra`. Follows 2.3 helper. | 2.3 |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 636 | 2 | — | test-only | Pre-Electra path does not assign; the `if is_electra` still contains the assignment. 2.3. | 2.3 |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 665 | 2 | — | test-only | Signing-root fixture zeros index by hand. Not a production guard. | 2.3 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 673 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 416. | 2.8 |
-| `crates/rvc/src/orchestrator/utils.rs` 152 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the closed-range predicate (2.3). | 2.3 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 673 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 417. | 2.8 |
+| `crates/rvc/src/orchestrator/utils.rs` 163 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the half-open `Electra..Gloas` predicate (2.3 / 2.8). | 2.3 |
 | `bin/rvc/tests/common/mock_bn.rs` 266 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
 | `crates/eth-types/src/fork.rs` 152 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
 | `crates/eth-types/src/fork.rs` 170 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
@@ -80,11 +81,12 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 
 ## Notes
 
-- **2.3 closed EIP-7549 zeroing.** Eight class-1 `>= ForkName::Electra` sites
-  under `orchestrator/` (production `utils.rs` / `attestation.rs` /
-  `aggregation.rs` plus five `fork_transition.rs` mirrors) now call
-  `zeroes_committee_index` (`Electra..=Fulu`) and no longer match class 1.
-  Class-2 assignments remain until 2.8 splits the wire-shape predicate.
+- **2.3 / 2.8 split EIP-7549 zeroing from Electra+ wire.** Zeroing is
+  `zeroes_committee_index` (`Electra..Gloas`). Wire shape is
+  `uses_electra_attestation_wire` (`>= Electra`, inherit-intentionally) so
+  Gloas keeps `SingleAttestation` / committee-index query / Electra aggregate
+  while preserving BN `data.index`. Class-2 assignments stay on the zeroing
+  predicate.
 - **Three, not four, `>= ForkName::Fulu` production sites.** The project plan
   cited four. The tree has `attestation.rs` 423, `aggregation.rs` 88,
   `aggregation.rs` 130. Recorded, not padded.

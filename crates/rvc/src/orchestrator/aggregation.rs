@@ -79,7 +79,7 @@ impl AggregationService {
         }
 
         let fork_name = ForkName::from_epoch(epoch, &self.config.fork_schedule);
-        let is_electra = utils::zeroes_committee_index(fork_name);
+        let uses_electra_wire = utils::uses_electra_attestation_wire(fork_name);
 
         let mut pre_electra_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
         let mut electra_aggregates: Vec<SignedElectraAggregateAndProof> = Vec::new();
@@ -87,7 +87,7 @@ impl AggregationService {
 
         let fork_label = if fork_name >= ForkName::Fulu {
             "fulu"
-        } else if is_electra {
+        } else if uses_electra_wire {
             "electra"
         } else {
             "pre_electra"
@@ -235,7 +235,7 @@ impl AggregationService {
         selection_proof: Vec<u8>,
         agg_span: Span,
     ) -> Option<ProducedAggregate> {
-        let is_electra = utils::zeroes_committee_index(fork_name);
+        let uses_electra_wire = utils::uses_electra_attestation_wire(fork_name);
         let committee_index: u64 = duty.committee_index.parse().ok()?;
 
         let attestation_data_response = match utils::timed(
@@ -268,10 +268,9 @@ impl AggregationService {
             }
         };
 
-        // EIP-7549: For Electra+, `AttestationData.index` must be zeroed
-        // before computing the tree-hash root used in the aggregate query.
-        // The BN returns the real committee index in its response; we must
-        // normalize it away here. Pre-Electra forks keep the index intact.
+        // EIP-7549: Electra through Fulu zero `AttestationData.index` before
+        // the aggregate-query tree-hash. Gloas preserves the BN value.
+        // Pre-Electra forks keep the index intact.
         let crypto_attestation_data = match utils::convert_and_normalize_attestation_data(
             &attestation_data_response.data,
             fork_name,
@@ -294,7 +293,7 @@ impl AggregationService {
 
         // Fetch the aggregate attestation
         // Electra: pass committee_index for per-committee aggregation
-        let electra_committee_index = if is_electra { Some(committee_index) } else { None };
+        let electra_committee_index = uses_electra_wire.then_some(committee_index);
         let aggregate = match utils::timed(
             "aggregate_attestation_fetch",
             self.config.timeouts.aggregate_fetch,
@@ -331,7 +330,7 @@ impl AggregationService {
 
         let aggregator_index: u64 = duty.validator_index.parse().ok()?;
 
-        if is_electra {
+        if uses_electra_wire {
             let electra_agg = match aggregate {
                 VersionedAggregateAttestation::Electra(a)
                 | VersionedAggregateAttestation::Fulu(a) => a,

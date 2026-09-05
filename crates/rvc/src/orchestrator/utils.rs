@@ -128,10 +128,20 @@ pub(crate) fn find_pubkey_bytes(
 
 /// Whether EIP-7549 zeroes `AttestationData.index` at this fork.
 ///
-/// Closed `Electra..=Fulu` so a later arm cannot inherit zeroing. 2.8 flips
-/// the upper bound once `ForkName::Gloas` exists.
+/// Half-open `Electra..Gloas`: Electra and Fulu zero the committee index.
+/// At Gloas the chain asserts `index < 2` (payload EMPTY=0 / FULL=1) and
+/// rs-vc **preserves, never computes**, the BN-supplied value.
 pub(crate) fn zeroes_committee_index(fork: ForkName) -> bool {
-    (ForkName::Electra..=ForkName::Fulu).contains(&fork)
+    (ForkName::Electra..ForkName::Gloas).contains(&fork)
+}
+
+/// Whether this fork uses the Electra+ attestation wire.
+///
+/// `SingleAttestation`, the aggregate `committee_index` query, and the
+/// Electra aggregate-and-proof variant. Open-ended so Gloas keeps that
+/// shape; index zeroing is the separate [`zeroes_committee_index`] rule.
+pub(crate) fn uses_electra_attestation_wire(fork: ForkName) -> bool {
+    fork >= ForkName::Electra
 }
 
 /// Converts BN-supplied attestation data and normalizes it per-fork.
@@ -139,7 +149,8 @@ pub(crate) fn zeroes_committee_index(fork: ForkName) -> bool {
 /// Per EIP-7549 (Electra through Fulu): `AttestationData.index` must be set to 0
 /// before computing the tree-hash root or signing. The BN still returns the
 /// real committee index in the response, so callers must zero it explicitly.
-/// Pre-Electra forks keep the original index intact.
+/// Pre-Electra forks keep the original index intact. At Gloas, `index` is the
+/// payload-status bit and is preserved as supplied by the BN.
 ///
 /// Use this helper everywhere a signing root or aggregate query root is needed
 /// to ensure consistent normalization across the attestation and aggregation paths.
@@ -413,8 +424,64 @@ mod tests {
             assert_eq!(
                 zeroes_committee_index(fork),
                 expected,
-                "{fork:?}: zeroes_committee_index is false Phase0..=Deneb, true Electra..=Fulu"
+                "{fork:?}: zeroes_committee_index is false Phase0..=Deneb, true Electra..Gloas"
             );
+        }
+    }
+
+    #[test]
+    fn test_uses_electra_attestation_wire_false_phase0_through_deneb_true_from_electra() {
+        let table = [
+            (ForkName::Phase0, false),
+            (ForkName::Altair, false),
+            (ForkName::Bellatrix, false),
+            (ForkName::Capella, false),
+            (ForkName::Deneb, false),
+            (ForkName::Electra, true),
+            (ForkName::Fulu, true),
+            (ForkName::Gloas, true),
+        ];
+        assert_eq!(table.len(), ForkName::COUNT, "table must cover every ForkName");
+        for (fork, expected) in table {
+            assert_eq!(
+                uses_electra_attestation_wire(fork),
+                expected,
+                "{fork:?}: Electra+ wire is false Phase0..=Deneb, true Electra onward"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zeroing_and_electra_wire_diverge_only_at_gloas() {
+        for fork in ForkName::ALL {
+            let zero = zeroes_committee_index(fork);
+            let wire = uses_electra_attestation_wire(fork);
+            if fork == ForkName::Gloas {
+                assert!(!zero && wire, "Gloas preserves index but keeps the Electra+ wire");
+            } else {
+                assert_eq!(zero, wire, "{fork:?}: zeroing and Electra+ wire match except at Gloas");
+            }
+        }
+    }
+
+    /// Electra 364544, Fulu 500000, Gloas 600000 — all finite (not `u64::MAX`).
+    fn finite_electra_fulu_gloas_schedule() -> eth_types::ForkSchedule {
+        eth_types::ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 74240,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 144896,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 194048,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 269568,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 364544,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 500000,
+            fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: 600000,
+            gloas_fork_version: [7, 0, 0, 0],
         }
     }
 
@@ -494,6 +561,38 @@ mod tests {
         let result =
             convert_and_normalize_attestation_data(&beacon_data, ForkName::Electra).unwrap();
         assert_eq!(result.index, 0);
+    }
+
+    #[test]
+    fn test_convert_and_normalize_preserves_gloas_index_zeroes_electra_and_fulu() {
+        let schedule = finite_electra_fulu_gloas_schedule();
+        let beacon_full = make_test_beacon_attestation_data("1");
+        let beacon_empty = make_test_beacon_attestation_data("0");
+
+        let gloas = ForkName::from_epoch(600000, &schedule);
+        assert_eq!(gloas, ForkName::Gloas);
+        assert_eq!(
+            convert_and_normalize_attestation_data(&beacon_full, gloas).unwrap().index,
+            1,
+            "Gloas preserves BN payload FULL=1"
+        );
+        assert_eq!(
+            convert_and_normalize_attestation_data(&beacon_empty, gloas).unwrap().index,
+            0,
+            "Gloas preserves BN payload EMPTY=0"
+        );
+
+        for (label, epoch, expected_fork) in
+            [("electra", 364544, ForkName::Electra), ("fulu", 500000, ForkName::Fulu)]
+        {
+            let fork = ForkName::from_epoch(epoch, &schedule);
+            assert_eq!(fork, expected_fork, "{label}: from_epoch on finite schedule");
+            assert_eq!(
+                convert_and_normalize_attestation_data(&beacon_full, fork).unwrap().index,
+                0,
+                "{label}: EIP-7549 still zeroes BN index 1"
+            );
+        }
     }
 
     // --- RF6-31: find_pubkey O(1) by compressed bytes ---
