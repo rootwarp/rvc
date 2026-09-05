@@ -42,6 +42,7 @@ pub fn exit_fork_schedule(network: &KeygenNetwork) -> ForkSchedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::capella_capped_fork_version;
     use eth_types::ForkName;
 
     // KAT anchors — byte literals that used to live in this file before RF3-04
@@ -214,11 +215,16 @@ mod tests {
         let net = from_name("mainnet").unwrap();
         let schedule = exit_fork_schedule(net);
 
-        // Any epoch should resolve to at most Capella
+        // Any realistic epoch should resolve to at most Capella
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
         assert_eq!(ForkName::from_epoch(0, &schedule), ForkName::Capella);
         assert_eq!(ForkName::from_epoch(1000, &schedule), ForkName::Capella);
-        assert_eq!(ForkName::from_epoch(999999, &schedule), ForkName::Capella);
+        assert_eq!(ForkName::from_epoch(1_000_000, &schedule), ForkName::Capella);
         assert_eq!(ForkName::from_epoch(u64::MAX - 1, &schedule), ForkName::Capella);
+        // Reverse scan at u64::MAX picks Gloas; EIP-7044 cap is independent.
+        assert_eq!(ForkName::from_epoch(u64::MAX, &schedule), ForkName::Gloas);
+        assert_eq!(capella_capped_fork_version(1_000_000, &schedule), net.capella_fork_version);
+        assert_eq!(capella_capped_fork_version(u64::MAX, &schedule), net.capella_fork_version);
     }
 
     #[test]

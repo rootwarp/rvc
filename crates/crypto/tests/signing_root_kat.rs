@@ -86,6 +86,29 @@ fn signing_ctx(schedule: &ForkSchedule) -> SigningCtx<'_> {
     SigningCtx { fork_schedule: schedule, genesis_validators_root: GVR }
 }
 
+// Issue 2.9 / #225: existing KAT vectors reused for sentinel-epoch inertness.
+// compressed_schedule() already sets gloas_fork_epoch = u64::MAX.
+const KAT_BLOCK_SIGNING_ROOT_PHASE0: Root = [
+    0x80, 0x1f, 0xbd, 0x74, 0x17, 0x52, 0xf6, 0xa9, 0xab, 0xaf, 0x0f, 0xd8, 0x20, 0xf9, 0xb3, 0x1b,
+    0xb7, 0x8f, 0xc4, 0xba, 0x26, 0x9b, 0x51, 0x3a, 0x38, 0xd6, 0xfd, 0xf3, 0xf7, 0x9d, 0xad, 0x8c,
+];
+const KAT_ATTESTATION_SIGNING_ROOT_ELECTRA_BOUNDARY: Root = [
+    0x28, 0x15, 0x19, 0xab, 0x10, 0xc9, 0x03, 0x76, 0x54, 0x79, 0xae, 0xd8, 0xa4, 0xec, 0x73, 0xae,
+    0x7b, 0x3c, 0x9a, 0x2f, 0x90, 0xf8, 0xa2, 0x12, 0x53, 0x1b, 0x93, 0x8e, 0x7b, 0xe7, 0xcb, 0x5c,
+];
+const KAT_AGGREGATE_AND_PROOF_SIGNING_ROOT_PHASE0: Root = [
+    0xbb, 0x54, 0x16, 0xb3, 0xdc, 0xde, 0xb5, 0x86, 0xb5, 0x4c, 0xe6, 0xcc, 0xe8, 0x39, 0x33, 0xf9,
+    0xa0, 0x60, 0x1d, 0xc4, 0xe3, 0x53, 0xc9, 0x85, 0x58, 0x83, 0x25, 0x6a, 0xd4, 0x4b, 0xf3, 0x84,
+];
+const KAT_ELECTRA_AGGREGATE_AND_PROOF_SIGNING_ROOT: Root = [
+    0x90, 0x5a, 0x0f, 0x50, 0x0c, 0x08, 0x7e, 0xdf, 0x43, 0x87, 0x77, 0xd1, 0x8d, 0xdc, 0x2b, 0xb7,
+    0xc9, 0xfc, 0x57, 0x1a, 0xa1, 0x0a, 0xa6, 0xe4, 0xc0, 0x52, 0xe4, 0x6e, 0x0e, 0x0f, 0x5b, 0xe2,
+];
+const KAT_VOLUNTARY_EXIT_SIGNING_ROOT_EIP7044_DENEB: Root = [
+    0xe7, 0x43, 0x2d, 0x27, 0xaf, 0x0c, 0x7e, 0xe4, 0xe3, 0x98, 0xb6, 0xa9, 0xd6, 0x02, 0xd0, 0x2f,
+    0x46, 0xf1, 0xea, 0x97, 0x29, 0xe4, 0x3a, 0xce, 0x3a, 0xa2, 0x78, 0xf9, 0x3e, 0x03, 0xd4, 0xe1,
+];
+
 // ============================================================
 // (a) Primitive compute_* KATs — same literal bytes as signing.rs
 // ============================================================
@@ -160,17 +183,12 @@ fn kat_domain_type_constants() {
 // domain_type = DOMAIN_BEACON_PROPOSER, fork = Phase0, gvr = 0xaa…, block_root = 0x11…
 #[test]
 fn kat_block_signing_root_phase0() {
-    const EXPECTED: Root = [
-        0x80, 0x1f, 0xbd, 0x74, 0x17, 0x52, 0xf6, 0xa9, 0xab, 0xaf, 0x0f, 0xd8, 0x20, 0xf9, 0xb3,
-        0x1b, 0xb7, 0x8f, 0xc4, 0xba, 0x26, 0x9b, 0x51, 0x3a, 0x38, 0xd6, 0xfd, 0xf3, 0xf7, 0x9d,
-        0xad, 0x8c,
-    ];
     let schedule = compressed_schedule();
     let block_root: Root = [0x11; 32];
     let slot = 0u64; // Phase0 epoch
     assert_eq!(
         signing_root_for(&DutyRef::BlockRoot { root: &block_root, slot }, &signing_ctx(&schedule)),
-        EXPECTED
+        KAT_BLOCK_SIGNING_ROOT_PHASE0
     );
 }
 
@@ -299,11 +317,6 @@ fn kat_attestation_signing_root_electra_boundary_minus_one_deneb() {
 // Electra boundary → Electra fork version.
 #[test]
 fn kat_attestation_signing_root_electra_boundary() {
-    const EXPECTED: Root = [
-        0x28, 0x15, 0x19, 0xab, 0x10, 0xc9, 0x03, 0x76, 0x54, 0x79, 0xae, 0xd8, 0xa4, 0xec, 0x73,
-        0xae, 0x7b, 0x3c, 0x9a, 0x2f, 0x90, 0xf8, 0xa2, 0x12, 0x53, 0x1b, 0x93, 0x8e, 0x7b, 0xe7,
-        0xcb, 0x5c,
-    ];
     let schedule = compressed_schedule();
     let target_epoch = 50u64;
     let data = AttestationData {
@@ -314,7 +327,7 @@ fn kat_attestation_signing_root_electra_boundary() {
         target: Checkpoint { epoch: target_epoch, root: [0x33; 32] },
     };
     let root = signing_root_for(&DutyRef::Attestation(&data), &signing_ctx(&schedule));
-    assert_eq!(root, EXPECTED);
+    assert_eq!(root, KAT_ATTESTATION_SIGNING_ROOT_ELECTRA_BOUNDARY);
     // Boundary: epoch 49 (Deneb) must not yield the same root as epoch 50.
     let pre = AttestationData {
         slot: 49 * SLOTS_PER_EPOCH,
@@ -369,11 +382,6 @@ fn kat_selection_proof_signing_root_altair() {
 // Complex BitList container — regression pin of free-function construction.
 #[test]
 fn kat_aggregate_and_proof_signing_root_phase0() {
-    const EXPECTED: Root = [
-        0xbb, 0x54, 0x16, 0xb3, 0xdc, 0xde, 0xb5, 0x86, 0xb5, 0x4c, 0xe6, 0xcc, 0xe8, 0x39, 0x33,
-        0xf9, 0xa0, 0x60, 0x1d, 0xc4, 0xe3, 0x53, 0xc9, 0x85, 0x58, 0x83, 0x25, 0x6a, 0xd4, 0x4b,
-        0xf3, 0x84,
-    ];
     let schedule = compressed_schedule();
     let slot: Slot = 100;
     let agg = AggregateAndProof {
@@ -393,18 +401,13 @@ fn kat_aggregate_and_proof_signing_root_phase0() {
     };
     assert_eq!(
         signing_root_for(&DutyRef::AggregateAndProof(&agg), &signing_ctx(&schedule)),
-        EXPECTED
+        KAT_AGGREGATE_AND_PROOF_SIGNING_ROOT_PHASE0
     );
 }
 
 // ElectraAggregateAndProof at electra epoch (test_sign_electra_aggregate_and_proof_valid).
 #[test]
 fn kat_electra_aggregate_and_proof_signing_root() {
-    const KAT_EXPECTED: Root = [
-        0x90, 0x5a, 0x0f, 0x50, 0x0c, 0x08, 0x7e, 0xdf, 0x43, 0x87, 0x77, 0xd1, 0x8d, 0xdc, 0x2b,
-        0xb7, 0xc9, 0xfc, 0x57, 0x1a, 0xa1, 0x0a, 0xa6, 0xe4, 0xc0, 0x52, 0xe4, 0x6e, 0x0e, 0x0f,
-        0x5b, 0xe2,
-    ];
     let schedule = compressed_schedule();
     let slot = 50 * SLOTS_PER_EPOCH;
     let agg = ElectraAggregateAndProof {
@@ -425,7 +428,7 @@ fn kat_electra_aggregate_and_proof_signing_root() {
     };
     assert_eq!(
         signing_root_for(&DutyRef::ElectraAggregateAndProof(&agg), &signing_ctx(&schedule)),
-        KAT_EXPECTED
+        KAT_ELECTRA_AGGREGATE_AND_PROOF_SIGNING_ROOT
     );
 }
 
@@ -664,11 +667,6 @@ fn kat_voluntary_exit_signing_root_eip7044_deneb_capped() {
         0x8d, 0xb8, 0x80, 0x43, 0xdb, 0x4d, 0x9e, 0x82, 0xec, 0x3c, 0x81, 0x68, 0xb6, 0xa7, 0x9f,
         0xe0, 0xf0,
     ];
-    const EXPECTED_ROOT: Root = [
-        0xe7, 0x43, 0x2d, 0x27, 0xaf, 0x0c, 0x7e, 0xe4, 0xe3, 0x98, 0xb6, 0xa9, 0xd6, 0x02, 0xd0,
-        0x2f, 0x46, 0xf1, 0xea, 0x97, 0x29, 0xe4, 0x3a, 0xce, 0x3a, 0xa2, 0x78, 0xf9, 0x3e, 0x03,
-        0xd4, 0xe1,
-    ];
     let schedule = compressed_schedule();
     let exit = VoluntaryExit { epoch: 45, validator_index: 42 };
     let version = capella_capped_fork_version(exit.epoch, &schedule);
@@ -676,7 +674,7 @@ fn kat_voluntary_exit_signing_root_eip7044_deneb_capped() {
     let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, version, GVR);
     assert_eq!(domain, EXPECTED_DOMAIN);
     let root = signing_root_for(&DutyRef::VoluntaryExit(&exit), &signing_ctx(&schedule));
-    assert_eq!(root, EXPECTED_ROOT);
+    assert_eq!(root, KAT_VOLUNTARY_EXIT_SIGNING_ROOT_EIP7044_DENEB);
     // Uncapped Deneb domain must differ.
     let deneb_domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, DENEB, GVR);
     assert_ne!(domain, deneb_domain);
@@ -821,6 +819,113 @@ async fn kat_typed_signer_voluntary_exit_eip7044_matches_kat_root() {
     let signer = make_local_signer(sk);
     let sig = TypedSigner::sign_voluntary_exit(&signer, &exit, &ctx).await.unwrap();
     assert!(sig.verify(&pk, &KAT_EXPECTED_ROOT).is_ok());
+}
+
+// ============================================================
+// Issue 2.9 / #225: sentinel-epoch inertness (ADR-009)
+// ============================================================
+
+/// With Gloas at `u64::MAX`, duty roots stay byte-identical to the existing
+/// `KAT_*` vectors (compressed_schedule already uses the sentinel).
+#[test]
+fn kat_sentinel_gloas_duty_signing_root() {
+    let schedule = compressed_schedule();
+    assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+    let ctx = signing_ctx(&schedule);
+
+    let target_epoch = 50u64;
+    let att_data = AttestationData {
+        slot: target_epoch * SLOTS_PER_EPOCH,
+        index: 0,
+        beacon_block_root: [0x11; 32],
+        source: Checkpoint { epoch: target_epoch - 1, root: [0x22; 32] },
+        target: Checkpoint { epoch: target_epoch, root: [0x33; 32] },
+    };
+    assert_eq!(
+        signing_root_for(&DutyRef::Attestation(&att_data), &ctx),
+        KAT_ATTESTATION_SIGNING_ROOT_ELECTRA_BOUNDARY
+    );
+
+    let block_root: Root = [0x11; 32];
+    assert_eq!(
+        signing_root_for(&DutyRef::BlockRoot { root: &block_root, slot: 0 }, &ctx),
+        KAT_BLOCK_SIGNING_ROOT_PHASE0
+    );
+
+    let slot: Slot = 100;
+    let agg = AggregateAndProof {
+        aggregator_index: 42,
+        aggregate: Attestation {
+            aggregation_bits: vec![0xff; 4],
+            data: AttestationData {
+                slot,
+                index: 1,
+                beacon_block_root: [1u8; 32],
+                source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH - 1, root: [2u8; 32] },
+                target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [3u8; 32] },
+            },
+            signature: vec![0xaa; 96],
+        },
+        selection_proof: vec![0xbb; 96],
+    };
+    assert_eq!(
+        signing_root_for(&DutyRef::AggregateAndProof(&agg), &ctx),
+        KAT_AGGREGATE_AND_PROOF_SIGNING_ROOT_PHASE0
+    );
+
+    let e_slot = 50 * SLOTS_PER_EPOCH;
+    let eagg = ElectraAggregateAndProof {
+        aggregator_index: 42,
+        aggregate: ElectraAttestation {
+            aggregation_bits: vec![0xff; 4],
+            data: AttestationData {
+                slot: e_slot,
+                index: 0,
+                beacon_block_root: [1u8; 32],
+                source: Checkpoint { epoch: 49, root: [2u8; 32] },
+                target: Checkpoint { epoch: 50, root: [3u8; 32] },
+            },
+            signature: vec![0xaa; 96],
+            committee_bits: vec![0x01, 0, 0, 0, 0, 0, 0, 0],
+        },
+        selection_proof: vec![0xbb; 96],
+    };
+    assert_eq!(
+        signing_root_for(&DutyRef::ElectraAggregateAndProof(&eagg), &ctx),
+        KAT_ELECTRA_AGGREGATE_AND_PROOF_SIGNING_ROOT
+    );
+
+    let exit = VoluntaryExit { epoch: 45, validator_index: 42 };
+    assert_eq!(
+        signing_root_for(&DutyRef::VoluntaryExit(&exit), &ctx),
+        KAT_VOLUNTARY_EXIT_SIGNING_ROOT_EIP7044_DENEB
+    );
+}
+
+/// EIP-7044: an exit at epoch 1_000_000 still signs under Capella with Gloas
+/// in the schedule at `u64::MAX`. `from_epoch(1_000_000)` is Fulu.
+#[test]
+fn test_eip7044_exit_epoch_1_000_000_still_capella_with_sentinel_gloas() {
+    let schedule = compressed_schedule();
+    assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+    assert_eq!(ForkName::from_epoch(1_000_000, &schedule), ForkName::Fulu);
+    assert_eq!(capella_capped_fork_version(1_000_000, &schedule), CAPELLA);
+
+    let exit = VoluntaryExit { epoch: 1_000_000, validator_index: 42 };
+    let root = signing_root_for(&DutyRef::VoluntaryExit(&exit), &signing_ctx(&schedule));
+    let capella_domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, CAPELLA, GVR);
+    assert_eq!(root, compute_signing_root(&exit, capella_domain));
+
+    let fulu = [0x06, 0x00, 0x00, 0x00];
+    let gloas = [0x07, 0x00, 0x00, 0x00];
+    assert_ne!(root, compute_signing_root(&exit, compute_domain(DOMAIN_VOLUNTARY_EXIT, fulu, GVR)));
+    assert_ne!(
+        root,
+        compute_signing_root(&exit, compute_domain(DOMAIN_VOLUNTARY_EXIT, gloas, GVR))
+    );
+
+    assert_eq!(ForkName::from_epoch(u64::MAX, &schedule), ForkName::Gloas);
+    assert_eq!(capella_capped_fork_version(u64::MAX, &schedule), CAPELLA);
 }
 
 #[tokio::test]

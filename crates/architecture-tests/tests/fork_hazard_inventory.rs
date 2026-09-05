@@ -118,7 +118,7 @@ const EXPECTED_COUNTS: [(Class, usize); 5] = [
     (Class::IndexZero, 6),
     (Class::MatchForkName, 3),
     (Class::StringDispatch, 6),
-    (Class::Entries, 6),
+    (Class::Entries, 7),
 ];
 
 /// Checked-in `(path, snippet)` inventory. Sorted by (class, path, line).
@@ -337,7 +337,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        183,
+        184,
         Class::Entries,
         false,
         ".entries()",
@@ -346,7 +346,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        193,
+        194,
         Class::Entries,
         false,
         ".entries()",
@@ -355,7 +355,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        202,
+        203,
         Class::Entries,
         false,
         ".entries()",
@@ -364,7 +364,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        578,
+        579,
         Class::Entries,
         false,
         "schedule.entries()",
@@ -373,12 +373,21 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        595,
+        596,
         Class::Entries,
         false,
         "schedule.entries()",
         Verdict::TestOnly,
         "2.1",
+    ),
+    inv(
+        "crates/eth-types/tests/sentinel_epoch_inertness.rs",
+        85,
+        Class::Entries,
+        false,
+        "schedule.entries()",
+        Verdict::TestOnly,
+        "2.9",
     ),
 ];
 

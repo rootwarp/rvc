@@ -464,6 +464,31 @@ mod tests {
         }
     }
 
+    /// Issue 2.9: with Gloas at the sentinel, realistic epochs keep Fulu
+    /// zeroing and Electra+ wire. `from_epoch(u64::MAX)` is Gloas (intended).
+    #[test]
+    fn test_sentinel_gloas_realistic_epochs_keep_fulu_zeroing_and_electra_wire() {
+        let mut schedule = finite_electra_fulu_gloas_schedule();
+        schedule.gloas_fork_epoch = u64::MAX;
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+
+        for epoch in [0, 269568, 364544, 500000, 1_000_000, u64::MAX - 1] {
+            let fork = ForkName::from_epoch(epoch, &schedule);
+            assert_ne!(fork, ForkName::Gloas, "epoch {epoch} must stay pre-Gloas");
+        }
+
+        let fulu = ForkName::from_epoch(1_000_000, &schedule);
+        assert_eq!(fulu, ForkName::Fulu);
+        assert!(zeroes_committee_index(fulu));
+        assert!(uses_electra_attestation_wire(fulu));
+
+        // Known exception: reverse scan at u64::MAX returns Gloas.
+        let gloas = ForkName::from_epoch(u64::MAX, &schedule);
+        assert_eq!(gloas, ForkName::Gloas);
+        assert!(!zeroes_committee_index(gloas));
+        assert!(uses_electra_attestation_wire(gloas));
+    }
+
     /// Electra 364544, Fulu 500000, Gloas 600000 — all finite (not `u64::MAX`).
     fn finite_electra_fulu_gloas_schedule() -> eth_types::ForkSchedule {
         eth_types::ForkSchedule {
@@ -593,6 +618,21 @@ mod tests {
                 "{label}: EIP-7549 still zeroes BN index 1"
             );
         }
+    }
+
+    #[test]
+    fn test_sentinel_gloas_convert_still_zeroes_index_at_epoch_1_000_000() {
+        let mut schedule = finite_electra_fulu_gloas_schedule();
+        schedule.gloas_fork_epoch = u64::MAX;
+        let fork = ForkName::from_epoch(1_000_000, &schedule);
+        assert_eq!(fork, ForkName::Fulu);
+        let beacon = make_test_beacon_attestation_data("1");
+        assert_eq!(
+            convert_and_normalize_attestation_data(&beacon, fork).unwrap().index,
+            0,
+            "sentinel Gloas: epoch 1_000_000 is Fulu and still zeroes"
+        );
+        assert!(uses_electra_attestation_wire(fork));
     }
 
     // --- RF6-31: find_pubkey O(1) by compressed bytes ---

@@ -388,10 +388,12 @@ mod tests {
         let schedule = compressed_schedule();
         // Table: (epoch, expected_fork_version) — remerkleable-derived roots in integration KATs.
         let cases: &[(Epoch, [u8; 4])] = &[
-            (25, BELLATRIX), // pre-Capella
-            (30, CAPELLA),   // Capella activation
-            (45, CAPELLA),   // Deneb epoch — capped
-            (55, CAPELLA),   // Electra epoch — capped
+            (25, BELLATRIX),      // pre-Capella
+            (30, CAPELLA),        // Capella activation
+            (45, CAPELLA),        // Deneb epoch — capped
+            (55, CAPELLA),        // Electra epoch — capped
+            (1_000_000, CAPELLA), // Fulu under sentinel Gloas — still Capella
+            (u64::MAX, CAPELLA),  // from_epoch(MAX) is Gloas; cap still Capella
         ];
         for &(epoch, expected_version) in cases {
             assert_eq!(
@@ -500,7 +502,7 @@ mod tests {
     #[test]
     fn test_capella_capped_fork_version_is_shared_with_signing_root_for() {
         let schedule = compressed_schedule();
-        for epoch in [0, 25, 30, 45, 55, 100] {
+        for epoch in [0, 25, 30, 45, 55, 100, 1_000_000, u64::MAX] {
             let exit = VoluntaryExit { epoch, validator_index: 1 };
             let via_helper = {
                 let version = capella_capped_fork_version(epoch, &schedule);
