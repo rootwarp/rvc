@@ -33,6 +33,8 @@ pub fn exit_fork_schedule(network: &KeygenNetwork) -> ForkSchedule {
         electra_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
         fulu_fork_epoch: u64::MAX,
         fulu_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
+        gloas_fork_epoch: u64::MAX,
+        gloas_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
     }
 }
 

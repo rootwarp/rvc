@@ -51,6 +51,8 @@ fn test_schedule() -> ForkSchedule {
         electra_fork_version: [0x05, 0x00, 0x00, 0x00],
         fulu_fork_epoch: 60,
         fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
+        gloas_fork_epoch: u64::MAX,
+        gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
     }
 }
 

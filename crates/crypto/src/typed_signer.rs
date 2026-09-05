@@ -652,6 +652,8 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: 60,
             fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
         };
         // Altair epoch — no cap, returns Altair version
         assert_eq!(capella_capped_fork_version(15, &schedule), [1, 0, 0, 0]);
@@ -673,6 +675,8 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: 60,
             fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
         };
         // Electra epoch — cap at Capella
         assert_eq!(capella_capped_fork_version(55, &schedule), [3, 0, 0, 0]);

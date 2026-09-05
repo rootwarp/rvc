@@ -51,7 +51,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 |---|---|---|---|---|---|
 | `bin/rvc-keygen/src/exit.rs` 107 | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 228. | — |
 | `crates/crypto/src/signing_root.rs` 228 | 1 | — | inherit-intentionally | EIP-7044: voluntary-exit domain stays Capella-capped however many post-Capella forks exist. Open-ended `>=` is the spec. | — |
-| `crates/crypto/src/signing_root.rs` 284 | 1 | — | inherit-intentionally | Test mirror of 228 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
+| `crates/crypto/src/signing_root.rs` 286 | 1 | — | inherit-intentionally | Test mirror of 228 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
 | `crates/rvc/src/orchestrator/aggregation.rs` 88 | 1 | — | decided-not-inherited | `>= Fulu` picks the `"fulu"` submit label. Gloas must not inherit; Phase 6 owns the versioned-wrapper choice. One of three production `>= Fulu` sites (plan cited four). | phase-6 |
 | `crates/rvc/src/orchestrator/aggregation.rs` 130 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedSignedAggregateAndProof::Fulu`. Same Phase-6 verdict as 88. | phase-6 |
 | `crates/rvc/src/orchestrator/attestation.rs` 423 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedAttestation::Fulu`. Phase 6; do not inherit via open-ended `>=`. | phase-6 |
@@ -62,20 +62,20 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 673 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 416. | 2.8 |
 | `crates/rvc/src/orchestrator/utils.rs` 152 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the closed-range predicate (2.3). | 2.3 |
 | `bin/rvc/tests/common/mock_bn.rs` 266 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
-| `crates/eth-types/src/fork.rs` 146 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
-| `crates/eth-types/src/fork.rs` 162 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
+| `crates/eth-types/src/fork.rs` 148 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
+| `crates/eth-types/src/fork.rs` 164 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
 | `crates/beacon/src/client.rs` 751 | 4 | exhaustive | inherit-intentionally | `VersionedSignedAggregateAndProof` → `Eth-Consensus-Version` `"electra"` / `"fulu"` (header at 768). New enum variant is a compile error; the Gloas header string is Phase 6. | phase-6 |
 | `crates/beacon/src/client.rs` 886 | 4 | exhaustive | inherit-intentionally | `VersionedAttestation` → `"phase0"` / `"electra"` / `"fulu"` (Fulu arm at 889). Same compile-forced grow-set; Gloas string is Phase 6. | phase-6 |
 | `crates/block-service/src/service/mod.rs` 581 | 4 | _ | decided-not-inherited | `ssz_block_format`: unblinded deneb/electra/fulu → `BlockContents`; `_ => BeaconBlock` silently skips the KZG bind. `"gloas"` would fall through. 2.7 leaves this untouched; Phase 6. | phase-6 |
-| `crates/block-service/src/service/tests/mocks.rs` 518 | 4 | _ | test-only | Test body SSZ picker. Wildcard `_ =>` Deneb body. Mirrors production string dispatch. | — |
-| `crates/block-service/src/service/tests/mocks.rs` 532 | 4 | _ | test-only | Blinded-body twin of 518. | — |
-| `crates/block-service/src/service/tests/mocks.rs` 625 | 4 | exhaustive | test-only | `matches!` on deneb/electra/fulu for `BlockContents` bytes. Closed string set; `"gloas"` is false. | — |
+| `crates/block-service/src/service/tests/mocks.rs` 520 | 4 | _ | test-only | Test body SSZ picker. Wildcard `_ =>` Deneb body. Mirrors production string dispatch. | — |
+| `crates/block-service/src/service/tests/mocks.rs` 534 | 4 | _ | test-only | Blinded-body twin of 520. | — |
+| `crates/block-service/src/service/tests/mocks.rs` 627 | 4 | exhaustive | test-only | `matches!` on deneb/electra/fulu for `BlockContents` bytes. Closed string set; `"gloas"` is false. | — |
 | `crates/crypto/src/typed_signer.rs` 58 | 5 | — | must-bound | `SignContext::resolve` first-matches `fork_info.current_version` over `entries()`. Two `[0xFF;4]` rows (unscheduled Fulu+Gloas after 2.6) resolve Fulu, so `Gloas.fork_version()` does not round-trip. 2.6 pins the collision; 2.10 confines it to both-unscheduled. | 2.6 |
-| `crates/eth-types/src/fork.rs` 175 | 5 | — | inherit-intentionally | `from_epoch` reverse-scans `entries()`; a new row is picked up automatically. Equal activation epochs pick the latest fork. | 2.5b |
-| `crates/eth-types/src/fork.rs` 185 | 5 | — | inherit-intentionally | `fork_version` lookup through `entries()`. New row participates by construction. | 2.5b |
-| `crates/eth-types/src/fork.rs` 194 | 5 | — | inherit-intentionally | `activation_epoch` lookup through `entries()`. Same inherit. | 2.5b |
-| `crates/eth-types/src/fork.rs` 550 | 5 | — | test-only | Seven-ness assert `entries().len() == 7`. 2.5b rewrites. | 2.5b |
-| `crates/eth-types/src/fork.rs` 566 | 5 | — | test-only | 2.1 uniqueness test (`entries().len() == COUNT`). Sixth class-5 site; plan listed five against the pre-2.1 tree. | 2.1 |
+| `crates/eth-types/src/fork.rs` 177 | 5 | — | inherit-intentionally | `from_epoch` reverse-scans `entries()`; a new row is picked up automatically. Equal activation epochs pick the latest fork. | 2.5b |
+| `crates/eth-types/src/fork.rs` 187 | 5 | — | inherit-intentionally | `fork_version` lookup through `entries()`. New row participates by construction. | 2.5b |
+| `crates/eth-types/src/fork.rs` 196 | 5 | — | inherit-intentionally | `activation_epoch` lookup through `entries()`. Same inherit. | 2.5b |
+| `crates/eth-types/src/fork.rs` 560 | 5 | — | test-only | Seven-ness assert `entries().len() == 7`. 2.5b rewrites. | 2.5b |
+| `crates/eth-types/src/fork.rs` 576 | 5 | — | test-only | 2.1 uniqueness test (`entries().len() == COUNT`). Sixth class-5 site; plan listed five against the pre-2.1 tree. | 2.1 |
 <!-- END INVENTORY -->
 
 ## Notes

@@ -144,7 +144,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/crypto/src/signing_root.rs",
-        284,
+        286,
         Class::GeForkName,
         false,
         ">= ForkName::Capella",
@@ -245,7 +245,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        146,
+        148,
         Class::MatchForkName,
         false,
         "match self {",
@@ -254,7 +254,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        162,
+        164,
         Class::MatchForkName,
         false,
         "match self {",
@@ -291,7 +291,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        518,
+        520,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -300,7 +300,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        532,
+        534,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -309,7 +309,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        625,
+        627,
         Class::StringDispatch,
         false,
         "matches!(consensus_version",
@@ -328,7 +328,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        175,
+        177,
         Class::Entries,
         false,
         ".entries()",
@@ -337,7 +337,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        185,
+        187,
         Class::Entries,
         false,
         ".entries()",
@@ -346,7 +346,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        194,
+        196,
         Class::Entries,
         false,
         ".entries()",
@@ -355,7 +355,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        550,
+        560,
         Class::Entries,
         false,
         "schedule.entries()",
@@ -364,7 +364,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        566,
+        576,
         Class::Entries,
         false,
         "schedule.entries()",

@@ -503,6 +503,8 @@ pub(crate) fn test_fork_schedule() -> ForkSchedule {
         electra_fork_version: [5, 0, 0, 0],
         fulu_fork_epoch: 60,
         fulu_fork_version: [6, 0, 0, 0],
+        gloas_fork_epoch: u64::MAX,
+        gloas_fork_version: [7, 0, 0, 0],
     }
 }
 

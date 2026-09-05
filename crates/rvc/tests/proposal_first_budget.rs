@@ -492,6 +492,8 @@ fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         electra_fork_version: [0, 0, 0, 6],
         fulu_fork_epoch: 60,
         fulu_fork_version: [0, 0, 0, 7],
+        gloas_fork_epoch: u64::MAX,
+        gloas_fork_version: [0, 0, 0, 8],
     })
 }
 

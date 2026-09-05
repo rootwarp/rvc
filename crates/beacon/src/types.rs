@@ -252,6 +252,8 @@ pub fn parse_fork_schedule(
             "FULU_FORK_VERSION",
             [0xFF, 0xFF, 0xFF, 0xFF],
         )?,
+        gloas_fork_epoch: u64::MAX,
+        gloas_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
     })
 }
 

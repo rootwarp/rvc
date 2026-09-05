@@ -173,6 +173,8 @@ mod tests {
             electra_fork_version: [0; 4],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [0; 4],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0; 4],
         }
     }
 

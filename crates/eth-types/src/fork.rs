@@ -32,6 +32,8 @@ pub struct ForkSchedule {
     pub electra_fork_version: Version,
     pub fulu_fork_epoch: Epoch,
     pub fulu_fork_version: Version,
+    pub gloas_fork_epoch: Epoch,
+    pub gloas_fork_version: Version,
 }
 
 /// Error returned when parsing an unknown fork name string.
@@ -228,6 +230,8 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: 500000,
             fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
         }
     }
 
@@ -248,6 +252,8 @@ mod tests {
             electra_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
         }
     }
 
@@ -314,6 +320,8 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
         };
         assert_eq!(ForkName::from_epoch(0, &schedule), ForkName::Phase0);
         assert_eq!(ForkName::from_epoch(10, &schedule), ForkName::Altair);
@@ -420,6 +428,8 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
         };
         assert_eq!(ForkName::from_epoch(1_000_000, &schedule), ForkName::Electra);
     }

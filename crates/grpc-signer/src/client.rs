@@ -713,6 +713,8 @@ mod tests {
             electra_fork_version: [0x05, 0x00, 0x00, 0x00],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
         }
     }
 
@@ -731,6 +733,8 @@ mod tests {
             electra_fork_version: HOODI_ELECTRA,
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [0x70, 0x00, 0x09, 0x10],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x80, 0x00, 0x09, 0x10],
         }
     }
 

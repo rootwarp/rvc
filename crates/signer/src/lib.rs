@@ -1195,6 +1195,8 @@ mod tests {
             electra_fork_version: [0x00, 0x00, 0x00, 0x06],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [0x00, 0x00, 0x00, 0x07],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x00, 0x00, 0x00, 0x08],
         }
     }
 
@@ -1268,6 +1270,8 @@ mod tests {
             electra_fork_version: [0x00, 0x00, 0x00, 0x06],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [0x00, 0x00, 0x00, 0x07],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x00, 0x00, 0x00, 0x08],
         };
         let attestation_data = create_test_attestation_data(50, 51);
         let genesis_root = [0xaa; 32];
@@ -1777,6 +1781,8 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: 60,
             fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
         }
     }
 
@@ -2877,6 +2883,8 @@ mod tests {
             electra_fork_version: [0x15, 0, 0, 0],
             fulu_fork_epoch: 60,
             fulu_fork_version: [0x16, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x17, 0, 0, 0],
         };
         let gvr: Root = [0xbb; 32];
         let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: gvr };

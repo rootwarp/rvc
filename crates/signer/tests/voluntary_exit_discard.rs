@@ -58,6 +58,8 @@ fn make_fork_schedule() -> ForkSchedule {
         electra_fork_version: [0x00, 0x00, 0x00, 0x06],
         fulu_fork_epoch: u64::MAX,
         fulu_fork_version: [0x00, 0x00, 0x00, 0x07],
+        gloas_fork_epoch: u64::MAX,
+        gloas_fork_version: [0x00, 0x00, 0x00, 0x08],
     }
 }
 
