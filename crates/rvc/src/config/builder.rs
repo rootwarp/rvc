@@ -22,7 +22,7 @@ use duty_tracker::DutyTracker;
 use eth_types::{Epoch, ForkSchedule, Root};
 use signer::{SignerService, ValidatorSigner};
 use slashing::{GroupCommitConfig, SlashingDb};
-use timing::SystemSlotClock;
+use timing::{DeadlineBps, SystemSlotClock};
 use validator_store::ValidatorStore;
 
 use secret_provider::SecretProvider;
@@ -502,7 +502,11 @@ impl ServiceBuilder {
         let slots_per_epoch = self.config.network.slots_per_epoch();
 
         let clock = SystemSlotClock::new(genesis_time, slot_duration, slots_per_epoch)
-            .map_err(|e| ConfigError::MissingField(format!("invalid slot clock: {e}")))?;
+            .map_err(|e| ConfigError::MissingField(format!("invalid slot clock: {e}")))?
+            .with_deadlines(DeadlineBps {
+                attestation: self.config.timing.attestation_due_bps,
+                aggregate: self.config.timing.aggregate_due_bps,
+            });
         info!(
             genesis_time = genesis_time,
             slot_duration_ms,
@@ -713,12 +717,15 @@ impl ServiceBuilder {
     ) -> OrchestratorConfig {
         OrchestratorConfig::new(genesis_validators_root, fork_schedule)
             .with_shutdown_timeout(Duration::from_secs(30))
+            .with_attestation_due_bps(self.config.timing.attestation_due_bps)
+            .with_aggregate_due_bps(self.config.timing.aggregate_due_bps)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TimingConfig;
     use crypto::{LocalSigner, Signer as _};
     use eth_types::NetworkPreset;
     use tempfile::TempDir;
@@ -956,6 +963,19 @@ mod tests {
         let clock = result.unwrap();
         assert_eq!(clock.genesis_time(), 1606824023);
         assert_eq!(clock.slot_duration(), Duration::from_secs(6));
+        assert_eq!(clock.deadlines().attestation, 3333);
+        assert_eq!(clock.deadlines().aggregate, 6667);
+    }
+
+    #[test]
+    fn test_build_slot_clock_forwards_timing_bps_fields() {
+        let config = Config {
+            timing: TimingConfig { attestation_due_bps: 2500, aggregate_due_bps: 4000 },
+            ..create_minimal_config()
+        };
+        let clock = ServiceBuilder::new(config).build_slot_clock(12_000).unwrap();
+        assert_eq!(clock.deadlines().attestation, 2500);
+        assert_eq!(clock.deadlines().aggregate, 4000);
     }
 
     #[test]
@@ -1046,13 +1066,8 @@ mod tests {
         assert!(Arc::strong_count(&tracker) > 0);
     }
 
-    #[test]
-    fn test_build_orchestrator_config() {
-        let config = create_minimal_config();
-        let builder = ServiceBuilder::new(config);
-
-        let root = [0xaa; 32];
-        let fork_schedule = Arc::new(ForkSchedule {
+    fn sample_fork_schedule() -> Arc<ForkSchedule> {
+        Arc::new(ForkSchedule {
             genesis_fork_version: [0, 0, 0, 0],
             altair_fork_epoch: 74240,
             altair_fork_version: [1, 0, 0, 0],
@@ -1066,11 +1081,33 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [6, 0, 0, 0],
-        });
-        let orch_config = builder.build_orchestrator_config(root, fork_schedule);
+        })
+    }
+
+    #[test]
+    fn test_build_orchestrator_config() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+
+        let root = [0xaa; 32];
+        let orch_config = builder.build_orchestrator_config(root, sample_fork_schedule());
 
         assert_eq!(orch_config.genesis_validators_root, root);
         assert_eq!(orch_config.shutdown_timeout, Duration::from_secs(30));
+        assert_eq!(orch_config.attestation_due_bps, 3333);
+        assert_eq!(orch_config.aggregate_due_bps, 6667);
+    }
+
+    #[test]
+    fn test_build_orchestrator_config_forwards_timing_bps_fields() {
+        let config = Config {
+            timing: TimingConfig { attestation_due_bps: 2500, aggregate_due_bps: 4000 },
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        assert_eq!(orch_config.attestation_due_bps, 2500);
+        assert_eq!(orch_config.aggregate_due_bps, 4000);
     }
 
     #[test]

@@ -55,6 +55,14 @@ fn test_orchestrator_config_new() {
 }
 
 #[test]
+fn test_orchestrator_config_default_bps_fields() {
+    let config = OrchestratorConfig::new([0xbb; 32], create_test_fork_schedule());
+    let defaults = timing::DeadlineBps::default();
+    assert_eq!(config.attestation_due_bps, defaults.attestation);
+    assert_eq!(config.aggregate_due_bps, defaults.aggregate);
+}
+
+#[test]
 fn test_orchestrator_config_with_shutdown_timeout() {
     let config = OrchestratorConfig::new([0xcc; 32], create_test_fork_schedule())
         .with_shutdown_timeout(Duration::from_secs(60));

@@ -1,6 +1,7 @@
 //! Coordinator tests: timeouts.
 
 use super::*;
+use timing::{AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS};
 
 #[test]
 fn test_timeout_constants_are_reasonable() {

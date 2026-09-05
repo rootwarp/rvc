@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use eth_types::Slot;
 
 use crate::error::TimingError;
-use crate::{due_ms, ATTESTATION_DUE_BPS, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+use crate::{due_ms, DeadlineBps, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 
 /// Slot timing source.
 ///
@@ -19,6 +19,10 @@ pub trait SlotClock: Send + Sync {
     fn current_time_secs(&self) -> u64;
     fn current_slot(&self) -> Result<Slot, TimingError>;
 
+    fn deadlines(&self) -> DeadlineBps {
+        DeadlineBps::default()
+    }
+
     fn slot_start_time(&self, slot: Slot) -> u64 {
         self.genesis_time() + (slot * self.slot_duration().as_secs())
     }
@@ -30,7 +34,7 @@ pub trait SlotClock: Send + Sync {
     fn attestation_time(&self, slot: Slot) -> u64 {
         let slot_start_ms = self.slot_start_time(slot) * 1000;
         let slot_duration_ms = self.slot_duration().as_millis() as u64;
-        (slot_start_ms + due_ms(ATTESTATION_DUE_BPS, slot_duration_ms)) / 1000
+        (slot_start_ms + due_ms(self.deadlines().attestation, slot_duration_ms)) / 1000
     }
 
     fn time_until_slot(&self, slot: Slot) -> Result<Duration, TimingError> {
@@ -56,7 +60,8 @@ pub trait SlotClock: Send + Sync {
         let current_time_ms = self.current_time_secs() * 1000;
         let slot_start_ms = self.slot_start_time(slot) * 1000;
         let slot_duration_ms = self.slot_duration().as_millis() as u64;
-        let attestation_time_ms = slot_start_ms + due_ms(ATTESTATION_DUE_BPS, slot_duration_ms);
+        let attestation_time_ms =
+            slot_start_ms + due_ms(self.deadlines().attestation, slot_duration_ms);
 
         if current_time_ms >= attestation_time_ms {
             return Ok(Duration::ZERO);
@@ -78,6 +83,7 @@ pub struct SystemSlotClock {
     genesis_time: u64,
     slot_duration: Duration,
     slots_per_epoch: u64,
+    deadlines: DeadlineBps,
 }
 
 impl SystemSlotClock {
@@ -95,7 +101,12 @@ impl SystemSlotClock {
             slots_per_epoch,
             "clock created"
         );
-        Ok(Self { genesis_time, slot_duration, slots_per_epoch })
+        Ok(Self { genesis_time, slot_duration, slots_per_epoch, deadlines: DeadlineBps::default() })
+    }
+
+    pub fn with_deadlines(mut self, deadlines: DeadlineBps) -> Self {
+        self.deadlines = deadlines;
+        self
     }
 
     pub fn new_mainnet(genesis_time: u64) -> Result<Self, TimingError> {
@@ -118,6 +129,10 @@ impl SlotClock for SystemSlotClock {
 
     fn slots_per_epoch(&self) -> u64 {
         self.slots_per_epoch
+    }
+
+    fn deadlines(&self) -> DeadlineBps {
+        self.deadlines
     }
 
     fn current_time_secs(&self) -> u64 {
@@ -147,6 +162,7 @@ pub struct MockSlotClock {
     slot_duration: Duration,
     slots_per_epoch: u64,
     current_time: std::sync::atomic::AtomicU64,
+    deadlines: DeadlineBps,
 }
 
 impl MockSlotClock {
@@ -156,7 +172,13 @@ impl MockSlotClock {
             slot_duration,
             slots_per_epoch,
             current_time: std::sync::atomic::AtomicU64::new(genesis_time),
+            deadlines: DeadlineBps::default(),
         }
+    }
+
+    pub fn with_deadlines(mut self, deadlines: DeadlineBps) -> Self {
+        self.deadlines = deadlines;
+        self
     }
 
     pub fn set_current_time(&self, time: u64) {
@@ -188,6 +210,10 @@ impl SlotClock for MockSlotClock {
 
     fn slots_per_epoch(&self) -> u64 {
         self.slots_per_epoch
+    }
+
+    fn deadlines(&self) -> DeadlineBps {
+        self.deadlines
     }
 
     fn current_time_secs(&self) -> u64 {
@@ -511,5 +537,40 @@ mod tests {
             now: TEST_GENESIS_TIME,
         };
         assert_eq!(clock7.time_until_attestation(0).unwrap(), Duration::from_millis(2333));
+    }
+
+    #[test]
+    fn test_deadlines_default_matches_pre_gloas_bps() {
+        let mock = create_mock_clock();
+        let system = SystemSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32).unwrap();
+        assert_eq!(mock.deadlines(), DeadlineBps::default());
+        assert_eq!(system.deadlines(), DeadlineBps::default());
+        assert_eq!(mock.deadlines().attestation, crate::ATTESTATION_DUE_BPS);
+        assert_eq!(mock.deadlines().aggregate, crate::AGGREGATE_DUE_BPS);
+    }
+
+    #[test]
+    fn test_with_deadlines_2500_bps_12s_is_3000ms() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .with_deadlines(DeadlineBps { attestation: 2500, aggregate: 6667 });
+        clock.set_current_time(TEST_GENESIS_TIME);
+        assert_eq!(clock.deadlines().attestation, 2500);
+        assert_eq!(clock.time_until_attestation(0).unwrap(), Duration::from_millis(3000));
+    }
+
+    #[test]
+    fn test_with_deadlines_7000ms_slot_3333_bps_is_2333ms() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_millis(7000), 32)
+            .with_deadlines(DeadlineBps { attestation: 3333, aggregate: 6667 });
+        clock.set_current_time(TEST_GENESIS_TIME);
+        assert_eq!(clock.time_until_attestation(0).unwrap(), Duration::from_millis(2333));
+    }
+
+    #[test]
+    fn test_system_slot_clock_with_deadlines() {
+        let clock = SystemSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .unwrap()
+            .with_deadlines(DeadlineBps { attestation: 2500, aggregate: 4000 });
+        assert_eq!(clock.deadlines(), DeadlineBps { attestation: 2500, aggregate: 4000 });
     }
 }

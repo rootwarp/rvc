@@ -403,6 +403,7 @@ pub(super) async fn setup_proposer_duty(
 // ── Topic modules ─────────────────────────────────────────────────────
 
 mod aggregation;
+mod bps_fields;
 mod circuit_breaker;
 mod cold_cache;
 mod core;

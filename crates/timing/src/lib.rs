@@ -32,6 +32,19 @@ pub const ATTESTATION_DUE_BPS: u64 = 3333;
 /// mark (matching the legacy `12000 * 2 / 3 = 8000 ms`).
 pub const AGGREGATE_DUE_BPS: u64 = 6667;
 
+/// Intra-slot attestation and aggregation deadlines as basis points of the slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineBps {
+    pub attestation: u64,
+    pub aggregate: u64,
+}
+
+impl Default for DeadlineBps {
+    fn default() -> Self {
+        Self { attestation: ATTESTATION_DUE_BPS, aggregate: AGGREGATE_DUE_BPS }
+    }
+}
+
 /// Intra-slot deadline in milliseconds for a basis-points fraction of the slot.
 ///
 /// Computes `bps * slot_duration_ms / BASIS_POINTS` with floor (integer)

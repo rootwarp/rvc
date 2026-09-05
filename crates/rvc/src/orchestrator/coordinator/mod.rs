@@ -22,7 +22,7 @@ use crate::metrics::{
     RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS, RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
 };
 use signer::{CircuitBreakerState, SignerService};
-use timing::{due_ms, SlotClock, AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS, SLOTS_PER_EPOCH};
+use timing::{due_ms, DeadlineBps, SlotClock, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
@@ -61,10 +61,13 @@ pub struct OrchestratorConfig {
     pub pre_proposal_deadline: Duration,
     /// Proposer-only fetch deadline when the epoch cache is cold (ARCH-3j).
     pub cold_proposer_fetch_deadline: Duration,
+    pub attestation_due_bps: u64,
+    pub aggregate_due_bps: u64,
 }
 
 impl OrchestratorConfig {
     pub fn new(genesis_validators_root: Root, fork_schedule: Arc<ForkSchedule>) -> Self {
+        let deadlines = DeadlineBps::default();
         Self {
             genesis_validators_root,
             fork_schedule,
@@ -72,6 +75,8 @@ impl OrchestratorConfig {
             timeouts: OperationTimeouts::default(),
             pre_proposal_deadline: DEFAULT_PRE_PROPOSAL_DEADLINE,
             cold_proposer_fetch_deadline: COLD_PROPOSER_FETCH_DEADLINE,
+            attestation_due_bps: deadlines.attestation,
+            aggregate_due_bps: deadlines.aggregate,
         }
     }
 
@@ -92,6 +97,16 @@ impl OrchestratorConfig {
 
     pub fn with_cold_proposer_fetch_deadline(mut self, deadline: Duration) -> Self {
         self.cold_proposer_fetch_deadline = deadline;
+        self
+    }
+
+    pub fn with_attestation_due_bps(mut self, bps: u64) -> Self {
+        self.attestation_due_bps = bps;
+        self
+    }
+
+    pub fn with_aggregate_due_bps(mut self, bps: u64) -> Self {
+        self.aggregate_due_bps = bps;
         self
     }
 }
@@ -488,7 +503,8 @@ where
                 // Basis-points formula in milliseconds (report §4.3), consistent
                 // with `time_until_attestation`: mainnet 1/3 = 3999 ms.
                 {
-                    let deadline = self.phase_deadline(current_slot, ATTESTATION_DUE_BPS);
+                    let deadline =
+                        self.phase_deadline(current_slot, self.config.attestation_due_bps);
                     let att_window_ms = deadline.offset.as_millis() as u64;
                     // Only warn if the delay exceeds the expected attestation window
                     // (i.e., we're past 2/3 of the slot).
@@ -547,7 +563,7 @@ where
                 // Basis-points formula in milliseconds (report §4.3): mainnet
                 // 2/3 = 6667 * 12000 / 10000 = 8000 ms (unchanged from the legacy
                 // `as_secs() * 2 / 3`), but exact for non-12 s / Gloas slots.
-                let deadline = self.phase_deadline(current_slot, AGGREGATE_DUE_BPS);
+                let deadline = self.phase_deadline(current_slot, self.config.aggregate_due_bps);
                 if !deadline.remaining.is_zero() {
                     {
                         let _guard = agg_phase_span.enter();
