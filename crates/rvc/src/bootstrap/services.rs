@@ -154,6 +154,14 @@ pub async fn build_services(
         }
     };
 
+    // D12: local `[fork_schedule]` vs BN `/eth/v1/config/spec`. Not opt-outable.
+    if let Err(e) =
+        startup::reconcile_gloas_fork_schedule(&config.fork_schedule, fork_schedule.as_ref())
+    {
+        error!(error = %e, "Gloas fork schedule reconciliation failed");
+        return Err(e.into());
+    }
+
     // SEC-9 / M-15: fork mismatch is fatal by default (mirrors the GVR chain-swap
     // gate). Opt out with `allow_unsupported_fork` for testnets / experimental forks.
     // Do not change `startup::check_fork_compatibility` itself.
@@ -239,12 +247,12 @@ pub async fn build_services(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, ForkScheduleConfig};
     use crate::orchestrator::PubkeyMap;
     use beacon::BeaconClient;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
     use doppelganger::{DoppelgangerDisabledByOperator, MonotonicEpochClock};
-    use eth_types::Root;
+    use eth_types::{ForkName, Root};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
@@ -295,30 +303,46 @@ mod tests {
 
     /// Mount fork-schedule (`/eth/v1/config/spec`) + head fork for SEC-9 gate.
     async fn mock_bn_server(head_fork_version: &str) -> MockServer {
+        mock_bn_server_gloas(head_fork_version, Some("18446744073709551615"), Some("0x07000000"))
+            .await
+    }
+
+    async fn mock_bn_server_gloas(
+        head_fork_version: &str,
+        gloas_epoch: Option<&str>,
+        gloas_version: Option<&str>,
+    ) -> MockServer {
         let server = MockServer::start().await;
+
+        let mut data = serde_json::json!({
+            "GENESIS_FORK_VERSION": "0x00000000",
+            "ALTAIR_FORK_EPOCH": "74240",
+            "ALTAIR_FORK_VERSION": "0x01000000",
+            "BELLATRIX_FORK_EPOCH": "144896",
+            "BELLATRIX_FORK_VERSION": "0x02000000",
+            "CAPELLA_FORK_EPOCH": "194048",
+            "CAPELLA_FORK_VERSION": "0x03000000",
+            "DENEB_FORK_EPOCH": "269568",
+            "DENEB_FORK_VERSION": "0x04000000",
+            "ELECTRA_FORK_EPOCH": "364544",
+            "ELECTRA_FORK_VERSION": "0x05000000",
+            "FULU_FORK_EPOCH": "18446744073709551615",
+            "FULU_FORK_VERSION": "0x06000000",
+            "SECONDS_PER_SLOT": "12",
+            "SLOTS_PER_EPOCH": "32"
+        });
+        let map = data.as_object_mut().expect("spec data object");
+        if let Some(epoch) = gloas_epoch {
+            map.insert("GLOAS_FORK_EPOCH".into(), serde_json::json!(epoch));
+        }
+        if let Some(version) = gloas_version {
+            map.insert("GLOAS_FORK_VERSION".into(), serde_json::json!(version));
+        }
 
         Mock::given(method("GET"))
             .and(path("/eth/v1/config/spec"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {
-                    "GENESIS_FORK_VERSION": "0x00000000",
-                    "ALTAIR_FORK_EPOCH": "74240",
-                    "ALTAIR_FORK_VERSION": "0x01000000",
-                    "BELLATRIX_FORK_EPOCH": "144896",
-                    "BELLATRIX_FORK_VERSION": "0x02000000",
-                    "CAPELLA_FORK_EPOCH": "194048",
-                    "CAPELLA_FORK_VERSION": "0x03000000",
-                    "DENEB_FORK_EPOCH": "269568",
-                    "DENEB_FORK_VERSION": "0x04000000",
-                    "ELECTRA_FORK_EPOCH": "364544",
-                    "ELECTRA_FORK_VERSION": "0x05000000",
-                    "FULU_FORK_EPOCH": "18446744073709551615",
-                    "FULU_FORK_VERSION": "0x06000000",
-                    "GLOAS_FORK_EPOCH": "18446744073709551615",
-                    "GLOAS_FORK_VERSION": "0x07000000",
-                    "SECONDS_PER_SLOT": "12",
-                    "SLOTS_PER_EPOCH": "32"
-                }
+                "data": data
             })))
             .mount(&server)
             .await;
@@ -529,6 +553,61 @@ mod tests {
                 !handles.attesting_enabled.load(Ordering::SeqCst),
                 "disable_attesting must seed toggle false"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_services_gloas_both_unscheduled_omitted_keys() {
+        let dir = TempDir::new().unwrap();
+        let server = mock_bn_server_gloas("0x05000000", None, None).await;
+        let config = base_config(&dir, &server.uri());
+        let beacon = beacon_handles(&server.uri()).await;
+        let keys = loaded_keys(pubkey_map_with(&[]));
+
+        let handles =
+            run_phase(&config, &keys, &beacon).await.expect("both sources unscheduled must start");
+        assert_eq!(handles.orchestrator_config.fork_schedule.gloas_fork_epoch, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_build_services_gloas_both_scheduled_equal_resolves_gloas() {
+        let dir = TempDir::new().unwrap();
+        let server = mock_bn_server_gloas("0x05000000", Some("600000"), Some("0x07000000")).await;
+        let mut config = base_config(&dir, &server.uri());
+        config.fork_schedule = ForkScheduleConfig {
+            gloas_fork_epoch: Some(600_000),
+            gloas_fork_version: Some("0X07000000".into()),
+        };
+        let beacon = beacon_handles(&server.uri()).await;
+        let keys = loaded_keys(pubkey_map_with(&[]));
+
+        let handles =
+            run_phase(&config, &keys, &beacon).await.expect("equal scheduled pair must start");
+        let schedule = handles.orchestrator_config.fork_schedule.as_ref();
+        assert_eq!(schedule.gloas_fork_epoch, 600_000);
+        assert_eq!(ForkName::from_epoch(600_000, schedule), ForkName::Gloas);
+    }
+
+    #[tokio::test]
+    async fn test_build_services_gloas_disagreement_ignores_allow_unsupported_fork() {
+        let dir = TempDir::new().unwrap();
+        let server = mock_bn_server_gloas("0x05000000", Some("600000"), Some("0x07000000")).await;
+        let mut config = base_config(&dir, &server.uri());
+        config.allow_unsupported_fork = true;
+        let beacon = beacon_handles(&server.uri()).await;
+        let keys = loaded_keys(pubkey_map_with(&[]));
+
+        let result = run_phase(&config, &keys, &beacon).await;
+        assert!(result.is_err(), "D12 disagreement is not opt-outable");
+        match result.err().unwrap() {
+            BootstrapError::Startup(err @ StartupError::ForkScheduleMismatch(_)) => {
+                let msg = err.to_string();
+                assert!(msg.contains("rvc-config"), "{msg}");
+                assert!(msg.contains("/eth/v1/config/spec"), "{msg}");
+                assert!(msg.contains("600000"), "{msg}");
+                assert!(msg.contains("0x07000000"), "{msg}");
+            }
+            other => panic!("expected ForkScheduleMismatch, got {other:?}"),
         }
     }
 

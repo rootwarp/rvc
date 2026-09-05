@@ -8,6 +8,7 @@
 
 mod beacon;
 mod builder_limits;
+mod fork_schedule;
 mod grpc_signer;
 mod keymanager;
 mod keys;
@@ -24,6 +25,7 @@ mod tracing;
 
 pub use beacon::{BeaconArgs, BeaconConfig};
 pub use builder_limits::{BuilderLimits, BuilderLimitsArgs};
+pub use fork_schedule::ForkScheduleConfig;
 pub use grpc_signer::{GrpcSignerArgs, GrpcSignerConfig};
 pub use keymanager::{KeymanagerArgs, KeymanagerConfig};
 pub use keys::{KeysArgs, KeysConfig};

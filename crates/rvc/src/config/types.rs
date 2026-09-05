@@ -24,12 +24,12 @@ use rvc_config::ConfigSource;
 use slashing::GroupCommitConfig;
 
 pub use rvc_config::{
-    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, GcpSecretArgs, GcpSecretConfig,
-    GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig,
-    LogfileArgs, LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
-    ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs,
-    SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig,
-    TimingConfig, TracingArgs, TracingConfig, TracingExporter,
+    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, ForkScheduleConfig, GcpSecretArgs,
+    GcpSecretConfig, GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs,
+    KeysConfig, LogfileArgs, LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs,
+    NetworkConfig, ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig,
+    SecretProviderArgs, SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction,
+    SlashingArgs, SlashingConfig, TimingConfig, TracingArgs, TracingConfig, TracingExporter,
 };
 
 /// Message types that may be broadcast to all beacon nodes.
@@ -77,7 +77,7 @@ impl FromStr for BroadcastTopic {
 ///
 /// Related knobs are grouped into nested sub-structs (`logfile`, `tracing`,
 /// `keymanager`, `grpc_signer`, `proposer_config`, `monitoring`,
-/// `builder_limits`, `timing`). ARCH-4h invents `[beacon]` / `[server]` /
+/// `builder_limits`, `timing`, `fork_schedule`). ARCH-4h invents `[beacon]` / `[server]` /
 /// `[network]` / `[safety]` / `[slashing]` / `[keys]` on the wire; `Config`'s
 /// public / serialize shape stays flat so ARCH-4d snapshots stay byte-identical.
 /// Existing operator TOML may still use the **flat** keys; both spellings are
@@ -181,6 +181,10 @@ pub struct Config {
 
     #[serde(default)]
     pub timing: TimingConfig,
+
+    /// Local Gloas schedule; reconciled against the BN spec at startup.
+    #[serde(default)]
+    pub fork_schedule: ForkScheduleConfig,
 
     // --- Proposer nodes / broadcast (remain flat) ---
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -292,6 +296,7 @@ impl Default for Config {
             monitoring: MonitoringConfig::default(),
             builder_limits: BuilderLimits::default(),
             timing: TimingConfig::default(),
+            fork_schedule: ForkScheduleConfig::default(),
             proposer_nodes: Vec::new(),
             broadcast: Vec::new(),
             bn_sync_tolerances: None,
@@ -417,6 +422,8 @@ struct ConfigWire {
     builder_limits: BuilderLimits,
     #[serde(default)]
     timing: TimingConfig,
+    #[serde(default)]
+    fork_schedule: ForkScheduleConfig,
 
     // Flat legacy keys (old spelling) — Option so we can detect presence
     keymanager_enabled: Option<bool>,
@@ -652,6 +659,7 @@ impl Config {
             monitoring,
             builder_limits,
             timing: w.timing,
+            fork_schedule: w.fork_schedule,
             proposer_nodes: w.proposer_nodes,
             broadcast: w.broadcast,
             bn_sync_tolerances: w.bn_sync_tolerances.or(w.beacon.inner.bn_sync_tolerances),
@@ -1359,6 +1367,8 @@ mod tests {
         assert_eq!(config.timing.contribution_due_bps_gloas, 5000);
         assert_eq!(config.timing.payload_due_bps, 5000);
         assert_eq!(config.timing.payload_attestation_due_bps, 7500);
+        assert!(config.fork_schedule.gloas_fork_epoch.is_none());
+        assert!(config.fork_schedule.gloas_fork_version.is_none());
     }
 
     #[test]
@@ -1620,6 +1630,48 @@ not_a_timing_key = 1
         .expect_err("unknown timing.* key must fail deserialize");
         let msg = err.to_string();
         assert!(msg.contains("not_a_timing_key"), "{msg}");
+    }
+
+    #[test]
+    fn test_fork_schedule_from_toml_is_observable() {
+        let config: Config = toml::from_str(
+            r#"
+[fork_schedule]
+gloas_fork_epoch = 600000
+gloas_fork_version = "0X07000000"
+"#,
+        )
+        .expect("[fork_schedule] must bind through ConfigWire");
+        assert_eq!(config.fork_schedule.gloas_fork_epoch, Some(600000));
+        assert_eq!(config.fork_schedule.gloas_fork_version.as_deref(), Some("0X07000000"));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fork_schedule_sentinel_epoch_string_is_u64_max() {
+        let config: Config = toml::from_str(
+            r#"
+[fork_schedule]
+gloas_fork_epoch = "18446744073709551615"
+"#,
+        )
+        .expect("sentinel decimal string must bind");
+        assert_eq!(config.fork_schedule.gloas_fork_epoch, Some(u64::MAX));
+        assert!(config.fork_schedule.gloas_fork_version.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fork_schedule_unknown_key_fails_naming_key() {
+        let err = toml::from_str::<Config>(
+            r#"
+[fork_schedule]
+not_a_fork_key = 1
+"#,
+        )
+        .expect_err("unknown fork_schedule.* key must fail deserialize");
+        let msg = err.to_string();
+        assert!(msg.contains("not_a_fork_key"), "{msg}");
     }
 
     #[test]
@@ -3149,6 +3201,7 @@ roles = ["not-a-role"]
             "pub monitoring: MonitoringConfig",
             "pub builder_limits: BuilderLimits",
             "pub timing: TimingConfig",
+            "pub fork_schedule: ForkScheduleConfig",
         ] {
             assert!(config_struct.contains(nested), "nested group missing from Config: {nested}");
         }

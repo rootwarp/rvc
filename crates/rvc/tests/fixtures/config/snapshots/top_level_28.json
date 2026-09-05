@@ -64,6 +64,7 @@
     "payload_due_bps": 5000,
     "payload_attestation_due_bps": 7500
   },
+  "fork_schedule": {},
   "proposer_nodes": [
     "http://proposer-top:5052"
   ],

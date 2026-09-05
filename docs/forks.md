@@ -90,15 +90,18 @@ private fork table.
 ### 1.4 SEC-9 fail-closed startup gate
 
 Unknown head fork version is fatal by default (exit 13). Named opt-out only.
+Two-source Gloas schedule reconciliation (D12) is a separate fail-closed gate with **no** opt-out.
 
 | What | File | Lines | Role |
 |---|---|---|---|
-| `EXIT_UNSUPPORTED_FORK_VERSION` | `crates/rvc/src/startup.rs` | 28 | Exit code 13. |
-| `StartupError::UnsupportedForkVersion` | `crates/rvc/src/startup.rs` | 40–41 | `"unsupported consensus fork version {version}; upgrade rvc"`. |
-| `check_fork_compatibility` | `crates/rvc/src/startup.rs` | 150–175 | Head `current_version` must be in the seven schedule versions (includes `fulu_fork_version` at 166). |
-| Apply + opt-out | `crates/rvc/src/bootstrap/services.rs` | 59–82, 149–155 | Fatal unless `allow_unsupported_fork`. Do not weaken `check_fork_compatibility`. |
+| `EXIT_UNSUPPORTED_FORK_VERSION` | `crates/rvc/src/startup.rs` | 30 | Exit code 13. |
+| `StartupError::UnsupportedForkVersion` | `crates/rvc/src/startup.rs` | 42–43 | `"unsupported consensus fork version {version}; upgrade rvc"`. |
+| `check_fork_compatibility` | `crates/rvc/src/startup.rs` | 171–196 | Head `current_version` must be in the seven schedule versions (includes `fulu_fork_version` at 187). |
+| Apply + opt-out | `crates/rvc/src/bootstrap/services.rs` | 64–82, 168–171 | Fatal unless `allow_unsupported_fork`. Do not weaken `check_fork_compatibility`. |
 | CLI / config knob | `crates/rvc-config/src/sections/safety.rs` | 79–84 | `--allow-unsupported-fork`. Testnets / experimental forks only. |
 | Fail-closed integration test | `bin/rvc/tests/integration_test.rs` | 530 | Head `0xdeadbeef` → non-zero exit. |
+| `StartupError::ForkScheduleMismatch` | `crates/rvc/src/startup.rs` | 45–46, 67–80 | Names `rvc-config` and `/eth/v1/config/spec` plus both epoch and version values. |
+| Two-source Gloas apply (no opt-out) | `crates/rvc/src/bootstrap/services.rs` | 157–163 | After `build_fork_schedule`, before SEC-9. Not routed through `apply_fork_compatibility_result`. |
 
 ---
 
@@ -257,11 +260,11 @@ variant and new body structs.
 
 ### Startup gate
 
-- [ ] `check_fork_compatibility` known-versions array (`crates/rvc/src/startup.rs` 159–167)
+- [ ] `check_fork_compatibility` known-versions array (`crates/rvc/src/startup.rs` 180–188)
       includes the new `*_fork_version`. An unknown head version still exits 13.
 - [ ] `allow_unsupported_fork` remains the only opt-out
-      (`crates/rvc/src/bootstrap/services.rs` 149–155). Do not make unknown
-      versions a warning by default.
+      (`crates/rvc/src/bootstrap/services.rs` 168–171). Do not make unknown
+      versions a warning by default. Two-source Gloas reconciliation is not this knob.
 - [ ] `test_startup_fails_closed_on_unsupported_fork`
       (`bin/rvc/tests/integration_test.rs` 530) stays green.
 

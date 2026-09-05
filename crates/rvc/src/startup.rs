@@ -13,8 +13,10 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use bn_manager::BeaconNodeClient;
+use eth_types::ForkSchedule;
 use fd_lock::RwLock;
 use observability::hex::{strip_prefix_strict, HexError};
+use rvc_config::ForkScheduleConfig;
 use slashing::SlashingDb;
 use tracing::{error, info, warn};
 
@@ -40,6 +42,9 @@ pub enum StartupError {
     #[error("unsupported consensus fork version {version}; upgrade rvc")]
     UnsupportedForkVersion { version: String },
 
+    #[error(transparent)]
+    ForkScheduleMismatch(Box<GloasForkScheduleMismatch>),
+
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
 
@@ -57,6 +62,22 @@ pub enum StartupError {
 
     #[error("invalid hex input: {0}")]
     InvalidHexInput(String),
+}
+
+/// Both source names and both Gloas epoch/version values (D12). Boxed in
+/// [`StartupError`] so the enum stays clippy-`result_large_err` sized.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "Gloas fork schedule mismatch: {local_source} epoch={local_epoch} version={local_version} \
+     disagrees with {bn_source} epoch={bn_epoch} version={bn_version}"
+)]
+pub struct GloasForkScheduleMismatch {
+    pub local_source: &'static str,
+    pub bn_source: &'static str,
+    pub local_epoch: String,
+    pub local_version: String,
+    pub bn_epoch: String,
+    pub bn_version: String,
 }
 
 impl StartupError {
@@ -174,6 +195,85 @@ pub async fn check_fork_compatibility(
     Ok(())
 }
 
+const LOCAL_FORK_SCHEDULE_SOURCE: &str = "rvc-config";
+const BN_FORK_SCHEDULE_SOURCE: &str = "/eth/v1/config/spec";
+const UNKNOWN_FORK_VERSION: [u8; 4] = [0xFF; 4];
+
+/// Reconcile the local `[fork_schedule]` Gloas pair against the BN spec-derived schedule.
+///
+/// Both unscheduled (unset or `u64::MAX` / `[0xFF; 4]`) → start. Either scheduled → both
+/// sources must supply equal epoch and version. Not opt-outable via `allow_unsupported_fork`.
+pub fn reconcile_gloas_fork_schedule(
+    local: &ForkScheduleConfig,
+    bn: &ForkSchedule,
+) -> Result<(), StartupError> {
+    let local_scheduled = local.gloas_fork_epoch.is_some_and(epoch_is_scheduled);
+    let bn_scheduled = epoch_is_scheduled(bn.gloas_fork_epoch);
+    if !local_scheduled && !bn_scheduled {
+        return Ok(());
+    }
+
+    let local_epoch = local.gloas_fork_epoch.filter(|&epoch| epoch_is_scheduled(epoch));
+    let bn_epoch = epoch_is_scheduled(bn.gloas_fork_epoch).then_some(bn.gloas_fork_epoch);
+    let local_version = local
+        .gloas_fork_version
+        .as_deref()
+        .and_then(parse_fork_version_bytes)
+        .filter(|&version| version_is_supplied(version));
+    let bn_version = version_is_supplied(bn.gloas_fork_version).then_some(bn.gloas_fork_version);
+
+    let agreed = matches!(
+        (local_epoch, bn_epoch, local_version, bn_version),
+        (Some(le), Some(be), Some(lv), Some(bv)) if le == be && lv == bv
+    );
+    if agreed {
+        return Ok(());
+    }
+
+    Err(StartupError::ForkScheduleMismatch(Box::new(GloasForkScheduleMismatch {
+        local_source: LOCAL_FORK_SCHEDULE_SOURCE,
+        bn_source: BN_FORK_SCHEDULE_SOURCE,
+        local_epoch: render_epoch(local.gloas_fork_epoch),
+        local_version: render_local_version(local.gloas_fork_version.as_deref()),
+        bn_epoch: bn.gloas_fork_epoch.to_string(),
+        bn_version: render_version_bytes(bn.gloas_fork_version),
+    })))
+}
+
+fn epoch_is_scheduled(epoch: u64) -> bool {
+    epoch != u64::MAX
+}
+
+fn version_is_supplied(version: [u8; 4]) -> bool {
+    version != UNKNOWN_FORK_VERSION
+}
+
+fn parse_fork_version_bytes(raw: &str) -> Option<[u8; 4]> {
+    let stripped = strip_prefix_strict(raw).ok()?;
+    let bytes = hex::decode(stripped).ok()?;
+    bytes.try_into().ok()
+}
+
+fn render_epoch(epoch: Option<u64>) -> String {
+    match epoch {
+        None => "unset".to_string(),
+        Some(epoch) => epoch.to_string(),
+    }
+}
+
+fn render_version_bytes(version: [u8; 4]) -> String {
+    format!("0x{}", hex::encode(version))
+}
+
+fn render_local_version(raw: Option<&str>) -> String {
+    match raw {
+        None => "unset".to_string(),
+        Some(s) => {
+            parse_fork_version_bytes(s).map(render_version_bytes).unwrap_or_else(|| s.to_string())
+        }
+    }
+}
+
 fn parse_version_hex(hex_str: &str) -> Result<[u8; 4], StartupError> {
     let stripped = match strip_prefix_strict(hex_str) {
         Ok(s) => s,
@@ -255,9 +355,14 @@ pub fn acquire_keystore_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beacon::{BeaconError, DataResponse, GenesisData, StateFork, StateResponse};
-    use bn_manager::MockBeaconNodeClient;
-    use eth_types::ForkSchedule;
+    use std::collections::HashMap;
+
+    use beacon::{
+        parse_fork_schedule, BeaconError, DataResponse, GenesisData, StateFork, StateResponse,
+    };
+    use bn_manager::{MockBeaconNodeClient, NodeStatusApi};
+    use eth_types::{ForkName, ForkSchedule};
+    use serde_json::json;
 
     // Shared mock helpers (RF4-24): error-by-default MockBeaconNodeClient with overrides.
 
@@ -637,5 +742,159 @@ mod tests {
             "error variant must be InvalidHexInput"
         );
         assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
+    }
+
+    // -- D12 two-source Gloas reconciliation --
+
+    fn spec_without_gloas() -> HashMap<String, serde_json::Value> {
+        let mut spec = HashMap::new();
+        spec.insert("GENESIS_FORK_VERSION".into(), json!("0x00000000"));
+        spec.insert("ALTAIR_FORK_EPOCH".into(), json!("74240"));
+        spec.insert("ALTAIR_FORK_VERSION".into(), json!("0x01000000"));
+        spec.insert("BELLATRIX_FORK_EPOCH".into(), json!("144896"));
+        spec.insert("BELLATRIX_FORK_VERSION".into(), json!("0x02000000"));
+        spec.insert("CAPELLA_FORK_EPOCH".into(), json!("194048"));
+        spec.insert("CAPELLA_FORK_VERSION".into(), json!("0x03000000"));
+        spec.insert("DENEB_FORK_EPOCH".into(), json!("269568"));
+        spec.insert("DENEB_FORK_VERSION".into(), json!("0x04000000"));
+        spec.insert("ELECTRA_FORK_EPOCH".into(), json!("364544"));
+        spec.insert("ELECTRA_FORK_VERSION".into(), json!("0x05000000"));
+        spec.insert("FULU_FORK_EPOCH".into(), json!("18446744073709551615"));
+        spec.insert("FULU_FORK_VERSION".into(), json!("0x06000000"));
+        spec
+    }
+
+    fn spec_with_gloas(epoch: &str, version: &str) -> HashMap<String, serde_json::Value> {
+        let mut spec = spec_without_gloas();
+        spec.insert("GLOAS_FORK_EPOCH".into(), json!(epoch));
+        spec.insert("GLOAS_FORK_VERSION".into(), json!(version));
+        spec
+    }
+
+    fn local_gloas(epoch: Option<u64>, version: Option<&str>) -> ForkScheduleConfig {
+        ForkScheduleConfig {
+            gloas_fork_epoch: epoch,
+            gloas_fork_version: version.map(str::to_string),
+        }
+    }
+
+    fn mismatch_msg(local: &ForkScheduleConfig, bn: &ForkSchedule) -> String {
+        reconcile_gloas_fork_schedule(local, bn).expect_err("expected mismatch").to_string()
+    }
+
+    #[tokio::test]
+    async fn test_gloas_both_unscheduled_omitted_keys_starts() {
+        let spec = spec_without_gloas();
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        let beacon = MockBeaconNodeClient::new().with_get_fork_schedule({
+            let schedule = schedule.clone();
+            move || Ok(schedule.clone())
+        });
+        let fetched = beacon.get_fork_schedule().await.unwrap();
+        reconcile_gloas_fork_schedule(&ForkScheduleConfig::default(), &fetched).unwrap();
+        assert_eq!(fetched.gloas_fork_epoch, u64::MAX);
+        assert_eq!(fetched.gloas_fork_version, [0xFF; 4]);
+    }
+
+    #[test]
+    fn test_gloas_explicit_sentinel_epoch_matches_unset() {
+        let bn = parse_fork_schedule(&spec_without_gloas()).unwrap();
+        let local = local_gloas(Some(18_446_744_073_709_551_615), None);
+        reconcile_gloas_fork_schedule(&local, &bn).unwrap();
+        assert_eq!(bn.gloas_fork_epoch, u64::MAX);
+    }
+
+    #[test]
+    fn test_gloas_both_scheduled_equal_resolves_gloas() {
+        let mut spec = spec_with_gloas("600000", "0x07000000");
+        spec.insert("FULU_FORK_EPOCH".into(), json!("500000"));
+        let bn = parse_fork_schedule(&spec).unwrap();
+        let local = local_gloas(Some(600_000), Some("0X07000000"));
+        reconcile_gloas_fork_schedule(&local, &bn).unwrap();
+        assert_eq!(ForkName::from_epoch(600_000, &bn), ForkName::Gloas);
+        assert_eq!(ForkName::from_epoch(599_999, &bn), ForkName::Fulu);
+    }
+
+    #[test]
+    fn test_gloas_bn_only_scheduled_fails() {
+        let bn = parse_fork_schedule(&spec_with_gloas("600000", "0x07000000")).unwrap();
+        let msg = mismatch_msg(&ForkScheduleConfig::default(), &bn);
+        assert!(msg.contains("rvc-config"), "{msg}");
+        assert!(msg.contains("/eth/v1/config/spec"), "{msg}");
+        assert!(msg.contains("600000"), "{msg}");
+        assert!(msg.contains("0x07000000"), "{msg}");
+        assert!(msg.contains("unset"), "{msg}");
+    }
+
+    #[test]
+    fn test_gloas_local_only_scheduled_fails() {
+        let bn = parse_fork_schedule(&spec_without_gloas()).unwrap();
+        let local = local_gloas(Some(600_000), Some("0x07000000"));
+        let msg = mismatch_msg(&local, &bn);
+        assert!(msg.contains("rvc-config"), "{msg}");
+        assert!(msg.contains("/eth/v1/config/spec"), "{msg}");
+        assert!(msg.contains("600000"), "{msg}");
+        assert!(msg.contains("0x07000000"), "{msg}");
+    }
+
+    #[test]
+    fn test_gloas_equal_epoch_different_version_fails() {
+        let bn = parse_fork_schedule(&spec_with_gloas("600000", "0x07000000")).unwrap();
+        let local = local_gloas(Some(600_000), Some("0x08000000"));
+        let msg = mismatch_msg(&local, &bn);
+        assert!(msg.contains("rvc-config"), "{msg}");
+        assert!(msg.contains("/eth/v1/config/spec"), "{msg}");
+        assert!(msg.contains("0x07000000"), "{msg}");
+        assert!(msg.contains("0x08000000"), "{msg}");
+    }
+
+    #[test]
+    fn test_gloas_scheduled_missing_local_version_fails() {
+        let bn = parse_fork_schedule(&spec_with_gloas("600000", "0x07000000")).unwrap();
+        let local = local_gloas(Some(600_000), None);
+        let msg = mismatch_msg(&local, &bn);
+        assert!(msg.contains("rvc-config"), "{msg}");
+        assert!(msg.contains("/eth/v1/config/spec"), "{msg}");
+        assert!(msg.contains("600000"), "{msg}");
+        assert!(msg.contains("unset"), "{msg}");
+        assert!(msg.contains("0x07000000"), "{msg}");
+    }
+
+    #[test]
+    fn test_gloas_scheduled_missing_bn_version_fails() {
+        let mut spec = spec_without_gloas();
+        spec.insert("GLOAS_FORK_EPOCH".into(), json!("600000"));
+        let bn = parse_fork_schedule(&spec).unwrap();
+        let local = local_gloas(Some(600_000), Some("0x07000000"));
+        let msg = mismatch_msg(&local, &bn);
+        assert!(msg.contains("rvc-config"), "{msg}");
+        assert!(msg.contains("/eth/v1/config/spec"), "{msg}");
+        assert!(msg.contains("600000"), "{msg}");
+        assert!(msg.contains("0x07000000"), "{msg}");
+        assert!(msg.contains("0xffffffff"), "{msg}");
+    }
+
+    #[test]
+    fn test_gloas_mismatch_names_sources_and_values() {
+        let bn = parse_fork_schedule(&spec_with_gloas("600000", "0x07000000")).unwrap();
+        let err = reconcile_gloas_fork_schedule(&ForkScheduleConfig::default(), &bn)
+            .expect_err("BN-only scheduled");
+        assert_eq!(err.exit_code(), 1);
+        let msg = err.to_string();
+        assert!(msg.contains("rvc-config"), "{msg}");
+        assert!(msg.contains("/eth/v1/config/spec"), "{msg}");
+        assert!(msg.contains("epoch="), "{msg}");
+        assert!(msg.contains("version="), "{msg}");
+        match err {
+            StartupError::ForkScheduleMismatch(inner) => {
+                assert_eq!(inner.local_source, "rvc-config");
+                assert_eq!(inner.bn_source, "/eth/v1/config/spec");
+                assert_eq!(inner.local_epoch, "unset");
+                assert_eq!(inner.local_version, "unset");
+                assert_eq!(inner.bn_epoch, "600000");
+                assert_eq!(inner.bn_version, "0x07000000");
+            }
+            other => panic!("expected ForkScheduleMismatch, got {other:?}"),
+        }
     }
 }
