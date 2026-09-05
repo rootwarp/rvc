@@ -90,3 +90,13 @@ async fn test_shutdown_during_the_post_duty_window_still_returns() {
 
     assert_eq!(outcome, WaitOutcome::Shutdown);
 }
+
+/// Permanent regression: pre-Gloas mainnet deadlines stay 3999 / 8000 ms.
+#[test]
+fn test_pre_gloas_mainnet_deadlines_are_3999_and_8000_ms() {
+    let (orchestrator, _handle) = wait_window_orchestrator();
+    let slot_duration_ms = orchestrator.clock.slot_duration().as_millis() as u64;
+    assert_eq!(slot_duration_ms, 12_000);
+    assert_eq!(due_ms(orchestrator.config.attestation_due_bps, slot_duration_ms), 3999);
+    assert_eq!(due_ms(orchestrator.config.aggregate_due_bps, slot_duration_ms), 8000);
+}

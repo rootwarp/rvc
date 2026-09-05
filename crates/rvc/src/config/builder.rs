@@ -970,7 +970,11 @@ mod tests {
     #[test]
     fn test_build_slot_clock_forwards_timing_bps_fields() {
         let config = Config {
-            timing: TimingConfig { attestation_due_bps: 2500, aggregate_due_bps: 4000 },
+            timing: TimingConfig {
+                attestation_due_bps: 2500,
+                aggregate_due_bps: 4000,
+                ..Default::default()
+            },
             ..create_minimal_config()
         };
         let clock = ServiceBuilder::new(config).build_slot_clock(12_000).unwrap();
@@ -1103,13 +1107,43 @@ mod tests {
     #[test]
     fn test_build_orchestrator_config_forwards_timing_bps_fields() {
         let config = Config {
-            timing: TimingConfig { attestation_due_bps: 2500, aggregate_due_bps: 4000 },
+            timing: TimingConfig {
+                attestation_due_bps: 2500,
+                aggregate_due_bps: 4000,
+                ..Default::default()
+            },
             ..create_minimal_config()
         };
         let builder = ServiceBuilder::new(config);
         let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
         assert_eq!(orch_config.attestation_due_bps, 2500);
         assert_eq!(orch_config.aggregate_due_bps, 4000);
+    }
+
+    #[test]
+    fn test_gloas_timing_keys_do_not_change_pre_gloas_deadlines() {
+        let config = Config {
+            timing: TimingConfig {
+                attestation_due_bps: 3333,
+                aggregate_due_bps: 6667,
+                attestation_due_bps_gloas: 2500,
+                aggregate_due_bps_gloas: 6667,
+                sync_message_due_bps_gloas: 2500,
+                contribution_due_bps_gloas: 5000,
+                payload_due_bps: 5000,
+                payload_attestation_due_bps: 7500,
+            },
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        let clock = builder.build_slot_clock(12_000).unwrap();
+        let orch = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        assert_eq!(clock.deadlines().attestation, 3333);
+        assert_eq!(clock.deadlines().aggregate, 6667);
+        assert_eq!(orch.attestation_due_bps, 3333);
+        assert_eq!(orch.aggregate_due_bps, 6667);
+        assert_eq!(timing::due_ms(clock.deadlines().attestation, 12_000), 3999);
+        assert_eq!(timing::due_ms(clock.deadlines().aggregate, 12_000), 8000);
     }
 
     #[test]

@@ -232,6 +232,7 @@ aggregate_due_bps = 4000
     .expect("[timing] TOML must round-trip onto Config");
     assert_eq!(config.timing.attestation_due_bps, 2500);
     assert_eq!(config.timing.aggregate_due_bps, 4000);
+    assert_eq!(config.timing.aggregate_due_bps_gloas, 5000);
 }
 
 #[test]
@@ -240,6 +241,12 @@ fn absent_timing_section_uses_pre_gloas_defaults() {
         toml::from_str("log_level = \"debug\"").expect("missing [timing] must parse");
     assert_eq!(config.timing.attestation_due_bps, 3333);
     assert_eq!(config.timing.aggregate_due_bps, 6667);
+    assert_eq!(config.timing.attestation_due_bps_gloas, 2500);
+    assert_eq!(config.timing.aggregate_due_bps_gloas, 5000);
+    assert_eq!(config.timing.sync_message_due_bps_gloas, 2500);
+    assert_eq!(config.timing.contribution_due_bps_gloas, 5000);
+    assert_eq!(config.timing.payload_due_bps, 5000);
+    assert_eq!(config.timing.payload_attestation_due_bps, 7500);
 }
 
 // ---------------------------------------------------------------------------

@@ -216,6 +216,45 @@ log_level = "info"
 
 CLI flags override config file values.
 
+### `[timing]` — duty deadlines (TOML only)
+
+These keys have no CLI flags. Values are basis points of the slot duration
+read from the beacon node's `/eth/v1/config/spec` as `SLOT_DURATION_MS`
+(milliseconds). A legacy `SECONDS_PER_SLOT` spelling is still accepted and
+converted (`seconds * 1000`). Deadline milliseconds are
+`bps * slot_duration_ms / 10000`. On mainnet (12000 ms) the pre-Gloas
+defaults are 3999 ms (attestation) and 8000 ms (aggregation).
+
+Gloas keys parse and validate at startup so a devnet can change
+`aggregate_due_bps_gloas` without a rebuild. They are not selected at
+runtime until fork-aware deadline resolution lands; pre-Gloas deadlines
+stay 3999 / 8000 ms on a 12 s slot.
+
+Unknown keys under `[timing]` fail startup and name the offending key.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `attestation_due_bps` | 3333 | Attestation deadline (pre-Gloas) |
+| `aggregate_due_bps` | 6667 | Aggregation deadline (pre-Gloas) |
+| `attestation_due_bps_gloas` | 2500 | Attestation deadline after Gloas |
+| `aggregate_due_bps_gloas` | 5000 | Aggregation deadline after Gloas (devnets may set 6667) |
+| `sync_message_due_bps_gloas` | 2500 | Sync-committee message deadline after Gloas |
+| `contribution_due_bps_gloas` | 5000 | Sync-committee contribution deadline after Gloas |
+| `payload_due_bps` | 5000 | Payload deadline (Gloas) |
+| `payload_attestation_due_bps` | 7500 | Payload attestation deadline (Gloas) |
+
+```toml
+[timing]
+attestation_due_bps = 3333
+aggregate_due_bps = 6667
+attestation_due_bps_gloas = 2500
+aggregate_due_bps_gloas = 5000
+sync_message_due_bps_gloas = 2500
+contribution_due_bps_gloas = 5000
+payload_due_bps = 5000
+payload_attestation_due_bps = 7500
+```
+
 ## Password File Format
 
 One entry per line. Comments (`#`) and blank lines are ignored, and a leading

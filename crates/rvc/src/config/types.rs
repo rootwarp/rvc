@@ -890,19 +890,23 @@ impl Config {
             return Err(ConfigError::MissingField(e.to_string()));
         }
 
-        if !(1..=10000).contains(&self.timing.attestation_due_bps) {
-            return Err(ConfigError::Invalid {
-                field: "timing.attestation_due_bps",
-                message: format!("must be 1..=10000, got {}", self.timing.attestation_due_bps),
-                source_layer: ConfigSource::Default,
-            });
-        }
-        if !(1..=10000).contains(&self.timing.aggregate_due_bps) {
-            return Err(ConfigError::Invalid {
-                field: "timing.aggregate_due_bps",
-                message: format!("must be 1..=10000, got {}", self.timing.aggregate_due_bps),
-                source_layer: ConfigSource::Default,
-            });
+        for (field, value) in [
+            ("timing.attestation_due_bps", self.timing.attestation_due_bps),
+            ("timing.aggregate_due_bps", self.timing.aggregate_due_bps),
+            ("timing.attestation_due_bps_gloas", self.timing.attestation_due_bps_gloas),
+            ("timing.aggregate_due_bps_gloas", self.timing.aggregate_due_bps_gloas),
+            ("timing.sync_message_due_bps_gloas", self.timing.sync_message_due_bps_gloas),
+            ("timing.contribution_due_bps_gloas", self.timing.contribution_due_bps_gloas),
+            ("timing.payload_due_bps", self.timing.payload_due_bps),
+            ("timing.payload_attestation_due_bps", self.timing.payload_attestation_due_bps),
+        ] {
+            if !(1..=10000).contains(&value) {
+                return Err(ConfigError::Invalid {
+                    field,
+                    message: format!("must be 1..=10000, got {value}"),
+                    source_layer: ConfigSource::Default,
+                });
+            }
         }
 
         // Validate proposer node URLs
@@ -1349,6 +1353,12 @@ mod tests {
         assert!(config.genesis_validators_root.is_none());
         assert_eq!(config.timing.attestation_due_bps, 3333);
         assert_eq!(config.timing.aggregate_due_bps, 6667);
+        assert_eq!(config.timing.attestation_due_bps_gloas, 2500);
+        assert_eq!(config.timing.aggregate_due_bps_gloas, 5000);
+        assert_eq!(config.timing.sync_message_due_bps_gloas, 2500);
+        assert_eq!(config.timing.contribution_due_bps_gloas, 5000);
+        assert_eq!(config.timing.payload_due_bps, 5000);
+        assert_eq!(config.timing.payload_attestation_due_bps, 7500);
     }
 
     #[test]
@@ -1555,6 +1565,89 @@ attestation_due_bps = "not-an-integer"
         .expect_err("non-integer bps must fail");
         let msg = err.to_string();
         assert!(msg.contains("attestation_due_bps"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_keys_from_toml_are_observable() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+attestation_due_bps_gloas = 2500
+aggregate_due_bps_gloas = 6667
+sync_message_due_bps_gloas = 1111
+contribution_due_bps_gloas = 2222
+payload_due_bps = 3333
+payload_attestation_due_bps = 4444
+"#,
+        )
+        .expect("[timing] Gloas keys must bind through ConfigWire");
+        assert_eq!(config.timing.attestation_due_bps_gloas, 2500);
+        assert_eq!(config.timing.aggregate_due_bps_gloas, 6667);
+        assert_eq!(config.timing.sync_message_due_bps_gloas, 1111);
+        assert_eq!(config.timing.contribution_due_bps_gloas, 2222);
+        assert_eq!(config.timing.payload_due_bps, 3333);
+        assert_eq!(config.timing.payload_attestation_due_bps, 4444);
+        assert_eq!(config.timing.attestation_due_bps, 3333);
+        assert_eq!(config.timing.aggregate_due_bps, 6667);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_timing_aggregate_due_bps_gloas_default_5000_toml_6667() {
+        let defaulted: Config = toml::from_str("").expect("empty config");
+        assert_eq!(defaulted.timing.aggregate_due_bps_gloas, 5000);
+        let from_toml: Config = toml::from_str(
+            r#"
+[timing]
+aggregate_due_bps_gloas = 6667
+"#,
+        )
+        .expect("TOML-only override");
+        assert_eq!(from_toml.timing.aggregate_due_bps_gloas, 6667);
+        assert_eq!(from_toml.timing.attestation_due_bps, 3333);
+        assert_eq!(from_toml.timing.aggregate_due_bps, 6667);
+        assert!(from_toml.validate().is_ok());
+    }
+
+    #[test]
+    fn test_timing_unknown_key_fails_naming_key() {
+        let err = toml::from_str::<Config>(
+            r#"
+[timing]
+not_a_timing_key = 1
+"#,
+        )
+        .expect_err("unknown timing.* key must fail deserialize");
+        let msg = err.to_string();
+        assert!(msg.contains("not_a_timing_key"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_bps_zero_fails_validate_naming_key() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+aggregate_due_bps_gloas = 0
+"#,
+        )
+        .expect("0 is a u64; reject at validate");
+        let err = config.validate().expect_err("bps=0 must fail validate");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.aggregate_due_bps_gloas"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_bps_above_range_fails_validate_naming_key() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+payload_attestation_due_bps = 10001
+"#,
+        )
+        .expect("10001 is a u64; reject at validate");
+        let err = config.validate().expect_err("bps=10001 must fail validate");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.payload_attestation_due_bps"), "{msg}");
     }
 
     #[test]
