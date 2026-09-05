@@ -16,8 +16,9 @@ pub fn from_name(name: &str) -> Result<&'static KeygenNetwork> {
 
 /// Creates a `ForkSchedule` suitable for EIP-7044 voluntary exit signing.
 ///
-/// Sets Capella as active at epoch 0 and all post-Capella forks at `u64::MAX`,
-/// ensuring `ForkName::from_epoch()` never returns beyond Capella.
+/// Sets Capella as active at epoch 0 and all post-Capella forks at `u64::MAX`.
+/// `from_epoch` at `u64::MAX` therefore picks Gloas; the Capella cap lives in
+/// `>= ForkName::Capella` (`crypto::capella_capped_fork_version`).
 pub fn exit_fork_schedule(network: &KeygenNetwork) -> ForkSchedule {
     ForkSchedule {
         genesis_fork_version: network.genesis_fork_version,

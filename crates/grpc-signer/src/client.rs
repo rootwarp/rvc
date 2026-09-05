@@ -758,7 +758,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mainnet_fork_ids_unchanged_for_all_seven_versions() {
+    fn test_mainnet_fork_ids_unchanged_for_all_eight_versions() {
         let schedule = mainnet_schedule();
         let expected = [
             (ForkName::Phase0, [0x00, 0x00, 0x00, 0x00], 0u32),
@@ -768,6 +768,7 @@ mod tests {
             (ForkName::Deneb, [0x04, 0x00, 0x00, 0x00], 4),
             (ForkName::Electra, [0x05, 0x00, 0x00, 0x00], 5),
             (ForkName::Fulu, [0x06, 0x00, 0x00, 0x00], 6),
+            (ForkName::Gloas, [0x07, 0x00, 0x00, 0x00], 7),
         ];
         for (name, version, id) in expected {
             let fork_info = ForkInfo {
@@ -817,6 +818,25 @@ mod tests {
         assert_eq!(GrpcRemoteSigner::fork_id(&ctx), ctx.fork_name.id());
         // Version bytes alone are non-mainnet; fork_id must still come from fork_name.
         assert_ne!(ctx.fork_info.current_version, [0x05, 0x00, 0x00, 0x00]);
+    }
+
+    /// A Gloas `SignContext` produces wire `fork_id == 7`. signer-server
+    /// `validate_fork_id` still rejects 7 (`UnknownForkId`) — Phase-2 fail-closed,
+    /// not the accepted end state (Phase 4 / D11).
+    #[test]
+    fn test_gloas_sign_context_produces_fork_id_7() {
+        let ctx = SignContext::new(
+            dummy_pubkey(),
+            ForkInfo {
+                previous_version: [0x06, 0x00, 0x00, 0x00],
+                current_version: [0x07, 0x00, 0x00, 0x00],
+                genesis_validators_root: [0xee; 32],
+            },
+            ForkName::Gloas,
+        );
+        assert_eq!(ctx.fork_name, ForkName::Gloas);
+        assert_eq!(GrpcRemoteSigner::fork_id(&ctx), 7);
+        assert_eq!(ctx.fork_name.id(), 7);
     }
 
     /// gRPC local-verify roots must match `signing_root_with_fork_version` for

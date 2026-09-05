@@ -271,5 +271,6 @@ fn fork_version_hex(fork: ForkName) -> String {
         ForkName::Deneb => "0x04000000".to_string(),
         ForkName::Electra => "0x05000000".to_string(),
         ForkName::Fulu => "0x06000000".to_string(),
+        ForkName::Gloas => "0x07000000".to_string(),
     }
 }

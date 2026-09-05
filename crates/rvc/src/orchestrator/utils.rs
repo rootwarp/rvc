@@ -406,6 +406,7 @@ mod tests {
             (ForkName::Deneb, false),
             (ForkName::Electra, true),
             (ForkName::Fulu, true),
+            (ForkName::Gloas, false),
         ];
         assert_eq!(table.len(), ForkName::COUNT, "table must cover every ForkName");
         for (fork, expected) in table {

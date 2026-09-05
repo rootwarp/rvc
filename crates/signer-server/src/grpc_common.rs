@@ -165,6 +165,7 @@ pub fn decode_sync_committee_contribution(
 mod tests {
     use super::*;
     use crate::proto::signer_v2::ForkInfo;
+    use eth_types::ForkName;
 
     /// Characterization: both gRPC surfaces (SignerService + PeerSignerService)
     /// must share this single `validate_pubkey` definition — not local copies.
@@ -363,5 +364,29 @@ mod tests {
         assert_eq!(att.beacon_block_root, [0xAB; 32]);
         assert_eq!(att.source.root, [0x01; 32]);
         assert_eq!(att.target.root, [0x02; 32]);
+    }
+
+    /// Phase-2 fail-closed: `grpc-signer` sends `fork_id = ctx.fork_name.id()`,
+    /// so a Gloas `SignContext` produces 7. This decode path still rejects 7
+    /// (`UnknownForkId`) even though `ForkName::try_from(7)` is `Ok(Gloas)`.
+    /// Phase 4 replaces this with a Gloas-safe gRPC signing contract (D11).
+    #[test]
+    fn test_gloas_fork_id_decode_is_unknown_fork_id_fail_closed() {
+        assert!(ForkName::try_from(7u32).is_ok());
+        assert_eq!(ForkName::Gloas.id(), 7);
+
+        let result = eth_decode_beacon_block_ssz(&[], ForkName::Gloas.id());
+        assert!(
+            matches!(result, Err(SszDecodeError::UnknownForkId(7))),
+            "Gloas fork_id must fail closed, got {result:?}"
+        );
+
+        let err = decode_beacon_block(&[], 7).expect_err("Gloas fork_id must fail closed");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("unknown fork_id: 7"),
+            "signer-server decode must surface UnknownForkId(7), got: {}",
+            err.message()
+        );
     }
 }

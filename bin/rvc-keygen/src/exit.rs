@@ -149,6 +149,30 @@ mod tests {
         assert!(signature.verify(&public_key, &genesis_root).is_err());
     }
 
+    /// At `u64::MAX`, `from_epoch` resolves Gloas; EIP-7044 still signs Capella.
+    #[test]
+    fn test_exit_eip7044_caps_at_capella_when_from_epoch_is_gloas() {
+        let secret_key = SecretKey::generate();
+        let public_key = secret_key.public_key();
+
+        let exit = VoluntaryExit { epoch: u64::MAX, validator_index: 42 };
+
+        let network = network::from_name("mainnet").unwrap();
+        let schedule = network::exit_fork_schedule(network);
+        assert_eq!(ForkName::from_epoch(exit.epoch, &schedule), ForkName::Gloas);
+
+        let signature =
+            sign_voluntary_exit(&exit, &secret_key, &schedule, network.genesis_validators_root);
+
+        let capella_domain = compute_domain(
+            DOMAIN_VOLUNTARY_EXIT,
+            network.capella_fork_version,
+            network.genesis_validators_root,
+        );
+        let capella_root = compute_signing_root(&exit, capella_domain);
+        assert!(signature.verify(&public_key, &capella_root).is_ok());
+    }
+
     /// RED: Output JSON has correct structure.
     #[test]
     fn test_exit_output_json_structure() {

@@ -14,6 +14,7 @@ pub enum ForkName {
     Deneb,
     Electra,
     Fulu,
+    Gloas,
 }
 
 /// Network fork schedule: activation epoch and version per fork.
@@ -61,7 +62,7 @@ impl fmt::Display for UnknownForkIdError {
 impl std::error::Error for UnknownForkIdError {}
 
 impl ForkSchedule {
-    /// Fork table in ascending fork order (Phase0 … Fulu).
+    /// Fork table in ascending fork order (Phase0 … Gloas).
     ///
     /// When several forks share an activation epoch, reverse iteration over this
     /// table selects the latest fork — matching the historical descending
@@ -78,6 +79,7 @@ impl ForkSchedule {
             (ForkName::Deneb, self.deneb_fork_epoch, self.deneb_fork_version),
             (ForkName::Electra, self.electra_fork_epoch, self.electra_fork_version),
             (ForkName::Fulu, self.fulu_fork_epoch, self.fulu_fork_version),
+            (ForkName::Gloas, self.gloas_fork_epoch, self.gloas_fork_version),
         ]
     }
 }
@@ -118,7 +120,7 @@ impl TryFrom<u32> for ForkName {
 
 impl ForkName {
     /// All fork variants in ascending order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Phase0,
         Self::Altair,
         Self::Bellatrix,
@@ -126,6 +128,7 @@ impl ForkName {
         Self::Deneb,
         Self::Electra,
         Self::Fulu,
+        Self::Gloas,
     ];
 
     /// Number of known forks; equal to [`Self::ALL`] length.
@@ -139,9 +142,10 @@ impl ForkName {
         (Self::Deneb, "deneb", 4),
         (Self::Electra, "electra", 5),
         (Self::Fulu, "fulu", 6),
+        (Self::Gloas, "gloas", 7),
     ];
 
-    /// Stable numeric id (PHASE0=0 … FULU=6), matching signer SSZ `fork_id`.
+    /// Stable numeric id (PHASE0=0 … GLOAS=7), matching signer SSZ `fork_id`.
     ///
     /// Exhaustive `match self` with no `_ =>` arm: the fork-addition tripwire.
     pub fn id(self) -> u32 {
@@ -153,18 +157,20 @@ impl ForkName {
             Self::Deneb => 4,
             Self::Electra => 5,
             Self::Fulu => 6,
+            Self::Gloas => 7,
         }
     }
 
     /// Body SSZ layout for KZG extraction, if the fork has blob commitments.
     ///
-    /// Deneb → Deneb layout; Electra/Fulu → Electra layout; pre-Deneb → `None`.
+    /// Deneb → Deneb layout; Electra/Fulu → Electra layout; pre-Deneb and Gloas
+    /// → `None` (Gloas has no body layout yet).
     /// [`crate::block::body_fork_layout`] delegates here after parsing the name.
     pub fn body_layout(self) -> Option<BodyForkLayout> {
         match self {
             Self::Deneb => Some(BodyForkLayout::Deneb),
             Self::Electra | Self::Fulu => Some(BodyForkLayout::Electra),
-            Self::Phase0 | Self::Altair | Self::Bellatrix | Self::Capella => None,
+            Self::Phase0 | Self::Altair | Self::Bellatrix | Self::Capella | Self::Gloas => None,
         }
     }
 
@@ -301,7 +307,7 @@ mod tests {
     #[test]
     fn test_fork_name_from_epoch_far_future() {
         let schedule = test_schedule();
-        assert_eq!(ForkName::from_epoch(u64::MAX, &schedule), ForkName::Fulu);
+        assert_eq!(ForkName::from_epoch(u64::MAX, &schedule), ForkName::Gloas);
     }
 
     #[test]
@@ -372,6 +378,7 @@ mod tests {
         assert_eq!(ForkName::Capella.as_ref(), "capella");
         assert_eq!(ForkName::Deneb.as_ref(), "deneb");
         assert_eq!(ForkName::Electra.as_ref(), "electra");
+        assert_eq!(ForkName::Gloas.as_ref(), "gloas");
     }
 
     #[test]
@@ -410,6 +417,7 @@ mod tests {
     #[test]
     fn test_fork_name_ordering_fulu() {
         assert!(ForkName::Electra < ForkName::Fulu);
+        assert!(ForkName::Fulu < ForkName::Gloas);
     }
 
     #[test]
@@ -444,6 +452,7 @@ mod tests {
         assert_eq!(ForkName::Deneb.activation_epoch(&schedule), 269568);
         assert_eq!(ForkName::Electra.activation_epoch(&schedule), 364544);
         assert_eq!(ForkName::Fulu.activation_epoch(&schedule), 500000);
+        assert_eq!(ForkName::Gloas.activation_epoch(&schedule), u64::MAX);
     }
 
     #[test]
@@ -490,7 +499,8 @@ mod tests {
             (364544, ForkName::Electra),
             (499999, ForkName::Electra),
             (500000, ForkName::Fulu),
-            (u64::MAX, ForkName::Fulu),
+            (u64::MAX - 1, ForkName::Fulu),
+            (u64::MAX, ForkName::Gloas),
         ];
         for (epoch, expected) in boundaries {
             assert_eq!(ForkName::from_epoch(epoch, &schedule), expected, "epoch {epoch}");
@@ -501,8 +511,8 @@ mod tests {
         assert_eq!(ForkName::from_epoch(0, &cap), ForkName::Capella);
         assert_eq!(ForkName::from_epoch(1, &cap), ForkName::Capella);
         assert_eq!(ForkName::from_epoch(u64::MAX - 1, &cap), ForkName::Capella);
-        // At u64::MAX every post-Capella entry activates; reverse scan picks Fulu.
-        assert_eq!(ForkName::from_epoch(u64::MAX, &cap), ForkName::Fulu);
+        // At u64::MAX every post-Capella entry activates; reverse scan picks Gloas.
+        assert_eq!(ForkName::from_epoch(u64::MAX, &cap), ForkName::Gloas);
     }
 
     #[test]
@@ -523,8 +533,14 @@ mod tests {
     }
 
     #[test]
-    fn test_fork_id_7_is_rejected() {
-        assert_eq!(ForkName::try_from(7u32), Err(UnknownForkIdError(7)));
+    fn test_fork_name_gloas_identity() {
+        assert_eq!(ForkName::from_str("gloas"), Ok(ForkName::Gloas));
+        assert_eq!(ForkName::try_from(7u32), Ok(ForkName::Gloas));
+        assert_eq!(ForkName::Gloas.id(), 7);
+        assert!(ForkName::Fulu < ForkName::Gloas);
+        assert_eq!(ForkName::COUNT, 8);
+        assert_eq!(ForkName::ALL.len(), 8);
+        assert_eq!(ForkName::try_from(8u32), Err(UnknownForkIdError(8)));
         assert!(ForkName::try_from(u32::MAX).is_err());
     }
 
@@ -538,10 +554,11 @@ mod tests {
         assert_eq!(ForkName::Deneb.body_layout(), Some(BodyForkLayout::Deneb));
         assert_eq!(ForkName::Electra.body_layout(), Some(BodyForkLayout::Electra));
         assert_eq!(ForkName::Fulu.body_layout(), Some(BodyForkLayout::Electra));
+        assert_eq!(ForkName::Gloas.body_layout(), None);
     }
 
     #[test]
-    fn test_fork_version_and_activation_epoch_unchanged_for_all_seven() {
+    fn test_fork_version_and_activation_epoch_unchanged_for_all_eight() {
         let schedule = test_schedule();
         let expected = [
             (ForkName::Phase0, 0u64, [0u8, 0, 0, 0]),
@@ -551,6 +568,7 @@ mod tests {
             (ForkName::Deneb, 269568, [4, 0, 0, 0]),
             (ForkName::Electra, 364544, [5, 0, 0, 0]),
             (ForkName::Fulu, 500000, [6, 0, 0, 0]),
+            (ForkName::Gloas, u64::MAX, [7, 0, 0, 0]),
         ];
         for (name, epoch, version) in expected {
             assert_eq!(name.activation_epoch(&schedule), epoch);
@@ -558,7 +576,8 @@ mod tests {
         }
 
         let entries = schedule.entries();
-        assert_eq!(entries.len(), 7);
+        assert_eq!(entries.len(), 8);
+        assert_eq!(entries.len(), ForkName::COUNT);
         for (i, (name, epoch, version)) in expected.into_iter().enumerate() {
             assert_eq!(entries[i], (name, epoch, version));
         }

@@ -245,7 +245,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        148,
+        152,
         Class::MatchForkName,
         false,
         "match self {",
@@ -254,7 +254,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        164,
+        170,
         Class::MatchForkName,
         false,
         "match self {",
@@ -328,7 +328,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        177,
+        183,
         Class::Entries,
         false,
         ".entries()",
@@ -337,7 +337,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        187,
+        193,
         Class::Entries,
         false,
         ".entries()",
@@ -346,7 +346,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        196,
+        202,
         Class::Entries,
         false,
         ".entries()",
@@ -355,7 +355,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        560,
+        578,
         Class::Entries,
         false,
         "schedule.entries()",
@@ -364,7 +364,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        576,
+        595,
         Class::Entries,
         false,
         "schedule.entries()",
