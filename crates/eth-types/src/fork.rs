@@ -163,14 +163,15 @@ impl ForkName {
 
     /// Body SSZ layout for KZG extraction, if the fork has blob commitments.
     ///
-    /// Deneb → Deneb layout; Electra/Fulu → Electra layout; pre-Deneb and Gloas
-    /// → `None` (Gloas has no body layout yet).
+    /// Deneb → Deneb layout; Electra/Fulu → Electra layout; Gloas → Gloas
+    /// (typed error; no decoder yet); pre-Deneb → `None`.
     /// [`crate::block::body_fork_layout`] delegates here after parsing the name.
     pub fn body_layout(self) -> Option<BodyForkLayout> {
         match self {
             Self::Deneb => Some(BodyForkLayout::Deneb),
             Self::Electra | Self::Fulu => Some(BodyForkLayout::Electra),
-            Self::Phase0 | Self::Altair | Self::Bellatrix | Self::Capella | Self::Gloas => None,
+            Self::Gloas => Some(BodyForkLayout::Gloas),
+            Self::Phase0 | Self::Altair | Self::Bellatrix | Self::Capella => None,
         }
     }
 
@@ -546,7 +547,7 @@ mod tests {
 
     #[test]
     fn test_body_layout_matches_body_fork_layout_string_mapping() {
-        for s in ["phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu"] {
+        for s in ["phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"] {
             let name = ForkName::from_str(s).unwrap();
             assert_eq!(name.body_layout(), body_fork_layout(s), "layout mismatch for {s}");
         }
@@ -554,7 +555,7 @@ mod tests {
         assert_eq!(ForkName::Deneb.body_layout(), Some(BodyForkLayout::Deneb));
         assert_eq!(ForkName::Electra.body_layout(), Some(BodyForkLayout::Electra));
         assert_eq!(ForkName::Fulu.body_layout(), Some(BodyForkLayout::Electra));
-        assert_eq!(ForkName::Gloas.body_layout(), None);
+        assert_eq!(ForkName::Gloas.body_layout(), Some(BodyForkLayout::Gloas));
     }
 
     #[test]

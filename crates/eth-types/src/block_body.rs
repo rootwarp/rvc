@@ -106,6 +106,9 @@ pub type MaxCommitteesPerSlot = U64;
 pub enum BodySszError {
     #[error("invalid SSZ body encoding: {0}")]
     InvalidEncoding(String),
+    /// Gloas has no body decoder yet; fail closed rather than `Ok(vec![])`.
+    #[error("Gloas BeaconBlockBody layout is not supported")]
+    GloasUnsupported,
 }
 
 impl From<DecodeError> for BodySszError {
@@ -1112,6 +1115,7 @@ pub fn body_tree_hash_root_for_layout(
             Ok(decode_beacon_block_body_electra(bytes)?.tree_hash_root())
         }
         crate::BodyForkLayout::Deneb => Ok(decode_beacon_block_body_deneb(bytes)?.tree_hash_root()),
+        crate::BodyForkLayout::Gloas => Err(BodySszError::GloasUnsupported),
     }
 }
 
@@ -1127,6 +1131,7 @@ pub fn blinded_body_tree_hash_root_for_layout(
         crate::BodyForkLayout::Deneb => {
             Ok(decode_blinded_beacon_block_body_deneb(bytes)?.tree_hash_root())
         }
+        crate::BodyForkLayout::Gloas => Err(BodySszError::GloasUnsupported),
     }
 }
 

@@ -14,18 +14,22 @@ use crate::{Root, Signature, Slot};
 ///
 /// Deneb has `blob_kzg_commitments` as the *last* variable field (field 12).
 /// Electra adds `execution_requests` as field 13 *after* `blob_kzg_commitments`.
+/// Gloas has no decoder yet; extraction and layout HTR fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyForkLayout {
     /// Deneb `BeaconBlockBody`: `blob_kzg_commitments` is the trailing variable field.
     Deneb,
     /// Electra+ `BeaconBlockBody`: `execution_requests` follows `blob_kzg_commitments`.
     Electra,
+    /// Gloas `BeaconBlockBody`: no decoder; KZG extraction and layout HTR error.
+    Gloas,
 }
 
 /// Map a `consensus_version` string from the BN response to a `BodyForkLayout`.
 ///
 /// Returns `Some(Deneb)` for `"deneb"`, `Some(Electra)` for `"electra"` /
-/// `"fulu"`. Pre-Deneb forks have no blob commitments and return `None`.
+/// `"fulu"`, `Some(Gloas)` for `"gloas"`. Pre-Deneb forks have no blob
+/// commitments and return `None`.
 ///
 /// Exact, case-sensitive match via [`ForkName::from_str`] + [`ForkName::body_layout`].
 /// Unrecognised strings (including wrong case) yield `None`.
@@ -43,6 +47,7 @@ pub fn body_fork_layout(consensus_version: &str) -> Option<BodyForkLayout> {
 /// `body.blob_kzg_commitments`. A **genuinely empty** commitment list is
 /// `Ok(vec![])`; a **malformed** body is `Err(BodySszError)` — the two must not
 /// be conflated (a corrupt body must not fingerprint as the empty list).
+/// [`BodyForkLayout::Gloas`] is always `Err` (no decoder; never `Ok(vec![])`).
 ///
 /// # Spec reference
 ///
@@ -62,6 +67,8 @@ pub(crate) fn extract_blob_kzg_commitments(
             let decoded = decode_beacon_block_body_electra(body)?;
             Ok(decoded.blob_kzg_commitments.into())
         }
+        // Empty Ok would silently disable the blob-binding control.
+        BodyForkLayout::Gloas => Err(BodySszError::GloasUnsupported),
     }
 }
 
@@ -454,6 +461,7 @@ mod tests {
             ("deneb", Some(BodyForkLayout::Deneb)),
             ("electra", Some(BodyForkLayout::Electra)),
             ("fulu", Some(BodyForkLayout::Electra)),
+            ("gloas", Some(BodyForkLayout::Gloas)),
             // Exact-match only: trailing space / wrong case / empty / garbage → None
             ("electra ", None),
             ("Deneb", None),
@@ -765,6 +773,19 @@ mod tests {
         assert!(matches!(err, TreeHashError::InvalidBody { .. }));
     }
 
+    #[test]
+    fn test_beacon_block_gloas_layout_try_tree_hash_root() {
+        // kat_exempt: Gloas layout is an error arm; no spec root exists to anchor
+        let block = sample_block();
+        let err = block
+            .try_tree_hash_root_for_layout(BodyForkLayout::Gloas)
+            .expect_err("Gloas layout must not produce a block root");
+        assert!(
+            matches!(err, TreeHashError::InvalidBody { .. }),
+            "expected InvalidBody, got {err:?}"
+        );
+    }
+
     // ── ISSUE-4.3 (L-3): extract_blob_kzg_commitments unit tests ────────────
     //
     // Well-formed bodies use typed SSZ encode (external-vector fixtures + set
@@ -876,6 +897,18 @@ mod tests {
         );
         // Deneb layout on an Electra body is a decode error (fail-closed).
         assert_body_ssz_err(extract_blob_kzg_commitments(&body, BodyForkLayout::Deneb));
+    }
+
+    /// Gloas is a typed error, never Ok([]) — empty would silently drop blob binding.
+    #[test]
+    fn test_extract_blob_kzg_commitments_gloas_returns_err() {
+        let body = sample_block().body;
+        let err = extract_blob_kzg_commitments(&body, BodyForkLayout::Gloas)
+            .expect_err("Gloas layout must not extract commitments");
+        let msg = err.to_string();
+        assert!(msg.to_ascii_lowercase().contains("gloas"), "error must name Gloas, got: {msg}");
+        assert!(sample_block().kzg_commitment_root(BodyForkLayout::Gloas).is_err());
+        assert!(sample_block().blob_kzg_count(BodyForkLayout::Gloas).is_err());
     }
 
     /// Round-trip: Electra encode → extract matches hand-set commitments.
