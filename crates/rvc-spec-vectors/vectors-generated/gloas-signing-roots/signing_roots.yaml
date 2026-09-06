@@ -1,0 +1,49 @@
+# Gloas island L3 signing roots from eth-ssz-specs==0.1.0.
+# compute_domain / get_domain / compute_signing_root match pyspec phase0.
+# BeaconBlock / AggregateAndProof / ExecutionPayloadEnvelope object roots
+# are official ssz_static minimal gloas ssz_random/case_0.
+# AttestationData is a generated row with index = 1.
+# DOMAIN_* parsed from phase0 + gloas beacon-chain.md at spec_tag.
+# Do not copy mix_in_length-wrapped list roots into this file.
+package: eth-ssz-specs==0.1.0
+python: 3.13.7
+spec_tag: v1.7.0-beta.0
+fork_version: '0x07000001'
+genesis_validators_root: '0x0000000000000000000000000000000000000000000000000000000000000000'
+argv: '--out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.0'
+input_sha256: '73b0b1b9eb58198ac80e23df2e6fd861413b059f1782c9f5a4f70cad0b3e7d2a'
+domain_beacon_proposer: '0x00000000'
+domain_beacon_attester: '0x01000000'
+domain_aggregate_and_proof: '0x06000000'
+domain_beacon_builder: '0x0b000000'
+containers:
+  - name: BeaconBlock
+    domain: DOMAIN_BEACON_PROPOSER
+    object_root: '0x797bb319a7a349213dcab18f6145424682894193e2fca77ba748b283e5353f52'
+    root: '0x797bb319a7a349213dcab18f6145424682894193e2fca77ba748b283e5353f52'
+    signing_root: '0xcb806d0b3ff015d77bc5b320e8066894e37ec38be25f5acb178b65bad3250dc3'
+    argv_flip_signing_root: '0xa33f39b07a3bdb52b529d8d8f4f01a5ec7eb4468644715f151b77fc4353c41ad'
+  - name: AggregateAndProof
+    domain: DOMAIN_AGGREGATE_AND_PROOF
+    object_root: '0x8e20d3aab21ae5374ec249d072afa489e501d89e5c098f6792b2771cf5509bd1'
+    root: '0x8e20d3aab21ae5374ec249d072afa489e501d89e5c098f6792b2771cf5509bd1'
+    signing_root: '0xacf89a4bea5c3f4e5c7510f7511021a4f72f2bb42615b77c6824d058c9887d14'
+  - name: ExecutionPayloadEnvelope
+    domain: DOMAIN_BEACON_BUILDER
+    object_root: '0x98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a'
+    root: '0x98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a'
+    signing_root: '0xb6969df7b86e2b5652a3dfc7f4eeeb4d73cf5bbbd484b819b8555735d83fc1f0'
+  - name: AttestationData
+    domain: DOMAIN_BEACON_ATTESTER
+    value:
+      slot: 1
+      index: 1
+      beacon_block_root: '0x1111111111111111111111111111111111111111111111111111111111111111'
+      source:
+        epoch: 0
+        root: '0x0000000000000000000000000000000000000000000000000000000000000000'
+      target:
+        epoch: 0
+        root: '0x0000000000000000000000000000000000000000000000000000000000000000'
+    root: '0x185124e32287ed1c87e8516d1e699077e0ee3cef4aed6d80d4ff711c21d939d9'
+    signing_root: '0xe58076702842f323afe7a32e0bb5806bed43ec3de1b985c5e2f5b0bf6f60d849'

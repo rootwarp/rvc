@@ -148,6 +148,10 @@ fn test_spec_kat_header_provenance_fields_are_nonempty() {
         generated_lines.iter().any(|line| line.contains("id=signing-roots")),
         "provenance-generated must name [[generated]] id=signing-roots: {generated_lines:?}"
     );
+    assert!(
+        generated_lines.iter().any(|line| line.contains("id=gloas-signing-roots")),
+        "provenance-generated must name [[generated]] id=gloas-signing-roots: {generated_lines:?}"
+    );
     for line in &generated_lines {
         let generated = line.strip_prefix("//! provenance-generated:").expect("prefix").trim();
         assert!(generated.contains("id="), "provenance-generated must name id: {generated}");
@@ -160,6 +164,7 @@ fn test_spec_kat_header_provenance_fields_are_nonempty() {
     assert!(!inputs.is_empty(), "provenance-input must be present");
     let mut saw_progressive = false;
     let mut saw_signing = false;
+    let mut saw_gloas_signing = false;
     for line in &inputs {
         let rest = line.strip_prefix("//! provenance-input:").expect("prefix").trim();
         let (path, sha) = rest.split_once(" sha256:").unwrap_or_else(|| {
@@ -174,9 +179,13 @@ fn test_spec_kat_header_provenance_fields_are_nonempty() {
         if path.contains("vectors-generated/signing-roots/signing_roots.yaml") {
             saw_signing = true;
         }
+        if path.contains("vectors-generated/gloas-signing-roots/signing_roots.yaml") {
+            saw_gloas_signing = true;
+        }
     }
     assert!(saw_progressive, "header must hash the 3.4b progressive artifact");
     assert!(saw_signing, "header must hash the 4.0 signing-roots artifact");
+    assert!(saw_gloas_signing, "header must hash the island gloas-signing-roots artifact");
 }
 
 #[test]

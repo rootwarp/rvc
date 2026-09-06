@@ -1,5 +1,5 @@
 //! Emit `spec_kat.rs` (`SPEC_PROGRESSIVE_*`, `SPEC_GLOAS_*`, `KAT_GLOAS_*`)
-//! from vector files.
+//! and `gloas_signing_kat.rs` from vector files.
 //!
 //! Argv only: `--vectors <dir> --out <path>` and optional `--gloas-out` /
 //! `--gloas-vectors`. L1 roots are copied from the 3.4b pyspec artifact
@@ -7,8 +7,9 @@
 //! `root` fields (`mix_in_length`-wrapped). `--out` copies P4 Gloas container
 //! roots from `ssz_static` when present, else the 4.0 pyspec artifact, and
 //! copies L3 signing roots from `gen_signing_roots.py` (this binary never
-//! computes a domain). `--gloas-out` emits the rvc-gloas per-preset island
-//! KATs from official `ssz_static` (or a documented residual).
+//! computes a domain). A sibling `gloas_signing_kat.rs` copies island L3
+//! signing roots from the same recipe. `--gloas-out` emits the rvc-gloas
+//! per-preset island KATs from official `ssz_static` (or a documented residual).
 
 #![forbid(unsafe_code)]
 
@@ -88,6 +89,15 @@ const ZERO_ROOT_HEX: &str = "000000000000000000000000000000000000000000000000000
 
 const PROGRESSIVE_ID: &str = "progressive";
 const SIGNING_ROOTS_ID: &str = "signing-roots";
+const GLOAS_SIGNING_ROOTS_ID: &str = "gloas-signing-roots";
+
+/// Island L3 signing roots copied from the 4.0 pyspec recipe (issue 5.13a).
+const GLOAS_SIGNING_KAT: &[(&str, &str)] = &[
+    ("BeaconBlock", "KAT_GLOAS_BLOCK_SIGNING_ROOT"),
+    ("AggregateAndProof", "KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT"),
+    ("ExecutionPayloadEnvelope", "KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT"),
+    ("AttestationData", "KAT_GLOAS_ATTESTATION_DATA_SIGNING_ROOT"),
+];
 
 /// P4 ssz_static handlers only (issue 4.0). Const name is `SPEC_GLOAS_<CONTAINER>_ROOT`.
 const GLOAS_SSZ_STATIC: &[(&str, &str)] = &[
@@ -127,10 +137,13 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let generated = lock_generated_pins(&lock)?;
     require_generated_id(&generated, PROGRESSIVE_ID)?;
     require_generated_id(&generated, SIGNING_ROOTS_ID)?;
+    require_generated_id(&generated, GLOAS_SIGNING_ROOTS_ID)?;
 
     let mut inputs = Vec::new();
     let mut progressive_parsed = None;
     let mut signing_artifact = None;
+    let mut gloas_signing_artifact = None;
+    let mut gloas_signing_pin = None;
     for pin in &generated {
         let path = workspace.join(&pin.output);
         if !path.is_file() {
@@ -166,12 +179,20 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         if pin.id == SIGNING_ROOTS_ID {
             signing_artifact = Some(parse_signing_roots_artifact(&text)?);
         }
+        if pin.id == GLOAS_SIGNING_ROOTS_ID {
+            gloas_signing_artifact = Some(parse_signing_roots_artifact(&text)?);
+            gloas_signing_pin = Some(pin.clone());
+        }
         push_input(&mut inputs, &workspace, &path)?;
     }
     let parsed = progressive_parsed
         .ok_or_else(|| format!("vectors.lock [[generated]] missing id={PROGRESSIVE_ID}"))?;
     let signing = signing_artifact
         .ok_or_else(|| format!("vectors.lock [[generated]] missing id={SIGNING_ROOTS_ID}"))?;
+    let gloas_signing = gloas_signing_artifact
+        .ok_or_else(|| format!("vectors.lock [[generated]] missing id={GLOAS_SIGNING_ROOTS_ID}"))?;
+    let gloas_pin = gloas_signing_pin
+        .ok_or_else(|| format!("vectors.lock [[generated]] missing id={GLOAS_SIGNING_ROOTS_ID}"))?;
 
     let ssz_static_files = collect_ssz_static_inputs(&args.vectors)?;
     for path in &ssz_static_files {
@@ -195,6 +216,22 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     })?;
 
     write_stable(&args.out, &body)?;
+
+    let island_kat = resolve_island_signing_kat(&gloas_signing, &gloas_pin)?;
+    let signing_kat_path = args
+        .out
+        .parent()
+        .map(|p| p.join("gloas_signing_kat.rs"))
+        .unwrap_or_else(|| PathBuf::from("gloas_signing_kat.rs"));
+    let signing_kat_body = render_gloas_signing_kat(&RenderGloasSigningInput {
+        date: DATE_PLACEHOLDER,
+        source: &source,
+        pin: &gloas_pin,
+        generator: &generator,
+        artifact: &gloas_signing,
+        kat: &island_kat,
+    })?;
+    write_stable(&signing_kat_path, &signing_kat_body)?;
 
     if let Some(gloas_out) = args.gloas_out.as_ref() {
         let gloas_vectors =
@@ -381,10 +418,13 @@ fn lock_tags(lock: &str) -> Result<(String, String), String> {
     }
 }
 
+#[derive(Clone)]
 struct GeneratedPin {
     id: String,
     output: String,
     sha256: String,
+    python: String,
+    argv: String,
 }
 
 fn require_generated_id(pins: &[GeneratedPin], id: &str) -> Result<(), String> {
@@ -399,6 +439,8 @@ fn finish_generated_pin(
     id: Option<String>,
     output: Option<String>,
     sha256: Option<String>,
+    python: Option<String>,
+    argv: Option<String>,
 ) -> Result<GeneratedPin, String> {
     match (id, output, sha256) {
         (Some(id), Some(output), Some(sha256))
@@ -407,7 +449,13 @@ fn finish_generated_pin(
                 && sha256.len() == 64
                 && sha256.bytes().all(|b| b.is_ascii_hexdigit()) =>
         {
-            Ok(GeneratedPin { id, output, sha256 })
+            Ok(GeneratedPin {
+                id,
+                output,
+                sha256,
+                python: python.unwrap_or_default(),
+                argv: argv.unwrap_or_default(),
+            })
         }
         _ => Err("vectors.lock [[generated]] missing id, output, or sha256".into()),
     }
@@ -420,20 +468,32 @@ fn lock_generated_pins(lock: &str) -> Result<Vec<GeneratedPin>, String> {
     let mut id = None;
     let mut output = None;
     let mut sha256 = None;
+    let mut python = None;
+    let mut argv = None;
     let mut flush = |id: &mut Option<String>,
                      output: &mut Option<String>,
-                     sha256: &mut Option<String>|
+                     sha256: &mut Option<String>,
+                     python: &mut Option<String>,
+                     argv: &mut Option<String>|
      -> Result<(), String> {
         if id.is_none() && output.is_none() && sha256.is_none() {
+            python.take();
+            argv.take();
             return Ok(());
         }
-        pins.push(finish_generated_pin(id.take(), output.take(), sha256.take())?);
+        pins.push(finish_generated_pin(
+            id.take(),
+            output.take(),
+            sha256.take(),
+            python.take(),
+            argv.take(),
+        )?);
         Ok(())
     };
     for line in lock.lines() {
         let line = line.trim();
         if line == "[[generated]]" {
-            flush(&mut id, &mut output, &mut sha256)?;
+            flush(&mut id, &mut output, &mut sha256, &mut python, &mut argv)?;
             in_block = true;
             continue;
         }
@@ -441,7 +501,7 @@ fn lock_generated_pins(lock: &str) -> Result<Vec<GeneratedPin>, String> {
             continue;
         }
         if line.is_empty() || line.starts_with("[[") || line.starts_with("archive ") {
-            flush(&mut id, &mut output, &mut sha256)?;
+            flush(&mut id, &mut output, &mut sha256, &mut python, &mut argv)?;
             in_block = false;
             continue;
         }
@@ -454,9 +514,13 @@ fn lock_generated_pins(lock: &str) -> Result<Vec<GeneratedPin>, String> {
             output = Some(v.trim().to_owned());
         } else if let Some(v) = line.strip_prefix("sha256=") {
             sha256 = Some(v.trim().to_ascii_lowercase());
+        } else if let Some(v) = line.strip_prefix("python=") {
+            python = Some(v.trim().to_owned());
+        } else if let Some(v) = line.strip_prefix("argv=") {
+            argv = Some(v.trim().to_owned());
         }
     }
-    flush(&mut id, &mut output, &mut sha256)?;
+    flush(&mut id, &mut output, &mut sha256, &mut python, &mut argv)?;
     if pins.is_empty() {
         return Err("vectors.lock [[generated]] missing id, output, or sha256".into());
     }
@@ -579,6 +643,18 @@ fn path_has_component(path: &Path, name: &str) -> bool {
 struct SigningRootsArtifact {
     containers: BTreeMap<String, String>,
     signing_roots: BTreeMap<String, String>,
+    argv_flip_signing_root: Option<String>,
+    package: String,
+    spec_tag: String,
+    python: String,
+    argv: String,
+    input_sha256: String,
+    fork_version: String,
+    genesis_validators_root: String,
+}
+
+fn optional_yaml_string(mapping: &serde_yaml::Mapping, field: &str) -> String {
+    yaml_string(mapping, field).unwrap_or_default()
 }
 
 fn parse_signing_roots_artifact(text: &str) -> Result<SigningRootsArtifact, String> {
@@ -588,6 +664,7 @@ fn parse_signing_roots_artifact(text: &str) -> Result<SigningRootsArtifact, Stri
     let seq = yaml_seq(mapping, "containers")?;
     let mut containers = BTreeMap::new();
     let mut signing_roots = BTreeMap::new();
+    let mut argv_flip_signing_root = None;
     for (i, item) in seq.iter().enumerate() {
         let item = item
             .as_mapping()
@@ -602,10 +679,27 @@ fn parse_signing_roots_artifact(text: &str) -> Result<SigningRootsArtifact, Stri
         }
         if item.get(serde_yaml::Value::String("signing_root".into())).is_some() {
             let signing = normalize_root_hex(&yaml_string(item, "signing_root")?)?;
-            signing_roots.insert(name, signing);
+            signing_roots.insert(name.clone(), signing);
+        }
+        if item.get(serde_yaml::Value::String("argv_flip_signing_root".into())).is_some() {
+            let flip = normalize_root_hex(&yaml_string(item, "argv_flip_signing_root")?)?;
+            if argv_flip_signing_root.replace(flip).is_some() {
+                return Err("duplicate argv_flip_signing_root in signing_roots.yaml".into());
+            }
         }
     }
-    Ok(SigningRootsArtifact { containers, signing_roots })
+    Ok(SigningRootsArtifact {
+        containers,
+        signing_roots,
+        argv_flip_signing_root,
+        package: optional_yaml_string(mapping, "package"),
+        spec_tag: optional_yaml_string(mapping, "spec_tag"),
+        python: optional_yaml_string(mapping, "python"),
+        argv: optional_yaml_string(mapping, "argv"),
+        input_sha256: optional_yaml_string(mapping, "input_sha256"),
+        fork_version: optional_yaml_string(mapping, "fork_version"),
+        genesis_validators_root: optional_yaml_string(mapping, "genesis_validators_root"),
+    })
 }
 
 fn parse_ssz_static_root(text: &str) -> Result<String, String> {
@@ -685,6 +779,140 @@ fn resolve_gloas_kat(
             "blocked: signing_roots.yaml missing ProposerPreferences signing_root (D28)".to_owned()
         })?;
     Ok(GloasKat { containers, payload_attestation_signing_root, proposer_preferences_signing_root })
+}
+
+struct IslandSigningKat {
+    rows: Vec<(&'static str, String)>,
+    argv_flip_signing_root: String,
+}
+
+fn resolve_island_signing_kat(
+    artifact: &SigningRootsArtifact,
+    pin: &GeneratedPin,
+) -> Result<IslandSigningKat, String> {
+    if pin.python.is_empty() {
+        return Err(format!(
+            "vectors.lock [[generated]] id={GLOAS_SIGNING_ROOTS_ID} missing python"
+        ));
+    }
+    if pin.argv.is_empty() {
+        return Err(format!("vectors.lock [[generated]] id={GLOAS_SIGNING_ROOTS_ID} missing argv"));
+    }
+    if !pin.argv.contains("--fork-version") || !pin.argv.contains("--genesis-validators-root") {
+        return Err(
+            "gloas signing-roots argv must record --fork-version and --genesis-validators-root"
+                .into(),
+        );
+    }
+    if pin.argv.contains("gloas_fork_version") {
+        return Err("gloas signing-roots argv must not name an rs-vc symbol".into());
+    }
+    if !artifact.argv.is_empty() && artifact.argv != pin.argv {
+        return Err(format!(
+            "island YAML argv does not match vectors.lock argv (yaml {} lock {})",
+            artifact.argv, pin.argv
+        ));
+    }
+    if !artifact.python.is_empty() && artifact.python != pin.python {
+        return Err(format!(
+            "island YAML python does not match vectors.lock python (yaml {} lock {})",
+            artifact.python, pin.python
+        ));
+    }
+    let mut rows = Vec::new();
+    for (name, const_name) in GLOAS_SIGNING_KAT {
+        let hex = artifact.signing_roots.get(*name).cloned().ok_or_else(|| {
+            format!("blocked: {GLOAS_SIGNING_ROOTS_ID} missing {name} signing_root (D28)")
+        })?;
+        rows.push((*const_name, hex));
+    }
+    let argv_flip_signing_root = artifact.argv_flip_signing_root.clone().ok_or_else(|| {
+        "blocked: island signing_roots.yaml missing argv_flip_signing_root (argv sensitivity)"
+            .to_owned()
+    })?;
+    if Some(&argv_flip_signing_root) == rows.first().map(|(_, hex)| hex) {
+        return Err("argv_flip_signing_root must differ from KAT_GLOAS_BLOCK_SIGNING_ROOT".into());
+    }
+    Ok(IslandSigningKat { rows, argv_flip_signing_root })
+}
+
+struct RenderGloasSigningInput<'a> {
+    date: &'a str,
+    source: &'a str,
+    pin: &'a GeneratedPin,
+    generator: &'a str,
+    artifact: &'a SigningRootsArtifact,
+    kat: &'a IslandSigningKat,
+}
+
+fn render_gloas_signing_kat(input: &RenderGloasSigningInput<'_>) -> Result<String, String> {
+    let mut out = String::new();
+    writeln!(out, "//! Generated Gloas island L3 signing-root KATs. Do not edit by hand.")
+        .map_err(write_err)?;
+    writeln!(out, "//!").map_err(write_err)?;
+    writeln!(out, "//! Regenerate with `make spec-kat`.").map_err(write_err)?;
+    writeln!(out, "//!").map_err(write_err)?;
+    writeln!(out, "//! # Provenance").map_err(write_err)?;
+    writeln!(out, "//!").map_err(write_err)?;
+    writeln!(out, "//! provenance-source: {}", input.source).map_err(write_err)?;
+    let revision = if input.artifact.spec_tag.is_empty() {
+        input.source.to_owned()
+    } else {
+        format!("ethereum/consensus-specs@{}", input.artifact.spec_tag)
+    };
+    writeln!(out, "//! provenance-pyspec-revision: {revision}").map_err(write_err)?;
+    let ssz = if input.artifact.package.is_empty() {
+        "eth-ssz-specs==0.1.0".to_owned()
+    } else {
+        input.artifact.package.clone()
+    };
+    writeln!(out, "//! provenance-eth-ssz-specs: {ssz}").map_err(write_err)?;
+    writeln!(out, "//! provenance-python: {}", input.pin.python).map_err(write_err)?;
+    writeln!(out, "//! provenance-argv: {}", input.pin.argv).map_err(write_err)?;
+    writeln!(out, "//! provenance-generated: id={} sha256={}", input.pin.id, input.pin.sha256)
+        .map_err(write_err)?;
+    writeln!(out, "//! provenance-generator: {}", input.generator).map_err(write_err)?;
+    writeln!(out, "{PROVENANCE_DATE_PREFIX} {}", input.date).map_err(write_err)?;
+    writeln!(out, "//! provenance-input: {} sha256:{}", input.pin.output, input.pin.sha256)
+        .map_err(write_err)?;
+    if !input.artifact.input_sha256.is_empty() {
+        writeln!(
+            out,
+            "//! provenance-input-spec: phase0+gloas beacon-chain.md sha256:{}",
+            input.artifact.input_sha256
+        )
+        .map_err(write_err)?;
+    }
+    if !input.artifact.fork_version.is_empty() {
+        writeln!(out, "//! provenance-fork-version: {}", input.artifact.fork_version)
+            .map_err(write_err)?;
+    }
+    if !input.artifact.genesis_validators_root.is_empty() {
+        writeln!(
+            out,
+            "//! provenance-genesis-validators-root: {}",
+            input.artifact.genesis_validators_root
+        )
+        .map_err(write_err)?;
+    }
+    writeln!(out).map_err(write_err)?;
+
+    let docs = [
+        "BeaconBlock signing root under DOMAIN_BEACON_PROPOSER, copied from the pyspec artifact.",
+        "AggregateAndProof signing root under DOMAIN_AGGREGATE_AND_PROOF, copied from the pyspec artifact.",
+        "ExecutionPayloadEnvelope signing root under DOMAIN_BEACON_BUILDER, copied from the pyspec artifact.",
+        "AttestationData signing root (index = 1) under DOMAIN_BEACON_ATTESTER, copied from the pyspec artifact.",
+    ];
+    for ((name, hex), doc) in input.kat.rows.iter().zip(docs) {
+        emit_hex_const(&mut out, name, hex, doc)?;
+    }
+    emit_hex_const(
+        &mut out,
+        "GLOAS_SIGNING_ROOT_ARGV_FLIP_WITNESS",
+        &input.kat.argv_flip_signing_root,
+        "BeaconBlock signing root with argv --fork-version last byte xor 1 (not a KAT).",
+    )?;
+    Ok(format!("{}\n", out.trim_end()))
 }
 
 struct RenderInput<'a> {

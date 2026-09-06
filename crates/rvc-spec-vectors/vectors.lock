@@ -30,3 +30,14 @@ script=scripts/gen_signing_roots.py
 argv=--out crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.0
 output=crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml
 sha256=864ff5176a0b83e9b3e12e2bc03688e32def59e39cbde8816be4a0b15d7962eb
+
+# Island L3 signing roots (block, aggregate, envelope, AttestationData index=1).
+# Same recipe as signing-roots; fork version and GVR remain argv (D28).
+[[generated]]
+id=gloas-signing-roots
+python=3.13.7
+pip=eth-ssz-specs==0.1.0 -r crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/requirements.txt
+script=scripts/gen_signing_roots.py
+argv=--out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.0
+output=crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml
+sha256=0d25fdbf4718bba760ab7bfae358b726c340ea89b98741d0764b3ca4e363c9e1

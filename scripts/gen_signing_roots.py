@@ -3,17 +3,20 @@
 
 Pinned to eth-ssz-specs==0.1.0. Imports that package and the stdlib only.
 Implements pyspec compute_domain / get_domain / compute_signing_root and the
-three Gloas containers using eth-ssz-specs types (the SSZ library pyspec uses
-at v1.7.0-beta.0). Fork version, genesis validators root, and spec tag come
-from argv. DOMAIN_PTC_ATTESTER / DOMAIN_PROPOSER_PREFERENCES are parsed from
-the pinned gloas beacon-chain spec (not hardcoded).
+Gloas containers using eth-ssz-specs types (the SSZ library pyspec uses at
+v1.7.0-beta.0). Fork version, genesis validators root, and spec tag come
+from argv. DOMAIN_* bytes are parsed from the pinned beacon-chain spec
+(not hardcoded).
 
-Output path comes from --out (argv); this file must not name a destination.
+--out is the 4.0 PTC / proposer-preferences artifact. --gloas-out is the
+island L3 artifact (block, aggregate-and-proof, envelope, AttestationData
+index=1). This file must not name a destination.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import re
 import sys
 from importlib.metadata import version
@@ -28,10 +31,22 @@ if sys.version_info < (3, 12):
 from ssz import Boolean, ByteVector, Container, Root, Uint64, hash_tree_root
 
 SPEC_TAG_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SPEC_REL_RE = re.compile(r"^specs/[A-Za-z0-9._/-]+\.md$")
 DOMAIN_ROW_RE = re.compile(
-    r"`(DOMAIN_PTC_ATTESTER|DOMAIN_PROPOSER_PREFERENCES)`\s*\|\s*"
+    r"`(DOMAIN_[A-Z0-9_]+)`\s*\|\s*"
     r"`DomainType\(['\"]0x([0-9A-Fa-f]{8})['\"]\)`"
 )
+LEGACY_DOMAIN_NAMES = (
+    "DOMAIN_PTC_ATTESTER",
+    "DOMAIN_PROPOSER_PREFERENCES",
+)
+ISLAND_DOMAIN_NAMES = (
+    "DOMAIN_BEACON_PROPOSER",
+    "DOMAIN_BEACON_ATTESTER",
+    "DOMAIN_AGGREGATE_AND_PROOF",
+    "DOMAIN_BEACON_BUILDER",
+)
+ALL_DOMAIN_NAMES = LEGACY_DOMAIN_NAMES + ISLAND_DOMAIN_NAMES
 
 # Deterministic non-zero objects (not mix_in_length, not a random case).
 DATA_BEACON_BLOCK_ROOT = bytes.fromhex("11" * 32)
@@ -45,6 +60,26 @@ PREFS_PROPOSAL_SLOT = 32
 PREFS_VALIDATOR_INDEX = 3
 PREFS_FEE_RECIPIENT = bytes.fromhex("44" * 20)
 PREFS_TARGET_GAS_LIMIT = 36_000_000
+
+# Official ssz_static minimal gloas ssz_random/case_0 object roots.
+OBJECT_BEACON_BLOCK_ROOT = bytes.fromhex(
+    "797bb319a7a349213dcab18f6145424682894193e2fca77ba748b283e5353f52"
+)
+OBJECT_AGGREGATE_AND_PROOF_ROOT = bytes.fromhex(
+    "8e20d3aab21ae5374ec249d072afa489e501d89e5c098f6792b2771cf5509bd1"
+)
+OBJECT_EXECUTION_PAYLOAD_ENVELOPE_ROOT = bytes.fromhex(
+    "98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a"
+)
+
+# Generated AttestationData row with index = 1 (ssz_static case_0 is not index=1).
+DATA_ATTESTATION_SLOT = 1
+DATA_ATTESTATION_INDEX = 1
+DATA_ATTESTATION_BEACON_BLOCK_ROOT = bytes.fromhex("11" * 32)
+DATA_ATTESTATION_SOURCE_EPOCH = 0
+DATA_ATTESTATION_SOURCE_ROOT = bytes.fromhex("00" * 32)
+DATA_ATTESTATION_TARGET_EPOCH = 0
+DATA_ATTESTATION_TARGET_ROOT = bytes.fromhex("00" * 32)
 
 
 class Bytes4(ByteVector):
@@ -110,6 +145,19 @@ class ProposerPreferences(Container):
     target_gas_limit: Uint64
 
 
+class Checkpoint(Container):
+    epoch: Uint64
+    root: Root
+
+
+class AttestationData(Container):
+    slot: Uint64
+    index: Uint64
+    beacon_block_root: Root
+    source: Checkpoint
+    target: Checkpoint
+
+
 def hex_bytes(node: bytes) -> str:
     return "0x" + bytes(node).hex()
 
@@ -121,13 +169,16 @@ def hex32(node: bytes) -> str:
     return hex_bytes(raw)
 
 
-def load_gloas_beacon_chain(spec_tag: str) -> str:
+def load_consensus_spec(spec_tag: str, relpath: str) -> str:
     if not SPEC_TAG_RE.fullmatch(spec_tag) or spec_tag in {".", ".."}:
         raise SystemExit(f"error: invalid spec-tag {spec_tag!r}")
+    if not SPEC_REL_RE.fullmatch(relpath) or ".." in relpath:
+        raise SystemExit(f"error: invalid spec path {relpath!r}")
     url = (
         "https://raw.githubusercontent.com/ethereum/consensus-specs/"
         + spec_tag
-        + "/specs/gloas/beacon-chain.md"
+        + "/"
+        + relpath
     )
     result = run(
         [
@@ -152,26 +203,22 @@ def load_gloas_beacon_chain(spec_tag: str) -> str:
     )
     if result.returncode != 0:
         err = (result.stderr or result.stdout or "curl failed").strip()
-        raise SystemExit(f"error: failed to fetch gloas beacon-chain spec: {err}")
+        raise SystemExit(f"error: failed to fetch {relpath}: {err}")
     if not result.stdout.strip():
-        raise SystemExit("error: gloas beacon-chain spec was empty")
+        raise SystemExit(f"error: {relpath} was empty")
     return result.stdout
 
 
-def parse_domain_types(markdown: str) -> tuple[bytes, bytes]:
+def parse_domain_types(markdown: str, names: tuple[str, ...]) -> dict[str, bytes]:
     found: dict[str, bytes] = {}
     for match in DOMAIN_ROW_RE.finditer(markdown):
         found[match.group(1)] = bytes.fromhex(match.group(2))
-    missing = [
-        name
-        for name in ("DOMAIN_PTC_ATTESTER", "DOMAIN_PROPOSER_PREFERENCES")
-        if name not in found
-    ]
+    missing = [name for name in names if name not in found]
     if missing:
         raise SystemExit(
-            "error: pyspec gloas beacon-chain.md missing " + ", ".join(missing)
+            "error: pyspec beacon-chain.md missing " + ", ".join(missing)
         )
-    return found["DOMAIN_PTC_ATTESTER"], found["DOMAIN_PROPOSER_PREFERENCES"]
+    return {name: found[name] for name in names}
 
 
 def parse_hex_bytes(label: str, raw: str, length: int) -> bytes:
@@ -261,22 +308,71 @@ def proposer_preferences() -> ProposerPreferences:
     )
 
 
+def attestation_data_index_one() -> AttestationData:
+    return AttestationData(
+        slot=Uint64(DATA_ATTESTATION_SLOT),
+        index=Uint64(DATA_ATTESTATION_INDEX),
+        beacon_block_root=Root(DATA_ATTESTATION_BEACON_BLOCK_ROOT),
+        source=Checkpoint(
+            epoch=Uint64(DATA_ATTESTATION_SOURCE_EPOCH),
+            root=Root(DATA_ATTESTATION_SOURCE_ROOT),
+        ),
+        target=Checkpoint(
+            epoch=Uint64(DATA_ATTESTATION_TARGET_EPOCH),
+            root=Root(DATA_ATTESTATION_TARGET_ROOT),
+        ),
+    )
+
+
+def python_version() -> str:
+    return (
+        f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    )
+
+
+def sha256_text(*parts: str) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(part.encode("utf-8"))
+    return h.hexdigest()
+
+
+def argv_record() -> str:
+    return " ".join(sys.argv[1:])
+
+
+def flipped_fork_version(fork_version: Version) -> Version:
+    raw = bytearray(bytes(fork_version))
+    raw[-1] ^= 0x01
+    return Version(bytes(raw))
+
+
+def write_yaml(path: Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(body, encoding="utf-8", newline="\n")
+    tmp.replace(path)
+
+
 def emit_yaml(
     spec_tag: str,
     fork_version: Version,
     genesis_validators_root: Root,
-    domain_ptc_attester: bytes,
-    domain_proposer_preferences: bytes,
+    domains: dict[str, bytes],
 ) -> str:
     data = payload_attestation_data()
     message = payload_attestation_message(data)
     prefs = proposer_preferences()
 
     ptc_domain = get_domain(
-        DomainType(domain_ptc_attester), fork_version, genesis_validators_root
+        DomainType(domains["DOMAIN_PTC_ATTESTER"]),
+        fork_version,
+        genesis_validators_root,
     )
     prefs_domain = get_domain(
-        DomainType(domain_proposer_preferences), fork_version, genesis_validators_root
+        DomainType(domains["DOMAIN_PROPOSER_PREFERENCES"]),
+        fork_version,
+        genesis_validators_root,
     )
 
     data_root = hash_tree_root(data)
@@ -294,8 +390,8 @@ def emit_yaml(
         f"spec_tag: {spec_tag}",
         f"fork_version: '{hex_bytes(fork_version)}'",
         f"genesis_validators_root: '{hex32(genesis_validators_root)}'",
-        f"domain_ptc_attester: '{hex_bytes(domain_ptc_attester)}'",
-        f"domain_proposer_preferences: '{hex_bytes(domain_proposer_preferences)}'",
+        f"domain_ptc_attester: '{hex_bytes(domains['DOMAIN_PTC_ATTESTER'])}'",
+        f"domain_proposer_preferences: '{hex_bytes(domains['DOMAIN_PROPOSER_PREFERENCES'])}'",
         "containers:",
         "  - name: PayloadAttestationData",
         "    value:",
@@ -328,9 +424,112 @@ def emit_yaml(
     return "\n".join(lines) + "\n"
 
 
+def emit_island_yaml(
+    spec_tag: str,
+    fork_version: Version,
+    genesis_validators_root: Root,
+    domains: dict[str, bytes],
+    input_digest: str,
+) -> str:
+    att = attestation_data_index_one()
+    proposer_domain = get_domain(
+        DomainType(domains["DOMAIN_BEACON_PROPOSER"]),
+        fork_version,
+        genesis_validators_root,
+    )
+    attester_domain = get_domain(
+        DomainType(domains["DOMAIN_BEACON_ATTESTER"]),
+        fork_version,
+        genesis_validators_root,
+    )
+    aggregate_domain = get_domain(
+        DomainType(domains["DOMAIN_AGGREGATE_AND_PROOF"]),
+        fork_version,
+        genesis_validators_root,
+    )
+    builder_domain = get_domain(
+        DomainType(domains["DOMAIN_BEACON_BUILDER"]),
+        fork_version,
+        genesis_validators_root,
+    )
+
+    block_obj = Root(OBJECT_BEACON_BLOCK_ROOT)
+    aggregate_obj = Root(OBJECT_AGGREGATE_AND_PROOF_ROOT)
+    envelope_obj = Root(OBJECT_EXECUTION_PAYLOAD_ENVELOPE_ROOT)
+    block_signing = compute_signing_root(block_obj, proposer_domain)
+    aggregate_signing = compute_signing_root(aggregate_obj, aggregate_domain)
+    envelope_signing = compute_signing_root(envelope_obj, builder_domain)
+    att_root = hash_tree_root(att)
+    att_signing = compute_signing_root(att, attester_domain)
+
+    flip_domain = get_domain(
+        DomainType(domains["DOMAIN_BEACON_PROPOSER"]),
+        flipped_fork_version(fork_version),
+        genesis_validators_root,
+    )
+    block_flip = compute_signing_root(block_obj, flip_domain)
+
+    lines = [
+        "# Gloas island L3 signing roots from eth-ssz-specs==0.1.0.",
+        "# compute_domain / get_domain / compute_signing_root match pyspec phase0.",
+        "# BeaconBlock / AggregateAndProof / ExecutionPayloadEnvelope object roots",
+        "# are official ssz_static minimal gloas ssz_random/case_0.",
+        "# AttestationData is a generated row with index = 1.",
+        "# DOMAIN_* parsed from phase0 + gloas beacon-chain.md at spec_tag.",
+        "# Do not copy mix_in_length-wrapped list roots into this file.",
+        "package: eth-ssz-specs==0.1.0",
+        f"python: {python_version()}",
+        f"spec_tag: {spec_tag}",
+        f"fork_version: '{hex_bytes(fork_version)}'",
+        f"genesis_validators_root: '{hex32(genesis_validators_root)}'",
+        f"argv: '{argv_record()}'",
+        f"input_sha256: '{input_digest}'",
+        f"domain_beacon_proposer: '{hex_bytes(domains['DOMAIN_BEACON_PROPOSER'])}'",
+        f"domain_beacon_attester: '{hex_bytes(domains['DOMAIN_BEACON_ATTESTER'])}'",
+        f"domain_aggregate_and_proof: '{hex_bytes(domains['DOMAIN_AGGREGATE_AND_PROOF'])}'",
+        f"domain_beacon_builder: '{hex_bytes(domains['DOMAIN_BEACON_BUILDER'])}'",
+        "containers:",
+        "  - name: BeaconBlock",
+        "    domain: DOMAIN_BEACON_PROPOSER",
+        f"    object_root: '{hex32(OBJECT_BEACON_BLOCK_ROOT)}'",
+        f"    root: '{hex32(OBJECT_BEACON_BLOCK_ROOT)}'",
+        f"    signing_root: '{hex32(block_signing)}'",
+        f"    argv_flip_signing_root: '{hex32(block_flip)}'",
+        "  - name: AggregateAndProof",
+        "    domain: DOMAIN_AGGREGATE_AND_PROOF",
+        f"    object_root: '{hex32(OBJECT_AGGREGATE_AND_PROOF_ROOT)}'",
+        f"    root: '{hex32(OBJECT_AGGREGATE_AND_PROOF_ROOT)}'",
+        f"    signing_root: '{hex32(aggregate_signing)}'",
+        "  - name: ExecutionPayloadEnvelope",
+        "    domain: DOMAIN_BEACON_BUILDER",
+        f"    object_root: '{hex32(OBJECT_EXECUTION_PAYLOAD_ENVELOPE_ROOT)}'",
+        f"    root: '{hex32(OBJECT_EXECUTION_PAYLOAD_ENVELOPE_ROOT)}'",
+        f"    signing_root: '{hex32(envelope_signing)}'",
+        "  - name: AttestationData",
+        "    domain: DOMAIN_BEACON_ATTESTER",
+        "    value:",
+        f"      slot: {DATA_ATTESTATION_SLOT}",
+        f"      index: {DATA_ATTESTATION_INDEX}",
+        f"      beacon_block_root: '0x{DATA_ATTESTATION_BEACON_BLOCK_ROOT.hex()}'",
+        "      source:",
+        f"        epoch: {DATA_ATTESTATION_SOURCE_EPOCH}",
+        f"        root: '0x{DATA_ATTESTATION_SOURCE_ROOT.hex()}'",
+        "      target:",
+        f"        epoch: {DATA_ATTESTATION_TARGET_EPOCH}",
+        f"        root: '0x{DATA_ATTESTATION_TARGET_ROOT.hex()}'",
+        f"    root: '{hex32(att_root)}'",
+        f"    signing_root: '{hex32(att_signing)}'",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Generate Gloas signing-root vectors.")
     parser.add_argument("--out", required=True, help="Destination YAML path")
+    parser.add_argument(
+        "--gloas-out",
+        help="Island L3 signing-root YAML path (block, aggregate, envelope, AttestationData)",
+    )
     parser.add_argument(
         "--fork-version",
         required=True,
@@ -344,7 +543,7 @@ def main() -> int:
     parser.add_argument(
         "--spec-tag",
         required=True,
-        help="consensus-specs tag whose gloas beacon-chain.md supplies DOMAIN_*",
+        help="consensus-specs tag whose beacon-chain.md supplies DOMAIN_*",
     )
     args = parser.parse_args()
 
@@ -359,22 +558,33 @@ def main() -> int:
     genesis_validators_root = Root(
         parse_hex_bytes("genesis-validators-root", args.genesis_validators_root, 32)
     )
-    domain_ptc_attester, domain_proposer_preferences = parse_domain_types(
-        load_gloas_beacon_chain(args.spec_tag)
-    )
+    gloas_md = load_consensus_spec(args.spec_tag, "specs/gloas/beacon-chain.md")
+    phase0_md = load_consensus_spec(args.spec_tag, "specs/phase0/beacon-chain.md")
+    domains = parse_domain_types(phase0_md + "\n" + gloas_md, ALL_DOMAIN_NAMES)
+    input_digest = sha256_text(phase0_md, gloas_md)
 
-    body = emit_yaml(
-        args.spec_tag,
-        fork_version,
-        genesis_validators_root,
-        domain_ptc_attester,
-        domain_proposer_preferences,
-    )
-    path = Path(args.out)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(body, encoding="utf-8", newline="\n")
-    tmp.replace(path)
+    out_path = Path(args.out)
+    gloas_path = Path(args.gloas_out) if args.gloas_out else None
+    same_path = gloas_path is not None and out_path.resolve() == gloas_path.resolve()
+
+    if not same_path:
+        body = emit_yaml(
+            args.spec_tag,
+            fork_version,
+            genesis_validators_root,
+            domains,
+        )
+        write_yaml(out_path, body)
+
+    if gloas_path is not None:
+        island = emit_island_yaml(
+            args.spec_tag,
+            fork_version,
+            genesis_validators_root,
+            domains,
+            input_digest,
+        )
+        write_yaml(gloas_path, island)
     return 0
 
 

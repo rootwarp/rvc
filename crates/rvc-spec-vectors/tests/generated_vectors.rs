@@ -158,6 +158,10 @@ fn test_verify_generated_accepts_checked_in_artifact() {
         log.contains("generated ok: signing-roots"),
         "verify must name the signing-roots id: {log}"
     );
+    assert!(
+        log.contains("generated ok: gloas-signing-roots"),
+        "verify must name the gloas-signing-roots id: {log}"
+    );
 }
 
 #[test]

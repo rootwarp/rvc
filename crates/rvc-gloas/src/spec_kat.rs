@@ -5,10 +5,12 @@
 //! # Provenance
 //!
 //! provenance-source: ethereum/consensus-specs@v1.7.0-beta.0 ethereum/ssz-specs@v0.1.0
+//! provenance-generated: id=gloas-signing-roots sha256=0d25fdbf4718bba760ab7bfae358b726c340ea89b98741d0764b3ca4e363c9e1
 //! provenance-generated: id=progressive sha256=af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-generated: id=signing-roots sha256=864ff5176a0b83e9b3e12e2bc03688e32def59e39cbde8816be4a0b15d7962eb
 //! provenance-generator: gen-spec-kat 0.7.0
 //! provenance-date: 2026-09-06
+//! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:0d25fdbf4718bba760ab7bfae358b726c340ea89b98741d0764b3ca4e363c9e1
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/progressive/roots.yaml sha256:af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml sha256:864ff5176a0b83e9b3e12e2bc03688e32def59e39cbde8816be4a0b15d7962eb
 //! provenance-input: crates/rvc-spec-vectors/vectors/v1.7.0-beta.0/mainnet.tar.gz sha256:0ef9c069293e2171dd75c5593faf7b97e32b9bcdce9285e870959938747c0774

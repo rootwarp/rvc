@@ -346,9 +346,10 @@ hint: script must be scripts/<name>.py"
     require_sha "$gen_sha"
 }
 
-# argv is space-separated tokens: --out <output> then optional --flag 0xhex pairs (4.0).
+# argv is space-separated tokens: --out <output> then optional --gloas-out <path>
+# and --flag 0xhex pairs (4.0 / 5.13a).
 validate_generated_argv() {
-    local tok expected
+    local tok expected gloas_out
     expected="--out $gen_output"
     if [[ "$gen_argv" != "$expected" && "$gen_argv" != "$expected "* ]]; then
         die "generated argv '$gen_argv' must start with '--out $gen_output'"
@@ -359,6 +360,18 @@ validate_generated_argv() {
         die "generated argv '$gen_argv' must start with '--out $gen_output'"
     fi
     shift 2
+    if [[ "${1:-}" == "--gloas-out" ]]; then
+        gloas_out="${2:-}"
+        [[ -n "$gloas_out" ]] || die "generated argv missing value for --gloas-out"
+        require_relpath gloas-out "$gloas_out"
+        case "$gloas_out" in
+            "${OUTPUT_PREFIX}"*) ;;
+            *)
+                die "generated --gloas-out '$gloas_out' must start with $OUTPUT_PREFIX"
+                ;;
+        esac
+        shift 2
+    fi
     for tok in "$@"; do
         if [[ ! "$tok" =~ $ARGV_TOKEN_RE ]]; then
             die "invalid generated argv token '$tok' in $LOCK

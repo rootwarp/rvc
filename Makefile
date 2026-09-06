@@ -90,7 +90,9 @@ spec-vectors-regen:
 # regeneration stays hermetic; L1 roots come from
 # vectors-generated/progressive/roots.yaml (pyspec pre-images), never JSON
 # mix_in_length. Gloas signing roots are copied from
-# vectors-generated/signing-roots/signing_roots.yaml (D28).
+# vectors-generated/signing-roots/signing_roots.yaml (D28). Island L3
+# signing roots are copied into src/gloas_signing_kat.rs (sibling of --out)
+# from vectors-generated/gloas-signing-roots/signing_roots.yaml.
 # --gloas-out emits crates/rvc-gloas/src/spec_kat.rs from both preset archives
 # under crates/rvc-spec-vectors/vectors/<SPEC_TAG>.
 spec-kat:
