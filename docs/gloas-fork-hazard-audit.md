@@ -40,9 +40,9 @@ Line numbers were opened on `feature/216-fork-hazard-audit` after 2.1
 | 1 `>= ForkName::X` | 7 |
 | 2 `.index = 0` | 6 |
 | 3 `match ForkName` | 3 |
-| 4 string-literal dispatch | 6 |
+| 4 string-literal dispatch | 4 |
 | 5 `.entries()` | 7 |
-| **Total** | **29** |
+| **Total** | **27** |
 
 Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 
@@ -65,8 +65,6 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `bin/rvc/tests/common/mock_bn.rs` 268 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
 | `crates/eth-types/src/fork.rs` 152 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
 | `crates/eth-types/src/fork.rs` 170 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
-| `crates/beacon/src/client.rs` 751 | 4 | exhaustive | inherit-intentionally | `VersionedSignedAggregateAndProof` → `Eth-Consensus-Version` `"electra"` / `"fulu"` (header at 768). New enum variant is a compile error; the Gloas header string is Phase 6. | phase-6 |
-| `crates/beacon/src/client.rs` 886 | 4 | exhaustive | inherit-intentionally | `VersionedAttestation` → `"phase0"` / `"electra"` / `"fulu"` (Fulu arm at 889). Same compile-forced grow-set; Gloas string is Phase 6. | phase-6 |
 | `crates/block-service/src/service/mod.rs` 581 | 4 | _ | decided-not-inherited | `ssz_block_format`: unblinded deneb/electra/fulu → `BlockContents`; `_ => BeaconBlock` silently skips the KZG bind. `"gloas"` would fall through. 2.7 leaves this untouched; Phase 6. | phase-6 |
 | `crates/block-service/src/service/tests/mocks.rs` 520 | 4 | _ | test-only | Test body SSZ picker. Wildcard `_ =>` Deneb body. Mirrors production string dispatch. | — |
 | `crates/block-service/src/service/tests/mocks.rs` 534 | 4 | _ | test-only | Blinded-body twin of 520. | — |

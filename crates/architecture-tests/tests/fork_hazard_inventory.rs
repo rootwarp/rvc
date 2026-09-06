@@ -117,7 +117,7 @@ const EXPECTED_COUNTS: [(Class, usize); 5] = [
     (Class::GeForkName, 7),
     (Class::IndexZero, 6),
     (Class::MatchForkName, 3),
-    (Class::StringDispatch, 6),
+    (Class::StringDispatch, 4),
     (Class::Entries, 7),
 ];
 
@@ -271,24 +271,6 @@ const INVENTORY: &[Inv] = &[
         "2.7",
     ),
     // Class 4
-    inv(
-        "crates/beacon/src/client.rs",
-        751,
-        Class::StringDispatch,
-        false,
-        "match proofs {",
-        Verdict::InheritIntentionally,
-        "phase-6",
-    ),
-    inv(
-        "crates/beacon/src/client.rs",
-        886,
-        Class::StringDispatch,
-        false,
-        "match attestations {",
-        Verdict::InheritIntentionally,
-        "phase-6",
-    ),
     inv(
         "crates/block-service/src/service/mod.rs",
         581,

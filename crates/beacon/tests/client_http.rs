@@ -1791,6 +1791,93 @@ async fn test_produce_block_v3_full_block() {
     assert_eq!(block.block().proposer_index, 42);
 }
 
+#[tokio::test]
+async fn test_produce_block_missing_consensus_version_is_rejected() {
+    let mock_server = MockServer::start().await;
+
+    let envelope = serde_json::json!({
+        "version": "deneb",
+        "execution_optimistic": false,
+        "data": {
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&envelope)
+                .insert_header("Eth-Execution-Payload-Blinded", "false"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.produce_block_v3(100, "0xrandao", None, None).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("Eth-Consensus-Version"), "{msg}");
+        }
+        Ok(resp) => panic!(
+            "missing Eth-Consensus-Version must be Err, got version {:?}",
+            resp.consensus_version
+        ),
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_unknown_consensus_version_is_rejected() {
+    let mock_server = MockServer::start().await;
+
+    let envelope = serde_json::json!({
+        "version": "gloas2",
+        "execution_optimistic": false,
+        "data": {
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&envelope)
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "gloas2"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.produce_block_v3(100, "0xrandao", None, None).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("gloas2"), "error should name the value: {msg}");
+        }
+        Ok(resp) => panic!(
+            "unknown Eth-Consensus-Version must be Err, got version {:?}",
+            resp.consensus_version
+        ),
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
 /// `produce_block_v3` — the proposer-duty block-production BN call — must run its work
 /// inside a `beacon.produce_block_v3` span carrying the canonical `slot` field, at `debug`
 /// level, matching its sibling `beacon.*` hot-path spans. Proves the span fires (correct

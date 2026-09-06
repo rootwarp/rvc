@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use std::time::Duration;
 
 use reqwest::Client;
@@ -6,7 +7,7 @@ use tracing::{debug, error, trace, warn, Instrument};
 
 use observability::logging::RedactedUrl;
 
-use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
+use eth_types::{ForkName, ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
 
 use crate::http_caps::{read_body_capped, read_body_capped_lossy, ResponseCaps};
 use crate::retry::RetryPolicy;
@@ -76,6 +77,24 @@ impl BeaconClientConfig {
         self.max_body_bytes = max_body_bytes;
         self
     }
+}
+
+/// Parse a required `Eth-Consensus-Version` header into a [`ForkName`].
+///
+/// Absent, non-UTF-8, or unknown values are [`BeaconError::ParseError`] naming
+/// the offending value. Responses that carry a versioned body must not proceed
+/// with an empty string.
+fn required_consensus_version(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<ForkName, BeaconError> {
+    let Some(raw) = headers.get("Eth-Consensus-Version") else {
+        return Err(BeaconError::ParseError("missing Eth-Consensus-Version header".to_string()));
+    };
+    let value = raw.to_str().map_err(|_| {
+        BeaconError::ParseError("unparseable Eth-Consensus-Version header".to_string())
+    })?;
+    ForkName::from_str(value)
+        .map_err(|_| BeaconError::ParseError(format!("invalid Eth-Consensus-Version: {value}")))
 }
 
 /// Async HTTP client wrapper for beacon node communication.
@@ -430,12 +449,8 @@ impl BeaconClient {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        let consensus_version = response
-            .headers()
-            .get("Eth-Consensus-Version")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let consensus_version =
+            required_consensus_version(response.headers())?.as_ref().to_string();
 
         let execution_payload_value = response
             .headers()
@@ -551,12 +566,8 @@ impl BeaconClient {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        let consensus_version = response
-            .headers()
-            .get("Eth-Consensus-Version")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let consensus_version =
+            required_consensus_version(response.headers())?.as_ref().to_string();
 
         let execution_payload_value = response
             .headers()
@@ -756,7 +767,7 @@ impl BeaconClient {
                 self.post_empty_with_headers(
                     "/eth/v2/validator/aggregate_and_proofs",
                     ps,
-                    &[("Eth-Consensus-Version", "electra")],
+                    &[("Eth-Consensus-Version", ForkName::Electra.as_ref())],
                 )
                 .instrument(span)
                 .await
@@ -765,7 +776,7 @@ impl BeaconClient {
                 self.post_empty_with_headers(
                     "/eth/v2/validator/aggregate_and_proofs",
                     ps,
-                    &[("Eth-Consensus-Version", "fulu")],
+                    &[("Eth-Consensus-Version", ForkName::Fulu.as_ref())],
                 )
                 .instrument(span)
                 .await
@@ -884,9 +895,9 @@ impl BeaconClient {
         );
 
         let (consensus_version, attestation_count) = match attestations {
-            VersionedAttestation::PreElectra(atts) => ("phase0", atts.len()),
-            VersionedAttestation::Electra(atts) => ("electra", atts.len()),
-            VersionedAttestation::Fulu(atts) => ("fulu", atts.len()),
+            VersionedAttestation::PreElectra(atts) => (ForkName::Phase0.as_ref(), atts.len()),
+            VersionedAttestation::Electra(atts) => (ForkName::Electra.as_ref(), atts.len()),
+            VersionedAttestation::Fulu(atts) => (ForkName::Fulu.as_ref(), atts.len()),
         };
 
         debug!(
@@ -1275,6 +1286,40 @@ mod tests {
             BeaconClientConfig::new("http://localhost:5052").with_timeout(Duration::from_secs(60));
         let client = BeaconClient::new(config).unwrap();
         assert_eq!(client.timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_required_consensus_version_missing() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = required_consensus_version(&headers).unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains("Eth-Consensus-Version"), "{msg}");
+                assert!(msg.contains("missing"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_required_consensus_version_unknown() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers
+            .insert("Eth-Consensus-Version", reqwest::header::HeaderValue::from_static("gloas2"));
+        let err = required_consensus_version(&headers).unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains("gloas2"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_required_consensus_version_known() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Eth-Consensus-Version", reqwest::header::HeaderValue::from_static("deneb"));
+        assert_eq!(required_consensus_version(&headers).unwrap(), ForkName::Deneb);
     }
 
     #[test]
