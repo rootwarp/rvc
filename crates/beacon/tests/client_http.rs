@@ -4454,3 +4454,194 @@ async fn test_429_without_retry_after_uses_exponential_backoff() {
     let result = client.get_genesis().await;
     assert!(result.is_ok(), "Should succeed after 429 retry with fallback backoff");
 }
+
+#[tokio::test]
+async fn test_post_ptc_duties_parses_dependent_root_field() {
+    let mock_server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+        "execution_optimistic": true,
+        "data": [
+            {
+                "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                "validator_index": "1234",
+                "slot": "10000"
+            }
+        ]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/duties/ptc/100"))
+        .and(body_json(["1234"]))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.post_ptc_duties(100, &["1234".to_string()]).await.unwrap();
+
+    assert_eq!(
+        result.dependent_root,
+        "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+    );
+    assert!(result.execution_optimistic);
+    assert_eq!(result.data.len(), 1);
+    assert_eq!(result.data[0].validator_index, "1234");
+    assert_eq!(result.data[0].slot, "10000");
+}
+
+#[tokio::test]
+async fn test_post_ptc_duties_500_is_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/duties/ptc/100"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.post_ptc_duties(100, &["1234".to_string()]).await;
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 500),
+        Ok(resp) => panic!("500 must not become an empty duty list, got {} items", resp.data.len()),
+        other => panic!("expected ApiError with status 500, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_get_payload_attestation_data_204_returns_none() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(wiremock::matchers::query_param("slot", "42"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri())
+        .with_max_retries(3)
+        .with_initial_backoff(Duration::from_millis(1));
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.get_payload_attestation_data(42).await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn test_get_payload_attestation_data_200_parses_data() {
+    let mock_server = MockServer::start().await;
+    let root = format!("0x{}", "11".repeat(32));
+
+    let response_body = serde_json::json!({
+        "version": "gloas",
+        "data": {
+            "beacon_block_root": root,
+            "slot": "42",
+            "payload_present": true,
+            "blob_data_available": false
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(wiremock::matchers::query_param("slot", "42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.get_payload_attestation_data(42).await.unwrap().unwrap();
+    assert_eq!(result.data.slot, 42);
+    assert!(result.data.payload_present);
+    assert!(!result.data.blob_data_available);
+    assert_eq!(result.data.beacon_block_root, [0x11; 32]);
+}
+
+#[tokio::test]
+async fn test_get_payload_attestation_data_500_is_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(wiremock::matchers::query_param("slot", "42"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.get_payload_attestation_data(42).await;
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 500),
+        Ok(None) => panic!("500 must not be treated as a 204 skip"),
+        other => panic!("expected ApiError with status 500, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_submit_payload_attestations_sends_consensus_version() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("missing Eth-Consensus-Version"))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    client.submit_payload_attestations(&[]).await.expect("header must be sent");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let version = requests[0]
+        .headers
+        .get("Eth-Consensus-Version")
+        .expect("Eth-Consensus-Version header must be present");
+    assert_eq!(version.to_str().unwrap(), "gloas");
+}
+
+#[tokio::test]
+async fn test_submit_payload_attestations_500_is_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    match client.submit_payload_attestations(&[]).await {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 500),
+        other => panic!("expected ApiError with status 500, got {other:?}"),
+    }
+}

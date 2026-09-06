@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use eth_types::{
-    BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, SyncCommitteeContribution,
-    SyncCommitteeDuty, Version,
+    BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, PayloadAttestationData,
+    SyncCommitteeContribution, SyncCommitteeDuty, Version,
 };
 use serde::{Deserialize, Serialize};
 
@@ -122,6 +122,20 @@ pub struct ProposerDuty {
 
 /// Response type for proposer duties endpoint.
 pub type ProposerDutiesResponse = DependentRootResponse<Vec<ProposerDuty>>;
+
+/// PTC duty information for a validator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtcDuty {
+    pub pubkey: String,
+    pub validator_index: String,
+    pub slot: String,
+}
+
+/// Response type for the PTC duties endpoint.
+pub type PtcDutiesResponse = DependentRootResponse<Vec<PtcDuty>>;
+
+/// Response type for the payload attestation data endpoint.
+pub type PayloadAttestationDataResponse = DataResponse<PayloadAttestationData>;
 
 /// Response from the produce block v3 endpoint, including header metadata.
 ///
@@ -672,6 +686,20 @@ mod tests {
         assert!(!response.execution_optimistic);
         assert_eq!(response.data.len(), 1);
         assert_eq!(response.data[0].validator_index, "1");
+    }
+
+    #[test]
+    fn test_ptc_duty_deserialize() {
+        let json = r#"{
+            "pubkey": "0xpubkey",
+            "validator_index": "7",
+            "slot": "42"
+        }"#;
+
+        let duty: PtcDuty = serde_json::from_str(json).unwrap();
+        assert_eq!(duty.pubkey, "0xpubkey");
+        assert_eq!(duty.validator_index, "7");
+        assert_eq!(duty.slot, "42");
     }
 
     #[test]

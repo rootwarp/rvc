@@ -9,7 +9,10 @@ use tracing::{debug, error, trace, warn, Instrument};
 
 use observability::logging::RedactedUrl;
 
-use eth_types::{ForkName, ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
+use eth_types::{
+    ForkName, ForkSchedule, PayloadAttestationMessage, SignedValidatorRegistration,
+    SignedVoluntaryExit,
+};
 
 use crate::http_caps::{read_body_capped, read_body_capped_lossy, ResponseCaps};
 use crate::retry::RetryPolicy;
@@ -17,11 +20,11 @@ use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
     BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
     GenesisResponse, IndexedAttestationError, NodeVersionResponse, NodeVersionV2Response,
-    ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof,
-    StateForkResponse, SubmitAttestationResult, SyncCommitteeContributionResponse,
-    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
-    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
+    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use crate::BeaconError;
 
@@ -705,6 +708,70 @@ impl BeaconClient {
         self.post(&path, &validator_indices)
             .instrument(tracing::info_span!("beacon.get_sync_committee_duties", epoch = epoch))
             .await
+    }
+
+    /// Fetches PTC duties for the given epoch and validator indices.
+    pub async fn post_ptc_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<PtcDutiesResponse, BeaconError> {
+        let path = format!("/eth/v1/validator/duties/ptc/{}", epoch);
+        self.post(&path, &validator_indices)
+            .instrument(tracing::info_span!("beacon.post_ptc_duties", epoch = epoch))
+            .await
+    }
+
+    /// Fetches payload attestation data for the given slot.
+    ///
+    /// HTTP 204 means the beacon node has not seen a block for this slot: skip
+    /// the duty (`Ok(None)`). It is not retried and is never treated as empty data.
+    pub async fn get_payload_attestation_data(
+        &self,
+        slot: u64,
+    ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError> {
+        let slot_s = slot.to_string();
+        let path = Self::build_path(
+            &["eth", "v1", "validator", "payload_attestation_data"],
+            &[("slot", &slot_s)],
+        );
+        let url = self.resolve_url(&path)?;
+        let max_body_bytes = self.config.max_body_bytes;
+
+        self.execute_with_retry_raw(
+            "GET",
+            &url,
+            || async { Self::traced(self.client.get(&url)).send().await },
+            move |response| async move {
+                let status = response.status();
+                if status.as_u16() == 204 {
+                    return Ok(None);
+                }
+                if !status.is_success() {
+                    return Err(Self::api_error_from_response(response).await);
+                }
+                let body = read_body_capped(response, max_body_bytes).await?;
+                serde_json::from_slice::<PayloadAttestationDataResponse>(&body).map(Some).map_err(
+                    |e| BeaconError::ParseError(format!("error decoding response body: {e}")),
+                )
+            },
+        )
+        .instrument(tracing::info_span!("beacon.get_payload_attestation_data", slot = slot))
+        .await
+    }
+
+    /// Submits payload attestation messages to the beacon node pool.
+    pub async fn submit_payload_attestations(
+        &self,
+        messages: &[PayloadAttestationMessage],
+    ) -> Result<(), BeaconError> {
+        self.post_empty_with_headers(
+            "/eth/v1/beacon/pool/payload_attestations",
+            &messages,
+            &[("Eth-Consensus-Version", ForkName::Gloas.as_ref())],
+        )
+        .instrument(tracing::info_span!("beacon.submit_payload_attestations"))
+        .await
     }
 
     /// Submits sync committee messages to the beacon node pool.
