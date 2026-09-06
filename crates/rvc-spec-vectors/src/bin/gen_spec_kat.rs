@@ -1,24 +1,31 @@
 //! Emit `spec_kat.rs` (`SPEC_PROGRESSIVE_*`, `SPEC_GLOAS_*`, `KAT_GLOAS_*`)
 //! from vector files.
 //!
-//! Argv only: `--vectors <dir> --out <path>`. L1 roots are copied from the
-//! 3.4b pyspec artifact (`vectors-generated/progressive/roots.yaml`), never
-//! from shipped JSON `root` fields (`mix_in_length`-wrapped). Gloas container
-//! roots come from `ssz_static/<Container>/**/roots.yaml` when present, else
-//! the 4.0 pyspec artifact. L3 signing roots are copied from
-//! `gen_signing_roots.py` output; this binary never computes a domain.
+//! Argv only: `--vectors <dir> --out <path>` and optional `--gloas-out` /
+//! `--gloas-vectors`. L1 roots are copied from the 3.4b pyspec artifact
+//! (`vectors-generated/progressive/roots.yaml`), never from shipped JSON
+//! `root` fields (`mix_in_length`-wrapped). `--out` copies P4 Gloas container
+//! roots from `ssz_static` when present, else the 4.0 pyspec artifact, and
+//! copies L3 signing roots from `gen_signing_roots.py` (this binary never
+//! computes a domain). `--gloas-out` emits the rvc-gloas per-preset island
+//! KATs from official `ssz_static` (or a documented residual).
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
+use tar::Archive;
+
+use rvc_spec_vectors::loader::{decode_snappy, roots_yaml};
 
 const GENERATOR_NAME: &str = "gen-spec-kat";
 const GENERATOR_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -32,7 +39,50 @@ const SSZ_SNAPPY_SUFFIX: &str = ".ssz_snappy";
 
 const REQUIRED_CHUNK_COUNTS: &[u32] = &[0, 1, 2, 4, 5, 6, 20, 21, 22, 84, 85, 86];
 const REQUIRED_WIDTHS: &[u32] = &[3, 4, 13];
+const GLOAS_WIDTHS: &[u32] = &[3, 4, 5, 13];
 const REQUIRED_PATTERNS: &[&str] = &["all_ones", "sparse_bit0_clear"];
+
+const GLOAS_FORK: &str = "gloas";
+const GLOAS_SUITE: &str = "ssz_random";
+const GLOAS_CASE: &str = "case_0";
+const GLOAS_PRESETS: &[&str] = &["minimal", "mainnet"];
+
+/// Island containers that 5.4–5.16 assert as `SPEC_GLOAS_<TYPE>_ROOT`.
+const GLOAS_TYPES: &[&str] = &[
+    "Checkpoint",
+    "AttestationData",
+    "Eth1Data",
+    "BeaconBlockHeader",
+    "SignedBeaconBlockHeader",
+    "ProposerSlashing",
+    "DepositData",
+    "Deposit",
+    "VoluntaryExit",
+    "SignedVoluntaryExit",
+    "SyncAggregate",
+    "BLSToExecutionChange",
+    "SignedBLSToExecutionChange",
+    "DepositRequest",
+    "WithdrawalRequest",
+    "ConsolidationRequest",
+    "BuilderDepositRequest",
+    "BuilderExitRequest",
+    "Attestation",
+    "IndexedAttestation",
+    "AttesterSlashing",
+    "AggregateAndProof",
+    "SignedAggregateAndProof",
+    "ExecutionRequests",
+    "PayloadAttestationData",
+    "PayloadAttestation",
+    "ExecutionPayloadBid",
+    "SignedExecutionPayloadBid",
+    "BeaconBlockBody",
+    "BeaconBlock",
+    "ExecutionPayload",
+    "ExecutionPayloadEnvelope",
+    "SignedExecutionPayloadEnvelope",
+];
 
 const ZERO_ROOT_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -51,7 +101,9 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("error: {e}");
-            eprintln!("usage: {GENERATOR_NAME} --vectors <dir> --out <path>");
+            eprintln!(
+                "usage: {GENERATOR_NAME} --vectors <dir> --out <path> [--gloas-out <path>] [--gloas-vectors <dir>]"
+            );
             ExitCode::FAILURE
         }
     }
@@ -142,27 +194,55 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         gloas: &gloas,
     })?;
 
-    let existing = fs::read_to_string(&args.out).ok();
-    let out_text = match existing {
-        Some(old) if with_date_placeholder(&old) == body => old,
-        _ => body.replace(
-            &format!("{PROVENANCE_DATE_PREFIX} {DATE_PLACEHOLDER}"),
-            &format!("{PROVENANCE_DATE_PREFIX} {}", today_utc()?),
-        ),
-    };
+    write_stable(&args.out, &body)?;
 
-    if let Some(parent) = args.out.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    if let Some(gloas_out) = args.gloas_out.as_ref() {
+        let gloas_vectors =
+            args.gloas_vectors.clone().unwrap_or_else(|| crate_dir.join("vectors").join(&spec_tag));
+        if !gloas_vectors.is_dir() {
+            return Err(format!(
+                "--gloas-vectors is not a directory: {} (fetch both presets: PRESET=minimal make spec-vectors && PRESET=mainnet make spec-vectors)",
+                gloas_vectors.display()
+            ));
         }
+        refuse_symlink(&gloas_vectors)?;
+        let progressive_rel = generated
+            .iter()
+            .find(|p| p.id == PROGRESSIVE_ID)
+            .map(|p| p.output.as_str())
+            .ok_or_else(|| format!("vectors.lock [[generated]] missing id={PROGRESSIVE_ID}"))?;
+        let progressive_path = workspace.join(progressive_rel);
+        let (families, residuals, mut island_inputs) =
+            collect_gloas(&workspace, &gloas_vectors, &progressive_path, &parsed)?;
+        for pin in &generated {
+            let path = workspace.join(&pin.output);
+            if path.is_file() {
+                push_input(&mut island_inputs, &workspace, &path)?;
+            }
+        }
+        island_inputs.sort_by(|a, b| a.rel.cmp(&b.rel));
+        island_inputs.dedup_by(|a, b| a.rel == b.rel);
+        refuse_dropped_gloas_names(gloas_out, &families)?;
+        let island_body = render_island(&IslandRenderInput {
+            date: DATE_PLACEHOLDER,
+            source: &source,
+            generated: &generated,
+            generator: &generator,
+            inputs: &island_inputs,
+            parsed: &parsed,
+            families: &families,
+            residuals: &residuals,
+        })?;
+        write_stable(gloas_out, &island_body)?;
     }
-    fs::write(&args.out, out_text).map_err(|e| format!("write {}: {e}", args.out.display()))?;
     Ok(())
 }
 
 struct Args {
     vectors: PathBuf,
     out: PathBuf,
+    gloas_out: Option<PathBuf>,
+    gloas_vectors: Option<PathBuf>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> {
@@ -170,6 +250,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> 
     let _argv0 = args.next();
     let mut vectors = None;
     let mut out = None;
+    let mut gloas_out = None;
+    let mut gloas_vectors = None;
     while let Some(raw) = args.next() {
         let flag = raw.to_string_lossy();
         match flag.as_ref() {
@@ -185,12 +267,29 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Args, String> 
                     return Err("duplicate --out".into());
                 }
             }
+            "--gloas-out" => {
+                let value = args.next().ok_or("missing value for --gloas-out")?;
+                if gloas_out.replace(PathBuf::from(value)).is_some() {
+                    return Err("duplicate --gloas-out".into());
+                }
+            }
+            "--gloas-vectors" => {
+                let value = args.next().ok_or("missing value for --gloas-vectors")?;
+                if gloas_vectors.replace(PathBuf::from(value)).is_some() {
+                    return Err("duplicate --gloas-vectors".into());
+                }
+            }
             other => return Err(format!("unexpected argument: {other}")),
         }
+    }
+    if gloas_vectors.is_some() && gloas_out.is_none() {
+        return Err("--gloas-vectors requires --gloas-out".into());
     }
     Ok(Args {
         vectors: vectors.ok_or("missing --vectors <dir>")?,
         out: out.ok_or("missing --out <path>")?,
+        gloas_out,
+        gloas_vectors,
     })
 }
 
@@ -732,6 +831,579 @@ fn emit_hex_const(out: &mut String, name: &str, hex: &str, doc: &str) -> Result<
     writeln!(out, "    \"{hex}\";").map_err(write_err)?;
     writeln!(out).map_err(write_err)?;
     Ok(())
+}
+
+struct IslandCase {
+    type_name: &'static str,
+    suffix: String,
+    root_hex: String,
+    ssz_hex: String,
+    rel: String,
+}
+
+struct IslandFamily {
+    preset: &'static str,
+    cases: Vec<IslandCase>,
+}
+
+struct IslandRenderInput<'a> {
+    date: &'a str,
+    source: &'a str,
+    generated: &'a [GeneratedPin],
+    generator: &'a str,
+    inputs: &'a [InputHash],
+    parsed: &'a ProgressiveVectors,
+    families: &'a [IslandFamily],
+    residuals: &'a [String],
+}
+
+fn render_island(input: &IslandRenderInput<'_>) -> Result<String, String> {
+    let mut out = String::new();
+    writeln!(out, "//! Generated KAT constants. Do not edit by hand.").map_err(write_err)?;
+    writeln!(out, "//!").map_err(write_err)?;
+    writeln!(out, "//! Regenerate with `make spec-kat`.").map_err(write_err)?;
+    writeln!(out, "//!").map_err(write_err)?;
+    writeln!(out, "//! # Provenance").map_err(write_err)?;
+    writeln!(out, "//!").map_err(write_err)?;
+    writeln!(out, "//! provenance-source: {}", input.source).map_err(write_err)?;
+    if input.generated.is_empty() {
+        return Err("no [[generated]] pins in provenance header".into());
+    }
+    for pin in input.generated {
+        writeln!(out, "//! provenance-generated: id={} sha256={}", pin.id, pin.sha256)
+            .map_err(write_err)?;
+    }
+    writeln!(out, "//! provenance-generator: {}", input.generator).map_err(write_err)?;
+    writeln!(out, "{PROVENANCE_DATE_PREFIX} {}", input.date).map_err(write_err)?;
+    if input.inputs.is_empty() {
+        return Err("no provenance inputs hashed".into());
+    }
+    for item in input.inputs {
+        writeln!(out, "//! provenance-input: {} sha256:{}", item.rel, item.sha256)
+            .map_err(write_err)?;
+    }
+    writeln!(out, "//!").map_err(write_err)?;
+    writeln!(out, "//! # Residuals").map_err(write_err)?;
+    writeln!(out, "//!").map_err(write_err)?;
+    if input.residuals.is_empty() {
+        writeln!(
+            out,
+            "//! residual: none — every island container has an official ssz_static case"
+        )
+        .map_err(write_err)?;
+    } else {
+        for line in input.residuals {
+            writeln!(out, "//! residual: {line}").map_err(write_err)?;
+        }
+    }
+    writeln!(out).map_err(write_err)?;
+    writeln!(out, "#![allow(dead_code)]").map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
+
+    if input.families.len() != GLOAS_PRESETS.len() {
+        return Err("gloas families must cover both presets".into());
+    }
+    for family in input.families {
+        writeln!(out, "pub mod {} {{", family.preset).map_err(write_err)?;
+        render_island_progressive(&mut out, input.parsed)?;
+        render_island_family(&mut out, family)?;
+        trim_trailing_blank(&mut out);
+        writeln!(out, "}}").map_err(write_err)?;
+        writeln!(out).map_err(write_err)?;
+    }
+    writeln!(out, "pub use minimal::*;").map_err(write_err)?;
+    Ok(out)
+}
+
+fn render_island_progressive(out: &mut String, parsed: &ProgressiveVectors) -> Result<(), String> {
+    let indent = "    ";
+    for width in GLOAS_WIDTHS {
+        for pattern in REQUIRED_PATTERNS {
+            if !parsed.mix_in.contains_key(&(*width, (*pattern).to_owned())) {
+                return Err(format!(
+                    "3.4b artifact missing mix_in_active_fields width {width} pattern {pattern}"
+                ));
+            }
+        }
+    }
+
+    writeln!(
+        out,
+        "{indent}/// Chunk counts from eth-ssz-specs `PROGRESSIVE_CHUNK_COUNTS` (issue 3.4a)."
+    )
+    .map_err(write_err)?;
+    write!(out, "{indent}pub const SPEC_PROGRESSIVE_CHUNK_COUNTS: &[u32] = &[")
+        .map_err(write_err)?;
+    for (i, count) in REQUIRED_CHUNK_COUNTS.iter().enumerate() {
+        if i > 0 {
+            write!(out, ", ").map_err(write_err)?;
+        }
+        write!(out, "{count}").map_err(write_err)?;
+    }
+    writeln!(out, "];").map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
+
+    writeln!(
+        out,
+        "{indent}/// Active-field widths 3 / 4 / 5 / 13 (`IndexedAttestation` / `Attestation` / `ExecutionRequests` / `BeaconBlockBody`)."
+    )
+    .map_err(write_err)?;
+    writeln!(
+        out,
+        "{indent}pub const SPEC_PROGRESSIVE_ACTIVE_FIELD_WIDTHS: &[u32] = &[3, 4, 5, 13];"
+    )
+    .map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
+
+    for count in REQUIRED_CHUNK_COUNTS {
+        let hex = &parsed.merkleize[count];
+        let name = format!("SPEC_PROGRESSIVE_CHUNKS_{count}");
+        emit_str_const(
+            out,
+            indent,
+            &name,
+            hex,
+            &format!("`merkleize_progressive(chunk_run({count}))` from the 3.4b pyspec artifact."),
+        )?;
+    }
+
+    writeln!(
+        out,
+        "{indent}/// `(chunk_count, root_hex)` pairs, same order as [`SPEC_PROGRESSIVE_CHUNK_COUNTS`]."
+    )
+    .map_err(write_err)?;
+    writeln!(out, "{indent}pub const SPEC_PROGRESSIVE_CHUNK_ROOTS: &[(u32, &str)] = &[")
+        .map_err(write_err)?;
+    for count in REQUIRED_CHUNK_COUNTS {
+        writeln!(out, "{indent}    ({count}, SPEC_PROGRESSIVE_CHUNKS_{count}),")
+            .map_err(write_err)?;
+    }
+    writeln!(out, "{indent}];").map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
+
+    let mut mix_const_names = Vec::new();
+    for width in GLOAS_WIDTHS {
+        for pattern in REQUIRED_PATTERNS {
+            let hex = &parsed.mix_in[&(*width, (*pattern).to_owned())];
+            let ident_pattern = pattern.to_ascii_uppercase();
+            let name = format!("SPEC_PROGRESSIVE_ACTIVE_FIELDS_{width}_{ident_pattern}");
+            emit_str_const(
+                out,
+                indent,
+                &name,
+                hex,
+                &format!(
+                    "`mix_in_active_fields(sample_root, {pattern})` at width {width} from the 3.4b pyspec artifact."
+                ),
+            )?;
+            mix_const_names.push((*width, *pattern, name));
+        }
+    }
+
+    writeln!(
+        out,
+        "{indent}/// `(width, pattern, root_hex)` pairs for widths 3 / 4 / 5 / 13 (all-ones + bit-0-clear sparse)."
+    )
+    .map_err(write_err)?;
+    writeln!(
+        out,
+        "{indent}pub const SPEC_PROGRESSIVE_ACTIVE_FIELD_ROOTS: &[(u32, &str, &str)] = &["
+    )
+    .map_err(write_err)?;
+    for (width, pattern, name) in &mix_const_names {
+        writeln!(out, "{indent}    ({width}, \"{pattern}\", {name}),").map_err(write_err)?;
+    }
+    writeln!(out, "{indent}];").map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
+    Ok(())
+}
+
+fn render_island_family(out: &mut String, family: &IslandFamily) -> Result<(), String> {
+    let indent = "    ";
+    writeln!(out, "{indent}/// Official `ssz_static` suite selected for Gloas KATs.")
+        .map_err(write_err)?;
+    writeln!(out, "{indent}pub const SPEC_GLOAS_SUITE: &str = \"{GLOAS_SUITE}\";")
+        .map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
+    writeln!(out, "{indent}/// Official `ssz_static` case selected for Gloas KATs.")
+        .map_err(write_err)?;
+    writeln!(out, "{indent}pub const SPEC_GLOAS_CASE: &str = \"{GLOAS_CASE}\";")
+        .map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
+
+    writeln!(out, "{indent}/// `SPEC_GLOAS_<TYPE>_ROOT` constant names in this module.")
+        .map_err(write_err)?;
+    writeln!(out, "{indent}pub const SPEC_GLOAS_ROOT_NAMES: &[&str] = &[").map_err(write_err)?;
+    for case in &family.cases {
+        writeln!(out, "{indent}    \"SPEC_GLOAS_{}_ROOT\",", case.suffix).map_err(write_err)?;
+    }
+    writeln!(out, "{indent}];").map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
+
+    for case in &family.cases {
+        emit_str_const(
+            out,
+            indent,
+            &format!("SPEC_GLOAS_{}_ROOT", case.suffix),
+            &case.root_hex,
+            &format!(
+                "Official `ssz_static` `{}` root from `{}` (preset {}).",
+                case.type_name, case.rel, family.preset
+            ),
+        )?;
+        emit_long_hex_const(
+            out,
+            indent,
+            &format!("SPEC_GLOAS_{}_SSZ", case.suffix),
+            &case.ssz_hex,
+            &format!(
+                "Decoded `serialized.ssz_snappy` for `{}` from `{}` (preset {}, lowercase hex).",
+                case.type_name, case.rel, family.preset
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_str_const(
+    out: &mut String,
+    indent: &str,
+    name: &str,
+    value: &str,
+    doc: &str,
+) -> Result<(), String> {
+    writeln!(out, "{indent}/// {doc}").map_err(write_err)?;
+    let one_line = format!("{indent}pub const {name}: &str = \"{value}\";");
+    if one_line.len() <= 100 {
+        writeln!(out, "{one_line}").map_err(write_err)?;
+    } else {
+        writeln!(out, "{indent}pub const {name}: &str =").map_err(write_err)?;
+        writeln!(out, "{indent}    \"{value}\";").map_err(write_err)?;
+    }
+    writeln!(out).map_err(write_err)?;
+    Ok(())
+}
+
+fn emit_long_hex_const(
+    out: &mut String,
+    indent: &str,
+    name: &str,
+    hex: &str,
+    doc: &str,
+) -> Result<(), String> {
+    if hex.len() <= 64 {
+        return emit_str_const(out, indent, name, hex, doc);
+    }
+    writeln!(out, "{indent}/// {doc}").map_err(write_err)?;
+    writeln!(out, "{indent}pub const {name}: &str = concat!(").map_err(write_err)?;
+    for chunk in hex.as_bytes().chunks(64) {
+        let s = std::str::from_utf8(chunk).map_err(|e| format!("ssz hex utf8: {e}"))?;
+        writeln!(out, "{indent}    \"{s}\",").map_err(write_err)?;
+    }
+    writeln!(out, "{indent});").map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
+    Ok(())
+}
+
+fn trim_trailing_blank(out: &mut String) {
+    if out.ends_with("\n\n") {
+        out.pop();
+    }
+}
+
+fn write_stable(path: &Path, body: &str) -> Result<(), String> {
+    let existing = fs::read_to_string(path).ok();
+    let out_text = match existing {
+        Some(old) if with_date_placeholder(&old) == body => old,
+        _ => body.replace(
+            &format!("{PROVENANCE_DATE_PREFIX} {DATE_PLACEHOLDER}"),
+            &format!("{PROVENANCE_DATE_PREFIX} {}", today_utc()?),
+        ),
+    };
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+        }
+    }
+    fs::write(path, out_text).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn camel_to_screaming(name: &str) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let mut out = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c.is_uppercase() && i > 0 {
+            let prev = chars[i - 1];
+            let next_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if prev.is_lowercase() || (prev.is_uppercase() && next_lower) {
+                out.push('_');
+            }
+        }
+        out.push(c.to_ascii_uppercase());
+    }
+    out
+}
+
+fn emitted_gloas_root_const_names(src: &str) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for line in src.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("pub const SPEC_GLOAS_") else {
+            continue;
+        };
+        let Some(name) = rest.split(':').next() else {
+            continue;
+        };
+        if name.ends_with("_ROOT") {
+            names.insert(format!("SPEC_GLOAS_{name}"));
+        }
+    }
+    names
+}
+
+fn refuse_dropped_gloas_names(path: &Path, families: &[IslandFamily]) -> Result<(), String> {
+    let Ok(old) = fs::read_to_string(path) else {
+        return Ok(());
+    };
+    let prev = emitted_gloas_root_const_names(&old);
+    if prev.is_empty() {
+        return Ok(());
+    }
+    let next: BTreeSet<String> = families
+        .iter()
+        .flat_map(|f| f.cases.iter().map(|c| format!("SPEC_GLOAS_{}_ROOT", c.suffix)))
+        .collect();
+    let missing: Vec<String> = prev.difference(&next).cloned().collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to drop previously emitted Gloas KAT names in {}: {}",
+        path.display(),
+        missing.join(", ")
+    ))
+}
+
+struct RawGloasFiles {
+    roots: Option<Vec<u8>>,
+    ssz: Option<Vec<u8>>,
+}
+
+type GloasCollect = (Vec<IslandFamily>, Vec<String>, Vec<InputHash>);
+
+fn collect_gloas(
+    workspace: &Path,
+    gloas_vectors: &Path,
+    progressive: &Path,
+    parsed: &ProgressiveVectors,
+) -> Result<GloasCollect, String> {
+    for width in GLOAS_WIDTHS {
+        for pattern in REQUIRED_PATTERNS {
+            if !parsed.mix_in.contains_key(&(*width, (*pattern).to_owned())) {
+                return Err(format!(
+                    "3.4b artifact missing mix_in_active_fields width {width} pattern {pattern} (needed for Gloas SPEC_PROGRESSIVE_*)"
+                ));
+            }
+        }
+    }
+
+    let mut files: BTreeMap<(&'static str, &'static str), RawGloasFiles> = BTreeMap::new();
+    let mut hashed = Vec::new();
+    push_input(&mut hashed, workspace, progressive)?;
+
+    let mut used_archives = false;
+    for preset in GLOAS_PRESETS {
+        let archive = gloas_vectors.join(format!("{preset}.tar.gz"));
+        if archive.is_file() {
+            refuse_symlink(&archive)?;
+            push_input(&mut hashed, workspace, &archive)?;
+            load_gloas_from_tar(&archive, preset, &mut files)?;
+            used_archives = true;
+        }
+    }
+    if !used_archives {
+        load_gloas_from_tree(gloas_vectors, &mut files)?;
+        for ((preset, type_name), raw) in &files {
+            let rel_dir = format!(
+                "tests/{preset}/{GLOAS_FORK}/{SSZ_STATIC}/{type_name}/{GLOAS_SUITE}/{GLOAS_CASE}"
+            );
+            let roots_path = gloas_vectors.join(&rel_dir).join("roots.yaml");
+            let ssz_path = gloas_vectors.join(&rel_dir).join("serialized.ssz_snappy");
+            if raw.roots.is_some() && roots_path.is_file() {
+                push_input(&mut hashed, workspace, &roots_path)?;
+            }
+            if raw.ssz.is_some() && ssz_path.is_file() {
+                push_input(&mut hashed, workspace, &ssz_path)?;
+            }
+        }
+    }
+
+    hashed.sort_by(|a, b| a.rel.cmp(&b.rel));
+    hashed.dedup_by(|a, b| a.rel == b.rel);
+
+    let mut residuals = Vec::new();
+    let mut families = Vec::new();
+    for preset in GLOAS_PRESETS {
+        let mut cases = Vec::new();
+        for type_name in GLOAS_TYPES {
+            match files.get(&(*preset, *type_name)) {
+                Some(raw) if raw.roots.is_some() && raw.ssz.is_some() => {
+                    let roots_bytes = raw
+                        .roots
+                        .as_ref()
+                        .ok_or_else(|| format!("{preset}/{type_name} missing roots.yaml"))?;
+                    let roots_text = String::from_utf8(roots_bytes.clone())
+                        .map_err(|e| format!("{preset}/{type_name} roots.yaml utf8: {e}"))?;
+                    let parsed_roots = roots_yaml(&roots_text)
+                        .map_err(|e| format!("{preset}/{type_name} roots.yaml: {e}"))?;
+                    let root_hex = normalize_root_hex(&parsed_roots.root)?;
+                    let snappy = raw
+                        .ssz
+                        .as_ref()
+                        .ok_or_else(|| format!("{preset}/{type_name} missing serialized.ssz_snappy"))?;
+                    let ssz = decode_snappy(snappy)
+                        .map_err(|e| format!("{preset}/{type_name} snappy: {e}"))?;
+                    let rel = format!(
+                        "tests/{preset}/{GLOAS_FORK}/{SSZ_STATIC}/{type_name}/{GLOAS_SUITE}/{GLOAS_CASE}"
+                    );
+                    cases.push(IslandCase {
+                        type_name,
+                        suffix: camel_to_screaming(type_name),
+                        root_hex,
+                        ssz_hex: hex::encode(ssz),
+                        rel,
+                    });
+                }
+                _ => residuals.push(format!(
+                    "{type_name} ({preset}) — official ssz_static {GLOAS_SUITE}/{GLOAS_CASE} missing at SPEC_TAG; not synthesized"
+                )),
+            }
+        }
+        families.push(IslandFamily { preset, cases });
+    }
+
+    let names: Vec<Vec<String>> =
+        families.iter().map(|f| f.cases.iter().map(|c| c.suffix.clone()).collect()).collect();
+    if names.len() == 2 && names[0] != names[1] {
+        return Err(format!(
+            "gloas ssz_static type set differs between presets (refusing to drop names): minimal={:?} mainnet={:?}",
+            names[0], names[1]
+        ));
+    }
+
+    if families.iter().any(|f| !f.cases.iter().any(|c| c.type_name == "SyncAggregate")) {
+        return Err(
+            "SyncAggregate ssz_static case missing in a preset; cannot emit SPEC_GLOAS_SYNC_AGGREGATE_ROOT"
+                .into(),
+        );
+    }
+
+    residuals.sort();
+    residuals.dedup();
+    Ok((families, residuals, hashed))
+}
+
+fn load_gloas_from_tree(
+    root: &Path,
+    files: &mut BTreeMap<(&'static str, &'static str), RawGloasFiles>,
+) -> Result<(), String> {
+    for preset in GLOAS_PRESETS {
+        for type_name in GLOAS_TYPES {
+            let dir = root
+                .join("tests")
+                .join(preset)
+                .join(GLOAS_FORK)
+                .join(SSZ_STATIC)
+                .join(type_name)
+                .join(GLOAS_SUITE)
+                .join(GLOAS_CASE);
+            if !dir.is_dir() {
+                continue;
+            }
+            refuse_symlink(&dir)?;
+            let roots_path = dir.join("roots.yaml");
+            let ssz_path = dir.join("serialized.ssz_snappy");
+            let mut raw = RawGloasFiles { roots: None, ssz: None };
+            if roots_path.is_file() {
+                refuse_symlink(&roots_path)?;
+                raw.roots = Some(
+                    fs::read(&roots_path)
+                        .map_err(|e| format!("read {}: {e}", roots_path.display()))?,
+                );
+            }
+            if ssz_path.is_file() {
+                refuse_symlink(&ssz_path)?;
+                raw.ssz = Some(
+                    fs::read(&ssz_path).map_err(|e| format!("read {}: {e}", ssz_path.display()))?,
+                );
+            }
+            files.insert((*preset, *type_name), raw);
+        }
+    }
+    Ok(())
+}
+
+fn load_gloas_from_tar(
+    archive: &Path,
+    preset: &'static str,
+    files: &mut BTreeMap<(&'static str, &'static str), RawGloasFiles>,
+) -> Result<(), String> {
+    let file = fs::File::open(archive).map_err(|e| format!("open {}: {e}", archive.display()))?;
+    let dec = GzDecoder::new(file);
+    let mut tar = Archive::new(dec);
+    let entries = tar.entries().map_err(|e| format!("read {}: {e}", archive.display()))?;
+    for ent in entries {
+        let mut ent = ent.map_err(|e| format!("read {}: {e}", archive.display()))?;
+        if ent.header().entry_type().is_symlink() {
+            return Err(format!(
+                "refusing symlink member in {}: {}",
+                archive.display(),
+                ent.path().map(|p| p.display().to_string()).unwrap_or_default()
+            ));
+        }
+        let path = ent.path().map_err(|e| format!("tar member path: {e}"))?;
+        let rel = path.to_string_lossy().replace('\\', "/");
+        let rel = rel.trim_start_matches("./");
+        let Some((type_name, kind)) = match_gloas_member(rel, preset) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        ent.read_to_end(&mut buf).map_err(|e| format!("read {rel}: {e}"))?;
+        let raw =
+            files.entry((preset, type_name)).or_insert(RawGloasFiles { roots: None, ssz: None });
+        match kind {
+            "roots" => raw.roots = Some(buf),
+            "ssz" => raw.ssz = Some(buf),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn match_gloas_member(rel: &str, preset: &str) -> Option<(&'static str, &'static str)> {
+    let prefix = format!("tests/{preset}/{GLOAS_FORK}/{SSZ_STATIC}/");
+    let rest = rel.strip_prefix(&prefix)?;
+    let mut parts = rest.split('/');
+    let type_name = parts.next()?;
+    let suite = parts.next()?;
+    let case = parts.next()?;
+    let file = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if suite != GLOAS_SUITE || case != GLOAS_CASE {
+        return None;
+    }
+    let type_name = GLOAS_TYPES.iter().copied().find(|t| *t == type_name)?;
+    let kind = if file == "roots.yaml" {
+        "roots"
+    } else if file == "serialized.ssz_snappy" || file.ends_with(SSZ_SNAPPY_SUFFIX) {
+        "ssz"
+    } else {
+        return None;
+    };
+    Some((type_name, kind))
 }
 
 fn write_err(e: std::fmt::Error) -> String {

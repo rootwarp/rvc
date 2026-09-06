@@ -86,14 +86,18 @@ spec-vectors-regen:
 	./scripts/fetch_spec_vectors.sh regen
 
 # Codegen SPEC_PROGRESSIVE_* / SPEC_GLOAS_* / KAT_GLOAS_* from artifacts + the
-# 3.3a fixture tree (no network). --vectors is the fixture tree so regeneration
-# stays hermetic; L1 roots come from vectors-generated/progressive/roots.yaml
-# (pyspec pre-images), never JSON mix_in_length. Gloas signing roots are copied
-# from vectors-generated/signing-roots/signing_roots.yaml (D28).
+# 3.3a fixture tree (no network). --vectors is the fixture tree so P3/4.0
+# regeneration stays hermetic; L1 roots come from
+# vectors-generated/progressive/roots.yaml (pyspec pre-images), never JSON
+# mix_in_length. Gloas signing roots are copied from
+# vectors-generated/signing-roots/signing_roots.yaml (D28).
+# --gloas-out emits crates/rvc-gloas/src/spec_kat.rs from both preset archives
+# under crates/rvc-spec-vectors/vectors/<SPEC_TAG>.
 spec-kat:
 	cargo run -p rvc-spec-vectors --bin gen-spec-kat -- \
 		--vectors crates/rvc-spec-vectors/tests/fixtures \
-		--out crates/rvc-spec-vectors/src/spec_kat.rs
+		--out crates/rvc-spec-vectors/src/spec_kat.rs \
+		--gloas-out crates/rvc-gloas/src/spec_kat.rs
 
 # All checks (CI)
 ci: fmt-check clippy test

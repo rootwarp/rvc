@@ -397,6 +397,16 @@ mix_in_active_fields:
     bits: [0, 1, 1, 1]
     sample_root: '0x0100000000000000000000000000000000000000000000000000000000000000'
     root: '0xad2a3dcb0c01109eb2ea9493f13f6bdfea5f2c58b07f7e8af959052ecdfac083'
+  - width: 5
+    pattern: all_ones
+    bits: [1, 1, 1, 1, 1]
+    sample_root: '0x0100000000000000000000000000000000000000000000000000000000000000'
+    root: '0x911c59673e029eac9c2cc499169aee5839df8b917c921207a71c1cf38ad96667'
+  - width: 5
+    pattern: sparse_bit0_clear
+    bits: [0, 1, 1, 1, 1]
+    sample_root: '0x0100000000000000000000000000000000000000000000000000000000000000'
+    root: '0xa69ae34f32951bc3c9f0e0b50dd37e5577f2247bdfc70a11878c37995de5c3ca'
   - width: 13
     pattern: all_ones
     bits: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]

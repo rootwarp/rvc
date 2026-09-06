@@ -27,11 +27,14 @@ PROGRESSIVE_CHUNK_COUNTS = [0, 1, 2, 4, 5, 6, 20, 21, 22, 84, 85, 86]
 SAMPLE_ROOT_BYTES = (1).to_bytes(32, "little")
 
 # (width, bits, pattern). Sparse patterns keep bit 0 clear.
+# Width 5 is ExecutionRequests / ExecutionPayloadEnvelope.
 ACTIVE_FIELD_CASES: tuple[tuple[int, tuple[int, ...], str], ...] = (
     (3, (1, 1, 1), "all_ones"),
     (3, (0, 1, 1), "sparse_bit0_clear"),
     (4, (1, 1, 1, 1), "all_ones"),
     (4, (0, 1, 1, 1), "sparse_bit0_clear"),
+    (5, (1, 1, 1, 1, 1), "all_ones"),
+    (5, (0, 1, 1, 1, 1), "sparse_bit0_clear"),
     (13, tuple([1] * 13), "all_ones"),
     (13, tuple([0] + [1] * 12), "sparse_bit0_clear"),
 )

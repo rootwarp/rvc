@@ -20,7 +20,7 @@ pydantic-core==2.46.5 --hash=sha256:f332f0e72a5a0400141f830744e141bf9f97917878db
 ";
 const ZERO_ROOT: &str = "0x0000000000000000000000000000000000000000000000000000000000000000";
 const CHUNK_COUNTS: &[u32] = &[0, 1, 2, 4, 5, 6, 20, 21, 22, 84, 85, 86];
-const WIDTHS: &[u32] = &[3, 4, 13];
+const WIDTHS: &[u32] = &[3, 4, 5, 13];
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
@@ -317,6 +317,8 @@ fn test_generated_artifact_lists_every_pyspec_count_and_width() {
     assert!(body.contains("bits: [0, 1, 1]"), "missing width-3 sparse bits");
     assert!(body.contains("bits: [1, 1, 1, 1]"), "missing width-4 all-ones bits");
     assert!(body.contains("bits: [0, 1, 1, 1]"), "missing width-4 sparse bits");
+    assert!(body.contains("bits: [1, 1, 1, 1, 1]"), "missing width-5 all-ones bits");
+    assert!(body.contains("bits: [0, 1, 1, 1, 1]"), "missing width-5 sparse bits");
     assert!(
         body.contains("bits: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]"),
         "missing width-13 all-ones bits"

@@ -5,7 +5,7 @@
 //! # Provenance
 //!
 //! provenance-source: ethereum/consensus-specs@v1.7.0-beta.0 ethereum/ssz-specs@v0.1.0
-//! provenance-generated: id=progressive sha256=6ead45d55e0b7512dd6fd05b30609d6c030ec0a0235cc37f5cffabf00a9ba401
+//! provenance-generated: id=progressive sha256=af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-generated: id=signing-roots sha256=864ff5176a0b83e9b3e12e2bc03688e32def59e39cbde8816be4a0b15d7962eb
 //! provenance-generator: gen-spec-kat 0.7.0
 //! provenance-date: 2026-09-06
@@ -13,7 +13,7 @@
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_0/serialized.ssz_snappy sha256:cac01c86ff78e57ad395c9e3bf0d0dfbb3dd41640a009b2a0cb8dc95509b3b51
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_1/roots.yaml sha256:64150d0e41e95c1a47bf3e67cc36ff1cfb48077e05d6e3ed3e18f814d85a0a72
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_1/serialized.ssz_snappy sha256:b9db39ec6d2d1add2c11d9ee7c24e98fd88ee3db80c81a0b2417416fabb2f608
-//! provenance-input: crates/rvc-spec-vectors/vectors-generated/progressive/roots.yaml sha256:6ead45d55e0b7512dd6fd05b30609d6c030ec0a0235cc37f5cffabf00a9ba401
+//! provenance-input: crates/rvc-spec-vectors/vectors-generated/progressive/roots.yaml sha256:af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml sha256:864ff5176a0b83e9b3e12e2bc03688e32def59e39cbde8816be4a0b15d7962eb
 
 /// Chunk counts from eth-ssz-specs `PROGRESSIVE_CHUNK_COUNTS` (issue 3.4a).
