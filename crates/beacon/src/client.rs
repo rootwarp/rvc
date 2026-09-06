@@ -26,6 +26,10 @@ use crate::types::{
     SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
+use crate::v4_wire::{
+    BuilderConfig, HEADER_ETH_CONSENSUS_VERSION, PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI,
+    QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
+};
 use crate::BeaconError;
 
 #[derive(Debug, Deserialize)]
@@ -524,6 +528,142 @@ impl BeaconClient {
                                 )
                                 .send()
                                 .await
+                            },
+                            Self::take_success_response,
+                        )
+                        .await?;
+                    return Self::parse_produce_block_json(
+                        fallback_response,
+                        self.config.max_body_bytes,
+                    )
+                    .await;
+                }
+            }
+        }
+
+        Self::parse_produce_block_json(response, self.config.max_body_bytes).await
+    }
+
+    /// Produces a block for the given slot using the v4 endpoint.
+    ///
+    /// `POST` with a required [`BuilderConfig`] JSON body. Requests SSZ and
+    /// falls back to JSON if the BN does not support SSZ or responds with JSON
+    /// despite the SSZ preference.
+    ///
+    /// `skip_all` keeps `randao_reveal` and the builder config out of the span.
+    #[tracing::instrument(name = "beacon.produce_block_v4", level = "debug", skip_all, fields(slot = slot))]
+    pub async fn produce_block_v4(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let slot_s = slot.to_string();
+        let mut query: Vec<(&str, &str)> =
+            vec![(QUERY_RANDAO_REVEAL, randao_reveal), (QUERY_INCLUDE_PAYLOAD, "true")];
+        if let Some(g) = graffiti {
+            query.push((QUERY_GRAFFITI, g));
+        }
+        let prefix = PRODUCE_BLOCK_V4_PATH_PREFIX.trim_start_matches('/');
+        let mut segments: Vec<&str> = prefix.split('/').collect();
+        segments.push(&slot_s);
+        let path = Self::build_path(&segments, &query);
+        let url = self.resolve_url(&path)?;
+
+        let body_bytes = serde_json::to_vec(builder_config).map_err(|e| {
+            BeaconError::HttpError(format!("failed to serialize request body: {e}"))
+        })?;
+
+        let response = self
+            .execute_with_retry_raw(
+                "POST",
+                &url,
+                || {
+                    let body_bytes = body_bytes.clone();
+                    let url = url.clone();
+                    async move {
+                        Self::traced(
+                            self.client
+                                .post(&url)
+                                .header(reqwest::header::ACCEPT, Self::SSZ_ACCEPT_HEADER)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .header(HEADER_ETH_CONSENSUS_VERSION, ForkName::Gloas.as_ref())
+                                .body(body_bytes),
+                        )
+                        .send()
+                        .await
+                    }
+                },
+                Self::take_success_response,
+            )
+            .await?;
+
+        let is_blinded = response
+            .headers()
+            .get("Eth-Execution-Payload-Blinded")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let consensus_version =
+            required_consensus_version(response.headers())?.as_ref().to_string();
+
+        let execution_payload_value = response
+            .headers()
+            .get("Eth-Execution-Payload-Value")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+
+        if content_type.starts_with("application/octet-stream") {
+            match Self::try_process_ssz_body(
+                response,
+                slot,
+                is_blinded,
+                &consensus_version,
+                &execution_payload_value,
+            )
+            .await
+            {
+                Ok(result) => return Ok(result),
+                Err(ssz_err) => {
+                    warn!(
+                        slot = slot,
+                        error = %ssz_err,
+                        "SSZ block response processing failed, retrying with JSON"
+                    );
+                    let fallback_response = self
+                        .execute_with_retry_raw(
+                            "POST",
+                            &url,
+                            || {
+                                let body_bytes = body_bytes.clone();
+                                let url = url.clone();
+                                async move {
+                                    Self::traced(
+                                        self.client
+                                            .post(&url)
+                                            .header(reqwest::header::ACCEPT, "application/json")
+                                            .header(
+                                                reqwest::header::CONTENT_TYPE,
+                                                "application/json",
+                                            )
+                                            .header(
+                                                HEADER_ETH_CONSENSUS_VERSION,
+                                                ForkName::Gloas.as_ref(),
+                                            )
+                                            .body(body_bytes),
+                                    )
+                                    .send()
+                                    .await
+                                }
                             },
                             Self::take_success_response,
                         )
