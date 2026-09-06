@@ -4406,6 +4406,7 @@ dependencies = [
 name = "rvc-gloas"
 version = "0.7.0"
 dependencies = [
+ "ethereum_ssz 0.8.3",
  "libssz",
  "libssz-derive",
  "libssz-merkle",
@@ -4413,6 +4414,7 @@ dependencies = [
  "proptest",
  "rvc-eth-types",
  "thiserror 2.0.18",
+ "tree_hash",
 ]
 
 [[package]]

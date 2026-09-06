@@ -20,3 +20,5 @@ thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+ssz08.workspace = true
+tree_hash.workspace = true

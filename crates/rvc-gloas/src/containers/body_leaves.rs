@@ -84,8 +84,10 @@ pub(crate) struct ConsolidationRequest {
 mod tests {
     use super::*;
     use crate::spec_kat::{mainnet, minimal};
-    use libssz::SszDecode;
+    use libssz::{SszDecode, SszEncode};
     use libssz_merkle::{HashTreeRoot, Sha2Hasher};
+    use ssz08::Decode;
+    use tree_hash::TreeHash;
 
     fn parse_hex(hex: &str) -> Vec<u8> {
         assert!(!hex.starts_with("0x"), "SPEC_* hex follows EXTERNAL_* style (no 0x prefix)");
@@ -112,6 +114,28 @@ mod tests {
         let decoded = T::from_ssz_bytes(&bytes).expect("SSZ decode");
         let got = decoded.hash_tree_root(&Sha2Hasher);
         assert_eq!(got, parse_root(root_hex));
+    }
+
+    fn tree_hash_root_bytes<T: TreeHash>(value: &T) -> [u8; 32] {
+        value.tree_hash_root().as_slice().try_into().expect("Hash256 is 32 bytes")
+    }
+
+    fn assert_island_matches_tree_hash<I, E>(ssz_hex: &str)
+    where
+        I: SszDecode + HashTreeRoot,
+        E: Decode + TreeHash,
+    {
+        assert_island_matches_tree_hash_bytes::<I, E>(&parse_hex(ssz_hex));
+    }
+
+    fn assert_island_matches_tree_hash_bytes<I, E>(bytes: &[u8])
+    where
+        I: SszDecode + HashTreeRoot,
+        E: Decode + TreeHash,
+    {
+        let island = I::from_ssz_bytes(bytes).expect("island SSZ decode");
+        let twin = E::from_ssz_bytes(bytes).expect("eth-types SSZ decode");
+        assert_eq!(island.hash_tree_root(&Sha2Hasher), tree_hash_root_bytes(&twin));
     }
 
     #[test]
@@ -232,5 +256,100 @@ mod tests {
             mainnet::SPEC_GLOAS_CONSOLIDATION_REQUEST_SSZ,
             mainnet::SPEC_GLOAS_CONSOLIDATION_REQUEST_ROOT,
         );
+    }
+
+    #[test]
+    fn test_deposit_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<Deposit, eth_types::block_body::Deposit>(
+            minimal::SPEC_GLOAS_DEPOSIT_SSZ,
+        );
+        assert_island_matches_tree_hash::<Deposit, eth_types::block_body::Deposit>(
+            mainnet::SPEC_GLOAS_DEPOSIT_SSZ,
+        );
+    }
+
+    #[test]
+    fn test_signed_voluntary_exit_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<SignedVoluntaryExit, eth_types::SignedVoluntaryExit>(
+            minimal::SPEC_GLOAS_SIGNED_VOLUNTARY_EXIT_SSZ,
+        );
+        assert_island_matches_tree_hash::<SignedVoluntaryExit, eth_types::SignedVoluntaryExit>(
+            mainnet::SPEC_GLOAS_SIGNED_VOLUNTARY_EXIT_SSZ,
+        );
+    }
+
+    #[test]
+    fn test_sync_aggregate_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        // eth-types twin is BitVector<U512> (mainnet); minimal Bitvector[32] has no twin.
+        assert_island_matches_tree_hash::<SyncAggregate<512>, eth_types::SyncAggregate>(
+            mainnet::SPEC_GLOAS_SYNC_AGGREGATE_SSZ,
+        );
+        let mut second = SyncAggregate::<512>::from_ssz_bytes(&parse_hex(
+            mainnet::SPEC_GLOAS_SYNC_AGGREGATE_SSZ,
+        ))
+        .expect("island SSZ decode");
+        second.sync_committee_signature[0] ^= 0xff;
+        let second_ssz = second.to_ssz();
+        assert_island_matches_tree_hash_bytes::<SyncAggregate<512>, eth_types::SyncAggregate>(
+            &second_ssz,
+        );
+        let first = SyncAggregate::<512>::from_ssz_bytes(&parse_hex(
+            mainnet::SPEC_GLOAS_SYNC_AGGREGATE_SSZ,
+        ))
+        .expect("island SSZ decode");
+        assert_ne!(first.hash_tree_root(&Sha2Hasher), second.hash_tree_root(&Sha2Hasher));
+    }
+
+    #[test]
+    fn test_signed_bls_to_execution_change_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<
+            SignedBlsToExecutionChange,
+            eth_types::block_body::SignedBlsToExecutionChange,
+        >(minimal::SPEC_GLOAS_SIGNED_BLS_TO_EXECUTION_CHANGE_SSZ);
+        assert_island_matches_tree_hash::<
+            SignedBlsToExecutionChange,
+            eth_types::block_body::SignedBlsToExecutionChange,
+        >(mainnet::SPEC_GLOAS_SIGNED_BLS_TO_EXECUTION_CHANGE_SSZ);
+    }
+
+    #[test]
+    fn test_deposit_request_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<DepositRequest, eth_types::block_body::DepositRequest>(
+            minimal::SPEC_GLOAS_DEPOSIT_REQUEST_SSZ,
+        );
+        assert_island_matches_tree_hash::<DepositRequest, eth_types::block_body::DepositRequest>(
+            mainnet::SPEC_GLOAS_DEPOSIT_REQUEST_SSZ,
+        );
+    }
+
+    #[test]
+    fn test_withdrawal_request_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<
+            WithdrawalRequest,
+            eth_types::block_body::WithdrawalRequest,
+        >(minimal::SPEC_GLOAS_WITHDRAWAL_REQUEST_SSZ);
+        assert_island_matches_tree_hash::<
+            WithdrawalRequest,
+            eth_types::block_body::WithdrawalRequest,
+        >(mainnet::SPEC_GLOAS_WITHDRAWAL_REQUEST_SSZ);
+    }
+
+    #[test]
+    fn test_consolidation_request_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<
+            ConsolidationRequest,
+            eth_types::block_body::ConsolidationRequest,
+        >(minimal::SPEC_GLOAS_CONSOLIDATION_REQUEST_SSZ);
+        assert_island_matches_tree_hash::<
+            ConsolidationRequest,
+            eth_types::block_body::ConsolidationRequest,
+        >(mainnet::SPEC_GLOAS_CONSOLIDATION_REQUEST_SSZ);
     }
 }

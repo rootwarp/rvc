@@ -57,6 +57,8 @@ mod tests {
     use crate::spec_kat::{mainnet, minimal};
     use libssz::{SszDecode, SszEncode};
     use libssz_merkle::{HashTreeRoot, Sha2Hasher};
+    use ssz08::Decode;
+    use tree_hash::TreeHash;
 
     fn parse_hex(hex: &str) -> Vec<u8> {
         assert!(!hex.starts_with("0x"), "SPEC_* hex follows EXTERNAL_* style (no 0x prefix)");
@@ -83,6 +85,21 @@ mod tests {
         let decoded = T::from_ssz_bytes(&bytes).expect("SSZ decode");
         let got = decoded.hash_tree_root(&Sha2Hasher);
         assert_eq!(got, parse_root(root_hex));
+    }
+
+    fn tree_hash_root_bytes<T: TreeHash>(value: &T) -> [u8; 32] {
+        value.tree_hash_root().as_slice().try_into().expect("Hash256 is 32 bytes")
+    }
+
+    fn assert_island_matches_tree_hash<I, E>(ssz_hex: &str)
+    where
+        I: SszDecode + HashTreeRoot,
+        E: Decode + TreeHash,
+    {
+        let bytes = parse_hex(ssz_hex);
+        let island = I::from_ssz_bytes(&bytes).expect("island SSZ decode");
+        let twin = E::from_ssz_bytes(&bytes).expect("eth-types SSZ decode");
+        assert_eq!(island.hash_tree_root(&Sha2Hasher), tree_hash_root_bytes(&twin));
     }
 
     fn wire_attestation_data_index(ssz: &[u8]) -> u64 {
@@ -192,5 +209,62 @@ mod tests {
                 index_zero.hash_tree_root(&Sha2Hasher)
             );
         }
+    }
+
+    #[test]
+    fn test_checkpoint_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<Checkpoint, eth_types::Checkpoint>(
+            minimal::SPEC_GLOAS_CHECKPOINT_SSZ,
+        );
+        assert_island_matches_tree_hash::<Checkpoint, eth_types::Checkpoint>(
+            mainnet::SPEC_GLOAS_CHECKPOINT_SSZ,
+        );
+    }
+
+    #[test]
+    fn test_attestation_data_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<AttestationData, eth_types::AttestationData>(
+            minimal::SPEC_GLOAS_ATTESTATION_DATA_SSZ,
+        );
+        assert_island_matches_tree_hash::<AttestationData, eth_types::AttestationData>(
+            mainnet::SPEC_GLOAS_ATTESTATION_DATA_SSZ,
+        );
+    }
+
+    #[test]
+    fn test_eth1data_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<Eth1Data, eth_types::block_body::Eth1Data>(
+            minimal::SPEC_GLOAS_ETH1DATA_SSZ,
+        );
+        assert_island_matches_tree_hash::<Eth1Data, eth_types::block_body::Eth1Data>(
+            mainnet::SPEC_GLOAS_ETH1DATA_SSZ,
+        );
+    }
+
+    #[test]
+    fn test_proposer_slashing_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<ProposerSlashing, eth_types::block_body::ProposerSlashing>(
+            minimal::SPEC_GLOAS_PROPOSER_SLASHING_SSZ,
+        );
+        assert_island_matches_tree_hash::<ProposerSlashing, eth_types::block_body::ProposerSlashing>(
+            mainnet::SPEC_GLOAS_PROPOSER_SLASHING_SSZ,
+        );
+    }
+
+    #[test]
+    fn test_signed_beacon_block_header_matches_tree_hash_root() {
+        // kat_exempt: cross-implementation differential, not a spec-root assertion
+        assert_island_matches_tree_hash::<
+            SignedBeaconBlockHeader,
+            eth_types::block_body::SignedBeaconBlockHeader,
+        >(minimal::SPEC_GLOAS_SIGNED_BEACON_BLOCK_HEADER_SSZ);
+        assert_island_matches_tree_hash::<
+            SignedBeaconBlockHeader,
+            eth_types::block_body::SignedBeaconBlockHeader,
+        >(mainnet::SPEC_GLOAS_SIGNED_BEACON_BLOCK_HEADER_SSZ);
     }
 }
