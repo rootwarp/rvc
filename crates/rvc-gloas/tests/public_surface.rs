@@ -1,8 +1,8 @@
 //! Compile-level public-surface lock.
 //!
 //! `roots::*`: `gloas_attestation_root`, `gloas_indexed_attestation_root`,
-//! `gloas_aggregate_and_proof_root`, `gloas_block_root`, `gloas_body_root`,
-//! `gloas_execution_payload_envelope_root`.
+//! `gloas_aggregate_and_proof_root`, `gloas_block_root`, `HeaderFields`,
+//! `gloas_body_root`, `gloas_execution_payload_envelope_root`.
 
 #[test]
 fn test_public_surface_implemented_root_fns() {
@@ -12,12 +12,22 @@ fn test_public_surface_implemented_root_fns() {
         rvc_gloas::gloas_indexed_attestation_root;
     let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
         rvc_gloas::gloas_aggregate_and_proof_root;
+    let _: fn(&rvc_gloas::HeaderFields, &[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
+        rvc_gloas::gloas_block_root;
     let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
         rvc_gloas::roots::gloas_attestation_root;
     let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
         rvc_gloas::roots::gloas_indexed_attestation_root;
     let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
         rvc_gloas::roots::gloas_aggregate_and_proof_root;
+    let _: fn(&rvc_gloas::roots::HeaderFields, &[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
+        rvc_gloas::roots::gloas_block_root;
+    let _ = rvc_gloas::HeaderFields {
+        slot: 0,
+        proposer_index: 0,
+        parent_root: [0u8; 32],
+        state_root: [0u8; 32],
+    };
 
     let _ = rvc_gloas::SPEC_TAG;
     let _ = rvc_gloas::ACTIVE_FIELDS_ATTESTATION;

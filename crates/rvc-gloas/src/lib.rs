@@ -40,7 +40,8 @@ pub mod roots;
 
 pub use error::GloasError;
 pub use roots::{
-    gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_indexed_attestation_root,
+    gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_block_root,
+    gloas_indexed_attestation_root, HeaderFields,
 };
 
 #[cfg(test)]
@@ -53,12 +54,18 @@ mod public_surface_tests {
             crate::gloas_indexed_attestation_root;
         let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
             crate::gloas_aggregate_and_proof_root;
+        let _: fn(&crate::HeaderFields, &[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::gloas_block_root;
         let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
             crate::roots::gloas_attestation_root;
         let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
             crate::roots::gloas_indexed_attestation_root;
         let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
             crate::roots::gloas_aggregate_and_proof_root;
+        let _: fn(
+            &crate::roots::HeaderFields,
+            &[u8],
+        ) -> Result<eth_types::Root, crate::GloasError> = crate::roots::gloas_block_root;
     }
 }
 
