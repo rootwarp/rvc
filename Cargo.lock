@@ -4630,7 +4630,9 @@ dependencies = [
 name = "rvc-spec-vectors"
 version = "0.7.0"
 dependencies = [
+ "hex",
  "serde_yaml",
+ "sha2",
  "snap",
  "tempfile",
  "thiserror 2.0.18",

@@ -1,6 +1,6 @@
 .PHONY: build build-release check fmt clippy test test-fast coverage clean \
        docker-rvc docker-signer docker-keygen docker-all architecture-doc \
-       spec-vectors spec-vectors-verify spec-vectors-regen
+       spec-vectors spec-vectors-verify spec-vectors-regen spec-kat
 
 # Build
 build:
@@ -84,6 +84,14 @@ spec-vectors-verify:
 # Re-run the pinned pyspec recipe. Nightly only; PR jobs verify the digest.
 spec-vectors-regen:
 	./scripts/fetch_spec_vectors.sh regen
+
+# Codegen SPEC_PROGRESSIVE_* from the 3.4b artifact + 3.3a fixture tree (no network).
+# --vectors is the fixture tree so regeneration stays hermetic; L1 roots come from
+# vectors-generated/progressive/roots.yaml (pyspec pre-images), never JSON mix_in_length.
+spec-kat:
+	cargo run -p rvc-spec-vectors --bin gen-spec-kat -- \
+		--vectors crates/rvc-spec-vectors/tests/fixtures \
+		--out crates/rvc-spec-vectors/src/spec_kat.rs
 
 # All checks (CI)
 ci: fmt-check clippy test
