@@ -19,9 +19,9 @@ use crypto::{compute_domain, compute_signing_root, PublicKey};
 use eth_types::{
     AttestationData, Root, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use signer::{SigningGate, SigningGateError};
 
@@ -103,6 +103,9 @@ pub enum PlanInput {
     /// Payload attestation (PTC). `object_root` is the tree-hash of
     /// `PayloadAttestationData` — identity-HTR path, same as [`Self::AggregateAndProof`].
     PayloadAttestation { object_root: Root, fork_version: [u8; 4], gvr: Root },
+    /// Proposer preferences. `object_root` is the tree-hash of
+    /// `ProposerPreferences` — identity-HTR path, same as [`Self::PayloadAttestation`].
+    ProposerPreferences { object_root: Root, fork_version: [u8; 4], gvr: Root },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -183,6 +186,11 @@ pub fn plan_sign(input: &PlanInput) -> SignPlan {
             let root = compute_signing_root(object_root, domain);
             (root, Slashing::NonSlashable, Some(NonSlashableOp::PayloadAttestation))
         }
+        PlanInput::ProposerPreferences { object_root, fork_version, gvr } => {
+            let domain = compute_domain(DOMAIN_PROPOSER_PREFERENCES, *fork_version, *gvr);
+            let root = compute_signing_root(object_root, domain);
+            (root, Slashing::NonSlashable, Some(NonSlashableOp::ProposerPreferences))
+        }
     };
     SignPlan { signing_root, slashing, non_slashable_op }
 }
@@ -236,6 +244,7 @@ pub enum NonSlashableOp {
     BuilderRegistration,
     VoluntaryExit,
     PayloadAttestation,
+    ProposerPreferences,
 }
 
 /// Error from [`dispatch_slashable`] / [`dispatch_non_slashable`].
@@ -325,6 +334,9 @@ pub async fn dispatch_non_slashable(
             NonSlashableOp::VoluntaryExit => gate.sign_voluntary_exit(&ctx.pubkey, root).await,
             NonSlashableOp::PayloadAttestation => {
                 gate.sign_payload_attestation(&ctx.pubkey, root).await
+            }
+            NonSlashableOp::ProposerPreferences => {
+                gate.sign_proposer_preferences(&ctx.pubkey, root).await
             }
         };
         finish_gate(metrics, backend_name, ctx.rpc_type, started, result)
@@ -508,6 +520,14 @@ mod tests {
             (
                 PlanInput::PayloadAttestation {
                     object_root: [7u8; 32],
+                    fork_version: FORK,
+                    gvr: GVR,
+                },
+                false,
+            ),
+            (
+                PlanInput::ProposerPreferences {
+                    object_root: [8u8; 32],
                     fork_version: FORK,
                     gvr: GVR,
                 },
@@ -727,6 +747,30 @@ mod tests {
         assert_eq!(ptc_plan, plan_sign(&dvt_ptc));
         assert_eq!(ptc_plan.slashing, Slashing::NonSlashable);
         assert_eq!(ptc_plan.non_slashable_op, Some(NonSlashableOp::PayloadAttestation));
+
+        // Proposer preferences: gRPC (future 4.20b), HTTP (4.16), and DVT all
+        // take the same precomputed object_root + fork_version + gvr.
+        let prefs_object_root = [0x33u8; 32];
+        let grpc_prefs = PlanInput::ProposerPreferences {
+            object_root: prefs_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let http_prefs = PlanInput::ProposerPreferences {
+            object_root: prefs_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let dvt_prefs = PlanInput::ProposerPreferences {
+            object_root: prefs_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let prefs_plan = plan_sign(&grpc_prefs);
+        assert_eq!(prefs_plan, plan_sign(&http_prefs));
+        assert_eq!(prefs_plan, plan_sign(&dvt_prefs));
+        assert_eq!(prefs_plan.slashing, Slashing::NonSlashable);
+        assert_eq!(prefs_plan.non_slashable_op, Some(NonSlashableOp::ProposerPreferences));
     }
 
     fn parse_kat_root(hex: &str) -> Root {
@@ -848,6 +892,91 @@ mod tests {
             dispatch.contains("NonSlashableOp::PayloadAttestation")
                 && dispatch.contains("gate.sign_payload_attestation"),
             "dispatch_non_slashable must route PayloadAttestation to SigningGate::sign_payload_attestation"
+        );
+    }
+
+    fn prefs_kat_plan() -> SignPlan {
+        let object_root =
+            parse_kat_root(rvc_spec_vectors::spec_kat::SPEC_GLOAS_PROPOSERPREFERENCES_ROOT);
+        plan_sign(&PlanInput::ProposerPreferences {
+            object_root,
+            fork_version: [0x07, 0x00, 0x00, 0x01],
+            gvr: [0u8; 32],
+        })
+    }
+
+    fn prefs_gate_and_ctx(
+        sk: crypto::SecretKey,
+    ) -> (signer::SigningGate, RequestCtx, std::sync::Arc<KeyedBackend>) {
+        let pubkey = sk.public_key();
+        let backend = std::sync::Arc::new(KeyedBackend::with_key(sk));
+        let db = std::sync::Arc::new(slashing::SlashingDb::open_in_memory().expect("slashing db"));
+        let gate = crate::service::SignerServiceImpl::build_gate(
+            std::sync::Arc::clone(&backend) as std::sync::Arc<dyn crate::backend::SigningBackend>,
+            db,
+        );
+        let ctx = RequestCtx {
+            client_cn: "test".into(),
+            pubkey_bytes: pubkey.to_bytes(),
+            pubkey,
+            rpc_type: crate::metrics::grpc_sign_type::PROPOSER_PREFERENCES,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        (gate, ctx, backend)
+    }
+
+    /// L3: plan engine signing root for the 4.0 pyspec ProposerPreferences
+    /// fixture (`KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT`).
+    #[test]
+    fn test_plan_proposer_preferences_signing_root() {
+        let plan = prefs_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(plan.non_slashable_op, Some(NonSlashableOp::ProposerPreferences));
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_proposer_preferences_dispatch_slashable_mismatch() {
+        let plan = prefs_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        let (gate, ctx, _backend) = prefs_gate_and_ctx(crypto::SecretKey::generate());
+        let err = dispatch_slashable(&gate, None, "basic", &ctx, &plan).await.unwrap_err();
+        assert!(matches!(err, DispatchError::PlanMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_plan_proposer_preferences_dispatch_sign_success() {
+        let plan = prefs_kat_plan();
+        let (gate, ctx, backend) = prefs_gate_and_ctx(crypto::SecretKey::generate());
+        let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
+            .await
+            .expect("dispatch_sign proposer preferences");
+        let direct = gate
+            .sign_proposer_preferences(&ctx.pubkey, plan.signing_root)
+            .await
+            .expect("direct gate proposer preferences");
+        assert_eq!(sig, direct, "dispatch_sign must use SigningGate::sign_proposer_preferences");
+        assert!(crypto::Signature::from_bytes(&sig)
+            .expect("bls sig")
+            .verify(&ctx.pubkey, &plan.signing_root)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_proposer_preferences_dispatch_arm_calls_sign_proposer_preferences() {
+        let src = include_str!("sign_plan.rs");
+        let rest = src
+            .split_once("pub async fn dispatch_non_slashable")
+            .expect("dispatch_non_slashable")
+            .1;
+        let dispatch = rest.split("pub async fn dispatch_sign").next().expect("dispatch_sign");
+        assert!(
+            dispatch.contains("NonSlashableOp::ProposerPreferences")
+                && dispatch.contains("gate.sign_proposer_preferences"),
+            "dispatch_non_slashable must route ProposerPreferences to SigningGate::sign_proposer_preferences"
         );
     }
 }

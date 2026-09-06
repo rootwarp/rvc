@@ -28,8 +28,9 @@
 //!
 //! For each non-slashable operation (`sign_sync_committee_message`,
 //! `sign_aggregate_and_proof`, `sign_payload_attestation`,
-//! `sign_contribution_and_proof`, `sign_selection_proof`, `sign_randao_reveal`,
-//! `sign_voluntary_exit`, `sign_builder_registration`):
+//! `sign_proposer_preferences`, `sign_contribution_and_proof`,
+//! `sign_selection_proof`, `sign_randao_reveal`, `sign_voluntary_exit`,
+//! `sign_builder_registration`):
 //!
 //! 1. Check `gate_decision` — if false, return
 //!    `Err(SigningGateError::BlockedByDoppelganger)` immediately.
@@ -484,6 +485,23 @@ impl SigningGate {
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
         self.sign_nonslashable(pubkey, signing_root, "sign_payload_attestation").await
+    }
+
+    /// Sign proposer preferences.
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_PROPOSER_PREFERENCES` over the `ProposerPreferences` HTR).
+    pub async fn sign_proposer_preferences(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_proposer_preferences").await
     }
 
     /// Sign a contribution-and-proof.

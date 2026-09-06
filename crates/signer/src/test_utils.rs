@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use crypto::{PublicKey, SecretKey, Signature};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    ForkSchedule, PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
+    VoluntaryExit,
 };
 
 use crate::{BeaconBlockHeaderFields, SignerError, ValidatorSigner};
@@ -178,6 +179,16 @@ impl ValidatorSigner for StubValidatorSigner {
     ) -> Result<Signature, SignerError> {
         Ok(mock_sig(b"payload-attestation"))
     }
+
+    async fn sign_proposer_preferences(
+        &self,
+        _prefs: &ProposerPreferences,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"proposer-preferences"))
+    }
 }
 
 #[cfg(test)]
@@ -265,5 +276,14 @@ mod tests {
             blob_data_available: false,
         };
         assert!(stub.sign_payload_attestation(&ptc, &pk, &fork, &gvr).await.is_ok());
+
+        let prefs = ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        };
+        assert!(stub.sign_proposer_preferences(&prefs, &pk, &fork, &gvr).await.is_ok());
     }
 }

@@ -28,6 +28,10 @@ pub mod grpc_sign_type {
     /// Web3Signer `PAYLOAD_ATTESTATION` (HTTP-only; domain 0x0C PTC attester).
     /// Not a v2 gRPC RPC, but shares the A7 `sign_*` series when HTTP dispatches.
     pub const PAYLOAD_ATTESTATION: &str = "payload_attestation";
+    /// Web3Signer `PROPOSER_PREFERENCES` (HTTP-only; domain 0x0D proposer preferences).
+    /// Not a v2 gRPC RPC, but shares the A7 `sign_*` series when HTTP dispatches.
+    /// Delta 0 (D4): declared-only; 4.20b adds this to `ALL` when gRPC-dispatchable.
+    pub const PROPOSER_PREFERENCES: &str = "proposer_preferences";
 
     /// All ten v2 RPC type labels — used by the table-driven recording test.
     pub const ALL: &[&str] = &[

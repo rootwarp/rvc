@@ -130,6 +130,12 @@ fn to_plan_input(
             let object_root = payload_attestation.data.tree_hash_root().0;
             Ok(PlanInput::PayloadAttestation { object_root, fork_version, gvr })
         }
+        SignPayload::ProposerPreferences { proposer_preferences } => {
+            // D19: Gloas proposer preferences is in scope (unlike BLOCK_V2).
+            let (fork_version, gvr) = require_fork_info(req)?;
+            let object_root = proposer_preferences.data.tree_hash_root().0;
+            Ok(PlanInput::ProposerPreferences { object_root, fork_version, gvr })
+        }
     }
 }
 
@@ -438,6 +444,37 @@ mod tests {
         assert_eq!(
             plan.signing_root,
             parse_kat_root(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+        );
+    }
+
+    fn gloas_proposer_preferences() -> SignRequest {
+        parse(&format!(
+            r#"{{ "type": "PROPOSER_PREFERENCES",
+                  "fork_info": {{ "fork": {{ "previous_version": "0x07000000",
+                                             "current_version": "0x07000001",
+                                             "epoch": "0" }},
+                       "genesis_validators_root": "0x{gvr}" }},
+                  "proposer_preferences": {{ "version": "GLOAS",
+                                            "data": {{ "dependent_root": "0x{dr}",
+                                                       "proposal_slot": "32",
+                                                       "validator_index": "3",
+                                                       "fee_recipient": "0x{fr}",
+                                                       "target_gas_limit": "36000000" }} }} }}"#,
+            gvr = "00".repeat(32),
+            dr = "33".repeat(32),
+            fr = "44".repeat(20),
+        ))
+    }
+
+    /// L3: HTTP adapter plans the same root as the plan engine / pyspec artifact.
+    #[test]
+    fn proposer_preferences_plan_matches_kat_gloas_proposer_preferences_signing_root() {
+        let plan = plan_sign(&gloas_proposer_preferences(), BUILDER_FORK_VERSION_MAINNET)
+            .expect("D19: GLOAS PROPOSER_PREFERENCES is in scope");
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
         );
     }
 }

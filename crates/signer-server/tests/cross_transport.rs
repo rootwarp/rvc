@@ -20,7 +20,7 @@ use tower::ServiceExt;
 use crypto::{compute_domain, compute_signing_root, KeyManager, PublicKey, SecretKey, Signature};
 use eth_types::{
     AttestationData, Checkpoint, ValidatorRegistrationV1, DOMAIN_APPLICATION_BUILDER,
-    DOMAIN_BEACON_ATTESTER, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_BEACON_ATTESTER, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
 };
 use signer_server::backend::{SigningBackend, SigningBackendError};
 use signer_server::http_api::{router, AuditCfg, Web3SignerState};
@@ -375,5 +375,38 @@ async fn test_payload_attestation_plan_identical_across_transports() {
     let pk = PublicKey::from_bytes(&s.pubkey).unwrap();
     let sig =
         s.gate.sign_payload_attestation(&pk, root).await.expect("shared-gate payload attestation");
+    assert!(Signature::from_bytes(&sig).unwrap().verify(&pk, &root).is_ok());
+}
+
+// ── Proposer preferences (non-slashable; HTTP-only until 4.20b) ─────────────
+//
+// No v2 SignerService RPC yet (4.20b). Transports build the same
+// PlanInput::ProposerPreferences (object_root + fork_version + gvr) and
+// dispatch through the shared gate.
+
+#[tokio::test]
+async fn test_proposer_preferences_plan_identical_across_transports() {
+    let s = shared(MAINNET_GENESIS);
+    let object_root: [u8; 32] =
+        hex::decode(rvc_spec_vectors::spec_kat::SPEC_GLOAS_PROPOSERPREFERENCES_ROOT)
+            .expect("spec object root hex")
+            .try_into()
+            .expect("32-byte object root");
+    let fork_version = [0x07, 0x00, 0x00, 0x01];
+    let gvr = [0u8; 32];
+    let domain = compute_domain(DOMAIN_PROPOSER_PREFERENCES, fork_version, gvr);
+    let root = compute_signing_root(&object_root, domain);
+    assert_eq!(
+        hex::encode(root),
+        rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT,
+        "shared object_root + DOMAIN_PROPOSER_PREFERENCES must match the 4.0 KAT"
+    );
+
+    let pk = PublicKey::from_bytes(&s.pubkey).unwrap();
+    let sig = s
+        .gate
+        .sign_proposer_preferences(&pk, root)
+        .await
+        .expect("shared-gate proposer preferences");
     assert!(Signature::from_bytes(&sig).unwrap().verify(&pk, &root).is_ok());
 }

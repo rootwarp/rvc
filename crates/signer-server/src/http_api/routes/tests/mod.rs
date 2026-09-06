@@ -20,11 +20,11 @@ use crypto::{compute_domain, compute_signing_root};
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
     ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, PayloadAttestationData,
-    Root, SyncAggregatorSelectionData, SyncCommitteeContribution, SyncCommitteeMessage,
-    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
-    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT,
+    ProposerPreferences, Root, SyncAggregatorSelectionData, SyncCommitteeContribution,
+    SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
+    DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 
 const CURRENT_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
@@ -384,6 +384,29 @@ fn payload_attestation_body(version: &str) -> String {
     )
 }
 
+fn prefs_kat_data() -> ProposerPreferences {
+    ProposerPreferences {
+        dependent_root: [0x33; 32],
+        proposal_slot: 32,
+        validator_index: 3,
+        fee_recipient: [0x44; 20],
+        target_gas_limit: 36_000_000,
+    }
+}
+
+fn proposer_preferences_body(version: &str) -> String {
+    format!(
+        r#"{{ "type": "PROPOSER_PREFERENCES",
+              "fork_info": {{ "fork": {{ "previous_version": "0x07000000",
+                                         "current_version": "0x07000001",
+                                         "epoch": "0" }},
+                   "genesis_validators_root": "0x{gvr}" }},
+              "proposer_preferences": {{ "version": "{version}", "data": {data} }} }}"#,
+        gvr = "00".repeat(32),
+        data = serde_json::to_string(&prefs_kat_data()).unwrap(),
+    )
+}
+
 /// A frozen, spec-derived Electra `AGGREGATE_AND_PROOF_V2` wire body. Field
 /// names and encodings (quoted `u64`, `0x`-lowercase hex bitlists, nested
 /// `data`) match the remote-signing schema; `committee_bits` is the EIP-7549
@@ -423,7 +446,7 @@ fn electra_v2_frozen_fixture() -> String {
 
 /// One valid body per supported Web3Signer `type` (FR-4..FR-14) — every duty
 /// a running validator performs. The full Web3Signer protocol also defines
-/// BLOCK v1 / DEPOSIT etc., which are out of scope for a VC (PRD); the 12
+/// BLOCK v1 / DEPOSIT etc., which are out of scope for a VC (PRD); the 13
 /// here are the complete dispatchable set.
 fn all_supported_type_bodies() -> Vec<(&'static str, String)> {
     vec![
@@ -466,6 +489,7 @@ fn all_supported_type_bodies() -> Vec<(&'static str, String)> {
         ("VOLUNTARY_EXIT", voluntary_exit_body(256, 99)),
         ("AGGREGATE_AND_PROOF_V2", electra_v2_frozen_fixture()),
         ("PAYLOAD_ATTESTATION", payload_attestation_body("GLOAS")),
+        ("PROPOSER_PREFERENCES", proposer_preferences_body("GLOAS")),
     ]
 }
 

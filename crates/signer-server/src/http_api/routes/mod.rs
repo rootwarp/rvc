@@ -198,7 +198,9 @@ fn payload_duty(payload: &SignPayload) -> Duty {
         SignPayload::Attestation { .. } | SignPayload::PayloadAttestation { .. } => {
             Duty::Attestation
         }
-        SignPayload::BlockV2 { .. } | SignPayload::RandaoReveal { .. } => Duty::Block,
+        SignPayload::BlockV2 { .. }
+        | SignPayload::RandaoReveal { .. }
+        | SignPayload::ProposerPreferences { .. } => Duty::Block,
         SignPayload::AggregationSlot { .. }
         | SignPayload::AggregateAndProof { .. }
         | SignPayload::AggregateAndProofV2 { .. } => Duty::Aggregate,
@@ -235,6 +237,9 @@ fn payload_slot(payload: &SignPayload) -> Option<u64> {
         }
         SignPayload::PayloadAttestation { payload_attestation } => {
             Some(payload_attestation.data.slot)
+        }
+        SignPayload::ProposerPreferences { proposer_preferences } => {
+            Some(proposer_preferences.data.proposal_slot)
         }
         SignPayload::RandaoReveal { .. }
         | SignPayload::ValidatorRegistration { .. }
@@ -340,6 +345,7 @@ fn http_a7_sign_type(payload: &SignPayload) -> &'static str {
         SignPayload::ValidatorRegistration { .. } => grpc_sign_type::BUILDER_REGISTRATION,
         SignPayload::VoluntaryExit { .. } => grpc_sign_type::VOLUNTARY_EXIT,
         SignPayload::PayloadAttestation { .. } => grpc_sign_type::PAYLOAD_ATTESTATION,
+        SignPayload::ProposerPreferences { .. } => grpc_sign_type::PROPOSER_PREFERENCES,
     }
 }
 

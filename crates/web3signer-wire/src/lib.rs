@@ -25,9 +25,10 @@
 //! | `VALIDATOR_REGISTRATION` | yes | yes |
 //! | `VOLUNTARY_EXIT` | yes | yes |
 //! | `AGGREGATE_AND_PROOF_V2` | **no** (not yet on TypedSigner builders) | yes (FROZEN FR-31) |
-//! | `PAYLOAD_ATTESTATION` | **no** (4.10) | yes (provisional: remote-signing-api PR #28) |
+//! | `PAYLOAD_ATTESTATION` | yes (4.10) | yes (provisional: remote-signing-api PR #28) |
+//! | `PROPOSER_PREFERENCES` | yes (4.16) | yes (provisional: remote-signing-api PR #28) |
 //!
-//! All twelve variants serialize and deserialize here. Adding a client *serialize*
+//! All thirteen variants serialize and deserialize here. Adding a client *serialize*
 //! path for `AGGREGATE_AND_PROOF_V2` is a deliberate follow-up (not silent).
 //!
 //! # Server leniency (preserved)
@@ -262,6 +263,11 @@ pub enum SignPayload {
     /// (`ethereum/remote-signing-api` PR #28).
     #[serde(rename = "PAYLOAD_ATTESTATION")]
     PayloadAttestation { payload_attestation: VersionedPayload<PayloadAttestationData> },
+    /// Gloas proposer preferences (`DOMAIN_PROPOSER_PREFERENCES`). Discriminator
+    /// `PROPOSER_PREFERENCES` and the `{version, data}` envelope are provisional
+    /// (`ethereum/remote-signing-api` PR #28).
+    #[serde(rename = "PROPOSER_PREFERENCES")]
+    ProposerPreferences { proposer_preferences: VersionedPayload<eth_types::ProposerPreferences> },
 }
 
 /// Client-facing alias for [`SignPayload`] (RF3-11 migration).
@@ -286,6 +292,7 @@ impl SignPayload {
             SignPayload::VoluntaryExit { .. } => "VOLUNTARY_EXIT",
             SignPayload::AggregateAndProofV2 { .. } => "AGGREGATE_AND_PROOF_V2",
             SignPayload::PayloadAttestation { .. } => "PAYLOAD_ATTESTATION",
+            SignPayload::ProposerPreferences { .. } => "PROPOSER_PREFERENCES",
         }
     }
 }
@@ -332,7 +339,7 @@ impl SignRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eth_types::{Checkpoint, Fork, ForkName};
+    use eth_types::{Checkpoint, Fork, ForkName, ProposerPreferences};
 
     // ── Recorded production-shaped bodies (from request.rs + routes.rs) ──────
     // Built by copy from existing decoder fixtures — never from this crate's
@@ -483,10 +490,19 @@ mod tests {
             br = "11".repeat(32),
         );
         assert_roundtrip(&ptc);
+
+        // PROPOSER_PREFERENCES (4.16; `{version, data}` wrapper, remote-signing-api PR #28)
+        let prefs = format!(
+            r#"{{"type":"PROPOSER_PREFERENCES","fork_info":{fi},"proposer_preferences":{{"version":"GLOAS","data":{{"dependent_root":"0x{dr}","proposal_slot":"32","validator_index":"3","fee_recipient":"0x{fr}","target_gas_limit":"36000000"}}}}}}"#,
+            fi = fork_info_compact(),
+            dr = "33".repeat(32),
+            fr = "44".repeat(20),
+        );
+        assert_roundtrip(&prefs);
     }
 
     #[test]
-    fn test_all_twelve_type_discriminators_roundtrip() {
+    fn test_all_thirteen_type_discriminators_roundtrip() {
         let discriminators = [
             "BLOCK_V2",
             "ATTESTATION",
@@ -500,6 +516,7 @@ mod tests {
             "VOLUNTARY_EXIT",
             "AGGREGATE_AND_PROOF_V2",
             "PAYLOAD_ATTESTATION",
+            "PROPOSER_PREFERENCES",
         ];
         // Smoke: construct each variant, type_name matches rename, and
         // serialize→deserialize preserves the discriminator.
@@ -619,10 +636,22 @@ mod tests {
                     },
                 },
             },
+            SignPayload::ProposerPreferences {
+                proposer_preferences: VersionedPayload {
+                    version: ForkName::Gloas,
+                    data: ProposerPreferences {
+                        dependent_root: [0x33; 32],
+                        proposal_slot: 32,
+                        validator_index: 3,
+                        fee_recipient: [0x44; 20],
+                        target_gas_limit: 36_000_000,
+                    },
+                },
+            },
         ];
 
-        assert_eq!(samples.len(), 12);
-        assert_eq!(discriminators.len(), 12);
+        assert_eq!(samples.len(), 13);
+        assert_eq!(discriminators.len(), 13);
         for (payload, expected_name) in samples.iter().zip(discriminators.iter()) {
             assert_eq!(payload.type_name(), *expected_name);
             let v = serde_json::to_value(payload).unwrap();
@@ -971,6 +1000,56 @@ mod tests {
                 assert!(!payload_attestation.data.blob_data_available);
             }
             other => panic!("expected PayloadAttestation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_proposer_preferences_unknown_version_fails_to_decode_naming_value() {
+        let body = format!(
+            r#"{{ "type": "PROPOSER_PREFERENCES", "fork_info": {fi},
+                  "proposer_preferences": {{ "version": "NOT_A_FORK",
+                                            "data": {{ "dependent_root": "0x{dr}",
+                                                       "proposal_slot": "32",
+                                                       "validator_index": "3",
+                                                       "fee_recipient": "0x{fr}",
+                                                       "target_gas_limit": "36000000" }} }} }}"#,
+            fi = fork_info_json(),
+            dr = "33".repeat(32),
+            fr = "44".repeat(20),
+        );
+        let err = serde_json::from_str::<SignRequest>(&body).unwrap_err().to_string();
+        match WireVersionError::from_serde_display(&err) {
+            Some(WireVersionError::Unknown(value)) => assert_eq!(value, "NOT_A_FORK"),
+            other => panic!("expected Unknown(NOT_A_FORK), got {other:?} from {err}"),
+        }
+    }
+
+    #[test]
+    fn test_proposer_preferences_gloas_version_decodes() {
+        let body = format!(
+            r#"{{ "type": "PROPOSER_PREFERENCES", "fork_info": {fi},
+                  "proposer_preferences": {{ "version": "GLOAS",
+                                            "data": {{ "dependent_root": "0x{dr}",
+                                                       "proposal_slot": "32",
+                                                       "validator_index": "3",
+                                                       "fee_recipient": "0x{fr}",
+                                                       "target_gas_limit": "36000000" }} }} }}"#,
+            fi = fork_info_json(),
+            dr = "33".repeat(32),
+            fr = "44".repeat(20),
+        );
+        let req: SignRequest = serde_json::from_str(&body).unwrap();
+        assert_eq!(req.payload.type_name(), "PROPOSER_PREFERENCES");
+        match req.payload {
+            SignPayload::ProposerPreferences { proposer_preferences } => {
+                assert_eq!(proposer_preferences.version, ForkName::Gloas);
+                assert_eq!(proposer_preferences.data.dependent_root, [0x33u8; 32]);
+                assert_eq!(proposer_preferences.data.proposal_slot, 32);
+                assert_eq!(proposer_preferences.data.validator_index, 3);
+                assert_eq!(proposer_preferences.data.fee_recipient, [0x44u8; 20]);
+                assert_eq!(proposer_preferences.data.target_gas_limit, 36_000_000);
+            }
+            other => panic!("expected ProposerPreferences, got {other:?}"),
         }
     }
 

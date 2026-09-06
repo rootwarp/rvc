@@ -11,10 +11,11 @@ use std::time::Duration;
 use eth_types::{
     blinded_body_tree_hash_root, body_tree_hash_root, AggregateAndProof, AttestationData,
     BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof, Epoch, Fork,
-    ForkName, PayloadAttestationData, Root, Slot, SyncCommitteeMessage, ValidatorRegistrationV1,
-    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    ForkName, PayloadAttestationData, ProposerPreferences, Root, Slot, SyncCommitteeMessage,
+    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
+    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF,
+    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 // Re-export wire types under the historical crypto names (stable public paths).
 pub use web3signer_wire::{
@@ -247,6 +248,34 @@ pub fn build_payload_attestation_request(
         signing_root,
         SignPayload::PayloadAttestation {
             payload_attestation: VersionedPayload { version: ForkName::Gloas, data: data.clone() },
+        },
+    );
+    (req, signing_root)
+}
+
+/// Build a `PROPOSER_PREFERENCES` request.
+///
+/// Proposer preferences is Gloas-only. D19 does **not** reject this type on
+/// the HTTP wire (unlike `BLOCK_V2` / `AGGREGATE_AND_PROOF`). Version is always
+/// `GLOAS`.
+pub fn build_proposer_preferences_request(
+    prefs: &ProposerPreferences,
+    ctx: &SignContext,
+) -> (SignRequest, Root) {
+    let signing_root = signing_root_with_fork_version(
+        prefs,
+        DOMAIN_PROPOSER_PREFERENCES,
+        ctx.fork_info.current_version,
+        ctx.fork_info.genesis_validators_root,
+    );
+    let req = SignRequest::with_fork(
+        WireForkInfo::from_sign_context(ctx),
+        signing_root,
+        SignPayload::ProposerPreferences {
+            proposer_preferences: VersionedPayload {
+                version: ForkName::Gloas,
+                data: prefs.clone(),
+            },
         },
     );
     (req, signing_root)
@@ -502,10 +531,20 @@ mod tests {
             let (req, root) = build_payload_attestation_request(&ptc, &gloas_ctx(&sk));
             v.push(("PAYLOAD_ATTESTATION", req, root));
 
+            let prefs = ProposerPreferences {
+                dependent_root: [0x33; 32],
+                proposal_slot: 32,
+                validator_index: 3,
+                fee_recipient: [0x44; 20],
+                target_gas_limit: 36_000_000,
+            };
+            let (req, root) = build_proposer_preferences_request(&prefs, &gloas_ctx(&sk));
+            v.push(("PROPOSER_PREFERENCES", req, root));
+
             v
         };
 
-        assert_eq!(checks.len(), 11, "eleven client-reachable types");
+        assert_eq!(checks.len(), 12, "twelve client-reachable types");
         for (name, req, root) in checks {
             assert_eq!(
                 req.signing_root,
@@ -821,6 +860,44 @@ mod tests {
         let body = req.to_json_value().expect("serialize");
         assert_eq!(body["type"], "PAYLOAD_ATTESTATION");
         assert_eq!(body["payload_attestation"]["version"], "GLOAS");
+        assert_eq!(body["signingRoot"], root_hex(&root));
+    }
+
+    /// L3: 4.15 fixture (dependent_root `[0x33; 32]`, proposal_slot 32,
+    /// validator index 3, fee recipient `[0x44; 20]`, gas 36_000_000, fork
+    /// `0x07000001`, GVR zeros). D19 does not reject proposer preferences on HTTP.
+    #[test]
+    fn test_build_proposer_preferences_request_signing_root() {
+        use rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT;
+
+        let sk = SecretKey::generate();
+        let ctx = SignContext {
+            pubkey: sk.public_key(),
+            fork_info: ForkInfo {
+                previous_version: [0x06, 0x00, 0x00, 0x01],
+                current_version: [0x07, 0x00, 0x00, 0x01],
+                genesis_validators_root: [0u8; 32],
+            },
+            fork_name: ForkName::Gloas,
+        };
+        let prefs = ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        };
+        let (req, root) = build_proposer_preferences_request(&prefs, &ctx);
+        let expected: Root = hex::decode(KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+            .expect("kat hex")
+            .try_into()
+            .expect("32-byte kat root");
+        assert_eq!(root, expected);
+        assert_eq!(req.signing_root, Some(root));
+        assert_eq!(req.payload.type_name(), "PROPOSER_PREFERENCES");
+        let body = req.to_json_value().expect("serialize");
+        assert_eq!(body["type"], "PROPOSER_PREFERENCES");
+        assert_eq!(body["proposer_preferences"]["version"], "GLOAS");
         assert_eq!(body["signingRoot"], root_hex(&root));
     }
 }

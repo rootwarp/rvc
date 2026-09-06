@@ -19,9 +19,10 @@ use crypto::{
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
     ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, ForkInfo, ForkName,
-    ForkSchedule, PayloadAttestationData, Root, Slot, SyncCommitteeContribution,
-    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
-    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    ForkSchedule, PayloadAttestationData, ProposerPreferences, Root, Slot,
+    SyncCommitteeContribution, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
+    DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT, SLOTS_PER_EPOCH,
 };
 use grpc_signer::{
@@ -178,6 +179,16 @@ fn ptc() -> PayloadAttestationData {
         slot: 1,
         payload_present: true,
         blob_data_available: false,
+    }
+}
+
+fn prefs() -> ProposerPreferences {
+    ProposerPreferences {
+        dependent_root: [0x33; 32],
+        proposal_slot: 32,
+        validator_index: 3,
+        fee_recipient: [0x44; 20],
+        target_gas_limit: 36_000_000,
     }
 }
 
@@ -392,6 +403,20 @@ impl TypedSigner for LocalBlsTyped {
         );
         self.sign_root(&root, &ctx.pubkey.to_bytes())
     }
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let root = signing_root_with_fork_version(
+            prefs,
+            DOMAIN_PROPOSER_PREFERENCES,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        self.sign_root(&root, &ctx.pubkey.to_bytes())
+    }
 }
 
 struct RecordingTyped {
@@ -531,6 +556,17 @@ impl TypedSigner for RecordingTyped {
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
         rec!(self, "sign_payload_attestation", self.inner.sign_payload_attestation(data, ctx).await)
+    }
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        rec!(
+            self,
+            "sign_proposer_preferences",
+            self.inner.sign_proposer_preferences(prefs, ctx).await
+        )
     }
 }
 
@@ -994,6 +1030,7 @@ async fn test_every_typed_signer_method_reached_from_validator_signer() {
     svc.sign_sync_committee_selection_proof(100, 2, &pk, &schedule, &gvr).await.unwrap();
     svc.sign_contribution_and_proof(&contribution(), &pk, &schedule, &gvr).await.unwrap();
     svc.sign_payload_attestation(&ptc(), &pk, &schedule, &gvr).await.unwrap();
+    svc.sign_proposer_preferences(&prefs(), &pk, &schedule, &gvr).await.unwrap();
 
     let seen = rec.seen.lock().unwrap().clone();
     for name in [
@@ -1007,6 +1044,7 @@ async fn test_every_typed_signer_method_reached_from_validator_signer() {
         "sign_sync_aggregator_selection",
         "sign_contribution_and_proof",
         "sign_payload_attestation",
+        "sign_proposer_preferences",
     ] {
         assert!(seen.contains(name), "TypedSigner::{name} was not reached; seen={seen:?}");
     }

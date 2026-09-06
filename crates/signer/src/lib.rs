@@ -61,7 +61,8 @@ use crypto::{
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock,
     ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, ForkName, ForkSchedule,
-    PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit, SLOTS_PER_EPOCH,
+    PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
+    VoluntaryExit, SLOTS_PER_EPOCH,
 };
 use observability::logging::fields::Duty;
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
@@ -1006,6 +1007,39 @@ impl ValidatorSigner for SignerService {
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
         self.sign_nonslashable(pubkey, signing_root, "payload_attestation", backend).await
+    }
+
+    /// Signs proposer preferences with `DOMAIN_PROPOSER_PREFERENCES`.
+    ///
+    /// Non-slashable: routes through [`Self::sign_nonslashable`], not
+    /// [`sign_slashable`].
+    #[tracing::instrument(
+        name = "sign.proposer_preferences",
+        skip_all,
+        fields(slot = prefs.proposal_slot)
+    )]
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::ProposerPreferences(prefs), &ctx);
+        let gvr = *genesis_validators_root;
+        let prefs_owned = prefs.clone();
+        let sign_ctx = sign_context_at_epoch(
+            pubkey.clone(),
+            fork_schedule,
+            gvr,
+            prefs.proposal_slot / SLOTS_PER_EPOCH,
+        );
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_proposer_preferences(&prefs_owned, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "proposer_preferences", backend).await
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
@@ -2362,6 +2396,60 @@ mod tests {
         );
     }
 
+    fn gloas_prefs_fixture() -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// Signing proposer preferences writes no slashing-DB row (row count
+    /// before and after).
+    #[tokio::test]
+    async fn test_sign_proposer_preferences_writes_no_slashing_row() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let before_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let before_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let prefs = gloas_prefs_fixture();
+        let sig = service
+            .sign_proposer_preferences(&prefs, &pubkey, &schedule, &gvr)
+            .await
+            .expect("proposer preferences is non-slashable and must sign");
+
+        let kat_root: Root =
+            hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+                .expect("kat hex")
+                .try_into()
+                .expect("32-byte kat root");
+        assert!(
+            sig.verify(&pubkey, &kat_root).is_ok(),
+            "proposer preferences must verify over KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT, not a fallback domain"
+        );
+
+        let after_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_blocks, before_blocks, "proposer preferences must not write a block row");
+        assert_eq!(
+            after_attestations, before_attestations,
+            "proposer preferences must not write an attestation row"
+        );
+    }
+
     #[test]
     fn test_unsupported_duty_from_signing_error() {
         let err: SignerError = SigningError::UnsupportedDuty { duty: "payload_attestation" }.into();
@@ -3410,6 +3498,15 @@ mod tests {
             sig.verify(&pubkey, &root).is_ok(),
             "payload attestation root must match signing_root_for"
         );
+
+        let prefs = gloas_prefs_fixture();
+        let sig =
+            service.sign_proposer_preferences(&prefs, &pubkey, &schedule, &gvr).await.unwrap();
+        let root = signing_root_for(&DutyRef::ProposerPreferences(&prefs), &ctx);
+        assert!(
+            sig.verify(&pubkey, &root).is_ok(),
+            "proposer preferences root must match signing_root_for"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -3540,6 +3637,10 @@ mod tests {
             .sign_payload_attestation(&gloas_ptc_fixture(), &pubkey, &schedule, &gvr)
             .await
             .expect("payload attestation");
+        service
+            .sign_proposer_preferences(&gloas_prefs_fixture(), &pubkey, &schedule, &gvr)
+            .await
+            .expect("proposer preferences");
 
         let blocks = slashing_db.get_blocks(&pubkey_hex).expect("get_blocks");
         let attestations = slashing_db.get_attestations(&pubkey_hex).expect("get_attestations");
@@ -3804,6 +3905,12 @@ mod tests {
                         .sign_payload_attestation(&gloas_ptc_fixture(), &pubkey, &schedule, &gvr)
                         .await,
                 ),
+                (
+                    "proposer_preferences",
+                    service
+                        .sign_proposer_preferences(&gloas_prefs_fixture(), &pubkey, &schedule, &gvr)
+                        .await,
+                ),
             ];
 
             for (name, result) in results {
@@ -3867,6 +3974,17 @@ mod tests {
                     "payload_attestation",
                     service
                         .sign_payload_attestation(&gloas_ptc_fixture(), &unknown, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "proposer_preferences",
+                    service
+                        .sign_proposer_preferences(
+                            &gloas_prefs_fixture(),
+                            &unknown,
+                            &schedule,
+                            &gvr,
+                        )
                         .await,
                 ),
             ];

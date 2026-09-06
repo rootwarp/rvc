@@ -171,6 +171,7 @@ pub const SIGNING_GATE_METHODS: &[&str] = &[
     "sign_voluntary_exit",
     "sign_builder_registration",
     "sign_payload_attestation",
+    "sign_proposer_preferences",
 ];
 
 /// Canonical `PubkeyScopedDb::stage_*` methods used by DVT share signing.

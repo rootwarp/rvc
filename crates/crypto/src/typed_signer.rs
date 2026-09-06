@@ -8,10 +8,11 @@ use async_trait::async_trait;
 
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock,
-    ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, PayloadAttestationData, Root,
-    Slot, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
-    DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
-    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, PayloadAttestationData,
+    ProposerPreferences, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 
@@ -206,6 +207,19 @@ pub trait TypedSigner: Send + Sync {
     ) -> Result<Signature, SigningError> {
         let _ = (data, ctx);
         Err(SigningError::UnsupportedDuty { duty: "payload_attestation" })
+    }
+
+    /// Sign proposer preferences (`DOMAIN_PROPOSER_PREFERENCES`).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override.
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (prefs, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "proposer_preferences" })
     }
 }
 
@@ -410,6 +424,21 @@ impl TypedSigner for LocalSigner {
         let signing_root = signing_root_with_fork_version(
             data,
             DOMAIN_PTC_ATTESTER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            prefs,
+            DOMAIN_PROPOSER_PREFERENCES,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
@@ -886,6 +915,56 @@ mod tests {
         match result {
             Err(SigningError::UnsupportedDuty { duty }) => {
                 assert_eq!(duty, "payload_attestation");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
+    }
+
+    fn gloas_prefs_fixture() -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// L3: signature verifies over `KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT`
+    /// (4.15 fixture: dependent_root `[0x33; 32]`, proposal_slot 32, validator
+    /// index 3, fee recipient `[0x44; 20]`, gas 36_000_000, fork `0x07000001`,
+    /// GVR zeros).
+    #[tokio::test]
+    async fn test_local_signer_proposer_preferences_signature_verifies() {
+        use rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT;
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let prefs = gloas_prefs_fixture();
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_proposer_preferences(&signer, &prefs, &ctx).await.unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "proposer preferences signature must verify over the KAT signing root"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_proposer_preferences_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let prefs = gloas_prefs_fixture();
+        let signer = CapabilityMissingSigner;
+
+        let result = TypedSigner::sign_proposer_preferences(&signer, &prefs, &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "proposer_preferences");
             }
             Ok(_) => panic!("unsupported signer must not produce a signature"),
             other => panic!("expected UnsupportedDuty, got: {other:?}"),

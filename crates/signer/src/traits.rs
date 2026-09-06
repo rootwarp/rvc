@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use crypto::{PublicKey, Signature};
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof,
-    ElectraAggregateAndProof, Epoch, ForkSchedule, PayloadAttestationData, Root, Slot,
-    ValidatorRegistrationV1, VoluntaryExit,
+    ElectraAggregateAndProof, Epoch, ForkSchedule, PayloadAttestationData, ProposerPreferences,
+    Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 use tree_hash::TreeHash;
 
@@ -197,4 +197,19 @@ pub trait ValidatorSigner: Send + Sync {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError>;
+
+    /// Sign proposer preferences (`DOMAIN_PROPOSER_PREFERENCES`).
+    ///
+    /// Default: unsupported. Local and HTTP remotes that can sign this duty
+    /// must override. Non-slashable: must not stage or commit a slashing-DB row.
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let _ = (prefs, pubkey, fork_schedule, genesis_validators_root);
+        Err(SignerError::UnsupportedDuty { duty: "proposer_preferences" })
+    }
 }
