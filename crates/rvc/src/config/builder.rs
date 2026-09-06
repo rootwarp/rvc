@@ -643,6 +643,7 @@ impl ServiceBuilder {
         beacon: Arc<dyn BeaconNodeClient>,
         validator_store: Arc<ValidatorStore>,
         genesis_fork_version: [u8; 4],
+        fork_schedule: Arc<ForkSchedule>,
     ) -> Arc<BuilderService> {
         // Bridge full trait objects onto the narrow builder seams
         // (`RegistrationSigner` / `BuilderBeaconClient`).
@@ -652,6 +653,7 @@ impl ServiceBuilder {
             Arc::new(beacon),
             validator_store,
             genesis_fork_version,
+            fork_schedule,
         );
         info!("Created builder service");
         Arc::new(service)
@@ -1419,8 +1421,13 @@ mod tests {
             .unwrap();
         let validator_store = builder.build_validator_store(Some(&config_path)).unwrap();
 
-        let _builder_service =
-            builder.build_builder_service(signer, beacon, validator_store, [0, 0, 0, 0]);
+        let _builder_service = builder.build_builder_service(
+            signer,
+            beacon,
+            validator_store,
+            [0, 0, 0, 0],
+            Arc::new(eth_types::ForkSchedule::unscheduled_gloas()),
+        );
     }
 
     #[test]

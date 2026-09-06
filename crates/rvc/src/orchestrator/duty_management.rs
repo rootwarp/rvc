@@ -8,8 +8,9 @@ use tracing::{debug, info, warn};
 use crate::metrics::RVC_DUTY_REORG_DETECTED_TOTAL;
 use beacon::{BeaconCommitteeSubscription, ProposerPreparation};
 use bn_manager::BeaconNodeClient;
+use builder::legacy_proposer_ops_retired;
 use duty_tracker::DutyTracker;
-use eth_types::Slot;
+use eth_types::{ForkName, Slot};
 use signer::{is_aggregator, SignerService, ValidatorSigner};
 use timing::SLOTS_PER_EPOCH;
 
@@ -362,8 +363,14 @@ impl DutyManagementService {
         }
     }
 
-    #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all)]
-    pub(crate) async fn prepare_proposers(&self) {
+    #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all, fields(epoch = epoch))]
+    pub(crate) async fn prepare_proposers(&self, epoch: u64) {
+        let fork = ForkName::from_epoch(epoch, &self.config.fork_schedule);
+        if legacy_proposer_ops_retired(fork) {
+            info!(epoch, fork = fork.as_ref(), "Skipping prepare_beacon_proposer at Gloas");
+            return;
+        }
+
         // O(validators): one registry lookup per local key — no duty-cache scan.
         // Build the preparations list under short sync locks (no await held).
         let preparations: Vec<ProposerPreparation> = {
@@ -514,7 +521,7 @@ impl DutyManagementService {
     #[tracing::instrument(name = "orchestrator.on_epoch_boundary", level = "debug", skip_all, fields(epoch = current_epoch))]
     pub(crate) async fn on_epoch_boundary(&self, current_epoch: u64, current_slot: Slot) {
         self.check_reorg_at_epoch_boundary(current_epoch).await;
-        self.prepare_proposers().await;
+        self.prepare_proposers(current_epoch).await;
         self.submit_committee_subscriptions(current_epoch).await;
         self.submit_committee_subscriptions(current_epoch + 1).await;
         self.log_epoch_boundary_summary(current_epoch, current_slot).await;

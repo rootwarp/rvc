@@ -11,7 +11,7 @@ use tracing::{debug, error, info, info_span, warn, Instrument};
 
 use block_service::{BeaconBlockClient, BlockService};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Propagator};
-use builder::BuilderService;
+use builder::{legacy_proposer_ops_retired, BuilderService, UpcomingProposal};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, ForkSchedule, Root, Slot};
@@ -32,7 +32,7 @@ use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
 use super::slot_context::SlotContext;
 use super::sync_committee::SyncCommitteeService;
-use super::utils::TimedOutcome;
+use super::utils::{self, TimedOutcome};
 use crate::pubkey_index::SharedPubkeyIndexRegistry;
 
 /// Shared, dynamically-updatable public key map.
@@ -547,7 +547,6 @@ where
             let next_slot = current_slot + 1;
             let time_until_next_slot = self.clock.time_until_slot(next_slot)?;
             let should_register = current_slot % SLOTS_PER_EPOCH == 0;
-            let builder_service = self.builder_service.clone();
             let post_duty_work = async {
                 self.duty_management
                     .fetch_epoch_duties(current_epoch)
@@ -570,25 +569,22 @@ where
                         .instrument(epoch_span)
                         .await;
 
-                    if let Some(bs) = builder_service {
+                    if self.builder_service.is_some() {
                         let jitter = Duration::from_secs(BuilderService::jitter_seconds());
                         debug!(
                             jitter_secs = jitter.as_secs(),
-                            "Delaying builder registration with jitter"
+                            "Delaying builder epoch-boundary work with jitter"
                         );
                         tokio::time::sleep(jitter).await;
                         match tokio::time::timeout(
                             BUILDER_REGISTRATION_TIMEOUT,
-                            bs.register_validators(),
+                            self.run_builder_epoch_boundary(current_epoch),
                         )
                         .await
                         {
-                            Ok(Ok(_)) => info!("Builder registration completed"),
-                            Ok(Err(e)) => {
-                                warn!(error = %e, "Builder registration failed (non-fatal)")
-                            }
+                            Ok(()) => {}
                             Err(_) => warn!(
-                                "Builder registration timed out after {}s (non-fatal)",
+                                "Builder epoch-boundary work timed out after {}s (non-fatal)",
                                 BUILDER_REGISTRATION_TIMEOUT.as_secs()
                             ),
                         }
@@ -607,6 +603,96 @@ where
                 return Ok(());
             }
         }
+    }
+
+    /// Legacy register (pre-Gloas) and preferences for Gloas+ proposal slots.
+    ///
+    /// Both may run at Gloas-1: register is still live, and next-epoch Gloas
+    /// slots are advertised one epoch early.
+    pub(crate) async fn run_builder_epoch_boundary(&self, current_epoch: u64) {
+        let Some(bs) = &self.builder_service else {
+            return;
+        };
+        let current_fork = ForkName::from_epoch(current_epoch, &self.config.fork_schedule);
+        if !legacy_proposer_ops_retired(current_fork) {
+            match bs.register_validators(current_epoch).await {
+                Ok(_) => info!("Builder registration completed"),
+                Err(e) => warn!(error = %e, "Builder registration failed (non-fatal)"),
+            }
+        }
+        let proposals = self.upcoming_proposals(current_epoch).await;
+        match bs
+            .broadcast_proposer_preferences(
+                current_epoch,
+                &proposals,
+                &self.config.genesis_validators_root,
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "Proposer preferences broadcast failed (non-fatal)"),
+        }
+    }
+
+    /// Local signing-enabled proposer duties for the current and next epoch.
+    async fn upcoming_proposals(&self, current_epoch: u64) -> Vec<UpcomingProposal> {
+        let mut out = Vec::new();
+        for epoch in [current_epoch, current_epoch.saturating_add(1)] {
+            out.extend(self.proposals_for_epoch(epoch).await);
+        }
+        out
+    }
+
+    async fn proposals_for_epoch(&self, epoch: u64) -> Vec<UpcomingProposal> {
+        let dependent_root = match self.duty_tracker.get_cached_proposer_dependent_root(epoch).await
+        {
+            Some(hex) => match eth_types::canonical::gvr_hex::parse_gvr_hex(&hex) {
+                Ok(root) => root,
+                Err(e) => {
+                    warn!(
+                        epoch,
+                        error = %e,
+                        "Invalid proposer dependent_root; skipping preferences"
+                    );
+                    return Vec::new();
+                }
+            },
+            None => {
+                debug!(epoch, "No cached proposer dependent_root for preferences");
+                return Vec::new();
+            }
+        };
+
+        let mut out = Vec::new();
+        for offset in 0..SLOTS_PER_EPOCH {
+            let slot = epoch.saturating_mul(SLOTS_PER_EPOCH).saturating_add(offset);
+            let Some(duty) = self.duty_tracker.get_proposer_duty(slot).await else {
+                continue;
+            };
+            let Some(pk) = utils::find_pubkey(&self.pubkey_map, &duty.pubkey) else {
+                continue;
+            };
+            let pubkey = pk.to_bytes();
+            if !self.validator_store.is_signing_enabled(&pubkey) {
+                continue;
+            }
+            let validator_index = match duty.validator_index.parse() {
+                Ok(i) => i,
+                Err(_) => {
+                    warn!(slot, "Skipping proposer duty with unparseable validator_index");
+                    continue;
+                }
+            };
+            let proposal_slot = match duty.slot.parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    warn!(slot, "Skipping proposer duty with unparseable slot");
+                    continue;
+                }
+            };
+            out.push(UpcomingProposal { pubkey, validator_index, proposal_slot, dependent_root });
+        }
+        out
     }
 
     /// Bounded proposer-only fetch when the current epoch cache is empty.

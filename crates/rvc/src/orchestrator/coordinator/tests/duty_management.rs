@@ -88,7 +88,7 @@ async fn test_prepare_proposers_sends_preparations() {
     deps.pubkey_index.write().insert(pubkey.to_bytes(), "42".to_string());
     let (orchestrator, _handle) = DutyOrchestrator::new(deps);
 
-    orchestrator.duty_management.prepare_proposers().await;
+    orchestrator.duty_management.prepare_proposers(3).await;
     // wiremock will verify expect(1) on drop
 }
 
@@ -138,7 +138,7 @@ async fn test_prepare_proposers_no_validators_no_call() {
         pubkey_map,
     ));
 
-    orchestrator.duty_management.prepare_proposers().await;
+    orchestrator.duty_management.prepare_proposers(0).await;
 }
 
 #[tokio::test]
@@ -219,7 +219,7 @@ async fn test_prepare_proposers_failure_is_non_fatal() {
     let (orchestrator, _handle) = DutyOrchestrator::new(deps);
 
     // Should not panic - failure is non-fatal
-    orchestrator.duty_management.prepare_proposers().await;
+    orchestrator.duty_management.prepare_proposers(3).await;
 }
 
 // --- B-05: Committee subscription tests ---
@@ -810,7 +810,7 @@ async fn test_prepare_proposers_index_lookups_are_linear_in_validators() {
     let (orchestrator, _handle) = DutyOrchestrator::new(deps);
 
     let before = duty_tracker.slot_duty_lookup_count();
-    orchestrator.duty_management.prepare_proposers().await;
+    orchestrator.duty_management.prepare_proposers(3).await;
     let after = duty_tracker.slot_duty_lookup_count();
     let lookups = after - before;
 
@@ -820,4 +820,293 @@ async fn test_prepare_proposers_index_lookups_are_linear_in_validators() {
         "prepare_proposers must not scan the duty cache (observed {lookups} get_duties_for_slot \
          calls; pre-fix O(v×64×d) for N={N} was typically hundreds)"
     );
+}
+
+// --- Gloas retirement of prepare_beacon_proposer / register_validators ---
+
+const ZERO_DEPENDENT_ROOT: &str =
+    "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+fn near_gloas_schedule(gloas_epoch: u64) -> Arc<ForkSchedule> {
+    let mut schedule = (*create_test_fork_schedule()).clone();
+    schedule.gloas_fork_epoch = gloas_epoch;
+    Arc::new(schedule)
+}
+
+fn empty_dependent<T>() -> beacon::DependentRootResponse<Vec<T>> {
+    beacon::DependentRootResponse {
+        dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+        execution_optimistic: false,
+        data: Vec::new(),
+    }
+}
+
+fn pubkey_hex(pk: &[u8; 48]) -> String {
+    format!("0x{}", hex::encode(pk))
+}
+
+fn proposer_duty(pubkey_hex: &str, index: &str, slot: u64) -> beacon::ProposerDuty {
+    beacon::ProposerDuty {
+        pubkey: pubkey_hex.to_string(),
+        validator_index: index.to_string(),
+        slot: slot.to_string(),
+    }
+}
+
+fn retirement_beacon_base() -> bn_manager::MockBeaconNodeClient {
+    bn_manager::MockBeaconNodeClient::new()
+        .with_get_attester_duties(|_e, _i| Ok(empty_dependent()))
+        .with_post_ptc_duties(|_e, _i| Ok(empty_dependent()))
+        .with_post_sync_committee_duties(|_e, _i| {
+            Ok(beacon::ExecutionOptimisticResponse {
+                execution_optimistic: false,
+                data: Vec::new(),
+            })
+        })
+        .with_prepare_beacon_proposer(|_p| Ok(()))
+        .with_register_validators(|_r| Ok(()))
+        .with_submit_proposer_preferences(|_p| Ok(()))
+        .with_submit_beacon_committee_subscriptions(|_s| Ok(()))
+}
+
+fn retirement_beacon() -> bn_manager::MockBeaconNodeClient {
+    retirement_beacon_base().with_get_proposer_duties(|_e| Ok(empty_dependent()))
+}
+
+fn retirement_beacon_with_mixed_duties(
+    local_hex: String,
+    disabled_hex: String,
+    foreign_hex: String,
+) -> bn_manager::MockBeaconNodeClient {
+    retirement_beacon_base().with_get_proposer_duties(move |epoch| {
+        let slots = ::timing::SLOTS_PER_EPOCH;
+        Ok(beacon::DependentRootResponse {
+            dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+            execution_optimistic: false,
+            data: vec![
+                proposer_duty(&local_hex, "42", epoch * slots + 5),
+                proposer_duty(&disabled_hex, "43", epoch * slots + 6),
+                proposer_duty(&foreign_hex, "99", epoch * slots + 7),
+            ],
+        })
+    })
+}
+
+fn retirement_beacon_legacy_errors() -> bn_manager::MockBeaconNodeClient {
+    use beacon::BeaconError;
+    retirement_beacon()
+        .with_prepare_beacon_proposer(|_p| {
+            Err(BeaconError::ApiError { status: 404, message: "not found".into() })
+        })
+        .with_register_validators(|_r| {
+            Err(BeaconError::ApiError { status: 501, message: "not implemented".into() })
+        })
+}
+
+struct RetirementDrive {
+    mock: Arc<bn_manager::MockBeaconNodeClient>,
+}
+
+async fn drive_prepare_and_register(
+    epoch: u64,
+    schedule: Arc<ForkSchedule>,
+    mock: bn_manager::MockBeaconNodeClient,
+    local: (SecretKey, bool),
+    extra_locals: Vec<(SecretKey, bool)>,
+    foreign_keys: Vec<SecretKey>,
+) -> RetirementDrive {
+    use signer::ValidatorSigner;
+    use validator_store::ValidatorConfig;
+
+    let mock = Arc::new(mock);
+    let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+    let slot = epoch * ::timing::SLOTS_PER_EPOCH;
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), slot));
+    clock.set_slot(slot);
+
+    let local_pk = local.0.public_key().to_bytes();
+    let mut key_manager = KeyManager::new();
+    let mut pubkey_map_inner = HashMap::new();
+    let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+
+    let mut keys = vec![local];
+    keys.extend(extra_locals);
+    for (sk, signing_enabled) in keys {
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let mut cfg = ValidatorConfig::new(pk_bytes);
+        cfg.builder_proposals = true;
+        cfg.enabled = signing_enabled;
+        validator_store.add_validator(cfg).unwrap();
+        pubkey_map_inner.insert(pk_bytes, pk);
+        key_manager.insert(sk);
+    }
+    // Signable but not in pubkey_map: a missing find_pubkey gate would submit these.
+    for sk in foreign_keys {
+        key_manager.insert(sk);
+    }
+
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+    let vs: Arc<dyn ValidatorSigner> = signer.clone();
+    let builder_service = Some(Arc::new(BuilderService::new(
+        Arc::new(vs),
+        Arc::new(beacon.clone()),
+        validator_store.clone(),
+        schedule.genesis_fork_version,
+        schedule.clone(),
+    )));
+
+    let duty_tracker = Arc::new(
+        DutyTracker::new(beacon.clone(), vec!["42".to_string(), "43".to_string()])
+            .with_fork_schedule((*schedule).clone()),
+    );
+
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+    let submitter = Arc::new(MockSubmitter::new());
+    let propagator = Arc::new(Propagator::new(submitter));
+    let config = OrchestratorConfig::new([0xaau8; 32], schedule);
+
+    let deps = OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        builder_service,
+        validator_store,
+        config,
+        pubkey_map,
+    );
+    deps.pubkey_index.write().insert(local_pk, "42".to_string());
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+
+    orchestrator.duty_management.on_epoch_boundary(epoch, slot).await;
+    orchestrator.run_builder_epoch_boundary(epoch).await;
+    RetirementDrive { mock }
+}
+
+#[tokio::test]
+async fn test_prepare_and_register_retired_only_at_gloas() {
+    let gloas_epoch = 100u64;
+    let schedule = near_gloas_schedule(gloas_epoch);
+    assert_eq!(ForkName::from_epoch(gloas_epoch - 1, &schedule), ForkName::Fulu);
+    assert_eq!(ForkName::from_epoch(gloas_epoch, &schedule), ForkName::Gloas);
+
+    let expected_fee = format!("0x{}", hex::encode([0xffu8; 20]));
+    let slots = ::timing::SLOTS_PER_EPOCH;
+
+    for (epoch, retired) in [(gloas_epoch - 1, false), (gloas_epoch, true)] {
+        let local = SecretKey::generate();
+        let disabled = SecretKey::generate();
+        let foreign = SecretKey::generate();
+        let local_hex = pubkey_hex(&local.public_key().to_bytes());
+        let disabled_hex = pubkey_hex(&disabled.public_key().to_bytes());
+        let foreign_hex = pubkey_hex(&foreign.public_key().to_bytes());
+        let mock = retirement_beacon_with_mixed_duties(local_hex, disabled_hex, foreign_hex);
+        let driven = drive_prepare_and_register(
+            epoch,
+            schedule.clone(),
+            mock,
+            (local, true),
+            vec![(disabled, false)],
+            vec![foreign],
+        )
+        .await;
+
+        let prepare = driven.mock.prepare_beacon_proposer_calls();
+        let register = driven.mock.register_validators_calls();
+        let prefs = driven.mock.submit_proposer_preferences_calls();
+        if retired {
+            assert!(
+                prepare.is_empty(),
+                "Gloas epoch {epoch}: prepare_beacon_proposer must not be called"
+            );
+            assert!(
+                register.is_empty(),
+                "Gloas epoch {epoch}: register_validators must not be called"
+            );
+            assert_eq!(prefs.len(), 1, "Gloas epoch {epoch}: one preferences POST");
+            assert_eq!(prefs[0].len(), 2, "Gloas arm: current + next epoch local slots only");
+            let current_slot = gloas_epoch * slots + 5;
+            let next_slot = (gloas_epoch + 1) * slots + 5;
+            let slots_sent: Vec<u64> =
+                prefs.iter().flatten().map(|p| p.message.proposal_slot).collect();
+            assert!(
+                slots_sent.contains(&current_slot),
+                "Gloas arm must advertise remaining current-epoch Gloas slot {current_slot}, got {slots_sent:?}"
+            );
+            assert!(
+                slots_sent.contains(&next_slot),
+                "Gloas arm must advertise Gloas+1 slot {next_slot}, got {slots_sent:?}"
+            );
+        } else {
+            assert_eq!(prepare.len(), 1, "pre-Gloas prepare call count");
+            assert_eq!(prepare[0].len(), 1);
+            assert_eq!(prepare[0][0].validator_index, "42");
+            assert_eq!(prepare[0][0].fee_recipient, expected_fee);
+            assert_eq!(register.len(), 1, "pre-Gloas register call count");
+            assert_eq!(register[0].len(), 1);
+            assert_eq!(register[0][0].message.fee_recipient, [0xffu8; 20]);
+            assert_eq!(register[0][0].message.gas_limit, 30_000_000);
+            assert_eq!(prefs.len(), 1, "Gloas-1 must submit preferences for Gloas slots");
+            assert_eq!(prefs[0].len(), 1);
+            assert_eq!(prefs[0][0].message.proposal_slot, gloas_epoch * slots + 5);
+            assert_eq!(prefs[0][0].message.validator_index, 42);
+            assert_eq!(prefs[0][0].message.fee_recipient, [0xffu8; 20]);
+        }
+
+        for signed in prefs.iter().flatten() {
+            assert_eq!(
+                signed.message.fee_recipient, [0xffu8; 20],
+                "only the local validator's fee recipient"
+            );
+            assert_ne!(signed.message.validator_index, 99, "foreign duty must not be signed");
+            assert_ne!(signed.message.validator_index, 43, "disabled local must not be signed");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_legacy_404_or_501_does_not_retire_prepare_or_register() {
+    let gloas_epoch = 100u64;
+    let schedule = near_gloas_schedule(gloas_epoch);
+    let epoch = gloas_epoch - 1;
+    assert_ne!(ForkName::from_epoch(epoch, &schedule), ForkName::Gloas);
+
+    let local = SecretKey::generate();
+    let driven = drive_prepare_and_register(
+        epoch,
+        schedule,
+        retirement_beacon_legacy_errors(),
+        (local, true),
+        vec![],
+        vec![],
+    )
+    .await;
+    assert_eq!(
+        driven.mock.prepare_beacon_proposer_calls().len(),
+        1,
+        "BN 404 must not skip prepare_beacon_proposer"
+    );
+    assert_eq!(
+        driven.mock.register_validators_calls().len(),
+        1,
+        "BN 501 must not skip register_validators"
+    );
+}
+
+#[test]
+fn test_retirement_gate_reads_only_fork_name_from_epoch() {
+    let gloas_epoch = 100u64;
+    let schedule = near_gloas_schedule(gloas_epoch);
+    assert!(!::builder::legacy_proposer_ops_retired(ForkName::from_epoch(
+        gloas_epoch - 1,
+        &schedule
+    )));
+    assert!(::builder::legacy_proposer_ops_retired(ForkName::from_epoch(gloas_epoch, &schedule)));
 }

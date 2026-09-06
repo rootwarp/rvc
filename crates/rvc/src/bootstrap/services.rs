@@ -209,6 +209,7 @@ pub async fn build_services(
         main_beacon.clone(),
         validator_store.clone(),
         orchestrator_config.fork_schedule.genesis_fork_version,
+        orchestrator_config.fork_schedule.clone(),
     ));
 
     // Step 7b: Configure remote signer if URL provided
