@@ -1,10 +1,12 @@
+use std::str::FromStr;
 use std::sync::Arc;
 
 use tracing::{debug, error, info, warn, Instrument};
 
 use crypto::PublicKey;
 use eth_types::{
-    blinded_body_tree_hash_root, body_tree_hash_root, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH,
+    blinded_body_tree_hash_root, body_tree_hash_root, ForkName, ForkSchedule, Root, Slot,
+    SLOTS_PER_EPOCH,
 };
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use signer::{BeaconBlockHeaderFields, CircuitBreakerState, ValidatorSigner};
@@ -260,6 +262,13 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         }
 
         // 4. Sign and publish based on block type
+        // Gloas retires blinded/mev-boost; keep the pre-Gloas helpers but drop the duty.
+        reject_blinded_at_gloas(
+            response.is_blinded,
+            &response.consensus_version,
+            slot,
+            &self.fork_schedule,
+        )?;
         debug!(slot = slot, is_blinded = response.is_blinded, "Blinded/unblinded path chosen");
         let (block_root, is_blinded) = if response.is_ssz {
             self.sign_and_publish_ssz(&response, slot, pubkey, validator).await
@@ -302,7 +311,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string())
         })?;
 
-        let format = ssz_block_format(response.is_blinded, &response.consensus_version);
+        let format = ssz_block_format(response.is_blinded, &response.consensus_version)?;
         let (block_root, block_data_offset, header): (Root, usize, BeaconBlockHeaderFields) =
             if response.is_blinded {
                 let (block, offset) =
@@ -485,6 +494,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         validator: Option<&BlockResponseValidator>,
     ) -> Result<(Root, bool), BlockServiceError> {
+        reject_blinded_at_gloas(true, &response.consensus_version, slot, &self.fork_schedule)?;
         let block = response.parse_blinded_block()?;
 
         if block.slot != slot {
@@ -588,21 +598,51 @@ fn compute_blinded_block_root(
 
 /// Determines the SSZ wire format based on block type and consensus version.
 ///
-/// - Blinded blocks are always raw `BeaconBlock` SSZ (all forks).
-/// - Unblinded blocks use `BlockContents` SSZ for Deneb and later forks
-///   (which wraps the `BeaconBlock` with kzg_proofs and blobs).
+/// - Blinded blocks are always raw `BeaconBlock` SSZ (all known forks).
+/// - Unblinded Deneb/Electra/Fulu use `BlockContents` (block + kzg_proofs + blobs).
+/// - Unblinded Gloas uses a named `BeaconBlock` arm (bare `SignedBeaconBlock`).
+/// - Unknown versions fail closed — they must not inherit a layout.
 fn ssz_block_format(
     is_blinded: bool,
     consensus_version: &str,
-) -> beacon::ssz_deser::SszBlockFormat {
+) -> Result<beacon::ssz_deser::SszBlockFormat, BlockServiceError> {
     use beacon::ssz_deser::SszBlockFormat;
+    let fork = ForkName::from_str(consensus_version).map_err(|_| {
+        BlockServiceError::UnknownSszConsensusVersion(consensus_version.to_string())
+    })?;
     if is_blinded {
-        return SszBlockFormat::BeaconBlock;
+        return Ok(SszBlockFormat::BeaconBlock);
     }
-    match consensus_version {
-        "deneb" | "electra" | "fulu" => SszBlockFormat::BlockContents,
-        _ => SszBlockFormat::BeaconBlock,
+    // Named Gloas arm is intentionally separate from pre-Deneb: a new fork
+    // must not inherit BeaconBlock via a shared catch-all (issue 6.4).
+    #[allow(clippy::match_same_arms)]
+    let format = match fork {
+        ForkName::Deneb | ForkName::Electra | ForkName::Fulu => SszBlockFormat::BlockContents,
+        ForkName::Gloas => SszBlockFormat::BeaconBlock,
+        ForkName::Phase0 | ForkName::Altair | ForkName::Bellatrix | ForkName::Capella => {
+            SszBlockFormat::BeaconBlock
+        }
+    };
+    Ok(format)
+}
+
+/// Blinded production is pre-Gloas only. Slot fork or `Eth-Consensus-Version`
+/// of Gloas both fail closed so a mis-advertised header cannot sign blinded.
+fn reject_blinded_at_gloas(
+    is_blinded: bool,
+    consensus_version: &str,
+    slot: Slot,
+    fork_schedule: &ForkSchedule,
+) -> Result<(), BlockServiceError> {
+    if !is_blinded {
+        return Ok(());
     }
+    let slot_fork = ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule);
+    if slot_fork >= ForkName::Gloas || consensus_version == "gloas" {
+        error!(slot = slot, consensus_version, "Blinded block at Gloas — dropping duty");
+        return Err(BlockServiceError::BlindedNotSupportedAtGloas { slot });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

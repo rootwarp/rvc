@@ -16,14 +16,15 @@ pub struct SszBlockHeader {
 /// SSZ wire format returned by the `/eth/v3/validator/blocks/{slot}` endpoint.
 ///
 /// The SSZ layout differs between forks and block types:
-/// - **`BeaconBlock`**: Pre-Deneb unblinded and all blinded blocks. `slot` is
-///   at byte offset 0.
-/// - **`BlockContents`**: Deneb+ unblinded blocks. The first 12 bytes are three
-///   4-byte LE offsets (block, kzg_proofs, blobs). The `BeaconBlock` data (and
-///   thus `slot`) lives at the offset given by the first 4 bytes.
+/// - **`BeaconBlock`**: Pre-Deneb unblinded, Gloas unblinded (bare
+///   `SignedBeaconBlock`), and all blinded blocks. `slot` is at byte offset 0.
+/// - **`BlockContents`**: Deneb/Electra/Fulu unblinded blocks. The first 12
+///   bytes are three 4-byte LE offsets (block, kzg_proofs, blobs). The
+///   `BeaconBlock` data (and thus `slot`) lives at the offset given by the
+///   first 4 bytes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SszBlockFormat {
-    /// Raw `BeaconBlock` — slot at byte 0 (pre-Deneb unblinded, all blinded).
+    /// Raw `BeaconBlock` — slot at byte 0 (pre-Deneb / Gloas unblinded, all blinded).
     BeaconBlock,
     /// `BlockContents` wrapper — first 4 bytes = LE offset to inner `BeaconBlock`.
     BlockContents,

@@ -37,12 +37,12 @@ Line numbers were opened on `feature/216-fork-hazard-audit` after 2.1
 
 | Class | Count |
 |-------|------:|
-| 1 `>= ForkName::X` | 10 |
+| 1 `>= ForkName::X` | 15 |
 | 2 `.index = 0` | 6 |
-| 3 `match ForkName` | 3 |
-| 4 string-literal dispatch | 4 |
+| 3 `match ForkName` | 4 |
+| 4 string-literal dispatch | 3 |
 | 5 `.entries()` | 7 |
-| **Total** | **30** |
+| **Total** | **35** |
 
 Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 
@@ -51,13 +51,18 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 |---|---|---|---|---|---|
 | `bin/rvc-keygen/src/exit.rs` 107 | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 251. | — |
 | `crates/beacon/src/client.rs` 401 | 1 | — | inherit-intentionally | Proposer-duties v1/v2 routing (4.5). Open-ended `>= Gloas` keeps later forks on v2 rather than silently falling back to deprecated v1. | 4.5 |
+| `crates/block-service/src/service/mod.rs` 641 | 1 | — | inherit-intentionally | `reject_blinded_at_gloas`: open-ended `>= Gloas` so later forks keep the no-blinded gate rather than silently re-entering pre-Gloas blinded sign/publish. | 6.4 |
 | `crates/crypto/src/signing_root.rs` 251 | 1 | — | inherit-intentionally | EIP-7044: voluntary-exit domain stays Capella-capped however many post-Capella forks exist. Open-ended `>=` is the spec. | — |
 | `crates/crypto/src/signing_root.rs` 315 | 1 | — | inherit-intentionally | Test mirror of 251 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
+| `crates/grpc-signer/src/client.rs` 263 | 1 | — | inherit-intentionally | `uses_gloas_rpc`: open-ended `>= Gloas` so later forks keep the Gloas-safe header/root RPCs rather than silently falling back to decoder-bound legacy RPCs. | 4.20c |
 | `crates/rvc/src/orchestrator/aggregation.rs` 88 | 1 | — | decided-not-inherited | `>= Fulu` picks the `"fulu"` submit label. Gloas must not inherit; Phase 6 owns the versioned-wrapper choice. One of three production `>= Fulu` sites (plan cited four). | phase-6 |
 | `crates/rvc/src/orchestrator/aggregation.rs` 130 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedSignedAggregateAndProof::Fulu`. Same Phase-6 verdict as 88. | phase-6 |
 | `crates/rvc/src/orchestrator/attestation.rs` 425 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedAttestation::Fulu`. Phase 6; do not inherit via open-ended `>=`. | phase-6 |
 | `crates/rvc/src/orchestrator/coordinator/mod.rs` 1099 | 1 | — | inherit-intentionally | PTC phase (4.13): open-ended `>= Gloas` so later forks keep the payload-attestation duty rather than silently dropping it. Threaded once-per-slot `ForkName`; not gated on decode failure. | 4.13 |
 | `crates/rvc/src/orchestrator/utils.rs` 144 | 1 | — | inherit-intentionally | `uses_electra_attestation_wire`: open-ended `>= Electra` so Gloas (and later forks) keep the Electra+ wire. Index zeroing is the separate `zeroes_committee_index` (`Electra..Gloas`). | 2.8 |
+| `crates/signer-server/src/dvt/peer_client.rs` 204 | 1 | — | inherit-intentionally | DVT peer `uses_gloas_rpc`: same open-ended `>= Gloas` as the gRPC client so later forks keep Gloas-safe RPCs. | 4.20c |
+| `crates/signer/src/lib.rs` 881 | 1 | — | inherit-intentionally | `sign_block_header` gRPC factory: open-ended `>= Gloas` always uses `SignBlockHeader` so a later fork never ships Gloas-shaped body SSZ into a legacy decoder RPC. | 4.20c |
+| `crates/signer/src/lib.rs` 1109 | 1 | — | inherit-intentionally | Electra aggregate gRPC path: open-ended `>= Gloas` keeps the root RPC rather than the pre-Electra `SignAggregateAndProof` decoder. | 4.20c |
 | `crates/timing/src/clock.rs` 30 | 1 | — | inherit-intentionally | `DeadlineSchedule::for_fork`: open-ended `>= Gloas` selects the Gloas deadline set so later forks keep those offsets rather than silently reverting to pre-Gloas 3333/6667. | 4.19 |
 | `crates/rvc/src/orchestrator/attestation.rs` 417 | 2 | — | must-bound | Submission-path `SingleAttestation.data.index = "0"` inside `zeroes_committee_index`, not the Electra+ wrapper branch, so Gloas preserves the BN value. | 2.8 |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 513 | 2 | — | test-only | Test applies `index = 0` when local `is_electra`. Follows 2.3 helper. | 2.3 |
@@ -66,19 +71,19 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 673 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 417. | 2.8 |
 | `crates/rvc/src/orchestrator/utils.rs` 163 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the half-open `Electra..Gloas` predicate (2.3 / 2.8). | 2.3 |
 | `bin/rvc/tests/common/mock_bn.rs` 268 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
+| `crates/block-service/src/service/mod.rs` 619 | 3 | exhaustive | inherit-intentionally | `ssz_block_format` named Gloas `BeaconBlock` arm; exhaustive `match fork` so a new variant is a compile error, not a silent `BlockContents`/`BeaconBlock` inherit. Unknown version strings fail closed before the match. | 6.4 |
 | `crates/eth-types/src/fork.rs` 178 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
 | `crates/eth-types/src/fork.rs` 196 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
-| `crates/block-service/src/service/mod.rs` 581 | 4 | _ | decided-not-inherited | `ssz_block_format`: unblinded deneb/electra/fulu → `BlockContents`; `_ => BeaconBlock` silently skips the KZG bind. `"gloas"` would fall through. 2.7 leaves this untouched; Phase 6. | phase-6 |
-| `crates/block-service/src/service/tests/mocks.rs` 530 | 4 | _ | test-only | Test body SSZ picker. Wildcard `_ =>` Deneb body. Mirrors production string dispatch. | — |
-| `crates/block-service/src/service/tests/mocks.rs` 544 | 4 | _ | test-only | Blinded-body twin of 530. | — |
-| `crates/block-service/src/service/tests/mocks.rs` 637 | 4 | exhaustive | test-only | `matches!` on deneb/electra/fulu for `BlockContents` bytes. Closed string set; `"gloas"` is false. | — |
-| `crates/crypto/src/typed_signer.rs` 58 | 5 | — | must-bound | `SignContext::resolve` first-matches `fork_info.current_version` over `entries()`. Two `[0xFF;4]` rows (unscheduled Fulu+Gloas after 2.6) resolve Fulu, so `Gloas.fork_version()` does not round-trip. 2.6 pins the collision; 2.10 confines it to both-unscheduled. | 2.6 |
+| `crates/block-service/src/service/tests/mocks.rs` 573 | 4 | _ | test-only | Test body SSZ picker. Wildcard `_ =>` Deneb body. Mirrors production string dispatch. | — |
+| `crates/block-service/src/service/tests/mocks.rs` 587 | 4 | _ | test-only | Blinded-body twin of 573. | — |
+| `crates/block-service/src/service/tests/mocks.rs` 680 | 4 | exhaustive | test-only | `matches!` on deneb/electra/fulu for `BlockContents` bytes. Closed string set; `"gloas"` is false. | — |
+| `crates/crypto/src/typed_signer.rs` 61 | 5 | — | must-bound | `SignContext::resolve` first-matches `fork_info.current_version` over `entries()`. Two `[0xFF;4]` rows (unscheduled Fulu+Gloas after 2.6) resolve Fulu, so `Gloas.fork_version()` does not round-trip. 2.6 pins the collision; 2.10 confines it to both-unscheduled. | 2.6 |
 | `crates/eth-types/src/fork.rs` 210 | 5 | — | inherit-intentionally | `from_epoch` reverse-scans `entries()`; a new row is picked up automatically. Equal activation epochs pick the latest fork. | 2.5b |
 | `crates/eth-types/src/fork.rs` 220 | 5 | — | inherit-intentionally | `fork_version` lookup through `entries()`. New row participates by construction. | 2.5b |
 | `crates/eth-types/src/fork.rs` 229 | 5 | — | inherit-intentionally | `activation_epoch` lookup through `entries()`. Same inherit. | 2.5b |
 | `crates/eth-types/src/fork.rs` 613 | 5 | — | test-only | Eight-ness assert `entries().len() == 8`. 2.5b rewrite of the former seven-ness table. | 2.5b |
 | `crates/eth-types/src/fork.rs` 630 | 5 | — | test-only | 2.1 uniqueness test (`entries().len() == COUNT`). Sixth class-5 site; plan listed five against the pre-2.1 tree. | 2.1 |
-| `crates/rvc-spec-vectors/src/bin/gen_spec_kat.rs` 1355 | 5 | — | test-only | tar `Archive::entries()`; not `ForkSchedule`. 4.0 generator, not a fork-addition hazard. | — |
+| `crates/rvc-spec-vectors/src/bin/gen_spec_kat.rs` 1598 | 5 | — | test-only | tar `Archive::entries()`; not `ForkSchedule`. 4.0 generator, not a fork-addition hazard. | — |
 <!-- END INVENTORY -->
 
 ## Notes
@@ -124,6 +129,14 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
   `DeadlineSchedule::for_fork` uses `>= ForkName::Gloas` so a later fork
   keeps the Gloas deadline set. Inherit-intentionally — do not switch to
   `== Gloas` (that would drop a successor fork onto pre-Gloas 3333/6667).
+- **6.4 Gloas SSZ format / blinded gate.** Class 3 grew by one
+  (`service/mod.rs` 619): exhaustive `match fork` with a named Gloas
+  `BeaconBlock` arm; a new variant is a compile error. Class 4 lost the
+  old `_ => BeaconBlock` string table (unknown versions fail closed via
+  `ForkName::from_str`). Class 1 grew by one (`service/mod.rs` 641):
+  `>= Gloas` rejects blinded so a later fork keeps that gate.
+  Inherit-intentionally. Four more class-1 `>= Gloas` sites from 4.20c
+  (`grpc-signer` / `signer` / `signer-server`) are inventoried the same way.
 
 ## Post-arm verdicts (issue 2.9)
 

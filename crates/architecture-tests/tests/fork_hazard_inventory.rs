@@ -114,10 +114,10 @@ const fn inv(
 
 /// Exact per-class counts. Update together with [`INVENTORY`] and the audit doc.
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
-    (Class::GeForkName, 10),
+    (Class::GeForkName, 15),
     (Class::IndexZero, 6),
-    (Class::MatchForkName, 3),
-    (Class::StringDispatch, 4),
+    (Class::MatchForkName, 4),
+    (Class::StringDispatch, 3),
     (Class::Entries, 7),
 ];
 
@@ -143,6 +143,15 @@ const INVENTORY: &[Inv] = &[
         "4.5",
     ),
     inv(
+        "crates/block-service/src/service/mod.rs",
+        641,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "6.4",
+    ),
+    inv(
         "crates/crypto/src/signing_root.rs",
         251,
         Class::GeForkName,
@@ -159,6 +168,15 @@ const INVENTORY: &[Inv] = &[
         ">= ForkName::Capella",
         Verdict::InheritIntentionally,
         "—",
+    ),
+    inv(
+        "crates/grpc-signer/src/client.rs",
+        263,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "4.20c",
     ),
     inv(
         "crates/rvc/src/orchestrator/aggregation.rs",
@@ -204,6 +222,33 @@ const INVENTORY: &[Inv] = &[
         ">= ForkName::Electra",
         Verdict::InheritIntentionally,
         "2.8",
+    ),
+    inv(
+        "crates/signer-server/src/dvt/peer_client.rs",
+        204,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "4.20c",
+    ),
+    inv(
+        "crates/signer/src/lib.rs",
+        881,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "4.20c",
+    ),
+    inv(
+        "crates/signer/src/lib.rs",
+        1109,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "4.20c",
     ),
     inv(
         "crates/timing/src/clock.rs",
@@ -280,6 +325,15 @@ const INVENTORY: &[Inv] = &[
         "2.5b",
     ),
     inv(
+        "crates/block-service/src/service/mod.rs",
+        619,
+        Class::MatchForkName,
+        false,
+        "match fork {",
+        Verdict::InheritIntentionally,
+        "6.4",
+    ),
+    inv(
         "crates/eth-types/src/fork.rs",
         178,
         Class::MatchForkName,
@@ -299,17 +353,8 @@ const INVENTORY: &[Inv] = &[
     ),
     // Class 4
     inv(
-        "crates/block-service/src/service/mod.rs",
-        581,
-        Class::StringDispatch,
-        true,
-        "match consensus_version {",
-        Verdict::DecidedNotInherited,
-        "phase-6",
-    ),
-    inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        530,
+        573,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -318,7 +363,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        544,
+        587,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -327,7 +372,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        637,
+        680,
         Class::StringDispatch,
         false,
         "matches!(consensus_version",
@@ -337,7 +382,7 @@ const INVENTORY: &[Inv] = &[
     // Class 5
     inv(
         "crates/crypto/src/typed_signer.rs",
-        58,
+        61,
         Class::Entries,
         false,
         ".entries()",
@@ -391,7 +436,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc-spec-vectors/src/bin/gen_spec_kat.rs",
-        1355,
+        1598,
         Class::Entries,
         false,
         ".entries()",

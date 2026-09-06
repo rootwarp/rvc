@@ -163,7 +163,7 @@ async fn test_propose_block_ssz_block_root_uses_tree_hash() {
     assert!(result.is_ok());
 
     // Deserialize the SSZ and compute tree_hash_root — SSZ path should match
-    let format = ssz_block_format(false, "deneb");
+    let format = ssz_block_format(false, "deneb").unwrap();
     let (block, _) =
         beacon::ssz_deser::deserialize_beacon_block_from_ssz(&ssz_bytes, format).unwrap();
     let expected_root: [u8; 32] = block.tree_hash_root().0;
@@ -260,30 +260,74 @@ async fn test_propose_block_ssz_deneb_blinded_uses_beacon_block_format() {
     assert!(proposal.is_blinded);
 }
 
+#[tokio::test]
+async fn test_propose_block_ssz_blinded_at_gloas_returns_typed_error_without_signer() {
+    let pubkey = test_pubkey();
+    let slot = 200;
+    let beacon = MockBeaconClient::ssz(slot, 42, true);
+    let signer = MockSigner::new();
+    let mut fork = test_fork_schedule();
+    fork.gloas_fork_epoch = 0;
+
+    let signer_arc = Arc::new(signer);
+    let beacon_arc = Arc::new(beacon);
+    let service = BlockService::new(
+        signer_arc.clone(),
+        beacon_arc.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(fork),
+        [0xaa; 32],
+    );
+
+    let err = service
+        .propose_block(slot, &pubkey, 42, None)
+        .await
+        .expect_err("SSZ blinded Gloas must fail closed");
+    assert!(
+        matches!(err, BlockServiceError::BlindedNotSupportedAtGloas { slot: s } if s == slot),
+        "expected BlindedNotSupportedAtGloas, got {err:?}"
+    );
+    assert!(signer_arc.header_calls.lock().unwrap().is_empty());
+    assert!(signer_arc.block_calls.lock().unwrap().is_empty());
+    assert!(beacon_arc.publish_ssz_calls.lock().unwrap().is_empty());
+}
+
 #[test]
 fn test_ssz_block_format_blinded_always_beacon_block() {
     use beacon::ssz_deser::SszBlockFormat;
-    assert_eq!(ssz_block_format(true, "phase0"), SszBlockFormat::BeaconBlock);
-    assert_eq!(ssz_block_format(true, "capella"), SszBlockFormat::BeaconBlock);
-    assert_eq!(ssz_block_format(true, "deneb"), SszBlockFormat::BeaconBlock);
-    assert_eq!(ssz_block_format(true, "electra"), SszBlockFormat::BeaconBlock);
+    assert_eq!(ssz_block_format(true, "phase0").unwrap(), SszBlockFormat::BeaconBlock);
+    assert_eq!(ssz_block_format(true, "capella").unwrap(), SszBlockFormat::BeaconBlock);
+    assert_eq!(ssz_block_format(true, "deneb").unwrap(), SszBlockFormat::BeaconBlock);
+    assert_eq!(ssz_block_format(true, "electra").unwrap(), SszBlockFormat::BeaconBlock);
+    assert_eq!(ssz_block_format(true, "gloas").unwrap(), SszBlockFormat::BeaconBlock);
 }
 
 #[test]
 fn test_ssz_block_format_unblinded_pre_deneb_beacon_block() {
     use beacon::ssz_deser::SszBlockFormat;
-    assert_eq!(ssz_block_format(false, "phase0"), SszBlockFormat::BeaconBlock);
-    assert_eq!(ssz_block_format(false, "altair"), SszBlockFormat::BeaconBlock);
-    assert_eq!(ssz_block_format(false, "bellatrix"), SszBlockFormat::BeaconBlock);
-    assert_eq!(ssz_block_format(false, "capella"), SszBlockFormat::BeaconBlock);
+    assert_eq!(ssz_block_format(false, "phase0").unwrap(), SszBlockFormat::BeaconBlock);
+    assert_eq!(ssz_block_format(false, "altair").unwrap(), SszBlockFormat::BeaconBlock);
+    assert_eq!(ssz_block_format(false, "bellatrix").unwrap(), SszBlockFormat::BeaconBlock);
+    assert_eq!(ssz_block_format(false, "capella").unwrap(), SszBlockFormat::BeaconBlock);
 }
 
 #[test]
-fn test_ssz_block_format_unblinded_deneb_plus_block_contents() {
+fn test_ssz_block_format_unblinded_deneb_electra_fulu_gloas_unknown() {
     use beacon::ssz_deser::SszBlockFormat;
-    assert_eq!(ssz_block_format(false, "deneb"), SszBlockFormat::BlockContents);
-    assert_eq!(ssz_block_format(false, "electra"), SszBlockFormat::BlockContents);
-    assert_eq!(ssz_block_format(false, "fulu"), SszBlockFormat::BlockContents);
+    assert_eq!(ssz_block_format(false, "deneb").unwrap(), SszBlockFormat::BlockContents);
+    assert_eq!(ssz_block_format(false, "electra").unwrap(), SszBlockFormat::BlockContents);
+    assert_eq!(ssz_block_format(false, "fulu").unwrap(), SszBlockFormat::BlockContents);
+    assert_eq!(ssz_block_format(false, "gloas").unwrap(), SszBlockFormat::BeaconBlock);
+    let err = ssz_block_format(false, "unknown").unwrap_err();
+    assert!(
+        matches!(err, BlockServiceError::UnknownSszConsensusVersion(ref v) if v == "unknown"),
+        "expected UnknownSszConsensusVersion, got {err:?}"
+    );
+    let err = ssz_block_format(true, "unknown").unwrap_err();
+    assert!(
+        matches!(err, BlockServiceError::UnknownSszConsensusVersion(ref v) if v == "unknown"),
+        "blinded unknown must fail closed, got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -536,7 +580,7 @@ fn test_ssz_propose_with_large_body_through_pipeline() {
     let body = test_body_ssz();
     let ssz = build_ssz_bytes_with_kzg(100, 42, &body, &[], &[]);
 
-    let format = ssz_block_format(false, "deneb");
+    let format = ssz_block_format(false, "deneb").unwrap();
     assert_eq!(format, SszBlockFormat::BlockContents);
 
     let (block, offset) =

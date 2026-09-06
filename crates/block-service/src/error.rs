@@ -35,6 +35,14 @@ pub enum BlockServiceError {
         hex::encode(got)
     )]
     ParentRootMismatch { expected: Root, got: Root },
+
+    /// SSZ format selection has no named arm for this consensus version.
+    #[error("unrecognised consensus version for SSZ block format: {0}")]
+    UnknownSszConsensusVersion(String),
+
+    /// Blinded proposal path is pre-Gloas only; Gloas drops the duty unsigned.
+    #[error("blinded block production is not supported at Gloas (slot {slot})")]
+    BlindedNotSupportedAtGloas { slot: u64 },
 }
 
 impl From<BeaconError> for BlockServiceError {

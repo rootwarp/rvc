@@ -197,6 +197,78 @@ async fn test_propose_block_blinded() {
 }
 
 #[tokio::test]
+async fn test_propose_block_blinded_at_gloas_returns_typed_error_without_signer() {
+    let pubkey = test_pubkey();
+    let slot = 200;
+    let block = test_blinded_block(slot);
+    let beacon = MockBeaconClient::blinded(block);
+    let signer = MockSigner::new();
+    let mut fork = test_fork_schedule();
+    fork.gloas_fork_epoch = 0;
+    let gvr: Root = [0xaa; 32];
+
+    let signer_arc = Arc::new(signer);
+    let beacon_arc = Arc::new(beacon);
+    let store = test_validator_store(&pubkey);
+    let service = BlockService::new(
+        signer_arc.clone(),
+        beacon_arc.clone(),
+        Arc::new(store),
+        Arc::new(fork),
+        gvr,
+    );
+
+    let err = service
+        .propose_block(slot, &pubkey, 42, None)
+        .await
+        .expect_err("blinded Gloas must fail closed");
+    assert!(
+        matches!(err, BlockServiceError::BlindedNotSupportedAtGloas { slot: s } if s == slot),
+        "expected BlindedNotSupportedAtGloas, got {err:?}"
+    );
+    assert!(
+        signer_arc.header_calls.lock().unwrap().is_empty(),
+        "Gloas blinded must not call sign_block_header"
+    );
+    assert!(
+        signer_arc.block_calls.lock().unwrap().is_empty(),
+        "Gloas blinded must not call sign_block"
+    );
+    assert!(beacon_arc.publish_blinded_calls.lock().unwrap().is_empty());
+    assert!(beacon_arc.publish_blinded_full_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_propose_block_blinded_gloas_version_returns_typed_error_without_signer() {
+    let pubkey = test_pubkey();
+    let slot = 200;
+    let block = test_blinded_block(slot);
+    let mut beacon = MockBeaconClient::blinded(block);
+    beacon.produce_response.as_mut().unwrap().consensus_version = "gloas".to_string();
+    let signer = MockSigner::new();
+
+    let signer_arc = Arc::new(signer);
+    let service = BlockService::new(
+        signer_arc.clone(),
+        Arc::new(beacon),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+
+    let err = service
+        .propose_block(slot, &pubkey, 42, None)
+        .await
+        .expect_err("gloas consensus_version blinded must fail closed");
+    assert!(
+        matches!(err, BlockServiceError::BlindedNotSupportedAtGloas { slot: s } if s == slot),
+        "expected BlindedNotSupportedAtGloas, got {err:?}"
+    );
+    assert!(signer_arc.header_calls.lock().unwrap().is_empty());
+    assert!(signer_arc.block_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_propose_block_signing_failure() {
     let pubkey = test_pubkey();
     let slot = 100;
