@@ -116,10 +116,8 @@ use crate::rules::{
     AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
 };
 use crate::SlashingDb;
-use eth_types::{Epoch, Root, Slot};
+use eth_types::{Epoch, Root, Slot, SLOTS_PER_EPOCH};
 use observability::logging::TruncatedPubkey;
-
-use std::sync::atomic::Ordering;
 
 /// Fixed audit origin written to the `client_cn` column on INSERT.
 ///
@@ -457,7 +455,7 @@ impl SlashingDb {
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        let strict = self.strict_semantics.load(Ordering::Relaxed);
+        let strict = self.fork_aware_strict(slot / SLOTS_PER_EPOCH);
         // Run violation checks inside a closure so any error — whether a SQL
         // I/O error from `?`-propagation or an EIP-3076 violation — funnels
         // through a single ROLLBACK before we return. Without this wrapper a
@@ -538,7 +536,7 @@ impl SlashingDb {
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        let strict = self.strict_semantics.load(Ordering::Relaxed);
+        let strict = self.fork_aware_strict(target_epoch);
         // Wrap the violation-check phase so any error — SQL I/O or EIP-3076 —
         // funnels through a single ROLLBACK before we return.  See the
         // matching note in `stage_block`.

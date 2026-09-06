@@ -621,6 +621,73 @@ mod tests {
     }
 
     #[test]
+    fn test_gloas_payload_status_index_unmodified_double_vote() {
+        use slashing::{AttestationSlashingViolation, SlashingDb, SlashingError};
+        use tree_hash::TreeHash;
+
+        let schedule = finite_electra_fulu_gloas_schedule();
+        let gloas = ForkName::from_epoch(600_000, &schedule);
+        assert_eq!(gloas, ForkName::Gloas);
+
+        let empty =
+            convert_and_normalize_attestation_data(&make_test_beacon_attestation_data("0"), gloas)
+                .unwrap();
+        let full =
+            convert_and_normalize_attestation_data(&make_test_beacon_attestation_data("1"), gloas)
+                .unwrap();
+        assert_eq!(empty.index, 0, "Gloas preserves payload EMPTY=0");
+        assert_eq!(full.index, 1, "Gloas preserves payload FULL=1");
+        assert_eq!(empty.source.epoch, full.source.epoch);
+        assert_eq!(full.target.epoch, empty.target.epoch);
+
+        let empty_sr = format!("0x{}", hex::encode(empty.tree_hash_root().as_slice()));
+        let full_sr = format!("0x{}", hex::encode(full.tree_hash_root().as_slice()));
+        assert_ne!(
+            empty_sr, full_sr,
+            "payload-status index must change the object hash reaching the DB"
+        );
+
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_gloas_fork_epoch(600_000);
+        db.check_and_record_attestation(
+            "0xd1",
+            empty.source.epoch,
+            empty.target.epoch,
+            Some(empty_sr),
+            &[0u8; 32],
+        )
+        .expect("first payload-status attestation");
+        let err = db
+            .check_and_record_attestation(
+                "0xd1",
+                full.source.epoch,
+                full.target.epoch,
+                Some(full_sr),
+                &[0u8; 32],
+            )
+            .expect_err("index 0 vs 1 at the same target is a double vote");
+        assert!(
+            matches!(
+                err,
+                SlashingError::SlashableAttestation(
+                    AttestationSlashingViolation::DoubleVote { .. }
+                )
+            ),
+            "got {err:?}"
+        );
+
+        // Electra zeroing would collapse both hashes into a re-sign. 2.3/2.8
+        // must keep Gloas off that path (asserted, not re-implemented).
+        let electra_full = convert_and_normalize_attestation_data(
+            &make_test_beacon_attestation_data("1"),
+            ForkName::Electra,
+        )
+        .unwrap();
+        assert_eq!(electra_full.index, 0);
+        assert_eq!(electra_full.tree_hash_root(), empty.tree_hash_root());
+    }
+
+    #[test]
     fn test_sentinel_gloas_convert_still_zeroes_index_at_epoch_1_000_000() {
         let mut schedule = finite_electra_fulu_gloas_schedule();
         schedule.gloas_fork_epoch = u64::MAX;

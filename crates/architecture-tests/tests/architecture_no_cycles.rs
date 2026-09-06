@@ -94,6 +94,7 @@ const EXPECTED_EDGE_SERVER: (&str, &str) = ("rvc-signer-server", "rvc-telemetry"
 /// Any new production edge must be reviewed and added here deliberately —
 /// do not widen this table to silence a real layering violation.
 const SIGNER_SERVER_ALLOWED_EDGES: &[&str] = &[
+    "rvc-config", // shared `[fork_schedule]` parse with the VC (FU-33 / 4.14)
     "rvc-crypto",
     "rvc-eth-types",
     "rvc-observability",

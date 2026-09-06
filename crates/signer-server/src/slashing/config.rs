@@ -35,6 +35,11 @@ pub struct SlashingDbConfig {
     pub db_path: Option<PathBuf>,
     /// Current protection mode, derived from CLI flags and env vars.
     pub mode: SlashingProtectionMode,
+    /// Epoch at which FU-33 `None==None` leniency is disabled.
+    ///
+    /// `u64::MAX` is the far-future unscheduled sentinel (same value the VC
+    /// and this signer apply when `[fork_schedule].gloas_fork_epoch` is unset).
+    pub gloas_fork_epoch: u64,
 }
 
 impl SlashingDbConfig {
@@ -43,8 +48,14 @@ impl SlashingDbConfig {
     /// - `data_dir`: The directory that holds `signer-slashing.db` (typically the
     ///   keystore directory's parent, or an explicit `--data-dir` argument).
     /// - `disable_cli_flag`: `true` iff `--disable-slashing-protection` was passed.
+    /// - `gloas_fork_epoch`: FU-33 leniency gate; `u64::MAX` leaves pre-Gloas
+    ///   epochs on the operator-strict flag alone.
     /// - `env_allow_insecure`: reads `RVC_ALLOW_INSECURE` from the environment.
-    pub fn from_env(data_dir: Option<&std::path::Path>, disable_cli_flag: bool) -> Self {
+    pub fn from_env(
+        data_dir: Option<&std::path::Path>,
+        disable_cli_flag: bool,
+        gloas_fork_epoch: u64,
+    ) -> Self {
         let allow_insecure = std::env::var("RVC_ALLOW_INSECURE").as_deref() == Ok("true");
 
         let mode = match (disable_cli_flag, allow_insecure) {
@@ -55,7 +66,7 @@ impl SlashingDbConfig {
 
         let db_path = data_dir.map(|d| d.join("signer-slashing.db"));
 
-        Self { db_path, mode }
+        Self { db_path, mode, gloas_fork_epoch }
     }
 
     /// Validate the configuration.
@@ -99,7 +110,11 @@ mod tests {
 
     #[test]
     fn test_required_mode_no_db_path_fails() {
-        let cfg = SlashingDbConfig { db_path: None, mode: SlashingProtectionMode::Required };
+        let cfg = SlashingDbConfig {
+            db_path: None,
+            mode: SlashingProtectionMode::Required,
+            gloas_fork_epoch: u64::MAX,
+        };
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("slashing") || err.contains("protection"), "{err}");
     }
@@ -109,21 +124,29 @@ mod tests {
         let cfg = SlashingDbConfig {
             db_path: Some("/tmp/test.db".into()),
             mode: SlashingProtectionMode::Required,
+            gloas_fork_epoch: u64::MAX,
         };
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn test_disabled_cli_only_fails() {
-        let cfg = SlashingDbConfig { db_path: None, mode: SlashingProtectionMode::DisabledCliOnly };
+        let cfg = SlashingDbConfig {
+            db_path: None,
+            mode: SlashingProtectionMode::DisabledCliOnly,
+            gloas_fork_epoch: u64::MAX,
+        };
         let err = cfg.validate().unwrap_err();
         assert!(err.contains("RVC_ALLOW_INSECURE") || err.contains("insecure"), "{err}");
     }
 
     #[test]
     fn test_disabled_both_flags_ok_without_db() {
-        let cfg =
-            SlashingDbConfig { db_path: None, mode: SlashingProtectionMode::DisabledBothFlags };
+        let cfg = SlashingDbConfig {
+            db_path: None,
+            mode: SlashingProtectionMode::DisabledBothFlags,
+            gloas_fork_epoch: u64::MAX,
+        };
         assert!(cfg.validate().is_ok());
     }
 
@@ -131,8 +154,11 @@ mod tests {
     fn test_from_env_both_flags() {
         // Can't set env vars reliably in unit tests without coordination;
         // test the struct directly instead.
-        let cfg =
-            SlashingDbConfig { db_path: None, mode: SlashingProtectionMode::DisabledBothFlags };
+        let cfg = SlashingDbConfig {
+            db_path: None,
+            mode: SlashingProtectionMode::DisabledBothFlags,
+            gloas_fork_epoch: u64::MAX,
+        };
         assert_eq!(cfg.mode, SlashingProtectionMode::DisabledBothFlags);
         assert!(cfg.validate().is_ok());
     }

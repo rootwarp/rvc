@@ -9,7 +9,11 @@ use signer_server::slashing::config::{SlashingDbConfig, SlashingProtectionMode};
 
 #[test]
 fn test_refuse_without_db() {
-    let cfg = SlashingDbConfig { db_path: None, mode: SlashingProtectionMode::Required };
+    let cfg = SlashingDbConfig {
+        db_path: None,
+        mode: SlashingProtectionMode::Required,
+        gloas_fork_epoch: u64::MAX,
+    };
     let result = cfg.validate();
     assert!(result.is_err(), "should refuse to start without slashing DB");
     let msg = result.unwrap_err();
@@ -25,7 +29,11 @@ fn test_refuse_without_db() {
 
 #[test]
 fn test_disable_slashing_requires_both_flags() {
-    let cfg = SlashingDbConfig { db_path: None, mode: SlashingProtectionMode::DisabledCliOnly };
+    let cfg = SlashingDbConfig {
+        db_path: None,
+        mode: SlashingProtectionMode::DisabledCliOnly,
+        gloas_fork_epoch: u64::MAX,
+    };
     let result = cfg.validate();
     assert!(result.is_err(), "must require both flags");
     let msg = result.unwrap_err();
@@ -41,7 +49,11 @@ fn test_disable_slashing_requires_both_flags() {
 
 #[test]
 fn test_both_flags_set_allows_no_db() {
-    let cfg = SlashingDbConfig { db_path: None, mode: SlashingProtectionMode::DisabledBothFlags };
+    let cfg = SlashingDbConfig {
+        db_path: None,
+        mode: SlashingProtectionMode::DisabledBothFlags,
+        gloas_fork_epoch: u64::MAX,
+    };
     let result = cfg.validate();
     assert!(result.is_ok(), "both flags must allow starting without DB, got: {:?}", result.err());
 }
@@ -56,6 +68,7 @@ fn test_db_path_provided_is_valid() {
     let cfg = SlashingDbConfig {
         db_path: Some(tmp.path().to_path_buf()),
         mode: SlashingProtectionMode::Required,
+        gloas_fork_epoch: u64::MAX,
     };
     let result = cfg.validate();
     assert!(result.is_ok(), "providing a DB path should be valid, got: {:?}", result.err());

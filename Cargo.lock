@@ -4641,6 +4641,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rustls",
  "rustls-pemfile",
+ "rvc-config",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-grpc-signer",

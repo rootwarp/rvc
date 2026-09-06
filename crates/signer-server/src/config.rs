@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+use rvc_config::ForkScheduleConfig;
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
@@ -78,6 +79,12 @@ impl std::fmt::Display for Backend {
 #[derive(Debug, Default, Deserialize)]
 pub struct SignerConfig {
     pub signer: Option<SignerSection>,
+    /// Same `[fork_schedule]` table as the VC. Unset = Gloas unscheduled
+    /// (`u64::MAX` sentinel). FU-33 uses `gloas_fork_epoch` from here — not a
+    /// second `[signer]` knob — so a shared operator file cannot leave the
+    /// remote-signer DB lenient.
+    #[serde(default)]
+    pub fork_schedule: ForkScheduleConfig,
 }
 
 /// TLS posture for the HTTP Remote Signing API listener (FR-28/FR-29, ADR-004).
@@ -211,6 +218,9 @@ pub struct ResolvedConfig {
     pub group_commit_batch_size: Option<usize>,
     /// Milliseconds to wait for a group-commit batch to fill. `None` = default 1.
     pub group_commit_wait_to_fill_ms: Option<u64>,
+    /// Gloas fork epoch for the FU-33 `None==None` leniency gate.
+    /// `u64::MAX` is the unscheduled sentinel.
+    pub gloas_fork_epoch: u64,
     /// Prometheus metrics listen address.
     pub metrics_address: String,
     /// Opt-in SIGHUP log-level reload (owned by `main` / `init_logging`).
@@ -563,6 +573,7 @@ pub fn merge_with_cli(
         group_commit_wait_to_fill_ms: cli
             .slashing_group_commit_wait_to_fill_ms
             .or(section.group_commit_wait_to_fill_ms),
+        gloas_fork_epoch: config.fork_schedule.gloas_fork_epoch.unwrap_or(u64::MAX),
         metrics_address: cli
             .metrics_address
             .clone()
@@ -747,6 +758,7 @@ index = 1
                 network: Some("holesky".to_string()),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let resolved = merge_with_cli(config, &empty_cli()).unwrap();
         assert_eq!(
@@ -763,6 +775,7 @@ index = 1
                 network: Some("mainnet".to_string()),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let cli = ServeArgs {
             keystore_dir: Some(PathBuf::from("/ks")),
@@ -784,6 +797,7 @@ index = 1
                 network: Some("not-a-network".to_string()),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let err = merge_with_cli(config, &empty_cli()).unwrap_err().to_string();
         assert!(err.contains("unknown network"), "error: {err}");
@@ -831,6 +845,7 @@ index = 1
                 }),
                 ..Default::default()
             }),
+            ..Default::default()
         };
 
         let resolved = merge_with_cli(config, &empty_cli()).unwrap();
@@ -867,6 +882,7 @@ index = 1
                 }),
                 ..Default::default()
             }),
+            ..Default::default()
         };
 
         let cli = ServeArgs {
@@ -925,6 +941,7 @@ dry_run = true
                 dry_run: Some(true),
                 ..Default::default()
             }),
+            ..Default::default()
         };
 
         let resolved = merge_with_cli(config, &empty_cli()).unwrap();
@@ -939,6 +956,7 @@ dry_run = true
                 dry_run: Some(false),
                 ..Default::default()
             }),
+            ..Default::default()
         };
 
         let cli = ServeArgs { dry_run: true, ..empty_cli() };
@@ -1083,6 +1101,7 @@ tls_ca_cert = "/http/ca.pem"
                 }),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let resolved = merge_with_cli(config, &empty_cli()).unwrap();
         assert!(resolved.http_enabled);
@@ -1107,6 +1126,7 @@ tls_ca_cert = "/http/ca.pem"
                 }),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let cli = ServeArgs {
             keystore_dir: Some(PathBuf::from("/ks")),
@@ -1134,6 +1154,7 @@ tls_ca_cert = "/http/ca.pem"
                 }),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let err = merge_with_cli(config, &empty_cli()).unwrap_err().to_string();
         assert!(err.contains("tls_mode"), "error must name the offending field: {err}");
@@ -1148,6 +1169,7 @@ tls_ca_cert = "/http/ca.pem"
                 http: Some(HttpSection { enabled: Some(true), ..Default::default() }),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let resolved = merge_with_cli(config, &empty_cli()).unwrap();
         assert!(resolved.http_enabled);
@@ -1178,6 +1200,7 @@ tls_ca_cert = "/http/ca.pem"
                 }),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         // Explicitly pass values that equal the built-in defaults.
         let cli = ServeArgs {
@@ -1215,6 +1238,7 @@ tls_ca_cert = "/http/ca.pem"
                 network: Some("sepolia".to_string()),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let resolved = merge_with_cli(config, &empty_cli()).unwrap();
         assert_eq!(resolved.listen_address, "10.1.2.3:4444");
@@ -1257,6 +1281,7 @@ tls_ca_cert = "/http/ca.pem"
                 }),
                 ..Default::default()
             }),
+            ..Default::default()
         };
         let resolved_file = merge_with_cli(config, &empty_cli()).unwrap();
         assert_eq!(resolved_file.dvt_timeout_ms, 4242);
@@ -1277,6 +1302,7 @@ tls_ca_cert = "/http/ca.pem"
                     }),
                     ..Default::default()
                 }),
+                ..Default::default()
             };
             let cli = ServeArgs {
                 dvt_timeout: Some(DEFAULT_DVT_TIMEOUT_MS),
@@ -1294,6 +1320,39 @@ tls_ca_cert = "/http/ca.pem"
             assert_eq!(resolved.dvt_threshold, Some(3));
             assert_eq!(resolved.dvt_index, Some(0));
         }
+    }
+
+    #[test]
+    fn test_fork_schedule_toml_sets_gloas_fork_epoch_without_signer_knob() {
+        let resolved = merge_with_cli(SignerConfig::default(), &cli_with_keystore("/ks")).unwrap();
+        assert_eq!(resolved.gloas_fork_epoch, u64::MAX);
+
+        let config: SignerConfig = toml::from_str(
+            r#"
+[signer]
+keystore_dir = "/ks"
+
+[fork_schedule]
+gloas_fork_epoch = 100
+"#,
+        )
+        .expect("[fork_schedule] must parse on SignerConfig");
+        assert_eq!(config.fork_schedule.gloas_fork_epoch, Some(100));
+        let resolved = merge_with_cli(config, &empty_cli()).unwrap();
+        assert_eq!(resolved.gloas_fork_epoch, 100);
+
+        let sentinel: SignerConfig = toml::from_str(
+            r#"
+[signer]
+keystore_dir = "/ks"
+
+[fork_schedule]
+gloas_fork_epoch = "18446744073709551615"
+"#,
+        )
+        .expect("sentinel decimal string");
+        let resolved = merge_with_cli(sentinel, &empty_cli()).unwrap();
+        assert_eq!(resolved.gloas_fork_epoch, u64::MAX);
     }
 
     /// Defaults are named constants in this module — a source-level pin so

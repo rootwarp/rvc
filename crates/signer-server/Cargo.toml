@@ -81,6 +81,7 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { workspace = true, features = ["util"] }
 rustls-pemfile = "2"
 prometheus.workspace = true
+rvc-config.workspace = true
 telemetry.workspace = true
 # release_max_level_debug: trace! (and below-cap spans) compile to nothing in
 # --release; debug! stays RUST_LOG-switchable. The `log` bridge feature is NOT

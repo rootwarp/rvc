@@ -326,6 +326,7 @@ mod tests {
             init_slashing_db: false,
             group_commit_batch_size: None,
             group_commit_wait_to_fill_ms: None,
+            gloas_fork_epoch: u64::MAX,
             metrics_address: format!("127.0.0.1:{metrics}"),
             enable_log_reload: false,
             allowed_client_cns: None,

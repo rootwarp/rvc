@@ -34,8 +34,11 @@ pub(crate) fn open_slashing_db(
     // slashing protection.
     let data_dir = resolved.data_dir.as_deref().or_else(|| resolved.keystore_dir.parent());
 
-    let slashing_cfg =
-        slashing::SlashingDbConfig::from_env(data_dir, resolved.disable_slashing_protection);
+    let slashing_cfg = slashing::SlashingDbConfig::from_env(
+        data_dir,
+        resolved.disable_slashing_protection,
+        resolved.gloas_fork_epoch,
+    );
     slashing_cfg.validate().map_err(|e| {
         error!(error = %e, "slashing protection configuration error");
         ServerError::slashing_db(e)
@@ -103,6 +106,7 @@ pub(crate) fn open_slashing_db(
                     db_path.display()
                 )));
             }
+            db.set_gloas_fork_epoch(slashing_cfg.gloas_fork_epoch);
             db.set_group_commit(
                 ::slashing::GroupCommitConfig::try_from_knobs(
                     resolved.group_commit_batch_size,
@@ -161,6 +165,7 @@ mod tests {
             init_slashing_db: false,
             group_commit_batch_size: None,
             group_commit_wait_to_fill_ms: None,
+            gloas_fork_epoch: u64::MAX,
             metrics_address: "127.0.0.1:0".to_string(),
             enable_log_reload: false,
             allowed_client_cns: None,
@@ -309,6 +314,59 @@ mod tests {
         let db = open_slashing_db(&resolved).expect("init should create fresh DB");
         assert!(db.is_some());
         assert!(resolved.data_dir.as_ref().unwrap().join("signer-slashing.db").exists());
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("RVC_ALLOW_INSECURE", v) },
+            None => unsafe { std::env::remove_var("RVC_ALLOW_INSECURE") },
+        }
+    }
+
+    #[test]
+    fn test_open_slashing_db_fork_schedule_gloas_epoch_rejects_null_root_double_vote() {
+        let _g = env_lock();
+        let prev = std::env::var("RVC_ALLOW_INSECURE").ok();
+        unsafe { std::env::remove_var("RVC_ALLOW_INSECURE") };
+
+        let tmp = TempDir::new().unwrap();
+        let keystore_dir = tmp.path().join("keystores");
+        std::fs::create_dir_all(&keystore_dir).unwrap();
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+
+        // Operator surface is `[fork_schedule]`, the same table the VC reads.
+        // `[signer] gloas_fork_epoch` must not exist and is not set here.
+        let cfg_path = tmp.path().join("signer.toml");
+        std::fs::write(
+            &cfg_path,
+            format!(
+                "[signer]\nkeystore_dir = \"{}\"\n\n[fork_schedule]\ngloas_fork_epoch = 100\n",
+                keystore_dir.display()
+            ),
+        )
+        .unwrap();
+        let file_cfg = crate::config::load_config(&cfg_path).expect("load signer.toml");
+        assert_eq!(file_cfg.fork_schedule.gloas_fork_epoch, Some(100));
+
+        let cli = crate::config::ServeArgs {
+            keystore_dir: Some(keystore_dir),
+            data_dir: Some(data_dir),
+            init_slashing_db: true,
+            insecure: true,
+            ..Default::default()
+        };
+        let resolved = crate::config::merge_with_cli(file_cfg, &cli).expect("merge");
+        assert_eq!(resolved.gloas_fork_epoch, 100);
+
+        let db = open_slashing_db(&resolved)
+            .expect("init should create fresh DB")
+            .expect("protection required");
+        const GVR: [u8; 32] = [0u8; 32];
+        db.check_and_record_attestation("0xpk", 99, 100, None, &GVR)
+            .expect("first Gloas attestation");
+        let err = db
+            .check_and_record_attestation("0xpk", 99, 100, None, &GVR)
+            .expect_err("fork_schedule alone must not leave the remote-signer DB lenient");
+        assert!(err.to_string().contains("double vote"), "expected double vote, got: {err}");
 
         match prev {
             Some(v) => unsafe { std::env::set_var("RVC_ALLOW_INSECURE", v) },

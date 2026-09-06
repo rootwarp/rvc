@@ -29,7 +29,7 @@ use crate::stage::{
     persist_reserved_row, with_immediate_txn, CommittedReservation, ReservationKind, AUDIT_ORIGIN,
 };
 use crate::SlashingDb;
-use eth_types::{Epoch, Root, Slot};
+use eth_types::{Epoch, Root, Slot, SLOTS_PER_EPOCH};
 
 /// Operator knobs for slashing-DB group commit.
 ///
@@ -600,9 +600,9 @@ fn check_spec_in_txn(
     spec: &ReserveSpec,
 ) -> Result<CommittedReservation, SlashingError> {
     wait_eval_gate(db);
-    let strict = db.strict_semantics.load(Ordering::Relaxed);
     match spec {
         ReserveSpec::Block { pubkey, slot, signing_root_hex, .. } => {
+            let strict = db.fork_aware_strict(*slot / SLOTS_PER_EPOCH);
             let watermark = read_watermark(conn, pubkey, WatermarkKind::Block)?;
             let history = TargetedSqlBlockHistory::new(conn, pubkey);
             let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
@@ -619,6 +619,7 @@ fn check_spec_in_txn(
         ReserveSpec::Attestation {
             pubkey, source_epoch, target_epoch, signing_root_hex, ..
         } => {
+            let strict = db.fork_aware_strict(*target_epoch);
             let wm_source = read_watermark(conn, pubkey, WatermarkKind::AttestationSource)?;
             let wm_target = read_watermark(conn, pubkey, WatermarkKind::AttestationTarget)?;
             let history = TargetedSqlAttestationHistory::new(conn, pubkey);

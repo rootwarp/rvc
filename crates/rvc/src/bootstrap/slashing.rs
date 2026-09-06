@@ -67,6 +67,12 @@ pub fn open_slashing_db(
         info!("Strict slashing semantics enabled: null-root re-signs will be rejected");
     }
 
+    // FU-33: Gloas epochs always reject None==None, even when the operator
+    // left strict_slashing_semantics off. Unset / sentinel keeps existing
+    // tests and pre-Gloas networks on the lenient arm.
+    let gloas_fork_epoch = config.fork_schedule.gloas_fork_epoch.unwrap_or(u64::MAX);
+    db.set_gloas_fork_epoch(gloas_fork_epoch);
+
     // Step 2b: Check slashing DB file permissions
     if strict_permissions {
         if let Err(e) = db.check_file_permissions_strict() {
@@ -265,6 +271,31 @@ mod tests {
 
         let handles = open_slashing_db(&config, false, true).expect("open with strict semantics");
         assert!(handles.db.check_integrity().is_ok());
+    }
+
+    #[test]
+    fn test_open_slashing_db_gloas_epoch_rejects_null_root_double_vote() {
+        let dir = TempDir::new().unwrap();
+        let keystore = dir.path().join("keys");
+        std::fs::create_dir_all(&keystore).unwrap();
+        let db_path = dir.path().join("slashing.db");
+        seed_valid_db(&db_path);
+
+        let mut config = config_with_paths(&keystore, &db_path);
+        config.disable_keystore_locking = true;
+        config.fork_schedule.gloas_fork_epoch = Some(100);
+
+        let handles = open_slashing_db(&config, false, false).expect("open");
+        let gvr = [0u8; 32];
+        handles
+            .db
+            .check_and_record_attestation("0xpk", 99, 100, None, &gvr)
+            .expect("first Gloas attestation");
+        let err = handles
+            .db
+            .check_and_record_attestation("0xpk", 99, 100, None, &gvr)
+            .expect_err("Gloas None==None must be a double vote");
+        assert!(err.to_string().contains("double vote"), "expected double vote, got: {err}");
     }
 
     #[test]
