@@ -41,7 +41,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Run clippy (dvt feature — Gate 1 secret-sink coverage)
         run: cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings
@@ -173,7 +173,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Generate coverage report
-        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --locked --workspace --lcov --output-path lcov.info
 
       - name: Generate coverage summary
         id: coverage

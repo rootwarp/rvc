@@ -99,6 +99,11 @@ ssz08 = { package = "ethereum_ssz", version = "0.8.3" }
 ssz_types = "0.10.1"
 tree_hash = "0.9"
 tree_hash_derive = "0.9"
+# Exact =0.3.0 (no caret). Do not enable ethereum-types.
+libssz = { version = "=0.3.0", default-features = false, features = ["sha2"] }
+libssz-merkle = { version = "=0.3.0", default-features = false, features = ["sha2"] }
+libssz-types = { version = "=0.3.0", default-features = false, features = ["sha2"] }
+libssz-derive = { version = "=0.3.0", default-features = false, features = ["sha2"] }
 sha2 = "0.10"
 url = "2"
 scrypt = "0.11"
