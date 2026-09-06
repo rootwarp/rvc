@@ -11,6 +11,12 @@ description = "Spec vectors + KAT codegen"
 [lints]
 workspace = true
 
+[features]
+default = []
+# Exposes Gloas/SPEC_* KAT constants to downstream test targets.
+# Enable only from consumers' [dev-dependencies].
+test-fixtures = []
+
 [dependencies]
 hex.workspace = true
 serde_yaml.workspace = true

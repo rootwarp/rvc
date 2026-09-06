@@ -6,6 +6,7 @@
 //!
 //! provenance-source: ethereum/consensus-specs@v1.7.0-beta.0 ethereum/ssz-specs@v0.1.0
 //! provenance-generated: id=progressive sha256=6ead45d55e0b7512dd6fd05b30609d6c030ec0a0235cc37f5cffabf00a9ba401
+//! provenance-generated: id=signing-roots sha256=864ff5176a0b83e9b3e12e2bc03688e32def59e39cbde8816be4a0b15d7962eb
 //! provenance-generator: gen-spec-kat 0.7.0
 //! provenance-date: 2026-09-06
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_0/roots.yaml sha256:4fd39bfafadb40d3fca6a6b77e712d1535a0df2fee7ed2d58607cb518a655c22
@@ -13,6 +14,7 @@
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_1/roots.yaml sha256:64150d0e41e95c1a47bf3e67cc36ff1cfb48077e05d6e3ed3e18f814d85a0a72
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_1/serialized.ssz_snappy sha256:b9db39ec6d2d1add2c11d9ee7c24e98fd88ee3db80c81a0b2417416fabb2f608
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/progressive/roots.yaml sha256:6ead45d55e0b7512dd6fd05b30609d6c030ec0a0235cc37f5cffabf00a9ba401
+//! provenance-input: crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml sha256:864ff5176a0b83e9b3e12e2bc03688e32def59e39cbde8816be4a0b15d7962eb
 
 /// Chunk counts from eth-ssz-specs `PROGRESSIVE_CHUNK_COUNTS` (issue 3.4a).
 pub const SPEC_PROGRESSIVE_CHUNK_COUNTS: &[u32] = &[0, 1, 2, 4, 5, 6, 20, 21, 22, 84, 85, 86];
@@ -117,3 +119,23 @@ pub const SPEC_PROGRESSIVE_ACTIVE_FIELD_ROOTS: &[(u32, &str, &str)] = &[
     (13, "all_ones", SPEC_PROGRESSIVE_ACTIVE_FIELDS_13_ALL_ONES),
     (13, "sparse_bit0_clear", SPEC_PROGRESSIVE_ACTIVE_FIELDS_13_SPARSE_BIT0_CLEAR),
 ];
+
+/// PayloadAttestationData hash tree root from 4.0 pyspec signing-roots artifact.
+pub const SPEC_GLOAS_PAYLOADATTESTATIONDATA_ROOT: &str =
+    "e03211fd0eb67b3042c3a42bf70a92f8d782e27a913be1db6a50d9f7d74c4cab";
+
+/// PayloadAttestationMessage hash tree root from 4.0 pyspec signing-roots artifact.
+pub const SPEC_GLOAS_PAYLOADATTESTATIONMESSAGE_ROOT: &str =
+    "91ff2e57c1d0f5c85614d8dc315a80f7620db016797576afd49e95f8ca98d7a4";
+
+/// ProposerPreferences hash tree root from 4.0 pyspec signing-roots artifact.
+pub const SPEC_GLOAS_PROPOSERPREFERENCES_ROOT: &str =
+    "655562e907de72391c5313b1dc03490d47774d84655aae26de5929d0bd1fa1b9";
+
+/// PayloadAttestationData signing root copied from the 4.0 pyspec artifact.
+pub const KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT: &str =
+    "fe0a6740a1b866580397fa5bb3467da40a74caf78a6c052ba1473054d2cb22b4";
+
+/// ProposerPreferences signing root copied from the 4.0 pyspec artifact.
+pub const KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT: &str =
+    "850f7bd0d76cf6c1bdef307d46936af098ff2f94cb5dd163db2757c02bffa185";

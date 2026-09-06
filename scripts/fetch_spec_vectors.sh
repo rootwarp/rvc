@@ -19,6 +19,7 @@ SHA_RE='^[0-9a-f]{64}$'
 PY_RE='^[0-9]+\.[0-9]+\.[0-9]+$'
 SCRIPT_RE='^scripts/[A-Za-z0-9._-]+\.py$'
 OUTPUT_PREFIX='crates/rvc-spec-vectors/vectors-generated/'
+ARGV_TOKEN_RE='^(--[A-Za-z0-9-]+|0x[0-9a-fA-F]+|[A-Za-z0-9._-]+)$'
 
 die() {
     printf 'error: %s\n' "$*" >&2
@@ -337,13 +338,33 @@ hint: script must be scripts/<name>.py"
     fi
     require_relpath output "$gen_output"
     require_relpath script "$gen_script"
-    if [[ "$gen_output" != "${OUTPUT_PREFIX}${gen_id}/roots.yaml" ]]; then
-        die "generated output '$gen_output' must be ${OUTPUT_PREFIX}${gen_id}/roots.yaml"
+    if [[ "$gen_output" != "${OUTPUT_PREFIX}${gen_id}/roots.yaml" &&
+        "$gen_output" != "${OUTPUT_PREFIX}${gen_id}/signing_roots.yaml" ]]; then
+        die "generated output '$gen_output' must be ${OUTPUT_PREFIX}${gen_id}/roots.yaml or signing_roots.yaml"
     fi
-    if [[ "$gen_argv" != "--out $gen_output" ]]; then
-        die "generated argv '$gen_argv' must be '--out $gen_output'"
-    fi
+    validate_generated_argv
     require_sha "$gen_sha"
+}
+
+# argv is space-separated tokens: --out <output> then optional --flag 0xhex pairs (4.0).
+validate_generated_argv() {
+    local tok expected
+    expected="--out $gen_output"
+    if [[ "$gen_argv" != "$expected" && "$gen_argv" != "$expected "* ]]; then
+        die "generated argv '$gen_argv' must start with '--out $gen_output'"
+    fi
+    # shellcheck disable=SC2086
+    set -- $gen_argv
+    if [[ "$1" != "--out" || "$2" != "$gen_output" ]]; then
+        die "generated argv '$gen_argv' must start with '--out $gen_output'"
+    fi
+    shift 2
+    for tok in "$@"; do
+        if [[ ! "$tok" =~ $ARGV_TOKEN_RE ]]; then
+            die "invalid generated argv token '$tok' in $LOCK
+hint: extra tokens must be --flags, 0x-prefixed hex (fork version / GVR), or a spec tag"
+        fi
+    done
 }
 
 foreach_generated() {
@@ -443,9 +464,11 @@ hint: add --hash=sha256:$actual to $rel"
     fi
 
     mkdir -p "$(dirname -- "$output_path")"
+    # shellcheck disable=SC2086
+    set -- $gen_argv
     if ! (
         cd "$REPO_ROOT"
-        PYTHONHASHSEED=0 "$venv/bin/python" "$gen_script" --out "$gen_output"
+        PYTHONHASHSEED=0 "$venv/bin/python" "$gen_script" "$@"
     ); then
         rm -rf -- "$venv" "$wheeld"
         die "recipe failed: $gen_script"

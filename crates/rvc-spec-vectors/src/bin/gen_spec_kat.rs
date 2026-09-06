@@ -1,8 +1,12 @@
-//! Emit `spec_kat.rs` (`SPEC_PROGRESSIVE_*`) from vector files.
+//! Emit `spec_kat.rs` (`SPEC_PROGRESSIVE_*`, `SPEC_GLOAS_*`, `KAT_GLOAS_*`)
+//! from vector files.
 //!
 //! Argv only: `--vectors <dir> --out <path>`. L1 roots are copied from the
 //! 3.4b pyspec artifact (`vectors-generated/progressive/roots.yaml`), never
-//! from shipped JSON `root` fields (`mix_in_length`-wrapped).
+//! from shipped JSON `root` fields (`mix_in_length`-wrapped). Gloas container
+//! roots come from `ssz_static/<Container>/**/roots.yaml` when present, else
+//! the 4.0 pyspec artifact. L3 signing roots are copied from
+//! `gen_signing_roots.py` output; this binary never computes a domain.
 
 #![forbid(unsafe_code)]
 
@@ -32,6 +36,16 @@ const REQUIRED_PATTERNS: &[&str] = &["all_ones", "sparse_bit0_clear"];
 
 const ZERO_ROOT_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+const PROGRESSIVE_ID: &str = "progressive";
+const SIGNING_ROOTS_ID: &str = "signing-roots";
+
+/// P4 ssz_static handlers only (issue 4.0). Const name is `SPEC_GLOAS_<CONTAINER>_ROOT`.
+const GLOAS_SSZ_STATIC: &[(&str, &str)] = &[
+    ("PayloadAttestationData", "SPEC_GLOAS_PAYLOADATTESTATIONDATA_ROOT"),
+    ("PayloadAttestationMessage", "SPEC_GLOAS_PAYLOADATTESTATIONMESSAGE_ROOT"),
+    ("ProposerPreferences", "SPEC_GLOAS_PROPOSERPREFERENCES_ROOT"),
+];
+
 fn main() -> ExitCode {
     match run(std::env::args_os()) {
         Ok(()) => ExitCode::SUCCESS,
@@ -55,41 +69,77 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         .join("../..")
         .canonicalize()
         .map_err(|e| format!("canonicalize workspace root: {e}"))?;
-    let progressive = crate_dir.join("vectors-generated/progressive/roots.yaml");
-    if !progressive.is_file() {
-        return Err(format!(
-            "missing 3.4b artifact (pyspec pre-images, not mix_in_length JSON): {}",
-            progressive.display()
-        ));
-    }
-    refuse_symlink(&progressive)?;
     let lock_path = crate_dir.join("vectors.lock");
     let lock = read_to_string(&lock_path)?;
     let (spec_tag, ssz_tag) = lock_tags(&lock)?;
-    let generated = lock_generated_pin(&lock)?;
-
-    let artifact = read_to_string(&progressive)?;
-    let parsed = parse_progressive_artifact(&artifact)?;
-    parsed.validate()?;
+    let generated = lock_generated_pins(&lock)?;
+    require_generated_id(&generated, PROGRESSIVE_ID)?;
+    require_generated_id(&generated, SIGNING_ROOTS_ID)?;
 
     let mut inputs = Vec::new();
-    push_input(&mut inputs, &workspace, &progressive)?;
-    for path in collect_ssz_static_inputs(&args.vectors)? {
+    let mut progressive_parsed = None;
+    let mut signing_artifact = None;
+    for pin in &generated {
+        let path = workspace.join(&pin.output);
+        if !path.is_file() {
+            return Err(format!(
+                "missing [[generated]] artifact id={}: {}",
+                pin.id,
+                path.display()
+            ));
+        }
+        refuse_symlink(&path)?;
+        let bytes = fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let digest = hex::encode(Sha256::digest(&bytes));
+        if digest != pin.sha256 {
+            return Err(format!(
+                "[[generated]] id={} digest mismatch: lock {} disk {}",
+                pin.id, pin.sha256, digest
+            ));
+        }
+        let text = String::from_utf8(bytes)
+            .map_err(|e| format!("{} is not utf-8: {e}", path.display()))?;
+        if text.to_ascii_lowercase().contains("remerkleable") {
+            return Err(format!(
+                "[[generated]] id={} artifact mentions remerkleable (D15): {}",
+                pin.id,
+                path.display()
+            ));
+        }
+        if pin.id == PROGRESSIVE_ID {
+            let parsed = parse_progressive_artifact(&text)?;
+            parsed.validate()?;
+            progressive_parsed = Some(parsed);
+        }
+        if pin.id == SIGNING_ROOTS_ID {
+            signing_artifact = Some(parse_signing_roots_artifact(&text)?);
+        }
         push_input(&mut inputs, &workspace, &path)?;
+    }
+    let parsed = progressive_parsed
+        .ok_or_else(|| format!("vectors.lock [[generated]] missing id={PROGRESSIVE_ID}"))?;
+    let signing = signing_artifact
+        .ok_or_else(|| format!("vectors.lock [[generated]] missing id={SIGNING_ROOTS_ID}"))?;
+
+    let ssz_static_files = collect_ssz_static_inputs(&args.vectors)?;
+    for path in &ssz_static_files {
+        push_input(&mut inputs, &workspace, path)?;
     }
     inputs.sort_by(|a, b| a.rel.cmp(&b.rel));
     inputs.dedup_by(|a, b| a.rel == b.rel);
 
+    let gloas = resolve_gloas_kat(&ssz_static_files, &signing)?;
+
     let source = format!("ethereum/consensus-specs@{spec_tag} ethereum/ssz-specs@{ssz_tag}");
-    let generated_pin = format!("id={} sha256={}", generated.id, generated.sha256);
     let generator = format!("{GENERATOR_NAME} {GENERATOR_VERSION}");
     let body = render(&RenderInput {
         date: DATE_PLACEHOLDER,
         source: &source,
-        generated: &generated_pin,
+        generated: &generated,
         generator: &generator,
         inputs: &inputs,
         parsed: &parsed,
+        gloas: &gloas,
     })?;
 
     let existing = fs::read_to_string(&args.out).ok();
@@ -234,49 +284,85 @@ fn lock_tags(lock: &str) -> Result<(String, String), String> {
 
 struct GeneratedPin {
     id: String,
+    output: String,
     sha256: String,
 }
 
-/// Names the `[[generated]]` pin in the header. Disk re-check of that digest is 3.6.
-fn lock_generated_pin(lock: &str) -> Result<GeneratedPin, String> {
+fn require_generated_id(pins: &[GeneratedPin], id: &str) -> Result<(), String> {
+    if pins.iter().any(|p| p.id == id) {
+        Ok(())
+    } else {
+        Err(format!("vectors.lock [[generated]] missing id={id}"))
+    }
+}
+
+fn finish_generated_pin(
+    id: Option<String>,
+    output: Option<String>,
+    sha256: Option<String>,
+) -> Result<GeneratedPin, String> {
+    match (id, output, sha256) {
+        (Some(id), Some(output), Some(sha256))
+            if !id.is_empty()
+                && !output.is_empty()
+                && sha256.len() == 64
+                && sha256.bytes().all(|b| b.is_ascii_hexdigit()) =>
+        {
+            Ok(GeneratedPin { id, output, sha256 })
+        }
+        _ => Err("vectors.lock [[generated]] missing id, output, or sha256".into()),
+    }
+}
+
+/// Names every `[[generated]]` pin in the header. Disk re-check of those digests is 3.6.
+fn lock_generated_pins(lock: &str) -> Result<Vec<GeneratedPin>, String> {
+    let mut pins = Vec::new();
     let mut in_block = false;
     let mut id = None;
+    let mut output = None;
     let mut sha256 = None;
+    let mut flush = |id: &mut Option<String>,
+                     output: &mut Option<String>,
+                     sha256: &mut Option<String>|
+     -> Result<(), String> {
+        if id.is_none() && output.is_none() && sha256.is_none() {
+            return Ok(());
+        }
+        pins.push(finish_generated_pin(id.take(), output.take(), sha256.take())?);
+        Ok(())
+    };
     for line in lock.lines() {
         let line = line.trim();
         if line == "[[generated]]" {
-            if in_block {
-                break;
-            }
+            flush(&mut id, &mut output, &mut sha256)?;
             in_block = true;
             continue;
         }
         if !in_block {
             continue;
         }
-        if line.is_empty()
-            || line.starts_with('#')
-            || line.starts_with("[[")
-            || line.starts_with("archive ")
-        {
-            break;
+        if line.is_empty() || line.starts_with("[[") || line.starts_with("archive ") {
+            flush(&mut id, &mut output, &mut sha256)?;
+            in_block = false;
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
         }
         if let Some(v) = line.strip_prefix("id=") {
             id = Some(v.trim().to_owned());
+        } else if let Some(v) = line.strip_prefix("output=") {
+            output = Some(v.trim().to_owned());
         } else if let Some(v) = line.strip_prefix("sha256=") {
             sha256 = Some(v.trim().to_ascii_lowercase());
         }
     }
-    match (id, sha256) {
-        (Some(id), Some(sha256))
-            if !id.is_empty()
-                && sha256.len() == 64
-                && sha256.bytes().all(|b| b.is_ascii_hexdigit()) =>
-        {
-            Ok(GeneratedPin { id, sha256 })
-        }
-        _ => Err("vectors.lock [[generated]] missing id or sha256".into()),
+    flush(&mut id, &mut output, &mut sha256)?;
+    if pins.is_empty() {
+        return Err("vectors.lock [[generated]] missing id, output, or sha256".into());
     }
+    pins.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(pins)
 }
 
 struct ProgressiveVectors {
@@ -358,7 +444,7 @@ fn yaml_seq<'a>(
     mapping
         .get(&key)
         .and_then(serde_yaml::Value::as_sequence)
-        .ok_or_else(|| format!("missing sequence field `{field}` in 3.4b artifact"))
+        .ok_or_else(|| format!("missing sequence field `{field}` in artifact"))
 }
 
 fn yaml_u32(mapping: &serde_yaml::Mapping, field: &str) -> Result<u32, String> {
@@ -387,13 +473,129 @@ fn normalize_root_hex(raw: &str) -> Result<String, String> {
     Ok(s.to_ascii_lowercase())
 }
 
+fn path_has_component(path: &Path, name: &str) -> bool {
+    path.components().any(|c| c.as_os_str() == name)
+}
+
+struct SigningRootsArtifact {
+    containers: BTreeMap<String, String>,
+    signing_roots: BTreeMap<String, String>,
+}
+
+fn parse_signing_roots_artifact(text: &str) -> Result<SigningRootsArtifact, String> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|e| format!("parse signing_roots.yaml: {e}"))?;
+    let mapping = value.as_mapping().ok_or("signing_roots.yaml must be a mapping")?;
+    let seq = yaml_seq(mapping, "containers")?;
+    let mut containers = BTreeMap::new();
+    let mut signing_roots = BTreeMap::new();
+    for (i, item) in seq.iter().enumerate() {
+        let item = item
+            .as_mapping()
+            .ok_or_else(|| format!("signing_roots.yaml containers[{i}] must be a mapping"))?;
+        let name = yaml_string(item, "name")?;
+        if name.is_empty() {
+            return Err(format!("signing_roots.yaml containers[{i}] name is empty"));
+        }
+        let root = normalize_root_hex(&yaml_string(item, "root")?)?;
+        if containers.insert(name.clone(), root).is_some() {
+            return Err(format!("duplicate signing_roots.yaml container {name}"));
+        }
+        if item.get(serde_yaml::Value::String("signing_root".into())).is_some() {
+            let signing = normalize_root_hex(&yaml_string(item, "signing_root")?)?;
+            signing_roots.insert(name, signing);
+        }
+    }
+    Ok(SigningRootsArtifact { containers, signing_roots })
+}
+
+fn parse_ssz_static_root(text: &str) -> Result<String, String> {
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(text).map_err(|e| format!("parse ssz_static roots.yaml: {e}"))?;
+    let mapping = value.as_mapping().ok_or("ssz_static roots.yaml must be a mapping")?;
+    normalize_root_hex(&yaml_string(mapping, "root")?)
+}
+
+fn official_ssz_static_root(
+    files: &[PathBuf],
+    container: &str,
+) -> Result<Option<(PathBuf, String)>, String> {
+    let mut matches: Vec<&PathBuf> = files
+        .iter()
+        .filter(|path| {
+            path.file_name().and_then(|n| n.to_str()) == Some("roots.yaml")
+                && path_has_component(path, SSZ_STATIC)
+                && path_has_component(path, container)
+        })
+        .collect();
+    matches.sort();
+    let Some(path) = matches.first() else {
+        return Ok(None);
+    };
+    let text = read_to_string(path)?;
+    let root = parse_ssz_static_root(&text)?;
+    Ok(Some(((*path).clone(), root)))
+}
+
+struct GloasRoot {
+    container: &'static str,
+    const_name: &'static str,
+    hex: String,
+    source: String,
+}
+
+struct GloasKat {
+    containers: Vec<GloasRoot>,
+    payload_attestation_signing_root: String,
+    proposer_preferences_signing_root: String,
+}
+
+fn resolve_gloas_kat(
+    ssz_static_files: &[PathBuf],
+    artifact: &SigningRootsArtifact,
+) -> Result<GloasKat, String> {
+    let mut containers = Vec::new();
+    for (name, const_name) in GLOAS_SSZ_STATIC {
+        let Some(hex) = artifact.containers.get(*name) else {
+            return Err(format!(
+                "blocked: no ssz_static case and no pyspec artifact root for {name} (ADR-005 / D15)"
+            ));
+        };
+        if let Some((path, official)) = official_ssz_static_root(ssz_static_files, name)? {
+            if official != *hex {
+                return Err(format!(
+                    "ssz_static {} root {official} disagrees with pyspec object root {hex} for {name}",
+                    path.display()
+                ));
+            }
+        }
+        containers.push(GloasRoot {
+            container: name,
+            const_name,
+            hex: hex.clone(),
+            source: "4.0 pyspec signing-roots artifact".to_owned(),
+        });
+    }
+    let payload_attestation_signing_root =
+        artifact.signing_roots.get("PayloadAttestationData").cloned().ok_or_else(|| {
+            "blocked: signing_roots.yaml missing PayloadAttestationData signing_root (D28)"
+                .to_owned()
+        })?;
+    let proposer_preferences_signing_root =
+        artifact.signing_roots.get("ProposerPreferences").cloned().ok_or_else(|| {
+            "blocked: signing_roots.yaml missing ProposerPreferences signing_root (D28)".to_owned()
+        })?;
+    Ok(GloasKat { containers, payload_attestation_signing_root, proposer_preferences_signing_root })
+}
+
 struct RenderInput<'a> {
     date: &'a str,
     source: &'a str,
-    generated: &'a str,
+    generated: &'a [GeneratedPin],
     generator: &'a str,
     inputs: &'a [InputHash],
     parsed: &'a ProgressiveVectors,
+    gloas: &'a GloasKat,
 }
 
 fn render(input: &RenderInput<'_>) -> Result<String, String> {
@@ -405,7 +607,13 @@ fn render(input: &RenderInput<'_>) -> Result<String, String> {
     writeln!(out, "//! # Provenance").map_err(write_err)?;
     writeln!(out, "//!").map_err(write_err)?;
     writeln!(out, "//! provenance-source: {}", input.source).map_err(write_err)?;
-    writeln!(out, "//! provenance-generated: {}", input.generated).map_err(write_err)?;
+    if input.generated.is_empty() {
+        return Err("no [[generated]] pins in provenance header".into());
+    }
+    for pin in input.generated {
+        writeln!(out, "//! provenance-generated: id={} sha256={}", pin.id, pin.sha256)
+            .map_err(write_err)?;
+    }
     writeln!(out, "//! provenance-generator: {}", input.generator).map_err(write_err)?;
     writeln!(out, "{PROVENANCE_DATE_PREFIX} {}", input.date).map_err(write_err)?;
     if input.inputs.is_empty() {
@@ -491,8 +699,31 @@ fn render(input: &RenderInput<'_>) -> Result<String, String> {
         writeln!(out, "    ({width}, \"{pattern}\", {name}),").map_err(write_err)?;
     }
     writeln!(out, "];").map_err(write_err)?;
+    writeln!(out).map_err(write_err)?;
 
-    Ok(out)
+    for item in &input.gloas.containers {
+        emit_hex_const(
+            &mut out,
+            item.const_name,
+            &item.hex,
+            &format!("{} hash tree root from {}.", item.container, item.source),
+        )?;
+    }
+
+    emit_hex_const(
+        &mut out,
+        "KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT",
+        &input.gloas.payload_attestation_signing_root,
+        "PayloadAttestationData signing root copied from the 4.0 pyspec artifact.",
+    )?;
+    emit_hex_const(
+        &mut out,
+        "KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT",
+        &input.gloas.proposer_preferences_signing_root,
+        "ProposerPreferences signing root copied from the 4.0 pyspec artifact.",
+    )?;
+
+    Ok(format!("{}\n", out.trim_end()))
 }
 
 fn emit_hex_const(out: &mut String, name: &str, hex: &str, doc: &str) -> Result<(), String> {

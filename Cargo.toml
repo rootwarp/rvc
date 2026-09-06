@@ -45,6 +45,7 @@ web3signer-wire = { path = "crates/web3signer-wire", package = "rvc-web3signer-w
 signer-proto = { path = "crates/signer-proto", package = "rvc-signer-proto" }
 signer-server = { path = "crates/signer-server", package = "rvc-signer-server" }
 rvc-test-support = { path = "crates/rvc-test-support" }
+rvc-spec-vectors = { path = "crates/rvc-spec-vectors" }
 
 # External
 async-trait = "0.1"

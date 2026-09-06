@@ -19,3 +19,14 @@ script=scripts/gen_progressive_vectors.py
 argv=--out crates/rvc-spec-vectors/vectors-generated/progressive/roots.yaml
 output=crates/rvc-spec-vectors/vectors-generated/progressive/roots.yaml
 sha256=6ead45d55e0b7512dd6fd05b30609d6c030ec0a0235cc37f5cffabf00a9ba401
+
+# Gloas container HTRs + L3 signing roots from eth-ssz-specs==0.1.0 (pyspec).
+# Fork version, GVR, and spec tag are argv (D28); DOMAIN_* are parsed from that tag.
+[[generated]]
+id=signing-roots
+python=3.13.7
+pip=eth-ssz-specs==0.1.0 -r crates/rvc-spec-vectors/vectors-generated/signing-roots/requirements.txt
+script=scripts/gen_signing_roots.py
+argv=--out crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.0
+output=crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml
+sha256=864ff5176a0b83e9b3e12e2bc03688e32def59e39cbde8816be4a0b15d7962eb

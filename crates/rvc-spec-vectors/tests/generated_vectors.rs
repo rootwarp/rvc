@@ -154,6 +154,10 @@ fn test_verify_generated_accepts_checked_in_artifact() {
     let log = combined(&output);
     assert!(output.status.success(), "checked-in artifact must verify: {log}");
     assert!(log.contains("generated ok: progressive"), "verify must name the id: {log}");
+    assert!(
+        log.contains("generated ok: signing-roots"),
+        "verify must name the signing-roots id: {log}"
+    );
 }
 
 #[test]
@@ -325,12 +329,32 @@ fn test_generated_artifact_lists_every_pyspec_count_and_width() {
 
 #[test]
 fn test_recipe_script_has_no_rsvc_path() {
-    let path = workspace_root().join(SCRIPT);
+    for rel in [SCRIPT, "scripts/gen_signing_roots.py"] {
+        let path = workspace_root().join(rel);
+        let body =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(!body.contains("rvc"), "recipe must not mention rvc: {}", path.display());
+        assert!(
+            !body.contains("vectors-generated"),
+            "recipe must not name the output dir: {}",
+            path.display()
+        );
+    }
+}
+
+#[test]
+fn test_signing_roots_recipe_does_not_hardcode_domain_bytes() {
+    let path = workspace_root().join("scripts/gen_signing_roots.py");
     let body = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    assert!(!body.contains("rvc"), "recipe must not mention rvc: {}", path.display());
+    let lower = body.to_ascii_lowercase();
     assert!(
-        !body.contains("vectors-generated"),
-        "recipe must not name the output dir: {}",
+        !lower.contains("0c000000"),
+        "DOMAIN_PTC_ATTESTER must be parsed from the pinned spec, not hardcoded: {}",
+        path.display()
+    );
+    assert!(
+        !lower.contains("0d000000"),
+        "DOMAIN_PROPOSER_PREFERENCES must be parsed from the pinned spec, not hardcoded: {}",
         path.display()
     );
 }

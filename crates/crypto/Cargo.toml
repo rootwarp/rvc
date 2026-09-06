@@ -44,6 +44,7 @@ rayon.workspace = true
 
 [dev-dependencies]
 eth-types = { workspace = true, features = ["test-fixtures"] }
+rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
