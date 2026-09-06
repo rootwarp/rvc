@@ -3,8 +3,8 @@
 use std::sync::LazyLock;
 
 use metrics::{
-    define_gauge, define_histogram_vec, define_int_counter, define_int_counter_vec, Gauge,
-    HistogramVec, IntCounter, IntCounterVec,
+    define_gauge, define_histogram_vec, define_int_counter, define_int_counter_vec,
+    define_int_gauge_vec, Gauge, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec,
 };
 
 pub use bn_manager::metrics::RVC_ATTESTATIONS_TOTAL;
@@ -137,6 +137,24 @@ pub static RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL: LazyLock<IntCounterVec> = Lazy
     )
 });
 
+/// `sign_type` label values for [`RVC_SIGNER_CAPABILITY`].
+pub mod signer_sign_type {
+    pub const PAYLOAD_ATTESTATION: &str = "PAYLOAD_ATTESTATION";
+    pub const PROPOSER_PREFERENCES: &str = "PROPOSER_PREFERENCES";
+    pub const ALL: &[&str] = &[PAYLOAD_ATTESTATION, PROPOSER_PREFERENCES];
+}
+
+/// Remote-signer Gloas sign-type support (1=supported, 0=unsupported or unknown).
+///
+/// Probe failures are recorded as 0; they must never be reported as supported.
+pub static RVC_SIGNER_CAPABILITY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    define_int_gauge_vec(
+        "rvc_signer_capability",
+        "Whether the configured remote signer supports a Gloas sign type (1=supported, 0=unsupported or unknown)",
+        &["sign_type"],
+    )
+});
+
 /// Force-register orchestrator families and the other owners rvc composes.
 pub fn init() {
     metrics::definitions::init_metrics();
@@ -157,6 +175,7 @@ pub fn init() {
     LazyLock::force(&RVC_ATTESTATION_TRIGGER_TOTAL);
     LazyLock::force(&RVC_SYNC_COMMITTEE_SKIPPED_TOTAL);
     LazyLock::force(&RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL);
+    LazyLock::force(&RVC_SIGNER_CAPABILITY);
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ pub mod executor;
 mod keys;
 mod run;
 mod services;
+mod signer_probe;
 mod slashing;
 mod tasks;
 

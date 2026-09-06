@@ -10,6 +10,7 @@
 //! pre-change tree (`develop` @ `eaef2fd`), which defined 35 families.
 //! Issue 4.6 adds `rvc_ptc_duties_fetched_total` (family delta +1).
 //! Issue 4.13 adds `rvc_payload_attestation_skipped_total` (family delta +1).
+//! Issue 4.12 adds `rvc_signer_capability` (family delta +1).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -73,6 +74,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_proposer_config_refresh_failures_total",
     "rvc_proposer_config_refresh_success_total",
     "rvc_ptc_duties_fetched_total",
+    "rvc_signer_capability",
     "rvc_signer_slashing_tx_hold_duration_ms",
     "rvc_signing_duration_seconds",
     "rvc_slashing_db_prune_total",
@@ -189,8 +191,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        37,
-        "issue 4.13 +1 family (rvc_payload_attestation_skipped_total) on the 4.6 36-family pin"
+        38,
+        "issue 4.12 +1 family (rvc_signer_capability) on the 4.13 37-family pin"
     );
 }
 

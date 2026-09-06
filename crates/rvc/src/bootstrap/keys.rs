@@ -116,6 +116,8 @@ pub async fn load_signing_keys(
     // Connect gRPC remote signer if configured (non-fatal: lazy connection).
     let grpc_signer = connect_grpc_remote_signer(config, &composite_signer).await?;
 
+    super::signer_probe::probe_configured_remote_signer(config).await;
+
     Ok(LoadedKeys {
         composite_signer,
         validator_count,
