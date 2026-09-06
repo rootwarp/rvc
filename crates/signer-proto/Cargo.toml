@@ -21,6 +21,9 @@ client = []
 prost.workspace = true
 tonic = { workspace = true }
 
+[dev-dependencies]
+eth-types.workspace = true
+
 [build-dependencies]
 tonic-build.workspace = true
 

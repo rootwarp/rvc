@@ -139,6 +139,7 @@ service PeerSignerService {
   rpc PartialSignBeaconBlock      (PartialSignBeaconBlockRequest)      returns (PartialSignResponse);
   rpc PartialSignAttestationData  (PartialSignAttestationDataRequest)  returns (PartialSignResponse);
   rpc PartialSignSyncCommittee    (PartialSignSyncCommitteeRequest)    returns (PartialSignResponse);
+  rpc PartialSignPayloadAttestation (PartialSignPayloadAttestationRequest) returns (PartialSignResponse);
 }
 message PartialSignBeaconBlockRequest {
   uint64   requester_index = 1;   // server enforces matches peer cert CN (allow-list)
@@ -165,4 +166,21 @@ message PartialSignSyncCommitteeRequest {
 message PartialSignResponse {
   bytes  partial_signature = 1;   // 96 bytes BLS share
   uint64 share_index       = 2;
+}
+
+// Gloas PayloadAttestationData (eth-types 4.1 field order). Embedded like
+// AttestationData rather than flattened onto the request.
+message PayloadAttestationData {
+  bytes  beacon_block_root    = 1; // 32 bytes
+  uint64 slot                 = 2;
+  bool   payload_present      = 3;
+  bool   blob_data_available  = 4;
+}
+message PartialSignPayloadAttestationRequest {
+  uint64                 requester_index = 1;   // server enforces matches peer cert CN (allow-list)
+  bytes                  pubkey          = 2;
+  ForkInfo               fork_info       = 3;
+  PayloadAttestationData data            = 4;
+  // Object-root / field path (not decode_*_ssz). Gloas=7 is valid here.
+  uint32                 fork_id         = 5;   // PHASE0 .. GLOAS enum
 }

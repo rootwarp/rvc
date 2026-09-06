@@ -4526,6 +4526,7 @@ dependencies = [
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-observability",
+ "rvc-spec-vectors",
  "rvc-web3signer-wire",
  "serde",
  "serde_json",
@@ -4609,6 +4610,7 @@ name = "rvc-signer-proto"
 version = "0.7.0"
 dependencies = [
  "prost 0.13.5",
+ "rvc-eth-types",
  "tonic 0.12.3",
  "tonic-build",
 ]
