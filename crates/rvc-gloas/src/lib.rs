@@ -6,6 +6,11 @@
 /// Pinned `ethereum/consensus-specs` release this island is generated against.
 pub const SPEC_TAG: &str = "v1.7.0-beta.0";
 
+/// Gloas `ExecutionRequests` EIP-7495 `active_fields` at `SPEC_TAG` (width 5, all-ones).
+pub const ACTIVE_FIELDS_EXECUTION_REQUESTS: &[bool] = &[true, true, true, true, true];
+
+const _: () = assert!(ACTIVE_FIELDS_EXECUTION_REQUESTS.len() == 5);
+
 mod containers;
 mod merkle;
 
