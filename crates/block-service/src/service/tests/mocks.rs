@@ -233,6 +233,16 @@ impl ValidatorSigner for MockSigner {
     ) -> Result<crypto::Signature, SignerError> {
         Ok(mock_sig(b"contribution"))
     }
+
+    async fn sign_payload_attestation(
+        &self,
+        _data: &eth_types::PayloadAttestationData,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<crypto::Signature, SignerError> {
+        Ok(mock_sig(b"payload-attestation"))
+    }
 }
 
 // --- Mock Beacon Client ---

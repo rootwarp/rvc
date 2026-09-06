@@ -75,7 +75,7 @@ pub enum SigningGateError {
     ///
     /// | Cause | Row fate |
     /// |---|---|
-    /// | Unambiguous no-signature (`KeyNotFound`, `LocalRejected`, `UnsupportedSigningType`) | `reconcile_unsigned` (failed delete **retains**) |
+    /// | Unambiguous no-signature (`KeyNotFound`, `LocalRejected`, `UnsupportedSigningType`, `UnsupportedDuty`) | `reconcile_unsigned` (failed delete **retains**) |
     /// | Sign **timeout** + [`crate::TimeoutPolicy::DiscardStagedRow`] | `reconcile_unsigned` (failed delete **retains**) |
     /// | Sign **timeout** + [`crate::TimeoutPolicy::RetainStagedRow`] | row already committed (no action) |
     /// | Ambiguous backend error + [`crate::TimeoutPolicy::DiscardStagedRow`] | `reconcile_unsigned` (failed delete **retains**) |

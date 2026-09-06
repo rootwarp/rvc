@@ -32,8 +32,8 @@
 //!    (failed delete retains).
 //!
 //! Unambiguous **no-signature** outcomes reconcile under both policies:
-//! `KeyNotFound`, `LocalRejected` (e.g. gRPC raw-root without remote I/O), and
-//! `UnsupportedSigningType`.
+//! `KeyNotFound`, `LocalRejected` (e.g. gRPC raw-root without remote I/O),
+//! `UnsupportedSigningType`, and `UnsupportedDuty`.
 //!
 //! # `!Send` staging guards
 //!
@@ -158,7 +158,8 @@ pub async fn sign_nonslashable_core(
 ///   [`TimeoutPolicy::RetainStagedRow`] these leave the reserved row committed.
 ///
 /// Unambiguous no-signature errors reconcile under both policies (`KeyNotFound`,
-/// `LocalRejected`, `UnsupportedSigningType`). A failed delete retains.
+/// `LocalRejected`, `UnsupportedSigningType`, `UnsupportedDuty`). A failed
+/// delete retains.
 ///
 /// # Error surface on retain
 ///

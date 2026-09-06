@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use crypto::{PublicKey, Signature};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    ForkSchedule, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 
 use crate::SignerError;
@@ -128,6 +128,17 @@ pub trait ValidatorSigner: Send + Sync {
     async fn sign_contribution_and_proof(
         &self,
         contribution_and_proof: &ContributionAndProof,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError>;
+
+    /// Sign payload attestation data (`DOMAIN_PTC_ATTESTER`).
+    ///
+    /// Non-slashable: must not stage or commit a slashing-DB row.
+    async fn sign_payload_attestation(
+        &self,
+        data: &PayloadAttestationData,
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,

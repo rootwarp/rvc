@@ -475,11 +475,11 @@ mod tests {
     use crate::typed_signer::SignContext;
     use eth_types::{
         AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-        Epoch, ForkInfo, Root as EthRoot, Slot, SyncAggregatorSelectionData,
-        ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
-        DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
-        DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-        DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+        Epoch, ForkInfo, PayloadAttestationData, Root as EthRoot, Slot,
+        SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
+        DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+        DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+        DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
     };
 
     struct MockGrpcSigner {
@@ -637,6 +637,19 @@ mod tests {
             let root = signing_root_with_fork_version(
                 exit,
                 DOMAIN_VOLUNTARY_EXIT,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            );
+            self.sign_root(&root, &ctx.pubkey.to_bytes())
+        }
+        async fn sign_payload_attestation(
+            &self,
+            data: &PayloadAttestationData,
+            ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            let root = signing_root_with_fork_version(
+                data,
+                DOMAIN_PTC_ATTESTER,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
             );

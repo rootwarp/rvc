@@ -8,10 +8,10 @@ use async_trait::async_trait;
 
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-    Epoch, ForkInfo, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    Epoch, ForkInfo, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 
 use crate::bls::{PublicKey, Signature};
@@ -166,6 +166,19 @@ pub trait TypedSigner: Send + Sync {
         exit: &VoluntaryExit,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError>;
+
+    /// Sign payload attestation data (`DOMAIN_PTC_ATTESTER`).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override.
+    async fn sign_payload_attestation(
+        &self,
+        data: &PayloadAttestationData,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (data, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "payload_attestation" })
+    }
 }
 
 // ============================================================
@@ -324,6 +337,21 @@ impl TypedSigner for LocalSigner {
         let signing_root = signing_root_with_fork_version(
             exit,
             DOMAIN_VOLUNTARY_EXIT,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_payload_attestation(
+        &self,
+        data: &PayloadAttestationData,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            data,
+            DOMAIN_PTC_ATTESTER,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
@@ -632,6 +660,151 @@ mod tests {
         let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, capella_version, genesis_root);
         let signing_root = compute_signing_root(&exit, domain);
         assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_payload_attestation ----
+
+    fn parse_kat_root(hex_str: &str) -> Root {
+        hex::decode(hex_str).expect("kat hex").try_into().expect("32-byte kat root")
+    }
+
+    fn gloas_ptc_fixture() -> PayloadAttestationData {
+        PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        }
+    }
+
+    fn gloas_kat_ctx(sk: &SecretKey) -> SignContext {
+        SignContext {
+            pubkey: sk.public_key(),
+            fork_info: ForkInfo {
+                previous_version: [0x06, 0x00, 0x00, 0x01],
+                current_version: [0x07, 0x00, 0x00, 0x01],
+                genesis_validators_root: [0u8; 32],
+            },
+            fork_name: ForkName::Gloas,
+        }
+    }
+
+    /// L3: signature verifies over `KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT`
+    /// (4.2 fixture: block root `[0x11; 32]`, slot 1, payload present, no blob
+    /// data, fork `0x07000001`, GVR zeros).
+    #[tokio::test]
+    async fn test_local_signer_payload_attestation_signature_verifies() {
+        use rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT;
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let data = gloas_ptc_fixture();
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_payload_attestation(&signer, &data, &ctx).await.unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "payload attestation signature must verify over the KAT signing root"
+        );
+    }
+
+    struct CapabilityMissingSigner;
+
+    #[async_trait]
+    impl TypedSigner for CapabilityMissingSigner {
+        async fn sign_block(
+            &self,
+            _block: &BeaconBlock,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_blinded_block(
+            &self,
+            _block: &BlindedBeaconBlock,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_attestation(
+            &self,
+            _data: &AttestationData,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_aggregate_and_proof(
+            &self,
+            _agg: &AggregateAndProof,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_sync_committee_message(
+            &self,
+            _slot: Slot,
+            _beacon_block_root: Root,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_sync_aggregator_selection(
+            &self,
+            _slot: Slot,
+            _subcommittee_index: u64,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_contribution_and_proof(
+            &self,
+            _c: &ContributionAndProof,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_builder_registration(
+            &self,
+            _reg: &ValidatorRegistrationV1,
+            _genesis_fork_version: [u8; 4],
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_randao_reveal(
+            &self,
+            _epoch: Epoch,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_voluntary_exit(
+            &self,
+            _exit: &VoluntaryExit,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_payload_attestation_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let data = gloas_ptc_fixture();
+        let signer = CapabilityMissingSigner;
+
+        let result = TypedSigner::sign_payload_attestation(&signer, &data, &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "payload_attestation");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
     }
 
     // ---- capella_capped_fork_version ----

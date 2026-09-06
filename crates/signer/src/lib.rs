@@ -58,7 +58,7 @@ use crypto::{
 };
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    ForkSchedule, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 use observability::logging::fields::Duty;
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
@@ -107,6 +107,13 @@ pub enum SignerError {
     /// No slashing-DB row was staged or committed.
     #[error("signing blocked by doppelganger gate")]
     BlockedByDoppelganger,
+
+    /// This signer cannot produce a signature for the named duty.
+    ///
+    /// The duty is dropped; implementations must not sign under a fallback
+    /// domain. No slashing-DB row is written.
+    #[error("unsupported duty: {duty}")]
+    UnsupportedDuty { duty: &'static str },
 }
 
 impl SignerError {
@@ -161,6 +168,7 @@ impl From<SigningError> for SignerError {
             SigningError::UnsupportedSigningType(msg) => {
                 SignerError::SigningFailed(format!("unsupported remote signing type: {msg}"))
             }
+            SigningError::UnsupportedDuty { duty } => SignerError::UnsupportedDuty { duty },
         }
     }
 }
@@ -714,6 +722,23 @@ impl ValidatorSigner for SignerService {
         let signing_root =
             signing_root_for(&DutyRef::SyncMessage { beacon_block_root, slot }, &ctx);
         self.sign_nonslashable(pubkey, signing_root, "sync_committee_message").await
+    }
+
+    /// Signs payload attestation data with `DOMAIN_PTC_ATTESTER`.
+    ///
+    /// Non-slashable: routes through [`Self::sign_nonslashable`], not
+    /// [`sign_slashable`].
+    #[tracing::instrument(name = "sign.payload_attestation", skip_all, fields(slot = data.slot))]
+    async fn sign_payload_attestation(
+        &self,
+        data: &PayloadAttestationData,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::PtcAttestation(data), &ctx);
+        self.sign_nonslashable(pubkey, signing_root, "payload_attestation").await
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
@@ -1460,6 +1485,9 @@ mod tests {
 
         let err = SignerError::SigningFailed("remote error".to_string());
         assert!(err.to_string().contains("signing failed"));
+
+        let err = SignerError::UnsupportedDuty { duty: "payload_attestation" };
+        assert_eq!(err.to_string(), "unsupported duty: payload_attestation");
     }
 
     /// RF4-03 (M1): production `sign_block` commit arm returns `CommitFailed`
@@ -1902,6 +1930,75 @@ mod tests {
         match result.unwrap_err() {
             SignerError::KeyNotFound(_) => {}
             other => panic!("expected KeyNotFound, got: {other:?}"),
+        }
+    }
+
+    fn gloas_ptc_fixture() -> PayloadAttestationData {
+        PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        }
+    }
+
+    fn gloas_ptc_fork_schedule() -> ForkSchedule {
+        let mut schedule = create_test_fork_schedule();
+        schedule.gloas_fork_epoch = 0;
+        schedule.gloas_fork_version = [0x07, 0x00, 0x00, 0x01];
+        schedule
+    }
+
+    /// Signing a payload attestation writes no slashing-DB row (row count
+    /// before and after).
+    #[tokio::test]
+    async fn test_sign_payload_attestation_writes_no_slashing_row() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let before_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let before_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let data = gloas_ptc_fixture();
+        let sig = service
+            .sign_payload_attestation(&data, &pubkey, &schedule, &gvr)
+            .await
+            .expect("payload attestation is non-slashable and must sign");
+
+        let kat_root: Root =
+            hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+                .expect("kat hex")
+                .try_into()
+                .expect("32-byte kat root");
+        assert!(
+            sig.verify(&pubkey, &kat_root).is_ok(),
+            "payload attestation must verify over KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT, not a fallback domain"
+        );
+
+        let after_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_blocks, before_blocks, "payload attestation must not write a block row");
+        assert_eq!(
+            after_attestations, before_attestations,
+            "payload attestation must not write an attestation row"
+        );
+    }
+
+    #[test]
+    fn test_unsupported_duty_from_signing_error() {
+        let err: SignerError = SigningError::UnsupportedDuty { duty: "payload_attestation" }.into();
+        match err {
+            SignerError::UnsupportedDuty { duty } => assert_eq!(duty, "payload_attestation"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
         }
     }
 
@@ -2936,6 +3033,14 @@ mod tests {
             sig.verify(&pubkey, &root).is_ok(),
             "builder registration must preserve per-transport fork version"
         );
+
+        let ptc = gloas_ptc_fixture();
+        let sig = service.sign_payload_attestation(&ptc, &pubkey, &schedule, &gvr).await.unwrap();
+        let root = signing_root_for(&DutyRef::PtcAttestation(&ptc), &ctx);
+        assert!(
+            sig.verify(&pubkey, &root).is_ok(),
+            "payload attestation root must match signing_root_for"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -3062,6 +3167,10 @@ mod tests {
             .sign_contribution_and_proof(&contribution, &pubkey, &schedule, &gvr)
             .await
             .expect("contribution");
+        service
+            .sign_payload_attestation(&gloas_ptc_fixture(), &pubkey, &schedule, &gvr)
+            .await
+            .expect("payload attestation");
 
         let blocks = slashing_db.get_blocks(&pubkey_hex).expect("get_blocks");
         let attestations = slashing_db.get_attestations(&pubkey_hex).expect("get_attestations");
@@ -3320,6 +3429,12 @@ mod tests {
                         .sign_contribution_and_proof(&contribution, &pubkey, &schedule, &gvr)
                         .await,
                 ),
+                (
+                    "payload_attestation",
+                    service
+                        .sign_payload_attestation(&gloas_ptc_fixture(), &pubkey, &schedule, &gvr)
+                        .await,
+                ),
             ];
 
             for (name, result) in results {
@@ -3377,6 +3492,12 @@ mod tests {
                     "contribution_and_proof",
                     service
                         .sign_contribution_and_proof(&contribution, &unknown, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "payload_attestation",
+                    service
+                        .sign_payload_attestation(&gloas_ptc_fixture(), &unknown, &schedule, &gvr)
                         .await,
                 ),
             ];

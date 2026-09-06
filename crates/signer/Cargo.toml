@@ -44,6 +44,7 @@ tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 criterion.workspace = true
+rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }
 
 # Latency-sanity companion to the Gate-4 zero-alloc test (issue 2.13). Run via
 # `cargo bench`; NOT a blocking gate and NOT run under nextest/CI.

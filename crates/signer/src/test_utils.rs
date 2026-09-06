@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use crypto::{PublicKey, SecretKey, Signature};
 use eth_types::{
     AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    ForkSchedule, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 
 use crate::{SignerError, ValidatorSigner};
@@ -27,7 +27,7 @@ pub fn mock_sig(tag: &[u8]) -> Signature {
 ///
 /// Intended for unit tests that only need a trait object, not call capture.
 /// Consumers that need failure injection or argument recording should wrap or
-/// extend this type rather than re-stubbing all 11 methods.
+/// extend this type rather than re-stubbing all 12 methods.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubValidatorSigner;
 
@@ -151,6 +151,16 @@ impl ValidatorSigner for StubValidatorSigner {
     ) -> Result<Signature, SignerError> {
         Ok(mock_sig(b"contribution"))
     }
+
+    async fn sign_payload_attestation(
+        &self,
+        _data: &PayloadAttestationData,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"payload-attestation"))
+    }
 }
 
 #[cfg(test)]
@@ -211,5 +221,13 @@ mod tests {
         };
         assert!(stub.sign_builder_registration(&reg, &pk, [0; 4]).await.is_ok());
         assert!(stub.sign_sync_committee_selection_proof(1, 0, &pk, &fork, &gvr).await.is_ok());
+
+        let ptc = PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        };
+        assert!(stub.sign_payload_attestation(&ptc, &pk, &fork, &gvr).await.is_ok());
     }
 }
