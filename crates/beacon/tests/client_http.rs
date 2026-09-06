@@ -2586,50 +2586,41 @@ async fn test_produce_block_v4_ssz_response() {
 }
 
 #[tokio::test]
-async fn test_produce_block_v4_ssz_empty_body_falls_back_to_json() {
+async fn test_produce_block_v4_ssz_empty_body_is_parse_error_not_retried() {
     let mock_server = MockServer::start().await;
     let slot = 900u64;
-    let json_envelope = v4_json_envelope(slot);
-
-    let responder = SszThenJsonResponder {
-        call_count: AtomicUsize::new(0),
-        first: ResponseTemplate::new(200)
-            .set_body_raw(vec![], "application/octet-stream")
-            .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Consensus-Version", "gloas")
-            .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
-        second: ResponseTemplate::new(200)
-            .set_body_json(&json_envelope)
-            .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Consensus-Version", "gloas")
-            .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
-    };
 
     Mock::given(method("POST"))
         .and(path(v4_blocks_path(slot)))
-        .respond_with(responder)
-        .expect(2)
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![], "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .expect(1)
         .mount(&mock_server)
         .await;
 
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result =
-        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
-
-    assert!(!result.is_ssz);
-    assert!(result.ssz_bytes.is_none());
-    assert_eq!(result.consensus_version, "gloas");
-    let block = result.parse_full_block().unwrap();
-    assert_eq!(block.block().slot, slot);
+    let result = client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(
+                msg.contains("empty SSZ") || msg.contains("after 2xx"),
+                "expected empty-SSZ ParseError, got {msg}"
+            );
+        }
+        other => panic!("empty SSZ 2xx must be ParseError, not a JSON retry: {other:?}"),
+    }
 
     let requests = mock_server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
-    for req in &requests {
-        assert_eq!(req.method.as_str(), "POST");
-        assert_v4_query_names(req);
-    }
+    assert_eq!(requests.len(), 1, "2xx must not be followed by a second produce POST");
+    assert_eq!(requests[0].method.as_str(), "POST");
+    assert_v4_query_names(&requests[0]);
 }
 
 fn v4_json_headers(
@@ -4827,6 +4818,35 @@ async fn test_429_exhausts_retries() {
         BeaconError::ApiError { status, .. } => assert_eq!(status, 429),
         e => panic!("expected ApiError(429), got: {e:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_429_max_retries_zero_does_not_sleep_retry_after() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/genesis"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = BeaconClientConfig::new(server.uri())
+        .with_max_retries(0)
+        .with_initial_backoff(Duration::from_millis(10));
+    let client = BeaconClient::new(config).unwrap();
+
+    let start = tokio::time::Instant::now();
+    let result = client.get_genesis().await;
+    let elapsed = start.elapsed();
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 429),
+        other => panic!("expected ApiError(429), got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "max_retries=0 must return 429 without sleeping Retry-After, took {elapsed:?}"
+    );
 }
 
 #[tokio::test]

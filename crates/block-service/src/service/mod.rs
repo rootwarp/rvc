@@ -261,7 +261,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             span.record("block.value_wei", value.as_str());
         }
 
-        // 4. Sign and publish based on block type
+        // 4. Sign and publish based on block type.
+        // D29: this `response` is committed once a signature exists — no
+        // re-production and no second sign for the slot. Publish keeps the
+        // existing broadcast/submit policy; envelope publish (6.20) must use
+        // the same bytes.
         // Gloas retires blinded/mev-boost; keep the pre-Gloas helpers but drop the duty.
         reject_blinded_at_gloas(
             response.is_blinded,

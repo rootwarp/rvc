@@ -325,7 +325,8 @@ impl Default for BroadcastTopics {
 ///
 /// BN selection is not configurable: strategy is fixed per operation on
 /// [`crate::BnManager`] (query-first for reads, broadcast for submissions,
-/// best-of for block production). See that type's docs.
+/// best-of for `produce_block_v3`, sequential failover for `produce_block_v4`).
+/// See that type's docs.
 #[derive(Debug, Clone)]
 pub struct BnManagerConfig {
     /// Beacon node endpoint URLs.

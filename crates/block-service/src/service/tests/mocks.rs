@@ -292,6 +292,8 @@ impl ValidatorSigner for MockSigner {
 
 pub(crate) struct MockBeaconClient {
     pub(crate) produce_response: Option<ProduceBlockResponse>,
+    /// Extra produce answers, consumed in order before `produce_response`.
+    pub(crate) produce_queue: Mutex<Vec<ProduceBlockResponse>>,
     pub(crate) fail_produce: bool,
     pub(crate) fail_publish: bool,
     pub(crate) publish_calls: Mutex<Vec<String>>,
@@ -317,6 +319,7 @@ impl MockBeaconClient {
                 builder_url: None,
                 consensus_block_value: None,
             }),
+            produce_queue: Mutex::new(Vec::new()),
             fail_produce: false,
             fail_publish: false,
             publish_calls: Mutex::new(Vec::new()),
@@ -342,6 +345,7 @@ impl MockBeaconClient {
                 builder_url: None,
                 consensus_block_value: None,
             }),
+            produce_queue: Mutex::new(Vec::new()),
             fail_produce: false,
             fail_publish: false,
             publish_calls: Mutex::new(Vec::new()),
@@ -380,6 +384,41 @@ impl MockBeaconClient {
                 builder_url: None,
                 consensus_block_value: None,
             }),
+            produce_queue: Mutex::new(Vec::new()),
+            fail_produce: false,
+            fail_publish: false,
+            publish_calls: Mutex::new(Vec::new()),
+            publish_blinded_calls: Mutex::new(Vec::new()),
+            publish_ssz_calls: Mutex::new(Vec::new()),
+            produce_full_calls: Mutex::new(Vec::new()),
+            publish_full_calls: Mutex::new(Vec::new()),
+            publish_blinded_full_calls: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Two (or more) distinct produce answers for the same slot.
+    ///
+    /// A second `produce_block_*` call would return the next candidate — used to
+    /// pin D29 single-flight (one signature / one publish even when two BNs
+    /// could answer).
+    pub(crate) fn unblinded_candidates(blocks: Vec<BeaconBlock>) -> Self {
+        let responses: Vec<ProduceBlockResponse> = blocks
+            .into_iter()
+            .map(|block| ProduceBlockResponse {
+                data: serde_json::to_value(&block).unwrap(),
+                is_blinded: false,
+                consensus_version: "deneb".to_string(),
+                execution_payload_value: Some("12345".to_string()),
+                is_ssz: false,
+                ssz_bytes: None,
+                payload_included: false,
+                builder_url: None,
+                consensus_block_value: None,
+            })
+            .collect();
+        Self {
+            produce_response: None,
+            produce_queue: Mutex::new(responses),
             fail_produce: false,
             fail_publish: false,
             publish_calls: Mutex::new(Vec::new()),
@@ -404,6 +443,7 @@ impl MockBeaconClient {
     pub(crate) fn from_response(response: ProduceBlockResponse) -> Self {
         Self {
             produce_response: Some(response),
+            produce_queue: Mutex::new(Vec::new()),
             fail_produce: false,
             fail_publish: false,
             publish_calls: Mutex::new(Vec::new()),
@@ -413,6 +453,19 @@ impl MockBeaconClient {
             publish_full_calls: Mutex::new(Vec::new()),
             publish_blinded_full_calls: Mutex::new(Vec::new()),
         }
+    }
+
+    fn take_produce_response(&self) -> Option<ProduceBlockResponse> {
+        let mut queue = self.produce_queue.lock().unwrap();
+        if !queue.is_empty() {
+            return Some(queue.remove(0));
+        }
+        drop(queue);
+        self.produce_response.clone()
+    }
+
+    fn next_produce_response(&self) -> ProduceBlockResponse {
+        self.take_produce_response().expect("produce response configured")
     }
 
     pub(crate) fn last_produce_call(&self) -> CapturedProduceCall {
@@ -492,17 +545,27 @@ impl BeaconBlockClient for MockBeaconClient {
         if self.fail_produce {
             return Err(BlockServiceError::Beacon("beacon down".to_string()));
         }
-        Ok(self.produce_response.clone().unwrap())
+        Ok(self.next_produce_response())
     }
 
     async fn produce_block_v4(
         &self,
-        _slot: Slot,
-        _randao_reveal: &str,
-        _graffiti: Option<&str>,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
         _builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        Err(BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
+        self.produce_full_calls.lock().unwrap().push(CapturedProduceCall {
+            slot,
+            randao_reveal: randao_reveal.to_string(),
+            graffiti: graffiti.map(|s| s.to_string()),
+            builder_boost_factor: None,
+        });
+        if self.fail_produce {
+            return Err(BlockServiceError::Beacon("beacon down".to_string()));
+        }
+        self.take_produce_response()
+            .ok_or_else(|| BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
     }
 
     async fn publish_block(

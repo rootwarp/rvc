@@ -5,10 +5,14 @@
 //! `is_better_block`) remain in `src/manager.rs`.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use beacon::{BeaconClient, BeaconClientConfig};
+use beacon::{
+    BeaconClient, BeaconClientConfig, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+    PRODUCE_BLOCK_V4_PATH_PREFIX,
+};
 use eth_types::ForkSchedule;
 use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};
@@ -16,7 +20,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rvc_bn_manager::{
     AttestationApi, BeaconError, BeaconNodeClient, BlockProducer, BnManager, BnManagerConfig,
-    BnRole, BnSyncDetail, BnSyncStatus, DutiesProvider, LivenessApi, NodeStatusApi,
+    BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, DutiesProvider, LivenessApi, NodeStatusApi,
     OperationTimeouts, PayloadAttestationApi, SignedBeaconBlock, SignedBlindedBeaconBlock,
     SyncCommitteeApi, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
@@ -984,6 +988,420 @@ async fn test_multi_best_single_bn_falls_back_to_first() {
     let manager = make_manager(&bn.uri());
     let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
     assert!(result.is_ok());
+}
+
+// -- V4 sequential failover (issue 6.6 / D29) --
+
+fn v4_blocks_path(slot: u64) -> String {
+    format!("{PRODUCE_BLOCK_V4_PATH_PREFIX}/{slot}")
+}
+
+fn v4_json_success(slot: u64, parent_byte: u8, payload_value: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .set_body_json(json!({
+            "version": "gloas",
+            "data": {
+                "slot": slot.to_string(),
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", hex_repeat(parent_byte)),
+                "state_root": format!("0x{}", hex_repeat(0x02)),
+                "body": "0xdead"
+            }
+        }))
+        .insert_header("Eth-Execution-Payload-Blinded", "false")
+        .insert_header("Eth-Consensus-Version", "gloas")
+        .insert_header("Eth-Execution-Payload-Value", payload_value)
+        .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true")
+}
+
+fn hex_repeat(byte: u8) -> String {
+    format!("{byte:02x}").repeat(32)
+}
+
+struct InflightProbe {
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
+    delay: Duration,
+    template: ResponseTemplate,
+}
+
+impl wiremock::Respond for InflightProbe {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        std::thread::sleep(self.delay);
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.template.clone()
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_three_healthy_reaches_exactly_one_bn() {
+    let bns = [MockServer::start().await, MockServer::start().await, MockServer::start().await];
+    let slot = 7u64;
+    for bn in &bns {
+        Mock::given(method("POST"))
+            .and(path(v4_blocks_path(slot)))
+            .respond_with(v4_json_success(slot, 0x11, "1000"))
+            .mount(bn)
+            .await;
+    }
+
+    let manager = make_multi_manager(&[&bns[0].uri(), &bns[1].uri(), &bns[2].uri()]);
+    let result = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    assert!(result.is_ok(), "first 2xx must succeed: {result:?}");
+
+    let mut counts = Vec::new();
+    for bn in &bns {
+        counts.push(bn.received_requests().await.unwrap().len());
+    }
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        1,
+        "exactly one BN must see produce_block_v4; per-BN counts={counts:?}"
+    );
+    assert_eq!(counts.iter().filter(|&&c| c == 1).count(), 1);
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_5xx_failsover_sequentially_never_two_in_flight() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+    let slot = 8u64;
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let delay = Duration::from_millis(80);
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(InflightProbe {
+            in_flight: Arc::clone(&in_flight),
+            max_in_flight: Arc::clone(&max_in_flight),
+            delay,
+            template: ResponseTemplate::new(500).set_body_string("primary 5xx"),
+        })
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(InflightProbe {
+            in_flight: Arc::clone(&in_flight),
+            max_in_flight: Arc::clone(&max_in_flight),
+            delay,
+            template: v4_json_success(slot, 0x22, "5000"),
+        })
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let result = manager
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .expect("5xx on the first BN must fail over");
+    assert_eq!(result.execution_payload_value.as_deref(), Some("5000"));
+
+    let primary_n = primary.received_requests().await.unwrap().len();
+    let secondary_n = secondary.received_requests().await.unwrap().len();
+    assert_eq!(primary_n, 1, "primary 5xx must be tried once");
+    assert_eq!(secondary_n, 1, "secondary must be tried after 5xx");
+    assert_eq!(
+        max_in_flight.load(Ordering::SeqCst),
+        1,
+        "produce_block_v4 must never fan out; max in-flight was {}",
+        max_in_flight.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_connect_error_failsover() {
+    let secondary = MockServer::start().await;
+    let slot = 9u64;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x33, "3000"))
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    // Port 1 refuses connections immediately on loopback.
+    let manager = make_multi_manager(&["http://127.0.0.1:1", &secondary.uri()]);
+    let result = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    assert!(result.is_ok(), "connect error must fail over: {result:?}");
+    assert_eq!(result.unwrap().execution_payload_value.as_deref(), Some("3000"));
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_timeout_failsover_within_block_production_budget() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+    let slot = 10u64;
+    let budget = Duration::from_millis(400);
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x11, "1000").set_delay(Duration::from_secs(5)))
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x44, "4000"))
+        .mount(&secondary)
+        .await;
+
+    let config = BnManagerConfig::new(vec![primary.uri(), secondary.uri()]);
+    let manager = BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+        block_production: budget,
+        ..OperationTimeouts::default()
+    });
+
+    let start = tokio::time::Instant::now();
+    let result = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    let elapsed = start.elapsed();
+
+    assert!(result.is_ok(), "timed-out primary must fail over: {result:?}");
+    assert_eq!(result.unwrap().execution_payload_value.as_deref(), Some("4000"));
+    assert_eq!(
+        secondary.received_requests().await.unwrap().len(),
+        1,
+        "secondary must receive the sequential retry"
+    );
+    assert!(
+        elapsed < budget + Duration::from_millis(150),
+        "total production must stay within t.block_production ({budget:?}), took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_2xx_never_followed_by_second_production() {
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    let slot = 11u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x01, "1111"))
+        .mount(&first)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x02, "2222"))
+        .mount(&second)
+        .await;
+
+    let manager = make_multi_manager(&[&first.uri(), &second.uri()]);
+    let result =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+
+    let n0 = first.received_requests().await.unwrap().len();
+    let n1 = second.received_requests().await.unwrap().len();
+    assert_eq!(n0 + n1, 1, "2xx must not be followed by a second production request ({n0}+{n1})");
+    assert_eq!(result.execution_payload_value.as_deref(), Some("1111"));
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_4xx_does_not_failover() {
+    let bns = [MockServer::start().await, MockServer::start().await, MockServer::start().await];
+    let slot = 12u64;
+    for bn in &bns {
+        Mock::given(method("POST"))
+            .and(path(v4_blocks_path(slot)))
+            .respond_with(ResponseTemplate::new(400).set_body_string("missing or undecodable body"))
+            .mount(bn)
+            .await;
+    }
+
+    let manager = make_multi_manager(&[&bns[0].uri(), &bns[1].uri(), &bns[2].uri()]);
+    let result = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 400),
+        other => panic!("expected 400 ApiError, got {other:?}"),
+    }
+
+    let counts: Vec<usize> = {
+        let mut v = Vec::new();
+        for bn in &bns {
+            v.push(bn.received_requests().await.unwrap().len());
+        }
+        v
+    };
+    assert_eq!(
+        counts.iter().sum::<usize>(),
+        1,
+        "4xx is not connect/timeout/5xx; must not fail over; counts={counts:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_2xx_parse_error_does_not_failover() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+    let slot = 13u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("not-json")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x55, "5555"))
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let result = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    assert!(
+        matches!(result, Err(BeaconError::ParseError(_))),
+        "2xx must commit the attempt even if the body is unusable: {result:?}"
+    );
+    assert_eq!(
+        secondary.received_requests().await.unwrap().len(),
+        0,
+        "never retry produce_block_v4 after a 2xx"
+    );
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_two_candidates_uses_first_2xx_only() {
+    let bn_a = MockServer::start().await;
+    let bn_b = MockServer::start().await;
+    let slot = 14u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0xaa, "100"))
+        .mount(&bn_a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0xbb, "99999"))
+        .mount(&bn_b)
+        .await;
+
+    let manager = make_multi_manager(&[&bn_a.uri(), &bn_b.uri()]);
+    let result =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+
+    assert_eq!(result.execution_payload_value.as_deref(), Some("100"));
+    assert_eq!(bn_a.received_requests().await.unwrap().len(), 1);
+    assert_eq!(
+        bn_b.received_requests().await.unwrap().len(),
+        0,
+        "second distinct BlockContents must never be requested after a 2xx"
+    );
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_empty_ssz_2xx_does_not_failover() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+    let slot = 15u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![], "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x66, "6666"))
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let result = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    assert!(
+        matches!(result, Err(BeaconError::ParseError(_))),
+        "empty SSZ 2xx must be ParseError, not a second produce: {result:?}"
+    );
+    assert_eq!(primary.received_requests().await.unwrap().len(), 1);
+    assert_eq!(
+        secondary.received_requests().await.unwrap().len(),
+        0,
+        "2xx empty SSZ must not POST produce_block_v4 to another BN"
+    );
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_429_does_not_sleep_into_timeout_failover() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+    let slot = 16u64;
+    let budget = Duration::from_millis(400);
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+        .mount(&primary)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x77, "7777"))
+        .mount(&secondary)
+        .await;
+
+    let config = BnManagerConfig::new(vec![primary.uri(), secondary.uri()]);
+    let manager = BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+        block_production: budget,
+        ..OperationTimeouts::default()
+    });
+
+    let start = tokio::time::Instant::now();
+    let result = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    let elapsed = start.elapsed();
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 429),
+        other => panic!("429 must surface as ApiError, not Timeout failover: {other:?}"),
+    }
+    assert_eq!(secondary.received_requests().await.unwrap().len(), 0);
+    assert!(
+        elapsed < budget + Duration::from_millis(150),
+        "429 with max_retries=0 must not sleep Retry-After, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_tries_higher_health_score_first() {
+    let low = MockServer::start().await;
+    let high = MockServer::start().await;
+    let slot = 17u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x10, "low"))
+        .mount(&low)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x20, "high"))
+        .mount(&high)
+        .await;
+
+    let manager = make_multi_manager(&[&low.uri(), &high.uri()]);
+    {
+        let mut trackers = manager.health_trackers().write().await;
+        trackers[1].record_success(Duration::from_millis(1));
+    }
+
+    let result =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(result.execution_payload_value.as_deref(), Some("high"));
+    assert_eq!(high.received_requests().await.unwrap().len(), 1);
+    assert_eq!(low.received_requests().await.unwrap().len(), 0);
 }
 
 // -- Broadcast: submissions --

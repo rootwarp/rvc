@@ -130,6 +130,49 @@ async fn test_propose_block_unblinded() {
     signer_arc.assert_last_sign_block_header(&fork, &gvr);
 }
 
+/// D29: two distinct produce answers exist, but sign + publish is single-flight.
+///
+/// `produce_queue` is drained by both v3 and v4 so 6.5 cannot drop this pin.
+/// Slashing-DB row count is covered by signer `reserve_block` tests; here
+/// `MockSigner.block_calls` is the stand-in (one sign = one staged row).
+#[tokio::test]
+async fn test_two_candidates_one_signature_one_publish() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let mut block_a = test_block(slot);
+    let mut block_b = test_block(slot);
+    block_a.parent_root = [0x0a; 32];
+    block_b.parent_root = [0x0b; 32];
+
+    let beacon = Arc::new(MockBeaconClient::unblinded_candidates(vec![block_a, block_b]));
+    let signer = Arc::new(MockSigner::new());
+    let fork = test_fork_schedule();
+    let gvr: Root = [0xaa; 32];
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(fork),
+        gvr,
+    );
+
+    let result = service.propose_block(slot, &pubkey, 42, None).await;
+    assert!(result.is_ok(), "proposal must succeed on the first candidate: {result:?}");
+
+    let produce_n = beacon.produce_full_calls.lock().unwrap().len();
+    let sign_n = signer.block_calls.lock().unwrap().len();
+    let header_n = signer.header_calls.lock().unwrap().len();
+    let publish_n = beacon.publish_full_calls.lock().unwrap().len();
+    assert_eq!(produce_n, 1, "must not re-produce after the first BlockContents");
+    assert_eq!(sign_n, 1, "exactly one signature (slashing-DB stand-in: one signed block)");
+    assert_eq!(header_n, 1);
+    assert_eq!(publish_n, 1, "exactly one block publish");
+    beacon.assert_last_published_block(slot, 42);
+
+    let leftover = beacon.produce_queue.lock().unwrap().len();
+    assert_eq!(leftover, 1, "second distinct BlockContents must remain unused");
+}
+
 /// Issue 2.10: the "Block publication success" info milestone logs the
 /// block_root TRUNCATED (0x{first10}...{last8}), never the full 64-hex.
 #[tracing_test::traced_test]

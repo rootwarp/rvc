@@ -141,6 +141,15 @@ fn parse_v4_produce_headers(
     })
 }
 
+/// After a 2xx, body/timeout/transport failures must not look retryable to
+/// `query_failover` (D29). `ParseError` / `BodyTooLarge` already stop failover.
+fn commit_v4_produce_error(err: BeaconError) -> BeaconError {
+    match err {
+        BeaconError::ParseError(_) | BeaconError::BodyTooLarge { .. } => err,
+        other => BeaconError::ParseError(format!("produce_block_v4 failed after 2xx: {other}")),
+    }
+}
+
 /// Parse a required `Eth-Execution-Payload-Included` header into a bool.
 ///
 /// Absent, non-UTF-8, or values other than `true`/`false` are
@@ -620,8 +629,9 @@ impl BeaconClient {
     /// Produces a block for the given slot using the v4 endpoint.
     ///
     /// `POST` with a required [`BuilderConfig`] JSON body. Requests SSZ and
-    /// falls back to JSON if the BN does not support SSZ or responds with JSON
-    /// despite the SSZ preference.
+    /// decodes JSON when the BN responds with JSON despite the SSZ preference.
+    /// A 2xx commits this BN: the body is decoded in place — never a second
+    /// produce POST (D29 / empty SSZ is `ParseError`, not a JSON retry).
     ///
     /// `skip_all` keeps `randao_reveal` and the builder config out of the span.
     #[tracing::instrument(name = "beacon.produce_block_v4", level = "debug", skip_all, fields(slot = slot))]
@@ -672,6 +682,16 @@ impl BeaconClient {
             )
             .await?;
 
+        // D29: this 2xx is the production attempt. Decode in place; never POST
+        // BuilderConfig (and its SignedBuilderRequestAuth) a second time.
+        self.decode_produce_block_v4(slot, response).await.map_err(commit_v4_produce_error)
+    }
+
+    async fn decode_produce_block_v4(
+        &self,
+        slot: u64,
+        response: reqwest::Response,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
         let is_blinded = response
             .headers()
             .get("Eth-Execution-Payload-Blinded")
@@ -697,7 +717,7 @@ impl BeaconClient {
 
         if content_type.starts_with("application/octet-stream") {
             let v4 = parse_v4_produce_headers(response.headers())?;
-            match Self::try_process_ssz_body(
+            return match Self::try_process_ssz_body(
                 response,
                 slot,
                 is_blinded,
@@ -707,50 +727,16 @@ impl BeaconClient {
             )
             .await
             {
-                Ok(result) => return Ok(result),
+                Ok(result) => Ok(result),
                 Err(ssz_err) => {
                     warn!(
                         slot = slot,
                         error = %ssz_err,
-                        "SSZ block response processing failed, retrying with JSON"
+                        "SSZ produce_block_v4 body unusable after 2xx; not retrying"
                     );
-                    let fallback_response = self
-                        .execute_with_retry_raw(
-                            "POST",
-                            &url,
-                            || {
-                                let body_bytes = body_bytes.clone();
-                                let url = url.clone();
-                                async move {
-                                    Self::traced(
-                                        self.client
-                                            .post(&url)
-                                            .header(reqwest::header::ACCEPT, "application/json")
-                                            .header(
-                                                reqwest::header::CONTENT_TYPE,
-                                                "application/json",
-                                            )
-                                            .header(
-                                                HEADER_ETH_CONSENSUS_VERSION,
-                                                ForkName::Gloas.as_ref(),
-                                            )
-                                            .body(body_bytes),
-                                    )
-                                    .send()
-                                    .await
-                                }
-                            },
-                            Self::take_success_response,
-                        )
-                        .await?;
-                    return Self::parse_produce_block_json(
-                        fallback_response,
-                        self.config.max_body_bytes,
-                        ProduceBlockApi::V4,
-                    )
-                    .await;
+                    Err(ssz_err)
                 }
-            }
+            };
         }
 
         Self::parse_produce_block_json(response, self.config.max_body_bytes, ProduceBlockApi::V4)
@@ -1492,15 +1478,19 @@ impl BeaconClient {
                     span.record("http.status_code", status.as_u16());
 
                     if status.as_u16() == 429 {
+                        last_error = Some(BeaconError::ApiError {
+                            status: 429,
+                            message: "Too Many Requests".to_string(),
+                        });
+                        if attempt >= policy.max_retries {
+                            // Last attempt: do not sleep Retry-After into a wrapper Timeout.
+                            break;
+                        }
                         let delay = RetryPolicy::retry_after_delay(
                             &response,
                             policy.calculate_backoff(attempt),
                         );
                         warn!(attempt = attempt, delay_ms = ?delay.as_millis(), "Rate limited (429), backing off");
-                        last_error = Some(BeaconError::ApiError {
-                            status: 429,
-                            message: "Too Many Requests".to_string(),
-                        });
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -1755,6 +1745,24 @@ mod tests {
         assert!(!parsed.payload_included);
         assert_eq!(parsed.builder_url, None);
         assert_eq!(parsed.consensus_block_value, None);
+    }
+
+    #[test]
+    fn test_commit_v4_produce_error_maps_timeout_and_keeps_parse() {
+        let parse = BeaconError::ParseError("empty SSZ".to_string());
+        assert!(matches!(
+            commit_v4_produce_error(parse),
+            BeaconError::ParseError(msg) if msg == "empty SSZ"
+        ));
+        let too_large = BeaconError::BodyTooLarge { expected: 8, got_so_far: 16 };
+        assert!(matches!(
+            commit_v4_produce_error(too_large),
+            BeaconError::BodyTooLarge { expected: 8, got_so_far: 16 }
+        ));
+        match commit_v4_produce_error(BeaconError::Timeout) {
+            BeaconError::ParseError(msg) => assert!(msg.contains("after 2xx"), "{msg}"),
+            other => panic!("Timeout after 2xx must be ParseError, got {other:?}"),
+        }
     }
 
     fn fulu_gloas_schedule() -> ForkSchedule {

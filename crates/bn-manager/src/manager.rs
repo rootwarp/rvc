@@ -52,6 +52,34 @@ enum TrackerOutcome {
     Error,
 }
 
+/// D29: V4 production may fail over only on connect / timeout / 5xx — never after
+/// a 2xx (ParseError) or a 4xx that the BN understood.
+///
+/// `HttpError` is the client's connect/request class (serialize failures use
+/// the same variant and fail identically on every BN). 429 is not 5xx.
+fn is_production_failover_error(err: &BeaconError) -> bool {
+    match err {
+        BeaconError::Timeout | BeaconError::OperationTimeout { .. } | BeaconError::HttpError(_) => {
+            true
+        }
+        BeaconError::ApiError { status, .. } if (500..600).contains(status) => true,
+        _ => false,
+    }
+}
+
+/// Split remaining slot budget across BNs still to try (last BN gets the rest).
+fn split_attempt_timeout(remaining: Duration, remaining_bns: usize) -> Duration {
+    if remaining_bns <= 1 {
+        return remaining;
+    }
+    let split = remaining / remaining_bns as u32;
+    if split.is_zero() {
+        remaining
+    } else {
+        split
+    }
+}
+
 /// Default sync check interval: once per epoch (~384 seconds).
 const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 
@@ -64,6 +92,8 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 ///   duty fetches, attestation/aggregate data, genesis/config, sync status reads.
 /// - **Best-of**: query healthy BNs in parallel and pick the highest-value result —
 ///   block production (`produce_block_v3`).
+/// - **Failover**: sequential, one in-flight; retry connect / timeout / 5xx only —
+///   `produce_block_v4` (D29). Never after a 2xx, never in parallel.
 /// - **Broadcast**: send to **role-matching** BNs (subject to `BroadcastTopics`),
 ///   succeed if any succeeds — attestations, blocks, sync committee messages,
 ///   subscriptions, preparations, validator registrations. Role filter only;
@@ -428,12 +458,14 @@ impl BnManager {
             healthy
         };
 
-        // Sort by health score descending (highest score first)
+        // Sort by health score descending; config index breaks ties so failover
+        // order is deterministic when scores are equal.
         result.sort_by(|&a, &b| {
             health_guard[b]
                 .score()
                 .partial_cmp(&health_guard[a].score())
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(&b))
         });
 
         result
@@ -644,6 +676,154 @@ impl BnManager {
             return Ok(None);
         }
         Err(last_err.expect("at least one client exists"))
+    }
+
+    /// Sequential production failover (D29): one in-flight request, health-score
+    /// order. Retry connect error / timeout / 5xx only — never after a 2xx
+    /// (including a 2xx whose body later fails to parse) and never in parallel.
+    ///
+    /// `budget` is the slot-budget remaining for the whole round; each attempt
+    /// is capped at `remaining / remaining_bns` so a hung primary cannot consume
+    /// `t.block_production` alone.
+    ///
+    /// One-in-flight is the client future this method polls. A per-attempt
+    /// timeout drops that future before the next POST; a cancelled reqwest
+    /// may still be aborting on the wire.
+    async fn query_failover<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
+        budget: Option<Duration>,
+        op: F,
+    ) -> Result<T, BeaconError>
+    where
+        T: Send,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
+        let strategy_span = tracing::info_span!(
+            "bn.strategy.failover",
+            strategy = "failover",
+            tried = tracing::field::Empty,
+        );
+        self.query_failover_inner(op_name, role, min_tier, budget, &op)
+            .instrument(strategy_span)
+            .await
+    }
+
+    async fn query_failover_inner<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
+        budget: Option<Duration>,
+        op: &F,
+    ) -> Result<T, BeaconError>
+    where
+        T: Send,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
+        let indices = self.synced_indices(role, min_tier).await;
+        if indices.is_empty() {
+            return Err(BeaconError::NoEligibleBn {
+                operation: op_name.to_string(),
+                role: role.to_string(),
+            });
+        }
+
+        let deadline = budget.map(|d| (tokio::time::Instant::now() + d, d));
+        let mut last_err = None;
+        let mut tried: usize = 0;
+        let mut failed_indices: Vec<usize> = Vec::new();
+
+        for (pos, i) in indices.iter().copied().enumerate() {
+            let remaining_bns = indices.len() - pos;
+            let attempt_timeout = if let Some((end, total)) = deadline {
+                let now = tokio::time::Instant::now();
+                if now >= end {
+                    last_err = Some(BeaconError::OperationTimeout {
+                        operation: op_name.to_string(),
+                        timeout: total,
+                    });
+                    break;
+                }
+                Some(split_attempt_timeout(end.saturating_duration_since(now), remaining_bns))
+            } else {
+                None
+            };
+
+            let client = &self.clients[i];
+            tried += 1;
+            let attempt_span = tracing::info_span!(
+                "bn.attempt",
+                bn_url = %RedactedUrl(client.endpoint()),
+            );
+            let start = tokio::time::Instant::now();
+            let fut = op(client).instrument(attempt_span);
+            let result = match attempt_timeout {
+                Some(d) => tokio::time::timeout(d, fut).await.unwrap_or(Err(BeaconError::Timeout)),
+                None => fut.await,
+            };
+
+            match result {
+                Ok(value) => {
+                    let mut outcomes: Vec<(usize, TrackerOutcome)> =
+                        failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
+                    let elapsed = start.elapsed();
+                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
+                    self.record_outcomes(&outcomes).await;
+                    debug!(
+                        op = op_name,
+                        bn_index = i,
+                        endpoint = %RedactedUrl(client.endpoint()),
+                        latency_ms = elapsed.as_millis() as u64,
+                        "query succeeded"
+                    );
+                    tracing::Span::current().record("tried", tried);
+                    return Ok(value);
+                }
+                Err(e) => {
+                    failed_indices.push(i);
+                    if is_production_failover_error(&e) {
+                        if let Some(&next_i) = indices.get(pos + 1) {
+                            warn!(
+                                failed_bn = %RedactedUrl(client.endpoint()),
+                                selected_bn = %RedactedUrl(self.clients[next_i].endpoint()),
+                                reason = %e,
+                                "BN failover triggered"
+                            );
+                        } else {
+                            warn!(
+                                op = op_name,
+                                bn_index = i,
+                                endpoint = %RedactedUrl(client.endpoint()),
+                                error = %e,
+                                "BN query failed, no more BNs to try"
+                            );
+                        }
+                        last_err = Some(e);
+                    } else {
+                        warn!(
+                            op = op_name,
+                            bn_index = i,
+                            endpoint = %RedactedUrl(client.endpoint()),
+                            error = %e,
+                            "BN production error is not failover-retryable"
+                        );
+                        last_err = Some(e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let outcomes: Vec<(usize, TrackerOutcome)> =
+            failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
+        self.record_outcomes(&outcomes).await;
+        tracing::Span::current().record("tried", tried);
+        Err(last_err.unwrap_or_else(|| {
+            BeaconError::HttpError(format!("{op_name}: all BNs failed in failover"))
+        }))
     }
 
     /// Query using the `Best` strategy: query synced BNs in parallel, pick best result.
@@ -1239,7 +1419,6 @@ impl BlockProducer for BnManager {
         .await
     }
 
-    // Temporary query_first until 6.6 query_failover; do not use query_best.
     async fn produce_block_v4(
         &self,
         slot: u64,
@@ -1247,12 +1426,17 @@ impl BlockProducer for BnManager {
         graffiti: Option<&str>,
         builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BeaconError> {
+        let budget = self.op_timeout(|t| t.block_production);
         self.with_op_timeout(
             "produce_block_v4",
-            self.op_timeout(|t| t.block_production),
-            self.query_first("produce_block_v4", BnRole::Proposal, HealthTier::Synced, |c| {
-                Box::pin(c.produce_block_v4(slot, randao_reveal, graffiti, builder_config))
-            }),
+            budget,
+            self.query_failover(
+                "produce_block_v4",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                budget,
+                |c| Box::pin(c.produce_block_v4(slot, randao_reveal, graffiti, builder_config)),
+            ),
         )
         .await
     }
@@ -2140,6 +2324,48 @@ mod tests {
             consensus_block_value: None,
         };
         assert!(!is_better_block(&a, &b));
+    }
+
+    #[test]
+    fn test_production_failover_retryable_errors() {
+        assert!(is_production_failover_error(&BeaconError::Timeout));
+        assert!(is_production_failover_error(&BeaconError::HttpError(
+            "connection refused".to_string()
+        )));
+        assert!(is_production_failover_error(&BeaconError::ApiError {
+            status: 500,
+            message: "x".to_string(),
+        }));
+        assert!(is_production_failover_error(&BeaconError::ApiError {
+            status: 503,
+            message: "x".to_string(),
+        }));
+        assert!(is_production_failover_error(&BeaconError::OperationTimeout {
+            operation: "produce_block_v4".to_string(),
+            timeout: Duration::from_millis(1),
+        }));
+        assert!(!is_production_failover_error(&BeaconError::ApiError {
+            status: 400,
+            message: "x".to_string(),
+        }));
+        assert!(!is_production_failover_error(&BeaconError::ApiError {
+            status: 404,
+            message: "x".to_string(),
+        }));
+        assert!(!is_production_failover_error(&BeaconError::ApiError {
+            status: 429,
+            message: "x".to_string(),
+        }));
+        assert!(!is_production_failover_error(&BeaconError::ParseError("bad json".to_string())));
+    }
+
+    #[test]
+    fn test_split_attempt_timeout_divides_remaining() {
+        let remaining = Duration::from_millis(400);
+        assert_eq!(split_attempt_timeout(remaining, 2), Duration::from_millis(200));
+        assert_eq!(split_attempt_timeout(remaining, 1), remaining);
+        // Truncating division that would be zero still spends the remainder.
+        assert_eq!(split_attempt_timeout(Duration::from_nanos(2), 3), Duration::from_nanos(2));
     }
 
     #[test]
