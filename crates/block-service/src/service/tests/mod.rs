@@ -7,7 +7,7 @@
 pub(super) use super::{
     compute_blinded_block_root, compute_block_root, ssz_block_format, BlockService,
 };
-pub(super) use crate::traits::{BeaconBlockClient, ProduceBlockResponse};
+pub(super) use crate::traits::{BeaconBlockClient, BuilderConfig, ProduceBlockResponse};
 pub(super) use crate::types::BlockSelectionMode;
 pub(super) use crate::BlockServiceError;
 pub(super) use crypto::PublicKey;

@@ -13,6 +13,7 @@ pub(crate) use crate::orchestrator::utils;
 pub(crate) use ::async_trait::async_trait;
 pub(crate) use ::beacon::{AttesterDuty, BeaconClient, BeaconClientConfig, VersionedAttestation};
 pub(crate) use ::block_service::BeaconBlockClient;
+pub(crate) use ::block_service::BuilderConfig;
 pub(crate) use ::block_service::ProduceBlockResponse;
 pub(crate) use ::bn_manager::{
     AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Propagator,
@@ -145,6 +146,16 @@ impl BeaconBlockClient for MockBlockBeacon {
         Err(block_service::BlockServiceError::Beacon("mock".to_string()))
     }
 
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("mock".to_string()))
+    }
+
     async fn publish_block(
         &self,
         _signed_block: &eth_types::SignedBeaconBlock,
@@ -209,6 +220,16 @@ impl BeaconBlockClient for BadProposerBlockBeacon {
             is_ssz: false,
             ssz_bytes: None,
         })
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
     }
 
     async fn publish_block(

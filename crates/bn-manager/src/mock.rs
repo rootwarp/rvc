@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    BlockRootData, BlockRootResponse, ConfigSpecResponse, GenesisResponse,
+    BlockRootData, BlockRootResponse, BuilderConfig, ConfigSpecResponse, GenesisResponse,
     PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
@@ -87,6 +87,8 @@ pub struct MockBeaconNodeClient {
     post_ptc_duties: MethodHook<(u64, Vec<String>), PtcDutiesResponse>,
     // BlockProducer
     produce_block_v3: MethodHook<(u64, String, Option<String>, Option<u64>), ProduceBlockResponse>,
+    produce_block_v4:
+        MethodHook<(u64, String, Option<String>, BuilderConfig), ProduceBlockResponse>,
     publish_block: MethodHook<(SignedBeaconBlock, String), ()>,
     publish_blinded_block: MethodHook<(SignedBlindedBeaconBlock, String), ()>,
     publish_block_ssz: MethodHook<(Vec<u8>, String, bool), ()>,
@@ -266,6 +268,24 @@ impl MockBeaconNodeClient {
     ) -> Self {
         self.produce_block_v3.set_handler(Arc::new(move |(slot, randao, graffiti, boost)| {
             f(slot, randao, graffiti, boost)
+        }));
+        self
+    }
+
+    pub fn with_produce_block_v4(
+        self,
+        f: impl Fn(
+                u64,
+                String,
+                Option<String>,
+                BuilderConfig,
+            ) -> Result<ProduceBlockResponse, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.produce_block_v4.set_handler(Arc::new(move |(slot, randao, graffiti, config)| {
+            f(slot, randao, graffiti, config)
         }));
         self
     }
@@ -492,6 +512,10 @@ impl MockBeaconNodeClient {
         self.produce_block_v3.calls()
     }
 
+    pub fn produce_block_v4_calls(&self) -> Vec<(u64, String, Option<String>, BuilderConfig)> {
+        self.produce_block_v4.calls()
+    }
+
     pub fn submit_sync_committee_messages_calls(&self) -> Vec<Vec<SyncCommitteeMessage>> {
         self.submit_sync_committee_messages.calls()
     }
@@ -588,6 +612,19 @@ impl BlockProducer for MockBeaconNodeClient {
         self.produce_block_v3.invoke(
             "produce_block_v3",
             (slot, randao_reveal.to_string(), graffiti.map(str::to_string), builder_boost_factor),
+        )
+    }
+
+    async fn produce_block_v4(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        self.produce_block_v4.invoke(
+            "produce_block_v4",
+            (slot, randao_reveal.to_string(), graffiti.map(str::to_string), builder_config.clone()),
         )
     }
 
@@ -788,6 +825,16 @@ mod tests {
             }
             other => panic!("expected HttpError, got {other:?}"),
         }
+        let err = mock
+            .produce_block_v4(1, "0xrandao", None, &BuilderConfig::default())
+            .await
+            .unwrap_err();
+        match err {
+            BeaconError::HttpError(msg) => {
+                assert!(msg.contains("produce_block_v4"), "unexpected message: {msg}");
+            }
+            other => panic!("expected HttpError, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -805,6 +852,27 @@ mod tests {
         }];
         mock.submit_proposer_preferences(&prefs).await.unwrap();
         assert_eq!(mock.submit_proposer_preferences_calls(), vec![prefs]);
+    }
+
+    #[tokio::test]
+    async fn test_shared_mock_produce_block_v4_captures() {
+        let mock =
+            MockBeaconNodeClient::new().with_produce_block_v4(|_slot, _randao, _graffiti, _cfg| {
+                Ok(ProduceBlockResponse {
+                    data: serde_json::Value::Null,
+                    is_blinded: false,
+                    consensus_version: "gloas".to_string(),
+                    execution_payload_value: None,
+                    is_ssz: false,
+                    ssz_bytes: None,
+                })
+            });
+        let cfg = BuilderConfig::default();
+        mock.produce_block_v4(7, "0xrandao", Some("0xgraf"), &cfg).await.unwrap();
+        assert_eq!(
+            mock.produce_block_v4_calls(),
+            vec![(7, "0xrandao".to_string(), Some("0xgraf".to_string()), cfg)]
+        );
     }
 
     #[tokio::test]

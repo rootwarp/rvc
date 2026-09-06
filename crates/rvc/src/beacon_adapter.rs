@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse};
+use block_service::{BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse};
 use bn_manager::BeaconNodeClient;
 use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
 
@@ -26,6 +26,19 @@ impl BeaconBlockClient for BeaconBlockAdapter {
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
         self.0
             .produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn produce_block_v4(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        self.0
+            .produce_block_v4(slot, randao_reveal, graffiti, builder_config)
             .await
             .map_err(Into::into)
     }
@@ -70,7 +83,7 @@ mod tests {
     use super::*;
     use block_service::BeaconBlockClient;
     use bn_manager::{BnManager, BnManagerConfig};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn block_response_template(payload_value: &str) -> ResponseTemplate {
@@ -137,6 +150,48 @@ mod tests {
             .await
             .expect("main-pool produce_block_v3");
         assert_eq!(produced.execution_payload_value.as_deref(), Some("111"));
+    }
+
+    /// Production path: adapter forwards `produce_block_v4` onto BnManager (POST /eth/v4/...).
+    #[tokio::test]
+    async fn test_produce_block_v4_forwards_to_bn_manager() {
+        let server = MockServer::start().await;
+        let slot = 42u64;
+        let builder_config =
+            BuilderConfig { min_bid: 10_000_000, builder_boost_factor: 50, builders: Vec::new() };
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v4/validator/blocks/42"))
+            .and(body_json(&builder_config))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Eth-Consensus-Version", "gloas")
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Execution-Payload-Value", "4242")
+                    .set_body_string(
+                        r#"{"data":{"slot":"42","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/42"))
+            .respond_with(block_response_template("v3-should-not-be-hit"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+
+        let produced = adapter
+            .produce_block_v4(slot, "0xrandao", None, &builder_config)
+            .await
+            .expect("produce_block_v4");
+        assert_eq!(produced.execution_payload_value.as_deref(), Some("4242"));
+        assert_eq!(produced.consensus_version, "gloas");
     }
 
     /// Configured proposer pool is preferred: request goes to proposer endpoint,

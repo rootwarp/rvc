@@ -28,7 +28,9 @@ use async_trait::async_trait;
 use beacon::{
     BeaconError, ExecutionOptimisticResponse, SubmitAttestationResult, VersionedAttestation,
 };
-use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
+use block_service::{
+    BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse as BlockProdResp,
+};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, Propagator};
 use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
 use duty_tracker::DutyTracker;
@@ -124,6 +126,15 @@ impl BeaconBlockClient for NoopBlockBeacon {
         _randao_reveal: &str,
         _graffiti: Option<&str>,
         _builder_boost_factor: Option<u64>,
+    ) -> Result<BlockProdResp, BlockServiceError> {
+        Err(BlockServiceError::Beacon("noop".to_string()))
+    }
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
     ) -> Result<BlockProdResp, BlockServiceError> {
         Err(BlockServiceError::Beacon("noop".to_string()))
     }

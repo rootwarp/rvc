@@ -486,6 +486,16 @@ impl BeaconBlockClient for MockBeaconClient {
         Ok(self.produce_response.clone().unwrap())
     }
 
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        Err(BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
+    }
+
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,

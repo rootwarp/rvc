@@ -24,7 +24,9 @@ use beacon::{
     BeaconError, DependentRootResponse, ExecutionOptimisticResponse, ProposerDuty,
     SubmitAttestationResult, VersionedAttestation,
 };
-use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
+use block_service::{
+    BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse as BlockProdResp,
+};
 use bn_manager::{
     AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, OperationTimeouts, Propagator,
 };
@@ -97,6 +99,16 @@ impl BeaconBlockClient for BarrierBlockBeacon {
             is_ssz: false,
             ssz_bytes: None,
         })
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<BlockProdResp, BlockServiceError> {
+        Err(BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
     }
 
     async fn publish_block(

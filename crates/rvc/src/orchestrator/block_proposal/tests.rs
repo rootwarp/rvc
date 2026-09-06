@@ -248,7 +248,9 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
 async fn test_proposal_passes_previous_slot_as_expected_parent() {
     use async_trait::async_trait;
     use beacon::{BlockRootData, DataResponse, DependentRootResponse, ProposerDuty};
-    use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse};
+    use block_service::{
+        BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse,
+    };
     use bn_manager::MockBeaconNodeClient;
     use eth_types::{Root, SignedBeaconBlock, SignedBlindedBeaconBlock};
 
@@ -281,6 +283,16 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
                 is_ssz: false,
                 ssz_bytes: None,
             })
+        }
+
+        async fn produce_block_v4(
+            &self,
+            _slot: Slot,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_config: &BuilderConfig,
+        ) -> Result<ProduceBlockResponse, BlockServiceError> {
+            Err(BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
         }
 
         async fn publish_block(

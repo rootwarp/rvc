@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconClient, BeaconCommitteeSubscription,
-    BeaconError, BlockRootResponse, ConfigSpecResponse, GenesisResponse,
+    BeaconError, BlockRootResponse, BuilderConfig, ConfigSpecResponse, GenesisResponse,
     PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
@@ -1209,7 +1209,7 @@ impl DutiesProvider for BnManager {
 
 #[async_trait]
 impl BlockProducer for BnManager {
-    // -- Block production: query(Best), Proposal role, require Synced --
+    // -- produce_block_v3: query(Best), Proposal role, require Synced --
 
     async fn produce_block_v3(
         &self,
@@ -1235,6 +1235,24 @@ impl BlockProducer for BnManager {
                 },
                 is_better_block,
             ),
+        )
+        .await
+    }
+
+    // Temporary query_first until 6.6 query_failover; do not use query_best.
+    async fn produce_block_v4(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        self.with_op_timeout(
+            "produce_block_v4",
+            self.op_timeout(|t| t.block_production),
+            self.query_first("produce_block_v4", BnRole::Proposal, HealthTier::Synced, |c| {
+                Box::pin(c.produce_block_v4(slot, randao_reveal, graffiti, builder_config))
+            }),
         )
         .await
     }
@@ -1694,6 +1712,13 @@ impl_beacon_client_passthrough! {
             graffiti: Option<&str>,
             builder_boost_factor: Option<u64>,
         ) -> Result<ProduceBlockResponse, BeaconError>;
+        async fn produce_block_v4(
+            &self,
+            slot: u64,
+            randao_reveal: &str,
+            graffiti: Option<&str>,
+            builder_config: &BuilderConfig,
+        ) -> Result<ProduceBlockResponse, BeaconError>;
         async fn publish_block(
             &self,
             signed_block: &SignedBeaconBlock,
@@ -1806,10 +1831,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 31 methods across the seven role traits (see impl_beacon_client_passthrough!).
+        // 32 methods across the seven role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            31,
+            32,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -1828,6 +1853,7 @@ mod tests {
             "get_attester_duties",
             "post_ptc_duties",
             "produce_block_v3",
+            "produce_block_v4",
             "publish_block_ssz",
             "submit_proposer_preferences",
             "submit_attestation",

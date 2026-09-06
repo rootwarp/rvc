@@ -42,12 +42,13 @@ use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 use async_trait::async_trait;
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    DependentRootResponse, ExecutionOptimisticResponse, PayloadAttestationDataResponse,
-    ProduceBlockResponse as BnProduceBlockResponse, ProposerDutiesResponse, ProposerDuty,
-    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    BuilderConfig, DependentRootResponse, ExecutionOptimisticResponse,
+    PayloadAttestationDataResponse, ProduceBlockResponse as BnProduceBlockResponse,
+    ProposerDutiesResponse, ProposerDuty, ProposerPreparation, PtcDutiesResponse,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
 use bn_manager::{
@@ -240,6 +241,15 @@ impl BlockProducer for DutyStallBeacon {
         builder_boost_factor: Option<u64>,
     ) -> Result<BnProduceBlockResponse, BeaconError> {
         self.inner.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+    async fn produce_block_v4(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<BnProduceBlockResponse, BeaconError> {
+        self.inner.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
     }
     async fn publish_block(
         &self,
@@ -434,6 +444,16 @@ impl BeaconBlockClient for TrackingBlockBeacon {
             is_ssz: false,
             ssz_bytes: None,
         })
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<BlockProdResp, BlockServiceError> {
+        Err(BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
     }
 
     async fn publish_block(

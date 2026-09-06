@@ -34,11 +34,11 @@ pub use types::{BnRole, HealthTier, TierThresholds};
 // don't need to depend on `beacon` directly.
 pub use beacon::{
     AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
-    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, Checkpoint, ConfigSpecResponse,
-    GenesisResponse, IndexedAttestationError, LegacyAttestation, PayloadAttestationDataResponse,
-    ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, ProposerPreparation,
-    PtcDutiesResponse, PtcDuty, SignedAggregateAndProof, SignedContributionAndProof,
-    SingleAttestation, StateForkResponse, SubmitAttestationResult,
+    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, BuilderConfig, Checkpoint,
+    ConfigSpecResponse, GenesisResponse, IndexedAttestationError, LegacyAttestation,
+    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty,
+    ProposerPreparation, PtcDutiesResponse, PtcDuty, SignedAggregateAndProof,
+    SignedContributionAndProof, SingleAttestation, StateForkResponse, SubmitAttestationResult,
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
     SyncingData, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,

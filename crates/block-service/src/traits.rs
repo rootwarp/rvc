@@ -4,7 +4,7 @@ use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
 
 use crate::BlockServiceError;
 
-pub use beacon::ProduceBlockResponse;
+pub use beacon::{BuilderConfig, ProduceBlockResponse};
 
 /// Minimal beacon client trait for block production and publication.
 ///
@@ -18,6 +18,14 @@ pub trait BeaconBlockClient: Send + Sync {
         randao_reveal: &str,
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
+    ) -> Result<ProduceBlockResponse, BlockServiceError>;
+
+    async fn produce_block_v4(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BlockServiceError>;
 
     async fn publish_block(

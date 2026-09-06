@@ -5,7 +5,7 @@ use beacon::{
     AttestationData, AttesterDuty, Checkpoint, DependentRootResponse, ExecutionOptimisticResponse,
     ProposerDuty,
 };
-use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse};
+use block_service::{BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse};
 use bn_manager::MockBeaconNodeClient;
 use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SyncCommitteeDuty};
 use parking_lot::Mutex as ParkingMutex;
@@ -66,6 +66,16 @@ impl BeaconBlockClient for RecordingBlockBeacon {
             is_ssz: false,
             ssz_bytes: None,
         })
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        Err(BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
     }
 
     async fn publish_block(

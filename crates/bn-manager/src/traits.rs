@@ -4,12 +4,12 @@ use async_trait::async_trait;
 
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    BlockRootResponse, ConfigSpecResponse, GenesisResponse, PayloadAttestationDataResponse,
-    ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse,
-    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    BlockRootResponse, BuilderConfig, ConfigSpecResponse, GenesisResponse,
+    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
+    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -61,6 +61,18 @@ pub trait BlockProducer: Send + Sync {
         randao_reveal: &str,
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
+    ) -> Result<ProduceBlockResponse, BeaconError>;
+
+    /// Produce a block via `POST /eth/v4/validator/blocks/{slot}`.
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn produce_block_v4(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BeaconError>;
 
     async fn publish_block(
