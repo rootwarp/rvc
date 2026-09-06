@@ -93,6 +93,10 @@ const EXPECTED_EDGE_SERVER: (&str, &str) = ("rvc-signer-server", "rvc-telemetry"
 /// Workspace production deps that `rvc-signer-server` is allowed to take.
 /// Any new production edge must be reviewed and added here deliberately —
 /// do not widen this table to silence a real layering violation.
+///
+/// Island (`rvc-gloas`) and BN (`beacon` / `rvc-bn-manager`) edges are
+/// forbidden here: DVT peers cannot observe the chain. `rvc-config` is the
+/// FU-33 / 4.14 shared `[fork_schedule]` parse — do not revert it.
 const SIGNER_SERVER_ALLOWED_EDGES: &[&str] = &[
     "rvc-config", // shared `[fork_schedule]` parse with the VC (FU-33 / 4.14)
     "rvc-crypto",
@@ -474,4 +478,31 @@ fn test_bin_rvc_signer_contains_only_cli() {
         !cargo_toml.contains("[lib]"),
         "bin/rvc-signer/Cargo.toml must not declare [lib]; library lives in crates/signer-server"
     );
+}
+
+/// Issue 4.18: the Gloas SSZ island never enters `crypto` or `signer-server`,
+/// and `SIGNER_SERVER_ALLOWED_EDGES` gains no island/BN edge.
+#[test]
+fn test_no_rvc_gloas_edge_into_crypto_or_signer_server() {
+    for forbidden in ["rvc-gloas", "beacon", "rvc-bn-manager"] {
+        assert!(
+            !SIGNER_SERVER_ALLOWED_EDGES.contains(&forbidden),
+            "SIGNER_SERVER_ALLOWED_EDGES must not include island/BN edge {forbidden}"
+        );
+    }
+    assert!(
+        SIGNER_SERVER_ALLOWED_EDGES.contains(&"rvc-config"),
+        "do not revert the rvc-config edge (shared ForkScheduleConfig, FU-33 / 4.14)"
+    );
+
+    let graph = rvc_architecture_tests::load_workspace_graph();
+    for crate_name in ["rvc-crypto", "rvc-signer-server"] {
+        let deps = graph.edges.get(crate_name).unwrap_or_else(|| {
+            panic!("package '{crate_name}' not found in workspace metadata");
+        });
+        assert!(
+            !deps.contains("rvc-gloas"),
+            "{crate_name} must not take a production edge into rvc-gloas; deps={deps:?}"
+        );
+    }
 }

@@ -64,7 +64,7 @@ pub static RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS: LazyLock<Histogram
     });
 
 /// Counter for duty reorg detections.
-/// Labels: duty_type (attester, proposer)
+/// Labels: duty_type (attester, proposer, ptc)
 pub static RVC_DUTY_REORG_DETECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     define_int_counter_vec(
         "rvc_duty_reorg_detected_total",

@@ -515,6 +515,14 @@ impl DutyTracker {
         Ok(response.data)
     }
 
+    /// Fetch PTC duties for `epoch` using the tracker's validator indices.
+    pub async fn fetch_ptc_duties_for_epoch(
+        &self,
+        epoch: u64,
+    ) -> Result<Vec<PtcDuty>, DutyTrackerError> {
+        self.fetch_ptc_duties(epoch, &self.validator_indices).await
+    }
+
     pub async fn get_ptc_duties_for_slot(&self, slot: u64) -> Vec<PtcDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.ptc_cache.read().await;

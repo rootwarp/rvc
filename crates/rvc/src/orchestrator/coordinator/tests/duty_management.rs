@@ -541,6 +541,12 @@ async fn test_check_reorg_at_epoch_boundary_uncached_fetches() {
         .mount(&mock_server)
         .await;
 
+    Mock::given(method("POST"))
+        .and(path_regex(r"/eth/v1/validator/duties/ptc/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&attester_response))
+        .mount(&mock_server)
+        .await;
+
     let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
         .with_timeout(Duration::from_secs(5))
         .with_max_retries(1);
@@ -580,6 +586,8 @@ async fn test_check_reorg_at_epoch_boundary_uncached_fetches() {
     assert!(duty_tracker.is_epoch_cached(11).await);
     assert!(duty_tracker.is_proposer_epoch_cached(10).await);
     assert!(duty_tracker.is_proposer_epoch_cached(11).await);
+    assert!(duty_tracker.is_ptc_epoch_cached(10).await);
+    assert!(duty_tracker.is_ptc_epoch_cached(11).await);
 }
 
 #[tokio::test]

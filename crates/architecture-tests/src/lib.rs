@@ -432,10 +432,12 @@ pub const DOMAIN_EDGE_ALLOWLIST: &[(&str, &str)] = &[
     // Duty services take the signing trait from the domain signing crate.
     ("rvc-block-service", "rvc-signer"),
     ("rvc-builder", "rvc-signer"),
-    // Remote signing library wraps the in-process signing stack.
-    ("rvc-signer-server", "rvc-signer"),
     // Issue 1.5: enablement gate lives in doppelganger (REQUIRED_EDGE).
     ("rvc-signer", "rvc-doppelganger"),
+    // Shared `[fork_schedule]` parse with the VC (FU-33 / 4.14). Not an island/BN edge.
+    ("rvc-signer-server", "rvc-config"),
+    // Remote signing library wraps the in-process signing stack.
+    ("rvc-signer-server", "rvc-signer"),
 ];
 
 /// Cross-check generated edges against standing policy tables used by

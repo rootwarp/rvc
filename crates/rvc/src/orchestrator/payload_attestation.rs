@@ -43,7 +43,16 @@ impl PayloadAttestationService {
         skip_all,
         fields(slot = slot)
     )]
-    pub(crate) async fn maybe_produce_payload_attestations(&self, slot: Slot, _epoch: u64) {
+    pub(crate) async fn maybe_produce_payload_attestations(&self, slot: Slot, epoch: u64) {
+        // Same lazy-fetch as attester `process_slot`: a cache-cold slot still
+        // POSTs duties/ptc rather than silently skipping the duty.
+        if !self.duty_tracker.is_ptc_epoch_cached(epoch).await {
+            if let Err(e) = self.duty_tracker.fetch_ptc_duties_for_epoch(epoch).await {
+                warn!(slot, epoch, error = %e, "Failed to fetch PTC duties");
+                return;
+            }
+        }
+
         let duties = self.duty_tracker.get_ptc_duties_for_slot(slot).await;
         if duties.is_empty() {
             return;

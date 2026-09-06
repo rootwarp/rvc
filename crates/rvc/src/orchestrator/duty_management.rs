@@ -103,6 +103,26 @@ impl DutyManagementService {
             }
         }
 
+        // PTC duties
+        if !self.duty_tracker.is_ptc_epoch_cached(epoch).await {
+            debug!(epoch, "Fetching PTC duties for epoch");
+            match utils::timed(
+                "ptc_duty_fetch",
+                self.config.timeouts.duty_fetch,
+                self.duty_tracker.fetch_ptc_duties_for_epoch(epoch),
+            )
+            .await
+            {
+                TimedOutcome::Ok(_) => {}
+                TimedOutcome::Err(e) => warn!(epoch, error = %e, "Failed to fetch PTC duties"),
+                TimedOutcome::Timeout => warn!(
+                    epoch,
+                    "PTC duty fetch timed out after {}s",
+                    self.config.timeouts.duty_fetch.as_secs()
+                ),
+            }
+        }
+
         // Sync committee duties (at period boundaries)
         if !self.duty_tracker.is_sync_period_cached(epoch).await {
             debug!(epoch, "Fetching sync committee duties");
@@ -300,6 +320,41 @@ impl DutyManagementService {
                     warn!(
                         epoch,
                         "Proposer reorg check timed out after {}s",
+                        self.config.timeouts.duty_fetch.as_secs()
+                    );
+                }
+            }
+
+            let ptc_cached = self.duty_tracker.is_ptc_epoch_cached(epoch).await;
+            let old_ptc_root = self.duty_tracker.get_cached_ptc_dependent_root(epoch).await;
+            match utils::timed(
+                "ptc_reorg_check",
+                self.config.timeouts.duty_fetch,
+                self.duty_tracker.check_and_refetch_ptc_if_root_changed(epoch),
+            )
+            .await
+            {
+                TimedOutcome::Ok(true) if ptc_cached => {
+                    let new_root = self.duty_tracker.get_cached_ptc_dependent_root(epoch).await;
+                    warn!(
+                        epoch,
+                        old_head = ?old_ptc_root,
+                        new_head = ?new_root,
+                        "Reorg detected: PTC duties refetched"
+                    );
+                    RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["ptc"]).inc();
+                }
+                TimedOutcome::Ok(true) => {
+                    debug!(epoch, "PTC duties fetched (was uncached)");
+                }
+                TimedOutcome::Ok(false) => {}
+                TimedOutcome::Err(e) => {
+                    warn!(epoch, error = %e, "Failed to check PTC dependent root");
+                }
+                TimedOutcome::Timeout => {
+                    warn!(
+                        epoch,
+                        "PTC reorg check timed out after {}s",
                         self.config.timeouts.duty_fetch.as_secs()
                     );
                 }
