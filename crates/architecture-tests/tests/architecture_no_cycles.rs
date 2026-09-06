@@ -69,6 +69,8 @@ const DOMAIN_EDGE_ALLOWLIST: &[(&str, &str)] = rvc_architecture_tests::DOMAIN_ED
 ///   dependents can take the light path without pulling BLS/KDF/HTTP via crypto.
 /// - `rvc-test-support`: dev-only rcgen PKI + mTLS harness (RF6-14); external deps only
 ///   (rcgen/tonic/tokio), never a production edge into the workspace graph.
+/// - `rvc-spec-vectors`: integration-only spec vectors + KAT codegen; external deps only
+///   (none yet), never a production edge into the workspace graph.
 const ZERO_OUT_EDGE_IF_PRESENT: &[&str] = &[
     "rvc-eth-types",
     "rvc-signer-registry",
@@ -76,6 +78,7 @@ const ZERO_OUT_EDGE_IF_PRESENT: &[&str] = &[
     "rvc-observability",
     "rvc-signer-proto",
     "rvc-test-support",
+    "rvc-spec-vectors",
 ];
 /// Edge that MUST be present (Issue 1.5 regression guard).
 const REQUIRED_EDGE: (&str, &str) = ("rvc-signer", "rvc-doppelganger");

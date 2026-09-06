@@ -124,6 +124,8 @@ const CLASSIFICATION: &[(&str, Layer, &str, &str)] = &[
     ("rvc-architecture-tests", Layer::Meta, "architecture-tests", "DAG + doc gates"),
     // Unchanged — dev-only PKI/mTLS harness; already zero-out-edge pinned.
     ("rvc-test-support", Layer::Meta, "test-support", "PKI + mTLS harness"),
+    // Integration-only spec vectors + KAT codegen; zero workspace out-edges.
+    ("rvc-spec-vectors", Layer::Meta, "spec-vectors", "spec vectors + KAT codegen"),
 ];
 
 /// Workspace package snapshot used by generators and gates.

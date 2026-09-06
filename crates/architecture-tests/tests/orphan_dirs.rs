@@ -9,6 +9,7 @@
 //! ARCH-3 lowered the pin from 29 → 28 when `sync-service` is deleted.
 //! ARCH-4e (`rvc-config`) raises it to 29.
 //! ARCH-6f (`rvc-remote-signer-client`) raises it to 30.
+//! Issue 3.1 (`rvc-spec-vectors`) raises it to 31.
 //!
 //! Failure copy (VD-P1): never recommend adding to `[workspace] members` unconditionally —
 //! historical orphans collide by package name with live members.
@@ -20,7 +21,8 @@ use std::path::{Path, PathBuf};
 use rvc_architecture_tests::{load_cargo_metadata, load_workspace_graph, workspace_root};
 
 /// Absolute G-1 pin. ARCH-4e raised to 29; ARCH-6f (`rvc-remote-signer-client`) raises to 30.
-const EXPECTED_MEMBER_COUNT: usize = 30;
+/// Issue 3.1 (`rvc-spec-vectors`) raises to 31.
+const EXPECTED_MEMBER_COUNT: usize = 31;
 
 // ---------------------------------------------------------------------------
 // Enumeration
