@@ -208,6 +208,7 @@ fn payload_duty(payload: &SignPayload) -> Duty {
         SignPayload::SyncCommitteeContributionAndProof { .. }
         | SignPayload::SyncCommitteeSelectionProof { .. } => Duty::SyncContribution,
         SignPayload::ValidatorRegistration { .. } => Duty::ValidatorRegistration,
+        SignPayload::BuilderRequestAuth { .. } => Duty::BuilderRequestAuth,
         SignPayload::VoluntaryExit { .. } => Duty::VoluntaryExit,
     }
 }
@@ -240,6 +241,9 @@ fn payload_slot(payload: &SignPayload) -> Option<u64> {
         }
         SignPayload::ProposerPreferences { proposer_preferences } => {
             Some(proposer_preferences.data.proposal_slot)
+        }
+        SignPayload::BuilderRequestAuth { builder_request_auth } => {
+            Some(builder_request_auth.data.slot())
         }
         SignPayload::RandaoReveal { .. }
         | SignPayload::ValidatorRegistration { .. }
@@ -346,6 +350,7 @@ fn http_a7_sign_type(payload: &SignPayload) -> &'static str {
         SignPayload::VoluntaryExit { .. } => grpc_sign_type::VOLUNTARY_EXIT,
         SignPayload::PayloadAttestation { .. } => grpc_sign_type::PAYLOAD_ATTESTATION,
         SignPayload::ProposerPreferences { .. } => grpc_sign_type::PROPOSER_PREFERENCES,
+        SignPayload::BuilderRequestAuth { .. } => grpc_sign_type::BUILDER_REQUEST_AUTH,
     }
 }
 

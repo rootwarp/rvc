@@ -474,12 +474,12 @@ mod tests {
     use crate::signing_root::signing_root_with_fork_version;
     use crate::typed_signer::SignContext;
     use eth_types::{
-        AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-        Epoch, ForkInfo, PayloadAttestationData, ProposerPreferences, Root as EthRoot, Slot,
-        SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
+        AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, BuilderRequestAuth,
+        ContributionAndProof, Epoch, ForkInfo, PayloadAttestationData, ProposerPreferences,
+        Root as EthRoot, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
         DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-        DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
-        DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+        DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
+        DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
         DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
     };
 
@@ -666,6 +666,20 @@ mod tests {
                 DOMAIN_PROPOSER_PREFERENCES,
                 ctx.fork_info.current_version,
                 ctx.fork_info.genesis_validators_root,
+            );
+            self.sign_root(&root, &ctx.pubkey.to_bytes())
+        }
+        async fn sign_builder_request_auth(
+            &self,
+            auth: &BuilderRequestAuth,
+            genesis_fork_version: [u8; 4],
+            ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            let root = signing_root_with_fork_version(
+                auth,
+                DOMAIN_BUILDER_REQUEST_AUTH,
+                genesis_fork_version,
+                [0u8; 32],
             );
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }

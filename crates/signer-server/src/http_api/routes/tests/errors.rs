@@ -323,6 +323,21 @@ async fn proposer_preferences_unknown_version_returns_400_and_skips_backend() {
     assert_eq!(backend.sign_call_count(), 0, "backend must not be invoked");
 }
 
+/// Unknown `version` on BUILDER_REQUEST_AUTH is a 4xx naming the value; serde
+/// fails closed so the backend is never invoked.
+#[tokio::test]
+async fn builder_request_auth_unknown_version_returns_400_and_skips_backend() {
+    let (_, pk_bytes) = test_keypair();
+    let backend = Arc::new(MockBackend::with_keys(vec![pk_bytes]));
+    let state = test_state(backend.clone());
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let resp = post_sign(state, &id, None, builder_request_auth_body("NOT_A_FORK")).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(text.contains("NOT_A_FORK"), "names the version: {text}");
+    assert_eq!(backend.sign_call_count(), 0, "backend must not be invoked");
+}
+
 /// D19: GLOAS on AGGREGATE_AND_PROOF_V2 is the same typed 4xx; no backend call.
 #[tokio::test]
 async fn gloas_aggregate_and_proof_v2_returns_400_naming_wire_and_skips_backend() {

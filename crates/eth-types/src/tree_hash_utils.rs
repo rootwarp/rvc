@@ -7,6 +7,9 @@ pub enum TreeHashError {
     /// Body bytes failed SSZ decode into a typed `BeaconBlockBody` (SEC-6c).
     #[error("invalid SSZ block body: {reason}")]
     InvalidBody { reason: String },
+    /// SSZ `ByteList[N]` was empty or over the type limit.
+    #[error("invalid SSZ byte list: {reason}")]
+    InvalidByteList { reason: String },
 }
 
 /// Implement `try_tree_hash_root` + `TreeHash` for an SSZ container.

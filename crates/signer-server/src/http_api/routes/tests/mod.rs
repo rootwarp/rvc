@@ -407,6 +407,18 @@ fn proposer_preferences_body(version: &str) -> String {
     )
 }
 
+fn auth_kat_data() -> eth_types::BuilderRequestAuth {
+    eth_types::BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1).unwrap()
+}
+
+fn builder_request_auth_body(version: &str) -> String {
+    format!(
+        r#"{{ "type": "BUILDER_REQUEST_AUTH",
+              "builder_request_auth": {{ "version": "{version}", "data": {data} }} }}"#,
+        data = serde_json::to_string(&auth_kat_data()).unwrap(),
+    )
+}
+
 /// A frozen, spec-derived Electra `AGGREGATE_AND_PROOF_V2` wire body. Field
 /// names and encodings (quoted `u64`, `0x`-lowercase hex bitlists, nested
 /// `data`) match the remote-signing schema; `committee_bits` is the EIP-7549
@@ -447,7 +459,7 @@ fn electra_v2_frozen_fixture() -> String {
 /// One valid body per supported Web3Signer `type` (FR-4..FR-14) — every duty
 /// a running validator performs. The full Web3Signer protocol also defines
 /// BLOCK v1 / DEPOSIT etc., which are out of scope for a VC (PRD); the 13
-/// here are the complete dispatchable set.
+/// here plus Gloas PTC / preferences / request-auth are the complete dispatchable set.
 fn all_supported_type_bodies() -> Vec<(&'static str, String)> {
     vec![
         ("BLOCK_V2", block_v2_body(0x11)),
@@ -490,6 +502,7 @@ fn all_supported_type_bodies() -> Vec<(&'static str, String)> {
         ("AGGREGATE_AND_PROOF_V2", electra_v2_frozen_fixture()),
         ("PAYLOAD_ATTESTATION", payload_attestation_body("GLOAS")),
         ("PROPOSER_PREFERENCES", proposer_preferences_body("GLOAS")),
+        ("BUILDER_REQUEST_AUTH", builder_request_auth_body("GLOAS")),
     ]
 }
 

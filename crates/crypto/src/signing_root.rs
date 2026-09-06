@@ -10,13 +10,14 @@
 //! [`ForkSchedule`] is available.
 
 use eth_types::{
-    AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-    DomainType, ElectraAggregateAndProof, Epoch, ForkName, ForkSchedule, PayloadAttestationData,
-    ProposerPreferences, Root, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1,
-    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
-    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT, SLOTS_PER_EPOCH,
+    AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, BuilderRequestAuth,
+    ContributionAndProof, DomainType, ElectraAggregateAndProof, Epoch, ForkName, ForkSchedule,
+    PayloadAttestationData, ProposerPreferences, Root, Slot, SyncAggregatorSelectionData,
+    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
+    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_VOLUNTARY_EXIT, SLOTS_PER_EPOCH,
 };
 use tree_hash::TreeHash;
 
@@ -73,6 +74,14 @@ pub enum DutyRef<'a> {
     /// `ForkSchedule::genesis_fork_version`.
     BuilderRegistration {
         registration: &'a ValidatorRegistrationV1,
+        genesis_fork_version: [u8; 4],
+    },
+    /// Builder request auth (`DOMAIN_BUILDER_REQUEST_AUTH`).
+    ///
+    /// Uses the genesis-fork and zero-GVR idiom of [`Self::BuilderRegistration`]
+    /// (builder-specs: analogous to `ValidatorRegistrationV1`).
+    BuilderRequestAuth {
+        auth: &'a BuilderRequestAuth,
         genesis_fork_version: [u8; 4],
     },
 }
@@ -207,6 +216,14 @@ pub fn signing_root_for(duty: &DutyRef<'_>, ctx: &SigningCtx<'_>) -> Root {
             let domain =
                 compute_domain(DOMAIN_APPLICATION_BUILDER, *genesis_fork_version, zero_gvr);
             compute_signing_root(registration, domain)
+        }
+        DutyRef::BuilderRequestAuth { auth, genesis_fork_version } => {
+            // builder-specs: compute_domain(DOMAIN_BUILDER_REQUEST_AUTH) with
+            // genesis fork version and zero GVR (ValidatorRegistrationV1 idiom).
+            let zero_gvr = [0u8; 32];
+            let domain =
+                compute_domain(DOMAIN_BUILDER_REQUEST_AUTH, *genesis_fork_version, zero_gvr);
+            compute_signing_root(auth, domain)
         }
     }
 }
@@ -633,6 +650,48 @@ mod tests {
         let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: [0u8; 32] };
         let got = signing_root_for(&DutyRef::ProposerPreferences(&prefs), &ctx);
         assert_eq!(got, parse_kat_root(KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT));
+    }
+
+    /// L3: BuilderRequestAuth signing root from the 4.0 pyspec recipe
+    /// (`KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT`) under
+    /// `DOMAIN_BUILDER_REQUEST_AUTH 0x0B000001` with genesis fork + zero GVR.
+    #[test]
+    fn test_builder_request_auth_signing_root() {
+        use eth_types::BuilderRequestAuth;
+        use rvc_spec_vectors::builder_request_auth_kat::{
+            BUILDER_SPECS_REVISION, KAT_BUILDER_REQUEST_AUTH_DATA_HEX,
+            KAT_BUILDER_REQUEST_AUTH_SLOT, KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT,
+        };
+
+        const KAT: &str = include_str!("../../rvc-spec-vectors/src/builder_request_auth_kat.rs");
+        let header: String = KAT.lines().take_while(|l| l.starts_with("//!")).collect();
+        assert!(
+            !header.to_ascii_lowercase().contains("remerkleable"),
+            "KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT provenance must not be remerkleable (D15)"
+        );
+        assert!(
+            header.contains(BUILDER_SPECS_REVISION),
+            "provenance must name the builder-specs revision"
+        );
+        assert!(
+            header.contains("0x0B000001") || header.contains("0x0b000001"),
+            "provenance must name DOMAIN_BUILDER_REQUEST_AUTH 0x0B000001"
+        );
+        assert_eq!(DOMAIN_BUILDER_REQUEST_AUTH, [0x0B, 0x00, 0x00, 0x01]);
+
+        let auth = BuilderRequestAuth::new(
+            hex::decode(KAT_BUILDER_REQUEST_AUTH_DATA_HEX).expect("kat data"),
+            KAT_BUILDER_REQUEST_AUTH_SLOT,
+        )
+        .expect("kat data valid");
+        let schedule = compressed_schedule();
+        let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: [0xff; 32] };
+        // Genesis-fork + zero GVR idiom: GVR on ctx must not affect the root.
+        let got = signing_root_for(
+            &DutyRef::BuilderRequestAuth { auth: &auth, genesis_fork_version: PHASE0 },
+            &ctx,
+        );
+        assert_eq!(got, parse_kat_root(KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT));
     }
 
     /// PTC fork version is `epoch_of(data.slot)`, unlike attestations (`target.epoch`).

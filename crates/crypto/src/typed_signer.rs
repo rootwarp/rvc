@@ -8,11 +8,11 @@ use async_trait::async_trait;
 
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock,
-    ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, PayloadAttestationData,
-    ProposerPreferences, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
-    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    BuilderRequestAuth, ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo,
+    PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
+    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
+    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 
@@ -220,6 +220,21 @@ pub trait TypedSigner: Send + Sync {
     ) -> Result<Signature, SigningError> {
         let _ = (prefs, ctx);
         Err(SigningError::UnsupportedDuty { duty: "proposer_preferences" })
+    }
+
+    /// Sign a builder request auth (`DOMAIN_BUILDER_REQUEST_AUTH`, genesis fork,
+    /// zero GVR).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override.
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        genesis_fork_version: [u8; 4],
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (auth, genesis_fork_version, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "builder_request_auth" })
     }
 }
 
@@ -441,6 +456,22 @@ impl TypedSigner for LocalSigner {
             DOMAIN_PROPOSER_PREFERENCES,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        genesis_fork_version: [u8; 4],
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            auth,
+            DOMAIN_BUILDER_REQUEST_AUTH,
+            genesis_fork_version,
+            [0u8; 32],
         );
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
@@ -965,6 +996,55 @@ mod tests {
         match result {
             Err(SigningError::UnsupportedDuty { duty }) => {
                 assert_eq!(duty, "proposer_preferences");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
+    }
+
+    fn kat_builder_request_auth() -> BuilderRequestAuth {
+        use rvc_spec_vectors::builder_request_auth_kat::{
+            KAT_BUILDER_REQUEST_AUTH_DATA_HEX, KAT_BUILDER_REQUEST_AUTH_SLOT,
+        };
+        BuilderRequestAuth::new(
+            hex::decode(KAT_BUILDER_REQUEST_AUTH_DATA_HEX).expect("kat data"),
+            KAT_BUILDER_REQUEST_AUTH_SLOT,
+        )
+        .expect("kat data valid")
+    }
+
+    /// L3: signature verifies over `KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT`.
+    #[tokio::test]
+    async fn test_local_signer_builder_request_auth_signature_verifies() {
+        use rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT;
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let auth = kat_builder_request_auth();
+        let signer = make_local_signer(sk);
+
+        let sig =
+            TypedSigner::sign_builder_request_auth(&signer, &auth, [0; 4], &ctx).await.unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "builder request auth signature must verify over the KAT signing root"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_builder_request_auth_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let auth = kat_builder_request_auth();
+        let signer = CapabilityMissingSigner;
+
+        let result = TypedSigner::sign_builder_request_auth(&signer, &auth, [0; 4], &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "builder_request_auth");
             }
             Ok(_) => panic!("unsupported signer must not produce a signature"),
             other => panic!("expected UnsupportedDuty, got: {other:?}"),

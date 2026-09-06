@@ -19,10 +19,11 @@ use tower::ServiceExt;
 
 use crypto::{compute_domain, compute_signing_root, KeyManager, PublicKey, SecretKey, Signature};
 use eth_types::{
-    AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
-    ContributionAndProof, PayloadAttestationData, ProposerPreferences, SyncCommitteeContribution,
-    ValidatorRegistrationV1, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, BuilderRequestAuth,
+    Checkpoint, ContributionAndProof, PayloadAttestationData, ProposerPreferences,
+    SyncCommitteeContribution, ValidatorRegistrationV1, DOMAIN_APPLICATION_BUILDER,
+    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH,
+    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
 };
 use signer_server::backend::{SigningBackend, SigningBackendError};
 use signer_server::http_api::{router, AuditCfg, Web3SignerState};
@@ -623,5 +624,52 @@ async fn test_proposer_preferences_plan_identical_across_transports() {
     let expected = s.sk.sign(&kat).to_bytes().to_vec();
     assert_eq!(grpc_resp, expected);
     let domain = compute_domain(DOMAIN_PROPOSER_PREFERENCES, [0x07, 0x00, 0x00, 0x01], [0u8; 32]);
+    assert_eq!(compute_signing_root(&object_root, domain), kat);
+}
+
+// ── Builder request auth (gRPC SignRoot vs HTTP BUILDER_REQUEST_AUTH) ────────
+
+#[tokio::test]
+async fn test_builder_request_auth_plan_identical_across_transports() {
+    let s = shared(MAINNET_GENESIS);
+    let data = BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1).unwrap();
+    let object_root = data.tree_hash_root().0;
+    assert_eq!(
+        hex::encode(object_root),
+        rvc_spec_vectors::builder_request_auth_kat::SPEC_GLOAS_BUILDERREQUESTAUTH_ROOT
+    );
+
+    let grpc_resp = SignerServiceV2::sign_root(
+        &grpc_svc(&s),
+        Request::new(SignRootRequest {
+            pubkey: s.pubkey.to_vec(),
+            fork_info: Some(gloas_fork_info()),
+            object_root: object_root.to_vec(),
+            duty: Duty::BuilderRequestAuth as i32,
+            fork_id: 7,
+        }),
+    )
+    .await
+    .expect("gRPC SignRoot builder request auth")
+    .into_inner()
+    .signature;
+
+    let body = format!(
+        r#"{{ "type": "BUILDER_REQUEST_AUTH",
+              "builder_request_auth": {{ "version": "GLOAS", "data": {data} }} }}"#,
+        data = serde_json::to_string(&data).unwrap(),
+    );
+    let http_sig = http_sign(http_state(&s), &s.pubkey, body).await;
+    assert_eq!(grpc_resp, http_sig, "gRPC SignRoot BUILDER_REQUEST_AUTH must match HTTP");
+
+    let kat: [u8; 32] = hex::decode(
+        rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT,
+    )
+    .expect("kat hex")
+    .try_into()
+    .expect("32-byte kat");
+    let expected = s.sk.sign(&kat).to_bytes().to_vec();
+    assert_eq!(grpc_resp, expected);
+    let domain = compute_domain(DOMAIN_BUILDER_REQUEST_AUTH, MAINNET_GENESIS, [0u8; 32]);
     assert_eq!(compute_signing_root(&object_root, domain), kat);
 }

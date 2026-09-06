@@ -11,9 +11,9 @@
 use async_trait::async_trait;
 use crypto::{PublicKey, SecretKey, Signature};
 use eth_types::{
-    AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
-    VoluntaryExit,
+    AggregateAndProof, AttestationData, BuilderRequestAuth, ContributionAndProof,
+    ElectraAggregateAndProof, Epoch, ForkSchedule, PayloadAttestationData, ProposerPreferences,
+    Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 
 use crate::{BeaconBlockHeaderFields, SignerError, ValidatorSigner};
@@ -189,6 +189,15 @@ impl ValidatorSigner for StubValidatorSigner {
     ) -> Result<Signature, SignerError> {
         Ok(mock_sig(b"proposer-preferences"))
     }
+
+    async fn sign_builder_request_auth(
+        &self,
+        _auth: &BuilderRequestAuth,
+        _pubkey: &PublicKey,
+        _genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"builder-request-auth"))
+    }
 }
 
 #[cfg(test)]
@@ -285,5 +294,8 @@ mod tests {
             target_gas_limit: 36_000_000,
         };
         assert!(stub.sign_proposer_preferences(&prefs, &pk, &fork, &gvr).await.is_ok());
+
+        let auth = BuilderRequestAuth::new(b"https://builder.example".to_vec(), 1).unwrap();
+        assert!(stub.sign_builder_request_auth(&auth, &pk, [0; 4]).await.is_ok());
     }
 }

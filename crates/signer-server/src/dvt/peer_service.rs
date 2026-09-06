@@ -73,6 +73,9 @@ pub struct PeerSignerServiceImpl {
     allow_list: Arc<AllowedPeers>,
     /// Slashing DB — `None` when slashing protection is disabled.
     slashing_db: Option<Arc<SlashingDb>>,
+    /// Network genesis fork for builder-registration-idiom duties
+    /// (`BUILDER_REQUEST_AUTH`). Must match HTTP/gRPC full-sign.
+    genesis_fork_version: [u8; 4],
 }
 
 impl PeerSignerServiceImpl {
@@ -85,7 +88,18 @@ impl PeerSignerServiceImpl {
         allow_list: Arc<AllowedPeers>,
         slashing_db: Option<Arc<SlashingDb>>,
     ) -> Self {
-        Self { shares, allow_list, slashing_db }
+        Self {
+            shares,
+            allow_list,
+            slashing_db,
+            genesis_fork_version: crate::sign_plan::BUILDER_FORK_VERSION_MAINNET,
+        }
+    }
+
+    /// Set the network genesis fork used for `BUILDER_REQUEST_AUTH` plans.
+    pub fn with_genesis_fork_version(mut self, genesis_fork_version: [u8; 4]) -> Self {
+        self.genesis_fork_version = genesis_fork_version;
+        self
     }
 
     #[allow(clippy::result_large_err)]
@@ -658,7 +672,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
         validate_transport_fork_id(r.fork_id)?;
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let object_root = validate_root32(&r.object_root, "object_root")?;
-        let planned = root_duty_plan(r.duty, object_root, fork_version, gvr)?;
+        let planned =
+            root_duty_plan(r.duty, object_root, fork_version, gvr, self.genesis_fork_version)?;
         let plan = plan_sign(&planned.input);
         let signing_root = plan.signing_root;
 
@@ -1399,6 +1414,48 @@ mod tests {
             before_atts,
             "non-slashable root duty must not write an attestation row"
         );
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_root_builder_request_auth_uses_configured_genesis() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let holesky = eth_types::NetworkPreset::HOLESKY.genesis_fork_version;
+        let mainnet = crate::sign_plan::BUILDER_FORK_VERSION_MAINNET;
+        assert_ne!(holesky, mainnet, "holesky genesis must differ from mainnet");
+
+        let object_root = [0x44u8; 32];
+        let fv = [0x04, 0x00, 0x00, 0x00];
+        let gvr = [0u8; 32];
+        let duty = crate::proto::signer_v2::Duty::BuilderRequestAuth as i32;
+        let holesky_root =
+            plan_sign(&root_duty_plan(duty, object_root, fv, gvr, holesky).unwrap().input)
+                .signing_root;
+        let mainnet_root =
+            plan_sign(&root_duty_plan(duty, object_root, fv, gvr, mainnet).unwrap().input)
+                .signing_root;
+        assert_ne!(holesky_root, mainnet_root);
+
+        let expected_holesky = partial_sign_with_share(&holesky_root, &share).unwrap();
+        let expected_mainnet = partial_sign_with_share(&mainnet_root, &share).unwrap();
+        assert_ne!(expected_holesky.as_slice(), expected_mainnet.as_slice());
+
+        let svc =
+            make_service(vec![(pk, share)], al, Some(make_db())).with_genesis_fork_version(holesky);
+        let resp = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: object_root.to_vec(),
+                duty,
+                fork_id: 7,
+            }))
+            .await
+            .expect("partial_sign_root BUILDER_REQUEST_AUTH");
+        let sig = resp.into_inner().partial_signature;
+        assert_eq!(sig.as_slice(), expected_holesky.as_slice());
+        assert_ne!(sig.as_slice(), expected_mainnet.as_slice());
     }
 
     #[tokio::test]

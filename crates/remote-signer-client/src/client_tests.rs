@@ -1,7 +1,8 @@
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use eth_types::{
-    AttestationData, Checkpoint, ForkInfo, ForkName, PayloadAttestationData, ProposerPreferences,
+    AttestationData, BuilderRequestAuth, Checkpoint, ForkInfo, ForkName, PayloadAttestationData,
+    ProposerPreferences,
 };
 use observability::logging::RedactedUrl;
 use tracing_subscriber::layer::SubscriberExt;
@@ -10,8 +11,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
 use crate::wire::{
-    build_attestation_request, build_payload_attestation_request,
-    build_proposer_preferences_request,
+    build_attestation_request, build_builder_request_auth_request,
+    build_payload_attestation_request, build_proposer_preferences_request,
 };
 use crypto::{SecretKey, Signer, SigningError, TypedSigner, PUBLIC_KEY_BYTES_LEN};
 
@@ -957,5 +958,136 @@ async fn test_remote_signer_sign_proposer_preferences_success() {
     let signer =
         RemoteSigner::new_unchecked(RemoteSignerConfig::new(mock_server.uri()), vec![pk_bytes]);
     let sig = TypedSigner::sign_proposer_preferences(&signer, &data, &ctx).await.unwrap();
+    assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
+}
+
+fn gloas_auth_data() -> BuilderRequestAuth {
+    BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1).unwrap()
+}
+
+async fn mock_auth_status(
+    status: u16,
+    body: serde_json::Value,
+) -> (MockServer, RemoteSigner, BuilderRequestAuth, SignContext) {
+    let sk = SecretKey::generate();
+    let pk_bytes = sk.public_key().to_bytes();
+    let ctx = gloas_kat_ctx(&sk);
+    let data = gloas_auth_data();
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/api/v1/eth2/sign/.*"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(&mock_server)
+        .await;
+    let signer =
+        RemoteSigner::new_unchecked(RemoteSignerConfig::new(mock_server.uri()), vec![pk_bytes]);
+    (mock_server, signer, data, ctx)
+}
+
+#[test]
+fn test_classify_builder_request_auth_400_is_transient_not_unsupported() {
+    let err = classify_web3signer_http_error(
+        reqwest::StatusCode::BAD_REQUEST,
+        "bad request",
+        Some("builder_request_auth"),
+    );
+    match &err {
+        SigningError::RemoteSignerError(msg) => assert!(msg.contains("400")),
+        other => panic!("400 must stay RemoteSignerError, got: {other:?}"),
+    }
+    assert!(
+        !err.is_unambiguous_no_signature(),
+        "400 is transient (retryable), never a permanent unsupported-type"
+    );
+}
+
+#[test]
+fn test_classify_builder_request_auth_404_is_unsupported_duty() {
+    let err = classify_web3signer_http_error(
+        reqwest::StatusCode::NOT_FOUND,
+        "not found",
+        Some("builder_request_auth"),
+    );
+    match err {
+        SigningError::UnsupportedDuty { duty } => assert_eq!(duty, "builder_request_auth"),
+        other => panic!("expected UnsupportedDuty, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_classify_builder_request_auth_501_is_unsupported_duty() {
+    let err = classify_web3signer_http_error(
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        "not implemented",
+        Some("builder_request_auth"),
+    );
+    match err {
+        SigningError::UnsupportedDuty { duty } => assert_eq!(duty, "builder_request_auth"),
+        other => panic!("expected UnsupportedDuty, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_builder_request_auth_http_400_is_transient_not_unsupported() {
+    let (_mock, signer, data, ctx) =
+        mock_auth_status(400, serde_json::json!({"error": "bad request"})).await;
+    let err =
+        TypedSigner::sign_builder_request_auth(&signer, &data, [0; 4], &ctx).await.unwrap_err();
+    match &err {
+        SigningError::RemoteSignerError(msg) => assert!(msg.contains("400"), "msg={msg}"),
+        other => panic!("400 must stay transient RemoteSignerError, got: {other:?}"),
+    }
+    assert!(!matches!(err, SigningError::UnsupportedDuty { .. }));
+    assert!(!matches!(err, SigningError::UnsupportedSigningType(_)));
+    assert!(!err.is_unambiguous_no_signature());
+}
+
+#[tokio::test]
+async fn test_builder_request_auth_http_404_is_unsupported_duty() {
+    let (_mock, signer, data, ctx) =
+        mock_auth_status(404, serde_json::json!({"error": "not found"})).await;
+    let err =
+        TypedSigner::sign_builder_request_auth(&signer, &data, [0; 4], &ctx).await.unwrap_err();
+    assert!(err.is_unambiguous_no_signature(), "duty is dropped; no signature");
+    match err {
+        SigningError::UnsupportedDuty { duty } => assert_eq!(duty, "builder_request_auth"),
+        other => panic!("expected UnsupportedDuty, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_builder_request_auth_http_501_is_unsupported_duty() {
+    let (_mock, signer, data, ctx) =
+        mock_auth_status(501, serde_json::json!({"error": "not implemented"})).await;
+    let err =
+        TypedSigner::sign_builder_request_auth(&signer, &data, [0; 4], &ctx).await.unwrap_err();
+    match err {
+        SigningError::UnsupportedDuty { duty } => assert_eq!(duty, "builder_request_auth"),
+        other => panic!("expected UnsupportedDuty, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_remote_signer_sign_builder_request_auth_success() {
+    let sk = SecretKey::generate();
+    let pk_bytes = sk.public_key().to_bytes();
+    let ctx = gloas_kat_ctx(&sk);
+    let data = gloas_auth_data();
+    let (_req, signing_root) = build_builder_request_auth_request(&data, [0; 4]);
+    let expected_sig = sk.sign(&signing_root);
+    let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/api/v1/eth2/sign/.*"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let signer =
+        RemoteSigner::new_unchecked(RemoteSignerConfig::new(mock_server.uri()), vec![pk_bytes]);
+    let sig = TypedSigner::sign_builder_request_auth(&signer, &data, [0; 4], &ctx).await.unwrap();
     assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
 }

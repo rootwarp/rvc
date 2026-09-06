@@ -175,6 +175,7 @@ pub const SIGNING_GATE_METHODS: &[&str] = &[
     "sign_builder_registration",
     "sign_payload_attestation",
     "sign_proposer_preferences",
+    "sign_builder_request_auth",
 ];
 
 /// Canonical `PubkeyScopedDb::stage_*` methods used by DVT share signing.

@@ -12,6 +12,7 @@ mod block;
 /// `ssz` 0.9 and `ssz08` 0.8 codecs; see `block_body` module docs.
 pub mod block_body;
 mod builder;
+mod builder_request_auth;
 pub mod canonical;
 mod deposit;
 mod domains;
@@ -69,13 +70,17 @@ pub mod fixtures {
 // paths keep working when the feature is on (dev builds / tests).
 pub use aggregator::is_aggregator;
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
+pub use builder_request_auth::{
+    BuilderRequestAuth, BuilderRequestAuthError, SignedBuilderRequestAuth,
+    MAX_BUILDER_AUTH_DATA_SIZE,
+};
 pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSToExecutionChange};
 pub use domains::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_CONTRIBUTION_AND_PROOF,
-    DOMAIN_DEPOSIT, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_BUILDER_REQUEST_AUTH,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_DEPOSIT, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 pub use duties::{ProposerDuty, SignedVoluntaryExit, VoluntaryExit};
 #[cfg(feature = "test-fixtures")]

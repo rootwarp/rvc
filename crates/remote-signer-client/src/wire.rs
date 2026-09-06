@@ -10,11 +10,12 @@ use std::time::Duration;
 
 use eth_types::{
     blinded_body_tree_hash_root, body_tree_hash_root, AggregateAndProof, AttestationData,
-    BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof, Epoch, Fork,
-    ForkName, PayloadAttestationData, ProposerPreferences, Root, Slot, SyncCommitteeMessage,
-    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
-    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF,
-    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, BuilderRequestAuth, ContributionAndProof,
+    Epoch, Fork, ForkName, PayloadAttestationData, ProposerPreferences, Root, Slot,
+    SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
+    DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
+    DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 // Re-export wire types under the historical crypto names (stable public paths).
@@ -281,6 +282,31 @@ pub fn build_proposer_preferences_request(
     (req, signing_root)
 }
 
+/// Build a `BUILDER_REQUEST_AUTH` request.
+///
+/// Like `VALIDATOR_REGISTRATION`, `fork_info` is omitted: domain is
+/// `compute_domain(DOMAIN_BUILDER_REQUEST_AUTH)` with genesis fork + zero GVR.
+/// Still version-wrapped (`GLOAS`). Discriminator is provisional
+/// (`ethereum/remote-signing-api` PR #28).
+pub fn build_builder_request_auth_request(
+    auth: &BuilderRequestAuth,
+    genesis_fork_version: [u8; 4],
+) -> (SignRequest, Root) {
+    let signing_root = signing_root_with_fork_version(
+        auth,
+        DOMAIN_BUILDER_REQUEST_AUTH,
+        genesis_fork_version,
+        [0u8; 32],
+    );
+    let req = SignRequest::without_fork(
+        signing_root,
+        SignPayload::BuilderRequestAuth {
+            builder_request_auth: VersionedPayload { version: ForkName::Gloas, data: auth.clone() },
+        },
+    );
+    (req, signing_root)
+}
+
 /// Build a `SYNC_COMMITTEE_MESSAGE` request.
 pub fn build_sync_committee_message_request(
     slot: Slot,
@@ -541,10 +567,16 @@ mod tests {
             let (req, root) = build_proposer_preferences_request(&prefs, &gloas_ctx(&sk));
             v.push(("PROPOSER_PREFERENCES", req, root));
 
+            let auth =
+                eth_types::BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1)
+                    .unwrap();
+            let (req, root) = build_builder_request_auth_request(&auth, [0; 4]);
+            v.push(("BUILDER_REQUEST_AUTH", req, root));
+
             v
         };
 
-        assert_eq!(checks.len(), 12, "twelve client-reachable types");
+        assert_eq!(checks.len(), 13, "thirteen client-reachable types");
         for (name, req, root) in checks {
             assert_eq!(
                 req.signing_root,
@@ -562,9 +594,12 @@ mod tests {
                 body.get("signing_root").is_none(),
                 "{name}: must not emit snake_case signing_root"
             );
-            // VALIDATOR_REGISTRATION omits fork_info; all others include it.
-            if name == "VALIDATOR_REGISTRATION" {
-                assert!(body.get("fork_info").is_none());
+            // Genesis-fork duties omit fork_info; all others include it.
+            if name == "VALIDATOR_REGISTRATION" || name == "BUILDER_REQUEST_AUTH" {
+                assert!(
+                    body.get("fork_info").is_none(),
+                    "{name}: genesis-fork duty must omit fork_info"
+                );
             } else {
                 assert!(body.get("fork_info").is_some(), "{name}: fork_info required");
             }
@@ -898,6 +933,36 @@ mod tests {
         let body = req.to_json_value().expect("serialize");
         assert_eq!(body["type"], "PROPOSER_PREFERENCES");
         assert_eq!(body["proposer_preferences"]["version"], "GLOAS");
+        assert_eq!(body["signingRoot"], root_hex(&root));
+    }
+
+    /// L3: builder-specs fixture (`data` `0x1234567890abcdef`, slot 1) under
+    /// `DOMAIN_BUILDER_REQUEST_AUTH` with genesis fork + zero GVR. No `fork_info`.
+    #[test]
+    fn test_build_builder_request_auth_request_signing_root() {
+        use rvc_spec_vectors::builder_request_auth_kat::{
+            KAT_BUILDER_REQUEST_AUTH_DATA_HEX, KAT_BUILDER_REQUEST_AUTH_SLOT,
+            KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT,
+        };
+
+        let auth = eth_types::BuilderRequestAuth::new(
+            hex::decode(KAT_BUILDER_REQUEST_AUTH_DATA_HEX).unwrap(),
+            KAT_BUILDER_REQUEST_AUTH_SLOT,
+        )
+        .unwrap();
+        let (req, root) = build_builder_request_auth_request(&auth, [0; 4]);
+        let expected: Root = hex::decode(KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT)
+            .expect("kat hex")
+            .try_into()
+            .expect("32-byte kat root");
+        assert_eq!(root, expected);
+        assert_eq!(req.signing_root, Some(root));
+        assert!(req.fork_info.is_none(), "BUILDER_REQUEST_AUTH omits fork_info");
+        assert_eq!(req.payload.type_name(), "BUILDER_REQUEST_AUTH");
+        let body = req.to_json_value().expect("serialize");
+        assert_eq!(body["type"], "BUILDER_REQUEST_AUTH");
+        assert_eq!(body["builder_request_auth"]["version"], "GLOAS");
+        assert!(body.get("fork_info").is_none());
         assert_eq!(body["signingRoot"], root_hex(&root));
     }
 }

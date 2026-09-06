@@ -241,7 +241,8 @@ impl SignerServiceImpl {
         self.metrics.as_ref()
     }
 
-    /// Set the network genesis fork version used for builder registration.
+    /// Set the network genesis fork version used for builder registration
+    /// and builder request auth (genesis-fork + zero-GVR duties).
     ///
     /// Both gRPC and HTTP must be configured with the same value (typically from
     /// [`eth_types::NetworkPreset`]) so identical registrations produce identical
@@ -1123,7 +1124,8 @@ impl SignerServiceV2 for SignerServiceImpl {
         validate_transport_fork_id(r.fork_id)?;
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
         let object_root = validate_root32(&r.object_root, "object_root")?;
-        let planned = root_duty_plan(r.duty, object_root, fork_version, gvr)?;
+        let planned =
+            root_duty_plan(r.duty, object_root, fork_version, gvr, self.genesis_fork_version)?;
         let plan = plan_sign(&planned.input);
 
         let ctx = self.request_ctx(
@@ -2028,10 +2030,21 @@ mod tests {
         .await
         .expect("proposer_preferences");
 
+        // 6.16 delta: SignRoot BUILDER_REQUEST_AUTH.
+        svc.sign_root(Request::new(SignRootRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            object_root: vec![0x33; 32],
+            duty: crate::proto::signer_v2::Duty::BuilderRequestAuth as i32,
+            fork_id: 7,
+        }))
+        .await
+        .expect("builder_request_auth");
+
         // Every type in the bounded set must have recorded a success.
         assert_eq!(
             grpc_sign_type::ALL.len(),
-            12,
+            13,
             "bounded type set must list every dispatched gRPC label"
         );
         for rpc_type in grpc_sign_type::ALL {
@@ -2234,22 +2247,17 @@ mod tests {
     async fn test_sign_root_unimplemented_duties_produce_no_signature() {
         let pubkey = test_pubkey_bytes();
         let (svc, calls) = make_counting_service();
-        for duty in [
-            crate::proto::signer_v2::Duty::ExecutionPayloadEnvelope as i32,
-            crate::proto::signer_v2::Duty::BuilderRequestAuth as i32,
-        ] {
-            let err = svc
-                .sign_root(Request::new(SignRootRequest {
-                    pubkey: pubkey.to_vec(),
-                    fork_info: Some(sample_fork_info()),
-                    object_root: vec![0x11; 32],
-                    duty,
-                    fork_id: 7,
-                }))
-                .await
-                .expect_err("unserved duty must not sign");
-            assert_eq!(err.code(), tonic::Code::Unimplemented);
-        }
+        let err = svc
+            .sign_root(Request::new(SignRootRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: crate::proto::signer_v2::Duty::ExecutionPayloadEnvelope as i32,
+                fork_id: 7,
+            }))
+            .await
+            .expect_err("unserved duty must not sign");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
@@ -2300,6 +2308,34 @@ mod tests {
                 .unwrap()
                 .try_into()
                 .unwrap();
+        let expected = test_secret_key().sign(&kat).to_bytes().to_vec();
+        assert_eq!(resp.into_inner().signature, expected);
+    }
+
+    #[tokio::test]
+    async fn test_sign_root_builder_request_auth_matches_kat() {
+        let pubkey = test_pubkey_bytes();
+        let svc = make_service_v2(MockBackend::with_test_key());
+        let object_root = hex::decode(
+            rvc_spec_vectors::builder_request_auth_kat::SPEC_GLOAS_BUILDERREQUESTAUTH_ROOT,
+        )
+        .unwrap();
+        let resp = svc
+            .sign_root(Request::new(SignRootRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(gloas_fork_info()),
+                object_root,
+                duty: crate::proto::signer_v2::Duty::BuilderRequestAuth as i32,
+                fork_id: 7,
+            }))
+            .await
+            .expect("builder request auth");
+        let kat: [u8; 32] = hex::decode(
+            rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT,
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
         let expected = test_secret_key().sign(&kat).to_bytes().to_vec();
         assert_eq!(resp.into_inner().signature, expected);
     }

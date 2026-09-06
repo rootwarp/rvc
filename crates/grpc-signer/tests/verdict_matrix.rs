@@ -16,11 +16,12 @@ use eth_types::{
     decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
     decode_sync_committee_contribution_ssz, encode_attestation_ssz, encode_beacon_block_ssz,
     encode_blinded_beacon_block_ssz, encode_sync_committee_contribution_ssz, AggregateAndProof,
-    Attestation, AttestationData, BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, Checkpoint,
-    ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, ForkInfo, ForkName,
-    ForkSchedule, PayloadAttestationData, ProposerPreferences, SyncAggregatorSelectionData,
-    SyncCommitteeContribution, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
-    DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF,
+    Attestation, AttestationData, BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock,
+    BuilderRequestAuth, Checkpoint, ContributionAndProof, ElectraAggregateAndProof,
+    ElectraAttestation, ForkInfo, ForkName, ForkSchedule, PayloadAttestationData,
+    ProposerPreferences, SyncAggregatorSelectionData, SyncCommitteeContribution,
+    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
     DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
@@ -203,6 +204,10 @@ fn prefs() -> ProposerPreferences {
         fee_recipient: [0x44; 20],
         target_gas_limit: 36_000_000,
     }
+}
+
+fn auth() -> BuilderRequestAuth {
+    BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1).unwrap()
 }
 
 fn proto_fork(ctx: &SignContext) -> ProtoForkInfo {
@@ -493,7 +498,14 @@ impl SignerServiceV2 for SigningV2 {
                 Err(Status::unimplemented("EXECUTION_PAYLOAD_ENVELOPE (issue 6.19)"))
             }
             Duty::BuilderRequestAuth => {
-                Err(Status::unimplemented("BUILDER_REQUEST_AUTH (issue 6.16)"))
+                let object_root: [u8; 32] = r
+                    .object_root
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| Status::invalid_argument("object_root"))?;
+                let domain = compute_domain(DOMAIN_BUILDER_REQUEST_AUTH, [0u8; 4], [0u8; 32]);
+                let root = compute_signing_root(&object_root, domain);
+                Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
             }
             other => {
                 let fi = r
@@ -779,6 +791,10 @@ async fn test_gloas_verdict_matrix_supported_duties_sign() {
         ),
         ("ptc", TypedSigner::sign_payload_attestation(&signer, &ptc(), &ctx).await.unwrap()),
         ("prefs", TypedSigner::sign_proposer_preferences(&signer, &prefs(), &ctx).await.unwrap()),
+        (
+            "builder_request_auth",
+            TypedSigner::sign_builder_request_auth(&signer, &auth(), [0; 4], &ctx).await.unwrap(),
+        ),
     ];
     for (name, sig) in &rows {
         assert_eq!(sig.to_bytes().len(), 96, "{name} must produce a 96-byte signature");
@@ -1033,27 +1049,25 @@ async fn test_unknown_duty_and_fork_id_fail_closed() {
 }
 
 #[tokio::test]
-async fn test_envelope_and_request_auth_unimplemented_until_p6() {
+async fn test_envelope_unimplemented_until_p6() {
     let sk = SecretKey::generate();
     let pk = sk.public_key();
     let (addr, _, _h) = start_recording_server(sk, false).await;
     let signer = connect(addr).await;
     let ctx = gloas_ctx(pk);
-    for duty in [Duty::ExecutionPayloadEnvelope as i32, Duty::BuilderRequestAuth as i32] {
-        let err = signer.sign_root([0x11; 32], duty, &ctx).await.unwrap_err();
-        match err {
-            crypto::SigningError::SignerLacksGloasSupport { rpc, details } => {
-                assert_eq!(rpc, "SignRoot");
-                assert!(
-                    details.contains("EXECUTION_PAYLOAD_ENVELOPE")
-                        || details.contains("BUILDER_REQUEST_AUTH")
-                        || details.contains("6.19")
-                        || details.contains("6.16"),
-                    "UNIMPLEMENTED-until-P6, got {details}"
-                );
-            }
-            other => panic!("envelope/auth must surface unimplemented, got {other:?}"),
+    let err = signer
+        .sign_root([0x11; 32], Duty::ExecutionPayloadEnvelope as i32, &ctx)
+        .await
+        .unwrap_err();
+    match err {
+        crypto::SigningError::SignerLacksGloasSupport { rpc, details } => {
+            assert_eq!(rpc, "SignRoot");
+            assert!(
+                details.contains("EXECUTION_PAYLOAD_ENVELOPE") || details.contains("6.19"),
+                "UNIMPLEMENTED-until-P6, got {details}"
+            );
         }
+        other => panic!("envelope must surface unimplemented, got {other:?}"),
     }
 }
 

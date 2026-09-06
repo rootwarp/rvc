@@ -19,9 +19,9 @@ use crypto::{compute_domain, compute_signing_root, PublicKey};
 use eth_types::{
     AttestationData, Root, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
-    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
+    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use signer::{SigningGate, SigningGateError};
 
@@ -106,6 +106,9 @@ pub enum PlanInput {
     /// Proposer preferences. `object_root` is the tree-hash of
     /// `ProposerPreferences` — identity-HTR path, same as [`Self::PayloadAttestation`].
     ProposerPreferences { object_root: Root, fork_version: [u8; 4], gvr: Root },
+    /// Builder request auth. Domain is fixed over `genesis_fork_version` +
+    /// zero GVR — same idiom as [`Self::BuilderRegistration`].
+    BuilderRequestAuth { object_root: Root, genesis_fork_version: [u8; 4] },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -191,6 +194,12 @@ pub fn plan_sign(input: &PlanInput) -> SignPlan {
             let root = compute_signing_root(object_root, domain);
             (root, Slashing::NonSlashable, Some(NonSlashableOp::ProposerPreferences))
         }
+        PlanInput::BuilderRequestAuth { object_root, genesis_fork_version } => {
+            let domain =
+                compute_domain(DOMAIN_BUILDER_REQUEST_AUTH, *genesis_fork_version, ZERO_ROOT);
+            let root = compute_signing_root(object_root, domain);
+            (root, Slashing::NonSlashable, Some(NonSlashableOp::BuilderRequestAuth))
+        }
     };
     SignPlan { signing_root, slashing, non_slashable_op }
 }
@@ -245,6 +254,7 @@ pub enum NonSlashableOp {
     VoluntaryExit,
     PayloadAttestation,
     ProposerPreferences,
+    BuilderRequestAuth,
 }
 
 /// Error from [`dispatch_slashable`] / [`dispatch_non_slashable`].
@@ -337,6 +347,9 @@ pub async fn dispatch_non_slashable(
             }
             NonSlashableOp::ProposerPreferences => {
                 gate.sign_proposer_preferences(&ctx.pubkey, root).await
+            }
+            NonSlashableOp::BuilderRequestAuth => {
+                gate.sign_builder_request_auth(&ctx.pubkey, root).await
             }
         };
         finish_gate(metrics, backend_name, ctx.rpc_type, started, result)
@@ -530,6 +543,13 @@ mod tests {
                     object_root: [8u8; 32],
                     fork_version: FORK,
                     gvr: GVR,
+                },
+                false,
+            ),
+            (
+                PlanInput::BuilderRequestAuth {
+                    object_root: [9u8; 32],
+                    genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
                 },
                 false,
             ),
@@ -771,6 +791,27 @@ mod tests {
         assert_eq!(prefs_plan, plan_sign(&dvt_prefs));
         assert_eq!(prefs_plan.slashing, Slashing::NonSlashable);
         assert_eq!(prefs_plan.non_slashable_op, Some(NonSlashableOp::ProposerPreferences));
+
+        // Builder request auth: gRPC SignRoot, HTTP, and DVT all take the
+        // same precomputed object_root + genesis_fork_version (zero GVR).
+        let auth_object_root = [0x44u8; 32];
+        let grpc_auth = PlanInput::BuilderRequestAuth {
+            object_root: auth_object_root,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        let http_auth = PlanInput::BuilderRequestAuth {
+            object_root: auth_object_root,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        let dvt_auth = PlanInput::BuilderRequestAuth {
+            object_root: auth_object_root,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        let auth_plan = plan_sign(&grpc_auth);
+        assert_eq!(auth_plan, plan_sign(&http_auth));
+        assert_eq!(auth_plan, plan_sign(&dvt_auth));
+        assert_eq!(auth_plan.slashing, Slashing::NonSlashable);
+        assert_eq!(auth_plan.non_slashable_op, Some(NonSlashableOp::BuilderRequestAuth));
     }
 
     fn parse_kat_root(hex: &str) -> Root {
@@ -977,6 +1018,92 @@ mod tests {
             dispatch.contains("NonSlashableOp::ProposerPreferences")
                 && dispatch.contains("gate.sign_proposer_preferences"),
             "dispatch_non_slashable must route ProposerPreferences to SigningGate::sign_proposer_preferences"
+        );
+    }
+
+    fn auth_kat_plan() -> SignPlan {
+        let object_root = parse_kat_root(
+            rvc_spec_vectors::builder_request_auth_kat::SPEC_GLOAS_BUILDERREQUESTAUTH_ROOT,
+        );
+        plan_sign(&PlanInput::BuilderRequestAuth {
+            object_root,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        })
+    }
+
+    fn auth_gate_and_ctx(
+        sk: crypto::SecretKey,
+    ) -> (signer::SigningGate, RequestCtx, std::sync::Arc<KeyedBackend>) {
+        let pubkey = sk.public_key();
+        let backend = std::sync::Arc::new(KeyedBackend::with_key(sk));
+        let db = std::sync::Arc::new(slashing::SlashingDb::open_in_memory().expect("slashing db"));
+        let gate = crate::service::SignerServiceImpl::build_gate(
+            std::sync::Arc::clone(&backend) as std::sync::Arc<dyn crate::backend::SigningBackend>,
+            db,
+        );
+        let ctx = RequestCtx {
+            client_cn: "test".into(),
+            pubkey_bytes: pubkey.to_bytes(),
+            pubkey,
+            rpc_type: crate::metrics::grpc_sign_type::BUILDER_REQUEST_AUTH,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        (gate, ctx, backend)
+    }
+
+    /// L3: plan engine signing root for the pyspec BuilderRequestAuth fixture.
+    #[test]
+    fn test_plan_builder_request_auth_signing_root() {
+        let plan = auth_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(plan.non_slashable_op, Some(NonSlashableOp::BuilderRequestAuth));
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(
+                rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_builder_request_auth_dispatch_slashable_mismatch() {
+        let plan = auth_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        let (gate, ctx, _backend) = auth_gate_and_ctx(crypto::SecretKey::generate());
+        let err = dispatch_slashable(&gate, None, "basic", &ctx, &plan).await.unwrap_err();
+        assert!(matches!(err, DispatchError::PlanMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_plan_builder_request_auth_dispatch_sign_success() {
+        let plan = auth_kat_plan();
+        let (gate, ctx, backend) = auth_gate_and_ctx(crypto::SecretKey::generate());
+        let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
+            .await
+            .expect("dispatch_sign builder request auth");
+        let direct = gate
+            .sign_builder_request_auth(&ctx.pubkey, plan.signing_root)
+            .await
+            .expect("direct gate builder request auth");
+        assert_eq!(sig, direct, "dispatch_sign must use SigningGate::sign_builder_request_auth");
+        assert!(crypto::Signature::from_bytes(&sig)
+            .expect("bls sig")
+            .verify(&ctx.pubkey, &plan.signing_root)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_builder_request_auth_dispatch_arm_calls_sign_builder_request_auth() {
+        let src = include_str!("sign_plan.rs");
+        let rest = src
+            .split_once("pub async fn dispatch_non_slashable")
+            .expect("dispatch_non_slashable")
+            .1;
+        let dispatch = rest.split("pub async fn dispatch_sign").next().expect("dispatch_sign");
+        assert!(
+            dispatch.contains("NonSlashableOp::BuilderRequestAuth")
+                && dispatch.contains("gate.sign_builder_request_auth"),
+            "dispatch_non_slashable must route BuilderRequestAuth to SigningGate::sign_builder_request_auth"
         );
     }
 }

@@ -2,9 +2,9 @@ use async_trait::async_trait;
 
 use crypto::{PublicKey, Signature};
 use eth_types::{
-    AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof,
-    ElectraAggregateAndProof, Epoch, ForkSchedule, PayloadAttestationData, ProposerPreferences,
-    Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    AggregateAndProof, AttestationData, BeaconBlockHeader, BuilderRequestAuth,
+    ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkSchedule, PayloadAttestationData,
+    ProposerPreferences, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 use tree_hash::TreeHash;
 
@@ -211,5 +211,20 @@ pub trait ValidatorSigner: Send + Sync {
     ) -> Result<Signature, SignerError> {
         let _ = (prefs, pubkey, fork_schedule, genesis_validators_root);
         Err(SignerError::UnsupportedDuty { duty: "proposer_preferences" })
+    }
+
+    /// Sign a builder request auth (`DOMAIN_BUILDER_REQUEST_AUTH`).
+    ///
+    /// Default: unsupported. Local and HTTP remotes that can sign this duty
+    /// must override. Non-slashable: must not stage or commit a slashing-DB row.
+    /// Uses the builder-registration domain idiom (genesis fork, zero GVR).
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        let _ = (auth, pubkey, genesis_fork_version);
+        Err(SignerError::UnsupportedDuty { duty: "builder_request_auth" })
     }
 }

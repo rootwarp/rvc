@@ -183,6 +183,7 @@ pub fn root_duty_plan(
     object_root: [u8; 32],
     fork_version: [u8; 4],
     gvr: [u8; 32],
+    genesis_fork_version: [u8; 4],
 ) -> Result<RootDutyPlan, Status> {
     match Duty::try_from(duty) {
         Ok(Duty::Unspecified) => Err(Status::invalid_argument("duty must not be UNSPECIFIED")),
@@ -209,9 +210,11 @@ pub fn root_duty_plan(
         Ok(Duty::ExecutionPayloadEnvelope) => {
             Err(Status::unimplemented("EXECUTION_PAYLOAD_ENVELOPE (issue 6.19)"))
         }
-        Ok(Duty::BuilderRequestAuth) => {
-            Err(Status::unimplemented("BUILDER_REQUEST_AUTH (issue 6.16)"))
-        }
+        Ok(Duty::BuilderRequestAuth) => Ok(RootDutyPlan {
+            input: PlanInput::BuilderRequestAuth { object_root, genesis_fork_version },
+            rpc_type: grpc_sign_type::BUILDER_REQUEST_AUTH,
+            op: NonSlashableOp::BuilderRequestAuth,
+        }),
         Err(_) => Err(Status::invalid_argument(format!("unknown duty: {duty}"))),
     }
 }
@@ -577,21 +580,28 @@ mod tests {
         let fv = [0x07, 0x00, 0x00, 0x01];
         let gvr = [0u8; 32];
 
-        let err = root_duty_plan(Duty::Unspecified as i32, root, fv, gvr).unwrap_err();
+        let genesis = [0u8; 4];
+        let err = root_duty_plan(Duty::Unspecified as i32, root, fv, gvr, genesis).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("UNSPECIFIED"));
 
-        let err = root_duty_plan(99, root, fv, gvr).unwrap_err();
+        let err = root_duty_plan(99, root, fv, gvr, genesis).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("unknown duty: 99"));
 
-        let err = root_duty_plan(Duty::ExecutionPayloadEnvelope as i32, root, fv, gvr).unwrap_err();
+        let err = root_duty_plan(Duty::ExecutionPayloadEnvelope as i32, root, fv, gvr, genesis)
+            .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unimplemented);
 
-        let err = root_duty_plan(Duty::BuilderRequestAuth as i32, root, fv, gvr).unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        let plan = root_duty_plan(Duty::BuilderRequestAuth as i32, root, fv, gvr, genesis).unwrap();
+        assert_eq!(plan.rpc_type, grpc_sign_type::BUILDER_REQUEST_AUTH);
+        assert!(matches!(
+            plan.input,
+            PlanInput::BuilderRequestAuth { genesis_fork_version, .. }
+                if genesis_fork_version == genesis
+        ));
 
-        let plan = root_duty_plan(Duty::PayloadAttestation as i32, root, fv, gvr).unwrap();
+        let plan = root_duty_plan(Duty::PayloadAttestation as i32, root, fv, gvr, genesis).unwrap();
         assert_eq!(plan.rpc_type, grpc_sign_type::PAYLOAD_ATTESTATION);
         assert!(matches!(plan.input, PlanInput::PayloadAttestation { .. }));
     }

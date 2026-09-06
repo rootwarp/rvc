@@ -60,8 +60,8 @@ use crypto::{
 };
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock,
-    ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, ForkName, ForkSchedule,
-    PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
+    BuilderRequestAuth, ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, ForkName,
+    ForkSchedule, PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
     VoluntaryExit, SLOTS_PER_EPOCH,
 };
 use observability::logging::fields::Duty;
@@ -1047,6 +1047,42 @@ impl ValidatorSigner for SignerService {
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
         self.sign_nonslashable(pubkey, signing_root, "proposer_preferences", backend).await
+    }
+
+    /// Signs a builder request auth with `DOMAIN_BUILDER_REQUEST_AUTH`.
+    ///
+    /// Non-slashable: routes through [`Self::sign_nonslashable`], not
+    /// [`sign_slashable`]. Genesis fork version + zero GVR (builder-registration
+    /// idiom).
+    #[tracing::instrument(name = "sign.builder_request_auth", skip_all, fields(slot = auth.slot()))]
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        let signing_root = signing_root_with_fork_version(
+            auth,
+            eth_types::DOMAIN_BUILDER_REQUEST_AUTH,
+            genesis_fork_version,
+            [0u8; 32],
+        );
+        let auth_owned = auth.clone();
+        let fv = genesis_fork_version;
+        let sign_ctx = SignContext::new(
+            pubkey.clone(),
+            ForkInfo {
+                previous_version: genesis_fork_version,
+                current_version: genesis_fork_version,
+                genesis_validators_root: [0u8; 32],
+            },
+            ForkName::Phase0,
+        );
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_builder_request_auth(&auth_owned, fv, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "builder_request_auth", backend).await
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
@@ -2466,6 +2502,52 @@ mod tests {
         assert_eq!(
             after_attestations, before_attestations,
             "proposer preferences must not write an attestation row"
+        );
+    }
+
+    fn kat_builder_request_auth() -> BuilderRequestAuth {
+        BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1).unwrap()
+    }
+
+    /// Signing builder request auth writes no slashing-DB row.
+    #[tokio::test]
+    async fn test_sign_builder_request_auth_writes_no_slashing_row() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let before_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let before_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+
+        let auth = kat_builder_request_auth();
+        let sig = service
+            .sign_builder_request_auth(&auth, &pubkey, [0; 4])
+            .await
+            .expect("builder request auth is non-slashable and must sign");
+
+        let kat_root: Root = hex::decode(
+            rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT,
+        )
+        .expect("kat hex")
+        .try_into()
+        .expect("32-byte kat root");
+        assert!(
+            sig.verify(&pubkey, &kat_root).is_ok(),
+            "builder request auth must verify over KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT"
+        );
+
+        let after_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_blocks, before_blocks, "builder request auth must not write a block row");
+        assert_eq!(
+            after_attestations, before_attestations,
+            "builder request auth must not write an attestation row"
         );
     }
 

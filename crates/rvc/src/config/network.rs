@@ -36,6 +36,19 @@ mod tests {
             );
             assert_eq!(net.genesis_time(), Some(genesis_time), "genesis_time for {net}");
         }
+        assert_eq!(
+            Network::Mainnet.genesis_fork_version(),
+            Some(eth_types::NetworkPreset::MAINNET.genesis_fork_version)
+        );
+        assert_eq!(
+            Network::Holesky.genesis_fork_version(),
+            Some(eth_types::NetworkPreset::HOLESKY.genesis_fork_version)
+        );
+        assert_ne!(
+            Network::Holesky.genesis_fork_version(),
+            Network::Mainnet.genesis_fork_version()
+        );
+        assert_eq!(Network::Custom.genesis_fork_version(), None);
     }
 
     #[test]

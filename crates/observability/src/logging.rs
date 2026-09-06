@@ -161,6 +161,7 @@ pub mod fields {
         SyncCommittee,
         SyncContribution,
         ValidatorRegistration,
+        BuilderRequestAuth,
         VoluntaryExit,
     }
 
@@ -174,6 +175,7 @@ pub mod fields {
                 Duty::SyncCommittee => "sync_committee",
                 Duty::SyncContribution => "sync_contribution",
                 Duty::ValidatorRegistration => "validator_registration",
+                Duty::BuilderRequestAuth => "builder_request_auth",
                 Duty::VoluntaryExit => "voluntary_exit",
             }
         }
@@ -523,7 +525,7 @@ mod tests {
     }
 
     #[test]
-    fn test_duty_as_str_pins_all_seven_variants() {
+    fn test_duty_as_str_pins_all_eight_variants() {
         use fields::Duty;
         assert_eq!(Duty::Attestation.as_str(), "attestation");
         assert_eq!(Duty::Block.as_str(), "block");
@@ -531,6 +533,7 @@ mod tests {
         assert_eq!(Duty::SyncCommittee.as_str(), "sync_committee");
         assert_eq!(Duty::SyncContribution.as_str(), "sync_contribution");
         assert_eq!(Duty::ValidatorRegistration.as_str(), "validator_registration");
+        assert_eq!(Duty::BuilderRequestAuth.as_str(), "builder_request_auth");
         assert_eq!(Duty::VoluntaryExit.as_str(), "voluntary_exit");
     }
 

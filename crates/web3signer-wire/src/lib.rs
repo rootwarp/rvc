@@ -27,8 +27,9 @@
 //! | `AGGREGATE_AND_PROOF_V2` | **no** (not yet on TypedSigner builders) | yes (FROZEN FR-31) |
 //! | `PAYLOAD_ATTESTATION` | yes (4.10) | yes (provisional: remote-signing-api PR #28) |
 //! | `PROPOSER_PREFERENCES` | yes (4.16) | yes (provisional: remote-signing-api PR #28) |
+//! | `BUILDER_REQUEST_AUTH` | yes (6.16) | yes (provisional: remote-signing-api PR #28) |
 //!
-//! All thirteen variants serialize and deserialize here. Adding a client *serialize*
+//! All fourteen variants serialize and deserialize here. Adding a client *serialize*
 //! path for `AGGREGATE_AND_PROOF_V2` is a deliberate follow-up (not silent).
 //!
 //! # Server leniency (preserved)
@@ -36,7 +37,7 @@
 //! - `signingRoot` accepts camelCase and snake_case `signing_root` alias.
 //! - Empty / `"0x"` signing root → `None` (Prysm).
 //! - `fork_info` is optional at the serde layer; per-type enforcement is the
-//!   dispatcher's job (`VALIDATOR_REGISTRATION` omits it).
+//!   dispatcher's job (`VALIDATOR_REGISTRATION` and `BUILDER_REQUEST_AUTH` omit it).
 //! - Unknown `type` fails to decode (no `#[serde(other)]`).
 //! - Unknown `version` fails to decode via fail-closed [`ForkName::from_str`]
 //!   (no `#[serde(other)]`). Web3Signer wire names are `PHASE0`…`GLOAS`; they
@@ -57,9 +58,9 @@ use std::fmt;
 use std::str::FromStr;
 
 use eth_types::{
-    AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof,
-    ElectraAggregateAndProof, Fork, ForkName, PayloadAttestationData, Root, SyncCommitteeMessage,
-    ValidatorRegistrationV1, VoluntaryExit,
+    AggregateAndProof, AttestationData, BeaconBlockHeader, BuilderRequestAuth,
+    ContributionAndProof, ElectraAggregateAndProof, Fork, ForkName, PayloadAttestationData, Root,
+    SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -268,6 +269,11 @@ pub enum SignPayload {
     /// (`ethereum/remote-signing-api` PR #28).
     #[serde(rename = "PROPOSER_PREFERENCES")]
     ProposerPreferences { proposer_preferences: VersionedPayload<eth_types::ProposerPreferences> },
+    /// Gloas builder request auth (`DOMAIN_BUILDER_REQUEST_AUTH`). Discriminator
+    /// `BUILDER_REQUEST_AUTH` and the `{version, data}` envelope are provisional
+    /// (`ethereum/remote-signing-api` PR #28). `fork_info` is not required.
+    #[serde(rename = "BUILDER_REQUEST_AUTH")]
+    BuilderRequestAuth { builder_request_auth: VersionedPayload<BuilderRequestAuth> },
 }
 
 /// Client-facing alias for [`SignPayload`] (RF3-11 migration).
@@ -293,6 +299,7 @@ impl SignPayload {
             SignPayload::AggregateAndProofV2 { .. } => "AGGREGATE_AND_PROOF_V2",
             SignPayload::PayloadAttestation { .. } => "PAYLOAD_ATTESTATION",
             SignPayload::ProposerPreferences { .. } => "PROPOSER_PREFERENCES",
+            SignPayload::BuilderRequestAuth { .. } => "BUILDER_REQUEST_AUTH",
         }
     }
 }
@@ -303,7 +310,8 @@ impl SignPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SignRequest {
     /// Optional at the serde layer; the dispatcher requires it for every type
-    /// except `VALIDATOR_REGISTRATION`. Omitted when `None` on serialize.
+    /// except `VALIDATOR_REGISTRATION` / `BUILDER_REQUEST_AUTH`. Omitted when
+    /// `None` on serialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork_info: Option<WireForkInfo>,
     /// `signingRoot` (camelCase) or `signing_root`. Absent / empty / `"0x"` →
@@ -499,10 +507,14 @@ mod tests {
             fr = "44".repeat(20),
         );
         assert_roundtrip(&prefs);
+
+        // BUILDER_REQUEST_AUTH (6.16; `{version, data}` wrapper, no fork_info)
+        let auth = r#"{"type":"BUILDER_REQUEST_AUTH","builder_request_auth":{"version":"GLOAS","data":{"data":"0x1234567890abcdef","slot":"1"}}}"#;
+        assert_roundtrip(auth);
     }
 
     #[test]
-    fn test_all_thirteen_type_discriminators_roundtrip() {
+    fn test_all_fourteen_type_discriminators_roundtrip() {
         let discriminators = [
             "BLOCK_V2",
             "ATTESTATION",
@@ -517,6 +529,7 @@ mod tests {
             "AGGREGATE_AND_PROOF_V2",
             "PAYLOAD_ATTESTATION",
             "PROPOSER_PREFERENCES",
+            "BUILDER_REQUEST_AUTH",
         ];
         // Smoke: construct each variant, type_name matches rename, and
         // serialize→deserialize preserves the discriminator.
@@ -648,10 +661,17 @@ mod tests {
                     },
                 },
             },
+            SignPayload::BuilderRequestAuth {
+                builder_request_auth: VersionedPayload {
+                    version: ForkName::Gloas,
+                    data: BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1)
+                        .unwrap(),
+                },
+            },
         ];
 
-        assert_eq!(samples.len(), 13);
-        assert_eq!(discriminators.len(), 13);
+        assert_eq!(samples.len(), 14);
+        assert_eq!(discriminators.len(), 14);
         for (payload, expected_name) in samples.iter().zip(discriminators.iter()) {
             assert_eq!(payload.type_name(), *expected_name);
             let v = serde_json::to_value(payload).unwrap();
@@ -1050,6 +1070,38 @@ mod tests {
                 assert_eq!(proposer_preferences.data.target_gas_limit, 36_000_000);
             }
             other => panic!("expected ProposerPreferences, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_request_auth_unknown_version_fails_to_decode_naming_value() {
+        let body = r#"{ "type": "BUILDER_REQUEST_AUTH",
+                  "builder_request_auth": { "version": "NOT_A_FORK",
+                                            "data": { "data": "0x1234567890abcdef", "slot": "1" } } }"#;
+        let err = serde_json::from_str::<SignRequest>(body).unwrap_err().to_string();
+        match WireVersionError::from_serde_display(&err) {
+            Some(WireVersionError::Unknown(value)) => assert_eq!(value, "NOT_A_FORK"),
+            other => panic!("expected Unknown(NOT_A_FORK), got {other:?} from {err}"),
+        }
+    }
+
+    #[test]
+    fn test_builder_request_auth_gloas_version_decodes() {
+        let body = r#"{ "type": "BUILDER_REQUEST_AUTH",
+                  "builder_request_auth": { "version": "GLOAS",
+                                            "data": { "data": "0x1234567890abcdef", "slot": "1" } } }"#;
+        let req: SignRequest = serde_json::from_str(body).unwrap();
+        assert_eq!(req.payload.type_name(), "BUILDER_REQUEST_AUTH");
+        match req.payload {
+            SignPayload::BuilderRequestAuth { builder_request_auth } => {
+                assert_eq!(builder_request_auth.version, ForkName::Gloas);
+                assert_eq!(
+                    builder_request_auth.data.data(),
+                    hex::decode("1234567890abcdef").unwrap()
+                );
+                assert_eq!(builder_request_auth.data.slot(), 1);
+            }
+            other => panic!("expected BuilderRequestAuth, got {other:?}"),
         }
     }
 

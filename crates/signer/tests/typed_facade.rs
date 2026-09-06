@@ -17,9 +17,9 @@ use crypto::{
     Signature, Signer, SigningError, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
 };
 use eth_types::{
-    AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
-    ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, ForkInfo, ForkName,
-    ForkSchedule, PayloadAttestationData, ProposerPreferences, Root, Slot,
+    AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, BuilderRequestAuth,
+    Checkpoint, ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, ForkInfo,
+    ForkName, ForkSchedule, PayloadAttestationData, ProposerPreferences, Root, Slot,
     SyncCommitteeContribution, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
     DOMAIN_APPLICATION_BUILDER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
     DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
@@ -1410,20 +1410,10 @@ async fn test_gloas_vc_path_reaches_in_process_signer_server() {
         }
         other => panic!("expected SignerLacksGloasSupport for envelope, got {other:?}"),
     }
-    let auth_err = grpc
-        .sign_root([0x11; 32], Duty::BuilderRequestAuth as i32, &gloas_ctx)
+    let auth = BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1).unwrap();
+    TypedSigner::sign_builder_request_auth(&grpc, &auth, [0; 4], &gloas_ctx)
         .await
-        .expect_err("request-auth UNIMPLEMENTED until P6");
-    match auth_err {
-        SigningError::SignerLacksGloasSupport { rpc, details } => {
-            assert_eq!(rpc, "SignRoot");
-            assert!(
-                details.contains("BUILDER_REQUEST_AUTH") || details.contains("6.16"),
-                "{details}"
-            );
-        }
-        other => panic!("expected SignerLacksGloasSupport for request-auth, got {other:?}"),
-    }
+        .expect("BUILDER_REQUEST_AUTH is served");
 
     let svc = grpc_vc(grpc);
     let schedule = gloas_schedule();

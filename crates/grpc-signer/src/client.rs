@@ -24,7 +24,7 @@
 //! | PTC payload attestation | supported via the root RPC | 4.20a `SignRoot` |
 //! | Proposer preferences | supported via the root RPC | 4.20a `SignRoot` |
 //! | Self-build execution payload envelope | supported via the root RPC (`EXECUTION_PAYLOAD_ENVELOPE`) | root from P5 5.16; served in P6 6.19 |
-//! | Builder request auth | supported via the root RPC (`BUILDER_REQUEST_AUTH`) | served in P6 6.16 |
+//! | Builder request auth | supported via the root RPC (`BUILDER_REQUEST_AUTH`) | served |
 //!
 //! No duty fails solely because `ForkName::Gloas.id() == 7`. The four
 //! decoder-bound legacy RPCs still reject id 7 (`UnknownForkId`); this client
@@ -46,12 +46,12 @@ use crypto::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use eth_types::{
     encode_attestation_ssz, encode_beacon_block_ssz, encode_blinded_beacon_block_ssz,
     encode_sync_committee_contribution_ssz, AggregateAndProof, Attestation, AttestationData,
-    BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof,
+    BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, BuilderRequestAuth, ContributionAndProof,
     ElectraAggregateAndProof, Epoch, ForkName, PayloadAttestationData, ProposerPreferences, Slot,
     SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
-    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
+    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use observability::logging::TruncatedPubkey;
@@ -167,6 +167,10 @@ pub struct GrpcRemoteSigner {
     /// Cached public keys from `ListPublicKeys` at connect time.
     pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,
     url: String,
+    /// Network genesis fork used for BUILDER_REQUEST_AUTH local-verify
+    /// (`compute_domain` with genesis + zero GVR). Default `[0; 4]` (mainnet /
+    /// KAT). Does not follow `SignContext::fork_info.current_version`.
+    genesis_fork_version: [u8; 4],
 }
 
 impl GrpcRemoteSigner {
@@ -229,11 +233,17 @@ impl GrpcRemoteSigner {
             "gRPC signer connection established (v2 typed RPCs)"
         );
 
-        Ok(Self { client_v2, pubkeys, url })
+        Ok(Self { client_v2, pubkeys, url, genesis_fork_version: [0; 4] })
     }
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Set the network genesis fork used for BUILDER_REQUEST_AUTH local-verify.
+    pub fn with_genesis_fork_version(mut self, genesis_fork_version: [u8; 4]) -> Self {
+        self.genesis_fork_version = genesis_fork_version;
+        self
     }
 
     /// Returns the cached public keys (fetched at connect time).
@@ -342,6 +352,7 @@ impl GrpcRemoteSigner {
             client_v2: SignerServiceClientV2::new(channel),
             pubkeys,
             url: "http://127.0.0.1:1".to_string(),
+            genesis_fork_version: [0; 4],
         }
     }
 
@@ -460,10 +471,10 @@ impl GrpcRemoteSigner {
         .await
     }
 
-    /// Gloas-safe `SignRoot` (PTC, proposer preferences, P6 envelope / request-auth).
+    /// Gloas-safe `SignRoot` (PTC, proposer preferences, request-auth, P6 envelope).
     ///
     /// Unknown / `UNSPECIFIED` duties fail closed locally with no RPC. Envelope
-    /// and builder-auth are sent and surface the server's `UNIMPLEMENTED`.
+    /// is sent and surfaces the server's `UNIMPLEMENTED`.
     pub async fn sign_root(
         &self,
         object_root: [u8; 32],
@@ -473,15 +484,42 @@ impl GrpcRemoteSigner {
         let duty = Self::root_duty_or_err(duty)?;
         let fork_version = ctx.fork_info.current_version;
         let gvr = ctx.fork_info.genesis_validators_root;
-        let domain = match duty {
-            Duty::AggregateAndProof => DOMAIN_AGGREGATE_AND_PROOF,
-            Duty::ContributionAndProof => DOMAIN_CONTRIBUTION_AND_PROOF,
-            Duty::PayloadAttestation => DOMAIN_PTC_ATTESTER,
-            Duty::ProposerPreferences => DOMAIN_PROPOSER_PREFERENCES,
-            Duty::ExecutionPayloadEnvelope | Duty::BuilderRequestAuth => [0u8; 4],
+        let signing_root = match duty {
+            Duty::AggregateAndProof => signing_root_with_fork_version(
+                &object_root,
+                DOMAIN_AGGREGATE_AND_PROOF,
+                fork_version,
+                gvr,
+            ),
+            Duty::ContributionAndProof => signing_root_with_fork_version(
+                &object_root,
+                DOMAIN_CONTRIBUTION_AND_PROOF,
+                fork_version,
+                gvr,
+            ),
+            Duty::PayloadAttestation => {
+                signing_root_with_fork_version(&object_root, DOMAIN_PTC_ATTESTER, fork_version, gvr)
+            }
+            Duty::ProposerPreferences => signing_root_with_fork_version(
+                &object_root,
+                DOMAIN_PROPOSER_PREFERENCES,
+                fork_version,
+                gvr,
+            ),
+            Duty::BuilderRequestAuth => signing_root_with_fork_version(
+                &object_root,
+                DOMAIN_BUILDER_REQUEST_AUTH,
+                // Builder-registration idiom: configured genesis + zero GVR.
+                // `current_version` is the active fork (e.g. Gloas) and must
+                // not be used; the server plans with its genesis too.
+                self.genesis_fork_version,
+                [0u8; 32],
+            ),
+            Duty::ExecutionPayloadEnvelope => {
+                signing_root_with_fork_version(&object_root, [0u8; 4], fork_version, gvr)
+            }
             Duty::Unspecified => unreachable!("rejected by root_duty_or_err"),
         };
-        let signing_root = signing_root_with_fork_version(&object_root, domain, fork_version, gvr);
         self.sign_root_rpc(object_root, duty, ctx, signing_root).await
     }
 }
@@ -878,6 +916,25 @@ impl TypedSigner for GrpcRemoteSigner {
         let signing_root =
             signing_root_with_fork_version(prefs, DOMAIN_PROPOSER_PREFERENCES, fork_version, gvr);
         self.sign_root_rpc(object_root, Duty::ProposerPreferences, ctx, signing_root).await
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        genesis_fork_version: [u8; 4],
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let object_root = auth
+            .try_tree_hash_root()
+            .map_err(|e| SigningError::LocalRejected(format!("invalid builder_request_auth: {e}")))?
+            .0;
+        let signing_root = signing_root_with_fork_version(
+            auth,
+            DOMAIN_BUILDER_REQUEST_AUTH,
+            genesis_fork_version,
+            [0u8; 32],
+        );
+        self.sign_root_rpc(object_root, Duty::BuilderRequestAuth, ctx, signing_root).await
     }
 }
 
@@ -1463,6 +1520,7 @@ mod tests {
             fee_recipient: [0x44; 20],
             target_gas_limit: 36_000_000,
         };
+        let auth = BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1).unwrap();
         let results = vec![
             TypedSigner::sign_block(&signer, &block, &ctx).await,
             TypedSigner::sign_blinded_block(&signer, &blinded, &ctx).await,
@@ -1476,10 +1534,11 @@ mod tests {
             TypedSigner::sign_voluntary_exit(&signer, &exit, &ctx).await,
             TypedSigner::sign_payload_attestation(&signer, &ptc, &ctx).await,
             TypedSigner::sign_proposer_preferences(&signer, &prefs, &ctx).await,
+            TypedSigner::sign_builder_request_auth(&signer, &auth, [0; 4], &ctx).await,
         ];
 
-        assert_eq!(results.len(), 12);
-        let mut messages = Vec::with_capacity(12);
+        assert_eq!(results.len(), 13);
+        let mut messages = Vec::with_capacity(13);
         for (i, result) in results.into_iter().enumerate() {
             match result {
                 Err(SigningError::RemoteSignerError(msg)) => {
@@ -1492,7 +1551,7 @@ mod tests {
                 other => panic!("method {i}: expected RemoteSignerError, got: {other:?}"),
             }
         }
-        // All twelve share the same error *shape* (shared map_err in sign_rpc).
+        // All thirteen share the same error *shape* (shared map_err in sign_rpc).
         assert!(messages.iter().all(|m| m.contains("failed (")));
     }
 }

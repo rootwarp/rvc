@@ -136,6 +136,13 @@ fn to_plan_input(
             let object_root = proposer_preferences.data.tree_hash_root().0;
             Ok(PlanInput::ProposerPreferences { object_root, fork_version, gvr })
         }
+        SignPayload::BuilderRequestAuth { builder_request_auth } => {
+            // No fork_info: builder-registration idiom (genesis fork + zero GVR).
+            let object_root = builder_request_auth.data.try_tree_hash_root().map_err(|_| {
+                HttpSignError::BadRequest("invalid builder_request_auth".to_string())
+            })?;
+            Ok(PlanInput::BuilderRequestAuth { object_root: object_root.0, genesis_fork_version })
+        }
     }
 }
 
@@ -475,6 +482,28 @@ mod tests {
         assert_eq!(
             plan.signing_root,
             parse_kat_root(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+        );
+    }
+
+    fn gloas_builder_request_auth() -> SignRequest {
+        parse(
+            r#"{ "type": "BUILDER_REQUEST_AUTH",
+                  "builder_request_auth": { "version": "GLOAS",
+                                            "data": { "data": "0x1234567890abcdef", "slot": "1" } } }"#,
+        )
+    }
+
+    /// L3: HTTP adapter plans the same root as the plan engine / pyspec artifact.
+    #[test]
+    fn builder_request_auth_plan_matches_kat_gloas_builder_request_auth_signing_root() {
+        let plan = plan_sign(&gloas_builder_request_auth(), BUILDER_FORK_VERSION_MAINNET)
+            .expect("BUILDER_REQUEST_AUTH is in scope");
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(
+                rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT
+            )
         );
     }
 }

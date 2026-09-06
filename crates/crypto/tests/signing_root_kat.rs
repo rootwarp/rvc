@@ -33,9 +33,10 @@ use eth_types::{
     ElectraAggregateAndProof, ElectraAttestation, Epoch, ForkInfo, ForkName, ForkSchedule, Root,
     Slot, SyncAggregatorSelectionData, SyncCommitteeContribution, ValidatorRegistrationV1,
     VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
-    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT, SLOTS_PER_EPOCH,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
+    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    SLOTS_PER_EPOCH,
 };
 use rvc_crypto::{
     capella_capped_fork_version, compute_domain, compute_fork_data_root, compute_signing_root,
@@ -175,6 +176,7 @@ fn kat_domain_type_constants() {
     assert_eq!(DOMAIN_PTC_ATTESTER, [0x0C, 0x00, 0x00, 0x00]);
     assert_eq!(DOMAIN_PROPOSER_PREFERENCES, [0x0D, 0x00, 0x00, 0x00]);
     assert_eq!(DOMAIN_APPLICATION_BUILDER, [0x00, 0x00, 0x00, 0x01]);
+    assert_eq!(DOMAIN_BUILDER_REQUEST_AUTH, [0x0B, 0x00, 0x00, 0x01]);
 }
 
 // ============================================================

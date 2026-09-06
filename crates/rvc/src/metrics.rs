@@ -141,7 +141,8 @@ pub static RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL: LazyLock<IntCounterVec> = Lazy
 pub mod signer_sign_type {
     pub const PAYLOAD_ATTESTATION: &str = "PAYLOAD_ATTESTATION";
     pub const PROPOSER_PREFERENCES: &str = "PROPOSER_PREFERENCES";
-    pub const ALL: &[&str] = &[PAYLOAD_ATTESTATION, PROPOSER_PREFERENCES];
+    pub const BUILDER_REQUEST_AUTH: &str = "BUILDER_REQUEST_AUTH";
+    pub const ALL: &[&str] = &[PAYLOAD_ATTESTATION, PROPOSER_PREFERENCES, BUILDER_REQUEST_AUTH];
 }
 
 /// Remote-signer Gloas sign-type support (1=supported, 0=unsupported or unknown).

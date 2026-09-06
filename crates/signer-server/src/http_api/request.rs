@@ -7,8 +7,8 @@
 //! One `serde` model decodes both Lighthouse and Prysm bodies. The shape is intentionally
 //! lenient (research R5): a SCREAMING_SNAKE_CASE `type` discriminator, snake_case payload
 //! fields, `fork_info` as `Option` (per-type enforcement lives in the dispatcher, not here —
-//! `VALIDATOR_REGISTRATION` will omit it), and `signingRoot` accepted from both `signingRoot`
-//! and `signing_root`, treated as absent when empty/zero.
+//! `VALIDATOR_REGISTRATION` and `BUILDER_REQUEST_AUTH` omit it), and `signingRoot` accepted
+//! from both `signingRoot` and `signing_root`, treated as absent when empty/zero.
 //!
 //! This module only *decodes*; the dispatcher computes the domain + signing root and
 //! enforces the per-type `fork_info` requirement.

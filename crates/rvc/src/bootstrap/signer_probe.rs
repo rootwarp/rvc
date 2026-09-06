@@ -11,9 +11,12 @@
 use std::time::Duration;
 
 use crypto::{SecretKey, SignContext};
-use eth_types::{ForkInfo, ForkName, PayloadAttestationData, ProposerPreferences};
+use eth_types::{
+    BuilderRequestAuth, ForkInfo, ForkName, PayloadAttestationData, ProposerPreferences,
+};
 use remote_signer_client::{
-    build_payload_attestation_request, build_proposer_preferences_request, sign_request_to_json,
+    build_builder_request_auth_request, build_payload_attestation_request,
+    build_proposer_preferences_request, sign_request_to_json,
 };
 use reqwest::StatusCode;
 use tracing::{error, warn};
@@ -57,16 +60,36 @@ fn transport_error(err: &reqwest::Error) -> String {
     }
 }
 
-/// Probe `PAYLOAD_ATTESTATION` and `PROPOSER_PREFERENCES` on the configured
-/// HTTP remote signer. No-op when no URL is set. Never fails startup.
+fn probe_auth_fixture() -> BuilderRequestAuth {
+    BuilderRequestAuth::new(vec![0x12, 0x34, 0x56, 0x78, 0x90, 0xab, 0xcd, 0xef], 1)
+        .expect("probe fixture data is non-empty and within limit")
+}
+
+/// Probe `PAYLOAD_ATTESTATION`, `PROPOSER_PREFERENCES`, and `BUILDER_REQUEST_AUTH`
+/// on the configured HTTP remote signer. No-op when no URL is set. Never fails startup.
 pub(super) async fn probe_configured_remote_signer(config: &Config) {
     let Some(url) = config.keymanager.remote_signer_url.as_deref() else {
         return;
     };
-    probe_signer_url(url, config.fork_schedule.gloas_fork_epoch, PROBE_TIMEOUT).await;
+    // `ForkScheduleConfig` is Gloas-only; genesis is the network preset.
+    // Custom networks have no preset — fall back to mainnet bytes (same as
+    // the previous hardcode) rather than failing startup.
+    let genesis_fork_version = config.network.genesis_fork_version().unwrap_or([0; 4]);
+    probe_signer_url(
+        url,
+        config.fork_schedule.gloas_fork_epoch,
+        genesis_fork_version,
+        PROBE_TIMEOUT,
+    )
+    .await;
 }
 
-async fn probe_signer_url(url: &str, gloas_fork_epoch: Option<u64>, timeout: Duration) {
+async fn probe_signer_url(
+    url: &str,
+    gloas_fork_epoch: Option<u64>,
+    genesis_fork_version: [u8; 4],
+    timeout: Duration,
+) {
     let gloas_scheduled = gloas_epoch_is_scheduled(gloas_fork_epoch);
     let client = match reqwest::Client::builder().timeout(timeout).build() {
         Ok(client) => client,
@@ -119,6 +142,8 @@ async fn probe_signer_url(url: &str, gloas_fork_epoch: Option<u64>, timeout: Dur
         },
         &ctx,
     );
+    let (auth_req, _) =
+        build_builder_request_auth_request(&probe_auth_fixture(), genesis_fork_version);
 
     let ptc_body = match sign_request_to_json(&ptc_req) {
         Ok(body) => Some(body),
@@ -146,8 +171,21 @@ async fn probe_signer_url(url: &str, gloas_fork_epoch: Option<u64>, timeout: Dur
             None
         }
     };
+    let auth_body = match sign_request_to_json(&auth_req) {
+        Ok(body) => Some(body),
+        Err(err) => {
+            record_probe_result(
+                signer_sign_type::BUILDER_REQUEST_AUTH,
+                url,
+                ProbeResult { outcome: ProbeOutcome::Unknown, error: Some(err.to_string()) },
+                gloas_scheduled,
+                gloas_fork_epoch,
+            );
+            None
+        }
+    };
 
-    let (ptc_raw, prefs_raw) = tokio::join!(
+    let (ptc_raw, prefs_raw, auth_raw) = tokio::join!(
         async {
             match &ptc_body {
                 Some(body) => Some(post_sign(&client, &dummy_sign_url, body).await),
@@ -160,9 +198,16 @@ async fn probe_signer_url(url: &str, gloas_fork_epoch: Option<u64>, timeout: Dur
                 None => None,
             }
         },
+        async {
+            match &auth_body {
+                Some(body) => Some(post_sign(&client, &dummy_sign_url, body).await),
+                None => None,
+            }
+        },
     );
 
-    let need_keys = raw_is_not_found(&ptc_raw) || raw_is_not_found(&prefs_raw);
+    let need_keys =
+        raw_is_not_found(&ptc_raw) || raw_is_not_found(&prefs_raw) || raw_is_not_found(&auth_raw);
     let loaded_key =
         if need_keys { Some(fetch_first_public_key(&client, base).await) } else { None };
 
@@ -180,6 +225,16 @@ async fn probe_signer_url(url: &str, gloas_fork_epoch: Option<u64>, timeout: Dur
         let result = resolve_probe(&client, base, raw, body, loaded_key.as_ref()).await;
         record_probe_result(
             signer_sign_type::PROPOSER_PREFERENCES,
+            url,
+            result,
+            gloas_scheduled,
+            gloas_fork_epoch,
+        );
+    }
+    if let (Some(raw), Some(body)) = (auth_raw, auth_body.as_ref()) {
+        let result = resolve_probe(&client, base, raw, body, loaded_key.as_ref()).await;
+        record_probe_result(
+            signer_sign_type::BUILDER_REQUEST_AUTH,
             url,
             result,
             gloas_scheduled,
@@ -451,8 +506,10 @@ mod tests {
         let cases: &[(&str, u16)] = &[
             (signer_sign_type::PAYLOAD_ATTESTATION, 400),
             (signer_sign_type::PROPOSER_PREFERENCES, 400),
+            (signer_sign_type::BUILDER_REQUEST_AUTH, 400),
             (signer_sign_type::PAYLOAD_ATTESTATION, 501),
             (signer_sign_type::PROPOSER_PREFERENCES, 501),
+            (signer_sign_type::BUILDER_REQUEST_AUTH, 501),
         ];
 
         for &(sign_type, status) in cases {
@@ -519,8 +576,10 @@ mod tests {
             .expect("startup still succeeds on probe transport error");
         assert_eq!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 0);
         assert_eq!(capability(signer_sign_type::PROPOSER_PREFERENCES), 0);
+        assert_eq!(capability(signer_sign_type::BUILDER_REQUEST_AUTH), 0);
         assert_ne!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 1);
         assert_ne!(capability(signer_sign_type::PROPOSER_PREFERENCES), 1);
+        assert_ne!(capability(signer_sign_type::BUILDER_REQUEST_AUTH), 1);
 
         // Timeout: delayed mock with a short probe budget.
         let server = MockServer::start().await;
@@ -529,7 +588,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
             .mount(&server)
             .await;
-        probe_signer_url(&server.uri(), Some(600_000), Duration::from_millis(50)).await;
+        probe_signer_url(&server.uri(), Some(600_000), [0; 4], Duration::from_millis(50)).await;
         assert_eq!(
             capability(signer_sign_type::PAYLOAD_ATTESTATION),
             0,
@@ -537,6 +596,11 @@ mod tests {
         );
         assert_eq!(
             capability(signer_sign_type::PROPOSER_PREFERENCES),
+            0,
+            "timeout must never be reported as supported"
+        );
+        assert_eq!(
+            capability(signer_sign_type::BUILDER_REQUEST_AUTH),
             0,
             "timeout must never be reported as supported"
         );
@@ -555,6 +619,7 @@ mod tests {
         load_signing_keys(&config, &denylist).await.expect("startup still succeeds");
         assert_eq!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 0);
         assert_eq!(capability(signer_sign_type::PROPOSER_PREFERENCES), 0);
+        assert_eq!(capability(signer_sign_type::BUILDER_REQUEST_AUTH), 0);
         assert_ne!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 1);
         assert!(logs_contain("no loaded keys"));
         assert!(logs_contain("ERROR"));
@@ -586,6 +651,7 @@ mod tests {
         load_signing_keys(&config, &denylist).await.expect("startup still succeeds");
         assert_eq!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 1);
         assert_eq!(capability(signer_sign_type::PROPOSER_PREFERENCES), 1);
+        assert_eq!(capability(signer_sign_type::BUILDER_REQUEST_AUTH), 1);
         assert!(!logs_contain("does not support sign type"));
     }
 
@@ -618,8 +684,10 @@ mod tests {
         load_signing_keys(&config, &denylist).await.expect("startup still succeeds");
         assert_eq!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 0);
         assert_eq!(capability(signer_sign_type::PROPOSER_PREFERENCES), 0);
+        assert_eq!(capability(signer_sign_type::BUILDER_REQUEST_AUTH), 0);
         assert!(logs_contain(signer_sign_type::PAYLOAD_ATTESTATION));
         assert!(logs_contain(signer_sign_type::PROPOSER_PREFERENCES));
+        assert!(logs_contain(signer_sign_type::BUILDER_REQUEST_AUTH));
         assert!(logs_contain("does not support sign type"));
         assert!(logs_contain("ERROR"));
     }
@@ -634,6 +702,7 @@ mod tests {
         load_signing_keys(&config, &denylist).await.expect("startup still succeeds");
         assert_eq!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 0);
         assert_eq!(capability(signer_sign_type::PROPOSER_PREFERENCES), 0);
+        assert_eq!(capability(signer_sign_type::BUILDER_REQUEST_AUTH), 0);
         assert!(logs_contain("HTTP 500"));
         assert!(logs_contain("ERROR"));
     }
@@ -649,8 +718,10 @@ mod tests {
             load_signing_keys(&config, &denylist).await.expect("pre-Gloas startup still succeeds");
             assert_eq!(capability(signer_sign_type::PAYLOAD_ATTESTATION), 0);
             assert_eq!(capability(signer_sign_type::PROPOSER_PREFERENCES), 0);
+            assert_eq!(capability(signer_sign_type::BUILDER_REQUEST_AUTH), 0);
             assert!(logs_contain(signer_sign_type::PAYLOAD_ATTESTATION));
             assert!(logs_contain(signer_sign_type::PROPOSER_PREFERENCES));
+            assert!(logs_contain(signer_sign_type::BUILDER_REQUEST_AUTH));
             assert!(
                 !logs_contain("ERROR"),
                 "unset / u64::MAX Gloas must not error-log, epoch={epoch:?}"
@@ -670,5 +741,68 @@ mod tests {
         assert!(logs_contain("ERROR"), "gloas_fork_epoch Some(0) is scheduled and must error");
         assert!(logs_contain(signer_sign_type::PAYLOAD_ATTESTATION));
         assert!(logs_contain(signer_sign_type::PROPOSER_PREFERENCES));
+        assert!(logs_contain(signer_sign_type::BUILDER_REQUEST_AUTH));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_capability_probe_builder_request_auth_uses_configured_genesis() {
+        let _lock = probe_metric_lock().await;
+        let holesky = eth_types::NetworkPreset::HOLESKY.genesis_fork_version;
+        let mainnet = [0u8; 4];
+        let auth = probe_auth_fixture();
+        let (_, holesky_root) = build_builder_request_auth_request(&auth, holesky);
+        let (_, mainnet_root) = build_builder_request_auth_request(&auth, mainnet);
+        assert_ne!(holesky_root, mainnet_root);
+
+        let holesky_hex = format!("0x{}", hex::encode(holesky_root));
+        let mainnet_hex = format!("0x{}", hex::encode(mainnet_root));
+
+        let server = MockServer::start().await;
+        // Genesis-mismatch 400 must not be reachable when the probe uses
+        // configured network genesis (would be recorded as "type missing").
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .and(body_string_contains(&mainnet_hex))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"error": "signingRoot mismatch"})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/api/v1/eth2/sign/.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+
+        let (mut config, dir) = empty_keystore_config(server.uri(), Some(600_000));
+        config.network = crate::config::Network::Holesky;
+        let denylist = DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"));
+        load_signing_keys(&config, &denylist).await.expect("startup still succeeds");
+
+        let requests = server.received_requests().await.expect("mock received requests");
+        let auth_bodies: Vec<serde_json::Value> = requests
+            .iter()
+            .filter_map(|req| serde_json::from_slice::<serde_json::Value>(&req.body).ok())
+            .filter(|body| body["type"] == "BUILDER_REQUEST_AUTH")
+            .collect();
+        assert!(!auth_bodies.is_empty(), "probe must POST BUILDER_REQUEST_AUTH");
+        for body in &auth_bodies {
+            assert_eq!(
+                body["signingRoot"], holesky_hex,
+                "Holesky genesis must be used for the request-auth signing root"
+            );
+            assert_ne!(
+                body["signingRoot"], mainnet_hex,
+                "must not send the mainnet signing root against a Holesky schedule"
+            );
+        }
+        assert_eq!(
+            capability(signer_sign_type::BUILDER_REQUEST_AUTH),
+            1,
+            "correct-genesis 200 is support; a mainnet-root 400 must not be treated as type missing"
+        );
+        assert!(!logs_contain("does not support sign type"));
     }
 }

@@ -9,9 +9,9 @@ use crypto::{
     TypedSigner, PUBLIC_KEY_BYTES_LEN,
 };
 use eth_types::{
-    AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-    Epoch, PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
-    VoluntaryExit,
+    AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, BuilderRequestAuth,
+    ContributionAndProof, Epoch, PayloadAttestationData, ProposerPreferences, Root, Slot,
+    ValidatorRegistrationV1, VoluntaryExit,
 };
 use observability::logging::{RedactedUrl, TruncatedPubkey};
 use reqwest::{Client, StatusCode};
@@ -21,11 +21,11 @@ use web3signer_wire::SignRequest;
 
 use crate::wire::{
     build_aggregate_and_proof_request, build_attestation_request, build_blinded_block_v2_request,
-    build_block_v2_request, build_contribution_and_proof_request,
-    build_payload_attestation_request, build_proposer_preferences_request,
-    build_randao_reveal_request, build_sync_committee_message_request,
-    build_sync_selection_proof_request, build_validator_registration_request,
-    build_voluntary_exit_request, RemoteSignerConfig,
+    build_block_v2_request, build_builder_request_auth_request,
+    build_contribution_and_proof_request, build_payload_attestation_request,
+    build_proposer_preferences_request, build_randao_reveal_request,
+    build_sync_committee_message_request, build_sync_selection_proof_request,
+    build_validator_registration_request, build_voluntary_exit_request, RemoteSignerConfig,
 };
 
 /// Environment variable that must be set to `"true"` to allow plaintext
@@ -372,6 +372,17 @@ impl TypedSigner for RemoteSigner {
         let pk = ctx.pubkey.to_bytes();
         let (req, signing_root) = build_proposer_preferences_request(prefs, ctx);
         self.sign_request_classified(&pk, &req, &signing_root, Some("proposer_preferences")).await
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        genesis_fork_version: [u8; 4],
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let pk = ctx.pubkey.to_bytes();
+        let (req, signing_root) = build_builder_request_auth_request(auth, genesis_fork_version);
+        self.sign_request_classified(&pk, &req, &signing_root, Some("builder_request_auth")).await
     }
 }
 
