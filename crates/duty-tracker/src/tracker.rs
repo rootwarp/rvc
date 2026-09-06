@@ -7,7 +7,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::metrics::RVC_DUTIES_FETCHED_TOTAL;
 use bn_manager::{AttesterDuty, BeaconNodeClient, ProposerDuty};
-use eth_types::{SyncCommitteeDuty, SLOTS_PER_EPOCH};
+use eth_types::{ForkSchedule, SyncCommitteeDuty, SLOTS_PER_EPOCH};
 
 use crate::error::DutyTrackerError;
 
@@ -138,6 +138,8 @@ pub struct DutyTracker {
     sync_committee_cache: RwLock<HashMap<u64, SyncPeriodDutyCache>>,
     /// Count of [`Self::get_duties_for_slot`] calls (complexity tests; RF6-31).
     slot_duty_lookups: AtomicU64,
+    /// Reconciled fork schedule used to route proposer-duties v1/v2.
+    fork_schedule: ForkSchedule,
 }
 
 impl DutyTracker {
@@ -149,7 +151,14 @@ impl DutyTracker {
             proposer_cache: RwLock::new(HashMap::new()),
             sync_committee_cache: RwLock::new(HashMap::new()),
             slot_duty_lookups: AtomicU64::new(0),
+            fork_schedule: ForkSchedule::unscheduled_gloas(),
         }
+    }
+
+    /// Pin the reconciled fork schedule used for proposer-duties v1/v2 routing.
+    pub fn with_fork_schedule(mut self, fork_schedule: ForkSchedule) -> Self {
+        self.fork_schedule = fork_schedule;
+        self
     }
 
     /// Number of times [`Self::get_duties_for_slot`] has been called (tests).
@@ -344,8 +353,11 @@ impl DutyTracker {
     ) -> Result<Vec<ProposerDuty>, DutyTrackerError> {
         debug!(epoch = epoch, "Fetching proposer duties for epoch");
 
-        let response =
-            self.beacon.get_proposer_duties(epoch).await.map_err(DutyTrackerError::BeaconError)?;
+        let response = self
+            .beacon
+            .get_proposer_duties(epoch, &self.fork_schedule)
+            .await
+            .map_err(DutyTrackerError::BeaconError)?;
 
         let epoch_cache =
             ProposerEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
@@ -390,8 +402,11 @@ impl DutyTracker {
             return Ok(true);
         }
 
-        let response =
-            self.beacon.get_proposer_duties(epoch).await.map_err(DutyTrackerError::BeaconError)?;
+        let response = self
+            .beacon
+            .get_proposer_duties(epoch, &self.fork_schedule)
+            .await
+            .map_err(DutyTrackerError::BeaconError)?;
 
         if cached_root.as_ref() != Some(&response.dependent_root) {
             info!(

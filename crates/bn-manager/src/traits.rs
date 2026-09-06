@@ -27,7 +27,11 @@ pub trait DutiesProvider: Send + Sync {
         validator_indices: &[String],
     ) -> Result<AttesterDutiesResponse, BeaconError>;
 
-    async fn get_proposer_duties(&self, epoch: u64) -> Result<ProposerDutiesResponse, BeaconError>;
+    async fn get_proposer_duties(
+        &self,
+        epoch: u64,
+        schedule: &ForkSchedule,
+    ) -> Result<ProposerDutiesResponse, BeaconError>;
 
     async fn post_sync_committee_duties(
         &self,
@@ -385,6 +389,7 @@ mod tests {
         async fn get_proposer_duties(
             &self,
             _epoch: u64,
+            _schedule: &ForkSchedule,
         ) -> Result<ProposerDutiesResponse, BeaconError> {
             Ok(ProposerDutiesResponse {
                 dependent_root: "0x00".into(),
@@ -407,7 +412,8 @@ mod tests {
         let only = OnlyDuties;
         let attester = only.get_attester_duties(1, &["0".into()]).await.unwrap();
         assert!(attester.data.is_empty());
-        let proposer = only.get_proposer_duties(1).await.unwrap();
+        let proposer =
+            only.get_proposer_duties(1, &ForkSchedule::unscheduled_gloas()).await.unwrap();
         assert!(proposer.data.is_empty());
         let sync = only.post_sync_committee_duties(1, &["0".into()]).await.unwrap();
         assert!(sync.data.is_empty());

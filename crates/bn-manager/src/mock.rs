@@ -490,7 +490,11 @@ impl DutiesProvider for MockBeaconNodeClient {
         self.get_attester_duties.invoke("get_attester_duties", (epoch, validator_indices.to_vec()))
     }
 
-    async fn get_proposer_duties(&self, epoch: u64) -> Result<ProposerDutiesResponse, BeaconError> {
+    async fn get_proposer_duties(
+        &self,
+        epoch: u64,
+        _schedule: &ForkSchedule,
+    ) -> Result<ProposerDutiesResponse, BeaconError> {
         self.get_proposer_duties.invoke("get_proposer_duties", epoch)
     }
 

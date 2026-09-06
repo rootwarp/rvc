@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beacon::{BeaconClient, BeaconClientConfig};
+use eth_types::ForkSchedule;
 use serde_json::json;
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -104,7 +105,7 @@ async fn test_get_proposer_duties_delegates() {
         .await;
 
     let manager = make_manager(&mock_server.uri());
-    let result = manager.get_proposer_duties(10).await;
+    let result = manager.get_proposer_duties(10, &ForkSchedule::unscheduled_gloas()).await;
     assert!(result.is_ok());
 }
 
@@ -621,7 +622,7 @@ async fn test_multi_duties_use_first_strategy() {
         .await;
 
     let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
-    let result = manager.get_proposer_duties(1).await;
+    let result = manager.get_proposer_duties(1, &ForkSchedule::unscheduled_gloas()).await;
     assert!(result.is_ok());
 }
 
@@ -1944,7 +1945,7 @@ async fn test_operation_timeout_on_duty_fetch() {
         ..OperationTimeouts::default()
     });
 
-    let result = manager.get_proposer_duties(1).await;
+    let result = manager.get_proposer_duties(1, &ForkSchedule::unscheduled_gloas()).await;
     assert!(result.is_err());
     assert!(
         matches!(result.unwrap_err(), BeaconError::OperationTimeout { operation, .. } if operation == "get_proposer_duties"),

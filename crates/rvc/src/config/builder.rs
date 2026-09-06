@@ -476,8 +476,9 @@ impl ServiceBuilder {
         &self,
         beacon: Arc<dyn BeaconNodeClient>,
         validator_indices: Vec<String>,
+        fork_schedule: ForkSchedule,
     ) -> Arc<DutyTracker> {
-        let tracker = DutyTracker::new(beacon, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices).with_fork_schedule(fork_schedule);
         info!("Created duty tracker");
         Arc::new(tracker)
     }
@@ -1067,7 +1068,11 @@ mod tests {
         let builder = ServiceBuilder::new(config);
 
         let beacon = builder.build_beacon().unwrap();
-        let tracker = builder.build_duty_tracker(beacon, vec!["1234".to_string()]);
+        let tracker = builder.build_duty_tracker(
+            beacon,
+            vec!["1234".to_string()],
+            ForkSchedule::unscheduled_gloas(),
+        );
 
         assert!(Arc::strong_count(&tracker) > 0);
     }

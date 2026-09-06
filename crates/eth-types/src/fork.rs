@@ -62,6 +62,32 @@ impl fmt::Display for UnknownForkIdError {
 impl std::error::Error for UnknownForkIdError {}
 
 impl ForkSchedule {
+    /// Schedule with every fork through Fulu active from epoch 0 and Gloas
+    /// unscheduled (`u64::MAX`).
+    ///
+    /// Used when a caller has not yet injected a reconciled BN schedule:
+    /// `ForkName::from_epoch` resolves Fulu for every practical epoch, so
+    /// proposer-duties routing stays on v1 until Gloas is actually scheduled.
+    pub fn unscheduled_gloas() -> Self {
+        Self {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 0,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 0,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 0,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 0,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 0,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 0,
+            fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
+        }
+    }
+
     /// Fork table in ascending fork order (Phase0 … Gloas).
     ///
     /// When several forks share an activation epoch, reverse iteration over this
@@ -268,6 +294,14 @@ mod tests {
     fn test_fork_name_from_epoch_phase0() {
         let schedule = test_schedule();
         assert_eq!(ForkName::from_epoch(0, &schedule), ForkName::Phase0);
+    }
+
+    #[test]
+    fn test_unscheduled_gloas_is_fulu_until_sentinel() {
+        let schedule = ForkSchedule::unscheduled_gloas();
+        assert_eq!(ForkName::from_epoch(0, &schedule), ForkName::Fulu);
+        assert_eq!(ForkName::from_epoch(u64::MAX - 1, &schedule), ForkName::Fulu);
+        assert_eq!(ForkName::from_epoch(u64::MAX, &schedule), ForkName::Gloas);
     }
 
     #[test]

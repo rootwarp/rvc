@@ -459,8 +459,35 @@ pub struct NodeVersionData {
     pub version: String,
 }
 
-/// Response type for the node version endpoint.
+/// Response type for the node version v1 endpoint.
 pub type NodeVersionResponse = DataResponse<NodeVersionData>;
+
+/// Engine-API `ClientVersionV1` object used by `/eth/v2/node/version`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ClientVersionV1 {
+    pub code: String,
+    pub name: String,
+    pub version: String,
+    pub commit: String,
+}
+
+/// Node version data from `/eth/v2/node/version`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NodeVersionV2Data {
+    pub beacon_node: ClientVersionV1,
+    #[serde(default)]
+    pub execution_client: Option<ClientVersionV1>,
+}
+
+impl NodeVersionV2Data {
+    /// User-agent-style string for logs (`{name}/{version}`).
+    pub fn version_string(&self) -> String {
+        format!("{}/{}", self.beacon_node.name, self.beacon_node.version)
+    }
+}
+
+/// Response type for the node version v2 endpoint.
+pub type NodeVersionV2Response = DataResponse<NodeVersionV2Data>;
 
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1052,6 +1079,67 @@ mod tests {
         assert_eq!(response.dependent_root, "0xdeproot");
         assert_eq!(response.data.len(), 1);
         assert_eq!(response.data[0].slot, "100");
+    }
+
+    #[test]
+    fn test_proposer_duties_v2_body_deserializes_as_v1_shape() {
+        // beacon-APIs proposer.v2.yaml uses the same GetProposerDutiesResponse
+        // schema as v1 (dependent_root, execution_optimistic, data[]).
+        let json = r#"{
+            "dependent_root": "0xabc",
+            "execution_optimistic": true,
+            "data": [{
+                "pubkey": "0xpubkey",
+                "validator_index": "7",
+                "slot": "32"
+            }]
+        }"#;
+        let response: ProposerDutiesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.dependent_root, "0xabc");
+        assert!(response.execution_optimistic);
+        assert_eq!(response.data[0].validator_index, "7");
+        assert_eq!(response.data[0].slot, "32");
+    }
+
+    #[test]
+    fn test_node_version_v2_deserialize_with_execution_client() {
+        let json = r#"{
+            "data": {
+                "beacon_node": {
+                    "code": "LH",
+                    "name": "Lighthouse",
+                    "version": "v8.0.1",
+                    "commit": "0xced49dd2"
+                },
+                "execution_client": {
+                    "code": "NM",
+                    "name": "Nethermind",
+                    "version": "v1.35.8",
+                    "commit": "0xc066aee2"
+                }
+            }
+        }"#;
+        let response: NodeVersionV2Response = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.beacon_node.code, "LH");
+        assert_eq!(response.data.version_string(), "Lighthouse/v8.0.1");
+        assert_eq!(response.data.execution_client.as_ref().unwrap().name, "Nethermind");
+    }
+
+    #[test]
+    fn test_node_version_v2_deserialize_without_execution_client() {
+        let json = r#"{
+            "data": {
+                "beacon_node": {
+                    "code": "LH",
+                    "name": "Lighthouse",
+                    "version": "v8.0.1",
+                    "commit": "0xced49dd2"
+                }
+            }
+        }"#;
+        let response: NodeVersionV2Response = serde_json::from_str(json).unwrap();
+        assert!(response.data.execution_client.is_none());
+        assert_eq!(response.data.version_string(), "Lighthouse/v8.0.1");
     }
 
     #[test]

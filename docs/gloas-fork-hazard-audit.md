@@ -37,11 +37,11 @@ Line numbers were opened on `feature/216-fork-hazard-audit` after 2.1
 
 | Class | Count |
 |-------|------:|
-| 1 `>= ForkName::X` | 7 |
+| 1 `>= ForkName::X` | 8 |
 | 2 `.index = 0` | 6 |
 | 3 `match ForkName` | 3 |
 | 4 string-literal dispatch | 4 |
-| 5 `.entries()` | 7 |
+| 5 `.entries()` | 6 |
 | **Total** | **27** |
 
 Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
@@ -50,6 +50,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | Site | Class | Kind | Verdict | Rationale | Issue |
 |---|---|---|---|---|---|
 | `bin/rvc-keygen/src/exit.rs` 107 | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 228. | — |
+| `crates/beacon/src/client.rs` 398 | 1 | — | inherit-intentionally | Proposer-duties v1/v2 routing (4.5). Open-ended `>= Gloas` keeps later forks on v2 rather than silently falling back to deprecated v1. | 4.5 |
 | `crates/crypto/src/signing_root.rs` 228 | 1 | — | inherit-intentionally | EIP-7044: voluntary-exit domain stays Capella-capped however many post-Capella forks exist. Open-ended `>=` is the spec. | — |
 | `crates/crypto/src/signing_root.rs` 286 | 1 | — | inherit-intentionally | Test mirror of 228 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
 | `crates/rvc/src/orchestrator/aggregation.rs` 88 | 1 | — | decided-not-inherited | `>= Fulu` picks the `"fulu"` submit label. Gloas must not inherit; Phase 6 owns the versioned-wrapper choice. One of three production `>= Fulu` sites (plan cited four). | phase-6 |
@@ -63,19 +64,18 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 673 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 417. | 2.8 |
 | `crates/rvc/src/orchestrator/utils.rs` 163 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the half-open `Electra..Gloas` predicate (2.3 / 2.8). | 2.3 |
 | `bin/rvc/tests/common/mock_bn.rs` 268 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
-| `crates/eth-types/src/fork.rs` 152 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
-| `crates/eth-types/src/fork.rs` 170 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
+| `crates/eth-types/src/fork.rs` 178 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
+| `crates/eth-types/src/fork.rs` 196 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
 | `crates/block-service/src/service/mod.rs` 581 | 4 | _ | decided-not-inherited | `ssz_block_format`: unblinded deneb/electra/fulu → `BlockContents`; `_ => BeaconBlock` silently skips the KZG bind. `"gloas"` would fall through. 2.7 leaves this untouched; Phase 6. | phase-6 |
 | `crates/block-service/src/service/tests/mocks.rs` 520 | 4 | _ | test-only | Test body SSZ picker. Wildcard `_ =>` Deneb body. Mirrors production string dispatch. | — |
 | `crates/block-service/src/service/tests/mocks.rs` 534 | 4 | _ | test-only | Blinded-body twin of 520. | — |
 | `crates/block-service/src/service/tests/mocks.rs` 627 | 4 | exhaustive | test-only | `matches!` on deneb/electra/fulu for `BlockContents` bytes. Closed string set; `"gloas"` is false. | — |
 | `crates/crypto/src/typed_signer.rs` 58 | 5 | — | must-bound | `SignContext::resolve` first-matches `fork_info.current_version` over `entries()`. Two `[0xFF;4]` rows (unscheduled Fulu+Gloas after 2.6) resolve Fulu, so `Gloas.fork_version()` does not round-trip. 2.6 pins the collision; 2.10 confines it to both-unscheduled. | 2.6 |
-| `crates/eth-types/src/fork.rs` 184 | 5 | — | inherit-intentionally | `from_epoch` reverse-scans `entries()`; a new row is picked up automatically. Equal activation epochs pick the latest fork. | 2.5b |
-| `crates/eth-types/src/fork.rs` 194 | 5 | — | inherit-intentionally | `fork_version` lookup through `entries()`. New row participates by construction. | 2.5b |
-| `crates/eth-types/src/fork.rs` 203 | 5 | — | inherit-intentionally | `activation_epoch` lookup through `entries()`. Same inherit. | 2.5b |
-| `crates/eth-types/src/fork.rs` 579 | 5 | — | test-only | Eight-ness assert `entries().len() == 8`. 2.5b rewrite of the former seven-ness table. | 2.5b |
-| `crates/eth-types/src/fork.rs` 596 | 5 | — | test-only | 2.1 uniqueness test (`entries().len() == COUNT`). Sixth class-5 site; plan listed five against the pre-2.1 tree. | 2.1 |
-| `crates/eth-types/tests/sentinel_epoch_inertness.rs` 85 | 5 | — | test-only | 2.9 `entries()` pin: Gloas row is the sentinel; `from_epoch` stays pre-Gloas for every realistic epoch. | 2.9 |
+| `crates/eth-types/src/fork.rs` 210 | 5 | — | inherit-intentionally | `from_epoch` reverse-scans `entries()`; a new row is picked up automatically. Equal activation epochs pick the latest fork. | 2.5b |
+| `crates/eth-types/src/fork.rs` 220 | 5 | — | inherit-intentionally | `fork_version` lookup through `entries()`. New row participates by construction. | 2.5b |
+| `crates/eth-types/src/fork.rs` 229 | 5 | — | inherit-intentionally | `activation_epoch` lookup through `entries()`. Same inherit. | 2.5b |
+| `crates/eth-types/src/fork.rs` 613 | 5 | — | test-only | Eight-ness assert `entries().len() == 8`. 2.5b rewrite of the former seven-ness table. | 2.5b |
+| `crates/eth-types/src/fork.rs` 630 | 5 | — | test-only | 2.1 uniqueness test (`entries().len() == COUNT`). Sixth class-5 site; plan listed five against the pre-2.1 tree. | 2.1 |
 <!-- END INVENTORY -->
 
 ## Notes
@@ -92,8 +92,8 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 - **Class 5 grew by one in 2.1.** Plan-verified five: `typed_signer.rs` 58,
   `fork.rs` from_epoch / fork_version / activation_epoch, and the seven-ness
   test. 2.1 added `test_entries_contains_each_all_variant_exactly_once`
-  (`fork.rs` 594). **Grew by one more in 2.9**
-  (`crates/eth-types/tests/sentinel_epoch_inertness.rs` 85).
+  (`fork.rs` 630). The 2.9 sentinel pin is the `u64::MAX - 1` stays-Fulu row
+  in `test_from_epoch_table_matches_legacy_if_else_for_every_boundary`.
 - **Not a class-3 `match ForkName`.** `crates/grpc-signer/src/client.rs` 761
   `test_mainnet_fork_ids_unchanged_for_all_eight_versions` is a test table of
   all variants, not a `match`. Adding Gloas is a 2.5b rewrite, not a compile
@@ -103,7 +103,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
   with an explicit `0..=6` decoder allowlist so id 7 cannot ride in on the
   Gloas arm. 2.9 re-pins that accept set with Gloas present.
 - **Two-source fork schedule (D12).** No `/eth/v1/config/fork_schedule` client
-  method exists. `crates/beacon/src/client.rs` 325–334 exposes
+  method exists. `crates/beacon/src/client.rs` 353–359 exposes
   `get_config_spec()` (`/eth/v1/config/spec`) and `get_fork_schedule()`, which
   derives the schedule from that spec. 2.6 parses Gloas epoch/version from the
   spec; 2.10 reconciles that BN-derived schedule against a local `rvc-config`
@@ -112,6 +112,11 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 - **Self-exclusion.** The scanner skips
   `crates/architecture-tests/tests/fork_hazard_inventory.rs` because its
   inventory literals contain the `>= ForkName::` snippets it searches for.
+- **4.5 proposer-duties v2.** Class 1 grew by one (`client.rs` 398):
+  `>= ForkName::Gloas` selects `/eth/v2/validator/duties/proposer/{epoch}`.
+  Inherit-intentionally — a later fork must stay on v2, not fall back to
+  deprecated v1. `ForkSchedule::unscheduled_gloas` shifted the `fork.rs`
+  class-3/5 line numbers.
 
 ## Post-arm verdicts (issue 2.9)
 
@@ -122,7 +127,7 @@ After 2.5b–2.10, with Gloas configured at `u64::MAX`:
   reverse scan returns Gloas — intended, because the sentinel *is* Gloas's
   activation epoch, so `activation <= epoch` holds for every row and the
   latest wins. No consensus slot has `epoch == u64::MAX`. Pinned in
-  `crates/eth-types/tests/sentinel_epoch_inertness.rs`.
+  `fork.rs` `test_from_epoch_table_matches_legacy_if_else_for_every_boundary`.
 - **Class-5 reverse-lookup (2.6).** `SignContext::resolve` first-matches on
   version. Two `[0xFF;4]` rows (unscheduled Fulu+Gloas) resolve Fulu, so
   `Gloas.fork_version()` does not round-trip through that sentinel.

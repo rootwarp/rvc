@@ -128,7 +128,6 @@ pub async fn build_services(
         Arc::clone(&beacon.bn_manager) as Arc<dyn BeaconNodeClient>;
     let validator_indices: Vec<String> =
         enablement.pubkey_index.read().indices().cloned().collect();
-    let duty_tracker = builder.build_duty_tracker(main_beacon.clone(), validator_indices);
 
     let slot_duration_ms = match builder.resolve_slot_duration_ms(main_beacon.as_ref()).await {
         Ok(ms) => ms,
@@ -161,6 +160,12 @@ pub async fn build_services(
         error!(error = %e, "Gloas fork schedule reconciliation failed");
         return Err(e.into());
     }
+
+    let duty_tracker = builder.build_duty_tracker(
+        main_beacon.clone(),
+        validator_indices,
+        fork_schedule.as_ref().clone(),
+    );
 
     // SEC-9 / M-15: fork mismatch is fatal by default (mirrors the GVR chain-swap
     // gate). Opt out with `allow_unsupported_fork` for testnets / experimental forks.

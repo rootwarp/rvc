@@ -200,9 +200,13 @@ impl DutiesProvider for DutyStallBeacon {
         self.inner.get_attester_duties(epoch, validator_indices).await
     }
 
-    async fn get_proposer_duties(&self, epoch: u64) -> Result<ProposerDutiesResponse, BeaconError> {
+    async fn get_proposer_duties(
+        &self,
+        epoch: u64,
+        schedule: &ForkSchedule,
+    ) -> Result<ProposerDutiesResponse, BeaconError> {
         self.inject_duty_stall().await;
-        self.inner.get_proposer_duties(epoch).await
+        self.inner.get_proposer_duties(epoch, schedule).await
     }
 
     async fn post_sync_committee_duties(

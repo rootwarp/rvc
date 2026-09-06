@@ -1,4 +1,6 @@
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::Client;
@@ -14,11 +16,12 @@ use crate::retry::RetryPolicy;
 use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
     BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
-    GenesisResponse, IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse,
-    ProposerPreparation, SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    GenesisResponse, IndexedAttestationError, NodeVersionResponse, NodeVersionV2Response,
+    ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof,
+    StateForkResponse, SubmitAttestationResult, SyncCommitteeContributionResponse,
+    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
 use crate::BeaconError;
 
@@ -102,6 +105,8 @@ fn required_consensus_version(
 pub struct BeaconClient {
     client: Client,
     config: BeaconClientConfig,
+    /// Logs the node-version v1 fallback once per BN (D25).
+    node_version_v1_fallback_logged: Arc<AtomicBool>,
 }
 
 impl BeaconClient {
@@ -126,7 +131,11 @@ impl BeaconClient {
 
         let config = BeaconClientConfig { endpoint: endpoint.to_string(), ..config };
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            node_version_v1_fallback_logged: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Returns the configured endpoint URL.
@@ -379,12 +388,29 @@ impl BeaconClient {
         self.get(&path).await
     }
 
+    /// Path for proposer duties: v1 pre-Gloas, v2 at Gloas.
+    ///
+    /// v1 remains `/eth/v1/validator/duties/proposer/{epoch}` (byte-identical
+    /// to the historical client). Endpoint availability is independent of
+    /// response shape — v1 is kept for the whole pre-Gloas window.
+    fn proposer_duties_path(epoch: u64, schedule: &ForkSchedule) -> String {
+        let version =
+            if ForkName::from_epoch(epoch, schedule) >= ForkName::Gloas { "v2" } else { "v1" };
+        format!("/eth/{version}/validator/duties/proposer/{epoch}")
+    }
+
     /// Fetches proposer duties for the given epoch.
+    ///
+    /// Routes on `ForkName::from_epoch(epoch, schedule)`: v1 for pre-Gloas
+    /// epochs, v2 at Gloas. A 404 on v2 at a Gloas epoch is an error, never a
+    /// silent downgrade to v1 (D25). A 404 on v1 pre-Gloas is the same error
+    /// it is today.
     pub async fn get_proposer_duties(
         &self,
         epoch: u64,
+        schedule: &ForkSchedule,
     ) -> Result<ProposerDutiesResponse, BeaconError> {
-        let path = format!("/eth/v1/validator/duties/proposer/{}", epoch);
+        let path = Self::proposer_duties_path(epoch, schedule);
         self.get(&path)
             .instrument(tracing::info_span!("beacon.get_proposer_duties", epoch = epoch))
             .await
@@ -868,10 +894,32 @@ impl BeaconClient {
     }
 
     /// Fetches the node version string from the beacon node.
+    ///
+    /// Tries `/eth/v2/node/version` first and, **only on HTTP 404**, falls back
+    /// to `/eth/v1/node/version`. This is the only beacon endpoint allowed to
+    /// route on a response status code: the payload is informational (logs /
+    /// metrics) and no duty or signature depends on it (D25). A 404 on v2 is
+    /// logged once per BN; any other v2 error is returned as-is.
     #[tracing::instrument(name = "beacon.get_node_version", skip_all)]
     pub async fn get_node_version(&self) -> Result<String, BeaconError> {
-        let response: crate::types::NodeVersionResponse = self.get("/eth/v1/node/version").await?;
-        Ok(response.data.version)
+        match self.get::<NodeVersionV2Response>("/eth/v2/node/version").await {
+            Ok(response) => Ok(response.data.version_string()),
+            Err(BeaconError::ApiError { status: 404, .. }) => {
+                if self
+                    .node_version_v1_fallback_logged
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    warn!(
+                        bn_url = %RedactedUrl(self.endpoint()),
+                        "GET /eth/v2/node/version returned 404; falling back to /eth/v1/node/version (informational only — no duty or signature depends on this endpoint)"
+                    );
+                }
+                let response: NodeVersionResponse = self.get("/eth/v1/node/version").await?;
+                Ok(response.data.version)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Submits signed attestations to the beacon node.
@@ -1320,6 +1368,35 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("Eth-Consensus-Version", reqwest::header::HeaderValue::from_static("deneb"));
         assert_eq!(required_consensus_version(&headers).unwrap(), ForkName::Deneb);
+    }
+
+    fn fulu_gloas_schedule() -> ForkSchedule {
+        let mut schedule = ForkSchedule::unscheduled_gloas();
+        schedule.fulu_fork_epoch = 500_000;
+        schedule.gloas_fork_epoch = 600_000;
+        schedule
+    }
+
+    #[test]
+    fn test_proposer_duties_path_v1_at_fulu_epoch() {
+        let schedule = fulu_gloas_schedule();
+        assert_eq!(
+            BeaconClient::proposer_duties_path(500_000, &schedule),
+            "/eth/v1/validator/duties/proposer/500000"
+        );
+        assert_eq!(
+            BeaconClient::proposer_duties_path(599_999, &schedule),
+            "/eth/v1/validator/duties/proposer/599999"
+        );
+    }
+
+    #[test]
+    fn test_proposer_duties_path_v2_at_gloas_epoch() {
+        let schedule = fulu_gloas_schedule();
+        assert_eq!(
+            BeaconClient::proposer_duties_path(600_000, &schedule),
+            "/eth/v2/validator/duties/proposer/600000"
+        );
     }
 
     #[test]

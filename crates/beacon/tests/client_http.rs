@@ -18,7 +18,29 @@ use beacon::{
     SingleAttestation, VersionedAggregateAttestation, VersionedAttestation,
     VersionedSignedAggregateAndProof,
 };
+use eth_types::ForkSchedule;
 use timing::{SlotClock, SystemSlotClock};
+
+fn fulu_gloas_schedule() -> ForkSchedule {
+    let mut schedule = ForkSchedule::unscheduled_gloas();
+    schedule.fulu_fork_epoch = 500_000;
+    schedule.gloas_fork_epoch = 600_000;
+    schedule
+}
+
+fn proposer_duties_body() -> serde_json::Value {
+    serde_json::json!({
+        "dependent_root": "0xabc123",
+        "execution_optimistic": true,
+        "data": [
+            {
+                "pubkey": "0xpubkey1",
+                "validator_index": "100",
+                "slot": "64000"
+            }
+        ]
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct TestData {
@@ -1705,7 +1727,8 @@ async fn test_get_proposer_duties_success() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_proposer_duties(10000).await.unwrap();
+    let result =
+        client.get_proposer_duties(10000, &ForkSchedule::unscheduled_gloas()).await.unwrap();
 
     assert_eq!(
         result.dependent_root,
@@ -1733,7 +1756,7 @@ async fn test_get_proposer_duties_api_error() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_proposer_duties(999).await;
+    let result = client.get_proposer_duties(999, &ForkSchedule::unscheduled_gloas()).await;
 
     match result {
         Err(BeaconError::ApiError { status, message }) => {
@@ -2506,12 +2529,95 @@ async fn test_get_proposer_duties_with_dependent_root() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_proposer_duties(2000).await.unwrap();
+    let result =
+        client.get_proposer_duties(2000, &ForkSchedule::unscheduled_gloas()).await.unwrap();
 
     assert_eq!(result.dependent_root, "0xabc123");
     assert!(result.execution_optimistic);
     assert_eq!(result.data.len(), 1);
     assert_eq!(result.data[0].pubkey, "0xpubkey1");
+}
+
+#[tokio::test]
+async fn test_get_proposer_duties_v1_at_fulu_epoch() {
+    let mock_server = MockServer::start().await;
+    let body = proposer_duties_body();
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/duties/proposer/550000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/duties/proposer/550000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let result = client.get_proposer_duties(550_000, &fulu_gloas_schedule()).await.unwrap();
+    assert_eq!(result.dependent_root, "0xabc123");
+    assert_eq!(result.data[0].validator_index, "100");
+}
+
+#[tokio::test]
+async fn test_get_proposer_duties_v2_at_gloas_epoch() {
+    let mock_server = MockServer::start().await;
+    let body = proposer_duties_body();
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/duties/proposer/600000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/duties/proposer/600000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let result = client.get_proposer_duties(600_000, &fulu_gloas_schedule()).await.unwrap();
+    assert_eq!(result.dependent_root, "0xabc123");
+    assert!(result.execution_optimistic);
+    assert_eq!(result.data.len(), 1);
+    assert_eq!(result.data[0].pubkey, "0xpubkey1");
+}
+
+#[tokio::test]
+async fn test_get_proposer_duties_v2_404_is_error_not_downgrade() {
+    let mock_server = MockServer::start().await;
+    let body = proposer_duties_body();
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/duties/proposer/600000"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/duties/proposer/600000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let result = client.get_proposer_duties(600_000, &fulu_gloas_schedule()).await;
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 404),
+        other => panic!("expected ApiError 404, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -3460,9 +3566,79 @@ async fn test_get_node_syncing_error() {
 
 // -- get_node_version tests --
 
+fn node_version_v2_body() -> serde_json::Value {
+    serde_json::json!({
+        "data": {
+            "beacon_node": {
+                "code": "LH",
+                "name": "Lighthouse",
+                "version": "v8.0.1",
+                "commit": "0xced49dd2"
+            },
+            "execution_client": {
+                "code": "NM",
+                "name": "Nethermind",
+                "version": "v1.35.8",
+                "commit": "0xc066aee2"
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_get_node_version_v2() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/node/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(node_version_v2_body()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "version": "should-not-be-used" }
+        })))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let version = client.get_node_version().await.unwrap();
+    assert_eq!(version, "Lighthouse/v8.0.1");
+}
+
 #[tokio::test]
 async fn test_get_node_version_success() {
     let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/node/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(node_version_v2_body()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let version = client.get_node_version().await.unwrap();
+    assert_eq!(version, "Lighthouse/v8.0.1");
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_get_node_version_falls_back_to_v1_on_404() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/node/version"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
 
     Mock::given(method("GET"))
         .and(path("/eth/v1/node/version"))
@@ -3471,14 +3647,24 @@ async fn test_get_node_version_success() {
                 r#"{"data":{"version":"Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}}"#,
             ),
         )
-        .expect(1)
+        .expect(2)
         .mount(&mock_server)
         .await;
 
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
-    let version = client.get_node_version().await.unwrap();
-    assert_eq!(version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    let first = client.get_node_version().await.unwrap();
+    let second = client.get_node_version().await.unwrap();
+    assert_eq!(first, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    assert_eq!(second, first);
+
+    logs_assert(|lines: &[&str]| {
+        let n = lines.iter().filter(|l| l.contains("falling back to /eth/v1/node/version")).count();
+        if n != 1 {
+            return Err(format!("expected fallback log once, got {n}: {lines:?}"));
+        }
+        Ok(())
+    });
 }
 
 #[tokio::test]
@@ -3486,9 +3672,19 @@ async fn test_get_node_version_error() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("GET"))
-        .and(path("/eth/v1/node/version"))
+        .and(path("/eth/v2/node/version"))
         .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
         .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/version"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":{"version":"should-not-fallback"}}"#),
+        )
+        .expect(0)
         .mount(&mock_server)
         .await;
 

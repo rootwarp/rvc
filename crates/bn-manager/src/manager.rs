@@ -1043,12 +1043,16 @@ impl DutiesProvider for BnManager {
         .await
     }
 
-    async fn get_proposer_duties(&self, epoch: u64) -> Result<ProposerDutiesResponse, BeaconError> {
+    async fn get_proposer_duties(
+        &self,
+        epoch: u64,
+        schedule: &ForkSchedule,
+    ) -> Result<ProposerDutiesResponse, BeaconError> {
         self.with_op_timeout(
             "get_proposer_duties",
             self.op_timeout(|t| t.duty_fetch),
             self.query_first("get_proposer_duties", BnRole::Proposal, HealthTier::Synced, |c| {
-                Box::pin(c.get_proposer_duties(epoch))
+                Box::pin(c.get_proposer_duties(epoch, schedule))
             }),
         )
         .await
@@ -1477,6 +1481,7 @@ impl_beacon_client_passthrough! {
         async fn get_proposer_duties(
             &self,
             epoch: u64,
+            schedule: &ForkSchedule,
         ) -> Result<ProposerDutiesResponse, BeaconError>;
         async fn post_sync_committee_duties(
             &self,
