@@ -669,6 +669,51 @@ impl ssz::Decode for crate::ElectraAttestation {
     }
 }
 
+impl Encode for crate::ElectraAggregateAndProof {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        <u64 as Encode>::ssz_fixed_len()
+            + BYTES_PER_LENGTH_OFFSET
+            + self.aggregate.ssz_bytes_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let proof = ssz08_sig96(&self.selection_proof)
+            .expect("ElectraAggregateAndProof.selection_proof must be 96 bytes");
+        let offset = <u64 as Encode>::ssz_fixed_len()
+            + <crate::ElectraAttestation as Encode>::ssz_fixed_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len();
+        let mut encoder = SszEncoder::container(buf, offset);
+        encoder.append(&self.aggregator_index);
+        encoder.append(&self.aggregate);
+        encoder.append(&proof);
+        encoder.finalize();
+    }
+}
+
+impl Decode for crate::ElectraAggregateAndProof {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut builder = SszDecoderBuilder::new(bytes);
+        builder.register_type::<u64>()?;
+        builder.register_type::<crate::ElectraAttestation>()?;
+        builder.register_type::<[u8; 96]>()?;
+        let mut decoder = builder.build()?;
+        Ok(Self {
+            aggregator_index: decoder.decode_next()?,
+            aggregate: decoder.decode_next()?,
+            selection_proof: decoder.decode_next::<[u8; 96]>()?.to_vec(),
+        })
+    }
+}
+
 ssz_container! {
     impl crate::DepositData {
         pubkey: [u8; 48],
@@ -2013,5 +2058,62 @@ mod tests {
         let first_var_offset = u32::from_le_bytes(encoded[200..204].try_into().unwrap());
         assert_eq!(first_var_offset, ELECTRA_FIXED_LEN);
         assert!(encoded.len() >= ELECTRA_FIXED_LEN as usize);
+    }
+
+    fn electra_aap_with_bits(aggregation_bits: Vec<u8>) -> crate::ElectraAggregateAndProof {
+        crate::ElectraAggregateAndProof {
+            aggregator_index: 42,
+            aggregate: crate::ElectraAttestation { aggregation_bits, ..kat_electra_attestation() },
+            selection_proof: vec![0xbb; 96],
+        }
+    }
+
+    #[test]
+    fn test_electra_aggregate_and_proof_ssz_roundtrip() {
+        let proof = electra_aap_with_bits(vec![0xff; 4]);
+        let encoded = Encode::as_ssz_bytes(&proof);
+        let decoded = <crate::ElectraAggregateAndProof as Decode>::from_ssz_bytes(&encoded)
+            .expect("decode ElectraAggregateAndProof");
+        assert_eq!(decoded, proof);
+
+        // aggregator_index, aggregate offset, selection_proof, then ElectraAttestation bytes
+        assert_eq!(&encoded[0..8], &42u64.to_le_bytes());
+        let aggregate_offset = u32::from_le_bytes(encoded[8..12].try_into().unwrap());
+        assert_eq!(aggregate_offset, 108);
+        assert_eq!(&encoded[12..108], &[0xbb; 96]);
+        assert_eq!(&encoded[108..], Encode::as_ssz_bytes(&proof.aggregate));
+    }
+
+    #[test]
+    fn test_electra_aggregate_and_proof_ssz_bytes_len_empty_and_dense() {
+        let empty = electra_aap_with_bits(vec![0x01]);
+        let dense = electra_aap_with_bits(vec![0xff; 512]);
+        for proof in [&empty, &dense] {
+            let encoded = Encode::as_ssz_bytes(proof);
+            assert_eq!(encoded.len(), Encode::ssz_bytes_len(proof));
+            let decoded =
+                <crate::ElectraAggregateAndProof as Decode>::from_ssz_bytes(&encoded).unwrap();
+            assert_eq!(&decoded, proof);
+        }
+    }
+
+    #[test]
+    fn test_electra_aggregate_and_proof_rejects_bad_selection_proof_and_overlength_bits() {
+        let mut bad_proof = electra_aap_with_bits(vec![0x01]);
+        bad_proof.selection_proof = vec![0xbb; 95];
+        assert!(ssz08_sig96(&bad_proof.selection_proof).is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Encode::as_ssz_bytes(&bad_proof)
+        }))
+        .is_err());
+
+        // Bitlist[MAX_VALIDATORS_PER_SLOT=131072] encodes in at most 16385 bytes.
+        let over = vec![0xff; 16386];
+        assert!(ssz08_bitlist::<MaxValidatorsPerSlot>(&over).is_err());
+        let over_proof = electra_aap_with_bits(over);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Encode::as_ssz_bytes(&over_proof)
+        }))
+        .is_err());
     }
 }
