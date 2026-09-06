@@ -7,7 +7,8 @@
 //! strings.
 //!
 //! The ARCH-6h plan cited 24 names against `0ae9a09`. This pin is taken from the
-//! pre-change tree (`develop` @ `eaef2fd`), which defines 35 families.
+//! pre-change tree (`develop` @ `eaef2fd`), which defined 35 families.
+//! Issue 4.6 adds `rvc_ptc_duties_fetched_total` (family delta +1).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -69,6 +70,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_proposer_bn_latency_ms",
     "rvc_proposer_config_refresh_failures_total",
     "rvc_proposer_config_refresh_success_total",
+    "rvc_ptc_duties_fetched_total",
     "rvc_signer_slashing_tx_hold_duration_ms",
     "rvc_signing_duration_seconds",
     "rvc_slashing_db_prune_total",
@@ -185,8 +187,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        35,
-        "pre-change tree pinned 35 families (plan's 24 was 0ae9a09)"
+        36,
+        "issue 4.6 +1 family (rvc_ptc_duties_fetched_total) on the pre-change 35-family pin"
     );
 }
 

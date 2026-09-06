@@ -125,9 +125,12 @@ impl DutyManagementService {
             }
         }
 
-        let (attester_count, proposer_count, sync_count) =
+        let (attester_count, proposer_count, sync_count, ptc_count) =
             self.duty_tracker.cached_duty_counts(epoch).await;
-        debug!(epoch, attester_count, proposer_count, sync_count, "Duty counts for epoch");
+        debug!(
+            epoch,
+            attester_count, proposer_count, sync_count, ptc_count, "Duty counts for epoch"
+        );
 
         // Prefetch next-period sync committee duties when approaching period boundary.
         self.maybe_prefetch_next_sync_period(epoch).await;

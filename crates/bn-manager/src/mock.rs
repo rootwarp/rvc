@@ -439,6 +439,10 @@ impl MockBeaconNodeClient {
         self.get_proposer_duties.calls()
     }
 
+    pub fn post_ptc_duties_calls(&self) -> Vec<(u64, Vec<String>)> {
+        self.post_ptc_duties.calls()
+    }
+
     pub fn post_validator_liveness_calls(&self) -> Vec<(u64, Vec<String>)> {
         self.post_validator_liveness.calls()
     }
