@@ -1,8 +1,9 @@
 //! Compile-level public-surface lock.
 //!
-//! `roots::*`: `gloas_attestation_root`, `gloas_indexed_attestation_root`,
+//! Implemented `roots::*`: `gloas_attestation_root`, `gloas_indexed_attestation_root`,
 //! `gloas_aggregate_and_proof_root`, `gloas_block_root`, `HeaderFields`,
-//! `gloas_body_root`, `gloas_execution_payload_envelope_root`.
+//! `gloas_execution_payload_envelope_root`.
+//! Closed set also includes `gloas_body_root` (5.11b, not exported).
 
 #[test]
 fn test_public_surface_implemented_root_fns() {
@@ -28,6 +29,10 @@ fn test_public_surface_implemented_root_fns() {
         parent_root: [0u8; 32],
         state_root: [0u8; 32],
     };
+    let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
+        rvc_gloas::gloas_execution_payload_envelope_root;
+    let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
+        rvc_gloas::roots::gloas_execution_payload_envelope_root;
 
     let _ = rvc_gloas::SPEC_TAG;
     let _ = rvc_gloas::ACTIVE_FIELDS_ATTESTATION;
@@ -35,6 +40,7 @@ fn test_public_surface_implemented_root_fns() {
     let _ = rvc_gloas::ACTIVE_FIELDS_EXECUTION_REQUESTS;
     let _ = rvc_gloas::ACTIVE_FIELDS_PAYLOAD_ATTESTATION;
     let _ = rvc_gloas::ACTIVE_FIELDS_BEACON_BLOCK_BODY;
+    let _ = rvc_gloas::ACTIVE_FIELDS_EXECUTION_PAYLOAD_ENVELOPE;
     let _ = rvc_gloas::GloasError::InvalidBody { reason: "surface".into() };
 }
 

@@ -27,11 +27,15 @@ pub const ACTIVE_FIELDS_PAYLOAD_ATTESTATION: &[bool] = &[true, true, true];
 pub const ACTIVE_FIELDS_BEACON_BLOCK_BODY: &[bool] =
     &[true, true, true, true, true, true, true, true, true, true, true, true, true];
 
+/// Gloas `ExecutionPayloadEnvelope` EIP-7495 `active_fields` at `SPEC_TAG` (width 5, all-ones).
+pub const ACTIVE_FIELDS_EXECUTION_PAYLOAD_ENVELOPE: &[bool] = &[true, true, true, true, true];
+
 const _: () = assert!(ACTIVE_FIELDS_ATTESTATION.len() == 4);
 const _: () = assert!(ACTIVE_FIELDS_INDEXED_ATTESTATION.len() == 3);
 const _: () = assert!(ACTIVE_FIELDS_EXECUTION_REQUESTS.len() == 5);
 const _: () = assert!(ACTIVE_FIELDS_PAYLOAD_ATTESTATION.len() == 3);
 const _: () = assert!(ACTIVE_FIELDS_BEACON_BLOCK_BODY.len() == 13);
+const _: () = assert!(ACTIVE_FIELDS_EXECUTION_PAYLOAD_ENVELOPE.len() == 5);
 
 mod containers;
 mod error;
@@ -41,7 +45,7 @@ pub mod roots;
 pub use error::GloasError;
 pub use roots::{
     gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_block_root,
-    gloas_indexed_attestation_root, HeaderFields,
+    gloas_execution_payload_envelope_root, gloas_indexed_attestation_root, HeaderFields,
 };
 
 #[cfg(test)]
@@ -66,6 +70,10 @@ mod public_surface_tests {
             &crate::roots::HeaderFields,
             &[u8],
         ) -> Result<eth_types::Root, crate::GloasError> = crate::roots::gloas_block_root;
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::gloas_execution_payload_envelope_root;
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::roots::gloas_execution_payload_envelope_root;
     }
 }
 

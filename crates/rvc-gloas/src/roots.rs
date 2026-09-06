@@ -1,8 +1,9 @@
 //! Gloas container roots over SSZ bytes.
 //!
 //! [`gloas_attestation_root`], [`gloas_indexed_attestation_root`],
-//! [`gloas_aggregate_and_proof_root`], [`gloas_block_root`]. Island types stay
-//! crate-private. `eth_types::Root` (`[u8; 32]`) is used, not re-exported.
+//! [`gloas_aggregate_and_proof_root`], [`gloas_block_root`],
+//! [`gloas_execution_payload_envelope_root`]. Island types stay crate-private.
+//! `eth_types::Root` (`[u8; 32]`) is used, not re-exported.
 
 use eth_types::Root;
 use libssz::SszDecode;
@@ -10,6 +11,7 @@ use libssz_merkle::{HashTreeRoot, Sha2Hasher};
 
 use crate::containers::attestation::{AggregateAndProof, Attestation, IndexedAttestation};
 use crate::containers::block_body::from_ssz_bytes;
+use crate::containers::envelope::ExecutionPayloadEnvelope;
 use crate::containers::leaves::BeaconBlockHeader;
 use crate::error::GloasError;
 
@@ -113,14 +115,22 @@ pub fn gloas_block_root(header: &HeaderFields, body_ssz: &[u8]) -> Result<Root, 
     Ok(block_header.hash_tree_root(&Sha2Hasher))
 }
 
+/// Hash tree root of unsigned Gloas `ExecutionPayloadEnvelope` SSZ.
+///
+/// This is the self-build signing object (D20). Decode failure is
+/// [`GloasError::InvalidBody`] — never a fallback root.
+pub fn gloas_execution_payload_envelope_root(ssz: &[u8]) -> Result<Root, GloasError> {
+    decode_root::<ExecutionPayloadEnvelope>(ssz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         decode_root, gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_block_root,
-        gloas_body_root_at, gloas_indexed_attestation_root, AggregateAndProof, Attestation,
-        HeaderFields, MAX_COMMITTEES_PER_SLOT_MAINNET, MAX_COMMITTEES_PER_SLOT_MINIMAL,
-        PTC_SIZE_MAINNET, PTC_SIZE_MINIMAL, SYNC_COMMITTEE_SIZE_MAINNET,
-        SYNC_COMMITTEE_SIZE_MINIMAL,
+        gloas_body_root_at, gloas_execution_payload_envelope_root, gloas_indexed_attestation_root,
+        AggregateAndProof, Attestation, HeaderFields, MAX_COMMITTEES_PER_SLOT_MAINNET,
+        MAX_COMMITTEES_PER_SLOT_MINIMAL, PTC_SIZE_MAINNET, PTC_SIZE_MINIMAL,
+        SYNC_COMMITTEE_SIZE_MAINNET, SYNC_COMMITTEE_SIZE_MINIMAL,
     };
     use crate::error::GloasError;
     use crate::spec_kat::{mainnet, minimal};
@@ -208,6 +218,25 @@ mod tests {
         assert_invalid_body(gloas_aggregate_and_proof_root(&[]));
         let ssz = parse_hex(mainnet::SPEC_GLOAS_AGGREGATE_AND_PROOF_SSZ);
         assert_invalid_body(gloas_aggregate_and_proof_root(truncated(&ssz)));
+    }
+
+    #[test]
+    fn test_gloas_execution_payload_envelope_root() {
+        let ssz = parse_hex(minimal::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ);
+        let got = gloas_execution_payload_envelope_root(&ssz).expect("valid envelope SSZ");
+        assert_eq!(got, parse_root(minimal::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT));
+        let ssz = parse_hex(mainnet::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ);
+        let got = gloas_execution_payload_envelope_root(&ssz).expect("valid envelope SSZ");
+        assert_eq!(got, parse_root(mainnet::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT));
+    }
+
+    #[test]
+    fn test_gloas_execution_payload_envelope_rejects_truncated() {
+        let ssz = parse_hex(minimal::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ);
+        assert_invalid_body(gloas_execution_payload_envelope_root(truncated(&ssz)));
+        assert_invalid_body(gloas_execution_payload_envelope_root(&[]));
+        let ssz = parse_hex(mainnet::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ);
+        assert_invalid_body(gloas_execution_payload_envelope_root(truncated(&ssz)));
     }
 
     #[test]
