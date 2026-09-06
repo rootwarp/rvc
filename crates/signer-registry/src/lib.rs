@@ -168,6 +168,7 @@ pub const SIGNING_GATE_METHODS: &[&str] = &[
     "sign_randao_reveal",
     "sign_voluntary_exit",
     "sign_builder_registration",
+    "sign_payload_attestation",
 ];
 
 /// Canonical `PubkeyScopedDb::stage_*` methods used by DVT share signing.

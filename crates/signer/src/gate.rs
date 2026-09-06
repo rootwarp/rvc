@@ -27,9 +27,9 @@
 //! # Non-slashable signing flow
 //!
 //! For each non-slashable operation (`sign_sync_committee_message`,
-//! `sign_aggregate_and_proof`, `sign_contribution_and_proof`,
-//! `sign_selection_proof`, `sign_randao_reveal`, `sign_voluntary_exit`,
-//! `sign_builder_registration`):
+//! `sign_aggregate_and_proof`, `sign_payload_attestation`,
+//! `sign_contribution_and_proof`, `sign_selection_proof`, `sign_randao_reveal`,
+//! `sign_voluntary_exit`, `sign_builder_registration`):
 //!
 //! 1. Check `gate_decision` — if false, return
 //!    `Err(SigningGateError::BlockedByDoppelganger)` immediately.
@@ -343,7 +343,7 @@ impl SigningGate {
 
     // ── Non-slashable signing methods ─────────────────────────────────────────
     //
-    // All 7 non-slashable methods: `gate_decision` (bool, fail-closed) then
+    // Non-slashable methods: `gate_decision` (bool, fail-closed) then
     // [`sign_nonslashable_core`]. No slashing DB, no spawn_blocking.
     //
     // Error mapping is uniform: timeout/generic → SigningFailed,
@@ -467,6 +467,23 @@ impl SigningGate {
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
         self.sign_nonslashable(pubkey, signing_root, "sign_aggregate_and_proof").await
+    }
+
+    /// Sign a payload attestation (PTC).
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_PTC_ATTESTER` domain over the `PayloadAttestationData` HTR).
+    pub async fn sign_payload_attestation(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_payload_attestation").await
     }
 
     /// Sign a contribution-and-proof.

@@ -4646,6 +4646,7 @@ dependencies = [
  "rvc-signer-proto",
  "rvc-signer-registry",
  "rvc-slashing",
+ "rvc-spec-vectors",
  "rvc-telemetry",
  "rvc-test-support",
  "rvc-web3signer-wire",

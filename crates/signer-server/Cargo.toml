@@ -133,3 +133,5 @@ bls12_381_plus.workspace = true
 
 # M4 enumeration gate (SS-1) — dev-only; must NOT be a production edge
 signer-registry.workspace = true
+# KAT constants for plan-engine PTC signing-root tests. Dev-only; not a production edge.
+rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }

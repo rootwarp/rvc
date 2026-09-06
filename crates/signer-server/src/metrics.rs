@@ -25,6 +25,9 @@ pub mod grpc_sign_type {
     /// Web3Signer `AGGREGATION_SLOT` (HTTP-only; domain 0x05 selection proof).
     /// Not a v2 gRPC RPC, but shares the A7 `sign_*` series when HTTP dispatches.
     pub const AGGREGATION_SLOT: &str = "aggregation_slot";
+    /// Web3Signer `PAYLOAD_ATTESTATION` (HTTP-only; domain 0x0C PTC attester).
+    /// Not a v2 gRPC RPC, but shares the A7 `sign_*` series when HTTP dispatches.
+    pub const PAYLOAD_ATTESTATION: &str = "payload_attestation";
 
     /// All ten v2 RPC type labels — used by the table-driven recording test.
     pub const ALL: &[&str] = &[
