@@ -4369,6 +4369,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rvc-gloas"
+version = "0.7.0"
+
+[[package]]
 name = "rvc-grpc-signer"
 version = "0.7.0"
 dependencies = [

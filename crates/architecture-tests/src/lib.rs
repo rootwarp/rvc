@@ -88,6 +88,8 @@ const CLASSIFICATION: &[(&str, Layer, &str, &str)] = &[
     ("rvc-timing", Layer::Base, "timing", "slot clock"),
     // Consensus types + SSZ; zero workspace out-edges, already pinned.
     ("rvc-eth-types", Layer::Base, "eth-types", "consensus types"),
+    // Gloas progressive SSZ island. Permitted production out-edge: rvc-eth-types.
+    ("rvc-gloas", Layer::Base, "rvc-gloas", "Gloas progressive SSZ"),
     // Zero WS out-edges; ADR-011 pure leaf. Tension (A-6-3): axum listener in server.rs.
     ("rvc-metrics", Layer::Base, "metrics", "prometheus"),
     // Logging-field registry + redaction helpers; zero out-edges, already pinned.

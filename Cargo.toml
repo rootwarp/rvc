@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/architecture-tests", "crates/beacon", "crates/block-service", "crates/bn-manager", "crates/builder", "crates/crypto", "crates/doppelganger", "crates/duty-tracker", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/observability", "crates/remote-signer-client", "crates/rvc", "crates/rvc-config", "crates/rvc-spec-vectors", "crates/rvc-test-support", "crates/secret-provider", "crates/signer", "crates/signer-proto", "crates/signer-registry", "crates/signer-server", "crates/slashing", "crates/telemetry", "crates/timing", "crates/validator-store", "crates/web3signer-wire"]
+members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/architecture-tests", "crates/beacon", "crates/block-service", "crates/bn-manager", "crates/builder", "crates/crypto", "crates/doppelganger", "crates/duty-tracker", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/observability", "crates/remote-signer-client", "crates/rvc", "crates/rvc-config", "crates/rvc-gloas", "crates/rvc-spec-vectors", "crates/rvc-test-support", "crates/secret-provider", "crates/signer", "crates/signer-proto", "crates/signer-registry", "crates/signer-server", "crates/slashing", "crates/telemetry", "crates/timing", "crates/validator-store", "crates/web3signer-wire"]
 default-members = ["bin/rvc", "crates/architecture-tests"]
 resolver = "2"
 
@@ -20,6 +20,7 @@ repository = "https://github.com/rootwarp/rvc"
 # Internal
 rvc = { path = "crates/rvc" }
 rvc-config = { path = "crates/rvc-config" }
+rvc-gloas = { path = "crates/rvc-gloas" }
 beacon = { path = "crates/beacon" }
 eth-types = { path = "crates/eth-types", package = "rvc-eth-types" }
 metrics = { path = "crates/metrics", package = "rvc-metrics" }
