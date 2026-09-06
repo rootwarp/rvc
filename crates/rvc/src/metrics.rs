@@ -10,9 +10,9 @@ use metrics::{
 pub use bn_manager::metrics::RVC_ATTESTATIONS_TOTAL;
 pub use duty_tracker::metrics::RVC_DUTIES_FETCHED_TOTAL;
 pub use metrics::definitions::{
-    attestation_status, attestation_trigger_source, orchestrator_result, pre_proposal_cold_fetch,
-    slot_context_parent_fallback, slot_phase_cache, sync_committee_skip_phase,
-    sync_committee_skip_reason, task_exit_outcome,
+    attestation_status, attestation_trigger_source, orchestrator_result,
+    payload_attestation_skip_reason, pre_proposal_cold_fetch, slot_context_parent_fallback,
+    slot_phase_cache, sync_committee_skip_phase, sync_committee_skip_reason, task_exit_outcome,
 };
 
 /// Counter for slots processed by the orchestrator.
@@ -128,6 +128,15 @@ pub static RVC_SYNC_COMMITTEE_SKIPPED_TOTAL: LazyLock<IntCounterVec> = LazyLock:
     )
 });
 
+/// Payload attestation duties skipped (HTTP 204 / no data).
+pub static RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_payload_attestation_skipped_total",
+        "Total number of payload attestation duties skipped",
+        &["reason"],
+    )
+});
+
 /// Force-register orchestrator families and the other owners rvc composes.
 pub fn init() {
     metrics::definitions::init_metrics();
@@ -147,6 +156,7 @@ pub fn init() {
     LazyLock::force(&RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS);
     LazyLock::force(&RVC_ATTESTATION_TRIGGER_TOTAL);
     LazyLock::force(&RVC_SYNC_COMMITTEE_SKIPPED_TOTAL);
+    LazyLock::force(&RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL);
 }
 
 #[cfg(test)]

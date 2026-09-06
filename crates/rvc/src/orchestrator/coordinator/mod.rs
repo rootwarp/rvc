@@ -29,6 +29,7 @@ use super::attestation::AttestationService;
 use super::duty_management::DutyManagementService;
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
+use super::payload_attestation::PayloadAttestationService;
 use super::slot_context::SlotContext;
 use super::sync_committee::SyncCommitteeService;
 use super::utils::TimedOutcome;
@@ -288,6 +289,7 @@ where
     pub(crate) attestation_service: AttestationService<C, S>,
     pub(crate) aggregation_service: AggregationService,
     pub(crate) sync_committee_service: SyncCommitteeService,
+    pub(crate) payload_attestation_service: PayloadAttestationService,
     pub(crate) duty_management: DutyManagementService,
     pub(crate) key_gen_rx: watch::Receiver<u64>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
@@ -365,6 +367,15 @@ where
             validator_store.clone(),
         );
 
+        let payload_attestation_service = PayloadAttestationService::new(
+            signer.clone(),
+            beacon.clone(),
+            duty_tracker.clone(),
+            pubkey_map.clone(),
+            config.clone(),
+            validator_store.clone(),
+        );
+
         let attestation_service = AttestationService::new(
             clock.clone(),
             signer.clone(),
@@ -401,6 +412,7 @@ where
             attestation_service,
             aggregation_service,
             sync_committee_service,
+            payload_attestation_service,
             duty_management,
             key_gen_rx,
             shutdown_rx,
@@ -416,10 +428,11 @@ where
         (orchestrator, handle)
     }
 
-    /// Runs the orchestrator main loop with three-phase slot processing:
+    /// Runs the orchestrator main loop with four-phase slot processing:
     /// - t=0: bounded parent capture + block proposal
-    /// - t=slot/3: attestations + sync committee messages (HeadEventGate wait)
-    /// - t=2*slot/3: sync committee contributions
+    /// - attestation due: attestations + sync committee messages (HeadEventGate wait)
+    /// - aggregate due: sync committee contributions + aggregations
+    /// - payload attestation due (Gloas+): payload attestations
     /// - post-duty: epoch duty fetches, epoch-boundary prep, builder registration
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
         info!("Starting duty orchestrator");
@@ -495,7 +508,8 @@ where
             let ctx = tokio::sync::Mutex::new(ctx);
             let att_phase_span = info_span!(parent: &slot_span, "slot.phase.attestation");
             let agg_phase_span = info_span!(parent: &slot_span, "slot.phase.aggregation");
-            let (att_outcome, agg_outcome) = tokio::join!(
+            let ptc_phase_span = info_span!(parent: &slot_span, "slot.phase.payload_attestation");
+            let (att_outcome, agg_outcome, ptc_outcome) = tokio::join!(
                 self.run_attestation_and_sync_phases(
                     current_slot,
                     current_epoch,
@@ -510,9 +524,17 @@ where
                     deadlines,
                     agg_phase_span,
                 ),
+                self.run_payload_attestation_phase(
+                    current_slot,
+                    current_epoch,
+                    fork,
+                    deadlines,
+                    ptc_phase_span,
+                ),
             );
             if matches!(att_outcome, WaitOutcome::Shutdown)
                 || matches!(agg_outcome, WaitOutcome::Shutdown)
+                || matches!(ptc_outcome, WaitOutcome::Shutdown)
             {
                 return Ok(());
             }
@@ -1062,6 +1084,41 @@ where
         if self.sync_enabled.load(Ordering::Acquire) {
             self.sync_committee_service.maybe_produce_sync_contributions(slot, epoch, ctx).await;
         }
+    }
+
+    /// Gloas+ payload-attestation phase. Waits to the 4.19-resolved
+    /// `deadlines.payload_attestation` offset, then signs and submits.
+    async fn run_payload_attestation_phase(
+        &self,
+        current_slot: Slot,
+        current_epoch: u64,
+        fork: ForkName,
+        deadlines: DeadlineBps,
+        ptc_phase_span: tracing::Span,
+    ) -> WaitOutcome {
+        if fork >= ForkName::Gloas {
+            if matches!(
+                self.wait_until_bps(
+                    current_slot,
+                    deadlines.payload_attestation,
+                    false,
+                    &ptc_phase_span,
+                    "Waiting for payload attestation time",
+                )
+                .await,
+                WaitOutcome::Shutdown
+            ) {
+                return WaitOutcome::Shutdown;
+            }
+            if self.check_shutdown() {
+                return WaitOutcome::Shutdown;
+            }
+            self.payload_attestation_service
+                .maybe_produce_payload_attestations(current_slot, current_epoch)
+                .instrument(ptc_phase_span)
+                .await;
+        }
+        WaitOutcome::Continue
     }
 }
 

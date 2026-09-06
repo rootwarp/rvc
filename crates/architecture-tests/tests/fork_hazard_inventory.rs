@@ -114,7 +114,7 @@ const fn inv(
 
 /// Exact per-class counts. Update together with [`INVENTORY`] and the audit doc.
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
-    (Class::GeForkName, 9),
+    (Class::GeForkName, 10),
     (Class::IndexZero, 6),
     (Class::MatchForkName, 3),
     (Class::StringDispatch, 4),
@@ -186,6 +186,15 @@ const INVENTORY: &[Inv] = &[
         ">= ForkName::Fulu",
         Verdict::DecidedNotInherited,
         "phase-6",
+    ),
+    inv(
+        "crates/rvc/src/orchestrator/coordinator/mod.rs",
+        1099,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "4.13",
     ),
     inv(
         "crates/rvc/src/orchestrator/utils.rs",

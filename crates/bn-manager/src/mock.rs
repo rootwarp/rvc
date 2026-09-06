@@ -467,6 +467,14 @@ impl MockBeaconNodeClient {
         self.get_attestation_data.calls()
     }
 
+    pub fn get_payload_attestation_data_calls(&self) -> Vec<u64> {
+        self.get_payload_attestation_data.calls()
+    }
+
+    pub fn submit_payload_attestations_calls(&self) -> Vec<Vec<PayloadAttestationMessage>> {
+        self.submit_payload_attestations.calls()
+    }
+
     pub fn produce_block_v3_calls(&self) -> Vec<(u64, String, Option<String>, Option<u64>)> {
         self.produce_block_v3.calls()
     }

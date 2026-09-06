@@ -228,6 +228,11 @@ pub mod sync_committee_skip_reason {
     pub const NO_HEAD_ROOT: &str = "no_head_root";
 }
 
+/// `reason` label values for `rvc_payload_attestation_skipped_total`.
+pub mod payload_attestation_skip_reason {
+    pub const NO_DATA: &str = "no_data";
+}
+
 /// `outcome` label values for `rvc_pre_proposal_cold_fetch_*`.
 pub mod pre_proposal_cold_fetch {
     pub const HIT: &str = "hit";
