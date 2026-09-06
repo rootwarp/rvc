@@ -12,11 +12,11 @@
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
     DomainType, ElectraAggregateAndProof, Epoch, ForkName, ForkSchedule, PayloadAttestationData,
-    Root, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT, SLOTS_PER_EPOCH,
+    ProposerPreferences, Root, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1,
+    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT, SLOTS_PER_EPOCH,
 };
 use tree_hash::TreeHash;
 
@@ -32,14 +32,17 @@ pub struct SigningCtx<'a> {
 /// Reference to a consensus duty whose BLS signing root is needed.
 ///
 /// Covers every production sign path: attestation, PTC payload attestation,
-/// block (full / root), blinded block, RANDAO, sync message/selection, attester
-/// selection proof, aggregate-and-proof (Phase0 and Electra),
-/// contribution-and-proof, voluntary exit, and builder registration.
+/// proposer preferences, block (full / root), blinded block, RANDAO, sync
+/// message/selection, attester selection proof, aggregate-and-proof (Phase0
+/// and Electra), contribution-and-proof, voluntary exit, and builder
+/// registration.
 #[derive(Debug, Clone, Copy)]
 pub enum DutyRef<'a> {
     Attestation(&'a AttestationData),
     /// Payload attestation (`DOMAIN_PTC_ATTESTER`); fork at `epoch_of(data.slot)`.
     PtcAttestation(&'a PayloadAttestationData),
+    /// Proposer preferences (`DOMAIN_PROPOSER_PREFERENCES`); fork at `epoch_of(proposal_slot)`.
+    ProposerPreferences(&'a ProposerPreferences),
     /// Full beacon block (TypedSigner path; tree-hashes the block container).
     Block(&'a BeaconBlock),
     /// Precomputed block root + slot for fork resolution (SignerService path).
@@ -93,6 +96,17 @@ pub fn signing_root_for(duty: &DutyRef<'_>, ctx: &SigningCtx<'_>) -> Root {
             let domain =
                 compute_domain(DOMAIN_PTC_ATTESTER, fork_version, ctx.genesis_validators_root);
             compute_signing_root(data, domain)
+        }
+        DutyRef::ProposerPreferences(prefs) => {
+            // Spec: compute_epoch_at_slot(proposal_slot).
+            let fork_version =
+                fork_version_at(prefs.proposal_slot / SLOTS_PER_EPOCH, ctx.fork_schedule);
+            let domain = compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                fork_version,
+                ctx.genesis_validators_root,
+            );
+            compute_signing_root(prefs, domain)
         }
         DutyRef::Block(block) => {
             let epoch = block.slot / SLOTS_PER_EPOCH;
@@ -242,10 +256,12 @@ pub fn capella_capped_fork_version(epoch: Epoch, schedule: &ForkSchedule) -> [u8
 mod tests {
     use super::*;
     use eth_types::{
-        Attestation, Checkpoint, ElectraAttestation, PayloadAttestationData,
+        Attestation, Checkpoint, ElectraAttestation, PayloadAttestationData, ProposerPreferences,
         SyncCommitteeContribution,
     };
-    use rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT;
+    use rvc_spec_vectors::spec_kat::{
+        KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT, KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT,
+    };
 
     const GVR: Root = [0xaa; 32];
     const PHASE0: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
@@ -566,6 +582,57 @@ mod tests {
         let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: [0u8; 32] };
         let got = signing_root_for(&DutyRef::PtcAttestation(&data), &ctx);
         assert_eq!(got, parse_kat_root(KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT));
+    }
+
+    /// DomainType bytes copied from the 4.0 pyspec artifact (parsed from
+    /// `consensus-specs` `SPEC_TAG` gloas beacon-chain.md — not hardcoded).
+    fn pinned_domain_proposer_preferences() -> [u8; 4] {
+        const YAML: &str = include_str!(
+            "../../rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml"
+        );
+        let line = YAML
+            .lines()
+            .find(|l| l.trim_start().starts_with("domain_proposer_preferences:"))
+            .expect("domain_proposer_preferences in 4.0 signing-roots artifact");
+        let hex = line
+            .split_once(':')
+            .expect("domain_proposer_preferences value")
+            .1
+            .trim()
+            .trim_matches('\'')
+            .trim_start_matches("0x");
+        hex::decode(hex).expect("domain hex").try_into().expect("4-byte domain")
+    }
+
+    /// L3: ProposerPreferences signing root from the 4.0 pyspec artifact
+    /// (`KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT`) under
+    /// `DOMAIN_PROPOSER_PREFERENCES` bytes from the pinned spec tag.
+    #[test]
+    fn test_proposer_preferences_signing_root() {
+        const SPEC_KAT: &str = include_str!("../../rvc-spec-vectors/src/spec_kat.rs");
+        let header: String = SPEC_KAT.lines().take_while(|l| l.starts_with("//!")).collect();
+        assert!(
+            !header.to_ascii_lowercase().contains("remerkleable"),
+            "KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT provenance must not be remerkleable (D15)"
+        );
+
+        let spec_domain = pinned_domain_proposer_preferences();
+        assert_eq!(DOMAIN_PROPOSER_PREFERENCES, spec_domain);
+
+        let mut schedule = compressed_schedule();
+        // Artifact: fork_version 0x07000001, GVR zeros, proposal_slot 32 (epoch 1).
+        schedule.gloas_fork_epoch = 0;
+        schedule.gloas_fork_version = [0x07, 0x00, 0x00, 0x01];
+        let prefs = ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        };
+        let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: [0u8; 32] };
+        let got = signing_root_for(&DutyRef::ProposerPreferences(&prefs), &ctx);
+        assert_eq!(got, parse_kat_root(KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT));
     }
 
     /// PTC fork version is `epoch_of(data.slot)`, unlike attestations (`target.epoch`).

@@ -49,10 +49,10 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 <!-- BEGIN INVENTORY -->
 | Site | Class | Kind | Verdict | Rationale | Issue |
 |---|---|---|---|---|---|
-| `bin/rvc-keygen/src/exit.rs` 107 | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 237. | — |
+| `bin/rvc-keygen/src/exit.rs` 107 | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 251. | — |
 | `crates/beacon/src/client.rs` 401 | 1 | — | inherit-intentionally | Proposer-duties v1/v2 routing (4.5). Open-ended `>= Gloas` keeps later forks on v2 rather than silently falling back to deprecated v1. | 4.5 |
-| `crates/crypto/src/signing_root.rs` 237 | 1 | — | inherit-intentionally | EIP-7044: voluntary-exit domain stays Capella-capped however many post-Capella forks exist. Open-ended `>=` is the spec. | — |
-| `crates/crypto/src/signing_root.rs` 299 | 1 | — | inherit-intentionally | Test mirror of 237 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
+| `crates/crypto/src/signing_root.rs` 251 | 1 | — | inherit-intentionally | EIP-7044: voluntary-exit domain stays Capella-capped however many post-Capella forks exist. Open-ended `>=` is the spec. | — |
+| `crates/crypto/src/signing_root.rs` 315 | 1 | — | inherit-intentionally | Test mirror of 251 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
 | `crates/rvc/src/orchestrator/aggregation.rs` 88 | 1 | — | decided-not-inherited | `>= Fulu` picks the `"fulu"` submit label. Gloas must not inherit; Phase 6 owns the versioned-wrapper choice. One of three production `>= Fulu` sites (plan cited four). | phase-6 |
 | `crates/rvc/src/orchestrator/aggregation.rs` 130 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedSignedAggregateAndProof::Fulu`. Same Phase-6 verdict as 88. | phase-6 |
 | `crates/rvc/src/orchestrator/attestation.rs` 425 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedAttestation::Fulu`. Phase 6; do not inherit via open-ended `>=`. | phase-6 |

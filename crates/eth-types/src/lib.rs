@@ -20,6 +20,7 @@ mod fork;
 pub(crate) mod hex_fixed;
 pub mod networks;
 mod payload_attestation;
+mod proposer_preferences;
 pub(crate) mod serde_signature;
 pub mod ssz_helpers;
 mod sync_committee;
@@ -72,8 +73,9 @@ pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSTo
 pub use domains::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
     DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_CONTRIBUTION_AND_PROOF,
-    DOMAIN_DEPOSIT, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_DEPOSIT, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_VOLUNTARY_EXIT,
 };
 pub use duties::{ProposerDuty, SignedVoluntaryExit, VoluntaryExit};
 #[cfg(feature = "test-fixtures")]
@@ -81,6 +83,7 @@ pub use fixtures::*;
 pub use fork::{ForkName, ForkSchedule, ParseForkNameError, UnknownForkIdError};
 pub use networks::{from_name as network_from_name, NetworkPreset, ALL as NETWORK_PRESETS};
 pub use payload_attestation::{PayloadAttestationData, PayloadAttestationMessage};
+pub use proposer_preferences::{ProposerPreferences, SignedProposerPreferences};
 pub use ssz_helpers::{
     decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
     decode_sync_committee_contribution_ssz, encode_attestation_ssz, encode_beacon_block_ssz,

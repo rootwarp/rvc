@@ -144,7 +144,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/crypto/src/signing_root.rs",
-        237,
+        251,
         Class::GeForkName,
         false,
         ">= ForkName::Capella",
@@ -153,7 +153,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/crypto/src/signing_root.rs",
-        299,
+        315,
         Class::GeForkName,
         false,
         ">= ForkName::Capella",
