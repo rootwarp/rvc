@@ -270,7 +270,7 @@ mod tests {
         let mut map = HashMap::new();
         let mut indices = Vec::new();
         for k in keys {
-            store.add_validator(ValidatorConfig::new(k.pk.to_bytes()));
+            store.add_validator(ValidatorConfig::new(k.pk.to_bytes())).unwrap();
             if !omit_secret_for.contains(&k.index) {
                 key_manager.insert(k.sk);
             }

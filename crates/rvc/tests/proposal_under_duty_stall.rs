@@ -652,7 +652,7 @@ async fn build_harness(
     let propagator = Arc::new(Propagator::new(Arc::new(NoopSubmitter)));
 
     let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
-    validator_store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+    validator_store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
     validator_store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
 
     let mut map = HashMap::new();

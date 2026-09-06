@@ -37,7 +37,7 @@ async fn build_sync_test_orchestrator(
     // signing gate permits sync duties (mirrors startup registration). The
     // sync_enabled=false test short-circuits before this gate, so it stays
     // correct regardless.
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pk_bytes));
+    validator_store.add_validator(validator_store::ValidatorConfig::new(pk_bytes)).unwrap();
     let config = create_test_config();
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(0);

@@ -16,9 +16,10 @@ use bn_manager::BeaconNodeClient;
 use eth_types::ForkSchedule;
 use fd_lock::RwLock;
 use observability::hex::{strip_prefix_strict, HexError};
-use rvc_config::ForkScheduleConfig;
+use rvc_config::{BuilderSettings, ForkScheduleConfig};
 use slashing::SlashingDb;
 use tracing::{error, info, warn};
+use validator_store::ValidatorStore;
 
 use crate::config::ConfigError;
 
@@ -199,6 +200,27 @@ const LOCAL_FORK_SCHEDULE_SOURCE: &str = "rvc-config";
 const BN_FORK_SCHEDULE_SOURCE: &str = "/eth/v1/config/spec";
 const UNKNOWN_FORK_VERSION: [u8; 4] = [0xFF; 4];
 
+/// Push `[builder]` URLs / min_bid / boost into the validator store.
+///
+/// A malformed URL is an error that names the offending value. An empty
+/// `builders` list is legal (local-only).
+pub fn apply_builder_settings(
+    store: &ValidatorStore,
+    settings: &BuilderSettings,
+) -> Result<(), ConfigError> {
+    settings.validate()?;
+    store
+        .set_global_builders(settings.builders.clone())
+        .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?;
+    if let Some(min_bid) = settings.min_bid {
+        store.set_global_min_bid(min_bid);
+    }
+    if let Some(factor) = settings.builder_boost_factor {
+        store.set_global_builder_boost_factor(factor);
+    }
+    Ok(())
+}
+
 /// Reconcile the local `[fork_schedule]` Gloas pair against the BN spec-derived schedule.
 ///
 /// Both unscheduled (unset or `u64::MAX` / `[0xFF; 4]`) → start. Either scheduled → both
@@ -363,6 +385,55 @@ mod tests {
     use bn_manager::{MockBeaconNodeClient, NodeStatusApi};
     use eth_types::{ForkName, ForkSchedule};
     use serde_json::json;
+    use validator_store::ValidatorConfig;
+
+    #[test]
+    fn builder_urls_from_rvc_config_reach_the_store() {
+        let store = ValidatorStore::new([0xaau8; 20], 30_000_000);
+        let pk = [0x11u8; 48];
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+
+        let settings: BuilderSettings = toml::from_str(
+            r#"
+builders = ["https://relay.example", "http://127.0.0.1:18550"]
+min_bid = 10000000
+builder_boost_factor = 80
+"#,
+        )
+        .expect("parse [builder]");
+
+        apply_builder_settings(&store, &settings).expect("apply");
+
+        assert_eq!(
+            store.builders(&pk),
+            vec!["https://relay.example".to_string(), "http://127.0.0.1:18550".to_string()]
+        );
+        assert_eq!(store.min_bid(&pk), 10_000_000);
+        assert_eq!(store.builder_boost_factor(&pk), 80);
+        let unknown = [0xffu8; 48];
+        assert_eq!(store.builders(&unknown), store.builders(&pk));
+        assert_eq!(store.min_bid(&unknown), 10_000_000);
+    }
+
+    #[test]
+    fn empty_builder_list_from_config_is_legal() {
+        let store = ValidatorStore::new([0xaau8; 20], 30_000_000);
+        let settings: BuilderSettings = toml::from_str("builders = []").expect("empty list");
+        apply_builder_settings(&store, &settings).expect("empty builders is legal");
+        assert!(store.builders(&[0x11u8; 48]).is_empty());
+    }
+
+    #[test]
+    fn malformed_builder_url_errors_naming_the_value() {
+        let store = ValidatorStore::new([0xaau8; 20], 30_000_000);
+        let settings = BuilderSettings {
+            builders: vec!["not a url".to_string()],
+            ..BuilderSettings::default()
+        };
+        let err = apply_builder_settings(&store, &settings).expect_err("malformed URL");
+        let msg = err.to_string();
+        assert!(msg.contains("not a url"), "{msg}");
+    }
 
     // Shared mock helpers (RF4-24): error-by-default MockBeaconNodeClient with overrides.
 

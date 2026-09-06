@@ -536,7 +536,7 @@ mod tests {
         // path). Mirrors startup registration so the per-validator gate permits
         // signing for keys the VC actually loaded.
         if !validator_store.has_validator(&pk.to_bytes()) {
-            validator_store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+            validator_store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
         }
         let mut key_manager = KeyManager::new();
         key_manager.insert(sk);
@@ -779,7 +779,7 @@ mod tests {
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
         let mut config = ValidatorConfig::new(pk_bytes);
         config.enabled = false;
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         let service = setup_service_with_store(beacon, pk_hex, pk, sk, store).await;
 
@@ -864,7 +864,7 @@ mod tests {
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
         let mut config = ValidatorConfig::new(pk_bytes);
         config.enabled = false;
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         // Build the service with this beacon and the disabled-validator store.
         let mut key_manager = KeyManager::new();
@@ -962,7 +962,7 @@ mod tests {
 
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
         for pk in [&pk_a, &pk_b, &pk_c] {
-            store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+            store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
         }
 
         // KeyManager holds A and C only — B signs with KeyNotFound.
@@ -1055,7 +1055,7 @@ mod tests {
 
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
         for pk in [&pk_a, &pk_b, &pk_c] {
-            store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+            store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
         }
 
         // KeyManager holds A and C only — B's selection proof fails KeyNotFound.

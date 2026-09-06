@@ -7,6 +7,7 @@
 //! `*Args::resolved()` is not called from `Config::load`.
 
 mod beacon;
+mod builder;
 mod builder_limits;
 mod fork_schedule;
 mod grpc_signer;
@@ -24,6 +25,7 @@ mod timing;
 mod tracing;
 
 pub use beacon::{BeaconArgs, BeaconConfig};
+pub use builder::BuilderSettings;
 pub use builder_limits::{BuilderLimits, BuilderLimitsArgs};
 pub use fork_schedule::ForkScheduleConfig;
 pub use grpc_signer::{GrpcSignerArgs, GrpcSignerConfig};

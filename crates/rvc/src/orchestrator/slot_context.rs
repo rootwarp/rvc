@@ -384,7 +384,7 @@ mod tests {
         );
 
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
-        store.add_validator(ValidatorConfig::new(pk.to_bytes()));
+        store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
         let mut key_manager = KeyManager::new();
         key_manager.insert(sk);
         let signer = Arc::new(

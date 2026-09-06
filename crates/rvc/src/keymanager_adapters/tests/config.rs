@@ -19,7 +19,7 @@ fn create_config_adapter_with_store() -> (ValidatorConfigManagerAdapter, Arc<Val
 
 fn add_test_validator(store: &ValidatorStore, id: u8) -> Pubkey {
     let pk = test_pubkey(id);
-    store.add_validator(validator_store::ValidatorConfig::new(pk));
+    store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
     pk
 }
 
@@ -152,7 +152,7 @@ fn test_config_adapter_save_persists_to_file() {
     let adapter = ValidatorConfigManagerAdapter::new(store.clone());
 
     let pk = test_pubkey(1);
-    store.add_validator(validator_store::ValidatorConfig::new(pk));
+    store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
 
     let fee = [0xFFu8; 20];
     adapter.set_fee_recipient(&pk, fee).unwrap();

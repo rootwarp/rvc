@@ -16,9 +16,9 @@ pub use rvc_config::ConfigSource;
 pub use start::{BuilderArgs, LoggingArgs, ProposerArgs, StartArgs};
 pub use types::{
     redact_url, BeaconArgs, BeaconConfig, BeaconNodeEntry, BroadcastTopic, BuilderLimits,
-    BuilderLimitsArgs, Config, ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs,
-    GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs,
-    LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
+    BuilderLimitsArgs, BuilderSettings, Config, ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig,
+    GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig,
+    LogfileArgs, LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
     ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs,
     SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig,
     TimingConfig, TracingArgs, TracingConfig, TracingExporter,

@@ -47,7 +47,9 @@ async fn test_non_builder_timeout_does_not_trip_breaker() {
     let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
     // D-3 fail-closed: register the loaded validator so the per-validator
     // signing gate permits this proposal (mirrors startup registration).
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+        .unwrap();
     validator_store
         .set_global_block_selection_mode(validator_store::BlockSelectionMode::ExecutionOnly);
 
@@ -131,7 +133,9 @@ async fn test_builder_timeout_trips_breaker() {
     let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
     // D-3 fail-closed: register the loaded validator so the per-validator
     // signing gate permits this proposal (mirrors startup registration).
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+        .unwrap();
     validator_store
         .set_global_block_selection_mode(validator_store::BlockSelectionMode::BuilderAlways);
 
@@ -218,7 +222,9 @@ async fn test_signer_error_does_not_trip_breaker() {
     // D-3 fail-closed: register the loaded validator so the signing gate is
     // passed and the RANDAO signing failure (empty KeyManager) is the path
     // under test (mirrors startup registration).
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+        .unwrap();
 
     let config = create_test_config();
     let mut pubkey_map_inner = HashMap::new();

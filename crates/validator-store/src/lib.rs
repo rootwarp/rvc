@@ -6,4 +6,4 @@ mod store;
 pub use block_selection::BlockSelectionMode;
 pub use config::{DefaultUpdate, ValidatorConfig, ValidatorConfigUpdate};
 pub use error::ValidatorStoreError;
-pub use store::{ValidatorDefaults, ValidatorStore};
+pub use store::{validate_builder_url, ValidatorDefaults, ValidatorStore};

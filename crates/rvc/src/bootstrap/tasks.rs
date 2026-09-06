@@ -513,8 +513,8 @@ mod tests {
 
         pubkey_map.write().insert(pk1, sk1.public_key());
         pubkey_map.write().insert(pk2, sk2.public_key());
-        validator_store.add_validator(ValidatorConfig::new(pk1));
-        validator_store.add_validator(ValidatorConfig::new(pk2));
+        validator_store.add_validator(ValidatorConfig::new(pk1)).unwrap();
+        validator_store.add_validator(ValidatorConfig::new(pk2)).unwrap();
 
         assert_eq!(live_monitoring_counts(&pubkey_map, &validator_store), (2, 2));
 

@@ -205,7 +205,7 @@ where
     let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
 
     let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
-    validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes()));
+    validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
     validator_store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
 
     let mut pubkey_map_inner = HashMap::new();

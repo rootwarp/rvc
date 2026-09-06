@@ -713,7 +713,7 @@ mod tests {
         let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
         let mut config = ValidatorConfig::new(pk_bytes);
         config.enabled = false;
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         let submit_calls = Arc::new(AtomicUsize::new(0));
 

@@ -61,7 +61,7 @@ fn test_newly_imported_validator_blocked() {
 
     let mut config = ValidatorConfig::new(pk);
     config.enabled = false;
-    store.add_validator(config);
+    store.add_validator(config).unwrap();
 
     assert!(
         !store.is_signing_enabled(&pk),
@@ -77,7 +77,7 @@ fn test_validator_enabled_after_window() {
 
     let mut config = ValidatorConfig::new(pk);
     config.enabled = false;
-    store.add_validator(config);
+    store.add_validator(config).unwrap();
 
     // Simulate window expiring: background task calls set_enabled(true)
     store.set_enabled(&pk, true);

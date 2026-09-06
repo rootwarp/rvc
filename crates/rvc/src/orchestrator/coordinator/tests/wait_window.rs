@@ -372,7 +372,7 @@ async fn test_pre_gloas_epoch_does_not_call_ptc_endpoint() {
     let mut map = HashMap::new();
     map.insert(pk.to_bytes(), pk.clone());
     let validator_store = create_mock_validator_store();
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pk.to_bytes()));
+    validator_store.add_validator(validator_store::ValidatorConfig::new(pk.to_bytes())).unwrap();
     let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
         clock,
         duty_tracker,

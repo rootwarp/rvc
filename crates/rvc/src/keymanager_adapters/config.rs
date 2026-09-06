@@ -29,7 +29,9 @@ impl ValidatorConfigManagerAdapter {
         pubkey: &Pubkey,
         update: ValidatorConfigUpdate,
     ) -> Result<(), ApiError> {
-        self.validator_store.update_config(pubkey, update);
+        self.validator_store
+            .update_config(pubkey, update)
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
         self.validator_store.save_config().map_err(|e| ApiError::Internal(e.to_string()))
     }
 }

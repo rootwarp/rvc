@@ -206,7 +206,7 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
     {
         let mut config = validator_store::ValidatorConfig::new(pk_bytes);
         config.enabled = false;
-        validator_store.add_validator(config);
+        validator_store.add_validator(config).unwrap();
     }
 
     let mut pubkey_map_inner = HashMap::new();
@@ -382,7 +382,9 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
     let propagator = Arc::new(Propagator::new(submitter));
 
     let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+        .unwrap();
     validator_store
         .set_global_block_selection_mode(validator_store::BlockSelectionMode::ExecutionOnly);
 

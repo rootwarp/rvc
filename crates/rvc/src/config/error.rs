@@ -136,3 +136,13 @@ pub enum ConfigError {
     #[error("validator store error: {0}")]
     ValidatorStoreError(String),
 }
+
+impl From<rvc_config::ConfigError> for ConfigError {
+    fn from(err: rvc_config::ConfigError) -> Self {
+        match err {
+            rvc_config::ConfigError::Invalid { field, message, source_layer } => {
+                Self::Invalid { field, message, source_layer }
+            }
+        }
+    }
+}

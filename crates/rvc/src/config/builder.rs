@@ -598,6 +598,8 @@ impl ServiceBuilder {
             return Err(ConfigError::ZeroFeeRecipient);
         }
 
+        crate::startup::apply_builder_settings(&store, &self.config.builder)?;
+
         info!("Created validator store");
         Ok(Arc::new(store))
     }
@@ -622,7 +624,9 @@ impl ServiceBuilder {
         for pubkey in pubkey_map.read().values() {
             let pk_bytes = pubkey.to_bytes();
             if !store.has_validator(&pk_bytes) {
-                store.add_validator(validator_store::ValidatorConfig::new(pk_bytes));
+                store
+                    .add_validator(validator_store::ValidatorConfig::new(pk_bytes))
+                    .expect("ValidatorConfig::new has no builder URLs");
                 registered += 1;
             }
         }
@@ -1527,6 +1531,53 @@ mod tests {
         assert_eq!(store.default_gas_limit(), 50_000_000);
     }
 
+    #[test]
+    fn test_build_validator_store_applies_builder_urls() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        std::fs::write(&config_path, format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n"))
+            .unwrap();
+
+        let config = Config {
+            builder: crate::config::BuilderSettings {
+                builders: vec!["https://relay.example".to_string()],
+                min_bid: Some(10_000_000),
+                builder_boost_factor: Some(80),
+            },
+            ..create_minimal_config()
+        };
+        let store =
+            ServiceBuilder::new(config).build_validator_store(Some(&config_path)).expect("store");
+        let unknown = [0xffu8; 48];
+        assert_eq!(store.builders(&unknown), vec!["https://relay.example".to_string()]);
+        assert_eq!(store.min_bid(&unknown), 10_000_000);
+        assert_eq!(store.builder_boost_factor(&unknown), 80);
+    }
+
+    #[test]
+    fn test_build_validator_store_rejects_malformed_builder_url() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        std::fs::write(&config_path, format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n"))
+            .unwrap();
+
+        let config = Config {
+            builder: crate::config::BuilderSettings {
+                builders: vec!["not a url".to_string()],
+                ..Default::default()
+            },
+            ..create_minimal_config()
+        };
+        let err = match ServiceBuilder::new(config).build_validator_store(Some(&config_path)) {
+            Err(e) => e,
+            Ok(_) => panic!("malformed URL"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("not a url"), "{msg}");
+    }
+
     // --- D-3 (Issue 2.11): no-availability-regression for fail-closed default ---
 
     /// Builds an in-memory `KeyManager` populated with `count` freshly generated
@@ -1604,7 +1655,7 @@ mod tests {
         // registration runs.
         let mut disabled = validator_store::ValidatorConfig::new(pk);
         disabled.enabled = false;
-        store.add_validator(disabled);
+        store.add_validator(disabled).unwrap();
 
         builder.register_loaded_validators(&store, &pubkey_map);
 

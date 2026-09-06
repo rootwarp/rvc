@@ -439,7 +439,7 @@ fn finish_fixture(
     // D-3 fail-closed: register the validator as signing-enabled so duties
     // are not dropped by the post-import store gate (unless import path starts empty).
     if preload {
-        validator_store.add_validator(ValidatorConfig::new(pubkey_bytes));
+        validator_store.add_validator(ValidatorConfig::new(pubkey_bytes)).unwrap();
     }
 
     let clock =

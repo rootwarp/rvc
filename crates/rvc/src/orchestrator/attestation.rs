@@ -527,7 +527,7 @@ mod tests {
         let store = ValidatorStore::new([0u8; 20], 30_000_000);
         let mut config = ValidatorConfig::new(pubkey.to_bytes());
         config.enabled = false;
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
         store
     }
 
@@ -596,7 +596,7 @@ mod tests {
 
         let pubkey_map = pubkey_map_with(&pubkey);
         let store = ValidatorStore::new([0u8; 20], 30_000_000);
-        store.add_validator(ValidatorConfig::new(pubkey.to_bytes())); // enabled by default
+        store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap(); // enabled by default
 
         assert!(
             attestation_duty_enabled(&duty, &pubkey_map, &store, 0),

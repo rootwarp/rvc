@@ -42,6 +42,10 @@ struct TomlValidator {
     enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     block_selection_mode: Option<BlockSelectionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    builders: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    min_bid: Option<u64>,
 }
 
 fn parse_hex_bytes<const N: usize>(s: &str) -> Result<[u8; N], ValidatorStoreError> {
@@ -55,6 +59,46 @@ const DEFAULT_FEE_RECIPIENT: [u8; 20] = [0u8; 20];
 
 /// Fallback gas limit when `[defaults]` omits `gas_limit`.
 const DEFAULT_GAS_LIMIT: u64 = 30_000_000;
+
+/// Built-in `builder_boost_factor` when neither per-validator nor global is set.
+const FALLBACK_BUILDER_BOOST_FACTOR: u64 = 100;
+
+/// Built-in `min_bid` when neither per-validator nor global is set.
+const FALLBACK_MIN_BID: u64 = 0;
+
+/// SSZ `MAX_BUILDER_URL_SIZE`; keep in lock-step with `rvc-config` `[builder]`
+/// and `beacon::v4_wire::MAX_BUILDER_URL_SIZE`.
+const MAX_BUILDER_URL_SIZE: usize = 2048;
+
+/// Reject a builder URL that is not `http`/`https` with a host, naming the value.
+///
+/// Empty lists are validated by skipping this helper (no URLs to check).
+/// Keep in lock-step with `rvc-config` `[builder]` validation.
+pub fn validate_builder_url(raw: &str) -> Result<(), ValidatorStoreError> {
+    if raw.len() > MAX_BUILDER_URL_SIZE {
+        return Err(ValidatorStoreError::Config(format!(
+            "builder URL exceeds {MAX_BUILDER_URL_SIZE} bytes: {raw:?}"
+        )));
+    }
+    let parsed = url::Url::parse(raw)
+        .map_err(|_| ValidatorStoreError::Config(format!("malformed builder URL: {raw:?}")))?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err(ValidatorStoreError::Config(format!(
+            "builder URL must start with http:// or https://: {raw:?}"
+        )));
+    }
+    if parsed.host_str().is_none() {
+        return Err(ValidatorStoreError::Config(format!("malformed builder URL: {raw:?}")));
+    }
+    Ok(())
+}
+
+fn validate_builder_urls(urls: &[String]) -> Result<(), ValidatorStoreError> {
+    for raw in urls {
+        validate_builder_url(raw)?;
+    }
+    Ok(())
+}
 
 /// Parse TOML validator config content into defaults and per-validator entries.
 ///
@@ -109,6 +153,9 @@ struct StoreState {
     validators: HashMap<[u8; 48], ValidatorConfig>,
     defaults: ValidatorDefaults,
     global_block_selection_mode: BlockSelectionMode,
+    global_builders: Option<Vec<String>>,
+    global_min_bid: Option<u64>,
+    global_builder_boost_factor: Option<u64>,
 }
 
 pub struct ValidatorStore {
@@ -133,6 +180,9 @@ impl ValidatorStore {
                     graffiti: None,
                 },
                 global_block_selection_mode: BlockSelectionMode::default(),
+                global_builders: None,
+                global_min_bid: None,
+                global_builder_boost_factor: None,
             }),
             config_path: None,
             save_lock: Mutex::new(()),
@@ -165,6 +215,9 @@ impl ValidatorStore {
                 validators,
                 defaults,
                 global_block_selection_mode: BlockSelectionMode::default(),
+                global_builders: None,
+                global_min_bid: None,
+                global_builder_boost_factor: None,
             }),
             config_path: Some(path.to_path_buf()),
             save_lock: Mutex::new(()),
@@ -228,7 +281,33 @@ impl ValidatorStore {
     }
 
     pub fn builder_boost_factor(&self, pubkey: &[u8; 48]) -> u64 {
-        self.state.read().validators.get(pubkey).map(|c| c.builder_boost_factor).unwrap_or(100)
+        let state = self.state.read();
+        state
+            .validators
+            .get(pubkey)
+            .and_then(|c| c.builder_boost_factor)
+            .or(state.global_builder_boost_factor)
+            .unwrap_or(FALLBACK_BUILDER_BOOST_FACTOR)
+    }
+
+    /// Builder URLs: per-validator override, then configured global, then `[]`.
+    pub fn builders(&self, pubkey: &[u8; 48]) -> Vec<String> {
+        let state = self.state.read();
+        if let Some(urls) = state.validators.get(pubkey).and_then(|c| c.builders.as_ref()) {
+            return urls.clone();
+        }
+        state.global_builders.clone().unwrap_or_default()
+    }
+
+    /// Min bid in Gwei: per-validator override, then configured global, then 0.
+    pub fn min_bid(&self, pubkey: &[u8; 48]) -> u64 {
+        let state = self.state.read();
+        state
+            .validators
+            .get(pubkey)
+            .and_then(|c| c.min_bid)
+            .or(state.global_min_bid)
+            .unwrap_or(FALLBACK_MIN_BID)
     }
 
     pub fn effective_block_selection_mode(&self, pubkey: &[u8; 48]) -> BlockSelectionMode {
@@ -242,6 +321,20 @@ impl ValidatorStore {
 
     pub fn set_global_block_selection_mode(&self, mode: BlockSelectionMode) {
         self.state.write().global_block_selection_mode = mode;
+    }
+
+    pub fn set_global_builders(&self, builders: Vec<String>) -> Result<(), ValidatorStoreError> {
+        validate_builder_urls(&builders)?;
+        self.state.write().global_builders = Some(builders);
+        Ok(())
+    }
+
+    pub fn set_global_min_bid(&self, min_bid: u64) {
+        self.state.write().global_min_bid = Some(min_bid);
+    }
+
+    pub fn set_global_builder_boost_factor(&self, factor: u64) {
+        self.state.write().global_builder_boost_factor = Some(factor);
     }
 
     #[tracing::instrument(name = "validator_store.list_enabled_pubkeys", skip_all)]
@@ -262,8 +355,12 @@ impl ValidatorStore {
         self.state.read().validators.get(pubkey).map(|c| c.enabled).unwrap_or(false)
     }
 
-    pub fn add_validator(&self, config: ValidatorConfig) {
+    pub fn add_validator(&self, config: ValidatorConfig) -> Result<(), ValidatorStoreError> {
+        if let Some(urls) = config.builders.as_deref() {
+            validate_builder_urls(urls)?;
+        }
         self.state.write().validators.insert(config.pubkey, config);
+        Ok(())
     }
 
     pub fn remove_validator(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
@@ -282,7 +379,14 @@ impl ValidatorStore {
         }
     }
 
-    pub fn update_config(&self, pubkey: &[u8; 48], update: ValidatorConfigUpdate) {
+    pub fn update_config(
+        &self,
+        pubkey: &[u8; 48],
+        update: ValidatorConfigUpdate,
+    ) -> Result<(), ValidatorStoreError> {
+        if let Some(ref builders) = update.builders {
+            validate_builder_urls(builders)?;
+        }
         let mut changed_fields = Vec::new();
         if update.fee_recipient.is_some() {
             changed_fields.push("fee_recipient");
@@ -302,6 +406,12 @@ impl ValidatorStore {
         if update.block_selection_mode.is_some() {
             changed_fields.push("block_selection_mode");
         }
+        if update.builders.is_some() {
+            changed_fields.push("builders");
+        }
+        if update.min_bid.is_some() {
+            changed_fields.push("min_bid");
+        }
 
         if let Some(config) = self.state.write().validators.get_mut(pubkey) {
             if let Some(fr) = update.fee_recipient {
@@ -317,10 +427,16 @@ impl ValidatorStore {
                 config.builder_proposals = bp;
             }
             if let Some(bbf) = update.builder_boost_factor {
-                config.builder_boost_factor = bbf;
+                config.builder_boost_factor = Some(bbf);
             }
             if let Some(bsm) = update.block_selection_mode {
                 config.block_selection_mode = bsm;
+            }
+            if let Some(builders) = update.builders {
+                config.builders = Some(builders);
+            }
+            if let Some(min_bid) = update.min_bid {
+                config.min_bid = Some(min_bid);
             }
 
             let pk_hex = hex::encode(pubkey);
@@ -330,6 +446,7 @@ impl ValidatorStore {
                 "validator config updated"
             );
         }
+        Ok(())
     }
 
     /// Apply a partial update to the store-wide defaults under one write guard.
@@ -397,10 +514,12 @@ impl ValidatorStore {
                     fee_recipient: v.fee_recipient.map(|fr| format!("0x{}", hex::encode(fr))),
                     gas_limit: v.gas_limit,
                     builder_proposals: Some(v.builder_proposals),
-                    builder_boost_factor: Some(v.builder_boost_factor),
+                    builder_boost_factor: v.builder_boost_factor,
                     graffiti: v.graffiti.map(|g| graffiti_to_string(&g)),
                     enabled: Some(v.enabled),
                     block_selection_mode: v.block_selection_mode,
+                    builders: v.builders.clone(),
+                    min_bid: v.min_bid,
                 })
                 .collect();
             (toml_defaults, toml_validators)
@@ -470,16 +589,22 @@ fn parse_validator(v: &TomlValidator) -> Result<ValidatorConfig, ValidatorStoreE
     let fee_recipient = v.fee_recipient.as_ref().map(|s| parse_hex_bytes(s)).transpose()?;
     let graffiti = v.graffiti.as_ref().map(|s| parse_graffiti(s));
 
-    Ok(ValidatorConfig {
+    let config = ValidatorConfig {
         pubkey,
         fee_recipient,
         gas_limit: v.gas_limit,
         builder_proposals: v.builder_proposals.unwrap_or(false),
-        builder_boost_factor: v.builder_boost_factor.unwrap_or(100),
+        builder_boost_factor: v.builder_boost_factor,
         graffiti,
         enabled: v.enabled.unwrap_or(true),
         block_selection_mode: v.block_selection_mode,
-    })
+        builders: v.builders.clone(),
+        min_bid: v.min_bid,
+    };
+    if let Some(urls) = config.builders.as_deref() {
+        validate_builder_urls(urls)?;
+    }
+    Ok(config)
 }
 
 fn parse_graffiti(s: &str) -> [u8; 32] {
@@ -529,12 +654,14 @@ mod tests {
         let pk = test_pubkey(1);
         let config = ValidatorConfig::new(pk);
 
-        store.add_validator(config.clone());
+        store.add_validator(config.clone()).unwrap();
 
         let retrieved = store.get_config(&pk).unwrap();
         assert_eq!(retrieved.pubkey, pk);
         assert!(retrieved.enabled);
-        assert_eq!(retrieved.builder_boost_factor, 100);
+        assert!(retrieved.builder_boost_factor.is_none());
+        assert!(retrieved.builders.is_none());
+        assert!(retrieved.min_bid.is_none());
     }
 
     #[test]
@@ -547,7 +674,7 @@ mod tests {
     fn test_remove_validator() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         let removed = store.remove_validator(&pk);
         assert!(removed.is_some());
@@ -570,7 +697,7 @@ mod tests {
 
         let mut config = ValidatorConfig::new(pk);
         config.fee_recipient = Some(override_fr);
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         assert_eq!(store.effective_fee_recipient(&pk), override_fr);
     }
@@ -580,7 +707,7 @@ mod tests {
         let default_fr = test_fee_recipient(1);
         let store = ValidatorStore::new(default_fr, 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         assert_eq!(store.effective_fee_recipient(&pk), default_fr);
     }
@@ -600,7 +727,7 @@ mod tests {
 
         let mut config = ValidatorConfig::new(pk);
         config.gas_limit = Some(35_000_000);
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         assert_eq!(store.effective_gas_limit(&pk), 35_000_000);
     }
@@ -609,7 +736,7 @@ mod tests {
     fn test_effective_gas_limit_uses_default() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         assert_eq!(store.effective_gas_limit(&pk), 30_000_000);
     }
@@ -624,7 +751,7 @@ mod tests {
 
         let mut config = ValidatorConfig::new(pk);
         config.graffiti = Some(graffiti);
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         assert_eq!(store.effective_graffiti(&pk), Some(graffiti));
     }
@@ -638,7 +765,7 @@ mod tests {
         store.state.write().defaults.graffiti = Some(default_graffiti);
 
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         assert_eq!(store.effective_graffiti(&pk), Some(default_graffiti));
     }
@@ -647,7 +774,7 @@ mod tests {
     fn test_effective_graffiti_returns_none() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         assert!(store.effective_graffiti(&pk).is_none());
     }
@@ -659,7 +786,7 @@ mod tests {
 
         let mut config = ValidatorConfig::new(pk);
         config.builder_proposals = true;
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         assert!(store.is_builder_enabled(&pk));
     }
@@ -668,7 +795,7 @@ mod tests {
     fn test_is_builder_disabled_by_default() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         assert!(!store.is_builder_enabled(&pk));
     }
@@ -683,7 +810,7 @@ mod tests {
     fn test_builder_boost_factor_default() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         assert_eq!(store.builder_boost_factor(&pk), 100);
     }
@@ -694,8 +821,8 @@ mod tests {
         let pk = test_pubkey(1);
 
         let mut config = ValidatorConfig::new(pk);
-        config.builder_boost_factor = 200;
-        store.add_validator(config);
+        config.builder_boost_factor = Some(200);
+        store.add_validator(config).unwrap();
 
         assert_eq!(store.builder_boost_factor(&pk), 200);
     }
@@ -707,6 +834,216 @@ mod tests {
     }
 
     #[test]
+    fn test_builders_fallback_empty() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+
+        assert!(store.builders(&pk).is_empty());
+        assert!(store.builders(&test_pubkey(99)).is_empty());
+    }
+
+    #[test]
+    fn test_builders_global_default() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.set_global_builders(vec!["https://relay.example".to_string()]).unwrap();
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+
+        assert_eq!(store.builders(&pk), vec!["https://relay.example".to_string()]);
+        assert_eq!(store.builders(&test_pubkey(99)), vec!["https://relay.example".to_string()]);
+    }
+
+    #[test]
+    fn test_builders_per_validator_override() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.set_global_builders(vec!["https://global.example".to_string()]).unwrap();
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.builders = Some(vec!["https://override.example".to_string()]);
+        store.add_validator(config).unwrap();
+
+        assert_eq!(store.builders(&pk), vec!["https://override.example".to_string()]);
+        assert_eq!(store.builders(&test_pubkey(99)), vec!["https://global.example".to_string()]);
+    }
+
+    #[test]
+    fn test_builders_empty_override_is_local_only() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.set_global_builders(vec!["https://global.example".to_string()]).unwrap();
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.builders = Some(Vec::new());
+        store.add_validator(config).unwrap();
+
+        assert!(store.builders(&pk).is_empty());
+        assert_eq!(store.builders(&test_pubkey(99)), vec!["https://global.example".to_string()]);
+    }
+
+    #[test]
+    fn test_builders_file_url_is_rejected_naming_the_value() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let err = store
+            .set_global_builders(vec!["file:///tmp/builder".to_string()])
+            .expect_err("file:// rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("file:///tmp/builder"), "{msg}");
+        assert!(store.builders(&test_pubkey(1)).is_empty());
+
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.builders = Some(vec!["file:///etc/passwd".to_string()]);
+        let err = store.add_validator(config).expect_err("file:// add rejected");
+        assert!(err.to_string().contains("file:///etc/passwd"), "{err}");
+        assert!(!store.has_validator(&pk));
+
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        let err = store
+            .update_config(
+                &pk,
+                ValidatorConfigUpdate {
+                    builders: Some(vec!["file://evil".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .expect_err("file:// update rejected");
+        assert!(err.to_string().contains("file://evil"), "{err}");
+        assert!(store.builders(&pk).is_empty());
+    }
+
+    #[test]
+    fn test_builders_malformed_url_is_rejected_naming_the_value() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let err =
+            store.set_global_builders(vec!["not a url".to_string()]).expect_err("malformed URL");
+        assert!(err.to_string().contains("not a url"), "{err}");
+
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.builders = Some(vec!["not a url".to_string()]);
+        let err = store.add_validator(config).expect_err("malformed add");
+        assert!(err.to_string().contains("not a url"), "{err}");
+        assert!(!store.has_validator(&pk));
+    }
+
+    #[test]
+    fn test_builders_empty_list_still_loads() {
+        let pubkey_hex = format!("0x{}", hex::encode([1u8; 48]));
+        let toml_content = format!(
+            r#"
+[defaults]
+fee_recipient = "0x{}"
+
+[[validators]]
+pubkey = "{pubkey_hex}"
+builders = []
+"#,
+            "aa".repeat(20),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).expect("empty [] is legal");
+        let pk = [1u8; 48];
+        assert!(store.get_config(&pk).unwrap().builders.as_ref().unwrap().is_empty());
+        assert!(store.builders(&pk).is_empty());
+
+        store.set_global_builders(Vec::new()).unwrap();
+        store
+            .update_config(
+                &pk,
+                ValidatorConfigUpdate { builders: Some(Vec::new()), ..Default::default() },
+            )
+            .unwrap();
+        assert!(store.builders(&pk).is_empty());
+    }
+
+    #[test]
+    fn test_builders_toml_file_url_is_rejected_naming_the_value() {
+        let pubkey_hex = format!("0x{}", hex::encode([1u8; 48]));
+        let toml_content = format!(
+            r#"
+[defaults]
+fee_recipient = "0x{}"
+
+[[validators]]
+pubkey = "{pubkey_hex}"
+builders = ["file:///tmp/builder"]
+"#,
+            "aa".repeat(20),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(&config_path, toml_content).unwrap();
+
+        let err = match ValidatorStore::load_from_config(&config_path) {
+            Err(e) => e,
+            Ok(_) => panic!("file:// toml"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("file:///tmp/builder"), "{msg}");
+    }
+
+    #[test]
+    fn test_min_bid_fallback_zero() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+
+        assert_eq!(store.min_bid(&pk), 0);
+        assert_eq!(store.min_bid(&test_pubkey(99)), 0);
+    }
+
+    #[test]
+    fn test_min_bid_global_default() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.set_global_min_bid(10_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+
+        assert_eq!(store.min_bid(&pk), 10_000_000);
+        assert_eq!(store.min_bid(&test_pubkey(99)), 10_000_000);
+    }
+
+    #[test]
+    fn test_min_bid_per_validator_override() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.set_global_min_bid(10_000_000);
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.min_bid = Some(1);
+        store.add_validator(config).unwrap();
+
+        assert_eq!(store.min_bid(&pk), 1);
+        assert_eq!(store.min_bid(&test_pubkey(99)), 10_000_000);
+    }
+
+    #[test]
+    fn test_builder_boost_factor_global_default() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.set_global_builder_boost_factor(50);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+
+        assert_eq!(store.builder_boost_factor(&pk), 50);
+        assert_eq!(store.builder_boost_factor(&test_pubkey(99)), 50);
+    }
+
+    #[test]
+    fn test_builder_boost_factor_override_beats_global() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.set_global_builder_boost_factor(50);
+        let pk = test_pubkey(1);
+        let mut config = ValidatorConfig::new(pk);
+        config.builder_boost_factor = Some(200);
+        store.add_validator(config).unwrap();
+
+        assert_eq!(store.builder_boost_factor(&pk), 200);
+        assert_eq!(store.builder_boost_factor(&test_pubkey(99)), 50);
+    }
+
+    #[test]
     fn test_list_enabled_pubkeys() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
 
@@ -714,12 +1051,12 @@ mod tests {
         let pk2 = test_pubkey(2);
         let pk3 = test_pubkey(3);
 
-        store.add_validator(ValidatorConfig::new(pk1));
-        store.add_validator(ValidatorConfig::new(pk2));
+        store.add_validator(ValidatorConfig::new(pk1)).unwrap();
+        store.add_validator(ValidatorConfig::new(pk2)).unwrap();
 
         let mut disabled = ValidatorConfig::new(pk3);
         disabled.enabled = false;
-        store.add_validator(disabled);
+        store.add_validator(disabled).unwrap();
 
         let mut enabled = store.list_enabled_pubkeys();
         enabled.sort();
@@ -733,7 +1070,7 @@ mod tests {
     fn test_set_enabled() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         assert!(store.get_config(&pk).unwrap().enabled);
 
@@ -754,7 +1091,7 @@ mod tests {
     fn test_update_config() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         let new_fr = test_fee_recipient(5);
         let update = ValidatorConfigUpdate {
@@ -764,15 +1101,19 @@ mod tests {
             builder_boost_factor: Some(150),
             graffiti: None, // no change
             block_selection_mode: None,
+            builders: Some(vec!["https://override.example".to_string()]),
+            min_bid: Some(42),
         };
 
-        store.update_config(&pk, update);
+        store.update_config(&pk, update).unwrap();
 
         let config = store.get_config(&pk).unwrap();
         assert_eq!(config.fee_recipient, Some(new_fr));
         assert_eq!(config.gas_limit, Some(50_000_000));
         assert!(config.builder_proposals);
-        assert_eq!(config.builder_boost_factor, 150);
+        assert_eq!(config.builder_boost_factor, Some(150));
+        assert_eq!(config.builders, Some(vec!["https://override.example".to_string()]));
+        assert_eq!(config.min_bid, Some(42));
         assert!(config.graffiti.is_none()); // unchanged
     }
 
@@ -784,14 +1125,14 @@ mod tests {
         let mut config = ValidatorConfig::new(pk);
         config.fee_recipient = Some(test_fee_recipient(5));
         config.gas_limit = Some(50_000_000);
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         let update = ValidatorConfigUpdate {
             fee_recipient: Some(None), // clear
             gas_limit: Some(None),     // clear
             ..Default::default()
         };
-        store.update_config(&pk, update);
+        store.update_config(&pk, update).unwrap();
 
         let config = store.get_config(&pk).unwrap();
         assert!(config.fee_recipient.is_none());
@@ -801,7 +1142,7 @@ mod tests {
     #[test]
     fn test_update_config_unknown_validator_is_noop() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        store.update_config(&test_pubkey(99), ValidatorConfigUpdate::default());
+        store.update_config(&test_pubkey(99), ValidatorConfigUpdate::default()).unwrap();
     }
 
     #[test]
@@ -957,7 +1298,7 @@ graffiti = "my graffiti"
         assert_eq!(config.fee_recipient, Some([2u8; 20]));
         assert_eq!(config.gas_limit, Some(35_000_000));
         assert!(config.builder_proposals);
-        assert_eq!(config.builder_boost_factor, 200);
+        assert_eq!(config.builder_boost_factor, Some(200));
         assert!(config.graffiti.is_some());
         assert!(config.enabled);
 
@@ -1067,7 +1408,7 @@ pubkey = "not-valid-hex"
             let store = Arc::clone(&store);
             handles.push(thread::spawn(move || {
                 let pk = test_pubkey(i);
-                store.add_validator(ValidatorConfig::new(pk));
+                store.add_validator(ValidatorConfig::new(pk)).unwrap();
             }));
         }
 
@@ -1132,6 +1473,8 @@ pubkey = "not-valid-hex"
             graffiti: None,
             enabled: None,
             block_selection_mode: None,
+            builders: None,
+            min_bid: None,
         };
         let cfg = parse_validator(&v).expect("0X-prefixed pubkey must parse");
         assert_eq!(cfg.pubkey, [0xabu8; 48]);
@@ -1160,7 +1503,9 @@ pubkey = "not-valid-hex"
         assert!(config.fee_recipient.is_none());
         assert!(config.gas_limit.is_none());
         assert!(!config.builder_proposals);
-        assert_eq!(config.builder_boost_factor, 100);
+        assert!(config.builder_boost_factor.is_none());
+        assert!(config.builders.is_none());
+        assert!(config.min_bid.is_none());
         assert!(config.graffiti.is_none());
         assert!(config.enabled);
     }
@@ -1307,7 +1652,7 @@ pubkey = "{}"
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
 
         let pk_extra = [99u8; 48];
-        store.add_validator(ValidatorConfig::new(pk_extra));
+        store.add_validator(ValidatorConfig::new(pk_extra)).unwrap();
         assert_eq!(store.list_enabled_pubkeys().len(), 2);
 
         store.reload_config().unwrap();
@@ -1653,9 +1998,11 @@ builder_proposals = true
                 gas_limit: Some(40_000_000),
                 graffiti: None,
                 builder_proposals: false,
-                builder_boost_factor: 100,
+                builder_boost_factor: None,
                 enabled: true,
                 block_selection_mode: None,
+                builders: None,
+                min_bid: None,
             },
         );
 
@@ -1693,9 +2040,11 @@ builder_proposals = true
                 gas_limit: Some(40_000_000),
                 graffiti: None,
                 builder_proposals: false,
-                builder_boost_factor: 100,
+                builder_boost_factor: None,
                 enabled: true,
                 block_selection_mode: None,
+                builders: None,
+                min_bid: None,
             },
         );
 
@@ -1723,7 +2072,7 @@ builder_proposals = true
 
         assert!(!store.has_validator(&pk));
 
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
         assert!(store.has_validator(&pk));
 
         assert!(!store.has_validator(&test_pubkey(99)));
@@ -1761,10 +2110,12 @@ graffiti = "my graffiti"
         // Update fee_recipient via update_config
         let pk = [1u8; 48];
         let new_fr = [0xbbu8; 20];
-        store.update_config(
-            &pk,
-            ValidatorConfigUpdate { fee_recipient: Some(Some(new_fr)), ..Default::default() },
-        );
+        store
+            .update_config(
+                &pk,
+                ValidatorConfigUpdate { fee_recipient: Some(Some(new_fr)), ..Default::default() },
+            )
+            .unwrap();
 
         // Save and reload
         store.save_config().unwrap();
@@ -1826,7 +2177,7 @@ enabled = false
         assert_eq!(config.fee_recipient, Some([0xaau8; 20]));
         assert_eq!(config.gas_limit, Some(35_000_000));
         assert!(config.builder_proposals);
-        assert_eq!(config.builder_boost_factor, 200);
+        assert_eq!(config.builder_boost_factor, Some(200));
         assert!(config.graffiti.is_some());
         assert!(!config.enabled);
     }
@@ -1837,7 +2188,7 @@ enabled = false
     fn test_effective_block_selection_mode_default() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::MaxProfit,);
     }
@@ -1846,7 +2197,7 @@ enabled = false
     fn test_effective_block_selection_mode_global_override() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
         store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
 
         assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::ExecutionOnly,);
@@ -1858,7 +2209,7 @@ enabled = false
         let pk = test_pubkey(1);
         let mut config = ValidatorConfig::new(pk);
         config.block_selection_mode = Some(BlockSelectionMode::BuilderOnly);
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         // Global is MaxProfit, but per-validator is BuilderOnly
         assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::BuilderOnly,);
@@ -1870,7 +2221,7 @@ enabled = false
         let pk = test_pubkey(1);
         let mut config = ValidatorConfig::new(pk);
         config.block_selection_mode = Some(BlockSelectionMode::BuilderAlways);
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
         store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
 
         // Per-validator (BuilderAlways) takes precedence over global (ExecutionOnly)
@@ -1931,7 +2282,7 @@ block_selection_mode = "builder-only"
     fn test_is_signing_enabled_explicit_true() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk)); // default enabled=true
+        store.add_validator(ValidatorConfig::new(pk)).unwrap(); // default enabled=true
         assert!(store.is_signing_enabled(&pk));
     }
 
@@ -1943,7 +2294,7 @@ block_selection_mode = "builder-only"
         let pk = test_pubkey(2);
         let mut config = ValidatorConfig::new(pk);
         config.enabled = false;
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
         assert!(!store.is_signing_enabled(&pk));
     }
 
@@ -1955,7 +2306,7 @@ block_selection_mode = "builder-only"
         let pk = test_pubkey(3);
         let mut config = ValidatorConfig::new(pk);
         config.enabled = false;
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
         assert!(!store.is_signing_enabled(&pk), "must be disabled before flip");
 
         store.set_enabled(&pk, true);
@@ -2178,7 +2529,7 @@ builder_boost_factor = 175
         let store = ValidatorStore::load_from_config(&config_path).unwrap();
         store.set_global_block_selection_mode(BlockSelectionMode::BuilderOnly);
         let pk_extra = [99u8; 48];
-        store.add_validator(ValidatorConfig::new(pk_extra));
+        store.add_validator(ValidatorConfig::new(pk_extra)).unwrap();
 
         std::fs::write(&config_path, "not valid toml [[[").unwrap();
         assert!(store.reload_config().is_err());
@@ -2190,7 +2541,7 @@ builder_boost_factor = 175
         assert_eq!(state.global_block_selection_mode, BlockSelectionMode::BuilderOnly);
         let cfg = state.validators.get(&pk).unwrap();
         assert!(cfg.builder_proposals);
-        assert_eq!(cfg.builder_boost_factor, 175);
+        assert_eq!(cfg.builder_boost_factor, Some(175));
         assert!(state.validators.contains_key(&pk_extra));
     }
 
@@ -2224,7 +2575,7 @@ builder_boost_factor = 175
         // Accessors must not take a write lock for pure reads: exercise the
         // read path concurrently while a writer holds the save_lock only.
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
         let cfg = store.effective_config(&pk);
         assert_eq!(cfg.gas_limit, 30_000_000);
         assert_eq!(store.default_fee_recipient(), test_fee_recipient(1));

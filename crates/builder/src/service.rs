@@ -421,7 +421,7 @@ mod tests {
             config.builder_proposals = *builder_enabled;
             config.fee_recipient = *fee_recipient;
             config.gas_limit = *gas_limit;
-            store.add_validator(config);
+            store.add_validator(config).unwrap();
         }
         store
     }
@@ -543,7 +543,7 @@ mod tests {
         let store = ValidatorStore::new(default_fr, 25_000_000);
         let mut config = ValidatorConfig::new(pk);
         config.builder_proposals = true;
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         let bn = Arc::new(MockBn::new());
         let signer = Arc::new(MockSigner::new());
@@ -658,7 +658,7 @@ mod tests {
         config.builder_proposals = true;
         config.fee_recipient = Some(fr1);
         config.gas_limit = Some(30_000_000);
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         let bn = Arc::new(MockBn::new());
         let signer = Arc::new(MockSigner::new());
@@ -670,13 +670,15 @@ mod tests {
         assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Change fee_recipient
-        store.update_config(
-            &pk,
-            validator_store::ValidatorConfigUpdate {
-                fee_recipient: Some(Some(fr2)),
-                ..Default::default()
-            },
-        );
+        store
+            .update_config(
+                &pk,
+                validator_store::ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(fr2)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         // Should re-register
         service.register_validators().await.unwrap();
@@ -695,7 +697,7 @@ mod tests {
         config.builder_proposals = true;
         config.fee_recipient = Some(fr);
         config.gas_limit = Some(30_000_000);
-        store.add_validator(config);
+        store.add_validator(config).unwrap();
 
         let bn = Arc::new(MockBn::new());
         let signer = Arc::new(MockSigner::new());
@@ -706,13 +708,15 @@ mod tests {
         assert_eq!(bn.register_calls.lock().len(), 1);
 
         // Change gas_limit
-        store.update_config(
-            &pk,
-            validator_store::ValidatorConfigUpdate {
-                gas_limit: Some(Some(50_000_000)),
-                ..Default::default()
-            },
-        );
+        store
+            .update_config(
+                &pk,
+                validator_store::ValidatorConfigUpdate {
+                    gas_limit: Some(Some(50_000_000)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         service.register_validators().await.unwrap();
         let calls = bn.register_calls.lock();
@@ -781,7 +785,7 @@ mod tests {
         let pk = gen_pubkey_bytes();
         let default_fr = test_fee_recipient(0xdd);
         let store = ValidatorStore::new(default_fr, 30_000_000);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         let bn = Arc::new(MockBn::new());
         let signer = Arc::new(MockSigner::new());

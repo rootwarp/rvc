@@ -105,6 +105,8 @@ impl ValidatorConfigUpdate {
                 builder_proposals: self.builder_enabled,
                 builder_boost_factor: None,
                 block_selection_mode: None,
+                builders: None,
+                min_bid: None,
             },
         ))
     }
@@ -287,7 +289,15 @@ pub fn apply_proposer_config_updates(
     }
     for update in updates {
         match update.to_store_update() {
-            Ok((pk, u)) => store.update_config(&pk, u),
+            Ok((pk, u)) => {
+                if let Err(e) = store.update_config(&pk, u) {
+                    warn!(
+                        error = %e,
+                        pubkey = %update.pubkey,
+                        "proposer config entry ignored"
+                    );
+                }
+            }
             Err(e) => {
                 warn!(
                     error = %e,
@@ -822,7 +832,7 @@ mod tests {
 
         let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
         let pk = [0x11u8; 48];
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         let fr = valid_fee_recipient_hex();
         let default_fr = format!("0x{}", hex::encode([0xbbu8; 20]));
@@ -858,7 +868,7 @@ mod tests {
         let pk = [0x11u8; 48];
         let mut cfg = ValidatorConfig::new(pk);
         cfg.fee_recipient = Some([0xaau8; 20]);
-        store.add_validator(cfg);
+        store.add_validator(cfg).unwrap();
 
         apply_proposer_config_updates(
             &store,

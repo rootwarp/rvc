@@ -210,7 +210,7 @@ async fn test_ptc_duty_round_trip() {
     map.insert(pubkey.to_bytes(), pubkey.clone());
     let pubkey_map = Arc::new(parking_lot::RwLock::new(map));
     let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
-    validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes()));
+    validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
 
     let clock =
         Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), SLOTS_PER_EPOCH));

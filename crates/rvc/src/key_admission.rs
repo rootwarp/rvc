@@ -165,7 +165,9 @@ impl KeyAdmissionService {
         self.notifier.pubkey_map().write().insert(pubkey, public_key.clone());
 
         // 4. ValidatorStore
-        self.validator_store.add_validator(ValidatorConfig::new(pubkey));
+        self.validator_store
+            .add_validator(ValidatorConfig::new(pubkey))
+            .expect("ValidatorConfig::new has no builder URLs");
 
         // 5. Final denylist re-check before irreversible notify / doppelganger.
         // If DELETE won the race after mutations, roll stores back and skip.

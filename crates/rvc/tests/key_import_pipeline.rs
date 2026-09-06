@@ -161,7 +161,7 @@ async fn test_imported_key_clears_duty_cache_without_restart() {
     fixture.beacon.set_duty_pubkey(pubkey_hex_0x.clone());
 
     // D-3 store gate open so a successful duty match can reach the signer.
-    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey_bytes));
+    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey_bytes)).unwrap();
 
     // ── Without cache clear: stale epoch cache cannot match the new key ────
     let blocked = fixture.process_slot(SLOT_A).await;
@@ -272,7 +272,7 @@ async fn test_imported_key_produces_no_attestations_during_doppelganger_window()
     );
 
     // Store gate open so we reach SignerService enablement (the SEC-2 gate).
-    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes()));
+    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
 
     let results = fixture.process_slot(SLOT_A).await.expect("process_slot returns results");
     assert_eq!(results.len(), 1, "duty must be found for imported key");
@@ -341,7 +341,7 @@ async fn test_imported_key_signs_after_doppelganger_window_clears() {
     );
     let pk_bytes = adapter.import_keystore(&keystore_json, PASSWORD).expect("import");
     monitor.start_monitoring(pk_bytes);
-    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes()));
+    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
 
     // While Pending: no signature (guard against a broken enablement wire-up).
     let blocked = fixture.process_slot(SLOT_A).await.expect("process during window");

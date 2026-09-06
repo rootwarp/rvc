@@ -53,7 +53,7 @@ mod slashed_validator_monitor {
         let pk = test_pubkey();
         let beacon = mock_with_validators(vec![make_validator(&pk, "active_slashed")]);
         let store = ValidatorStore::new([0u8; 20], 100);
-        store.add_validator(validator_store::ValidatorConfig::new(pk));
+        store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
 
         let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
@@ -73,7 +73,7 @@ mod slashed_validator_monitor {
         let pk = test_pubkey();
         let beacon = mock_with_validators(vec![make_validator(&pk, "active_ongoing")]);
         let store = ValidatorStore::new([0u8; 20], 100);
-        store.add_validator(validator_store::ValidatorConfig::new(pk));
+        store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
 
         let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
@@ -89,7 +89,7 @@ mod slashed_validator_monitor {
         let pk = test_pubkey();
         let beacon = mock_failing();
         let store = ValidatorStore::new([0u8; 20], 100);
-        store.add_validator(validator_store::ValidatorConfig::new(pk));
+        store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
 
         let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
@@ -105,7 +105,7 @@ mod slashed_validator_monitor {
         let pk = test_pubkey();
         let beacon = mock_with_validators(vec![make_validator(&pk, "exited_slashed")]);
         let store = ValidatorStore::new([0u8; 20], 100);
-        store.add_validator(validator_store::ValidatorConfig::new(pk));
+        store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
 
         let outcome = check_slashed_validators(&beacon, &store, SlashedAction::Shutdown).await;
 
@@ -121,7 +121,7 @@ mod slashed_validator_monitor {
         let pk = test_pubkey();
         let beacon = mock_with_validators(vec![make_validator(&pk, "active_slashed")]);
         let store = ValidatorStore::new([0u8; 20], 100);
-        store.add_validator(validator_store::ValidatorConfig::new(pk));
+        store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
 
         let outcome = check_slashed_validators(&beacon, &store, SlashedAction::None).await;
 
@@ -149,8 +149,8 @@ mod slashed_validator_monitor {
         ]);
 
         let store = ValidatorStore::new([0u8; 20], 100);
-        store.add_validator(validator_store::ValidatorConfig::new(pk1));
-        store.add_validator(validator_store::ValidatorConfig::new(pk2));
+        store.add_validator(validator_store::ValidatorConfig::new(pk1)).unwrap();
+        store.add_validator(validator_store::ValidatorConfig::new(pk2)).unwrap();
 
         let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;
 
@@ -319,7 +319,7 @@ mod composition {
         let pk = test_pubkey();
         let beacon = mock_with_validators(vec![make_validator(&pk, "active_slashed")]);
         let store = ValidatorStore::new([0u8; 20], 100);
-        store.add_validator(validator_store::ValidatorConfig::new(pk));
+        store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
 
         let attesting_enabled = Arc::new(AtomicBool::new(false));
 
@@ -364,7 +364,7 @@ mod composition {
         let pk = test_pubkey();
         let beacon = mock_with_validators(vec![make_validator(&pk, "active_ongoing")]);
         let store = ValidatorStore::new([0u8; 20], 100);
-        store.add_validator(validator_store::ValidatorConfig::new(pk));
+        store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
 
         // All features operating together: no slashing, no circuit breaker trip, attestation on
         let outcome = check_slashed_validators(&beacon, &store, SlashedAction::DisableOnly).await;

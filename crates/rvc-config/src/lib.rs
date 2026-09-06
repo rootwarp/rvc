@@ -13,12 +13,13 @@ pub mod sections;
 pub use error::{ConfigError, ConfigSource};
 pub use network::Network;
 pub use sections::{
-    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, ForkScheduleConfig, GcpSecretArgs,
-    GcpSecretConfig, GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs,
-    KeysConfig, LogfileArgs, LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs,
-    NetworkConfig, ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig,
-    SecretProviderArgs, SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction,
-    SlashingArgs, SlashingConfig, TimingConfig, TracingArgs, TracingConfig, TracingExporter,
+    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, BuilderSettings,
+    ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs, GrpcSignerConfig,
+    KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs, LogfileConfig,
+    MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig, ProposerConfigArgs,
+    ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs, SecretProviderConfig,
+    ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig, TimingConfig,
+    TracingArgs, TracingConfig, TracingExporter,
 };
 
 #[cfg(test)]

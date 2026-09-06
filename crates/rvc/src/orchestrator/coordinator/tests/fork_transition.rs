@@ -80,7 +80,7 @@ async fn build_fork_transition_orchestrator_with_schedule(
     // D-3 fail-closed: register the loaded validator so the per-validator
     // signing gate permits its duties (mirrors startup registration).
     let validator_store = create_mock_validator_store();
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes));
+    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes)).unwrap();
 
     let (orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
         clock,

@@ -20,12 +20,17 @@ hex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ethereum_serde_utils = { workspace = true }
 telemetry = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
 rand = { workspace = true }
+
+[package.metadata.cargo-machete]
+# Crate renames to `serde_utils`; only referenced via serde `with` paths.
+ignored = ["ethereum_serde_utils"]
 
 [dev-dependencies]
 eth-types = { workspace = true, features = ["test-fixtures"] }

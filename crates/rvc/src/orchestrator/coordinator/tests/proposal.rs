@@ -84,7 +84,7 @@ async fn test_orchestrator_skips_duty_during_doppelganger_window() {
     {
         let mut config = validator_store::ValidatorConfig::new(duty_pk_bytes);
         config.enabled = false;
-        validator_store.add_validator(config);
+        validator_store.add_validator(config).unwrap();
     }
 
     let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(

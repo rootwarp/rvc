@@ -206,7 +206,7 @@ async fn build_integration_orchestrator(
     // validators at startup (ServiceBuilder::register_loaded_validators); this
     // harness bypasses that, so register the test validator (enabled) here —
     // otherwise the H-7 phase under test is suppressed before it can run.
-    validator_store.add_validator(ValidatorConfig::new(pk_bytes));
+    validator_store.add_validator(ValidatorConfig::new(pk_bytes)).unwrap();
     let config = create_test_config();
 
     // Set clock to 2/3 of FIXTURE_SLOT so all phase waits resolve immediately.

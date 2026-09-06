@@ -23,7 +23,7 @@ impl ValidatorManager for ValidatorManagerAdapter {
         let pubkey_hex = pubkey_hex(pubkey);
         let mut config = validator_store::ValidatorConfig::new(pubkey);
         config.enabled = enabled;
-        self.validator_store.add_validator(config);
+        self.validator_store.add_validator(config).expect("imported validator has no builder URLs");
         info!(pubkey = %pubkey_hex, enabled, "Added validator to store");
     }
 

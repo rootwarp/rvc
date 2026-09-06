@@ -24,12 +24,13 @@ use rvc_config::ConfigSource;
 use slashing::GroupCommitConfig;
 
 pub use rvc_config::{
-    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, ForkScheduleConfig, GcpSecretArgs,
-    GcpSecretConfig, GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs,
-    KeysConfig, LogfileArgs, LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs,
-    NetworkConfig, ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig,
-    SecretProviderArgs, SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction,
-    SlashingArgs, SlashingConfig, TimingConfig, TracingArgs, TracingConfig, TracingExporter,
+    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, BuilderSettings,
+    ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs, GrpcSignerConfig,
+    KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs, LogfileConfig,
+    MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig, ProposerConfigArgs,
+    ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs, SecretProviderConfig,
+    ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig, TimingConfig,
+    TracingArgs, TracingConfig, TracingExporter,
 };
 
 /// Message types that may be broadcast to all beacon nodes.
@@ -179,6 +180,10 @@ pub struct Config {
     #[serde(default)]
     pub builder_limits: BuilderLimits,
 
+    /// Global builder URLs / min_bid for produceBlockV4 (`[builder]`).
+    #[serde(default, skip_serializing_if = "BuilderSettings::is_default")]
+    pub builder: BuilderSettings,
+
     #[serde(default)]
     pub timing: TimingConfig,
 
@@ -295,6 +300,7 @@ impl Default for Config {
             proposer_config: ProposerConfigSource::default(),
             monitoring: MonitoringConfig::default(),
             builder_limits: BuilderLimits::default(),
+            builder: BuilderSettings::default(),
             timing: TimingConfig::default(),
             fork_schedule: ForkScheduleConfig::default(),
             proposer_nodes: Vec::new(),
@@ -420,6 +426,8 @@ struct ConfigWire {
     monitoring: MonitoringConfig,
     #[serde(default)]
     builder_limits: BuilderLimits,
+    #[serde(default)]
+    builder: BuilderSettings,
     #[serde(default)]
     timing: TimingConfig,
     #[serde(default)]
@@ -658,6 +666,7 @@ impl Config {
             proposer_config,
             monitoring,
             builder_limits,
+            builder: w.builder,
             timing: w.timing,
             fork_schedule: w.fork_schedule,
             proposer_nodes: w.proposer_nodes,
@@ -937,6 +946,8 @@ impl Config {
                 source_layer: ConfigSource::Default,
             });
         }
+
+        self.builder.validate()?;
 
         // Validate proposer node URLs
         for node_url in &self.proposer_nodes {
@@ -3194,6 +3205,39 @@ roles = ["not-a-role"]
         assert!(config.validate().is_ok());
     }
 
+    #[test]
+    fn builder_section_urls_and_min_bid_parse() {
+        let config: Config = toml::from_str(
+            r#"
+beacon_url = "http://localhost:5052"
+[builder]
+builders = ["https://relay.example"]
+min_bid = 10000000
+builder_boost_factor = 80
+"#,
+        )
+        .expect("parse [builder]");
+        assert_eq!(config.builder.builders, vec!["https://relay.example".to_string()]);
+        assert_eq!(config.builder.min_bid, Some(10_000_000));
+        assert_eq!(config.builder.builder_boost_factor, Some(80));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn builder_section_malformed_url_fails_validate_naming_the_value() {
+        let config: Config = toml::from_str(
+            r#"
+beacon_url = "http://localhost:5052"
+[builder]
+builders = ["not a url"]
+"#,
+        )
+        .expect("parse");
+        let err = config.validate().expect_err("malformed URL");
+        let msg = err.to_string();
+        assert!(msg.contains("not a url"), "{msg}");
+    }
+
     // -- CQ-2.5: strip_prefix_strict adoption test --
 
     /// load_passwords must warn and skip a pubkey entry that carries a double 0x prefix.
@@ -3253,6 +3297,7 @@ roles = ["not-a-role"]
             "pub proposer_config: ProposerConfigSource",
             "pub monitoring: MonitoringConfig",
             "pub builder_limits: BuilderLimits",
+            "pub builder: BuilderSettings",
             "pub timing: TimingConfig",
             "pub fork_schedule: ForkScheduleConfig",
         ] {

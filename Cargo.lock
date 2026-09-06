@@ -648,6 +648,7 @@ name = "beacon"
 version = "0.7.0"
 dependencies = [
  "bytes",
+ "ethereum_serde_utils 0.8.0",
  "hex",
  "rand 0.8.5",
  "reqwest 0.12.28",
@@ -4309,6 +4310,7 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "tracing",
+ "url",
 ]
 
 [[package]]
@@ -4779,6 +4781,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-test",
+ "url",
 ]
 
 [[package]]

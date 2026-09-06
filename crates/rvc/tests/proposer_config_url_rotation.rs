@@ -37,7 +37,7 @@ fn store_with_validator() -> Arc<ValidatorStore> {
     let store = Arc::new(ValidatorStore::new([0x01u8; 20], 30_000_000));
     let mut cfg = ValidatorConfig::new(test_pubkey());
     cfg.fee_recipient = Some(fee_a());
-    store.add_validator(cfg);
+    store.add_validator(cfg).unwrap();
     store
 }
 
@@ -310,13 +310,15 @@ async fn an_http_401_leaves_all_previous_values_intact() {
     assert_ne!(store.default_fee_recipient(), default_before);
 
     // Explicitly confirm a deliberate store change is not clobbered by subsequent 401s.
-    store.update_config(
-        &pk,
-        ValidatorConfigUpdate {
-            fee_recipient: Some(Some(fee_b())),
-            ..ValidatorConfigUpdate::default()
-        },
-    );
+    store
+        .update_config(
+            &pk,
+            ValidatorConfigUpdate {
+                fee_recipient: Some(Some(fee_b())),
+                ..ValidatorConfigUpdate::default()
+            },
+        )
+        .unwrap();
     tokio::time::sleep(Duration::from_millis(120)).await;
     assert_eq!(
         store.effective_fee_recipient(&pk),

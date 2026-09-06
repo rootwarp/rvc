@@ -6,10 +6,15 @@ pub struct ValidatorConfig {
     pub fee_recipient: Option<[u8; 20]>,
     pub gas_limit: Option<u64>,
     pub builder_proposals: bool,
-    pub builder_boost_factor: u64,
+    /// Per-validator override. `None` falls through to the store global, then 100.
+    pub builder_boost_factor: Option<u64>,
     pub graffiti: Option<[u8; 32]>,
     pub enabled: bool,
     pub block_selection_mode: Option<BlockSelectionMode>,
+    /// Per-validator builder URLs. `None` falls through to the store global, then `[]`.
+    pub builders: Option<Vec<String>>,
+    /// Per-validator min bid (Gwei). `None` falls through to the store global, then 0.
+    pub min_bid: Option<u64>,
 }
 
 impl ValidatorConfig {
@@ -19,10 +24,12 @@ impl ValidatorConfig {
             fee_recipient: None,
             gas_limit: None,
             builder_proposals: false,
-            builder_boost_factor: 100,
+            builder_boost_factor: None,
             graffiti: None,
             enabled: true,
             block_selection_mode: None,
+            builders: None,
+            min_bid: None,
         }
     }
 }
@@ -35,6 +42,8 @@ pub struct ValidatorConfigUpdate {
     pub builder_proposals: Option<bool>,
     pub builder_boost_factor: Option<u64>,
     pub block_selection_mode: Option<Option<BlockSelectionMode>>,
+    pub builders: Option<Vec<String>>,
+    pub min_bid: Option<u64>,
 }
 
 /// Partial update for store-wide defaults ([`crate::ValidatorDefaults`]).
