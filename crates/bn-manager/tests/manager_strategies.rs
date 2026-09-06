@@ -11,7 +11,7 @@ use std::time::Duration;
 use beacon::{BeaconClient, BeaconClientConfig};
 use eth_types::ForkSchedule;
 use serde_json::json;
-use wiremock::matchers::{method, path, query_param};
+use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rvc_bn_manager::{
@@ -249,6 +249,23 @@ async fn test_prepare_beacon_proposer_delegates() {
 
     let manager = make_manager(&mock_server.uri());
     let result = manager.prepare_beacon_proposer(&[]).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_submit_proposer_preferences_delegates() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .and(header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let manager = make_manager(&mock_server.uri());
+    let result = manager.submit_proposer_preferences(&[]).await;
     assert!(result.is_ok());
 }
 

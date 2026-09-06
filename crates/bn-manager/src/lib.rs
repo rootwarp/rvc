@@ -45,5 +45,5 @@ pub use beacon::{
 };
 pub use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedValidatorRegistration, ValidatorRegistrationV1,
+    SignedProposerPreferences, SignedValidatorRegistration, ValidatorRegistrationV1,
 };

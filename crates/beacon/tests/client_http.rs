@@ -4645,3 +4645,93 @@ async fn test_submit_payload_attestations_500_is_error() {
         other => panic!("expected ApiError with status 500, got {other:?}"),
     }
 }
+
+/// 4.16 KAT object (`gloas_prefs_fixture`) plus a 96-byte signature.
+fn gloas_signed_proposer_preferences() -> eth_types::SignedProposerPreferences {
+    eth_types::SignedProposerPreferences {
+        message: eth_types::ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        },
+        signature: vec![0xaa; 96],
+    }
+}
+
+#[tokio::test]
+async fn test_submit_proposer_preferences_sends_consensus_version() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("missing Eth-Consensus-Version"))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    client.submit_proposer_preferences(&[]).await.expect("header must be sent");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let version = requests[0]
+        .headers
+        .get("Eth-Consensus-Version")
+        .expect("Eth-Consensus-Version header must be present");
+    assert_eq!(version.to_str().unwrap(), "gloas");
+
+    // A BN rejecting the request surfaces as an error, never a silent skip.
+    let reject_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalid proposer preferences"))
+        .expect(1)
+        .mount(&reject_server)
+        .await;
+
+    let reject_client =
+        BeaconClient::new(BeaconClientConfig::new(reject_server.uri()).with_max_retries(0))
+            .unwrap();
+    match reject_client.submit_proposer_preferences(&[]).await {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 400),
+        other => panic!("BN reject must surface as error, never a silent skip, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_submit_proposer_preferences_round_trips_signed_bytes() {
+    let mock_server = MockServer::start().await;
+    let signed = gloas_signed_proposer_preferences();
+    let expected_body = serde_json::to_vec(std::slice::from_ref(&signed)).expect("serialize");
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    client.submit_proposer_preferences(std::slice::from_ref(&signed)).await.expect("submit");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].body, expected_body,
+        "wire body must be byte-identical to the signed object JSON"
+    );
+}

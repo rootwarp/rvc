@@ -19,7 +19,7 @@ use beacon::{
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedValidatorRegistration, Slot,
+    SignedProposerPreferences, SignedValidatorRegistration, Slot,
 };
 
 use crate::traits::{
@@ -92,6 +92,7 @@ pub struct MockBeaconNodeClient {
     publish_block_ssz: MethodHook<(Vec<u8>, String, bool), ()>,
     prepare_beacon_proposer: MethodHook<Vec<ProposerPreparation>, ()>,
     register_validators: MethodHook<Vec<SignedValidatorRegistration>, ()>,
+    submit_proposer_preferences: MethodHook<Vec<SignedProposerPreferences>, ()>,
     // AttestationApi
     get_attestation_data: MethodHook<(u64, u64), AttestationDataResponse>,
     submit_attestation: MethodHook<VersionedAttestation, SubmitAttestationResult>,
@@ -310,6 +311,14 @@ impl MockBeaconNodeClient {
         self
     }
 
+    pub fn with_submit_proposer_preferences(
+        self,
+        f: impl Fn(Vec<SignedProposerPreferences>) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.submit_proposer_preferences.set_handler(Arc::new(f));
+        self
+    }
+
     // -- AttestationApi builders --
 
     pub fn with_get_attestation_data(
@@ -453,6 +462,10 @@ impl MockBeaconNodeClient {
 
     pub fn register_validators_calls(&self) -> Vec<Vec<SignedValidatorRegistration>> {
         self.register_validators.calls()
+    }
+
+    pub fn submit_proposer_preferences_calls(&self) -> Vec<Vec<SignedProposerPreferences>> {
+        self.submit_proposer_preferences.calls()
     }
 
     pub fn get_block_root_calls(&self) -> Vec<String> {
@@ -623,6 +636,13 @@ impl BlockProducer for MockBeaconNodeClient {
     ) -> Result<(), BeaconError> {
         self.register_validators.invoke("register_validators", registrations.to_vec())
     }
+
+    async fn submit_proposer_preferences(
+        &self,
+        preferences: &[SignedProposerPreferences],
+    ) -> Result<(), BeaconError> {
+        self.submit_proposer_preferences.invoke("submit_proposer_preferences", preferences.to_vec())
+    }
 }
 
 #[async_trait]
@@ -761,6 +781,30 @@ mod tests {
         assert!(matches!(err, BeaconError::HttpError(_)));
         let err = mock.post_validator_liveness(2, &["1".into()]).await.unwrap_err();
         assert!(matches!(err, BeaconError::HttpError(_)));
+        let err = mock.submit_proposer_preferences(&[]).await.unwrap_err();
+        match err {
+            BeaconError::HttpError(msg) => {
+                assert!(msg.contains("submit_proposer_preferences"), "unexpected message: {msg}");
+            }
+            other => panic!("expected HttpError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_shared_mock_submit_proposer_preferences_captures() {
+        let mock = MockBeaconNodeClient::new().with_submit_proposer_preferences(|_prefs| Ok(()));
+        let prefs = vec![SignedProposerPreferences {
+            message: eth_types::ProposerPreferences {
+                dependent_root: [0x33; 32],
+                proposal_slot: 32,
+                validator_index: 3,
+                fee_recipient: [0x44; 20],
+                target_gas_limit: 36_000_000,
+            },
+            signature: vec![0xaa; 96],
+        }];
+        mock.submit_proposer_preferences(&prefs).await.unwrap();
+        assert_eq!(mock.submit_proposer_preferences_calls(), vec![prefs]);
     }
 
     #[tokio::test]

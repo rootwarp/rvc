@@ -10,8 +10,8 @@ use tracing::{debug, error, trace, warn, Instrument};
 use observability::logging::RedactedUrl;
 
 use eth_types::{
-    ForkName, ForkSchedule, PayloadAttestationMessage, SignedValidatorRegistration,
-    SignedVoluntaryExit,
+    ForkName, ForkSchedule, PayloadAttestationMessage, SignedProposerPreferences,
+    SignedValidatorRegistration, SignedVoluntaryExit,
 };
 
 use crate::http_caps::{read_body_capped, read_body_capped_lossy, ResponseCaps};
@@ -888,6 +888,23 @@ impl BeaconClient {
         self.post_empty("/eth/v1/validator/prepare_beacon_proposer", &preparations)
             .instrument(tracing::info_span!("beacon.prepare_beacon_proposer"))
             .await
+    }
+
+    /// Submits signed proposer preferences (`POST /eth/v1/validator/proposer_preferences`).
+    ///
+    /// `Eth-Consensus-Version` is required by beacon-APIs; a BN that rejects the
+    /// request is returned as an error, never skipped.
+    pub async fn submit_proposer_preferences(
+        &self,
+        preferences: &[SignedProposerPreferences],
+    ) -> Result<(), BeaconError> {
+        self.post_empty_with_headers(
+            "/eth/v1/validator/proposer_preferences",
+            &preferences,
+            &[("Eth-Consensus-Version", ForkName::Gloas.as_ref())],
+        )
+        .instrument(tracing::info_span!("beacon.submit_proposer_preferences"))
+        .await
     }
 
     /// Posts validator indices to check liveness for the given epoch.

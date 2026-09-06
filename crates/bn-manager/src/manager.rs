@@ -16,7 +16,7 @@ use beacon::{
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedValidatorRegistration,
+    SignedProposerPreferences, SignedValidatorRegistration,
 };
 use futures::future::join_all;
 use tracing::Instrument;
@@ -1334,6 +1334,20 @@ impl BlockProducer for BnManager {
         )
         .await
     }
+
+    async fn submit_proposer_preferences(
+        &self,
+        preferences: &[SignedProposerPreferences],
+    ) -> Result<(), BeaconError> {
+        self.with_op_timeout(
+            "submit_proposer_preferences",
+            self.op_timeout(|t| t.preparation),
+            self.broadcast("submit_proposer_preferences", BnRole::Proposal, |c| {
+                Box::pin(c.submit_proposer_preferences(preferences))
+            }),
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -1704,6 +1718,10 @@ impl_beacon_client_passthrough! {
             &self,
             registrations: &[SignedValidatorRegistration],
         ) -> Result<(), BeaconError>;
+        async fn submit_proposer_preferences(
+            &self,
+            preferences: &[SignedProposerPreferences],
+        ) -> Result<(), BeaconError>;
     }
     AttestationApi {
         async fn get_attestation_data(
@@ -1788,10 +1806,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 30 methods across the seven role traits (see impl_beacon_client_passthrough!).
+        // 31 methods across the seven role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            30,
+            31,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -1811,6 +1829,7 @@ mod tests {
             "post_ptc_duties",
             "produce_block_v3",
             "publish_block_ssz",
+            "submit_proposer_preferences",
             "submit_attestation",
             "get_payload_attestation_data",
             "submit_payload_attestations",

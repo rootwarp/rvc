@@ -13,7 +13,7 @@ use beacon::{
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedValidatorRegistration,
+    SignedProposerPreferences, SignedValidatorRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -94,6 +94,16 @@ pub trait BlockProducer: Send + Sync {
     async fn register_validators(
         &self,
         registrations: &[SignedValidatorRegistration],
+    ) -> Result<(), BeaconError>;
+
+    /// Submit signed proposer preferences
+    /// (`POST /eth/v1/validator/proposer_preferences`).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn submit_proposer_preferences(
+        &self,
+        preferences: &[SignedProposerPreferences],
     ) -> Result<(), BeaconError>;
 }
 
