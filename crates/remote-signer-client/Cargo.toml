@@ -24,6 +24,7 @@ web3signer-wire.workspace = true
 
 [dev-dependencies]
 eth-types = { workspace = true, features = ["test-fixtures"] }
+rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing-subscriber.workspace = true
 wiremock.workspace = true

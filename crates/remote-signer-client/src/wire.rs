@@ -11,10 +11,10 @@ use std::time::Duration;
 use eth_types::{
     blinded_body_tree_hash_root, body_tree_hash_root, AggregateAndProof, AttestationData,
     BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof, Epoch, Fork,
-    ForkName, Root, Slot, SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit,
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    ForkName, PayloadAttestationData, Root, Slot, SyncCommitteeMessage, ValidatorRegistrationV1,
+    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 // Re-export wire types under the historical crypto names (stable public paths).
 pub use web3signer_wire::{
@@ -23,7 +23,7 @@ pub use web3signer_wire::{
 };
 pub use web3signer_wire::{SignPayload as Web3SignerPayload, SignRequest as Web3SignerSignRequest};
 
-use web3signer_wire::{reject_gloas_http_wire, SignPayload, SignRequest};
+use web3signer_wire::{reject_gloas_http_wire, SignPayload, SignRequest, VersionedPayload};
 
 use crypto::signing_root_with_fork_version;
 use crypto::{SignContext, SigningError};
@@ -226,6 +226,30 @@ pub fn build_aggregate_and_proof_request(
         SignPayload::AggregateAndProof { aggregate_and_proof: agg.clone() },
     );
     Ok((req, signing_root))
+}
+
+/// Build a `PAYLOAD_ATTESTATION` request.
+///
+/// PTC is Gloas-only. D19 does **not** reject this type on the HTTP wire
+/// (unlike `BLOCK_V2` / `AGGREGATE_AND_PROOF`). Version is always `GLOAS`.
+pub fn build_payload_attestation_request(
+    data: &PayloadAttestationData,
+    ctx: &SignContext,
+) -> (SignRequest, Root) {
+    let signing_root = signing_root_with_fork_version(
+        data,
+        DOMAIN_PTC_ATTESTER,
+        ctx.fork_info.current_version,
+        ctx.fork_info.genesis_validators_root,
+    );
+    let req = SignRequest::with_fork(
+        WireForkInfo::from_sign_context(ctx),
+        signing_root,
+        SignPayload::PayloadAttestation {
+            payload_attestation: VersionedPayload { version: ForkName::Gloas, data: data.clone() },
+        },
+    );
+    (req, signing_root)
 }
 
 /// Build a `SYNC_COMMITTEE_MESSAGE` request.
@@ -469,10 +493,19 @@ mod tests {
             let (req, root) = build_block_v2_request(&block, &ctx).expect("BLOCK_V2");
             v.push(("BLOCK_V2", req, root));
 
+            let ptc = PayloadAttestationData {
+                beacon_block_root: [0x11; 32],
+                slot: 1,
+                payload_present: true,
+                blob_data_available: false,
+            };
+            let (req, root) = build_payload_attestation_request(&ptc, &gloas_ctx(&sk));
+            v.push(("PAYLOAD_ATTESTATION", req, root));
+
             v
         };
 
-        assert_eq!(checks.len(), 10, "ten client-reachable types");
+        assert_eq!(checks.len(), 11, "eleven client-reachable types");
         for (name, req, root) in checks {
             assert_eq!(
                 req.signing_root,
@@ -752,5 +785,42 @@ mod tests {
         assert!(msg.contains("Web3Signer HTTP wire"), "names the wire: {msg}");
         assert!(msg.contains("deferred"), "names the deferral: {msg}");
         assert!(matches!(err, SigningError::LocalRejected(_)));
+    }
+
+    /// L3: 4.2 fixture (`beacon_block_root` `[0x11; 32]`, slot 1, payload
+    /// present, no blob data, fork `0x07000001`, GVR zeros). D19 does not
+    /// reject PTC on HTTP.
+    #[test]
+    fn test_build_payload_attestation_request_signing_root() {
+        use rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT;
+
+        let sk = SecretKey::generate();
+        let ctx = SignContext {
+            pubkey: sk.public_key(),
+            fork_info: ForkInfo {
+                previous_version: [0x06, 0x00, 0x00, 0x01],
+                current_version: [0x07, 0x00, 0x00, 0x01],
+                genesis_validators_root: [0u8; 32],
+            },
+            fork_name: ForkName::Gloas,
+        };
+        let data = PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        };
+        let (req, root) = build_payload_attestation_request(&data, &ctx);
+        let expected: Root = hex::decode(KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+            .expect("kat hex")
+            .try_into()
+            .expect("32-byte kat root");
+        assert_eq!(root, expected);
+        assert_eq!(req.signing_root, Some(root));
+        assert_eq!(req.payload.type_name(), "PAYLOAD_ATTESTATION");
+        let body = req.to_json_value().expect("serialize");
+        assert_eq!(body["type"], "PAYLOAD_ATTESTATION");
+        assert_eq!(body["payload_attestation"]["version"], "GLOAS");
+        assert_eq!(body["signingRoot"], root_hex(&root));
     }
 }

@@ -10,17 +10,18 @@ use crypto::{
 };
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-    Epoch, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    Epoch, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 use observability::logging::{RedactedUrl, TruncatedPubkey};
-use reqwest::Client;
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tracing::Instrument;
 use web3signer_wire::SignRequest;
 
 use crate::wire::{
     build_aggregate_and_proof_request, build_attestation_request, build_blinded_block_v2_request,
-    build_block_v2_request, build_contribution_and_proof_request, build_randao_reveal_request,
+    build_block_v2_request, build_contribution_and_proof_request,
+    build_payload_attestation_request, build_randao_reveal_request,
     build_sync_committee_message_request, build_sync_selection_proof_request,
     build_validator_registration_request, build_voluntary_exit_request, RemoteSignerConfig,
 };
@@ -116,6 +117,16 @@ impl RemoteSigner {
         request: &SignRequest,
         signing_root: &Root,
     ) -> Result<Signature, SigningError> {
+        self.sign_request_classified(pubkey, request, signing_root, None).await
+    }
+
+    async fn sign_request_classified(
+        &self,
+        pubkey: &[u8; PUBLIC_KEY_BYTES_LEN],
+        request: &SignRequest,
+        signing_root: &Root,
+        unsupported_duty: Option<&'static str>,
+    ) -> Result<Signature, SigningError> {
         if !self.pubkeys.contains(pubkey) {
             return Err(SigningError::KeyNotFound(hex::encode(pubkey)));
         }
@@ -146,9 +157,7 @@ impl RemoteSigner {
 
             if !status.is_success() {
                 let body = response.text().await.unwrap_or_default();
-                return Err(SigningError::RemoteSignerError(format!(
-                    "Web3Signer returned {status}: {body}"
-                )));
+                return Err(classify_web3signer_http_error(status, &body, unsupported_duty));
             }
 
             let sign_response: SignResponse = response.json().await.map_err(|e| {
@@ -185,6 +194,31 @@ impl RemoteSigner {
 #[derive(Deserialize)]
 struct SignResponse {
     signature: String,
+}
+
+/// Classify a non-success Web3Signer HTTP status.
+///
+/// HTTP 400 is the generic bad-request code and stays
+/// [`SigningError::RemoteSignerError`] (transient; callers may retry). It must
+/// never become [`SigningError::UnsupportedDuty`] or
+/// [`SigningError::UnsupportedSigningType`] — that would poison a key (4.10).
+/// 404/501 for a named duty mean the signer does not support the type.
+pub(crate) fn classify_web3signer_http_error(
+    status: StatusCode,
+    body: &str,
+    unsupported_duty: Option<&'static str>,
+) -> SigningError {
+    if let Some(duty) = unsupported_duty {
+        if matches!(status, StatusCode::NOT_FOUND | StatusCode::NOT_IMPLEMENTED) {
+            tracing::warn!(
+                status = status.as_u16(),
+                duty,
+                "remote signer does not support duty; dropping"
+            );
+            return SigningError::UnsupportedDuty { duty };
+        }
+    }
+    SigningError::RemoteSignerError(format!("Web3Signer returned {status}: {body}"))
 }
 
 #[async_trait]
@@ -316,6 +350,16 @@ impl TypedSigner for RemoteSigner {
         let pk = ctx.pubkey.to_bytes();
         let (req, signing_root) = build_voluntary_exit_request(exit, ctx);
         self.sign_request(&pk, &req, &signing_root).await
+    }
+
+    async fn sign_payload_attestation(
+        &self,
+        data: &PayloadAttestationData,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let pk = ctx.pubkey.to_bytes();
+        let (req, signing_root) = build_payload_attestation_request(data, ctx);
+        self.sign_request_classified(&pk, &req, &signing_root, Some("payload_attestation")).await
     }
 }
 

@@ -1,13 +1,13 @@
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
-use eth_types::{AttestationData, Checkpoint, ForkInfo};
+use eth_types::{AttestationData, Checkpoint, ForkInfo, ForkName, PayloadAttestationData};
 use observability::logging::RedactedUrl;
 use tracing_subscriber::layer::SubscriberExt;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use super::*;
-use crate::wire::build_attestation_request;
+use crate::wire::{build_attestation_request, build_payload_attestation_request};
 use crypto::{SecretKey, Signer, SigningError, TypedSigner, PUBLIC_KEY_BYTES_LEN};
 
 /// Serialise tests in this module that read or mutate
@@ -663,4 +663,160 @@ async fn test_web3signer_client_posts_typed_body_not_bare_root() {
     assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
     // RF3-10-M1: request builder set signing_root.
     assert_eq!(req.signing_root, Some(signing_root));
+}
+
+fn gloas_ptc_data() -> PayloadAttestationData {
+    PayloadAttestationData {
+        beacon_block_root: [0x11; 32],
+        slot: 1,
+        payload_present: true,
+        blob_data_available: false,
+    }
+}
+
+fn gloas_kat_ctx(sk: &SecretKey) -> SignContext {
+    SignContext {
+        pubkey: sk.public_key(),
+        fork_info: ForkInfo {
+            previous_version: [0x06, 0x00, 0x00, 0x01],
+            current_version: [0x07, 0x00, 0x00, 0x01],
+            genesis_validators_root: [0u8; 32],
+        },
+        fork_name: ForkName::Gloas,
+    }
+}
+
+async fn mock_ptc_status(
+    status: u16,
+    body: serde_json::Value,
+) -> (MockServer, RemoteSigner, PayloadAttestationData, SignContext) {
+    let sk = SecretKey::generate();
+    let pk_bytes = sk.public_key().to_bytes();
+    let ctx = gloas_kat_ctx(&sk);
+    let data = gloas_ptc_data();
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/api/v1/eth2/sign/.*"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(body))
+        .mount(&mock_server)
+        .await;
+    let signer =
+        RemoteSigner::new_unchecked(RemoteSignerConfig::new(mock_server.uri()), vec![pk_bytes]);
+    (mock_server, signer, data, ctx)
+}
+
+#[test]
+fn test_classify_payload_attestation_400_is_transient_not_unsupported() {
+    let err = classify_web3signer_http_error(
+        reqwest::StatusCode::BAD_REQUEST,
+        "bad request",
+        Some("payload_attestation"),
+    );
+    match &err {
+        SigningError::RemoteSignerError(msg) => assert!(msg.contains("400")),
+        other => panic!("400 must stay RemoteSignerError, got: {other:?}"),
+    }
+    assert!(
+        !err.is_unambiguous_no_signature(),
+        "400 is transient (retryable), never a permanent unsupported-type"
+    );
+}
+
+#[test]
+fn test_classify_payload_attestation_404_is_unsupported_duty() {
+    let err = classify_web3signer_http_error(
+        reqwest::StatusCode::NOT_FOUND,
+        "not found",
+        Some("payload_attestation"),
+    );
+    match err {
+        SigningError::UnsupportedDuty { duty } => assert_eq!(duty, "payload_attestation"),
+        other => panic!("expected UnsupportedDuty, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_classify_payload_attestation_501_is_unsupported_duty() {
+    let err = classify_web3signer_http_error(
+        reqwest::StatusCode::NOT_IMPLEMENTED,
+        "not implemented",
+        Some("payload_attestation"),
+    );
+    match err {
+        SigningError::UnsupportedDuty { duty } => assert_eq!(duty, "payload_attestation"),
+        other => panic!("expected UnsupportedDuty, got: {other:?}"),
+    }
+}
+
+#[test]
+fn test_classify_404_without_duty_stays_remote_error() {
+    let err = classify_web3signer_http_error(reqwest::StatusCode::NOT_FOUND, "key missing", None);
+    match err {
+        SigningError::RemoteSignerError(msg) => assert!(msg.contains("404")),
+        other => {
+            panic!("existing mapping: 404 without a duty stays RemoteSignerError, got: {other:?}")
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_payload_attestation_http_400_is_transient_not_unsupported() {
+    let (_mock, signer, data, ctx) =
+        mock_ptc_status(400, serde_json::json!({"error": "bad request"})).await;
+    let err = TypedSigner::sign_payload_attestation(&signer, &data, &ctx).await.unwrap_err();
+    match &err {
+        SigningError::RemoteSignerError(msg) => assert!(msg.contains("400"), "msg={msg}"),
+        other => panic!("400 must stay transient RemoteSignerError, got: {other:?}"),
+    }
+    assert!(!matches!(err, SigningError::UnsupportedDuty { .. }));
+    assert!(!matches!(err, SigningError::UnsupportedSigningType(_)));
+    assert!(!err.is_unambiguous_no_signature());
+}
+
+#[tokio::test]
+async fn test_payload_attestation_http_404_is_unsupported_duty() {
+    let (_mock, signer, data, ctx) =
+        mock_ptc_status(404, serde_json::json!({"error": "not found"})).await;
+    let err = TypedSigner::sign_payload_attestation(&signer, &data, &ctx).await.unwrap_err();
+    assert!(err.is_unambiguous_no_signature(), "duty is dropped; no signature");
+    match err {
+        SigningError::UnsupportedDuty { duty } => assert_eq!(duty, "payload_attestation"),
+        other => panic!("expected UnsupportedDuty, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_payload_attestation_http_501_is_unsupported_duty() {
+    let (_mock, signer, data, ctx) =
+        mock_ptc_status(501, serde_json::json!({"error": "not implemented"})).await;
+    let err = TypedSigner::sign_payload_attestation(&signer, &data, &ctx).await.unwrap_err();
+    match err {
+        SigningError::UnsupportedDuty { duty } => assert_eq!(duty, "payload_attestation"),
+        other => panic!("expected UnsupportedDuty, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_remote_signer_sign_payload_attestation_success() {
+    let sk = SecretKey::generate();
+    let pk_bytes = sk.public_key().to_bytes();
+    let ctx = gloas_kat_ctx(&sk);
+    let data = gloas_ptc_data();
+    let (_req, signing_root) = build_payload_attestation_request(&data, &ctx);
+    let expected_sig = sk.sign(&signing_root);
+    let sig_hex = format!("0x{}", hex::encode(expected_sig.to_bytes()));
+
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/api/v1/eth2/sign/.*"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"signature": sig_hex})),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let signer =
+        RemoteSigner::new_unchecked(RemoteSignerConfig::new(mock_server.uri()), vec![pk_bytes]);
+    let sig = TypedSigner::sign_payload_attestation(&signer, &data, &ctx).await.unwrap();
+    assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
 }
