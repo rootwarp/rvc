@@ -81,6 +81,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beacon::HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED;
     use block_service::BeaconBlockClient;
     use bn_manager::{BnManager, BnManagerConfig};
     use wiremock::matchers::{body_json, method, path};
@@ -168,6 +169,7 @@ mod tests {
                     .insert_header("Eth-Consensus-Version", "gloas")
                     .insert_header("Eth-Execution-Payload-Blinded", "false")
                     .insert_header("Eth-Execution-Payload-Value", "4242")
+                    .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true")
                     .set_body_string(
                         r#"{"data":{"slot":"42","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
                     ),
@@ -192,6 +194,7 @@ mod tests {
             .expect("produce_block_v4");
         assert_eq!(produced.execution_payload_value.as_deref(), Some("4242"));
         assert_eq!(produced.consensus_version, "gloas");
+        assert!(produced.payload_included);
     }
 
     /// Configured proposer pool is preferred: request goes to proposer endpoint,
@@ -230,11 +233,11 @@ mod tests {
         assert_eq!(produced.execution_payload_value.as_deref(), Some("proposer-value"));
     }
 
-    /// Pins that the adapter hop keeps all six ProduceBlockResponse fields,
+    /// Pins that the adapter hop keeps all ProduceBlockResponse fields,
     /// including the SSZ pair that a field-copy can drop. Passes with the
     /// current copy and after it is deleted.
     #[tokio::test]
-    async fn beacon_adapter_preserves_all_six_fields_for_an_ssz_response() {
+    async fn beacon_adapter_preserves_all_fields_for_an_ssz_response() {
         let server = MockServer::start().await;
         let ssz_payload = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
 
@@ -266,5 +269,8 @@ mod tests {
         assert_eq!(produced.execution_payload_value.as_deref(), Some("99999"));
         assert!(produced.is_ssz);
         assert_eq!(produced.ssz_bytes.as_deref(), Some(ssz_payload.as_slice()));
+        assert!(!produced.payload_included);
+        assert!(produced.builder_url.is_none());
+        assert!(produced.consensus_block_value.is_none());
     }
 }

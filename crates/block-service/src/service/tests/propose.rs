@@ -751,6 +751,9 @@ fn test_block_and_blobs_json_through_produce_response() {
         execution_payload_value: Some("99999".to_string()),
         is_ssz: false,
         ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
     };
 
     let contents = response.parse_full_block().unwrap();
@@ -1179,6 +1182,9 @@ fn block_and_blobs_response(slot: Slot, commitments: &[[u8; 48]]) -> ProduceBloc
         execution_payload_value: Some("12345".to_string()),
         is_ssz: false,
         ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
     }
 }
 
@@ -1276,6 +1282,9 @@ async fn test_l3_propose_block_and_blobs_warns_on_commitment_count_mismatch() {
         execution_payload_value: Some("99".to_string()),
         is_ssz: false,
         ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
     };
 
     let beacon = MockBeaconClient::from_response(response);

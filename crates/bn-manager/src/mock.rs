@@ -865,6 +865,9 @@ mod tests {
                     execution_payload_value: None,
                     is_ssz: false,
                     ssz_bytes: None,
+                    payload_included: false,
+                    builder_url: None,
+                    consensus_block_value: None,
                 })
             });
         let cfg = BuilderConfig::default();

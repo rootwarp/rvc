@@ -16,8 +16,10 @@ use beacon::{
     parse_slot_duration_ms, AttestationData, BeaconClient, BeaconClientConfig,
     BeaconCommitteeSubscription, BeaconError, BuilderConfig, Checkpoint, LegacyAttestation,
     ProposerPreparation, SingleAttestation, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof, HEADER_ETH_CONSENSUS_VERSION, PRODUCE_BLOCK_V4_PATH_PREFIX,
-    QUERY_GRAFFITI, QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL, QUERY_SKIP_RANDAO_VERIFICATION,
+    VersionedSignedAggregateAndProof, HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+    HEADER_ETH_CONSENSUS_VERSION, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+    PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI, QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
+    QUERY_SKIP_RANDAO_VERIFICATION,
 };
 use eth_types::{ForkName, ForkSchedule};
 use timing::{SlotClock, SystemSlotClock};
@@ -1809,6 +1811,9 @@ async fn test_produce_block_v3_full_block() {
     assert_eq!(result.execution_payload_value, Some("12345".to_string()));
     assert!(!result.is_ssz);
     assert!(result.ssz_bytes.is_none());
+    assert!(!result.payload_included);
+    assert!(result.builder_url.is_none());
+    assert!(result.consensus_block_value.is_none());
 
     let block = result.parse_full_block().unwrap();
     assert_eq!(block.block().slot, 100);
@@ -2420,6 +2425,7 @@ fn v4_json_success(slot: u64) -> ResponseTemplate {
         .insert_header("Eth-Execution-Payload-Blinded", "false")
         .insert_header("Eth-Consensus-Version", "gloas")
         .insert_header("Eth-Execution-Payload-Value", "12345")
+        .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true")
 }
 
 fn assert_v4_query_names(req: &wiremock::Request) {
@@ -2555,7 +2561,8 @@ async fn test_produce_block_v4_ssz_response() {
                 .set_body_raw(ssz_payload.clone(), "application/octet-stream")
                 .insert_header("Eth-Execution-Payload-Blinded", "false")
                 .insert_header("Eth-Consensus-Version", "gloas")
-                .insert_header("Eth-Execution-Payload-Value", "99999"),
+                .insert_header("Eth-Execution-Payload-Value", "99999")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
         )
         .expect(1)
         .mount(&mock_server)
@@ -2589,11 +2596,13 @@ async fn test_produce_block_v4_ssz_empty_body_falls_back_to_json() {
         first: ResponseTemplate::new(200)
             .set_body_raw(vec![], "application/octet-stream")
             .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Consensus-Version", "gloas"),
+            .insert_header("Eth-Consensus-Version", "gloas")
+            .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
         second: ResponseTemplate::new(200)
             .set_body_json(&json_envelope)
             .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Consensus-Version", "gloas"),
+            .insert_header("Eth-Consensus-Version", "gloas")
+            .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
     };
 
     Mock::given(method("POST"))
@@ -2620,6 +2629,217 @@ async fn test_produce_block_v4_ssz_empty_body_falls_back_to_json() {
     for req in &requests {
         assert_eq!(req.method.as_str(), "POST");
         assert_v4_query_names(req);
+    }
+}
+
+fn v4_json_headers(
+    slot: u64,
+    payload_included: &str,
+    builder_url: Option<&str>,
+    consensus_block_value: Option<&str>,
+) -> ResponseTemplate {
+    let mut template = ResponseTemplate::new(200)
+        .set_body_json(v4_json_envelope(slot))
+        .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+        .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, payload_included);
+    if let Some(url) = builder_url {
+        template = template.insert_header(HEADER_ETH_BUILDER_URL, url);
+    }
+    if let Some(value) = consensus_block_value {
+        template = template.insert_header(HEADER_ETH_CONSENSUS_BLOCK_VALUE, value);
+    }
+    template
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_payload_included_true_and_false() {
+    for included in [true, false] {
+        let mock_server = MockServer::start().await;
+        let slot = 110u64;
+        let header_value = if included { "true" } else { "false" };
+
+        Mock::given(method("POST"))
+            .and(path(v4_blocks_path(slot)))
+            .respond_with(v4_json_headers(slot, header_value, None, None))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+        let result = client
+            .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.payload_included, included,
+            "{HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED}={header_value}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_missing_payload_included_is_rejected() {
+    let mock_server = MockServer::start().await;
+    let slot = 111u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(v4_json_envelope(slot))
+                .insert_header("Eth-Consensus-Version", "gloas"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let result = client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(
+                msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED),
+                "error must name {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED}: {msg}"
+            );
+        }
+        Ok(resp) => panic!(
+            "missing {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} must be Err, got payload_included={}",
+            resp.payload_included
+        ),
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_unparseable_payload_included_is_rejected() {
+    let mock_server = MockServer::start().await;
+    let slot = 112u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "yes", None, None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let result = client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(
+                msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED),
+                "error must name {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED}: {msg}"
+            );
+        }
+        Ok(resp) => panic!(
+            "unparseable {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} must be Err, got payload_included={}",
+            resp.payload_included
+        ),
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_builder_url_and_consensus_block_value() {
+    let slot = 113u64;
+    let huge_value = "999999999999999999999";
+    let builder = "https://builder.example.com";
+
+    let mock_present = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "true", Some(builder), Some(huge_value)))
+        .expect(1)
+        .mount(&mock_present)
+        .await;
+    let present = BeaconClient::new(BeaconClientConfig::new(mock_present.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(present.builder_url.as_deref(), Some(builder));
+    assert_eq!(present.consensus_block_value.as_deref(), Some(huge_value));
+
+    let mock_absent = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", None, None))
+        .expect(1)
+        .mount(&mock_absent)
+        .await;
+    let absent = BeaconClient::new(BeaconClientConfig::new(mock_absent.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(absent.builder_url, None);
+    assert_eq!(absent.consensus_block_value, None);
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_payload_included_and_optional_headers() {
+    let mock_server = MockServer::start().await;
+    let slot = 114u64;
+    let ssz_payload = vec![0xde, 0xad, 0xbe, 0xef];
+    let builder = "https://relay.example";
+    let value = "42";
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(ssz_payload.clone(), "application/octet-stream")
+                .insert_header("Eth-Consensus-Version", "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "false")
+                .insert_header(HEADER_ETH_BUILDER_URL, builder)
+                .insert_header(HEADER_ETH_CONSENSUS_BLOCK_VALUE, value),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let result = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+
+    assert!(result.is_ssz);
+    assert!(!result.payload_included);
+    assert_eq!(result.builder_url.as_deref(), Some(builder));
+    assert_eq!(result.consensus_block_value.as_deref(), Some(value));
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_missing_payload_included_is_rejected() {
+    let mock_server = MockServer::start().await;
+    let slot = 115u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![0xde, 0xad, 0xbe, 0xef], "application/octet-stream")
+                .insert_header("Eth-Consensus-Version", "gloas"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let result = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(
+                msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED),
+                "error must name {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED}: {msg}"
+            );
+        }
+        Ok(_) => panic!("SSZ missing {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} must be Err"),
+        other => panic!("expected ParseError, got {other:?}"),
     }
 }
 

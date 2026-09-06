@@ -98,6 +98,9 @@ impl BeaconBlockClient for BarrierBlockBeacon {
             execution_payload_value: Some("0".to_string()),
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         })
     }
 

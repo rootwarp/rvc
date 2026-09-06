@@ -140,7 +140,7 @@ pub type PtcDutiesResponse = DependentRootResponse<Vec<PtcDuty>>;
 /// Response type for the payload attestation data endpoint.
 pub type PayloadAttestationDataResponse = DataResponse<PayloadAttestationData>;
 
-/// Response from the produce block v3 endpoint, including header metadata.
+/// Response from the produce block v3/v4 endpoint, including header metadata.
 ///
 /// Supports both JSON and SSZ content types. When the BN responds with SSZ,
 /// `is_ssz` is `true` and `ssz_bytes` contains the raw SSZ-encoded block.
@@ -155,6 +155,11 @@ pub struct ProduceBlockResponse {
     pub is_ssz: bool,
     /// Raw SSZ bytes when the BN responded with SSZ content type.
     pub ssz_bytes: Option<Vec<u8>>,
+    /// Required on V4 (fail closed); V3 defaults false.
+    pub payload_included: bool,
+    pub builder_url: Option<String>,
+    /// Unparsed header; no arithmetic.
+    pub consensus_block_value: Option<String>,
 }
 
 impl ProduceBlockResponse {
@@ -1190,6 +1195,9 @@ mod tests {
             execution_payload_value: Some("12345".to_string()),
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
 
         let block = response.parse_full_block().unwrap();
@@ -1214,6 +1222,9 @@ mod tests {
             execution_payload_value: None,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
 
         let block = response.parse_blinded_block().unwrap();
@@ -1230,6 +1241,9 @@ mod tests {
             execution_payload_value: None,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
 
         assert!(response.parse_full_block().is_err());

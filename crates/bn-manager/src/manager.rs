@@ -2068,6 +2068,9 @@ mod tests {
             execution_payload_value: Some("5000".to_string()),
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
@@ -2076,6 +2079,9 @@ mod tests {
             execution_payload_value: Some("1000".to_string()),
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
         assert!(is_better_block(&a, &b));
         assert!(!is_better_block(&b, &a));
@@ -2090,6 +2096,9 @@ mod tests {
             execution_payload_value: None,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
@@ -2098,6 +2107,9 @@ mod tests {
             execution_payload_value: Some("1000".to_string()),
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
         assert!(!is_better_block(&a, &b));
         assert!(is_better_block(&b, &a));
@@ -2112,6 +2124,9 @@ mod tests {
             execution_payload_value: None,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
@@ -2120,6 +2135,9 @@ mod tests {
             execution_payload_value: None,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
         assert!(!is_better_block(&a, &b));
     }
@@ -2133,6 +2151,9 @@ mod tests {
             execution_payload_value: Some("1000".to_string()),
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
@@ -2141,6 +2162,9 @@ mod tests {
             execution_payload_value: Some("1000".to_string()),
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
         assert!(!is_better_block(&a, &b));
     }

@@ -27,8 +27,9 @@ use crate::types::{
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use crate::v4_wire::{
-    BuilderConfig, HEADER_ETH_CONSENSUS_VERSION, PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI,
-    QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
+    BuilderConfig, HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+    HEADER_ETH_CONSENSUS_VERSION, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+    PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI, QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
 };
 use crate::BeaconError;
 
@@ -105,6 +106,75 @@ fn required_consensus_version(
     })?;
     ForkName::from_str(value)
         .map_err(|_| BeaconError::ParseError(format!("invalid Eth-Consensus-Version: {value}")))
+}
+
+/// Distinguishes produce-block wire versions so V4 cannot silently take V3 defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProduceBlockApi {
+    V3,
+    V4,
+}
+
+/// V4 produce-block response headers. V3 uses [`ProduceV4Headers::v3_defaults`].
+#[derive(Debug)]
+struct ProduceV4Headers {
+    payload_included: bool,
+    builder_url: Option<String>,
+    consensus_block_value: Option<String>,
+}
+
+impl ProduceV4Headers {
+    /// Pre-Gloas V3 does not send these headers; do not fail closed on their absence.
+    fn v3_defaults() -> Self {
+        Self { payload_included: false, builder_url: None, consensus_block_value: None }
+    }
+}
+
+/// Parse V4 produce-block headers. `Eth-Execution-Payload-Included` is required.
+fn parse_v4_produce_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<ProduceV4Headers, BeaconError> {
+    Ok(ProduceV4Headers {
+        payload_included: required_payload_included(headers)?,
+        builder_url: optional_header_str(headers, HEADER_ETH_BUILDER_URL)?,
+        consensus_block_value: optional_header_str(headers, HEADER_ETH_CONSENSUS_BLOCK_VALUE)?,
+    })
+}
+
+/// Parse a required `Eth-Execution-Payload-Included` header into a bool.
+///
+/// Absent, non-UTF-8, or values other than `true`/`false` are
+/// [`BeaconError::ParseError`] naming the header. Never default.
+fn required_payload_included(headers: &reqwest::header::HeaderMap) -> Result<bool, BeaconError> {
+    let Some(raw) = headers.get(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED) else {
+        return Err(BeaconError::ParseError(format!(
+            "missing {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} header"
+        )));
+    };
+    let value = raw.to_str().map_err(|_| {
+        BeaconError::ParseError(format!(
+            "unparseable {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} header"
+        ))
+    })?;
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(BeaconError::ParseError(format!(
+            "unparseable {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} header: {value}"
+        ))),
+    }
+}
+
+fn optional_header_str(
+    headers: &reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, BeaconError> {
+    let Some(raw) = headers.get(name) else {
+        return Ok(None);
+    };
+    let value =
+        raw.to_str().map_err(|_| BeaconError::ParseError(format!("unparseable {name} header")))?;
+    Ok(Some(value.to_string()))
 }
 
 /// Async HTTP client wrapper for beacon node communication.
@@ -505,6 +575,7 @@ impl BeaconClient {
                 is_blinded,
                 &consensus_version,
                 &execution_payload_value,
+                ProduceV4Headers::v3_defaults(),
             )
             .await
             {
@@ -535,13 +606,15 @@ impl BeaconClient {
                     return Self::parse_produce_block_json(
                         fallback_response,
                         self.config.max_body_bytes,
+                        ProduceBlockApi::V3,
                     )
                     .await;
                 }
             }
         }
 
-        Self::parse_produce_block_json(response, self.config.max_body_bytes).await
+        Self::parse_produce_block_json(response, self.config.max_body_bytes, ProduceBlockApi::V3)
+            .await
     }
 
     /// Produces a block for the given slot using the v4 endpoint.
@@ -623,12 +696,14 @@ impl BeaconClient {
             .to_string();
 
         if content_type.starts_with("application/octet-stream") {
+            let v4 = parse_v4_produce_headers(response.headers())?;
             match Self::try_process_ssz_body(
                 response,
                 slot,
                 is_blinded,
                 &consensus_version,
                 &execution_payload_value,
+                v4,
             )
             .await
             {
@@ -671,13 +746,15 @@ impl BeaconClient {
                     return Self::parse_produce_block_json(
                         fallback_response,
                         self.config.max_body_bytes,
+                        ProduceBlockApi::V4,
                     )
                     .await;
                 }
             }
         }
 
-        Self::parse_produce_block_json(response, self.config.max_body_bytes).await
+        Self::parse_produce_block_json(response, self.config.max_body_bytes, ProduceBlockApi::V4)
+            .await
     }
 
     /// Attempt to read and validate the SSZ body from an HTTP response.
@@ -687,6 +764,7 @@ impl BeaconClient {
         is_blinded: bool,
         consensus_version: &str,
         execution_payload_value: &Option<String>,
+        v4: ProduceV4Headers,
     ) -> Result<ProduceBlockResponse, BeaconError> {
         // H-12 (SSZ path): cap before allocation — read_body_capped streams in chunks
         // and returns BodyTooLarge before allocating more than MAX_SSZ_BLOCK_BYTES.
@@ -713,6 +791,9 @@ impl BeaconClient {
             execution_payload_value: execution_payload_value.clone(),
             is_ssz: true,
             ssz_bytes: Some(ssz_bytes),
+            payload_included: v4.payload_included,
+            builder_url: v4.builder_url,
+            consensus_block_value: v4.consensus_block_value,
         })
     }
 
@@ -725,6 +806,7 @@ impl BeaconClient {
     async fn parse_produce_block_json(
         response: reqwest::Response,
         max_body_bytes: usize,
+        api: ProduceBlockApi,
     ) -> Result<ProduceBlockResponse, BeaconError> {
         // Extract all headers before consuming the body (reqwest moves the
         // response when reading the body, so we capture metadata first).
@@ -744,6 +826,11 @@ impl BeaconClient {
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_string());
 
+        let v4_headers = match api {
+            ProduceBlockApi::V4 => parse_v4_produce_headers(response.headers())?,
+            ProduceBlockApi::V3 => ProduceV4Headers::v3_defaults(),
+        };
+
         // H-12: cap the body before deserialising.
         let bytes = read_body_capped(response, max_body_bytes).await?;
         let body: serde_json::Value =
@@ -760,6 +847,9 @@ impl BeaconClient {
             execution_payload_value,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: v4_headers.payload_included,
+            builder_url: v4_headers.builder_url,
+            consensus_block_value: v4_headers.consensus_block_value,
         })
     }
 
@@ -1604,6 +1694,67 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("Eth-Consensus-Version", reqwest::header::HeaderValue::from_static("deneb"));
         assert_eq!(required_consensus_version(&headers).unwrap(), ForkName::Deneb);
+    }
+
+    #[test]
+    fn test_parse_v4_produce_headers_missing_payload_included() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = parse_v4_produce_headers(&headers).unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED), "{msg}");
+                assert!(msg.contains("missing"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_v4_produce_headers_unparseable_payload_included() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+            reqwest::header::HeaderValue::from_static("yes"),
+        );
+        let err = parse_v4_produce_headers(&headers).unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED), "{msg}");
+                assert!(msg.contains("yes"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_v4_produce_headers_true_false_and_optionals() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+            reqwest::header::HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            HEADER_ETH_BUILDER_URL,
+            reqwest::header::HeaderValue::from_static("https://builder.example"),
+        );
+        headers.insert(
+            HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+            reqwest::header::HeaderValue::from_static("999999999999999999999"),
+        );
+        let parsed = parse_v4_produce_headers(&headers).unwrap();
+        assert!(parsed.payload_included);
+        assert_eq!(parsed.builder_url.as_deref(), Some("https://builder.example"));
+        assert_eq!(parsed.consensus_block_value.as_deref(), Some("999999999999999999999"));
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+            reqwest::header::HeaderValue::from_static("false"),
+        );
+        let parsed = parse_v4_produce_headers(&headers).unwrap();
+        assert!(!parsed.payload_included);
+        assert_eq!(parsed.builder_url, None);
+        assert_eq!(parsed.consensus_block_value, None);
     }
 
     fn fulu_gloas_schedule() -> ForkSchedule {
