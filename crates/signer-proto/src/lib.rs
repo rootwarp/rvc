@@ -164,6 +164,7 @@ mod tests {
                 ("fork_info".into(), 3),
                 ("data".into(), 4),
                 ("fork_id".into(), 5),
+                ("object_root".into(), 6),
             ]
         );
 
@@ -217,6 +218,7 @@ mod tests {
                 blob_data_available: false,
             }),
             fork_id: ForkName::Gloas.id(),
+            object_root: vec![],
         };
         assert_eq!(req.fork_id, 7);
 

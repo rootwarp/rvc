@@ -10,8 +10,8 @@ use crate::dvt::allow_list::AllowedPeers;
 use crate::grpc_tls::TlsConfig;
 use crate::proto::signer_v2::peer_signer_service_client::PeerSignerServiceClient;
 use crate::proto::signer_v2::{
-    PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest, PartialSignResponse,
-    PartialSignSyncCommitteeRequest,
+    PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest,
+    PartialSignPayloadAttestationRequest, PartialSignResponse, PartialSignSyncCommitteeRequest,
 };
 
 #[derive(Error, Debug)]
@@ -235,6 +235,17 @@ impl GrpcPeerRequester {
                     fork_id: *fork_id,
                 };
                 client.partial_sign_sync_committee(req).await
+            }
+            PartialSignDuty::PayloadAttestation { fork_info, data, fork_id, object_root } => {
+                let req = PartialSignPayloadAttestationRequest {
+                    requester_index,
+                    pubkey: pubkey.to_vec(),
+                    fork_info: Some(fork_info.clone()),
+                    data: Some(data.clone()),
+                    fork_id: *fork_id,
+                    object_root: object_root.clone(),
+                };
+                client.partial_sign_payload_attestation(req).await
             }
         }
     }

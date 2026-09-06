@@ -10,7 +10,7 @@ use super::{SigningBackend, SigningBackendError};
 use crate::dvt::lagrange::{combine_partial_signatures, verify_combined_signature};
 use crate::dvt::types::ShareInfo;
 use crate::metrics::DvtMetrics;
-use crate::proto::signer_v2::{AttestationData, ForkInfo};
+use crate::proto::signer_v2::{AttestationData, ForkInfo, PayloadAttestationData};
 
 const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
@@ -21,9 +21,28 @@ const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 /// DVT client API.
 #[derive(Debug, Clone)]
 pub enum PartialSignDuty {
-    BeaconBlock { fork_info: ForkInfo, block_ssz: Vec<u8>, fork_id: u32 },
-    AttestationData { fork_info: ForkInfo, data: AttestationData, fork_id: u32 },
-    SyncCommittee { fork_info: ForkInfo, slot: u64, beacon_block_root: Vec<u8>, fork_id: u32 },
+    BeaconBlock {
+        fork_info: ForkInfo,
+        block_ssz: Vec<u8>,
+        fork_id: u32,
+    },
+    AttestationData {
+        fork_info: ForkInfo,
+        data: AttestationData,
+        fork_id: u32,
+    },
+    SyncCommittee {
+        fork_info: ForkInfo,
+        slot: u64,
+        beacon_block_root: Vec<u8>,
+        fork_id: u32,
+    },
+    PayloadAttestation {
+        fork_info: ForkInfo,
+        data: PayloadAttestationData,
+        fork_id: u32,
+        object_root: Vec<u8>,
+    },
 }
 
 /// Trait for requesting partial signatures from remote DVT peers.

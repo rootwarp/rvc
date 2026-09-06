@@ -6,7 +6,11 @@
 
 use tonic::Status;
 
+#[cfg(feature = "dvt")]
+use crate::proto::signer_v2::PayloadAttestationData as ProtoPayloadAttestationData;
 use crate::proto::signer_v2::{AttestationData as ProtoAttestationData, ForkInfo as ProtoForkInfo};
+#[cfg(feature = "dvt")]
+use eth_types::PayloadAttestationData;
 use eth_types::{
     decode_attestation_ssz as eth_decode_attestation_ssz,
     decode_beacon_block_ssz as eth_decode_beacon_block_ssz,
@@ -125,6 +129,23 @@ pub fn decode_attestation_data(
     };
 
     Ok((att_data, source_epoch, target_epoch))
+}
+
+/// Decode proto `PayloadAttestationData` into the eth-types struct.
+#[cfg(feature = "dvt")]
+#[allow(clippy::result_large_err)]
+pub fn decode_payload_attestation_data(
+    data: Option<ProtoPayloadAttestationData>,
+) -> Result<PayloadAttestationData, Status> {
+    let proto_data =
+        data.ok_or_else(|| Status::invalid_argument("payload attestation data required"))?;
+    let beacon_block_root = validate_root32(&proto_data.beacon_block_root, "beacon_block_root")?;
+    Ok(PayloadAttestationData {
+        beacon_block_root,
+        slot: proto_data.slot,
+        payload_present: proto_data.payload_present,
+        blob_data_available: proto_data.blob_data_available,
+    })
 }
 
 /// Decode SSZ-encoded `BeaconBlock`, mapping errors to `Status`.
@@ -364,6 +385,35 @@ mod tests {
         assert_eq!(att.beacon_block_root, [0xAB; 32]);
         assert_eq!(att.source.root, [0x01; 32]);
         assert_eq!(att.target.root, [0x02; 32]);
+    }
+
+    #[cfg(feature = "dvt")]
+    #[test]
+    fn test_decode_payload_attestation_data_happy_and_missing_fields() {
+        let err = decode_payload_attestation_data(None).expect_err("missing data");
+        assert_eq!(err.message(), "payload attestation data required");
+
+        let short_root = ProtoPayloadAttestationData {
+            beacon_block_root: vec![0x11; 16],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        };
+        let err = decode_payload_attestation_data(Some(short_root)).unwrap_err();
+        assert_eq!(err.message(), "beacon_block_root must be 32 bytes, got 16");
+
+        let ok = ProtoPayloadAttestationData {
+            beacon_block_root: vec![0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        };
+        let data =
+            decode_payload_attestation_data(Some(ok)).expect("valid payload attestation data");
+        assert_eq!(data.beacon_block_root, [0x11; 32]);
+        assert_eq!(data.slot, 1);
+        assert!(data.payload_present);
+        assert!(!data.blob_data_available);
     }
 
     /// Phase-2 fail-closed: `grpc-signer` sends `fork_id = ctx.fork_name.id()`,

@@ -52,6 +52,8 @@ pub enum MessageKind {
     SyncSelection,
     /// Legacy v1 raw-root `sign(signing_root, pubkey)` — no typed domain.
     V1RawRoot,
+    /// Payload attestation (PTC) — `DOMAIN_PTC_ATTESTER` (non-slashable).
+    PayloadAttestation,
 }
 
 impl MessageKind {
@@ -189,8 +191,9 @@ pub const SLASHING_STAGE_METHODS: &[&str] = &["stage_block", "stage_attestation"
 /// Only live-listener signing methods are listed:
 /// - `list_public_keys` and `get_status` are informational, not signing methods.
 /// - The v1 raw-root `sign` RPC has been removed from the live listener (SS-1, Issue 2.2).
-/// - DVT `PartialSignSyncCommittee` is registered as [`GateRouting::NonSlashable`]
-///   with `gate_method = None` (sync is not slashable; no stage method).
+/// - DVT `PartialSignSyncCommittee` and `PartialSignPayloadAttestation` are
+///   registered as [`GateRouting::NonSlashable`] with `gate_method = None`
+///   (neither is slashable; no stage method).
 ///
 /// Service path is the protobuf fully-qualified service name (`package.ServiceName`).
 pub const REGISTERED_METHODS: &[SigningMethod] = &[
@@ -285,6 +288,14 @@ pub const REGISTERED_METHODS: &[SigningMethod] = &[
         service: DVT_PEER_SERVICE,
         method: "PartialSignSyncCommittee",
         message_kind: MessageKind::SyncMessage,
+        gate_routing: GateRouting::NonSlashable,
+        gate_method: None,
+    },
+    #[cfg(feature = "dvt")]
+    SigningMethod {
+        service: DVT_PEER_SERVICE,
+        method: "PartialSignPayloadAttestation",
+        message_kind: MessageKind::PayloadAttestation,
         gate_routing: GateRouting::NonSlashable,
         gate_method: None,
     },

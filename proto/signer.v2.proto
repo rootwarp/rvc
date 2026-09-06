@@ -183,4 +183,8 @@ message PartialSignPayloadAttestationRequest {
   PayloadAttestationData data            = 4;
   // Object-root / field path (not decode_*_ssz). Gloas=7 is valid here.
   uint32                 fork_id         = 5;   // PHASE0 .. GLOAS enum
+  // Required 32-byte planned PayloadAttestationData HTR. Peer re-hashes `data`
+  // and rejects empty, wrong-length, or mismatched values. Additive on this
+  // 4.11a message only.
+  bytes                  object_root     = 6;
 }
