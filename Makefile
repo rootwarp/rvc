@@ -1,5 +1,6 @@
 .PHONY: build build-release check fmt clippy test test-fast coverage clean \
-       docker-rvc docker-signer docker-keygen docker-all architecture-doc spec-vectors
+       docker-rvc docker-signer docker-keygen docker-all architecture-doc \
+       spec-vectors spec-vectors-verify spec-vectors-regen
 
 # Build
 build:
@@ -75,6 +76,14 @@ export PRESET
 
 spec-vectors:
 	./scripts/fetch_spec_vectors.sh
+
+# Digest-check tracked pyspec artifacts ([[generated]] in vectors.lock). No Python.
+spec-vectors-verify:
+	./scripts/fetch_spec_vectors.sh verify
+
+# Re-run the pinned pyspec recipe. Nightly only; PR jobs verify the digest.
+spec-vectors-regen:
+	./scripts/fetch_spec_vectors.sh regen
 
 # All checks (CI)
 ci: fmt-check clippy test
