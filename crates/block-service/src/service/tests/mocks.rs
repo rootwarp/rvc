@@ -3,7 +3,7 @@
 use super::*;
 use async_trait::async_trait;
 use eth_types::{BeaconBlock, BlindedBeaconBlock, SignedBeaconBlock, SignedBlindedBeaconBlock};
-use signer::SignerError;
+use signer::{BeaconBlockHeaderFields, SignerError};
 use std::sync::{Arc, Mutex};
 use validator_store::ValidatorStore;
 
@@ -34,6 +34,14 @@ pub(crate) struct CapturedSignBlockCall {
     pub(crate) genesis_validators_root: Root,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedSignBlockHeaderCall {
+    pub(crate) header: BeaconBlockHeaderFields,
+    pub(crate) pubkey: PublicKey,
+    pub(crate) fork_schedule: ForkSchedule,
+    pub(crate) genesis_validators_root: Root,
+}
+
 // --- Mock Signer ---
 
 pub(crate) struct MockSigner {
@@ -41,6 +49,7 @@ pub(crate) struct MockSigner {
     pub(crate) fail_block: bool,
     pub(crate) randao_calls: Mutex<Vec<u64>>,
     pub(crate) block_calls: Mutex<Vec<CapturedSignBlockCall>>,
+    pub(crate) header_calls: Mutex<Vec<CapturedSignBlockHeaderCall>>,
 }
 
 impl MockSigner {
@@ -50,6 +59,7 @@ impl MockSigner {
             fail_block: false,
             randao_calls: Mutex::new(Vec::new()),
             block_calls: Mutex::new(Vec::new()),
+            header_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -75,6 +85,21 @@ impl MockSigner {
         assert_eq!(
             last.genesis_validators_root, *expected_gvr,
             "sign_block genesis_validators_root mismatch"
+        );
+    }
+
+    pub(crate) fn assert_last_sign_block_header(
+        &self,
+        expected_fork: &ForkSchedule,
+        expected_gvr: &Root,
+    ) {
+        let calls = self.header_calls.lock().unwrap();
+        assert!(!calls.is_empty(), "no sign_block_header calls captured");
+        let last = calls.last().unwrap();
+        assert_eq!(last.fork_schedule, *expected_fork, "sign_block_header fork_schedule mismatch");
+        assert_eq!(
+            last.genesis_validators_root, *expected_gvr,
+            "sign_block_header genesis_validators_root mismatch"
         );
     }
 }
@@ -136,6 +161,24 @@ impl ValidatorSigner for MockSigner {
         } else {
             Ok(mock_block_sig())
         }
+    }
+
+    async fn sign_block_header(
+        &self,
+        header: &BeaconBlockHeaderFields,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<crypto::Signature, SignerError> {
+        self.header_calls.lock().unwrap().push(CapturedSignBlockHeaderCall {
+            header: header.clone(),
+            pubkey: pubkey.clone(),
+            fork_schedule: fork_schedule.clone(),
+            genesis_validators_root: *genesis_validators_root,
+        });
+        let block_root = header.object_root();
+        self.sign_block(&block_root, header.slot, pubkey, fork_schedule, genesis_validators_root)
+            .await
     }
 
     async fn sign_randao_reveal(
@@ -769,10 +812,37 @@ pub(crate) async fn test_sign_block_captures_fork_schedule_and_genesis_root() {
     assert!(result.is_ok());
 
     signer_arc.assert_last_sign_block_domain(&fork, &gvr);
+    signer_arc.assert_last_sign_block_header(&fork, &gvr);
     let calls = signer_arc.block_calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].slot, slot);
     assert_eq!(calls[0].pubkey, pubkey);
+    drop(calls);
+    let headers = signer_arc.header_calls.lock().unwrap();
+    assert_eq!(headers[0].header.slot, slot);
+    assert_eq!(headers[0].pubkey, pubkey);
+}
+
+#[tokio::test]
+pub(crate) async fn test_sign_block_header_matches_sign_block_at_fulu() {
+    let signer = MockSigner::new();
+    let pk = test_pubkey();
+    let fork = test_fork_schedule();
+    let gvr: Root = [0xaa; 32];
+    let slot = 60 * SLOTS_PER_EPOCH;
+    let header = BeaconBlockHeaderFields {
+        slot,
+        proposer_index: 3,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body_root: [0x33; 32],
+        body_ssz: Vec::new(),
+        is_blinded: false,
+    };
+    let block_root = header.object_root();
+    let sig_header = signer.sign_block_header(&header, &pk, &fork, &gvr).await.unwrap();
+    let sig_block = signer.sign_block(&block_root, slot, &pk, &fork, &gvr).await.unwrap();
+    assert_eq!(sig_header.to_bytes(), sig_block.to_bytes());
 }
 
 // --- Assertion helper tests ---

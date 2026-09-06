@@ -2,11 +2,51 @@ use async_trait::async_trait;
 
 use crypto::{PublicKey, Signature};
 use eth_types::{
-    AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof,
+    ElectraAggregateAndProof, Epoch, ForkSchedule, PayloadAttestationData, Root, Slot,
+    ValidatorRegistrationV1, VoluntaryExit,
 };
+use tree_hash::TreeHash;
 
 use crate::SignerError;
+
+/// Five spec header leaves plus pre-Gloas body bytes for the gRPC legacy RPC.
+///
+/// Spec field order (`slot`, `proposer_index`, `parent_root`, `state_root`,
+/// `body_root`) is hashed with `tree_hash` 0.9. `body_ssz` is **not** a spec
+/// leaf: production fills it so a gRPC key can speak `SignBeaconBlock` /
+/// `SignBlindedBeaconBlock` until 4.20c routes Gloas to `SignBlockHeader`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeaconBlockHeaderFields {
+    pub slot: Slot,
+    pub proposer_index: u64,
+    pub parent_root: Root,
+    pub state_root: Root,
+    pub body_root: Root,
+    /// Original body SSZ (full or blinded). Empty when the caller only has leaves.
+    pub body_ssz: Vec<u8>,
+    pub is_blinded: bool,
+}
+
+impl BeaconBlockHeaderFields {
+    /// Spec `BeaconBlockHeader` (five leaves only).
+    #[must_use]
+    pub fn spec_header(&self) -> BeaconBlockHeader {
+        BeaconBlockHeader {
+            slot: self.slot,
+            proposer_index: self.proposer_index,
+            parent_root: self.parent_root,
+            state_root: self.state_root,
+            body_root: self.body_root,
+        }
+    }
+
+    /// `tree_hash` 0.9 of the five spec leaves.
+    #[must_use]
+    pub fn object_root(&self) -> Root {
+        self.spec_header().tree_hash_root().0
+    }
+}
 
 /// Trait for signing validator duties with slashing protection.
 ///
@@ -44,6 +84,20 @@ pub trait ValidatorSigner: Send + Sync {
         &self,
         block_root: &Root,
         slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError>;
+
+    /// Sign a block from its five header leaves after slashing protection.
+    ///
+    /// Local and HTTP keys hash the five spec leaves (`tree_hash` 0.9) into the
+    /// same root [`Self::sign_block`] would take. gRPC keys use the legacy
+    /// `SignBeaconBlock` / `SignBlindedBeaconBlock` RPCs when `body_ssz` is
+    /// present (4.20c will select `SignBlockHeader` at Gloas).
+    async fn sign_block_header(
+        &self,
+        header: &BeaconBlockHeaderFields,
         pubkey: &PublicKey,
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,

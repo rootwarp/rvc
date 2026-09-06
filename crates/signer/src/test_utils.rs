@@ -15,7 +15,14 @@ use eth_types::{
     ForkSchedule, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 
-use crate::{SignerError, ValidatorSigner};
+use crate::{BeaconBlockHeaderFields, SignerError, ValidatorSigner};
+
+fn stub_block_sig() -> Signature {
+    thread_local! {
+        static SIG: Signature = SecretKey::generate().sign(b"block");
+    }
+    SIG.with(Clone::clone)
+}
 
 /// Valid-curve mock BLS signature (fresh key each call).
 #[must_use]
@@ -58,7 +65,17 @@ impl ValidatorSigner for StubValidatorSigner {
         _fork_schedule: &ForkSchedule,
         _genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        Ok(mock_sig(b"block"))
+        Ok(stub_block_sig())
+    }
+
+    async fn sign_block_header(
+        &self,
+        _header: &BeaconBlockHeaderFields,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(stub_block_sig())
     }
 
     async fn sign_randao_reveal(
@@ -204,6 +221,25 @@ mod tests {
         };
         assert!(stub.sign_attestation(&data, &pk, &fork, &gvr).await.is_ok());
         assert!(stub.sign_block(&[4; 32], 1, &pk, &fork, &gvr).await.is_ok());
+        let header = BeaconBlockHeaderFields {
+            slot: 1920,
+            proposer_index: 1,
+            parent_root: [0x11; 32],
+            state_root: [0x22; 32],
+            body_root: [0x33; 32],
+            body_ssz: Vec::new(),
+            is_blinded: false,
+        };
+        // Stub returns a dummy constant (not a BLS signature over the root).
+        // Compare the same dummy from both methods using the spec-header HTR.
+        let object = header.object_root();
+        let sig_header = stub.sign_block_header(&header, &pk, &fork, &gvr).await.unwrap();
+        let sig_block = stub.sign_block(&object, header.slot, &pk, &fork, &gvr).await.unwrap();
+        assert_eq!(
+            sig_header.to_bytes(),
+            sig_block.to_bytes(),
+            "stub sign_block_header must match sign_block of the header object"
+        );
         assert!(stub.sign_randao_reveal(1, &pk, &fork, &gvr).await.is_ok());
         assert!(stub.sign_sync_committee_message(&[5; 32], 1, &pk, &fork, &gvr).await.is_ok());
         assert!(stub.sign_selection_proof(1, &pk, &fork, &gvr).await.is_ok());

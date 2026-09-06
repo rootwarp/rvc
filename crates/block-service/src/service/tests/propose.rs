@@ -127,6 +127,7 @@ async fn test_propose_block_unblinded() {
     beacon_arc.assert_last_produce_slot(slot);
     beacon_arc.assert_last_published_block(slot, 42);
     signer_arc.assert_last_sign_block_domain(&fork, &gvr);
+    signer_arc.assert_last_sign_block_header(&fork, &gvr);
 }
 
 /// Issue 2.10: the "Block publication success" info milestone logs the
@@ -192,6 +193,7 @@ async fn test_propose_block_blinded() {
     beacon_arc.assert_last_produce_slot(slot);
     beacon_arc.assert_last_published_blinded_block(slot, 42);
     signer_arc.assert_last_sign_block_domain(&fork, &gvr);
+    signer_arc.assert_last_sign_block_header(&fork, &gvr);
 }
 
 #[tokio::test]
@@ -507,6 +509,7 @@ async fn test_propose_block_calls_randao_with_correct_epoch() {
     drop(calls);
 
     signer_arc.assert_last_sign_block_domain(&fork, &gvr);
+    signer_arc.assert_last_sign_block_header(&fork, &gvr);
 }
 // --- Issue 3.2: Slot 0 / Epoch boundary block proposal tests (Finding #23) ---
 

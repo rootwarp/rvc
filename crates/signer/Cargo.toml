@@ -29,10 +29,17 @@ slashing.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
+tree_hash.workspace = true
 
 [dev-dependencies]
 crypto.workspace = true
+eth-types = { workspace = true, features = ["test-fixtures"] }
+grpc-signer.workspace = true
+prost.workspace = true
 remote-signer-client.workspace = true
+signer-server.workspace = true
+tonic.workspace = true
+tokio-stream.workspace = true
 # Enables `slashing::fail_next_commits` for RF4-03 path-level CommitFailed tests.
 slashing = { workspace = true, features = ["test-utils"] }
 # Feature-unify `test-utils` onto the crate-under-test so integration tests

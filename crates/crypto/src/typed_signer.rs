@@ -7,11 +7,12 @@
 use async_trait::async_trait;
 
 use eth_types::{
-    AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-    Epoch, ForkInfo, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    AggregateAndProof, AttestationData, BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock,
+    ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, PayloadAttestationData, Root,
+    Slot, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
+    DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 
 use crate::bls::{PublicKey, Signature};
@@ -30,6 +31,7 @@ use eth_types::{ForkName, ForkSchedule, SyncAggregatorSelectionData};
 /// (gRPC remote path). Callers that already know the active fork from a
 /// [`ForkSchedule`] should set [`Self::fork_name`] directly; use
 /// [`Self::resolve`] when only version bytes are available.
+#[derive(Clone)]
 pub struct SignContext {
     pub pubkey: PublicKey,
     pub fork_info: ForkInfo,
@@ -92,6 +94,19 @@ pub trait TypedSigner: Send + Sync {
         ctx: &SignContext,
     ) -> Result<Signature, SigningError>;
 
+    /// Sign a five-leaf beacon block header (DOMAIN_BEACON_PROPOSER).
+    ///
+    /// Default: unsupported. Local and gRPC remotes that can hash the header
+    /// (or forward it on the wire) must override.
+    async fn sign_block_header(
+        &self,
+        header: &BeaconBlockHeader,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (header, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "block_header" })
+    }
+
     /// Sign a blinded beacon block (DOMAIN_BEACON_PROPOSER).
     async fn sign_blinded_block(
         &self,
@@ -112,6 +127,19 @@ pub trait TypedSigner: Send + Sync {
         agg: &AggregateAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError>;
+
+    /// Sign an Electra aggregate-and-proof (DOMAIN_AGGREGATE_AND_PROOF).
+    ///
+    /// Default: unsupported. Distinct from [`Self::sign_aggregate_and_proof`]
+    /// because the inner attestation SSZ layout differs.
+    async fn sign_electra_aggregate_and_proof(
+        &self,
+        agg: &ElectraAggregateAndProof,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (agg, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "electra_aggregate_and_proof" })
+    }
 
     /// Sign a sync committee message (DOMAIN_SYNC_COMMITTEE).
     async fn sign_sync_committee_message(
@@ -202,6 +230,21 @@ impl TypedSigner for LocalSigner {
         Signer::sign(self, &signing_root, &pk).await
     }
 
+    async fn sign_block_header(
+        &self,
+        header: &BeaconBlockHeader,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            header,
+            DOMAIN_BEACON_PROPOSER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
     async fn sign_blinded_block(
         &self,
         block: &BlindedBeaconBlock,
@@ -235,6 +278,21 @@ impl TypedSigner for LocalSigner {
     async fn sign_aggregate_and_proof(
         &self,
         agg: &AggregateAndProof,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            agg,
+            DOMAIN_AGGREGATE_AND_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_electra_aggregate_and_proof(
+        &self,
+        agg: &ElectraAggregateAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
         let signing_root = signing_root_with_fork_version(
@@ -414,6 +472,33 @@ mod tests {
             ctx.fork_info.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&block, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_block_header ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_block_header_verifies() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let header = BeaconBlockHeader {
+            slot: 100,
+            proposer_index: 1,
+            parent_root: [0x11; 32],
+            state_root: [0x22; 32],
+            body_root: [0x33; 32],
+        };
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_block_header(&signer, &header, &ctx).await.unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_BEACON_PROPOSER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&header, domain);
         assert!(sig.verify(&pk, &signing_root).is_ok());
     }
 

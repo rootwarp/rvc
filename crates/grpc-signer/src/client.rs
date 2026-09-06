@@ -13,10 +13,11 @@ use crypto::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use eth_types::{
     encode_attestation_ssz, encode_beacon_block_ssz, encode_blinded_beacon_block_ssz,
     encode_sync_committee_contribution_ssz, AggregateAndProof, AttestationData, BeaconBlock,
-    BlindedBeaconBlock, ContributionAndProof, Epoch, Slot, SyncAggregatorSelectionData,
-    ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
-    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof, Epoch, ForkName,
+    PayloadAttestationData, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1,
+    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use observability::logging::TruncatedPubkey;
 
@@ -359,6 +360,29 @@ impl TypedSigner for GrpcRemoteSigner {
         .await
     }
 
+    async fn sign_block_header(
+        &self,
+        header: &BeaconBlockHeader,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        // 4.20c will select SignBlockHeader at Gloas. 4.20b is unimplemented and
+        // GLOAS_FORK_EPOCH is far-future — never send the new RPC here.
+        if ctx.fork_name >= ForkName::Gloas {
+            return Err(SigningError::UnsupportedDuty { duty: "block_header" });
+        }
+        // Legacy SignBeaconBlock: outer container is fork-invariant. Callers
+        // that still hold body SSZ should prefer `sign_block` so the server
+        // tree-hash matches the header leaf.
+        let block = BeaconBlock {
+            slot: header.slot,
+            proposer_index: header.proposer_index,
+            parent_root: header.parent_root,
+            state_root: header.state_root,
+            body: Vec::new(),
+        };
+        self.sign_block(&block, ctx).await
+    }
+
     async fn sign_blinded_block(
         &self,
         block: &BlindedBeaconBlock,
@@ -621,6 +645,17 @@ impl TypedSigner for GrpcRemoteSigner {
             move |mut client| async move { client.sign_voluntary_exit(req).await },
         )
         .await
+    }
+
+    async fn sign_payload_attestation(
+        &self,
+        data: &PayloadAttestationData,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        // 4.20c will send SignRoot at Gloas. Do not select that RPC while
+        // GLOAS_FORK_EPOCH is far-future (4.20b is unimplemented).
+        let _ = (data, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "payload_attestation" })
     }
 }
 

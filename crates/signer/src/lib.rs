@@ -39,12 +39,14 @@ pub use locks::ValidatorLockMap;
 /// Shared duty-crate helpers (circuit breaker, …). Home for types that must not
 /// create peer domain edges (block-service must not depend on builder for this).
 pub use service_util::CircuitBreakerState;
-pub use traits::ValidatorSigner;
+pub use traits::{BeaconBlockHeaderFields, ValidatorSigner};
 
 /// Test-only stubs (`StubValidatorSigner`, `mock_sig`). Enable via `test-utils`.
 #[cfg(any(test, feature = "test-utils"))]
 pub use test_utils::{mock_sig, StubValidatorSigner};
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,12 +55,13 @@ use thiserror::Error;
 use tracing::{debug, error, warn};
 
 use crypto::{
-    signing_root_for, signing_root_with_fork_version, CompositeSigner, DutyRef, PublicKey,
-    Signature, Signer, SigningCtx, SigningError,
+    capella_capped_fork_version, signing_root_for, signing_root_with_fork_version, CompositeSigner,
+    DutyRef, PublicKey, SignContext, Signature, Signer, SigningCtx, SigningError, TypedSigner,
 };
 use eth_types::{
-    AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    AggregateAndProof, Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock,
+    ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, ForkName, ForkSchedule,
+    PayloadAttestationData, Root, Slot, ValidatorRegistrationV1, VoluntaryExit, SLOTS_PER_EPOCH,
 };
 use observability::logging::fields::Duty;
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
@@ -273,6 +276,102 @@ pub fn always_enabled() -> Arc<dyn SigningEnablement> {
     Arc::new(AlwaysEnabled)
 }
 
+/// One-shot factory invoked inside the existing timeout envelope.
+type TypedSignFut = Pin<Box<dyn Future<Output = Result<Signature, SigningError>> + Send>>;
+type TypedSignFactory = Box<dyn FnOnce() -> TypedSignFut + Send>;
+
+/// Adapts a typed gRPC sign into [`Signer::sign`] so slashable/non-slashable
+/// cores keep their lock / stage / timeout path. Verifies the signature against
+/// the staged `signing_root` before returning (HTTP remote already does this).
+struct TypedSignAdapter {
+    factory: parking_lot::Mutex<Option<TypedSignFactory>>,
+    expected_root: Root,
+    pubkey: PublicKey,
+}
+
+#[async_trait]
+impl Signer for TypedSignAdapter {
+    async fn sign(
+        &self,
+        signing_root: &Root,
+        _pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        if signing_root != &self.expected_root {
+            return Err(SigningError::LocalRejected(
+                "typed sign adapter: signing_root mismatch".to_string(),
+            ));
+        }
+        let factory = self.factory.lock().take().ok_or_else(|| {
+            SigningError::LocalRejected("typed sign adapter: already consumed".to_string())
+        })?;
+        let sig = factory().await?;
+        if sig.verify(&self.pubkey, signing_root).is_err() {
+            return Err(SigningError::InvalidRemoteSignature);
+        }
+        Ok(sig)
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        vec![self.pubkey.to_bytes()]
+    }
+}
+
+fn grpc_raw_root_rejected() -> TypedSignFactory {
+    Box::new(|| {
+        Box::pin(async {
+            Err(SigningError::LocalRejected(
+                "raw-root signing is not supported for gRPC remote signers; \
+                 use TypedSigner::sign_block / sign_attestation / etc."
+                    .to_string(),
+            ))
+        })
+    })
+}
+
+fn sign_context_at_epoch(
+    pubkey: PublicKey,
+    fork_schedule: &ForkSchedule,
+    genesis_validators_root: Root,
+    epoch: Epoch,
+) -> SignContext {
+    let fork_name = ForkName::from_epoch(epoch, fork_schedule);
+    let current_version = fork_name.fork_version(fork_schedule);
+    let previous_version = fork_name.previous_fork(fork_schedule).fork_version(fork_schedule);
+    SignContext::new(
+        pubkey,
+        ForkInfo { previous_version, current_version, genesis_validators_root },
+        fork_name,
+    )
+}
+
+fn electra_aggregate_as_legacy(e: &ElectraAggregateAndProof) -> AggregateAndProof {
+    AggregateAndProof {
+        aggregator_index: e.aggregator_index,
+        aggregate: Attestation {
+            aggregation_bits: e.aggregate.aggregation_bits.clone(),
+            data: e.aggregate.data.clone(),
+            signature: e.aggregate.signature.clone(),
+        },
+        selection_proof: e.selection_proof.clone(),
+    }
+}
+
+fn sign_context_for_exit(
+    pubkey: PublicKey,
+    fork_schedule: &ForkSchedule,
+    genesis_validators_root: Root,
+    epoch: Epoch,
+) -> SignContext {
+    let fork_name = ForkName::from_epoch(epoch, fork_schedule);
+    let current_version = capella_capped_fork_version(epoch, fork_schedule);
+    let previous_version = fork_name.previous_fork(fork_schedule).fork_version(fork_schedule);
+    SignContext::new(
+        pubkey,
+        ForkInfo { previous_version, current_version, genesis_validators_root },
+        fork_name,
+    )
+}
+
 impl SignerService {
     /// Creates a new SignerService with the provided composite signer and slashing database.
     ///
@@ -401,6 +500,35 @@ impl SignerService {
         Err(SignerError::BlockedByDoppelganger)
     }
 
+    /// Raw-root [`Self::sign_backend`] for local/HTTP keys; typed adapter for gRPC.
+    fn bls_backend_for_duty(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+        typed: Option<TypedSignFactory>,
+    ) -> Arc<dyn Signer> {
+        if self.signer.has_grpc_remote(&pubkey.to_bytes()) {
+            Arc::new(TypedSignAdapter {
+                factory: parking_lot::Mutex::new(Some(
+                    typed.unwrap_or_else(grpc_raw_root_rejected),
+                )),
+                expected_root: signing_root,
+                pubkey: pubkey.clone(),
+            })
+        } else {
+            Arc::clone(&self.sign_backend)
+        }
+    }
+
+    fn grpc_typed_factory<F, Fut>(&self, pubkey: &PublicKey, f: F) -> Option<TypedSignFactory>
+    where
+        F: FnOnce(Arc<dyn TypedSigner + Send + Sync>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Signature, SigningError>> + Send + 'static,
+    {
+        let grpc = self.signer.get_grpc_remote(&pubkey.to_bytes())?;
+        Some(Box::new(move || Box::pin(f(grpc))))
+    }
+
     /// Map shared-core [`SigningGateError`] into the VC [`SignerError`] surface.
     fn map_gate_error(err: SigningGateError, pubkey_hex: &str) -> SignerError {
         match err {
@@ -441,6 +569,7 @@ impl SignerService {
         pubkey: &PublicKey,
         signing_root: Root,
         op_name: &str,
+        backend: Arc<dyn Signer>,
     ) -> Result<Signature, SignerError> {
         // Same gate point as slashable early check (Result, not a bool).
         self.ensure_signing_enabled(pubkey)?;
@@ -456,7 +585,7 @@ impl SignerService {
 
         match sign_nonslashable_core(
             self.enablement.as_ref(),
-            self.sign_backend.as_ref(),
+            backend.as_ref(),
             pubkey,
             signing_root,
             self.sign_timeout,
@@ -574,11 +703,18 @@ impl ValidatorSigner for SignerService {
         // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
         let policy = self.timeout_policy_source(pubkey);
 
+        let data_owned = data.clone();
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, data.target.epoch);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_attestation(&data_owned, &sign_ctx).await
+        });
+        let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
+
         let result = sign_slashable(SignSlashableRequest {
             locks: &self.validator_locks,
             pubkey,
             enablement: self.enablement.as_ref(),
-            signer: Arc::clone(&self.sign_backend),
+            signer,
             signing_root,
             sign_timeout: self.sign_timeout,
             policy,
@@ -649,17 +785,125 @@ impl ValidatorSigner for SignerService {
         let gvr = *genesis_validators_root;
         // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
         let policy = self.timeout_policy_source(pubkey);
+        let signer = self.bls_backend_for_duty(pubkey, signing_root, None);
 
         let result = sign_slashable(SignSlashableRequest {
             locks: &self.validator_locks,
             pubkey,
             enablement: self.enablement.as_ref(),
-            signer: Arc::clone(&self.sign_backend),
+            signer,
             signing_root,
             sign_timeout: self.sign_timeout,
             policy,
             hooks: Arc::new(StandardSlashableHooks::block()),
             op_name: "sign_block",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: AUDIT_CN_VC.to_string(),
+            gvr,
+            kind: SlashableKind::Block { slot },
+        })
+        .await;
+
+        match result {
+            Ok(bytes) => {
+                observability::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "safe",
+                );
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "block",
+                    "Signing completed"
+                );
+                Self::signature_from_bytes(bytes)
+            }
+            Err(e) => {
+                if matches!(e, SigningGateError::SlashingBlocked(_)) {
+                    observability::logging::record_display(
+                        &tracing::Span::current(),
+                        "slashing_result",
+                        "blocked",
+                    );
+                }
+                Err(Self::map_gate_error(e, &pubkey_hex))
+            }
+        }
+    }
+
+    /// Signs a block from five header leaves after slashing protection.
+    ///
+    /// Raw-root keys hash the header into [`DutyRef::BlockRoot`] (byte-identical
+    /// to [`Self::sign_block`] for the same object root). gRPC keys call
+    /// [`TypedSigner::sign_block_header`].
+    #[tracing::instrument(name = "sign.block", skip_all, fields(slot = header.slot, duty = %Duty::Block.as_str(), slashing_result = tracing::field::Empty))]
+    async fn sign_block_header(
+        &self,
+        header: &BeaconBlockHeaderFields,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        self.ensure_signing_enabled(pubkey)?;
+
+        let start = Instant::now();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let slot = header.slot;
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "block",
+            "Signing block header"
+        );
+
+        let block_root: Root = header.object_root();
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::BlockRoot { root: &block_root, slot }, &ctx);
+
+        let gvr = *genesis_validators_root;
+        let policy = self.timeout_policy_source(pubkey);
+
+        let header_owned = header.clone();
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            // Pre-Gloas: legacy SignBeaconBlock / SignBlindedBeaconBlock when
+            // the caller still has body bytes. 4.20c selects SignBlockHeader at Gloas.
+            if header_owned.body_ssz.is_empty() {
+                grpc.sign_block_header(&header_owned.spec_header(), &sign_ctx).await
+            } else if header_owned.is_blinded {
+                let blinded = BlindedBeaconBlock {
+                    slot: header_owned.slot,
+                    proposer_index: header_owned.proposer_index,
+                    parent_root: header_owned.parent_root,
+                    state_root: header_owned.state_root,
+                    body: header_owned.body_ssz,
+                };
+                grpc.sign_blinded_block(&blinded, &sign_ctx).await
+            } else {
+                let block = BeaconBlock {
+                    slot: header_owned.slot,
+                    proposer_index: header_owned.proposer_index,
+                    parent_root: header_owned.parent_root,
+                    state_root: header_owned.state_root,
+                    body: header_owned.body_ssz,
+                };
+                grpc.sign_block(&block, &sign_ctx).await
+            }
+        });
+        let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
+
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &self.validator_locks,
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer,
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy,
+            hooks: Arc::new(StandardSlashableHooks::block()),
+            op_name: "sign_block_header",
             slashing_db: Arc::clone(&self.slashing_db),
             client_cn: AUDIT_CN_VC.to_string(),
             gvr,
@@ -705,7 +949,14 @@ impl ValidatorSigner for SignerService {
     ) -> Result<Signature, SignerError> {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::Randao(epoch), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "randao").await
+        let gvr = *genesis_validators_root;
+        let epoch_c = epoch;
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_randao_reveal(epoch_c, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "randao", backend).await
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
@@ -721,7 +972,15 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::SyncMessage { beacon_block_root, slot }, &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "sync_committee_message").await
+        let gvr = *genesis_validators_root;
+        let root = *beacon_block_root;
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_sync_committee_message(slot, root, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "sync_committee_message", backend).await
     }
 
     /// Signs payload attestation data with `DOMAIN_PTC_ATTESTER`.
@@ -738,7 +997,15 @@ impl ValidatorSigner for SignerService {
     ) -> Result<Signature, SignerError> {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::PtcAttestation(data), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "payload_attestation").await
+        let gvr = *genesis_validators_root;
+        let data_owned = data.clone();
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, data.slot / SLOTS_PER_EPOCH);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_payload_attestation(&data_owned, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "payload_attestation", backend).await
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
@@ -752,7 +1019,8 @@ impl ValidatorSigner for SignerService {
     ) -> Result<Signature, SignerError> {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::SelectionProof(slot), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "selection_proof").await
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, None);
+        self.sign_nonslashable(pubkey, signing_root, "selection_proof", backend).await
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -769,7 +1037,15 @@ impl ValidatorSigner for SignerService {
     ) -> Result<Signature, SignerError> {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::AggregateAndProof(aggregate_and_proof), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "aggregate_and_proof").await
+        let gvr = *genesis_validators_root;
+        let agg = aggregate_and_proof.clone();
+        let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_aggregate_and_proof(&agg, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "aggregate_and_proof", backend).await
     }
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -784,9 +1060,27 @@ impl ValidatorSigner for SignerService {
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
-        let signing_root =
-            signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof").await
+        let gvr = *genesis_validators_root;
+        let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let pk = pubkey.to_bytes();
+        if self.signer.has_grpc_remote(&pk) {
+            // Existing SignAggregateAndProof RPC is pre-Electra attestation SSZ.
+            let legacy = electra_aggregate_as_legacy(aggregate_and_proof);
+            let signing_root = signing_root_for(&DutyRef::AggregateAndProof(&legacy), &ctx);
+            let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+                grpc.sign_aggregate_and_proof(&legacy, &sign_ctx).await
+            });
+            let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+            self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
+                .await
+        } else {
+            let signing_root =
+                signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
+            let backend = self.bls_backend_for_duty(pubkey, signing_root, None);
+            self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
+                .await
+        }
     }
 
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
@@ -812,7 +1106,15 @@ impl ValidatorSigner for SignerService {
         // EIP-7044 Capella cap is applied inside signing_root_for.
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::VoluntaryExit(voluntary_exit), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "voluntary_exit").await
+        let gvr = *genesis_validators_root;
+        let exit = voluntary_exit.clone();
+        let sign_ctx =
+            sign_context_for_exit(pubkey.clone(), fork_schedule, gvr, voluntary_exit.epoch);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_voluntary_exit(&exit, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "voluntary_exit", backend).await
     }
 
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
@@ -833,7 +1135,22 @@ impl ValidatorSigner for SignerService {
             fork_version,
             [0u8; 32],
         );
-        self.sign_nonslashable(pubkey, signing_root, "builder_registration").await
+        let reg = registration.clone();
+        let fv = fork_version;
+        let sign_ctx = SignContext::new(
+            pubkey.clone(),
+            ForkInfo {
+                previous_version: fork_version,
+                current_version: fork_version,
+                genesis_validators_root: [0u8; 32],
+            },
+            ForkName::Phase0,
+        );
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_builder_registration(&reg, fv, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "builder_registration", backend).await
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
@@ -849,7 +1166,15 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::SyncSelection { slot, subcommittee_index }, &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "sync_committee_selection_proof").await
+        let gvr = *genesis_validators_root;
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_sync_aggregator_selection(slot, subcommittee_index, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "sync_committee_selection_proof", backend)
+            .await
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
@@ -864,7 +1189,15 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::ContributionAndProof(contribution_and_proof), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "contribution_and_proof").await
+        let gvr = *genesis_validators_root;
+        let cap = contribution_and_proof.clone();
+        let epoch = contribution_and_proof.contribution.slot / SLOTS_PER_EPOCH;
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_contribution_and_proof(&cap, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "contribution_and_proof", backend).await
     }
 }
 
@@ -1844,6 +2177,42 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].slot, 5);
         assert!(blocks[0].signing_root.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sign_block_header_matches_sign_block_at_fulu() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let db_header = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let db_block = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let header_svc =
+            SignerService::new(Arc::clone(&signer), db_header).with_enablement(always_enabled());
+        let block_svc = SignerService::new(signer, db_block).with_enablement(always_enabled());
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let slot = 60 * SLOTS_PER_EPOCH;
+        let header = BeaconBlockHeaderFields {
+            slot,
+            proposer_index: 7,
+            parent_root: [0x11; 32],
+            state_root: [0x22; 32],
+            body_root: [0x33; 32],
+            body_ssz: Vec::new(),
+            is_blinded: false,
+        };
+        let block_root = header.object_root();
+
+        let sig_header = header_svc
+            .sign_block_header(&header, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect("header sign");
+        let sig_block = block_svc
+            .sign_block(&block_root, slot, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect("root sign");
+        assert_eq!(sig_header.to_bytes(), sig_block.to_bytes());
     }
 
     #[tokio::test]
