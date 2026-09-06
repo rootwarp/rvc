@@ -124,6 +124,12 @@ fn to_plan_input(
             })?;
             Ok(PlanInput::AggregateAndProof { object_root: object_root.0, fork_version, gvr })
         }
+        SignPayload::PayloadAttestation { payload_attestation } => {
+            // D19: Gloas PTC is in scope (unlike BLOCK_V2).
+            let (fork_version, gvr) = require_fork_info(req)?;
+            let object_root = payload_attestation.data.tree_hash_root().0;
+            Ok(PlanInput::PayloadAttestation { object_root, fork_version, gvr })
+        }
     }
 }
 
@@ -400,5 +406,38 @@ mod tests {
         assert!(body.contains("AGGREGATE_AND_PROOF_V2"), "names the HTTP type: {body}");
         assert!(body.contains("Web3Signer HTTP wire"), "names the wire: {body}");
         assert!(body.contains("deferred"), "names the deferral: {body}");
+    }
+
+    fn gloas_payload_attestation() -> SignRequest {
+        parse(&format!(
+            r#"{{ "type": "PAYLOAD_ATTESTATION",
+                  "fork_info": {{ "fork": {{ "previous_version": "0x07000000",
+                                             "current_version": "0x07000001",
+                                             "epoch": "0" }},
+                       "genesis_validators_root": "0x{gvr}" }},
+                  "payload_attestation": {{ "version": "GLOAS",
+                                            "data": {{ "beacon_block_root": "0x{br}",
+                                                       "slot": "1",
+                                                       "payload_present": true,
+                                                       "blob_data_available": false }} }} }}"#,
+            gvr = "00".repeat(32),
+            br = "11".repeat(32),
+        ))
+    }
+
+    fn parse_kat_root(hex: &str) -> Root {
+        hex::decode(hex).expect("kat hex").try_into().expect("32-byte kat root")
+    }
+
+    /// L3: HTTP adapter plans the same root as the plan engine / pyspec artifact.
+    #[test]
+    fn payload_attestation_plan_matches_kat_gloas_payload_attestation_signing_root() {
+        let plan = plan_sign(&gloas_payload_attestation(), BUILDER_FORK_VERSION_MAINNET)
+            .expect("D19: GLOAS PAYLOAD_ATTESTATION is in scope");
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+        );
     }
 }

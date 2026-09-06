@@ -25,8 +25,9 @@
 //! | `VALIDATOR_REGISTRATION` | yes | yes |
 //! | `VOLUNTARY_EXIT` | yes | yes |
 //! | `AGGREGATE_AND_PROOF_V2` | **no** (not yet on TypedSigner builders) | yes (FROZEN FR-31) |
+//! | `PAYLOAD_ATTESTATION` | **no** (4.10) | yes (provisional: remote-signing-api PR #28) |
 //!
-//! All eleven variants serialize and deserialize here. Adding a client *serialize*
+//! All twelve variants serialize and deserialize here. Adding a client *serialize*
 //! path for `AGGREGATE_AND_PROOF_V2` is a deliberate follow-up (not silent).
 //!
 //! # Server leniency (preserved)
@@ -56,8 +57,8 @@ use std::str::FromStr;
 
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof,
-    ElectraAggregateAndProof, Fork, ForkName, Root, SyncCommitteeMessage, ValidatorRegistrationV1,
-    VoluntaryExit,
+    ElectraAggregateAndProof, Fork, ForkName, PayloadAttestationData, Root, SyncCommitteeMessage,
+    ValidatorRegistrationV1, VoluntaryExit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -256,6 +257,11 @@ pub enum SignPayload {
     /// Inner object is the Consensys `{version, data}` wrapper.
     #[serde(rename = "AGGREGATE_AND_PROOF_V2")]
     AggregateAndProofV2 { aggregate_and_proof: VersionedPayload<ElectraAggregateAndProof> },
+    /// Gloas PTC (`DOMAIN_PTC_ATTESTER`). Discriminator `PAYLOAD_ATTESTATION` and
+    /// the `{version, data}` envelope are provisional
+    /// (`ethereum/remote-signing-api` PR #28).
+    #[serde(rename = "PAYLOAD_ATTESTATION")]
+    PayloadAttestation { payload_attestation: VersionedPayload<PayloadAttestationData> },
 }
 
 /// Client-facing alias for [`SignPayload`] (RF3-11 migration).
@@ -279,6 +285,7 @@ impl SignPayload {
             SignPayload::ValidatorRegistration { .. } => "VALIDATOR_REGISTRATION",
             SignPayload::VoluntaryExit { .. } => "VOLUNTARY_EXIT",
             SignPayload::AggregateAndProofV2 { .. } => "AGGREGATE_AND_PROOF_V2",
+            SignPayload::PayloadAttestation { .. } => "PAYLOAD_ATTESTATION",
         }
     }
 }
@@ -468,10 +475,18 @@ mod tests {
             sp = "cd".repeat(96),
         );
         assert_roundtrip(&electra_v2);
+
+        // PAYLOAD_ATTESTATION (4.9b; `{version, data}` wrapper, remote-signing-api PR #28)
+        let ptc = format!(
+            r#"{{"type":"PAYLOAD_ATTESTATION","fork_info":{fi},"payload_attestation":{{"version":"GLOAS","data":{{"beacon_block_root":"0x{br}","slot":"1","payload_present":true,"blob_data_available":false}}}}}}"#,
+            fi = fork_info_compact(),
+            br = "11".repeat(32),
+        );
+        assert_roundtrip(&ptc);
     }
 
     #[test]
-    fn test_all_eleven_type_discriminators_roundtrip() {
+    fn test_all_twelve_type_discriminators_roundtrip() {
         let discriminators = [
             "BLOCK_V2",
             "ATTESTATION",
@@ -484,6 +499,7 @@ mod tests {
             "VALIDATOR_REGISTRATION",
             "VOLUNTARY_EXIT",
             "AGGREGATE_AND_PROOF_V2",
+            "PAYLOAD_ATTESTATION",
         ];
         // Smoke: construct each variant, type_name matches rename, and
         // serialize→deserialize preserves the discriminator.
@@ -592,10 +608,21 @@ mod tests {
                     },
                 },
             },
+            SignPayload::PayloadAttestation {
+                payload_attestation: VersionedPayload {
+                    version: ForkName::Gloas,
+                    data: PayloadAttestationData {
+                        beacon_block_root: [0x11; 32],
+                        slot: 1,
+                        payload_present: true,
+                        blob_data_available: false,
+                    },
+                },
+            },
         ];
 
-        assert_eq!(samples.len(), 11);
-        assert_eq!(discriminators.len(), 11);
+        assert_eq!(samples.len(), 12);
+        assert_eq!(discriminators.len(), 12);
         for (payload, expected_name) in samples.iter().zip(discriminators.iter()) {
             assert_eq!(payload.type_name(), *expected_name);
             let v = serde_json::to_value(payload).unwrap();
@@ -899,6 +926,51 @@ mod tests {
                 );
             }
             other => panic!("expected BlockV2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_payload_attestation_unknown_version_fails_to_decode_naming_value() {
+        let body = format!(
+            r#"{{ "type": "PAYLOAD_ATTESTATION", "fork_info": {fi},
+                  "payload_attestation": {{ "version": "NOT_A_FORK",
+                                            "data": {{ "beacon_block_root": "0x{br}",
+                                                       "slot": "1",
+                                                       "payload_present": true,
+                                                       "blob_data_available": false }} }} }}"#,
+            fi = fork_info_json(),
+            br = "11".repeat(32),
+        );
+        let err = serde_json::from_str::<SignRequest>(&body).unwrap_err().to_string();
+        match WireVersionError::from_serde_display(&err) {
+            Some(WireVersionError::Unknown(value)) => assert_eq!(value, "NOT_A_FORK"),
+            other => panic!("expected Unknown(NOT_A_FORK), got {other:?} from {err}"),
+        }
+    }
+
+    #[test]
+    fn test_payload_attestation_gloas_version_decodes() {
+        let body = format!(
+            r#"{{ "type": "PAYLOAD_ATTESTATION", "fork_info": {fi},
+                  "payload_attestation": {{ "version": "GLOAS",
+                                            "data": {{ "beacon_block_root": "0x{br}",
+                                                       "slot": "1",
+                                                       "payload_present": true,
+                                                       "blob_data_available": false }} }} }}"#,
+            fi = fork_info_json(),
+            br = "11".repeat(32),
+        );
+        let req: SignRequest = serde_json::from_str(&body).unwrap();
+        assert_eq!(req.payload.type_name(), "PAYLOAD_ATTESTATION");
+        match req.payload {
+            SignPayload::PayloadAttestation { payload_attestation } => {
+                assert_eq!(payload_attestation.version, ForkName::Gloas);
+                assert_eq!(payload_attestation.data.beacon_block_root, [0x11u8; 32]);
+                assert_eq!(payload_attestation.data.slot, 1);
+                assert!(payload_attestation.data.payload_present);
+                assert!(!payload_attestation.data.blob_data_available);
+            }
+            other => panic!("expected PayloadAttestation, got {other:?}"),
         }
     }
 

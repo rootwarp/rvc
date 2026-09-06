@@ -195,7 +195,9 @@ async fn sign_traced(
 /// proposer/block duty); the Web3Signer `type` stays distinct in the audit line.
 fn payload_duty(payload: &SignPayload) -> Duty {
     match payload {
-        SignPayload::Attestation { .. } => Duty::Attestation,
+        SignPayload::Attestation { .. } | SignPayload::PayloadAttestation { .. } => {
+            Duty::Attestation
+        }
         SignPayload::BlockV2 { .. } | SignPayload::RandaoReveal { .. } => Duty::Block,
         SignPayload::AggregationSlot { .. }
         | SignPayload::AggregateAndProof { .. }
@@ -230,6 +232,9 @@ fn payload_slot(payload: &SignPayload) -> Option<u64> {
         }
         SignPayload::SyncCommitteeSelectionProof { sync_aggregator_selection_data } => {
             Some(sync_aggregator_selection_data.slot)
+        }
+        SignPayload::PayloadAttestation { payload_attestation } => {
+            Some(payload_attestation.data.slot)
         }
         SignPayload::RandaoReveal { .. }
         | SignPayload::ValidatorRegistration { .. }
@@ -334,6 +339,7 @@ fn http_a7_sign_type(payload: &SignPayload) -> &'static str {
         }
         SignPayload::ValidatorRegistration { .. } => grpc_sign_type::BUILDER_REGISTRATION,
         SignPayload::VoluntaryExit { .. } => grpc_sign_type::VOLUNTARY_EXIT,
+        SignPayload::PayloadAttestation { .. } => grpc_sign_type::PAYLOAD_ATTESTATION,
     }
 }
 

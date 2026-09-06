@@ -19,8 +19,8 @@ use crypto::{compute_domain, compute_signing_root};
 // `rvc-beacon::BeaconBlockHeader` DTO exists and would compute a garbage root.
 use eth_types::{
     AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
-    ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, Root,
-    SyncAggregatorSelectionData, SyncCommitteeContribution, SyncCommitteeMessage,
+    ContributionAndProof, ElectraAggregateAndProof, ElectraAttestation, PayloadAttestationData,
+    Root, SyncAggregatorSelectionData, SyncCommitteeContribution, SyncCommitteeMessage,
     ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
     DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO,
     DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
@@ -360,6 +360,30 @@ fn versioned_aggregate_v2_json(version: &str, data_json: String) -> String {
     format!(r#"{{ "version": "{version}", "data": {data_json} }}"#)
 }
 
+// ── Issue 4.9b: PAYLOAD_ATTESTATION (Gloas PTC, fail-closed version) ──────
+
+fn ptc_kat_data() -> PayloadAttestationData {
+    PayloadAttestationData {
+        beacon_block_root: [0x11; 32],
+        slot: 1,
+        payload_present: true,
+        blob_data_available: false,
+    }
+}
+
+fn payload_attestation_body(version: &str) -> String {
+    format!(
+        r#"{{ "type": "PAYLOAD_ATTESTATION",
+              "fork_info": {{ "fork": {{ "previous_version": "0x07000000",
+                                         "current_version": "0x07000001",
+                                         "epoch": "0" }},
+                   "genesis_validators_root": "0x{gvr}" }},
+              "payload_attestation": {{ "version": "{version}", "data": {data} }} }}"#,
+        gvr = "00".repeat(32),
+        data = serde_json::to_string(&ptc_kat_data()).unwrap(),
+    )
+}
+
 /// A frozen, spec-derived Electra `AGGREGATE_AND_PROOF_V2` wire body. Field
 /// names and encodings (quoted `u64`, `0x`-lowercase hex bitlists, nested
 /// `data`) match the remote-signing schema; `committee_bits` is the EIP-7549
@@ -399,7 +423,7 @@ fn electra_v2_frozen_fixture() -> String {
 
 /// One valid body per supported Web3Signer `type` (FR-4..FR-14) — every duty
 /// a running validator performs. The full Web3Signer protocol also defines
-/// BLOCK v1 / DEPOSIT etc., which are out of scope for a VC (PRD); the 11
+/// BLOCK v1 / DEPOSIT etc., which are out of scope for a VC (PRD); the 12
 /// here are the complete dispatchable set.
 fn all_supported_type_bodies() -> Vec<(&'static str, String)> {
     vec![
@@ -441,11 +465,12 @@ fn all_supported_type_bodies() -> Vec<(&'static str, String)> {
         ("VALIDATOR_REGISTRATION", registration_body(&sample_registration(), true)),
         ("VOLUNTARY_EXIT", voluntary_exit_body(256, 99)),
         ("AGGREGATE_AND_PROOF_V2", electra_v2_frozen_fixture()),
+        ("PAYLOAD_ATTESTATION", payload_attestation_body("GLOAS")),
     ]
 }
 
 // Re-export production helpers used by topic suites (`super::sign_span`).
-pub(super) use super::sign_span;
+pub(super) use super::{http_a7_sign_type, sign_span};
 
 mod auth;
 mod errors;

@@ -102,8 +102,6 @@ pub enum PlanInput {
     VoluntaryExit { object_root: Root, fork_version: [u8; 4], gvr: Root },
     /// Payload attestation (PTC). `object_root` is the tree-hash of
     /// `PayloadAttestationData` — identity-HTR path, same as [`Self::AggregateAndProof`].
-    /// HTTP (4.9b) and gRPC (4.20b) construct this; until then only tests do.
-    #[allow(dead_code)]
     PayloadAttestation { object_root: Root, fork_version: [u8; 4], gvr: Root },
 }
 

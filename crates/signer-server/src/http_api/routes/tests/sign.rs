@@ -481,12 +481,68 @@ async fn electra_v2_frozen_fixture_parses_and_signs_to_eth_types_root() {
     assert_eq!(sign_ok(fixture).await, expected.to_vec());
 }
 
+/// L3: HTTP `PAYLOAD_ATTESTATION` signs the plan-engine / pyspec root.
+#[tokio::test]
+async fn payload_attestation_kat_signs_kat_gloas_payload_attestation_signing_root() {
+    let (sk, _) = test_keypair();
+    let kat: [u8; 32] =
+        hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+            .expect("kat hex")
+            .try_into()
+            .expect("32-byte kat root");
+    let expected = sk.sign(&kat).to_bytes();
+    assert_eq!(sign_ok(payload_attestation_body("GLOAS")).await, expected.to_vec());
+}
+
+/// A7 label is the bounded `grpc_sign_type::PAYLOAD_ATTESTATION` constant, never
+/// the request's `type` discriminator.
+#[test]
+fn http_a7_sign_type_payload_attestation_is_bounded() {
+    use crate::http_api::request::SignPayload;
+    use crate::metrics::grpc_sign_type;
+    use eth_types::ForkName;
+    use web3signer_wire::VersionedPayload;
+
+    let payload = SignPayload::PayloadAttestation {
+        payload_attestation: VersionedPayload { version: ForkName::Gloas, data: ptc_kat_data() },
+    };
+    let label = http_a7_sign_type(&payload);
+    assert_eq!(label, grpc_sign_type::PAYLOAD_ATTESTATION);
+    assert_eq!(label, "payload_attestation");
+    assert_ne!(label, payload.type_name(), "must not use the request type discriminator");
+}
+
+#[tokio::test]
+async fn payload_attestation_http_a7_records_bounded_label() {
+    use crate::metrics::grpc_sign_type;
+
+    let (sk, pk_bytes) = test_keypair();
+    let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+    let metrics = Arc::clone(&state.metrics);
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let resp = post_sign(state, &id, None, payload_attestation_body("GLOAS")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        metrics
+            .sign_total
+            .with_label_values(&["basic", grpc_sign_type::PAYLOAD_ATTESTATION, "success"])
+            .get(),
+        1,
+        "A7 sign_total uses the bounded payload_attestation label"
+    );
+    assert_eq!(
+        metrics.sign_total.with_label_values(&["basic", "PAYLOAD_ATTESTATION", "success"]).get(),
+        0,
+        "must not record the request type discriminator as the A7 label"
+    );
+}
+
 /// Completeness: every supported type dispatches end-to-end to `200` with a
 /// signature, after the P2 arms landed. A regression in any arm fails here.
 #[tokio::test]
 async fn all_supported_types_dispatch_to_200() {
     let bodies = all_supported_type_bodies();
-    assert_eq!(bodies.len(), 11, "all FR-4..FR-14 types are covered");
+    assert_eq!(bodies.len(), 12, "all FR-4..FR-14 types plus PAYLOAD_ATTESTATION are covered");
     for (type_name, body) in bodies {
         let (sk, pk_bytes) = test_keypair();
         let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
