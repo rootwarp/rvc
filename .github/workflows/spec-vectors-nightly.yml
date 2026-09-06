@@ -1,0 +1,80 @@
+name: Spec vectors (nightly)
+
+on:
+  schedule:
+    # 05:00 UTC daily. GitHub only fires `schedule` on the default branch.
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+jobs:
+  # Nightly mainnet spec-vectors (#240 / 3.10b).
+  #
+  # Schedule: 05:00 UTC daily (`cron: "0 5 * * *"`). `schedule` runs only on
+  # the default branch and has no PR check; `workflow_dispatch` is the
+  # pre-merge proof.
+  # Archive: consensus-specs v1.7.0-beta.0 mainnet.tar.gz is 902712950 bytes
+  # (~861 MiB). Expected runtime ~15–40 min cold (download + extract dominate);
+  # timeout-minutes is 120.
+  # Cache/steps: reuse 3.10a — archives-only (no restore-keys), always
+  # re-extract from digest-checked tarballs. Same lock-hash key as the PR job
+  # (a prior minimal save of that key omits mainnet.tar.gz; nightly then
+  # re-downloads ~861 MiB, which timeout-minutes covers).
+  # Failures surface as a red run on the Actions tab for this workflow
+  # (Actions → Spec vectors (nightly)); GitHub also emails users who have
+  # Actions failure notifications. Nothing is posted to a PR.
+  spec-vectors-mainnet:
+    name: Spec Vectors (mainnet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RVC_SPEC_VECTORS_REQUIRED: "1"
+      PRESET: mainnet
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-spec-vectors-deps-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-spec-vectors-deps-
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Archives only: the pin is the tarball digest, not a restored tests/ tree.
+      # No restore-keys: a lock change must miss, not restore a stale archive.
+      - name: Cache spec-vector archives
+        id: spec-vector-cache
+        uses: actions/cache@v4
+        with:
+          path: crates/rvc-spec-vectors/vectors/**/*.tar.gz
+          key: ${{ runner.os }}-spec-vectors-${{ hashFiles('crates/rvc-spec-vectors/vectors.lock') }}
+
+      - name: Report spec-vector cache
+        run: echo "spec-vector cache-hit=${{ steps.spec-vector-cache.outputs.cache-hit }}"
+
+      - name: Fetch spec vectors
+        run: make spec-vectors
+
+      # Pyspec branch: pin CPython ≥ 3.12 (lock records 3.13.7) and re-run
+      # 3.4b's recipe. PR jobs only sha256-verify; this is the reproduction.
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13.7"
+
+      - name: Regen pyspec artifact
+        run: make spec-vectors-regen
+
+      - name: Verify generated vector digest
+        run: make spec-vectors-verify
+
+      - name: Run spec-vector suites
+        run: cargo nextest run -p rvc-spec-vectors --locked --final-status-level pass
