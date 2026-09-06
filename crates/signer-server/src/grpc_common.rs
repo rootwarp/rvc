@@ -6,9 +6,14 @@
 
 use tonic::Status;
 
+use crate::metrics::grpc_sign_type;
 #[cfg(feature = "dvt")]
 use crate::proto::signer_v2::PayloadAttestationData as ProtoPayloadAttestationData;
-use crate::proto::signer_v2::{AttestationData as ProtoAttestationData, ForkInfo as ProtoForkInfo};
+use crate::proto::signer_v2::{
+    AttestationData as ProtoAttestationData, BeaconBlockHeader as ProtoBeaconBlockHeader, Duty,
+    ForkInfo as ProtoForkInfo,
+};
+use crate::sign_plan::{NonSlashableOp, PlanInput};
 #[cfg(feature = "dvt")]
 use eth_types::PayloadAttestationData;
 use eth_types::{
@@ -16,8 +21,8 @@ use eth_types::{
     decode_beacon_block_ssz as eth_decode_beacon_block_ssz,
     decode_blinded_beacon_block_ssz as eth_decode_blinded_beacon_block_ssz,
     decode_sync_committee_contribution_ssz as eth_decode_sync_committee_contribution_ssz,
-    Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock, Checkpoint, SszDecodeError,
-    SyncCommitteeContribution,
+    Attestation, AttestationData, BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, Checkpoint,
+    ForkName, SszDecodeError, SyncCommitteeContribution,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -77,6 +82,15 @@ pub fn validate_root32(bytes: &[u8], field_name: &str) -> Result<[u8; 32], Statu
     })
 }
 
+/// Transport fork identity for Gloas-safe RPCs (no SSZ bytes).
+///
+/// Accepts [`ForkName`] ids 0..=7 (Gloas=7 after 2.5b) and rejects 8 / `u32::MAX`.
+/// Distinct from `validate_fork_id` (`0..=6`) used by the four SSZ decoders.
+#[allow(clippy::result_large_err)]
+pub fn validate_transport_fork_id(fork_id: u32) -> Result<ForkName, Status> {
+    ForkName::try_from(fork_id).map_err(|e| Status::invalid_argument(e.to_string()))
+}
+
 /// Convert a `SszDecodeError` to a gRPC `Status::invalid_argument`.
 pub fn ssz_err(e: SszDecodeError) -> Status {
     Status::invalid_argument(format!("SSZ decode error: {e}"))
@@ -129,6 +143,77 @@ pub fn decode_attestation_data(
     };
 
     Ok((att_data, source_epoch, target_epoch))
+}
+
+/// Decode proto `BeaconBlockHeader` into the eth-types 5-leaf header.
+///
+/// Each root must be exactly 32 bytes so the server hashes the same object the
+/// client constructed; a short/long leaf cannot produce the expected HTR.
+#[allow(clippy::result_large_err)]
+pub fn decode_beacon_block_header(
+    header: Option<ProtoBeaconBlockHeader>,
+) -> Result<BeaconBlockHeader, Status> {
+    let header = header.ok_or_else(|| Status::invalid_argument("header required"))?;
+    let parent_root = validate_root32(&header.parent_root, "parent_root")?;
+    let state_root = validate_root32(&header.state_root, "state_root")?;
+    let body_root = validate_root32(&header.body_root, "body_root")?;
+    Ok(BeaconBlockHeader {
+        slot: header.slot,
+        proposer_index: header.proposer_index,
+        parent_root,
+        state_root,
+        body_root,
+    })
+}
+
+/// Planned non-slashable input for `SignRoot` / `PartialSignRoot`.
+///
+/// `UNSPECIFIED` and unknown enum values fail closed; duties this server does
+/// not yet serve return `UNIMPLEMENTED` (never a signature).
+#[derive(Debug)]
+pub struct RootDutyPlan {
+    pub input: PlanInput,
+    pub rpc_type: &'static str,
+    pub op: NonSlashableOp,
+}
+
+#[allow(clippy::result_large_err)]
+pub fn root_duty_plan(
+    duty: i32,
+    object_root: [u8; 32],
+    fork_version: [u8; 4],
+    gvr: [u8; 32],
+) -> Result<RootDutyPlan, Status> {
+    match Duty::try_from(duty) {
+        Ok(Duty::Unspecified) => Err(Status::invalid_argument("duty must not be UNSPECIFIED")),
+        Ok(Duty::AggregateAndProof) => Ok(RootDutyPlan {
+            input: PlanInput::AggregateAndProof { object_root, fork_version, gvr },
+            rpc_type: grpc_sign_type::AGGREGATE_AND_PROOF,
+            op: NonSlashableOp::AggregateAndProof,
+        }),
+        Ok(Duty::ContributionAndProof) => Ok(RootDutyPlan {
+            input: PlanInput::ContributionAndProof { object_root, fork_version, gvr },
+            rpc_type: grpc_sign_type::CONTRIBUTION_AND_PROOF,
+            op: NonSlashableOp::ContributionAndProof,
+        }),
+        Ok(Duty::PayloadAttestation) => Ok(RootDutyPlan {
+            input: PlanInput::PayloadAttestation { object_root, fork_version, gvr },
+            rpc_type: grpc_sign_type::PAYLOAD_ATTESTATION,
+            op: NonSlashableOp::PayloadAttestation,
+        }),
+        Ok(Duty::ProposerPreferences) => Ok(RootDutyPlan {
+            input: PlanInput::ProposerPreferences { object_root, fork_version, gvr },
+            rpc_type: grpc_sign_type::PROPOSER_PREFERENCES,
+            op: NonSlashableOp::ProposerPreferences,
+        }),
+        Ok(Duty::ExecutionPayloadEnvelope) => {
+            Err(Status::unimplemented("EXECUTION_PAYLOAD_ENVELOPE (issue 6.19)"))
+        }
+        Ok(Duty::BuilderRequestAuth) => {
+            Err(Status::unimplemented("BUILDER_REQUEST_AUTH (issue 6.16)"))
+        }
+        Err(_) => Err(Status::invalid_argument(format!("unknown duty: {duty}"))),
+    }
 }
 
 /// Decode proto `PayloadAttestationData` into the eth-types struct.
@@ -438,5 +523,76 @@ mod tests {
             "signer-server decode must surface UnknownForkId(7), got: {}",
             err.message()
         );
+    }
+
+    #[test]
+    fn test_validate_transport_fork_id_accepts_0_through_7_rejects_8_and_max() {
+        for id in 0u32..=7 {
+            validate_transport_fork_id(id)
+                .unwrap_or_else(|e| panic!("fork_id={id} should be accepted: {e}"));
+        }
+        assert_eq!(validate_transport_fork_id(7).unwrap(), ForkName::Gloas);
+        for id in [8u32, u32::MAX] {
+            let err = validate_transport_fork_id(id).expect_err("unknown fork id");
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+            assert!(
+                err.message().contains(&id.to_string()),
+                "typed unknown-fork status must name {id}, got: {}",
+                err.message()
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_beacon_block_header_requires_32_byte_roots() {
+        let err = decode_beacon_block_header(None).expect_err("missing header");
+        assert_eq!(err.message(), "header required");
+
+        let short = ProtoBeaconBlockHeader {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: vec![0x11; 32],
+            state_root: vec![0x22; 32],
+            body_root: vec![0x33; 31],
+        };
+        let err = decode_beacon_block_header(Some(short)).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.message(), "body_root must be 32 bytes, got 31");
+
+        let ok = ProtoBeaconBlockHeader {
+            slot: 42,
+            proposer_index: 7,
+            parent_root: vec![0x11; 32],
+            state_root: vec![0x22; 32],
+            body_root: vec![0x33; 32],
+        };
+        let header = decode_beacon_block_header(Some(ok)).expect("valid header");
+        assert_eq!(header.slot, 42);
+        assert_eq!(header.body_root, [0x33; 32]);
+    }
+
+    #[test]
+    fn test_root_duty_plan_fail_closed_and_unimplemented() {
+        let root = [0x11u8; 32];
+        let fv = [0x07, 0x00, 0x00, 0x01];
+        let gvr = [0u8; 32];
+
+        let err = root_duty_plan(Duty::Unspecified as i32, root, fv, gvr).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("UNSPECIFIED"));
+
+        let err = root_duty_plan(99, root, fv, gvr).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("unknown duty: 99"));
+
+        let err = root_duty_plan(Duty::ExecutionPayloadEnvelope as i32, root, fv, gvr).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+        let err = root_duty_plan(Duty::BuilderRequestAuth as i32, root, fv, gvr).unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+        let plan = root_duty_plan(Duty::PayloadAttestation as i32, root, fv, gvr).unwrap();
+        assert_eq!(plan.rpc_type, grpc_sign_type::PAYLOAD_ATTESTATION);
+        assert!(matches!(plan.input, PlanInput::PayloadAttestation { .. }));
     }
 }

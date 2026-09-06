@@ -54,6 +54,9 @@ pub enum MessageKind {
     V1RawRoot,
     /// Payload attestation (PTC) — `DOMAIN_PTC_ATTESTER` (non-slashable).
     PayloadAttestation,
+    /// Gloas-safe `SignRoot` / `PartialSignRoot` — duty selected on the wire
+    /// (non-slashable; aggregate, contribution, PTC, proposer preferences).
+    Root,
 }
 
 impl MessageKind {
@@ -268,6 +271,20 @@ pub const REGISTERED_METHODS: &[SigningMethod] = &[
         gate_routing: GateRouting::NonSlashable,
         gate_method: Some("sign_voluntary_exit"),
     },
+    SigningMethod {
+        service: V2_SIGNER_SERVICE,
+        method: "SignBlockHeader",
+        message_kind: MessageKind::Block,
+        gate_routing: GateRouting::Gated,
+        gate_method: Some("sign_block"),
+    },
+    SigningMethod {
+        service: V2_SIGNER_SERVICE,
+        method: "SignRoot",
+        message_kind: MessageKind::Root,
+        gate_routing: GateRouting::NonSlashable,
+        gate_method: None,
+    },
     #[cfg(feature = "dvt")]
     SigningMethod {
         service: DVT_PEER_SERVICE,
@@ -297,6 +314,22 @@ pub const REGISTERED_METHODS: &[SigningMethod] = &[
         service: DVT_PEER_SERVICE,
         method: "PartialSignPayloadAttestation",
         message_kind: MessageKind::PayloadAttestation,
+        gate_routing: GateRouting::NonSlashable,
+        gate_method: None,
+    },
+    #[cfg(feature = "dvt")]
+    SigningMethod {
+        service: DVT_PEER_SERVICE,
+        method: "PartialSignBlockHeader",
+        message_kind: MessageKind::Block,
+        gate_routing: GateRouting::SlashingScopedShare,
+        gate_method: Some("stage_block"),
+    },
+    #[cfg(feature = "dvt")]
+    SigningMethod {
+        service: DVT_PEER_SERVICE,
+        method: "PartialSignRoot",
+        message_kind: MessageKind::Root,
         gate_routing: GateRouting::NonSlashable,
         gate_method: None,
     },

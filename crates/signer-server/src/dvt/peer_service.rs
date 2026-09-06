@@ -30,6 +30,7 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 use tracing::Span;
+use tree_hash::TreeHash;
 
 use crate::audit;
 use crate::dvt::allow_list::AllowedPeers;
@@ -47,8 +48,9 @@ use crate::proto::signer_v2::{
 use slashing::SlashingDb;
 
 use crate::grpc_common::{
-    decode_attestation_data, decode_beacon_block, decode_fork_info,
-    decode_payload_attestation_data, validate_pubkey, validate_root32,
+    decode_attestation_data, decode_beacon_block, decode_beacon_block_header, decode_fork_info,
+    decode_payload_attestation_data, root_duty_plan, validate_pubkey, validate_root32,
+    validate_transport_fork_id,
 };
 use crate::sign_plan::{plan_sign, PlanInput};
 
@@ -528,22 +530,152 @@ impl PeerSignerService for PeerSignerServiceImpl {
         Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
     }
 
-    /// Wire stub for `PeerSignerService/PartialSignBlockHeader` (4.20a).
-    /// Handler logic is 4.20b.
+    /// `signer.v2.PeerSignerService/PartialSignBlockHeader` (4.20b).
+    ///
+    /// Slashable: hashes the 5-leaf header and stages `slot` from the same
+    /// message via `PubkeyScopedDb`. Transport fork identity uses
+    /// `ForkName::try_from` (Gloas=7 is valid).
+    #[tracing::instrument(
+        name = "signer.dvt.partial_sign_block_header",
+        skip_all,
+        fields(pubkey, slot, peer_cn, share_index)
+    )]
+    #[allow(clippy::result_large_err)]
     async fn partial_sign_block_header(
         &self,
-        _req: Request<PartialSignBlockHeaderRequest>,
+        req: Request<PartialSignBlockHeaderRequest>,
     ) -> Result<Response<PartialSignResponse>, Status> {
-        Err(Status::unimplemented("PartialSignBlockHeader (issue 4.20b)"))
+        let allow_list = Arc::clone(&self.allow_list);
+        let shares = Arc::clone(&self.shares);
+        let db_arc: Arc<SlashingDb> = Arc::clone(self.require_db()?);
+
+        let peer_cn = audit::cn::extract_client_cn(&req);
+        Span::current().record("peer_cn", peer_cn.as_str());
+
+        let r = req.into_inner();
+
+        let share_index = {
+            let allowed = authenticate_peer(&allow_list, &peer_cn, r.requester_index)?;
+            allowed.share_index
+        };
+        Span::current().record("share_index", share_index);
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        validate_transport_fork_id(r.fork_id)?;
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+        let header = decode_beacon_block_header(r.header)?;
+        let slot = header.slot;
+        Span::current().record("slot", slot);
+
+        let object_root = header.tree_hash_root().0;
+        let plan = plan_sign(&PlanInput::Block { object_root, slot, fork_version, gvr });
+        let signing_root = plan.signing_root;
+        let signing_root_hex = Some(root_hex(&signing_root));
+
+        let share =
+            shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        drop(shares);
+
+        let scoped = PubkeyScopedDb::new(db_arc, peer_cn.clone(), gvr);
+        let peer_cn_for_log = peer_cn;
+
+        let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
+            let (staged, audit) = scoped
+                .stage_block(&pubkey_hex_str, slot, signing_root_hex)
+                .map_err(slashing_err)?;
+
+            let sign_result = partial_sign_with_share(&signing_root, &share);
+
+            match sign_result {
+                Ok(sig) => {
+                    let commit_result = staged
+                        .commit()
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")));
+                    audit.emit();
+                    commit_result?;
+                    Ok(sig)
+                }
+                Err(e) => {
+                    staged.discard();
+                    audit.emit();
+                    Err(e)
+                }
+            }
+        })
+        .await
+        .map_err(|join_err| {
+            Status::internal(format!(
+                "partial_sign_block_header blocking task panicked: {join_err}"
+            ))
+        })??;
+
+        tracing::info!(
+            pubkey = %pubkey_hex(&pubkey),
+            slot,
+            peer_cn = %peer_cn_for_log,
+            share_index,
+            "partial_sign_block_header: success"
+        );
+        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
     }
 
-    /// Wire stub for `PeerSignerService/PartialSignRoot` (4.20a).
-    /// Handler logic is 4.20b.
+    /// `signer.v2.PeerSignerService/PartialSignRoot` (4.20b).
+    ///
+    /// Non-slashable: no `PubkeyScopedDb` stage/commit. Same duty mapping as
+    /// `SignRoot`.
+    #[tracing::instrument(
+        name = "signer.dvt.partial_sign_root",
+        skip_all,
+        fields(pubkey, duty, peer_cn, share_index)
+    )]
+    #[allow(clippy::result_large_err)]
     async fn partial_sign_root(
         &self,
-        _req: Request<PartialSignRootRequest>,
+        req: Request<PartialSignRootRequest>,
     ) -> Result<Response<PartialSignResponse>, Status> {
-        Err(Status::unimplemented("PartialSignRoot (issue 4.20b)"))
+        let allow_list = Arc::clone(&self.allow_list);
+        let shares = Arc::clone(&self.shares);
+
+        let peer_cn = audit::cn::extract_client_cn(&req);
+        Span::current().record("peer_cn", peer_cn.as_str());
+
+        let r = req.into_inner();
+
+        let share_index = {
+            let allowed = authenticate_peer(&allow_list, &peer_cn, r.requester_index)?;
+            allowed.share_index
+        };
+        Span::current().record("share_index", share_index);
+        Span::current().record("duty", r.duty);
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        validate_transport_fork_id(r.fork_id)?;
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+        let object_root = validate_root32(&r.object_root, "object_root")?;
+        let planned = root_duty_plan(r.duty, object_root, fork_version, gvr)?;
+        let plan = plan_sign(&planned.input);
+        let signing_root = plan.signing_root;
+
+        let share =
+            shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        drop(shares);
+
+        let sig = partial_sign_with_share(&signing_root, &share)?;
+
+        tracing::info!(
+            pubkey = %pubkey_hex_str,
+            duty = r.duty,
+            peer_cn = %peer_cn,
+            share_index,
+            "partial_sign_root: success"
+        );
+        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
     }
 }
 
@@ -1197,5 +1329,138 @@ mod tests {
             db.get_attestations(&pubkey_hex_str).expect("get_attestations after").len();
         assert_eq!(after_blocks, before_blocks, "PTC must not write a block row");
         assert_eq!(after_atts, before_atts, "PTC must not write an attestation row");
+    }
+
+    fn sample_header(slot: u64) -> crate::proto::signer_v2::BeaconBlockHeader {
+        crate::proto::signer_v2::BeaconBlockHeader {
+            slot,
+            proposer_index: 1,
+            parent_root: vec![0x11; 32],
+            state_root: vec![0x22; 32],
+            body_root: vec![0x33; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_block_header_happy_path_gloas() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let svc = make_service(vec![(pk, share)], al, Some(Arc::clone(&db)));
+
+        let resp = svc
+            .partial_sign_block_header(Request::new(PartialSignBlockHeaderRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                header: Some(sample_header(77)),
+                fork_id: 7,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp.into_inner().partial_signature.len(), 96);
+
+        let blocks = db.get_blocks(&pubkey_hex(&pk)).expect("get_blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].slot, 77);
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_root_payload_attestation_writes_no_slashing_row() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let pubkey_hex_str = pubkey_hex(&pk);
+        let before_blocks = db.get_blocks(&pubkey_hex_str).expect("get_blocks before").len();
+        let before_atts =
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations before").len();
+
+        let svc = make_service(vec![(pk, share)], al, Some(Arc::clone(&db)));
+        let resp = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: sample_payload_attestation_object_root(),
+                duty: crate::proto::signer_v2::Duty::PayloadAttestation as i32,
+                fork_id: 7,
+            }))
+            .await
+            .expect("partial_sign_root PTC");
+        assert_eq!(resp.into_inner().partial_signature.len(), 96);
+
+        assert_eq!(
+            db.get_blocks(&pubkey_hex_str).expect("get_blocks after").len(),
+            before_blocks,
+            "non-slashable root duty must not write a block row"
+        );
+        assert_eq!(
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations after").len(),
+            before_atts,
+            "non-slashable root duty must not write an attestation row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_root_unspecified_duty_rejected_before_share() {
+        let (pk, _) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let svc = make_service(vec![], al, Some(make_db()));
+
+        let err = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: 0,
+                fork_id: 7,
+            }))
+            .await
+            .expect_err("UNSPECIFIED must fail closed");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_ne!(err.code(), tonic::Code::NotFound, "share map must not be consulted");
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_root_fork_id_8_rejected_before_share() {
+        let (pk, _) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let svc = make_service(vec![], al, Some(make_db()));
+
+        let err = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: crate::proto::signer_v2::Duty::PayloadAttestation as i32,
+                fork_id: 8,
+            }))
+            .await
+            .expect_err("fork_id 8 must fail closed");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_ne!(err.code(), tonic::Code::NotFound, "share map must not be consulted");
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_block_header_legacy_ssz_still_rejects_fork_id_7() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let svc = make_service(vec![(pk, share)], al, Some(db));
+
+        let err = svc
+            .partial_sign_beacon_block(Request::new(PartialSignBeaconBlockRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                block_ssz: sample_block_ssz(42),
+                fork_id: 7,
+            }))
+            .await
+            .expect_err("legacy SSZ path must keep rejecting Gloas");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("unknown fork_id: 7"));
     }
 }

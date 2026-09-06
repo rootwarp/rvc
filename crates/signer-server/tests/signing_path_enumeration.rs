@@ -173,11 +173,11 @@ fn all_entries_use_v2_service_path() {
 #[test]
 fn registered_methods_count_matches_live_listener() {
     // Update when a v2 (or DVT) signing method is added/removed
-    // (see crates/signer-registry/src/lib.rs). 10 default / 14 with `--features dvt`.
+    // (see crates/signer-registry/src/lib.rs).
     #[cfg(not(feature = "dvt"))]
-    const EXPECTED: usize = 10;
+    const EXPECTED: usize = 12;
     #[cfg(feature = "dvt")]
-    const EXPECTED: usize = 14;
+    const EXPECTED: usize = 18;
     let run = if cfg!(feature = "dvt") { " --features dvt" } else { " default features" };
     assert_eq!(
         signer_registry::REGISTERED_METHODS.len(),
@@ -343,12 +343,28 @@ fn dvt_partial_sign_methods_are_registered() {
     assert_eq!(ptc.gate_method, None);
     assert!(ptc.enforcement_error().is_none(), "{:?}", ptc.enforcement_error());
 
+    let header = find("PartialSignBlockHeader")
+        .expect("PartialSignBlockHeader must be in REGISTERED_METHODS under --features dvt");
+    assert_eq!(header.message_kind, MessageKind::Block);
+    assert_eq!(header.gate_routing, GateRouting::SlashingScopedShare);
+    assert_eq!(header.gate_method, Some("stage_block"));
+    assert!(header.enforcement_error().is_none(), "{:?}", header.enforcement_error());
+
+    let root = find("PartialSignRoot")
+        .expect("PartialSignRoot must be in REGISTERED_METHODS under --features dvt");
+    assert_eq!(root.message_kind, MessageKind::Root);
+    assert_eq!(root.gate_routing, GateRouting::NonSlashable);
+    assert_eq!(root.gate_method, None);
+    assert!(root.enforcement_error().is_none(), "{:?}", root.enforcement_error());
+
     // Unlisted live DVT RPC fails CI: registry rows must match the proto inventory.
     const LIVE_DVT_RPCS: &[&str] = &[
         "PartialSignBeaconBlock",
         "PartialSignAttestationData",
         "PartialSignSyncCommittee",
         "PartialSignPayloadAttestation",
+        "PartialSignBlockHeader",
+        "PartialSignRoot",
     ];
     let dvt_count = REGISTERED_METHODS.iter().filter(|m| m.service == DVT_PEER_SERVICE).count();
     assert_eq!(

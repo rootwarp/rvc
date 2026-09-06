@@ -19,17 +19,22 @@ use tower::ServiceExt;
 
 use crypto::{compute_domain, compute_signing_root, KeyManager, PublicKey, SecretKey, Signature};
 use eth_types::{
-    AttestationData, Checkpoint, ValidatorRegistrationV1, DOMAIN_APPLICATION_BUILDER,
-    DOMAIN_BEACON_ATTESTER, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    AggregateAndProof, Attestation, AttestationData, BeaconBlockHeader, Checkpoint,
+    ContributionAndProof, PayloadAttestationData, ProposerPreferences, SyncCommitteeContribution,
+    ValidatorRegistrationV1, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
 };
 use signer_server::backend::{SigningBackend, SigningBackendError};
 use signer_server::http_api::{router, AuditCfg, Web3SignerState};
 use signer_server::proto::signer_v2::signer_service_server::SignerService as SignerServiceV2;
 use signer_server::proto::signer_v2::{
-    AttestationData as ProtoAttestationData, Checkpoint as ProtoCheckpoint, ForkInfo,
-    SignAttestationDataRequest, SignBuilderRegistrationRequest, SignRandaoRevealRequest,
+    AttestationData as ProtoAttestationData, BeaconBlockHeader as ProtoBeaconBlockHeader,
+    Checkpoint as ProtoCheckpoint, Duty, ForkInfo, SignAttestationDataRequest,
+    SignBlockHeaderRequest, SignBuilderRegistrationRequest, SignRandaoRevealRequest,
+    SignRootRequest,
 };
 use signer_server::service::SignerServiceImpl;
+use tree_hash::TreeHash;
 
 const GVR: [u8; 32] = [0xab; 32];
 const CURRENT_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
@@ -347,66 +352,276 @@ async fn test_randao_signature_identical_across_transports() {
     assert!(Signature::from_bytes(&grpc_resp).unwrap().verify(&pk, &root).is_ok());
 }
 
-// ── Payload attestation (non-slashable; HTTP-only until 4.20b) ───────────────
-//
-// No v2 SignerService RPC yet (4.20b) and no Web3Signer PAYLOAD_ATTESTATION
-// type yet (4.9b). Future transports build the same PlanInput::PayloadAttestation
-// (object_root + fork_version + gvr) and dispatch through the shared gate.
+fn gloas_fork_info() -> ForkInfo {
+    ForkInfo {
+        previous_version: vec![0x07, 0x00, 0x00, 0x00],
+        current_version: vec![0x07, 0x00, 0x00, 0x01],
+        epoch: 0,
+        genesis_validators_root: vec![0x00; 32],
+    }
+}
+
+fn gloas_http_fork_info() -> String {
+    format!(
+        r#"{{ "fork": {{ "previous_version": "0x07000000",
+                         "current_version": "0x07000001",
+                         "epoch": "0" }},
+              "genesis_validators_root": "0x{gvr}" }}"#,
+        gvr = "00".repeat(32),
+    )
+}
+
+fn deneb_http_fork_info() -> String {
+    format!(
+        r#"{{ "fork": {{ "previous_version": "0x04000000",
+                         "current_version": "0x04000000",
+                         "epoch": "0" }},
+              "genesis_validators_root": "0x{gvr}" }}"#,
+        gvr = hex::encode(GVR),
+    )
+}
+
+// ── Block header (slashable; gRPC SignBlockHeader vs HTTP BLOCK_V2) ──────────
+
+#[tokio::test]
+async fn test_block_header_signature_identical_across_transports() {
+    let s = shared(MAINNET_GENESIS);
+    let header = BeaconBlockHeader {
+        slot: 3_000_000,
+        proposer_index: 12_345,
+        parent_root: [0xaa; 32],
+        state_root: [0xbb; 32],
+        body_root: [0xcc; 32],
+    };
+
+    let grpc_resp = SignerServiceV2::sign_block_header(
+        &grpc_svc(&s),
+        Request::new(SignBlockHeaderRequest {
+            pubkey: s.pubkey.to_vec(),
+            fork_info: Some(fork_info()),
+            header: Some(ProtoBeaconBlockHeader {
+                slot: header.slot,
+                proposer_index: header.proposer_index,
+                parent_root: header.parent_root.to_vec(),
+                state_root: header.state_root.to_vec(),
+                body_root: header.body_root.to_vec(),
+            }),
+            fork_id: 4,
+        }),
+    )
+    .await
+    .expect("gRPC block header")
+    .into_inner()
+    .signature;
+
+    let body = format!(
+        r#"{{ "type": "BLOCK_V2",
+              "fork_info": {fi},
+              "beacon_block": {{ "version": "DENEB",
+                                 "block_header": {{ "slot": "{slot}",
+                                                    "proposer_index": "{idx}",
+                                                    "parent_root": "0x{p}",
+                                                    "state_root": "0x{st}",
+                                                    "body_root": "0x{b}" }} }} }}"#,
+        fi = deneb_http_fork_info(),
+        slot = header.slot,
+        idx = header.proposer_index,
+        p = hex::encode(header.parent_root),
+        st = hex::encode(header.state_root),
+        b = hex::encode(header.body_root),
+    );
+    let http_sig = http_sign(http_state(&s), &s.pubkey, body).await;
+    assert_eq!(grpc_resp, http_sig, "gRPC header and HTTP BLOCK_V2 must match");
+
+    let domain = compute_domain(DOMAIN_BEACON_PROPOSER, CURRENT_VERSION, GVR);
+    let root = compute_signing_root(&header, domain);
+    let pk = PublicKey::from_bytes(&s.pubkey).unwrap();
+    assert!(Signature::from_bytes(&grpc_resp).unwrap().verify(&pk, &root).is_ok());
+}
+
+// ── Aggregate / contribution via SignRoot vs HTTP ────────────────────────────
+
+#[tokio::test]
+async fn test_aggregate_and_proof_root_rpc_matches_http() {
+    let s = shared(MAINNET_GENESIS);
+    let agg = AggregateAndProof {
+        aggregator_index: 1,
+        aggregate: Attestation {
+            aggregation_bits: vec![0x01],
+            data: sample_attestation(),
+            signature: vec![0xAB; 96],
+        },
+        selection_proof: vec![0xCD; 96],
+    };
+    let object_root = agg.try_tree_hash_root().expect("aggregate htr").0;
+
+    let grpc_resp = SignerServiceV2::sign_root(
+        &grpc_svc(&s),
+        Request::new(SignRootRequest {
+            pubkey: s.pubkey.to_vec(),
+            fork_info: Some(fork_info()),
+            object_root: object_root.to_vec(),
+            duty: Duty::AggregateAndProof as i32,
+            fork_id: 4,
+        }),
+    )
+    .await
+    .expect("gRPC SignRoot aggregate")
+    .into_inner()
+    .signature;
+
+    let body = format!(
+        r#"{{ "type": "AGGREGATE_AND_PROOF", "fork_info": {fi}, "aggregate_and_proof": {payload} }}"#,
+        fi = deneb_http_fork_info(),
+        payload = serde_json::to_string(&agg).unwrap(),
+    );
+    let http_sig = http_sign(http_state(&s), &s.pubkey, body).await;
+    assert_eq!(grpc_resp, http_sig, "gRPC SignRoot aggregate must match HTTP");
+}
+
+#[tokio::test]
+async fn test_contribution_and_proof_root_rpc_matches_http() {
+    let s = shared(MAINNET_GENESIS);
+    let cap = ContributionAndProof {
+        aggregator_index: 1,
+        contribution: SyncCommitteeContribution {
+            slot: 5,
+            beacon_block_root: [0x11; 32],
+            subcommittee_index: 0,
+            aggregation_bits: vec![0u8; 16],
+            signature: vec![0xAB; 96],
+        },
+        selection_proof: vec![0xCD; 96],
+    };
+    let object_root = cap.tree_hash_root().0;
+
+    let grpc_resp = SignerServiceV2::sign_root(
+        &grpc_svc(&s),
+        Request::new(SignRootRequest {
+            pubkey: s.pubkey.to_vec(),
+            fork_info: Some(fork_info()),
+            object_root: object_root.to_vec(),
+            duty: Duty::ContributionAndProof as i32,
+            fork_id: 4,
+        }),
+    )
+    .await
+    .expect("gRPC SignRoot contribution")
+    .into_inner()
+    .signature;
+
+    let body = format!(
+        r#"{{ "type": "SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF", "fork_info": {fi}, "contribution_and_proof": {payload} }}"#,
+        fi = deneb_http_fork_info(),
+        payload = serde_json::to_string(&cap).unwrap(),
+    );
+    let http_sig = http_sign(http_state(&s), &s.pubkey, body).await;
+    assert_eq!(grpc_resp, http_sig, "gRPC SignRoot contribution must match HTTP");
+}
+
+// ── Payload attestation (gRPC SignRoot vs HTTP PAYLOAD_ATTESTATION) ──────────
 
 #[tokio::test]
 async fn test_payload_attestation_plan_identical_across_transports() {
     let s = shared(MAINNET_GENESIS);
-    let object_root: [u8; 32] =
-        hex::decode(rvc_spec_vectors::spec_kat::SPEC_GLOAS_PAYLOADATTESTATIONDATA_ROOT)
-            .expect("spec object root hex")
-            .try_into()
-            .expect("32-byte object root");
-    let fork_version = [0x07, 0x00, 0x00, 0x01];
-    let gvr = [0u8; 32];
-    // Same object_root + fork + gvr every transport will hand to plan_sign (4.9b / 4.20b).
-    let domain = compute_domain(DOMAIN_PTC_ATTESTER, fork_version, gvr);
-    let root = compute_signing_root(&object_root, domain);
+    let data = PayloadAttestationData {
+        beacon_block_root: [0x11; 32],
+        slot: 1,
+        payload_present: true,
+        blob_data_available: false,
+    };
+    let object_root = data.tree_hash_root().0;
     assert_eq!(
-        hex::encode(root),
-        rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT,
-        "shared object_root + DOMAIN_PTC_ATTESTER must match the 4.0 KAT"
+        hex::encode(object_root),
+        rvc_spec_vectors::spec_kat::SPEC_GLOAS_PAYLOADATTESTATIONDATA_ROOT
     );
 
-    let pk = PublicKey::from_bytes(&s.pubkey).unwrap();
-    let sig =
-        s.gate.sign_payload_attestation(&pk, root).await.expect("shared-gate payload attestation");
-    assert!(Signature::from_bytes(&sig).unwrap().verify(&pk, &root).is_ok());
+    let grpc_resp = SignerServiceV2::sign_root(
+        &grpc_svc(&s),
+        Request::new(SignRootRequest {
+            pubkey: s.pubkey.to_vec(),
+            fork_info: Some(gloas_fork_info()),
+            object_root: object_root.to_vec(),
+            duty: Duty::PayloadAttestation as i32,
+            fork_id: 7,
+        }),
+    )
+    .await
+    .expect("gRPC SignRoot payload attestation")
+    .into_inner()
+    .signature;
+
+    let body = format!(
+        r#"{{ "type": "PAYLOAD_ATTESTATION",
+              "fork_info": {fi},
+              "payload_attestation": {{ "version": "GLOAS", "data": {data} }} }}"#,
+        fi = gloas_http_fork_info(),
+        data = serde_json::to_string(&data).unwrap(),
+    );
+    let http_sig = http_sign(http_state(&s), &s.pubkey, body).await;
+    assert_eq!(grpc_resp, http_sig, "gRPC SignRoot PTC must match HTTP");
+
+    let kat: [u8; 32] =
+        hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+            .expect("kat hex")
+            .try_into()
+            .expect("32-byte kat");
+    let expected = s.sk.sign(&kat).to_bytes().to_vec();
+    assert_eq!(grpc_resp, expected, "PTC signature must be over KAT_GLOAS_* signing root");
+    let domain = compute_domain(DOMAIN_PTC_ATTESTER, [0x07, 0x00, 0x00, 0x01], [0u8; 32]);
+    assert_eq!(compute_signing_root(&object_root, domain), kat);
 }
 
-// ── Proposer preferences (non-slashable; HTTP-only until 4.20b) ─────────────
-//
-// No v2 SignerService RPC yet (4.20b). Transports build the same
-// PlanInput::ProposerPreferences (object_root + fork_version + gvr) and
-// dispatch through the shared gate.
+// ── Proposer preferences (gRPC SignRoot vs HTTP PROPOSER_PREFERENCES) ────────
 
 #[tokio::test]
 async fn test_proposer_preferences_plan_identical_across_transports() {
     let s = shared(MAINNET_GENESIS);
-    let object_root: [u8; 32] =
-        hex::decode(rvc_spec_vectors::spec_kat::SPEC_GLOAS_PROPOSERPREFERENCES_ROOT)
-            .expect("spec object root hex")
-            .try_into()
-            .expect("32-byte object root");
-    let fork_version = [0x07, 0x00, 0x00, 0x01];
-    let gvr = [0u8; 32];
-    let domain = compute_domain(DOMAIN_PROPOSER_PREFERENCES, fork_version, gvr);
-    let root = compute_signing_root(&object_root, domain);
+    let data = ProposerPreferences {
+        dependent_root: [0x33; 32],
+        proposal_slot: 32,
+        validator_index: 3,
+        fee_recipient: [0x44; 20],
+        target_gas_limit: 36_000_000,
+    };
+    let object_root = data.tree_hash_root().0;
     assert_eq!(
-        hex::encode(root),
-        rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT,
-        "shared object_root + DOMAIN_PROPOSER_PREFERENCES must match the 4.0 KAT"
+        hex::encode(object_root),
+        rvc_spec_vectors::spec_kat::SPEC_GLOAS_PROPOSERPREFERENCES_ROOT
     );
 
-    let pk = PublicKey::from_bytes(&s.pubkey).unwrap();
-    let sig = s
-        .gate
-        .sign_proposer_preferences(&pk, root)
-        .await
-        .expect("shared-gate proposer preferences");
-    assert!(Signature::from_bytes(&sig).unwrap().verify(&pk, &root).is_ok());
+    let grpc_resp = SignerServiceV2::sign_root(
+        &grpc_svc(&s),
+        Request::new(SignRootRequest {
+            pubkey: s.pubkey.to_vec(),
+            fork_info: Some(gloas_fork_info()),
+            object_root: object_root.to_vec(),
+            duty: Duty::ProposerPreferences as i32,
+            fork_id: 7,
+        }),
+    )
+    .await
+    .expect("gRPC SignRoot proposer preferences")
+    .into_inner()
+    .signature;
+
+    let body = format!(
+        r#"{{ "type": "PROPOSER_PREFERENCES",
+              "fork_info": {fi},
+              "proposer_preferences": {{ "version": "GLOAS", "data": {data} }} }}"#,
+        fi = gloas_http_fork_info(),
+        data = serde_json::to_string(&data).unwrap(),
+    );
+    let http_sig = http_sign(http_state(&s), &s.pubkey, body).await;
+    assert_eq!(grpc_resp, http_sig, "gRPC SignRoot proposer preferences must match HTTP");
+
+    let kat: [u8; 32] =
+        hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+            .expect("kat hex")
+            .try_into()
+            .expect("32-byte kat");
+    let expected = s.sk.sign(&kat).to_bytes().to_vec();
+    assert_eq!(grpc_resp, expected);
+    let domain = compute_domain(DOMAIN_PROPOSER_PREFERENCES, [0x07, 0x00, 0x00, 0x01], [0u8; 32]);
+    assert_eq!(compute_signing_root(&object_root, domain), kat);
 }

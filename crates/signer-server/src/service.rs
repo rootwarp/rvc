@@ -1,9 +1,9 @@
 //! gRPC signer service implementation.
 //!
 //! # V2 service (`SignerService` from `signer.v2.proto`)
-//! All 10 typed RPCs are implemented (ISSUE-1.6a–d) and route through
-//! `SigningGate` (Issue 2.10a — D-3).  The legacy v1 raw-root proto surface
-//! was retired in RF2-17; only `signer.v2` is compiled and registered.
+//! Typed v2 RPCs (legacy plus Gloas-safe `SignBlockHeader` / `SignRoot`) route
+//! through `SigningGate` (Issue 2.10a — D-3).  The legacy v1 raw-root proto
+//! surface was retired in RF2-17; only `signer.v2` is compiled and registered.
 //!
 //! # Gate routing (D-3 wiring, Issue 2.10a)
 //!
@@ -50,9 +50,10 @@ use crate::audit;
 use crate::backend::signer_adapter::SigningBackendAsSigner;
 use crate::backend::{SigningBackend, SigningBackendError};
 use crate::grpc_common::{
-    decode_attestation, decode_attestation_data, decode_beacon_block, decode_blinded_beacon_block,
-    decode_fork_info, decode_sync_committee_contribution, validate_pubkey, validate_root32,
-    validate_selection_proof,
+    decode_attestation, decode_attestation_data, decode_beacon_block, decode_beacon_block_header,
+    decode_blinded_beacon_block, decode_fork_info, decode_sync_committee_contribution,
+    root_duty_plan, validate_pubkey, validate_root32, validate_selection_proof,
+    validate_transport_fork_id,
 };
 use crate::metrics::{grpc_sign_type, SignerMetrics};
 use crate::sign_plan::{
@@ -1048,19 +1049,108 @@ impl SignerServiceV2 for SignerServiceImpl {
         Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
-    // Wire stubs for 4.20a; handler logic is 4.20b.
+    // ── SignBlockHeader (Gloas-safe slashable block) ──────────────────────────
+    //
+    // Hashes the 5-leaf header and takes `slot` from the same message. Transport
+    // fork identity uses `ForkName::try_from` (accepts 7); SSZ `validate_fork_id`
+    // is not on this path.
+
+    #[allow(clippy::result_large_err)]
+    #[tracing::instrument(name = "signer.v2.sign_block_header", skip_all, fields(pubkey, slot))]
     async fn sign_block_header(
         &self,
-        _req: Request<SignBlockHeaderRequest>,
+        req: Request<SignBlockHeaderRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        Err(Status::unimplemented("SignBlockHeader (issue 4.20b)"))
+        let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
+        let r = req.into_inner();
+
+        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+
+        validate_transport_fork_id(r.fork_id)?;
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+        let header = decode_beacon_block_header(r.header)?;
+        let slot = header.slot;
+        Span::current().record("slot", slot);
+
+        let object_root = header.tree_hash_root().0;
+        let plan = plan_sign(&PlanInput::Block { object_root, slot, fork_version, gvr });
+
+        let ctx = self.request_ctx(
+            client_cn.clone(),
+            pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            grpc_sign_type::BEACON_BLOCK,
+        );
+        let sig = dispatch_slashable(
+            self.require_gate()?,
+            self.metrics.as_deref(),
+            &self.backend_name,
+            &ctx,
+            &plan,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
+
+        tracing::info!(
+            pubkey = %pubkey_hex_str,
+            slot,
+            client_cn = %client_cn,
+            "sign_block_header: success"
+        );
+        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
+    // ── SignRoot (Gloas-safe non-slashable duties) ────────────────────────────
+
+    #[allow(clippy::result_large_err)]
+    #[tracing::instrument(name = "signer.v2.sign_root", skip_all, fields(pubkey, duty))]
     async fn sign_root(
         &self,
-        _req: Request<SignRootRequest>,
+        req: Request<SignRootRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        Err(Status::unimplemented("SignRoot (issue 4.20b)"))
+        let client_cn = audit::cn::extract_client_cn(&req);
+        self.authorize_client_cn(&client_cn)?;
+        let r = req.into_inner();
+
+        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        Span::current().record("duty", r.duty);
+
+        validate_transport_fork_id(r.fork_id)?;
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+        let object_root = validate_root32(&r.object_root, "object_root")?;
+        let planned = root_duty_plan(r.duty, object_root, fork_version, gvr)?;
+        let plan = plan_sign(&planned.input);
+
+        let ctx = self.request_ctx(
+            client_cn.clone(),
+            pubkey_from_bytes(&pubkey_bytes)?,
+            pubkey_bytes,
+            planned.rpc_type,
+        );
+        let sig = dispatch_non_slashable(
+            self.gate.as_deref(),
+            self.backend.as_ref(),
+            self.metrics.as_deref(),
+            &self.backend_name,
+            &ctx,
+            &plan,
+            planned.op,
+        )
+        .await
+        .map_err(dispatch_err_to_status)?;
+
+        tracing::info!(
+            pubkey = %pubkey_hex_str,
+            duty = r.duty,
+            client_cn = %client_cn,
+            "sign_root: success"
+        );
+        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     async fn list_public_keys(
@@ -1190,6 +1280,67 @@ mod tests {
         // In-memory: avoids SEC-3 CorruptOrEmpty on 0-byte NamedTempFile paths.
         let db = Arc::new(slashing::SlashingDb::open_in_memory().unwrap());
         SignerServiceImpl::new_v2(Arc::new(backend), "basic".to_string(), db)
+    }
+
+    fn make_service_v2_with_db(
+        backend: MockBackend,
+    ) -> (SignerServiceImpl, Arc<slashing::SlashingDb>) {
+        let db = Arc::new(slashing::SlashingDb::open_in_memory().unwrap());
+        let svc =
+            SignerServiceImpl::new_v2(Arc::new(backend), "basic".to_string(), Arc::clone(&db));
+        (svc, db)
+    }
+
+    struct CountingBackend {
+        inner: MockBackend,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl SigningBackend for CountingBackend {
+        async fn sign(
+            &self,
+            signing_root: &[u8; 32],
+            pubkey: &[u8; 48],
+        ) -> Result<[u8; 96], SigningBackendError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.sign(signing_root, pubkey).await
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            self.inner.public_keys()
+        }
+    }
+
+    fn make_counting_service() -> (SignerServiceImpl, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let backend =
+            CountingBackend { inner: MockBackend::with_test_key(), calls: Arc::clone(&calls) };
+        (make_service_v2_from_backend(Arc::new(backend)), calls)
+    }
+
+    fn make_service_v2_from_backend(backend: Arc<dyn SigningBackend>) -> SignerServiceImpl {
+        let db = Arc::new(slashing::SlashingDb::open_in_memory().unwrap());
+        SignerServiceImpl::new_v2(backend, "basic".to_string(), db)
+    }
+
+    fn sample_header(slot: u64) -> crate::proto::signer_v2::BeaconBlockHeader {
+        crate::proto::signer_v2::BeaconBlockHeader {
+            slot,
+            proposer_index: 1,
+            parent_root: vec![0x11; 32],
+            state_root: vec![0x22; 32],
+            body_root: vec![0x33; 32],
+        }
+    }
+
+    fn gloas_fork_info() -> crate::proto::signer_v2::ForkInfo {
+        crate::proto::signer_v2::ForkInfo {
+            previous_version: vec![0x07, 0x00, 0x00, 0x00],
+            current_version: vec![0x07, 0x00, 0x00, 0x01],
+            epoch: 0,
+            genesis_validators_root: vec![0x00; 32],
+        }
     }
 
     fn sample_block_ssz(slot: u64) -> Vec<u8> {
@@ -1696,8 +1847,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_all_v2_handlers_record_sign_total() {
-        // Table-driven across all 10 RPCs so a future handler added without
-        // recording fails the test (RF1-09 / D4 safety net).
+        // Table-driven across ALL labels so a future handler added without
+        // recording fails the test (RF1-09 / D4 safety net). RPCs that reuse
+        // an existing label (header/block, SignRoot aggregate/contribution)
+        // are exercised in their own tests, never appended here.
         use eth_types::{
             encode_attestation_ssz, encode_blinded_beacon_block_ssz,
             encode_sync_committee_contribution_ssz, Attestation, AttestationData,
@@ -1854,8 +2007,33 @@ mod tests {
         .await
         .expect("voluntary_exit");
 
+        // New ALL labels (4.20b delta): SignRoot PTC + proposer preferences.
+        svc.sign_root(Request::new(SignRootRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            object_root: vec![0x11; 32],
+            duty: crate::proto::signer_v2::Duty::PayloadAttestation as i32,
+            fork_id: 7,
+        }))
+        .await
+        .expect("payload_attestation");
+
+        svc.sign_root(Request::new(SignRootRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            object_root: vec![0x22; 32],
+            duty: crate::proto::signer_v2::Duty::ProposerPreferences as i32,
+            fork_id: 7,
+        }))
+        .await
+        .expect("proposer_preferences");
+
         // Every type in the bounded set must have recorded a success.
-        assert_eq!(grpc_sign_type::ALL.len(), 10, "bounded type set must list all 10 RPCs");
+        assert_eq!(
+            grpc_sign_type::ALL.len(),
+            12,
+            "bounded type set must list every dispatched gRPC label"
+        );
         for rpc_type in grpc_sign_type::ALL {
             assert_eq!(
                 metrics.sign_total.with_label_values(&["basic", rpc_type, "success"]).get(),
@@ -1871,6 +2049,276 @@ mod tests {
                 "handler for type={rpc_type} must record duration"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_sign_block_header_records_beacon_block_label_separately() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, metrics) = make_service_v2_with_metrics(MockBackend::with_test_key());
+        svc.sign_block_header(Request::new(SignBlockHeaderRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            header: Some(sample_header(42)),
+            fork_id: 7,
+        }))
+        .await
+        .expect("sign_block_header");
+        assert_eq!(
+            metrics
+                .sign_total
+                .with_label_values(&["basic", grpc_sign_type::BEACON_BLOCK, "success"])
+                .get(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_root_aggregate_records_existing_label_separately() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, metrics) = make_service_v2_with_metrics(MockBackend::with_test_key());
+        svc.sign_root(Request::new(SignRootRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            object_root: vec![0xAA; 32],
+            duty: crate::proto::signer_v2::Duty::AggregateAndProof as i32,
+            fork_id: 4,
+        }))
+        .await
+        .expect("sign_root aggregate");
+        assert_eq!(
+            metrics
+                .sign_total
+                .with_label_values(&["basic", grpc_sign_type::AGGREGATE_AND_PROOF, "success"])
+                .get(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_root_contribution_records_existing_label_separately() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, metrics) = make_service_v2_with_metrics(MockBackend::with_test_key());
+        svc.sign_root(Request::new(SignRootRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            object_root: vec![0xBB; 32],
+            duty: crate::proto::signer_v2::Duty::ContributionAndProof as i32,
+            fork_id: 4,
+        }))
+        .await
+        .expect("sign_root contribution");
+        assert_eq!(
+            metrics
+                .sign_total
+                .with_label_values(&["basic", grpc_sign_type::CONTRIBUTION_AND_PROOF, "success"])
+                .get(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sign_block_header_slashing_row_uses_header_slot() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, db) = make_service_v2_with_db(MockBackend::with_test_key());
+        let header = sample_header(4242);
+        let typed = decode_beacon_block_header(Some(header.clone())).unwrap();
+        svc.sign_block_header(Request::new(SignBlockHeaderRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            header: Some(header),
+            fork_id: 7,
+        }))
+        .await
+        .expect("sign_block_header");
+
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+        let blocks = db.get_blocks(&pubkey_hex).expect("get_blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].slot, 4242, "slashing row slot must come from the hashed header");
+
+        let domain = crypto::compute_domain(
+            eth_types::DOMAIN_BEACON_PROPOSER,
+            [0x04, 0x00, 0x00, 0x00],
+            [0u8; 32],
+        );
+        let signing_root = crypto::compute_signing_root(&typed.tree_hash_root().0, domain);
+        let other = crypto::compute_signing_root(&[0xFFu8; 32], domain);
+        assert_ne!(signing_root, other, "hashed header must not match an unrelated root");
+    }
+
+    #[tokio::test]
+    async fn test_sign_block_header_malformed_root_rejected_before_backend() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, calls) = make_counting_service();
+        let mut header = sample_header(1);
+        header.body_root = vec![0x33; 31];
+        let err = svc
+            .sign_block_header(Request::new(SignBlockHeaderRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                header: Some(header),
+                fork_id: 7,
+            }))
+            .await
+            .expect_err("short body_root must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sign_block_header_fork_id_8_rejected_before_backend() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, calls) = make_counting_service();
+        let err = svc
+            .sign_block_header(Request::new(SignBlockHeaderRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                header: Some(sample_header(1)),
+                fork_id: 8,
+            }))
+            .await
+            .expect_err("fork_id 8 must fail closed");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sign_root_unspecified_and_unknown_duty_rejected_before_backend() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, calls) = make_counting_service();
+        let unspecified = svc
+            .sign_root(Request::new(SignRootRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: crate::proto::signer_v2::Duty::Unspecified as i32,
+                fork_id: 7,
+            }))
+            .await
+            .expect_err("UNSPECIFIED must fail closed");
+        assert_eq!(unspecified.code(), tonic::Code::InvalidArgument);
+
+        let unknown = svc
+            .sign_root(Request::new(SignRootRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: 99,
+                fork_id: 7,
+            }))
+            .await
+            .expect_err("unknown duty must fail closed");
+        assert_eq!(unknown.code(), tonic::Code::InvalidArgument);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sign_root_fork_id_max_rejected_before_backend() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, calls) = make_counting_service();
+        let err = svc
+            .sign_root(Request::new(SignRootRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: crate::proto::signer_v2::Duty::PayloadAttestation as i32,
+                fork_id: u32::MAX,
+            }))
+            .await
+            .expect_err("u32::MAX fork_id must fail closed");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sign_root_unimplemented_duties_produce_no_signature() {
+        let pubkey = test_pubkey_bytes();
+        let (svc, calls) = make_counting_service();
+        for duty in [
+            crate::proto::signer_v2::Duty::ExecutionPayloadEnvelope as i32,
+            crate::proto::signer_v2::Duty::BuilderRequestAuth as i32,
+        ] {
+            let err = svc
+                .sign_root(Request::new(SignRootRequest {
+                    pubkey: pubkey.to_vec(),
+                    fork_info: Some(sample_fork_info()),
+                    object_root: vec![0x11; 32],
+                    duty,
+                    fork_id: 7,
+                }))
+                .await
+                .expect_err("unserved duty must not sign");
+            assert_eq!(err.code(), tonic::Code::Unimplemented);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_sign_root_payload_attestation_matches_kat_gloas() {
+        let pubkey = test_pubkey_bytes();
+        let svc = make_service_v2(MockBackend::with_test_key());
+        let object_root =
+            hex::decode(rvc_spec_vectors::spec_kat::SPEC_GLOAS_PAYLOADATTESTATIONDATA_ROOT)
+                .unwrap();
+        let resp = svc
+            .sign_root(Request::new(SignRootRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(gloas_fork_info()),
+                object_root,
+                duty: crate::proto::signer_v2::Duty::PayloadAttestation as i32,
+                fork_id: 7,
+            }))
+            .await
+            .expect("gloas payload attestation");
+        let kat: [u8; 32] =
+            hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let expected = test_secret_key().sign(&kat).to_bytes().to_vec();
+        assert_eq!(resp.into_inner().signature, expected);
+    }
+
+    #[tokio::test]
+    async fn test_sign_root_proposer_preferences_matches_kat_gloas() {
+        let pubkey = test_pubkey_bytes();
+        let svc = make_service_v2(MockBackend::with_test_key());
+        let object_root =
+            hex::decode(rvc_spec_vectors::spec_kat::SPEC_GLOAS_PROPOSERPREFERENCES_ROOT).unwrap();
+        let resp = svc
+            .sign_root(Request::new(SignRootRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(gloas_fork_info()),
+                object_root,
+                duty: crate::proto::signer_v2::Duty::ProposerPreferences as i32,
+                fork_id: 7,
+            }))
+            .await
+            .expect("gloas proposer preferences");
+        let kat: [u8; 32] =
+            hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let expected = test_secret_key().sign(&kat).to_bytes().to_vec();
+        assert_eq!(resp.into_inner().signature, expected);
+    }
+
+    #[tokio::test]
+    async fn test_legacy_ssz_block_still_rejects_fork_id_7() {
+        let pubkey = test_pubkey_bytes();
+        let svc = make_service_v2(MockBackend::with_test_key());
+        let err = svc
+            .sign_beacon_block(Request::new(SignBeaconBlockRequest {
+                pubkey: pubkey.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                block_ssz: sample_block_ssz(42),
+                fork_id: 7,
+            }))
+            .await
+            .expect_err("legacy SSZ path must keep rejecting Gloas");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("unknown fork_id: 7"));
     }
 
     // ── SEC-4: primary client-CN allow-list ───────────────────────────────────
