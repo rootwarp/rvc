@@ -114,7 +114,7 @@ const fn inv(
 
 /// Exact per-class counts. Update together with [`INVENTORY`] and the audit doc.
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
-    (Class::GeForkName, 8),
+    (Class::GeForkName, 9),
     (Class::IndexZero, 6),
     (Class::MatchForkName, 3),
     (Class::StringDispatch, 4),
@@ -135,7 +135,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/beacon/src/client.rs",
-        398,
+        401,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -195,6 +195,15 @@ const INVENTORY: &[Inv] = &[
         ">= ForkName::Electra",
         Verdict::InheritIntentionally,
         "2.8",
+    ),
+    inv(
+        "crates/timing/src/clock.rs",
+        30,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "4.19",
     ),
     // Class 2
     inv(
@@ -291,7 +300,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        520,
+        530,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -300,7 +309,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        534,
+        544,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -309,7 +318,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        627,
+        637,
         Class::StringDispatch,
         false,
         "matches!(consensus_version",

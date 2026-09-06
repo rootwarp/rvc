@@ -58,8 +58,12 @@ fn test_orchestrator_config_new() {
 fn test_orchestrator_config_default_bps_fields() {
     let config = OrchestratorConfig::new([0xbb; 32], create_test_fork_schedule());
     let defaults = timing::DeadlineBps::default();
-    assert_eq!(config.attestation_due_bps, defaults.attestation);
-    assert_eq!(config.aggregate_due_bps, defaults.aggregate);
+    assert_eq!(config.deadline_schedule.pre_gloas.attestation, defaults.attestation);
+    assert_eq!(config.deadline_schedule.pre_gloas.aggregate, defaults.aggregate);
+    assert_eq!(config.deadline_schedule.gloas.attestation, 2500);
+    assert_eq!(config.deadline_schedule.gloas.aggregate, 5000);
+    assert_eq!(config.deadline_schedule.gloas.payload, 5000);
+    assert_eq!(config.deadline_schedule.gloas.payload_attestation, 7500);
 }
 
 #[test]

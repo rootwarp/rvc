@@ -2,10 +2,38 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eth_types::Slot;
+use eth_types::{ForkName, Slot};
 
 use crate::error::TimingError;
 use crate::{due_ms, DeadlineBps, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+
+/// Pre-Gloas and Gloas deadline sets selected by an already-resolved [`ForkName`].
+///
+/// No `Default`: both sets must be fully specified. 1.7's six Gloas fields have
+/// serde defaults, so a missing member cannot occur at runtime; omitting one at
+/// this boundary is a compile error. Startup errors are reserved for range and
+/// phase order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineSchedule {
+    pub pre_gloas: DeadlineBps,
+    pub gloas: DeadlineBps,
+}
+
+impl DeadlineSchedule {
+    /// Both forks share `deadlines`. Used by 1.6's single-set `with_deadlines`.
+    pub const fn uniform(deadlines: DeadlineBps) -> Self {
+        Self { pre_gloas: deadlines, gloas: deadlines }
+    }
+
+    /// Select the set for an already-resolved fork. Does not compare epochs.
+    pub fn for_fork(&self, fork: ForkName) -> DeadlineBps {
+        if fork >= ForkName::Gloas {
+            self.gloas
+        } else {
+            self.pre_gloas
+        }
+    }
+}
 
 /// Slot timing source.
 ///
@@ -21,6 +49,12 @@ pub trait SlotClock: Send + Sync {
 
     fn deadlines(&self) -> DeadlineBps {
         DeadlineBps::default()
+    }
+
+    /// Deadline set for an already-resolved `fork`. Default body ignores the
+    /// fork and returns [`Self::deadlines`] so 1.6 clocks stay pre-Gloas.
+    fn deadlines_for(&self, _fork: ForkName) -> DeadlineBps {
+        self.deadlines()
     }
 
     fn slot_start_time(&self, slot: Slot) -> u64 {
@@ -48,7 +82,7 @@ pub trait SlotClock: Send + Sync {
         Ok(Duration::from_secs(slot_start - current_time))
     }
 
-    fn time_until_attestation(&self, slot: Slot) -> Result<Duration, TimingError> {
+    fn time_until_due(&self, slot: Slot, bps: u64) -> Result<Duration, TimingError> {
         // Basis-points formula in millisecond arithmetic so the deadline is exact
         // for non-standard slot durations (e.g. 6 s testnets where 1/3 = 2.000 s
         // exactly, but a 7 s slot would be truncated from 2.333 s to 2 s under
@@ -60,14 +94,25 @@ pub trait SlotClock: Send + Sync {
         let current_time_ms = self.current_time_secs() * 1000;
         let slot_start_ms = self.slot_start_time(slot) * 1000;
         let slot_duration_ms = self.slot_duration().as_millis() as u64;
-        let attestation_time_ms =
-            slot_start_ms + due_ms(self.deadlines().attestation, slot_duration_ms);
+        let due_time_ms = slot_start_ms + due_ms(bps, slot_duration_ms);
 
-        if current_time_ms >= attestation_time_ms {
+        if current_time_ms >= due_time_ms {
             return Ok(Duration::ZERO);
         }
 
-        Ok(Duration::from_millis(attestation_time_ms - current_time_ms))
+        Ok(Duration::from_millis(due_time_ms - current_time_ms))
+    }
+
+    fn time_until_attestation(&self, slot: Slot) -> Result<Duration, TimingError> {
+        self.time_until_due(slot, self.deadlines().attestation)
+    }
+
+    fn time_until_attestation_for(
+        &self,
+        slot: Slot,
+        fork: ForkName,
+    ) -> Result<Duration, TimingError> {
+        self.time_until_due(slot, self.deadlines_for(fork).attestation)
     }
 
     fn slot_to_epoch(&self, slot: Slot) -> u64 {
@@ -83,7 +128,7 @@ pub struct SystemSlotClock {
     genesis_time: u64,
     slot_duration: Duration,
     slots_per_epoch: u64,
-    deadlines: DeadlineBps,
+    schedule: DeadlineSchedule,
 }
 
 impl SystemSlotClock {
@@ -101,11 +146,21 @@ impl SystemSlotClock {
             slots_per_epoch,
             "clock created"
         );
-        Ok(Self { genesis_time, slot_duration, slots_per_epoch, deadlines: DeadlineBps::default() })
+        Ok(Self {
+            genesis_time,
+            slot_duration,
+            slots_per_epoch,
+            schedule: DeadlineSchedule::uniform(DeadlineBps::default()),
+        })
     }
 
     pub fn with_deadlines(mut self, deadlines: DeadlineBps) -> Self {
-        self.deadlines = deadlines;
+        self.schedule = DeadlineSchedule::uniform(deadlines);
+        self
+    }
+
+    pub fn with_deadline_schedule(mut self, schedule: DeadlineSchedule) -> Self {
+        self.schedule = schedule;
         self
     }
 
@@ -132,7 +187,11 @@ impl SlotClock for SystemSlotClock {
     }
 
     fn deadlines(&self) -> DeadlineBps {
-        self.deadlines
+        self.schedule.pre_gloas
+    }
+
+    fn deadlines_for(&self, fork: ForkName) -> DeadlineBps {
+        self.schedule.for_fork(fork)
     }
 
     fn current_time_secs(&self) -> u64 {
@@ -162,7 +221,7 @@ pub struct MockSlotClock {
     slot_duration: Duration,
     slots_per_epoch: u64,
     current_time: std::sync::atomic::AtomicU64,
-    deadlines: DeadlineBps,
+    schedule: DeadlineSchedule,
 }
 
 impl MockSlotClock {
@@ -172,12 +231,17 @@ impl MockSlotClock {
             slot_duration,
             slots_per_epoch,
             current_time: std::sync::atomic::AtomicU64::new(genesis_time),
-            deadlines: DeadlineBps::default(),
+            schedule: DeadlineSchedule::uniform(DeadlineBps::default()),
         }
     }
 
     pub fn with_deadlines(mut self, deadlines: DeadlineBps) -> Self {
-        self.deadlines = deadlines;
+        self.schedule = DeadlineSchedule::uniform(deadlines);
+        self
+    }
+
+    pub fn with_deadline_schedule(mut self, schedule: DeadlineSchedule) -> Self {
+        self.schedule = schedule;
         self
     }
 
@@ -213,7 +277,11 @@ impl SlotClock for MockSlotClock {
     }
 
     fn deadlines(&self) -> DeadlineBps {
-        self.deadlines
+        self.schedule.pre_gloas
+    }
+
+    fn deadlines_for(&self, fork: ForkName) -> DeadlineBps {
+        self.schedule.for_fork(fork)
     }
 
     fn current_time_secs(&self) -> u64 {
@@ -549,10 +617,25 @@ mod tests {
         assert_eq!(mock.deadlines().aggregate, crate::AGGREGATE_DUE_BPS);
     }
 
+    fn bps(attestation: u64, aggregate: u64) -> DeadlineBps {
+        DeadlineBps { attestation, aggregate, ..DeadlineBps::default() }
+    }
+
+    fn spec_gloas_bps() -> DeadlineBps {
+        DeadlineBps {
+            attestation: 2500,
+            aggregate: 5000,
+            sync_message: 2500,
+            contribution: 5000,
+            payload: 5000,
+            payload_attestation: 7500,
+        }
+    }
+
     #[test]
     fn test_with_deadlines_2500_bps_12s_is_3000ms() {
         let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
-            .with_deadlines(DeadlineBps { attestation: 2500, aggregate: 6667 });
+            .with_deadlines(bps(2500, 6667));
         clock.set_current_time(TEST_GENESIS_TIME);
         assert_eq!(clock.deadlines().attestation, 2500);
         assert_eq!(clock.time_until_attestation(0).unwrap(), Duration::from_millis(3000));
@@ -561,7 +644,7 @@ mod tests {
     #[test]
     fn test_with_deadlines_7000ms_slot_3333_bps_is_2333ms() {
         let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_millis(7000), 32)
-            .with_deadlines(DeadlineBps { attestation: 3333, aggregate: 6667 });
+            .with_deadlines(bps(3333, 6667));
         clock.set_current_time(TEST_GENESIS_TIME);
         assert_eq!(clock.time_until_attestation(0).unwrap(), Duration::from_millis(2333));
     }
@@ -570,7 +653,56 @@ mod tests {
     fn test_system_slot_clock_with_deadlines() {
         let clock = SystemSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
             .unwrap()
-            .with_deadlines(DeadlineBps { attestation: 2500, aggregate: 4000 });
-        assert_eq!(clock.deadlines(), DeadlineBps { attestation: 2500, aggregate: 4000 });
+            .with_deadlines(bps(2500, 4000));
+        assert_eq!(clock.deadlines(), bps(2500, 4000));
+    }
+
+    #[test]
+    fn test_deadlines_for_selects_pre_gloas_before_gloas_fork() {
+        let schedule =
+            DeadlineSchedule { pre_gloas: DeadlineBps::default(), gloas: spec_gloas_bps() };
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .with_deadline_schedule(schedule);
+        assert_eq!(clock.deadlines_for(ForkName::Fulu), DeadlineBps::default());
+        assert_eq!(clock.deadlines_for(ForkName::Electra).attestation, 3333);
+        assert_eq!(clock.deadlines(), DeadlineBps::default());
+    }
+
+    #[test]
+    fn test_deadlines_for_selects_gloas_set_at_gloas() {
+        let schedule =
+            DeadlineSchedule { pre_gloas: DeadlineBps::default(), gloas: spec_gloas_bps() };
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .with_deadline_schedule(schedule);
+        assert_eq!(clock.deadlines_for(ForkName::Gloas), spec_gloas_bps());
+        assert_eq!(clock.deadlines_for(ForkName::Gloas).payload, 5000);
+        assert_eq!(clock.deadlines_for(ForkName::Gloas).payload_attestation, 7500);
+    }
+
+    #[test]
+    fn test_time_until_attestation_for_gloas_is_3000ms() {
+        let schedule =
+            DeadlineSchedule { pre_gloas: DeadlineBps::default(), gloas: spec_gloas_bps() };
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .with_deadline_schedule(schedule);
+        clock.set_current_time(TEST_GENESIS_TIME);
+        assert_eq!(
+            clock.time_until_attestation_for(0, ForkName::Fulu).unwrap(),
+            Duration::from_millis(3999)
+        );
+        assert_eq!(
+            clock.time_until_attestation_for(0, ForkName::Gloas).unwrap(),
+            Duration::from_millis(3000)
+        );
+        // 1.6 default body stays on the pre-Gloas set.
+        assert_eq!(clock.time_until_attestation(0).unwrap(), Duration::from_millis(3999));
+    }
+
+    #[test]
+    fn test_time_until_due_aggregate_5000_bps_is_6000ms() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32);
+        clock.set_current_time(TEST_GENESIS_TIME);
+        assert_eq!(clock.time_until_due(0, 5000).unwrap(), Duration::from_millis(6000));
+        assert_eq!(clock.time_until_due(0, 6667).unwrap(), Duration::from_millis(8000));
     }
 }

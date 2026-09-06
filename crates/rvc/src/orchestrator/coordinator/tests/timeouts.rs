@@ -242,3 +242,20 @@ fn test_missed_deadline_uses_one_third_bps_at_421_427() {
     // Before the deadline (3 s): not missed.
     assert!(!would_warn((TEST_GENESIS_TIME + 3) * 1000), "3 s in: before the deadline");
 }
+
+#[test]
+fn test_resolved_gloas_deadlines_are_2500_and_5000_bps() {
+    let mut schedule = ForkSchedule::unscheduled_gloas();
+    schedule.gloas_fork_epoch = 1;
+    let config = OrchestratorConfig::new([0xaa; 32], Arc::new(schedule));
+    let pre = ForkName::from_epoch(0, &config.fork_schedule);
+    let gloas = ForkName::from_epoch(1, &config.fork_schedule);
+    let pre_set = config.deadline_schedule.for_fork(pre);
+    let gloas_set = config.deadline_schedule.for_fork(gloas);
+    assert_eq!(due_ms(pre_set.attestation, 12_000), 3999);
+    assert_eq!(due_ms(pre_set.aggregate, 12_000), 8000);
+    assert_eq!(due_ms(gloas_set.attestation, 12_000), 3000);
+    assert_eq!(due_ms(gloas_set.aggregate, 12_000), 6000);
+    assert_eq!(gloas_set.payload, 5000);
+    assert_eq!(gloas_set.payload_attestation, 7500);
+}

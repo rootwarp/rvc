@@ -25,6 +25,7 @@ const PARENT_WALKBACK_ATTEMPTS: u64 = 4;
 
 /// Per-slot chain context. `parent_root` and `head_root` are different
 /// positions, captured at different times.
+#[derive(Clone)]
 pub(crate) struct SlotContext {
     /// The slot this context was captured for.
     pub slot: Slot,

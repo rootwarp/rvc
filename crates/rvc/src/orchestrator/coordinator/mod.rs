@@ -14,7 +14,7 @@ use bn_manager::{AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Prop
 use builder::BuilderService;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
-use eth_types::{ForkSchedule, Root, Slot};
+use eth_types::{ForkName, ForkSchedule, Root, Slot};
 use metrics::definitions::{slot_phase_cache, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS};
 
 use crate::metrics::{
@@ -22,7 +22,7 @@ use crate::metrics::{
     RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS, RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
 };
 use signer::{CircuitBreakerState, SignerService};
-use timing::{due_ms, DeadlineBps, SlotClock, SLOTS_PER_EPOCH};
+use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
@@ -61,13 +61,13 @@ pub struct OrchestratorConfig {
     pub pre_proposal_deadline: Duration,
     /// Proposer-only fetch deadline when the epoch cache is cold (ARCH-3j).
     pub cold_proposer_fetch_deadline: Duration,
-    pub attestation_due_bps: u64,
-    pub aggregate_due_bps: u64,
+    /// Pre-Gloas and Gloas deadline sets. Selected once per slot via
+    /// [`ForkName::from_epoch`]; wait sites consume the resolved [`DeadlineBps`].
+    pub deadline_schedule: DeadlineSchedule,
 }
 
 impl OrchestratorConfig {
     pub fn new(genesis_validators_root: Root, fork_schedule: Arc<ForkSchedule>) -> Self {
-        let deadlines = DeadlineBps::default();
         Self {
             genesis_validators_root,
             fork_schedule,
@@ -75,8 +75,19 @@ impl OrchestratorConfig {
             timeouts: OperationTimeouts::default(),
             pre_proposal_deadline: DEFAULT_PRE_PROPOSAL_DEADLINE,
             cold_proposer_fetch_deadline: COLD_PROPOSER_FETCH_DEADLINE,
-            attestation_due_bps: deadlines.attestation,
-            aggregate_due_bps: deadlines.aggregate,
+            deadline_schedule: DeadlineSchedule {
+                pre_gloas: DeadlineBps::default(),
+                // All six Gloas members required: serde defaults fill omitted TOML
+                // keys, so "missing" is a compile error here, not a startup error.
+                gloas: DeadlineBps {
+                    attestation: 2500,
+                    aggregate: 5000,
+                    sync_message: 2500,
+                    contribution: 5000,
+                    payload: 5000,
+                    payload_attestation: 7500,
+                },
+            },
         }
     }
 
@@ -101,12 +112,17 @@ impl OrchestratorConfig {
     }
 
     pub fn with_attestation_due_bps(mut self, bps: u64) -> Self {
-        self.attestation_due_bps = bps;
+        self.deadline_schedule.pre_gloas.attestation = bps;
         self
     }
 
     pub fn with_aggregate_due_bps(mut self, bps: u64) -> Self {
-        self.aggregate_due_bps = bps;
+        self.deadline_schedule.pre_gloas.aggregate = bps;
+        self
+    }
+
+    pub fn with_deadline_schedule(mut self, schedule: DeadlineSchedule) -> Self {
+        self.deadline_schedule = schedule;
         self
     }
 }
@@ -424,6 +440,10 @@ where
             };
 
             let current_epoch = current_slot / SLOTS_PER_EPOCH;
+            // One resolved fork per slot; wait sites consume `deadlines`, not
+            // `from_epoch` or a BN response shape.
+            let fork = ForkName::from_epoch(current_epoch, &self.config.fork_schedule);
+            let deadlines = self.config.deadline_schedule.for_fork(fork);
 
             let slot_span = info_span!("slot.process", slot = current_slot, epoch = current_epoch,);
 
@@ -436,7 +456,7 @@ where
             // Parent from slot-1 at t=0, bounded by the aggregate pre-proposal
             // deadline (covers the 3d walk-back and the 3j cold-cache fetch).
             // Head is captured at phase 2 and reused at phase 3 (H-5).
-            let mut ctx = match tokio::time::timeout(self.config.pre_proposal_deadline, async {
+            let ctx = match tokio::time::timeout(self.config.pre_proposal_deadline, async {
                 self.maybe_cold_fetch_proposer_duties(current_slot, current_epoch).await;
                 SlotContext::capture_parent(&*self.beacon, current_slot, current_epoch).await
             })
@@ -468,137 +488,33 @@ where
                 return Ok(());
             }
 
-            // === Phase 2: t=slot/3 — Attestations + sync committee messages ===
+            // Duty waits are absolute offsets from slot start, so they run
+            // concurrently after proposal. Sequencing stacked full waits on a
+            // frozen MockSlotClock would fire aggregates at att+agg instead of
+            // agg, and wall-clock production already uses remaining time.
+            let ctx = tokio::sync::Mutex::new(ctx);
+            let att_phase_span = info_span!(parent: &slot_span, "slot.phase.attestation");
+            let agg_phase_span = info_span!(parent: &slot_span, "slot.phase.aggregation");
+            let (att_outcome, agg_outcome) = tokio::join!(
+                self.run_attestation_and_sync_phases(
+                    current_slot,
+                    current_epoch,
+                    &ctx,
+                    deadlines,
+                    att_phase_span,
+                ),
+                self.run_aggregation_and_contribution_phases(
+                    current_slot,
+                    current_epoch,
+                    &ctx,
+                    deadlines,
+                    agg_phase_span,
+                ),
+            );
+            if matches!(att_outcome, WaitOutcome::Shutdown)
+                || matches!(agg_outcome, WaitOutcome::Shutdown)
             {
-                let att_phase_span = info_span!(parent: &slot_span, "slot.phase.attestation");
-
-                let time_until_attestation = self.clock.time_until_attestation(current_slot)?;
-                if !time_until_attestation.is_zero() {
-                    let _guard = att_phase_span.enter();
-                    debug!(
-                        slot = current_slot,
-                        wait_ms = time_until_attestation.as_millis(),
-                        "Waiting for attestation time"
-                    );
-                    drop(_guard);
-
-                    if matches!(
-                        self.wait_for_attestation_or_head(current_slot, time_until_attestation)
-                            .instrument(att_phase_span.clone())
-                            .await,
-                        WaitOutcome::Shutdown
-                    ) {
-                        return Ok(());
-                    }
-                }
-
-                if self.check_shutdown() {
-                    return Ok(());
-                }
-
-                // Head as of phase 2. Phase 3 reuses this value (H-5).
-                ctx.capture_head(&*self.beacon).await;
-
-                // Check for missed attestation deadline.
-                // Basis-points formula in milliseconds (report §4.3), consistent
-                // with `time_until_attestation`: mainnet 1/3 = 3999 ms.
-                {
-                    let deadline =
-                        self.phase_deadline(current_slot, self.config.attestation_due_bps);
-                    let att_window_ms = deadline.offset.as_millis() as u64;
-                    // Only warn if the delay exceeds the expected attestation window
-                    // (i.e., we're past 2/3 of the slot).
-                    if deadline.overrun_ms > att_window_ms {
-                        warn!(
-                            slot = current_slot,
-                            delay_ms = deadline.overrun_ms,
-                            "Missed attestation deadline"
-                        );
-                    }
-                }
-
-                if self.attesting_enabled.load(Ordering::Relaxed) {
-                    if let Err(e) = self
-                        .attestation_service
-                        .process_slot(current_slot)
-                        .instrument(att_phase_span.clone())
-                        .await
-                    {
-                        let _guard = att_phase_span.enter();
-                        match &e {
-                            OrchestratorError::SlotMissed { slot, current_slot } => {
-                                warn!(slot = slot, current_slot = current_slot, "Missed slot");
-                                RVC_ATTESTATIONS_TOTAL
-                                    .with_label_values(&[attestation_status::SKIPPED])
-                                    .inc();
-                            }
-                            OrchestratorError::NoDutiesForSlot { slot } => {
-                                debug!(slot = slot, "No duties for slot");
-                            }
-                            _ => {
-                                error!(slot = current_slot, error = %e, "Error processing slot");
-                            }
-                        }
-                    }
-                } else {
-                    debug!(slot = current_slot, "Attestation duties skipped (disabled)");
-                }
-
-                // H-7: sync-committee messages are gated by `sync_enabled`,
-                // which is independent of `attesting_enabled`. Disabling
-                // attestations no longer silently disables sync-committee duties.
-                self.run_sync_messages_phase(current_slot, current_epoch, &ctx)
-                    .instrument(att_phase_span)
-                    .await;
-            }
-
-            if self.check_shutdown() {
                 return Ok(());
-            }
-
-            // === Phase 3: t=2*slot/3 — Aggregation + sync committee contributions ===
-            {
-                let agg_phase_span = info_span!(parent: &slot_span, "slot.phase.aggregation");
-
-                // Basis-points formula in milliseconds (report §4.3): mainnet
-                // 2/3 = 6667 * 12000 / 10000 = 8000 ms (unchanged from the legacy
-                // `as_secs() * 2 / 3`), but exact for non-12 s / Gloas slots.
-                let deadline = self.phase_deadline(current_slot, self.config.aggregate_due_bps);
-                if !deadline.remaining.is_zero() {
-                    {
-                        let _guard = agg_phase_span.enter();
-                        debug!(
-                            slot = current_slot,
-                            wait_ms = deadline.remaining.as_millis(),
-                            "Waiting for 2/3 slot time"
-                        );
-                    }
-
-                    if matches!(
-                        self.wait_for(deadline.remaining).instrument(agg_phase_span.clone()).await,
-                        WaitOutcome::Shutdown
-                    ) {
-                        return Ok(());
-                    }
-                }
-
-                if self.check_shutdown() {
-                    return Ok(());
-                }
-
-                // H-7: sync contributions gated by `sync_enabled` independently.
-                self.run_sync_contributions_phase(current_slot, current_epoch, &ctx)
-                    .instrument(agg_phase_span.clone())
-                    .await;
-
-                if self.attesting_enabled.load(Ordering::Relaxed) {
-                    self.aggregation_service
-                        .maybe_produce_aggregations(current_slot, current_epoch)
-                        .instrument(agg_phase_span)
-                        .await;
-                } else {
-                    debug!(slot = current_slot, "Aggregation duties skipped (attesting disabled)");
-                }
             }
 
             // === Post-duty: host work in the next-slot wait ===
@@ -762,14 +678,6 @@ where
         }
     }
 
-    /// Wait up to `duration`, returning early if shutdown is requested.
-    ///
-    /// Thin `&mut self` delegate around [`Self::wait_for_shared`]. Phase 2
-    /// uses [`Self::wait_for_attestation_or_head`].
-    async fn wait_for(&mut self, duration: Duration) -> WaitOutcome {
-        self.wait_for_shared(duration).await
-    }
-
     /// Phase-2 wait: [`HeadEventGate::wait_for_head_or`] (timer-only today)
     /// raced with shutdown. ARCH-3m implements the head-event arm in the gate.
     async fn wait_for_attestation_or_head(&self, slot: Slot, timer: Duration) -> WaitOutcome {
@@ -848,6 +756,274 @@ where
                 remaining: Duration::ZERO,
                 overrun_ms: now_ms - deadline_ms,
             }
+        }
+    }
+
+    /// Wait until `bps` into `slot`. Attestation waits use the head-event gate;
+    /// other duties use the timer.
+    async fn wait_until_bps(
+        &self,
+        slot: Slot,
+        bps: u64,
+        use_head_gate: bool,
+        span: &tracing::Span,
+        wait_msg: &'static str,
+    ) -> WaitOutcome {
+        let deadline = self.phase_deadline(slot, bps);
+        if deadline.remaining.is_zero() {
+            return if self.check_shutdown() {
+                WaitOutcome::Shutdown
+            } else {
+                WaitOutcome::Continue
+            };
+        }
+        {
+            let _guard = span.enter();
+            debug!(slot, wait_ms = deadline.remaining.as_millis(), "{}", wait_msg);
+        }
+        if use_head_gate {
+            self.wait_for_attestation_or_head(slot, deadline.remaining)
+                .instrument(span.clone())
+                .await
+        } else {
+            self.wait_for_shared(deadline.remaining).instrument(span.clone()).await
+        }
+    }
+
+    fn warn_if_attestation_overrun(&self, slot: Slot, attestation_due_bps: u64) {
+        let deadline = self.phase_deadline(slot, attestation_due_bps);
+        let att_window_ms = deadline.offset.as_millis() as u64;
+        if deadline.overrun_ms > att_window_ms {
+            warn!(slot, delay_ms = deadline.overrun_ms, "Missed attestation deadline");
+        }
+    }
+
+    async fn capture_head_if_needed(&self, ctx: &tokio::sync::Mutex<SlotContext>) {
+        let mut ctx = ctx.lock().await;
+        if ctx.head_root.is_none() {
+            ctx.capture_head(&*self.beacon).await;
+        }
+    }
+
+    async fn snapshot_ctx(&self, ctx: &tokio::sync::Mutex<SlotContext>) -> SlotContext {
+        ctx.lock().await.clone()
+    }
+
+    async fn run_attestation_phase(&self, current_slot: Slot, att_phase_span: &tracing::Span) {
+        if self.attesting_enabled.load(Ordering::Relaxed) {
+            if let Err(e) = self
+                .attestation_service
+                .process_slot(current_slot)
+                .instrument(att_phase_span.clone())
+                .await
+            {
+                let _guard = att_phase_span.enter();
+                match &e {
+                    OrchestratorError::SlotMissed { slot, current_slot } => {
+                        warn!(slot = slot, current_slot = current_slot, "Missed slot");
+                        RVC_ATTESTATIONS_TOTAL
+                            .with_label_values(&[attestation_status::SKIPPED])
+                            .inc();
+                    }
+                    OrchestratorError::NoDutiesForSlot { slot } => {
+                        debug!(slot = slot, "No duties for slot");
+                    }
+                    _ => {
+                        error!(slot = current_slot, error = %e, "Error processing slot");
+                    }
+                }
+            }
+        } else {
+            debug!(slot = current_slot, "Attestation duties skipped (disabled)");
+        }
+    }
+
+    async fn run_aggregation_phase(
+        &self,
+        current_slot: Slot,
+        current_epoch: u64,
+        agg_phase_span: tracing::Span,
+    ) {
+        if self.attesting_enabled.load(Ordering::Relaxed) {
+            self.aggregation_service
+                .maybe_produce_aggregations(current_slot, current_epoch)
+                .instrument(agg_phase_span)
+                .await;
+        } else {
+            debug!(slot = current_slot, "Aggregation duties skipped (attesting disabled)");
+        }
+    }
+
+    /// Attestations and sync messages share a wait while their bps match;
+    /// otherwise each duty waits from slot start to its own offset.
+    async fn run_attestation_and_sync_phases(
+        &self,
+        current_slot: Slot,
+        current_epoch: u64,
+        ctx: &tokio::sync::Mutex<SlotContext>,
+        deadlines: DeadlineBps,
+        att_phase_span: tracing::Span,
+    ) -> WaitOutcome {
+        if deadlines.attestation == deadlines.sync_message {
+            if matches!(
+                self.wait_until_bps(
+                    current_slot,
+                    deadlines.attestation,
+                    true,
+                    &att_phase_span,
+                    "Waiting for attestation time",
+                )
+                .await,
+                WaitOutcome::Shutdown
+            ) {
+                return WaitOutcome::Shutdown;
+            }
+            if self.check_shutdown() {
+                return WaitOutcome::Shutdown;
+            }
+            self.capture_head_if_needed(ctx).await;
+            self.warn_if_attestation_overrun(current_slot, deadlines.attestation);
+            self.run_attestation_phase(current_slot, &att_phase_span).await;
+            let snapshot = self.snapshot_ctx(ctx).await;
+            self.run_sync_messages_phase(current_slot, current_epoch, &snapshot)
+                .instrument(att_phase_span)
+                .await;
+            return WaitOutcome::Continue;
+        }
+
+        let (att_outcome, sync_outcome) = tokio::join!(
+            async {
+                if matches!(
+                    self.wait_until_bps(
+                        current_slot,
+                        deadlines.attestation,
+                        true,
+                        &att_phase_span,
+                        "Waiting for attestation time",
+                    )
+                    .await,
+                    WaitOutcome::Shutdown
+                ) {
+                    return WaitOutcome::Shutdown;
+                }
+                self.capture_head_if_needed(ctx).await;
+                self.warn_if_attestation_overrun(current_slot, deadlines.attestation);
+                self.run_attestation_phase(current_slot, &att_phase_span).await;
+                WaitOutcome::Continue
+            },
+            async {
+                if matches!(
+                    self.wait_until_bps(
+                        current_slot,
+                        deadlines.sync_message,
+                        false,
+                        &att_phase_span,
+                        "Waiting for sync message time",
+                    )
+                    .await,
+                    WaitOutcome::Shutdown
+                ) {
+                    return WaitOutcome::Shutdown;
+                }
+                self.capture_head_if_needed(ctx).await;
+                let snapshot = self.snapshot_ctx(ctx).await;
+                self.run_sync_messages_phase(current_slot, current_epoch, &snapshot)
+                    .instrument(att_phase_span.clone())
+                    .await;
+                WaitOutcome::Continue
+            },
+        );
+        if matches!(att_outcome, WaitOutcome::Shutdown)
+            || matches!(sync_outcome, WaitOutcome::Shutdown)
+        {
+            WaitOutcome::Shutdown
+        } else {
+            WaitOutcome::Continue
+        }
+    }
+
+    /// Contributions share the aggregate wait while their bps match; otherwise
+    /// each duty waits from slot start to its own offset.
+    async fn run_aggregation_and_contribution_phases(
+        &self,
+        current_slot: Slot,
+        current_epoch: u64,
+        ctx: &tokio::sync::Mutex<SlotContext>,
+        deadlines: DeadlineBps,
+        agg_phase_span: tracing::Span,
+    ) -> WaitOutcome {
+        if deadlines.contribution == deadlines.aggregate {
+            if matches!(
+                self.wait_until_bps(
+                    current_slot,
+                    deadlines.aggregate,
+                    false,
+                    &agg_phase_span,
+                    "Waiting for 2/3 slot time",
+                )
+                .await,
+                WaitOutcome::Shutdown
+            ) {
+                return WaitOutcome::Shutdown;
+            }
+            if self.check_shutdown() {
+                return WaitOutcome::Shutdown;
+            }
+            let snapshot = self.snapshot_ctx(ctx).await;
+            self.run_sync_contributions_phase(current_slot, current_epoch, &snapshot)
+                .instrument(agg_phase_span.clone())
+                .await;
+            self.run_aggregation_phase(current_slot, current_epoch, agg_phase_span).await;
+            return WaitOutcome::Continue;
+        }
+
+        let (contrib_outcome, agg_outcome) = tokio::join!(
+            async {
+                if matches!(
+                    self.wait_until_bps(
+                        current_slot,
+                        deadlines.contribution,
+                        false,
+                        &agg_phase_span,
+                        "Waiting for contribution time",
+                    )
+                    .await,
+                    WaitOutcome::Shutdown
+                ) {
+                    return WaitOutcome::Shutdown;
+                }
+                self.capture_head_if_needed(ctx).await;
+                let snapshot = self.snapshot_ctx(ctx).await;
+                self.run_sync_contributions_phase(current_slot, current_epoch, &snapshot)
+                    .instrument(agg_phase_span.clone())
+                    .await;
+                WaitOutcome::Continue
+            },
+            async {
+                if matches!(
+                    self.wait_until_bps(
+                        current_slot,
+                        deadlines.aggregate,
+                        false,
+                        &agg_phase_span,
+                        "Waiting for aggregate time",
+                    )
+                    .await,
+                    WaitOutcome::Shutdown
+                ) {
+                    return WaitOutcome::Shutdown;
+                }
+                self.run_aggregation_phase(current_slot, current_epoch, agg_phase_span.clone())
+                    .await;
+                WaitOutcome::Continue
+            },
+        );
+        if matches!(contrib_outcome, WaitOutcome::Shutdown)
+            || matches!(agg_outcome, WaitOutcome::Shutdown)
+        {
+            WaitOutcome::Shutdown
+        } else {
+            WaitOutcome::Continue
         }
     }
 

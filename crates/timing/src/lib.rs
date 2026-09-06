@@ -8,7 +8,7 @@
 mod clock;
 mod error;
 
-pub use clock::{MockSlotClock, SlotClock, SystemSlotClock};
+pub use clock::{DeadlineSchedule, MockSlotClock, SlotClock, SystemSlotClock};
 pub use error::TimingError;
 
 pub use eth_types::{SLOTS_PER_EPOCH, SLOT_DURATION_MS};
@@ -32,16 +32,34 @@ pub const ATTESTATION_DUE_BPS: u64 = 3333;
 /// mark (matching the legacy `12000 * 2 / 3 = 8000 ms`).
 pub const AGGREGATE_DUE_BPS: u64 = 6667;
 
-/// Intra-slot attestation and aggregation deadlines as basis points of the slot.
+/// Intra-slot duty deadlines as basis points of the slot.
+///
+/// All six members are required at construction. `Default` is the pre-Gloas
+/// 1.5/1.6 pair (3333 / 6667) with the other four matching current wait-sharing
+/// (`sync_message` = attestation, `contribution` / unused payload fields =
+/// aggregate). The Gloas set is built without `Default` so omitting a member is
+/// a compile error; 1.7 serde defaults already fill missing TOML keys, so a
+/// runtime "missing" case cannot occur.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeadlineBps {
     pub attestation: u64,
     pub aggregate: u64,
+    pub sync_message: u64,
+    pub contribution: u64,
+    pub payload: u64,
+    pub payload_attestation: u64,
 }
 
 impl Default for DeadlineBps {
     fn default() -> Self {
-        Self { attestation: ATTESTATION_DUE_BPS, aggregate: AGGREGATE_DUE_BPS }
+        Self {
+            attestation: ATTESTATION_DUE_BPS,
+            aggregate: AGGREGATE_DUE_BPS,
+            sync_message: ATTESTATION_DUE_BPS,
+            contribution: AGGREGATE_DUE_BPS,
+            payload: AGGREGATE_DUE_BPS,
+            payload_attestation: AGGREGATE_DUE_BPS,
+        }
     }
 }
 

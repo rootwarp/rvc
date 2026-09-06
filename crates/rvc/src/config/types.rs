@@ -917,6 +917,27 @@ impl Config {
             }
         }
 
+        if self.timing.attestation_due_bps_gloas > self.timing.aggregate_due_bps_gloas {
+            return Err(ConfigError::Invalid {
+                field: "timing.aggregate_due_bps_gloas",
+                message: format!(
+                    "must be >= timing.attestation_due_bps_gloas ({}), got {}",
+                    self.timing.attestation_due_bps_gloas, self.timing.aggregate_due_bps_gloas
+                ),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        if self.timing.aggregate_due_bps_gloas > self.timing.payload_attestation_due_bps {
+            return Err(ConfigError::Invalid {
+                field: "timing.payload_attestation_due_bps",
+                message: format!(
+                    "must be >= timing.aggregate_due_bps_gloas ({}), got {}",
+                    self.timing.aggregate_due_bps_gloas, self.timing.payload_attestation_due_bps
+                ),
+                source_layer: ConfigSource::Default,
+            });
+        }
+
         // Validate proposer node URLs
         for node_url in &self.proposer_nodes {
             if node_url.is_empty() {
@@ -1587,7 +1608,7 @@ aggregate_due_bps_gloas = 6667
 sync_message_due_bps_gloas = 1111
 contribution_due_bps_gloas = 2222
 payload_due_bps = 3333
-payload_attestation_due_bps = 4444
+payload_attestation_due_bps = 8000
 "#,
         )
         .expect("[timing] Gloas keys must bind through ConfigWire");
@@ -1596,7 +1617,7 @@ payload_attestation_due_bps = 4444
         assert_eq!(config.timing.sync_message_due_bps_gloas, 1111);
         assert_eq!(config.timing.contribution_due_bps_gloas, 2222);
         assert_eq!(config.timing.payload_due_bps, 3333);
-        assert_eq!(config.timing.payload_attestation_due_bps, 4444);
+        assert_eq!(config.timing.payload_attestation_due_bps, 8000);
         assert_eq!(config.timing.attestation_due_bps, 3333);
         assert_eq!(config.timing.aggregate_due_bps, 6667);
         assert!(config.validate().is_ok());
@@ -1700,6 +1721,38 @@ payload_attestation_due_bps = 10001
         let err = config.validate().expect_err("bps=10001 must fail validate");
         let msg = err.to_string();
         assert!(msg.contains("timing.payload_attestation_due_bps"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_phase_order_names_aggregate_when_before_attestation() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+attestation_due_bps_gloas = 5000
+aggregate_due_bps_gloas = 4000
+"#,
+        )
+        .expect("in-range values; reject at validate");
+        let err = config.validate().expect_err("attestation > aggregate must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.aggregate_due_bps_gloas"), "{msg}");
+        assert!(msg.contains("4000"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_phase_order_names_payload_attestation_when_before_aggregate() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+aggregate_due_bps_gloas = 5000
+payload_attestation_due_bps = 4000
+"#,
+        )
+        .expect("in-range values; reject at validate");
+        let err = config.validate().expect_err("aggregate > payload_attestation must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.payload_attestation_due_bps"), "{msg}");
+        assert!(msg.contains("4000"), "{msg}");
     }
 
     #[test]

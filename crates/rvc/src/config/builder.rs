@@ -20,9 +20,10 @@ use doppelganger::{
 };
 use duty_tracker::DutyTracker;
 use eth_types::{Epoch, ForkSchedule, Root};
+use rvc_config::TimingConfig;
 use signer::{SignerService, ValidatorSigner};
 use slashing::{GroupCommitConfig, SlashingDb};
-use timing::{DeadlineBps, SystemSlotClock};
+use timing::{DeadlineBps, DeadlineSchedule, SystemSlotClock};
 use validator_store::ValidatorStore;
 
 use secret_provider::SecretProvider;
@@ -504,10 +505,7 @@ impl ServiceBuilder {
 
         let clock = SystemSlotClock::new(genesis_time, slot_duration, slots_per_epoch)
             .map_err(|e| ConfigError::MissingField(format!("invalid slot clock: {e}")))?
-            .with_deadlines(DeadlineBps {
-                attestation: self.config.timing.attestation_due_bps,
-                aggregate: self.config.timing.aggregate_due_bps,
-            });
+            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing));
         info!(
             genesis_time = genesis_time,
             slot_duration_ms,
@@ -720,8 +718,32 @@ impl ServiceBuilder {
     ) -> OrchestratorConfig {
         OrchestratorConfig::new(genesis_validators_root, fork_schedule)
             .with_shutdown_timeout(Duration::from_secs(30))
-            .with_attestation_due_bps(self.config.timing.attestation_due_bps)
-            .with_aggregate_due_bps(self.config.timing.aggregate_due_bps)
+            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing))
+    }
+}
+
+/// Build both deadline sets from `[timing]`. Gloas members are listed in full so
+/// omitting one is a compile error; 1.7 serde defaults already fill missing TOML
+/// keys, so runtime "missing" cannot occur.
+fn deadline_schedule_from_timing(timing: &TimingConfig) -> DeadlineSchedule {
+    DeadlineSchedule {
+        pre_gloas: DeadlineBps {
+            attestation: timing.attestation_due_bps,
+            aggregate: timing.aggregate_due_bps,
+            // Pre-Gloas waits: sync messages share attestation, contributions share aggregate.
+            sync_message: timing.attestation_due_bps,
+            contribution: timing.aggregate_due_bps,
+            payload: timing.aggregate_due_bps,
+            payload_attestation: timing.aggregate_due_bps,
+        },
+        gloas: DeadlineBps {
+            attestation: timing.attestation_due_bps_gloas,
+            aggregate: timing.aggregate_due_bps_gloas,
+            sync_message: timing.sync_message_due_bps_gloas,
+            contribution: timing.contribution_due_bps_gloas,
+            payload: timing.payload_due_bps,
+            payload_attestation: timing.payload_attestation_due_bps,
+        },
     }
 }
 
@@ -1107,8 +1129,14 @@ mod tests {
 
         assert_eq!(orch_config.genesis_validators_root, root);
         assert_eq!(orch_config.shutdown_timeout, Duration::from_secs(30));
-        assert_eq!(orch_config.attestation_due_bps, 3333);
-        assert_eq!(orch_config.aggregate_due_bps, 6667);
+        assert_eq!(orch_config.deadline_schedule.pre_gloas.attestation, 3333);
+        assert_eq!(orch_config.deadline_schedule.pre_gloas.aggregate, 6667);
+        assert_eq!(orch_config.deadline_schedule.gloas.attestation, 2500);
+        assert_eq!(orch_config.deadline_schedule.gloas.aggregate, 5000);
+        assert_eq!(orch_config.deadline_schedule.gloas.sync_message, 2500);
+        assert_eq!(orch_config.deadline_schedule.gloas.contribution, 5000);
+        assert_eq!(orch_config.deadline_schedule.gloas.payload, 5000);
+        assert_eq!(orch_config.deadline_schedule.gloas.payload_attestation, 7500);
     }
 
     #[test]
@@ -1123,8 +1151,8 @@ mod tests {
         };
         let builder = ServiceBuilder::new(config);
         let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
-        assert_eq!(orch_config.attestation_due_bps, 2500);
-        assert_eq!(orch_config.aggregate_due_bps, 4000);
+        assert_eq!(orch_config.deadline_schedule.pre_gloas.attestation, 2500);
+        assert_eq!(orch_config.deadline_schedule.pre_gloas.aggregate, 4000);
     }
 
     #[test]
@@ -1147,10 +1175,32 @@ mod tests {
         let orch = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
         assert_eq!(clock.deadlines().attestation, 3333);
         assert_eq!(clock.deadlines().aggregate, 6667);
-        assert_eq!(orch.attestation_due_bps, 3333);
-        assert_eq!(orch.aggregate_due_bps, 6667);
+        assert_eq!(orch.deadline_schedule.pre_gloas.attestation, 3333);
+        assert_eq!(orch.deadline_schedule.pre_gloas.aggregate, 6667);
+        assert_eq!(orch.deadline_schedule.gloas.aggregate, 6667);
+        assert_eq!(orch.deadline_schedule.gloas.contribution, 5000);
+        assert_eq!(orch.deadline_schedule.gloas.payload, 5000);
         assert_eq!(timing::due_ms(clock.deadlines().attestation, 12_000), 3999);
         assert_eq!(timing::due_ms(clock.deadlines().aggregate, 12_000), 8000);
+    }
+
+    #[test]
+    fn test_aggregate_due_bps_gloas_toml_changes_offset_without_rebuild() {
+        let root = [0xaau8; 32];
+        let schedule = sample_fork_schedule();
+        let defaulted = ServiceBuilder::new(create_minimal_config())
+            .build_orchestrator_config(root, schedule.clone());
+        assert_eq!(defaulted.deadline_schedule.gloas.aggregate, 5000);
+        assert_eq!(timing::due_ms(defaulted.deadline_schedule.gloas.aggregate, 12_000), 6000);
+
+        let timing: TimingConfig =
+            toml::from_str("aggregate_due_bps_gloas = 6667").expect("TOML-only override");
+        let mut config = create_minimal_config();
+        config.timing = timing;
+        let orch = ServiceBuilder::new(config).build_orchestrator_config(root, schedule);
+        assert_eq!(orch.deadline_schedule.gloas.aggregate, 6667);
+        assert_eq!(timing::due_ms(orch.deadline_schedule.gloas.aggregate, 12_000), 8000);
+        assert_eq!(orch.deadline_schedule.pre_gloas.aggregate, 6667);
     }
 
     #[test]
