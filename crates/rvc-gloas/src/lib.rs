@@ -18,12 +18,18 @@ pub const ACTIVE_FIELDS_EXECUTION_REQUESTS: &[bool] = &[true, true, true, true, 
 /// Gloas `PayloadAttestation` EIP-7495 `active_fields` at `SPEC_TAG` (width 3, all-ones).
 pub const ACTIVE_FIELDS_PAYLOAD_ATTESTATION: &[bool] = &[true, true, true];
 
+/// Gloas `BeaconBlockBody` EIP-7495 `active_fields` at `SPEC_TAG` (width 13, all-ones).
+pub const ACTIVE_FIELDS_BEACON_BLOCK_BODY: &[bool] =
+    &[true, true, true, true, true, true, true, true, true, true, true, true, true];
+
 const _: () = assert!(ACTIVE_FIELDS_ATTESTATION.len() == 4);
 const _: () = assert!(ACTIVE_FIELDS_INDEXED_ATTESTATION.len() == 3);
 const _: () = assert!(ACTIVE_FIELDS_EXECUTION_REQUESTS.len() == 5);
 const _: () = assert!(ACTIVE_FIELDS_PAYLOAD_ATTESTATION.len() == 3);
+const _: () = assert!(ACTIVE_FIELDS_BEACON_BLOCK_BODY.len() == 13);
 
 mod containers;
+mod error;
 mod merkle;
 
 #[cfg(test)]

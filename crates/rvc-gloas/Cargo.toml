@@ -16,3 +16,7 @@ libssz.workspace = true
 libssz-derive.workspace = true
 libssz-merkle.workspace = true
 libssz-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
