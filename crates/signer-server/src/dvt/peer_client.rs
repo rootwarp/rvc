@@ -5,7 +5,7 @@ use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
 
-use crate::backend::dvt::{PartialSignDuty, PeerRequestError, PeerRequester};
+use crate::backend::dvt::{PartialSignDuty, PeerPartial, PeerRequestError, PeerRequester};
 use crate::dvt::allow_list::AllowedPeers;
 use crate::grpc_tls::TlsConfig;
 use crate::proto::signer_v2::peer_signer_service_client::PeerSignerServiceClient;
@@ -254,6 +254,10 @@ impl GrpcPeerRequester {
     ///
     /// Returns a vector of `(share_index, partial_signature)` for successful responses.
     /// Peers that fail or timeout are logged and skipped.
+    ///
+    /// **Unused by `DvtSigner`.** Aggregation (including the 4.11c PTC bind to
+    /// the coordinator signing root) lives in `DvtSigner::coordinate`. This
+    /// helper does not apply that filter; do not combine its results for PTC.
     pub async fn request_all_partials(
         &self,
         duty: &PartialSignDuty,
@@ -324,7 +328,7 @@ impl PeerRequester for GrpcPeerRequester {
         duty: &PartialSignDuty,
         pubkey: &[u8; 48],
         requester_index: u64,
-    ) -> Result<(u64, [u8; 96]), PeerRequestError> {
+    ) -> Result<PeerPartial, PeerRequestError> {
         let (_, client) =
             self.peers.iter().find(|(addr, _)| addr == peer_addr).ok_or_else(|| {
                 PeerRequestError::RequestFailed(format!("peer not found: {}", peer_addr))
@@ -345,7 +349,11 @@ impl PeerRequester for GrpcPeerRequester {
             PeerRequestError::RequestFailed("invalid signature length from peer".to_string())
         })?;
 
-        Ok((inner.share_index, sig))
+        // gRPC `PartialSignResponse` has no session fields. Do not stamp the
+        // request session onto the response (that made the 4.11c tag filter a
+        // tautology). `ptc_session: None`; `DvtSigner::coordinate` binds the
+        // 96-byte share to the coordinator signing root.
+        Ok(PeerPartial { share_index: inner.share_index, signature: sig, ptc_session: None })
     }
 }
 

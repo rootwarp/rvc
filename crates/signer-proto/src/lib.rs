@@ -474,7 +474,7 @@ mod tests {
 
     #[cfg(feature = "server")]
     #[test]
-    fn test_server_stub_includes_sign_block_header_and_sign_root() {
+    fn test_server_stub_includes_sign_block_header_and_sign_root_rpc() {
         use tonic::{Request, Response, Status};
 
         use crate::signer_v2::signer_service_server::SignerService;
@@ -582,7 +582,7 @@ mod tests {
 
     #[cfg(feature = "client")]
     #[test]
-    fn test_client_stub_includes_sign_block_header_and_sign_root() {
+    fn test_client_stub_includes_sign_block_header_and_sign_root_rpc() {
         use crate::signer_v2::signer_service_client::SignerServiceClient;
 
         async fn call_rpcs<T>(

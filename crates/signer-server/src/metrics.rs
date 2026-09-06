@@ -578,6 +578,37 @@ mod tests {
             assert!(names.contains(&"rvc_signer_dvt_partial_sign_duration_seconds"));
         }
 
+        /// 4.11c / D4: reuse `threshold_failures_total`; do not register a new family.
+        /// Pins DVT family *identity*, not an absolute family count.
+        #[test]
+        fn test_signer_server_dvt_metric_families_unchanged() {
+            let m = SignerMetrics::new();
+            // Touch each existing family so gather() emits them.
+            m.dvt.coordination_duration_seconds.with_label_values(&[] as &[&str]).observe(0.0);
+            m.dvt.peers_responded.with_label_values(&[] as &[&str]).observe(0.0);
+            m.dvt.threshold_failures_total.with_label_values(&[] as &[&str]).inc();
+            m.dvt.partial_sign_duration_seconds.with_label_values(&["peer"]).observe(0.0);
+
+            let gathered = m.registry.gather();
+            let names: Vec<&str> = gathered.iter().map(|mf| mf.name()).collect();
+            assert!(
+                !names.iter().any(|n| n.contains("disagreement") || n.contains("ptc_session")),
+                "4.11c must not register a disagreement/session family: {names:?}"
+            );
+            let mut dvt: Vec<&str> =
+                names.iter().copied().filter(|n| n.starts_with("rvc_signer_dvt_")).collect();
+            dvt.sort_unstable();
+            assert_eq!(
+                dvt,
+                [
+                    "rvc_signer_dvt_coordination_duration_seconds",
+                    "rvc_signer_dvt_partial_sign_duration_seconds",
+                    "rvc_signer_dvt_peers_responded",
+                    "rvc_signer_dvt_threshold_failures_total",
+                ]
+            );
+        }
+
         #[test]
         fn test_dvt_coordination_duration_records() {
             let m = SignerMetrics::new();

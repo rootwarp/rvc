@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use tracing::info;
 
+use observability::logging::TruncatedRoot;
+
 use super::{SigningBackend, SigningBackendError};
 use crate::dvt::lagrange::{combine_partial_signatures, verify_combined_signature};
 use crate::dvt::types::ShareInfo;
@@ -45,6 +47,145 @@ pub enum PartialSignDuty {
     },
 }
 
+/// PTC aggregation session: the requesting VC's planned root and fork version.
+///
+/// Peers cannot consult a BN (`SIGNER_SERVER_ALLOWED_EDGES` forbids a
+/// `beacon` / `bn-manager` edge). Agreement is this pair only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PtcSessionIdentity {
+    pub object_root: [u8; 32],
+    pub fork_version: [u8; 4],
+}
+
+/// Partial signature collected from a DVT peer.
+#[derive(Debug, Clone, Copy)]
+pub struct PeerPartial {
+    pub share_index: u64,
+    pub signature: [u8; 96],
+    /// Session the peer signed, when known. PTC aggregation excludes a
+    /// partial whose planned root or `fork_version` differs from the
+    /// coordinator's — never aggregate across fork versions (4.11c).
+    ///
+    /// Production gRPC responses have no session fields (`None`). Do not
+    /// stamp the request session onto a response; bind `None` partials to
+    /// the coordinator signing root instead of treating `None` as agree.
+    pub ptc_session: Option<PtcSessionIdentity>,
+}
+
+impl From<(u64, [u8; 96])> for PeerPartial {
+    fn from((share_index, signature): (u64, [u8; 96])) -> Self {
+        Self { share_index, signature, ptc_session: None }
+    }
+}
+
+/// Coordinator view of a `PartialSignDuty` for the PTC aggregation filter.
+enum PtcDutyKind {
+    NotPtc,
+    Session(PtcSessionIdentity),
+    /// `PayloadAttestation` whose `object_root` is not 32 bytes or
+    /// `fork_info.current_version` is not 4 bytes.
+    Unparsable,
+}
+
+impl PartialSignDuty {
+    fn ptc_duty_kind(&self) -> PtcDutyKind {
+        match self {
+            Self::PayloadAttestation { fork_info, object_root, .. } => {
+                match (
+                    <[u8; 32]>::try_from(object_root.as_slice()),
+                    <[u8; 4]>::try_from(fork_info.current_version.as_slice()),
+                ) {
+                    (Ok(object_root), Ok(fork_version)) => {
+                        PtcDutyKind::Session(PtcSessionIdentity { object_root, fork_version })
+                    }
+                    _ => PtcDutyKind::Unparsable,
+                }
+            }
+            _ => PtcDutyKind::NotPtc,
+        }
+    }
+}
+
+/// Whether a tagged PTC session may enter the combine set.
+///
+/// Non-PTC duties always agree. `None` is unknown (gRPC wire) and is kept
+/// here — [`bind_ptc_partials_to_signing_root`] binds those to the
+/// coordinator signing root. Unparsable coordinator identity is fail-closed.
+fn ptc_partial_agrees_with_session(duty: &PartialSignDuty, partial: &PeerPartial) -> bool {
+    match duty.ptc_duty_kind() {
+        PtcDutyKind::NotPtc => true,
+        PtcDutyKind::Unparsable => false,
+        PtcDutyKind::Session(session) => match partial.ptc_session {
+            None => true,
+            Some(peer) => {
+                peer.object_root == session.object_root && peer.fork_version == session.fork_version
+            }
+        },
+    }
+}
+
+/// `ShareInfo` has only this node's scalar and the aggregate pubkey — no
+/// per-share verification keys. Bind PTC partials by selecting a subset
+/// whose Lagrange combine verifies on the coordinator `signing_root`.
+fn bind_ptc_partials_to_signing_root(
+    partials: &[(u64, [u8; 96])],
+    threshold: u64,
+    pubkey: &[u8; 48],
+    signing_root: &[u8; 32],
+) -> Vec<(u64, [u8; 96])> {
+    let n = partials.len();
+    let t = threshold as usize;
+    if n < t {
+        return partials.to_vec();
+    }
+    for size in (t..=n).rev() {
+        let mut found = None;
+        each_index_combination(n, size, |idxs| {
+            let subset: Vec<_> = idxs.iter().map(|&i| partials[i]).collect();
+            if let Ok(combined) = combine_partial_signatures(&subset) {
+                if verify_combined_signature(&combined, pubkey, signing_root).is_ok() {
+                    found = Some(subset);
+                    return true;
+                }
+            }
+            false
+        });
+        if let Some(subset) = found {
+            return subset;
+        }
+    }
+    // No verifying subset ≥ threshold: keep the local share so the
+    // existing threshold check fires (not combined-signature verification).
+    partials.first().copied().into_iter().collect()
+}
+
+/// Visit k-combinations of `0..n`. `visit` returns true to stop.
+fn each_index_combination(n: usize, k: usize, mut visit: impl FnMut(&[usize]) -> bool) -> bool {
+    if k == 0 || k > n {
+        return false;
+    }
+    let mut c: Vec<usize> = (0..k).collect();
+    loop {
+        if visit(&c) {
+            return true;
+        }
+        let mut i = k;
+        loop {
+            if i == 0 {
+                return false;
+            }
+            i -= 1;
+            if c[i] < n - k + i {
+                c[i] += 1;
+                for j in i + 1..k {
+                    c[j] = c[j - 1] + 1;
+                }
+                break;
+            }
+        }
+    }
+}
+
 /// Trait for requesting partial signatures from remote DVT peers.
 #[async_trait]
 pub trait PeerRequester: Send + Sync {
@@ -58,7 +199,7 @@ pub trait PeerRequester: Send + Sync {
         duty: &PartialSignDuty,
         pubkey: &[u8; 48],
         requester_index: u64,
-    ) -> Result<(u64, [u8; 96]), PeerRequestError>;
+    ) -> Result<PeerPartial, PeerRequestError>;
 }
 
 /// Error returned by peer partial-signature requests.
@@ -175,6 +316,14 @@ impl DvtSigner {
     ) -> Result<[u8; 96], SigningBackendError> {
         let key_info = self.keys.get(pubkey).ok_or(SigningBackendError::KeyNotFound(*pubkey))?;
 
+        if let Some(d) = duty {
+            if matches!(d.ptc_duty_kind(), PtcDutyKind::Unparsable) {
+                return Err(SigningBackendError::SigningFailed(
+                    "PTC duty has unparsable object_root or fork_version".to_string(),
+                ));
+            }
+        }
+
         let threshold = key_info.share.threshold;
         let span = tracing::Span::current();
         span.record("threshold", threshold);
@@ -228,13 +377,31 @@ impl DvtSigner {
             while let Some(result) = join_set.join_next().await {
                 match result {
                     Ok((addr, Ok(Ok(partial)), elapsed)) => {
-                        partials.push(partial);
-                        peers_responded += 1;
                         if let Some(ref m) = self.metrics {
                             m.partial_sign_duration_seconds
                                 .with_label_values(&[&addr])
                                 .observe(elapsed.as_secs_f64());
                         }
+                        peers_responded += 1;
+                        // 4.11c: drop PTC partials that disagree on planned
+                        // root or fork_version so they cannot enter combine.
+                        if !ptc_partial_agrees_with_session(duty, &partial) {
+                            let (root, fork) = match partial.ptc_session {
+                                Some(s) => (
+                                    TruncatedRoot::new(&s.object_root).to_string(),
+                                    TruncatedRoot::new(&s.fork_version).to_string(),
+                                ),
+                                None => ("unknown".to_string(), "unknown".to_string()),
+                            };
+                            tracing::warn!(
+                                peer = %addr,
+                                object_root = %root,
+                                fork_version = %fork,
+                                "excluding DVT PTC partial: planned root or fork_version disagrees with session"
+                            );
+                            continue;
+                        }
+                        partials.push((partial.share_index, partial.signature));
                     }
                     Ok((addr, Ok(Err(e)), elapsed)) => {
                         peers_failed += 1;
@@ -274,6 +441,23 @@ impl DvtSigner {
             span.record("peers_contacted", 0u64);
             span.record("peers_responded", 0u64);
             span.record("peers_failed", 0u64);
+        }
+
+        // 4.11c: ShareInfo has no per-share verification keys. Bind PTC
+        // partials (including gRPC `None` session) to the coordinator
+        // signing_root before Lagrange so a lying 96-byte share cannot
+        // poison an otherwise threshold-met aggregate.
+        if matches!(duty, Some(PartialSignDuty::PayloadAttestation { .. })) {
+            let before = partials.len();
+            partials =
+                bind_ptc_partials_to_signing_root(&partials, threshold, pubkey, signing_root);
+            if partials.len() < before {
+                tracing::warn!(
+                    dropped = before - partials.len(),
+                    remaining = partials.len(),
+                    "excluding DVT PTC partials that do not bind to the coordinator signing_root"
+                );
+            }
         }
 
         span.record("partials_received", partials.len() as u64);
@@ -420,10 +604,11 @@ mod tests {
                 _duty: &PartialSignDuty,
                 _pubkey: &[u8; 48],
                 _requester_index: u64,
-            ) -> Result<(u64, [u8; 96]), PeerRequestError> {
+            ) -> Result<PeerPartial, PeerRequestError> {
                 self.partials
                     .get(peer_addr)
-                    .cloned()
+                    .copied()
+                    .map(PeerPartial::from)
                     .ok_or_else(|| PeerRequestError::RequestFailed("unknown peer".to_string()))
             }
         }
@@ -439,7 +624,7 @@ mod tests {
                 _duty: &PartialSignDuty,
                 _pubkey: &[u8; 48],
                 _requester_index: u64,
-            ) -> Result<(u64, [u8; 96]), PeerRequestError> {
+            ) -> Result<PeerPartial, PeerRequestError> {
                 Err(PeerRequestError::RequestFailed("peer down".to_string()))
             }
         }
@@ -464,6 +649,62 @@ mod tests {
                 beacon_block_root: vec![0xAB; 32],
                 fork_id: 4,
             }
+        }
+
+        const PTC_FORK: [u8; 4] = [0x07, 0x00, 0x00, 0x00];
+        const PTC_ROOT: [u8; 32] = [0xAA; 32];
+
+        fn ptc_duty(object_root: [u8; 32], fork_version: [u8; 4]) -> PartialSignDuty {
+            PartialSignDuty::PayloadAttestation {
+                fork_info: ForkInfo {
+                    previous_version: fork_version.to_vec(),
+                    current_version: fork_version.to_vec(),
+                    epoch: 0,
+                    genesis_validators_root: vec![0x00; 32],
+                },
+                data: PayloadAttestationData {
+                    beacon_block_root: vec![0x11; 32],
+                    slot: 1,
+                    payload_present: true,
+                    blob_data_available: false,
+                },
+                fork_id: 7,
+                object_root: object_root.to_vec(),
+            }
+        }
+
+        /// Scripted peer that returns a partial tagged with an explicit PTC session.
+        struct ScriptedPtcPeer {
+            responses: HashMap<String, (u64, [u8; 96], PtcSessionIdentity)>,
+        }
+
+        #[async_trait]
+        impl PeerRequester for ScriptedPtcPeer {
+            async fn request_partial(
+                &self,
+                peer_addr: &str,
+                _duty: &PartialSignDuty,
+                _pubkey: &[u8; 48],
+                _requester_index: u64,
+            ) -> Result<PeerPartial, PeerRequestError> {
+                let (share_index, signature, session) =
+                    self.responses.get(peer_addr).copied().ok_or_else(|| {
+                        PeerRequestError::RequestFailed("unknown peer".to_string())
+                    })?;
+                Ok(PeerPartial { share_index, signature, ptc_session: Some(session) })
+            }
+        }
+
+        fn assert_threshold_failure(err: SigningBackendError) {
+            let msg = err.to_string();
+            assert!(
+                msg.contains("insufficient partials"),
+                "must fail threshold rather than emitting a signature, got: {msg}"
+            );
+            assert!(
+                !msg.contains("verification failed"),
+                "disagreeing partials must be excluded before combine, got: {msg}"
+            );
         }
 
         // ---- RED/GREEN tests ----
@@ -857,7 +1098,7 @@ mod tests {
                     _duty: &PartialSignDuty,
                     _pubkey: &[u8; 48],
                     _requester_index: u64,
-                ) -> Result<(u64, [u8; 96]), PeerRequestError> {
+                ) -> Result<PeerPartial, PeerRequestError> {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     unreachable!()
                 }
@@ -881,6 +1122,488 @@ mod tests {
             let result = signer.sign_with_duty(&[0u8; 32], &pk, &duty).await;
             // Should fail because timeout → only 1 partial, need 2
             assert!(matches!(result, Err(SigningBackendError::SigningFailed(_))));
+        }
+
+        // ---- 4.11c PTC aggregation policy ----
+
+        #[test]
+        fn test_ptc_partial_agrees_when_root_and_fork_match() {
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let partial = PeerPartial {
+                share_index: 2,
+                signature: [0u8; 96],
+                ptc_session: Some(PtcSessionIdentity {
+                    object_root: PTC_ROOT,
+                    fork_version: PTC_FORK,
+                }),
+            };
+            assert!(super::super::ptc_partial_agrees_with_session(&duty, &partial));
+        }
+
+        #[test]
+        fn test_ptc_partial_disagrees_when_planned_root_differs() {
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let partial = PeerPartial {
+                share_index: 2,
+                signature: [0u8; 96],
+                ptc_session: Some(PtcSessionIdentity {
+                    object_root: [0xBB; 32],
+                    fork_version: PTC_FORK,
+                }),
+            };
+            assert!(!super::super::ptc_partial_agrees_with_session(&duty, &partial));
+        }
+
+        #[test]
+        fn test_ptc_partial_disagrees_on_fork_version_when_root_matches() {
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let partial = PeerPartial {
+                share_index: 2,
+                signature: [0u8; 96],
+                ptc_session: Some(PtcSessionIdentity {
+                    object_root: PTC_ROOT,
+                    fork_version: [0x06, 0x00, 0x00, 0x00],
+                }),
+            };
+            assert!(!super::super::ptc_partial_agrees_with_session(&duty, &partial));
+        }
+
+        #[test]
+        fn test_non_ptc_duty_is_not_filtered_by_ptc_session_policy() {
+            let duty = dummy_duty();
+            let partial = PeerPartial {
+                share_index: 2,
+                signature: [0u8; 96],
+                ptc_session: Some(PtcSessionIdentity {
+                    object_root: [0xFF; 32],
+                    fork_version: [0xFF; 4],
+                }),
+            };
+            assert!(super::super::ptc_partial_agrees_with_session(&duty, &partial));
+        }
+
+        #[test]
+        fn test_ptc_none_session_kept_at_tag_filter() {
+            // gRPC `None` must not be fail-closed-dropped at the tag layer.
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let partial = PeerPartial { share_index: 2, signature: [0u8; 96], ptc_session: None };
+            assert!(super::super::ptc_partial_agrees_with_session(&duty, &partial));
+        }
+
+        #[tokio::test]
+        async fn test_ptc_mismatched_planned_root_excluded_fails_threshold() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let session_root = [0x11u8; 32];
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+
+            // Peer signs a different message so accidental inclusion cannot
+            // produce a session signature — it must be excluded first.
+            let peer_sig = partial_sign(&shares[1].1, &[0xEEu8; 32]);
+            let mut responses = HashMap::new();
+            responses.insert(
+                "peer1:5000".to_string(),
+                (
+                    shares[1].0,
+                    peer_sig,
+                    PtcSessionIdentity { object_root: [0xBB; 32], fork_version: PTC_FORK },
+                ),
+            );
+
+            let metrics = Arc::new(crate::metrics::SignerMetrics::new());
+            let dvt_metrics = Arc::new(metrics.dvt.clone());
+            let before =
+                dvt_metrics.threshold_failures_total.with_label_values(&[] as &[&str]).get();
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["peer1:5000".to_string()],
+                Some(Arc::new(ScriptedPtcPeer { responses })),
+                Duration::from_secs(5),
+            )
+            .with_metrics(dvt_metrics.clone());
+
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let err = signer.sign_with_duty(&session_root, &pk, &duty).await.unwrap_err();
+            assert_threshold_failure(err);
+
+            let after =
+                dvt_metrics.threshold_failures_total.with_label_values(&[] as &[&str]).get();
+            assert_eq!(
+                after.saturating_sub(before),
+                1,
+                "one disagreement-driven threshold failure"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_ptc_mismatched_fork_version_excluded_when_root_matches() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let session_root = [0x22u8; 32];
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+
+            let peer_sig = partial_sign(&shares[1].1, &[0xEEu8; 32]);
+            let mut responses = HashMap::new();
+            responses.insert(
+                "peer1:5000".to_string(),
+                (
+                    shares[1].0,
+                    peer_sig,
+                    PtcSessionIdentity {
+                        object_root: PTC_ROOT,
+                        fork_version: [0x06, 0x00, 0x00, 0x00],
+                    },
+                ),
+            );
+
+            let metrics = Arc::new(crate::metrics::SignerMetrics::new());
+            let dvt_metrics = Arc::new(metrics.dvt.clone());
+            let before =
+                dvt_metrics.threshold_failures_total.with_label_values(&[] as &[&str]).get();
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["peer1:5000".to_string()],
+                Some(Arc::new(ScriptedPtcPeer { responses })),
+                Duration::from_secs(5),
+            )
+            .with_metrics(dvt_metrics.clone());
+
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let err = signer.sign_with_duty(&session_root, &pk, &duty).await.unwrap_err();
+            assert_threshold_failure(err);
+
+            let after =
+                dvt_metrics.threshold_failures_total.with_label_values(&[] as &[&str]).get();
+            assert_eq!(
+                after.saturating_sub(before),
+                1,
+                "one disagreement-driven threshold failure"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_ptc_disagreement_increments_threshold_failures_once() {
+            // Two disagreeing peers in one session: still one threshold failure.
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let session_root = [0x33u8; 32];
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+
+            let mut responses = HashMap::new();
+            responses.insert(
+                "peer1:5000".to_string(),
+                (
+                    shares[1].0,
+                    partial_sign(&shares[1].1, &[0xE1u8; 32]),
+                    PtcSessionIdentity { object_root: [0xBB; 32], fork_version: PTC_FORK },
+                ),
+            );
+            responses.insert(
+                "peer2:5000".to_string(),
+                (
+                    shares[2].0,
+                    partial_sign(&shares[2].1, &[0xE2u8; 32]),
+                    PtcSessionIdentity {
+                        object_root: PTC_ROOT,
+                        fork_version: [0x05, 0x00, 0x00, 0x00],
+                    },
+                ),
+            );
+
+            let metrics = Arc::new(crate::metrics::SignerMetrics::new());
+            let dvt_metrics = Arc::new(metrics.dvt.clone());
+            let before =
+                dvt_metrics.threshold_failures_total.with_label_values(&[] as &[&str]).get();
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["peer1:5000".to_string(), "peer2:5000".to_string()],
+                Some(Arc::new(ScriptedPtcPeer { responses })),
+                Duration::from_secs(5),
+            )
+            .with_metrics(dvt_metrics.clone());
+
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let err = signer.sign_with_duty(&session_root, &pk, &duty).await.unwrap_err();
+            assert_threshold_failure(err);
+
+            let after =
+                dvt_metrics.threshold_failures_total.with_label_values(&[] as &[&str]).get();
+            assert_eq!(
+                after.saturating_sub(before),
+                1,
+                "two excluded partials must still increment threshold_failures_total once"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_ptc_agreeing_peer_still_aggregates() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let signing_root = [0x44u8; 32];
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+            let peer_sig = partial_sign(&shares[1].1, &signing_root);
+
+            let mut responses = HashMap::new();
+            responses.insert(
+                "peer1:5000".to_string(),
+                (
+                    shares[1].0,
+                    peer_sig,
+                    PtcSessionIdentity { object_root: PTC_ROOT, fork_version: PTC_FORK },
+                ),
+            );
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["peer1:5000".to_string()],
+                Some(Arc::new(ScriptedPtcPeer { responses })),
+                Duration::from_secs(5),
+            );
+
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let sig = signer.sign_with_duty(&signing_root, &pk, &duty).await.unwrap();
+            assert_eq!(sig, sk.sign(&signing_root).to_bytes());
+        }
+
+        #[tokio::test]
+        async fn test_ptc_mixed_cluster_combines_agreeing_set() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let signing_root = [0x55u8; 32];
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+
+            let mut responses = HashMap::new();
+            responses.insert(
+                "peer1:5000".to_string(),
+                (
+                    shares[1].0,
+                    partial_sign(&shares[1].1, &signing_root),
+                    PtcSessionIdentity { object_root: PTC_ROOT, fork_version: PTC_FORK },
+                ),
+            );
+            responses.insert(
+                "peer2:5000".to_string(),
+                (
+                    shares[2].0,
+                    partial_sign(&shares[2].1, &[0xEEu8; 32]),
+                    PtcSessionIdentity { object_root: [0xBB; 32], fork_version: PTC_FORK },
+                ),
+            );
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["peer1:5000".to_string(), "peer2:5000".to_string()],
+                Some(Arc::new(ScriptedPtcPeer { responses })),
+                Duration::from_secs(5),
+            );
+
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let sig = signer.sign_with_duty(&signing_root, &pk, &duty).await.unwrap();
+            assert_eq!(sig, sk.sign(&signing_root).to_bytes());
+        }
+
+        /// Mimics production `GrpcPeerRequester`: `ptc_session: None`.
+        struct GrpcLikePtcPeer {
+            responses: HashMap<String, (u64, [u8; 96])>,
+        }
+
+        #[async_trait]
+        impl PeerRequester for GrpcLikePtcPeer {
+            async fn request_partial(
+                &self,
+                peer_addr: &str,
+                _duty: &PartialSignDuty,
+                _pubkey: &[u8; 48],
+                _requester_index: u64,
+            ) -> Result<PeerPartial, PeerRequestError> {
+                self.responses
+                    .get(peer_addr)
+                    .copied()
+                    .map(PeerPartial::from)
+                    .ok_or_else(|| PeerRequestError::RequestFailed("unknown peer".to_string()))
+            }
+        }
+
+        /// Mimics the pre-fix gRPC stamp: tags the *request* session on every Ok.
+        struct RequestStampedPtcPeer {
+            responses: HashMap<String, (u64, [u8; 96])>,
+        }
+
+        #[async_trait]
+        impl PeerRequester for RequestStampedPtcPeer {
+            async fn request_partial(
+                &self,
+                peer_addr: &str,
+                duty: &PartialSignDuty,
+                _pubkey: &[u8; 48],
+                _requester_index: u64,
+            ) -> Result<PeerPartial, PeerRequestError> {
+                let (share_index, signature) =
+                    self.responses.get(peer_addr).copied().ok_or_else(|| {
+                        PeerRequestError::RequestFailed("unknown peer".to_string())
+                    })?;
+                let ptc_session = match duty {
+                    PartialSignDuty::PayloadAttestation { fork_info, object_root, .. } => {
+                        match (
+                            <[u8; 32]>::try_from(object_root.as_slice()),
+                            <[u8; 4]>::try_from(fork_info.current_version.as_slice()),
+                        ) {
+                            (Ok(object_root), Ok(fork_version)) => {
+                                Some(PtcSessionIdentity { object_root, fork_version })
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                Ok(PeerPartial { share_index, signature, ptc_session })
+            }
+        }
+
+        #[tokio::test]
+        async fn test_ptc_grpc_like_lying_peer_fails_threshold_not_verify() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let signing_root = [0x66u8; 32];
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+
+            let mut responses = HashMap::new();
+            responses.insert(
+                "peer1:5000".to_string(),
+                (shares[1].0, partial_sign(&shares[1].1, &[0xEEu8; 32])),
+            );
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["peer1:5000".to_string()],
+                Some(Arc::new(GrpcLikePtcPeer { responses })),
+                Duration::from_secs(5),
+            );
+
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let err = signer.sign_with_duty(&signing_root, &pk, &duty).await.unwrap_err();
+            assert_threshold_failure(err);
+        }
+
+        #[tokio::test]
+        async fn test_ptc_grpc_like_own_honest_lying_still_aggregates() {
+            // n=3,t=2: a None-tagged liar must not poison Lagrange (DoS) and
+            // must not emit a verify-failed error; the honest subset aggregates.
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let signing_root = [0x77u8; 32];
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+
+            let mut responses = HashMap::new();
+            responses.insert(
+                "honest:5000".to_string(),
+                (shares[1].0, partial_sign(&shares[1].1, &signing_root)),
+            );
+            responses.insert(
+                "liar:5000".to_string(),
+                (shares[2].0, partial_sign(&shares[2].1, &[0xEEu8; 32])),
+            );
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["honest:5000".to_string(), "liar:5000".to_string()],
+                Some(Arc::new(GrpcLikePtcPeer { responses })),
+                Duration::from_secs(5),
+            );
+
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let sig = signer.sign_with_duty(&signing_root, &pk, &duty).await.expect(
+                "own+honest must still aggregate; liar must not take the verify-failed path",
+            );
+            assert_eq!(sig, sk.sign(&signing_root).to_bytes());
+        }
+
+        #[tokio::test]
+        async fn test_ptc_request_stamped_liar_excluded_by_signing_root_bind() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let signing_root = [0x88u8; 32];
+            let shares = split_key(&sk, 2, 3);
+            let own_idx = shares[0].0;
+
+            let mut responses = HashMap::new();
+            responses.insert(
+                "peer1:5000".to_string(),
+                (shares[1].0, partial_sign(&shares[1].1, &[0xEEu8; 32])),
+            );
+
+            let share_info = make_share_info(own_idx, shares[0].1, pk, 2, 3);
+            let signer = DvtSigner::new(
+                vec![share_info],
+                own_idx,
+                vec!["peer1:5000".to_string()],
+                Some(Arc::new(RequestStampedPtcPeer { responses })),
+                Duration::from_secs(5),
+            );
+
+            let duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            let err = signer.sign_with_duty(&signing_root, &pk, &duty).await.unwrap_err();
+            assert_threshold_failure(err);
+        }
+
+        #[tokio::test]
+        async fn test_ptc_unparsable_object_root_fails_closed() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let share_info = make_share_info(1, sk.to_bytes(), pk, 1, 1);
+            let signer = DvtSigner::new(vec![share_info], 1, vec![], None, Duration::from_secs(5));
+
+            let mut duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            if let PartialSignDuty::PayloadAttestation { object_root, .. } = &mut duty {
+                *object_root = vec![0xAA; 16];
+            }
+            let err = signer.sign_with_duty(&[0x11u8; 32], &pk, &duty).await.unwrap_err();
+            assert!(
+                err.to_string().contains("unparsable"),
+                "unparsable PTC identity must fail closed, got: {err}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_ptc_unparsable_fork_version_fails_closed() {
+            let sk = crypto::SecretKey::generate();
+            let pk = sk.public_key().to_bytes();
+            let share_info = make_share_info(1, sk.to_bytes(), pk, 1, 1);
+            let signer = DvtSigner::new(vec![share_info], 1, vec![], None, Duration::from_secs(5));
+
+            let mut duty = ptc_duty(PTC_ROOT, PTC_FORK);
+            if let PartialSignDuty::PayloadAttestation { fork_info, .. } = &mut duty {
+                fork_info.current_version = vec![0x07, 0x00, 0x00];
+            }
+            let err = signer.sign_with_duty(&[0x11u8; 32], &pk, &duty).await.unwrap_err();
+            assert!(
+                err.to_string().contains("unparsable"),
+                "unparsable PTC fork_version must fail closed, got: {err}"
+            );
         }
     }
 }
