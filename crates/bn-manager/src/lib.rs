@@ -26,7 +26,7 @@ pub use sync_status::{BnSyncDetail, BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
     BroadcastTopics, DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts,
-    SyncCommitteeApi,
+    PayloadAttestationApi, SyncCommitteeApi,
 };
 pub use types::{BnRole, HealthTier, TierThresholds};
 
@@ -35,14 +35,15 @@ pub use types::{BnRole, HealthTier, TierThresholds};
 pub use beacon::{
     AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
     BeaconCommitteeSubscription, BeaconError, BlockRootResponse, Checkpoint, ConfigSpecResponse,
-    GenesisResponse, IndexedAttestationError, LegacyAttestation, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerDuty, ProposerPreparation, SignedAggregateAndProof,
-    SignedContributionAndProof, SingleAttestation, StateForkResponse, SubmitAttestationResult,
+    GenesisResponse, IndexedAttestationError, LegacyAttestation, PayloadAttestationDataResponse,
+    ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, ProposerPreparation,
+    PtcDutiesResponse, PtcDuty, SignedAggregateAndProof, SignedContributionAndProof,
+    SingleAttestation, StateForkResponse, SubmitAttestationResult,
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
     SyncingData, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 pub use eth_types::{
-    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
-    ValidatorRegistrationV1,
+    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SignedValidatorRegistration, ValidatorRegistrationV1,
 };

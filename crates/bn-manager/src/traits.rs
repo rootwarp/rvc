@@ -4,21 +4,23 @@ use async_trait::async_trait;
 
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    BlockRootResponse, ConfigSpecResponse, GenesisResponse, PayloadAttestationDataResponse,
+    ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
-    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SignedValidatorRegistration,
 };
 
 // ---------------------------------------------------------------------------
 // Role traits (domain splits of the former monolithic BeaconNodeClient)
 // ---------------------------------------------------------------------------
 
-/// Duty discovery: attester, proposer, and sync-committee duty endpoints.
+/// Duty discovery: attester, proposer, sync-committee, and PTC duty endpoints.
 #[async_trait]
 pub trait DutiesProvider: Send + Sync {
     async fn get_attester_duties(
@@ -38,6 +40,16 @@ pub trait DutiesProvider: Send + Sync {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError>;
+
+    /// Fetch PTC duties for the given epoch (`POST /eth/v1/validator/duties/ptc/{epoch}`).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn post_ptc_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<PtcDutiesResponse, BeaconError>;
 }
 
 /// Block production, publication, proposer preparation, and builder registration.
@@ -117,6 +129,32 @@ pub trait AttestationApi: Send + Sync {
     ) -> Result<(), BeaconError>;
 }
 
+/// Payload attestation data fetch and pool submission.
+#[async_trait]
+pub trait PayloadAttestationApi: Send + Sync {
+    /// Fetch payload attestation data for `slot`
+    /// (`GET /eth/v1/validator/payload_attestation_data?slot=`).
+    ///
+    /// HTTP 204 from the BN is `Ok(None)` (skip the duty).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn get_payload_attestation_data(
+        &self,
+        slot: u64,
+    ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError>;
+
+    /// Submit payload attestation messages
+    /// (`POST /eth/v1/beacon/pool/payload_attestations`).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[PayloadAttestationMessage],
+    ) -> Result<(), BeaconError>;
+}
+
 /// Sync committee messages, contributions, and contribution-and-proofs.
 #[async_trait]
 pub trait SyncCommitteeApi: Send + Sync {
@@ -188,16 +226,17 @@ pub trait NodeStatusApi: Send + Sync {
     async fn get_node_version(&self) -> Result<String, BeaconError>;
 }
 
-/// Full beacon-node surface: composition of the six role traits.
+/// Full beacon-node surface: composition of the seven role traits.
 ///
 /// Supertrait composition (not a blanket impl) keeps `dyn BeaconNodeClient`
 /// object-safe and lets callers that only need one role depend on that role
-/// alone. Implementors provide the six role traits, then an empty
+/// alone. Implementors provide the seven role traits, then an empty
 /// `impl BeaconNodeClient for T {}`.
 pub trait BeaconNodeClient:
     DutiesProvider
     + BlockProducer
     + AttestationApi
+    + PayloadAttestationApi
     + SyncCommitteeApi
     + LivenessApi
     + NodeStatusApi
@@ -357,6 +396,7 @@ mod tests {
         fn _assert_role_duties(_: &dyn DutiesProvider) {}
         fn _assert_role_block(_: &dyn BlockProducer) {}
         fn _assert_role_attestation(_: &dyn AttestationApi) {}
+        fn _assert_role_payload_attestation(_: &dyn PayloadAttestationApi) {}
         fn _assert_role_sync(_: &dyn SyncCommitteeApi) {}
         fn _assert_role_liveness(_: &dyn LivenessApi) {}
         fn _assert_role_status(_: &dyn NodeStatusApi) {}
@@ -405,6 +445,18 @@ mod tests {
         ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
             Ok(SyncCommitteeDutiesResponse { execution_optimistic: false, data: vec![] })
         }
+
+        async fn post_ptc_duties(
+            &self,
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<PtcDutiesResponse, BeaconError> {
+            Ok(PtcDutiesResponse {
+                dependent_root: "0x00".into(),
+                execution_optimistic: false,
+                data: vec![],
+            })
+        }
     }
 
     #[tokio::test]
@@ -417,6 +469,8 @@ mod tests {
         assert!(proposer.data.is_empty());
         let sync = only.post_sync_committee_duties(1, &["0".into()]).await.unwrap();
         assert!(sync.data.is_empty());
+        let ptc = only.post_ptc_duties(1, &["0".into()]).await.unwrap();
+        assert!(ptc.data.is_empty());
         // OnlyDuties is *not* a BeaconNodeClient — that is the point of role traits.
         fn _takes_duties(_: &dyn DutiesProvider) {}
         _takes_duties(&only);

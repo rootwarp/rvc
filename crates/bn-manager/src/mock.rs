@@ -10,19 +10,21 @@ use async_trait::async_trait;
 
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    BlockRootData, BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
+    BlockRootData, BlockRootResponse, ConfigSpecResponse, GenesisResponse,
+    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
+    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
     SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
-    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration, Slot,
+    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SignedValidatorRegistration, Slot,
 };
 
 use crate::traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, DutiesProvider, LivenessApi, NodeStatusApi,
-    SyncCommitteeApi,
+    PayloadAttestationApi, SyncCommitteeApi,
 };
 
 type Handler<A, R> = Arc<dyn Fn(A) -> Result<R, BeaconError> + Send + Sync>;
@@ -82,6 +84,7 @@ pub struct MockBeaconNodeClient {
     get_attester_duties: MethodHook<(u64, Vec<String>), AttesterDutiesResponse>,
     get_proposer_duties: MethodHook<u64, ProposerDutiesResponse>,
     post_sync_committee_duties: MethodHook<(u64, Vec<String>), SyncCommitteeDutiesResponse>,
+    post_ptc_duties: MethodHook<(u64, Vec<String>), PtcDutiesResponse>,
     // BlockProducer
     produce_block_v3: MethodHook<(u64, String, Option<String>, Option<u64>), ProduceBlockResponse>,
     publish_block: MethodHook<(SignedBeaconBlock, String), ()>,
@@ -96,6 +99,9 @@ pub struct MockBeaconNodeClient {
         MethodHook<(u64, String, Option<u64>), VersionedAggregateAttestation>,
     submit_aggregate_and_proofs: MethodHook<VersionedSignedAggregateAndProof, ()>,
     submit_beacon_committee_subscriptions: MethodHook<Vec<BeaconCommitteeSubscription>, ()>,
+    // PayloadAttestationApi
+    get_payload_attestation_data: MethodHook<u64, Option<PayloadAttestationDataResponse>>,
+    submit_payload_attestations: MethodHook<Vec<PayloadAttestationMessage>, ()>,
     // SyncCommitteeApi
     submit_sync_committee_messages: MethodHook<Vec<SyncCommitteeMessage>, ()>,
     get_sync_committee_contribution:
@@ -235,6 +241,14 @@ impl MockBeaconNodeClient {
         self
     }
 
+    pub fn with_post_ptc_duties(
+        self,
+        f: impl Fn(u64, Vec<String>) -> Result<PtcDutiesResponse, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.post_ptc_duties.set_handler(Arc::new(move |(epoch, indices)| f(epoch, indices)));
+        self
+    }
+
     // -- BlockProducer builders --
 
     pub fn with_produce_block_v3(
@@ -343,6 +357,27 @@ impl MockBeaconNodeClient {
         f: impl Fn(Vec<BeaconCommitteeSubscription>) -> Result<(), BeaconError> + Send + Sync + 'static,
     ) -> Self {
         self.submit_beacon_committee_subscriptions.set_handler(Arc::new(f));
+        self
+    }
+
+    // -- PayloadAttestationApi builders --
+
+    pub fn with_get_payload_attestation_data(
+        self,
+        f: impl Fn(u64) -> Result<Option<PayloadAttestationDataResponse>, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.get_payload_attestation_data.set_handler(Arc::new(f));
+        self
+    }
+
+    pub fn with_submit_payload_attestations(
+        self,
+        f: impl Fn(Vec<PayloadAttestationMessage>) -> Result<(), BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.submit_payload_attestations.set_handler(Arc::new(f));
         self
     }
 
@@ -506,6 +541,14 @@ impl DutiesProvider for MockBeaconNodeClient {
         self.post_sync_committee_duties
             .invoke("post_sync_committee_duties", (epoch, validator_indices.to_vec()))
     }
+
+    async fn post_ptc_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<PtcDutiesResponse, BeaconError> {
+        self.post_ptc_duties.invoke("post_ptc_duties", (epoch, validator_indices.to_vec()))
+    }
 }
 
 #[async_trait]
@@ -612,6 +655,23 @@ impl AttestationApi for MockBeaconNodeClient {
     ) -> Result<(), BeaconError> {
         self.submit_beacon_committee_subscriptions
             .invoke("submit_beacon_committee_subscriptions", subscriptions.to_vec())
+    }
+}
+
+#[async_trait]
+impl PayloadAttestationApi for MockBeaconNodeClient {
+    async fn get_payload_attestation_data(
+        &self,
+        slot: u64,
+    ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError> {
+        self.get_payload_attestation_data.invoke("get_payload_attestation_data", slot)
+    }
+
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[PayloadAttestationMessage],
+    ) -> Result<(), BeaconError> {
+        self.submit_payload_attestations.invoke("submit_payload_attestations", messages.to_vec())
     }
 }
 

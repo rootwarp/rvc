@@ -4,7 +4,8 @@
 //!
 //! Strategy:
 //! - BN mock with per-endpoint latency injection on **duty endpoints only**
-//!   (`get_attester_duties`, `get_proposer_duties`, `post_sync_committee_duties`).
+//!   (`get_attester_duties`, `get_proposer_duties`, `post_sync_committee_duties`,
+//!   `post_ptc_duties`).
 //! - `get_block_root` and the separate block-production client stay fast so a
 //!   miss is attributable to pre-proposal duty-fetch ordering.
 //! - Deterministic [`MockSlotClock`] + `tokio` `start_paused` so multi-second
@@ -41,23 +42,24 @@ use tokio::sync::{Mutex as AsyncMutex, MutexGuard};
 use async_trait::async_trait;
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    DependentRootResponse, ExecutionOptimisticResponse,
+    DependentRootResponse, ExecutionOptimisticResponse, PayloadAttestationDataResponse,
     ProduceBlockResponse as BnProduceBlockResponse, ProposerDutiesResponse, ProposerDuty,
-    ProposerPreparation, SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
 use bn_manager::{
     AttestationApi, AttestationSubmitter, BeaconNodeClient, BlockProducer, DutiesProvider,
-    LivenessApi, MockBeaconNodeClient, NodeStatusApi, OperationTimeouts, Propagator,
-    SyncCommitteeApi,
+    LivenessApi, MockBeaconNodeClient, NodeStatusApi, OperationTimeouts, PayloadAttestationApi,
+    Propagator, SyncCommitteeApi,
 };
 use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 use duty_tracker::DutyTracker;
 use eth_types::{
-    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration, Slot,
+    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SignedValidatorRegistration, Slot,
 };
 use metrics::definitions::{slot_phase_cache, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS};
 use rvc::orchestrator::{
@@ -139,7 +141,7 @@ impl MissRateReport {
 
 // ── latency-injecting BN (duty endpoints only) ───────────────────────────────
 
-/// Beacon mock that delays **only** the three duty-fetch endpoints.
+/// Beacon mock that delays **only** the duty-fetch endpoints.
 ///
 /// All other methods forward immediately so proposal submission and
 /// `get_block_root` cannot inflate the measured miss rate.
@@ -216,6 +218,15 @@ impl DutiesProvider for DutyStallBeacon {
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
         self.inject_duty_stall().await;
         self.inner.post_sync_committee_duties(epoch, validator_indices).await
+    }
+
+    async fn post_ptc_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<PtcDutiesResponse, BeaconError> {
+        self.inject_duty_stall().await;
+        self.inner.post_ptc_duties(epoch, validator_indices).await
     }
 }
 
@@ -300,6 +311,22 @@ impl AttestationApi for DutyStallBeacon {
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
         self.inner.submit_beacon_committee_subscriptions(subscriptions).await
+    }
+}
+
+#[async_trait]
+impl PayloadAttestationApi for DutyStallBeacon {
+    async fn get_payload_attestation_data(
+        &self,
+        slot: u64,
+    ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError> {
+        self.inner.get_payload_attestation_data(slot).await
+    }
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[PayloadAttestationMessage],
+    ) -> Result<(), BeaconError> {
+        self.inner.submit_payload_attestations(messages).await
     }
 }
 

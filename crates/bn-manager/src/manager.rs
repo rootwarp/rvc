@@ -6,15 +6,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconClient, BeaconCommitteeSubscription,
-    BeaconError, BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
+    BeaconError, BlockRootResponse, ConfigSpecResponse, GenesisResponse,
+    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
+    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
     SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
     SyncCommitteeMessage, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse,
     ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
     VersionedSignedAggregateAndProof,
 };
 use eth_types::{
-    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SignedValidatorRegistration,
 };
 use futures::future::join_all;
 use tracing::Instrument;
@@ -33,7 +35,8 @@ use crate::sync_status::{
 };
 use crate::traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
-    DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts, SyncCommitteeApi,
+    DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi,
+    SyncCommitteeApi,
 };
 use crate::types::{BnRole, HealthTier, TierThresholds};
 use crate::BnManagerError;
@@ -528,6 +531,118 @@ impl BnManager {
         self.record_outcomes(&outcomes).await;
 
         tracing::Span::current().record("tried", tried);
+        Err(last_err.expect("at least one client exists"))
+    }
+
+    /// Like [`Self::query_first`], but `Ok(None)` is not a cluster answer.
+    ///
+    /// A per-BN 204 (`Ok(None)`) means that node has not seen the slot; a peer
+    /// may still have data. 204 is not recorded as health success, so the empty
+    /// BN does not stay preferred.
+    async fn query_first_prefer_some<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
+        op: F,
+    ) -> Result<Option<T>, BeaconError>
+    where
+        T: Send,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, Option<T>>,
+    {
+        let strategy_span = tracing::info_span!(
+            "bn.strategy.first",
+            strategy = "first",
+            tried = tracing::field::Empty,
+        );
+        self.query_first_prefer_some_inner(op_name, role, min_tier, &op)
+            .instrument(strategy_span)
+            .await
+    }
+
+    async fn query_first_prefer_some_inner<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
+        op: &F,
+    ) -> Result<Option<T>, BeaconError>
+    where
+        T: Send,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, Option<T>>,
+    {
+        let indices = self.synced_indices(role, min_tier).await;
+        let mut last_err = None;
+        let mut saw_none = false;
+        let mut tried: usize = 0;
+        let mut failed_indices: Vec<usize> = Vec::new();
+
+        for (pos, i) in indices.iter().copied().enumerate() {
+            let client = &self.clients[i];
+            tried += 1;
+            let attempt_span = tracing::info_span!(
+                "bn.attempt",
+                bn_url = %RedactedUrl(client.endpoint()),
+            );
+            let start = tokio::time::Instant::now();
+            match op(client).instrument(attempt_span).await {
+                Ok(Some(result)) => {
+                    let elapsed = start.elapsed();
+                    let mut outcomes: Vec<(usize, TrackerOutcome)> =
+                        failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
+                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
+                    self.record_outcomes(&outcomes).await;
+                    debug!(
+                        op = op_name,
+                        bn_index = i,
+                        endpoint = %RedactedUrl(client.endpoint()),
+                        latency_ms = elapsed.as_millis() as u64,
+                        "query succeeded"
+                    );
+                    tracing::Span::current().record("tried", tried);
+                    return Ok(Some(result));
+                }
+                Ok(None) => {
+                    saw_none = true;
+                    debug!(
+                        op = op_name,
+                        bn_index = i,
+                        endpoint = %RedactedUrl(client.endpoint()),
+                        "BN returned no data, trying next"
+                    );
+                }
+                Err(e) => {
+                    failed_indices.push(i);
+                    if let Some(&next_i) = indices.get(pos + 1) {
+                        let next_client = &self.clients[next_i];
+                        warn!(
+                            failed_bn = %RedactedUrl(client.endpoint()),
+                            selected_bn = %RedactedUrl(next_client.endpoint()),
+                            reason = %e,
+                            "BN failover triggered"
+                        );
+                    } else {
+                        warn!(
+                            op = op_name,
+                            bn_index = i,
+                            endpoint = %RedactedUrl(client.endpoint()),
+                            error = %e,
+                            "BN query failed, no more BNs to try"
+                        );
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let outcomes: Vec<(usize, TrackerOutcome)> =
+            failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
+        self.record_outcomes(&outcomes).await;
+        tracing::Span::current().record("tried", tried);
+
+        if saw_none {
+            return Ok(None);
+        }
         Err(last_err.expect("at least one client exists"))
     }
 
@@ -1075,6 +1190,21 @@ impl DutiesProvider for BnManager {
         )
         .await
     }
+
+    async fn post_ptc_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<PtcDutiesResponse, BeaconError> {
+        self.with_op_timeout(
+            "post_ptc_duties",
+            self.op_timeout(|t| t.duty_fetch),
+            self.query_first("post_ptc_duties", BnRole::Attestation, HealthTier::SmallLag, |c| {
+                Box::pin(c.post_ptc_duties(epoch, validator_indices))
+            }),
+        )
+        .await
+    }
 }
 
 #[async_trait]
@@ -1319,6 +1449,54 @@ impl AttestationApi for BnManager {
 }
 
 #[async_trait]
+impl PayloadAttestationApi for BnManager {
+    async fn get_payload_attestation_data(
+        &self,
+        slot: u64,
+    ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError> {
+        self.with_op_timeout(
+            "get_payload_attestation_data",
+            self.op_timeout(|t| t.attestation_fetch),
+            self.query_first_prefer_some(
+                "get_payload_attestation_data",
+                BnRole::Attestation,
+                HealthTier::SmallLag,
+                |c| Box::pin(c.get_payload_attestation_data(slot)),
+            ),
+        )
+        .await
+    }
+
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[PayloadAttestationMessage],
+    ) -> Result<(), BeaconError> {
+        if self.broadcast_topics.attestations {
+            self.with_op_timeout(
+                "submit_payload_attestations",
+                self.op_timeout(|t| t.attestation_submit),
+                self.broadcast("submit_payload_attestations", BnRole::Attestation, |c| {
+                    Box::pin(c.submit_payload_attestations(messages))
+                }),
+            )
+            .await
+        } else {
+            self.with_op_timeout(
+                "submit_payload_attestations",
+                self.op_timeout(|t| t.attestation_submit),
+                self.query_first(
+                    "submit_payload_attestations",
+                    BnRole::Submission,
+                    HealthTier::LargeLag,
+                    |c| Box::pin(c.submit_payload_attestations(messages)),
+                ),
+            )
+            .await
+        }
+    }
+}
+
+#[async_trait]
 impl SyncCommitteeApi for BnManager {
     // -- Sync committee: SyncCommittee role, accept SmallLag --
 
@@ -1488,6 +1666,11 @@ impl_beacon_client_passthrough! {
             epoch: u64,
             validator_indices: &[String],
         ) -> Result<SyncCommitteeDutiesResponse, BeaconError>;
+        async fn post_ptc_duties(
+            &self,
+            epoch: u64,
+            validator_indices: &[String],
+        ) -> Result<PtcDutiesResponse, BeaconError>;
     }
     BlockProducer {
         async fn produce_block_v3(
@@ -1547,6 +1730,16 @@ impl_beacon_client_passthrough! {
             subscriptions: &[BeaconCommitteeSubscription],
         ) -> Result<(), BeaconError>;
     }
+    PayloadAttestationApi {
+        async fn get_payload_attestation_data(
+            &self,
+            slot: u64,
+        ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError>;
+        async fn submit_payload_attestations(
+            &self,
+            messages: &[PayloadAttestationMessage],
+        ) -> Result<(), BeaconError>;
+    }
     SyncCommitteeApi {
         async fn submit_sync_committee_messages(
             &self,
@@ -1595,10 +1788,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 27 methods across the six role traits (see impl_beacon_client_passthrough!).
+        // 30 methods across the seven role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            27,
+            30,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -1615,9 +1808,12 @@ mod tests {
         for required in [
             "get_genesis",
             "get_attester_duties",
+            "post_ptc_duties",
             "produce_block_v3",
             "publish_block_ssz",
             "submit_attestation",
+            "get_payload_attestation_data",
+            "submit_payload_attestations",
             "submit_sync_committee_messages",
             "post_validator_liveness",
             "post_validator_liveness_merged",

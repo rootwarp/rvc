@@ -17,8 +17,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use rvc_bn_manager::{
     AttestationApi, BeaconError, BeaconNodeClient, BlockProducer, BnManager, BnManagerConfig,
     BnRole, BnSyncDetail, BnSyncStatus, DutiesProvider, LivenessApi, NodeStatusApi,
-    OperationTimeouts, SignedBeaconBlock, SignedBlindedBeaconBlock, SyncCommitteeApi,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    OperationTimeouts, PayloadAttestationApi, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SyncCommitteeApi, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 
 // -- Helper --
@@ -128,6 +128,25 @@ async fn test_get_attester_duties_delegates() {
 }
 
 #[tokio::test]
+async fn test_post_ptc_duties_delegates() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/duties/ptc/5"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"dependent_root":"0xptc","execution_optimistic":false,"data":[]}"#,
+        ))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let manager = make_manager(&mock_server.uri());
+    let result = manager.post_ptc_duties(5, &["1".to_string(), "2".to_string()]).await;
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap().dependent_root, "0xptc");
+}
+
+#[tokio::test]
 async fn test_get_block_root_delegates() {
     let mock_server = MockServer::start().await;
 
@@ -160,6 +179,44 @@ async fn test_get_attestation_data_delegates() {
 
     let manager = make_manager(&mock_server.uri());
     let result = manager.get_attestation_data(100, 0).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_get_payload_attestation_data_delegates() {
+    let mock_server = MockServer::start().await;
+    let root = format!("0x{}", "11".repeat(32));
+    let body = format!(
+        r#"{{"data":{{"beacon_block_root":"{root}","slot":"42","payload_present":true,"blob_data_available":false}}}}"#
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(query_param("slot", "42"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let manager = make_manager(&mock_server.uri());
+    let result = manager.get_payload_attestation_data(42).await.unwrap().unwrap();
+    assert_eq!(result.data.slot, 42);
+    assert!(result.data.payload_present);
+}
+
+#[tokio::test]
+async fn test_submit_payload_attestations_delegates() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let manager = make_manager(&mock_server.uri());
+    let result = manager.submit_payload_attestations(&[]).await;
     assert!(result.is_ok());
 }
 
@@ -432,6 +489,149 @@ async fn test_post_validator_liveness_failover() {
     assert_eq!(data.len(), 2);
     assert!(!data[0].is_live);
     assert!(data[1].is_live);
+}
+
+/// `post_ptc_duties` uses query_first + duty_fetch timeout (same as attester duties).
+#[tokio::test]
+async fn test_post_ptc_duties_failover() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/duties/ptc/42"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/duties/ptc/42"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"dependent_root":"0xsecondary","execution_optimistic":false,"data":[]}"#,
+        ))
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let result = manager.post_ptc_duties(42, &["1".to_string()]).await;
+    assert!(result.is_ok(), "failover must succeed: {result:?}");
+    assert_eq!(result.unwrap().dependent_root, "0xsecondary");
+}
+
+/// `get_payload_attestation_data` fails over on error (same as attestation data).
+#[tokio::test]
+async fn test_get_payload_attestation_data_failover() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+    let root = format!("0x{}", "11".repeat(32));
+    let body = format!(
+        r#"{{"data":{{"beacon_block_root":"{root}","slot":"7","payload_present":true,"blob_data_available":false}}}}"#
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(query_param("slot", "7"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(query_param("slot", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let result = manager.get_payload_attestation_data(7).await;
+    assert!(result.is_ok(), "failover must succeed: {result:?}");
+    let data = result.unwrap().unwrap().data;
+    assert_eq!(data.slot, 7);
+    assert!(data.payload_present);
+}
+
+/// A per-BN 204 is not the cluster answer: continue until a peer returns data.
+#[tokio::test]
+async fn test_get_payload_attestation_data_failover_204_then_200() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+    let root = format!("0x{}", "11".repeat(32));
+    let body = format!(
+        r#"{{"data":{{"beacon_block_root":"{root}","slot":"7","payload_present":true,"blob_data_available":false}}}}"#
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(query_param("slot", "7"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(query_param("slot", "7"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let result = manager.get_payload_attestation_data(7).await;
+    assert!(result.is_ok(), "204 must fail over: {result:?}");
+    let data = result.unwrap().unwrap().data;
+    assert_eq!(data.slot, 7);
+    assert!(data.payload_present);
+}
+
+/// Every eligible BN 204s (none returns Some) ⇒ `Ok(None)`.
+#[tokio::test]
+async fn test_get_payload_attestation_data_all_204_returns_none() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+
+    for server in [&primary, &secondary] {
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/payload_attestation_data"))
+            .and(query_param("slot", "7"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let result = manager.get_payload_attestation_data(7).await;
+    assert!(result.is_ok(), "all-204 must be Ok(None), not an error: {result:?}");
+    assert!(result.unwrap().is_none());
+}
+
+/// `submit_payload_attestations` broadcasts like `submit_attestation`: any success wins.
+#[tokio::test]
+async fn test_submit_payload_attestations_failover() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let result = manager.submit_payload_attestations(&[]).await;
+    assert!(result.is_ok(), "broadcast any-success must succeed: {result:?}");
 }
 
 /// ARCH-P1-13 / ARCH-3n: fail-safe OR-merge — any BN reporting live wins.
@@ -2313,7 +2513,7 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
     assert_eq!(writes, 2, "synced fail (1) + batched unsynced fallback (1) expected; got {writes}");
 }
 
-/// Each of the five topic-gated submission methods respects its broadcast flag:
+/// Each of the six topic-gated submission methods respects its broadcast flag:
 /// topic on → both BNs receive; topic off → only the primary (query_first).
 #[tokio::test]
 async fn test_submit_helper_respects_each_broadcast_topic_flag() {
@@ -2430,6 +2630,44 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.attestations = false;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.submit_attestation(&empty_atts).await.is_ok());
+    }
+
+    // -- payload attestations (shares attestations topic) --
+    {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        for bn in [&bn1, &bn2] {
+            Mock::given(method("POST"))
+                .and(path("/eth/v1/beacon/pool/payload_attestations"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(bn)
+                .await;
+        }
+        let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+        config.broadcast_topics.attestations = true;
+        let manager = BnManager::new(config).unwrap();
+        assert!(manager.submit_payload_attestations(&[]).await.is_ok());
+    }
+    {
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/payload_attestations"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/pool/payload_attestations"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&bn2)
+            .await;
+        let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+        config.broadcast_topics.attestations = false;
+        let manager = BnManager::new(config).unwrap();
+        assert!(manager.submit_payload_attestations(&[]).await.is_ok());
     }
 
     // -- blocks (publish_block) --
