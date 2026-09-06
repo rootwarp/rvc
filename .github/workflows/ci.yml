@@ -66,13 +66,14 @@ jobs:
       - name: Run cargo machete
         run: cargo machete
 
-      # 3.9b: targeted graph assertion on a real libssz consumer (rvc-spec-vectors).
+      # 3.9b + 5.15 / #290: graph assertion on a real libssz consumer.
       # Not blanket `cargo tree -d` emptiness — ethereum_ssz 0.9 + 0.8.3 is an
       # intentional existing dual (workspace `ssz` / `ssz08`).
       # `cargo tree -d` alone is not enough: ruint's primitive-types 0.12.2 is
       # lock-resident but not tree-linked, so enabling libssz-merkle's
       # `ethereum_types` feature adds ethereum-types + primitive-types 0.13
       # without a -d duplicate. Also scan Cargo.lock / invert-tree.
+      # 5.15: no ethereum-types, exactly one primitive-types (island stack purity).
       - name: Assert no ethereum-types / single primitive-types
         run: |
           set -euo pipefail
@@ -126,6 +127,13 @@ jobs:
             fail=1
           fi
           exit "$fail"
+
+      # 5.15 / #290: island build/test against Cargo.lock (no silent dep float).
+      - name: Build rvc-gloas
+        run: cargo build -p rvc-gloas --locked
+
+      - name: Test rvc-gloas
+        run: cargo test -p rvc-gloas --locked --all-targets
 
   secret-scan:
     name: Secret Scan
