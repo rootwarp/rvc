@@ -176,22 +176,26 @@ fn test_fetch_script_cold_cache_downloads_verifies_extracts() {
     assert_extracted(&fx.dest);
 }
 
+fn truncate_file(path: &Path) -> String {
+    let len = fs::metadata(path).unwrap_or_else(|e| panic!("stat {}: {e}", path.display())).len();
+    assert!(len > 1, "{} too small to truncate", path.display());
+    OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("open {}: {e}", path.display()))
+        .set_len(len - 1)
+        .unwrap_or_else(|e| panic!("truncate {}: {e}", path.display()));
+    sha256_hex(path)
+}
+
 #[test]
 fn test_fetch_script_corrupt_archive_fails_closed() {
     let fx = Fixture::new();
+    let actual = truncate_file(&fx.minimal_tar);
     let tag_dir = fx.dest.join(SPEC_TAG);
     fs::create_dir_all(&tag_dir).expect("mkdir cache");
     let cached = tag_dir.join("minimal.tar.gz");
-    fs::copy(&fx.minimal_tar, &cached).expect("seed cache");
-    let len = fs::metadata(&cached).expect("stat cached archive").len();
-    assert!(len > 1, "fixture archive too small to truncate");
-    OpenOptions::new()
-        .write(true)
-        .open(&cached)
-        .expect("open cached archive")
-        .set_len(len - 1)
-        .expect("truncate");
-    let actual = sha256_hex(&cached);
+    fs::copy(&fx.minimal_tar, &cached).expect("seed truncated cache");
 
     let output = fx.run(&[]);
     let log = combined(&output);
@@ -199,6 +203,10 @@ fn test_fetch_script_corrupt_archive_fails_closed() {
     assert!(log.contains("minimal.tar.gz"), "error must name the file: {log}");
     assert!(log.contains(&fx.minimal_sha), "error must name expected digest: {log}");
     assert!(log.contains(&actual), "error must name actual digest: {log}");
+    assert!(
+        log.contains("re-downloading once") || log.contains("cache mismatch"),
+        "mismatch must re-download once: {log}"
+    );
     assert!(
         !tag_dir.join("tests").exists(),
         "corrupt archive must not extract, found {}",
@@ -208,10 +216,26 @@ fn test_fetch_script_corrupt_archive_fails_closed() {
         !fx.dest.join(SSZ_SPECS_TAG).join("progressive").exists(),
         "corrupt archive must extract nothing"
     );
-    assert!(
-        log.contains("rm -f --") && log.contains(&cached.display().to_string()),
-        "mismatch must hint how to recover the cache: {log}"
-    );
+}
+
+#[test]
+fn test_fetch_script_corrupt_cached_archive_redownloads_once() {
+    let fx = Fixture::new();
+    let tag_dir = fx.dest.join(SPEC_TAG);
+    fs::create_dir_all(&tag_dir).expect("mkdir cache");
+    let cached = tag_dir.join("minimal.tar.gz");
+    fs::copy(&fx.minimal_tar, &cached).expect("seed cache");
+    let actual = truncate_file(&cached);
+    assert_ne!(actual, fx.minimal_sha, "truncate must change digest");
+
+    let output = fx.run(&[]);
+    let log = combined(&output);
+    assert!(output.status.success(), "good source must recover after one re-download: {log}");
+    assert!(log.contains("cache mismatch") || log.contains("re-downloading once"), "{log}");
+    assert!(log.contains("downloading:"), "must re-download after mismatch: {log}");
+    assert!(log.contains(&fx.minimal_sha), "error must name expected digest: {log}");
+    assert!(log.contains(&actual), "error must name cached digest: {log}");
+    assert_extracted(&fx.dest);
 }
 
 #[test]
@@ -272,7 +296,45 @@ fn test_fetch_script_second_invocation_skips_download() {
         second_log.contains("cache hit:") || second_log.contains("skip download"),
         "warm path must report a cache hit: {second_log}"
     );
+    assert!(
+        second_log.contains("extracting:"),
+        "warm path must re-extract from the verified tarball: {second_log}"
+    );
+    assert!(
+        !second_log.contains("already extracted:"),
+        "stamp skip would persist a restored tree: {second_log}"
+    );
     assert_extracted(&fx.dest);
+}
+
+#[test]
+fn test_fetch_script_reextracts_over_poisoned_tree() {
+    let fx = Fixture::new();
+    let first = fx.run(&[]);
+    let first_log = combined(&first);
+    assert!(first.status.success(), "first fetch failed: {first_log}");
+    assert_extracted(&fx.dest);
+
+    let marker = fx.dest.join(SPEC_TAG).join("tests/minimal/marker.txt");
+    let extra = fx.dest.join(SPEC_TAG).join("tests/minimal/pwned.txt");
+    let stamp = fx.dest.join(SPEC_TAG).join(".extracted.minimal.tar.gz");
+    fs::write(&marker, b"poisoned\n").expect("poison marker");
+    fs::write(&extra, b"extra\n").expect("write extra file");
+    fs::write(&stamp, format!("{}\n", fx.minimal_sha)).expect("write extract stamp");
+
+    fs::remove_file(&fx.minimal_tar).expect("remove minimal fixture");
+    fs::remove_file(&fx.ssz_tar).expect("remove ssz fixture");
+
+    let second = fx.run(&[]);
+    let second_log = combined(&second);
+    assert!(second.status.success(), "re-extract failed: {second_log}");
+    assert!(!second_log.contains("downloading:"), "must not re-download: {second_log}");
+    assert!(
+        second_log.contains("extracting:"),
+        "must extract from the verified tarball: {second_log}"
+    );
+    assert_extracted(&fx.dest);
+    assert!(!extra.exists(), "extra file from a restored tree must not survive extract");
 }
 
 fn valid_zero_sha() -> String {
