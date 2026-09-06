@@ -245,3 +245,53 @@ jobs:
       # feature-gated suite cannot hide in a green summary.
       - name: Run signer-server DVT enumeration gate
         run: cargo nextest run -p rvc-signer-server --features dvt --final-status-level pass
+
+  # REQUIRED is job-local: coverage runs --workspace without fetching vectors
+  # and must keep skipping (3.3b). A top-level env would turn that skip into RED.
+  spec-vectors:
+    name: Spec Vectors
+    runs-on: ubuntu-latest
+    env:
+      RVC_SPEC_VECTORS_REQUIRED: "1"
+      PRESET: minimal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-spec-vectors-deps-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-spec-vectors-deps-
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Archives only: the pin is the tarball digest, not a restored tests/ tree.
+      # No restore-keys: a lock change must miss, not restore a stale archive.
+      - name: Cache spec-vector archives
+        id: spec-vector-cache
+        uses: actions/cache@v4
+        with:
+          path: crates/rvc-spec-vectors/vectors/**/*.tar.gz
+          key: ${{ runner.os }}-spec-vectors-${{ hashFiles('crates/rvc-spec-vectors/vectors.lock') }}
+
+      - name: Report spec-vector cache
+        run: echo "spec-vector cache-hit=${{ steps.spec-vector-cache.outputs.cache-hit }}"
+
+      - name: Fetch spec vectors
+        run: make spec-vectors
+
+      # 3.4b pyspec artifact is checked in; this step is sha256-only (no Python).
+      # Regeneration is 3.10b nightly.
+      - name: Verify generated vector digest
+        run: make spec-vectors-verify
+
+      - name: Run spec-vector suites
+        run: cargo nextest run -p rvc-spec-vectors --locked --final-status-level pass

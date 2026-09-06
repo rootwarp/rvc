@@ -483,6 +483,17 @@ download() {
     esac
 }
 
+download_and_verify() {
+    local url="$1" dest="$2" sha="$3"
+    echo "downloading: $url"
+    rm -f -- "$dest"
+    download "$url" "$dest"
+    if ! verify_file "$dest" "$sha"; then
+        rm -f -- "$dest"
+        return 1
+    fi
+}
+
 ensure_archive() {
     local tag="$1" url="$2" sha="$3"
     local dir="$VECTORS_DIR/$tag"
@@ -497,37 +508,40 @@ ensure_archive() {
             echo "cache hit: $archive (sha256 match, skip download)"
             return 0
         fi
-        printf "hint: rm -f -- '%s' and re-run to re-download\n" "$archive" >&2
-        return 1
+        # Pin is the lock digest, not a restored blob. One retry, then fail closed.
+        echo "cache mismatch: removing $archive and re-downloading once" >&2
+        rm -f -- "$archive"
     fi
 
-    echo "downloading: $url"
-    rm -f -- "$part"
-    download "$url" "$part"
-    if ! verify_file "$part" "$sha"; then
-        rm -f -- "$part"
+    if ! download_and_verify "$url" "$part" "$sha"; then
         return 1
     fi
     mv -- "$part" "$archive"
 }
 
+# Drop stamps and extracted trees. `.extracted.<archive>.tar.gz` matches *.tar.gz,
+# so delete stamps by prefix before the archive keep-list.
+drop_non_archives() {
+    local dir="$1"
+    rm -f -- "$dir"/.extracted.*
+    find "$dir" -mindepth 1 -maxdepth 1 ! -name '*.tar.gz' ! -name '*.tar.gz.part' \
+        -exec rm -rf {} +
+}
+
 extract_archive() {
     local tag="$1" url="$2" sha="$3"
     local dir="$VECTORS_DIR/$tag"
-    local base archive stamp
+    local base archive
     base="$(basename_from_url "$url")"
     archive="$dir/$base"
-    stamp="$dir/.extracted.$base"
     assert_under_cache "$dir"
-
-    if [[ -f "$stamp" ]] && [[ "$(tr -d ' \t\n' < "$stamp" | tr 'A-F' 'a-f')" == "$sha" ]]; then
-        echo "already extracted: $dir ($base)"
-        return 0
-    fi
+    [[ -f "$archive" ]] || die "archive missing after fetch: $archive"
+    # Pin is the tarball digest, not a stamp or a previously extracted tree.
+    verify_file "$archive" "$sha" || die "archive digest mismatch before extract: $archive"
 
     echo "extracting: $archive -> $dir"
+    drop_non_archives "$dir"
     tar -xzf "$archive" -C "$dir"
-    printf '%s\n' "$sha" >"$stamp"
 }
 
 emit_work() {
