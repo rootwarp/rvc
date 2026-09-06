@@ -2,6 +2,11 @@
 //!
 //! Declares progressively-merkleized Gloas containers and exports roots only.
 //! Production path dependency: `{rvc-eth-types}` (primitive aliases only).
+//! `eth_types::Root` is used in [`roots`] and is not re-exported.
+//!
+//! ```compile_fail
+//! let _: rvc_gloas::Root = [0u8; 32];
+//! ```
 
 /// Pinned `ethereum/consensus-specs` release this island is generated against.
 pub const SPEC_TAG: &str = "v1.7.0-beta.0";
@@ -31,6 +36,31 @@ const _: () = assert!(ACTIVE_FIELDS_BEACON_BLOCK_BODY.len() == 13);
 mod containers;
 mod error;
 mod merkle;
+pub mod roots;
+
+pub use error::GloasError;
+pub use roots::{
+    gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_indexed_attestation_root,
+};
+
+#[cfg(test)]
+mod public_surface_tests {
+    #[test]
+    fn test_public_api_uses_eth_types() {
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::gloas_attestation_root;
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::gloas_indexed_attestation_root;
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::gloas_aggregate_and_proof_root;
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::roots::gloas_attestation_root;
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::roots::gloas_indexed_attestation_root;
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::roots::gloas_aggregate_and_proof_root;
+    }
+}
 
 #[cfg(test)]
 mod spec_kat;

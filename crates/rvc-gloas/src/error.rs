@@ -1,12 +1,12 @@
-//! Crate-internal Gloas decode errors.
-//!
-//! Public error / root surface lands in issue 5.10.
+//! Public Gloas root-API errors.
 
 use thiserror::Error;
 
-/// Decode failure for a Gloas container. Never a zero, guessed, or fallback body.
+/// Decode or `active_fields` failure. Never a zero, guessed, or fallback root.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
-pub(crate) enum GloasError {
-    #[error("invalid SSZ block body: {reason}")]
+pub enum GloasError {
+    #[error("invalid SSZ: {reason}")]
     InvalidBody { reason: String },
+    #[error("active_fields width: expected {expected}, actual {actual}")]
+    ActiveFieldsWidth { expected: usize, actual: usize },
 }
