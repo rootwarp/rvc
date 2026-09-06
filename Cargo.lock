@@ -4410,6 +4410,7 @@ dependencies = [
  "libssz-derive",
  "libssz-merkle",
  "libssz-types",
+ "rvc-eth-types",
 ]
 
 [[package]]
