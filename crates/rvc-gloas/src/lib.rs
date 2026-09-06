@@ -44,7 +44,7 @@ pub mod roots;
 
 pub use error::GloasError;
 pub use roots::{
-    gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_block_root,
+    gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_block_root, gloas_body_root,
     gloas_execution_payload_envelope_root, gloas_indexed_attestation_root, HeaderFields,
 };
 
@@ -60,6 +60,7 @@ mod public_surface_tests {
             crate::gloas_aggregate_and_proof_root;
         let _: fn(&crate::HeaderFields, &[u8]) -> Result<eth_types::Root, crate::GloasError> =
             crate::gloas_block_root;
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> = crate::gloas_body_root;
         let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
             crate::roots::gloas_attestation_root;
         let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
@@ -70,6 +71,8 @@ mod public_surface_tests {
             &crate::roots::HeaderFields,
             &[u8],
         ) -> Result<eth_types::Root, crate::GloasError> = crate::roots::gloas_block_root;
+        let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
+            crate::roots::gloas_body_root;
         let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =
             crate::gloas_execution_payload_envelope_root;
         let _: fn(&[u8]) -> Result<eth_types::Root, crate::GloasError> =

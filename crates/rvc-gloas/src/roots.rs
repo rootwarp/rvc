@@ -1,7 +1,7 @@
 //! Gloas container roots over SSZ bytes.
 //!
 //! [`gloas_attestation_root`], [`gloas_indexed_attestation_root`],
-//! [`gloas_aggregate_and_proof_root`], [`gloas_block_root`],
+//! [`gloas_aggregate_and_proof_root`], [`gloas_block_root`], [`gloas_body_root`],
 //! [`gloas_execution_payload_envelope_root`]. Island types stay crate-private.
 //! `eth_types::Root` (`[u8; 32]`) is used, not re-exported.
 
@@ -76,8 +76,11 @@ pub fn gloas_aggregate_and_proof_root(ssz: &[u8]) -> Result<Root, GloasError> {
     >(ssz)
 }
 
-/// Typed hash tree root of Gloas `BeaconBlockBody` SSZ (minimal or mainnet preset).
-fn gloas_body_root(body_ssz: &[u8]) -> Result<Root, GloasError> {
+/// Hash tree root of Gloas `BeaconBlockBody` SSZ (minimal or mainnet preset).
+///
+/// This is the `body_root` leaf for the gRPC header RPC. Decode failure is
+/// [`GloasError::InvalidBody`] — never a fallback root.
+pub fn gloas_body_root(body_ssz: &[u8]) -> Result<Root, GloasError> {
     gloas_body_root_at::<
         MAX_COMMITTEES_PER_SLOT_MINIMAL,
         SYNC_COMMITTEE_SIZE_MINIMAL,
@@ -127,14 +130,16 @@ pub fn gloas_execution_payload_envelope_root(ssz: &[u8]) -> Result<Root, GloasEr
 mod tests {
     use super::{
         decode_root, gloas_aggregate_and_proof_root, gloas_attestation_root, gloas_block_root,
-        gloas_body_root_at, gloas_execution_payload_envelope_root, gloas_indexed_attestation_root,
-        AggregateAndProof, Attestation, HeaderFields, MAX_COMMITTEES_PER_SLOT_MAINNET,
-        MAX_COMMITTEES_PER_SLOT_MINIMAL, PTC_SIZE_MAINNET, PTC_SIZE_MINIMAL,
-        SYNC_COMMITTEE_SIZE_MAINNET, SYNC_COMMITTEE_SIZE_MINIMAL,
+        gloas_body_root, gloas_body_root_at, gloas_execution_payload_envelope_root,
+        gloas_indexed_attestation_root, AggregateAndProof, Attestation, HeaderFields,
+        MAX_COMMITTEES_PER_SLOT_MAINNET, MAX_COMMITTEES_PER_SLOT_MINIMAL, PTC_SIZE_MAINNET,
+        PTC_SIZE_MINIMAL, SYNC_COMMITTEE_SIZE_MAINNET, SYNC_COMMITTEE_SIZE_MINIMAL,
     };
+    use crate::containers::leaves::BeaconBlockHeader;
     use crate::error::GloasError;
     use crate::spec_kat::{mainnet, minimal};
     use eth_types::Root;
+    use libssz_merkle::{HashTreeRoot, Sha2Hasher};
 
     fn parse_hex(hex: &str) -> Vec<u8> {
         assert!(!hex.starts_with("0x"), "SPEC_* hex follows EXTERNAL_* style (no 0x prefix)");
@@ -299,16 +304,51 @@ mod tests {
         (header, &block_ssz[offset..])
     }
 
+    fn header_root(header: &HeaderFields, body_root: Root) -> Root {
+        BeaconBlockHeader {
+            slot: header.slot,
+            proposer_index: header.proposer_index,
+            parent_root: header.parent_root,
+            state_root: header.state_root,
+            body_root,
+        }
+        .hash_tree_root(&Sha2Hasher)
+    }
+
+    #[test]
+    fn test_gloas_body_root() {
+        // Standalone BeaconBlockBody vector (5.9), not the nested BeaconBlock body.
+        let ssz = parse_hex(minimal::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ);
+        let got = gloas_body_root(&ssz).expect("valid BeaconBlockBody SSZ");
+        assert_eq!(got, parse_root(minimal::SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT));
+        let ssz = parse_hex(mainnet::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ);
+        let got = gloas_body_root(&ssz).expect("valid BeaconBlockBody SSZ");
+        assert_eq!(got, parse_root(mainnet::SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT));
+    }
+
+    #[test]
+    fn test_gloas_body_rejects_truncated() {
+        let ssz = parse_hex(minimal::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ);
+        assert_invalid_body(gloas_body_root(truncated(&ssz)));
+        assert_invalid_body(gloas_body_root(&[]));
+        let ssz = parse_hex(mainnet::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ);
+        assert_invalid_body(gloas_body_root(truncated(&ssz)));
+    }
+
     #[test]
     fn test_gloas_block_root() {
         let ssz = parse_hex(minimal::SPEC_GLOAS_BEACON_BLOCK_SSZ);
         let (header, body) = header_and_body(&ssz);
         let got = gloas_block_root(&header, body).expect("valid BeaconBlock SSZ");
         assert_eq!(got, parse_root(minimal::SPEC_GLOAS_BEACON_BLOCK_ROOT));
+        let body_leaf = gloas_body_root(body).expect("valid nested body SSZ");
+        assert_eq!(got, header_root(&header, body_leaf));
         let ssz = parse_hex(mainnet::SPEC_GLOAS_BEACON_BLOCK_SSZ);
         let (header, body) = header_and_body(&ssz);
         let got = gloas_block_root(&header, body).expect("valid BeaconBlock SSZ");
         assert_eq!(got, parse_root(mainnet::SPEC_GLOAS_BEACON_BLOCK_ROOT));
+        let body_leaf = gloas_body_root(body).expect("valid nested body SSZ");
+        assert_eq!(got, header_root(&header, body_leaf));
     }
 
     #[test]

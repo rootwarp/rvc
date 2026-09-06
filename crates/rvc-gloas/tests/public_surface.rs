@@ -1,9 +1,8 @@
 //! Compile-level public-surface lock.
 //!
 //! Implemented `roots::*`: `gloas_attestation_root`, `gloas_indexed_attestation_root`,
-//! `gloas_aggregate_and_proof_root`, `gloas_block_root`, `HeaderFields`,
+//! `gloas_aggregate_and_proof_root`, `gloas_block_root`, `gloas_body_root`, `HeaderFields`,
 //! `gloas_execution_payload_envelope_root`.
-//! Closed set also includes `gloas_body_root` (5.11b, not exported).
 
 #[test]
 fn test_public_surface_implemented_root_fns() {
@@ -15,6 +14,7 @@ fn test_public_surface_implemented_root_fns() {
         rvc_gloas::gloas_aggregate_and_proof_root;
     let _: fn(&rvc_gloas::HeaderFields, &[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
         rvc_gloas::gloas_block_root;
+    let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> = rvc_gloas::gloas_body_root;
     let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
         rvc_gloas::roots::gloas_attestation_root;
     let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
@@ -23,6 +23,7 @@ fn test_public_surface_implemented_root_fns() {
         rvc_gloas::roots::gloas_aggregate_and_proof_root;
     let _: fn(&rvc_gloas::roots::HeaderFields, &[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> =
         rvc_gloas::roots::gloas_block_root;
+    let _: fn(&[u8]) -> Result<[u8; 32], rvc_gloas::GloasError> = rvc_gloas::roots::gloas_body_root;
     let _ = rvc_gloas::HeaderFields {
         slot: 0,
         proposer_index: 0,
