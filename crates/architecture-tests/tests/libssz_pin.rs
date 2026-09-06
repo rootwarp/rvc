@@ -1,14 +1,31 @@
-//! Issue 3.9a: the libssz family is pinned at exact `=0.3.0` in `[workspace.dependencies]`.
+//! Issue 3.9a / 3.7: the libssz family is pinned at exact `=0.3.0` in `[workspace.dependencies]`.
 //!
 //! A caret (`"0.3.0"` / `"^0.3.0"`) would silently float a hasher that computes signing roots.
+//! Feature names are the published 0.3.0 names (`sha2-backend` on libssz-merkle; no `sha2` feature).
 //! No external dependency (Phase-1 rule P6): hand-rolled scan, same style as `kat_policy.rs`.
 
 use rvc_architecture_tests::workspace_root;
 
 const LIBSSZ_FAMILY: &[&str] = &["libssz", "libssz-derive", "libssz-merkle", "libssz-types"];
 
-const EXPECTED_SPEC: &str =
-    r#"{ version = "=0.3.0", default-features = false, features = ["sha2"] }"#;
+/// Per-crate pin spec. Published 0.3.0: hasher is `sha2-backend` on `libssz-merkle` only.
+const EXPECTED_SPEC: &[(&str, &str)] = &[
+    ("libssz", r#"{ version = "=0.3.0", default-features = false, features = ["alloc"] }"#),
+    ("libssz-derive", r#"{ version = "=0.3.0", default-features = false }"#),
+    (
+        "libssz-merkle",
+        r#"{ version = "=0.3.0", default-features = false, features = ["alloc", "sha2-backend"] }"#,
+    ),
+    ("libssz-types", r#"{ version = "=0.3.0", default-features = false, features = ["alloc"] }"#),
+];
+
+fn expected_spec(name: &str) -> &'static str {
+    EXPECTED_SPEC
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, spec)| *spec)
+        .unwrap_or_else(|| panic!("missing EXPECTED_SPEC for {name}"))
+}
 
 /// Body of `[workspace.dependencies]`, excluding later unrelated tables.
 fn workspace_dependencies(manifest: &str) -> &str {
@@ -49,12 +66,13 @@ fn check_libssz_pins(manifest: &str) -> Result<(), Vec<String>> {
     let section = workspace_dependencies(manifest);
     let mut errors = Vec::new();
     for name in LIBSSZ_FAMILY {
+        let expected = expected_spec(name);
         match pin_spec(section, name) {
             None => errors.push(format!("{name} missing from [workspace.dependencies]")),
             Some(spec) => {
-                if spec != EXPECTED_SPEC {
+                if spec != expected {
                     errors.push(format!(
-                        "{name} must be `{name} = {EXPECTED_SPEC}` (exact =0.3.0, no caret); \
+                        "{name} must be `{name} = {expected}` (exact =0.3.0, no caret); \
                          found `{name} = {spec}`"
                     ));
                 }
@@ -72,10 +90,10 @@ fn check_libssz_pins(manifest: &str) -> Result<(), Vec<String>> {
 fn caret_version_is_rejected() {
     let manifest = r#"
 [workspace.dependencies]
-libssz = { version = "0.3.0", default-features = false, features = ["sha2"] }
-libssz-derive = { version = "^0.3.0", default-features = false, features = ["sha2"] }
+libssz = { version = "0.3.0", default-features = false, features = ["alloc"] }
+libssz-derive = { version = "^0.3.0", default-features = false }
 libssz-merkle = "0.3.0"
-libssz-types = { version = "=0.3.0", default-features = false, features = ["sha2"] }
+libssz-types = { version = "=0.3.0", default-features = false, features = ["alloc"] }
 "#;
     let errors = check_libssz_pins(manifest).expect_err("caret pins must fail");
     assert!(
@@ -102,7 +120,7 @@ fn exact_inline_table_is_accepted() {
         "[workspace.dependencies]\n{}\n",
         LIBSSZ_FAMILY
             .iter()
-            .map(|name| format!("{name} = {EXPECTED_SPEC}"))
+            .map(|name| format!("{name} = {}", expected_spec(name)))
             .collect::<Vec<_>>()
             .join("\n")
     );

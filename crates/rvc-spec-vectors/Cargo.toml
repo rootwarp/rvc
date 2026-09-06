@@ -19,6 +19,7 @@ snap.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+libssz-merkle.workspace = true
 tempfile.workspace = true
 
 [[bin]]

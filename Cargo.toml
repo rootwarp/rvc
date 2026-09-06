@@ -101,10 +101,11 @@ ssz_types = "0.10.1"
 tree_hash = "0.9"
 tree_hash_derive = "0.9"
 # Exact =0.3.0 (no caret). Do not enable ethereum-types.
-libssz = { version = "=0.3.0", default-features = false, features = ["sha2"] }
-libssz-merkle = { version = "=0.3.0", default-features = false, features = ["sha2"] }
-libssz-types = { version = "=0.3.0", default-features = false, features = ["sha2"] }
-libssz-derive = { version = "=0.3.0", default-features = false, features = ["sha2"] }
+# Published 0.3.0 names: hasher is sha2-backend on libssz-merkle; other crates have no sha2 feature.
+libssz = { version = "=0.3.0", default-features = false, features = ["alloc"] }
+libssz-merkle = { version = "=0.3.0", default-features = false, features = ["alloc", "sha2-backend"] }
+libssz-types = { version = "=0.3.0", default-features = false, features = ["alloc"] }
+libssz-derive = { version = "=0.3.0", default-features = false }
 sha2 = "0.10"
 url = "2"
 scrypt = "0.11"
