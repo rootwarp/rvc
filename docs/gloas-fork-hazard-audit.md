@@ -41,18 +41,18 @@ Line numbers were opened on `feature/216-fork-hazard-audit` after 2.1
 | 2 `.index = 0` | 6 |
 | 3 `match ForkName` | 3 |
 | 4 string-literal dispatch | 4 |
-| 5 `.entries()` | 6 |
-| **Total** | **27** |
+| 5 `.entries()` | 7 |
+| **Total** | **28** |
 
 Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 
 <!-- BEGIN INVENTORY -->
 | Site | Class | Kind | Verdict | Rationale | Issue |
 |---|---|---|---|---|---|
-| `bin/rvc-keygen/src/exit.rs` 107 | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 228. | — |
+| `bin/rvc-keygen/src/exit.rs` 107 | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 237. | — |
 | `crates/beacon/src/client.rs` 398 | 1 | — | inherit-intentionally | Proposer-duties v1/v2 routing (4.5). Open-ended `>= Gloas` keeps later forks on v2 rather than silently falling back to deprecated v1. | 4.5 |
-| `crates/crypto/src/signing_root.rs` 228 | 1 | — | inherit-intentionally | EIP-7044: voluntary-exit domain stays Capella-capped however many post-Capella forks exist. Open-ended `>=` is the spec. | — |
-| `crates/crypto/src/signing_root.rs` 286 | 1 | — | inherit-intentionally | Test mirror of 228 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
+| `crates/crypto/src/signing_root.rs` 237 | 1 | — | inherit-intentionally | EIP-7044: voluntary-exit domain stays Capella-capped however many post-Capella forks exist. Open-ended `>=` is the spec. | — |
+| `crates/crypto/src/signing_root.rs` 299 | 1 | — | inherit-intentionally | Test mirror of 237 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
 | `crates/rvc/src/orchestrator/aggregation.rs` 88 | 1 | — | decided-not-inherited | `>= Fulu` picks the `"fulu"` submit label. Gloas must not inherit; Phase 6 owns the versioned-wrapper choice. One of three production `>= Fulu` sites (plan cited four). | phase-6 |
 | `crates/rvc/src/orchestrator/aggregation.rs` 130 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedSignedAggregateAndProof::Fulu`. Same Phase-6 verdict as 88. | phase-6 |
 | `crates/rvc/src/orchestrator/attestation.rs` 425 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedAttestation::Fulu`. Phase 6; do not inherit via open-ended `>=`. | phase-6 |
@@ -76,6 +76,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/eth-types/src/fork.rs` 229 | 5 | — | inherit-intentionally | `activation_epoch` lookup through `entries()`. Same inherit. | 2.5b |
 | `crates/eth-types/src/fork.rs` 613 | 5 | — | test-only | Eight-ness assert `entries().len() == 8`. 2.5b rewrite of the former seven-ness table. | 2.5b |
 | `crates/eth-types/src/fork.rs` 630 | 5 | — | test-only | 2.1 uniqueness test (`entries().len() == COUNT`). Sixth class-5 site; plan listed five against the pre-2.1 tree. | 2.1 |
+| `crates/rvc-spec-vectors/src/bin/gen_spec_kat.rs` 1355 | 5 | — | test-only | tar `Archive::entries()`; not `ForkSchedule`. 4.0 generator, not a fork-addition hazard. | — |
 <!-- END INVENTORY -->
 
 ## Notes

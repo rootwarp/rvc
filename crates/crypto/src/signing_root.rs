@@ -11,12 +11,12 @@
 
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-    DomainType, ElectraAggregateAndProof, Epoch, ForkName, ForkSchedule, Root, Slot,
-    SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
+    DomainType, ElectraAggregateAndProof, Epoch, ForkName, ForkSchedule, PayloadAttestationData,
+    Root, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
-    SLOTS_PER_EPOCH,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_VOLUNTARY_EXIT, SLOTS_PER_EPOCH,
 };
 use tree_hash::TreeHash;
 
@@ -31,13 +31,15 @@ pub struct SigningCtx<'a> {
 
 /// Reference to a consensus duty whose BLS signing root is needed.
 ///
-/// Covers every production sign path: attestation, block (full / root),
-/// blinded block, RANDAO, sync message/selection, attester selection proof,
-/// aggregate-and-proof (Phase0 and Electra), contribution-and-proof, voluntary
-/// exit, and builder registration.
+/// Covers every production sign path: attestation, PTC payload attestation,
+/// block (full / root), blinded block, RANDAO, sync message/selection, attester
+/// selection proof, aggregate-and-proof (Phase0 and Electra),
+/// contribution-and-proof, voluntary exit, and builder registration.
 #[derive(Debug, Clone, Copy)]
 pub enum DutyRef<'a> {
     Attestation(&'a AttestationData),
+    /// Payload attestation (`DOMAIN_PTC_ATTESTER`); fork at `epoch_of(data.slot)`.
+    PtcAttestation(&'a PayloadAttestationData),
     /// Full beacon block (TypedSigner path; tree-hashes the block container).
     Block(&'a BeaconBlock),
     /// Precomputed block root + slot for fork resolution (SignerService path).
@@ -83,6 +85,13 @@ pub fn signing_root_for(duty: &DutyRef<'_>, ctx: &SigningCtx<'_>) -> Root {
             let fork_version = fork_version_at(data.target.epoch, ctx.fork_schedule);
             let domain =
                 compute_domain(DOMAIN_BEACON_ATTESTER, fork_version, ctx.genesis_validators_root);
+            compute_signing_root(data, domain)
+        }
+        DutyRef::PtcAttestation(data) => {
+            // Spec: compute_epoch_at_slot(data.slot) — not an attestation target epoch.
+            let fork_version = fork_version_at(data.slot / SLOTS_PER_EPOCH, ctx.fork_schedule);
+            let domain =
+                compute_domain(DOMAIN_PTC_ATTESTER, fork_version, ctx.genesis_validators_root);
             compute_signing_root(data, domain)
         }
         DutyRef::Block(block) => {
@@ -232,7 +241,11 @@ pub fn capella_capped_fork_version(epoch: Epoch, schedule: &ForkSchedule) -> [u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eth_types::{Attestation, Checkpoint, ElectraAttestation, SyncCommitteeContribution};
+    use eth_types::{
+        Attestation, Checkpoint, ElectraAttestation, PayloadAttestationData,
+        SyncCommitteeContribution,
+    };
+    use rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT;
 
     const GVR: Root = [0xaa; 32];
     const PHASE0: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
@@ -528,6 +541,73 @@ mod tests {
         let got = signing_root_for(&DutyRef::Block(&block), &ctx(&schedule));
         let domain = compute_domain(DOMAIN_BEACON_PROPOSER, ELECTRA, GVR);
         assert_eq!(got, compute_signing_root(&block, domain));
+    }
+
+    fn parse_kat_root(hex: &str) -> Root {
+        hex::decode(hex).expect("kat hex").try_into().expect("32-byte kat root")
+    }
+
+    /// L3: PayloadAttestationData signing root from the 4.0 pyspec artifact
+    /// (`KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT`) under `DOMAIN_PTC_ATTESTER`.
+    #[test]
+    fn test_ptc_attester_signing_root() {
+        assert_eq!(DOMAIN_PTC_ATTESTER, [0x0C, 0x00, 0x00, 0x00]);
+
+        let mut schedule = compressed_schedule();
+        // Artifact: fork_version 0x07000001, GVR zeros, slot 1 (epoch 0).
+        schedule.gloas_fork_epoch = 0;
+        schedule.gloas_fork_version = [0x07, 0x00, 0x00, 0x01];
+        let data = PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        };
+        let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: [0u8; 32] };
+        let got = signing_root_for(&DutyRef::PtcAttestation(&data), &ctx);
+        assert_eq!(got, parse_kat_root(KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT));
+    }
+
+    /// PTC fork version is `epoch_of(data.slot)`, unlike attestations (`target.epoch`).
+    #[test]
+    fn test_ptc_attester_fork_version_uses_slot_epoch_not_target_epoch() {
+        let mut schedule = compressed_schedule();
+        schedule.gloas_fork_epoch = 70;
+        let slot = 70 * SLOTS_PER_EPOCH;
+        let data = PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot,
+            payload_present: true,
+            blob_data_available: false,
+        };
+        let got = signing_root_for(&DutyRef::PtcAttestation(&data), &ctx(&schedule));
+
+        let gloas_domain = compute_domain(DOMAIN_PTC_ATTESTER, schedule.gloas_fork_version, GVR);
+        assert_eq!(got, compute_signing_root(&data, gloas_domain));
+
+        // Attestation-style target.epoch can sit in the previous fork (Fulu here).
+        let target_epoch = 69;
+        assert_eq!(ForkName::from_epoch(target_epoch, &schedule), ForkName::Fulu);
+        let fulu_domain =
+            compute_domain(DOMAIN_PTC_ATTESTER, ForkName::Fulu.fork_version(&schedule), GVR);
+        assert_ne!(got, compute_signing_root(&data, fulu_domain));
+    }
+
+    /// EIP-7044: with Gloas actually scheduled, a post-Gloas exit still uses Capella.
+    #[test]
+    fn test_eip7044_post_gloas_exit_still_capella() {
+        let mut schedule = compressed_schedule();
+        schedule.gloas_fork_epoch = 70;
+        let epoch = 80;
+        assert_eq!(ForkName::from_epoch(epoch, &schedule), ForkName::Gloas);
+        assert_eq!(capella_capped_fork_version(epoch, &schedule), CAPELLA);
+
+        let exit = VoluntaryExit { epoch, validator_index: 42 };
+        let root = signing_root_for(&DutyRef::VoluntaryExit(&exit), &ctx(&schedule));
+        let capella_domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, CAPELLA, GVR);
+        assert_eq!(root, compute_signing_root(&exit, capella_domain));
+        let gloas_domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, schedule.gloas_fork_version, GVR);
+        assert_ne!(root, compute_signing_root(&exit, gloas_domain));
     }
 
     /// Smoke: BlindedBeaconBlock arm matches compute_signing_root at Electra.

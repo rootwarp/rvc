@@ -11,6 +11,7 @@ pub const DOMAIN_SYNC_COMMITTEE: DomainType = [0x07, 0x00, 0x00, 0x00];
 pub const DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF: DomainType = [0x08, 0x00, 0x00, 0x00];
 pub const DOMAIN_CONTRIBUTION_AND_PROOF: DomainType = [0x09, 0x00, 0x00, 0x00];
 pub const DOMAIN_BLS_TO_EXECUTION_CHANGE: DomainType = [0x0A, 0x00, 0x00, 0x00];
+pub const DOMAIN_PTC_ATTESTER: DomainType = [0x0C, 0x00, 0x00, 0x00];
 pub const DOMAIN_APPLICATION_BUILDER: DomainType = [0x00, 0x00, 0x00, 0x01];
 
 #[cfg(test)]
@@ -50,6 +51,7 @@ mod tests {
                 DOMAIN_BLS_TO_EXECUTION_CHANGE,
                 [0x0A, 0x00, 0x00, 0x00],
             ),
+            ("DOMAIN_PTC_ATTESTER", DOMAIN_PTC_ATTESTER, [0x0C, 0x00, 0x00, 0x00]),
             ("DOMAIN_APPLICATION_BUILDER", DOMAIN_APPLICATION_BUILDER, [0x00, 0x00, 0x00, 0x01]),
         ];
         for (name, actual, expected) in table {
@@ -76,6 +78,7 @@ mod tests {
             DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
             DOMAIN_CONTRIBUTION_AND_PROOF,
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
+            DOMAIN_PTC_ATTESTER,
             DOMAIN_APPLICATION_BUILDER,
         ];
         for i in 0..domains.len() {

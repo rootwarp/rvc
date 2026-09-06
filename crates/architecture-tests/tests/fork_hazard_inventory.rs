@@ -118,7 +118,7 @@ const EXPECTED_COUNTS: [(Class, usize); 5] = [
     (Class::IndexZero, 6),
     (Class::MatchForkName, 3),
     (Class::StringDispatch, 4),
-    (Class::Entries, 6),
+    (Class::Entries, 7),
 ];
 
 /// Checked-in `(path, snippet)` inventory. Sorted by (class, path, line).
@@ -144,7 +144,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/crypto/src/signing_root.rs",
-        228,
+        237,
         Class::GeForkName,
         false,
         ">= ForkName::Capella",
@@ -153,7 +153,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/crypto/src/signing_root.rs",
-        286,
+        299,
         Class::GeForkName,
         false,
         ">= ForkName::Capella",
@@ -370,6 +370,15 @@ const INVENTORY: &[Inv] = &[
         "schedule.entries()",
         Verdict::TestOnly,
         "2.1",
+    ),
+    inv(
+        "crates/rvc-spec-vectors/src/bin/gen_spec_kat.rs",
+        1355,
+        Class::Entries,
+        false,
+        ".entries()",
+        Verdict::TestOnly,
+        "—",
     ),
 ];
 
