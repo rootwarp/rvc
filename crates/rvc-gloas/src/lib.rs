@@ -7,6 +7,8 @@
 /// Pinned `ethereum/consensus-specs` release this island is generated against.
 pub const SPEC_TAG: &str = "v1.7.0-beta.0";
 
+mod merkle;
+
 #[cfg(test)]
 mod spec_kat;
 

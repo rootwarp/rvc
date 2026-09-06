@@ -11,3 +11,7 @@ description = "Gloas progressive SSZ"
 workspace = true
 
 [dependencies]
+libssz.workspace = true
+libssz-derive.workspace = true
+libssz-merkle.workspace = true
+libssz-types.workspace = true
