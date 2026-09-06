@@ -263,6 +263,7 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         let island_body = render_island(&IslandRenderInput {
             date: DATE_PLACEHOLDER,
             source: &source,
+            spec_tag: &spec_tag,
             generated: &generated,
             generator: &generator,
             inputs: &island_inputs,
@@ -1077,6 +1078,7 @@ struct IslandFamily {
 struct IslandRenderInput<'a> {
     date: &'a str,
     source: &'a str,
+    spec_tag: &'a str,
     generated: &'a [GeneratedPin],
     generator: &'a str,
     inputs: &'a [InputHash],
@@ -1132,7 +1134,20 @@ fn render_island(input: &IslandRenderInput<'_>) -> Result<String, String> {
         return Err("gloas families must cover both presets".into());
     }
     for family in input.families {
+        writeln!(
+            out,
+            "/// `{}` Gloas island KATs at consensus-specs `{}`.",
+            family.preset, input.spec_tag
+        )
+        .map_err(write_err)?;
         writeln!(out, "pub mod {} {{", family.preset).map_err(write_err)?;
+        emit_str_const(
+            &mut out,
+            "    ",
+            "SPEC_TAG",
+            input.spec_tag,
+            "Pinned `ethereum/consensus-specs` release this preset module is generated against.",
+        )?;
         render_island_progressive(&mut out, input.parsed)?;
         render_island_family(&mut out, family)?;
         trim_trailing_blank(&mut out);

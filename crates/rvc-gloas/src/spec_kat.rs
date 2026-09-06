@@ -22,7 +22,11 @@
 
 #![allow(dead_code)]
 
+/// `minimal` Gloas island KATs at consensus-specs `v1.7.0-beta.0`.
 pub mod minimal {
+    /// Pinned `ethereum/consensus-specs` release this preset module is generated against.
+    pub const SPEC_TAG: &str = "v1.7.0-beta.0";
+
     /// Chunk counts from eth-ssz-specs `PROGRESSIVE_CHUNK_COUNTS` (issue 3.4a).
     pub const SPEC_PROGRESSIVE_CHUNK_COUNTS: &[u32] = &[0, 1, 2, 4, 5, 6, 20, 21, 22, 84, 85, 86];
 
@@ -1870,7 +1874,11 @@ pub mod minimal {
     );
 }
 
+/// `mainnet` Gloas island KATs at consensus-specs `v1.7.0-beta.0`.
 pub mod mainnet {
+    /// Pinned `ethereum/consensus-specs` release this preset module is generated against.
+    pub const SPEC_TAG: &str = "v1.7.0-beta.0";
+
     /// Chunk counts from eth-ssz-specs `PROGRESSIVE_CHUNK_COUNTS` (issue 3.4a).
     pub const SPEC_PROGRESSIVE_CHUNK_COUNTS: &[u32] = &[0, 1, 2, 4, 5, 6, 20, 21, 22, 84, 85, 86];
 

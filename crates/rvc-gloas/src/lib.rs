@@ -130,4 +130,60 @@ mod spec_kat_tests {
             );
         }
     }
+
+    /// Frozen-tag `ACTIVE_FIELDS_*` widths (3/4/5/13 plus envelope 5). A wrong
+    /// width or sparse bitvector must name the container and `SPEC_TAG`.
+    #[test]
+    fn test_active_fields_width_table_at_spec_tag() {
+        const FROZEN_TAG: &str = "v1.7.0-beta.0";
+        assert_eq!(
+            crate::SPEC_TAG, FROZEN_TAG,
+            "SPEC_TAG must stay the frozen consensus-specs tag {FROZEN_TAG}; do not invent a new tag"
+        );
+        assert_eq!(
+            super::spec_kat::minimal::SPEC_TAG,
+            crate::SPEC_TAG,
+            "spec_kat::minimal header SPEC_TAG must equal crate SPEC_TAG {}",
+            crate::SPEC_TAG
+        );
+        assert_eq!(
+            super::spec_kat::mainnet::SPEC_TAG,
+            crate::SPEC_TAG,
+            "spec_kat::mainnet header SPEC_TAG must equal crate SPEC_TAG {}",
+            crate::SPEC_TAG
+        );
+
+        const TABLE: &[(&str, &[bool], usize)] = &[
+            ("Attestation", crate::ACTIVE_FIELDS_ATTESTATION, 4),
+            ("IndexedAttestation", crate::ACTIVE_FIELDS_INDEXED_ATTESTATION, 3),
+            ("ExecutionRequests", crate::ACTIVE_FIELDS_EXECUTION_REQUESTS, 5),
+            ("PayloadAttestation", crate::ACTIVE_FIELDS_PAYLOAD_ATTESTATION, 3),
+            ("BeaconBlockBody", crate::ACTIVE_FIELDS_BEACON_BLOCK_BODY, 13),
+            ("ExecutionPayloadEnvelope", crate::ACTIVE_FIELDS_EXECUTION_PAYLOAD_ENVELOPE, 5),
+        ];
+        let prod = include_str!("lib.rs").split("#[cfg(test)]").next().expect("prod lib.rs");
+        assert_eq!(
+            TABLE.len(),
+            prod.matches("pub const ACTIVE_FIELDS_").count(),
+            "width table must list every ACTIVE_FIELDS_* const at SPEC_TAG {}",
+            crate::SPEC_TAG
+        );
+
+        for &(container, bits, expected_width) in TABLE {
+            let actual = bits.len();
+            assert_eq!(
+                actual, expected_width,
+                "{container} active_fields width {actual} != {expected_width} at SPEC_TAG {}; \
+                 a wrong width changes every root — re-read specs/gloas/beacon-chain.md at this tag, \
+                 do not adapt silently",
+                crate::SPEC_TAG
+            );
+            assert!(
+                bits.iter().copied().all(|bit| bit),
+                "{container} active_fields at SPEC_TAG {} is sparse (non all-ones); \
+                 a sparse bitvector changes every root — re-read the frozen tag, do not adapt silently",
+                crate::SPEC_TAG
+            );
+        }
+    }
 }

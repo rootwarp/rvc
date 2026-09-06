@@ -87,6 +87,58 @@ fn test_gloas_spec_kat_header_provenance_fields_are_nonempty() {
     assert!(src.contains("SPEC_PROGRESSIVE_ACTIVE_FIELDS_5_ALL_ONES"), "missing width 5");
 }
 
+fn module_spec_tag(mod_src: &str) -> Option<&str> {
+    let needle = "pub const SPEC_TAG";
+    let at = mod_src.find(needle)?;
+    for line in mod_src[at..].lines().take(3) {
+        let t = line.trim().trim_end_matches(';').trim();
+        if let Some(rest) = t.strip_prefix("pub const SPEC_TAG: &str =") {
+            return Some(rest.trim().trim_matches('"'));
+        }
+        if t.len() >= 2 && t.starts_with('"') {
+            return Some(t.trim_matches('"'));
+        }
+    }
+    None
+}
+
+#[test]
+fn test_gloas_spec_kat_emits_spec_tag_in_both_preset_headers() {
+    let lock = fs::read_to_string(crate_dir().join("vectors.lock")).expect("vectors.lock");
+    let tag = lock
+        .lines()
+        .find_map(|l| l.strip_prefix("SPEC_TAG=").map(str::trim))
+        .expect("SPEC_TAG")
+        .to_owned();
+    assert_eq!(rvc_gloas::SPEC_TAG, tag, "crate SPEC_TAG must match vectors.lock");
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out = tmp.path().join("p3.rs");
+    let gloas_out = tmp.path().join("gloas.rs");
+    let result = run_gen(&p3_fixtures(), &out, &gloas_fixtures(), &gloas_out);
+    assert!(result.status.success(), "gen failed: {}", combined(&result));
+    let src = fs::read_to_string(&gloas_out).expect("read gloas");
+    let provenance = header_field(&src, "provenance-source");
+    assert!(
+        provenance.contains(&format!("ethereum/consensus-specs@{tag}")),
+        "provenance-source must name SPEC_TAG {tag}: {provenance}"
+    );
+    assert!(
+        src.contains(&format!("/// `minimal` Gloas island KATs at consensus-specs `{tag}`.")),
+        "minimal preset header must name SPEC_TAG {tag}"
+    );
+    assert!(
+        src.contains(&format!("/// `mainnet` Gloas island KATs at consensus-specs `{tag}`.")),
+        "mainnet preset header must name SPEC_TAG {tag}"
+    );
+    let min_idx = src.find("pub mod minimal").expect("minimal");
+    let main_idx = src.find("pub mod mainnet").expect("mainnet");
+    let min_tag = module_spec_tag(&src[min_idx..main_idx]).expect("minimal SPEC_TAG");
+    let main_tag = module_spec_tag(&src[main_idx..]).expect("mainnet SPEC_TAG");
+    assert_eq!(min_tag, tag, "minimal preset SPEC_TAG const");
+    assert_eq!(main_tag, tag, "mainnet preset SPEC_TAG const");
+}
+
 #[test]
 fn test_gloas_spec_kat_sync_aggregate_roots_differ_in_generated_source() {
     let tmp = tempfile::tempdir().expect("tempdir");
