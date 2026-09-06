@@ -40,7 +40,8 @@ use slashing::PubkeyScopedDb;
 use crate::proto::signer_v2::peer_signer_service_server::PeerSignerService;
 use crate::proto::signer_v2::{
     PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest,
-    PartialSignPayloadAttestationRequest, PartialSignResponse, PartialSignSyncCommitteeRequest,
+    PartialSignBlockHeaderRequest, PartialSignPayloadAttestationRequest, PartialSignResponse,
+    PartialSignRootRequest, PartialSignSyncCommitteeRequest,
 };
 
 use slashing::SlashingDb;
@@ -525,6 +526,24 @@ impl PeerSignerService for PeerSignerServiceImpl {
             "partial_sign_payload_attestation: success"
         );
         Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+    }
+
+    /// Wire stub for `PeerSignerService/PartialSignBlockHeader` (4.20a).
+    /// Handler logic is 4.20b.
+    async fn partial_sign_block_header(
+        &self,
+        _req: Request<PartialSignBlockHeaderRequest>,
+    ) -> Result<Response<PartialSignResponse>, Status> {
+        Err(Status::unimplemented("PartialSignBlockHeader (issue 4.20b)"))
+    }
+
+    /// Wire stub for `PeerSignerService/PartialSignRoot` (4.20a).
+    /// Handler logic is 4.20b.
+    async fn partial_sign_root(
+        &self,
+        _req: Request<PartialSignRootRequest>,
+    ) -> Result<Response<PartialSignResponse>, Status> {
+        Err(Status::unimplemented("PartialSignRoot (issue 4.20b)"))
     }
 }
 

@@ -67,9 +67,10 @@ use crate::proto::signer_v2::{
     ListPublicKeysRequest as ListPublicKeysRequestV2,
     ListPublicKeysResponse as ListPublicKeysResponseV2, SignAggregateAndProofRequest,
     SignAttestationDataRequest, SignBeaconBlockRequest, SignBlindedBeaconBlockRequest,
-    SignBuilderRegistrationRequest, SignContributionAndProofRequest, SignRandaoRevealRequest,
-    SignResponse as SignResponseV2, SignSyncAggregatorSelectionDataRequest,
-    SignSyncCommitteeMessageRequest, SignVoluntaryExitRequest,
+    SignBlockHeaderRequest, SignBuilderRegistrationRequest, SignContributionAndProofRequest,
+    SignRandaoRevealRequest, SignResponse as SignResponseV2, SignRootRequest,
+    SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
+    SignVoluntaryExitRequest,
 };
 
 use crypto::PublicKey;
@@ -1045,6 +1046,21 @@ impl SignerServiceV2 for SignerServiceImpl {
             "sign_voluntary_exit: success"
         );
         Ok(Response::new(SignResponseV2 { signature: sig }))
+    }
+
+    // Wire stubs for 4.20a; handler logic is 4.20b.
+    async fn sign_block_header(
+        &self,
+        _req: Request<SignBlockHeaderRequest>,
+    ) -> Result<Response<SignResponseV2>, Status> {
+        Err(Status::unimplemented("SignBlockHeader (issue 4.20b)"))
+    }
+
+    async fn sign_root(
+        &self,
+        _req: Request<SignRootRequest>,
+    ) -> Result<Response<SignResponseV2>, Status> {
+        Err(Status::unimplemented("SignRoot (issue 4.20b)"))
     }
 
     async fn list_public_keys(

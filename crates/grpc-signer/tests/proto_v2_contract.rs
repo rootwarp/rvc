@@ -38,8 +38,9 @@ use rvc_grpc_signer::{
         GetStatusResponse as GetStatusResponseV2, ListPublicKeysRequest as ListPublicKeysRequestV2,
         ListPublicKeysResponse as ListPublicKeysResponseV2, SignAggregateAndProofRequest,
         SignAttestationDataRequest, SignBeaconBlockRequest, SignBlindedBeaconBlockRequest,
-        SignBuilderRegistrationRequest, SignContributionAndProofRequest, SignRandaoRevealRequest,
-        SignResponse, SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
+        SignBlockHeaderRequest, SignBuilderRegistrationRequest, SignContributionAndProofRequest,
+        SignRandaoRevealRequest, SignResponse, SignRootRequest,
+        SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
         SignVoluntaryExitRequest,
     },
     GrpcRemoteSigner, GrpcRemoteSignerConfig,
@@ -80,7 +81,7 @@ struct MockV2Signer {
 }
 
 impl MockV2Signer {
-    fn sign_root(&self, root: &[u8; 32]) -> Vec<u8> {
+    fn bls_sign(&self, root: &[u8; 32]) -> Vec<u8> {
         self.sk.sign(root).to_bytes().to_vec()
     }
 
@@ -106,7 +107,7 @@ impl SignerServiceV2 for MockV2Signer {
             .map_err(|e| Status::invalid_argument(format!("SSZ decode: {e}")))?;
         let domain = compute_domain(DOMAIN_BEACON_PROPOSER, curr, gvr);
         let root = compute_signing_root(&block, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
     }
 
     async fn sign_blinded_beacon_block(
@@ -121,7 +122,7 @@ impl SignerServiceV2 for MockV2Signer {
             .map_err(|e| Status::invalid_argument(format!("SSZ decode: {e}")))?;
         let domain = compute_domain(DOMAIN_BEACON_PROPOSER, curr, gvr);
         let root = compute_signing_root(&block, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
     }
 
     async fn sign_attestation_data(
@@ -153,7 +154,7 @@ impl SignerServiceV2 for MockV2Signer {
         };
         let domain = compute_domain(DOMAIN_BEACON_ATTESTER, curr, gvr);
         let root = compute_signing_root(&data, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
     }
 
     async fn sign_aggregate_and_proof(
@@ -173,7 +174,7 @@ impl SignerServiceV2 for MockV2Signer {
         };
         let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, curr, gvr);
         let root = compute_signing_root(&agg, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
     }
 
     async fn sign_sync_committee_message(
@@ -191,7 +192,7 @@ impl SignerServiceV2 for MockV2Signer {
             .map_err(|_| Status::invalid_argument("bad beacon_block_root"))?;
         let domain = compute_domain(DOMAIN_SYNC_COMMITTEE, curr, gvr);
         let root = compute_signing_root(&bbr, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
     }
 
     async fn sign_sync_aggregator_selection_data(
@@ -206,7 +207,7 @@ impl SignerServiceV2 for MockV2Signer {
             SyncAggregatorSelectionData { slot: r.slot, subcommittee_index: r.subcommittee_index };
         let domain = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, curr, gvr);
         let root = compute_signing_root(&sel, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
     }
 
     async fn sign_contribution_and_proof(
@@ -226,7 +227,7 @@ impl SignerServiceV2 for MockV2Signer {
         };
         let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, curr, gvr);
         let root = compute_signing_root(&cap, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
     }
 
     async fn sign_builder_registration(
@@ -259,7 +260,7 @@ impl SignerServiceV2 for MockV2Signer {
         };
         let domain = compute_domain(DOMAIN_APPLICATION_BUILDER, genesis_fork_version, zero_gvr);
         let root = compute_signing_root(&reg, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
     }
 
     async fn sign_randao_reveal(
@@ -272,7 +273,7 @@ impl SignerServiceV2 for MockV2Signer {
         let (_prev, curr, gvr) = Self::extract_fork_info(fi);
         let domain = compute_domain(DOMAIN_RANDAO, curr, gvr);
         let root = compute_signing_root(&r.epoch, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
     }
 
     async fn sign_voluntary_exit(
@@ -286,7 +287,21 @@ impl SignerServiceV2 for MockV2Signer {
         let exit = VoluntaryExit { epoch: r.epoch, validator_index: r.validator_index };
         let domain = compute_domain(DOMAIN_VOLUNTARY_EXIT, curr, gvr);
         let root = compute_signing_root(&exit, domain);
-        Ok(Response::new(SignResponse { signature: self.sign_root(&root) }))
+        Ok(Response::new(SignResponse { signature: self.bls_sign(&root) }))
+    }
+
+    async fn sign_block_header(
+        &self,
+        _request: Request<SignBlockHeaderRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("SignBlockHeader (issue 4.20b)"))
+    }
+
+    async fn sign_root(
+        &self,
+        _request: Request<SignRootRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("SignRoot (issue 4.20b)"))
     }
 
     async fn list_public_keys(
@@ -725,6 +740,20 @@ impl SignerServiceV2 for UnimplementedV2Signer {
     async fn sign_voluntary_exit(
         &self,
         _request: Request<SignVoluntaryExitRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_block_header(
+        &self,
+        _request: Request<SignBlockHeaderRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
+    }
+
+    async fn sign_root(
+        &self,
+        _request: Request<SignRootRequest>,
     ) -> Result<Response<SignResponse>, Status> {
         Err(Status::unimplemented("legacy stand-in: v2 signing unavailable"))
     }

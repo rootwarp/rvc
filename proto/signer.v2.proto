@@ -22,6 +22,9 @@ service SignerService {
   rpc SignBuilderRegistration          (SignBuilderRegistrationRequest)          returns (SignResponse);
   rpc SignRandaoReveal                 (SignRandaoRevealRequest)                 returns (SignResponse);
   rpc SignVoluntaryExit                (SignVoluntaryExitRequest)                returns (SignResponse);
+  // Gloas-safe shapes (4.20a): no SSZ bytes; do not enter validate_fork_id 0..=6.
+  rpc SignBlockHeader                  (SignBlockHeaderRequest)                  returns (SignResponse);
+  rpc SignRoot                         (SignRootRequest)                         returns (SignResponse);
 
   rpc ListPublicKeys (ListPublicKeysRequest) returns (ListPublicKeysResponse);
   rpc GetStatus      (GetStatusRequest)      returns (GetStatusResponse);
@@ -140,6 +143,8 @@ service PeerSignerService {
   rpc PartialSignAttestationData  (PartialSignAttestationDataRequest)  returns (PartialSignResponse);
   rpc PartialSignSyncCommittee    (PartialSignSyncCommitteeRequest)    returns (PartialSignResponse);
   rpc PartialSignPayloadAttestation (PartialSignPayloadAttestationRequest) returns (PartialSignResponse);
+  rpc PartialSignBlockHeader      (PartialSignBlockHeaderRequest)      returns (PartialSignResponse);
+  rpc PartialSignRoot             (PartialSignRootRequest)             returns (PartialSignResponse);
 }
 message PartialSignBeaconBlockRequest {
   uint64   requester_index = 1;   // server enforces matches peer cert CN (allow-list)
@@ -187,4 +192,67 @@ message PartialSignPayloadAttestationRequest {
   // and rejects empty, wrong-length, or mismatched values. Additive on this
   // 4.11a message only.
   bytes                  object_root     = 6;
+}
+
+// === Gloas-safe wire shapes (4.20a) ===
+// Fixed-layout header mirroring eth_types::BeaconBlockHeader (spec order).
+// Server hashes these five leaves and takes slot from this message (4.20b).
+// No SSZ-bytes field: Gloas body bytes must not enter validate_fork_id 0..=6.
+message BeaconBlockHeader {
+  uint64 slot           = 1;
+  uint64 proposer_index = 2;
+  bytes  parent_root    = 3; // 32 bytes
+  bytes  state_root     = 4; // 32 bytes
+  bytes  body_root      = 5; // 32 bytes
+}
+
+message SignBlockHeaderRequest {
+  bytes             pubkey    = 1;   // 48 bytes
+  ForkInfo          fork_info = 2;
+  BeaconBlockHeader header    = 3;
+  // Object-root / field path (not decode_*_ssz). Gloas=7 is valid here.
+  uint32            fork_id   = 4;   // PHASE0 .. GLOAS enum
+}
+
+// First enum in this file. Fail-closed (behaviour asserted in 4.20b):
+// UNSPECIFIED (0) and unknown values MUST be rejected; a value the server
+// does not yet serve MUST return UNIMPLEMENTED, never a signature.
+enum Duty {
+  UNSPECIFIED                 = 0;
+  AGGREGATE_AND_PROOF         = 1;
+  CONTRIBUTION_AND_PROOF      = 2;
+  PAYLOAD_ATTESTATION         = 3;
+  PROPOSER_PREFERENCES        = 4;
+  EXECUTION_PAYLOAD_ENVELOPE  = 5; // served in 6.19
+  BUILDER_REQUEST_AUTH        = 6; // served in 6.16
+}
+
+// Non-slashable root-only signing. object_root is a 32-byte hash_tree_root,
+// not SSZ bytes — Gloas containers never enter decode_*_ssz / validate_fork_id.
+message SignRootRequest {
+  bytes    pubkey      = 1;   // 48 bytes
+  ForkInfo fork_info   = 2;
+  bytes    object_root = 3;   // 32 bytes
+  Duty     duty        = 4;
+  // Object-root / field path (not decode_*_ssz). Gloas=7 is valid here.
+  uint32   fork_id     = 5;   // PHASE0 .. GLOAS enum
+}
+
+message PartialSignBlockHeaderRequest {
+  uint64            requester_index = 1;   // server enforces matches peer cert CN (allow-list)
+  bytes             pubkey          = 2;
+  ForkInfo          fork_info       = 3;
+  BeaconBlockHeader header          = 4;
+  // Object-root / field path (not decode_*_ssz). Gloas=7 is valid here.
+  uint32            fork_id         = 5;   // PHASE0 .. GLOAS enum
+}
+
+message PartialSignRootRequest {
+  uint64   requester_index = 1;   // server enforces matches peer cert CN (allow-list)
+  bytes    pubkey          = 2;
+  ForkInfo fork_info       = 3;
+  bytes    object_root     = 4;   // 32 bytes
+  Duty     duty            = 5;
+  // Object-root / field path (not decode_*_ssz). Gloas=7 is valid here.
+  uint32   fork_id         = 6;   // PHASE0 .. GLOAS enum
 }

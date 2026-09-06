@@ -24,9 +24,10 @@ use rvc_grpc_signer::proto::signer_v2::{
     ListPublicKeysRequest as ListPublicKeysRequestV2,
     ListPublicKeysResponse as ListPublicKeysResponseV2, SignAggregateAndProofRequest,
     SignAttestationDataRequest, SignBeaconBlockRequest, SignBlindedBeaconBlockRequest,
-    SignBuilderRegistrationRequest, SignContributionAndProofRequest, SignRandaoRevealRequest,
-    SignResponse as SignResponseV2, SignSyncAggregatorSelectionDataRequest,
-    SignSyncCommitteeMessageRequest, SignVoluntaryExitRequest,
+    SignBlockHeaderRequest, SignBuilderRegistrationRequest, SignContributionAndProofRequest,
+    SignRandaoRevealRequest, SignResponse as SignResponseV2, SignRootRequest,
+    SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
+    SignVoluntaryExitRequest,
 };
 
 // ---------------------------------------------------------------------------
@@ -146,6 +147,20 @@ impl SignerServiceV2 for TestSignerServiceV2 {
         _request: Request<SignVoluntaryExitRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
         Err(Status::unimplemented("test mock: sign_voluntary_exit not implemented"))
+    }
+
+    async fn sign_block_header(
+        &self,
+        _request: Request<SignBlockHeaderRequest>,
+    ) -> Result<Response<SignResponseV2>, Status> {
+        Err(Status::unimplemented("test mock: sign_block_header not implemented"))
+    }
+
+    async fn sign_root(
+        &self,
+        _request: Request<SignRootRequest>,
+    ) -> Result<Response<SignResponseV2>, Status> {
+        Err(Status::unimplemented("test mock: sign_root not implemented"))
     }
 }
 

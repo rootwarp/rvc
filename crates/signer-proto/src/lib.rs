@@ -22,9 +22,10 @@ mod tests {
     use prost::Message;
 
     use super::signer_v2::{
-        PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest,
-        PartialSignPayloadAttestationRequest, PartialSignResponse, PartialSignSyncCommitteeRequest,
-        PayloadAttestationData,
+        BeaconBlockHeader, PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest,
+        PartialSignBlockHeaderRequest, PartialSignPayloadAttestationRequest, PartialSignResponse,
+        PartialSignRootRequest, PartialSignSyncCommitteeRequest, PayloadAttestationData,
+        SignBlockHeaderRequest, SignRootRequest,
     };
 
     const PROTO: &str = include_str!("../../../proto/signer.v2.proto");
@@ -98,8 +99,8 @@ mod tests {
         panic!("unterminated varint");
     }
 
-    /// Existing three PeerSignerService RPCs and their message field numbers
-    /// stay frozen; the fourth RPC is additive.
+    /// Historical PeerSigner field numbers stay frozen; later RPCs are additive
+    /// (see `signer_v2_wire_contract` for the mechanical D18/B5 freeze).
     #[test]
     fn test_existing_peer_signer_rpc_field_numbers_unchanged() {
         assert_eq!(
@@ -109,6 +110,8 @@ mod tests {
                 "PartialSignAttestationData",
                 "PartialSignSyncCommittee",
                 "PartialSignPayloadAttestation",
+                "PartialSignBlockHeader",
+                "PartialSignRoot",
             ]
         );
 
@@ -165,6 +168,56 @@ mod tests {
                 ("data".into(), 4),
                 ("fork_id".into(), 5),
                 ("object_root".into(), 6),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(PROTO, "BeaconBlockHeader"),
+            [
+                ("slot".into(), 1),
+                ("proposer_index".into(), 2),
+                ("parent_root".into(), 3),
+                ("state_root".into(), 4),
+                ("body_root".into(), 5),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(PROTO, "SignBlockHeaderRequest"),
+            [
+                ("pubkey".into(), 1),
+                ("fork_info".into(), 2),
+                ("header".into(), 3),
+                ("fork_id".into(), 4),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(PROTO, "SignRootRequest"),
+            [
+                ("pubkey".into(), 1),
+                ("fork_info".into(), 2),
+                ("object_root".into(), 3),
+                ("duty".into(), 4),
+                ("fork_id".into(), 5),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(PROTO, "PartialSignBlockHeaderRequest"),
+            [
+                ("requester_index".into(), 1),
+                ("pubkey".into(), 2),
+                ("fork_info".into(), 3),
+                ("header".into(), 4),
+                ("fork_id".into(), 5),
+            ]
+        );
+        assert_eq!(
+            proto_message_fields(PROTO, "PartialSignRootRequest"),
+            [
+                ("requester_index".into(), 1),
+                ("pubkey".into(), 2),
+                ("fork_info".into(), 3),
+                ("object_root".into(), 4),
+                ("duty".into(), 5),
+                ("fork_id".into(), 6),
             ]
         );
 
@@ -277,6 +330,20 @@ mod tests {
             ) -> Result<Response<PartialSignResponse>, Status> {
                 Err(Status::unimplemented("test stub"))
             }
+
+            async fn partial_sign_block_header(
+                &self,
+                _request: Request<PartialSignBlockHeaderRequest>,
+            ) -> Result<Response<PartialSignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+
+            async fn partial_sign_root(
+                &self,
+                _request: Request<PartialSignRootRequest>,
+            ) -> Result<Response<PartialSignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
         }
 
         let _ = Stub;
@@ -301,5 +368,239 @@ mod tests {
         }
 
         let _ = call_rpc::<tonic::transport::Channel>;
+    }
+
+    fn proto_enum_values(src: &str, name: &str) -> Vec<(String, u32)> {
+        let header = format!("enum {name} {{");
+        let start = src.find(&header).unwrap_or_else(|| panic!("missing enum {name}"));
+        let after = &src[start + header.len()..];
+        let end = after.find('}').unwrap_or_else(|| panic!("unclosed enum {name}"));
+        let mut values = Vec::new();
+        for line in after[..end].lines() {
+            let line = line.split("//").next().unwrap().trim().trim_end_matches(';').trim();
+            if line.is_empty() {
+                continue;
+            }
+            let (left, right) =
+                line.split_once('=').unwrap_or_else(|| panic!("no enum number: {line}"));
+            values.push((
+                left.trim().to_string(),
+                right.trim().parse().unwrap_or_else(|_| panic!("bad enum number: {line}")),
+            ));
+        }
+        values
+    }
+
+    /// Gloas-safe header/root shapes: no SSZ bytes, Gloas fork_id is on the wire,
+    /// and Duty 0 / unknown are representable (fail-closed in 4.20b).
+    #[test]
+    fn test_gloas_safe_header_and_root_shapes() {
+        assert_eq!(
+            proto_service_rpcs(PROTO, "SignerService")
+                .into_iter()
+                .filter(|rpc| rpc == "SignBlockHeader" || rpc == "SignRoot")
+                .collect::<Vec<_>>(),
+            ["SignBlockHeader", "SignRoot"]
+        );
+        assert_eq!(
+            proto_enum_values(PROTO, "Duty"),
+            [
+                ("UNSPECIFIED".into(), 0),
+                ("AGGREGATE_AND_PROOF".into(), 1),
+                ("CONTRIBUTION_AND_PROOF".into(), 2),
+                ("PAYLOAD_ATTESTATION".into(), 3),
+                ("PROPOSER_PREFERENCES".into(), 4),
+                ("EXECUTION_PAYLOAD_ENVELOPE".into(), 5),
+                ("BUILDER_REQUEST_AUTH".into(), 6),
+            ]
+        );
+        let stripped: String =
+            PROTO.lines().map(|l| l.split("//").next().unwrap()).collect::<Vec<_>>().join("\n");
+        let enum_pos = stripped.find("enum ").expect("Duty enum");
+        assert!(stripped[enum_pos..].starts_with("enum Duty"), "first proto enum must be Duty");
+
+        let header = BeaconBlockHeader {
+            slot: 42,
+            proposer_index: 7,
+            parent_root: vec![0x11; 32],
+            state_root: vec![0x22; 32],
+            body_root: vec![0x33; 32],
+        };
+        let header_req = SignBlockHeaderRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            header: Some(header),
+            fork_id: ForkName::Gloas.id(),
+        };
+        let decoded = SignBlockHeaderRequest::decode(header_req.encode_to_vec().as_slice())
+            .expect("SignBlockHeaderRequest must encode/decode");
+        assert_eq!(decoded.fork_id, 7);
+        let decoded_header = decoded.header.expect("header");
+        assert_eq!(decoded_header.slot, 42);
+        assert_eq!(decoded_header.proposer_index, 7);
+        assert_eq!(decoded_header.parent_root, vec![0x11; 32]);
+        assert_eq!(decoded_header.state_root, vec![0x22; 32]);
+        assert_eq!(decoded_header.body_root, vec![0x33; 32]);
+
+        let unspecified = SignRootRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            object_root: vec![0x44; 32],
+            duty: 0,
+            fork_id: ForkName::Gloas.id(),
+        };
+        let decoded = SignRootRequest::decode(unspecified.encode_to_vec().as_slice())
+            .expect("UNSPECIFIED duty must encode/decode");
+        assert_eq!(decoded.duty, 0);
+        assert_eq!(decoded.fork_id, 7);
+
+        let unknown = SignRootRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            object_root: vec![0x44; 32],
+            duty: 99,
+            fork_id: ForkName::Gloas.id(),
+        };
+        let decoded = SignRootRequest::decode(unknown.encode_to_vec().as_slice())
+            .expect("unknown duty must remain representable on the wire");
+        assert_eq!(decoded.duty, 99);
+
+        let ssz = decode_beacon_block_ssz(&[], 7);
+        assert!(
+            matches!(ssz, Err(SszDecodeError::UnknownForkId(7))),
+            "validate_fork_id(7) via decode_*_ssz must stay UnknownForkId, got {ssz:?}"
+        );
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn test_server_stub_includes_sign_block_header_and_sign_root() {
+        use tonic::{Request, Response, Status};
+
+        use crate::signer_v2::signer_service_server::SignerService;
+        use crate::signer_v2::{
+            GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
+            SignAggregateAndProofRequest, SignAttestationDataRequest, SignBeaconBlockRequest,
+            SignBlindedBeaconBlockRequest, SignBuilderRegistrationRequest,
+            SignContributionAndProofRequest, SignRandaoRevealRequest, SignResponse,
+            SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
+            SignVoluntaryExitRequest,
+        };
+
+        struct Stub;
+
+        #[tonic::async_trait]
+        impl SignerService for Stub {
+            async fn sign_beacon_block(
+                &self,
+                _request: Request<SignBeaconBlockRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_blinded_beacon_block(
+                &self,
+                _request: Request<SignBlindedBeaconBlockRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_attestation_data(
+                &self,
+                _request: Request<SignAttestationDataRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_aggregate_and_proof(
+                &self,
+                _request: Request<SignAggregateAndProofRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_sync_committee_message(
+                &self,
+                _request: Request<SignSyncCommitteeMessageRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_sync_aggregator_selection_data(
+                &self,
+                _request: Request<SignSyncAggregatorSelectionDataRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_contribution_and_proof(
+                &self,
+                _request: Request<SignContributionAndProofRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_builder_registration(
+                &self,
+                _request: Request<SignBuilderRegistrationRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_randao_reveal(
+                &self,
+                _request: Request<SignRandaoRevealRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_voluntary_exit(
+                &self,
+                _request: Request<SignVoluntaryExitRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_block_header(
+                &self,
+                _request: Request<SignBlockHeaderRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn sign_root(
+                &self,
+                _request: Request<SignRootRequest>,
+            ) -> Result<Response<SignResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn list_public_keys(
+                &self,
+                _request: Request<ListPublicKeysRequest>,
+            ) -> Result<Response<ListPublicKeysResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+            async fn get_status(
+                &self,
+                _request: Request<GetStatusRequest>,
+            ) -> Result<Response<GetStatusResponse>, Status> {
+                Err(Status::unimplemented("test stub"))
+            }
+        }
+
+        let _ = Stub;
+    }
+
+    #[cfg(feature = "client")]
+    #[test]
+    fn test_client_stub_includes_sign_block_header_and_sign_root() {
+        use crate::signer_v2::signer_service_client::SignerServiceClient;
+
+        async fn call_rpcs<T>(
+            client: &mut SignerServiceClient<T>,
+            header: SignBlockHeaderRequest,
+            root: SignRootRequest,
+        ) -> Result<(), tonic::Status>
+        where
+            T: tonic::client::GrpcService<tonic::body::BoxBody>,
+            T::Error: Into<tonic::codegen::StdError>,
+            T::ResponseBody: tonic::codegen::Body<Data = tonic::codegen::Bytes> + Send + 'static,
+            <T::ResponseBody as tonic::codegen::Body>::Error: Into<tonic::codegen::StdError> + Send,
+        {
+            let _ = client.sign_block_header(header).await?;
+            let _ = client.sign_root(root).await?;
+            Ok(())
+        }
+
+        let _ = call_rpcs::<tonic::transport::Channel>;
     }
 }

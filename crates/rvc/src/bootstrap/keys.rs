@@ -208,8 +208,8 @@ mod tests {
     use grpc_signer::proto::signer_v2::{
         GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
         SignAggregateAndProofRequest, SignAttestationDataRequest, SignBeaconBlockRequest,
-        SignBlindedBeaconBlockRequest, SignBuilderRegistrationRequest,
-        SignContributionAndProofRequest, SignRandaoRevealRequest, SignResponse,
+        SignBlindedBeaconBlockRequest, SignBlockHeaderRequest, SignBuilderRegistrationRequest,
+        SignContributionAndProofRequest, SignRandaoRevealRequest, SignResponse, SignRootRequest,
         SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
         SignVoluntaryExitRequest,
     };
@@ -460,6 +460,18 @@ mod tests {
         async fn sign_voluntary_exit(
             &self,
             _: Request<SignVoluntaryExitRequest>,
+        ) -> Result<Response<SignResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+        async fn sign_block_header(
+            &self,
+            _: Request<SignBlockHeaderRequest>,
+        ) -> Result<Response<SignResponse>, Status> {
+            Err(Status::unimplemented("mock"))
+        }
+        async fn sign_root(
+            &self,
+            _: Request<SignRootRequest>,
         ) -> Result<Response<SignResponse>, Status> {
             Err(Status::unimplemented("mock"))
         }

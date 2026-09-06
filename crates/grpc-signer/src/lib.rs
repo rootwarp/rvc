@@ -19,7 +19,7 @@ pub use proto::signer_v2::signer_service_server::{
 #[cfg(test)]
 mod tests {
     // ---- proto v2 compile tests ----
-    // These tests verify that all 10 typed SignerService RPCs + 3 PeerSignerService RPCs
+    // These tests verify that SignerService and PeerSignerService request types
     // from signer.v2.proto are reachable from crates/grpc-signer.
 
     #[test]
@@ -164,6 +164,39 @@ mod tests {
     }
 
     #[test]
+    fn test_v2_sign_block_header_request_accessible() {
+        use crate::proto::signer_v2::{BeaconBlockHeader, SignBlockHeaderRequest};
+        let req = SignBlockHeaderRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            header: Some(BeaconBlockHeader {
+                slot: 42,
+                proposer_index: 1,
+                parent_root: vec![0u8; 32],
+                state_root: vec![0u8; 32],
+                body_root: vec![0u8; 32],
+            }),
+            fork_id: 7,
+        };
+        assert_eq!(req.fork_id, 7);
+        assert_eq!(req.header.unwrap().slot, 42);
+    }
+
+    #[test]
+    fn test_v2_sign_root_request_accessible() {
+        use crate::proto::signer_v2::SignRootRequest;
+        let req = SignRootRequest {
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            object_root: vec![0u8; 32],
+            duty: 0,
+            fork_id: 7,
+        };
+        assert_eq!(req.duty, 0);
+        assert_eq!(req.fork_id, 7);
+    }
+
+    #[test]
     fn test_v2_sign_response_accessible() {
         use crate::proto::signer_v2::SignResponse;
         let resp = SignResponse { signature: vec![0u8; 96] };
@@ -215,6 +248,34 @@ mod tests {
         use crate::proto::signer_v2::PartialSignResponse;
         let resp = PartialSignResponse { partial_signature: vec![0u8; 96], share_index: 1 };
         assert_eq!(resp.share_index, 1);
+    }
+
+    #[test]
+    fn test_v2_partial_sign_block_header_request_accessible() {
+        use crate::proto::signer_v2::PartialSignBlockHeaderRequest;
+        let req = PartialSignBlockHeaderRequest {
+            requester_index: 4,
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            header: None,
+            fork_id: 7,
+        };
+        assert_eq!(req.requester_index, 4);
+    }
+
+    #[test]
+    fn test_v2_partial_sign_root_request_accessible() {
+        use crate::proto::signer_v2::PartialSignRootRequest;
+        let req = PartialSignRootRequest {
+            requester_index: 5,
+            pubkey: vec![0u8; 48],
+            fork_info: None,
+            object_root: vec![0u8; 32],
+            duty: 3,
+            fork_id: 7,
+        };
+        assert_eq!(req.requester_index, 5);
+        assert_eq!(req.duty, 3);
     }
 
     #[test]

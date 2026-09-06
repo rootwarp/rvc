@@ -28,9 +28,10 @@ use tonic::{Code, Request, Response, Status};
 use grpc_signer::proto::signer_v2::{
     GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
     SignAggregateAndProofRequest, SignAttestationDataRequest, SignBeaconBlockRequest,
-    SignBlindedBeaconBlockRequest, SignBuilderRegistrationRequest, SignContributionAndProofRequest,
-    SignRandaoRevealRequest, SignResponse, SignSyncAggregatorSelectionDataRequest,
-    SignSyncCommitteeMessageRequest, SignVoluntaryExitRequest,
+    SignBlindedBeaconBlockRequest, SignBlockHeaderRequest, SignBuilderRegistrationRequest,
+    SignContributionAndProofRequest, SignRandaoRevealRequest, SignResponse, SignRootRequest,
+    SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
+    SignVoluntaryExitRequest,
 };
 use grpc_signer::{SignerServiceClientV2, SignerServiceServerV2, SignerServiceV2};
 
@@ -165,6 +166,20 @@ impl SignerServiceV2 for TestService {
     async fn sign_voluntary_exit(
         &self,
         _request: Request<SignVoluntaryExitRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_block_header(
+        &self,
+        _request: Request<SignBlockHeaderRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_root(
+        &self,
+        _request: Request<SignRootRequest>,
     ) -> Result<Response<SignResponse>, Status> {
         Err(Status::unimplemented("test mock"))
     }
