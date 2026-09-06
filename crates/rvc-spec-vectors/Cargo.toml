@@ -12,6 +12,9 @@ description = "Spec vectors + KAT codegen"
 workspace = true
 
 [dependencies]
+serde_yaml.workspace = true
+snap.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
