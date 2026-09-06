@@ -430,7 +430,7 @@ async fn aggregate_and_proof_v2_electra_kat() {
     let body = p1_body(
         "AGGREGATE_AND_PROOF_V2",
         "aggregate_and_proof",
-        serde_json::to_string(&agg).unwrap(),
+        versioned_aggregate_v2_json("ELECTRA", serde_json::to_string(&agg).unwrap()),
     );
     assert_eq!(sign_ok(body).await, expected.to_vec());
 }
@@ -450,7 +450,7 @@ async fn base_and_electra_aggregate_and_proof_do_not_collide() {
     let electra_body = p1_body(
         "AGGREGATE_AND_PROOF_V2",
         "aggregate_and_proof",
-        serde_json::to_string(&electra).unwrap(),
+        versioned_aggregate_v2_json("ELECTRA", serde_json::to_string(&electra).unwrap()),
     );
     assert_ne!(sign_ok(base_body).await, sign_ok(electra_body).await);
 }
@@ -466,8 +466,9 @@ async fn electra_v2_frozen_fixture_parses_and_signs_to_eth_types_root() {
     // (the same `ElectraAggregateAndProof` serde the server's variant uses),
     // NOT from our own serializer — this is the wire-shape freeze check.
     let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+    assert_eq!(v["aggregate_and_proof"]["version"], "ELECTRA");
     let electra: ElectraAggregateAndProof =
-        serde_json::from_value(v["aggregate_and_proof"].clone()).unwrap();
+        serde_json::from_value(v["aggregate_and_proof"]["data"].clone()).unwrap();
     assert!(!electra.aggregate.committee_bits.is_empty(), "Electra committee_bits decoded");
 
     let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, CURRENT_VERSION, expected_gvr());

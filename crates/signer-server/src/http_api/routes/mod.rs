@@ -220,7 +220,7 @@ fn payload_slot(payload: &SignPayload) -> Option<u64> {
             Some(aggregate_and_proof.aggregate.data.slot)
         }
         SignPayload::AggregateAndProofV2 { aggregate_and_proof } => {
-            Some(aggregate_and_proof.aggregate.data.slot)
+            Some(aggregate_and_proof.data.aggregate.data.slot)
         }
         SignPayload::SyncCommitteeMessage { sync_committee_message } => {
             Some(sync_committee_message.slot)
@@ -264,8 +264,16 @@ async fn sign_inner(
     // 2. Decode the body. A serde decode failure maps to a FIXED 400 — the
     //    decoder message can echo request bytes / field text and is NEVER
     //    surfaced to the client (SEC-INFO-01).
-    let req: SignRequest = serde_json::from_slice(body)
-        .map_err(|_| HttpSignError::BadRequest("invalid sign request body".to_string()))?;
+    let req: SignRequest = serde_json::from_slice(body).map_err(|e| {
+        // Named unknown-version identifiers only. Empty / invalid tokens and
+        // every other decoder failure stay the fixed SEC-INFO-01 body.
+        match web3signer_wire::WireVersionError::from_serde_display(&e.to_string()) {
+            Some(web3signer_wire::WireVersionError::Unknown(value)) => {
+                HttpSignError::BadRequest(format!("unknown version: {value}"))
+            }
+            _ => HttpSignError::BadRequest("invalid sign request body".to_string()),
+        }
+    })?;
     // Record the type for the audit entry now that the payload is known, so a
     // later slashing/gate rejection still audits the correct `type` (Issue 4.4).
     *rpc_type = Some(req.payload.type_name());

@@ -10,10 +10,10 @@ use std::time::Duration;
 
 use eth_types::{
     blinded_body_tree_hash_root, body_tree_hash_root, AggregateAndProof, AttestationData,
-    BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof, Epoch, Fork, Root,
-    Slot, SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF,
-    DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER,
-    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof, Epoch, Fork,
+    ForkName, Root, Slot, SyncCommitteeMessage, ValidatorRegistrationV1, VoluntaryExit,
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 // Re-export wire types under the historical crypto names (stable public paths).
@@ -23,7 +23,7 @@ pub use web3signer_wire::{
 };
 pub use web3signer_wire::{SignPayload as Web3SignerPayload, SignRequest as Web3SignerSignRequest};
 
-use web3signer_wire::{SignPayload, SignRequest};
+use web3signer_wire::{reject_gloas_http_wire, SignPayload, SignRequest};
 
 use crypto::signing_root_with_fork_version;
 use crypto::{SignContext, SigningError};
@@ -90,18 +90,15 @@ impl SignRequestJson for SignRequest {
     }
 }
 
-fn fork_version_label(version: [u8; 4]) -> &'static str {
-    // Label only — not hashed. Matches common mainnet/testnet version bytes.
-    match version {
-        [0, 0, 0, 0] => "PHASE0",
-        [1, 0, 0, 0] => "ALTAIR",
-        [2, 0, 0, 0] => "BELLATRIX",
-        [3, 0, 0, 0] => "CAPELLA",
-        [4, 0, 0, 0] => "DENEB",
-        [5, 0, 0, 0] => "ELECTRA",
-        [6, 0, 0, 0] => "FULU",
-        _ => "UNKNOWN",
-    }
+/// Fail closed on Gloas for HTTP block/aggregate builders (D19) *before*
+/// `tree_hash` 0.9 derivation.
+fn http_wire_fork_name(
+    ctx: &SignContext,
+    type_name: &'static str,
+) -> Result<ForkName, SigningError> {
+    reject_gloas_http_wire(ctx.fork_name, type_name)
+        .map_err(|e| SigningError::LocalRejected(e.to_string()))?;
+    Ok(ctx.fork_name)
 }
 
 fn header_from_beacon_block(block: &BeaconBlock) -> Result<BeaconBlockHeader, SigningError> {
@@ -137,6 +134,7 @@ pub fn build_block_v2_request(
     block: &BeaconBlock,
     ctx: &SignContext,
 ) -> Result<(SignRequest, Root), SigningError> {
+    let version = http_wire_fork_name(ctx, "BLOCK_V2")?;
     let header = header_from_beacon_block(block)?;
     let signing_root = signing_root_with_fork_version(
         &header,
@@ -148,10 +146,7 @@ pub fn build_block_v2_request(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
         SignPayload::BlockV2 {
-            beacon_block: BeaconBlockEnvelope {
-                version: fork_version_label(ctx.fork_info.current_version).to_string(),
-                block_header: header,
-            },
+            beacon_block: BeaconBlockEnvelope { version, block_header: header },
         },
     );
     Ok((req, signing_root))
@@ -162,6 +157,7 @@ pub fn build_blinded_block_v2_request(
     block: &BlindedBeaconBlock,
     ctx: &SignContext,
 ) -> Result<(SignRequest, Root), SigningError> {
+    let version = http_wire_fork_name(ctx, "BLOCK_V2")?;
     let header = header_from_blinded_block(block)?;
     let signing_root = signing_root_with_fork_version(
         &header,
@@ -173,10 +169,7 @@ pub fn build_blinded_block_v2_request(
         WireForkInfo::from_sign_context(ctx),
         signing_root,
         SignPayload::BlockV2 {
-            beacon_block: BeaconBlockEnvelope {
-                version: fork_version_label(ctx.fork_info.current_version).to_string(),
-                block_header: header,
-            },
+            beacon_block: BeaconBlockEnvelope { version, block_header: header },
         },
     );
     Ok((req, signing_root))
@@ -218,7 +211,9 @@ pub fn build_randao_reveal_request(epoch: Epoch, ctx: &SignContext) -> (SignRequ
 pub fn build_aggregate_and_proof_request(
     agg: &AggregateAndProof,
     ctx: &SignContext,
-) -> (SignRequest, Root) {
+) -> Result<(SignRequest, Root), SigningError> {
+    reject_gloas_http_wire(ctx.fork_name, "AGGREGATE_AND_PROOF")
+        .map_err(|e| SigningError::LocalRejected(e.to_string()))?;
     let signing_root = signing_root_with_fork_version(
         agg,
         DOMAIN_AGGREGATE_AND_PROOF,
@@ -230,7 +225,7 @@ pub fn build_aggregate_and_proof_request(
         signing_root,
         SignPayload::AggregateAndProof { aggregate_and_proof: agg.clone() },
     );
-    (req, signing_root)
+    Ok((req, signing_root))
 }
 
 /// Build a `SYNC_COMMITTEE_MESSAGE` request.
@@ -359,8 +354,10 @@ pub fn build_aggregation_slot_request(slot: Slot, ctx: &SignContext) -> (SignReq
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crypto::SecretKey;
-    use eth_types::{Attestation, Checkpoint, ForkInfo, SyncCommitteeContribution};
+    use crypto::{SecretKey, SigningError};
+    use eth_types::{
+        Attestation, BlindedBeaconBlock, Checkpoint, ForkInfo, ForkName, SyncCommitteeContribution,
+    };
 
     fn test_fork_info() -> ForkInfo {
         ForkInfo {
@@ -421,7 +418,8 @@ mod tests {
                 },
                 selection_proof: vec![0xcd; 96],
             };
-            let (req, root) = build_aggregate_and_proof_request(&agg, &ctx);
+            let (req, root) =
+                build_aggregate_and_proof_request(&agg, &ctx).expect("aggregate builder");
             v.push(("AGGREGATE_AND_PROOF", req, root));
 
             let (req, root) = build_sync_committee_message_request(5, [0x22; 32], &ctx);
@@ -674,5 +672,85 @@ mod tests {
             ctx.fork_info.genesis_validators_root,
         );
         assert_eq!(root, expected);
+    }
+
+    fn gloas_ctx(sk: &SecretKey) -> SignContext {
+        SignContext {
+            pubkey: sk.public_key(),
+            fork_info: ForkInfo {
+                previous_version: [0x06, 0x00, 0x00, 0x00],
+                current_version: [0x07, 0x00, 0x00, 0x00],
+                genesis_validators_root: [0xaa; 32],
+            },
+            fork_name: ForkName::Gloas,
+        }
+    }
+
+    fn unhashable_block_body() -> Vec<u8> {
+        // Not valid Deneb/Electra SSZ: hashing first would be RemoteSignerError.
+        vec![0xff; 8]
+    }
+
+    #[test]
+    fn test_gloas_block_v2_is_rejected_before_root_derivation() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_ctx(&sk);
+        let block = BeaconBlock {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: [0; 32],
+            state_root: [0; 32],
+            body: unhashable_block_body(),
+        };
+        let err = build_block_v2_request(&block, &ctx).expect_err("D19");
+        let msg = err.to_string();
+        assert!(!msg.contains("invalid beacon block body"), "must not have hashed first: {msg}");
+        assert!(msg.contains("BLOCK_V2"), "names the type: {msg}");
+        assert!(msg.contains("Web3Signer HTTP wire"), "names the wire: {msg}");
+        assert!(msg.contains("deferred"), "names the deferral: {msg}");
+        assert!(matches!(err, SigningError::LocalRejected(_)));
+    }
+
+    #[test]
+    fn test_gloas_blinded_block_v2_is_rejected_before_root_derivation() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_ctx(&sk);
+        let block = BlindedBeaconBlock {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: [0; 32],
+            state_root: [0; 32],
+            body: unhashable_block_body(),
+        };
+        let err = build_blinded_block_v2_request(&block, &ctx).expect_err("D19");
+        let msg = err.to_string();
+        assert!(!msg.contains("invalid blinded block body"), "must not have hashed first: {msg}");
+        assert!(msg.contains("BLOCK_V2"), "names the type: {msg}");
+        assert!(msg.contains("Web3Signer HTTP wire"), "names the wire: {msg}");
+        assert!(msg.contains("deferred"), "names the deferral: {msg}");
+        assert!(matches!(err, SigningError::LocalRejected(_)));
+    }
+
+    #[test]
+    fn test_gloas_aggregate_and_proof_is_rejected_before_root_derivation() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_ctx(&sk);
+        let agg = AggregateAndProof {
+            aggregator_index: 1,
+            aggregate: Attestation {
+                // Over the pre-Electra bitlist limit: hashing first panics in
+                // `tree_hash_root`, so a D19 LocalRejected proves reject-first.
+                aggregation_bits: vec![0xff; 4096],
+                data: sample_attestation(),
+                signature: vec![0xab; 96],
+            },
+            selection_proof: vec![0xcd; 96],
+        };
+        let err = build_aggregate_and_proof_request(&agg, &ctx).expect_err("D19");
+        let msg = err.to_string();
+        assert!(msg.contains("AGGREGATE_AND_PROOF"), "names the type: {msg}");
+        assert!(msg.contains("Web3Signer HTTP wire"), "names the wire: {msg}");
+        assert!(msg.contains("deferred"), "names the deferral: {msg}");
+        assert!(matches!(err, SigningError::LocalRejected(_)));
     }
 }

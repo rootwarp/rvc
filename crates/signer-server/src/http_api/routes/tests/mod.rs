@@ -355,18 +355,18 @@ fn sample_electra_aggregate_and_proof() -> ElectraAggregateAndProof {
 // live capture once Electra traffic is available, fixing any casing/encoding
 // discrepancy in request.rs/dispatch.rs then.
 
+/// Wrap an Electra aggregate object in the Consensys `{version, data}` envelope.
+fn versioned_aggregate_v2_json(version: &str, data_json: String) -> String {
+    format!(r#"{{ "version": "{version}", "data": {data_json} }}"#)
+}
+
 /// A frozen, spec-derived Electra `AGGREGATE_AND_PROOF_V2` wire body. Field
 /// names and encodings (quoted `u64`, `0x`-lowercase hex bitlists, nested
 /// `data`) match the remote-signing schema; `committee_bits` is the EIP-7549
 /// Electra addition. Only the repetitive hex blobs are generated.
 fn electra_v2_frozen_fixture() -> String {
-    format!(
-        r#"{{ "type": "AGGREGATE_AND_PROOF_V2",
-              "fork_info": {{ "fork": {{ "previous_version": "0x03000000",
-                                         "current_version": "0x04000000",
-                                         "epoch": "100" }},
-                   "genesis_validators_root": "0x{gvr}" }},
-              "aggregate_and_proof": {{
+    let inner = format!(
+        r#"{{
                 "aggregator_index": "1",
                 "aggregate": {{
                   "aggregation_bits": "0x01",
@@ -378,11 +378,20 @@ fn electra_v2_frozen_fixture() -> String {
                   "committee_bits": "0x0101010101010101"
                 }},
                 "selection_proof": "0x{sp}"
-              }} }}"#,
-        gvr = hex::encode(expected_gvr()),
+              }}"#,
         z = "00".repeat(32),
         sig = "ab".repeat(96),
         sp = "cd".repeat(96),
+    );
+    format!(
+        r#"{{ "type": "AGGREGATE_AND_PROOF_V2",
+              "fork_info": {{ "fork": {{ "previous_version": "0x03000000",
+                                         "current_version": "0x04000000",
+                                         "epoch": "100" }},
+                   "genesis_validators_root": "0x{gvr}" }},
+              "aggregate_and_proof": {payload} }}"#,
+        gvr = hex::encode(expected_gvr()),
+        payload = versioned_aggregate_v2_json("ELECTRA", inner),
     )
 }
 

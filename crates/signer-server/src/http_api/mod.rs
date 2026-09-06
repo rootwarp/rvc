@@ -128,6 +128,7 @@ const _: fn(
 /// Shared test helpers for the `http_api` submodules.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -143,15 +144,20 @@ pub(crate) mod test_support {
     pub struct MockBackend {
         keys: Vec<[u8; 48]>,
         sig: [u8; 96],
+        sign_calls: AtomicUsize,
     }
 
     impl MockBackend {
         pub fn with_keys(keys: Vec<[u8; 48]>) -> Self {
-            Self { keys, sig: [0xAB; 96] }
+            Self { keys, sig: [0xAB; 96], sign_calls: AtomicUsize::new(0) }
         }
 
         pub fn empty() -> Self {
-            Self { keys: vec![], sig: [0xAB; 96] }
+            Self { keys: vec![], sig: [0xAB; 96], sign_calls: AtomicUsize::new(0) }
+        }
+
+        pub fn sign_call_count(&self) -> usize {
+            self.sign_calls.load(Ordering::SeqCst)
         }
     }
 
@@ -162,6 +168,7 @@ pub(crate) mod test_support {
             _signing_root: &[u8; 32],
             pubkey: &[u8; 48],
         ) -> Result<[u8; 96], SigningBackendError> {
+            self.sign_calls.fetch_add(1, Ordering::SeqCst);
             if self.keys.contains(pubkey) {
                 Ok(self.sig)
             } else {

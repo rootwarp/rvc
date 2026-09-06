@@ -15,6 +15,7 @@ use crate::sign_plan::{self, client_signing_root_matches, PlanInput, SignPlan};
 
 use super::request::{SignPayload, SignRequest, WireForkInfo};
 use super::response::HttpSignError;
+use web3signer_wire::reject_gloas_http_wire;
 
 /// Compute the server-side signing root for `req`, enforce the per-type
 /// `fork_info` requirement, and apply the `signingRoot` verification policy
@@ -47,6 +48,9 @@ fn to_plan_input(
 ) -> Result<PlanInput, HttpSignError> {
     match &req.payload {
         SignPayload::BlockV2 { beacon_block } => {
+            // D19: reject Gloas before tree_hash 0.9 derivation.
+            reject_gloas_http_wire(beacon_block.version, "BLOCK_V2")
+                .map_err(|e| HttpSignError::BadRequest(e.to_string()))?;
             let (fork_version, gvr) = require_fork_info(req)?;
             let object_root = beacon_block.block_header.tree_hash_root().0;
             Ok(PlanInput::Block {
@@ -111,8 +115,11 @@ fn to_plan_input(
             Ok(PlanInput::VoluntaryExit { object_root, fork_version, gvr })
         }
         SignPayload::AggregateAndProofV2 { aggregate_and_proof } => {
+            // D19: reject Gloas before tree_hash 0.9 derivation.
+            reject_gloas_http_wire(aggregate_and_proof.version, "AGGREGATE_AND_PROOF_V2")
+                .map_err(|e| HttpSignError::BadRequest(e.to_string()))?;
             let (fork_version, gvr) = require_fork_info(req)?;
-            let object_root = aggregate_and_proof.try_tree_hash_root().map_err(|_| {
+            let object_root = aggregate_and_proof.data.try_tree_hash_root().map_err(|_| {
                 HttpSignError::BadRequest("invalid aggregate_and_proof".to_string())
             })?;
             Ok(PlanInput::AggregateAndProof { object_root: object_root.0, fork_version, gvr })
@@ -137,7 +144,8 @@ mod tests {
     use axum::http::StatusCode;
     use crypto::{compute_domain, compute_signing_root};
     use eth_types::{
-        Root, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+        AttestationData, Checkpoint, ElectraAggregateAndProof, ElectraAttestation, Root,
+        DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
     };
 
     fn fork_info_json() -> &'static str {
@@ -329,5 +337,68 @@ mod tests {
         let (_, missing_body) =
             plan_sign(&randao(false), BUILDER_FORK_VERSION_MAINNET).unwrap_err().status_and_body();
         assert_eq!(missing_body, "fork_info is required for this request type");
+    }
+
+    fn gloas_block_v2() -> SignRequest {
+        parse(&format!(
+            r#"{{ "type": "BLOCK_V2", "fork_info": {fi},
+                  "beacon_block": {{ "version": "GLOAS",
+                                     "block_header": {{ "slot": "3000000",
+                                                        "proposer_index": "12345",
+                                                        "parent_root": "0x{r}",
+                                                        "state_root": "0x{r}",
+                                                        "body_root": "0x{r}" }} }} }}"#,
+            fi = fork_info_json(),
+            r = "aa".repeat(32),
+        ))
+    }
+
+    #[test]
+    fn gloas_block_v2_is_rejected_before_root_derivation() {
+        let err = plan_sign(&gloas_block_v2(), BUILDER_FORK_VERSION_MAINNET)
+            .expect_err("D19: GLOAS BLOCK_V2 must 400");
+        let (status, body) = err.status_and_body();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("BLOCK_V2"), "names the HTTP type: {body}");
+        assert!(body.contains("GLOAS"), "names the version: {body}");
+        assert!(body.contains("Web3Signer HTTP wire"), "names the wire: {body}");
+        assert!(body.contains("deferred"), "names the deferral: {body}");
+    }
+
+    #[test]
+    fn gloas_aggregate_and_proof_v2_is_rejected_before_root_derivation() {
+        let z = [0u8; 32];
+        let unhashable = ElectraAggregateAndProof {
+            aggregator_index: 1,
+            aggregate: ElectraAttestation {
+                // Past the Electra bitlist limit: hashing first would 400 as
+                // `invalid aggregate_and_proof` instead of the D19 deferral.
+                aggregation_bits: vec![0xff; 20_000],
+                data: AttestationData {
+                    slot: 5,
+                    index: 0,
+                    beacon_block_root: z,
+                    source: Checkpoint { epoch: 1, root: z },
+                    target: Checkpoint { epoch: 2, root: z },
+                },
+                signature: vec![0xab; 96],
+                committee_bits: vec![0x01; 8],
+            },
+            selection_proof: vec![0xcd; 96],
+        };
+        let req = parse(&format!(
+            r#"{{ "type": "AGGREGATE_AND_PROOF_V2", "fork_info": {fi},
+                  "aggregate_and_proof": {{ "version": "GLOAS", "data": {data} }} }}"#,
+            fi = fork_info_json(),
+            data = serde_json::to_string(&unhashable).unwrap(),
+        ));
+        let err = plan_sign(&req, BUILDER_FORK_VERSION_MAINNET)
+            .expect_err("D19: GLOAS AGGREGATE_AND_PROOF_V2 must 400");
+        let (status, body) = err.status_and_body();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_ne!(body, "invalid aggregate_and_proof", "must not have hashed first");
+        assert!(body.contains("AGGREGATE_AND_PROOF_V2"), "names the HTTP type: {body}");
+        assert!(body.contains("Web3Signer HTTP wire"), "names the wire: {body}");
+        assert!(body.contains("deferred"), "names the deferral: {body}");
     }
 }

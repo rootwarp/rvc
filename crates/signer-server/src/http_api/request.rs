@@ -52,7 +52,7 @@ mod tests {
         assert_eq!(req.signing_root, Some([0x11u8; 32]));
         match req.payload {
             SignPayload::BlockV2 { beacon_block } => {
-                assert_eq!(beacon_block.version, "DENEB");
+                assert_eq!(beacon_block.version, eth_types::ForkName::Deneb);
                 assert_eq!(beacon_block.block_header.slot, 3_000_000);
                 assert_eq!(beacon_block.block_header.proposer_index, 12_345);
                 assert_eq!(beacon_block.block_header.parent_root, [0xaau8; 32]);

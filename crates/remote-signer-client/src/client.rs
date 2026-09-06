@@ -250,7 +250,7 @@ impl TypedSigner for RemoteSigner {
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
         let pk = ctx.pubkey.to_bytes();
-        let (req, signing_root) = build_aggregate_and_proof_request(agg, ctx);
+        let (req, signing_root) = build_aggregate_and_proof_request(agg, ctx)?;
         self.sign_request(&pk, &req, &signing_root).await
     }
 

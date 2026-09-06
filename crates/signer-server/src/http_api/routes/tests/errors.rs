@@ -149,7 +149,7 @@ async fn aggregate_and_proof_v2_malformed_bits_is_400_not_panic() {
     let body = p1_body(
         "AGGREGATE_AND_PROOF_V2",
         "aggregate_and_proof",
-        serde_json::to_string(&agg).unwrap(),
+        versioned_aggregate_v2_json("ELECTRA", serde_json::to_string(&agg).unwrap()),
     );
     let resp = post_sign(state, &id, None, body).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "malformed bits → 400, not panic");
@@ -172,7 +172,11 @@ async fn aggregate_and_proof_v2_missing_committee_bits_returns_400() {
         sig = "ab".repeat(96),
         sp = "cd".repeat(96),
     );
-    let body = p1_body("AGGREGATE_AND_PROOF_V2", "aggregate_and_proof", agg_json);
+    let body = p1_body(
+        "AGGREGATE_AND_PROOF_V2",
+        "aggregate_and_proof",
+        versioned_aggregate_v2_json("ELECTRA", agg_json),
+    );
     let resp = post_sign(state, &id, None, body).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
@@ -186,7 +190,10 @@ async fn aggregate_and_proof_v2_missing_fork_info_returns_400() {
     let id = format!("0x{}", hex::encode(pk_bytes));
     let body = format!(
         r#"{{ "type": "AGGREGATE_AND_PROOF_V2", "aggregate_and_proof": {agg} }}"#,
-        agg = serde_json::to_string(&sample_electra_aggregate_and_proof()).unwrap(),
+        agg = versioned_aggregate_v2_json(
+            "ELECTRA",
+            serde_json::to_string(&sample_electra_aggregate_and_proof()).unwrap(),
+        ),
     );
     let resp = post_sign(state, &id, None, body).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -205,6 +212,114 @@ async fn unknown_type_returns_400_not_panic() {
     );
     let resp = post_sign(state, &id, None, body).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Unknown `version` on a known type is a 4xx naming the value; serde fails
+/// closed so the backend is never invoked.
+#[tokio::test]
+async fn unknown_version_returns_400_naming_value_and_skips_backend() {
+    let (_, pk_bytes) = test_keypair();
+    let backend = Arc::new(MockBackend::with_keys(vec![pk_bytes]));
+    let state = test_state(backend.clone());
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let req = format!(
+        r#"{{ "type": "BLOCK_V2", {fi},
+              "beacon_block": {{ "version": "NOT_A_FORK",
+                                 "block_header": {{ "slot": "3000000",
+                                                    "proposer_index": "12345",
+                                                    "parent_root": "0x{aa}",
+                                                    "state_root": "0x{aa}",
+                                                    "body_root": "0x{aa}" }} }} }}"#,
+        fi = fork_info_json(),
+        aa = "aa".repeat(32),
+    );
+    let resp = post_sign(state, &id, None, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(text.contains("NOT_A_FORK"), "names the version: {text}");
+    assert_eq!(backend.sign_call_count(), 0, "backend must not be invoked");
+}
+
+/// Empty `version` is a generic 400 — never serde `at line N column M`.
+#[tokio::test]
+async fn empty_version_returns_generic_400_without_decoder_text() {
+    let (_, pk_bytes) = test_keypair();
+    let backend = Arc::new(MockBackend::with_keys(vec![pk_bytes]));
+    let state = test_state(backend.clone());
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let req = format!(
+        r#"{{ "type": "BLOCK_V2", {fi},
+              "beacon_block": {{ "version": "",
+                                 "block_header": {{ "slot": "3000000",
+                                                    "proposer_index": "12345",
+                                                    "parent_root": "0x{aa}",
+                                                    "state_root": "0x{aa}",
+                                                    "body_root": "0x{aa}" }} }} }}"#,
+        fi = fork_info_json(),
+        aa = "aa".repeat(32),
+    );
+    let resp = post_sign(state, &id, None, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert_eq!(text, "invalid sign request body");
+    assert!(!text.contains("line") && !text.contains("column"), "no decoder text: {text}");
+    assert_eq!(backend.sign_call_count(), 0, "backend must not be invoked");
+}
+
+/// D19: GLOAS on BLOCK_V2 is a typed 4xx naming the HTTP wire; no backend call.
+#[tokio::test]
+async fn gloas_block_v2_returns_400_naming_wire_and_skips_backend() {
+    let (_, pk_bytes) = test_keypair();
+    let backend = Arc::new(MockBackend::with_keys(vec![pk_bytes]));
+    let state = test_state(backend.clone());
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let req = format!(
+        r#"{{ "type": "BLOCK_V2", {fi},
+              "beacon_block": {{ "version": "GLOAS",
+                                 "block_header": {{ "slot": "3000000",
+                                                    "proposer_index": "12345",
+                                                    "parent_root": "0x{aa}",
+                                                    "state_root": "0x{aa}",
+                                                    "body_root": "0x{aa}" }} }} }}"#,
+        fi = fork_info_json(),
+        aa = "aa".repeat(32),
+    );
+    let resp = post_sign(state, &id, None, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert!(text.contains("BLOCK_V2"), "names the type: {text}");
+    assert!(text.contains("Web3Signer HTTP wire"), "names the wire: {text}");
+    assert!(text.contains("deferred"), "names the deferral: {text}");
+    assert_eq!(backend.sign_call_count(), 0, "backend must not be invoked");
+}
+
+/// D19: GLOAS on AGGREGATE_AND_PROOF_V2 is the same typed 4xx; no backend call.
+#[tokio::test]
+async fn gloas_aggregate_and_proof_v2_returns_400_naming_wire_and_skips_backend() {
+    let (_, pk_bytes) = test_keypair();
+    let backend = Arc::new(MockBackend::with_keys(vec![pk_bytes]));
+    let state = test_state(backend.clone());
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let req = format!(
+        r#"{{ "type": "AGGREGATE_AND_PROOF_V2", {fi},
+              "aggregate_and_proof": {payload} }}"#,
+        fi = fork_info_json(),
+        payload = versioned_aggregate_v2_json("GLOAS", {
+            let mut agg = sample_electra_aggregate_and_proof();
+            // Unhashable: if D19 ran *after* tree_hash the body would be
+            // `invalid aggregate_and_proof`, not the deferral.
+            agg.aggregate.aggregation_bits = vec![0xff; 20_000];
+            serde_json::to_string(&agg).unwrap()
+        },),
+    );
+    let resp = post_sign(state, &id, None, req).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let text = String::from_utf8(body_bytes(resp).await).unwrap();
+    assert_ne!(text, "invalid aggregate_and_proof", "must not have hashed first");
+    assert!(text.contains("AGGREGATE_AND_PROOF_V2"), "names the type: {text}");
+    assert!(text.contains("Web3Signer HTTP wire"), "names the wire: {text}");
+    assert!(text.contains("deferred"), "names the deferral: {text}");
+    assert_eq!(backend.sign_call_count(), 0, "backend must not be invoked");
 }
 
 /// Status-mapping spot-check after the P2 arms: a valid body to an unloaded

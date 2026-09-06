@@ -36,6 +36,10 @@
 //! - `fork_info` is optional at the serde layer; per-type enforcement is the
 //!   dispatcher's job (`VALIDATOR_REGISTRATION` omits it).
 //! - Unknown `type` fails to decode (no `#[serde(other)]`).
+//! - Unknown `version` fails to decode via fail-closed [`ForkName::from_str`]
+//!   (no `#[serde(other)]`). Web3Signer wire names are `PHASE0`…`GLOAS`; they
+//!   are folded to lowercase before `from_str`. Empty / non-identifier version
+//!   strings are invalid (not named on the HTTP 400).
 //!
 //! # Naming
 //!
@@ -47,9 +51,12 @@
 
 mod hex_serde;
 
+use std::fmt;
+use std::str::FromStr;
+
 use eth_types::{
     AggregateAndProof, AttestationData, BeaconBlockHeader, ContributionAndProof,
-    ElectraAggregateAndProof, Fork, Root, SyncCommitteeMessage, ValidatorRegistrationV1,
+    ElectraAggregateAndProof, Fork, ForkName, Root, SyncCommitteeMessage, ValidatorRegistrationV1,
     VoluntaryExit,
 };
 use serde::{Deserialize, Serialize};
@@ -66,13 +73,127 @@ pub struct WireForkInfo {
     pub genesis_validators_root: Root,
 }
 
-/// `beacon_block` payload (Bellatrix+): a `version` fork-name string plus the
-/// `block_header`. Only `block_header` is hashed for the signing root; `version`
-/// is decorative (the domain comes from `fork_info`).
+/// Web3Signer `{version, data}` envelope used by `*_V2` types and new Gloas
+/// sign types (remote-signing-api). `version` is fail-closed: an unknown
+/// string never becomes a domain choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedPayload<T> {
+    #[serde(with = "fork_name_wire")]
+    pub version: ForkName,
+    pub data: T,
+}
+
+/// `BLOCK_V2` envelope. Same fail-closed `version` as [`VersionedPayload`],
+/// but Consensys / remote-signing-api name the object `block_header` not `data`.
+/// Only `block_header` is hashed; the domain still comes from `fork_info`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BeaconBlockEnvelope {
-    pub version: String,
+    #[serde(with = "fork_name_wire")]
+    pub version: ForkName,
     pub block_header: BeaconBlockHeader,
+}
+
+/// Gloas block and aggregate signing over the Web3Signer HTTP wire is deferred
+/// (D19). Named so server and client reject with the same typed error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GloasHttpWireDeferred {
+    pub type_name: &'static str,
+}
+
+impl fmt::Display for GloasHttpWireDeferred {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} with version GLOAS is deferred on the Web3Signer HTTP wire", self.type_name)
+    }
+}
+
+impl std::error::Error for GloasHttpWireDeferred {}
+
+/// Reject `ForkName::Gloas` for existing v2 HTTP types before any root is derived.
+pub fn reject_gloas_http_wire(
+    version: ForkName,
+    type_name: &'static str,
+) -> Result<(), GloasHttpWireDeferred> {
+    if version == ForkName::Gloas {
+        Err(GloasHttpWireDeferred { type_name })
+    } else {
+        Ok(())
+    }
+}
+
+/// Fail-closed parse of a Web3Signer `version` string.
+///
+/// Empty / whitespace / non-identifier tokens are [`WireVersionError::Invalid`]
+/// (HTTP maps these to the generic SEC-INFO-01 body). A well-formed identifier
+/// that is not a [`ForkName`] is [`WireVersionError::Unknown`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireVersionError {
+    Invalid,
+    Unknown(String),
+}
+
+impl fmt::Display for WireVersionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid => f.write_str("invalid version"),
+            Self::Unknown(v) => write!(f, "unknown version: {v}"),
+        }
+    }
+}
+
+impl std::error::Error for WireVersionError {}
+
+fn is_wire_version_token(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 64 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Parse a wire `version` via [`ForkName::from_str`] (lowercase fold).
+pub fn parse_wire_fork_name(raw: &str) -> Result<ForkName, WireVersionError> {
+    let trimmed = raw.trim();
+    if !is_wire_version_token(trimmed) {
+        return Err(WireVersionError::Invalid);
+    }
+    ForkName::from_str(&trimmed.to_ascii_lowercase())
+        .map_err(|_| WireVersionError::Unknown(trimmed.to_string()))
+}
+
+impl WireVersionError {
+    /// Recover a typed unknown-version error from a serde_json Display.
+    ///
+    /// Only a single identifier token after `unknown version: ` matches —
+    /// empty versions, location text (`at line N column M`), and other decoder
+    /// failures return `None`.
+    pub fn from_serde_display(msg: &str) -> Option<Self> {
+        const PREFIX: &str = "unknown version: ";
+        let start = msg.find(PREFIX)?;
+        let token = msg[start + PREFIX.len()..].split_whitespace().next()?;
+        if !is_wire_version_token(token) {
+            return None;
+        }
+        Some(Self::Unknown(token.to_string()))
+    }
+}
+
+/// Web3Signer `version` strings are `PHASE0`…`GLOAS`. Fold to lowercase so
+/// [`ForkName::from_str`] stays the single fail-closed parser (beacon-API
+/// names are lowercase; the HTTP wire is uppercase).
+mod fork_name_wire {
+    use super::{parse_wire_fork_name, ForkName};
+    use serde::{de, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(name: &ForkName, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        s.serialize_str(&name.as_ref().to_ascii_uppercase())
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<ForkName, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(d)?;
+        parse_wire_fork_name(&raw).map_err(de::Error::custom)
+    }
 }
 
 /// `randao_reveal` payload: a single quoted `epoch`.
@@ -132,8 +253,9 @@ pub enum SignPayload {
     VoluntaryExit { voluntary_exit: VoluntaryExit },
     /// Electra sibling of `AGGREGATE_AND_PROOF` (FR-14 / FR-31 FROZEN).
     /// Server-reachable today; client builders not yet (see module doc table).
+    /// Inner object is the Consensys `{version, data}` wrapper.
     #[serde(rename = "AGGREGATE_AND_PROOF_V2")]
-    AggregateAndProofV2 { aggregate_and_proof: ElectraAggregateAndProof },
+    AggregateAndProofV2 { aggregate_and_proof: VersionedPayload<ElectraAggregateAndProof> },
 }
 
 /// Client-facing alias for [`SignPayload`] (RF3-11 migration).
@@ -203,7 +325,7 @@ impl SignRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use eth_types::{Checkpoint, Fork};
+    use eth_types::{Checkpoint, Fork, ForkName};
 
     // ── Recorded production-shaped bodies (from request.rs + routes.rs) ──────
     // Built by copy from existing decoder fixtures — never from this crate's
@@ -336,9 +458,10 @@ mod tests {
         assert_roundtrip(&cap);
 
         // AGGREGATE_AND_PROOF_V2 (electra_v2_frozen_fixture from routes.rs, FR-31)
-        // Compact form of the frozen fixture field names/encodings.
+        // Compact form of the frozen fixture field names/encodings, including
+        // the Consensys `{version, data}` wrapper.
         let electra_v2 = format!(
-            r#"{{"type":"AGGREGATE_AND_PROOF_V2","fork_info":{fi},"aggregate_and_proof":{{"aggregator_index":"1","aggregate":{{"aggregation_bits":"0x01","data":{{"slot":"5","index":"0","beacon_block_root":"0x{z}","source":{{"epoch":"1","root":"0x{z}"}},"target":{{"epoch":"2","root":"0x{z}"}}}},"signature":"0x{sig}","committee_bits":"0x0101010101010101"}},"selection_proof":"0x{sp}"}}}}"#,
+            r#"{{"type":"AGGREGATE_AND_PROOF_V2","fork_info":{fi},"aggregate_and_proof":{{"version":"ELECTRA","data":{{"aggregator_index":"1","aggregate":{{"aggregation_bits":"0x01","data":{{"slot":"5","index":"0","beacon_block_root":"0x{z}","source":{{"epoch":"1","root":"0x{z}"}},"target":{{"epoch":"2","root":"0x{z}"}}}},"signature":"0x{sig}","committee_bits":"0x0101010101010101"}},"selection_proof":"0x{sp}"}}}}}}"#,
             fi = fork_info_compact(),
             z = "00".repeat(32),
             sig = "ab".repeat(96),
@@ -367,7 +490,7 @@ mod tests {
         let samples: Vec<SignPayload> = vec![
             SignPayload::BlockV2 {
                 beacon_block: BeaconBlockEnvelope {
-                    version: "DENEB".into(),
+                    version: ForkName::Deneb,
                     block_header: BeaconBlockHeader {
                         slot: 1,
                         proposer_index: 0,
@@ -449,21 +572,24 @@ mod tests {
                 voluntary_exit: VoluntaryExit { epoch: 7, validator_index: 1 },
             },
             SignPayload::AggregateAndProofV2 {
-                aggregate_and_proof: ElectraAggregateAndProof {
-                    aggregator_index: 1,
-                    aggregate: eth_types::ElectraAttestation {
-                        aggregation_bits: vec![0x01],
-                        data: AttestationData {
-                            slot: 5,
-                            index: 0,
-                            beacon_block_root: [0; 32],
-                            source: Checkpoint { epoch: 1, root: [0; 32] },
-                            target: Checkpoint { epoch: 2, root: [0; 32] },
+                aggregate_and_proof: VersionedPayload {
+                    version: ForkName::Electra,
+                    data: ElectraAggregateAndProof {
+                        aggregator_index: 1,
+                        aggregate: eth_types::ElectraAttestation {
+                            aggregation_bits: vec![0x01],
+                            data: AttestationData {
+                                slot: 5,
+                                index: 0,
+                                beacon_block_root: [0; 32],
+                                source: Checkpoint { epoch: 1, root: [0; 32] },
+                                target: Checkpoint { epoch: 2, root: [0; 32] },
+                            },
+                            signature: vec![0xab; 96],
+                            committee_bits: vec![0x01; 8],
                         },
-                        signature: vec![0xab; 96],
-                        committee_bits: vec![0x01; 8],
+                        selection_proof: vec![0xcd; 96],
                     },
-                    selection_proof: vec![0xcd; 96],
                 },
             },
         ];
@@ -570,7 +696,7 @@ mod tests {
         assert_eq!(req.signing_root, Some([0x11u8; 32]));
         match req.payload {
             SignPayload::BlockV2 { beacon_block } => {
-                assert_eq!(beacon_block.version, "DENEB");
+                assert_eq!(beacon_block.version, ForkName::Deneb);
                 assert_eq!(beacon_block.block_header.slot, 3_000_000);
                 assert_eq!(beacon_block.block_header.proposer_index, 12_345);
                 assert_eq!(beacon_block.block_header.parent_root, [0xaau8; 32]);
@@ -671,17 +797,20 @@ mod tests {
                                              "epoch": "100" }},
                        "genesis_validators_root": "0x{gvr}" }},
                   "aggregate_and_proof": {{
-                    "aggregator_index": "1",
-                    "aggregate": {{
-                      "aggregation_bits": "0x01",
-                      "data": {{ "slot": "5", "index": "0",
-                                "beacon_block_root": "0x{z}",
-                                "source": {{ "epoch": "1", "root": "0x{z}" }},
-                                "target": {{ "epoch": "2", "root": "0x{z}" }} }},
-                      "signature": "0x{sig}",
-                      "committee_bits": "0x0101010101010101"
-                    }},
-                    "selection_proof": "0x{sp}"
+                    "version": "ELECTRA",
+                    "data": {{
+                      "aggregator_index": "1",
+                      "aggregate": {{
+                        "aggregation_bits": "0x01",
+                        "data": {{ "slot": "5", "index": "0",
+                                  "beacon_block_root": "0x{z}",
+                                  "source": {{ "epoch": "1", "root": "0x{z}" }},
+                                  "target": {{ "epoch": "2", "root": "0x{z}" }} }},
+                        "signature": "0x{sig}",
+                        "committee_bits": "0x0101010101010101"
+                      }},
+                      "selection_proof": "0x{sp}"
+                    }}
                   }} }}"#,
             gvr = hex::encode(expected_gvr()),
             z = "00".repeat(32),
@@ -692,12 +821,108 @@ mod tests {
         assert_eq!(req.payload.type_name(), "AGGREGATE_AND_PROOF_V2");
         match req.payload {
             SignPayload::AggregateAndProofV2 { aggregate_and_proof } => {
-                assert_eq!(aggregate_and_proof.aggregator_index, 1);
-                assert_eq!(aggregate_and_proof.aggregate.data.slot, 5);
-                assert_eq!(aggregate_and_proof.aggregate.committee_bits, vec![0x01; 8]);
+                assert_eq!(aggregate_and_proof.version, ForkName::Electra);
+                assert_eq!(aggregate_and_proof.data.aggregator_index, 1);
+                assert_eq!(aggregate_and_proof.data.aggregate.data.slot, 5);
+                assert_eq!(aggregate_and_proof.data.aggregate.committee_bits, vec![0x01; 8]);
             }
             other => panic!("expected AggregateAndProofV2, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_unknown_version_fails_to_decode_naming_value() {
+        let body = format!(
+            r#"{{ "type": "BLOCK_V2", "fork_info": {fi},
+                  "beacon_block": {{ "version": "NOT_A_FORK",
+                                     "block_header": {{ "slot": "1",
+                                                        "proposer_index": "0",
+                                                        "parent_root": "0x{z}",
+                                                        "state_root": "0x{z}",
+                                                        "body_root": "0x{z}" }} }} }}"#,
+            fi = fork_info_json(),
+            z = "00".repeat(32),
+        );
+        let err = serde_json::from_str::<SignRequest>(&body).unwrap_err().to_string();
+        match WireVersionError::from_serde_display(&err) {
+            Some(WireVersionError::Unknown(value)) => assert_eq!(value, "NOT_A_FORK"),
+            other => panic!("expected Unknown(NOT_A_FORK), got {other:?} from {err}"),
+        }
+    }
+
+    #[test]
+    fn test_empty_version_is_invalid_not_named() {
+        for version in ["", "   "] {
+            let body = format!(
+                r#"{{ "type": "BLOCK_V2", "fork_info": {fi},
+                      "beacon_block": {{ "version": "{version}",
+                                         "block_header": {{ "slot": "1",
+                                                            "proposer_index": "0",
+                                                            "parent_root": "0x{z}",
+                                                            "state_root": "0x{z}",
+                                                            "body_root": "0x{z}" }} }} }}"#,
+                fi = fork_info_json(),
+                z = "00".repeat(32),
+            );
+            let err = serde_json::from_str::<SignRequest>(&body).unwrap_err().to_string();
+            assert!(
+                WireVersionError::from_serde_display(&err).is_none(),
+                "empty/whitespace version must not name a token (no serde location leak): {err}"
+            );
+            assert!(!err.to_lowercase().contains("unknown version:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_gloas_version_decodes_as_fork_name() {
+        // GLOAS is a known ForkName (serde succeeds); D19 rejection is dispatch
+        // / client, not the decoder — otherwise we could not name the deferral.
+        let body = format!(
+            r#"{{ "type": "BLOCK_V2", "fork_info": {fi},
+                  "beacon_block": {{ "version": "GLOAS",
+                                     "block_header": {{ "slot": "1",
+                                                        "proposer_index": "0",
+                                                        "parent_root": "0x{z}",
+                                                        "state_root": "0x{z}",
+                                                        "body_root": "0x{z}" }} }} }}"#,
+            fi = fork_info_json(),
+            z = "00".repeat(32),
+        );
+        let req: SignRequest = serde_json::from_str(&body).unwrap();
+        match req.payload {
+            SignPayload::BlockV2 { beacon_block } => {
+                assert_eq!(beacon_block.version, ForkName::Gloas);
+                let err = reject_gloas_http_wire(beacon_block.version, "BLOCK_V2").unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    "BLOCK_V2 with version GLOAS is deferred on the Web3Signer HTTP wire"
+                );
+            }
+            other => panic!("expected BlockV2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_wire_fork_name_empty_is_invalid() {
+        assert_eq!(parse_wire_fork_name(""), Err(WireVersionError::Invalid));
+        assert_eq!(parse_wire_fork_name("   "), Err(WireVersionError::Invalid));
+        assert_eq!(parse_wire_fork_name("NOT A FORK"), Err(WireVersionError::Invalid));
+        assert_eq!(
+            parse_wire_fork_name("NOT_A_FORK"),
+            Err(WireVersionError::Unknown("NOT_A_FORK".into()))
+        );
+        assert_eq!(parse_wire_fork_name("DENEB"), Ok(ForkName::Deneb));
+        assert_eq!(parse_wire_fork_name("deneb"), Ok(ForkName::Deneb));
+    }
+
+    #[test]
+    fn test_versioned_payload_roundtrips_uppercase_fork_name() {
+        let payload = VersionedPayload { version: ForkName::Fulu, data: 7u64 };
+        let v = serde_json::to_value(&payload).unwrap();
+        assert_eq!(v["version"], "FULU");
+        assert_eq!(v["data"], 7);
+        let back: VersionedPayload<u64> = serde_json::from_value(v).unwrap();
+        assert_eq!(back, payload);
     }
 
     #[test]
