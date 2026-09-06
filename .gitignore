@@ -31,3 +31,6 @@ password
 validator_keys/
 deposit_data-*.json
 slashing_protection.sqlite
+
+# Fetched spec-vector cache (lockfile is tracked)
+crates/rvc-spec-vectors/vectors/

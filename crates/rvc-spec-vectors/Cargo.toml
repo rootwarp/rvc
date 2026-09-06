@@ -12,3 +12,6 @@ description = "Spec vectors + KAT codegen"
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+tempfile.workspace = true

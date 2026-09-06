@@ -1,5 +1,5 @@
 .PHONY: build build-release check fmt clippy test test-fast coverage clean \
-       docker-rvc docker-signer docker-keygen docker-all architecture-doc
+       docker-rvc docker-signer docker-keygen docker-all architecture-doc spec-vectors
 
 # Build
 build:
@@ -67,6 +67,14 @@ clean:
 # CI enforces doc == generated via crates/architecture-tests.
 architecture-doc:
 	cargo run -p rvc-architecture-tests --bin generate-architecture-md
+
+# Fetched consensus-specs / ssz-specs vector cache (gitignored).
+# Export rather than splicing PRESET into the recipe (values with quotes/spaces).
+PRESET ?= minimal
+export PRESET
+
+spec-vectors:
+	./scripts/fetch_spec_vectors.sh
 
 # All checks (CI)
 ci: fmt-check clippy test

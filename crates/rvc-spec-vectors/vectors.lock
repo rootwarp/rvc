@@ -1,0 +1,9 @@
+# Pinned consensus-specs and ssz-specs archives (tag + URL + sha256).
+# A digest mismatch is a spec signal: re-pin this file, do not "fix" the hash.
+
+SPEC_TAG=v1.7.0-beta.0
+SSZ_SPECS_TAG=v0.1.0
+
+archive minimal v1.7.0-beta.0 https://github.com/ethereum/consensus-specs/releases/download/v1.7.0-beta.0/minimal.tar.gz ba9203686b7312cddf160bfd3d4ad55e531dace6662e0223fe9b13b979535441
+archive mainnet v1.7.0-beta.0 https://github.com/ethereum/consensus-specs/releases/download/v1.7.0-beta.0/mainnet.tar.gz 0ef9c069293e2171dd75c5593faf7b97e32b9bcdce9285e870959938747c0774
+archive ssz v0.1.0 https://github.com/ethereum/ssz-specs/releases/download/v0.1.0/ssz-test-vectors-v0.1.0.tar.gz e2a65f032b59835c26127295293ea1bc07d7ca0ea1fe0e4f1128dffed333f878
