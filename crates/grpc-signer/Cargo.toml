@@ -18,11 +18,16 @@ hex.workspace = true
 signer-proto = { workspace = true, features = ["server", "client"] }
 tonic = { workspace = true, features = ["transport", "tls"] }
 tracing.workspace = true
+tree_hash.workspace = true
 url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 eth-types = { workspace = true, features = ["test-fixtures"] }
+hex.workspace = true
+prost.workspace = true
+tree_hash.workspace = true
+rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }
 rvc-test-support.workspace = true
 slashing.workspace = true
 tempfile.workspace = true

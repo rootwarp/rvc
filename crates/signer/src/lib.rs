@@ -173,6 +173,12 @@ impl From<SigningError> for SignerError {
                 SignerError::SigningFailed(format!("unsupported remote signing type: {msg}"))
             }
             SigningError::UnsupportedDuty { duty } => SignerError::UnsupportedDuty { duty },
+            SigningError::SignerLacksGloasSupport { rpc, details } => {
+                SignerError::SigningFailed(truncate_error_body(
+                    &format!("signer does not support Gloas duties ({rpc}): {details}"),
+                    200,
+                ))
+            }
         }
     }
 }
@@ -869,9 +875,10 @@ impl ValidatorSigner for SignerService {
         let sign_ctx =
             sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
-            // Pre-Gloas: legacy SignBeaconBlock / SignBlindedBeaconBlock when
-            // the caller still has body bytes. 4.20c selects SignBlockHeader at Gloas.
-            if header_owned.body_ssz.is_empty() {
+            // Gloas: always SignBlockHeader so Gloas body SSZ never enters a
+            // legacy decoder RPC. Pre-Gloas: legacy SSZ RPCs when body bytes
+            // remain; header-only callers still use sign_block_header.
+            if sign_ctx.fork_name >= ForkName::Gloas || header_owned.body_ssz.is_empty() {
                 grpc.sign_block_header(&header_owned.spec_header(), &sign_ctx).await
             } else if header_owned.is_blinded {
                 let blinded = BlindedBeaconBlock {
@@ -1099,15 +1106,27 @@ impl ValidatorSigner for SignerService {
         let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
         let pk = pubkey.to_bytes();
         if self.signer.has_grpc_remote(&pk) {
-            // Existing SignAggregateAndProof RPC is pre-Electra attestation SSZ.
-            let legacy = electra_aggregate_as_legacy(aggregate_and_proof);
-            let signing_root = signing_root_for(&DutyRef::AggregateAndProof(&legacy), &ctx);
-            let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
-                grpc.sign_aggregate_and_proof(&legacy, &sign_ctx).await
-            });
-            let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-            self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
-                .await
+            if sign_ctx.fork_name >= ForkName::Gloas {
+                let signing_root =
+                    signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
+                let agg = aggregate_and_proof.clone();
+                let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+                    grpc.sign_electra_aggregate_and_proof(&agg, &sign_ctx).await
+                });
+                let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+                self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
+                    .await
+            } else {
+                // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
+                let legacy = electra_aggregate_as_legacy(aggregate_and_proof);
+                let signing_root = signing_root_for(&DutyRef::AggregateAndProof(&legacy), &ctx);
+                let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+                    grpc.sign_aggregate_and_proof(&legacy, &sign_ctx).await
+                });
+                let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+                self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
+                    .await
+            }
         } else {
             let signing_root =
                 signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);

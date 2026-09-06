@@ -5,13 +5,16 @@ use thiserror::Error;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
 
+use eth_types::ForkName;
+
 use crate::backend::dvt::{PartialSignDuty, PeerPartial, PeerRequestError, PeerRequester};
 use crate::dvt::allow_list::AllowedPeers;
 use crate::grpc_tls::TlsConfig;
 use crate::proto::signer_v2::peer_signer_service_client::PeerSignerServiceClient;
 use crate::proto::signer_v2::{
     PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest,
-    PartialSignPayloadAttestationRequest, PartialSignResponse, PartialSignSyncCommitteeRequest,
+    PartialSignBlockHeaderRequest, PartialSignPayloadAttestationRequest, PartialSignResponse,
+    PartialSignRootRequest, PartialSignSyncCommitteeRequest,
 };
 
 #[derive(Error, Debug)]
@@ -197,7 +200,31 @@ impl GrpcPeerRequester {
             .collect()
     }
 
+    fn uses_gloas_rpc(fork_id: u32) -> bool {
+        matches!(ForkName::try_from(fork_id), Ok(name) if name >= ForkName::Gloas)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn map_gloas_unimplemented(
+        result: Result<tonic::Response<PartialSignResponse>, tonic::Status>,
+        rpc: &'static str,
+    ) -> Result<tonic::Response<PartialSignResponse>, tonic::Status> {
+        match result {
+            Err(status) if status.code() == tonic::Code::Unimplemented => {
+                Err(tonic::Status::unimplemented(format!(
+                    "signer does not support Gloas duties ({rpc}): {}",
+                    status.message()
+                )))
+            }
+            other => other,
+        }
+    }
+
     /// Dispatch a typed partial-sign RPC for `duty` on `client`.
+    ///
+    /// Same fork-aware rule as `grpc-signer`: `>= Gloas` uses the new RPC,
+    /// otherwise the legacy RPC. No fallback-on-error retry.
+    #[allow(clippy::result_large_err)]
     async fn partial_sign_rpc(
         client: &mut PeerSignerServiceClient<Channel>,
         duty: &PartialSignDuty,
@@ -206,6 +233,12 @@ impl GrpcPeerRequester {
     ) -> Result<tonic::Response<PartialSignResponse>, tonic::Status> {
         match duty {
             PartialSignDuty::BeaconBlock { fork_info, block_ssz, fork_id } => {
+                if Self::uses_gloas_rpc(*fork_id) {
+                    return Err(tonic::Status::failed_precondition(
+                        "Gloas block partial-sign must use PartialSignBlockHeader; \
+                         refusing legacy SSZ RPC",
+                    ));
+                }
                 let req = PartialSignBeaconBlockRequest {
                     requester_index,
                     pubkey: pubkey.to_vec(),
@@ -237,6 +270,7 @@ impl GrpcPeerRequester {
                 client.partial_sign_sync_committee(req).await
             }
             PartialSignDuty::PayloadAttestation { fork_info, data, fork_id, object_root } => {
+                // Stay on PartialSignPayloadAttestation (Gloas-safe, 4.11c filter).
                 let req = PartialSignPayloadAttestationRequest {
                     requester_index,
                     pubkey: pubkey.to_vec(),
@@ -246,6 +280,33 @@ impl GrpcPeerRequester {
                     object_root: object_root.clone(),
                 };
                 client.partial_sign_payload_attestation(req).await
+            }
+            PartialSignDuty::BlockHeader { fork_info, header, fork_id } => {
+                let req = PartialSignBlockHeaderRequest {
+                    requester_index,
+                    pubkey: pubkey.to_vec(),
+                    fork_info: Some(fork_info.clone()),
+                    header: Some(header.clone()),
+                    fork_id: *fork_id,
+                };
+                Self::map_gloas_unimplemented(
+                    client.partial_sign_block_header(req).await,
+                    "PartialSignBlockHeader",
+                )
+            }
+            PartialSignDuty::Root { fork_info, object_root, duty, fork_id } => {
+                let req = PartialSignRootRequest {
+                    requester_index,
+                    pubkey: pubkey.to_vec(),
+                    fork_info: Some(fork_info.clone()),
+                    object_root: object_root.clone(),
+                    duty: *duty,
+                    fork_id: *fork_id,
+                };
+                Self::map_gloas_unimplemented(
+                    client.partial_sign_root(req).await,
+                    "PartialSignRoot",
+                )
             }
         }
     }
@@ -393,5 +454,235 @@ mod tests {
     fn test_peer_client_error_display_not_found() {
         let err = PeerClientError::PeerNotFound("unknown:1234".to_string());
         assert!(err.to_string().contains("unknown:1234"));
+    }
+
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+
+    use crate::proto::signer_v2::peer_signer_service_server::{
+        PeerSignerService, PeerSignerServiceServer,
+    };
+    use crate::proto::signer_v2::{
+        BeaconBlockHeader, ForkInfo, PartialSignAttestationDataRequest,
+        PartialSignBeaconBlockRequest, PartialSignBlockHeaderRequest,
+        PartialSignPayloadAttestationRequest, PartialSignRootRequest,
+        PartialSignSyncCommitteeRequest,
+    };
+
+    type RpcLog = Arc<Mutex<Vec<String>>>;
+
+    struct RecordingPeer {
+        calls: RpcLog,
+        legacy_only: bool,
+    }
+
+    fn dummy_partial() -> PartialSignResponse {
+        PartialSignResponse { partial_signature: vec![1u8; 96], share_index: 1 }
+    }
+
+    #[tonic::async_trait]
+    impl PeerSignerService for RecordingPeer {
+        async fn partial_sign_beacon_block(
+            &self,
+            _request: tonic::Request<PartialSignBeaconBlockRequest>,
+        ) -> Result<tonic::Response<PartialSignResponse>, tonic::Status> {
+            self.calls.lock().unwrap().push("partial_sign_beacon_block".into());
+            Ok(tonic::Response::new(dummy_partial()))
+        }
+        async fn partial_sign_attestation_data(
+            &self,
+            _request: tonic::Request<PartialSignAttestationDataRequest>,
+        ) -> Result<tonic::Response<PartialSignResponse>, tonic::Status> {
+            self.calls.lock().unwrap().push("partial_sign_attestation_data".into());
+            Ok(tonic::Response::new(dummy_partial()))
+        }
+        async fn partial_sign_sync_committee(
+            &self,
+            _request: tonic::Request<PartialSignSyncCommitteeRequest>,
+        ) -> Result<tonic::Response<PartialSignResponse>, tonic::Status> {
+            self.calls.lock().unwrap().push("partial_sign_sync_committee".into());
+            Ok(tonic::Response::new(dummy_partial()))
+        }
+        async fn partial_sign_payload_attestation(
+            &self,
+            _request: tonic::Request<PartialSignPayloadAttestationRequest>,
+        ) -> Result<tonic::Response<PartialSignResponse>, tonic::Status> {
+            self.calls.lock().unwrap().push("partial_sign_payload_attestation".into());
+            Ok(tonic::Response::new(dummy_partial()))
+        }
+        async fn partial_sign_block_header(
+            &self,
+            _request: tonic::Request<PartialSignBlockHeaderRequest>,
+        ) -> Result<tonic::Response<PartialSignResponse>, tonic::Status> {
+            self.calls.lock().unwrap().push("partial_sign_block_header".into());
+            if self.legacy_only {
+                return Err(tonic::Status::unimplemented("PartialSignBlockHeader"));
+            }
+            Ok(tonic::Response::new(dummy_partial()))
+        }
+        async fn partial_sign_root(
+            &self,
+            _request: tonic::Request<PartialSignRootRequest>,
+        ) -> Result<tonic::Response<PartialSignResponse>, tonic::Status> {
+            self.calls.lock().unwrap().push("partial_sign_root".into());
+            if self.legacy_only {
+                return Err(tonic::Status::unimplemented("PartialSignRoot"));
+            }
+            Ok(tonic::Response::new(dummy_partial()))
+        }
+    }
+
+    async fn start_peer(legacy_only: bool) -> (SocketAddr, RpcLog, tokio::task::JoinHandle<()>) {
+        let calls: RpcLog = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let svc = RecordingPeer { calls: Arc::clone(&calls), legacy_only };
+        let handle = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(PeerSignerServiceServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        (addr, calls, handle)
+    }
+
+    fn fi(version: u8) -> ForkInfo {
+        ForkInfo {
+            previous_version: vec![version.saturating_sub(1), 0, 0, 0],
+            current_version: vec![version, 0, 0, 0],
+            epoch: 0,
+            genesis_validators_root: vec![0xab; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dvt_pre_gloas_uses_legacy_partial_rpcs() {
+        let (addr, calls, _h) = start_peer(true).await;
+        let requester = GrpcPeerRequester::connect(
+            &[PeerConnectInfo { addr: addr.to_string(), sni_cn: String::new() }],
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let pk = [0u8; 48];
+        requester
+            .request_partial(
+                &addr.to_string(),
+                &PartialSignDuty::BeaconBlock {
+                    fork_info: fi(6),
+                    block_ssz: vec![0u8; 8],
+                    fork_id: 6,
+                },
+                &pk,
+                1,
+            )
+            .await
+            .unwrap();
+        requester
+            .request_partial(
+                &addr.to_string(),
+                &PartialSignDuty::AttestationData {
+                    fork_info: fi(6),
+                    data: crate::proto::signer_v2::AttestationData {
+                        slot: 1,
+                        index: 0,
+                        beacon_block_root: vec![0u8; 32],
+                        source: None,
+                        target: None,
+                    },
+                    fork_id: 6,
+                },
+                &pk,
+                1,
+            )
+            .await
+            .unwrap();
+        let names = calls.lock().unwrap().clone();
+        assert_eq!(
+            names,
+            vec![
+                "partial_sign_beacon_block".to_string(),
+                "partial_sign_attestation_data".to_string()
+            ]
+        );
+        assert!(!names.iter().any(|n| n.contains("block_header") || n.contains("sign_root")));
+    }
+
+    #[tokio::test]
+    async fn test_dvt_gloas_header_no_retry_on_legacy() {
+        let (addr, calls, _h) = start_peer(true).await;
+        let requester = GrpcPeerRequester::connect(
+            &[PeerConnectInfo { addr: addr.to_string(), sni_cn: String::new() }],
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let err = requester
+            .request_partial(
+                &addr.to_string(),
+                &PartialSignDuty::BlockHeader {
+                    fork_info: fi(7),
+                    header: BeaconBlockHeader {
+                        slot: 1,
+                        proposer_index: 0,
+                        parent_root: vec![0u8; 32],
+                        state_root: vec![0u8; 32],
+                        body_root: vec![0u8; 32],
+                    },
+                    fork_id: 7,
+                },
+                &[0u8; 48],
+                1,
+            )
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("signer does not support Gloas duties")
+                && msg.contains("PartialSignBlockHeader"),
+            "typed Gloas error, got {msg}"
+        );
+        let names = calls.lock().unwrap().clone();
+        assert_eq!(names, vec!["partial_sign_block_header".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_dvt_gloas_ptc_stays_on_payload_attestation() {
+        let (addr, calls, _h) = start_peer(false).await;
+        let requester = GrpcPeerRequester::connect(
+            &[PeerConnectInfo { addr: addr.to_string(), sni_cn: String::new() }],
+            None,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        requester
+            .request_partial(
+                &addr.to_string(),
+                &PartialSignDuty::PayloadAttestation {
+                    fork_info: fi(7),
+                    data: crate::proto::signer_v2::PayloadAttestationData {
+                        beacon_block_root: vec![0x11; 32],
+                        slot: 1,
+                        payload_present: true,
+                        blob_data_available: false,
+                    },
+                    fork_id: 7,
+                    object_root: vec![0x22; 32],
+                },
+                &[0u8; 48],
+                1,
+            )
+            .await
+            .unwrap();
+        let names = calls.lock().unwrap().clone();
+        assert_eq!(names, vec!["partial_sign_payload_attestation".to_string()]);
     }
 }

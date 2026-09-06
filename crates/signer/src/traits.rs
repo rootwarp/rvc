@@ -15,7 +15,7 @@ use crate::SignerError;
 /// Spec field order (`slot`, `proposer_index`, `parent_root`, `state_root`,
 /// `body_root`) is hashed with `tree_hash` 0.9. `body_ssz` is **not** a spec
 /// leaf: production fills it so a gRPC key can speak `SignBeaconBlock` /
-/// `SignBlindedBeaconBlock` until 4.20c routes Gloas to `SignBlockHeader`.
+/// `SignBlindedBeaconBlock` pre-Gloas. At Gloas, 4.20c selects `SignBlockHeader`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BeaconBlockHeaderFields {
     pub slot: Slot,
@@ -94,7 +94,7 @@ pub trait ValidatorSigner: Send + Sync {
     /// Local and HTTP keys hash the five spec leaves (`tree_hash` 0.9) into the
     /// same root [`Self::sign_block`] would take. gRPC keys use the legacy
     /// `SignBeaconBlock` / `SignBlindedBeaconBlock` RPCs when `body_ssz` is
-    /// present (4.20c will select `SignBlockHeader` at Gloas).
+    /// present and the fork is pre-Gloas; at Gloas they select `SignBlockHeader`.
     async fn sign_block_header(
         &self,
         header: &BeaconBlockHeaderFields,

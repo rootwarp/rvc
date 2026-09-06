@@ -38,6 +38,14 @@ pub enum SigningError {
     /// domain. No remote I/O and no signature.
     #[error("unsupported duty: {duty}")]
     UnsupportedDuty { duty: &'static str },
+
+    /// Remote gRPC signer answered `UNIMPLEMENTED` for a Gloas-only RPC.
+    ///
+    /// The new client selected `SignBlockHeader` / `SignRoot` (or the DVT
+    /// partial equivalents) and must **not** retry the legacy SSZ RPC. Upgrade
+    /// the remote signer. No signature.
+    #[error("signer does not support Gloas duties ({rpc}): {details}")]
+    SignerLacksGloasSupport { rpc: &'static str, details: String },
 }
 
 impl SigningError {
@@ -50,6 +58,7 @@ impl SigningError {
                 | Self::LocalRejected(_)
                 | Self::UnsupportedSigningType(_)
                 | Self::UnsupportedDuty { .. }
+                | Self::SignerLacksGloasSupport { .. }
         )
     }
 }
@@ -225,6 +234,18 @@ mod tests {
     fn test_unsupported_duty_display_names_duty() {
         let err = SigningError::UnsupportedDuty { duty: "payload_attestation" };
         assert_eq!(err.to_string(), "unsupported duty: payload_attestation");
+        assert!(err.is_unambiguous_no_signature());
+    }
+
+    #[test]
+    fn test_signer_lacks_gloas_support_is_unambiguous() {
+        let err = SigningError::SignerLacksGloasSupport {
+            rpc: "SignBlockHeader",
+            details: "unimplemented".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("signer does not support Gloas duties"));
+        assert!(msg.contains("SignBlockHeader"));
         assert!(err.is_unambiguous_no_signature());
     }
 }

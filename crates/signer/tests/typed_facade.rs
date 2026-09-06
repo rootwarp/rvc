@@ -28,12 +28,13 @@ use eth_types::{
 use grpc_signer::{
     proto::signer_v2::{
         signer_service_server::{SignerService as SignerServiceV2, SignerServiceServer},
-        ForkInfo as ProtoForkInfo, GetStatusRequest, GetStatusResponse, ListPublicKeysRequest,
-        ListPublicKeysResponse, SignAggregateAndProofRequest, SignAttestationDataRequest,
-        SignBeaconBlockRequest, SignBlindedBeaconBlockRequest, SignBlockHeaderRequest,
-        SignBuilderRegistrationRequest, SignContributionAndProofRequest, SignRandaoRevealRequest,
-        SignResponse, SignRootRequest, SignSyncAggregatorSelectionDataRequest,
-        SignSyncCommitteeMessageRequest, SignVoluntaryExitRequest,
+        Duty, ForkInfo as ProtoForkInfo, GetStatusRequest, GetStatusResponse,
+        ListPublicKeysRequest, ListPublicKeysResponse, SignAggregateAndProofRequest,
+        SignAttestationDataRequest, SignBeaconBlockRequest, SignBlindedBeaconBlockRequest,
+        SignBlockHeaderRequest, SignBuilderRegistrationRequest, SignContributionAndProofRequest,
+        SignRandaoRevealRequest, SignResponse, SignRootRequest,
+        SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
+        SignVoluntaryExitRequest,
     },
     GrpcRemoteSigner, GrpcRemoteSignerConfig,
 };
@@ -1340,4 +1341,179 @@ async fn test_in_process_signer_server_attestation_via_facade() {
     svc.sign_attestation(&att_data(), &pk, &phase0_schedule(), &GVR)
         .await
         .expect("legacy attestation RPC through in-process signer-server");
+}
+
+fn gloas_schedule() -> ForkSchedule {
+    ForkSchedule {
+        genesis_fork_version: [0, 0, 0, 0],
+        altair_fork_epoch: 10,
+        altair_fork_version: [1, 0, 0, 0],
+        bellatrix_fork_epoch: 20,
+        bellatrix_fork_version: [2, 0, 0, 0],
+        capella_fork_epoch: 30,
+        capella_fork_version: [3, 0, 0, 0],
+        deneb_fork_epoch: 40,
+        deneb_fork_version: [4, 0, 0, 0],
+        electra_fork_epoch: 50,
+        electra_fork_version: [5, 0, 0, 0],
+        fulu_fork_epoch: 60,
+        fulu_fork_version: [6, 0, 0, 0],
+        gloas_fork_epoch: 70,
+        gloas_fork_version: [7, 0, 0, 0],
+    }
+}
+
+#[tokio::test]
+async fn test_gloas_vc_path_reaches_in_process_signer_server() {
+    let sk = SecretKey::generate();
+    let pk = sk.public_key();
+    let mut km = KeyManager::new();
+    km.insert(SecretKey::from_bytes(&sk.to_bytes()).unwrap());
+    let backend = Arc::new(MemBackend { km });
+    let db = open_db();
+    let impl_svc =
+        signer_server::service::SignerServiceImpl::new_v2(backend, "test".to_string(), db);
+
+    allow_insecure();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(signer_server::SignerServiceServerV2::new(impl_svc))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let grpc = connect_grpc(addr).await;
+    let gloas_ctx = SignContext::new(
+        pk.clone(),
+        ForkInfo {
+            previous_version: [6, 0, 0, 0],
+            current_version: [7, 0, 0, 0],
+            genesis_validators_root: GVR,
+        },
+        ForkName::Gloas,
+    );
+    let env_err = grpc
+        .sign_root([0x11; 32], Duty::ExecutionPayloadEnvelope as i32, &gloas_ctx)
+        .await
+        .expect_err("envelope UNIMPLEMENTED until P6");
+    match env_err {
+        SigningError::SignerLacksGloasSupport { rpc, details } => {
+            assert_eq!(rpc, "SignRoot");
+            assert!(
+                details.contains("EXECUTION_PAYLOAD_ENVELOPE") || details.contains("6.19"),
+                "{details}"
+            );
+        }
+        other => panic!("expected SignerLacksGloasSupport for envelope, got {other:?}"),
+    }
+    let auth_err = grpc
+        .sign_root([0x11; 32], Duty::BuilderRequestAuth as i32, &gloas_ctx)
+        .await
+        .expect_err("request-auth UNIMPLEMENTED until P6");
+    match auth_err {
+        SigningError::SignerLacksGloasSupport { rpc, details } => {
+            assert_eq!(rpc, "SignRoot");
+            assert!(
+                details.contains("BUILDER_REQUEST_AUTH") || details.contains("6.16"),
+                "{details}"
+            );
+        }
+        other => panic!("expected SignerLacksGloasSupport for request-auth, got {other:?}"),
+    }
+
+    let svc = grpc_vc(grpc);
+    let schedule = gloas_schedule();
+    let slot = 70 * SLOTS_PER_EPOCH;
+    let hdr = header(slot);
+    svc.sign_block_header(&hdr, &pk, &schedule, &GVR)
+        .await
+        .expect("Gloas block header through in-process signer-server");
+
+    let mut agg = aggregate();
+    agg.aggregate.data.slot = slot;
+    svc.sign_aggregate_and_proof(&agg, &pk, &schedule, &GVR)
+        .await
+        .expect("Gloas aggregate through in-process signer-server");
+
+    let ptc_msg = PayloadAttestationData {
+        beacon_block_root: [0x11; 32],
+        slot,
+        payload_present: true,
+        blob_data_available: false,
+    };
+    svc.sign_payload_attestation(&ptc_msg, &pk, &schedule, &GVR)
+        .await
+        .expect("Gloas PTC through in-process signer-server");
+
+    let mut prefs_msg = prefs();
+    prefs_msg.proposal_slot = slot;
+    svc.sign_proposer_preferences(&prefs_msg, &pk, &schedule, &GVR)
+        .await
+        .expect("Gloas proposer preferences through in-process signer-server");
+
+    let mut electra = electra_aggregate();
+    electra.aggregate.data.slot = slot;
+    let gloas_version = [7, 0, 0, 0];
+    let electra_sr =
+        signing_root_with_fork_version(&electra, DOMAIN_AGGREGATE_AND_PROOF, gloas_version, GVR);
+    let stripped = AggregateAndProof {
+        aggregator_index: electra.aggregator_index,
+        aggregate: Attestation {
+            aggregation_bits: electra.aggregate.aggregation_bits.clone(),
+            data: electra.aggregate.data.clone(),
+            signature: electra.aggregate.signature.clone(),
+        },
+        selection_proof: electra.selection_proof.clone(),
+    };
+    let stripped_sr =
+        signing_root_with_fork_version(&stripped, DOMAIN_AGGREGATE_AND_PROOF, gloas_version, GVR);
+    assert_ne!(
+        electra_sr, stripped_sr,
+        "committee_bits must participate in the Gloas Electra aggregate object root"
+    );
+    let sig = svc
+        .sign_electra_aggregate_and_proof(&electra, &pk, &schedule, &GVR)
+        .await
+        .expect("Gloas Electra aggregate through in-process signer-server");
+    assert!(sig.verify(&pk, &electra_sr).is_ok());
+    assert!(
+        sig.verify(&pk, &stripped_sr).is_err(),
+        "must not sign the committee_bits-stripped pre-Electra root"
+    );
+}
+
+#[tokio::test]
+async fn test_gloas_header_with_body_ssz_selects_sign_block_header() {
+    let sk = SecretKey::generate();
+    let pk = sk.public_key();
+    let (addr, capture, _handle) = start_capturing_server(sk.to_bytes()).await;
+    let grpc = connect_grpc(addr).await;
+    let svc = grpc_vc(grpc);
+    let schedule = gloas_schedule();
+    let slot = 70 * SLOTS_PER_EPOCH;
+    let (hdr, _) = header_with_electra_body(slot);
+    assert!(!hdr.body_ssz.is_empty(), "production fills body_ssz");
+    svc.sign_block_header(&hdr, &pk, &schedule, &GVR).await.expect("Gloas header with body_ssz");
+    let captured = capture.lock().unwrap();
+    assert!(
+        captured.contains_key("sign_block_header"),
+        "Gloas populated body_ssz must still select SignBlockHeader"
+    );
+    assert!(
+        !captured.contains_key("sign_beacon_block"),
+        "body_ssz must not go to SignBeaconBlock at Gloas"
+    );
+    let bytes = captured.get("sign_block_header").expect("header RPC");
+    let req = SignBlockHeaderRequest::decode(bytes.as_slice()).expect("decode header request");
+    assert_eq!(req.fork_id, 7);
+    let header = req.header.expect("header leaves");
+    assert_eq!(header.body_root, hdr.body_root.to_vec());
+    assert!(
+        !bytes.windows(hdr.body_ssz.len()).any(|w| w == hdr.body_ssz.as_slice()),
+        "body_ssz must not appear on the SignBlockHeader wire"
+    );
 }

@@ -1,8 +1,41 @@
+//! gRPC remote signer (`TypedSigner` only).
+//!
+//! # Per-duty Gloas verdict matrix (D11 / 4.20c)
+//!
+//! Selection is on the resolved [`ForkName`], once per duty: `>= Gloas` uses the
+//! Gloas-safe RPC, otherwise the legacy RPC. A failure is a failure — there is
+//! **no** fallback-on-error retry onto the other shape.
+//!
+//! `SignContext::resolve` must actually resolve Gloas (P2 **2.2**). With 2.6's
+//! `[0xFF;4]` default, `Gloas.fork_version()` does not round-trip (D7); if that
+//! hazard is unresolved the client fails before sending and no row here is
+//! reachable.
+//!
+//! With `GLOAS_FORK_EPOCH` at its far-future sentinel the resolved fork is
+//! never `>= Gloas`, so no new RPC is selected.
+//!
+//! | Duty | Gloas verdict | Path |
+//! |---|---|---|
+//! | Attestation | supported, unchanged | legacy typed RPC; `fork_id` ignored server-side |
+//! | Sync-committee message / selection | supported, unchanged | legacy typed RPC |
+//! | RANDAO, voluntary exit, builder registration | supported, unchanged | legacy typed RPC |
+//! | Block / blinded block | supported via the header RPC | 4.20a `SignBlockHeader`; Gloas `body_root` from `gloas_body_root` (P5 5.11b) through 4.21's `sign_block_header`. `sign_block` / `sign_blinded_block` refuse at Gloas (no Electra/Deneb body hash). |
+//! | Aggregate-and-proof, Electra aggregate-and-proof, contribution-and-proof | supported via the root RPC | 4.20a `SignRoot`; Electra keeps `committee_bits` in the object root |
+//! | PTC payload attestation | supported via the root RPC | 4.20a `SignRoot` |
+//! | Proposer preferences | supported via the root RPC | 4.20a `SignRoot` |
+//! | Self-build execution payload envelope | supported via the root RPC (`EXECUTION_PAYLOAD_ENVELOPE`) | root from P5 5.16; served in P6 6.19 |
+//! | Builder request auth | supported via the root RPC (`BUILDER_REQUEST_AUTH`) | served in P6 6.16 |
+//!
+//! No duty fails solely because `ForkName::Gloas.id() == 7`. The four
+//! decoder-bound legacy RPCs still reject id 7 (`UnknownForkId`); this client
+//! never sends Gloas SSZ to those RPCs.
+
 use std::time::Instant;
 
 use async_trait::async_trait;
 use tonic::transport::Channel;
 use tracing::Instrument;
+use tree_hash::TreeHash;
 use url::Url;
 use zeroize::Zeroizing;
 
@@ -12,23 +45,25 @@ use crypto::{InsecureGate, InsecureMode};
 use crypto::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use eth_types::{
     encode_attestation_ssz, encode_beacon_block_ssz, encode_blinded_beacon_block_ssz,
-    encode_sync_committee_contribution_ssz, AggregateAndProof, AttestationData, BeaconBlock,
-    BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof, Epoch, ForkName,
-    PayloadAttestationData, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1,
-    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
+    encode_sync_committee_contribution_ssz, AggregateAndProof, Attestation, AttestationData,
+    BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, ContributionAndProof,
+    ElectraAggregateAndProof, Epoch, ForkName, PayloadAttestationData, ProposerPreferences, Slot,
+    SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
+    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
     DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use observability::logging::TruncatedPubkey;
 
 use crate::proto::signer_v2::signer_service_client::SignerServiceClient as SignerServiceClientV2;
 use crate::proto::signer_v2::{
-    AttestationData as ProtoAttestationData, Checkpoint as ProtoCheckpoint,
-    ForkInfo as ProtoForkInfo, SignAggregateAndProofRequest, SignAttestationDataRequest,
-    SignBeaconBlockRequest, SignBlindedBeaconBlockRequest, SignBuilderRegistrationRequest,
-    SignContributionAndProofRequest, SignRandaoRevealRequest, SignResponse,
-    SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
-    SignVoluntaryExitRequest,
+    AttestationData as ProtoAttestationData, BeaconBlockHeader as ProtoBeaconBlockHeader,
+    Checkpoint as ProtoCheckpoint, Duty, ForkInfo as ProtoForkInfo, SignAggregateAndProofRequest,
+    SignAttestationDataRequest, SignBeaconBlockRequest, SignBlindedBeaconBlockRequest,
+    SignBlockHeaderRequest, SignBuilderRegistrationRequest, SignContributionAndProofRequest,
+    SignRandaoRevealRequest, SignResponse, SignRootRequest, SignSyncAggregatorSelectionDataRequest,
+    SignSyncCommitteeMessageRequest, SignVoluntaryExitRequest,
 };
 
 // RF2-15: v1 SignerService surface fully retired from this crate; connect and
@@ -224,6 +259,54 @@ impl GrpcRemoteSigner {
         ctx.fork_name.id()
     }
 
+    fn uses_gloas_rpc(ctx: &SignContext) -> bool {
+        ctx.fork_name >= ForkName::Gloas
+    }
+
+    fn proto_header(header: &BeaconBlockHeader) -> ProtoBeaconBlockHeader {
+        ProtoBeaconBlockHeader {
+            slot: header.slot,
+            proposer_index: header.proposer_index,
+            parent_root: header.parent_root.to_vec(),
+            state_root: header.state_root.to_vec(),
+            body_root: header.body_root.to_vec(),
+        }
+    }
+
+    fn gloas_block_requires_header() -> SigningError {
+        SigningError::LocalRejected(
+            "use sign_block_header: Gloas body_root is gloas_body_root from the VC, \
+             not an Electra/Deneb body hash"
+                .to_string(),
+        )
+    }
+
+    fn map_grpc_status(status: tonic::Status, rpc_name: &'static str) -> SigningError {
+        if status.code() == tonic::Code::Unimplemented
+            && matches!(rpc_name, "SignBlockHeader" | "SignRoot")
+        {
+            SigningError::SignerLacksGloasSupport {
+                rpc: rpc_name,
+                details: status.message().to_string(),
+            }
+        } else {
+            SigningError::RemoteSignerError(format!(
+                "gRPC {rpc_name} failed ({}): {}",
+                status.code(),
+                status.message()
+            ))
+        }
+    }
+
+    fn root_duty_or_err(duty: i32) -> Result<Duty, SigningError> {
+        match Duty::try_from(duty) {
+            Ok(Duty::Unspecified) | Err(_) => {
+                Err(SigningError::LocalRejected(format!("unknown sign type: duty={duty}")))
+            }
+            Ok(d) => Ok(d),
+        }
+    }
+
     fn ensure_pubkey(&self, ctx: &SignContext) -> Result<(), SigningError> {
         let pk_bytes = ctx.pubkey.to_bytes();
         if !self.pubkeys.contains(&pk_bytes) {
@@ -310,11 +393,7 @@ impl GrpcRemoteSigner {
                     error_code = %status.code(),
                     "sign gRPC error"
                 );
-                SigningError::RemoteSignerError(format!(
-                    "gRPC {rpc_name} failed ({}): {}",
-                    status.code(),
-                    status.message()
-                ))
+                Self::map_grpc_status(status, rpc_name)
             })?;
 
             let latency_ms = start.elapsed().as_millis() as u64;
@@ -331,6 +410,80 @@ impl GrpcRemoteSigner {
         .instrument(span)
         .await
     }
+
+    async fn sign_block_header_rpc(
+        &self,
+        header: &BeaconBlockHeader,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let fork_id = Self::fork_id(ctx);
+        let req = SignBlockHeaderRequest {
+            pubkey: ctx.pubkey.to_bytes().to_vec(),
+            fork_info: Some(Self::make_fork_info(ctx)),
+            header: Some(Self::proto_header(header)),
+            fork_id,
+        };
+        let fork_version = ctx.fork_info.current_version;
+        let gvr = ctx.fork_info.genesis_validators_root;
+        self.sign_rpc(
+            ctx,
+            "block_header",
+            "SignBlockHeader",
+            || signing_root_with_fork_version(header, DOMAIN_BEACON_PROPOSER, fork_version, gvr),
+            move |mut client| async move { client.sign_block_header(req).await },
+        )
+        .await
+    }
+
+    async fn sign_root_rpc(
+        &self,
+        object_root: [u8; 32],
+        duty: Duty,
+        ctx: &SignContext,
+        signing_root: [u8; 32],
+    ) -> Result<Signature, SigningError> {
+        let fork_id = Self::fork_id(ctx);
+        let req = SignRootRequest {
+            pubkey: ctx.pubkey.to_bytes().to_vec(),
+            fork_info: Some(Self::make_fork_info(ctx)),
+            object_root: object_root.to_vec(),
+            duty: duty as i32,
+            fork_id,
+        };
+        self.sign_rpc(
+            ctx,
+            "sign_root",
+            "SignRoot",
+            move || signing_root,
+            move |mut client| async move { client.sign_root(req).await },
+        )
+        .await
+    }
+
+    /// Gloas-safe `SignRoot` (PTC, proposer preferences, P6 envelope / request-auth).
+    ///
+    /// Unknown / `UNSPECIFIED` duties fail closed locally with no RPC. Envelope
+    /// and builder-auth are sent and surface the server's `UNIMPLEMENTED`.
+    pub async fn sign_root(
+        &self,
+        object_root: [u8; 32],
+        duty: i32,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let duty = Self::root_duty_or_err(duty)?;
+        let fork_version = ctx.fork_info.current_version;
+        let gvr = ctx.fork_info.genesis_validators_root;
+        let domain = match duty {
+            Duty::AggregateAndProof => DOMAIN_AGGREGATE_AND_PROOF,
+            Duty::ContributionAndProof => DOMAIN_CONTRIBUTION_AND_PROOF,
+            Duty::PayloadAttestation => DOMAIN_PTC_ATTESTER,
+            Duty::ProposerPreferences => DOMAIN_PROPOSER_PREFERENCES,
+            Duty::ExecutionPayloadEnvelope | Duty::BuilderRequestAuth => [0u8; 4],
+            Duty::Unspecified => unreachable!("rejected by root_duty_or_err"),
+        };
+        let signing_root = signing_root_with_fork_version(&object_root, domain, fork_version, gvr);
+        self.sign_root_rpc(object_root, duty, ctx, signing_root).await
+    }
 }
 
 #[async_trait]
@@ -340,6 +493,10 @@ impl TypedSigner for GrpcRemoteSigner {
         block: &BeaconBlock,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
+        if Self::uses_gloas_rpc(ctx) {
+            let _ = block;
+            return Err(Self::gloas_block_requires_header());
+        }
         let fork_id = Self::fork_id(ctx);
         let block_ssz = encode_beacon_block_ssz(block, fork_id);
         let req = SignBeaconBlockRequest {
@@ -365,14 +522,12 @@ impl TypedSigner for GrpcRemoteSigner {
         header: &BeaconBlockHeader,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        // 4.20c will select SignBlockHeader at Gloas. 4.20b is unimplemented and
-        // GLOAS_FORK_EPOCH is far-future — never send the new RPC here.
-        if ctx.fork_name >= ForkName::Gloas {
-            return Err(SigningError::UnsupportedDuty { duty: "block_header" });
+        if Self::uses_gloas_rpc(ctx) {
+            return self.sign_block_header_rpc(header, ctx).await;
         }
-        // Legacy SignBeaconBlock: outer container is fork-invariant. Callers
-        // that still hold body SSZ should prefer `sign_block` so the server
-        // tree-hash matches the header leaf.
+        // Pre-Gloas: legacy SignBeaconBlock. Outer container is fork-invariant.
+        // Callers that still hold body SSZ should prefer `sign_block` so the
+        // server tree-hash matches the header leaf.
         let block = BeaconBlock {
             slot: header.slot,
             proposer_index: header.proposer_index,
@@ -388,6 +543,10 @@ impl TypedSigner for GrpcRemoteSigner {
         block: &BlindedBeaconBlock,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
+        if Self::uses_gloas_rpc(ctx) {
+            let _ = block;
+            return Err(Self::gloas_block_requires_header());
+        }
         let fork_id = Self::fork_id(ctx);
         let block_ssz = encode_blinded_beacon_block_ssz(block, fork_id);
         let req = SignBlindedBeaconBlockRequest {
@@ -450,6 +609,16 @@ impl TypedSigner for GrpcRemoteSigner {
         agg: &AggregateAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
+        if Self::uses_gloas_rpc(ctx) {
+            let object_root = agg.tree_hash_root().0;
+            let fork_version = ctx.fork_info.current_version;
+            let gvr = ctx.fork_info.genesis_validators_root;
+            let signing_root =
+                signing_root_with_fork_version(agg, DOMAIN_AGGREGATE_AND_PROOF, fork_version, gvr);
+            return self
+                .sign_root_rpc(object_root, Duty::AggregateAndProof, ctx, signing_root)
+                .await;
+        }
         let fork_id = Self::fork_id(ctx);
         let aggregate_ssz = encode_attestation_ssz(&agg.aggregate, fork_id);
         let req = SignAggregateAndProofRequest {
@@ -470,6 +639,34 @@ impl TypedSigner for GrpcRemoteSigner {
             move |mut client| async move { client.sign_aggregate_and_proof(req).await },
         )
         .await
+    }
+
+    async fn sign_electra_aggregate_and_proof(
+        &self,
+        agg: &ElectraAggregateAndProof,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        if Self::uses_gloas_rpc(ctx) {
+            let object_root = agg.tree_hash_root().0;
+            let fork_version = ctx.fork_info.current_version;
+            let gvr = ctx.fork_info.genesis_validators_root;
+            let signing_root =
+                signing_root_with_fork_version(agg, DOMAIN_AGGREGATE_AND_PROOF, fork_version, gvr);
+            return self
+                .sign_root_rpc(object_root, Duty::AggregateAndProof, ctx, signing_root)
+                .await;
+        }
+        // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
+        let legacy = AggregateAndProof {
+            aggregator_index: agg.aggregator_index,
+            aggregate: Attestation {
+                aggregation_bits: agg.aggregate.aggregation_bits.clone(),
+                data: agg.aggregate.data.clone(),
+                signature: agg.aggregate.signature.clone(),
+            },
+            selection_proof: agg.selection_proof.clone(),
+        };
+        self.sign_aggregate_and_proof(&legacy, ctx).await
     }
 
     async fn sign_sync_committee_message(
@@ -544,6 +741,16 @@ impl TypedSigner for GrpcRemoteSigner {
         c: &ContributionAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
+        if Self::uses_gloas_rpc(ctx) {
+            let object_root = c.tree_hash_root().0;
+            let fork_version = ctx.fork_info.current_version;
+            let gvr = ctx.fork_info.genesis_validators_root;
+            let signing_root =
+                signing_root_with_fork_version(c, DOMAIN_CONTRIBUTION_AND_PROOF, fork_version, gvr);
+            return self
+                .sign_root_rpc(object_root, Duty::ContributionAndProof, ctx, signing_root)
+                .await;
+        }
         let fork_id = Self::fork_id(ctx);
         let contribution_ssz = encode_sync_committee_contribution_ssz(&c.contribution, fork_id);
         let req = SignContributionAndProofRequest {
@@ -652,10 +859,25 @@ impl TypedSigner for GrpcRemoteSigner {
         data: &PayloadAttestationData,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
-        // 4.20c will send SignRoot at Gloas. Do not select that RPC while
-        // GLOAS_FORK_EPOCH is far-future (4.20b is unimplemented).
-        let _ = (data, ctx);
-        Err(SigningError::UnsupportedDuty { duty: "payload_attestation" })
+        let object_root = data.tree_hash_root().0;
+        let fork_version = ctx.fork_info.current_version;
+        let gvr = ctx.fork_info.genesis_validators_root;
+        let signing_root =
+            signing_root_with_fork_version(data, DOMAIN_PTC_ATTESTER, fork_version, gvr);
+        self.sign_root_rpc(object_root, Duty::PayloadAttestation, ctx, signing_root).await
+    }
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let object_root = prefs.tree_hash_root().0;
+        let fork_version = ctx.fork_info.current_version;
+        let gvr = ctx.fork_info.genesis_validators_root;
+        let signing_root =
+            signing_root_with_fork_version(prefs, DOMAIN_PROPOSER_PREFERENCES, fork_version, gvr);
+        self.sign_root_rpc(object_root, Duty::ProposerPreferences, ctx, signing_root).await
     }
 }
 
@@ -1119,6 +1341,47 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_sign_block_at_gloas_requires_header() {
+        let pk = dummy_pubkey();
+        let signer = GrpcRemoteSigner::with_pubkeys_for_test(vec![pk.to_bytes()]);
+        let ctx = SignContext::new(
+            pk,
+            ForkInfo {
+                previous_version: [0x06, 0, 0, 0],
+                current_version: [0x07, 0, 0, 0],
+                genesis_validators_root: [0xaa; 32],
+            },
+            ForkName::Gloas,
+        );
+        let block = BeaconBlock {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: [0u8; 32],
+            state_root: [0u8; 32],
+            body: eth_types::external_vector_electra_body().as_ssz_bytes(),
+        };
+        match TypedSigner::sign_block(&signer, &block, &ctx).await {
+            Err(SigningError::LocalRejected(msg)) => {
+                assert!(msg.contains("sign_block_header"), "got {msg}");
+            }
+            other => panic!("expected LocalRejected use sign_block_header, got: {other:?}"),
+        }
+        let blinded = BlindedBeaconBlock {
+            slot: 1,
+            proposer_index: 0,
+            parent_root: [0u8; 32],
+            state_root: [0u8; 32],
+            body: eth_types::external_vector_blinded_electra_body().as_ssz_bytes(),
+        };
+        match TypedSigner::sign_blinded_block(&signer, &blinded, &ctx).await {
+            Err(SigningError::LocalRejected(msg)) => {
+                assert!(msg.contains("sign_block_header"), "got {msg}");
+            }
+            other => panic!("expected LocalRejected for blinded, got: {other:?}"),
+        }
+    }
+
     /// Behavioral proxy for shared `sign_rpc` error mapping: a dead transport
     /// must yield the same `RemoteSignerError` shape from every TypedSigner method.
     #[tokio::test]
@@ -1187,6 +1450,19 @@ mod tests {
         };
         let exit = VoluntaryExit { epoch: 10, validator_index: 1 };
 
+        let ptc = PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        };
+        let prefs = ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        };
         let results = vec![
             TypedSigner::sign_block(&signer, &block, &ctx).await,
             TypedSigner::sign_blinded_block(&signer, &blinded, &ctx).await,
@@ -1198,10 +1474,12 @@ mod tests {
             TypedSigner::sign_builder_registration(&signer, &reg, [0; 4], &ctx).await,
             TypedSigner::sign_randao_reveal(&signer, 10, &ctx).await,
             TypedSigner::sign_voluntary_exit(&signer, &exit, &ctx).await,
+            TypedSigner::sign_payload_attestation(&signer, &ptc, &ctx).await,
+            TypedSigner::sign_proposer_preferences(&signer, &prefs, &ctx).await,
         ];
 
-        assert_eq!(results.len(), 10);
-        let mut messages = Vec::with_capacity(10);
+        assert_eq!(results.len(), 12);
+        let mut messages = Vec::with_capacity(12);
         for (i, result) in results.into_iter().enumerate() {
             match result {
                 Err(SigningError::RemoteSignerError(msg)) => {
@@ -1214,7 +1492,7 @@ mod tests {
                 other => panic!("method {i}: expected RemoteSignerError, got: {other:?}"),
             }
         }
-        // All ten share the same error *shape* (shared map_err in sign_rpc).
+        // All twelve share the same error *shape* (shared map_err in sign_rpc).
         assert!(messages.iter().all(|m| m.contains("failed (")));
     }
 }

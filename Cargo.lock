@@ -4423,11 +4423,13 @@ version = "0.7.0"
 dependencies = [
  "async-trait",
  "hex",
+ "prost 0.13.5",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-observability",
  "rvc-signer-proto",
  "rvc-slashing",
+ "rvc-spec-vectors",
  "rvc-test-support",
  "tempfile",
  "tokio",
@@ -4435,6 +4437,7 @@ dependencies = [
  "tonic 0.12.3",
  "tracing",
  "tracing-subscriber",
+ "tree_hash",
  "url",
  "zeroize",
 ]

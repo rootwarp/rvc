@@ -12,7 +12,9 @@ use super::{SigningBackend, SigningBackendError};
 use crate::dvt::lagrange::{combine_partial_signatures, verify_combined_signature};
 use crate::dvt::types::ShareInfo;
 use crate::metrics::DvtMetrics;
-use crate::proto::signer_v2::{AttestationData, ForkInfo, PayloadAttestationData};
+use crate::proto::signer_v2::{
+    AttestationData, BeaconBlockHeader, Duty, ForkInfo, PayloadAttestationData,
+};
 
 const BLS_DST: &[u8] = b"BLS_SIG_BLS12381G2_XMD:SHA-256_SSWU_RO_POP_";
 
@@ -44,6 +46,22 @@ pub enum PartialSignDuty {
         data: PayloadAttestationData,
         fork_id: u32,
         object_root: Vec<u8>,
+    },
+    /// Gloas-safe header (4.20c): `PartialSignBlockHeader`, never SSZ body bytes.
+    BlockHeader {
+        fork_info: ForkInfo,
+        header: BeaconBlockHeader,
+        fork_id: u32,
+    },
+    /// Gloas-safe root (4.20c): `PartialSignRoot` for aggregate / contribution /
+    /// prefs / P6 envelope and request-auth. PTC stays on [`Self::PayloadAttestation`]
+    /// so the 4.11c filter applies; a `Root` with `Duty::PayloadAttestation` is
+    /// still treated as a PTC session.
+    Root {
+        fork_info: ForkInfo,
+        object_root: Vec<u8>,
+        duty: i32,
+        fork_id: u32,
     },
 }
 
@@ -82,24 +100,33 @@ impl From<(u64, [u8; 96])> for PeerPartial {
 enum PtcDutyKind {
     NotPtc,
     Session(PtcSessionIdentity),
-    /// `PayloadAttestation` whose `object_root` is not 32 bytes or
+    /// PTC duty whose `object_root` is not 32 bytes or
     /// `fork_info.current_version` is not 4 bytes.
     Unparsable,
+}
+
+fn ptc_session_from(fork_info: &ForkInfo, object_root: &[u8]) -> PtcDutyKind {
+    match (
+        <[u8; 32]>::try_from(object_root),
+        <[u8; 4]>::try_from(fork_info.current_version.as_slice()),
+    ) {
+        (Ok(object_root), Ok(fork_version)) => {
+            PtcDutyKind::Session(PtcSessionIdentity { object_root, fork_version })
+        }
+        _ => PtcDutyKind::Unparsable,
+    }
 }
 
 impl PartialSignDuty {
     fn ptc_duty_kind(&self) -> PtcDutyKind {
         match self {
             Self::PayloadAttestation { fork_info, object_root, .. } => {
-                match (
-                    <[u8; 32]>::try_from(object_root.as_slice()),
-                    <[u8; 4]>::try_from(fork_info.current_version.as_slice()),
-                ) {
-                    (Ok(object_root), Ok(fork_version)) => {
-                        PtcDutyKind::Session(PtcSessionIdentity { object_root, fork_version })
-                    }
-                    _ => PtcDutyKind::Unparsable,
-                }
+                ptc_session_from(fork_info, object_root)
+            }
+            Self::Root { fork_info, object_root, duty, .. }
+                if *duty == Duty::PayloadAttestation as i32 =>
+            {
+                ptc_session_from(fork_info, object_root)
             }
             _ => PtcDutyKind::NotPtc,
         }
@@ -1603,6 +1630,58 @@ mod tests {
             assert!(
                 err.to_string().contains("unparsable"),
                 "unparsable PTC fork_version must fail closed, got: {err}"
+            );
+        }
+
+        #[test]
+        fn test_root_payload_attestation_duty_is_ptc_session() {
+            let duty = PartialSignDuty::Root {
+                fork_info: ForkInfo {
+                    previous_version: PTC_FORK.to_vec(),
+                    current_version: PTC_FORK.to_vec(),
+                    epoch: 0,
+                    genesis_validators_root: vec![0x00; 32],
+                },
+                object_root: PTC_ROOT.to_vec(),
+                duty: Duty::PayloadAttestation as i32,
+                fork_id: 7,
+            };
+            let agree = PeerPartial {
+                share_index: 1,
+                signature: [0u8; 96],
+                ptc_session: Some(PtcSessionIdentity {
+                    object_root: PTC_ROOT,
+                    fork_version: PTC_FORK,
+                }),
+            };
+            let disagree = PeerPartial {
+                share_index: 1,
+                signature: [0u8; 96],
+                ptc_session: Some(PtcSessionIdentity {
+                    object_root: [0xBB; 32],
+                    fork_version: PTC_FORK,
+                }),
+            };
+            assert!(ptc_partial_agrees_with_session(&duty, &agree));
+            assert!(
+                !ptc_partial_agrees_with_session(&duty, &disagree),
+                "Root+PayloadAttestation must run the 4.11c session filter"
+            );
+
+            let aggregate = PartialSignDuty::Root {
+                fork_info: ForkInfo {
+                    previous_version: PTC_FORK.to_vec(),
+                    current_version: PTC_FORK.to_vec(),
+                    epoch: 0,
+                    genesis_validators_root: vec![0x00; 32],
+                },
+                object_root: PTC_ROOT.to_vec(),
+                duty: Duty::AggregateAndProof as i32,
+                fork_id: 7,
+            };
+            assert!(
+                ptc_partial_agrees_with_session(&aggregate, &disagree),
+                "non-PTC Root duties are not PTC sessions"
             );
         }
     }
