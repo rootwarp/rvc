@@ -652,6 +652,107 @@ async fn test_aggregation_fulu_dispatches_as_fulu() {
 }
 
 #[tokio::test]
+async fn test_aggregation_gloas_dispatches_as_gloas() {
+    use wiremock::matchers::{header, method, path, path_regex, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let mut schedule = (*create_test_fork_schedule()).clone();
+    schedule.gloas_fork_epoch = 70;
+    let (orchestrator, _handle, _, pubkey_hex) =
+        build_aggregation_orchestrator_with_schedule(&mock_server.uri(), Arc::new(schedule)).await;
+
+    // Gloas epoch = 70, slot = 70 * 32 = 2240
+    let slot = 2240u64;
+    let epoch = slot / SLOTS_PER_EPOCH;
+    orchestrator.clock.set_slot(slot);
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey_hex,
+                "validator_index": "42",
+                "committee_index": "1",
+                "committee_length": "8",
+                "committees_at_slot": "4",
+                "validator_committee_index": "0",
+                "slot": slot.to_string()
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/attestation_data"))
+        .and(query_param("slot", slot.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "slot": slot.to_string(),
+                "index": "1",
+                "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "source": {
+                    "epoch": (epoch - 1).to_string(),
+                    "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                },
+                "target": {
+                    "epoch": epoch.to_string(),
+                    "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(query_param("slot", slot.to_string()))
+        .and(query_param("committee_index", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "aggregation_bits": "0xffffffff",
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "1",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                },
+                "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "committee_bits": "0x0200000000000000"
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/validator/aggregate_and_proofs"))
+        .and(header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/aggregate_and_proofs"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+}
+
+#[tokio::test]
 async fn test_aggregation_mismatched_response_logs_warning() {
     use wiremock::matchers::{method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};

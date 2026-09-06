@@ -147,6 +147,7 @@ impl AttestationSubmitter for RecordingSubmitter {
             VersionedAttestation::PreElectra(v) => v.len(),
             VersionedAttestation::Electra(v) => v.len(),
             VersionedAttestation::Fulu(v) => v.len(),
+            VersionedAttestation::Gloas(v) => v.len(),
         };
         self.batch_count.fetch_add(1, Ordering::SeqCst);
         self.signature_count.fetch_add(n, Ordering::SeqCst);

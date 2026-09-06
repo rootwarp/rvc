@@ -37,12 +37,12 @@ Line numbers were opened on `feature/216-fork-hazard-audit` after 2.1
 
 | Class | Count |
 |-------|------:|
-| 1 `>= ForkName::X` | 15 |
+| 1 `>= ForkName::X` | 12 |
 | 2 `.index = 0` | 6 |
 | 3 `match ForkName` | 4 |
 | 4 string-literal dispatch | 3 |
 | 5 `.entries()` | 7 |
-| **Total** | **35** |
+| **Total** | **32** |
 
 Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 
@@ -55,9 +55,6 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/crypto/src/signing_root.rs` 251 | 1 | — | inherit-intentionally | EIP-7044: voluntary-exit domain stays Capella-capped however many post-Capella forks exist. Open-ended `>=` is the spec. | — |
 | `crates/crypto/src/signing_root.rs` 315 | 1 | — | inherit-intentionally | Test mirror of 251 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
 | `crates/grpc-signer/src/client.rs` 263 | 1 | — | inherit-intentionally | `uses_gloas_rpc`: open-ended `>= Gloas` so later forks keep the Gloas-safe header/root RPCs rather than silently falling back to decoder-bound legacy RPCs. | 4.20c |
-| `crates/rvc/src/orchestrator/aggregation.rs` 88 | 1 | — | decided-not-inherited | `>= Fulu` picks the `"fulu"` submit label. Gloas must not inherit; Phase 6 owns the versioned-wrapper choice. One of three production `>= Fulu` sites (plan cited four). | phase-6 |
-| `crates/rvc/src/orchestrator/aggregation.rs` 130 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedSignedAggregateAndProof::Fulu`. Same Phase-6 verdict as 88. | phase-6 |
-| `crates/rvc/src/orchestrator/attestation.rs` 425 | 1 | — | decided-not-inherited | `>= Fulu` selects `VersionedAttestation::Fulu`. Phase 6; do not inherit via open-ended `>=`. | phase-6 |
 | `crates/rvc/src/orchestrator/coordinator/mod.rs` 1099 | 1 | — | inherit-intentionally | PTC phase (4.13): open-ended `>= Gloas` so later forks keep the payload-attestation duty rather than silently dropping it. Threaded once-per-slot `ForkName`; not gated on decode failure. | 4.13 |
 | `crates/rvc/src/orchestrator/utils.rs` 144 | 1 | — | inherit-intentionally | `uses_electra_attestation_wire`: open-ended `>= Electra` so Gloas (and later forks) keep the Electra+ wire. Index zeroing is the separate `zeroes_committee_index` (`Electra..Gloas`). | 2.8 |
 | `crates/signer-server/src/dvt/peer_client.rs` 204 | 1 | — | inherit-intentionally | DVT peer `uses_gloas_rpc`: same open-ended `>= Gloas` as the gRPC client so later forks keep Gloas-safe RPCs. | 4.20c |
@@ -65,10 +62,10 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/signer/src/lib.rs` 1109 | 1 | — | inherit-intentionally | Electra aggregate gRPC path: open-ended `>= Gloas` keeps the root RPC rather than the pre-Electra `SignAggregateAndProof` decoder. | 4.20c |
 | `crates/timing/src/clock.rs` 30 | 1 | — | inherit-intentionally | `DeadlineSchedule::for_fork`: open-ended `>= Gloas` selects the Gloas deadline set so later forks keep those offsets rather than silently reverting to pre-Gloas 3333/6667. | 4.19 |
 | `crates/rvc/src/orchestrator/attestation.rs` 417 | 2 | — | must-bound | Submission-path `SingleAttestation.data.index = "0"` inside `zeroes_committee_index`, not the Electra+ wrapper branch, so Gloas preserves the BN value. | 2.8 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 513 | 2 | — | test-only | Test applies `index = 0` when local `is_electra`. Follows 2.3 helper. | 2.3 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 636 | 2 | — | test-only | Pre-Electra path does not assign; the `if is_electra` still contains the assignment. 2.3. | 2.3 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 665 | 2 | — | test-only | Signing-root fixture zeros index by hand. Not a production guard. | 2.3 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 673 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 417. | 2.8 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 521 | 2 | — | test-only | Test applies `index = 0` when local `is_electra`. Follows 2.3 helper. | 2.3 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 646 | 2 | — | test-only | Pre-Electra path does not assign; the `if is_electra` still contains the assignment. 2.3. | 2.3 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 675 | 2 | — | test-only | Signing-root fixture zeros index by hand. Not a production guard. | 2.3 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 683 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 417. | 2.8 |
 | `crates/rvc/src/orchestrator/utils.rs` 163 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the half-open `Electra..Gloas` predicate (2.3 / 2.8). | 2.3 |
 | `bin/rvc/tests/common/mock_bn.rs` 268 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
 | `crates/block-service/src/service/mod.rs` 619 | 3 | exhaustive | inherit-intentionally | `ssz_block_format` named Gloas `BeaconBlock` arm; exhaustive `match fork` so a new variant is a compile error, not a silent `BlockContents`/`BeaconBlock` inherit. Unknown version strings fail closed before the match. | 6.4 |
@@ -94,9 +91,10 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
   Gloas keeps `SingleAttestation` / committee-index query / Electra aggregate
   while preserving BN `data.index`. Class-2 assignments stay on the zeroing
   predicate.
-- **Three, not four, `>= ForkName::Fulu` production sites.** The project plan
-  cited four. The tree has `attestation.rs` 423, `aggregation.rs` 88,
-  `aggregation.rs` 130. Recorded, not padded.
+- **6.15 closed the three production `>= ForkName::Fulu` sites.** Attestation
+  and aggregate wrapper selection now matches the resolved fork (`== Gloas` /
+  `== Fulu` / else Electra) so a Gloas epoch submits `Eth-Consensus-Version:
+  gloas` rather than inheriting Fulu.
 - **Class 5 grew by one in 2.1.** Plan-verified five: `typed_signer.rs` 58,
   `fork.rs` from_epoch / fork_version / activation_epoch, and the seven-ness
   test. 2.1 added `test_entries_contains_each_all_variant_exactly_once`

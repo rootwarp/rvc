@@ -181,7 +181,9 @@ async fn test_pre_electra_attestation_produces_legacy_format() {
             // data.index should be the committee index from the duty ("3")
             assert_eq!(att.data.index, "3");
         }
-        VersionedAttestation::Electra(_) | VersionedAttestation::Fulu(_) => {
+        VersionedAttestation::Electra(_)
+        | VersionedAttestation::Fulu(_)
+        | VersionedAttestation::Gloas(_) => {
             panic!("Expected PreElectra attestation for slot in epoch 3 (< electra_fork_epoch=50)");
         }
     }
@@ -224,7 +226,9 @@ async fn test_electra_attestation_produces_single_attestation_format() {
             // attester_index should be the validator index
             assert_eq!(att.attester_index, 42);
         }
-        VersionedAttestation::PreElectra(_) | VersionedAttestation::Fulu(_) => {
+        VersionedAttestation::PreElectra(_)
+        | VersionedAttestation::Fulu(_)
+        | VersionedAttestation::Gloas(_) => {
             panic!("Expected Electra attestation for slot in epoch 50 (= electra_fork_epoch)");
         }
     }
@@ -260,7 +264,9 @@ async fn test_fork_boundary_last_pre_electra_slot() {
             assert!(!attestations[0].aggregation_bits.is_empty());
             assert_eq!(attestations[0].data.index, "3");
         }
-        VersionedAttestation::Electra(_) | VersionedAttestation::Fulu(_) => {
+        VersionedAttestation::Electra(_)
+        | VersionedAttestation::Fulu(_)
+        | VersionedAttestation::Gloas(_) => {
             panic!("Expected PreElectra attestation for slot 1599 (epoch 49, last pre-Electra)");
         }
     }
@@ -470,7 +476,9 @@ async fn test_electra_attestation_data_index_zero_before_signing() {
             assert_eq!(atts[0].committee_index, 7);
             assert_eq!(atts[0].attester_index, 99);
         }
-        VersionedAttestation::PreElectra(_) | VersionedAttestation::Fulu(_) => {
+        VersionedAttestation::PreElectra(_)
+        | VersionedAttestation::Fulu(_)
+        | VersionedAttestation::Gloas(_) => {
             panic!("Expected Electra attestation for epoch 51");
         }
     }
@@ -596,7 +604,9 @@ async fn test_electra_submitted_single_attestation_data_index_zero() {
             );
             assert_eq!(att.attester_index, 77);
         }
-        VersionedAttestation::PreElectra(_) | VersionedAttestation::Fulu(_) => {
+        VersionedAttestation::PreElectra(_)
+        | VersionedAttestation::Fulu(_)
+        | VersionedAttestation::Gloas(_) => {
             panic!("Expected Electra attestation for epoch 52");
         }
     }
@@ -844,10 +854,6 @@ fn gloas_capable_fork_schedule() -> Arc<ForkSchedule> {
     let mut schedule = (*mainnet_shaped_fork_schedule()).clone();
     schedule.gloas_fork_epoch = B1_GLOAS_EPOCH;
     Arc::new(schedule)
-}
-
-fn is_fulu_wrapper_fork(fork: ForkName) -> bool {
-    fork == ForkName::Fulu || fork == ForkName::Gloas
 }
 
 /// B1 (D18): Electra and Fulu still zero `data.index` through the attestation
@@ -1109,10 +1115,12 @@ async fn test_submission_preserves_index_at_gloas_zeroes_at_electra_and_fulu() {
                 &atts[0]
             }
             VersionedAttestation::Fulu(atts) => {
-                assert!(
-                    is_fulu_wrapper_fork(expected_fork),
-                    "{label}: Fulu wrapper (Gloas inherits >= Fulu until Phase 6)"
-                );
+                assert_eq!(expected_fork, ForkName::Fulu, "{label}: Fulu wrapper");
+                assert_eq!(atts.len(), 1);
+                &atts[0]
+            }
+            VersionedAttestation::Gloas(atts) => {
+                assert_eq!(expected_fork, ForkName::Gloas, "{label}: Gloas wrapper");
                 assert_eq!(atts.len(), 1);
                 &atts[0]
             }
@@ -1159,7 +1167,7 @@ async fn test_submission_preserves_index_at_gloas_zeroes_at_electra_and_fulu() {
 /// query (aggregate `:297` / `:334`) at Electra onward, pre-Electra at Deneb.
 #[tokio::test]
 async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let schedule = gloas_capable_fork_schedule();
@@ -1269,6 +1277,7 @@ async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
         let submit_v2 = if electra_wire {
             Mock::given(method("POST"))
                 .and(path("/eth/v2/validator/aggregate_and_proofs"))
+                .and(header("Eth-Consensus-Version", expected_fork.as_ref()))
                 .respond_with(ResponseTemplate::new(200))
                 .expect(1)
         } else {
@@ -1300,10 +1309,13 @@ async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
             }
             VersionedAttestation::Fulu(atts) => {
                 assert!(electra_wire, "{label}: Fulu SingleAttestation is Electra+ wire");
-                assert!(
-                    is_fulu_wrapper_fork(expected_fork),
-                    "{label}: Fulu wrapper at Fulu and Gloas (Phase 6 owns Gloas variant)"
-                );
+                assert_eq!(expected_fork, ForkName::Fulu, "{label}: Fulu wrapper");
+                assert_eq!(atts.len(), 1);
+                assert_eq!(atts[0].data.index, submitted_index);
+            }
+            VersionedAttestation::Gloas(atts) => {
+                assert!(electra_wire, "{label}: Gloas SingleAttestation is Electra+ wire");
+                assert_eq!(expected_fork, ForkName::Gloas, "{label}: Gloas wrapper");
                 assert_eq!(atts.len(), 1);
                 assert_eq!(atts[0].data.index, submitted_index);
             }

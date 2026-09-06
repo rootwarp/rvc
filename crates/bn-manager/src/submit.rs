@@ -78,12 +78,12 @@ fn extract_attestation_context(attestations: &VersionedAttestation) -> (String, 
             Some(a) => (a.data.slot.clone(), a.data.target.epoch.clone()),
             None => ("unknown".into(), "unknown".into()),
         },
-        VersionedAttestation::Electra(atts) | VersionedAttestation::Fulu(atts) => {
-            match atts.first() {
-                Some(a) => (a.data.slot.clone(), a.data.target.epoch.clone()),
-                None => ("unknown".into(), "unknown".into()),
-            }
-        }
+        VersionedAttestation::Electra(atts)
+        | VersionedAttestation::Fulu(atts)
+        | VersionedAttestation::Gloas(atts) => match atts.first() {
+            Some(a) => (a.data.slot.clone(), a.data.target.epoch.clone()),
+            None => ("unknown".into(), "unknown".into()),
+        },
     }
 }
 
@@ -105,7 +105,9 @@ impl<S: AttestationSubmitter> Propagator<S> {
     ) -> Result<PropagationResult, PropagatorError> {
         let total = match attestations {
             VersionedAttestation::PreElectra(a) => a.len(),
-            VersionedAttestation::Electra(a) | VersionedAttestation::Fulu(a) => a.len(),
+            VersionedAttestation::Electra(a)
+            | VersionedAttestation::Fulu(a)
+            | VersionedAttestation::Gloas(a) => a.len(),
         };
 
         // Late-bind the count onto the span. Uses raw record() (not
@@ -652,6 +654,34 @@ mod tests {
                 assert_eq!(att.signature, "0xsignature");
             }
             other => panic!("Expected Fulu variant, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_propagate_gloas_variant() {
+        let submitter = Arc::new(MockSubmitter::new(SubmitAttestationResult::Success));
+        let propagator = Propagator::new(submitter.clone());
+
+        let attestations =
+            VersionedAttestation::Gloas(vec![create_test_single_attestation("2000000", 3, 99)]);
+
+        let result = propagator.propagate(&attestations).await.unwrap();
+
+        assert!(result.is_success());
+        assert_eq!(result.total, 1);
+        assert_eq!(result.success_count, 1);
+        assert_eq!(submitter.call_count(), 1);
+
+        let submitted = submitter.last_submitted().await.expect("attestation was submitted");
+        match submitted {
+            VersionedAttestation::Gloas(atts) => {
+                assert_eq!(atts.len(), 1);
+                let att = &atts[0];
+                assert_eq!(att.committee_index, 3);
+                assert_eq!(att.attester_index, 99);
+                assert_eq!(att.data.slot, "2000000");
+            }
+            other => panic!("Expected Gloas variant, got {:?}", other),
         }
     }
 

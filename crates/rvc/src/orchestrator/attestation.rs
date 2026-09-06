@@ -410,7 +410,7 @@ where
         let sig_hex = format!("0x{}", hex::encode(signature.to_bytes()));
 
         // Electra+ shares SingleAttestation; EIP-7549 index-zeroing is
-        // Electra..Gloas only. The Fulu vs Electra constructor is Phase 6.
+        // Electra..Gloas only. Variant is the resolved fork, not `>= Fulu`.
         let versioned = if uses_electra_wire {
             let mut single_data = beacon_attestation_data.clone();
             if utils::zeroes_committee_index(fork_name) {
@@ -422,7 +422,9 @@ where
                 data: single_data,
                 signature: sig_hex,
             };
-            if fork_name >= ForkName::Fulu {
+            if fork_name == ForkName::Gloas {
+                VersionedAttestation::Gloas(vec![single])
+            } else if fork_name == ForkName::Fulu {
                 VersionedAttestation::Fulu(vec![single])
             } else {
                 VersionedAttestation::Electra(vec![single])
@@ -449,6 +451,7 @@ where
         };
 
         let versioned_type = match &versioned {
+            VersionedAttestation::Gloas(_) => "Gloas",
             VersionedAttestation::Fulu(_) => "Fulu",
             VersionedAttestation::Electra(_) => "Electra",
             VersionedAttestation::PreElectra(_) => "PreElectra",

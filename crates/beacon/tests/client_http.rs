@@ -4024,6 +4024,128 @@ async fn test_submit_aggregate_and_proofs_fulu_has_version_header() {
     assert!(result.is_ok());
 }
 
+#[tokio::test]
+async fn test_submit_attestation_fulu_has_version_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "fulu"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let attestation = SingleAttestation {
+        attester_index: 0,
+        data: AttestationData {
+            slot: "1000".to_string(),
+            index: "0".to_string(),
+            beacon_block_root: "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                .to_string(),
+            source: Checkpoint {
+                epoch: "100".to_string(),
+                root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            },
+            target: Checkpoint {
+                epoch: "101".to_string(),
+                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            },
+        },
+        committee_index: 0,
+        signature: "0xsignature".to_string(),
+    };
+    let versioned = VersionedAttestation::Fulu(vec![attestation]);
+    let result = client.submit_attestation(&versioned).await.unwrap();
+    assert!(result.is_success());
+}
+
+#[tokio::test]
+async fn test_submit_attestation_gloas_has_version_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let attestation = SingleAttestation {
+        attester_index: 0,
+        data: AttestationData {
+            slot: "1000".to_string(),
+            index: "1".to_string(),
+            beacon_block_root: "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                .to_string(),
+            source: Checkpoint {
+                epoch: "100".to_string(),
+                root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            },
+            target: Checkpoint {
+                epoch: "101".to_string(),
+                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            },
+        },
+        committee_index: 0,
+        signature: "0xsignature".to_string(),
+    };
+    let versioned = VersionedAttestation::Gloas(vec![attestation]);
+    let result = client.submit_attestation(&versioned).await.unwrap();
+    assert!(result.is_success());
+}
+
+#[tokio::test]
+async fn test_submit_aggregate_and_proofs_gloas_has_version_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/validator/aggregate_and_proofs"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let proofs =
+        VersionedSignedAggregateAndProof::Gloas(vec![eth_types::SignedElectraAggregateAndProof {
+            message: eth_types::ElectraAggregateAndProof {
+                aggregator_index: 42,
+                aggregate: eth_types::ElectraAttestation {
+                    aggregation_bits: vec![0xff; 4],
+                    data: eth_types::AttestationData {
+                        slot: 100,
+                        index: 1,
+                        beacon_block_root: [1u8; 32],
+                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                    },
+                    signature: vec![0xaa; 96],
+                    committee_bits: vec![0x01; 8],
+                },
+                selection_proof: vec![0xbb; 96],
+            },
+            signature: vec![0xcc; 96],
+        }]);
+
+    let result = client.submit_aggregate_and_proofs(&proofs).await;
+    assert!(result.is_ok());
+}
+
 // FIX-07: URL-encode graffiti tests
 
 #[tokio::test]

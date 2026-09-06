@@ -114,7 +114,7 @@ const fn inv(
 
 /// Exact per-class counts. Update together with [`INVENTORY`] and the audit doc.
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
-    (Class::GeForkName, 15),
+    (Class::GeForkName, 12),
     (Class::IndexZero, 6),
     (Class::MatchForkName, 4),
     (Class::StringDispatch, 3),
@@ -177,33 +177,6 @@ const INVENTORY: &[Inv] = &[
         ">= ForkName::Gloas",
         Verdict::InheritIntentionally,
         "4.20c",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/aggregation.rs",
-        88,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Fulu",
-        Verdict::DecidedNotInherited,
-        "phase-6",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/aggregation.rs",
-        130,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Fulu",
-        Verdict::DecidedNotInherited,
-        "phase-6",
-    ),
-    inv(
-        "crates/rvc/src/orchestrator/attestation.rs",
-        425,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Fulu",
-        Verdict::DecidedNotInherited,
-        "phase-6",
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/mod.rs",
@@ -271,7 +244,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        513,
+        521,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -280,7 +253,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        636,
+        646,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -289,7 +262,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        665,
+        675,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -298,7 +271,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        673,
+        683,
         Class::IndexZero,
         false,
         ".index = \"0\"",

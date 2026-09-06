@@ -35,12 +35,14 @@ pub(crate) struct AggregationService {
 enum ProducedAggregate {
     PreElectra(SignedAggregateAndProof),
     Electra(SignedElectraAggregateAndProof),
+    Gloas(SignedElectraAggregateAndProof),
 }
 
 /// Selects the pre-refactor log message set for aggregate submission.
 enum AggregateSubmitLabel {
     PreElectra,
     Electra,
+    Gloas,
 }
 
 /// Result of attempting aggregation for a single attester duty.
@@ -85,7 +87,9 @@ impl AggregationService {
         let mut electra_aggregates: Vec<SignedElectraAggregateAndProof> = Vec::new();
         let mut source_validators: Vec<String> = Vec::new();
 
-        let fork_label = if fork_name >= ForkName::Fulu {
+        let fork_label = if fork_name == ForkName::Gloas {
+            "gloas"
+        } else if fork_name == ForkName::Fulu {
             "fulu"
         } else if uses_electra_wire {
             "electra"
@@ -110,7 +114,9 @@ impl AggregationService {
             source_validators.push(outcome.validator_index);
             match outcome.proof {
                 Some(ProducedAggregate::PreElectra(p)) => pre_electra_aggregates.push(p),
-                Some(ProducedAggregate::Electra(p)) => electra_aggregates.push(p),
+                Some(ProducedAggregate::Electra(p) | ProducedAggregate::Gloas(p)) => {
+                    electra_aggregates.push(p)
+                }
                 None => {}
             }
         }
@@ -127,18 +133,25 @@ impl AggregationService {
         }
 
         if !electra_aggregates.is_empty() {
-            let versioned = if fork_name >= ForkName::Fulu {
-                VersionedSignedAggregateAndProof::Fulu(electra_aggregates)
+            // Exact fork, not `>= Fulu`: Gloas must submit Eth-Consensus-Version: gloas.
+            // Fulu keeps the Electra submit-label so its log literals stay byte-identical.
+            let (versioned, label) = if fork_name == ForkName::Gloas {
+                (
+                    VersionedSignedAggregateAndProof::Gloas(electra_aggregates),
+                    AggregateSubmitLabel::Gloas,
+                )
+            } else if fork_name == ForkName::Fulu {
+                (
+                    VersionedSignedAggregateAndProof::Fulu(electra_aggregates),
+                    AggregateSubmitLabel::Electra,
+                )
             } else {
-                VersionedSignedAggregateAndProof::Electra(electra_aggregates)
+                (
+                    VersionedSignedAggregateAndProof::Electra(electra_aggregates),
+                    AggregateSubmitLabel::Electra,
+                )
             };
-            self.submit_versioned(
-                slot,
-                versioned,
-                &source_validators,
-                AggregateSubmitLabel::Electra,
-            )
-            .await;
+            self.submit_versioned(slot, versioned, &source_validators, label).await;
         }
     }
 
@@ -333,8 +346,9 @@ impl AggregationService {
         if uses_electra_wire {
             let electra_agg = match aggregate {
                 VersionedAggregateAttestation::Electra(a)
-                | VersionedAggregateAttestation::Fulu(a) => a,
-                _ => {
+                | VersionedAggregateAttestation::Fulu(a)
+                | VersionedAggregateAttestation::Gloas(a) => a,
+                VersionedAggregateAttestation::PreElectra(_) => {
                     warn!(
                         slot,
                         validator_index = %duty.validator_index,
@@ -352,11 +366,17 @@ impl AggregationService {
             let signed = self
                 .sign_and_wrap_electra(slot, &duty.validator_index, pubkey, message, agg_span)
                 .await?;
-            Some(ProducedAggregate::Electra(signed))
+            Some(if fork_name == ForkName::Gloas {
+                ProducedAggregate::Gloas(signed)
+            } else {
+                ProducedAggregate::Electra(signed)
+            })
         } else {
             let pre_electra_agg = match aggregate {
                 VersionedAggregateAttestation::PreElectra(a) => a,
-                _ => {
+                VersionedAggregateAttestation::Electra(_)
+                | VersionedAggregateAttestation::Fulu(_)
+                | VersionedAggregateAttestation::Gloas(_) => {
                     warn!(
                         slot,
                         validator_index = %duty.validator_index,
@@ -470,8 +490,8 @@ impl AggregationService {
     }
 
     /// Submit a versioned batch of signed aggregates; shared by pre-Electra and
-    /// Electra/Fulu. Log messages stay as static literals (byte-identical to
-    /// the pre-refactor paths) via [`AggregateSubmitLabel`].
+    /// Electra/Fulu/Gloas. Log messages stay as static literals (byte-identical
+    /// to the pre-refactor paths) via [`AggregateSubmitLabel`].
     async fn submit_versioned(
         &self,
         slot: Slot,
@@ -482,7 +502,8 @@ impl AggregationService {
         let count = match &versioned {
             VersionedSignedAggregateAndProof::PreElectra(v) => v.len(),
             VersionedSignedAggregateAndProof::Electra(v)
-            | VersionedSignedAggregateAndProof::Fulu(v) => v.len(),
+            | VersionedSignedAggregateAndProof::Fulu(v)
+            | VersionedSignedAggregateAndProof::Gloas(v) => v.len(),
         };
         let source_validators_str = source_validators.join(",");
 
@@ -509,6 +530,9 @@ impl AggregationService {
                     AggregateSubmitLabel::Electra => {
                         info!(slot, count, "Submitted Electra aggregate and proofs");
                     }
+                    AggregateSubmitLabel::Gloas => {
+                        info!(slot, count, "Submitted Gloas aggregate and proofs");
+                    }
                 }
                 RVC_AGGREGATIONS_TOTAL
                     .with_label_values(&[attestation_status::SUCCESS])
@@ -521,6 +545,9 @@ impl AggregationService {
                     }
                     AggregateSubmitLabel::Electra => {
                         warn!(slot, error = %e, "Failed to submit Electra aggregate and proofs");
+                    }
+                    AggregateSubmitLabel::Gloas => {
+                        warn!(slot, error = %e, "Failed to submit Gloas aggregate and proofs");
                     }
                 }
                 RVC_AGGREGATIONS_TOTAL
@@ -540,6 +567,13 @@ impl AggregationService {
                         warn!(
                             slot,
                             "Electra aggregate and proofs submit timed out after {}s",
+                            self.config.timeouts.aggregate_submit.as_secs()
+                        );
+                    }
+                    AggregateSubmitLabel::Gloas => {
+                        warn!(
+                            slot,
+                            "Gloas aggregate and proofs submit timed out after {}s",
                             self.config.timeouts.aggregate_submit.as_secs()
                         );
                     }

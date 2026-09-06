@@ -48,6 +48,7 @@ pub enum VersionedAttestation {
     PreElectra(Vec<LegacyAttestation>),
     Electra(Vec<SingleAttestation>),
     Fulu(Vec<SingleAttestation>),
+    Gloas(Vec<SingleAttestation>),
 }
 
 /// Fork-versioned aggregate attestation for fetch responses.
@@ -56,6 +57,7 @@ pub enum VersionedAggregateAttestation {
     PreElectra(eth_types::Attestation),
     Electra(eth_types::ElectraAttestation),
     Fulu(eth_types::ElectraAttestation),
+    Gloas(eth_types::ElectraAttestation),
 }
 
 /// Fork-versioned signed aggregate and proof for submission.
@@ -64,6 +66,7 @@ pub enum VersionedSignedAggregateAndProof {
     PreElectra(Vec<eth_types::SignedAggregateAndProof>),
     Electra(Vec<eth_types::SignedElectraAggregateAndProof>),
     Fulu(Vec<eth_types::SignedElectraAggregateAndProof>),
+    Gloas(Vec<eth_types::SignedElectraAggregateAndProof>),
 }
 
 /// Header of a beacon block.
@@ -1437,6 +1440,24 @@ mod tests {
     }
 
     #[test]
+    fn test_versioned_attestation_gloas() {
+        let single = SingleAttestation {
+            committee_index: 1,
+            attester_index: 42,
+            data: AttestationData {
+                slot: "100".to_string(),
+                index: "1".to_string(),
+                beacon_block_root: "0xroot".to_string(),
+                source: Checkpoint { epoch: "3".to_string(), root: "0xs".to_string() },
+                target: Checkpoint { epoch: "4".to_string(), root: "0xt".to_string() },
+            },
+            signature: "0xsig".to_string(),
+        };
+        let versioned = VersionedAttestation::Gloas(vec![single]);
+        assert!(matches!(versioned, VersionedAttestation::Gloas(ref v) if v.len() == 1));
+    }
+
+    #[test]
     fn test_versioned_aggregate_attestation_pre_electra() {
         let att = eth_types::Attestation {
             aggregation_bits: vec![0xff],
@@ -1469,6 +1490,24 @@ mod tests {
         };
         let versioned = VersionedAggregateAttestation::Electra(att);
         assert!(matches!(versioned, VersionedAggregateAttestation::Electra(_)));
+    }
+
+    #[test]
+    fn test_versioned_aggregate_attestation_gloas() {
+        let att = eth_types::ElectraAttestation {
+            aggregation_bits: vec![0xff],
+            data: eth_types::AttestationData {
+                slot: 100,
+                index: 1,
+                beacon_block_root: [1u8; 32],
+                source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+            },
+            signature: vec![0xaa; 96],
+            committee_bits: vec![0x01; 8],
+        };
+        let versioned = VersionedAggregateAttestation::Gloas(att);
+        assert!(matches!(versioned, VersionedAggregateAttestation::Gloas(_)));
     }
 
     #[test]
@@ -1521,6 +1560,33 @@ mod tests {
         let versioned = VersionedSignedAggregateAndProof::Electra(proofs);
         assert!(
             matches!(versioned, VersionedSignedAggregateAndProof::Electra(ref v) if v.len() == 1)
+        );
+    }
+
+    #[test]
+    fn test_versioned_signed_aggregate_and_proof_gloas() {
+        let proofs = vec![eth_types::SignedElectraAggregateAndProof {
+            message: eth_types::ElectraAggregateAndProof {
+                aggregator_index: 42,
+                aggregate: eth_types::ElectraAttestation {
+                    aggregation_bits: vec![0xff],
+                    data: eth_types::AttestationData {
+                        slot: 100,
+                        index: 1,
+                        beacon_block_root: [1u8; 32],
+                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                    },
+                    signature: vec![0xaa; 96],
+                    committee_bits: vec![0x01; 8],
+                },
+                selection_proof: vec![0xbb; 96],
+            },
+            signature: vec![0xcc; 96],
+        }];
+        let versioned = VersionedSignedAggregateAndProof::Gloas(proofs);
+        assert!(
+            matches!(versioned, VersionedSignedAggregateAndProof::Gloas(ref v) if v.len() == 1)
         );
     }
 

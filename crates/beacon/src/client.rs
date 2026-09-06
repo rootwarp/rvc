@@ -874,6 +874,15 @@ impl BeaconClient {
                 .instrument(span)
                 .await
             }
+            VersionedSignedAggregateAndProof::Gloas(ps) => {
+                self.post_empty_with_headers(
+                    "/eth/v2/validator/aggregate_and_proofs",
+                    ps,
+                    &[("Eth-Consensus-Version", ForkName::Gloas.as_ref())],
+                )
+                .instrument(span)
+                .await
+            }
         }
     }
 
@@ -1030,6 +1039,7 @@ impl BeaconClient {
             VersionedAttestation::PreElectra(atts) => (ForkName::Phase0.as_ref(), atts.len()),
             VersionedAttestation::Electra(atts) => (ForkName::Electra.as_ref(), atts.len()),
             VersionedAttestation::Fulu(atts) => (ForkName::Fulu.as_ref(), atts.len()),
+            VersionedAttestation::Gloas(atts) => (ForkName::Gloas.as_ref(), atts.len()),
         };
 
         debug!(
@@ -1055,7 +1065,9 @@ impl BeaconClient {
                             .send()
                             .await
                         }
-                        VersionedAttestation::Electra(atts) | VersionedAttestation::Fulu(atts) => {
+                        VersionedAttestation::Electra(atts)
+                        | VersionedAttestation::Fulu(atts)
+                        | VersionedAttestation::Gloas(atts) => {
                             Self::traced(
                                 self.client
                                     .post(&url)

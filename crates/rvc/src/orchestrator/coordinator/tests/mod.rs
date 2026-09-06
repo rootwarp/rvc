@@ -291,6 +291,18 @@ pub(super) async fn build_aggregation_orchestrator(
     PublicKey,
     String,
 ) {
+    build_aggregation_orchestrator_with_schedule(mock_server_uri, create_test_fork_schedule()).await
+}
+
+pub(super) async fn build_aggregation_orchestrator_with_schedule(
+    mock_server_uri: &str,
+    schedule: Arc<ForkSchedule>,
+) -> (
+    DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>,
+    OrchestratorHandle,
+    PublicKey,
+    String,
+) {
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(100);
 
@@ -313,7 +325,7 @@ pub(super) async fn build_aggregation_orchestrator(
     let submitter = Arc::new(MockSubmitter::new());
     let propagator = Arc::new(Propagator::new(submitter));
 
-    let config = create_test_config();
+    let config = OrchestratorConfig::new([0xaa; 32], schedule);
     let mut pubkey_map_inner = HashMap::new();
     pubkey_map_inner.insert(pubkey.to_bytes(), pubkey.clone());
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
