@@ -66,6 +66,67 @@ jobs:
       - name: Run cargo machete
         run: cargo machete
 
+      # 3.9b: targeted graph assertion on a real libssz consumer (rvc-spec-vectors).
+      # Not blanket `cargo tree -d` emptiness — ethereum_ssz 0.9 + 0.8.3 is an
+      # intentional existing dual (workspace `ssz` / `ssz08`).
+      # `cargo tree -d` alone is not enough: ruint's primitive-types 0.12.2 is
+      # lock-resident but not tree-linked, so enabling libssz-merkle's
+      # `ethereum_types` feature adds ethereum-types + primitive-types 0.13
+      # without a -d duplicate. Also scan Cargo.lock / invert-tree.
+      - name: Assert no ethereum-types / single primitive-types
+        run: |
+          set -euo pipefail
+          # Non-vacuity: 3.7 put libssz in Cargo.lock; an empty match would
+          # make the graph grep succeed without a consumer.
+          if ! grep -q libssz Cargo.lock; then
+            echo "libssz missing from Cargo.lock — cargo tree -d assertion would be vacuous"
+            exit 1
+          fi
+          echo "=== Cargo.lock libssz ==="
+          grep -n libssz Cargo.lock
+          echo "=== resolved libssz-merkle ==="
+          # CARGO_TERM_COLOR=always would inject ANSI into package lines.
+          tree=$(CARGO_TERM_COLOR=never cargo tree --locked --workspace --color never -i libssz-merkle)
+          printf '%s\n' "$tree"
+          resolved=$(printf '%s\n' "$tree" | sed -n 's/^libssz-merkle v\([0-9][0-9.]*\).*/libssz-merkle \1/p' | head -n 1)
+          if [ "$resolved" != "libssz-merkle 0.3.0" ]; then
+            echo "libssz-merkle 0.3.0 missing from resolved graph (got: ${resolved:-none})"
+            exit 1
+          fi
+          echo "$resolved"
+          echo "=== cargo tree -d --workspace ==="
+          dups=$(CARGO_TERM_COLOR=never cargo tree --locked -d --workspace --color never)
+          printf '%s\n' "$dups"
+          fail=0
+          if printf '%s\n' "$dups" | grep -F -- 'ethereum-types'; then
+            echo "REGRESSION: ethereum-types present in cargo tree -d --workspace"
+            fail=1
+          fi
+          # Duplicate roots are unindented "name vversion".
+          pt_d=$(printf '%s\n' "$dups" | sed -n 's/^primitive-types v\([^ ]*\).*/\1/p' | sort -u | grep -c . || true)
+          if [ "$pt_d" -ge 2 ]; then
+            echo "REGRESSION: second primitive-types in cargo tree -d ($pt_d versions)"
+            fail=1
+          fi
+          # Invert-tree: unique ethereum-types never appears in -d.
+          if et_tree=$(CARGO_TERM_COLOR=never cargo tree --locked --workspace --color never -i ethereum-types --depth 0 2>/dev/null); then
+            echo "REGRESSION: ethereum-types entered the resolved graph:"
+            printf '%s\n' "$et_tree"
+            fail=1
+          fi
+          pt_lock=$(grep -c '^name = "primitive-types"' Cargo.lock || true)
+          echo "Cargo.lock primitive-types packages: $pt_lock"
+          if [ "$pt_lock" -ne 1 ]; then
+            echo "REGRESSION: expected exactly one primitive-types in Cargo.lock, found $pt_lock"
+            awk '/^name = "primitive-types"$/{print; getline; print}' Cargo.lock
+            fail=1
+          fi
+          if grep -q '^name = "ethereum-types"' Cargo.lock; then
+            echo "REGRESSION: ethereum-types entered Cargo.lock"
+            fail=1
+          fi
+          exit "$fail"
+
   secret-scan:
     name: Secret Scan
     runs-on: ubuntu-latest
