@@ -6,9 +6,17 @@
 /// Pinned `ethereum/consensus-specs` release this island is generated against.
 pub const SPEC_TAG: &str = "v1.7.0-beta.0";
 
+/// Gloas `Attestation` EIP-7495 `active_fields` at `SPEC_TAG` (width 4, all-ones).
+pub const ACTIVE_FIELDS_ATTESTATION: &[bool] = &[true, true, true, true];
+
+/// Gloas `IndexedAttestation` EIP-7495 `active_fields` at `SPEC_TAG` (width 3, all-ones).
+pub const ACTIVE_FIELDS_INDEXED_ATTESTATION: &[bool] = &[true, true, true];
+
 /// Gloas `ExecutionRequests` EIP-7495 `active_fields` at `SPEC_TAG` (width 5, all-ones).
 pub const ACTIVE_FIELDS_EXECUTION_REQUESTS: &[bool] = &[true, true, true, true, true];
 
+const _: () = assert!(ACTIVE_FIELDS_ATTESTATION.len() == 4);
+const _: () = assert!(ACTIVE_FIELDS_INDEXED_ATTESTATION.len() == 3);
 const _: () = assert!(ACTIVE_FIELDS_EXECUTION_REQUESTS.len() == 5);
 
 mod containers;
