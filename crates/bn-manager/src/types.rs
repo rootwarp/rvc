@@ -39,6 +39,15 @@ impl fmt::Display for HealthTier {
     }
 }
 
+/// Bounded `capability` label values for `rvc_bn_capability_state` (issue 6.7).
+///
+/// Code-derived only — never request-derived (cardinality). Issue 8.3 owns
+/// `ALL` membership tests and endpoint-label redaction checks.
+pub mod bn_capability {
+    pub const FORK_RECOGNISED: &str = "fork_recognised";
+    pub const PRODUCE_BLOCK_V4: &str = "produce_block_v4";
+}
+
 /// Tier threshold configuration.
 ///
 /// Defines the width of each sync distance tier:

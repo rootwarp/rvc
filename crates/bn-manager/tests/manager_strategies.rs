@@ -18,6 +18,8 @@ use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use rvc_bn_manager::metrics::RVC_BN_CAPABILITY_STATE;
+use rvc_bn_manager::types::bn_capability;
 use rvc_bn_manager::{
     AttestationApi, BeaconError, BeaconNodeClient, BlockProducer, BnManager, BnManagerConfig,
     BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, DutiesProvider, LivenessApi, NodeStatusApi,
@@ -1082,6 +1084,22 @@ impl wiremock::Respond for InflightProbe {
     }
 }
 
+struct SeqRespond {
+    n: Arc<AtomicUsize>,
+    first: ResponseTemplate,
+    rest: ResponseTemplate,
+}
+
+impl wiremock::Respond for SeqRespond {
+    fn respond(&self, _request: &wiremock::Request) -> ResponseTemplate {
+        if self.n.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first.clone()
+        } else {
+            self.rest.clone()
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_produce_block_v4_three_healthy_reaches_exactly_one_bn() {
     let bns = [MockServer::start().await, MockServer::start().await, MockServer::start().await];
@@ -1278,6 +1296,19 @@ async fn test_produce_block_v4_4xx_does_not_failover() {
         1,
         "4xx is not connect/timeout/5xx; must not fail over; counts={counts:?}"
     );
+    {
+        let trackers = manager.health_trackers().read().await;
+        assert!(
+            trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4),
+            "400 is a understood bad request, not a missing /eth/v4 gap"
+        );
+        let ep = trackers[0].endpoint().to_string();
+        assert_eq!(
+            capability_state(&ep, bn_capability::PRODUCE_BLOCK_V4),
+            1,
+            "400 must not publish capability 0"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1449,6 +1480,398 @@ async fn test_produce_block_v4_tries_higher_health_score_first() {
     assert_eq!(result.execution_payload_value.as_deref(), Some("high"));
     assert_eq!(high.received_requests().await.unwrap().len(), 1);
     assert_eq!(low.received_requests().await.unwrap().len(), 0);
+}
+
+fn capability_state(endpoint: &str, capability: &str) -> i64 {
+    RVC_BN_CAPABILITY_STATE.with_label_values(&[endpoint, capability]).get()
+}
+
+async fn v3_request_count(bn: &MockServer) -> usize {
+    bn.received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|req| req.url.path().contains("/eth/v3/validator/blocks"))
+        .count()
+}
+
+// -- V4 per-endpoint capability health (issue 6.7) --
+
+#[tokio::test]
+async fn test_produce_block_v4_404_excludes_bn_from_next_selection() {
+    let missing = MockServer::start().await;
+    let ok = MockServer::start().await;
+    let slot = 21u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(ResponseTemplate::new(404).set_body_string("no /eth/v4"))
+        .mount(&missing)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x21, "2100"))
+        .mount(&ok)
+        .await;
+
+    let manager = make_multi_manager(&[&missing.uri(), &ok.uri()]);
+    let missing_ep = manager.health_trackers().read().await[0].endpoint().to_string();
+    assert_eq!(
+        capability_state(&missing_ep, bn_capability::PRODUCE_BLOCK_V4),
+        1,
+        "gauge starts capable so a later 0 is a real transition"
+    );
+    let first =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(first.execution_payload_value.as_deref(), Some("2100"));
+    assert_eq!(missing.received_requests().await.unwrap().len(), 1);
+    assert_eq!(ok.received_requests().await.unwrap().len(), 1);
+
+    {
+        let mut trackers = manager.health_trackers().write().await;
+        assert!(!trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4));
+        assert!(trackers[1].is_capable(bn_capability::PRODUCE_BLOCK_V4));
+        // Restore EMA health so exclusion is capability, not the error-rate cut.
+        for _ in 0..20 {
+            trackers[0].record_success(Duration::from_millis(1));
+        }
+        assert!(trackers[0].is_healthy());
+        assert!(!trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4));
+    }
+    assert_eq!(
+        capability_state(&missing_ep, bn_capability::PRODUCE_BLOCK_V4),
+        0,
+        "404 must publish capability 0 after a 1→0 transition"
+    );
+
+    let second =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(second.execution_payload_value.as_deref(), Some("2100"));
+    assert_eq!(
+        missing.received_requests().await.unwrap().len(),
+        1,
+        "404 BN must be excluded from the next produce_block_v4 selection"
+    );
+    assert_eq!(ok.received_requests().await.unwrap().len(), 2);
+}
+
+async fn v4_status_excludes_from_next_selection(status: u16) {
+    let missing = MockServer::start().await;
+    let ok = MockServer::start().await;
+    let slot = 30 + u64::from(status);
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(ResponseTemplate::new(status).set_body_string("no /eth/v4"))
+        .mount(&missing)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x30, "3000"))
+        .mount(&ok)
+        .await;
+
+    let manager = make_multi_manager(&[&missing.uri(), &ok.uri()]);
+    let missing_ep = manager.health_trackers().read().await[0].endpoint().to_string();
+    assert_eq!(capability_state(&missing_ep, bn_capability::PRODUCE_BLOCK_V4), 1);
+
+    let first =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(first.execution_payload_value.as_deref(), Some("3000"));
+    assert_eq!(missing.received_requests().await.unwrap().len(), 1);
+
+    {
+        let mut trackers = manager.health_trackers().write().await;
+        assert!(!trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4));
+        for _ in 0..20 {
+            trackers[0].record_success(Duration::from_millis(1));
+        }
+        assert!(trackers[0].is_healthy());
+    }
+    assert_eq!(
+        capability_state(&missing_ep, bn_capability::PRODUCE_BLOCK_V4),
+        0,
+        "{status} must publish capability 0"
+    );
+
+    let second =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(second.execution_payload_value.as_deref(), Some("3000"));
+    assert_eq!(
+        missing.received_requests().await.unwrap().len(),
+        1,
+        "{status} BN must be excluded from the next produce_block_v4 selection"
+    );
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_405_excludes_bn_from_next_selection() {
+    v4_status_excludes_from_next_selection(405).await;
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_501_excludes_bn_from_next_selection() {
+    v4_status_excludes_from_next_selection(501).await;
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_reprobes_incapable_bn_while_peer_stays_healthy() {
+    let recovered = MockServer::start().await;
+    let healthy = MockServer::start().await;
+    let slot = 27u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(SeqRespond {
+            n: Arc::new(AtomicUsize::new(0)),
+            first: ResponseTemplate::new(404).set_body_string("no /eth/v4"),
+            rest: v4_json_success(slot, 0xaa, "recovered"),
+        })
+        .mount(&recovered)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0xbb, "healthy"))
+        .mount(&healthy)
+        .await;
+
+    let manager = make_multi_manager(&[&recovered.uri(), &healthy.uri()]);
+
+    let first =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(first.execution_payload_value.as_deref(), Some("healthy"));
+    assert_eq!(recovered.received_requests().await.unwrap().len(), 1);
+    assert_eq!(healthy.received_requests().await.unwrap().len(), 1);
+
+    {
+        let mut trackers = manager.health_trackers().write().await;
+        assert!(!trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4));
+        for _ in 0..20 {
+            trackers[0].record_success(Duration::from_millis(1));
+        }
+        assert!(trackers[0].is_healthy());
+        assert!(trackers[1].is_healthy());
+    }
+
+    let skip =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(skip.execution_payload_value.as_deref(), Some("healthy"));
+    assert_eq!(
+        recovered.received_requests().await.unwrap().len(),
+        1,
+        "incapable BN is excluded from the immediately next selection"
+    );
+
+    let reprobe =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(
+        reprobe.execution_payload_value.as_deref(),
+        Some("recovered"),
+        "re-probe must contact the recovered BN while the peer stays healthy"
+    );
+    assert_eq!(recovered.received_requests().await.unwrap().len(), 2);
+    {
+        let trackers = manager.health_trackers().read().await;
+        assert!(trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4));
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_all_incapable_returns_no_eligible_bn_not_v3() {
+    let bn_a = MockServer::start().await;
+    let bn_b = MockServer::start().await;
+    let slot = 22u64;
+
+    for bn in [&bn_a, &bn_b] {
+        Mock::given(method("POST"))
+            .and(path(v4_blocks_path(slot)))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no /eth/v4"))
+            .mount(bn)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v3/validator/blocks/{slot}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string("should never be called"))
+            .expect(0)
+            .mount(bn)
+            .await;
+    }
+
+    let manager = make_multi_manager(&[&bn_a.uri(), &bn_b.uri()]);
+    let result = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match result {
+        Err(BeaconError::NoEligibleBn { operation, role }) => {
+            assert_eq!(operation, "produce_block_v4");
+            assert_eq!(role, "proposal");
+        }
+        other => panic!("expected NoEligibleBn, got {other:?}"),
+    }
+    assert_eq!(v3_request_count(&bn_a).await, 0);
+    assert_eq!(v3_request_count(&bn_b).await, 0);
+
+    let again = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match again {
+        Err(BeaconError::NoEligibleBn { operation, role }) => {
+            assert_eq!(operation, "produce_block_v4");
+            assert_eq!(role, "proposal");
+        }
+        other => panic!("re-probe of all-incapable must stay NoEligibleBn, got {other:?}"),
+    }
+    assert_eq!(v3_request_count(&bn_a).await, 0);
+    assert_eq!(v3_request_count(&bn_b).await, 0);
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_200_clears_capability_and_is_selectable() {
+    let bn = MockServer::start().await;
+    let slot_miss = 23u64;
+    let slot_ok = 24u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot_miss)))
+        .respond_with(ResponseTemplate::new(404).set_body_string("no /eth/v4"))
+        .mount(&bn)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot_ok)))
+        .respond_with(v4_json_success(slot_ok, 0x24, "2400"))
+        .mount(&bn)
+        .await;
+
+    let manager = make_manager(&bn.uri());
+    let first =
+        manager.produce_block_v4(slot_miss, "0xrandao", None, &BuilderConfig::default()).await;
+    match first {
+        Err(BeaconError::NoEligibleBn { operation, .. }) => {
+            assert_eq!(operation, "produce_block_v4");
+        }
+        other => panic!("single 404 BN must be NoEligibleBn, got {other:?}"),
+    }
+    {
+        let trackers = manager.health_trackers().read().await;
+        assert!(!trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4));
+    }
+
+    let recovered = manager
+        .produce_block_v4(slot_ok, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(recovered.execution_payload_value.as_deref(), Some("2400"));
+    let endpoint = manager.health_trackers().read().await[0].endpoint().to_string();
+    {
+        let trackers = manager.health_trackers().read().await;
+        assert!(
+            trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4),
+            "a subsequent 200 must clear the sticky capability flag"
+        );
+    }
+    assert_eq!(capability_state(&endpoint, bn_capability::PRODUCE_BLOCK_V4), 1);
+
+    let still = manager
+        .produce_block_v4(slot_ok, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(still.execution_payload_value.as_deref(), Some("2400"));
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_404_does_not_affect_duties_or_attestations() {
+    let bn = MockServer::start().await;
+    let slot = 25u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(ResponseTemplate::new(404).set_body_string("no /eth/v4"))
+        .mount(&bn)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/duties/attester/5"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"dependent_root":"0xdef","execution_optimistic":false,"data":[]}"#,
+        ))
+        .mount(&bn)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/attestation_data"))
+        .and(query_param("slot", "100"))
+        .and(query_param("committee_index", "0"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"slot":"100","index":"0","beacon_block_root":"0xabc","source":{"epoch":"3","root":"0x01"},"target":{"epoch":"4","root":"0x02"}}}"#,
+        ))
+        .mount(&bn)
+        .await;
+
+    let manager = make_manager(&bn.uri());
+    let v4 = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    assert!(
+        matches!(v4, Err(BeaconError::NoEligibleBn { .. })),
+        "v4 404 must not fall through to v3: {v4:?}"
+    );
+
+    let duties = manager.get_attester_duties(5, &["1".to_string()]).await;
+    assert!(duties.is_ok(), "duty-fetch on the same BN must remain available: {duties:?}");
+    let att = manager.get_attestation_data(100, 0).await;
+    assert!(att.is_ok(), "attestation path on the same BN must remain available: {att:?}");
+
+    {
+        let trackers = manager.health_trackers().read().await;
+        assert!(!trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4));
+        assert!(trackers[0].is_capable("get_attester_duties"));
+        assert!(trackers[0].is_capable("get_attestation_data"));
+    }
+
+    let v4_again =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    assert!(
+        matches!(v4_again, Err(BeaconError::NoEligibleBn { .. })),
+        "duties success must not clear produce_block_v4 capability: {v4_again:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_unrecognised_fork_excludes_from_next_selection() {
+    let unknown = MockServer::start().await;
+    let ok = MockServer::start().await;
+    let slot = 26u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"version": "gloas2", "data": {}}))
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "gloas2")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .mount(&unknown)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot, 0x26, "2600"))
+        .mount(&ok)
+        .await;
+
+    let manager = make_multi_manager(&[&unknown.uri(), &ok.uri()]);
+    let first = manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    assert!(
+        matches!(first, Err(BeaconError::NoEligibleBn { .. } | BeaconError::ParseError(_))),
+        "unrecognised fork must fail closed, not V3: {first:?}"
+    );
+    assert_eq!(ok.received_requests().await.unwrap().len(), 0, "2xx is not failover-retryable");
+
+    {
+        let mut trackers = manager.health_trackers().write().await;
+        assert!(!trackers[0].is_capable(bn_capability::PRODUCE_BLOCK_V4));
+        assert!(!trackers[0].is_capable(bn_capability::FORK_RECOGNISED));
+        for _ in 0..20 {
+            trackers[0].record_success(Duration::from_millis(1));
+        }
+    }
+
+    let second =
+        manager.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(second.execution_payload_value.as_deref(), Some("2600"));
+    assert_eq!(unknown.received_requests().await.unwrap().len(), 1);
+    assert_eq!(ok.received_requests().await.unwrap().len(), 1);
 }
 
 // -- Broadcast: submissions --

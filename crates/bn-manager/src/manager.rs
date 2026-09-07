@@ -28,7 +28,7 @@ use observability::logging::RedactedUrl;
 use crate::sync_status::BnSyncStatus;
 
 use crate::broadcast::{BnOutcome, BroadcastResult};
-use crate::health::{new_shared_health_trackers, SharedHealthTrackers};
+use crate::health::{new_shared_health_trackers, BnHealthTracker, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
 use crate::sync_status::{
     check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, SharedSyncStatuses,
@@ -38,7 +38,7 @@ use crate::traits::{
     DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi,
     SyncCommitteeApi,
 };
-use crate::types::{BnRole, HealthTier, TierThresholds};
+use crate::types::{bn_capability, BnRole, HealthTier, TierThresholds};
 use crate::BnManagerError;
 
 type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send + 'a>>;
@@ -50,21 +50,112 @@ type IndexedTimedResultFut<'a, T> =
 enum TrackerOutcome {
     Success(Duration),
     Error,
+    /// Missing `/eth/v4` (404/405/501) or an unrecognised fork — skip this BN
+    /// for the operation until a later success re-probes it.
+    Incapable {
+        unrecognised_fork: bool,
+    },
 }
 
 /// D29: V4 production may fail over only on connect / timeout / 5xx — never after
 /// a 2xx (ParseError) or a 4xx that the BN understood.
 ///
-/// `HttpError` is the client's connect/request class (serialize failures use
-/// the same variant and fail identically on every BN). 429 is not 5xx.
+/// 404/405/501 mean the BN does not serve the endpoint (capability gap), not
+/// that it understood a bad request; those are retryable so a peer with `/eth/v4`
+/// can still produce. 400/429 stay fail-closed. `HttpError` is the client's
+/// connect/request class (serialize failures use the same variant and fail
+/// identically on every BN).
 fn is_production_failover_error(err: &BeaconError) -> bool {
     match err {
         BeaconError::Timeout | BeaconError::OperationTimeout { .. } | BeaconError::HttpError(_) => {
             true
         }
-        BeaconError::ApiError { status, .. } if (500..600).contains(status) => true,
+        BeaconError::ApiError { status, .. }
+            if matches!(status, 404 | 405) || (500..600).contains(status) =>
+        {
+            true
+        }
         _ => false,
     }
+}
+
+fn is_unrecognised_fork(err: &BeaconError) -> bool {
+    match err {
+        BeaconError::ParseError(msg) => {
+            msg.contains("invalid Eth-Consensus-Version")
+                || msg.contains("unparseable Eth-Consensus-Version")
+        }
+        _ => false,
+    }
+}
+
+fn is_v4_capability_gap(op_name: &str, err: &BeaconError) -> bool {
+    op_name == bn_capability::PRODUCE_BLOCK_V4
+        && matches!(err, BeaconError::ApiError { status: 404 | 405 | 501, .. })
+}
+
+fn error_outcome(op_name: &str, err: &BeaconError) -> TrackerOutcome {
+    if is_unrecognised_fork(err) {
+        TrackerOutcome::Incapable { unrecognised_fork: true }
+    } else if is_v4_capability_gap(op_name, err) {
+        TrackerOutcome::Incapable { unrecognised_fork: false }
+    } else {
+        TrackerOutcome::Error
+    }
+}
+
+fn no_eligible_bn(op_name: &str, role: BnRole) -> BeaconError {
+    BeaconError::NoEligibleBn { operation: op_name.to_string(), role: role.to_string() }
+}
+
+/// `scheme://host:port` with userinfo and path stripped — dashboards key on host,
+/// not credentials or request path (issue 8.3 label hygiene).
+fn capability_endpoint_label(endpoint: &str) -> String {
+    match Url::parse(endpoint) {
+        Ok(mut parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_path("");
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string().trim_end_matches('/').to_string()
+        }
+        // Unparseable (or non-http) input must not become a label — userinfo
+        // can sit in a raw string that `Url::parse` rejects.
+        _ => "unknown".to_string(),
+    }
+}
+
+fn publish_capability(endpoint: &str, capability: &str, capable: bool) {
+    crate::metrics::RVC_BN_CAPABILITY_STATE
+        .with_label_values(&[&capability_endpoint_label(endpoint), capability])
+        .set(i64::from(capable));
+}
+
+fn capable_of(tracker: &BnHealthTracker, op_name: &str) -> bool {
+    tracker.is_capable(op_name)
+        && (op_name != bn_capability::PRODUCE_BLOCK_V4
+            || tracker.is_capable(bn_capability::FORK_RECOGNISED))
+}
+
+/// Consume mixed-fleet skip budget. `true` excludes this selection.
+fn skip_capability(tracker: &BnHealthTracker, op_name: &str) -> bool {
+    let skip_op = tracker.consume_reprobe_skip(op_name);
+    if op_name == bn_capability::PRODUCE_BLOCK_V4 {
+        tracker.consume_reprobe_skip(bn_capability::FORK_RECOGNISED) || skip_op
+    } else {
+        skip_op
+    }
+}
+
+fn sort_indices_by_health(indices: &mut [usize], health_guard: &[BnHealthTracker]) {
+    indices.sort_by(|&a, &b| {
+        health_guard[b]
+            .score()
+            .partial_cmp(&health_guard[a].score())
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.cmp(&b))
+    });
 }
 
 /// Split remaining slot budget across BNs still to try (last BN gets the rest).
@@ -93,7 +184,9 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 /// - **Best-of**: query healthy BNs in parallel and pick the highest-value result —
 ///   block production (`produce_block_v3`).
 /// - **Failover**: sequential, one in-flight; retry connect / timeout / 5xx only —
-///   `produce_block_v4` (D29). Never after a 2xx, never in parallel.
+///   `produce_block_v4` (D29). Never after a 2xx, never in parallel. 404/405/501
+///   are a capability gap (missing `/eth/v4`) and do fail over; a later success
+///   re-probes. All-incapable is `NoEligibleBn`, never V3.
 /// - **Broadcast**: send to **role-matching** BNs (subject to `BroadcastTopics`),
 ///   succeed if any succeeds — attestations, blocks, sync committee messages,
 ///   subscriptions, preparations, validator registrations. Role filter only;
@@ -188,6 +281,10 @@ impl BnManager {
         let sync_statuses = new_shared_sync_statuses(clients.len());
         let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
         let health_trackers = new_shared_health_trackers(&endpoints);
+        for ep in &endpoints {
+            publish_capability(ep, bn_capability::PRODUCE_BLOCK_V4, true);
+            publish_capability(ep, bn_capability::FORK_RECOGNISED, true);
+        }
         Ok(Self {
             clients,
             sync_statuses,
@@ -244,15 +341,36 @@ impl BnManager {
     ///
     /// Selection strategies collect outcomes during the round and call this once
     /// so the health write lock is taken at most once per selection round.
-    async fn record_outcomes(&self, outcomes: &[(usize, TrackerOutcome)]) {
+    async fn record_outcomes(&self, op_name: &str, outcomes: &[(usize, TrackerOutcome)]) {
         if outcomes.is_empty() {
             return;
         }
         let mut trackers = self.health_trackers.write().await;
         for &(idx, outcome) in outcomes {
             match outcome {
-                TrackerOutcome::Success(latency) => trackers[idx].record_success(latency),
+                TrackerOutcome::Success(latency) => {
+                    trackers[idx].record_success(latency);
+                    trackers[idx].mark_capable(op_name);
+                    if op_name == bn_capability::PRODUCE_BLOCK_V4 {
+                        let endpoint = trackers[idx].endpoint().to_string();
+                        trackers[idx].mark_capable(bn_capability::FORK_RECOGNISED);
+                        publish_capability(&endpoint, bn_capability::PRODUCE_BLOCK_V4, true);
+                        publish_capability(&endpoint, bn_capability::FORK_RECOGNISED, true);
+                    }
+                }
                 TrackerOutcome::Error => trackers[idx].record_error(),
+                TrackerOutcome::Incapable { unrecognised_fork } => {
+                    trackers[idx].record_error();
+                    trackers[idx].mark_incapable(op_name);
+                    let endpoint = trackers[idx].endpoint().to_string();
+                    if op_name == bn_capability::PRODUCE_BLOCK_V4 {
+                        publish_capability(&endpoint, bn_capability::PRODUCE_BLOCK_V4, false);
+                    }
+                    if unrecognised_fork {
+                        trackers[idx].mark_incapable(bn_capability::FORK_RECOGNISED);
+                        publish_capability(&endpoint, bn_capability::FORK_RECOGNISED, false);
+                    }
+                }
             }
         }
     }
@@ -372,14 +490,23 @@ impl BnManager {
     /// Returns indices of BNs matching the given role and meeting the minimum health tier,
     /// ordered by health score (highest first).
     ///
-    /// Filtering order: role → tier → health score.
+    /// Filtering order: role → tier → capability → health score.
     ///
     /// Fallback chain:
     /// 1. If no BNs match the role, fall back to `All`-role BNs with WARN
     /// 2. If no BNs meet the tier, try the next lower tier with WARN
     /// 3. If still empty, fall back to all BNs (query path only)
-    #[tracing::instrument(name = "bn_manager.synced_indices", skip_all, fields(role = %role, min_tier = %min_tier))]
-    async fn synced_indices(&self, role: BnRole, min_tier: HealthTier) -> Vec<usize> {
+    /// 4. Capability is a hard exclude for one selection when a capable peer
+    ///    remains; the next selection re-probes flagged BNs first (bounded
+    ///    schedule). If every remaining BN is incapable of `op_name`, those BNs
+    ///    are returned immediately so the caller can re-probe — never V3.
+    #[tracing::instrument(name = "bn_manager.synced_indices", skip_all, fields(role = %role, min_tier = %min_tier, op = op_name))]
+    async fn synced_indices(
+        &self,
+        role: BnRole,
+        min_tier: HealthTier,
+        op_name: &str,
+    ) -> Vec<usize> {
         let sync_guard = self.sync_statuses.read().await;
         let health_guard = self.health_trackers.read().await;
 
@@ -444,31 +571,60 @@ impl BnManager {
             tier_filtered = role_indices;
         }
 
-        // Step 3: Filter out unhealthy BNs (unless it would leave none)
-        let healthy: Vec<usize> =
-            tier_filtered.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
+        let capable: Vec<usize> = tier_filtered
+            .iter()
+            .copied()
+            .filter(|&i| capable_of(&health_guard[i], op_name))
+            .collect();
 
-        let mut result = if healthy.is_empty() {
-            error!(
-                bn_count = tier_filtered.len(),
-                "All BNs unhealthy, using all tier-matching BNs"
-            );
-            tier_filtered
+        if capable.is_empty() {
+            if !tier_filtered.is_empty() {
+                warn!(
+                    op = op_name,
+                    bn_count = tier_filtered.len(),
+                    "all eligible BNs incapable of operation, re-probing"
+                );
+            }
+            let healthy: Vec<usize> =
+                tier_filtered.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
+            let mut result = if healthy.is_empty() {
+                error!(
+                    bn_count = tier_filtered.len(),
+                    "All BNs unhealthy, using all tier-matching BNs"
+                );
+                tier_filtered
+            } else {
+                healthy
+            };
+            sort_indices_by_health(&mut result, &health_guard);
+            return result;
+        }
+
+        // Mixed fleet: skip flagged BNs for one selection, then re-probe them
+        // first so a recovered BN is contacted while a capable peer stays healthy.
+        let mut reprobe = Vec::new();
+        for &i in &tier_filtered {
+            if capable_of(&health_guard[i], op_name) {
+                continue;
+            }
+            if skip_capability(&health_guard[i], op_name) {
+                continue;
+            }
+            reprobe.push(i);
+        }
+
+        let healthy_capable: Vec<usize> =
+            capable.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
+        let mut capable_pool = if healthy_capable.is_empty() {
+            error!(bn_count = capable.len(), "All BNs unhealthy, using all tier-matching BNs");
+            capable
         } else {
-            healthy
+            healthy_capable
         };
-
-        // Sort by health score descending; config index breaks ties so failover
-        // order is deterministic when scores are equal.
-        result.sort_by(|&a, &b| {
-            health_guard[b]
-                .score()
-                .partial_cmp(&health_guard[a].score())
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.cmp(&b))
-        });
-
-        result
+        sort_indices_by_health(&mut reprobe, &health_guard);
+        sort_indices_by_health(&mut capable_pool, &health_guard);
+        reprobe.extend(capable_pool);
+        reprobe
     }
 
     /// Query using the `First` strategy: try synced BNs in order, fail over on error.
@@ -502,10 +658,13 @@ impl BnManager {
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let indices = self.synced_indices(role, min_tier).await;
+        let indices = self.synced_indices(role, min_tier, op_name).await;
+        if indices.is_empty() {
+            return Err(no_eligible_bn(op_name, role));
+        }
         let mut last_err = None;
         let mut tried: usize = 0;
-        let mut failed_indices: Vec<usize> = Vec::new();
+        let mut failed: Vec<(usize, TrackerOutcome)> = Vec::new();
 
         for (pos, i) in indices.iter().copied().enumerate() {
             let client = &self.clients[i];
@@ -519,10 +678,9 @@ impl BnManager {
                 Ok(result) => {
                     let elapsed = start.elapsed();
                     // Batch update: record success + all prior errors in one lock acquisition
-                    let mut outcomes: Vec<(usize, TrackerOutcome)> =
-                        failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
+                    let mut outcomes = failed;
                     outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    self.record_outcomes(&outcomes).await;
+                    self.record_outcomes(op_name, &outcomes).await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -534,7 +692,7 @@ impl BnManager {
                     return Ok(result);
                 }
                 Err(e) => {
-                    failed_indices.push(i);
+                    failed.push((i, error_outcome(op_name, &e)));
                     if let Some(&next_i) = indices.get(pos + 1) {
                         let next_client = &self.clients[next_i];
                         warn!(
@@ -558,12 +716,10 @@ impl BnManager {
         }
 
         // All failed — batch record errors
-        let outcomes: Vec<(usize, TrackerOutcome)> =
-            failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
-        self.record_outcomes(&outcomes).await;
+        self.record_outcomes(op_name, &failed).await;
 
         tracing::Span::current().record("tried", tried);
-        Err(last_err.expect("at least one client exists"))
+        Err(last_err.unwrap_or_else(|| no_eligible_bn(op_name, role)))
     }
 
     /// Like [`Self::query_first`], but `Ok(None)` is not a cluster answer.
@@ -603,11 +759,14 @@ impl BnManager {
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, Option<T>>,
     {
-        let indices = self.synced_indices(role, min_tier).await;
+        let indices = self.synced_indices(role, min_tier, op_name).await;
+        if indices.is_empty() {
+            return Err(no_eligible_bn(op_name, role));
+        }
         let mut last_err = None;
         let mut saw_none = false;
         let mut tried: usize = 0;
-        let mut failed_indices: Vec<usize> = Vec::new();
+        let mut failed: Vec<(usize, TrackerOutcome)> = Vec::new();
 
         for (pos, i) in indices.iter().copied().enumerate() {
             let client = &self.clients[i];
@@ -620,10 +779,9 @@ impl BnManager {
             match op(client).instrument(attempt_span).await {
                 Ok(Some(result)) => {
                     let elapsed = start.elapsed();
-                    let mut outcomes: Vec<(usize, TrackerOutcome)> =
-                        failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
+                    let mut outcomes = failed;
                     outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    self.record_outcomes(&outcomes).await;
+                    self.record_outcomes(op_name, &outcomes).await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -644,7 +802,7 @@ impl BnManager {
                     );
                 }
                 Err(e) => {
-                    failed_indices.push(i);
+                    failed.push((i, error_outcome(op_name, &e)));
                     if let Some(&next_i) = indices.get(pos + 1) {
                         let next_client = &self.clients[next_i];
                         warn!(
@@ -667,20 +825,19 @@ impl BnManager {
             }
         }
 
-        let outcomes: Vec<(usize, TrackerOutcome)> =
-            failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
-        self.record_outcomes(&outcomes).await;
+        self.record_outcomes(op_name, &failed).await;
         tracing::Span::current().record("tried", tried);
 
         if saw_none {
             return Ok(None);
         }
-        Err(last_err.expect("at least one client exists"))
+        Err(last_err.unwrap_or_else(|| no_eligible_bn(op_name, role)))
     }
 
     /// Sequential production failover (D29): one in-flight request, health-score
-    /// order. Retry connect error / timeout / 5xx only — never after a 2xx
-    /// (including a 2xx whose body later fails to parse) and never in parallel.
+    /// order. Retry connect error / timeout / 5xx / missing-endpoint 404/405 —
+    /// never after a 2xx (including a 2xx whose body later fails to parse) and
+    /// never in parallel.
     ///
     /// `budget` is the slot-budget remaining for the whole round; each attempt
     /// is capped at `remaining / remaining_bns` so a hung primary cannot consume
@@ -723,18 +880,15 @@ impl BnManager {
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let indices = self.synced_indices(role, min_tier).await;
+        let indices = self.synced_indices(role, min_tier, op_name).await;
         if indices.is_empty() {
-            return Err(BeaconError::NoEligibleBn {
-                operation: op_name.to_string(),
-                role: role.to_string(),
-            });
+            return Err(no_eligible_bn(op_name, role));
         }
 
         let deadline = budget.map(|d| (tokio::time::Instant::now() + d, d));
         let mut last_err = None;
         let mut tried: usize = 0;
-        let mut failed_indices: Vec<usize> = Vec::new();
+        let mut failed: Vec<(usize, TrackerOutcome)> = Vec::new();
 
         for (pos, i) in indices.iter().copied().enumerate() {
             let remaining_bns = indices.len() - pos;
@@ -767,11 +921,10 @@ impl BnManager {
 
             match result {
                 Ok(value) => {
-                    let mut outcomes: Vec<(usize, TrackerOutcome)> =
-                        failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
+                    let mut outcomes = failed;
                     let elapsed = start.elapsed();
                     outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    self.record_outcomes(&outcomes).await;
+                    self.record_outcomes(op_name, &outcomes).await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -783,7 +936,7 @@ impl BnManager {
                     return Ok(value);
                 }
                 Err(e) => {
-                    failed_indices.push(i);
+                    failed.push((i, error_outcome(op_name, &e)));
                     if is_production_failover_error(&e) {
                         if let Some(&next_i) = indices.get(pos + 1) {
                             warn!(
@@ -817,13 +970,19 @@ impl BnManager {
             }
         }
 
-        let outcomes: Vec<(usize, TrackerOutcome)> =
-            failed_indices.iter().map(|&fi| (fi, TrackerOutcome::Error)).collect();
-        self.record_outcomes(&outcomes).await;
+        self.record_outcomes(op_name, &failed).await;
         tracing::Span::current().record("tried", tried);
-        Err(last_err.unwrap_or_else(|| {
-            BeaconError::HttpError(format!("{op_name}: all BNs failed in failover"))
-        }))
+        let all_incapable = !failed.is_empty()
+            && failed.iter().all(|(_, o)| matches!(o, TrackerOutcome::Incapable { .. }));
+        if all_incapable
+            && last_err
+                .as_ref()
+                .is_none_or(|e| is_v4_capability_gap(op_name, e) || is_unrecognised_fork(e))
+        {
+            // Every tried BN lacks this endpoint / fork — fail closed, never V3.
+            return Err(no_eligible_bn(op_name, role));
+        }
+        Err(last_err.unwrap_or_else(|| no_eligible_bn(op_name, role)))
     }
 
     /// Query using the `Best` strategy: query synced BNs in parallel, pick best result.
@@ -865,8 +1024,11 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
-        let indices = self.synced_indices(role, min_tier).await;
+        let indices = self.synced_indices(role, min_tier, op_name).await;
         tracing::Span::current().record("tried", indices.len());
+        if indices.is_empty() {
+            return Err(no_eligible_bn(op_name, role));
+        }
 
         if indices.len() == 1 {
             let client = &self.clients[indices[0]];
@@ -878,7 +1040,8 @@ impl BnManager {
             let start = tokio::time::Instant::now();
             match op(client).instrument(attempt_span).await {
                 Ok(result) => {
-                    self.record_outcomes(&[(i, TrackerOutcome::Success(start.elapsed()))]).await;
+                    self.record_outcomes(op_name, &[(i, TrackerOutcome::Success(start.elapsed()))])
+                        .await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -888,7 +1051,7 @@ impl BnManager {
                     return Ok(result);
                 }
                 Err(e) => {
-                    self.record_outcomes(&[(i, TrackerOutcome::Error)]).await;
+                    self.record_outcomes(op_name, &[(i, error_outcome(op_name, &e))]).await;
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -944,7 +1107,7 @@ impl BnManager {
                     });
                 }
                 Err(e) => {
-                    outcomes.push((i, TrackerOutcome::Error));
+                    outcomes.push((i, error_outcome(op_name, &e)));
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -956,7 +1119,7 @@ impl BnManager {
             }
         }
 
-        self.record_outcomes(&outcomes).await;
+        self.record_outcomes(op_name, &outcomes).await;
 
         match best {
             Some((i, value)) => {
@@ -1005,7 +1168,7 @@ impl BnManager {
                 Ok(result) => {
                     let elapsed = start.elapsed();
                     outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    self.record_outcomes(&outcomes).await;
+                    self.record_outcomes(op_name, &outcomes).await;
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -1016,7 +1179,7 @@ impl BnManager {
                     return Some(result);
                 }
                 Err(e) => {
-                    outcomes.push((i, TrackerOutcome::Error));
+                    outcomes.push((i, error_outcome(op_name, &e)));
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -1028,7 +1191,7 @@ impl BnManager {
             }
         }
 
-        self.record_outcomes(&outcomes).await;
+        self.record_outcomes(op_name, &outcomes).await;
         None
     }
 
@@ -1129,7 +1292,7 @@ impl BnManager {
                     );
                 }
                 Err(e) => {
-                    health_outcomes.push((i, TrackerOutcome::Error));
+                    health_outcomes.push((i, error_outcome(op_name, e)));
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -1141,7 +1304,7 @@ impl BnManager {
             }
             outcomes.push(BnOutcome { endpoint, result, latency: elapsed });
         }
-        self.record_outcomes(&health_outcomes).await;
+        self.record_outcomes(op_name, &health_outcomes).await;
 
         BroadcastResult { outcomes }
     }
@@ -2087,6 +2250,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::types::bn_capability;
 
     /// Guard: the passthrough macro list must name every role-trait method.
     /// Primary enforcement is compile-time (missing method → trait not satisfied).
@@ -2497,8 +2661,15 @@ mod tests {
             status: 400,
             message: "x".to_string(),
         }));
-        assert!(!is_production_failover_error(&BeaconError::ApiError {
-            status: 404,
+        assert!(
+            is_production_failover_error(&BeaconError::ApiError {
+                status: 404,
+                message: "x".to_string(),
+            }),
+            "404 is a missing-endpoint gap, not a 4xx the BN understood"
+        );
+        assert!(is_production_failover_error(&BeaconError::ApiError {
+            status: 405,
             message: "x".to_string(),
         }));
         assert!(!is_production_failover_error(&BeaconError::ApiError {
@@ -2506,6 +2677,36 @@ mod tests {
             message: "x".to_string(),
         }));
         assert!(!is_production_failover_error(&BeaconError::ParseError("bad json".to_string())));
+    }
+
+    #[test]
+    fn test_capability_endpoint_label_strips_userinfo_and_path() {
+        assert_eq!(capability_endpoint_label("http://127.0.0.1:5052"), "http://127.0.0.1:5052");
+        assert_eq!(
+            capability_endpoint_label("http://user:secret@bn.example:5052/eth/v4"),
+            "http://bn.example:5052"
+        );
+        assert_eq!(capability_endpoint_label("not a url"), "unknown");
+        assert_eq!(
+            capability_endpoint_label("user:secret@host"),
+            "unknown",
+            "parse failure (or non-http scheme) must not emit userinfo"
+        );
+    }
+
+    #[test]
+    fn test_v4_capability_gap_classifier() {
+        let not_found = BeaconError::ApiError { status: 404, message: "no v4".to_string() };
+        assert!(is_v4_capability_gap(bn_capability::PRODUCE_BLOCK_V4, &not_found));
+        assert!(!is_v4_capability_gap("get_attester_duties", &not_found));
+        assert!(!is_v4_capability_gap(
+            bn_capability::PRODUCE_BLOCK_V4,
+            &BeaconError::ApiError { status: 400, message: "bad body".to_string() },
+        ));
+        assert!(is_unrecognised_fork(&BeaconError::ParseError(
+            "invalid Eth-Consensus-Version: gloas2".to_string()
+        )));
+        assert!(!is_unrecognised_fork(&BeaconError::ParseError("bad json".to_string())));
     }
 
     #[test]

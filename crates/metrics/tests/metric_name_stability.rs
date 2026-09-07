@@ -11,6 +11,7 @@
 //! Issue 4.6 adds `rvc_ptc_duties_fetched_total` (family delta +1).
 //! Issue 4.13 adds `rvc_payload_attestation_skipped_total` (family delta +1).
 //! Issue 4.12 adds `rvc_signer_capability` (family delta +1).
+//! Issue 6.7 adds `rvc_bn_capability_state` (family delta +1).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -54,6 +55,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_attestation_trigger_total",
     "rvc_attestations_total",
     "rvc_attesting_enabled",
+    "rvc_bn_capability_state",
     "rvc_bn_health_tier",
     "rvc_builder_circuit_breaker_trips_total",
     "rvc_builder_consecutive_misses",
@@ -191,8 +193,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        38,
-        "issue 4.12 +1 family (rvc_signer_capability) on the 4.13 37-family pin"
+        39,
+        "issue 6.7 +1 family (rvc_bn_capability_state) on the 4.12 38-family pin"
     );
 }
 
