@@ -286,6 +286,17 @@ impl ValidatorSigner for MockSigner {
     ) -> Result<crypto::Signature, SignerError> {
         Ok(mock_sig(b"payload-attestation"))
     }
+
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        _object_root: &Root,
+        _slot: Slot,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<crypto::Signature, SignerError> {
+        Ok(mock_sig(b"execution-payload-envelope"))
+    }
 }
 
 // --- Mock Beacon Client ---

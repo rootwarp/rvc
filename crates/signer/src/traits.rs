@@ -227,4 +227,19 @@ pub trait ValidatorSigner: Send + Sync {
         let _ = (auth, pubkey, genesis_fork_version);
         Err(SignerError::UnsupportedDuty { duty: "builder_request_auth" })
     }
+
+    /// Sign a self-build execution payload envelope root (`DOMAIN_BEACON_BUILDER`).
+    ///
+    /// Precomputed island root + slot for fork resolution. Self-build only;
+    /// bids and external envelopes stay builder-signed. Non-slashable: must
+    /// not stage or commit a slashing-DB row. Per-slot uniqueness is VC-only
+    /// (SignRoot has no slot): a second envelope for the same slot is refused.
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError>;
 }

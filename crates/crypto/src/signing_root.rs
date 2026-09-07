@@ -14,10 +14,10 @@ use eth_types::{
     ContributionAndProof, DomainType, ElectraAggregateAndProof, Epoch, ForkName, ForkSchedule,
     PayloadAttestationData, ProposerPreferences, Root, Slot, SyncAggregatorSelectionData,
     ValidatorRegistrationV1, VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER,
-    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH,
-    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
-    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
-    DOMAIN_VOLUNTARY_EXIT, SLOTS_PER_EPOCH,
+    DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER,
+    DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES,
+    DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT, SLOTS_PER_EPOCH,
 };
 use tree_hash::TreeHash;
 
@@ -35,8 +35,9 @@ pub struct SigningCtx<'a> {
 /// Covers every production sign path: attestation, PTC payload attestation,
 /// proposer preferences, block (full / root), blinded block, RANDAO, sync
 /// message/selection, attester selection proof, aggregate-and-proof (Phase0
-/// and Electra), contribution-and-proof, voluntary exit, and builder
-/// registration.
+/// and Electra), contribution-and-proof, voluntary exit, builder
+/// registration, builder request auth, and self-build execution payload
+/// envelope.
 #[derive(Debug, Clone, Copy)]
 pub enum DutyRef<'a> {
     Attestation(&'a AttestationData),
@@ -48,6 +49,14 @@ pub enum DutyRef<'a> {
     Block(&'a BeaconBlock),
     /// Precomputed block root + slot for fork resolution (SignerService path).
     BlockRoot {
+        root: &'a Root,
+        slot: Slot,
+    },
+    /// Precomputed self-build envelope root + slot (`DOMAIN_BEACON_BUILDER`).
+    ///
+    /// Self-build only: bids and external envelopes stay builder-signed.
+    /// `slot` selects the fork; per-slot uniqueness is VC `SignerService`.
+    ExecutionPayloadEnvelopeRoot {
         root: &'a Root,
         slot: Slot,
     },
@@ -129,6 +138,13 @@ pub fn signing_root_for(duty: &DutyRef<'_>, ctx: &SigningCtx<'_>) -> Root {
             let fork_version = fork_version_at(epoch, ctx.fork_schedule);
             let domain =
                 compute_domain(DOMAIN_BEACON_PROPOSER, fork_version, ctx.genesis_validators_root);
+            compute_signing_root(root, domain)
+        }
+        DutyRef::ExecutionPayloadEnvelopeRoot { root, slot } => {
+            let epoch = *slot / SLOTS_PER_EPOCH;
+            let fork_version = fork_version_at(epoch, ctx.fork_schedule);
+            let domain =
+                compute_domain(DOMAIN_BEACON_BUILDER, fork_version, ctx.genesis_validators_root);
             compute_signing_root(root, domain)
         }
         DutyRef::BlindedBlock(block) => {
@@ -276,6 +292,7 @@ mod tests {
         Attestation, Checkpoint, ElectraAttestation, PayloadAttestationData, ProposerPreferences,
         SyncCommitteeContribution,
     };
+    use rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT;
     use rvc_spec_vectors::spec_kat::{
         KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT, KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT,
     };
@@ -692,6 +709,38 @@ mod tests {
             &ctx,
         );
         assert_eq!(got, parse_kat_root(KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT));
+    }
+
+    /// L3: ExecutionPayloadEnvelope signing root from the 5.13a pyspec artifact
+    /// (`KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT`) under
+    /// `DOMAIN_BEACON_BUILDER 0x0B000000` at `epoch_of(slot)`.
+    #[test]
+    fn test_execution_payload_envelope_signing_root() {
+        const KAT: &str = include_str!("../../rvc-spec-vectors/src/gloas_signing_kat.rs");
+        let header: String = KAT.lines().take_while(|l| l.starts_with("//!")).collect();
+        assert!(
+            !header.to_ascii_lowercase().contains("remerkleable"),
+            "KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT provenance must not be remerkleable (D15)"
+        );
+        assert_eq!(DOMAIN_BEACON_BUILDER, [0x0B, 0x00, 0x00, 0x00]);
+        assert_ne!(DOMAIN_BEACON_BUILDER, DOMAIN_BUILDER_REQUEST_AUTH);
+
+        // Official ssz_static minimal case_0 object root (5.16 / 5.13a yaml).
+        const SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT: &str =
+            "98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a";
+        let object_root = parse_kat_root(SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT);
+
+        let mut schedule = compressed_schedule();
+        // Artifact: fork_version 0x07000001, GVR zeros, slot 1 (epoch 0).
+        schedule.gloas_fork_epoch = 0;
+        schedule.gloas_fork_version = [0x07, 0x00, 0x00, 0x01];
+        let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: [0u8; 32] };
+        let slot = 1;
+        let got = signing_root_for(
+            &DutyRef::ExecutionPayloadEnvelopeRoot { root: &object_root, slot },
+            &ctx,
+        );
+        assert_eq!(got, parse_kat_root(KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT));
     }
 
     /// PTC fork version is `epoch_of(data.slot)`, unlike attestations (`target.epoch`).

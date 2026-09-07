@@ -45,6 +45,7 @@ pub use traits::{BeaconBlockHeaderFields, ValidatorSigner};
 #[cfg(any(test, feature = "test-utils"))]
 pub use test_utils::{mock_sig, StubValidatorSigner};
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -118,6 +119,14 @@ pub enum SignerError {
     /// domain. No slashing-DB row is written.
     #[error("unsupported duty: {duty}")]
     UnsupportedDuty { duty: &'static str },
+
+    /// A self-build envelope was already reserved or signed for this slot.
+    ///
+    /// In-process single-flight (VC-only; SignRoot has no slot). Not a
+    /// slashing-DB event. Timeout, remote errors, and a dropped sign future
+    /// retain the reservation so a retry cannot produce a second signature.
+    #[error("execution payload envelope already signed for slot {slot}")]
+    EnvelopeSlotAlreadySigned { slot: Slot },
 }
 
 impl SignerError {
@@ -241,6 +250,68 @@ pub struct SignerService {
     /// Expiry returns `Err(SigningFailed("signer timed out"))`. Defaults to 4s.
     /// On retain policies the staged slashing row is **committed**, not discarded.
     sign_timeout: Duration,
+    /// In-process single-flight for self-build envelope roots (not slashable).
+    ///
+    /// Per-slot uniqueness is VC-only: SignRoot/PartialSignRoot carry no slot.
+    envelope_slots: parking_lot::Mutex<HashMap<([u8; 48], Slot), EnvelopeSlotState>>,
+}
+
+/// Per-slot envelope reservation. In-flight is refused the same as signed so
+/// two concurrent calls cannot produce two signatures for one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeSlotState {
+    InFlight,
+    Signed,
+}
+
+/// Drop retains the slot (timeout / remote / cancelled future may still sign).
+/// [`Self::release`] only for unambiguous no-signature errors.
+struct EnvelopeSlotGuard<'a> {
+    slots: &'a parking_lot::Mutex<HashMap<([u8; 48], Slot), EnvelopeSlotState>>,
+    key: ([u8; 48], Slot),
+    release: bool,
+}
+
+impl<'a> EnvelopeSlotGuard<'a> {
+    fn reserve(
+        slots: &'a parking_lot::Mutex<HashMap<([u8; 48], Slot), EnvelopeSlotState>>,
+        pk: [u8; 48],
+        slot: Slot,
+    ) -> Result<Self, SignerError> {
+        let key = (pk, slot);
+        let mut map = slots.lock();
+        if map.contains_key(&key) {
+            return Err(SignerError::EnvelopeSlotAlreadySigned { slot });
+        }
+        map.insert(key, EnvelopeSlotState::InFlight);
+        Ok(Self { slots, key, release: false })
+    }
+
+    fn release(&mut self) {
+        self.release = true;
+    }
+}
+
+impl Drop for EnvelopeSlotGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = self.slots.lock();
+        if self.release {
+            if map.get(&self.key) == Some(&EnvelopeSlotState::InFlight) {
+                map.remove(&self.key);
+            }
+        } else {
+            map.insert(self.key, EnvelopeSlotState::Signed);
+        }
+    }
+}
+
+fn envelope_slot_is_unambiguous_no_signature(err: &SignerError) -> bool {
+    matches!(
+        err,
+        SignerError::KeyNotFound(_)
+            | SignerError::BlockedByDoppelganger
+            | SignerError::UnsupportedDuty { .. }
+    )
 }
 
 /// Fail-closed enablement used when no `with_enablement` was provided.
@@ -398,6 +469,7 @@ impl SignerService {
             validator_locks: ValidatorLockMap::new(),
             enablement: Arc::new(FailClosedEnablement),
             sign_timeout: DEFAULT_SIGN_TIMEOUT,
+            envelope_slots: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1083,6 +1155,47 @@ impl ValidatorSigner for SignerService {
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
         self.sign_nonslashable(pubkey, signing_root, "builder_request_auth", backend).await
+    }
+
+    /// Signs a self-build envelope root with `DOMAIN_BEACON_BUILDER`.
+    ///
+    /// Non-slashable: routes through [`Self::sign_nonslashable`], not
+    /// [`sign_slashable`]. Per-slot uniqueness is VC-only. A second call for
+    /// the same slot is refused. Timeout, remote errors, and a dropped future
+    /// keep the reservation (the backend may still complete).
+    #[tracing::instrument(name = "sign.execution_payload_envelope", skip_all, fields(slot = slot))]
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(
+            &DutyRef::ExecutionPayloadEnvelopeRoot { root: object_root, slot },
+            &ctx,
+        );
+        let gvr = *genesis_validators_root;
+        let root = *object_root;
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_execution_payload_envelope_root(&root, slot, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+
+        let mut guard = EnvelopeSlotGuard::reserve(&self.envelope_slots, pubkey.to_bytes(), slot)?;
+        let result = self
+            .sign_nonslashable(pubkey, signing_root, "execution_payload_envelope", backend)
+            .await;
+        if let Err(e) = &result {
+            if envelope_slot_is_unambiguous_no_signature(e) {
+                guard.release();
+            }
+        }
+        result
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
@@ -2551,6 +2664,321 @@ mod tests {
         );
     }
 
+    fn envelope_object_root() -> Root {
+        hex::decode("98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a")
+            .expect("spec envelope object root hex")
+            .try_into()
+            .expect("32-byte object root")
+    }
+
+    /// Signing a self-build envelope writes no slashing-DB row; a second
+    /// call for the same slot is refused (still no row).
+    #[tokio::test]
+    async fn test_sign_execution_payload_envelope_root_single_flight_no_slashing_row() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let before_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let before_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let object_root = envelope_object_root();
+        let slot = 1;
+        let sig = service
+            .sign_execution_payload_envelope_root(&object_root, slot, &pubkey, &schedule, &gvr)
+            .await
+            .expect("envelope is non-slashable and must sign");
+
+        let kat_root: Root = hex::decode(
+            rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT,
+        )
+        .expect("kat hex")
+        .try_into()
+        .expect("32-byte kat root");
+        assert!(
+            sig.verify(&pubkey, &kat_root).is_ok(),
+            "envelope must verify over KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT"
+        );
+
+        let after_first_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_first_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_first_blocks, before_blocks, "envelope must not write a block row");
+        assert_eq!(
+            after_first_attestations, before_attestations,
+            "envelope must not write an attestation row"
+        );
+
+        let other_root = [0x22u8; 32];
+        let second = service
+            .sign_execution_payload_envelope_root(&other_root, slot, &pubkey, &schedule, &gvr)
+            .await;
+        match second {
+            Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) => assert_eq!(s, slot),
+            other => panic!("second envelope for the same slot must be refused, got: {other:?}"),
+        }
+
+        let after_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_blocks, before_blocks, "refused envelope must not write a block row");
+        assert_eq!(
+            after_attestations, before_attestations,
+            "refused envelope must not write an attestation row"
+        );
+
+        let other_slot = slot + 1;
+        service
+            .sign_execution_payload_envelope_root(&other_root, other_slot, &pubkey, &schedule, &gvr)
+            .await
+            .expect("a different slot must still be signable");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_envelope_timeout_retains_slot() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let mut km = KeyManager::new();
+        km.insert(secret_key);
+        let slow: Arc<dyn Signer> =
+            Arc::new(SlowSigner { inner: LocalSigner::new(km), sleep: Duration::from_millis(400) });
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = SignerService::new(composite, slashing_db)
+            .with_enablement(always_enabled())
+            .with_sign_timeout(Duration::from_millis(50))
+            .with_sign_backend(slow);
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 1;
+        let first = service
+            .sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(
+                first,
+                Err(SignerError::SigningFailed(ref msg)) if msg.contains("timed out")
+            ),
+            "expected timeout, got: {first:?}"
+        );
+
+        let second = service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await;
+        match second {
+            Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) => assert_eq!(s, slot),
+            other => panic!("timeout must retain the slot, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_envelope_dropped_future_retains_slot() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let mut km = KeyManager::new();
+        km.insert(secret_key);
+        let slow: Arc<dyn Signer> =
+            Arc::new(SlowSigner { inner: LocalSigner::new(km), sleep: Duration::from_secs(5) });
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = Arc::new(
+            SignerService::new(composite, slashing_db)
+                .with_enablement(always_enabled())
+                .with_sign_timeout(Duration::from_secs(30))
+                .with_sign_backend(slow),
+        );
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 1;
+        let svc = Arc::clone(&service);
+        let pk = pubkey.clone();
+        let sched = schedule.clone();
+        let handle = tokio::spawn(async move {
+            svc.sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pk,
+                &sched,
+                &gvr,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let second = service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await;
+        match second {
+            Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) => assert_eq!(s, slot),
+            other => panic!("dropped future must retain the slot, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_envelope_concurrent_same_slot_one_ok() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service =
+            Arc::new(SignerService::new(signer, slashing_db).with_enablement(always_enabled()));
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 7;
+        let a = Arc::clone(&service);
+        let b = Arc::clone(&service);
+        let pk_a = pubkey.clone();
+        let pk_b = pubkey.clone();
+        let (r1, r2) = tokio::join!(
+            a.sign_execution_payload_envelope_root(&[0x11u8; 32], slot, &pk_a, &schedule, &gvr),
+            b.sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pk_b, &schedule, &gvr),
+        );
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let refused = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) if *s == slot))
+            .count();
+        assert_eq!(oks, 1, "exactly one concurrent envelope sign must succeed, got {r1:?} {r2:?}");
+        assert_eq!(refused, 1, "the other concurrent sign must be refused, got {r1:?} {r2:?}");
+    }
+
+    #[tokio::test]
+    async fn test_envelope_key_not_found_releases_slot_for_retry() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = SignerService::new(Arc::clone(&composite), slashing_db)
+            .with_enablement(always_enabled());
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 3;
+        let first = service
+            .sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(first, Err(SignerError::KeyNotFound(_))),
+            "expected KeyNotFound, got: {first:?}"
+        );
+
+        composite.add_local_key(secret_key);
+        service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await
+            .expect("KeyNotFound must release the slot so a later sign can proceed");
+    }
+
+    #[tokio::test]
+    async fn test_envelope_doppelganger_releases_slot_for_retry() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct FlipEnablement(Arc<std::sync::atomic::AtomicBool>);
+        impl SigningEnablement for FlipEnablement {
+            fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
+                self.0.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+        let service = SignerService::new(signer, slashing_db)
+            .with_enablement(Arc::new(FlipEnablement(Arc::clone(&gate))));
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 4;
+        let first = service
+            .sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(first, Err(SignerError::BlockedByDoppelganger)),
+            "expected BlockedByDoppelganger, got: {first:?}"
+        );
+
+        gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await
+            .expect("doppelganger block must release the slot so a later sign can proceed");
+    }
+
+    #[tokio::test]
+    async fn test_envelope_remote_error_retains_slot() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        struct RemoteErr;
+        #[async_trait]
+        impl Signer for RemoteErr {
+            async fn sign(
+                &self,
+                _signing_root: &Root,
+                _pubkey: &[u8; 48],
+            ) -> Result<Signature, crypto::SigningError> {
+                Err(crypto::SigningError::RemoteSignerError("ambiguous remote".into()))
+            }
+            fn public_keys(&self) -> Vec<[u8; 48]> {
+                Vec::new()
+            }
+        }
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = SignerService::new(composite, slashing_db)
+            .with_enablement(always_enabled())
+            .with_sign_backend(Arc::new(RemoteErr));
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 5;
+        let first = service
+            .sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(first, Err(SignerError::SigningFailed(_))),
+            "expected remote SigningFailed, got: {first:?}"
+        );
+
+        let second = service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await;
+        match second {
+            Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) => assert_eq!(s, slot),
+            other => panic!("remote error must retain the slot, got: {other:?}"),
+        }
+    }
+
     #[test]
     fn test_unsupported_duty_from_signing_error() {
         let err: SignerError = SigningError::UnsupportedDuty { duty: "payload_attestation" }.into();
@@ -3608,6 +4036,18 @@ mod tests {
             sig.verify(&pubkey, &root).is_ok(),
             "proposer preferences root must match signing_root_for"
         );
+
+        let env_root: Root = [0x42; 32];
+        let env_slot = 50 * SLOTS_PER_EPOCH;
+        let sig = service
+            .sign_execution_payload_envelope_root(&env_root, env_slot, &pubkey, &schedule, &gvr)
+            .await
+            .unwrap();
+        let root = signing_root_for(
+            &DutyRef::ExecutionPayloadEnvelopeRoot { root: &env_root, slot: env_slot },
+            &ctx,
+        );
+        assert!(sig.verify(&pubkey, &root).is_ok(), "envelope root must match signing_root_for");
     }
 
     // -------------------------------------------------------------------------
@@ -3742,6 +4182,10 @@ mod tests {
             .sign_proposer_preferences(&gloas_prefs_fixture(), &pubkey, &schedule, &gvr)
             .await
             .expect("proposer preferences");
+        service
+            .sign_execution_payload_envelope_root(&[0x42; 32], 100, &pubkey, &schedule, &gvr)
+            .await
+            .expect("execution payload envelope");
 
         let blocks = slashing_db.get_blocks(&pubkey_hex).expect("get_blocks");
         let attestations = slashing_db.get_attestations(&pubkey_hex).expect("get_attestations");
@@ -4012,6 +4456,18 @@ mod tests {
                         .sign_proposer_preferences(&gloas_prefs_fixture(), &pubkey, &schedule, &gvr)
                         .await,
                 ),
+                (
+                    "execution_payload_envelope",
+                    service
+                        .sign_execution_payload_envelope_root(
+                            &[0x42; 32],
+                            1,
+                            &pubkey,
+                            &schedule,
+                            &gvr,
+                        )
+                        .await,
+                ),
             ];
 
             for (name, result) in results {
@@ -4082,6 +4538,18 @@ mod tests {
                     service
                         .sign_proposer_preferences(
                             &gloas_prefs_fixture(),
+                            &unknown,
+                            &schedule,
+                            &gvr,
+                        )
+                        .await,
+                ),
+                (
+                    "execution_payload_envelope",
+                    service
+                        .sign_execution_payload_envelope_root(
+                            &[0x42; 32],
+                            1,
                             &unknown,
                             &schedule,
                             &gvr,

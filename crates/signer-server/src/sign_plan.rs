@@ -19,9 +19,10 @@ use crypto::{compute_domain, compute_signing_root, PublicKey};
 use eth_types::{
     AttestationData, Root, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
-    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_VOLUNTARY_EXIT,
 };
 use signer::{SigningGate, SigningGateError};
 
@@ -109,6 +110,10 @@ pub enum PlanInput {
     /// Builder request auth. Domain is fixed over `genesis_fork_version` +
     /// zero GVR — same idiom as [`Self::BuilderRegistration`].
     BuilderRequestAuth { object_root: Root, genesis_fork_version: [u8; 4] },
+    /// Self-build execution payload envelope. `object_root` is the island HTR;
+    /// domain is `DOMAIN_BEACON_BUILDER` at the caller's fork version.
+    /// Per-slot uniqueness is VC `SignerService` only — SignRoot has no slot.
+    ExecutionPayloadEnvelope { object_root: Root, fork_version: [u8; 4], gvr: Root },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -200,6 +205,11 @@ pub fn plan_sign(input: &PlanInput) -> SignPlan {
             let root = compute_signing_root(object_root, domain);
             (root, Slashing::NonSlashable, Some(NonSlashableOp::BuilderRequestAuth))
         }
+        PlanInput::ExecutionPayloadEnvelope { object_root, fork_version, gvr } => {
+            let domain = compute_domain(DOMAIN_BEACON_BUILDER, *fork_version, *gvr);
+            let root = compute_signing_root(object_root, domain);
+            (root, Slashing::NonSlashable, Some(NonSlashableOp::ExecutionPayloadEnvelope))
+        }
     };
     SignPlan { signing_root, slashing, non_slashable_op }
 }
@@ -255,6 +265,7 @@ pub enum NonSlashableOp {
     PayloadAttestation,
     ProposerPreferences,
     BuilderRequestAuth,
+    ExecutionPayloadEnvelope,
 }
 
 /// Error from [`dispatch_slashable`] / [`dispatch_non_slashable`].
@@ -350,6 +361,9 @@ pub async fn dispatch_non_slashable(
             }
             NonSlashableOp::BuilderRequestAuth => {
                 gate.sign_builder_request_auth(&ctx.pubkey, root).await
+            }
+            NonSlashableOp::ExecutionPayloadEnvelope => {
+                gate.sign_execution_payload_envelope(&ctx.pubkey, root).await
             }
         };
         finish_gate(metrics, backend_name, ctx.rpc_type, started, result)
@@ -550,6 +564,14 @@ mod tests {
                 PlanInput::BuilderRequestAuth {
                     object_root: [9u8; 32],
                     genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+                },
+                false,
+            ),
+            (
+                PlanInput::ExecutionPayloadEnvelope {
+                    object_root: [0x0au8; 32],
+                    fork_version: FORK,
+                    gvr: GVR,
                 },
                 false,
             ),
@@ -812,6 +834,24 @@ mod tests {
         assert_eq!(auth_plan, plan_sign(&dvt_auth));
         assert_eq!(auth_plan.slashing, Slashing::NonSlashable);
         assert_eq!(auth_plan.non_slashable_op, Some(NonSlashableOp::BuilderRequestAuth));
+
+        // Envelope: gRPC SignRoot and DVT take the same precomputed object_root
+        // + fork_version + gvr. HTTP wire is not added (D19).
+        let env_object_root = [0x55u8; 32];
+        let grpc_env = PlanInput::ExecutionPayloadEnvelope {
+            object_root: env_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let dvt_env = PlanInput::ExecutionPayloadEnvelope {
+            object_root: env_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let env_plan = plan_sign(&grpc_env);
+        assert_eq!(env_plan, plan_sign(&dvt_env));
+        assert_eq!(env_plan.slashing, Slashing::NonSlashable);
+        assert_eq!(env_plan.non_slashable_op, Some(NonSlashableOp::ExecutionPayloadEnvelope));
     }
 
     fn parse_kat_root(hex: &str) -> Root {
@@ -1104,6 +1144,96 @@ mod tests {
             dispatch.contains("NonSlashableOp::BuilderRequestAuth")
                 && dispatch.contains("gate.sign_builder_request_auth"),
             "dispatch_non_slashable must route BuilderRequestAuth to SigningGate::sign_builder_request_auth"
+        );
+    }
+
+    fn envelope_kat_plan() -> SignPlan {
+        let object_root =
+            parse_kat_root("98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a");
+        plan_sign(&PlanInput::ExecutionPayloadEnvelope {
+            object_root,
+            fork_version: [0x07, 0x00, 0x00, 0x01],
+            gvr: [0u8; 32],
+        })
+    }
+
+    fn envelope_gate_and_ctx(
+        sk: crypto::SecretKey,
+    ) -> (signer::SigningGate, RequestCtx, std::sync::Arc<KeyedBackend>) {
+        let pubkey = sk.public_key();
+        let backend = std::sync::Arc::new(KeyedBackend::with_key(sk));
+        let db = std::sync::Arc::new(slashing::SlashingDb::open_in_memory().expect("slashing db"));
+        let gate = crate::service::SignerServiceImpl::build_gate(
+            std::sync::Arc::clone(&backend) as std::sync::Arc<dyn crate::backend::SigningBackend>,
+            db,
+        );
+        let ctx = RequestCtx {
+            client_cn: "test".into(),
+            pubkey_bytes: pubkey.to_bytes(),
+            pubkey,
+            rpc_type: crate::metrics::grpc_sign_type::EXECUTION_PAYLOAD_ENVELOPE,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        (gate, ctx, backend)
+    }
+
+    /// L3: plan engine signing root for the pyspec ExecutionPayloadEnvelope fixture.
+    #[test]
+    fn test_plan_execution_payload_envelope_signing_root() {
+        let plan = envelope_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(plan.non_slashable_op, Some(NonSlashableOp::ExecutionPayloadEnvelope));
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(
+                rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT
+            )
+        );
+        assert_eq!(eth_types::DOMAIN_BEACON_BUILDER, [0x0B, 0x00, 0x00, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn test_plan_execution_payload_envelope_dispatch_slashable_mismatch() {
+        let plan = envelope_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        let (gate, ctx, _backend) = envelope_gate_and_ctx(crypto::SecretKey::generate());
+        let err = dispatch_slashable(&gate, None, "basic", &ctx, &plan).await.unwrap_err();
+        assert!(matches!(err, DispatchError::PlanMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_plan_execution_payload_envelope_dispatch_sign_success() {
+        let plan = envelope_kat_plan();
+        let (gate, ctx, backend) = envelope_gate_and_ctx(crypto::SecretKey::generate());
+        let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
+            .await
+            .expect("dispatch_sign execution payload envelope");
+        let direct = gate
+            .sign_execution_payload_envelope(&ctx.pubkey, plan.signing_root)
+            .await
+            .expect("direct gate execution payload envelope");
+        assert_eq!(
+            sig, direct,
+            "dispatch_sign must use SigningGate::sign_execution_payload_envelope"
+        );
+        assert!(crypto::Signature::from_bytes(&sig)
+            .expect("bls sig")
+            .verify(&ctx.pubkey, &plan.signing_root)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_execution_payload_envelope_dispatch_arm_calls_sign_execution_payload_envelope() {
+        let src = include_str!("sign_plan.rs");
+        let rest = src
+            .split_once("pub async fn dispatch_non_slashable")
+            .expect("dispatch_non_slashable")
+            .1;
+        let dispatch = rest.split("pub async fn dispatch_sign").next().expect("dispatch_sign");
+        assert!(
+            dispatch.contains("NonSlashableOp::ExecutionPayloadEnvelope")
+                && dispatch.contains("gate.sign_execution_payload_envelope"),
+            "dispatch_non_slashable must route ExecutionPayloadEnvelope to SigningGate::sign_execution_payload_envelope"
         );
     }
 }

@@ -1459,6 +1459,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_partial_sign_root_execution_payload_envelope_writes_no_slashing_row() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let pubkey_hex_str = pubkey_hex(&pk);
+        let before_blocks = db.get_blocks(&pubkey_hex_str).expect("get_blocks before").len();
+        let before_atts =
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations before").len();
+
+        let svc = make_service(vec![(pk, share)], al, Some(Arc::clone(&db)));
+        let resp = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: crate::proto::signer_v2::Duty::ExecutionPayloadEnvelope as i32,
+                fork_id: 7,
+            }))
+            .await
+            .expect("partial_sign_root EXECUTION_PAYLOAD_ENVELOPE");
+        assert_eq!(resp.into_inner().partial_signature.len(), 96);
+
+        assert_eq!(
+            db.get_blocks(&pubkey_hex_str).expect("get_blocks after").len(),
+            before_blocks,
+            "non-slashable envelope duty must not write a block row"
+        );
+        assert_eq!(
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations after").len(),
+            before_atts,
+            "non-slashable envelope duty must not write an attestation row"
+        );
+    }
+
+    #[tokio::test]
     async fn test_partial_sign_root_unspecified_duty_rejected_before_share() {
         let (pk, _) = make_share(1);
         let al = make_allow_list(vec![("unknown", 1)]);

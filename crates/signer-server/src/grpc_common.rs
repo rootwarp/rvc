@@ -168,8 +168,7 @@ pub fn decode_beacon_block_header(
 
 /// Planned non-slashable input for `SignRoot` / `PartialSignRoot`.
 ///
-/// `UNSPECIFIED` and unknown enum values fail closed; duties this server does
-/// not yet serve return `UNIMPLEMENTED` (never a signature).
+/// `UNSPECIFIED` and unknown enum values fail closed (never a signature).
 #[derive(Debug)]
 pub struct RootDutyPlan {
     pub input: PlanInput,
@@ -207,9 +206,12 @@ pub fn root_duty_plan(
             rpc_type: grpc_sign_type::PROPOSER_PREFERENCES,
             op: NonSlashableOp::ProposerPreferences,
         }),
-        Ok(Duty::ExecutionPayloadEnvelope) => {
-            Err(Status::unimplemented("EXECUTION_PAYLOAD_ENVELOPE (issue 6.19)"))
-        }
+        Ok(Duty::ExecutionPayloadEnvelope) => Ok(RootDutyPlan {
+            // No slot on this RPC; per-slot uniqueness is VC SignerService.
+            input: PlanInput::ExecutionPayloadEnvelope { object_root, fork_version, gvr },
+            rpc_type: grpc_sign_type::EXECUTION_PAYLOAD_ENVELOPE,
+            op: NonSlashableOp::ExecutionPayloadEnvelope,
+        }),
         Ok(Duty::BuilderRequestAuth) => Ok(RootDutyPlan {
             input: PlanInput::BuilderRequestAuth { object_root, genesis_fork_version },
             rpc_type: grpc_sign_type::BUILDER_REQUEST_AUTH,
@@ -575,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_root_duty_plan_fail_closed_and_unimplemented() {
+    fn test_root_duty_plan_fail_closed_and_served_duties() {
         let root = [0x11u8; 32];
         let fv = [0x07, 0x00, 0x00, 0x01];
         let gvr = [0u8; 32];
@@ -589,9 +591,11 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert!(err.message().contains("unknown duty: 99"));
 
-        let err = root_duty_plan(Duty::ExecutionPayloadEnvelope as i32, root, fv, gvr, genesis)
-            .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        let plan =
+            root_duty_plan(Duty::ExecutionPayloadEnvelope as i32, root, fv, gvr, genesis).unwrap();
+        assert_eq!(plan.rpc_type, grpc_sign_type::EXECUTION_PAYLOAD_ENVELOPE);
+        assert!(matches!(plan.input, PlanInput::ExecutionPayloadEnvelope { .. }));
+        assert_eq!(plan.op, NonSlashableOp::ExecutionPayloadEnvelope);
 
         let plan = root_duty_plan(Duty::BuilderRequestAuth as i32, root, fv, gvr, genesis).unwrap();
         assert_eq!(plan.rpc_type, grpc_sign_type::BUILDER_REQUEST_AUTH);

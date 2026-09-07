@@ -11,9 +11,9 @@ use eth_types::{
     BuilderRequestAuth, ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo,
     PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
     VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
-    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 
 use crate::bls::{PublicKey, Signature};
@@ -235,6 +235,21 @@ pub trait TypedSigner: Send + Sync {
     ) -> Result<Signature, SigningError> {
         let _ = (auth, genesis_fork_version, ctx);
         Err(SigningError::UnsupportedDuty { duty: "builder_request_auth" })
+    }
+
+    /// Sign a self-build execution payload envelope root (`DOMAIN_BEACON_BUILDER`).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override. `slot` is unused here — fork version
+    /// is already resolved on `ctx`; the VC path uses it for single-flight.
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (object_root, slot, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "execution_payload_envelope" })
     }
 }
 
@@ -472,6 +487,22 @@ impl TypedSigner for LocalSigner {
             DOMAIN_BUILDER_REQUEST_AUTH,
             genesis_fork_version,
             [0u8; 32],
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        _slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            object_root,
+            DOMAIN_BEACON_BUILDER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
         );
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
@@ -1045,6 +1076,48 @@ mod tests {
         match result {
             Err(SigningError::UnsupportedDuty { duty }) => {
                 assert_eq!(duty, "builder_request_auth");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
+    }
+
+    /// L3: signature verifies over `KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT`.
+    #[tokio::test]
+    async fn test_local_signer_execution_payload_envelope_signature_verifies() {
+        use rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT;
+
+        const SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT: &str =
+            "98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a";
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let object_root = parse_kat_root(SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT);
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_execution_payload_envelope_root(&signer, &object_root, 1, &ctx)
+            .await
+            .unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "envelope signature must verify over KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_execution_payload_envelope_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let object_root = [0x11u8; 32];
+        let signer = CapabilityMissingSigner;
+
+        let result =
+            TypedSigner::sign_execution_payload_envelope_root(&signer, &object_root, 1, &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "execution_payload_envelope");
             }
             Ok(_) => panic!("unsupported signer must not produce a signature"),
             other => panic!("expected UnsupportedDuty, got: {other:?}"),

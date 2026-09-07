@@ -47,12 +47,12 @@ use eth_types::{
     encode_attestation_ssz, encode_beacon_block_ssz, encode_blinded_beacon_block_ssz,
     encode_sync_committee_contribution_ssz, AggregateAndProof, Attestation, AttestationData,
     BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, BuilderRequestAuth, ContributionAndProof,
-    ElectraAggregateAndProof, Epoch, ForkName, PayloadAttestationData, ProposerPreferences, Slot,
-    SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
+    ElectraAggregateAndProof, Epoch, ForkName, PayloadAttestationData, ProposerPreferences, Root,
+    Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
-    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 use observability::logging::TruncatedPubkey;
 
@@ -471,10 +471,9 @@ impl GrpcRemoteSigner {
         .await
     }
 
-    /// Gloas-safe `SignRoot` (PTC, proposer preferences, request-auth, P6 envelope).
+    /// Gloas-safe `SignRoot` (PTC, proposer preferences, request-auth, envelope).
     ///
-    /// Unknown / `UNSPECIFIED` duties fail closed locally with no RPC. Envelope
-    /// is sent and surfaces the server's `UNIMPLEMENTED`.
+    /// Unknown / `UNSPECIFIED` duties fail closed locally with no RPC.
     pub async fn sign_root(
         &self,
         object_root: [u8; 32],
@@ -515,9 +514,12 @@ impl GrpcRemoteSigner {
                 self.genesis_fork_version,
                 [0u8; 32],
             ),
-            Duty::ExecutionPayloadEnvelope => {
-                signing_root_with_fork_version(&object_root, [0u8; 4], fork_version, gvr)
-            }
+            Duty::ExecutionPayloadEnvelope => signing_root_with_fork_version(
+                &object_root,
+                DOMAIN_BEACON_BUILDER,
+                fork_version,
+                gvr,
+            ),
             Duty::Unspecified => unreachable!("rejected by root_duty_or_err"),
         };
         self.sign_root_rpc(object_root, duty, ctx, signing_root).await
@@ -935,6 +937,19 @@ impl TypedSigner for GrpcRemoteSigner {
             [0u8; 32],
         );
         self.sign_root_rpc(object_root, Duty::BuilderRequestAuth, ctx, signing_root).await
+    }
+
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        _slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let fork_version = ctx.fork_info.current_version;
+        let gvr = ctx.fork_info.genesis_validators_root;
+        let signing_root =
+            signing_root_with_fork_version(object_root, DOMAIN_BEACON_BUILDER, fork_version, gvr);
+        self.sign_root_rpc(*object_root, Duty::ExecutionPayloadEnvelope, ctx, signing_root).await
     }
 }
 
@@ -1535,10 +1550,11 @@ mod tests {
             TypedSigner::sign_payload_attestation(&signer, &ptc, &ctx).await,
             TypedSigner::sign_proposer_preferences(&signer, &prefs, &ctx).await,
             TypedSigner::sign_builder_request_auth(&signer, &auth, [0; 4], &ctx).await,
+            TypedSigner::sign_execution_payload_envelope_root(&signer, &[0x11; 32], 1, &ctx).await,
         ];
 
-        assert_eq!(results.len(), 13);
-        let mut messages = Vec::with_capacity(13);
+        assert_eq!(results.len(), 14);
+        let mut messages = Vec::with_capacity(14);
         for (i, result) in results.into_iter().enumerate() {
             match result {
                 Err(SigningError::RemoteSignerError(msg)) => {
@@ -1551,7 +1567,7 @@ mod tests {
                 other => panic!("method {i}: expected RemoteSignerError, got: {other:?}"),
             }
         }
-        // All thirteen share the same error *shape* (shared map_err in sign_rpc).
+        // All fourteen share the same error *shape* (shared map_err in sign_rpc).
         assert!(messages.iter().all(|m| m.contains("failed (")));
     }
 }

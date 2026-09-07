@@ -418,6 +418,21 @@ impl TypedSigner for LocalBlsTyped {
         );
         self.sign_root(&root, &ctx.pubkey.to_bytes())
     }
+
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        _slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let root = signing_root_with_fork_version(
+            object_root,
+            eth_types::DOMAIN_BEACON_BUILDER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        self.sign_root(&root, &ctx.pubkey.to_bytes())
+    }
 }
 
 struct RecordingTyped {
@@ -567,6 +582,19 @@ impl TypedSigner for RecordingTyped {
             self,
             "sign_proposer_preferences",
             self.inner.sign_proposer_preferences(prefs, ctx).await
+        )
+    }
+
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        rec!(
+            self,
+            "sign_execution_payload_envelope_root",
+            self.inner.sign_execution_payload_envelope_root(object_root, slot, ctx).await
         )
     }
 }
@@ -1396,20 +1424,9 @@ async fn test_gloas_vc_path_reaches_in_process_signer_server() {
         },
         ForkName::Gloas,
     );
-    let env_err = grpc
-        .sign_root([0x11; 32], Duty::ExecutionPayloadEnvelope as i32, &gloas_ctx)
+    grpc.sign_root([0x11; 32], Duty::ExecutionPayloadEnvelope as i32, &gloas_ctx)
         .await
-        .expect_err("envelope UNIMPLEMENTED until P6");
-    match env_err {
-        SigningError::SignerLacksGloasSupport { rpc, details } => {
-            assert_eq!(rpc, "SignRoot");
-            assert!(
-                details.contains("EXECUTION_PAYLOAD_ENVELOPE") || details.contains("6.19"),
-                "{details}"
-            );
-        }
-        other => panic!("expected SignerLacksGloasSupport for envelope, got {other:?}"),
-    }
+        .expect("EXECUTION_PAYLOAD_ENVELOPE is served");
     let auth = BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1).unwrap();
     TypedSigner::sign_builder_request_auth(&grpc, &auth, [0; 4], &gloas_ctx)
         .await
@@ -1445,6 +1462,10 @@ async fn test_gloas_vc_path_reaches_in_process_signer_server() {
         .await
         .expect("Gloas proposer preferences through in-process signer-server");
 
+    svc.sign_execution_payload_envelope_root(&[0x11; 32], slot, &pk, &schedule, &GVR)
+        .await
+        .expect("Gloas envelope through in-process signer-server");
+
     let mut electra = electra_aggregate();
     electra.aggregate.data.slot = slot;
     let gloas_version = [7, 0, 0, 0];
@@ -1474,6 +1495,76 @@ async fn test_gloas_vc_path_reaches_in_process_signer_server() {
         sig.verify(&pk, &stripped_sr).is_err(),
         "must not sign the committee_bits-stripped pre-Electra root"
     );
+}
+
+#[tokio::test]
+async fn test_local_and_grpc_envelope_signatures_match() {
+    let sk = SecretKey::generate();
+    let pk = sk.public_key();
+    let object_root: Root =
+        hex::decode("98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a")
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let slot = 1;
+    let mut schedule = gloas_schedule();
+    schedule.gloas_fork_epoch = 0;
+    schedule.gloas_fork_version = [0x07, 0x00, 0x00, 0x01];
+    let gvr = [0u8; 32];
+
+    let mut local_km = KeyManager::new();
+    local_km.insert(SecretKey::from_bytes(&sk.to_bytes()).unwrap());
+    let local =
+        SignerService::new(Arc::new(CompositeSigner::new(LocalSigner::new(local_km))), open_db())
+            .with_enablement(always_enabled());
+    let local_sig = local
+        .sign_execution_payload_envelope_root(&object_root, slot, &pk, &schedule, &gvr)
+        .await
+        .expect("local envelope");
+
+    let mut km = KeyManager::new();
+    km.insert(SecretKey::from_bytes(&sk.to_bytes()).unwrap());
+    let backend = Arc::new(MemBackend { km });
+    let impl_svc =
+        signer_server::service::SignerServiceImpl::new_v2(backend, "test".to_string(), open_db());
+    allow_insecure();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let _handle = tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(signer_server::SignerServiceServerV2::new(impl_svc))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let grpc = connect_grpc(addr).await;
+    let ctx = SignContext::new(
+        pk.clone(),
+        ForkInfo {
+            previous_version: [0x07, 0x00, 0x00, 0x00],
+            current_version: [0x07, 0x00, 0x00, 0x01],
+            genesis_validators_root: gvr,
+        },
+        ForkName::Gloas,
+    );
+    let rpc_sig = grpc
+        .sign_root(object_root, Duty::ExecutionPayloadEnvelope as i32, &ctx)
+        .await
+        .expect("gRPC SignRoot envelope");
+    assert_eq!(
+        local_sig.to_bytes(),
+        rpc_sig.to_bytes(),
+        "gRPC root RPC must return the same signature as the local path"
+    );
+
+    let grpc_svc = grpc_vc(grpc);
+    let facade_sig = grpc_svc
+        .sign_execution_payload_envelope_root(&object_root, slot, &pk, &schedule, &gvr)
+        .await
+        .expect("gRPC facade envelope");
+    assert_eq!(local_sig.to_bytes(), facade_sig.to_bytes());
 }
 
 #[tokio::test]

@@ -198,6 +198,17 @@ impl ValidatorSigner for StubValidatorSigner {
     ) -> Result<Signature, SignerError> {
         Ok(mock_sig(b"builder-request-auth"))
     }
+
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        _object_root: &Root,
+        _slot: Slot,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"execution-payload-envelope"))
+    }
 }
 
 #[cfg(test)]
@@ -297,5 +308,9 @@ mod tests {
 
         let auth = BuilderRequestAuth::new(b"https://builder.example".to_vec(), 1).unwrap();
         assert!(stub.sign_builder_request_auth(&auth, &pk, [0; 4]).await.is_ok());
+        assert!(stub
+            .sign_execution_payload_envelope_root(&[0x11; 32], 1, &pk, &fork, &gvr)
+            .await
+            .is_ok());
     }
 }

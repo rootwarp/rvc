@@ -2041,10 +2041,21 @@ mod tests {
         .await
         .expect("builder_request_auth");
 
+        // 6.19 delta: SignRoot EXECUTION_PAYLOAD_ENVELOPE.
+        svc.sign_root(Request::new(SignRootRequest {
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(sample_fork_info()),
+            object_root: vec![0x44; 32],
+            duty: crate::proto::signer_v2::Duty::ExecutionPayloadEnvelope as i32,
+            fork_id: 7,
+        }))
+        .await
+        .expect("execution_payload_envelope");
+
         // Every type in the bounded set must have recorded a success.
         assert_eq!(
             grpc_sign_type::ALL.len(),
-            13,
+            14,
             "bounded type set must list every dispatched gRPC label"
         );
         for rpc_type in grpc_sign_type::ALL {
@@ -2244,21 +2255,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sign_root_unimplemented_duties_produce_no_signature() {
+    async fn test_sign_root_execution_payload_envelope_matches_kat() {
         let pubkey = test_pubkey_bytes();
-        let (svc, calls) = make_counting_service();
-        let err = svc
+        let svc = make_service_v2(MockBackend::with_test_key());
+        let object_root =
+            hex::decode("98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a")
+                .unwrap();
+        let resp = svc
             .sign_root(Request::new(SignRootRequest {
                 pubkey: pubkey.to_vec(),
-                fork_info: Some(sample_fork_info()),
-                object_root: vec![0x11; 32],
+                fork_info: Some(gloas_fork_info()),
+                object_root,
                 duty: crate::proto::signer_v2::Duty::ExecutionPayloadEnvelope as i32,
                 fork_id: 7,
             }))
             .await
-            .expect_err("unserved duty must not sign");
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
-        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            .expect("gloas execution payload envelope");
+        let kat: [u8; 32] = hex::decode(
+            rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT,
+        )
+        .unwrap()
+        .try_into()
+        .unwrap();
+        let expected = test_secret_key().sign(&kat).to_bytes().to_vec();
+        assert_eq!(resp.into_inner().signature, expected);
     }
 
     #[tokio::test]

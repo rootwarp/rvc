@@ -28,7 +28,8 @@
 //!
 //! For each non-slashable operation (`sign_sync_committee_message`,
 //! `sign_aggregate_and_proof`, `sign_payload_attestation`,
-//! `sign_proposer_preferences`, `sign_builder_request_auth`, `sign_contribution_and_proof`,
+//! `sign_proposer_preferences`, `sign_builder_request_auth`,
+//! `sign_execution_payload_envelope`, `sign_contribution_and_proof`,
 //! `sign_selection_proof`, `sign_randao_reveal`, `sign_voluntary_exit`,
 //! `sign_builder_registration`):
 //!
@@ -598,5 +599,16 @@ impl SigningGate {
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
         self.sign_nonslashable(pubkey, signing_root, "sign_builder_request_auth").await
+    }
+
+    /// Sign a self-build execution payload envelope (`DOMAIN_BEACON_BUILDER`).
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    pub async fn sign_execution_payload_envelope(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_execution_payload_envelope").await
     }
 }

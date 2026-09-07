@@ -31,6 +31,8 @@ pub mod grpc_sign_type {
     pub const PROPOSER_PREFERENCES: &str = "proposer_preferences";
     /// Web3Signer `BUILDER_REQUEST_AUTH` and gRPC `SignRoot` (domain 0x0B000001).
     pub const BUILDER_REQUEST_AUTH: &str = "builder_request_auth";
+    /// gRPC `SignRoot` self-build envelope (domain 0x0B000000). HTTP wire is D19.
+    pub const EXECUTION_PAYLOAD_ENVELOPE: &str = "execution_payload_envelope";
 
     /// All dispatched v2 RPC type labels — used by the table-driven recording test.
     pub const ALL: &[&str] = &[
@@ -47,6 +49,7 @@ pub mod grpc_sign_type {
         PAYLOAD_ATTESTATION,
         PROPOSER_PREFERENCES,
         BUILDER_REQUEST_AUTH,
+        EXECUTION_PAYLOAD_ENVELOPE,
     ];
 }
 
@@ -538,12 +541,13 @@ mod tests {
 
     #[test]
     fn test_grpc_sign_type_all_lists_dispatched_handlers() {
-        assert_eq!(grpc_sign_type::ALL.len(), 13);
+        assert_eq!(grpc_sign_type::ALL.len(), 14);
         assert_eq!(grpc_sign_type::ALL[0], grpc_sign_type::BEACON_BLOCK);
         assert_eq!(grpc_sign_type::ALL[9], grpc_sign_type::VOLUNTARY_EXIT);
         assert_eq!(grpc_sign_type::ALL[10], grpc_sign_type::PAYLOAD_ATTESTATION);
         assert_eq!(grpc_sign_type::ALL[11], grpc_sign_type::PROPOSER_PREFERENCES);
         assert_eq!(grpc_sign_type::ALL[12], grpc_sign_type::BUILDER_REQUEST_AUTH);
+        assert_eq!(grpc_sign_type::ALL[13], grpc_sign_type::EXECUTION_PAYLOAD_ENVELOPE);
     }
 
     #[tokio::test]

@@ -478,9 +478,10 @@ mod tests {
         ContributionAndProof, Epoch, ForkInfo, PayloadAttestationData, ProposerPreferences,
         Root as EthRoot, Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
         DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-        DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF,
-        DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-        DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+        DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH,
+        DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER,
+        DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+        DOMAIN_VOLUNTARY_EXIT,
     };
 
     struct MockGrpcSigner {
@@ -680,6 +681,20 @@ mod tests {
                 DOMAIN_BUILDER_REQUEST_AUTH,
                 genesis_fork_version,
                 [0u8; 32],
+            );
+            self.sign_root(&root, &ctx.pubkey.to_bytes())
+        }
+        async fn sign_execution_payload_envelope_root(
+            &self,
+            object_root: &EthRoot,
+            _slot: Slot,
+            ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            let root = signing_root_with_fork_version(
+                object_root,
+                DOMAIN_BEACON_BUILDER,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
             );
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }

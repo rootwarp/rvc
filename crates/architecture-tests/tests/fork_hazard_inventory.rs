@@ -135,7 +135,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/beacon/src/client.rs",
-        405,
+        484,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -144,7 +144,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        641,
+        645,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -162,7 +162,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/crypto/src/signing_root.rs",
-        268,
+        284,
         Class::GeForkName,
         false,
         ">= ForkName::Capella",
@@ -171,7 +171,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/crypto/src/signing_root.rs",
-        332,
+        349,
         Class::GeForkName,
         false,
         ">= ForkName::Capella",
@@ -216,7 +216,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        881,
+        953,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -225,7 +225,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1145,
+        1258,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -308,7 +308,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        619,
+        623,
         Class::MatchForkName,
         false,
         "match fork {",
@@ -336,7 +336,7 @@ const INVENTORY: &[Inv] = &[
     // Class 4
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        583,
+        666,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -345,7 +345,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        597,
+        680,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -354,7 +354,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        690,
+        773,
         Class::StringDispatch,
         false,
         "matches!(consensus_version",
