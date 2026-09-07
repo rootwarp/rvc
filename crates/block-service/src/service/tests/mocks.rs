@@ -18,6 +18,14 @@ pub(crate) struct CapturedProduceCall {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct CapturedProduceV4Call {
+    pub(crate) slot: Slot,
+    pub(crate) randao_reveal: String,
+    pub(crate) graffiti: Option<String>,
+    pub(crate) builder_config: BuilderConfig,
+}
+
+#[derive(Debug, Clone)]
 pub(crate) struct CapturedPublishCall {
     pub(crate) consensus_version: String,
     pub(crate) slot: Slot,
@@ -311,25 +319,16 @@ pub(crate) struct MockBeaconClient {
     pub(crate) publish_blinded_calls: Mutex<Vec<String>>,
     pub(crate) publish_ssz_calls: Mutex<Vec<(Vec<u8>, String, bool)>>,
     pub(crate) produce_full_calls: Mutex<Vec<CapturedProduceCall>>,
+    pub(crate) produce_v3_calls: Mutex<Vec<CapturedProduceCall>>,
+    pub(crate) produce_v4_calls: Mutex<Vec<CapturedProduceV4Call>>,
     pub(crate) publish_full_calls: Mutex<Vec<CapturedPublishCall>>,
     pub(crate) publish_blinded_full_calls: Mutex<Vec<CapturedPublishCall>>,
 }
 
 impl MockBeaconClient {
-    pub(crate) fn unblinded(block: BeaconBlock) -> Self {
-        let data = serde_json::to_value(&block).unwrap();
+    fn new_with_response(produce_response: Option<ProduceBlockResponse>) -> Self {
         Self {
-            produce_response: Some(ProduceBlockResponse {
-                data,
-                is_blinded: false,
-                consensus_version: "deneb".to_string(),
-                execution_payload_value: Some("12345".to_string()),
-                is_ssz: false,
-                ssz_bytes: None,
-                payload_included: false,
-                builder_url: None,
-                consensus_block_value: None,
-            }),
+            produce_response,
             produce_queue: Mutex::new(Vec::new()),
             fail_produce: false,
             fail_publish: false,
@@ -337,35 +336,41 @@ impl MockBeaconClient {
             publish_blinded_calls: Mutex::new(Vec::new()),
             publish_ssz_calls: Mutex::new(Vec::new()),
             produce_full_calls: Mutex::new(Vec::new()),
+            produce_v3_calls: Mutex::new(Vec::new()),
+            produce_v4_calls: Mutex::new(Vec::new()),
             publish_full_calls: Mutex::new(Vec::new()),
             publish_blinded_full_calls: Mutex::new(Vec::new()),
         }
     }
 
+    pub(crate) fn unblinded(block: BeaconBlock) -> Self {
+        let data = serde_json::to_value(&block).unwrap();
+        Self::new_with_response(Some(ProduceBlockResponse {
+            data,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("12345".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        }))
+    }
+
     pub(crate) fn blinded(block: BlindedBeaconBlock) -> Self {
         let data = serde_json::to_value(&block).unwrap();
-        Self {
-            produce_response: Some(ProduceBlockResponse {
-                data,
-                is_blinded: true,
-                consensus_version: "deneb".to_string(),
-                execution_payload_value: None,
-                is_ssz: false,
-                ssz_bytes: None,
-                payload_included: false,
-                builder_url: None,
-                consensus_block_value: None,
-            }),
-            produce_queue: Mutex::new(Vec::new()),
-            fail_produce: false,
-            fail_publish: false,
-            publish_calls: Mutex::new(Vec::new()),
-            publish_blinded_calls: Mutex::new(Vec::new()),
-            publish_ssz_calls: Mutex::new(Vec::new()),
-            produce_full_calls: Mutex::new(Vec::new()),
-            publish_full_calls: Mutex::new(Vec::new()),
-            publish_blinded_full_calls: Mutex::new(Vec::new()),
-        }
+        Self::new_with_response(Some(ProduceBlockResponse {
+            data,
+            is_blinded: true,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        }))
     }
 
     /// Create an SSZ mock response.
@@ -383,28 +388,17 @@ impl MockBeaconClient {
         consensus_version: &str,
     ) -> Self {
         let ssz_bytes = build_ssz_bytes(slot, proposer_index, is_blinded, consensus_version);
-        Self {
-            produce_response: Some(ProduceBlockResponse {
-                data: serde_json::Value::Null,
-                is_blinded,
-                consensus_version: consensus_version.to_string(),
-                execution_payload_value: Some("99999".to_string()),
-                is_ssz: true,
-                ssz_bytes: Some(ssz_bytes),
-                payload_included: false,
-                builder_url: None,
-                consensus_block_value: None,
-            }),
-            produce_queue: Mutex::new(Vec::new()),
-            fail_produce: false,
-            fail_publish: false,
-            publish_calls: Mutex::new(Vec::new()),
-            publish_blinded_calls: Mutex::new(Vec::new()),
-            publish_ssz_calls: Mutex::new(Vec::new()),
-            produce_full_calls: Mutex::new(Vec::new()),
-            publish_full_calls: Mutex::new(Vec::new()),
-            publish_blinded_full_calls: Mutex::new(Vec::new()),
-        }
+        Self::new_with_response(Some(ProduceBlockResponse {
+            data: serde_json::Value::Null,
+            is_blinded,
+            consensus_version: consensus_version.to_string(),
+            execution_payload_value: Some("99999".to_string()),
+            is_ssz: true,
+            ssz_bytes: Some(ssz_bytes),
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        }))
     }
 
     /// Two (or more) distinct produce answers for the same slot.
@@ -427,18 +421,9 @@ impl MockBeaconClient {
                 consensus_block_value: None,
             })
             .collect();
-        Self {
-            produce_response: None,
-            produce_queue: Mutex::new(responses),
-            fail_produce: false,
-            fail_publish: false,
-            publish_calls: Mutex::new(Vec::new()),
-            publish_blinded_calls: Mutex::new(Vec::new()),
-            publish_ssz_calls: Mutex::new(Vec::new()),
-            produce_full_calls: Mutex::new(Vec::new()),
-            publish_full_calls: Mutex::new(Vec::new()),
-            publish_blinded_full_calls: Mutex::new(Vec::new()),
-        }
+        let mut client = Self::new_with_response(None);
+        client.produce_queue = Mutex::new(responses);
+        client
     }
 
     pub(crate) fn with_produce_error(mut self) -> Self {
@@ -452,18 +437,17 @@ impl MockBeaconClient {
     }
 
     pub(crate) fn from_response(response: ProduceBlockResponse) -> Self {
-        Self {
-            produce_response: Some(response),
-            produce_queue: Mutex::new(Vec::new()),
-            fail_produce: false,
-            fail_publish: false,
-            publish_calls: Mutex::new(Vec::new()),
-            publish_blinded_calls: Mutex::new(Vec::new()),
-            publish_ssz_calls: Mutex::new(Vec::new()),
-            produce_full_calls: Mutex::new(Vec::new()),
-            publish_full_calls: Mutex::new(Vec::new()),
-            publish_blinded_full_calls: Mutex::new(Vec::new()),
+        Self::new_with_response(Some(response))
+    }
+
+    pub(crate) fn with_consensus_version(mut self, version: &str) -> Self {
+        if let Some(ref mut response) = self.produce_response {
+            response.consensus_version = version.to_string();
         }
+        for response in self.produce_queue.get_mut().unwrap().iter_mut() {
+            response.consensus_version = version.to_string();
+        }
+        self
     }
 
     fn take_produce_response(&self) -> Option<ProduceBlockResponse> {
@@ -547,12 +531,14 @@ impl BeaconBlockClient for MockBeaconClient {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        self.produce_full_calls.lock().unwrap().push(CapturedProduceCall {
+        let call = CapturedProduceCall {
             slot,
             randao_reveal: randao_reveal.to_string(),
             graffiti: graffiti.map(|s| s.to_string()),
             builder_boost_factor,
-        });
+        };
+        self.produce_v3_calls.lock().unwrap().push(call.clone());
+        self.produce_full_calls.lock().unwrap().push(call);
         if self.fail_produce {
             return Err(BlockServiceError::Beacon("beacon down".to_string()));
         }
@@ -564,13 +550,19 @@ impl BeaconBlockClient for MockBeaconClient {
         slot: Slot,
         randao_reveal: &str,
         graffiti: Option<&str>,
-        _builder_config: &BuilderConfig,
+        builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        self.produce_v4_calls.lock().unwrap().push(CapturedProduceV4Call {
+            slot,
+            randao_reveal: randao_reveal.to_string(),
+            graffiti: graffiti.map(|s| s.to_string()),
+            builder_config: builder_config.clone(),
+        });
         self.produce_full_calls.lock().unwrap().push(CapturedProduceCall {
             slot,
             randao_reveal: randao_reveal.to_string(),
             graffiti: graffiti.map(|s| s.to_string()),
-            builder_boost_factor: None,
+            builder_boost_factor: Some(builder_config.builder_boost_factor),
         });
         if self.fail_produce {
             return Err(BlockServiceError::Beacon("beacon down".to_string()));
@@ -654,6 +646,23 @@ pub(crate) fn test_fork_schedule() -> ForkSchedule {
         gloas_fork_epoch: u64::MAX,
         gloas_fork_version: [7, 0, 0, 0],
     }
+}
+
+/// Test-only Gloas activation after Fulu (epoch 60). Never a real network value.
+pub(crate) const TEST_GLOAS_EPOCH: u64 = 70;
+
+pub(crate) fn test_fork_schedule_with_near_gloas() -> ForkSchedule {
+    let mut fork = test_fork_schedule();
+    fork.gloas_fork_epoch = TEST_GLOAS_EPOCH;
+    fork
+}
+
+pub(crate) fn test_fulu_slot() -> Slot {
+    60 * SLOTS_PER_EPOCH
+}
+
+pub(crate) fn test_gloas_slot() -> Slot {
+    TEST_GLOAS_EPOCH * SLOTS_PER_EPOCH
 }
 
 pub(crate) fn test_body_ssz() -> Vec<u8> {

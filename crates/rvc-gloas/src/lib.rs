@@ -80,8 +80,17 @@ mod public_surface_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-fixtures"))]
+#[allow(unused_imports)]
 mod spec_kat;
+
+/// Spec-vector hex for downstream tests. Not on the default public surface.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod test_fixtures {
+    pub use crate::spec_kat::minimal::{
+        SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT, SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ,
+    };
+}
 
 #[cfg(test)]
 mod spec_kat_tests {

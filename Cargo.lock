@@ -4248,6 +4248,7 @@ dependencies = [
  "hex",
  "rvc-crypto",
  "rvc-eth-types",
+ "rvc-gloas",
  "rvc-observability",
  "rvc-signer",
  "rvc-validator-store",

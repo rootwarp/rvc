@@ -9,7 +9,8 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, error, info, info_span, warn, Instrument};
 
-use block_service::{BeaconBlockClient, BlockService};
+use async_trait::async_trait;
+use block_service::{BeaconBlockClient, BlockService, BuilderConfig, BuilderConfigProvider};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Propagator};
 use builder::{legacy_proposer_ops_retired, BuilderService, UpcomingProposal};
 use crypto::PublicKey;
@@ -340,7 +341,7 @@ where
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let block_service = BlockService::with_circuit_breaker(
+        let mut block_service = BlockService::with_circuit_breaker(
             signer.clone(),
             block_beacon,
             validator_store.clone(),
@@ -348,6 +349,10 @@ where
             config.genesis_validators_root,
             circuit_breaker.clone(),
         );
+        if let Some(ref builder) = builder_service {
+            block_service = block_service
+                .with_builder_config_provider(Arc::new(BuilderConfigAdapter(builder.clone())));
+        }
 
         let aggregation_service = AggregationService::new(
             signer.clone(),
@@ -1209,6 +1214,16 @@ where
                 .await;
         }
         WaitOutcome::Continue
+    }
+}
+
+/// Forwards 6.17 cached signed auth into V4 produce without a block-service→builder edge.
+struct BuilderConfigAdapter(Arc<BuilderService>);
+
+#[async_trait]
+impl BuilderConfigProvider for BuilderConfigAdapter {
+    async fn builder_config_for(&self, pubkey: &[u8; 48], slot: Slot) -> BuilderConfig {
+        self.0.builder_config_for(pubkey, slot).await
     }
 }
 

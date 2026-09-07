@@ -261,7 +261,7 @@ async fn test_propose_block_ssz_deneb_blinded_uses_beacon_block_format() {
 }
 
 #[tokio::test]
-async fn test_propose_block_ssz_blinded_at_gloas_returns_typed_error_without_signer() {
+async fn test_propose_block_ssz_gloas_slot_deneb_version_mismatch_drops_duty() {
     let pubkey = test_pubkey();
     let slot = 200;
     let beacon = MockBeaconClient::ssz(slot, 42, true);
@@ -282,10 +282,14 @@ async fn test_propose_block_ssz_blinded_at_gloas_returns_typed_error_without_sig
     let err = service
         .propose_block(slot, &pubkey, 42, None)
         .await
-        .expect_err("SSZ blinded Gloas must fail closed");
+        .expect_err("SSZ Gloas slot with deneb Eth-Consensus-Version must fail closed");
     assert!(
-        matches!(err, BlockServiceError::BlindedNotSupportedAtGloas { slot: s } if s == slot),
-        "expected BlindedNotSupportedAtGloas, got {err:?}"
+        matches!(
+            err,
+            BlockServiceError::ConsensusVersionMismatch { ref expected, ref got }
+            if expected == "gloas" && got == "deneb"
+        ),
+        "expected ConsensusVersionMismatch, got {err:?}"
     );
     assert!(signer_arc.header_calls.lock().unwrap().is_empty());
     assert!(signer_arc.block_calls.lock().unwrap().is_empty());

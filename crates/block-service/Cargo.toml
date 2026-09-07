@@ -23,10 +23,12 @@ tracing.workspace = true
 tree_hash.workspace = true
 serde_json.workspace = true
 validator-store.workspace = true
+rvc-gloas.workspace = true
 
 [dev-dependencies]
 crypto.workspace = true
 eth-types = { workspace = true, features = ["test-fixtures"] }
+rvc-gloas = { workspace = true, features = ["test-fixtures"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
 toml.workspace = true
 tracing-test.workspace = true

@@ -12,7 +12,9 @@ use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use signer::{BeaconBlockHeaderFields, CircuitBreakerState, ValidatorSigner};
 use validator_store::ValidatorStore;
 
-use crate::traits::{BeaconBlockClient, ProduceBlockResponse};
+use crate::traits::{
+    BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse,
+};
 use crate::types::BlockSelectionMode;
 use crate::validation::BlockResponseValidator;
 use crate::BlockServiceError;
@@ -35,6 +37,7 @@ pub struct BlockService<S: ValidatorSigner, B: BeaconBlockClient> {
     fork_schedule: Arc<ForkSchedule>,
     genesis_validators_root: Root,
     circuit_breaker: Arc<CircuitBreakerState>,
+    builder_config_provider: Option<Arc<dyn BuilderConfigProvider>>,
 }
 
 impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
@@ -70,7 +73,31 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             fork_schedule,
             genesis_validators_root,
             circuit_breaker,
+            builder_config_provider: None,
         }
+    }
+
+    /// 6.17 cached signed builder auth. `None` keeps `builders: []` (no dummy unsigned auth).
+    pub fn with_builder_config_provider(
+        mut self,
+        provider: Arc<dyn BuilderConfigProvider>,
+    ) -> Self {
+        self.builder_config_provider = Some(provider);
+        self
+    }
+
+    async fn v4_builder_config(&self, pubkey: &[u8; 48], slot: Slot, boost: u64) -> BuilderConfig {
+        let mut config = match &self.builder_config_provider {
+            Some(provider) => provider.builder_config_for(pubkey, slot).await,
+            None => BuilderConfig {
+                min_bid: self.validator_store.min_bid(pubkey),
+                builder_boost_factor: boost,
+                builders: Vec::new(),
+            },
+        };
+        config.builder_boost_factor = boost;
+        config.min_bid = self.validator_store.min_bid(pubkey);
+        config
     }
 
     /// Propose a block for the given duty slot and validator key.
@@ -133,6 +160,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         info!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), %mode, "Block proposal started");
 
         let epoch = slot / SLOTS_PER_EPOCH;
+        let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
 
         // 1. Sign RANDAO reveal
         let randao_start = std::time::Instant::now();
@@ -203,16 +231,24 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             }
         };
 
-        // 3. Request block from beacon node
-        let response = self
-            .beacon
-            .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
-            .instrument(tracing::info_span!("beacon.produce_block_v3"))
-            .await;
+        // 3. Request block from beacon node. Dispatch on the slot fork, never
+        // on response headers: Gloas is V4, pre-Gloas stays V3 verbatim.
+        let produce_result = if fork >= ForkName::Gloas {
+            let builder_config = self.v4_builder_config(&pubkey_bytes, slot, boost).await;
+            self.beacon
+                .produce_block_v4(slot, &randao_hex, graffiti_hex.as_deref(), &builder_config)
+                .instrument(tracing::info_span!("beacon.produce_block_v4"))
+                .await
+        } else {
+            self.beacon
+                .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
+                .instrument(tracing::info_span!("beacon.produce_block_v3"))
+                .await
+        };
 
         // Handle block-production failure, tagging the error so the coordinator
         // can apply H-3 circuit-breaker scoping.
-        let response = match response {
+        let response = match produce_result {
             Ok(resp) => resp,
             Err(e) => {
                 if mode == BlockSelectionMode::BuilderOnly {
@@ -246,40 +282,71 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             }
         };
 
-        info!(
-            slot = slot,
-            is_blinded = response.is_blinded,
-            execution_payload_value = response.execution_payload_value.as_deref().unwrap_or("none"),
-            "Block production response received"
-        );
-
         // Record dynamic attributes after block production
         let span = tracing::Span::current();
-        span.record("block.blinded", response.is_blinded);
         span.record("block.consensus_version", &response.consensus_version);
         if let Some(ref value) = response.execution_payload_value {
             span.record("block.value_wei", value.as_str());
         }
 
-        // 4. Sign and publish based on block type.
+        if fork >= ForkName::Gloas {
+            info!(
+                slot = slot,
+                fork = fork.as_ref(),
+                execution_payload_value =
+                    response.execution_payload_value.as_deref().unwrap_or("none"),
+                "Block production response received"
+            );
+        } else {
+            info!(
+                slot = slot,
+                is_blinded = response.is_blinded,
+                execution_payload_value =
+                    response.execution_payload_value.as_deref().unwrap_or("none"),
+                "Block production response received"
+            );
+            span.record("block.blinded", response.is_blinded);
+        }
+
+        // 4. Sign and publish. Fork is resolved from the slot; V4 never
+        // dispatches on `Eth-Consensus-Version` or `is_blinded`.
         // D29: this `response` is committed once a signature exists — no
         // re-production and no second sign for the slot. Publish keeps the
         // existing broadcast/submit policy; envelope publish (6.20) must use
         // the same bytes.
-        // Gloas retires blinded/mev-boost; keep the pre-Gloas helpers but drop the duty.
-        reject_blinded_at_gloas(
-            response.is_blinded,
-            &response.consensus_version,
-            slot,
-            &self.fork_schedule,
-        )?;
-        debug!(slot = slot, is_blinded = response.is_blinded, "Blinded/unblinded path chosen");
-        let (block_root, is_blinded) = if response.is_ssz {
-            self.sign_and_publish_ssz(&response, slot, pubkey, validator).await
-        } else if response.is_blinded {
-            self.sign_and_publish_blinded(&response, slot, pubkey, validator).await
+        let (block_root, is_blinded) = if fork >= ForkName::Gloas {
+            self.sign_and_publish_v4(&response, slot, pubkey, validator, fork).await
         } else {
-            self.sign_and_publish_full(&response, slot, pubkey, validator).await
+            reject_blinded_at_gloas(
+                response.is_blinded,
+                &response.consensus_version,
+                slot,
+                &self.fork_schedule,
+            )?;
+            // Pre-Gloas keeps response.consensus_version for format/publish (V3 verbatim).
+            debug!(slot = slot, is_blinded = response.is_blinded, "Blinded/unblinded path chosen");
+            if response.is_ssz {
+                self.sign_and_publish_ssz(
+                    &response,
+                    slot,
+                    pubkey,
+                    validator,
+                    response.is_blinded,
+                    &response.consensus_version,
+                )
+                .await
+            } else if response.is_blinded {
+                self.sign_and_publish_blinded(&response, slot, pubkey, validator).await
+            } else {
+                self.sign_and_publish_full(
+                    &response,
+                    slot,
+                    pubkey,
+                    validator,
+                    &response.consensus_version,
+                )
+                .await
+            }
         }
         .map_err(|e| {
             error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %e, "Block publication failed");
@@ -304,20 +371,127 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         })
     }
 
+    /// Gloas V4 sign+publish: slot-resolved `fork` only. Self-build vs builder-win is 6.20.
+    async fn sign_and_publish_v4(
+        &self,
+        response: &ProduceBlockResponse,
+        slot: Slot,
+        pubkey: &PublicKey,
+        validator: Option<&BlockResponseValidator>,
+        fork: ForkName,
+    ) -> Result<(Root, bool), BlockServiceError> {
+        cross_check_consensus_version(&response.consensus_version, fork)?;
+        // Envelope BlockContents parse is 6.18; fail closed rather than Electra-hash.
+        if response.payload_included {
+            return Err(BlockServiceError::Parse(
+                "Gloas payload_included body requires BlockContents parse (6.18)".to_string(),
+            ));
+        }
+        if response.is_ssz {
+            self.sign_and_publish_ssz_gloas(response, slot, pubkey, validator, fork).await
+        } else {
+            self.sign_and_publish_json_gloas(response, slot, pubkey, validator, fork).await
+        }
+    }
+
+    async fn sign_and_publish_json_gloas(
+        &self,
+        response: &ProduceBlockResponse,
+        slot: Slot,
+        pubkey: &PublicKey,
+        validator: Option<&BlockResponseValidator>,
+        fork: ForkName,
+    ) -> Result<(Root, bool), BlockServiceError> {
+        let block_contents = response.parse_full_block()?;
+        let block = block_contents.block().clone();
+        if block.slot != slot {
+            return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
+        }
+        if let Some(v) = validator {
+            v.validate_full(&block).map_err(|e| {
+                error!(slot = slot, error = %e, "BN block response validation failed — dropping duty");
+                e
+            })?;
+        }
+        let (header, block_root) = gloas_header_and_root(&block)?;
+        let sig = self
+            .signer
+            .sign_block_header(&header, pubkey, &self.fork_schedule, &self.genesis_validators_root)
+            .instrument(tracing::info_span!("sign.block"))
+            .await
+            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        let signed =
+            eth_types::SignedBeaconBlock { message: block, signature: sig.to_bytes().to_vec() };
+        self.beacon
+            .publish_block(&signed, fork.as_ref(), response.builder_url.as_deref())
+            .instrument(tracing::info_span!("beacon.publish_block"))
+            .await?;
+        Ok((block_root, false))
+    }
+
+    async fn sign_and_publish_ssz_gloas(
+        &self,
+        response: &ProduceBlockResponse,
+        slot: Slot,
+        pubkey: &PublicKey,
+        validator: Option<&BlockResponseValidator>,
+        fork: ForkName,
+    ) -> Result<(Root, bool), BlockServiceError> {
+        let ssz_bytes = response.ssz_bytes.as_ref().ok_or_else(|| {
+            BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string())
+        })?;
+        let format = beacon::ssz_deser::SszBlockFormat::BeaconBlock;
+        let (block, block_data_offset) =
+            beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
+                .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+        if block.slot != slot {
+            return Err(BlockServiceError::Parse(format!(
+                "SSZ block slot mismatch: header has {}, expected {}",
+                block.slot, slot,
+            )));
+        }
+        if let Some(v) = validator {
+            v.validate_full(&block).map_err(|e| {
+                error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
+                e
+            })?;
+        }
+        let (header, block_root) = gloas_header_and_root(&block)?;
+        let sig = self
+            .signer
+            .sign_block_header(&header, pubkey, &self.fork_schedule, &self.genesis_validators_root)
+            .instrument(tracing::info_span!("sign.block"))
+            .await
+            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        let block_ssz = &ssz_bytes[block_data_offset..];
+        let message_offset: u32 = 100;
+        let mut signed_ssz = Vec::with_capacity(100 + block_ssz.len());
+        signed_ssz.extend_from_slice(&message_offset.to_le_bytes());
+        signed_ssz.extend_from_slice(&sig.to_bytes());
+        signed_ssz.extend_from_slice(block_ssz);
+        self.beacon
+            .publish_block_ssz(&signed_ssz, fork.as_ref(), false, response.builder_url.as_deref())
+            .instrument(tracing::info_span!("beacon.publish_block"))
+            .await?;
+        Ok((block_root, false))
+    }
+
     async fn sign_and_publish_ssz(
         &self,
         response: &ProduceBlockResponse,
         slot: Slot,
         pubkey: &PublicKey,
         validator: Option<&BlockResponseValidator>,
+        is_blinded: bool,
+        consensus_version: &str,
     ) -> Result<(Root, bool), BlockServiceError> {
         let ssz_bytes = response.ssz_bytes.as_ref().ok_or_else(|| {
             BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string())
         })?;
 
-        let format = ssz_block_format(response.is_blinded, &response.consensus_version)?;
+        let format = ssz_block_format(is_blinded, consensus_version)?;
         let (block_root, block_data_offset, header): (Root, usize, BeaconBlockHeaderFields) =
-            if response.is_blinded {
+            if is_blinded {
                 let (block, offset) =
                     beacon::ssz_deser::deserialize_blinded_beacon_block_from_ssz(ssz_bytes, format)
                         .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
@@ -355,7 +529,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 // this fingerprint is an rvc-internal binding (NOT spec-aligned —
                 // see kzg_commitment_list_root doc) separate from the signing scope.
                 if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
-                    if let Some(layout) = eth_types::body_fork_layout(&response.consensus_version) {
+                    if let Some(layout) = eth_types::body_fork_layout(consensus_version) {
                         // Fail closed: malformed body must not fingerprint as empty list.
                         let kzg_count = block
                             .blob_kzg_count(layout)
@@ -400,14 +574,14 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         self.beacon
             .publish_block_ssz(
                 &signed_ssz,
-                &response.consensus_version,
-                response.is_blinded,
+                consensus_version,
+                is_blinded,
                 response.builder_url.as_deref(),
             )
             .instrument(tracing::info_span!("beacon.publish_block"))
             .await?;
 
-        Ok((block_root, response.is_blinded))
+        Ok((block_root, is_blinded))
     }
 
     async fn sign_and_publish_full(
@@ -416,6 +590,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         slot: Slot,
         pubkey: &PublicKey,
         validator: Option<&BlockResponseValidator>,
+        consensus_version: &str,
     ) -> Result<(Root, bool), BlockServiceError> {
         let block_contents = response.parse_full_block()?;
         let block = block_contents.block().clone();
@@ -441,7 +616,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         // This does NOT change the BN-facing signing scope; it is a rvc-internal
         // consistency check performed before the signature is created.
         if let eth_types::BlockContents::BlockAndBlobs { ref blob_sidecars, .. } = block_contents {
-            if let Some(layout) = eth_types::body_fork_layout(&response.consensus_version) {
+            if let Some(layout) = eth_types::body_fork_layout(consensus_version) {
                 // Fail closed: malformed body must not fingerprint as empty list.
                 let kzg_commitments = block_contents
                     .blob_kzg_commitments(layout)
@@ -489,7 +664,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let signed =
             eth_types::SignedBeaconBlock { message: block, signature: sig.to_bytes().to_vec() };
         self.beacon
-            .publish_block(&signed, &response.consensus_version, response.builder_url.as_deref())
+            .publish_block(&signed, consensus_version, response.builder_url.as_deref())
             .instrument(tracing::info_span!("beacon.publish_block"))
             .await?;
 
@@ -546,6 +721,24 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         Ok((block_root, true))
     }
+}
+
+/// Gloas header leaves: body root from the island, never Electra/Deneb HTR.
+fn gloas_header_and_root(
+    block: &eth_types::BeaconBlock,
+) -> Result<(BeaconBlockHeaderFields, Root), BlockServiceError> {
+    let body_root = rvc_gloas::gloas_body_root(&block.body)?;
+    let header = BeaconBlockHeaderFields {
+        slot: block.slot,
+        proposer_index: block.proposer_index,
+        parent_root: block.parent_root,
+        state_root: block.state_root,
+        body_root,
+        body_ssz: block.body.clone(),
+        is_blinded: false,
+    };
+    let block_root = header.object_root();
+    Ok((header, block_root))
 }
 
 fn header_from_full(
@@ -652,6 +845,17 @@ fn reject_blinded_at_gloas(
         return Err(BlockServiceError::BlindedNotSupportedAtGloas { slot });
     }
     Ok(())
+}
+
+/// Header-derived fork is a cross-check only: mismatch drops the duty unsigned.
+fn cross_check_consensus_version(got: &str, expected: ForkName) -> Result<(), BlockServiceError> {
+    match ForkName::from_str(got) {
+        Ok(parsed) if parsed == expected => Ok(()),
+        _ => Err(BlockServiceError::ConsensusVersionMismatch {
+            expected: expected.as_ref().to_string(),
+            got: got.to_string(),
+        }),
+    }
 }
 
 #[cfg(test)]

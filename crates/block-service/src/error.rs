@@ -43,6 +43,14 @@ pub enum BlockServiceError {
     /// Blinded proposal path is pre-Gloas only; Gloas drops the duty unsigned.
     #[error("blinded block production is not supported at Gloas (slot {slot})")]
     BlindedNotSupportedAtGloas { slot: u64 },
+
+    /// `Eth-Consensus-Version` disagreed with the slot-resolved fork. Duty dropped unsigned.
+    #[error("Eth-Consensus-Version {got} does not match slot fork {expected}")]
+    ConsensusVersionMismatch { expected: String, got: String },
+
+    /// Gloas body merkleization failed. Duty dropped unsigned — never an Electra fallback.
+    #[error(transparent)]
+    Gloas(#[from] rvc_gloas::GloasError),
 }
 
 impl From<BeaconError> for BlockServiceError {

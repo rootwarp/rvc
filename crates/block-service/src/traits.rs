@@ -6,6 +6,13 @@ use crate::BlockServiceError;
 
 pub use beacon::{BuilderConfig, ProduceBlockResponse};
 
+/// Cached V4 `BuilderConfig` (6.17 signed auth). Implemented in `rvc`, not here:
+/// `rvc-block-service → rvc-builder` is a forbidden edge.
+#[async_trait]
+pub trait BuilderConfigProvider: Send + Sync {
+    async fn builder_config_for(&self, pubkey: &[u8; 48], slot: Slot) -> BuilderConfig;
+}
+
 /// Minimal beacon client trait for block production and publication.
 ///
 /// Defined locally for testability; the real `beacon::BeaconClient`
