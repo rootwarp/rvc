@@ -10,7 +10,7 @@ use beacon::{
     SubmitAttestationResult, SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse,
     SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
     ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -101,6 +101,19 @@ pub trait BlockProducer: Send + Sync {
         consensus_version: &str,
         is_blinded: bool,
         builder_url: Option<&str>,
+    ) -> Result<(), BeaconError>;
+
+    /// Publish a signed execution payload envelope with blobs and proofs.
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
     ) -> Result<(), BeaconError>;
 
     async fn prepare_beacon_proposer(

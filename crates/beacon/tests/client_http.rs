@@ -13,14 +13,16 @@ use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use beacon::{
-    parse_slot_duration_ms, AttestationData, BeaconClient, BeaconClientConfig,
+    parse_slot_duration_ms, ssz_deser, AttestationData, BeaconClient, BeaconClientConfig,
     BeaconCommitteeSubscription, BeaconError, BuilderConfig, BuilderPreferencesEntry, Checkpoint,
-    LegacyAttestation, ProposerPreparation, SignedBuilderRequestAuth, SingleAttestation,
-    SubmitBuilderPreferencesResult, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof, BUILDER_PREFERENCES_PATH, HEADER_ETH_BUILDER_URL,
-    HEADER_ETH_CONSENSUS_BLOCK_VALUE, HEADER_ETH_CONSENSUS_VERSION,
-    HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI,
-    QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL, QUERY_SKIP_RANDAO_VERIFICATION,
+    LegacyAttestation, ProduceBlockV4Body, ProposerPreparation, SignedBuilderRequestAuth,
+    SingleAttestation, SubmitBuilderPreferencesResult, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody, BUILDER_PREFERENCES_PATH,
+    HEADER_ETH_BLOB_DATA_INCLUDED, HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+    HEADER_ETH_CONSENSUS_VERSION, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+    PRODUCE_BLOCK_V4_PATH_PREFIX, PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH,
+    QUERY_BROADCAST_VALIDATION, QUERY_GRAFFITI, QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
+    QUERY_SKIP_RANDAO_VERIFICATION,
 };
 use eth_types::{ForkName, ForkSchedule};
 use timing::{SlotClock, SystemSlotClock};
@@ -2833,6 +2835,406 @@ async fn test_produce_block_v4_ssz_missing_payload_included_is_rejected() {
         Ok(_) => panic!("SSZ missing {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} must be Err"),
         other => panic!("expected ParseError, got {other:?}"),
     }
+}
+
+fn v4_json_block_contents(slot: u64) -> serde_json::Value {
+    json!({
+        "version": "gloas",
+        "data": {
+            "block": {
+                "slot": slot.to_string(),
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", "01".repeat(32)),
+                "state_root": format!("0x{}", "02".repeat(32)),
+                "body": "0xdead"
+            },
+            "execution_payload_envelope": { "builder_index": "0", "payload": "0xee" },
+            "kzg_proofs": ["0xaa"],
+            "blobs": ["0xbb"]
+        }
+    })
+}
+
+fn build_beacon_block_ssz_for_test(slot: u64, proposer_index: u64, body: &[u8]) -> Vec<u8> {
+    let body_offset: u32 = 84;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&slot.to_le_bytes());
+    buf.extend_from_slice(&proposer_index.to_le_bytes());
+    buf.extend_from_slice(&[0x11; 32]);
+    buf.extend_from_slice(&[0x22; 32]);
+    buf.extend_from_slice(&body_offset.to_le_bytes());
+    buf.extend_from_slice(body);
+    buf
+}
+
+fn build_gloas_block_contents_ssz_for_test(
+    slot: u64,
+    envelope: &[u8],
+    kzg_proofs: &[u8],
+    blobs: &[u8],
+) -> Vec<u8> {
+    let block_ssz = build_beacon_block_ssz_for_test(slot, 42, &[0xde, 0xad]);
+    let block_off: u32 = 16;
+    let envelope_off = block_off + block_ssz.len() as u32;
+    let kzg_off = envelope_off + envelope.len() as u32;
+    let blobs_off = kzg_off + kzg_proofs.len() as u32;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&block_off.to_le_bytes());
+    buf.extend_from_slice(&envelope_off.to_le_bytes());
+    buf.extend_from_slice(&kzg_off.to_le_bytes());
+    buf.extend_from_slice(&blobs_off.to_le_bytes());
+    buf.extend_from_slice(&block_ssz);
+    buf.extend_from_slice(envelope);
+    buf.extend_from_slice(kzg_proofs);
+    buf.extend_from_slice(blobs);
+    buf
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_json_decodes_beacon_block_and_block_contents() {
+    let slot = 300u64;
+
+    let mock_block = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", None, None))
+        .expect(1)
+        .mount(&mock_block)
+        .await;
+    let block_resp = BeaconClient::new(BeaconClientConfig::new(mock_block.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match block_resp.decode_v4_body().unwrap() {
+        ProduceBlockV4Body::BeaconBlock { block, .. } => assert_eq!(block.slot, slot),
+        other => panic!("expected BeaconBlock, got {other:?}"),
+    }
+
+    let mock_contents = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(v4_json_block_contents(slot))
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .expect(1)
+        .mount(&mock_contents)
+        .await;
+    let contents_resp = BeaconClient::new(BeaconClientConfig::new(mock_contents.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match contents_resp.decode_v4_body().unwrap() {
+        ProduceBlockV4Body::BlockContents(contents) => {
+            assert_eq!(contents.block.slot, slot);
+            assert_eq!(contents.kzg_proofs, WireBody::Json(json!(["0xaa"])));
+            assert_eq!(contents.blobs, WireBody::Json(json!(["0xbb"])));
+        }
+        other => panic!("expected BlockContents, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_json_payload_included_mismatch_is_typed_error() {
+    let slot = 301u64;
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "true", None, None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let resp = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match resp.decode_v4_body() {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("payload_included"), "{msg}");
+            assert!(msg.contains("BeaconBlock"), "{msg}");
+        }
+        other => panic!("expected payload_included mismatch ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_decodes_beacon_block_and_block_contents() {
+    let slot = 302u64;
+    let envelope = vec![0xe0, 0xe1, 0xe2, 0xe3];
+    let kzg = vec![0xaa, 0xab];
+    let blobs = vec![0xbb, 0xbc, 0xbd];
+    let contents_ssz = build_gloas_block_contents_ssz_for_test(slot, &envelope, &kzg, &blobs);
+    let block_ssz = build_beacon_block_ssz_for_test(slot, 7, &[0xca, 0xfe]);
+
+    let mock_contents = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(contents_ssz, "application/octet-stream")
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .expect(1)
+        .mount(&mock_contents)
+        .await;
+    let contents_resp = BeaconClient::new(BeaconClientConfig::new(mock_contents.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match contents_resp.decode_v4_body().unwrap() {
+        ProduceBlockV4Body::BlockContents(contents) => {
+            assert_eq!(contents.block.slot, slot);
+            assert_eq!(contents.execution_payload_envelope, WireBody::Ssz(envelope));
+            assert_eq!(contents.kzg_proofs, WireBody::Ssz(kzg));
+            assert_eq!(contents.blobs, WireBody::Ssz(blobs));
+            assert!(contents.block_ssz.is_some());
+        }
+        other => panic!("expected BlockContents, got {other:?}"),
+    }
+
+    let mock_block = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(block_ssz, "application/octet-stream")
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "false"),
+        )
+        .expect(1)
+        .mount(&mock_block)
+        .await;
+    let block_resp = BeaconClient::new(BeaconClientConfig::new(mock_block.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match block_resp.decode_v4_body().unwrap() {
+        ProduceBlockV4Body::BeaconBlock { block, block_ssz } => {
+            assert_eq!(block.slot, slot);
+            assert!(block_ssz.is_some());
+        }
+        other => panic!("expected BeaconBlock, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_payload_included_mismatch_is_typed_error() {
+    let slot = 303u64;
+    let envelope = vec![0xe0];
+    let contents_ssz = build_gloas_block_contents_ssz_for_test(slot, &envelope, &[0xaa], &[0xbb]);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(contents_ssz, "application/octet-stream")
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "false"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let resp = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match resp.decode_v4_body() {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("payload_included"), "{msg}");
+            assert!(msg.contains("BlockContents"), "{msg}");
+        }
+        other => panic!("expected payload_included mismatch ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_publish_execution_payload_envelope_sends_blob_data_included() {
+    let mock_server = MockServer::start().await;
+    let slot = 304u64;
+    let envelope = vec![0xe0, 0xe1, 0xe2, 0xe3];
+    let kzg = vec![0xaa, 0xab, 0xac];
+    let blobs = vec![0xbb, 0xbc];
+    let contents_ssz = build_gloas_block_contents_ssz_for_test(slot, &envelope, &kzg, &blobs);
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(contents_ssz, "application/octet-stream")
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    let ProduceBlockV4Body::BlockContents(contents) = produced.decode_v4_body().unwrap() else {
+        panic!("expected BlockContents produce response");
+    };
+    let WireBody::Ssz(envelope_ssz) = contents.execution_payload_envelope else {
+        panic!("expected SSZ envelope");
+    };
+    let signed_envelope = ssz_deser::serialize_signed_beacon_block_ssz(&envelope_ssz, &[0x11; 96])
+        .expect("signed envelope frame");
+
+    client
+        .publish_execution_payload_envelope(
+            &WireBody::Ssz(signed_envelope.clone()),
+            &contents.blobs,
+            &contents.kzg_proofs,
+            "gloas",
+            Some("consensus"),
+        )
+        .await
+        .unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish = requests
+        .iter()
+        .find(|r| r.url.path() == PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH)
+        .expect("envelope publish request");
+    let version = publish
+        .headers
+        .get(HEADER_ETH_CONSENSUS_VERSION)
+        .expect("Eth-Consensus-Version")
+        .to_str()
+        .unwrap();
+    assert_eq!(version, "gloas");
+    let blob_included = publish
+        .headers
+        .get(HEADER_ETH_BLOB_DATA_INCLUDED)
+        .expect("Eth-Blob-Data-Included")
+        .to_str()
+        .unwrap();
+    assert_eq!(blob_included, "true");
+    let pairs: Vec<(String, String)> =
+        publish.url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    assert!(
+        pairs.iter().any(|(n, v)| n == QUERY_BROADCAST_VALIDATION && v == "consensus"),
+        "broadcast_validation must be passed through: {pairs:?}"
+    );
+    let expected_body = ssz_deser::encode_signed_envelope_contents(&signed_envelope, &kzg, &blobs);
+    assert_eq!(publish.body, expected_body, "envelope+blobs+proofs must match produce response");
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_publish_execution_payload_envelope_200_and_202() {
+    let envelope = WireBody::Json(json!({"message": {}, "signature": "0xaa"}));
+    let blobs = WireBody::Json(json!(["0xbb"]));
+    let proofs = WireBody::Json(json!(["0xaa"]));
+
+    let mock_200 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_200)
+        .await;
+    BeaconClient::new(BeaconClientConfig::new(mock_200.uri()))
+        .unwrap()
+        .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+        .await
+        .unwrap();
+
+    let mock_202 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&mock_202)
+        .await;
+    BeaconClient::new(BeaconClientConfig::new(mock_202.uri()))
+        .unwrap()
+        .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+        .await
+        .unwrap();
+    assert!(
+        logs_contain("broadcast succeeded but integration failed"),
+        "202 must be logged as broadcast/integration failure"
+    );
+}
+
+#[tokio::test]
+async fn test_publish_execution_payload_envelope_400_and_503_typed() {
+    let envelope = WireBody::Json(json!({"message": {}}));
+    let blobs = WireBody::Json(json!([]));
+    let proofs = WireBody::Json(json!([]));
+
+    let mock_400 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalid envelope"))
+        .expect(1)
+        .mount(&mock_400)
+        .await;
+    let client_400 = BeaconClient::new(
+        BeaconClientConfig::new(mock_400.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1)),
+    )
+    .unwrap();
+    match client_400
+        .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+        .await
+    {
+        Err(BeaconError::ApiError { status, message }) => {
+            assert_eq!(status, 400);
+            assert!(message.contains("invalid envelope"), "{message}");
+        }
+        other => panic!("expected ApiError 400, got {other:?}"),
+    }
+    assert_eq!(mock_400.received_requests().await.unwrap().len(), 1, "400 must not be retried");
+
+    let mock_503 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string("syncing"))
+        .expect(1)
+        .mount(&mock_503)
+        .await;
+    // Default BeaconClient retries 5xx (same as publish_block_ssz). Production
+    // BnManager uses max_retries=0, so 503 is typed and not retried there.
+    let client_503 = BeaconClient::new(
+        BeaconClientConfig::new(mock_503.uri())
+            .with_max_retries(0)
+            .with_initial_backoff(Duration::from_millis(1)),
+    )
+    .unwrap();
+    match client_503
+        .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+        .await
+    {
+        Err(BeaconError::ApiError { status, message }) => {
+            assert_eq!(status, 503);
+            assert!(message.contains("syncing"), "{message}");
+        }
+        other => panic!("expected ApiError 503, got {other:?}"),
+    }
+    assert_eq!(
+        mock_503.received_requests().await.unwrap().len(),
+        1,
+        "503 is typed and not retried when max_retries=0 (BnManager production)"
+    );
 }
 
 #[tokio::test]

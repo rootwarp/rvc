@@ -1,12 +1,41 @@
 use std::collections::HashMap;
 
 use eth_types::{
-    BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, PayloadAttestationData,
+    BeaconBlock, BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, PayloadAttestationData,
     SyncCommitteeContribution, SyncCommitteeDuty, Version,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::ssz_deser;
+use crate::v4_wire::{
+    FIELD_BLOBS, FIELD_BLOCK, FIELD_EXECUTION_PAYLOAD_ENVELOPE, FIELD_KZG_PROOFS,
+};
 use crate::BeaconError;
+
+/// JSON object or raw SSZ bytes for a V4 envelope/blob/proof field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireBody {
+    Json(serde_json::Value),
+    Ssz(Vec<u8>),
+}
+
+/// Gloas produce-block V4 body when `payload_included` is true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GloasBlockContents {
+    pub block: BeaconBlock,
+    pub execution_payload_envelope: WireBody,
+    pub kzg_proofs: WireBody,
+    pub blobs: WireBody,
+    /// Bounded inner `BeaconBlock` SSZ for `[offset][sig][block]` framing.
+    pub block_ssz: Option<Vec<u8>>,
+}
+
+/// V4 produce-block `data`: bare `BeaconBlock` or payload-inclusive `BlockContents`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProduceBlockV4Body {
+    BeaconBlock { block: BeaconBlock, block_ssz: Option<Vec<u8>> },
+    BlockContents(GloasBlockContents),
+}
 
 /// A checkpoint in the beacon chain consisting of an epoch and block root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -174,6 +203,161 @@ impl ProduceBlockResponse {
         serde_json::from_value(self.data.clone())
             .map_err(|e| BeaconError::ParseError(format!("invalid blinded block: {}", e)))
     }
+
+    /// Decode a V4 produce body and require `payload_included` to match the shape.
+    pub fn decode_v4_body(&self) -> Result<ProduceBlockV4Body, BeaconError> {
+        if self.is_ssz {
+            self.decode_v4_ssz()
+        } else {
+            self.decode_v4_json()
+        }
+    }
+
+    fn decode_v4_json(&self) -> Result<ProduceBlockV4Body, BeaconError> {
+        let is_contents = json_is_gloas_block_contents(&self.data);
+        match (self.payload_included, is_contents) {
+            (true, true) => {
+                Ok(ProduceBlockV4Body::BlockContents(parse_gloas_block_contents_json(&self.data)?))
+            }
+            (false, false) => {
+                let block = parse_json_beacon_block(&self.data)?;
+                Ok(ProduceBlockV4Body::BeaconBlock { block, block_ssz: None })
+            }
+            (true, false) => Err(BeaconError::ParseError(
+                "payload_included is true but decoded shape is BeaconBlock, not BlockContents"
+                    .to_string(),
+            )),
+            (false, true) => Err(BeaconError::ParseError(
+                "payload_included is false but decoded shape is BlockContents, not BeaconBlock"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn decode_v4_ssz(&self) -> Result<ProduceBlockV4Body, BeaconError> {
+        let bytes = self.ssz_bytes.as_deref().ok_or_else(|| {
+            BeaconError::ParseError("SSZ produce response missing ssz_bytes".to_string())
+        })?;
+        if bytes.is_empty() {
+            return Err(BeaconError::ParseError("received empty SSZ body from beacon node".into()));
+        }
+        let is_contents = ssz_deser::looks_like_gloas_block_contents(bytes);
+        match (self.payload_included, is_contents) {
+            (true, true) => {
+                let parsed = ssz_deser::deserialize_gloas_block_contents(bytes)?;
+                Ok(ProduceBlockV4Body::BlockContents(GloasBlockContents {
+                    block: parsed.block,
+                    execution_payload_envelope: WireBody::Ssz(parsed.envelope_ssz),
+                    kzg_proofs: WireBody::Ssz(parsed.kzg_proofs),
+                    blobs: WireBody::Ssz(parsed.blobs),
+                    block_ssz: Some(parsed.block_ssz),
+                }))
+            }
+            (false, false) => {
+                let (block, offset) = ssz_deser::deserialize_beacon_block_from_ssz(
+                    bytes,
+                    ssz_deser::SszBlockFormat::BeaconBlock,
+                )?;
+                Ok(ProduceBlockV4Body::BeaconBlock {
+                    block,
+                    block_ssz: Some(bytes[offset..].to_vec()),
+                })
+            }
+            (true, false) => Err(BeaconError::ParseError(
+                "payload_included is true but SSZ shape is BeaconBlock, not BlockContents"
+                    .to_string(),
+            )),
+            (false, true) => Err(BeaconError::ParseError(
+                "payload_included is false but SSZ shape is BlockContents, not BeaconBlock"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+fn json_is_gloas_block_contents(data: &serde_json::Value) -> bool {
+    data.get(FIELD_BLOCK).is_some()
+        && data.get(FIELD_EXECUTION_PAYLOAD_ENVELOPE).is_some()
+        && data.get(FIELD_KZG_PROOFS).is_some()
+        && data.get(FIELD_BLOBS).is_some()
+}
+
+fn parse_gloas_block_contents_json(
+    data: &serde_json::Value,
+) -> Result<GloasBlockContents, BeaconError> {
+    let block = parse_json_beacon_block(data.get(FIELD_BLOCK).ok_or_else(|| {
+        BeaconError::ParseError(format!("BlockContents missing '{FIELD_BLOCK}'"))
+    })?)?;
+    let execution_payload_envelope =
+        data.get(FIELD_EXECUTION_PAYLOAD_ENVELOPE).cloned().ok_or_else(|| {
+            BeaconError::ParseError(format!(
+                "BlockContents missing '{FIELD_EXECUTION_PAYLOAD_ENVELOPE}'"
+            ))
+        })?;
+    let kzg_proofs = data.get(FIELD_KZG_PROOFS).cloned().ok_or_else(|| {
+        BeaconError::ParseError(format!("BlockContents missing '{FIELD_KZG_PROOFS}'"))
+    })?;
+    let blobs = data
+        .get(FIELD_BLOBS)
+        .cloned()
+        .ok_or_else(|| BeaconError::ParseError(format!("BlockContents missing '{FIELD_BLOBS}'")))?;
+    Ok(GloasBlockContents {
+        block,
+        execution_payload_envelope: WireBody::Json(execution_payload_envelope),
+        kzg_proofs: WireBody::Json(kzg_proofs),
+        blobs: WireBody::Json(blobs),
+        block_ssz: None,
+    })
+}
+
+/// Parse a JSON `BeaconBlock`. Hex `body` uses the eth-types contract; a nested
+/// Gloas JSON object is accepted and stored as opaque JSON bytes (not SSZ).
+fn parse_json_beacon_block(value: &serde_json::Value) -> Result<BeaconBlock, BeaconError> {
+    if let Ok(block) = serde_json::from_value::<BeaconBlock>(value.clone()) {
+        return Ok(block);
+    }
+    let slot = json_quoted_u64(value.get("slot"), "slot")?;
+    let proposer_index = json_quoted_u64(value.get("proposer_index"), "proposer_index")?;
+    let parent_root = json_root_hex(value.get("parent_root"), "parent_root")?;
+    let state_root = json_root_hex(value.get("state_root"), "state_root")?;
+    let body = match value.get("body") {
+        Some(body) if body.is_object() || body.is_array() => serde_json::to_vec(body)
+            .map_err(|e| BeaconError::ParseError(format!("invalid beacon block body: {e}")))?,
+        Some(serde_json::Value::String(s)) => decode_hex_bytes(s, "body")?,
+        Some(_) => {
+            return Err(BeaconError::ParseError("invalid beacon block body".to_string()));
+        }
+        None => return Err(BeaconError::ParseError("beacon block missing body".to_string())),
+    };
+    Ok(BeaconBlock { slot, proposer_index, parent_root, state_root, body })
+}
+
+fn json_quoted_u64(value: Option<&serde_json::Value>, field: &str) -> Result<u64, BeaconError> {
+    match value {
+        Some(serde_json::Value::String(s)) => s
+            .parse::<u64>()
+            .map_err(|_| BeaconError::ParseError(format!("invalid beacon block {field}: {s}"))),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| BeaconError::ParseError(format!("invalid beacon block {field}"))),
+        _ => Err(BeaconError::ParseError(format!("beacon block missing {field}"))),
+    }
+}
+
+fn json_root_hex(value: Option<&serde_json::Value>, field: &str) -> Result<[u8; 32], BeaconError> {
+    let s = value
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BeaconError::ParseError(format!("beacon block missing {field}")))?;
+    let bytes = decode_hex_bytes(s, field)?;
+    bytes
+        .try_into()
+        .map_err(|_| BeaconError::ParseError(format!("beacon block {field} must be 32 bytes")))
+}
+
+fn decode_hex_bytes(s: &str, field: &str) -> Result<Vec<u8>, BeaconError> {
+    let hex_str = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(hex_str)
+        .map_err(|e| BeaconError::ParseError(format!("invalid beacon block {field}: {e}")))
 }
 
 /// Response type for attestation data endpoint.
@@ -1299,6 +1483,109 @@ mod tests {
         };
 
         assert!(response.parse_full_block().is_err());
+    }
+
+    fn sample_beacon_block_json() -> serde_json::Value {
+        serde_json::json!({
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        })
+    }
+
+    fn sample_block_contents_json() -> serde_json::Value {
+        serde_json::json!({
+            "block": sample_beacon_block_json(),
+            "execution_payload_envelope": { "builder_index": "0" },
+            "kzg_proofs": ["0xaa"],
+            "blobs": ["0xbb"]
+        })
+    }
+
+    fn produce_json(data: serde_json::Value, payload_included: bool) -> ProduceBlockResponse {
+        ProduceBlockResponse {
+            data,
+            is_blinded: false,
+            consensus_version: "gloas".to_string(),
+            execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included,
+            builder_url: None,
+            consensus_block_value: None,
+        }
+    }
+
+    #[test]
+    fn test_decode_v4_json_beacon_block() {
+        let body = produce_json(sample_beacon_block_json(), false).decode_v4_body().unwrap();
+        match body {
+            ProduceBlockV4Body::BeaconBlock { block, block_ssz } => {
+                assert_eq!(block.slot, 100);
+                assert!(block_ssz.is_none());
+            }
+            other => panic!("expected BeaconBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_v4_json_block_contents() {
+        let body = produce_json(sample_block_contents_json(), true).decode_v4_body().unwrap();
+        match body {
+            ProduceBlockV4Body::BlockContents(contents) => {
+                assert_eq!(contents.block.slot, 100);
+                assert_eq!(
+                    contents.execution_payload_envelope,
+                    WireBody::Json(serde_json::json!({ "builder_index": "0" }))
+                );
+                assert_eq!(contents.kzg_proofs, WireBody::Json(serde_json::json!(["0xaa"])));
+                assert_eq!(contents.blobs, WireBody::Json(serde_json::json!(["0xbb"])));
+            }
+            other => panic!("expected BlockContents, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_v4_json_payload_included_mismatch_is_typed_error() {
+        let err = produce_json(sample_beacon_block_json(), true).decode_v4_body().unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains("payload_included"), "{msg}");
+                assert!(msg.contains("BeaconBlock"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+
+        let err = produce_json(sample_block_contents_json(), false).decode_v4_body().unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains("payload_included"), "{msg}");
+                assert!(msg.contains("BlockContents"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_v4_json_nested_gloas_body_object() {
+        let nested = serde_json::json!({
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": { "randao_reveal": "0xaa", "graffiti": "0xbb" }
+        });
+        let body = produce_json(nested, false).decode_v4_body().unwrap();
+        match body {
+            ProduceBlockV4Body::BeaconBlock { block, .. } => {
+                assert_eq!(block.slot, 100);
+                assert_eq!(block.proposer_index, 42);
+                assert!(!block.body.is_empty());
+            }
+            other => panic!("expected BeaconBlock, got {other:?}"),
+        }
     }
 
     #[test]

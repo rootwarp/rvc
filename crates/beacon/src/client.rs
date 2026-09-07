@@ -16,6 +16,7 @@ use eth_types::{
 
 use crate::http_caps::{read_body_capped, read_body_capped_lossy, ResponseCaps};
 use crate::retry::RetryPolicy;
+use crate::ssz_deser;
 use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
     BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
@@ -25,12 +26,14 @@ use crate::types::{
     StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
     SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
 };
 use crate::v4_wire::{
-    BuilderConfig, BuilderPreferencesEntry, BUILDER_PREFERENCES_PATH, HEADER_ETH_BUILDER_URL,
-    HEADER_ETH_CONSENSUS_BLOCK_VALUE, HEADER_ETH_CONSENSUS_VERSION,
-    HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI,
+    BuilderConfig, BuilderPreferencesEntry, BUILDER_PREFERENCES_PATH, FIELD_BLOBS,
+    FIELD_KZG_PROOFS, FIELD_SIGNED_EXECUTION_PAYLOAD_ENVELOPE, HEADER_ETH_BLOB_DATA_INCLUDED,
+    HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_BLOCK_VALUE, HEADER_ETH_CONSENSUS_VERSION,
+    HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, PRODUCE_BLOCK_V4_PATH_PREFIX,
+    PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH, QUERY_BROADCAST_VALIDATION, QUERY_GRAFFITI,
     QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
 };
 use crate::BeaconError;
@@ -923,6 +926,90 @@ impl BeaconClient {
                 }
             },
         )
+        .await
+    }
+
+    /// Publishes a signed execution payload envelope with blobs and proofs.
+    ///
+    /// Always sends `Eth-Blob-Data-Included: true` so the receiving BN does not
+    /// need the producing BN's cache. `broadcast_validation` is forwarded when set.
+    pub async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        let query: Vec<(&str, &str)> = match broadcast_validation {
+            Some(v) => vec![(QUERY_BROADCAST_VALIDATION, v)],
+            None => vec![],
+        };
+        let prefix = PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH.trim_start_matches('/');
+        let segments: Vec<&str> = prefix.split('/').collect();
+        let path = Self::build_path(&segments, &query);
+        let url = self.resolve_url(&path)?;
+        let cv = consensus_version.to_string();
+
+        let (content_type, body): (&'static str, Vec<u8>) = match (
+            signed_envelope,
+            blobs,
+            kzg_proofs,
+        ) {
+            (WireBody::Json(envelope), WireBody::Json(blobs_json), WireBody::Json(proofs_json)) => {
+                let mut map = serde_json::Map::new();
+                map.insert(FIELD_SIGNED_EXECUTION_PAYLOAD_ENVELOPE.to_string(), envelope.clone());
+                map.insert(FIELD_KZG_PROOFS.to_string(), proofs_json.clone());
+                map.insert(FIELD_BLOBS.to_string(), blobs_json.clone());
+                let bytes = serde_json::to_vec(&serde_json::Value::Object(map)).map_err(|e| {
+                    BeaconError::HttpError(format!("failed to serialize request body: {e}"))
+                })?;
+                ("application/json", bytes)
+            }
+            (WireBody::Ssz(envelope), WireBody::Ssz(blobs_ssz), WireBody::Ssz(proofs_ssz)) => (
+                "application/octet-stream",
+                ssz_deser::encode_signed_envelope_contents(envelope, proofs_ssz, blobs_ssz),
+            ),
+            _ => {
+                return Err(BeaconError::ParseError(
+                    "publish_execution_payload_envelope requires JSON or SSZ for envelope, blobs, and proofs together"
+                        .to_string(),
+                ));
+            }
+        };
+
+        self.execute_with_retry_raw(
+            "POST",
+            &url,
+            || {
+                let cv = cv.clone();
+                let url = url.clone();
+                let body = body.clone();
+                async move {
+                    let request = self
+                        .client
+                        .post(&url)
+                        .header(reqwest::header::CONTENT_TYPE, content_type)
+                        .header(HEADER_ETH_CONSENSUS_VERSION, &cv)
+                        .header(HEADER_ETH_BLOB_DATA_INCLUDED, "true")
+                        .body(body);
+                    Self::traced(request).send().await
+                }
+            },
+            |response| async move {
+                let status = response.status();
+                if status.as_u16() == 202 {
+                    warn!("execution payload envelope broadcast succeeded but integration failed");
+                    return Ok(());
+                }
+                if status.is_success() {
+                    Ok(())
+                } else {
+                    Err(Self::api_error_from_response(response).await)
+                }
+            },
+        )
+        .instrument(tracing::info_span!("beacon.publish_execution_payload_envelope"))
         .await
     }
 

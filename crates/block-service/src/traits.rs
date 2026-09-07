@@ -4,7 +4,7 @@ use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
 
 use crate::BlockServiceError;
 
-pub use beacon::{BuilderConfig, ProduceBlockResponse};
+pub use beacon::{BuilderConfig, ProduceBlockResponse, WireBody};
 
 /// Cached V4 `BuilderConfig` (6.17 signed auth). Implemented in `rvc`, not here:
 /// `rvc-block-service → rvc-builder` is a forbidden edge.
@@ -57,6 +57,15 @@ pub trait BeaconBlockClient: Send + Sync {
         consensus_version: &str,
         is_blinded: bool,
         builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError>;
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
     ) -> Result<(), BlockServiceError>;
 }
 

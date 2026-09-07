@@ -13,6 +13,7 @@ use beacon::{
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
     SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody,
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -1707,6 +1708,33 @@ impl BlockProducer for BnManager {
         }
     }
 
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        self.submit(
+            "publish_execution_payload_envelope",
+            self.broadcast_topics.blocks,
+            BnRole::Submission,
+            HealthTier::LargeLag,
+            self.op_timeout(|t| t.block_publication),
+            |c| {
+                Box::pin(c.publish_execution_payload_envelope(
+                    signed_envelope,
+                    blobs,
+                    kzg_proofs,
+                    consensus_version,
+                    broadcast_validation,
+                ))
+            },
+        )
+        .await
+    }
+
     // -- Proposer preparation: broadcast --
 
     async fn prepare_beacon_proposer(
@@ -2160,6 +2188,14 @@ impl_beacon_client_passthrough! {
             is_blinded: bool,
             builder_url: Option<&str>,
         ) -> Result<(), BeaconError>;
+        async fn publish_execution_payload_envelope(
+            &self,
+            signed_envelope: &WireBody,
+            blobs: &WireBody,
+            kzg_proofs: &WireBody,
+            consensus_version: &str,
+            broadcast_validation: Option<&str>,
+        ) -> Result<(), BeaconError>;
         async fn prepare_beacon_proposer(
             &self,
             preparations: &[ProposerPreparation],
@@ -2261,10 +2297,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 33 methods across the seven role traits (see impl_beacon_client_passthrough!).
+        // 34 methods across the seven role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            33,
+            34,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -2285,6 +2321,7 @@ mod tests {
             "produce_block_v3",
             "produce_block_v4",
             "publish_block_ssz",
+            "publish_execution_payload_envelope",
             "submit_proposer_preferences",
             "submit_builder_preferences",
             "submit_attestation",

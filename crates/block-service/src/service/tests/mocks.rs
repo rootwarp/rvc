@@ -2,6 +2,7 @@
 
 use super::*;
 use async_trait::async_trait;
+use beacon::WireBody;
 use eth_types::{BeaconBlock, BlindedBeaconBlock, SignedBeaconBlock, SignedBlindedBeaconBlock};
 use signer::{BeaconBlockHeaderFields, SignerError};
 use std::sync::{Arc, Mutex};
@@ -620,6 +621,20 @@ impl BeaconBlockClient for MockBeaconClient {
             consensus_version.to_string(),
             is_blinded,
         ));
+        if self.fail_publish {
+            return Err(BlockServiceError::Beacon("publish failed".to_string()));
+        }
+        Ok(())
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &WireBody,
+        _blobs: &WireBody,
+        _kzg_proofs: &WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
         if self.fail_publish {
             return Err(BlockServiceError::Beacon("publish failed".to_string()));
         }

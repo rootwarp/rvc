@@ -36,6 +36,15 @@ const MIN_BEACON_BLOCK_HEADER_LEN: usize = 16;
 /// Minimum size of the `BlockContents` fixed portion (3 × 4-byte offsets).
 const BLOCK_CONTENTS_FIXED_LEN: usize = 12;
 
+/// Gloas `BlockContents` fixed portion (4 × 4-byte offsets).
+const GLOAS_BLOCK_CONTENTS_FIXED_LEN: usize = 16;
+
+/// SSZ `SignedBeaconBlock` / `SignedBlindedBeaconBlock` message offset (4 + 96).
+pub const SIGNED_BEACON_BLOCK_MESSAGE_OFFSET: u32 = 100;
+
+/// BLS signature size on the SSZ wire.
+const SSZ_SIGNATURE_LEN: usize = 96;
+
 /// Fixed portion of the SSZ `BeaconBlock` layout:
 /// slot(8) + proposer_index(8) + parent_root(32) + state_root(32) + body_offset(4) = 84.
 const BEACON_BLOCK_FIXED_LEN: usize = 84;
@@ -242,6 +251,131 @@ fn deserialize_block_fields(
     let body = bytes[body_start..block_region_end].to_vec();
 
     Ok(BeaconBlock { slot, proposer_index, parent_root, state_root, body })
+}
+
+/// Parsed Gloas V4 `BlockContents` SSZ: bounded block plus opaque envelope/blob slices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GloasBlockContentsSsz {
+    pub block: BeaconBlock,
+    /// Inner `BeaconBlock` SSZ (no envelope / proofs / blobs).
+    pub block_ssz: Vec<u8>,
+    pub envelope_ssz: Vec<u8>,
+    pub kzg_proofs: Vec<u8>,
+    pub blobs: Vec<u8>,
+}
+
+fn read_u32_le(bytes: &[u8], at: usize) -> Result<usize, BeaconError> {
+    let slice = bytes.get(at..at + 4).ok_or_else(|| {
+        BeaconError::ParseError("SSZ Gloas BlockContents too short for offset table".to_string())
+    })?;
+    let arr: [u8; 4] = slice
+        .try_into()
+        .map_err(|_| BeaconError::ParseError("SSZ offset slice must be 4 bytes".to_string()))?;
+    Ok(u32::from_le_bytes(arr) as usize)
+}
+
+/// True when `bytes` is a 4-offset Gloas `BlockContents` container.
+pub fn looks_like_gloas_block_contents(bytes: &[u8]) -> bool {
+    if bytes.len() < GLOAS_BLOCK_CONTENTS_FIXED_LEN {
+        return false;
+    }
+    let Ok(block_off) = read_u32_le(bytes, 0) else {
+        return false;
+    };
+    let Ok(envelope_off) = read_u32_le(bytes, 4) else {
+        return false;
+    };
+    let Ok(kzg_off) = read_u32_le(bytes, 8) else {
+        return false;
+    };
+    let Ok(blobs_off) = read_u32_le(bytes, 12) else {
+        return false;
+    };
+    block_off == GLOAS_BLOCK_CONTENTS_FIXED_LEN
+        && block_off <= envelope_off
+        && envelope_off <= kzg_off
+        && kzg_off <= blobs_off
+        && blobs_off <= bytes.len()
+}
+
+/// Deserialize Gloas `BlockContents` `{block, envelope, kzg_proofs, blobs}`.
+pub fn deserialize_gloas_block_contents(
+    bytes: &[u8],
+) -> Result<GloasBlockContentsSsz, BeaconError> {
+    if bytes.len() < GLOAS_BLOCK_CONTENTS_FIXED_LEN {
+        return Err(BeaconError::ParseError(format!(
+            "SSZ Gloas BlockContents too short: {} bytes, need at least {}",
+            bytes.len(),
+            GLOAS_BLOCK_CONTENTS_FIXED_LEN,
+        )));
+    }
+    let block_off = read_u32_le(bytes, 0)?;
+    let envelope_off = read_u32_le(bytes, 4)?;
+    let kzg_off = read_u32_le(bytes, 8)?;
+    let blobs_off = read_u32_le(bytes, 12)?;
+    if block_off < GLOAS_BLOCK_CONTENTS_FIXED_LEN {
+        return Err(BeaconError::ParseError(format!(
+            "SSZ Gloas BlockContents block offset {block_off} is inside the fixed portion (< {GLOAS_BLOCK_CONTENTS_FIXED_LEN})"
+        )));
+    }
+    if !(block_off <= envelope_off
+        && envelope_off <= kzg_off
+        && kzg_off <= blobs_off
+        && blobs_off <= bytes.len())
+    {
+        return Err(BeaconError::ParseError(format!(
+            "SSZ Gloas BlockContents offsets not monotonic or out of bounds: block={block_off} envelope={envelope_off} kzg={kzg_off} blobs={blobs_off} len={}",
+            bytes.len()
+        )));
+    }
+    let block = deserialize_block_fields(bytes, block_off, envelope_off)?;
+    Ok(GloasBlockContentsSsz {
+        block,
+        block_ssz: bytes[block_off..envelope_off].to_vec(),
+        envelope_ssz: bytes[envelope_off..kzg_off].to_vec(),
+        kzg_proofs: bytes[kzg_off..blobs_off].to_vec(),
+        blobs: bytes[blobs_off..].to_vec(),
+    })
+}
+
+/// Frame a signed beacon block as `[offset=100][96-byte sig][block_ssz]`.
+pub fn serialize_signed_beacon_block_ssz(
+    block_ssz: &[u8],
+    signature: &[u8],
+) -> Result<Vec<u8>, BeaconError> {
+    if signature.len() != SSZ_SIGNATURE_LEN {
+        return Err(BeaconError::ParseError(format!(
+            "signature must be {SSZ_SIGNATURE_LEN} bytes, got {}",
+            signature.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(100 + block_ssz.len());
+    out.extend_from_slice(&SIGNED_BEACON_BLOCK_MESSAGE_OFFSET.to_le_bytes());
+    out.extend_from_slice(signature);
+    out.extend_from_slice(block_ssz);
+    Ok(out)
+}
+
+/// SSZ `SignedExecutionPayloadEnvelopeContents`: three variable-length fields.
+pub fn encode_signed_envelope_contents(
+    signed_envelope: &[u8],
+    kzg_proofs: &[u8],
+    blobs: &[u8],
+) -> Vec<u8> {
+    const FIXED: u32 = 12;
+    let signed_len = signed_envelope.len() as u32;
+    let kzg_len = kzg_proofs.len() as u32;
+    let o0 = FIXED;
+    let o1 = FIXED + signed_len;
+    let o2 = o1 + kzg_len;
+    let mut out = Vec::with_capacity(12 + signed_envelope.len() + kzg_proofs.len() + blobs.len());
+    out.extend_from_slice(&o0.to_le_bytes());
+    out.extend_from_slice(&o1.to_le_bytes());
+    out.extend_from_slice(&o2.to_le_bytes());
+    out.extend_from_slice(signed_envelope);
+    out.extend_from_slice(kzg_proofs);
+    out.extend_from_slice(blobs);
+    out
 }
 
 #[cfg(test)]
@@ -732,5 +866,74 @@ mod tests {
         let (block, _) =
             deserialize_beacon_block_from_ssz(&ssz, SszBlockFormat::BeaconBlock).unwrap();
         assert!(block.body.is_empty());
+    }
+
+    fn build_gloas_block_contents_ssz(
+        slot: u64,
+        proposer_index: u64,
+        envelope: &[u8],
+        kzg_proofs: &[u8],
+        blobs: &[u8],
+    ) -> Vec<u8> {
+        let block_ssz =
+            build_beacon_block_ssz(slot, proposer_index, [0x11; 32], [0x22; 32], &[0xde, 0xad]);
+        let block_off: u32 = GLOAS_BLOCK_CONTENTS_FIXED_LEN as u32;
+        let envelope_off = block_off + block_ssz.len() as u32;
+        let kzg_off = envelope_off + envelope.len() as u32;
+        let blobs_off = kzg_off + kzg_proofs.len() as u32;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&block_off.to_le_bytes());
+        buf.extend_from_slice(&envelope_off.to_le_bytes());
+        buf.extend_from_slice(&kzg_off.to_le_bytes());
+        buf.extend_from_slice(&blobs_off.to_le_bytes());
+        buf.extend_from_slice(&block_ssz);
+        buf.extend_from_slice(envelope);
+        buf.extend_from_slice(kzg_proofs);
+        buf.extend_from_slice(blobs);
+        buf
+    }
+
+    #[test]
+    fn test_gloas_block_contents_extracts_opaque_slices_and_bounded_block() {
+        let envelope = vec![0xe0, 0xe1, 0xe2];
+        let kzg = vec![0xaa; 8];
+        let blobs = vec![0xbb; 16];
+        let bytes = build_gloas_block_contents_ssz(77, 3, &envelope, &kzg, &blobs);
+        assert!(looks_like_gloas_block_contents(&bytes));
+        let parsed = deserialize_gloas_block_contents(&bytes).unwrap();
+        assert_eq!(parsed.block.slot, 77);
+        assert_eq!(parsed.block.proposer_index, 3);
+        assert_eq!(parsed.envelope_ssz, envelope);
+        assert_eq!(parsed.kzg_proofs, kzg);
+        assert_eq!(parsed.blobs, blobs);
+        assert!(!parsed.block_ssz.windows(envelope.len()).any(|w| w == envelope.as_slice()));
+        assert!(!parsed.block_ssz.windows(kzg.len()).any(|w| w == kzg.as_slice()));
+    }
+
+    #[test]
+    fn test_serialize_signed_beacon_block_ssz_offset_sig_block() {
+        let block_ssz = vec![0x01, 0x02, 0x03, 0x04];
+        let sig = vec![0xab; 96];
+        let framed = serialize_signed_beacon_block_ssz(&block_ssz, &sig).unwrap();
+        assert_eq!(&framed[0..4], &SIGNED_BEACON_BLOCK_MESSAGE_OFFSET.to_le_bytes());
+        assert_eq!(&framed[4..100], sig.as_slice());
+        assert_eq!(&framed[100..], block_ssz.as_slice());
+    }
+
+    #[test]
+    fn test_looks_like_gloas_block_contents_rejects_bare_beacon_block() {
+        let ssz = build_beacon_block_ssz(100, 42, [1u8; 32], [2u8; 32], &[0xde]);
+        assert!(!looks_like_gloas_block_contents(&ssz));
+    }
+
+    #[test]
+    fn test_gloas_block_contents_too_short_is_error() {
+        let err = deserialize_gloas_block_contents(&[0u8; 8]).unwrap_err();
+        match err {
+            crate::BeaconError::ParseError(msg) => {
+                assert!(msg.contains("Gloas BlockContents"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
     }
 }

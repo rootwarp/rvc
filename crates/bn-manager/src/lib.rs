@@ -43,8 +43,8 @@ pub use beacon::{
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
     SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorLiveness,
     ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof, FALLBACK_MAX_EXECUTION_PAYMENT,
-    MAX_BUILDER_ENTRIES,
+    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
+    FALLBACK_MAX_EXECUTION_PAYMENT, MAX_BUILDER_ENTRIES,
 };
 pub use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,

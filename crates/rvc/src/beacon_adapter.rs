@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use block_service::{BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse};
+use block_service::{
+    BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse, WireBody,
+};
 use bn_manager::BeaconNodeClient;
 use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
 
@@ -78,12 +80,35 @@ impl BeaconBlockClient for BeaconBlockAdapter {
             .await
             .map_err(|e| BlockServiceError::Beacon(e.to_string()))
     }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        self.0
+            .publish_execution_payload_envelope(
+                signed_envelope,
+                blobs,
+                kzg_proofs,
+                consensus_version,
+                broadcast_validation,
+            )
+            .await
+            .map_err(|e| BlockServiceError::Beacon(e.to_string()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use beacon::{HEADER_ETH_BUILDER_URL, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED};
+    use beacon::{
+        HEADER_ETH_BLOB_DATA_INCLUDED, HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_VERSION,
+        HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH,
+    };
     use block_service::BeaconBlockClient;
     use bn_manager::{BnManager, BnManagerConfig};
     use wiremock::matchers::{body_json, method, path};
@@ -322,6 +347,57 @@ mod tests {
         assert!(
             requests[0].headers.get(HEADER_ETH_BUILDER_URL).is_none(),
             "must not send {HEADER_ETH_BUILDER_URL} when builder_url is None"
+        );
+    }
+
+    /// Production path: envelope publish uses block-publish policy, never produce failover.
+    #[tokio::test]
+    async fn test_publish_execution_payload_envelope_forwards_and_not_production_failover() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        let envelope = WireBody::Json(serde_json::json!({"message": {}, "signature": "0xaa"}));
+        let blobs = WireBody::Json(serde_json::json!(["0xbb"]));
+        let proofs = WireBody::Json(serde_json::json!(["0xaa"]));
+
+        Mock::given(method("POST"))
+            .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad envelope"))
+            .expect(1)
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&secondary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v4/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&primary)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![primary.uri(), secondary.uri()]))
+            .expect("BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        adapter
+            .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+            .await
+            .expect("broadcast/submit succeeds if any BN accepts");
+
+        let primary_reqs = primary.received_requests().await.unwrap();
+        let secondary_reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(primary_reqs.len(), 1, "broadcast hits the first BN");
+        assert_eq!(secondary_reqs.len(), 1, "broadcast hits the second BN; not query_failover");
+        let blob_header = secondary_reqs[0]
+            .headers
+            .get(HEADER_ETH_BLOB_DATA_INCLUDED)
+            .expect("Eth-Blob-Data-Included");
+        assert_eq!(blob_header.to_str().unwrap(), "true");
+        assert_eq!(
+            secondary_reqs[0].headers.get(HEADER_ETH_CONSENSUS_VERSION).unwrap().to_str().unwrap(),
+            "gloas"
         );
     }
 

@@ -31,6 +31,26 @@ pub const HEADER_ETH_EXECUTION_PAYLOAD_VALUE: &str = "Eth-Execution-Payload-Valu
 pub const HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED: &str = "Eth-Execution-Payload-Included";
 /// Response header: winning builder URL to echo on publish.
 pub const HEADER_ETH_BUILDER_URL: &str = "Eth-Builder-Url";
+/// Request header: envelope POST body is `SignedExecutionPayloadEnvelopeContents`.
+pub const HEADER_ETH_BLOB_DATA_INCLUDED: &str = "Eth-Blob-Data-Included";
+
+/// Path for `POST /eth/v1/beacon/execution_payload_envelopes`.
+pub const PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH: &str =
+    "/eth/v1/beacon/execution_payload_envelopes";
+
+/// Query: gossip/consensus validation level on envelope publish.
+pub const QUERY_BROADCAST_VALIDATION: &str = "broadcast_validation";
+
+/// JSON `BlockContents.block`.
+pub const FIELD_BLOCK: &str = "block";
+/// JSON `BlockContents.execution_payload_envelope`.
+pub const FIELD_EXECUTION_PAYLOAD_ENVELOPE: &str = "execution_payload_envelope";
+/// JSON `kzg_proofs` on produce `BlockContents` and envelope contents.
+pub const FIELD_KZG_PROOFS: &str = "kzg_proofs";
+/// JSON `blobs` on produce `BlockContents` and envelope contents.
+pub const FIELD_BLOBS: &str = "blobs";
+/// JSON `SignedExecutionPayloadEnvelopeContents.signed_execution_payload_envelope`.
+pub const FIELD_SIGNED_EXECUTION_PAYLOAD_ENVELOPE: &str = "signed_execution_payload_envelope";
 
 /// SSZ `MAX_BUILDER_ENTRIES`.
 pub const MAX_BUILDER_ENTRIES: usize = 64;

@@ -327,6 +327,17 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
             self.publish_called.store(true, Ordering::SeqCst);
             Ok(())
         }
+
+        async fn publish_execution_payload_envelope(
+            &self,
+            _signed_envelope: &block_service::WireBody,
+            _blobs: &block_service::WireBody,
+            _kzg_proofs: &block_service::WireBody,
+            _consensus_version: &str,
+            _broadcast_validation: Option<&str>,
+        ) -> Result<(), BlockServiceError> {
+            Ok(())
+        }
     }
 
     let slot: Slot = 100;

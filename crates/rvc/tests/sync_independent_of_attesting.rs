@@ -162,6 +162,17 @@ impl BeaconBlockClient for NoopBlockBeacon {
     ) -> Result<(), BlockServiceError> {
         Ok(())
     }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &block_service::WireBody,
+        _blobs: &block_service::WireBody,
+        _kzg_proofs: &block_service::WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        Ok(())
+    }
 }
 
 // ── NoopSubmitter ─────────────────────────────────────────────────────────────

@@ -182,6 +182,17 @@ impl BeaconBlockClient for MockBlockBeacon {
     ) -> Result<(), block_service::BlockServiceError> {
         Ok(())
     }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &block_service::WireBody,
+        _blobs: &block_service::WireBody,
+        _kzg_proofs: &block_service::WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Ok(())
+    }
 }
 
 pub(crate) fn create_mock_block_beacon() -> Arc<MockBlockBeacon> {
@@ -264,6 +275,17 @@ impl BeaconBlockClient for BadProposerBlockBeacon {
         _builder_url: Option<&str>,
     ) -> Result<(), block_service::BlockServiceError> {
         self.publish_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &block_service::WireBody,
+        _blobs: &block_service::WireBody,
+        _kzg_proofs: &block_service::WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
         Ok(())
     }
 }

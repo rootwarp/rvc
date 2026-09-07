@@ -16,7 +16,7 @@ use beacon::{
     SubmitAttestationResult, SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse,
     SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
     ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -93,6 +93,8 @@ pub struct MockBeaconNodeClient {
     publish_block: MethodHook<(SignedBeaconBlock, String, Option<String>), ()>,
     publish_blinded_block: MethodHook<(SignedBlindedBeaconBlock, String), ()>,
     publish_block_ssz: MethodHook<(Vec<u8>, String, bool, Option<String>), ()>,
+    publish_execution_payload_envelope:
+        MethodHook<(WireBody, WireBody, WireBody, String, Option<String>), ()>,
     prepare_beacon_proposer: MethodHook<Vec<ProposerPreparation>, ()>,
     register_validators: MethodHook<Vec<SignedValidatorRegistration>, ()>,
     submit_proposer_preferences: MethodHook<Vec<SignedProposerPreferences>, ()>,
@@ -327,6 +329,21 @@ impl MockBeaconNodeClient {
         self
     }
 
+    pub fn with_publish_execution_payload_envelope(
+        self,
+        f: impl Fn(WireBody, WireBody, WireBody, String, Option<String>) -> Result<(), BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.publish_execution_payload_envelope.set_handler(Arc::new(
+            move |(envelope, blobs, proofs, version, validation)| {
+                f(envelope, blobs, proofs, version, validation)
+            },
+        ));
+        self
+    }
+
     pub fn with_prepare_beacon_proposer(
         self,
         f: impl Fn(Vec<ProposerPreparation>) -> Result<(), BeaconError> + Send + Sync + 'static,
@@ -543,6 +560,12 @@ impl MockBeaconNodeClient {
         self.produce_block_v4.calls()
     }
 
+    pub fn publish_execution_payload_envelope_calls(
+        &self,
+    ) -> Vec<(WireBody, WireBody, WireBody, String, Option<String>)> {
+        self.publish_execution_payload_envelope.calls()
+    }
+
     pub fn submit_sync_committee_messages_calls(&self) -> Vec<Vec<SyncCommitteeMessage>> {
         self.submit_sync_committee_messages.calls()
     }
@@ -692,6 +715,26 @@ impl BlockProducer for MockBeaconNodeClient {
                 consensus_version.to_string(),
                 is_blinded,
                 builder_url.map(str::to_string),
+            ),
+        )
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        self.publish_execution_payload_envelope.invoke(
+            "publish_execution_payload_envelope",
+            (
+                signed_envelope.clone(),
+                blobs.clone(),
+                kzg_proofs.clone(),
+                consensus_version.to_string(),
+                broadcast_validation.map(str::to_string),
             ),
         )
     }

@@ -49,6 +49,7 @@ use beacon::{
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
     SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
 use bn_manager::{
@@ -275,6 +276,24 @@ impl BlockProducer for DutyStallBeacon {
     ) -> Result<(), BeaconError> {
         self.inner.publish_block_ssz(ssz_bytes, consensus_version, is_blinded, builder_url).await
     }
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        self.inner
+            .publish_execution_payload_envelope(
+                signed_envelope,
+                blobs,
+                kzg_proofs,
+                consensus_version,
+                broadcast_validation,
+            )
+            .await
+    }
     async fn prepare_beacon_proposer(
         &self,
         preparations: &[ProposerPreparation],
@@ -500,6 +519,17 @@ impl BeaconBlockClient for TrackingBlockBeacon {
             0
         };
         self.published_slots.lock().expect("published_slots lock").push(slot);
+        Ok(())
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &block_service::WireBody,
+        _blobs: &block_service::WireBody,
+        _kzg_proofs: &block_service::WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
         Ok(())
     }
 }
