@@ -40,7 +40,7 @@ pub mod mnemonic;
 mod signer_trait;
 mod signing;
 mod signing_root;
-#[cfg(feature = "test-utils")]
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_utils;
 pub mod typed_signer;
 mod voluntary_exit_signing;

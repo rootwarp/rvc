@@ -323,23 +323,7 @@ mod tests {
     const ELECTRA: [u8; 4] = [0x05, 0x00, 0x00, 0x00];
 
     fn compressed_schedule() -> ForkSchedule {
-        ForkSchedule {
-            genesis_fork_version: PHASE0,
-            altair_fork_epoch: 10,
-            altair_fork_version: ALTAIR,
-            bellatrix_fork_epoch: 20,
-            bellatrix_fork_version: BELLATRIX,
-            capella_fork_epoch: 30,
-            capella_fork_version: CAPELLA,
-            deneb_fork_epoch: 40,
-            deneb_fork_version: DENEB,
-            electra_fork_epoch: 50,
-            electra_fork_version: ELECTRA,
-            fulu_fork_epoch: 60,
-            fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
-            gloas_fork_epoch: u64::MAX,
-            gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
-        }
+        crate::test_utils::sentinel_gloas_schedule()
     }
 
     fn ctx(schedule: &ForkSchedule) -> SigningCtx<'_> {

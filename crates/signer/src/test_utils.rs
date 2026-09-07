@@ -228,23 +228,7 @@ mod tests {
     use eth_types::{Checkpoint, ValidatorRegistrationV1};
 
     fn fs() -> ForkSchedule {
-        ForkSchedule {
-            genesis_fork_version: [0; 4],
-            altair_fork_epoch: u64::MAX,
-            altair_fork_version: [0; 4],
-            bellatrix_fork_epoch: u64::MAX,
-            bellatrix_fork_version: [0; 4],
-            capella_fork_epoch: u64::MAX,
-            capella_fork_version: [0; 4],
-            deneb_fork_epoch: u64::MAX,
-            deneb_fork_version: [0; 4],
-            electra_fork_epoch: u64::MAX,
-            electra_fork_version: [0; 4],
-            fulu_fork_epoch: u64::MAX,
-            fulu_fork_version: [0; 4],
-            gloas_fork_epoch: u64::MAX,
-            gloas_fork_version: [0; 4],
-        }
+        crypto::test_utils::sentinel_gloas_schedule()
     }
 
     #[tokio::test]

@@ -38,6 +38,11 @@ use eth_types::{
     DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
     SLOTS_PER_EPOCH,
 };
+use rvc_crypto::test_utils::{
+    KAT_AGGREGATE_AND_PROOF_SIGNING_ROOT_PHASE0, KAT_ATTESTATION_SIGNING_ROOT_ELECTRA_BOUNDARY,
+    KAT_BLOCK_SIGNING_ROOT_PHASE0, KAT_BUILDER_REGISTRATION_SIGNING_ROOT,
+    KAT_SYNC_COMMITTEE_MESSAGE_SIGNING_ROOT_PHASE0, KAT_VOLUNTARY_EXIT_SIGNING_ROOT_EIP7044_DENEB,
+};
 use rvc_crypto::{
     capella_capped_fork_version, compute_domain, compute_fork_data_root, compute_signing_root,
     signing_root_for, DutyRef, KeyManager, LocalSigner, SecretKey, SignContext, SigningCtx,
@@ -54,27 +59,10 @@ const ALTAIR: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
 const BELLATRIX: [u8; 4] = [0x02, 0x00, 0x00, 0x00];
 const CAPELLA: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 const DENEB: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
-const ELECTRA: [u8; 4] = [0x05, 0x00, 0x00, 0x00];
 
 /// Compressed fork schedule matching free-function unit tests (epochs 10/20/30/40/50/60).
 fn compressed_schedule() -> ForkSchedule {
-    ForkSchedule {
-        genesis_fork_version: PHASE0,
-        altair_fork_epoch: 10,
-        altair_fork_version: ALTAIR,
-        bellatrix_fork_epoch: 20,
-        bellatrix_fork_version: BELLATRIX,
-        capella_fork_epoch: 30,
-        capella_fork_version: CAPELLA,
-        deneb_fork_epoch: 40,
-        deneb_fork_version: DENEB,
-        electra_fork_epoch: 50,
-        electra_fork_version: ELECTRA,
-        fulu_fork_epoch: 60,
-        fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
-        gloas_fork_epoch: u64::MAX,
-        gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
-    }
+    rvc_crypto::test_utils::sentinel_gloas_schedule()
 }
 
 fn make_local_signer(sk: SecretKey) -> LocalSigner {
@@ -88,26 +76,10 @@ fn signing_ctx(schedule: &ForkSchedule) -> SigningCtx<'_> {
 }
 
 // Issue 2.9 / #225: existing KAT vectors reused for sentinel-epoch inertness.
-// compressed_schedule() already sets gloas_fork_epoch = u64::MAX.
-const KAT_BLOCK_SIGNING_ROOT_PHASE0: Root = [
-    0x80, 0x1f, 0xbd, 0x74, 0x17, 0x52, 0xf6, 0xa9, 0xab, 0xaf, 0x0f, 0xd8, 0x20, 0xf9, 0xb3, 0x1b,
-    0xb7, 0x8f, 0xc4, 0xba, 0x26, 0x9b, 0x51, 0x3a, 0x38, 0xd6, 0xfd, 0xf3, 0xf7, 0x9d, 0xad, 0x8c,
-];
-const KAT_ATTESTATION_SIGNING_ROOT_ELECTRA_BOUNDARY: Root = [
-    0x28, 0x15, 0x19, 0xab, 0x10, 0xc9, 0x03, 0x76, 0x54, 0x79, 0xae, 0xd8, 0xa4, 0xec, 0x73, 0xae,
-    0x7b, 0x3c, 0x9a, 0x2f, 0x90, 0xf8, 0xa2, 0x12, 0x53, 0x1b, 0x93, 0x8e, 0x7b, 0xe7, 0xcb, 0x5c,
-];
-const KAT_AGGREGATE_AND_PROOF_SIGNING_ROOT_PHASE0: Root = [
-    0xbb, 0x54, 0x16, 0xb3, 0xdc, 0xde, 0xb5, 0x86, 0xb5, 0x4c, 0xe6, 0xcc, 0xe8, 0x39, 0x33, 0xf9,
-    0xa0, 0x60, 0x1d, 0xc4, 0xe3, 0x53, 0xc9, 0x85, 0x58, 0x83, 0x25, 0x6a, 0xd4, 0x4b, 0xf3, 0x84,
-];
+// Shared with L5 via `rvc_crypto::test_utils` (do not duplicate hex).
 const KAT_ELECTRA_AGGREGATE_AND_PROOF_SIGNING_ROOT: Root = [
     0x90, 0x5a, 0x0f, 0x50, 0x0c, 0x08, 0x7e, 0xdf, 0x43, 0x87, 0x77, 0xd1, 0x8d, 0xdc, 0x2b, 0xb7,
     0xc9, 0xfc, 0x57, 0x1a, 0xa1, 0x0a, 0xa6, 0xe4, 0xc0, 0x52, 0xe4, 0x6e, 0x0e, 0x0f, 0x5b, 0xe2,
-];
-const KAT_VOLUNTARY_EXIT_SIGNING_ROOT_EIP7044_DENEB: Root = [
-    0xe7, 0x43, 0x2d, 0x27, 0xaf, 0x0c, 0x7e, 0xe4, 0xe3, 0x98, 0xb6, 0xa9, 0xd6, 0x02, 0xd0, 0x2f,
-    0x46, 0xf1, 0xea, 0x97, 0x29, 0xe4, 0x3a, 0xce, 0x3a, 0xa2, 0x78, 0xf9, 0x3e, 0x03, 0xd4, 0xe1,
 ];
 
 // ============================================================
@@ -443,11 +415,6 @@ fn kat_electra_aggregate_and_proof_signing_root() {
 
 #[test]
 fn kat_sync_committee_message_signing_root_phase0() {
-    const EXPECTED: Root = [
-        0x5c, 0xfb, 0x10, 0x98, 0xb7, 0x3a, 0x93, 0xeb, 0x68, 0xe3, 0x79, 0x03, 0xf6, 0x6a, 0xcd,
-        0x7a, 0xf9, 0xec, 0x54, 0xe1, 0x09, 0x88, 0x8d, 0xf1, 0xab, 0x21, 0x84, 0x1a, 0x97, 0x0f,
-        0xb0, 0x74,
-    ];
     let schedule = compressed_schedule();
     let beacon_block_root: Root = [0x11; 32];
     let slot: Slot = 100; // Phase0
@@ -456,7 +423,7 @@ fn kat_sync_committee_message_signing_root_phase0() {
             &DutyRef::SyncMessage { beacon_block_root: &beacon_block_root, slot },
             &signing_ctx(&schedule)
         ),
-        EXPECTED
+        KAT_SYNC_COMMITTEE_MESSAGE_SIGNING_ROOT_PHASE0
     );
 }
 
@@ -615,11 +582,6 @@ fn kat_builder_registration_signing_root() {
         0xad, 0xcf, 0x81, 0x76, 0x6d, 0xd0, 0xdf, 0xd0, 0xae, 0x64, 0x46, 0x94, 0x77, 0xbb, 0x2c,
         0xf6, 0x61,
     ];
-    const KAT_EXPECTED_ROOT: Root = [
-        0x06, 0x13, 0x1b, 0x3a, 0x74, 0x1b, 0xd5, 0x52, 0x58, 0x93, 0xbf, 0xe1, 0x4d, 0x62, 0xb9,
-        0xb4, 0xfc, 0x10, 0x8b, 0x1f, 0x01, 0xc4, 0xc9, 0x51, 0x97, 0xeb, 0x7f, 0xc5, 0x6e, 0xeb,
-        0x44, 0x89,
-    ];
     let schedule = compressed_schedule();
     let registration = ValidatorRegistrationV1 {
         fee_recipient: [0xab; 20],
@@ -638,7 +600,7 @@ fn kat_builder_registration_signing_root() {
             },
             &signing_ctx(&schedule)
         ),
-        KAT_EXPECTED_ROOT
+        KAT_BUILDER_REGISTRATION_SIGNING_ROOT
     );
     // Non-zero gvr must produce a different domain (zeroed-gvr contract).
     let nonzero = compute_domain(DOMAIN_APPLICATION_BUILDER, ALTAIR, GVR);
@@ -799,11 +761,6 @@ async fn kat_typed_signer_builder_registration_matches_kat_root() {
 
 #[tokio::test]
 async fn kat_typed_signer_voluntary_exit_eip7044_matches_kat_root() {
-    const KAT_EXPECTED_ROOT: Root = [
-        0xe7, 0x43, 0x2d, 0x27, 0xaf, 0x0c, 0x7e, 0xe4, 0xe3, 0x98, 0xb6, 0xa9, 0xd6, 0x02, 0xd0,
-        0x2f, 0x46, 0xf1, 0xea, 0x97, 0x29, 0xe4, 0x3a, 0xce, 0x3a, 0xa2, 0x78, 0xf9, 0x3e, 0x03,
-        0xd4, 0xe1,
-    ];
     let sk = SecretKey::generate();
     let pk = sk.public_key();
     let schedule = compressed_schedule();
@@ -822,7 +779,7 @@ async fn kat_typed_signer_voluntary_exit_eip7044_matches_kat_root() {
     };
     let signer = make_local_signer(sk);
     let sig = TypedSigner::sign_voluntary_exit(&signer, &exit, &ctx).await.unwrap();
-    assert!(sig.verify(&pk, &KAT_EXPECTED_ROOT).is_ok());
+    assert!(sig.verify(&pk, &KAT_VOLUNTARY_EXIT_SIGNING_ROOT_EIP7044_DENEB).is_ok());
 }
 
 // ============================================================
@@ -830,7 +787,7 @@ async fn kat_typed_signer_voluntary_exit_eip7044_matches_kat_root() {
 // ============================================================
 
 /// With Gloas at `u64::MAX`, duty roots stay byte-identical to the existing
-/// `KAT_*` vectors (compressed_schedule already uses the sentinel).
+/// `KAT_*` vectors (`sentinel_gloas_schedule` already uses the sentinel).
 #[test]
 fn kat_sentinel_gloas_duty_signing_root() {
     let schedule = compressed_schedule();
@@ -934,11 +891,6 @@ fn test_eip7044_exit_epoch_1_000_000_still_capella_with_sentinel_gloas() {
 
 #[tokio::test]
 async fn kat_typed_signer_sync_message_matches_kat_root() {
-    const KAT_EXPECTED_ROOT: Root = [
-        0x5c, 0xfb, 0x10, 0x98, 0xb7, 0x3a, 0x93, 0xeb, 0x68, 0xe3, 0x79, 0x03, 0xf6, 0x6a, 0xcd,
-        0x7a, 0xf9, 0xec, 0x54, 0xe1, 0x09, 0x88, 0x8d, 0xf1, 0xab, 0x21, 0x84, 0x1a, 0x97, 0x0f,
-        0xb0, 0x74,
-    ];
     let sk = SecretKey::generate();
     let pk = sk.public_key();
     let beacon_block_root: Root = [0x11; 32];
@@ -956,5 +908,5 @@ async fn kat_typed_signer_sync_message_matches_kat_root() {
     let sig = TypedSigner::sign_sync_committee_message(&signer, slot, beacon_block_root, &ctx)
         .await
         .unwrap();
-    assert!(sig.verify(&pk, &KAT_EXPECTED_ROOT).is_ok());
+    assert!(sig.verify(&pk, &KAT_SYNC_COMMITTEE_MESSAGE_SIGNING_ROOT_PHASE0).is_ok());
 }

@@ -32,7 +32,7 @@ tracing.workspace = true
 tree_hash.workspace = true
 
 [dev-dependencies]
-crypto.workspace = true
+crypto = { workspace = true, features = ["test-utils"] }
 eth-types = { workspace = true, features = ["test-fixtures"] }
 grpc-signer.workspace = true
 prost.workspace = true

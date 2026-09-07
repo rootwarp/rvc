@@ -37,23 +37,7 @@ const CURRENT_FORK_VERSION: [u8; 4] = [0x04, 0x00, 0x00, 0x00];
 const PREVIOUS_FORK_VERSION: [u8; 4] = [0x03, 0x00, 0x00, 0x00];
 
 fn test_schedule() -> ForkSchedule {
-    ForkSchedule {
-        genesis_fork_version: [0x00, 0x00, 0x00, 0x00],
-        altair_fork_epoch: 10,
-        altair_fork_version: [0x01, 0x00, 0x00, 0x00],
-        bellatrix_fork_epoch: 20,
-        bellatrix_fork_version: [0x02, 0x00, 0x00, 0x00],
-        capella_fork_epoch: 30,
-        capella_fork_version: [0x03, 0x00, 0x00, 0x00],
-        deneb_fork_epoch: 40,
-        deneb_fork_version: [0x04, 0x00, 0x00, 0x00],
-        electra_fork_epoch: 50,
-        electra_fork_version: [0x05, 0x00, 0x00, 0x00],
-        fulu_fork_epoch: 60,
-        fulu_fork_version: [0x06, 0x00, 0x00, 0x00],
-        gloas_fork_epoch: u64::MAX,
-        gloas_fork_version: [0x07, 0x00, 0x00, 0x00],
-    }
+    rvc_crypto::test_utils::sentinel_gloas_schedule()
 }
 
 fn make_signer(sk: SecretKey) -> LocalSigner {

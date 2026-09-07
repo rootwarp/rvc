@@ -11,8 +11,8 @@ workspace = true
 
 [features]
 default = []
-# Exposes `test_utils` (create_test_keystore fixtures). Enable only from
-# consumers' [dev-dependencies] — never on production dependency lines.
+# Exposes `test_utils` (keystore fixtures + sentinel-Gloas schedule). Enable
+# only from [dev-dependencies] — never on production dependency lines.
 test-utils = []
 
 [dependencies]
@@ -44,6 +44,7 @@ rayon.workspace = true
 
 [dev-dependencies]
 eth-types = { workspace = true, features = ["test-fixtures"] }
+rvc-crypto = { path = ".", features = ["test-utils"] }
 rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }
 proptest.workspace = true
 tempfile.workspace = true

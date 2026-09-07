@@ -4337,6 +4337,7 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rayon",
+ "rvc-crypto",
  "rvc-eth-types",
  "rvc-observability",
  "rvc-spec-vectors",

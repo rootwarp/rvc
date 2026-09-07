@@ -31,23 +31,7 @@ mod tests {
     use eth_types::{ForkName, DOMAIN_VOLUNTARY_EXIT};
 
     fn test_fork_schedule() -> ForkSchedule {
-        ForkSchedule {
-            genesis_fork_version: [0, 0, 0, 0],
-            altair_fork_epoch: 10,
-            altair_fork_version: [1, 0, 0, 0],
-            bellatrix_fork_epoch: 20,
-            bellatrix_fork_version: [2, 0, 0, 0],
-            capella_fork_epoch: 30,
-            capella_fork_version: [3, 0, 0, 0],
-            deneb_fork_epoch: 40,
-            deneb_fork_version: [4, 0, 0, 0],
-            electra_fork_epoch: 50,
-            electra_fork_version: [5, 0, 0, 0],
-            fulu_fork_epoch: 60,
-            fulu_fork_version: [6, 0, 0, 0],
-            gloas_fork_epoch: u64::MAX,
-            gloas_fork_version: [7, 0, 0, 0],
-        }
+        crate::test_utils::sentinel_gloas_schedule()
     }
 
     fn test_genesis_validators_root() -> Root {
