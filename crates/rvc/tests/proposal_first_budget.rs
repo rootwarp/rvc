@@ -237,8 +237,9 @@ impl BlockProducer for DutyStallBeacon {
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
-        self.inner.publish_block(signed_block, consensus_version).await
+        self.inner.publish_block(signed_block, consensus_version, builder_url).await
     }
     async fn publish_blinded_block(
         &self,
@@ -252,8 +253,9 @@ impl BlockProducer for DutyStallBeacon {
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
-        self.inner.publish_block_ssz(ssz_bytes, consensus_version, is_blinded).await
+        self.inner.publish_block_ssz(ssz_bytes, consensus_version, is_blinded, builder_url).await
     }
     async fn prepare_beacon_proposer(
         &self,
@@ -435,6 +437,7 @@ impl BeaconBlockClient for TrackingBlockBeacon {
         &self,
         signed_block: &SignedBeaconBlock,
         _consensus_version: &str,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         self.published_slots.lock().expect("published_slots lock").push(signed_block.message.slot);
         Ok(())
@@ -454,6 +457,7 @@ impl BeaconBlockClient for TrackingBlockBeacon {
         ssz_bytes: &[u8],
         _consensus_version: &str,
         _is_blinded: bool,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         let slot = if ssz_bytes.len() >= 8 {
             u64::from_le_bytes(ssz_bytes[0..8].try_into().unwrap_or([0u8; 8]))

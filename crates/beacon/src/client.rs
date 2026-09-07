@@ -840,18 +840,22 @@ impl BeaconClient {
     }
 
     /// Publishes a signed beacon block to the network.
+    ///
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; the header is
+    /// sent only when `Some`.
     pub async fn publish_block<B: Serialize>(
         &self,
         signed_block: &B,
         consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
-        self.post_empty_with_headers(
-            "/eth/v2/beacon/blocks",
-            signed_block,
-            &[("Eth-Consensus-Version", consensus_version)],
-        )
-        .instrument(tracing::info_span!("beacon.publish_block"))
-        .await
+        let mut headers = vec![(HEADER_ETH_CONSENSUS_VERSION, consensus_version)];
+        if let Some(url) = builder_url {
+            headers.push((HEADER_ETH_BUILDER_URL, url));
+        }
+        self.post_empty_with_headers("/eth/v2/beacon/blocks", signed_block, &headers)
+            .instrument(tracing::info_span!("beacon.publish_block"))
+            .await
     }
 
     /// Publishes a signed blinded beacon block to the network.
@@ -872,17 +876,21 @@ impl BeaconClient {
     /// Publishes a block as raw SSZ bytes using `Content-Type: application/octet-stream`.
     ///
     /// Routes to the blinded or unblinded endpoint based on `is_blinded`.
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; the header is
+    /// sent only when `Some`.
     pub async fn publish_block_ssz(
         &self,
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
         let path =
             if is_blinded { "/eth/v1/beacon/blinded_blocks" } else { "/eth/v2/beacon/blocks" };
         let url = self.resolve_url(path)?;
         let cv = consensus_version.to_string();
         let body = ssz_bytes.to_vec();
+        let builder_header = builder_url.map(str::to_string);
 
         self.execute_with_retry_raw(
             "POST",
@@ -891,16 +899,18 @@ impl BeaconClient {
                 let cv = cv.clone();
                 let body = body.clone();
                 let url = url.clone();
+                let builder_header = builder_header.clone();
                 async move {
-                    Self::traced(
-                        self.client
-                            .post(&url)
-                            .header("Content-Type", "application/octet-stream")
-                            .header("Eth-Consensus-Version", &cv)
-                            .body(body),
-                    )
-                    .send()
-                    .await
+                    let mut request = self
+                        .client
+                        .post(&url)
+                        .header("Content-Type", "application/octet-stream")
+                        .header(HEADER_ETH_CONSENSUS_VERSION, &cv)
+                        .body(body);
+                    if let Some(ref builder_url) = builder_header {
+                        request = request.header(HEADER_ETH_BUILDER_URL, builder_url);
+                    }
+                    Self::traced(request).send().await
                 }
             },
             |response| async move {

@@ -2861,7 +2861,83 @@ async fn test_publish_block() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    client.publish_block(&signed_block, "deneb").await.unwrap();
+    client.publish_block(&signed_block, "deneb", None).await.unwrap();
+}
+
+fn publish_builder_url_header(request: &wiremock::Request) -> Option<&str> {
+    request.headers.get(HEADER_ETH_BUILDER_URL).and_then(|v| v.to_str().ok())
+}
+
+#[tokio::test]
+async fn test_publish_block_echoes_builder_url_from_produce_response() {
+    let mock_server = MockServer::start().await;
+    let slot = 200u64;
+    let builder = "https://builder.example.com/v1?cluster=a";
+    let signed_block = serde_json::json!({"message": {}});
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", Some(builder), None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .and(wiremock::matchers::header(HEADER_ETH_BUILDER_URL, builder))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(produced.builder_url.as_deref(), Some(builder));
+
+    client.publish_block(&signed_block, "gloas", produced.builder_url.as_deref()).await.unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish =
+        requests.iter().find(|r| r.url.path() == "/eth/v2/beacon/blocks").expect("publish request");
+    assert_eq!(publish_builder_url_header(publish), Some(builder));
+}
+
+#[tokio::test]
+async fn test_publish_block_omits_builder_url_header_when_produce_omitted_it() {
+    let mock_server = MockServer::start().await;
+    let slot = 201u64;
+    let signed_block = serde_json::json!({"message": {}});
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", None, None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(produced.builder_url, None);
+
+    client.publish_block(&signed_block, "gloas", produced.builder_url.as_deref()).await.unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish =
+        requests.iter().find(|r| r.url.path() == "/eth/v2/beacon/blocks").expect("publish request");
+    assert_eq!(
+        publish_builder_url_header(publish),
+        None,
+        "must not send {HEADER_ETH_BUILDER_URL} when produce omitted it"
+    );
 }
 
 #[tokio::test]
@@ -2879,7 +2955,7 @@ async fn test_publish_block_api_error() {
     let client = BeaconClient::new(config).unwrap();
 
     let signed_block = serde_json::json!({"message": {}});
-    let result = client.publish_block(&signed_block, "deneb").await;
+    let result = client.publish_block(&signed_block, "deneb", None).await;
 
     match result {
         Err(BeaconError::ApiError { status, message }) => {
@@ -3088,7 +3164,7 @@ async fn test_publish_block_server_error_with_retry() {
     let client = BeaconClient::new(config).unwrap();
 
     let signed_block = serde_json::json!({"message": {}});
-    client.publish_block(&signed_block, "deneb").await.unwrap();
+    client.publish_block(&signed_block, "deneb", None).await.unwrap();
 }
 
 #[tokio::test]
@@ -4708,7 +4784,7 @@ async fn test_publish_block_ssz_retries_on_503() {
     let client = BeaconClient::new(config).unwrap();
 
     let ssz_bytes = vec![0x01, 0x02, 0x03];
-    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false).await;
+    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false, None).await;
     assert!(result.is_ok());
 }
 
@@ -4729,7 +4805,7 @@ async fn test_publish_block_ssz_fails_on_400_no_retry() {
     let client = BeaconClient::new(config).unwrap();
 
     let ssz_bytes = vec![0x01, 0x02, 0x03];
-    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false).await;
+    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false, None).await;
 
     match result {
         Err(BeaconError::ApiError { status, .. }) => {
@@ -4757,7 +4833,7 @@ async fn test_publish_block_ssz_exhausts_retries() {
     let client = BeaconClient::new(config).unwrap();
 
     let ssz_bytes = vec![0x01, 0x02, 0x03];
-    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false).await;
+    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false, None).await;
 
     match result {
         Err(BeaconError::ApiError { status, .. }) => {
@@ -4765,6 +4841,84 @@ async fn test_publish_block_ssz_exhausts_retries() {
         }
         _ => panic!("Expected ApiError with status 503"),
     }
+}
+
+#[tokio::test]
+async fn test_publish_block_ssz_echoes_builder_url_from_produce_response() {
+    let mock_server = MockServer::start().await;
+    let slot = 202u64;
+    let builder = "https://relay.example/ssz";
+    let ssz_bytes = vec![0x01, 0x02, 0x03];
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", Some(builder), None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .and(wiremock::matchers::header(HEADER_ETH_BUILDER_URL, builder))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(produced.builder_url.as_deref(), Some(builder));
+
+    client
+        .publish_block_ssz(&ssz_bytes, "gloas", false, produced.builder_url.as_deref())
+        .await
+        .unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish =
+        requests.iter().find(|r| r.url.path() == "/eth/v2/beacon/blocks").expect("publish request");
+    assert_eq!(publish_builder_url_header(publish), Some(builder));
+}
+
+#[tokio::test]
+async fn test_publish_block_ssz_omits_builder_url_header_when_produce_omitted_it() {
+    let mock_server = MockServer::start().await;
+    let slot = 203u64;
+    let ssz_bytes = vec![0x01, 0x02, 0x03];
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", None, None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(produced.builder_url, None);
+
+    client
+        .publish_block_ssz(&ssz_bytes, "gloas", false, produced.builder_url.as_deref())
+        .await
+        .unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish =
+        requests.iter().find(|r| r.url.path() == "/eth/v2/beacon/blocks").expect("publish request");
+    assert_eq!(
+        publish_builder_url_header(publish),
+        None,
+        "must not send {HEADER_ETH_BUILDER_URL} when produce omitted it"
+    );
 }
 
 // --- COR-08: 429 Retry-After tests ---

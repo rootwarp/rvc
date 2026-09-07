@@ -28,10 +28,12 @@ pub trait BeaconBlockClient: Send + Sync {
         builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BlockServiceError>;
 
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError>;
 
     async fn publish_blinded_block(
@@ -41,11 +43,13 @@ pub trait BeaconBlockClient: Send + Sync {
     ) -> Result<(), BlockServiceError>;
 
     /// Publish a block as raw SSZ bytes using `Content-Type: application/octet-stream`.
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block_ssz(
         &self,
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError>;
 }
 

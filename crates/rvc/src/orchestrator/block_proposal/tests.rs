@@ -302,6 +302,7 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
             &self,
             _signed_block: &SignedBeaconBlock,
             _consensus_version: &str,
+            _builder_url: Option<&str>,
         ) -> Result<(), BlockServiceError> {
             self.publish_called.store(true, Ordering::SeqCst);
             Ok(())
@@ -321,6 +322,7 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
             _ssz_bytes: &[u8],
             _consensus_version: &str,
             _is_blinded: bool,
+            _builder_url: Option<&str>,
         ) -> Result<(), BlockServiceError> {
             self.publish_called.store(true, Ordering::SeqCst);
             Ok(())

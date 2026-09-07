@@ -75,10 +75,12 @@ pub trait BlockProducer: Send + Sync {
         builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BeaconError>;
 
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError>;
 
     async fn publish_blinded_block(
@@ -91,11 +93,13 @@ pub trait BlockProducer: Send + Sync {
     ///
     /// No default body: an unimplemented method is a compile error, not a
     /// silent runtime failure (same policy as [`LivenessApi::post_validator_liveness`]).
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block_ssz(
         &self,
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError>;
 
     async fn prepare_beacon_proposer(

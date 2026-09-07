@@ -187,6 +187,7 @@ impl BeaconBlockClient for NoopBlockBeacon {
         &self,
         _signed_block: &eth_types::SignedBeaconBlock,
         _consensus_version: &str,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         Ok(())
     }
@@ -204,6 +205,7 @@ impl BeaconBlockClient for NoopBlockBeacon {
         _ssz_bytes: &[u8],
         _consensus_version: &str,
         _is_blinded: bool,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         Ok(())
     }

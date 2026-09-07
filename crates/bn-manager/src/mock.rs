@@ -89,9 +89,9 @@ pub struct MockBeaconNodeClient {
     produce_block_v3: MethodHook<(u64, String, Option<String>, Option<u64>), ProduceBlockResponse>,
     produce_block_v4:
         MethodHook<(u64, String, Option<String>, BuilderConfig), ProduceBlockResponse>,
-    publish_block: MethodHook<(SignedBeaconBlock, String), ()>,
+    publish_block: MethodHook<(SignedBeaconBlock, String, Option<String>), ()>,
     publish_blinded_block: MethodHook<(SignedBlindedBeaconBlock, String), ()>,
-    publish_block_ssz: MethodHook<(Vec<u8>, String, bool), ()>,
+    publish_block_ssz: MethodHook<(Vec<u8>, String, bool, Option<String>), ()>,
     prepare_beacon_proposer: MethodHook<Vec<ProposerPreparation>, ()>,
     register_validators: MethodHook<Vec<SignedValidatorRegistration>, ()>,
     submit_proposer_preferences: MethodHook<Vec<SignedProposerPreferences>, ()>,
@@ -292,9 +292,14 @@ impl MockBeaconNodeClient {
 
     pub fn with_publish_block(
         self,
-        f: impl Fn(SignedBeaconBlock, String) -> Result<(), BeaconError> + Send + Sync + 'static,
+        f: impl Fn(SignedBeaconBlock, String, Option<String>) -> Result<(), BeaconError>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
-        self.publish_block.set_handler(Arc::new(move |(block, version)| f(block, version)));
+        self.publish_block.set_handler(Arc::new(move |(block, version, builder_url)| {
+            f(block, version, builder_url)
+        }));
         self
     }
 
@@ -308,10 +313,14 @@ impl MockBeaconNodeClient {
 
     pub fn with_publish_block_ssz(
         self,
-        f: impl Fn(Vec<u8>, String, bool) -> Result<(), BeaconError> + Send + Sync + 'static,
+        f: impl Fn(Vec<u8>, String, bool, Option<String>) -> Result<(), BeaconError>
+            + Send
+            + Sync
+            + 'static,
     ) -> Self {
-        self.publish_block_ssz
-            .set_handler(Arc::new(move |(bytes, version, blinded)| f(bytes, version, blinded)));
+        self.publish_block_ssz.set_handler(Arc::new(
+            move |(bytes, version, blinded, builder_url)| f(bytes, version, blinded, builder_url),
+        ));
         self
     }
 
@@ -632,9 +641,12 @@ impl BlockProducer for MockBeaconNodeClient {
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
-        self.publish_block
-            .invoke("publish_block", (signed_block.clone(), consensus_version.to_string()))
+        self.publish_block.invoke(
+            "publish_block",
+            (signed_block.clone(), consensus_version.to_string(), builder_url.map(str::to_string)),
+        )
     }
 
     async fn publish_blinded_block(
@@ -653,10 +665,16 @@ impl BlockProducer for MockBeaconNodeClient {
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
         self.publish_block_ssz.invoke(
             "publish_block_ssz",
-            (ssz_bytes.to_vec(), consensus_version.to_string(), is_blinded),
+            (
+                ssz_bytes.to_vec(),
+                consensus_version.to_string(),
+                is_blinded,
+                builder_url.map(str::to_string),
+            ),
         )
     }
 

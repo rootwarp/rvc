@@ -85,6 +85,7 @@ impl BeaconBlockClient for RecordingBlockBeacon {
         &self,
         _signed_block: &SignedBeaconBlock,
         _consensus_version: &str,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         self.published.fetch_add(1, Ordering::SeqCst);
         Ok(())
@@ -104,6 +105,7 @@ impl BeaconBlockClient for RecordingBlockBeacon {
         _ssz_bytes: &[u8],
         _consensus_version: &str,
         _is_blinded: bool,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         self.published.fetch_add(1, Ordering::SeqCst);
         Ok(())

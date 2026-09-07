@@ -398,7 +398,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         signed_ssz.extend_from_slice(block_ssz);
 
         self.beacon
-            .publish_block_ssz(&signed_ssz, &response.consensus_version, response.is_blinded)
+            .publish_block_ssz(
+                &signed_ssz,
+                &response.consensus_version,
+                response.is_blinded,
+                response.builder_url.as_deref(),
+            )
             .instrument(tracing::info_span!("beacon.publish_block"))
             .await?;
 
@@ -484,7 +489,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let signed =
             eth_types::SignedBeaconBlock { message: block, signature: sig.to_bytes().to_vec() };
         self.beacon
-            .publish_block(&signed, &response.consensus_version)
+            .publish_block(&signed, &response.consensus_version, response.builder_url.as_deref())
             .instrument(tracing::info_span!("beacon.publish_block"))
             .await?;
 

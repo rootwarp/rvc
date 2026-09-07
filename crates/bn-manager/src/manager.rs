@@ -1447,6 +1447,7 @@ impl BlockProducer for BnManager {
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
         self.submit(
             "publish_block",
@@ -1454,7 +1455,7 @@ impl BlockProducer for BnManager {
             BnRole::Submission,
             HealthTier::LargeLag,
             self.op_timeout(|t| t.block_publication),
-            |c| Box::pin(c.publish_block(signed_block, consensus_version)),
+            |c| Box::pin(c.publish_block(signed_block, consensus_version, builder_url)),
         )
         .await
     }
@@ -1480,13 +1481,19 @@ impl BlockProducer for BnManager {
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
         if self.broadcast_topics.blocks {
             self.with_op_timeout(
                 "publish_block_ssz",
                 self.op_timeout(|t| t.block_publication),
                 self.broadcast("publish_block_ssz", BnRole::Submission, |c| {
-                    Box::pin(c.publish_block_ssz(ssz_bytes, consensus_version, is_blinded))
+                    Box::pin(c.publish_block_ssz(
+                        ssz_bytes,
+                        consensus_version,
+                        is_blinded,
+                        builder_url,
+                    ))
                 }),
             )
             .await
@@ -1498,7 +1505,14 @@ impl BlockProducer for BnManager {
                     "publish_block_ssz",
                     BnRole::Submission,
                     HealthTier::LargeLag,
-                    |c| Box::pin(c.publish_block_ssz(ssz_bytes, consensus_version, is_blinded)),
+                    |c| {
+                        Box::pin(c.publish_block_ssz(
+                            ssz_bytes,
+                            consensus_version,
+                            is_blinded,
+                            builder_url,
+                        ))
+                    },
                 ),
             )
             .await
@@ -1907,6 +1921,7 @@ impl_beacon_client_passthrough! {
             &self,
             signed_block: &SignedBeaconBlock,
             consensus_version: &str,
+            builder_url: Option<&str>,
         ) -> Result<(), BeaconError>;
         async fn publish_blinded_block(
             &self,
@@ -1918,6 +1933,7 @@ impl_beacon_client_passthrough! {
             ssz_bytes: &[u8],
             consensus_version: &str,
             is_blinded: bool,
+            builder_url: Option<&str>,
         ) -> Result<(), BeaconError>;
         async fn prepare_beacon_proposer(
             &self,

@@ -583,6 +583,7 @@ impl BeaconBlockClient for MockBeaconClient {
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         self.publish_calls.lock().unwrap().push(consensus_version.to_string());
         self.publish_full_calls.lock().unwrap().push(CapturedPublishCall {
@@ -620,6 +621,7 @@ impl BeaconBlockClient for MockBeaconClient {
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         self.publish_ssz_calls.lock().unwrap().push((
             ssz_bytes.to_vec(),

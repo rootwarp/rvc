@@ -118,6 +118,7 @@ impl BeaconBlockClient for BarrierBlockBeacon {
         &self,
         signed_block: &SignedBeaconBlock,
         _consensus_version: &str,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         let _ = signed_block;
         self.entered.store(true, Ordering::SeqCst);
@@ -154,6 +155,7 @@ impl BeaconBlockClient for BarrierBlockBeacon {
         _ssz_bytes: &[u8],
         _consensus_version: &str,
         _is_blinded: bool,
+        _builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         self.entered.store(true, Ordering::SeqCst);
         if self.hold.load(Ordering::SeqCst) {

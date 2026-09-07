@@ -3121,7 +3121,7 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
         config.broadcast_topics.blocks = true;
         let manager = BnManager::new(config).unwrap();
-        assert!(manager.publish_block(&signed, "deneb").await.is_ok());
+        assert!(manager.publish_block(&signed, "deneb", None).await.is_ok());
     }
     {
         let bn1 = MockServer::start().await;
@@ -3141,7 +3141,7 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
         config.broadcast_topics.blocks = false;
         let manager = BnManager::new(config).unwrap();
-        assert!(manager.publish_block(&signed, "deneb").await.is_ok());
+        assert!(manager.publish_block(&signed, "deneb", None).await.is_ok());
     }
 
     // -- blocks (publish_blinded_block) shares the same topic flag --

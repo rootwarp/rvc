@@ -160,6 +160,7 @@ impl BeaconBlockClient for MockBlockBeacon {
         &self,
         _signed_block: &eth_types::SignedBeaconBlock,
         _consensus_version: &str,
+        _builder_url: Option<&str>,
     ) -> Result<(), block_service::BlockServiceError> {
         Ok(())
     }
@@ -177,6 +178,7 @@ impl BeaconBlockClient for MockBlockBeacon {
         _ssz_bytes: &[u8],
         _consensus_version: &str,
         _is_blinded: bool,
+        _builder_url: Option<&str>,
     ) -> Result<(), block_service::BlockServiceError> {
         Ok(())
     }
@@ -239,6 +241,7 @@ impl BeaconBlockClient for BadProposerBlockBeacon {
         &self,
         _signed_block: &eth_types::SignedBeaconBlock,
         _consensus_version: &str,
+        _builder_url: Option<&str>,
     ) -> Result<(), block_service::BlockServiceError> {
         self.publish_called.store(true, Ordering::SeqCst);
         Ok(())
@@ -258,6 +261,7 @@ impl BeaconBlockClient for BadProposerBlockBeacon {
         _ssz_bytes: &[u8],
         _consensus_version: &str,
         _is_blinded: bool,
+        _builder_url: Option<&str>,
     ) -> Result<(), block_service::BlockServiceError> {
         self.publish_called.store(true, Ordering::SeqCst);
         Ok(())
