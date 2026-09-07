@@ -758,9 +758,9 @@ mod tests {
     use super::*;
     use crate::config::TimingConfig;
     use crypto::{LocalSigner, Signer as _};
-    use eth_types::NetworkPreset;
+    use eth_types::{ForkName, NetworkPreset, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
     use tempfile::TempDir;
-    use timing::SlotClock;
+    use timing::{due_ms, SlotClock};
 
     fn create_minimal_config() -> Config {
         Config {
@@ -1222,6 +1222,50 @@ mod tests {
         assert_eq!(orch.deadline_schedule.gloas.aggregate, 6667);
         assert_eq!(timing::due_ms(orch.deadline_schedule.gloas.aggregate, 12_000), 8000);
         assert_eq!(orch.deadline_schedule.pre_gloas.aggregate, 6667);
+    }
+
+    fn gloas_at_epoch(epoch: u64) -> Arc<ForkSchedule> {
+        let mut schedule = ForkSchedule::unscheduled_gloas();
+        schedule.gloas_fork_epoch = epoch;
+        Arc::new(schedule)
+    }
+
+    /// D9 / 6.14: a TOML-only Gloas attestation bps change moves the benchmark
+    /// helper's reported deadline with no rebuild. The helper is the coordinator
+    /// path (`from_epoch` → `for_fork` → `due_ms`); this test names the config
+    /// key, the bench harness must not.
+    #[test]
+    fn test_attestation_due_bps_gloas_toml_moves_benchmark_deadline_without_rebuild() {
+        let root = [0xaau8; 32];
+        let fork_schedule = gloas_at_epoch(1);
+        let gloas_slot = SLOTS_PER_EPOCH;
+        let pre_gloas_slot = 0;
+        let slot_duration_ms = SLOT_DURATION_MS;
+
+        assert_eq!(
+            ForkName::from_epoch(gloas_slot / SLOTS_PER_EPOCH, &fork_schedule),
+            ForkName::Gloas
+        );
+        assert!(
+            ForkName::from_epoch(pre_gloas_slot / SLOTS_PER_EPOCH, &fork_schedule)
+                < ForkName::Gloas
+        );
+
+        let defaulted = ServiceBuilder::new(create_minimal_config())
+            .build_orchestrator_config(root, fork_schedule.clone());
+        let default_deadline = defaulted.attestation_deadline_ms(gloas_slot, slot_duration_ms);
+        let default_pre = defaulted.attestation_deadline_ms(pre_gloas_slot, slot_duration_ms);
+
+        let timing: TimingConfig =
+            toml::from_str("attestation_due_bps_gloas = 4000").expect("TOML-only override");
+        let mut config = create_minimal_config();
+        config.timing = timing;
+        let orch = ServiceBuilder::new(config).build_orchestrator_config(root, fork_schedule);
+        let moved = orch.attestation_deadline_ms(gloas_slot, slot_duration_ms);
+
+        assert_ne!(moved, default_deadline);
+        assert_eq!(moved, due_ms(4000, slot_duration_ms));
+        assert_eq!(orch.attestation_deadline_ms(pre_gloas_slot, slot_duration_ms), default_pre);
     }
 
     #[test]

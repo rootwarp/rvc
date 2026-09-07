@@ -127,6 +127,20 @@ impl OrchestratorConfig {
         self.deadline_schedule = schedule;
         self
     }
+
+    /// Attestation deadline offset (ms from slot start) for `slot`.
+    ///
+    /// Same path the coordinator slot loop uses: `ForkName::from_epoch` then
+    /// [`DeadlineSchedule::for_fork`] (`>= Gloas` inherits the Gloas set) then
+    /// [`due_ms`] — the `phase_deadline` offset. Callers pass the already-resolved
+    /// `slot_duration_ms` (P1 1.2/1.3 / BN spec). Issue 6.14's bench and D9 test
+    /// share this helper so a TOML-only Gloas bps change moves the reported
+    /// deadline with no rebuild.
+    pub fn attestation_deadline_ms(&self, slot: Slot, slot_duration_ms: u64) -> u64 {
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
+        due_ms(self.deadline_schedule.for_fork(fork).attestation, slot_duration_ms)
+    }
 }
 
 /// Handle for controlling the orchestrator.

@@ -86,3 +86,9 @@ criterion.workspace = true
 [[bench]]
 name = "per_slot"
 harness = false
+
+# Issue 6.14: Gloas attestation deadline via the P4 resolver (D9). Custom
+# harness prints JSON; not a criterion micro-bench and not run under nextest/CI.
+[[bench]]
+name = "deadline_rebenchmark"
+harness = false
