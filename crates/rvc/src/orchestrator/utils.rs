@@ -687,6 +687,20 @@ mod tests {
         assert_eq!(electra_full.tree_hash_root(), empty.tree_hash_root());
     }
 
+    /// Issue 6.12: Gloas is outside the half-open EIP-7549 range. The L4
+    /// `index = 1` round-trip relies on this (do not inject a test-only
+    /// parameter into the production helper).
+    #[test]
+    fn test_gloas_index_1_detects_reverted_electra_gloas_guard() {
+        assert!(
+            !zeroes_committee_index(ForkName::Gloas),
+            "production guard is half-open Electra..Gloas"
+        );
+        let bn = make_test_beacon_attestation_data("1");
+        let signed = convert_and_normalize_attestation_data(&bn, ForkName::Gloas).unwrap();
+        assert_eq!(signed.index, 1, "Gloas preserves BN payload FULL=1");
+    }
+
     #[test]
     fn test_sentinel_gloas_convert_still_zeroes_index_at_epoch_1_000_000() {
         let mut schedule = finite_electra_fulu_gloas_schedule();
