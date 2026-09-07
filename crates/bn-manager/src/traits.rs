@@ -4,12 +4,13 @@ use async_trait::async_trait;
 
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    BlockRootResponse, BuilderConfig, ConfigSpecResponse, GenesisResponse,
+    BlockRootResponse, BuilderConfig, BuilderPreferencesEntry, ConfigSpecResponse, GenesisResponse,
     PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    SubmitAttestationResult, SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse,
+    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -121,6 +122,15 @@ pub trait BlockProducer: Send + Sync {
         &self,
         preferences: &[SignedProposerPreferences],
     ) -> Result<(), BeaconError>;
+
+    /// Submit builder preferences (`POST /eth/v1/validator/builder_preferences`).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError>;
 }
 
 /// Attestation data, submission, aggregation, and committee subscriptions.

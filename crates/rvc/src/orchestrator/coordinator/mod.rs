@@ -632,6 +632,10 @@ where
             Ok(_) => {}
             Err(e) => warn!(error = %e, "Proposer preferences broadcast failed (non-fatal)"),
         }
+        match bs.broadcast_builder_preferences(current_epoch, &proposals).await {
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "Builder preferences broadcast failed (non-fatal)"),
+        }
     }
 
     /// Local signing-enabled proposer duties for the current and next epoch.

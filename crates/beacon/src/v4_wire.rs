@@ -43,6 +43,11 @@ pub const MAX_BUILDER_PUBKEYS: usize = 64;
 pub const FALLBACK_BUILDER_BOOST_FACTOR: u64 = 100;
 /// Built-in `min_bid` when neither per-validator nor global is set.
 pub const FALLBACK_MIN_BID: u64 = 0;
+/// Built-in `max_execution_payment` when none is configured (no store slot yet).
+pub const FALLBACK_MAX_EXECUTION_PAYMENT: u64 = 0;
+
+/// Path for `POST /eth/v1/validator/builder_preferences`.
+pub const BUILDER_PREFERENCES_PATH: &str = "/eth/v1/validator/builder_preferences";
 
 /// Opaque builder-request auth payload (JSON hex + slot).
 ///
@@ -94,6 +99,32 @@ impl Default for BuilderConfig {
             min_bid: FALLBACK_MIN_BID,
             builder_boost_factor: FALLBACK_BUILDER_BOOST_FACTOR,
             builders: Vec::new(),
+        }
+    }
+}
+
+/// Per-proposer, per-builder preferences submitted one epoch early.
+///
+/// Distinct from [`BuilderEntry`]: the BN routes each entry to `url` and
+/// forwards `auth` + `max_execution_payment` to that builder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BuilderPreferencesEntry {
+    pub proposer_pubkey: String,
+    pub url: String,
+    pub auth: SignedBuilderRequestAuth,
+    #[serde(with = "serde_utils::quoted_u64")]
+    pub max_execution_payment: u64,
+}
+
+impl SignedBuilderRequestAuth {
+    /// Wire form of a 6.16-signed object so V4 `BuilderEntry.auth` can reuse it.
+    pub fn from_signed(signed: &eth_types::SignedBuilderRequestAuth) -> Self {
+        Self {
+            message: BuilderRequestAuth {
+                data: format!("0x{}", hex::encode(signed.message.data())),
+                slot: signed.message.slot(),
+            },
+            signature: format!("0x{}", hex::encode(&signed.signature)),
         }
     }
 }
@@ -157,5 +188,34 @@ mod tests {
             decoded,
             serde_json::from_str(&serde_json::to_string(&decoded).unwrap()).unwrap()
         );
+    }
+
+    #[test]
+    fn builder_preferences_entry_serde_round_trip() {
+        let original = BuilderPreferencesEntry {
+            proposer_pubkey: format!("0x{}", "ab".repeat(48)),
+            url: "https://builder.example.com".to_string(),
+            auth: sample_auth(),
+            max_execution_payment: 1_000_000_000,
+        };
+        let json = serde_json::to_string(&original).expect("serialize");
+        let decoded: BuilderPreferencesEntry = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(original, decoded);
+    }
+
+    #[test]
+    fn from_signed_matches_eth_types_json() {
+        let signed = eth_types::SignedBuilderRequestAuth {
+            message: eth_types::BuilderRequestAuth::new(
+                b"https://builder.example.com".to_vec(),
+                32,
+            )
+            .expect("url bytes"),
+            signature: vec![0xcd; 96],
+        };
+        let wire = SignedBuilderRequestAuth::from_signed(&signed);
+        let eth_json = serde_json::to_vec(&signed).expect("eth json");
+        let wire_json = serde_json::to_vec(&wire).expect("wire json");
+        assert_eq!(eth_json, wire_json, "V4 auth must be byte-identical to the signed object");
     }
 }

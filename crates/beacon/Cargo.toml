@@ -33,6 +33,7 @@ rand = { workspace = true }
 ignored = ["ethereum_serde_utils"]
 
 [dev-dependencies]
+crypto = { workspace = true }
 eth-types = { workspace = true, features = ["test-fixtures"] }
 timing = { workspace = true }
 tree_hash = { workspace = true }

@@ -14,12 +14,13 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use beacon::{
     parse_slot_duration_ms, AttestationData, BeaconClient, BeaconClientConfig,
-    BeaconCommitteeSubscription, BeaconError, BuilderConfig, Checkpoint, LegacyAttestation,
-    ProposerPreparation, SingleAttestation, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof, HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_BLOCK_VALUE,
-    HEADER_ETH_CONSENSUS_VERSION, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
-    PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI, QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
-    QUERY_SKIP_RANDAO_VERIFICATION,
+    BeaconCommitteeSubscription, BeaconError, BuilderConfig, BuilderPreferencesEntry, Checkpoint,
+    LegacyAttestation, ProposerPreparation, SignedBuilderRequestAuth, SingleAttestation,
+    SubmitBuilderPreferencesResult, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof, BUILDER_PREFERENCES_PATH, HEADER_ETH_BUILDER_URL,
+    HEADER_ETH_CONSENSUS_BLOCK_VALUE, HEADER_ETH_CONSENSUS_VERSION,
+    HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI,
+    QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL, QUERY_SKIP_RANDAO_VERIFICATION,
 };
 use eth_types::{ForkName, ForkSchedule};
 use timing::{SlotClock, SystemSlotClock};
@@ -5482,4 +5483,116 @@ async fn test_submit_proposer_preferences_round_trips_signed_bytes() {
         requests[0].body, expected_body,
         "wire body must be byte-identical to the signed object JSON"
     );
+}
+
+fn signed_builder_request_auth(
+    sk: &crypto::SecretKey,
+    url: &str,
+    slot: u64,
+    genesis_fork_version: [u8; 4],
+) -> (eth_types::SignedBuilderRequestAuth, SignedBuilderRequestAuth) {
+    let message =
+        eth_types::BuilderRequestAuth::new(url.as_bytes().to_vec(), slot).expect("url bytes");
+    let root = crypto::signing_root_with_fork_version(
+        &message,
+        eth_types::DOMAIN_BUILDER_REQUEST_AUTH,
+        genesis_fork_version,
+        [0u8; 32],
+    );
+    let sig = sk.sign(&root);
+    let signed =
+        eth_types::SignedBuilderRequestAuth { message, signature: sig.to_bytes().to_vec() };
+    let wire = SignedBuilderRequestAuth::from_signed(&signed);
+    (signed, wire)
+}
+
+#[tokio::test]
+async fn test_submit_builder_preferences_sends_signed_request_auth() {
+    let mock_server = MockServer::start().await;
+    let sk = crypto::SecretKey::generate();
+    let pk = sk.public_key();
+    let genesis_fork = [0u8; 4];
+    let url = "https://builder.example.com";
+    let slot = 32u64;
+    let (_signed, wire_auth) = signed_builder_request_auth(&sk, url, slot, genesis_fork);
+    let entry = BuilderPreferencesEntry {
+        proposer_pubkey: format!("0x{}", hex::encode(pk.to_bytes())),
+        url: url.to_string(),
+        auth: wire_auth,
+        max_execution_payment: 0,
+    };
+
+    Mock::given(method("POST"))
+        .and(path(BUILDER_PREFERENCES_PATH))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(BUILDER_PREFERENCES_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_string("missing Eth-Consensus-Version"))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    client.submit_builder_preferences(std::slice::from_ref(&entry)).await.expect("submit");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let version = requests[0]
+        .headers
+        .get("Eth-Consensus-Version")
+        .expect("Eth-Consensus-Version header must be present");
+    assert_eq!(version.to_str().unwrap(), "gloas");
+
+    let posted: Vec<BuilderPreferencesEntry> =
+        serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].auth.message.slot, slot);
+    assert_eq!(posted[0], entry);
+
+    let data_hex = posted[0].auth.message.data.trim_start_matches("0x");
+    let data = hex::decode(data_hex).expect("auth data hex");
+    let message = eth_types::BuilderRequestAuth::new(data, posted[0].auth.message.slot)
+        .expect("reconstruct auth");
+    let sig_hex = posted[0].auth.signature.trim_start_matches("0x");
+    let sig = crypto::Signature::from_bytes(&hex::decode(sig_hex).expect("sig hex")).expect("sig");
+    let root = crypto::signing_root_with_fork_version(
+        &message,
+        eth_types::DOMAIN_BUILDER_REQUEST_AUTH,
+        genesis_fork,
+        [0u8; 32],
+    );
+    sig.verify(&pk, &root).expect("signature must verify under DOMAIN_BUILDER_REQUEST_AUTH");
+}
+
+#[tokio::test]
+async fn test_submit_builder_preferences_400_indexed_is_not_retried() {
+    let mock_server = MockServer::start().await;
+    let body = serde_json::json!({
+        "code": 400,
+        "message": "some failures",
+        "failures": [{ "index": 1, "message": "builder rejected" }]
+    });
+
+    Mock::given(method("POST"))
+        .and(path(BUILDER_PREFERENCES_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_json(body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client =
+        BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(3)).unwrap();
+    match client.submit_builder_preferences(&[]).await {
+        Ok(SubmitBuilderPreferencesResult::PartialFailure { failures }) => {
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].index, 1);
+            assert_eq!(failures[0].message, "builder rejected");
+        }
+        other => panic!("400 IndexedErrorMessage must surface as PartialFailure, got {other:?}"),
+    }
 }

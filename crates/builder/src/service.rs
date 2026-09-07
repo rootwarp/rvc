@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -6,11 +6,13 @@ use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 use bn_manager::{
-    BeaconError, ProposerPreparation, SignedValidatorRegistration, ValidatorRegistrationV1,
+    BeaconError, BuilderConfig, BuilderEntry, BuilderPreferencesEntry, ProposerPreparation,
+    SignedBuilderRequestAuth as WireSignedAuth, SignedValidatorRegistration,
+    ValidatorRegistrationV1, FALLBACK_MAX_EXECUTION_PAYMENT, MAX_BUILDER_ENTRIES,
 };
 use eth_types::{
-    ForkName, ForkSchedule, ProposerPreferences, Root, SignedProposerPreferences, Slot,
-    SLOTS_PER_EPOCH,
+    BuilderRequestAuth, ForkName, ForkSchedule, ProposerPreferences, Root,
+    SignedProposerPreferences, Slot, SLOTS_PER_EPOCH,
 };
 use signer::SignerError;
 use validator_store::ValidatorStore;
@@ -50,6 +52,15 @@ struct CachedRegistration {
     gas_limit: u64,
 }
 
+/// Signed per-builder auth reused at proposal time for byte-identical V4 `auth`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedBuilderPref {
+    auth: WireSignedAuth,
+    max_execution_payment: u64,
+}
+
+type BuilderPrefCacheKey = ([u8; 48], Slot, String);
+
 pub struct BuilderService {
     signer: Arc<dyn RegistrationSigner>,
     bn: Arc<dyn BuilderBeaconClient>,
@@ -58,6 +69,7 @@ pub struct BuilderService {
     fork_schedule: Arc<ForkSchedule>,
     cache: tokio::sync::RwLock<HashMap<[u8; 48], CachedRegistration>>,
     preference_cache: tokio::sync::RwLock<HashMap<([u8; 48], Slot), CachedRegistration>>,
+    builder_pref_cache: tokio::sync::RwLock<HashMap<BuilderPrefCacheKey, CachedBuilderPref>>,
     registration_batch_size: usize,
     registration_batch_delay_ms: u64,
 }
@@ -90,6 +102,7 @@ impl BuilderService {
             fork_schedule,
             cache: tokio::sync::RwLock::new(HashMap::new()),
             preference_cache: tokio::sync::RwLock::new(HashMap::new()),
+            builder_pref_cache: tokio::sync::RwLock::new(HashMap::new()),
             registration_batch_size,
             registration_batch_delay_ms,
         }
@@ -428,10 +441,233 @@ impl BuilderService {
         }
     }
 
+    /// Sign and submit one [`BuilderPreferencesEntry`] per (proposer, builder)
+    /// for each Gloas+ proposal slot on the 6.10 schedule.
+    ///
+    /// Auth is keyed by slot, not `dependent_root`. A later 6.11 rebroadcast
+    /// that only changes `dependent_root` must not re-sign; a slot move is a
+    /// cache miss and re-signs through 6.16.
+    #[tracing::instrument(
+        name = "builder.broadcast_builder_preferences",
+        skip_all,
+        fields(epoch = epoch)
+    )]
+    pub async fn broadcast_builder_preferences(
+        &self,
+        epoch: u64,
+        proposals: &[UpcomingProposal],
+    ) -> Result<(), BuilderServiceError> {
+        let gloas: Vec<&UpcomingProposal> = proposals
+            .iter()
+            .filter(|p| {
+                let slot_fork =
+                    ForkName::from_epoch(p.proposal_slot / SLOTS_PER_EPOCH, &self.fork_schedule);
+                legacy_proposer_ops_retired(slot_fork)
+            })
+            .collect();
+
+        if gloas.is_empty() {
+            debug!(epoch, "no builder preferences to broadcast");
+            return Ok(());
+        }
+
+        let candidates: Vec<(UpcomingProposal, String)> = {
+            let cache = self.builder_pref_cache.read().await;
+            let mut out = Vec::new();
+            for p in gloas {
+                for url in capped_unique_builder_urls(self.validator_store.builders(&p.pubkey)) {
+                    if cache.contains_key(&(p.pubkey, p.proposal_slot, url.clone())) {
+                        continue;
+                    }
+                    out.push((p.clone(), url));
+                }
+            }
+            out
+        };
+
+        if candidates.is_empty() {
+            debug!(epoch, "no builder preferences to broadcast");
+            return Ok(());
+        }
+
+        let mut entries = Vec::new();
+        let mut signed_keys = Vec::new();
+        for (proposal, url) in &candidates {
+            // No out-of-band override is configured; default to URL UTF-8 bytes.
+            let auth =
+                match BuilderRequestAuth::new(url.as_bytes().to_vec(), proposal.proposal_slot) {
+                    Ok(auth) => auth,
+                    Err(e) => {
+                        warn!(
+                            pubkey = hex::encode(proposal.pubkey),
+                            url = %url,
+                            error = %e,
+                            "skipping invalid builder request auth data"
+                        );
+                        continue;
+                    }
+                };
+            let pk = match crypto::PublicKey::from_bytes(&proposal.pubkey) {
+                Ok(pk) => pk,
+                Err(e) => {
+                    warn!(
+                        pubkey = hex::encode(proposal.pubkey),
+                        error = %e,
+                        "skipping invalid pubkey"
+                    );
+                    continue;
+                }
+            };
+            match self.signer.sign_builder_request_auth(&auth, &pk, self.genesis_fork_version).await
+            {
+                Ok(signature) => {
+                    let signed = eth_types::SignedBuilderRequestAuth {
+                        message: auth,
+                        signature: signature.to_bytes().to_vec(),
+                    };
+                    let wire_auth = WireSignedAuth::from_signed(&signed);
+                    entries.push(BuilderPreferencesEntry {
+                        proposer_pubkey: format!("0x{}", hex::encode(proposal.pubkey)),
+                        url: url.clone(),
+                        auth: wire_auth.clone(),
+                        max_execution_payment: FALLBACK_MAX_EXECUTION_PAYMENT,
+                    });
+                    signed_keys.push((
+                        proposal.pubkey,
+                        proposal.proposal_slot,
+                        url.clone(),
+                        CachedBuilderPref {
+                            auth: wire_auth,
+                            max_execution_payment: FALLBACK_MAX_EXECUTION_PAYMENT,
+                        },
+                    ));
+                }
+                Err(e) => {
+                    error!(
+                        pubkey = hex::encode(proposal.pubkey),
+                        url = %url,
+                        error = %e,
+                        "failed to sign builder request auth"
+                    );
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            debug!("no signed builder preferences to submit");
+            return Ok(());
+        }
+
+        let count = entries.len();
+        match self.bn.submit_builder_preferences(&entries).await {
+            Ok(result) => {
+                let failed: HashSet<u32> = result.failures().iter().map(|f| f.index).collect();
+                if !failed.is_empty() {
+                    for f in result.failures() {
+                        let url = entries
+                            .get(f.index as usize)
+                            .map(|e| e.url.as_str())
+                            .unwrap_or("<missing>");
+                        warn!(
+                            index = f.index,
+                            url,
+                            message = %f.message,
+                            "builder preference entry rejected"
+                        );
+                    }
+                }
+                let kept: Vec<_> = signed_keys
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(
+                        |(i, key)| {
+                            if failed.contains(&(i as u32)) {
+                                None
+                            } else {
+                                Some(key)
+                            }
+                        },
+                    )
+                    .collect();
+                info!(count, kept = kept.len(), epoch, "builder preferences broadcast");
+                self.write_builder_pref_cache(epoch, kept).await;
+                Ok(())
+            }
+            Err(e) => {
+                warn!(error = %e, "builder preferences broadcast failure");
+                Err(e.into())
+            }
+        }
+    }
+
+    async fn write_builder_pref_cache(
+        &self,
+        epoch: u64,
+        keys: Vec<([u8; 48], Slot, String, CachedBuilderPref)>,
+    ) {
+        let mut cache = self.builder_pref_cache.write().await;
+        for (pubkey, slot, url, cached) in keys {
+            cache.insert((pubkey, slot, url), cached);
+        }
+        cache.retain(|(_, slot, _), _| *slot / SLOTS_PER_EPOCH >= epoch);
+    }
+
+    /// Cached signed auths for a proposer/slot so 6.5 can reuse byte-identical `auth`.
+    pub async fn cached_builder_entries(&self, pubkey: &[u8; 48], slot: Slot) -> Vec<BuilderEntry> {
+        let cache = self.builder_pref_cache.read().await;
+        capped_unique_builder_urls(self.validator_store.builders(pubkey))
+            .into_iter()
+            .filter_map(|url| {
+                let cached = cache.get(&(*pubkey, slot, url.clone()))?;
+                Some(BuilderEntry {
+                    url,
+                    auth: cached.auth.clone(),
+                    builder_pubkeys: Vec::new(),
+                    max_execution_payment: cached.max_execution_payment,
+                    min_bid: self.validator_store.min_bid(pubkey),
+                    builder_boost_factor: self.validator_store.builder_boost_factor(pubkey),
+                })
+            })
+            .collect()
+    }
+
+    /// V4 body for `pubkey` at `slot` using the same signed auths as preferences submit.
+    pub async fn builder_config_for(&self, pubkey: &[u8; 48], slot: Slot) -> BuilderConfig {
+        BuilderConfig {
+            min_bid: self.validator_store.min_bid(pubkey),
+            builder_boost_factor: self.validator_store.builder_boost_factor(pubkey),
+            builders: self.cached_builder_entries(pubkey, slot).await,
+        }
+    }
+
     pub fn jitter_seconds() -> u64 {
         use rand::Rng;
         rand::thread_rng().gen_range(0..30)
     }
+}
+
+fn capped_unique_builder_urls(urls: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut dropped = 0usize;
+    for url in urls {
+        if !seen.insert(url.clone()) {
+            continue;
+        }
+        if out.len() >= MAX_BUILDER_ENTRIES {
+            dropped += 1;
+            continue;
+        }
+        out.push(url);
+    }
+    if dropped > 0 {
+        warn!(
+            dropped,
+            cap = MAX_BUILDER_ENTRIES,
+            "capping builder URL list at MAX_BUILDER_ENTRIES"
+        );
+    }
+    out
 }
 
 #[cfg(test)]
@@ -443,6 +679,8 @@ mod tests {
     use crypto::PublicKey;
     use eth_types::{ProposerPreferences, ValidatorRegistrationV1};
     use validator_store::ValidatorConfig;
+
+    use bn_manager::SubmitBuilderPreferencesResult;
 
     const PRE_GLOAS_EPOCH: u64 = 0;
     const GENESIS_FORK: [u8; 4] = [0x00, 0x00, 0x00, 0x00];
@@ -464,11 +702,13 @@ mod tests {
         register_calls: Mutex<Vec<Vec<SignedValidatorRegistration>>>,
         prepare_calls: Mutex<Vec<Vec<ProposerPreparation>>>,
         preference_calls: Mutex<Vec<Vec<SignedProposerPreferences>>>,
+        builder_pref_calls: Mutex<Vec<Vec<BuilderPreferencesEntry>>>,
         fail_register: bool,
         fail_prepare: bool,
         fail_preferences: bool,
         /// Fail only on these 0-based call indices (e.g. [1] fails the second call).
         fail_register_on_calls: Vec<usize>,
+        indexed_fail_on: Option<Vec<bn_manager::IndexedFailure>>,
     }
 
     impl MockBn {
@@ -477,10 +717,12 @@ mod tests {
                 register_calls: Mutex::new(Vec::new()),
                 prepare_calls: Mutex::new(Vec::new()),
                 preference_calls: Mutex::new(Vec::new()),
+                builder_pref_calls: Mutex::new(Vec::new()),
                 fail_register: false,
                 fail_prepare: false,
                 fail_preferences: false,
                 fail_register_on_calls: Vec::new(),
+                indexed_fail_on: None,
             }
         }
 
@@ -496,6 +738,11 @@ mod tests {
 
         fn with_register_error_on_calls(mut self, indices: Vec<usize>) -> Self {
             self.fail_register_on_calls = indices;
+            self
+        }
+
+        fn with_indexed_failures(mut self, failures: Vec<bn_manager::IndexedFailure>) -> Self {
+            self.indexed_fail_on = Some(failures);
             self
         }
     }
@@ -538,6 +785,19 @@ mod tests {
             self.preference_calls.lock().push(preferences.to_vec());
             Ok(())
         }
+
+        async fn submit_builder_preferences(
+            &self,
+            entries: &[BuilderPreferencesEntry],
+        ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+            self.builder_pref_calls.lock().push(entries.to_vec());
+            if let Some(failures) = &self.indexed_fail_on {
+                return Ok(SubmitBuilderPreferencesResult::PartialFailure {
+                    failures: failures.clone(),
+                });
+            }
+            Ok(SubmitBuilderPreferencesResult::Success)
+        }
     }
 
     // --- Narrow mock signer ---
@@ -547,6 +807,7 @@ mod tests {
         sign_calls: Mutex<Vec<[u8; 48]>>,
         /// Fixed valid BLS signature for wire-boundary assertions.
         sig: crypto::Signature,
+        auth_sk: Option<crypto::SecretKey>,
     }
 
     impl MockSigner {
@@ -555,11 +816,17 @@ mod tests {
                 fail_sign: false,
                 sign_calls: Mutex::new(Vec::new()),
                 sig: crypto::SecretKey::generate().sign(b"mock-builder-reg"),
+                auth_sk: None,
             }
         }
 
         fn with_sign_error(mut self) -> Self {
             self.fail_sign = true;
+            self
+        }
+
+        fn with_auth_key(mut self, sk: crypto::SecretKey) -> Self {
+            self.auth_sk = Some(sk);
             self
         }
 
@@ -594,6 +861,28 @@ mod tests {
                 return Err(SignerError::KeyNotFound("mock sign failure".into()));
             }
             self.sign_calls.lock().push(pubkey.to_bytes());
+            Ok(self.sig.clone())
+        }
+
+        async fn sign_builder_request_auth(
+            &self,
+            auth: &BuilderRequestAuth,
+            pubkey: &PublicKey,
+            genesis_fork_version: [u8; 4],
+        ) -> Result<crypto::Signature, SignerError> {
+            if self.fail_sign {
+                return Err(SignerError::KeyNotFound("mock sign failure".into()));
+            }
+            self.sign_calls.lock().push(pubkey.to_bytes());
+            if let Some(sk) = &self.auth_sk {
+                let root = crypto::signing_root_with_fork_version(
+                    auth,
+                    eth_types::DOMAIN_BUILDER_REQUEST_AUTH,
+                    genesis_fork_version,
+                    [0u8; 32],
+                );
+                return Ok(sk.sign(&root));
+            }
             Ok(self.sig.clone())
         }
     }
@@ -653,8 +942,8 @@ mod tests {
         )
     }
 
-    /// RED→GREEN: BuilderService compiles against a three-method BN stub +
-    /// two-method registration signer (no BeaconNodeClient / ValidatorSigner).
+    /// RED→GREEN: BuilderService compiles against a four-method BN stub +
+    /// three-method registration signer (no BeaconNodeClient / ValidatorSigner).
     #[tokio::test]
     async fn test_builder_service_compiles_against_two_method_stub() {
         let pk = gen_pubkey_bytes();
@@ -1586,5 +1875,294 @@ mod tests {
         let proposals = vec![upcoming_for(pk, epoch, 1)];
         service.broadcast_proposer_preferences(epoch, &proposals, &TEST_GVR).await.unwrap();
         assert!(bn.preference_calls.lock().is_empty());
+    }
+
+    fn store_with_builders(pk: [u8; 48], urls: &[&str]) -> ValidatorStore {
+        let store = ValidatorStore::new(test_fee_recipient(0xff), 30_000_000);
+        let mut config = ValidatorConfig::new(pk);
+        config.builder_proposals = true;
+        config.builders = Some(urls.iter().map(|u| (*u).to_string()).collect());
+        store.add_validator(config).unwrap();
+        store
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_builder_preferences_one_entry_per_proposer_builder() {
+        let sk = crypto::SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        let proposer_pk = sk.public_key();
+        let urls = ["https://a.example", "https://b.example"];
+        let store = store_with_builders(pk, &urls);
+        let bn = Arc::new(MockBn::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            Arc::new(MockSigner::new().with_auth_key(sk)),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let proposal = upcoming_for(pk, gloas_epoch, 1);
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+
+        let calls = bn.builder_pref_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 2);
+        let mut seen_urls = calls[0].iter().map(|e| e.url.as_str()).collect::<Vec<_>>();
+        seen_urls.sort();
+        assert_eq!(seen_urls, vec!["https://a.example", "https://b.example"]);
+        for entry in &calls[0] {
+            assert_eq!(entry.auth.message.slot, proposal.proposal_slot);
+            assert_eq!(entry.proposer_pubkey, format!("0x{}", hex::encode(pk)));
+            let data = hex::decode(entry.auth.message.data.trim_start_matches("0x")).unwrap();
+            let auth = BuilderRequestAuth::new(data, entry.auth.message.slot).expect("auth data");
+            let sig = crypto::Signature::from_bytes(
+                &hex::decode(entry.auth.signature.trim_start_matches("0x")).unwrap(),
+            )
+            .unwrap();
+            let root = crypto::signing_root_with_fork_version(
+                &auth,
+                eth_types::DOMAIN_BUILDER_REQUEST_AUTH,
+                GENESIS_FORK,
+                [0u8; 32],
+            );
+            sig.verify(&proposer_pk, &root).expect("6.16 domain");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_builder_preferences_skips_unchanged_set() {
+        let pk = gen_pubkey_bytes();
+        let store = store_with_builders(pk, &["https://a.example"]);
+        let bn = Arc::new(MockBn::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            Arc::new(MockSigner::new()),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let proposal = upcoming_for(pk, gloas_epoch, 1);
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        assert_eq!(bn.builder_pref_calls.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_builder_preferences_empty_builders_does_not_sign() {
+        let pk = gen_pubkey_bytes();
+        let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
+        assert!(store.builders(&pk).is_empty());
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            signer.clone(),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let proposal = upcoming_for(pk, gloas_epoch, 1);
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        assert!(bn.builder_pref_calls.lock().is_empty());
+        assert!(signer.sign_calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_builder_preferences_at_gloas_minus_one_for_gloas_slots() {
+        let pk = gen_pubkey_bytes();
+        let store = store_with_builders(pk, &["https://a.example"]);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            signer.clone(),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+
+        let pre = UpcomingProposal {
+            pubkey: pk,
+            validator_index: 1,
+            proposal_slot: (gloas_epoch - 1) * SLOTS_PER_EPOCH,
+            dependent_root: [0x11; 32],
+        };
+        service.broadcast_builder_preferences(gloas_epoch - 1, &[pre]).await.unwrap();
+        assert!(bn.builder_pref_calls.lock().is_empty());
+        assert!(signer.sign_calls.lock().is_empty());
+
+        let gloas_slot = upcoming_for(pk, gloas_epoch - 1, 1);
+        assert_eq!(gloas_slot.proposal_slot / SLOTS_PER_EPOCH, gloas_epoch);
+        service
+            .broadcast_builder_preferences(gloas_epoch - 1, std::slice::from_ref(&gloas_slot))
+            .await
+            .unwrap();
+        let calls = bn.builder_pref_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 1);
+        assert_eq!(calls[0][0].auth.message.slot, gloas_slot.proposal_slot);
+        assert_eq!(calls[0][0].url, "https://a.example");
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_builder_preferences_pre_gloas_is_noop() {
+        let pk = gen_pubkey_bytes();
+        let store = store_with_builders(pk, &["https://a.example"]);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            signer.clone(),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let pre = UpcomingProposal {
+            pubkey: pk,
+            validator_index: 1,
+            proposal_slot: (gloas_epoch - 1) * SLOTS_PER_EPOCH,
+            dependent_root: [0x11; 32],
+        };
+        service.broadcast_builder_preferences(gloas_epoch - 1, &[pre]).await.unwrap();
+        assert!(bn.builder_pref_calls.lock().is_empty());
+        assert!(signer.sign_calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_builder_preferences_400_keeps_accepted_entries() {
+        let pk = gen_pubkey_bytes();
+        let store = store_with_builders(pk, &["https://a.example", "https://b.example"]);
+        let bn = Arc::new(MockBn::new().with_indexed_failures(vec![bn_manager::IndexedFailure {
+            index: 1,
+            message: "builder rejected".into(),
+        }]));
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            Arc::new(MockSigner::new()),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let proposal = upcoming_for(pk, gloas_epoch, 1);
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        assert_eq!(bn.builder_pref_calls.lock().len(), 1);
+        assert_eq!(bn.builder_pref_calls.lock()[0].len(), 2);
+
+        let config = service.builder_config_for(&pk, proposal.proposal_slot).await;
+        assert_eq!(config.builders.len(), 1);
+        assert_eq!(config.builders[0].url, "https://a.example");
+    }
+
+    #[tokio::test]
+    async fn test_builder_config_auth_is_byte_identical_to_preferences_submit() {
+        let pk = gen_pubkey_bytes();
+        let store = store_with_builders(pk, &["https://a.example"]);
+        let bn = Arc::new(MockBn::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            Arc::new(MockSigner::new()),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let proposal = upcoming_for(pk, gloas_epoch, 1);
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        let submitted = bn.builder_pref_calls.lock()[0][0].auth.clone();
+        let config = service.builder_config_for(&pk, proposal.proposal_slot).await;
+        assert_eq!(config.builders.len(), 1);
+        let submitted_bytes = serde_json::to_vec(&submitted).unwrap();
+        let config_bytes = serde_json::to_vec(&config.builders[0].auth).unwrap();
+        assert_eq!(submitted_bytes, config_bytes);
+        assert_eq!(submitted, config.builders[0].auth);
+    }
+
+    #[tokio::test]
+    async fn test_sentinel_gloas_epoch_does_not_submit_builder_preferences() {
+        let pk = gen_pubkey_bytes();
+        let store = store_with_builders(pk, &["https://a.example"]);
+        let bn = Arc::new(MockBn::new());
+        let schedule = unscheduled();
+        let epoch = 1_000_000;
+        let service = BuilderService::new(
+            Arc::new(MockSigner::new()),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            schedule,
+        );
+        let proposals = vec![upcoming_for(pk, epoch, 1)];
+        service.broadcast_builder_preferences(epoch, &proposals).await.unwrap();
+        assert!(bn.builder_pref_calls.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_builder_preferences_dedupes_and_caps_urls() {
+        let pk = gen_pubkey_bytes();
+        let mut urls: Vec<String> = vec!["https://a.example".into(), "https://a.example".into()];
+        urls.extend((0..MAX_BUILDER_ENTRIES).map(|i| format!("https://b{i}.example")));
+        assert_eq!(urls.len(), 2 + MAX_BUILDER_ENTRIES);
+        let store = ValidatorStore::new(test_fee_recipient(0xff), 30_000_000);
+        let mut config = ValidatorConfig::new(pk);
+        config.builder_proposals = true;
+        config.builders = Some(urls);
+        store.add_validator(config).unwrap();
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            signer.clone(),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let proposal = upcoming_for(pk, gloas_epoch, 1);
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        let calls = bn.builder_pref_calls.lock();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), MAX_BUILDER_ENTRIES);
+        assert_eq!(calls[0][0].url, "https://a.example");
+        assert_eq!(signer.sign_calls.lock().len(), MAX_BUILDER_ENTRIES);
+    }
+
+    #[test]
+    fn test_capped_unique_builder_urls_dedupes() {
+        let urls = vec![
+            "https://a.example".into(),
+            "https://a.example".into(),
+            "https://b.example".into(),
+        ];
+        assert_eq!(
+            capped_unique_builder_urls(urls),
+            vec!["https://a.example".to_string(), "https://b.example".to_string()]
+        );
     }
 }

@@ -6,13 +6,13 @@ use std::time::Duration;
 use async_trait::async_trait;
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconClient, BeaconCommitteeSubscription,
-    BeaconError, BlockRootResponse, BuilderConfig, ConfigSpecResponse, GenesisResponse,
-    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
-    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse,
-    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    BeaconError, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry, ConfigSpecResponse,
+    GenesisResponse, IndexedFailure, PayloadAttestationDataResponse, ProduceBlockResponse,
+    ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof,
+    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -1251,6 +1251,31 @@ fn merge_liveness_broadcast(
     })
 }
 
+/// Union Indexed failures across BNs so a sibling reject is never cached.
+fn merge_builder_preferences_broadcast(
+    broadcast: BroadcastResult<SubmitBuilderPreferencesResult>,
+) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+    if !broadcast.any_success() {
+        return broadcast.into_result();
+    }
+    let mut by_index: HashMap<u32, String> = HashMap::new();
+    for outcome in broadcast.outcomes {
+        let Ok(SubmitBuilderPreferencesResult::PartialFailure { failures }) = outcome.result else {
+            continue;
+        };
+        for f in failures {
+            by_index.entry(f.index).or_insert(f.message);
+        }
+    }
+    if by_index.is_empty() {
+        return Ok(SubmitBuilderPreferencesResult::Success);
+    }
+    let mut failures: Vec<IndexedFailure> =
+        by_index.into_iter().map(|(index, message)| IndexedFailure { index, message }).collect();
+    failures.sort_by_key(|f| f.index);
+    Ok(SubmitBuilderPreferencesResult::PartialFailure { failures })
+}
+
 #[async_trait]
 impl NodeStatusApi for BnManager {
     // -- State / Config: query(First), any role, accept SmallLag --
@@ -1561,6 +1586,43 @@ impl BlockProducer for BnManager {
             self.broadcast("submit_proposer_preferences", BnRole::Proposal, |c| {
                 Box::pin(c.submit_proposer_preferences(preferences))
             }),
+        )
+        .await
+    }
+
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        self.with_op_timeout(
+            "submit_builder_preferences",
+            self.op_timeout(|t| t.preparation),
+            async {
+                let strategy_span = tracing::info_span!(
+                    "bn.strategy.broadcast",
+                    strategy = "broadcast",
+                    tried = tracing::field::Empty,
+                );
+                async {
+                    let broadcast = self
+                        .broadcast_inner(
+                            "submit_builder_preferences",
+                            BnRole::Proposal,
+                            &|c: &BeaconClient| Box::pin(c.submit_builder_preferences(entries)),
+                        )
+                        .await;
+                    Self::log_partial_failure("submit_builder_preferences", &broadcast);
+                    if broadcast.outcomes.is_empty() {
+                        return Err(BeaconError::NoEligibleBn {
+                            operation: "submit_builder_preferences".to_string(),
+                            role: BnRole::Proposal.to_string(),
+                        });
+                    }
+                    merge_builder_preferences_broadcast(broadcast)
+                }
+                .instrument(strategy_span)
+                .await
+            },
         )
         .await
     }
@@ -1947,6 +2009,10 @@ impl_beacon_client_passthrough! {
             &self,
             preferences: &[SignedProposerPreferences],
         ) -> Result<(), BeaconError>;
+        async fn submit_builder_preferences(
+            &self,
+            entries: &[BuilderPreferencesEntry],
+        ) -> Result<SubmitBuilderPreferencesResult, BeaconError>;
     }
     AttestationApi {
         async fn get_attestation_data(
@@ -2031,10 +2097,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 32 methods across the seven role traits (see impl_beacon_client_passthrough!).
+        // 33 methods across the seven role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            32,
+            33,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -2056,6 +2122,7 @@ mod tests {
             "produce_block_v4",
             "publish_block_ssz",
             "submit_proposer_preferences",
+            "submit_builder_preferences",
             "submit_attestation",
             "get_payload_attestation_data",
             "submit_payload_attestations",
@@ -2121,6 +2188,72 @@ mod tests {
     }
 
     // -- Construction tests --
+
+    fn pref_outcome(
+        endpoint: &str,
+        result: Result<SubmitBuilderPreferencesResult, BeaconError>,
+    ) -> BnOutcome<SubmitBuilderPreferencesResult> {
+        BnOutcome { endpoint: endpoint.to_string(), result, latency: Duration::from_millis(1) }
+    }
+
+    #[test]
+    fn test_merge_builder_preferences_unions_indexed_failures() {
+        let merged = merge_builder_preferences_broadcast(BroadcastResult {
+            outcomes: vec![
+                pref_outcome(
+                    "http://bn1",
+                    Ok(SubmitBuilderPreferencesResult::PartialFailure {
+                        failures: vec![IndexedFailure { index: 0, message: "a".into() }],
+                    }),
+                ),
+                pref_outcome(
+                    "http://bn2",
+                    Ok(SubmitBuilderPreferencesResult::PartialFailure {
+                        failures: vec![IndexedFailure { index: 1, message: "b".into() }],
+                    }),
+                ),
+            ],
+        })
+        .unwrap();
+        match merged {
+            SubmitBuilderPreferencesResult::PartialFailure { failures } => {
+                assert_eq!(failures.iter().map(|f| f.index).collect::<Vec<_>>(), vec![0, 1]);
+            }
+            other => panic!("expected unioned PartialFailure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_merge_builder_preferences_never_caches_index_any_bn_failed() {
+        let merged = merge_builder_preferences_broadcast(BroadcastResult {
+            outcomes: vec![
+                pref_outcome("http://bn1", Ok(SubmitBuilderPreferencesResult::Success)),
+                pref_outcome(
+                    "http://bn2",
+                    Ok(SubmitBuilderPreferencesResult::PartialFailure {
+                        failures: vec![IndexedFailure { index: 1, message: "reject".into() }],
+                    }),
+                ),
+            ],
+        })
+        .unwrap();
+        match merged {
+            SubmitBuilderPreferencesResult::PartialFailure { failures } => {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].index, 1);
+            }
+            other => panic!("a sibling Indexed reject must remain failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_merge_builder_preferences_all_errors_stay_err() {
+        let err = merge_builder_preferences_broadcast(BroadcastResult {
+            outcomes: vec![pref_outcome("http://bn1", Err(BeaconError::HttpError("down".into())))],
+        })
+        .unwrap_err();
+        assert!(matches!(err, BeaconError::HttpError(_)));
+    }
 
     #[test]
     fn test_new_with_single_endpoint() {

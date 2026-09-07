@@ -518,11 +518,36 @@ pub struct IndexedAttestationError {
     pub message: String,
 }
 
+/// One failed item in a beacon-APIs `IndexedErrorMessage` (400 partial submit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedFailure {
+    pub index: u32,
+    pub message: String,
+}
+
+/// beacon-APIs `IndexedErrorMessage` body on a 400 partial-failure submit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedErrorMessage {
+    pub code: u16,
+    pub message: String,
+    pub failures: Vec<IndexedFailure>,
+}
+
 /// Result of submitting attestations to the beacon node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitAttestationResult {
     Success,
     PartialFailure { failures: Vec<IndexedAttestationError> },
+}
+
+/// Result of `POST /eth/v1/validator/builder_preferences`.
+///
+/// A 400 `IndexedErrorMessage` is [`Self::PartialFailure`]: listed entries
+/// failed, the others were submitted. It is not a BN fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitBuilderPreferencesResult {
+    Success,
+    PartialFailure { failures: Vec<IndexedFailure> },
 }
 
 impl SubmitAttestationResult {
@@ -531,6 +556,19 @@ impl SubmitAttestationResult {
     }
 
     pub fn failures(&self) -> &[IndexedAttestationError] {
+        match self {
+            Self::Success => &[],
+            Self::PartialFailure { failures } => failures,
+        }
+    }
+}
+
+impl SubmitBuilderPreferencesResult {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    pub fn failures(&self) -> &[IndexedFailure] {
         match self {
             Self::Success => &[],
             Self::PartialFailure { failures } => failures,
@@ -720,6 +758,20 @@ mod tests {
         let error: IndexedAttestationError = serde_json::from_str(json).unwrap();
         assert_eq!(error.index, 0);
         assert_eq!(error.message, "Invalid signature");
+    }
+
+    #[test]
+    fn test_indexed_error_message_deserialize() {
+        let json = r#"{
+            "code": 400,
+            "message": "some failures",
+            "failures": [{"index": 1, "message": "builder rejected"}]
+        }"#;
+        let err: IndexedErrorMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(err.code, 400);
+        assert_eq!(err.failures.len(), 1);
+        assert_eq!(err.failures[0].index, 1);
+        assert_eq!(err.failures[0].message, "builder rejected");
     }
 
     #[test]

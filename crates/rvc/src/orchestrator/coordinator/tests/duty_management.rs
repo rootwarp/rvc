@@ -866,6 +866,7 @@ fn retirement_beacon_base() -> bn_manager::MockBeaconNodeClient {
         .with_prepare_beacon_proposer(|_p| Ok(()))
         .with_register_validators(|_r| Ok(()))
         .with_submit_proposer_preferences(|_p| Ok(()))
+        .with_submit_builder_preferences(|_e| Ok(beacon::SubmitBuilderPreferencesResult::Success))
         .with_submit_beacon_committee_subscriptions(|_s| Ok(()))
 }
 
@@ -937,6 +938,9 @@ async fn drive_prepare_and_register(
         let mut cfg = ValidatorConfig::new(pk_bytes);
         cfg.builder_proposals = true;
         cfg.enabled = signing_enabled;
+        if signing_enabled {
+            cfg.builders = Some(vec!["https://builder.example.com".to_string()]);
+        }
         validator_store.add_validator(cfg).unwrap();
         pubkey_map_inner.insert(pk_bytes, pk);
         key_manager.insert(sk);
@@ -1021,6 +1025,7 @@ async fn test_prepare_and_register_retired_only_at_gloas() {
         let prepare = driven.mock.prepare_beacon_proposer_calls();
         let register = driven.mock.register_validators_calls();
         let prefs = driven.mock.submit_proposer_preferences_calls();
+        let builder_prefs = driven.mock.submit_builder_preferences_calls();
         if retired {
             assert!(
                 prepare.is_empty(),
@@ -1044,6 +1049,15 @@ async fn test_prepare_and_register_retired_only_at_gloas() {
                 slots_sent.contains(&next_slot),
                 "Gloas arm must advertise Gloas+1 slot {next_slot}, got {slots_sent:?}"
             );
+            assert_eq!(builder_prefs.len(), 1, "Gloas epoch {epoch}: one builder_preferences POST");
+            assert_eq!(builder_prefs[0].len(), 2, "Gloas arm: one entry per Gloas slot × builder");
+            let builder_slots: Vec<u64> =
+                builder_prefs.iter().flatten().map(|e| e.auth.message.slot).collect();
+            assert!(builder_slots.contains(&current_slot), "got {builder_slots:?}");
+            assert!(builder_slots.contains(&next_slot), "got {builder_slots:?}");
+            for entry in builder_prefs.iter().flatten() {
+                assert_eq!(entry.url, "https://builder.example.com");
+            }
         } else {
             assert_eq!(prepare.len(), 1, "pre-Gloas prepare call count");
             assert_eq!(prepare[0].len(), 1);
@@ -1058,6 +1072,14 @@ async fn test_prepare_and_register_retired_only_at_gloas() {
             assert_eq!(prefs[0][0].message.proposal_slot, gloas_epoch * slots + 5);
             assert_eq!(prefs[0][0].message.validator_index, 42);
             assert_eq!(prefs[0][0].message.fee_recipient, [0xffu8; 20]);
+            assert_eq!(
+                builder_prefs.len(),
+                1,
+                "Gloas-1 must submit builder_preferences for Gloas slots"
+            );
+            assert_eq!(builder_prefs[0].len(), 1);
+            assert_eq!(builder_prefs[0][0].auth.message.slot, gloas_epoch * slots + 5);
+            assert_eq!(builder_prefs[0][0].url, "https://builder.example.com");
         }
 
         for signed in prefs.iter().flatten() {

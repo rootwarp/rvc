@@ -274,6 +274,53 @@ async fn test_submit_proposer_preferences_delegates() {
 }
 
 #[tokio::test]
+async fn test_submit_builder_preferences_delegates() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/builder_preferences"))
+        .and(header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let manager = make_manager(&mock_server.uri());
+    let result = manager.submit_builder_preferences(&[]).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_submit_builder_preferences_indexed_does_not_penalize_health() {
+    let mock_server = MockServer::start().await;
+    let body = serde_json::json!({
+        "code": 400,
+        "message": "some failures",
+        "failures": [{ "index": 0, "message": "builder rejected" }]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/builder_preferences"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let manager = make_manager(&mock_server.uri());
+    let result = manager.submit_builder_preferences(&[]).await.unwrap();
+    match result {
+        rvc_bn_manager::SubmitBuilderPreferencesResult::PartialFailure { failures } => {
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].index, 0);
+        }
+        other => panic!("expected PartialFailure, got {other:?}"),
+    }
+    let scores = manager.health_scores().await;
+    assert_eq!(scores[0].error_rate, 0.0, "Indexed 400 must not count as a BN fault");
+    assert!(scores[0].score > 0.5, "score should stay high after Indexed 400");
+}
+
+#[tokio::test]
 async fn test_submit_beacon_committee_subscriptions_delegates() {
     let mock_server = MockServer::start().await;
 

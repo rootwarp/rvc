@@ -19,17 +19,19 @@ use crate::retry::RetryPolicy;
 use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
     BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
-    GenesisResponse, IndexedAttestationError, NodeVersionResponse, NodeVersionV2Response,
-    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
-    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    GenesisResponse, IndexedAttestationError, IndexedErrorMessage, NodeVersionResponse,
+    NodeVersionV2Response, PayloadAttestationDataResponse, ProduceBlockResponse,
+    ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof,
+    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use crate::v4_wire::{
-    BuilderConfig, HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_BLOCK_VALUE,
-    HEADER_ETH_CONSENSUS_VERSION, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
-    PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI, QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
+    BuilderConfig, BuilderPreferencesEntry, BUILDER_PREFERENCES_PATH, HEADER_ETH_BUILDER_URL,
+    HEADER_ETH_CONSENSUS_BLOCK_VALUE, HEADER_ETH_CONSENSUS_VERSION,
+    HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, PRODUCE_BLOCK_V4_PATH_PREFIX, QUERY_GRAFFITI,
+    QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
 };
 use crate::BeaconError;
 
@@ -1139,6 +1141,62 @@ impl BeaconClient {
             &[("Eth-Consensus-Version", ForkName::Gloas.as_ref())],
         )
         .instrument(tracing::info_span!("beacon.submit_proposer_preferences"))
+        .await
+    }
+
+    /// Submits builder preferences (`POST /eth/v1/validator/builder_preferences`).
+    ///
+    /// JSON body (BN also accepts SSZ). A 400 with `IndexedErrorMessage` is
+    /// [`SubmitBuilderPreferencesResult::PartialFailure`] and is not retried —
+    /// other entries were submitted. It is not a BN fault.
+    pub async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        let url = self.resolve_url(BUILDER_PREFERENCES_PATH)?;
+        let body_bytes = serde_json::to_vec(entries).map_err(|e| {
+            BeaconError::HttpError(format!("failed to serialize request body: {e}"))
+        })?;
+        let consensus_version = ForkName::Gloas.as_ref();
+
+        self.execute_with_retry_raw(
+            "POST",
+            &url,
+            || {
+                let body_bytes = body_bytes.clone();
+                let url = url.clone();
+                async move {
+                    Self::traced(
+                        self.client
+                            .post(&url)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .header(HEADER_ETH_CONSENSUS_VERSION, consensus_version)
+                            .body(body_bytes),
+                    )
+                    .send()
+                    .await
+                }
+            },
+            |response| async move {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(SubmitBuilderPreferencesResult::Success);
+                }
+                if status.as_u16() == 400 {
+                    let body = read_body_capped_lossy(response, 16 * 1024).await;
+                    if let Ok(indexed) = serde_json::from_str::<IndexedErrorMessage>(&body) {
+                        if !indexed.failures.is_empty() {
+                            return Ok(SubmitBuilderPreferencesResult::PartialFailure {
+                                failures: indexed.failures,
+                            });
+                        }
+                    }
+                    return Err(BeaconError::ApiError { status: 400, message: body });
+                }
+                Err(Self::api_error_from_response(response).await)
+            },
+        )
+        .instrument(tracing::info_span!("beacon.submit_builder_preferences"))
         .await
     }
 

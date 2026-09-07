@@ -27,9 +27,9 @@ use beacon::{
     PayloadAttestationDataResponse, ProduceBlockResponse as BnProduceBlockResponse,
     ProposerDutiesResponse, ProposerDuty, ProposerPreparation, PtcDutiesResponse,
     SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse as BlockProdResp};
 use bn_manager::{
@@ -274,6 +274,12 @@ impl BlockProducer for DutyStallBeacon {
         preferences: &[SignedProposerPreferences],
     ) -> Result<(), BeaconError> {
         self.inner.submit_proposer_preferences(preferences).await
+    }
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[beacon::BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        self.inner.submit_builder_preferences(entries).await
     }
 }
 

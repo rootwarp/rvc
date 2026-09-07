@@ -10,12 +10,13 @@ use async_trait::async_trait;
 
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    BlockRootData, BlockRootResponse, BuilderConfig, ConfigSpecResponse, GenesisResponse,
-    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
+    BlockRootData, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry, ConfigSpecResponse,
+    GenesisResponse, PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    SubmitAttestationResult, SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse,
+    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
 use eth_types::{
     ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -95,6 +96,8 @@ pub struct MockBeaconNodeClient {
     prepare_beacon_proposer: MethodHook<Vec<ProposerPreparation>, ()>,
     register_validators: MethodHook<Vec<SignedValidatorRegistration>, ()>,
     submit_proposer_preferences: MethodHook<Vec<SignedProposerPreferences>, ()>,
+    submit_builder_preferences:
+        MethodHook<Vec<BuilderPreferencesEntry>, SubmitBuilderPreferencesResult>,
     // AttestationApi
     get_attestation_data: MethodHook<(u64, u64), AttestationDataResponse>,
     submit_attestation: MethodHook<VersionedAttestation, SubmitAttestationResult>,
@@ -348,6 +351,17 @@ impl MockBeaconNodeClient {
         self
     }
 
+    pub fn with_submit_builder_preferences(
+        self,
+        f: impl Fn(Vec<BuilderPreferencesEntry>) -> Result<SubmitBuilderPreferencesResult, BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.submit_builder_preferences.set_handler(Arc::new(f));
+        self
+    }
+
     // -- AttestationApi builders --
 
     pub fn with_get_attestation_data(
@@ -495,6 +509,10 @@ impl MockBeaconNodeClient {
 
     pub fn submit_proposer_preferences_calls(&self) -> Vec<Vec<SignedProposerPreferences>> {
         self.submit_proposer_preferences.calls()
+    }
+
+    pub fn submit_builder_preferences_calls(&self) -> Vec<Vec<BuilderPreferencesEntry>> {
+        self.submit_builder_preferences.calls()
     }
 
     pub fn get_block_root_calls(&self) -> Vec<String> {
@@ -698,6 +716,13 @@ impl BlockProducer for MockBeaconNodeClient {
     ) -> Result<(), BeaconError> {
         self.submit_proposer_preferences.invoke("submit_proposer_preferences", preferences.to_vec())
     }
+
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        self.submit_builder_preferences.invoke("submit_builder_preferences", entries.to_vec())
+    }
 }
 
 #[async_trait]
@@ -843,6 +868,13 @@ mod tests {
             }
             other => panic!("expected HttpError, got {other:?}"),
         }
+        let err = mock.submit_builder_preferences(&[]).await.unwrap_err();
+        match err {
+            BeaconError::HttpError(msg) => {
+                assert!(msg.contains("submit_builder_preferences"), "unexpected message: {msg}");
+            }
+            other => panic!("expected HttpError, got {other:?}"),
+        }
         let err = mock
             .produce_block_v4(1, "0xrandao", None, &BuilderConfig::default())
             .await
@@ -870,6 +902,23 @@ mod tests {
         }];
         mock.submit_proposer_preferences(&prefs).await.unwrap();
         assert_eq!(mock.submit_proposer_preferences_calls(), vec![prefs]);
+    }
+
+    #[tokio::test]
+    async fn test_shared_mock_submit_builder_preferences_captures() {
+        let mock = MockBeaconNodeClient::new()
+            .with_submit_builder_preferences(|_e| Ok(SubmitBuilderPreferencesResult::Success));
+        let entries = vec![BuilderPreferencesEntry {
+            proposer_pubkey: format!("0x{}", "ab".repeat(48)),
+            url: "https://builder.example.com".to_string(),
+            auth: beacon::SignedBuilderRequestAuth {
+                message: beacon::BuilderRequestAuth { data: "0x1234".to_string(), slot: 32 },
+                signature: format!("0x{}", "cd".repeat(96)),
+            },
+            max_execution_payment: 0,
+        }];
+        mock.submit_builder_preferences(&entries).await.unwrap();
+        assert_eq!(mock.submit_builder_preferences_calls(), vec![entries]);
     }
 
     #[tokio::test]

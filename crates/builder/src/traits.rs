@@ -6,10 +6,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bn_manager::{BeaconError, BeaconNodeClient, ProposerPreparation, SignedValidatorRegistration};
+use bn_manager::{
+    BeaconError, BeaconNodeClient, BuilderPreferencesEntry, ProposerPreparation,
+    SignedValidatorRegistration, SubmitBuilderPreferencesResult,
+};
 use crypto::{PublicKey, Signature};
 use eth_types::{
-    ForkSchedule, ProposerPreferences, Root, SignedProposerPreferences, ValidatorRegistrationV1,
+    BuilderRequestAuth, ForkSchedule, ProposerPreferences, Root, SignedProposerPreferences,
+    ValidatorRegistrationV1,
 };
 use signer::{SignerError, ValidatorSigner};
 
@@ -30,6 +34,11 @@ pub trait BuilderBeaconClient: Send + Sync {
         &self,
         preferences: &[SignedProposerPreferences],
     ) -> Result<(), BeaconError>;
+
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError>;
 }
 
 /// Production bridge: full BN trait object satisfies the narrow builder surface.
@@ -57,6 +66,13 @@ impl BuilderBeaconClient for Arc<dyn BeaconNodeClient> {
     ) -> Result<(), BeaconError> {
         (**self).submit_proposer_preferences(preferences).await
     }
+
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        (**self).submit_builder_preferences(entries).await
+    }
 }
 
 /// Signer methods used by [`crate::BuilderService`] for builder registrations
@@ -83,6 +99,13 @@ pub trait RegistrationSigner: Send + Sync {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError>;
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError>;
 }
 
 /// Production bridge: full signer trait object satisfies the registration surface.
@@ -107,5 +130,14 @@ impl RegistrationSigner for Arc<dyn ValidatorSigner> {
         (**self)
             .sign_proposer_preferences(prefs, pubkey, fork_schedule, genesis_validators_root)
             .await
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        (**self).sign_builder_request_auth(auth, pubkey, genesis_fork_version).await
     }
 }
