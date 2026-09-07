@@ -7,6 +7,10 @@
 //! ```compile_fail
 //! let _: rvc_gloas::Root = [0u8; 32];
 //! ```
+//!
+//! ```compile_fail
+//! let _ = rvc_gloas::KAT_GLOAS_BLOCK_SIGNING_ROOT;
+//! ```
 
 /// Pinned `ethereum/consensus-specs` release this island is generated against.
 pub const SPEC_TAG: &str = "v1.7.0-beta.0";
@@ -84,13 +88,27 @@ mod public_surface_tests {
 #[allow(unused_imports)]
 mod spec_kat;
 
+#[cfg(any(test, feature = "test-fixtures"))]
+mod kat;
+
 /// Spec-vector hex for downstream tests. Not on the default public surface.
 #[cfg(any(test, feature = "test-fixtures"))]
 pub mod test_fixtures {
+    pub use crate::kat::{
+        KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT, KAT_GLOAS_ATTESTATION_DATA_SIGNING_ROOT,
+        KAT_GLOAS_BLOCK_SIGNING_ROOT, KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT,
+    };
     pub use crate::spec_kat::minimal::{
         SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT, SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ,
+        SPEC_GLOAS_BEACON_BLOCK_ROOT, SPEC_GLOAS_BEACON_BLOCK_SSZ,
     };
 }
+
+#[cfg(feature = "test-fixtures")]
+pub use test_fixtures::{
+    KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT, KAT_GLOAS_ATTESTATION_DATA_SIGNING_ROOT,
+    KAT_GLOAS_BLOCK_SIGNING_ROOT, KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT,
+};
 
 #[cfg(test)]
 mod spec_kat_tests {

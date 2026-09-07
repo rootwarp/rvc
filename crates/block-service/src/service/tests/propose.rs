@@ -7,10 +7,15 @@ use std::sync::Arc;
 #[test]
 fn test_compute_block_root_matches_tree_hash() {
     use tree_hash::TreeHash;
-    let block = test_block(100);
-    let root = compute_block_root(&block).unwrap();
-    let expected = block.tree_hash_root();
-    assert_eq!(root, expected.0);
+    let block = eth_types::external_vector_electra_block();
+    let root = compute_block_root(&block).expect("valid Electra vector body");
+    assert_eq!(root, block.tree_hash_root().0);
+    let expected = hex::decode(eth_types::EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap();
+    assert_eq!(
+        root.as_slice(),
+        expected.as_slice(),
+        "compute_block_root must match remerkleable EXTERNAL_ELECTRA_BLOCK_ROOT_HEX"
+    );
 }
 
 #[test]
@@ -20,18 +25,6 @@ fn test_compute_blinded_block_root_matches_tree_hash() {
     let root = compute_blinded_block_root(&block).unwrap();
     let expected = block.tree_hash_root();
     assert_eq!(root, expected.0);
-}
-
-#[test]
-fn test_compute_block_root_matches_external_electra_vector() {
-    let block = eth_types::external_vector_electra_block();
-    let root = compute_block_root(&block).expect("valid external vector body");
-    let expected = hex::decode(eth_types::EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap();
-    assert_eq!(
-        root.as_slice(),
-        expected.as_slice(),
-        "compute_block_root must match remerkleable external Electra block root"
-    );
 }
 
 #[test]

@@ -144,8 +144,9 @@ async fn test_propose_block_ssz_short_bytes_returns_error() {
 #[tokio::test]
 async fn test_propose_block_ssz_block_root_uses_tree_hash() {
     let pubkey = test_pubkey();
-    let slot = 100;
-    let beacon = MockBeaconClient::ssz(slot, 42, false);
+    let fixture = eth_types::external_vector_electra_block();
+    let slot = fixture.slot;
+    let beacon = MockBeaconClient::ssz_with_version(slot, fixture.proposer_index, false, "electra");
     let ssz_bytes = beacon.produce_response.as_ref().unwrap().ssz_bytes.clone().unwrap();
     let signer = MockSigner::new();
 
@@ -162,18 +163,22 @@ async fn test_propose_block_ssz_block_root_uses_tree_hash() {
     let result = service.propose_block(slot, &pubkey, 42, None).await;
     assert!(result.is_ok());
 
-    // Deserialize the SSZ and compute tree_hash_root — SSZ path should match
-    let format = ssz_block_format(false, "deneb").unwrap();
+    let format = ssz_block_format(false, "electra").unwrap();
     let (block, _) =
         beacon::ssz_deser::deserialize_beacon_block_from_ssz(&ssz_bytes, format).unwrap();
-    let expected_root: [u8; 32] = block.tree_hash_root().0;
+    let tree_hash_root: [u8; 32] = block.tree_hash_root().0;
+    let expected = hex::decode(eth_types::EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap();
     let proposal = result.unwrap();
-    assert_eq!(proposal.block_root, expected_root);
+    assert_eq!(proposal.block_root, tree_hash_root);
+    assert_eq!(
+        proposal.block_root.as_slice(),
+        expected.as_slice(),
+        "SSZ propose path must match remerkleable EXTERNAL_ELECTRA_BLOCK_ROOT_HEX"
+    );
 
-    // Verify signer was called with the tree_hash root
     let block_calls = signer_arc.block_calls.lock().unwrap();
     assert_eq!(block_calls.len(), 1);
-    assert_eq!(block_calls[0].block_root, expected_root);
+    assert_eq!(block_calls[0].block_root, tree_hash_root);
 }
 
 #[test]

@@ -130,6 +130,71 @@ async fn test_fulu_epoch_calls_produce_block_v3() {
 }
 
 #[tokio::test]
+async fn test_fulu_slot_gloas_version_unblinded_json_drops_duty_before_hasher() {
+    let pubkey = test_pubkey();
+    let slot = test_fulu_slot();
+    let beacon =
+        Arc::new(MockBeaconClient::unblinded(test_block(slot)).with_consensus_version("gloas"));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_with_near_gloas()),
+        [0xaa; 32],
+    );
+
+    let err = service
+        .propose_block(slot, &pubkey, 42, None)
+        .await
+        .expect_err("Gloas-versioned unblinded JSON on a Fulu slot must fail closed");
+    assert!(
+        matches!(
+            err,
+            BlockServiceError::ConsensusVersionMismatch { ref expected, ref got }
+            if expected == "fulu" && got == "gloas"
+        ),
+        "expected ConsensusVersionMismatch fulu vs gloas, got {err:?}"
+    );
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+    assert!(signer.block_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_ssz_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn test_fulu_slot_gloas_version_unblinded_ssz_drops_duty_before_hasher() {
+    let pubkey = test_pubkey();
+    let slot = test_fulu_slot();
+    let beacon = Arc::new(MockBeaconClient::ssz_with_version(slot, 42, false, "gloas"));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_with_near_gloas()),
+        [0xaa; 32],
+    );
+
+    let err = service
+        .propose_block(slot, &pubkey, 42, None)
+        .await
+        .expect_err("Gloas-versioned unblinded SSZ on a Fulu slot must fail closed");
+    assert!(
+        matches!(
+            err,
+            BlockServiceError::ConsensusVersionMismatch { ref expected, ref got }
+            if expected == "fulu" && got == "gloas"
+        ),
+        "expected ConsensusVersionMismatch fulu vs gloas, got {err:?}"
+    );
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+    assert!(signer.block_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_ssz_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn test_v4_consensus_version_mismatch_drops_duty_before_signer() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
@@ -252,6 +317,18 @@ async fn test_gloas_header_uses_island_body_leaf() {
     let expected_hex = rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT;
     assert_eq!(hex::encode(expected), expected_hex);
 
+    let block = gloas_block(slot);
+    let island_root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("valid Gloas body");
+
     let signer = Arc::new(MockSigner::new());
     let service = BlockService::new(
         signer.clone(),
@@ -266,6 +343,8 @@ async fn test_gloas_header_uses_island_body_leaf() {
     let headers = signer.header_calls.lock().unwrap();
     assert_eq!(headers.len(), 1);
     assert_eq!(headers[0].header.body_root, expected);
+    assert_eq!(headers[0].header.object_root(), island_root);
+    assert_eq!(result.unwrap().block_root, island_root);
 }
 
 #[tokio::test]
@@ -286,6 +365,17 @@ async fn test_gloas_ssz_e2e_signs_with_island_body_leaf() {
         [0xaa; 32],
     );
 
+    let island_root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot,
+            proposer_index: 42,
+            parent_root: [0x11; 32],
+            state_root: [0x22; 32],
+        },
+        &body,
+    )
+    .expect("valid Gloas body");
+
     let result = service.propose_block(slot, &pubkey, 42, None).await;
     assert!(result.is_ok(), "Gloas SSZ proposal must succeed: {result:?}");
     assert_eq!(beacon.publish_ssz_calls.lock().unwrap().len(), 1);
@@ -293,6 +383,8 @@ async fn test_gloas_ssz_e2e_signs_with_island_body_leaf() {
     let headers = signer.header_calls.lock().unwrap();
     assert_eq!(headers.len(), 1);
     assert_eq!(headers[0].header.body_root, expected);
+    assert_eq!(headers[0].header.object_root(), island_root);
+    assert_eq!(result.unwrap().block_root, island_root);
 }
 
 #[tokio::test]
@@ -339,6 +431,80 @@ async fn test_v4_builders_empty_without_provider_even_if_store_has_urls() {
         beacon.produce_v4_calls.lock().unwrap()[0].builder_config.builders.is_empty(),
         "must not invent unsigned builder auth"
     );
+}
+
+#[test]
+fn test_gloas_block_signing_root() {
+    use crypto::{compute_domain, compute_signing_root, DOMAIN_BEACON_PROPOSER};
+
+    let ssz = hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_SSZ).unwrap();
+    let (block, _) = beacon::ssz_deser::deserialize_beacon_block_from_ssz(
+        &ssz,
+        beacon::ssz_deser::SszBlockFormat::BeaconBlock,
+    )
+    .expect("official BeaconBlock SSZ");
+    let (header, block_root) = gloas_header_and_root(&block).expect("valid Gloas body");
+    let island_root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("valid Gloas body");
+    assert_eq!(header.body_root, rvc_gloas::gloas_body_root(&block.body).unwrap());
+    assert_eq!(block_root, island_root);
+    assert_eq!(header.object_root(), island_root);
+
+    // pyspec argv: --fork-version 0x07000001, zero GVR (gloas_signing_kat provenance).
+    let domain = compute_domain(DOMAIN_BEACON_PROPOSER, [0x07, 0x00, 0x00, 0x01], [0u8; 32]);
+    let got = compute_signing_root(&block_root, domain);
+    assert_eq!(hex::encode(got), rvc_gloas::KAT_GLOAS_BLOCK_SIGNING_ROOT);
+}
+
+#[tokio::test]
+async fn test_gloas_invalid_body_drops_duty_without_signer_or_publish() {
+    let pubkey = test_pubkey();
+    let slot = test_gloas_slot();
+    let mut block = gloas_block(slot);
+    block.body.truncate(block.body.len() / 2);
+    let beacon = Arc::new(MockBeaconClient::unblinded(block).with_consensus_version("gloas"));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_with_near_gloas()),
+        [0xaa; 32],
+    );
+
+    let err = service
+        .propose_block(slot, &pubkey, 42, None)
+        .await
+        .expect_err("InvalidBody must drop the duty");
+    assert!(
+        matches!(err, BlockServiceError::Gloas(rvc_gloas::GloasError::InvalidBody { .. })),
+        "expected GloasError::InvalidBody, got {err:?}"
+    );
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+    assert!(signer.block_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_ssz_calls.lock().unwrap().is_empty());
+}
+
+#[test]
+fn test_gloas_header_helper_uses_island_not_electra_htr() {
+    let src = include_str!("../mod.rs");
+    let start = src.find("fn gloas_header_and_root").expect("gloas_header_and_root must exist");
+    let rest = &src[start + 1..];
+    let end = rest.find("\nfn ").expect("helper must be followed by another fn");
+    let body = &src[start..start + 1 + end];
+    assert!(body.contains("gloas_block_root"), "{body}");
+    assert!(body.contains("gloas_body_root"), "{body}");
+    assert!(!body.contains("compute_block_root"), "{body}");
+    assert!(!body.contains("body_tree_hash_root"), "{body}");
 }
 
 #[test]

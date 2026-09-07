@@ -46,6 +46,32 @@ fn test_public_surface_implemented_root_fns() {
 }
 
 #[test]
+fn test_kat_gloas_constants_are_feature_gated() {
+    let src = include_str!("../src/lib.rs");
+    let needle = "pub use test_fixtures::{";
+    let at = src.find(needle).expect("crate-root re-export of test_fixtures");
+    let prev = src[..at]
+        .trim_end()
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .expect("cfg attribute on crate-root re-export");
+    assert_eq!(
+        prev.trim(),
+        "#[cfg(feature = \"test-fixtures\")]",
+        "crate-root KAT re-export must be immediately cfg-gated, got {prev:?}"
+    );
+    assert!(
+        src[at..].contains("KAT_GLOAS_BLOCK_SIGNING_ROOT"),
+        "crate-root re-export must name KAT_GLOAS_BLOCK_SIGNING_ROOT"
+    );
+    assert!(
+        !src.contains("\npub const KAT_GLOAS"),
+        "ungated crate-root pub const KAT_GLOAS_* is forbidden"
+    );
+}
+
+#[test]
 fn test_crate_does_not_reexport_eth_types() {
     for src in [
         include_str!("../src/lib.rs"),

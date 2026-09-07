@@ -323,6 +323,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 slot,
                 &self.fork_schedule,
             )?;
+            reject_gloas_version_pre_gloas(&response.consensus_version, fork)?;
             // Pre-Gloas keeps response.consensus_version for format/publish (V3 verbatim).
             debug!(slot = slot, is_blinded = response.is_blinded, "Blinded/unblinded path chosen");
             if response.is_ssz {
@@ -723,7 +724,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     }
 }
 
-/// Gloas header leaves: body root from the island, never Electra/Deneb HTR.
+/// Gloas header leaves + proposal root from the island, never Electra/Deneb HTR.
 fn gloas_header_and_root(
     block: &eth_types::BeaconBlock,
 ) -> Result<(BeaconBlockHeaderFields, Root), BlockServiceError> {
@@ -737,7 +738,21 @@ fn gloas_header_and_root(
         body_ssz: block.body.clone(),
         is_blinded: false,
     };
-    let block_root = header.object_root();
+    let block_root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )?;
+    // libssz vs tree_hash 0.9 must not sign one root and return the other.
+    if header.object_root() != block_root {
+        return Err(BlockServiceError::Parse(
+            "Gloas island block root diverged from header object_root".to_string(),
+        ));
+    }
     Ok((header, block_root))
 }
 
@@ -843,6 +858,25 @@ fn reject_blinded_at_gloas(
     if slot_fork >= ForkName::Gloas || consensus_version == "gloas" {
         error!(slot = slot, consensus_version, "Blinded block at Gloas — dropping duty");
         return Err(BlockServiceError::BlindedNotSupportedAtGloas { slot });
+    }
+    Ok(())
+}
+
+/// Pre-Gloas slots must not Electra/Deneb-hash a Gloas-versioned body.
+fn reject_gloas_version_pre_gloas(
+    consensus_version: &str,
+    slot_fork: ForkName,
+) -> Result<(), BlockServiceError> {
+    if slot_fork >= ForkName::Gloas {
+        return Ok(());
+    }
+    if let Ok(got) = ForkName::from_str(consensus_version) {
+        if got >= ForkName::Gloas {
+            return Err(BlockServiceError::ConsensusVersionMismatch {
+                expected: slot_fork.as_ref().to_string(),
+                got: got.as_ref().to_string(),
+            });
+        }
     }
     Ok(())
 }

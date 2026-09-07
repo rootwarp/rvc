@@ -17,8 +17,8 @@
 //! without a deliberate policy exception (prefer KAT vectors or a `// kat_exempt: reason` marker
 //! next to the test instead).
 //!
-//! Cross-ref: test-audit issue **3.4** ("Rewrite tautological block root test") is expected to
-//! drop `test_compute_block_root_matches_tree_hash` / sibling self-consistency rows as it lands.
+//! Cross-ref: issue **6.8** KAT-anchored `test_compute_block_root_matches_tree_hash` and
+//! `test_propose_block_ssz_block_root_uses_tree_hash` via `EXTERNAL_ELECTRA_BLOCK_ROOT_HEX`.
 //!
 //! No external dependency (Phase-1 rule P6): hand-rolled scan, same style as `no_rvc_prefix.rs`.
 
@@ -57,14 +57,6 @@ const EXEMPTIONS: &[(&str, &str)] = &[
     (
         "crates/block-service/src/service/tests/propose.rs",
         "test_compute_blinded_block_root_matches_tree_hash",
-    ),
-    (
-        "crates/block-service/src/service/tests/propose.rs",
-        "test_compute_block_root_matches_tree_hash",
-    ),
-    (
-        "crates/block-service/src/service/tests/ssz.rs",
-        "test_propose_block_ssz_block_root_uses_tree_hash",
     ),
     ("crates/crypto/src/signing.rs", "test_attestation_data_tree_hash_root"),
     ("crates/crypto/src/signing.rs", "test_checkpoint_tree_hash_root"),
@@ -422,8 +414,8 @@ fn kat_policy_no_unanchored_root_tests() {
 #[allow(non_snake_case)]
 fn kat_policy_exemptions_count_is_at_most_N() {
     assert!(
-        EXEMPTIONS.len() <= 40,
-        "EXEMPTIONS is shrinking-only; len={} exceeds ratchet 40",
+        EXEMPTIONS.len() <= 38,
+        "EXEMPTIONS is shrinking-only; len={} exceeds ratchet 38",
         EXEMPTIONS.len()
     );
 }

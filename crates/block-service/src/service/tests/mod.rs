@@ -5,7 +5,8 @@
 
 // Re-exports for topic submodules (`use super::*`).
 pub(super) use super::{
-    compute_blinded_block_root, compute_block_root, ssz_block_format, BlockService,
+    compute_blinded_block_root, compute_block_root, gloas_header_and_root, ssz_block_format,
+    BlockService,
 };
 pub(super) use crate::traits::{
     BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse,

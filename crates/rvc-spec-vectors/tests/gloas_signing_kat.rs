@@ -206,6 +206,19 @@ fn test_gloas_signing_kat_constants_match_pyspec_artifact() {
 }
 
 #[test]
+fn test_island_kat_hex_matches_gloas_signing_kat() {
+    let island = include_str!("../../rvc-gloas/src/kat.rs");
+    for hex in [
+        KAT_GLOAS_BLOCK_SIGNING_ROOT,
+        KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT,
+        KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT,
+        KAT_GLOAS_ATTESTATION_DATA_SIGNING_ROOT,
+    ] {
+        assert!(island.contains(hex), "rvc-gloas kat.rs must copy {hex} from gloas_signing_kat");
+    }
+}
+
+#[test]
 fn test_gloas_signing_recipe_argv_fork_version_changes_constant() {
     assert_ne!(
         KAT_GLOAS_BLOCK_SIGNING_ROOT, GLOAS_SIGNING_ROOT_ARGV_FLIP_WITNESS,
