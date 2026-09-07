@@ -400,6 +400,22 @@ impl DutyTracker {
         cache.get(&epoch).map(|c| c.dependent_root.clone())
     }
 
+    /// Write proposer duties into the in-process cache.
+    ///
+    /// Returns `true` when this epoch was already cached under a different
+    /// `dependent_root` — the signal to re-broadcast preferences.
+    pub async fn cache_proposer_duties(
+        &self,
+        epoch: u64,
+        dependent_root: String,
+        duties: &[ProposerDuty],
+    ) -> bool {
+        let mut cache = self.proposer_cache.write().await;
+        let root_changed = cache.get(&epoch).is_some_and(|c| c.dependent_root != dependent_root);
+        cache.insert(epoch, ProposerEpochDutyCache::from_response(dependent_root, duties));
+        root_changed
+    }
+
     #[tracing::instrument(name = "duty_tracker.fetch_proposer_duties", level = "debug", skip_all, fields(epoch =epoch))]
     pub async fn fetch_proposer_duties(
         &self,
@@ -413,13 +429,11 @@ impl DutyTracker {
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
-        let epoch_cache =
-            ProposerEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
+        let _ = self
+            .cache_proposer_duties(epoch, response.dependent_root.clone(), &response.data)
+            .await;
 
         info!(epoch = epoch, count = response.data.len(), "Cached proposer duties for epoch");
-
-        let mut cache = self.proposer_cache.write().await;
-        cache.insert(epoch, epoch_cache);
 
         Ok(response.data)
     }
@@ -470,13 +484,8 @@ impl DutyTracker {
                 "Proposer dependent root changed, refetching duties"
             );
 
-            let epoch_cache = ProposerEpochDutyCache::from_response(
-                response.dependent_root.clone(),
-                &response.data,
-            );
-
-            let mut cache = self.proposer_cache.write().await;
-            cache.insert(epoch, epoch_cache);
+            let _ =
+                self.cache_proposer_duties(epoch, response.dependent_root, &response.data).await;
             return Ok(true);
         }
 
@@ -1264,6 +1273,25 @@ mod tests {
 
         let changed = tracker.check_and_refetch_proposer_if_root_changed(10).await.unwrap();
         assert!(!changed);
+    }
+
+    #[tokio::test]
+    async fn test_cache_proposer_duties_signals_root_change_without_bn() {
+        let tracker = DutyTracker::new(empty_beacon(), vec!["1234".to_string()]);
+        let duties = vec![proposer_duty(320, "1234", "0xpubkey_1234")];
+
+        assert!(!tracker.cache_proposer_duties(10, "0xroot_a".into(), &duties).await);
+        assert_eq!(
+            tracker.get_cached_proposer_dependent_root(10).await.as_deref(),
+            Some("0xroot_a")
+        );
+        assert!(!tracker.cache_proposer_duties(10, "0xroot_a".into(), &duties).await);
+        assert!(tracker.cache_proposer_duties(10, "0xroot_b".into(), &duties).await);
+        assert_eq!(
+            tracker.get_cached_proposer_dependent_root(10).await.as_deref(),
+            Some("0xroot_b")
+        );
+        assert_eq!(tracker.get_proposer_duty(320).await.unwrap().validator_index, "1234");
     }
 
     // --- PTC duty tests ---

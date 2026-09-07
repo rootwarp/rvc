@@ -52,13 +52,27 @@ struct CachedRegistration {
     gas_limit: u64,
 }
 
+/// Last broadcast proposer preferences for a `(pubkey, slot)`.
+///
+/// Keyed without `dependent_root` so A→B→A misses on the stored root
+/// instead of hitting a historical key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedPreference {
+    fee_recipient: [u8; 20],
+    gas_limit: u64,
+    dependent_root: Root,
+}
+
 /// Signed per-builder auth reused at proposal time for byte-identical V4 `auth`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedBuilderPref {
     auth: WireSignedAuth,
     max_execution_payment: u64,
+    /// A reorg must re-submit even when slot and URL are unchanged.
+    dependent_root: Root,
 }
 
+type PreferenceCacheKey = ([u8; 48], Slot);
 type BuilderPrefCacheKey = ([u8; 48], Slot, String);
 
 pub struct BuilderService {
@@ -68,7 +82,7 @@ pub struct BuilderService {
     genesis_fork_version: [u8; 4],
     fork_schedule: Arc<ForkSchedule>,
     cache: tokio::sync::RwLock<HashMap<[u8; 48], CachedRegistration>>,
-    preference_cache: tokio::sync::RwLock<HashMap<([u8; 48], Slot), CachedRegistration>>,
+    preference_cache: tokio::sync::RwLock<HashMap<PreferenceCacheKey, CachedPreference>>,
     builder_pref_cache: tokio::sync::RwLock<HashMap<BuilderPrefCacheKey, CachedBuilderPref>>,
     registration_batch_size: usize,
     registration_batch_delay_ms: u64,
@@ -352,7 +366,11 @@ impl BuilderService {
                 .filter(|p| {
                     let fee_recipient = self.validator_store.effective_fee_recipient(&p.pubkey);
                     let gas_limit = self.validator_store.effective_gas_limit(&p.pubkey);
-                    let cached = CachedRegistration { fee_recipient, gas_limit };
+                    let cached = CachedPreference {
+                        fee_recipient,
+                        gas_limit,
+                        dependent_root: p.dependent_root,
+                    };
                     cache.get(&(p.pubkey, p.proposal_slot)) != Some(&cached)
                 })
                 .cloned()
@@ -405,7 +423,11 @@ impl BuilderService {
                     signed_keys.push((
                         proposal.pubkey,
                         proposal.proposal_slot,
-                        CachedRegistration { fee_recipient, gas_limit },
+                        CachedPreference {
+                            fee_recipient,
+                            gas_limit,
+                            dependent_root: proposal.dependent_root,
+                        },
                     ));
                 }
                 Err(e) => {
@@ -444,9 +466,10 @@ impl BuilderService {
     /// Sign and submit one [`BuilderPreferencesEntry`] per (proposer, builder)
     /// for each Gloas+ proposal slot on the 6.10 schedule.
     ///
-    /// Auth is keyed by slot, not `dependent_root`. A later 6.11 rebroadcast
-    /// that only changes `dependent_root` must not re-sign; a slot move is a
-    /// cache miss and re-signs through 6.16.
+    /// Lookup is `(pubkey, slot, url)` so proposal-time `auth` reuse is unchanged.
+    /// A `dependent_root`-only change re-submits the cached auth without
+    /// re-signing: `BuilderRequestAuth` is `{data, slot}` and does not include
+    /// the root. A slot or URL change is a cache miss and re-signs.
     #[tracing::instrument(
         name = "builder.broadcast_builder_preferences",
         skip_all,
@@ -471,28 +494,39 @@ impl BuilderService {
             return Ok(());
         }
 
-        let candidates: Vec<(UpcomingProposal, String)> = {
-            let cache = self.builder_pref_cache.read().await;
-            let mut out = Vec::new();
-            for p in gloas {
-                for url in capped_unique_builder_urls(self.validator_store.builders(&p.pubkey)) {
-                    if cache.contains_key(&(p.pubkey, p.proposal_slot, url.clone())) {
-                        continue;
-                    }
-                    out.push((p.clone(), url));
-                }
-            }
-            out
-        };
-
-        if candidates.is_empty() {
-            debug!(epoch, "no builder preferences to broadcast");
-            return Ok(());
-        }
-
         let mut entries = Vec::new();
         let mut signed_keys = Vec::new();
-        for (proposal, url) in &candidates {
+        let mut to_sign = Vec::new();
+        {
+            let cache = self.builder_pref_cache.read().await;
+            for p in gloas {
+                for url in capped_unique_builder_urls(self.validator_store.builders(&p.pubkey)) {
+                    match cache.get(&(p.pubkey, p.proposal_slot, url.clone())) {
+                        Some(cached) if cached.dependent_root == p.dependent_root => {}
+                        Some(cached) => {
+                            entries.push(BuilderPreferencesEntry {
+                                proposer_pubkey: format!("0x{}", hex::encode(p.pubkey)),
+                                url: url.clone(),
+                                auth: cached.auth.clone(),
+                                max_execution_payment: cached.max_execution_payment,
+                            });
+                            signed_keys.push((
+                                p.pubkey,
+                                p.proposal_slot,
+                                url,
+                                CachedBuilderPref {
+                                    dependent_root: p.dependent_root,
+                                    ..cached.clone()
+                                },
+                            ));
+                        }
+                        None => to_sign.push((p.clone(), url)),
+                    }
+                }
+            }
+        }
+
+        for (proposal, url) in &to_sign {
             // No out-of-band override is configured; default to URL UTF-8 bytes.
             let auth =
                 match BuilderRequestAuth::new(url.as_bytes().to_vec(), proposal.proposal_slot) {
@@ -539,6 +573,7 @@ impl BuilderService {
                         CachedBuilderPref {
                             auth: wire_auth,
                             max_execution_payment: FALLBACK_MAX_EXECUTION_PAYMENT,
+                            dependent_root: proposal.dependent_root,
                         },
                     ));
                 }
@@ -1742,6 +1777,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_broadcast_rebroadcasts_on_dependent_root_change_only() {
+        let pk = gen_pubkey_bytes();
+        let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
+        let bn = Arc::new(MockBn::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            Arc::new(MockSigner::new()),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+
+        let root_a = [0x33; 32];
+        let root_b = [0x44; 32];
+        let slot_a = upcoming_for(pk, gloas_epoch, 1);
+        let slot_b = UpcomingProposal {
+            pubkey: pk,
+            validator_index: 1,
+            proposal_slot: slot_a.proposal_slot + 3,
+            dependent_root: root_a,
+        };
+        let with_root = |root: Root| {
+            vec![
+                UpcomingProposal { dependent_root: root, ..slot_a.clone() },
+                UpcomingProposal { dependent_root: root, ..slot_b.clone() },
+            ]
+        };
+
+        service
+            .broadcast_proposer_preferences(gloas_epoch, &with_root(root_a), &TEST_GVR)
+            .await
+            .unwrap();
+        assert_eq!(bn.preference_calls.lock().len(), 1);
+        assert_eq!(bn.preference_calls.lock()[0].len(), 2);
+
+        service
+            .broadcast_proposer_preferences(gloas_epoch, &with_root(root_a), &TEST_GVR)
+            .await
+            .unwrap();
+        assert_eq!(bn.preference_calls.lock().len(), 1);
+
+        service
+            .broadcast_proposer_preferences(gloas_epoch, &with_root(root_b), &TEST_GVR)
+            .await
+            .unwrap();
+        {
+            let calls = bn.preference_calls.lock();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1].len(), 2);
+            let slots: Vec<u64> = calls[1].iter().map(|p| p.message.proposal_slot).collect();
+            assert!(slots.contains(&slot_a.proposal_slot));
+            assert!(slots.contains(&slot_b.proposal_slot));
+            for signed in &calls[1] {
+                assert_eq!(signed.message.dependent_root, root_b);
+            }
+        }
+
+        service
+            .broadcast_proposer_preferences(gloas_epoch, &with_root(root_b), &TEST_GVR)
+            .await
+            .unwrap();
+        assert_eq!(bn.preference_calls.lock().len(), 2);
+
+        service
+            .broadcast_proposer_preferences(gloas_epoch, &with_root(root_a), &TEST_GVR)
+            .await
+            .unwrap();
+        {
+            let calls = bn.preference_calls.lock();
+            assert_eq!(calls.len(), 3);
+            assert_eq!(calls[2].len(), 2);
+            for signed in &calls[2] {
+                assert_eq!(signed.message.dependent_root, root_a);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_broadcast_at_gloas_minus_one_for_gloas_slots() {
         let pk = gen_pubkey_bytes();
         let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
@@ -1845,9 +1959,17 @@ mod tests {
             proposal_slot: (gloas_epoch + 2) * SLOTS_PER_EPOCH,
             dependent_root: [0x55; 32],
         };
-        service.broadcast_proposer_preferences(gloas_epoch + 2, &[later], &TEST_GVR).await.unwrap();
+        service
+            .broadcast_proposer_preferences(
+                gloas_epoch + 2,
+                std::slice::from_ref(&later),
+                &TEST_GVR,
+            )
+            .await
+            .unwrap();
         let cache = service.preference_cache.read().await;
         assert!(!cache.contains_key(&(pk, old.proposal_slot)));
+        assert!(cache.contains_key(&(pk, later.proposal_slot)));
         assert_eq!(cache.len(), 1);
     }
 
@@ -1956,6 +2078,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bn.builder_pref_calls.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_broadcast_builder_preferences_resubmits_on_dependent_root_change() {
+        let pk = gen_pubkey_bytes();
+        let store = store_with_builders(pk, &["https://a.example"]);
+        let bn = Arc::new(MockBn::new());
+        let signer = Arc::new(MockSigner::new());
+        let gloas_epoch = 10;
+        let service = BuilderService::new(
+            signer.clone(),
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let mut proposal = upcoming_for(pk, gloas_epoch, 1);
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        assert_eq!(bn.builder_pref_calls.lock().len(), 1);
+        let first_auth = bn.builder_pref_calls.lock()[0][0].auth.clone();
+        let signs_after_first = signer.sign_calls.lock().len();
+        assert!(signs_after_first >= 1);
+
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        assert_eq!(bn.builder_pref_calls.lock().len(), 1);
+        assert_eq!(signer.sign_calls.lock().len(), signs_after_first);
+
+        proposal.dependent_root = [0x44; 32];
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        {
+            let calls = bn.builder_pref_calls.lock();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[1].len(), 1);
+            assert_eq!(calls[1][0].auth.message.slot, proposal.proposal_slot);
+            assert_eq!(calls[1][0].auth, first_auth);
+        }
+        assert_eq!(signer.sign_calls.lock().len(), signs_after_first);
+
+        service
+            .broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal))
+            .await
+            .unwrap();
+        assert_eq!(bn.builder_pref_calls.lock().len(), 2);
+        assert_eq!(signer.sign_calls.lock().len(), signs_after_first);
     }
 
     #[tokio::test]

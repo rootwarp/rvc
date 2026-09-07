@@ -251,8 +251,10 @@ impl DutyManagementService {
         }
     }
 
+    /// Returns `true` when a previously cached proposer `dependent_root` changed.
     #[tracing::instrument(name = "orchestrator.check_reorg", level = "debug", skip_all, fields(epoch = current_epoch))]
-    pub(crate) async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) {
+    pub(crate) async fn check_reorg_at_epoch_boundary(&self, current_epoch: u64) -> bool {
+        let mut proposer_root_changed = false;
         for epoch in [current_epoch, current_epoch + 1] {
             let attester_cached = self.duty_tracker.is_epoch_cached(epoch).await;
             let old_attester_root = self.duty_tracker.get_cached_dependent_root(epoch).await;
@@ -309,6 +311,7 @@ impl DutyManagementService {
                         "Reorg detected: proposer duties refetched"
                     );
                     RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["proposer"]).inc();
+                    proposer_root_changed = true;
                 }
                 TimedOutcome::Ok(true) => {
                     debug!(epoch, "Proposer duties fetched (was uncached)");
@@ -361,6 +364,7 @@ impl DutyManagementService {
                 }
             }
         }
+        proposer_root_changed
     }
 
     #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all, fields(epoch = epoch))]
@@ -519,12 +523,13 @@ impl DutyManagementService {
     /// phase dispatcher. Circuit-breaker reset stays in the coordinator (it
     /// owns that state).
     #[tracing::instrument(name = "orchestrator.on_epoch_boundary", level = "debug", skip_all, fields(epoch = current_epoch))]
-    pub(crate) async fn on_epoch_boundary(&self, current_epoch: u64, current_slot: Slot) {
-        self.check_reorg_at_epoch_boundary(current_epoch).await;
+    pub(crate) async fn on_epoch_boundary(&self, current_epoch: u64, current_slot: Slot) -> bool {
+        let proposer_root_changed = self.check_reorg_at_epoch_boundary(current_epoch).await;
         self.prepare_proposers(current_epoch).await;
         self.submit_committee_subscriptions(current_epoch).await;
         self.submit_committee_subscriptions(current_epoch + 1).await;
         self.log_epoch_boundary_summary(current_epoch, current_slot).await;
+        proposer_root_changed
     }
 
     /// Count attester/proposer/sync duties for the epoch and emit the

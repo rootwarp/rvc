@@ -1132,3 +1132,96 @@ fn test_retirement_gate_reads_only_fork_name_from_epoch() {
     )));
     assert!(::builder::legacy_proposer_ops_retired(ForkName::from_epoch(gloas_epoch, &schedule)));
 }
+
+#[tokio::test]
+async fn test_proposer_root_change_rebroadcasts_preferences() {
+    use signer::ValidatorSigner;
+    use validator_store::ValidatorConfig;
+
+    const ROOT_A: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const ROOT_B: &str = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    let gloas_epoch = 100u64;
+    let schedule = near_gloas_schedule(gloas_epoch);
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let local_hex = pubkey_hex(&local_pk);
+    let mock = Arc::new(retirement_beacon());
+    let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+    let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), slot));
+    clock.set_slot(slot);
+
+    let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+    let mut cfg = ValidatorConfig::new(local_pk);
+    cfg.builder_proposals = true;
+    cfg.builders = Some(vec!["https://builder.example.com".to_string()]);
+    validator_store.add_validator(cfg).unwrap();
+
+    let mut key_manager = KeyManager::new();
+    let mut pubkey_map_inner = HashMap::new();
+    pubkey_map_inner.insert(local_pk, local.public_key());
+    key_manager.insert(local);
+
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let vs: Arc<dyn ValidatorSigner> = signer.clone();
+    let builder_service = Some(Arc::new(BuilderService::new(
+        Arc::new(vs),
+        Arc::new(beacon.clone()),
+        validator_store.clone(),
+        schedule.genesis_fork_version,
+        schedule.clone(),
+    )));
+    let duty_tracker = Arc::new(
+        DutyTracker::new(beacon.clone(), vec!["42".to_string()])
+            .with_fork_schedule((*schedule).clone()),
+    );
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+    let submitter = Arc::new(MockSubmitter::new());
+    let propagator = Arc::new(Propagator::new(submitter));
+    let config = OrchestratorConfig::new([0xaau8; 32], schedule);
+    let deps = OrchestratorDeps::for_test(
+        clock,
+        duty_tracker.clone(),
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        builder_service,
+        validator_store,
+        config,
+        pubkey_map,
+    );
+    deps.pubkey_index.write().insert(local_pk, "42".to_string());
+    let (orchestrator, _handle) = DutyOrchestrator::new(deps);
+
+    let proposal_slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH + 5;
+    let duties = vec![proposer_duty(&local_hex, "42", proposal_slot)];
+
+    assert!(!duty_tracker.cache_proposer_duties(gloas_epoch, ROOT_A.into(), &duties).await);
+    orchestrator.run_builder_epoch_boundary(gloas_epoch).await;
+    {
+        let calls = mock.submit_proposer_preferences_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].len(), 1);
+        assert_eq!(
+            calls[0][0].message.dependent_root,
+            eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_A).unwrap()
+        );
+    }
+
+    assert!(duty_tracker.cache_proposer_duties(gloas_epoch, ROOT_B.into(), &duties).await);
+    orchestrator.on_proposer_dependent_root_changed(gloas_epoch).await;
+    {
+        let calls = mock.submit_proposer_preferences_calls();
+        assert_eq!(calls.len(), 2, "root change must invoke one more preferences POST");
+        assert_eq!(calls[1].len(), 1);
+        assert_eq!(
+            calls[1][0].message.dependent_root,
+            eth_types::canonical::gvr_hex::parse_gvr_hex(ROOT_B).unwrap()
+        );
+    }
+}

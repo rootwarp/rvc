@@ -569,10 +569,14 @@ where
 
                     let epoch_span =
                         info_span!(parent: &slot_span, "epoch.boundary", epoch = current_epoch);
-                    self.duty_management
+                    let proposer_root_changed = self
+                        .duty_management
                         .on_epoch_boundary(current_epoch, current_slot)
                         .instrument(epoch_span)
                         .await;
+                    if proposer_root_changed {
+                        self.on_proposer_dependent_root_changed(current_epoch).await;
+                    }
 
                     if self.builder_service.is_some() {
                         let jitter = Duration::from_secs(BuilderService::jitter_seconds());
@@ -625,6 +629,20 @@ where
                 Err(e) => warn!(error = %e, "Builder registration failed (non-fatal)"),
             }
         }
+        self.broadcast_preferences(current_epoch).await;
+    }
+
+    /// Re-broadcast preferences after a proposer `dependent_root` change.
+    ///
+    /// Call when [`DutyTracker::cache_proposer_duties`] returns `true`.
+    pub(crate) async fn on_proposer_dependent_root_changed(&self, current_epoch: u64) {
+        self.broadcast_preferences(current_epoch).await;
+    }
+
+    async fn broadcast_preferences(&self, current_epoch: u64) {
+        let Some(bs) = &self.builder_service else {
+            return;
+        };
         let proposals = self.upcoming_proposals(current_epoch).await;
         match bs
             .broadcast_proposer_preferences(
