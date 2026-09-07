@@ -360,6 +360,17 @@ impl ValidatorSigner for MockSigner {
             Ok(mock_envelope_sig())
         }
     }
+
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        _object_root: &Root,
+        _slot: Slot,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<crypto::Signature, SignerError> {
+        Ok(mock_sig(b"aggregate-and-proof-root"))
+    }
 }
 
 pub(crate) fn mock_envelope_sig() -> crypto::Signature {

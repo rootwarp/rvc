@@ -698,6 +698,20 @@ mod tests {
             );
             self.sign_root(&root, &ctx.pubkey.to_bytes())
         }
+        async fn sign_aggregate_and_proof_root(
+            &self,
+            object_root: &EthRoot,
+            _slot: Slot,
+            ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            let root = signing_root_with_fork_version(
+                object_root,
+                DOMAIN_AGGREGATE_AND_PROOF,
+                ctx.fork_info.current_version,
+                ctx.fork_info.genesis_validators_root,
+            );
+            self.sign_root(&root, &ctx.pubkey.to_bytes())
+        }
     }
 
     fn test_fork_info() -> ForkInfo {

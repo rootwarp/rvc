@@ -400,6 +400,11 @@ fn ssz08_bitlist<N: ssz_types::typenum::Unsigned + Clone>(
     BitList::<N>::from_ssz_bytes(bytes)
 }
 
+/// Same `Bitlist[MAX_VALIDATORS_PER_SLOT]` decode `ElectraAttestation` Encode uses.
+pub fn try_electra_aggregation_bits(bytes: &[u8]) -> Result<(), DecodeError> {
+    ssz08_bitlist::<MaxValidatorsPerSlot>(bytes).map(|_| ())
+}
+
 fn ssz08_sig96(bytes: &[u8]) -> Result<[u8; 96], DecodeError> {
     <[u8; 96]>::from_ssz_bytes(bytes)
 }

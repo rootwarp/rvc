@@ -774,16 +774,6 @@ async fn test_gloas_verdict_matrix_supported_duties_sign() {
         ),
         ("header", TypedSigner::sign_block_header(&signer, &header(), &ctx).await.unwrap()),
         (
-            "aggregate",
-            TypedSigner::sign_aggregate_and_proof(&signer, &aggregate(), &ctx).await.unwrap(),
-        ),
-        (
-            "electra_aggregate",
-            TypedSigner::sign_electra_aggregate_and_proof(&signer, &electra_aggregate(), &ctx)
-                .await
-                .unwrap(),
-        ),
-        (
             "contribution",
             TypedSigner::sign_contribution_and_proof(&signer, &contribution(), &ctx).await.unwrap(),
         ),
@@ -796,6 +786,12 @@ async fn test_gloas_verdict_matrix_supported_duties_sign() {
         (
             "envelope",
             TypedSigner::sign_execution_payload_envelope_root(&signer, &[0x11; 32], 1, &ctx)
+                .await
+                .unwrap(),
+        ),
+        (
+            "aggregate_root",
+            TypedSigner::sign_aggregate_and_proof_root(&signer, &[0x22; 32], 1, &ctx)
                 .await
                 .unwrap(),
         ),
@@ -828,6 +824,24 @@ async fn test_gloas_verdict_matrix_supported_duties_sign() {
             assert!(msg.contains("sign_block_header"), "{msg}");
         }
         other => panic!("Gloas sign_block must refuse Electra body hash, got {other:?}"),
+    }
+    for (name, result) in [
+        ("aggregate", TypedSigner::sign_aggregate_and_proof(&signer, &aggregate(), &ctx).await),
+        (
+            "electra_aggregate",
+            TypedSigner::sign_electra_aggregate_and_proof(&signer, &electra_aggregate(), &ctx)
+                .await,
+        ),
+    ] {
+        match result {
+            Err(crypto::SigningError::LocalRejected(msg)) => {
+                assert!(
+                    msg.contains("sign_aggregate_and_proof_root"),
+                    "{name} must point at the root method: {msg}"
+                );
+            }
+            other => panic!("{name} must refuse container hash at Gloas, got {other:?}"),
+        }
     }
 }
 
@@ -914,7 +928,13 @@ async fn test_gloas_block_aggregate_contribution_use_new_rpcs_only() {
     let signer = connect(addr).await;
     let ctx = gloas_ctx(pk);
     TypedSigner::sign_block_header(&signer, &header(), &ctx).await.unwrap();
-    TypedSigner::sign_aggregate_and_proof(&signer, &aggregate(), &ctx).await.unwrap();
+    match TypedSigner::sign_aggregate_and_proof(&signer, &aggregate(), &ctx).await {
+        Err(crypto::SigningError::LocalRejected(msg)) => {
+            assert!(msg.contains("sign_aggregate_and_proof_root"), "{msg}");
+        }
+        other => panic!("Gloas container aggregate must be refused, got {other:?}"),
+    }
+    TypedSigner::sign_aggregate_and_proof_root(&signer, &[0x22; 32], 1, &ctx).await.unwrap();
     TypedSigner::sign_contribution_and_proof(&signer, &contribution(), &ctx).await.unwrap();
     let names = RecordingV2::names(&calls);
     assert_eq!(
@@ -934,21 +954,19 @@ async fn test_gloas_electra_aggregate_keeps_committee_bits() {
     let signer = connect(addr).await;
     let ctx = gloas_ctx(pk);
     let electra = electra_aggregate();
-    TypedSigner::sign_electra_aggregate_and_proof(&signer, &electra, &ctx).await.unwrap();
+    match TypedSigner::sign_electra_aggregate_and_proof(&signer, &electra, &ctx).await {
+        Err(crypto::SigningError::LocalRejected(msg)) => {
+            assert!(msg.contains("sign_aggregate_and_proof_root"), "{msg}");
+        }
+        other => panic!("Gloas Electra container must be refused, got {other:?}"),
+    }
+    let island_root = [0x22u8; 32];
+    TypedSigner::sign_aggregate_and_proof_root(&signer, &island_root, 1, &ctx).await.unwrap();
     let bytes = RecordingV2::bytes(&calls, "sign_root");
     let req = SignRootRequest::decode(bytes.as_slice()).unwrap();
     assert_eq!(req.fork_id, 7);
-    assert_eq!(req.object_root, electra.tree_hash_root().0.to_vec());
-    let stripped = AggregateAndProof {
-        aggregator_index: electra.aggregator_index,
-        aggregate: Attestation {
-            aggregation_bits: electra.aggregate.aggregation_bits.clone(),
-            data: electra.aggregate.data.clone(),
-            signature: electra.aggregate.signature.clone(),
-        },
-        selection_proof: electra.selection_proof.clone(),
-    };
-    assert_ne!(req.object_root, stripped.tree_hash_root().0.to_vec());
+    assert_eq!(req.object_root, island_root.to_vec());
+    assert_ne!(req.object_root, electra.tree_hash_root().0.to_vec());
 }
 
 #[tokio::test]
@@ -991,19 +1009,19 @@ async fn test_new_client_old_server_gloas_is_typed_no_retry() {
     let err =
         TypedSigner::sign_aggregate_and_proof(&signer, &aggregate(), &gloas).await.unwrap_err();
     match err {
-        crypto::SigningError::SignerLacksGloasSupport { rpc, .. } => {
-            assert_eq!(rpc, "SignRoot");
+        crypto::SigningError::LocalRejected(msg) => {
+            assert!(msg.contains("sign_aggregate_and_proof_root"), "{msg}");
         }
-        other => panic!("expected SignerLacksGloasSupport for aggregate, got {other:?}"),
+        other => panic!("expected LocalRejected for aggregate, got {other:?}"),
     }
     let err = TypedSigner::sign_electra_aggregate_and_proof(&signer, &electra_aggregate(), &gloas)
         .await
         .unwrap_err();
     match err {
-        crypto::SigningError::SignerLacksGloasSupport { rpc, .. } => {
-            assert_eq!(rpc, "SignRoot");
+        crypto::SigningError::LocalRejected(msg) => {
+            assert!(msg.contains("sign_aggregate_and_proof_root"), "{msg}");
         }
-        other => panic!("expected SignerLacksGloasSupport for electra aggregate, got {other:?}"),
+        other => panic!("expected LocalRejected for electra aggregate, got {other:?}"),
     }
 
     let names = RecordingV2::names(&calls);
@@ -1014,7 +1032,7 @@ async fn test_new_client_old_server_gloas_is_typed_no_retry() {
     assert_eq!(beacon_calls, 1, "only the pre-Gloas block used SignBeaconBlock: {names:?}");
     assert!(!names.iter().any(|n| n == "sign_aggregate_and_proof"));
     let root_calls = names.iter().filter(|n| n.as_str() == "sign_root").count();
-    assert_eq!(root_calls, 2, "aggregate + electra aggregate, no legacy retry: {names:?}");
+    assert_eq!(root_calls, 0, "container aggregates must not hit SignRoot: {names:?}");
 }
 
 #[tokio::test]

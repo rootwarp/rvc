@@ -251,6 +251,21 @@ pub trait TypedSigner: Send + Sync {
         let _ = (object_root, slot, ctx);
         Err(SigningError::UnsupportedDuty { duty: "execution_payload_envelope" })
     }
+
+    /// Sign a precomputed aggregate-and-proof root (`DOMAIN_AGGREGATE_AND_PROOF`).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override. `slot` is unused here — fork version
+    /// is already resolved on `ctx`.
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (object_root, slot, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "aggregate_and_proof_root" })
+    }
 }
 
 // ============================================================
@@ -324,6 +339,10 @@ impl TypedSigner for LocalSigner {
         agg: &AggregateAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
+        if ctx.fork_name >= ForkName::Gloas {
+            let _ = agg;
+            return Err(SigningError::UnsupportedDuty { duty: "aggregate_and_proof" });
+        }
         let signing_root = signing_root_with_fork_version(
             agg,
             DOMAIN_AGGREGATE_AND_PROOF,
@@ -339,6 +358,10 @@ impl TypedSigner for LocalSigner {
         agg: &ElectraAggregateAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
+        if ctx.fork_name >= ForkName::Gloas {
+            let _ = agg;
+            return Err(SigningError::UnsupportedDuty { duty: "electra_aggregate_and_proof" });
+        }
         let signing_root = signing_root_with_fork_version(
             agg,
             DOMAIN_AGGREGATE_AND_PROOF,
@@ -501,6 +524,22 @@ impl TypedSigner for LocalSigner {
         let signing_root = signing_root_with_fork_version(
             object_root,
             DOMAIN_BEACON_BUILDER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        _slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            object_root,
+            DOMAIN_AGGREGATE_AND_PROOF,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
         );
@@ -1118,6 +1157,75 @@ mod tests {
         match result {
             Err(SigningError::UnsupportedDuty { duty }) => {
                 assert_eq!(duty, "execution_payload_envelope");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_signer_aggregate_and_proof_root_signature_verifies() {
+        use rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT;
+
+        const SPEC_GLOAS_AGGREGATE_AND_PROOF_ROOT: &str =
+            "8e20d3aab21ae5374ec249d072afa489e501d89e5c098f6792b2771cf5509bd1";
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let object_root = parse_kat_root(SPEC_GLOAS_AGGREGATE_AND_PROOF_ROOT);
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_aggregate_and_proof_root(&signer, &object_root, 1, &ctx)
+            .await
+            .unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "aggregate-and-proof root signature must verify over KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_signer_container_aggregate_refused_at_gloas() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let signer = make_local_signer(sk);
+        let agg = AggregateAndProof {
+            aggregator_index: 1,
+            aggregate: eth_types::Attestation {
+                aggregation_bits: vec![0xff, 0x01],
+                data: AttestationData {
+                    slot: 1,
+                    index: 0,
+                    beacon_block_root: [0x11; 32],
+                    source: eth_types::Checkpoint { epoch: 0, root: [0; 32] },
+                    target: eth_types::Checkpoint { epoch: 0, root: [0; 32] },
+                },
+                signature: vec![0xaa; 96],
+            },
+            selection_proof: vec![0xbb; 96],
+        };
+        match TypedSigner::sign_aggregate_and_proof(&signer, &agg, &ctx).await {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "aggregate_and_proof");
+            }
+            other => panic!("expected UnsupportedDuty, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_aggregate_and_proof_root_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let object_root = [0x11u8; 32];
+        let signer = CapabilityMissingSigner;
+
+        let result =
+            TypedSigner::sign_aggregate_and_proof_root(&signer, &object_root, 1, &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "aggregate_and_proof_root");
             }
             Ok(_) => panic!("unsupported signer must not produce a signature"),
             other => panic!("expected UnsupportedDuty, got: {other:?}"),

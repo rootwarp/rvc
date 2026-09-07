@@ -291,6 +291,14 @@ impl GrpcRemoteSigner {
         )
     }
 
+    fn gloas_aggregate_requires_root() -> SigningError {
+        SigningError::LocalRejected(
+            "use sign_aggregate_and_proof_root: Gloas aggregate object_root is \
+             gloas_aggregate_and_proof_root from the VC, not a tree_hash 0.9 container hash"
+                .to_string(),
+        )
+    }
+
     fn map_grpc_status(status: tonic::Status, rpc_name: &'static str) -> SigningError {
         if status.code() == tonic::Code::Unimplemented
             && matches!(rpc_name, "SignBlockHeader" | "SignRoot")
@@ -650,14 +658,8 @@ impl TypedSigner for GrpcRemoteSigner {
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
         if Self::uses_gloas_rpc(ctx) {
-            let object_root = agg.tree_hash_root().0;
-            let fork_version = ctx.fork_info.current_version;
-            let gvr = ctx.fork_info.genesis_validators_root;
-            let signing_root =
-                signing_root_with_fork_version(agg, DOMAIN_AGGREGATE_AND_PROOF, fork_version, gvr);
-            return self
-                .sign_root_rpc(object_root, Duty::AggregateAndProof, ctx, signing_root)
-                .await;
+            let _ = agg;
+            return Err(Self::gloas_aggregate_requires_root());
         }
         let fork_id = Self::fork_id(ctx);
         let aggregate_ssz = encode_attestation_ssz(&agg.aggregate, fork_id);
@@ -687,14 +689,8 @@ impl TypedSigner for GrpcRemoteSigner {
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
         if Self::uses_gloas_rpc(ctx) {
-            let object_root = agg.tree_hash_root().0;
-            let fork_version = ctx.fork_info.current_version;
-            let gvr = ctx.fork_info.genesis_validators_root;
-            let signing_root =
-                signing_root_with_fork_version(agg, DOMAIN_AGGREGATE_AND_PROOF, fork_version, gvr);
-            return self
-                .sign_root_rpc(object_root, Duty::AggregateAndProof, ctx, signing_root)
-                .await;
+            let _ = agg;
+            return Err(Self::gloas_aggregate_requires_root());
         }
         // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
         let legacy = AggregateAndProof {
@@ -950,6 +946,23 @@ impl TypedSigner for GrpcRemoteSigner {
         let signing_root =
             signing_root_with_fork_version(object_root, DOMAIN_BEACON_BUILDER, fork_version, gvr);
         self.sign_root_rpc(*object_root, Duty::ExecutionPayloadEnvelope, ctx, signing_root).await
+    }
+
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        _slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let fork_version = ctx.fork_info.current_version;
+        let gvr = ctx.fork_info.genesis_validators_root;
+        let signing_root = signing_root_with_fork_version(
+            object_root,
+            DOMAIN_AGGREGATE_AND_PROOF,
+            fork_version,
+            gvr,
+        );
+        self.sign_root_rpc(*object_root, Duty::AggregateAndProof, ctx, signing_root).await
     }
 }
 
@@ -1551,10 +1564,11 @@ mod tests {
             TypedSigner::sign_proposer_preferences(&signer, &prefs, &ctx).await,
             TypedSigner::sign_builder_request_auth(&signer, &auth, [0; 4], &ctx).await,
             TypedSigner::sign_execution_payload_envelope_root(&signer, &[0x11; 32], 1, &ctx).await,
+            TypedSigner::sign_aggregate_and_proof_root(&signer, &[0x22; 32], 1, &ctx).await,
         ];
 
-        assert_eq!(results.len(), 14);
-        let mut messages = Vec::with_capacity(14);
+        assert_eq!(results.len(), 15);
+        let mut messages = Vec::with_capacity(15);
         for (i, result) in results.into_iter().enumerate() {
             match result {
                 Err(SigningError::RemoteSignerError(msg)) => {
@@ -1567,7 +1581,7 @@ mod tests {
                 other => panic!("method {i}: expected RemoteSignerError, got: {other:?}"),
             }
         }
-        // All fourteen share the same error *shape* (shared map_err in sign_rpc).
+        // All fifteen share the same error *shape* (shared map_err in sign_rpc).
         assert!(messages.iter().all(|m| m.contains("failed (")));
     }
 }

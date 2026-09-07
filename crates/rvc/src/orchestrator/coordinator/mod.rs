@@ -22,7 +22,7 @@ use crate::metrics::{
     attestation_status, pre_proposal_cold_fetch, RVC_ATTESTATIONS_TOTAL,
     RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS, RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
 };
-use signer::{CircuitBreakerState, SignerService};
+use signer::{CircuitBreakerState, SignerService, ValidatorSigner};
 use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
@@ -355,8 +355,9 @@ where
                 .with_builder_config_provider(Arc::new(BuilderConfigAdapter(builder.clone())));
         }
 
+        let aggregation_signer: Arc<dyn ValidatorSigner> = signer.clone();
         let aggregation_service = AggregationService::new(
-            signer.clone(),
+            aggregation_signer,
             beacon.clone(),
             duty_tracker.clone(),
             pubkey_map.clone(),

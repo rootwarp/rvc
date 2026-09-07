@@ -433,6 +433,21 @@ impl TypedSigner for LocalBlsTyped {
         );
         self.sign_root(&root, &ctx.pubkey.to_bytes())
     }
+
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        _slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let root = signing_root_with_fork_version(
+            object_root,
+            DOMAIN_AGGREGATE_AND_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        self.sign_root(&root, &ctx.pubkey.to_bytes())
+    }
 }
 
 struct RecordingTyped {
@@ -595,6 +610,19 @@ impl TypedSigner for RecordingTyped {
             self,
             "sign_execution_payload_envelope_root",
             self.inner.sign_execution_payload_envelope_root(object_root, slot, ctx).await
+        )
+    }
+
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        rec!(
+            self,
+            "sign_aggregate_and_proof_root",
+            self.inner.sign_aggregate_and_proof_root(object_root, slot, ctx).await
         )
     }
 }
@@ -1060,6 +1088,7 @@ async fn test_every_typed_signer_method_reached_from_validator_signer() {
     svc.sign_contribution_and_proof(&contribution(), &pk, &schedule, &gvr).await.unwrap();
     svc.sign_payload_attestation(&ptc(), &pk, &schedule, &gvr).await.unwrap();
     svc.sign_proposer_preferences(&prefs(), &pk, &schedule, &gvr).await.unwrap();
+    svc.sign_aggregate_and_proof_root(&[0x11; 32], 100, &pk, &schedule, &gvr).await.unwrap();
 
     let seen = rec.seen.lock().unwrap().clone();
     for name in [
@@ -1074,6 +1103,7 @@ async fn test_every_typed_signer_method_reached_from_validator_signer() {
         "sign_contribution_and_proof",
         "sign_payload_attestation",
         "sign_proposer_preferences",
+        "sign_aggregate_and_proof_root",
     ] {
         assert!(seen.contains(name), "TypedSigner::{name} was not reached; seen={seen:?}");
     }
@@ -1442,9 +1472,12 @@ async fn test_gloas_vc_path_reaches_in_process_signer_server() {
 
     let mut agg = aggregate();
     agg.aggregate.data.slot = slot;
-    svc.sign_aggregate_and_proof(&agg, &pk, &schedule, &GVR)
-        .await
-        .expect("Gloas aggregate through in-process signer-server");
+    match svc.sign_aggregate_and_proof(&agg, &pk, &schedule, &GVR).await {
+        Err(SignerError::UnsupportedDuty { duty }) => {
+            assert_eq!(duty, "aggregate_and_proof");
+        }
+        other => panic!("Gloas container aggregate must be refused, got {other:?}"),
+    }
 
     let ptc_msg = PayloadAttestationData {
         beacon_block_root: [0x11; 32],
@@ -1465,36 +1498,29 @@ async fn test_gloas_vc_path_reaches_in_process_signer_server() {
     svc.sign_execution_payload_envelope_root(&[0x11; 32], slot, &pk, &schedule, &GVR)
         .await
         .expect("Gloas envelope through in-process signer-server");
+    svc.sign_aggregate_and_proof_root(&[0x11; 32], slot, &pk, &schedule, &GVR)
+        .await
+        .expect("Gloas aggregate root through in-process signer-server");
 
     let mut electra = electra_aggregate();
     electra.aggregate.data.slot = slot;
-    let gloas_version = [7, 0, 0, 0];
-    let electra_sr =
-        signing_root_with_fork_version(&electra, DOMAIN_AGGREGATE_AND_PROOF, gloas_version, GVR);
-    let stripped = AggregateAndProof {
-        aggregator_index: electra.aggregator_index,
-        aggregate: Attestation {
-            aggregation_bits: electra.aggregate.aggregation_bits.clone(),
-            data: electra.aggregate.data.clone(),
-            signature: electra.aggregate.signature.clone(),
-        },
-        selection_proof: electra.selection_proof.clone(),
-    };
-    let stripped_sr =
-        signing_root_with_fork_version(&stripped, DOMAIN_AGGREGATE_AND_PROOF, gloas_version, GVR);
-    assert_ne!(
-        electra_sr, stripped_sr,
-        "committee_bits must participate in the Gloas Electra aggregate object root"
-    );
+    match svc.sign_electra_aggregate_and_proof(&electra, &pk, &schedule, &GVR).await {
+        Err(SignerError::UnsupportedDuty { duty }) => {
+            assert_eq!(duty, "electra_aggregate_and_proof");
+        }
+        other => panic!("Gloas Electra container aggregate must be refused, got {other:?}"),
+    }
+    let object_root = [0x22u8; 32];
     let sig = svc
-        .sign_electra_aggregate_and_proof(&electra, &pk, &schedule, &GVR)
+        .sign_aggregate_and_proof_root(&object_root, slot, &pk, &schedule, &GVR)
         .await
-        .expect("Gloas Electra aggregate through in-process signer-server");
-    assert!(sig.verify(&pk, &electra_sr).is_ok());
-    assert!(
-        sig.verify(&pk, &stripped_sr).is_err(),
-        "must not sign the committee_bits-stripped pre-Electra root"
+        .expect("Gloas aggregate root through in-process signer-server");
+    let ctx = crypto::SigningCtx { fork_schedule: &schedule, genesis_validators_root: GVR };
+    let signing_root = crypto::signing_root_for(
+        &crypto::DutyRef::AggregateAndProofRoot { root: &object_root, slot },
+        &ctx,
     );
+    assert!(sig.verify(&pk, &signing_root).is_ok());
 }
 
 #[tokio::test]

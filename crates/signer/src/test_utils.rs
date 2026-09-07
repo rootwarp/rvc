@@ -209,6 +209,17 @@ impl ValidatorSigner for StubValidatorSigner {
     ) -> Result<Signature, SignerError> {
         Ok(mock_sig(b"execution-payload-envelope"))
     }
+
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        _object_root: &Root,
+        _slot: Slot,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"aggregate-and-proof-root"))
+    }
 }
 
 #[cfg(test)]
@@ -312,5 +323,6 @@ mod tests {
             .sign_execution_payload_envelope_root(&[0x11; 32], 1, &pk, &fork, &gvr)
             .await
             .is_ok());
+        assert!(stub.sign_aggregate_and_proof_root(&[0x22; 32], 1, &pk, &fork, &gvr).await.is_ok());
     }
 }

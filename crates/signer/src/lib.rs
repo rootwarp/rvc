@@ -1225,17 +1225,47 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
+        if ForkName::from_epoch(epoch, fork_schedule) >= ForkName::Gloas {
+            return Err(SignerError::UnsupportedDuty { duty: "aggregate_and_proof" });
+        }
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::AggregateAndProof(aggregate_and_proof), &ctx);
         let gvr = *genesis_validators_root;
         let agg = aggregate_and_proof.clone();
-        let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
         let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_aggregate_and_proof(&agg, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
         self.sign_nonslashable(pubkey, signing_root, "aggregate_and_proof", backend).await
+    }
+
+    /// Signs a precomputed aggregate-and-proof root with DOMAIN_AGGREGATE_AND_PROOF.
+    ///
+    /// Non-slashable: same chain-of-custody rule as [`Self::sign_aggregate_and_proof`].
+    /// Gloas island HTR; `slot` selects the fork. Does not use [`EnvelopeSlotGuard`].
+    #[tracing::instrument(name = "sign.aggregate_and_proof_root", skip_all, fields(duty = %Duty::Aggregate.as_str(), slot = slot))]
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root =
+            signing_root_for(&DutyRef::AggregateAndProofRoot { root: object_root, slot }, &ctx);
+        let gvr = *genesis_validators_root;
+        let root = *object_root;
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_aggregate_and_proof_root(&root, slot, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "aggregate_and_proof_root", backend).await
     }
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -1249,33 +1279,24 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
+        if ForkName::from_epoch(epoch, fork_schedule) >= ForkName::Gloas {
+            return Err(SignerError::UnsupportedDuty { duty: "electra_aggregate_and_proof" });
+        }
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let gvr = *genesis_validators_root;
-        let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
         let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
         let pk = pubkey.to_bytes();
         if self.signer.has_grpc_remote(&pk) {
-            if sign_ctx.fork_name >= ForkName::Gloas {
-                let signing_root =
-                    signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
-                let agg = aggregate_and_proof.clone();
-                let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
-                    grpc.sign_electra_aggregate_and_proof(&agg, &sign_ctx).await
-                });
-                let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-                self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
-                    .await
-            } else {
-                // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
-                let legacy = electra_aggregate_as_legacy(aggregate_and_proof);
-                let signing_root = signing_root_for(&DutyRef::AggregateAndProof(&legacy), &ctx);
-                let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
-                    grpc.sign_aggregate_and_proof(&legacy, &sign_ctx).await
-                });
-                let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-                self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
-                    .await
-            }
+            // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
+            let legacy = electra_aggregate_as_legacy(aggregate_and_proof);
+            let signing_root = signing_root_for(&DutyRef::AggregateAndProof(&legacy), &ctx);
+            let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+                grpc.sign_aggregate_and_proof(&legacy, &sign_ctx).await
+            });
+            let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+            self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
+                .await
         } else {
             let signing_root =
                 signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
@@ -3270,6 +3291,32 @@ mod tests {
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
+    #[tokio::test]
+    async fn test_sign_aggregate_and_proof_root_success() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let slot: Slot = 100;
+        let object_root: Root = [0x33; 32];
+
+        let result = service
+            .sign_aggregate_and_proof_root(&object_root, slot, &pubkey, &schedule, &genesis_root)
+            .await;
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+        let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: genesis_root };
+        let signing_root =
+            signing_root_for(&DutyRef::AggregateAndProofRoot { root: &object_root, slot }, &ctx);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
     // --- Voluntary exit signing tests ---
 
     #[tokio::test]
@@ -4048,6 +4095,21 @@ mod tests {
             &ctx,
         );
         assert!(sig.verify(&pubkey, &root).is_ok(), "envelope root must match signing_root_for");
+
+        let agg_root: Root = [0x33; 32];
+        let agg_slot = 50 * SLOTS_PER_EPOCH;
+        let sig = service
+            .sign_aggregate_and_proof_root(&agg_root, agg_slot, &pubkey, &schedule, &gvr)
+            .await
+            .unwrap();
+        let root = signing_root_for(
+            &DutyRef::AggregateAndProofRoot { root: &agg_root, slot: agg_slot },
+            &ctx,
+        );
+        assert!(
+            sig.verify(&pubkey, &root).is_ok(),
+            "aggregate-and-proof root must match signing_root_for"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -4186,6 +4248,10 @@ mod tests {
             .sign_execution_payload_envelope_root(&[0x42; 32], 100, &pubkey, &schedule, &gvr)
             .await
             .expect("execution payload envelope");
+        service
+            .sign_aggregate_and_proof_root(&[0x33; 32], 100, &pubkey, &schedule, &gvr)
+            .await
+            .expect("aggregate and proof root");
 
         let blocks = slashing_db.get_blocks(&pubkey_hex).expect("get_blocks");
         let attestations = slashing_db.get_attestations(&pubkey_hex).expect("get_attestations");
@@ -4468,6 +4534,12 @@ mod tests {
                         )
                         .await,
                 ),
+                (
+                    "aggregate_and_proof_root",
+                    service
+                        .sign_aggregate_and_proof_root(&[0x33; 32], 100, &pubkey, &schedule, &gvr)
+                        .await,
+                ),
             ];
 
             for (name, result) in results {
@@ -4554,6 +4626,12 @@ mod tests {
                             &schedule,
                             &gvr,
                         )
+                        .await,
+                ),
+                (
+                    "aggregate_and_proof_root",
+                    service
+                        .sign_aggregate_and_proof_root(&[0x33; 32], 100, &unknown, &schedule, &gvr)
                         .await,
                 ),
             ];

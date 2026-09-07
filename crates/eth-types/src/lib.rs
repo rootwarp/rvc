@@ -40,9 +40,9 @@ pub use block_body::{
     blinded_body_tree_hash_root, blinded_body_tree_hash_root_for_layout, body_tree_hash_root,
     body_tree_hash_root_for_layout, decode_beacon_block_body_deneb,
     decode_beacon_block_body_electra, decode_blinded_beacon_block_body_deneb,
-    decode_blinded_beacon_block_body_electra, BeaconBlockBodyDeneb, BeaconBlockBodyElectra,
-    BlindedBeaconBlockBodyDeneb, BlindedBeaconBlockBodyElectra, BodySszError, ExecutionPayload,
-    ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
+    decode_blinded_beacon_block_body_electra, try_electra_aggregation_bits, BeaconBlockBodyDeneb,
+    BeaconBlockBodyElectra, BlindedBeaconBlockBodyDeneb, BlindedBeaconBlockBodyElectra,
+    BodySszError, ExecutionPayload, ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
 };
 
 /// Deterministic SSZ/KAT bodies and known roots for tests (RF3-19 / G5).

@@ -4153,6 +4153,7 @@ dependencies = [
  "beacon",
  "clap",
  "criterion",
+ "ethereum_ssz 0.8.3",
  "fd-lock",
  "hex",
  "http-body-util",

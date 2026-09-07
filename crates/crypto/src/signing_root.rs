@@ -34,10 +34,10 @@ pub struct SigningCtx<'a> {
 ///
 /// Covers every production sign path: attestation, PTC payload attestation,
 /// proposer preferences, block (full / root), blinded block, RANDAO, sync
-/// message/selection, attester selection proof, aggregate-and-proof (Phase0
-/// and Electra), contribution-and-proof, voluntary exit, builder
-/// registration, builder request auth, and self-build execution payload
-/// envelope.
+/// message/selection, attester selection proof, aggregate-and-proof (Phase0,
+/// Electra, and precomputed Gloas root), contribution-and-proof, voluntary
+/// exit, builder registration, builder request auth, and self-build
+/// execution payload envelope.
 #[derive(Debug, Clone, Copy)]
 pub enum DutyRef<'a> {
     Attestation(&'a AttestationData),
@@ -57,6 +57,13 @@ pub enum DutyRef<'a> {
     /// Self-build only: bids and external envelopes stay builder-signed.
     /// `slot` selects the fork; per-slot uniqueness is VC `SignerService`.
     ExecutionPayloadEnvelopeRoot {
+        root: &'a Root,
+        slot: Slot,
+    },
+    /// Precomputed aggregate-and-proof object root + slot (`DOMAIN_AGGREGATE_AND_PROOF`).
+    ///
+    /// Gloas island HTR; `slot` selects the fork.
+    AggregateAndProofRoot {
         root: &'a Root,
         slot: Slot,
     },
@@ -145,6 +152,16 @@ pub fn signing_root_for(duty: &DutyRef<'_>, ctx: &SigningCtx<'_>) -> Root {
             let fork_version = fork_version_at(epoch, ctx.fork_schedule);
             let domain =
                 compute_domain(DOMAIN_BEACON_BUILDER, fork_version, ctx.genesis_validators_root);
+            compute_signing_root(root, domain)
+        }
+        DutyRef::AggregateAndProofRoot { root, slot } => {
+            let epoch = *slot / SLOTS_PER_EPOCH;
+            let fork_version = fork_version_at(epoch, ctx.fork_schedule);
+            let domain = compute_domain(
+                DOMAIN_AGGREGATE_AND_PROOF,
+                fork_version,
+                ctx.genesis_validators_root,
+            );
             compute_signing_root(root, domain)
         }
         DutyRef::BlindedBlock(block) => {

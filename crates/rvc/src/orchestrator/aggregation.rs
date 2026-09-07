@@ -9,10 +9,11 @@ use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
     AggregateAndProof, ElectraAggregateAndProof, ForkName, SignedAggregateAndProof,
-    SignedElectraAggregateAndProof, Slot,
+    SignedElectraAggregateAndProof, Slot, MAX_COMMITTEES_PER_SLOT,
 };
 use observability::logging::TruncatedPubkey;
-use signer::{is_aggregator, SignerService, ValidatorSigner};
+use signer::{is_aggregator, ValidatorSigner};
+use ssz08::Encode;
 use tree_hash::TreeHash;
 use validator_store::ValidatorStore;
 
@@ -20,7 +21,7 @@ use super::coordinator::{OrchestratorConfig, PubkeyMap};
 use super::utils::{self, TimedOutcome};
 
 pub(crate) struct AggregationService {
-    signer: Arc<SignerService>,
+    signer: Arc<dyn ValidatorSigner>,
     beacon: Arc<dyn BeaconNodeClient>,
     duty_tracker: Arc<DutyTracker>,
     pubkey_map: PubkeyMap,
@@ -58,7 +59,7 @@ struct AggregateDutyOutcome {
 
 impl AggregationService {
     pub(crate) fn new(
-        signer: Arc<SignerService>,
+        signer: Arc<dyn ValidatorSigner>,
         beacon: Arc<dyn BeaconNodeClient>,
         duty_tracker: Arc<DutyTracker>,
         pubkey_map: PubkeyMap,
@@ -363,14 +364,18 @@ impl AggregationService {
                 aggregate: electra_agg,
                 selection_proof,
             };
-            let signed = self
-                .sign_and_wrap_electra(slot, &duty.validator_index, pubkey, message, agg_span)
-                .await?;
-            Some(if fork_name == ForkName::Gloas {
-                ProducedAggregate::Gloas(signed)
+            // Inherit-intentionally: Gloas and later use the island root, not tree_hash 0.9.
+            if fork_name >= ForkName::Gloas {
+                let signed = self
+                    .sign_and_wrap_gloas(slot, &duty.validator_index, pubkey, message, agg_span)
+                    .await?;
+                Some(ProducedAggregate::Gloas(signed))
             } else {
-                ProducedAggregate::Electra(signed)
-            })
+                let signed = self
+                    .sign_and_wrap_electra(slot, &duty.validator_index, pubkey, message, agg_span)
+                    .await?;
+                Some(ProducedAggregate::Electra(signed))
+            }
         } else {
             let pre_electra_agg = match aggregate {
                 VersionedAggregateAttestation::PreElectra(a) => a,
@@ -489,6 +494,61 @@ impl AggregationService {
         Some(SignedElectraAggregateAndProof { message, signature: signature.to_bytes().to_vec() })
     }
 
+    /// Island root + sign + wrap for Gloas aggregate-and-proof.
+    ///
+    /// Pre-Gloas `try_tree_hash_root` is intentionally not used: the island
+    /// decode is the validity gate. A [`rvc_gloas::GloasError`] skips the
+    /// duty with a failure increment and no signer call.
+    async fn sign_and_wrap_gloas(
+        &self,
+        slot: Slot,
+        validator_index: &str,
+        pubkey: &PublicKey,
+        message: ElectraAggregateAndProof,
+        agg_span: Span,
+    ) -> Option<SignedElectraAggregateAndProof> {
+        let ssz = match encode_electra_aggregate_and_proof(&message) {
+            Ok(ssz) => ssz,
+            Err(e) => {
+                skip_gloas_aggregate(slot, validator_index, "encode", &e);
+                return None;
+            }
+        };
+        let object_root = match rvc_gloas::gloas_aggregate_and_proof_root(&ssz) {
+            Ok(root) => root,
+            Err(e) => {
+                skip_gloas_aggregate(slot, validator_index, "island_root", &e);
+                return None;
+            }
+        };
+        let sign_slot = message.aggregate.data.slot;
+        let signature = match self
+            .signer
+            .sign_aggregate_and_proof_root(
+                &object_root,
+                sign_slot,
+                pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
+            )
+            .instrument(agg_span)
+            .await
+        {
+            Ok(sig) => sig,
+            Err(e) => {
+                warn!(
+                    slot,
+                    validator_index = %validator_index,
+                    error = %e,
+                    "Failed to sign Gloas aggregate and proof"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+        };
+        Some(SignedElectraAggregateAndProof { message, signature: signature.to_bytes().to_vec() })
+    }
+
     /// Submit a versioned batch of signed aggregates; shared by pre-Electra and
     /// Electra/Fulu/Gloas. Log messages stay as static literals (byte-identical
     /// to the pre-refactor paths) via [`AggregateSubmitLabel`].
@@ -586,28 +646,79 @@ impl AggregationService {
     }
 }
 
+fn skip_gloas_aggregate(
+    slot: Slot,
+    validator_index: &str,
+    stage: &'static str,
+    error: &rvc_gloas::GloasError,
+) {
+    warn!(
+        slot,
+        validator_index = %validator_index,
+        stage,
+        error = %error,
+        "Skipping Gloas aggregate"
+    );
+    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+}
+
+fn encode_electra_aggregate_and_proof(
+    message: &ElectraAggregateAndProof,
+) -> Result<Vec<u8>, rvc_gloas::GloasError> {
+    const COMMITTEE_BITS_LEN: usize = (MAX_COMMITTEES_PER_SLOT as usize).div_ceil(8);
+    if message.selection_proof.len() != 96 || message.aggregate.signature.len() != 96 {
+        return Err(rvc_gloas::GloasError::InvalidBody {
+            reason: "bls signature fields must be 96 bytes".to_string(),
+        });
+    }
+    if message.aggregate.committee_bits.len() != COMMITTEE_BITS_LEN {
+        return Err(rvc_gloas::GloasError::InvalidBody {
+            reason: "committee_bits must be Bitvector[MAX_COMMITTEES_PER_SLOT]".to_string(),
+        });
+    }
+    eth_types::try_electra_aggregation_bits(&message.aggregate.aggregation_bits).map_err(|e| {
+        rvc_gloas::GloasError::InvalidBody { reason: format!("aggregation_bits: {e:?}") }
+    })?;
+    Ok(Encode::as_ssz_bytes(message))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     };
 
+    use async_trait::async_trait;
     use beacon::{DataResponse, DependentRootResponse, VersionedAggregateAttestation};
     use bn_manager::MockBeaconNodeClient;
-    use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
+    use crypto::{
+        signing_root_for, CompositeSigner, DutyRef, KeyManager, LocalSigner, PublicKey, SecretKey,
+        Signature, SigningCtx,
+    };
     use duty_tracker::DutyTracker;
     use eth_types::{
-        Attestation as EthAttestation, AttestationData, Checkpoint, ForkName, ForkSchedule,
+        Attestation as EthAttestation, AttestationData, Checkpoint, ElectraAggregateAndProof,
+        ElectraAttestation, Epoch, ForkName, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH,
     };
-    use signer::{always_enabled, SignerService};
+    use signer::{
+        always_enabled, SignerError, SignerService, StubValidatorSigner, ValidatorSigner,
+    };
     use slashing::SlashingDb;
+    use ssz08::{Decode, Encode};
     use tree_hash::TreeHash;
     use validator_store::{ValidatorConfig, ValidatorStore};
 
     use super::utils;
     use super::{AggregationService, OrchestratorConfig};
+    use crate::metrics::{attestation_status, RVC_AGGREGATIONS_TOTAL};
+
+    /// Process-wide aggregations-failed counter; serialize exact-delta assertions.
+    async fn agg_fail_metric_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+    }
 
     fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         Arc::new(ForkSchedule {
@@ -633,10 +744,41 @@ mod tests {
         OrchestratorConfig::new([0u8; 32], create_test_fork_schedule())
     }
 
+    fn electra_attestation(slot: Slot) -> ElectraAttestation {
+        ElectraAttestation {
+            aggregation_bits: vec![0xff, 0x01],
+            data: AttestationData {
+                slot,
+                index: 0,
+                beacon_block_root: [0x11; 32],
+                source: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [0u8; 32] },
+                target: Checkpoint { epoch: slot / SLOTS_PER_EPOCH, root: [0u8; 32] },
+            },
+            signature: vec![0xab; 96],
+            committee_bits: vec![0x01, 0, 0, 0, 0, 0, 0, 0],
+        }
+    }
+
+    fn pre_electra_attestation(slot: Slot) -> EthAttestation {
+        EthAttestation {
+            aggregation_bits: vec![0xff, 0x01],
+            data: AttestationData {
+                slot,
+                index: 0,
+                beacon_block_root: [0x11; 32],
+                source: Checkpoint { epoch: 0, root: [0u8; 32] },
+                target: Checkpoint { epoch: 0, root: [0u8; 32] },
+            },
+            signature: vec![0xab; 96],
+        }
+    }
+
     /// Shared mock that records submit_aggregate_and_proofs calls (RF4-24).
     fn tracking_beacon(
         duty_pubkey: String,
         submit_agg_calls: Arc<AtomicUsize>,
+        duty_slot: Slot,
+        aggregate: VersionedAggregateAttestation,
     ) -> MockBeaconNodeClient {
         MockBeaconNodeClient::new()
             .with_slot_aware_block_root(0, &[], |_queried| {
@@ -653,7 +795,7 @@ mod tests {
                         committee_length: "8".to_string(), // small → always aggregator
                         committees_at_slot: "1".to_string(),
                         validator_committee_index: "0".to_string(),
-                        slot: "0".to_string(),
+                        slot: duty_slot.to_string(),
                     }],
                 })
             })
@@ -680,18 +822,15 @@ mod tests {
                     },
                 })
             })
-            .with_get_aggregate_attestation(|slot, _root, _idx| {
-                Ok(VersionedAggregateAttestation::PreElectra(EthAttestation {
-                    aggregation_bits: vec![0xff, 0x01],
-                    data: AttestationData {
-                        slot,
-                        index: 0,
-                        beacon_block_root: [0x11; 32],
-                        source: eth_types::Checkpoint { epoch: 0, root: [0u8; 32] },
-                        target: eth_types::Checkpoint { epoch: 0, root: [0u8; 32] },
-                    },
-                    signature: vec![0xab; 96],
-                }))
+            .with_get_aggregate_attestation(move |slot, _root, _idx| {
+                let mut agg = aggregate.clone();
+                match &mut agg {
+                    VersionedAggregateAttestation::PreElectra(a) => a.data.slot = slot,
+                    VersionedAggregateAttestation::Electra(a)
+                    | VersionedAggregateAttestation::Fulu(a)
+                    | VersionedAggregateAttestation::Gloas(a) => a.data.slot = slot,
+                }
+                Ok(agg)
             })
             .with_submit_aggregate_and_proofs(move |_proofs| {
                 submit_agg_calls.fetch_add(1, Ordering::SeqCst);
@@ -699,25 +838,30 @@ mod tests {
             })
     }
 
+    struct AggEnv {
+        config: OrchestratorConfig,
+        slot: Slot,
+        aggregate: VersionedAggregateAttestation,
+    }
+
     async fn setup_agg_service(
         duty_pubkey: String,
         pk: crypto::PublicKey,
-        sk: SecretKey,
+        signer: Arc<dyn ValidatorSigner>,
         validator_store: Arc<ValidatorStore>,
         submit_agg_calls: Arc<AtomicUsize>,
+        env: AggEnv,
     ) -> AggregationService {
-        let mut key_manager = KeyManager::new();
-        key_manager.insert(sk);
-        let local_signer = LocalSigner::new(key_manager);
-        let composite = Arc::new(CompositeSigner::new(local_signer));
-        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let signer =
-            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-
-        let beacon = Arc::new(tracking_beacon(duty_pubkey.clone(), submit_agg_calls));
+        let epoch = env.slot / SLOTS_PER_EPOCH;
+        let beacon = Arc::new(tracking_beacon(
+            duty_pubkey.clone(),
+            submit_agg_calls,
+            env.slot,
+            env.aggregate,
+        ));
 
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
-        duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
+        duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
         let mut map = HashMap::new();
         map.insert(pk.to_bytes(), pk);
@@ -728,9 +872,78 @@ mod tests {
             beacon,
             duty_tracker,
             pubkey_map,
-            create_test_config(),
+            env.config,
             validator_store,
         )
+    }
+
+    fn local_signer_service(sk: SecretKey) -> Arc<dyn ValidatorSigner> {
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let local_signer = LocalSigner::new(key_manager);
+        let composite = Arc::new(CompositeSigner::new(local_signer));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()))
+    }
+
+    fn enabled_store(pk_bytes: [u8; 48]) -> Arc<ValidatorStore> {
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        store.add_validator(ValidatorConfig::new(pk_bytes)).unwrap();
+        store
+    }
+
+    struct RecordingSigner {
+        inner: StubValidatorSigner,
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingSigner {
+        fn new() -> Self {
+            Self { inner: StubValidatorSigner::new(), calls: Mutex::new(Vec::new()) }
+        }
+
+        fn record(&self, name: &'static str) {
+            self.calls.lock().unwrap().push(name);
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    macro_rules! rec_fwd {
+        ($($name:ident($($arg:ident: $ty:ty),* $(,)?));* $(;)?) => {
+            #[async_trait]
+            impl ValidatorSigner for RecordingSigner {
+                $(
+                    async fn $name(
+                        &self,
+                        $($arg: $ty),*
+                    ) -> Result<Signature, SignerError> {
+                        self.record(stringify!($name));
+                        self.inner.$name($($arg),*).await
+                    }
+                )*
+            }
+        };
+    }
+
+    rec_fwd! {
+        sign_attestation(data: &AttestationData, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_block(block_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_block_header(header: &signer::BeaconBlockHeaderFields, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_randao_reveal(epoch: Epoch, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_sync_committee_message(beacon_block_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_selection_proof(slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_aggregate_and_proof(aggregate_and_proof: &eth_types::AggregateAndProof, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_electra_aggregate_and_proof(aggregate_and_proof: &ElectraAggregateAndProof, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_voluntary_exit(voluntary_exit: &eth_types::VoluntaryExit, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_builder_registration(registration: &eth_types::ValidatorRegistrationV1, pubkey: &PublicKey, fork_version: [u8; 4]);
+        sign_sync_committee_selection_proof(slot: Slot, subcommittee_index: u64, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_contribution_and_proof(contribution_and_proof: &eth_types::ContributionAndProof, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_payload_attestation(data: &eth_types::PayloadAttestationData, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_execution_payload_envelope_root(object_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_aggregate_and_proof_root(object_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
     }
 
     // -----------------------------------------------------------------------
@@ -751,7 +964,19 @@ mod tests {
 
         let submit_calls = Arc::new(AtomicUsize::new(0));
 
-        let service = setup_agg_service(pk_hex, pk, sk, store, submit_calls.clone()).await;
+        let service = setup_agg_service(
+            pk_hex,
+            pk,
+            local_signer_service(sk),
+            store,
+            submit_calls.clone(),
+            AggEnv {
+                config: create_test_config(),
+                slot: 0,
+                aggregate: VersionedAggregateAttestation::PreElectra(pre_electra_attestation(0)),
+            },
+        )
+        .await;
 
         // Epoch 0 / slot 0 — the duty tracker has the duty for slot 0.
         service.maybe_produce_aggregations(0, 0).await;
@@ -853,5 +1078,264 @@ mod tests {
         // Guard: zero-index root differs from the preserved-index root
         let zero_root = make_crypto_attestation_data(0).tree_hash_root();
         assert_ne!(agg_root, zero_root, "Pre-Electra root must differ from the zero-index root");
+    }
+
+    fn parse_hex(hex: &str) -> Vec<u8> {
+        assert!(!hex.starts_with("0x"), "SPEC_* hex follows EXTERNAL_* style (no 0x prefix)");
+        assert_eq!(hex.len() % 2, 0, "SPEC_* hex must have even length, got {}", hex.len());
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| {
+                let s = core::str::from_utf8(chunk).expect("hex digits are utf8");
+                u8::from_str_radix(s, 16).unwrap_or_else(|e| panic!("hex {s}: {e}"))
+            })
+            .collect()
+    }
+
+    fn parse_root(hex: &str) -> Root {
+        assert_eq!(hex.len(), 64, "KAT hex must be 64 chars, got {} ({hex:?})", hex.len());
+        parse_hex(hex).try_into().expect("64 hex chars decode to 32 bytes")
+    }
+
+    fn gloas_kat_schedule() -> ForkSchedule {
+        let mut schedule = (*create_test_fork_schedule()).clone();
+        schedule.gloas_fork_epoch = 0;
+        schedule.gloas_fork_version = [0x07, 0x00, 0x00, 0x01];
+        schedule
+    }
+
+    fn gloas_config(gloas_epoch: u64) -> OrchestratorConfig {
+        let mut schedule = (*create_test_fork_schedule()).clone();
+        schedule.gloas_fork_epoch = gloas_epoch;
+        OrchestratorConfig::new([0u8; 32], Arc::new(schedule))
+    }
+
+    #[test]
+    fn test_gloas_aggregate_and_proof_signing_root() {
+        let spec_ssz = parse_hex(rvc_gloas::test_fixtures::SPEC_GLOAS_AGGREGATE_AND_PROOF_SSZ);
+        let object_root = rvc_gloas::gloas_aggregate_and_proof_root(&spec_ssz)
+            .expect("spec AggregateAndProof SSZ");
+        assert_eq!(
+            object_root,
+            parse_root(rvc_gloas::test_fixtures::SPEC_GLOAS_AGGREGATE_AND_PROOF_ROOT)
+        );
+
+        let mainnet_ssz =
+            parse_hex(rvc_gloas::test_fixtures::SPEC_GLOAS_AGGREGATE_AND_PROOF_SSZ_MAINNET);
+        let mainnet_root = rvc_gloas::gloas_aggregate_and_proof_root(&mainnet_ssz)
+            .expect("mainnet spec AggregateAndProof SSZ");
+        assert_eq!(
+            mainnet_root,
+            parse_root(rvc_gloas::test_fixtures::SPEC_GLOAS_AGGREGATE_AND_PROOF_ROOT_MAINNET)
+        );
+        match ElectraAggregateAndProof::from_ssz_bytes(&mainnet_ssz) {
+            Ok(proof) => {
+                let encoded = Encode::as_ssz_bytes(&proof);
+                assert_eq!(
+                    rvc_gloas::gloas_aggregate_and_proof_root(&encoded)
+                        .expect("6.9a re-encode of mainnet SPEC"),
+                    mainnet_root
+                );
+            }
+            Err(_) => {
+                // Mainnet SPEC SSZ is Gloas progressive; Electra decode may fail.
+                // Production 6.9a encode of a mainnet-shaped Electra container
+                // must still be island-decodable (SPEC root is a different object).
+                let encoded = Encode::as_ssz_bytes(&ElectraAggregateAndProof {
+                    aggregator_index: 1,
+                    aggregate: electra_attestation(1),
+                    selection_proof: vec![0xbb; 96],
+                });
+                rvc_gloas::gloas_aggregate_and_proof_root(&encoded)
+                    .expect("6.9a-encoded ElectraAggregateAndProof must be island-decodable");
+            }
+        }
+
+        let schedule = gloas_kat_schedule();
+        let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: [0u8; 32] };
+        let got =
+            signing_root_for(&DutyRef::AggregateAndProofRoot { root: &object_root, slot: 1 }, &ctx);
+        assert_eq!(got, parse_root(rvc_gloas::KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT));
+    }
+
+    #[tokio::test]
+    async fn test_gloas_aggregate_uses_root_signer_not_electra() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let rec = Arc::new(RecordingSigner::new());
+        let submit_calls = Arc::new(AtomicUsize::new(0));
+        let gloas_epoch = 70;
+        let slot = gloas_epoch * SLOTS_PER_EPOCH;
+        let service = setup_agg_service(
+            pk_hex,
+            pk,
+            rec.clone(),
+            enabled_store(pk_bytes),
+            submit_calls,
+            AggEnv {
+                config: gloas_config(gloas_epoch),
+                slot,
+                aggregate: VersionedAggregateAttestation::Gloas(electra_attestation(slot)),
+            },
+        )
+        .await;
+
+        service.maybe_produce_aggregations(slot, gloas_epoch).await;
+
+        let calls = rec.calls();
+        assert!(
+            calls.contains(&"sign_aggregate_and_proof_root"),
+            "Gloas aggregate must sign the island root; calls={calls:?}"
+        );
+        assert!(
+            !calls.contains(&"sign_electra_aggregate_and_proof"),
+            "Gloas aggregate must not call sign_electra_aggregate_and_proof; calls={calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fulu_aggregate_still_uses_electra_signer() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let rec = Arc::new(RecordingSigner::new());
+        let submit_calls = Arc::new(AtomicUsize::new(0));
+        let fulu_epoch = 60;
+        let slot = fulu_epoch * SLOTS_PER_EPOCH;
+        let service = setup_agg_service(
+            pk_hex,
+            pk,
+            rec.clone(),
+            enabled_store(pk_bytes),
+            submit_calls,
+            AggEnv {
+                config: create_test_config(),
+                slot,
+                aggregate: VersionedAggregateAttestation::Fulu(electra_attestation(slot)),
+            },
+        )
+        .await;
+
+        service.maybe_produce_aggregations(slot, fulu_epoch).await;
+
+        let calls = rec.calls();
+        assert!(
+            calls.contains(&"sign_electra_aggregate_and_proof"),
+            "Fulu aggregate must still call sign_electra_aggregate_and_proof; calls={calls:?}"
+        );
+        assert!(
+            !calls.contains(&"sign_aggregate_and_proof_root"),
+            "Fulu aggregate must not call sign_aggregate_and_proof_root; calls={calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_gloas_error_skips_aggregate_without_signer() {
+        let _guard = agg_fail_metric_lock().await;
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let rec = Arc::new(RecordingSigner::new());
+        let submit_calls = Arc::new(AtomicUsize::new(0));
+        let gloas_epoch = 70;
+        let slot = gloas_epoch * SLOTS_PER_EPOCH;
+        let mut bad = electra_attestation(slot);
+        bad.committee_bits = vec![0x01, 0x00, 0x00];
+        let failed_before =
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+
+        let service = setup_agg_service(
+            pk_hex,
+            pk,
+            rec.clone(),
+            enabled_store(pk_bytes),
+            submit_calls.clone(),
+            AggEnv {
+                config: gloas_config(gloas_epoch),
+                slot,
+                aggregate: VersionedAggregateAttestation::Gloas(bad),
+            },
+        )
+        .await;
+
+        service.maybe_produce_aggregations(slot, gloas_epoch).await;
+
+        let calls = rec.calls();
+        assert!(
+            !calls.contains(&"sign_aggregate_and_proof_root"),
+            "GloasError must not call the signer; calls={calls:?}"
+        );
+        assert!(
+            !calls.contains(&"sign_electra_aggregate_and_proof"),
+            "GloasError must not fall back to Electra signing; calls={calls:?}"
+        );
+        let failed_after =
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+        assert_eq!(
+            failed_after.saturating_sub(failed_before),
+            1,
+            "GloasError must increment RVC_AGGREGATIONS_TOTAL failed"
+        );
+        assert_eq!(submit_calls.load(Ordering::SeqCst), 0, "GloasError must not submit");
+    }
+
+    #[tokio::test]
+    async fn test_gloas_invalid_aggregation_bits_skip_without_signer() {
+        let _guard = agg_fail_metric_lock().await;
+        const OVER_LEN: usize = 16_386;
+        for (label, bits) in
+            [("empty", vec![]), ("no-sentinel", vec![0x00]), ("over-length", vec![0xff; OVER_LEN])]
+        {
+            let sk = SecretKey::generate();
+            let pk = sk.public_key();
+            let pk_bytes = pk.to_bytes();
+            let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+            let rec = Arc::new(RecordingSigner::new());
+            let submit_calls = Arc::new(AtomicUsize::new(0));
+            let gloas_epoch = 70;
+            let slot = gloas_epoch * SLOTS_PER_EPOCH;
+            let mut bad = electra_attestation(slot);
+            bad.aggregation_bits = bits;
+            let failed_before =
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+
+            let service = setup_agg_service(
+                pk_hex,
+                pk,
+                rec.clone(),
+                enabled_store(pk_bytes),
+                submit_calls.clone(),
+                AggEnv {
+                    config: gloas_config(gloas_epoch),
+                    slot,
+                    aggregate: VersionedAggregateAttestation::Gloas(bad),
+                },
+            )
+            .await;
+
+            service.maybe_produce_aggregations(slot, gloas_epoch).await;
+
+            let calls = rec.calls();
+            assert!(
+                !calls.contains(&"sign_aggregate_and_proof_root"),
+                "{label}: must not call signer; calls={calls:?}"
+            );
+            assert!(
+                !calls.contains(&"sign_electra_aggregate_and_proof"),
+                "{label}: must not fall back to Electra signing; calls={calls:?}"
+            );
+            let failed_after =
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+            assert_eq!(
+                failed_after.saturating_sub(failed_before),
+                1,
+                "{label}: must increment RVC_AGGREGATIONS_TOTAL failed"
+            );
+            assert_eq!(submit_calls.load(Ordering::SeqCst), 0, "{label}: must not submit");
+        }
     }
 }

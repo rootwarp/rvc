@@ -242,4 +242,17 @@ pub trait ValidatorSigner: Send + Sync {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError>;
+
+    /// Sign a precomputed aggregate-and-proof root (`DOMAIN_AGGREGATE_AND_PROOF`).
+    ///
+    /// Gloas island HTR + slot for fork resolution. Same chain-of-custody as
+    /// [`Self::sign_aggregate_and_proof`]: non-slashable, no slashing-DB row.
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError>;
 }
