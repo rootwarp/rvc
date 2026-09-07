@@ -51,6 +51,10 @@ pub enum BlockServiceError {
     /// Gloas body merkleization failed. Duty dropped unsigned — never an Electra fallback.
     #[error(transparent)]
     Gloas(#[from] rvc_gloas::GloasError),
+
+    /// Envelope sign/publish failed after the block was already published.
+    #[error("self-build envelope failed after block publish: {0}")]
+    EnvelopeAfterPublish(String),
 }
 
 impl From<BeaconError> for BlockServiceError {

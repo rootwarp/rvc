@@ -1162,6 +1162,21 @@ mod tests {
     }
 
     #[test]
+    fn test_payload_due_bps_toml_reaches_orchestrator_schedule() {
+        let config = Config {
+            timing: TimingConfig { payload_due_bps: 1234, ..Default::default() },
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        assert_eq!(orch_config.deadline_schedule.gloas.payload, 1234);
+        assert_eq!(
+            timing::due_ms(orch_config.deadline_schedule.gloas.payload, 12_000),
+            timing::due_ms(1234, 12_000)
+        );
+    }
+
+    #[test]
     fn test_gloas_timing_keys_do_not_change_pre_gloas_deadlines() {
         let config = Config {
             timing: TimingConfig {

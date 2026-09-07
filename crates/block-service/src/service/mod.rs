@@ -1,17 +1,23 @@
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
+use std::time::Instant;
 
 use tracing::{debug, error, info, warn, Instrument};
 
+use beacon::{GloasBlockContents, ProduceBlockV4Body, WireBody};
 use crypto::PublicKey;
 use eth_types::{
     blinded_body_tree_hash_root, body_tree_hash_root, ForkName, ForkSchedule, Root, Slot,
-    SLOTS_PER_EPOCH,
+    SLOTS_PER_EPOCH, SLOT_DURATION_MS,
 };
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use signer::{BeaconBlockHeaderFields, CircuitBreakerState, ValidatorSigner};
+use timing::{due_ms, DeadlineBps, DeadlineSchedule};
 use validator_store::ValidatorStore;
 
+use crate::metrics::{proposal_outcome, RVC_PROPOSALS_TOTAL};
 use crate::traits::{
     BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse,
 };
@@ -38,6 +44,57 @@ pub struct BlockService<S: ValidatorSigner, B: BeaconBlockClient> {
     genesis_validators_root: Root,
     circuit_breaker: Arc<CircuitBreakerState>,
     builder_config_provider: Option<Arc<dyn BuilderConfigProvider>>,
+    deadline_schedule: DeadlineSchedule,
+    #[cfg(test)]
+    envelope_deadline_note: Mutex<Option<EnvelopeDeadlineNote>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EnvelopeDeadlineNote {
+    pub elapsed_ms: u64,
+    pub deadline_ms: u64,
+    pub overrun_stage: Option<&'static str>,
+}
+
+pub(crate) struct PayloadDeadline {
+    start: Instant,
+    deadline_ms: u64,
+    first_overrun_stage: Option<&'static str>,
+}
+
+impl PayloadDeadline {
+    fn new(fork: ForkName, schedule: &DeadlineSchedule, start: Instant) -> Self {
+        Self {
+            start,
+            deadline_ms: due_ms(schedule.for_fork(fork).payload, SLOT_DURATION_MS),
+            first_overrun_stage: None,
+        }
+    }
+
+    fn mark(&mut self, stage: &'static str) {
+        self.mark_at(stage, self.start.elapsed().as_millis() as u64);
+    }
+
+    pub(crate) fn mark_at(&mut self, stage: &'static str, elapsed_ms: u64) {
+        if self.first_overrun_stage.is_none() && elapsed_ms > self.deadline_ms {
+            self.first_overrun_stage = Some(stage);
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis() as u64
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(deadline_ms: u64) -> Self {
+        Self { start: Instant::now(), deadline_ms, first_overrun_stage: None }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn first_overrun_stage(&self) -> Option<&'static str> {
+        self.first_overrun_stage
+    }
 }
 
 impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
@@ -74,6 +131,9 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             genesis_validators_root,
             circuit_breaker,
             builder_config_provider: None,
+            deadline_schedule: DeadlineSchedule::uniform(DeadlineBps::default()),
+            #[cfg(test)]
+            envelope_deadline_note: Mutex::new(None),
         }
     }
 
@@ -84,6 +144,17 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     ) -> Self {
         self.builder_config_provider = Some(provider);
         self
+    }
+
+    /// Injected deadline schedule. Default is uniform [`DeadlineBps::default`].
+    pub fn with_deadline_schedule(mut self, schedule: DeadlineSchedule) -> Self {
+        self.deadline_schedule = schedule;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_envelope_deadline_note(&self) -> Option<EnvelopeDeadlineNote> {
+        self.envelope_deadline_note.lock().ok().and_then(|g| *g)
     }
 
     async fn v4_builder_config(&self, pubkey: &[u8; 48], slot: Slot, boost: u64) -> BuilderConfig {
@@ -155,12 +226,14 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         validator: Option<&BlockResponseValidator>,
     ) -> Result<BlockProposalResult, BlockServiceError> {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
-        let proposal_start = std::time::Instant::now();
+        let proposal_start = Instant::now();
 
         info!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), %mode, "Block proposal started");
 
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
+        let mut payload_deadline =
+            PayloadDeadline::new(fork, &self.deadline_schedule, proposal_start);
 
         // 1. Sign RANDAO reveal
         let randao_start = std::time::Instant::now();
@@ -282,6 +355,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             }
         };
 
+        payload_deadline.mark("produce");
+
         // Record dynamic attributes after block production
         let span = tracing::Span::current();
         span.record("block.consensus_version", &response.consensus_version);
@@ -308,14 +383,19 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             span.record("block.blinded", response.is_blinded);
         }
 
-        // 4. Sign and publish. Fork is resolved from the slot; V4 never
-        // dispatches on `Eth-Consensus-Version` or `is_blinded`.
-        // D29: this `response` is committed once a signature exists — no
-        // re-production and no second sign for the slot. Publish keeps the
-        // existing broadcast/submit policy; envelope publish (6.20) must use
-        // the same bytes.
+        // Sign and publish. Fork is resolved from the slot; V4 never
+        // dispatches on Eth-Consensus-Version or is_blinded. Once a signature
+        // exists this response is committed — no re-produce and no second sign.
         let (block_root, is_blinded) = if fork >= ForkName::Gloas {
-            self.sign_and_publish_v4(&response, slot, pubkey, validator, fork).await
+            self.sign_and_publish_v4(
+                &response,
+                slot,
+                pubkey,
+                validator,
+                fork,
+                &mut payload_deadline,
+            )
+            .await
         } else {
             reject_blinded_at_gloas(
                 response.is_blinded,
@@ -350,7 +430,16 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             }
         }
         .map_err(|e| {
-            error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %e, "Block publication failed");
+            if matches!(e, BlockServiceError::EnvelopeAfterPublish(_)) {
+                error!(
+                    slot = slot,
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    error = %e,
+                    "Self-build envelope failed after block publish"
+                );
+            } else {
+                error!(slot = slot, pubkey = %TruncatedPubkey::new(&pubkey_hex), error = %e, "Block publication failed");
+            }
             e
         })?;
 
@@ -372,7 +461,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         })
     }
 
-    /// Gloas V4 sign+publish: slot-resolved `fork` only. Self-build vs builder-win is 6.20.
+    /// Gloas V4 sign+publish. Self-build vs builder-win from the decoded body.
     async fn sign_and_publish_v4(
         &self,
         response: &ProduceBlockResponse,
@@ -380,31 +469,25 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         validator: Option<&BlockResponseValidator>,
         fork: ForkName,
+        payload_deadline: &mut PayloadDeadline,
     ) -> Result<(Root, bool), BlockServiceError> {
         cross_check_consensus_version(&response.consensus_version, fork)?;
-        // Envelope BlockContents parse is 6.18; fail closed rather than Electra-hash.
-        if response.payload_included {
+        let body = response.decode_v4_body()?;
+        let (block, block_ssz, envelope) = match body {
+            ProduceBlockV4Body::BeaconBlock { block, block_ssz } => (block, block_ssz, None),
+            ProduceBlockV4Body::BlockContents(GloasBlockContents {
+                block,
+                block_ssz,
+                execution_payload_envelope,
+                kzg_proofs,
+                blobs,
+            }) => (block, block_ssz, Some((execution_payload_envelope, blobs, kzg_proofs))),
+        };
+        if envelope.is_some() && response.builder_url.is_some() {
             return Err(BlockServiceError::Parse(
-                "Gloas payload_included body requires BlockContents parse (6.18)".to_string(),
+                "BlockContents must not include Eth-Builder-Url".to_string(),
             ));
         }
-        if response.is_ssz {
-            self.sign_and_publish_ssz_gloas(response, slot, pubkey, validator, fork).await
-        } else {
-            self.sign_and_publish_json_gloas(response, slot, pubkey, validator, fork).await
-        }
-    }
-
-    async fn sign_and_publish_json_gloas(
-        &self,
-        response: &ProduceBlockResponse,
-        slot: Slot,
-        pubkey: &PublicKey,
-        validator: Option<&BlockResponseValidator>,
-        fork: ForkName,
-    ) -> Result<(Root, bool), BlockServiceError> {
-        let block_contents = response.parse_full_block()?;
-        let block = block_contents.block().clone();
         if block.slot != slot {
             return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
         }
@@ -414,6 +497,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 e
             })?;
         }
+        let envelope_root = if let Some((ref envelope_body, _, _)) = envelope {
+            let envelope_ssz = envelope_ssz_for_island(envelope_body)?;
+            Some(rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz)?)
+        } else {
+            None
+        };
         let (header, block_root) = gloas_header_and_root(&block)?;
         let sig = self
             .signer
@@ -421,60 +510,106 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .instrument(tracing::info_span!("sign.block"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
-        let signed =
-            eth_types::SignedBeaconBlock { message: block, signature: sig.to_bytes().to_vec() };
-        self.beacon
-            .publish_block(&signed, fork.as_ref(), response.builder_url.as_deref())
-            .instrument(tracing::info_span!("beacon.publish_block"))
-            .await?;
+        payload_deadline.mark("sign_block");
+        let builder_url = if envelope.is_some() { None } else { response.builder_url.as_deref() };
+        if let Some(ref block_ssz) = block_ssz {
+            let signed_ssz =
+                beacon::ssz_deser::serialize_signed_beacon_block_ssz(block_ssz, &sig.to_bytes())
+                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+            self.beacon
+                .publish_block_ssz(&signed_ssz, fork.as_ref(), false, builder_url)
+                .instrument(tracing::info_span!("beacon.publish_block"))
+                .await?;
+        } else {
+            let signed =
+                eth_types::SignedBeaconBlock { message: block, signature: sig.to_bytes().to_vec() };
+            self.beacon
+                .publish_block(&signed, fork.as_ref(), builder_url)
+                .instrument(tracing::info_span!("beacon.publish_block"))
+                .await?;
+        }
+        payload_deadline.mark("publish_block");
+        if let (Some((envelope_body, blobs, proofs)), Some(object_root)) = (envelope, envelope_root)
+        {
+            if let Err(e) = self
+                .sign_and_publish_envelope(
+                    response,
+                    &envelope_body,
+                    &blobs,
+                    &proofs,
+                    object_root,
+                    slot,
+                    pubkey,
+                    fork,
+                    payload_deadline,
+                )
+                .await
+            {
+                return Err(BlockServiceError::EnvelopeAfterPublish(e.to_string()));
+            }
+        }
         Ok((block_root, false))
     }
 
-    async fn sign_and_publish_ssz_gloas(
+    /// Self-build envelope: never before the block publish; same produce body.
+    #[allow(clippy::too_many_arguments)]
+    async fn sign_and_publish_envelope(
         &self,
         response: &ProduceBlockResponse,
+        envelope_body: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        object_root: Root,
         slot: Slot,
         pubkey: &PublicKey,
-        validator: Option<&BlockResponseValidator>,
         fork: ForkName,
-    ) -> Result<(Root, bool), BlockServiceError> {
-        let ssz_bytes = response.ssz_bytes.as_ref().ok_or_else(|| {
-            BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string())
-        })?;
-        let format = beacon::ssz_deser::SszBlockFormat::BeaconBlock;
-        let (block, block_data_offset) =
-            beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
-                .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-        if block.slot != slot {
-            return Err(BlockServiceError::Parse(format!(
-                "SSZ block slot mismatch: header has {}, expected {}",
-                block.slot, slot,
-            )));
+        payload_deadline: &mut PayloadDeadline,
+    ) -> Result<(), BlockServiceError> {
+        if !response.payload_included {
+            return Err(BlockServiceError::Parse(
+                "envelope publish requires payload_included on the signed produce response"
+                    .to_string(),
+            ));
         }
-        if let Some(v) = validator {
-            v.validate_full(&block).map_err(|e| {
-                error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
-                e
-            })?;
-        }
-        let (header, block_root) = gloas_header_and_root(&block)?;
         let sig = self
             .signer
-            .sign_block_header(&header, pubkey, &self.fork_schedule, &self.genesis_validators_root)
-            .instrument(tracing::info_span!("sign.block"))
+            .sign_execution_payload_envelope_root(
+                &object_root,
+                slot,
+                pubkey,
+                &self.fork_schedule,
+                &self.genesis_validators_root,
+            )
+            .instrument(tracing::info_span!("sign.envelope"))
             .await
             .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
-        let block_ssz = &ssz_bytes[block_data_offset..];
-        let message_offset: u32 = 100;
-        let mut signed_ssz = Vec::with_capacity(100 + block_ssz.len());
-        signed_ssz.extend_from_slice(&message_offset.to_le_bytes());
-        signed_ssz.extend_from_slice(&sig.to_bytes());
-        signed_ssz.extend_from_slice(block_ssz);
-        self.beacon
-            .publish_block_ssz(&signed_ssz, fork.as_ref(), false, response.builder_url.as_deref())
-            .instrument(tracing::info_span!("beacon.publish_block"))
-            .await?;
-        Ok((block_root, false))
+        payload_deadline.mark("sign_envelope");
+        let signed = signed_envelope_wire(envelope_body, &sig.to_bytes())?;
+        let publish = self
+            .beacon
+            .publish_execution_payload_envelope(&signed, blobs, kzg_proofs, fork.as_ref(), None)
+            .instrument(tracing::info_span!("beacon.publish_execution_payload_envelope"))
+            .await;
+        payload_deadline.mark("publish_envelope");
+        self.note_envelope_deadline(payload_deadline);
+        publish
+    }
+
+    fn note_envelope_deadline(&self, payload_deadline: &PayloadDeadline) {
+        let elapsed_ms = payload_deadline.elapsed_ms();
+        let deadline_ms = payload_deadline.deadline_ms;
+        let overrun_stage = payload_deadline.first_overrun_stage;
+        if let Some(stage) = overrun_stage {
+            warn!(
+                elapsed_ms,
+                deadline_ms, stage, "self-build envelope published after payload due"
+            );
+            RVC_PROPOSALS_TOTAL.with_label_values(&[proposal_outcome::ENVELOPE_LATE]).inc();
+        }
+        #[cfg(test)]
+        if let Ok(mut slot) = self.envelope_deadline_note.lock() {
+            *slot = Some(EnvelopeDeadlineNote { elapsed_ms, deadline_ms, overrun_stage });
+        }
     }
 
     async fn sign_and_publish_ssz(
@@ -721,6 +856,41 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             .await?;
 
         Ok((block_root, true))
+    }
+}
+
+/// Island envelope root needs SSZ. JSON is accepted only as hex-encoded SSZ.
+fn envelope_ssz_for_island(body: &WireBody) -> Result<Vec<u8>, BlockServiceError> {
+    match body {
+        WireBody::Ssz(bytes) => Ok(bytes.clone()),
+        WireBody::Json(serde_json::Value::String(s)) => {
+            let hex_str = s.strip_prefix("0x").unwrap_or(s);
+            hex::decode(hex_str).map_err(|e| {
+                BlockServiceError::Parse(format!(
+                    "JSON execution payload envelope is not island SSZ: {e}"
+                ))
+            })
+        }
+        WireBody::Json(_) => Err(BlockServiceError::Parse(
+            "JSON execution payload envelope is not island SSZ".to_string(),
+        )),
+    }
+}
+
+fn signed_envelope_wire(
+    unsigned: &WireBody,
+    signature: &[u8],
+) -> Result<WireBody, BlockServiceError> {
+    match unsigned {
+        WireBody::Ssz(ssz) => {
+            let framed = beacon::ssz_deser::serialize_signed_beacon_block_ssz(ssz, signature)
+                .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+            Ok(WireBody::Ssz(framed))
+        }
+        WireBody::Json(message) => Ok(WireBody::Json(serde_json::json!({
+            "message": message,
+            "signature": format!("0x{}", hex::encode(signature)),
+        }))),
     }
 }
 

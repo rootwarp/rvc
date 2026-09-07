@@ -6,7 +6,7 @@
 // Re-exports for topic submodules (`use super::*`).
 pub(super) use super::{
     compute_blinded_block_root, compute_block_root, gloas_header_and_root, ssz_block_format,
-    BlockService,
+    BlockService, PayloadDeadline,
 };
 pub(super) use crate::traits::{
     BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse,
@@ -22,6 +22,7 @@ mod mocks;
 pub(crate) use mocks::*;
 
 mod boost;
+mod envelope;
 mod propose;
 mod ssz;
 mod v4;

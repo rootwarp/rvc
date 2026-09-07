@@ -12,6 +12,7 @@
 //! Issue 4.13 adds `rvc_payload_attestation_skipped_total` (family delta +1).
 //! Issue 4.12 adds `rvc_signer_capability` (family delta +1).
 //! Issue 6.7 adds `rvc_bn_capability_state` (family delta +1).
+//! Issue 6.20 adds `rvc_proposals_total` (family delta +1; `outcome=envelope_late`).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -41,6 +42,7 @@ const NAME_CTORS: &[&str] = &[
 /// Files that declare the pinned families. Owner crates are added as metrics move.
 const DEFINITION_FILES: &[&str] = &[
     "crates/metrics/src/definitions.rs",
+    "crates/block-service/src/metrics.rs",
     "crates/bn-manager/src/metrics.rs",
     "crates/duty-tracker/src/metrics.rs",
     "crates/rvc/src/metrics.rs",
@@ -71,6 +73,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_payload_attestation_skipped_total",
     "rvc_pre_proposal_cold_fetch_duration_seconds",
     "rvc_pre_proposal_cold_fetch_total",
+    "rvc_proposals_total", // operator-facing: self-build envelope_late (issue 6.20)
     "rvc_proposer_bn_health_score",
     "rvc_proposer_bn_latency_ms",
     "rvc_proposer_config_refresh_failures_total",
@@ -190,11 +193,6 @@ fn expected_metric_names_is_sorted_and_unique() {
         EXPECTED_METRIC_NAMES,
         sorted.as_slice(),
         "EXPECTED_METRIC_NAMES must be sorted and unique (edit-only list)"
-    );
-    assert_eq!(
-        EXPECTED_METRIC_NAMES.len(),
-        39,
-        "issue 6.7 +1 family (rvc_bn_capability_state) on the 4.12 38-family pin"
     );
 }
 

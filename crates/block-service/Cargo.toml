@@ -16,9 +16,11 @@ crypto.workspace = true
 observability.workspace = true
 eth-types.workspace = true
 hex.workspace = true
+metrics.workspace = true
 sha2.workspace = true
 signer.workspace = true
 thiserror.workspace = true
+timing.workspace = true
 tracing.workspace = true
 tree_hash.workspace = true
 serde_json.workspace = true
@@ -29,6 +31,6 @@ rvc-gloas.workspace = true
 crypto.workspace = true
 eth-types = { workspace = true, features = ["test-fixtures"] }
 rvc-gloas = { workspace = true, features = ["test-fixtures"] }
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 toml.workspace = true
 tracing-test.workspace = true

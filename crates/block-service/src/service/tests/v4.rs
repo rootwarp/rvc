@@ -3,22 +3,8 @@
 use super::*;
 use async_trait::async_trait;
 use beacon::{BuilderEntry, BuilderRequestAuth, SignedBuilderRequestAuth};
-use eth_types::{body_tree_hash_root, BeaconBlock};
+use eth_types::body_tree_hash_root;
 use std::sync::Arc;
-
-fn gloas_body_ssz() -> Vec<u8> {
-    hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap()
-}
-
-fn gloas_block(slot: Slot) -> BeaconBlock {
-    BeaconBlock {
-        slot,
-        proposer_index: 42,
-        parent_root: [1u8; 32],
-        state_root: [2u8; 32],
-        body: gloas_body_ssz(),
-    }
-}
 
 fn gloas_unblinded(slot: Slot) -> MockBeaconClient {
     MockBeaconClient::unblinded(gloas_block(slot)).with_consensus_version("gloas")
@@ -510,8 +496,7 @@ fn test_gloas_header_helper_uses_island_not_electra_htr() {
 #[test]
 fn test_gloas_v4_helpers_do_not_read_is_blinded_or_electra_htr() {
     let src = include_str!("../mod.rs");
-    for name in ["sign_and_publish_v4", "sign_and_publish_json_gloas", "sign_and_publish_ssz_gloas"]
-    {
+    for name in ["sign_and_publish_v4", "sign_and_publish_envelope"] {
         let needle = format!("async fn {name}");
         let start = src.find(&needle).unwrap_or_else(|| panic!("{name} must exist"));
         let rest = &src[start..];
@@ -521,5 +506,6 @@ fn test_gloas_v4_helpers_do_not_read_is_blinded_or_electra_htr() {
         assert!(!body.contains("compute_block_root"), "{name} must not call compute_block_root");
         assert!(!body.contains("body_tree_hash_root"), "{name} must not call body_tree_hash_root");
         assert!(!body.contains("header_from_full"), "{name} must not call header_from_full");
+        assert!(!body.contains("parse_full_block"), "{name} must not call parse_full_block");
     }
 }

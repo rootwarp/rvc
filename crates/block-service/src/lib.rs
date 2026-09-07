@@ -4,6 +4,7 @@
 //! and block publication through the beacon node API.
 
 mod error;
+pub mod metrics;
 mod service;
 mod traits;
 mod types;

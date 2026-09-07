@@ -163,6 +163,7 @@ pub fn init() {
     signer::metrics::init();
     duty_tracker::metrics::init();
     bn_manager::metrics::init();
+    block_service::metrics::init();
     LazyLock::force(&RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL);
     LazyLock::force(&RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL);
     LazyLock::force(&RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS);

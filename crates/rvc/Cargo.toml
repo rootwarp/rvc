@@ -59,6 +59,7 @@ bn-manager = { workspace = true, features = ["test-utils"] }
 crypto.workspace = true
 # ARCH-7b: valid Deneb body fixtures for proposal success path in M1 harness.
 eth-types = { workspace = true, features = ["test-fixtures"] }
+rvc-gloas = { workspace = true, features = ["test-fixtures"] }
 http-body-util.workspace = true
 # Used by pipeline_slashing.rs to poison a file-backed SlashingDb (DROP TABLE)
 # for the RF1-02 fail-closed DB-error integration test.

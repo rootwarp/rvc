@@ -61,8 +61,8 @@ async fn test_propose_block_ssz_calls_publish_block_ssz() {
 
     let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
     assert_eq!(ssz_calls.len(), 1);
-    assert_eq!(ssz_calls[0].1, "deneb");
-    assert!(!ssz_calls[0].2); // is_blinded = false
+    assert_eq!(ssz_calls[0].consensus_version, "deneb");
+    assert!(!ssz_calls[0].is_blinded);
 
     // JSON publish endpoints should NOT be called
     assert!(beacon_arc.publish_calls.lock().unwrap().is_empty());
@@ -90,7 +90,7 @@ async fn test_propose_block_ssz_blinded_passes_is_blinded_flag() {
 
     let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
     assert_eq!(ssz_calls.len(), 1);
-    assert!(ssz_calls[0].2); // is_blinded = true
+    assert!(ssz_calls[0].is_blinded);
 }
 
 #[tokio::test]
@@ -373,7 +373,7 @@ async fn test_ssz_published_payload_contains_signature() {
 
     let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
     assert_eq!(ssz_calls.len(), 1);
-    let published = &ssz_calls[0].0;
+    let published = &ssz_calls[0].bytes;
 
     // First 4 bytes: message_offset = 100 (4 + 96)
     let message_offset = u32::from_le_bytes(published[0..4].try_into().unwrap());
@@ -416,7 +416,7 @@ async fn test_ssz_published_payload_is_signed_beacon_block() {
     assert!(result.is_ok());
 
     let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
-    let published = &ssz_calls[0].0;
+    let published = &ssz_calls[0].bytes;
 
     // Published length = 100 (4 offset + 96 sig) + block_ssz_len
     assert_eq!(published.len(), 100 + block_ssz_len);
@@ -443,7 +443,7 @@ async fn test_ssz_blinded_block_also_includes_signature() {
 
     let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
     assert_eq!(ssz_calls.len(), 1);
-    let published = &ssz_calls[0].0;
+    let published = &ssz_calls[0].bytes;
 
     // First 4 bytes: message_offset = 100
     let message_offset = u32::from_le_bytes(published[0..4].try_into().unwrap());
@@ -454,7 +454,7 @@ async fn test_ssz_blinded_block_also_includes_signature() {
     assert_eq!(sig, mock_block_sig().to_bytes());
 
     // Blinded flag should be true
-    assert!(ssz_calls[0].2);
+    assert!(ssz_calls[0].is_blinded);
 }
 // --- Issue 3.1: SSZ large-body + non-empty KZG tests (Finding #21) ---
 
