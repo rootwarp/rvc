@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 from pytest_socket import disable_socket
 
-SCRIPT = Path(__file__).resolve().parents[1] / "validator_perf.py"
+def _script_path(name: str) -> Path:
+    return Path(__file__).resolve().parents[1] / f"{name}.py"
+
+
+SCRIPT = _script_path("validator_perf")
 _FIXTURES = Path(__file__).parent / "fixtures"
 
 
@@ -25,18 +29,27 @@ def xdg_cache_home(tmp_path, monkeypatch):
 
 
 def load_script(name: str = "validator_perf"):
-    spec = importlib.util.spec_from_file_location(name, SCRIPT)
+    path = _script_path(name)
+    # Unique module aliases (validator_perf_guard) still load validator_perf.py.
+    if not path.is_file():
+        path = SCRIPT
+    spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
-        raise FileNotFoundError(SCRIPT)
+        raise FileNotFoundError(path)
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
-    spec.loader.exec_module(mod)  # requires the __main__ guard in §16
+    spec.loader.exec_module(mod)  # requires the __main__ guard
     return mod
 
 
 @pytest.fixture(scope="session")
 def vp():
     return load_script()
+
+
+@pytest.fixture(scope="session")
+def dr():
+    return load_script("devnet_report")
 
 
 @pytest.fixture
@@ -47,6 +60,11 @@ def load():
 def raw_response(vp, name: str, status: int = 200, truncated: bool = False):
     body = (_FIXTURES / f"{name}.json").read_bytes()
     return vp.RawResponse(status, body, truncated)
+
+
+def raw_text(mod, name: str, status: int = 200):
+    body = (_FIXTURES / f"{name}.txt").read_bytes()
+    return mod.RawResponse(status, body)
 
 
 def route_map(**scenarios):
