@@ -68,6 +68,27 @@ class Log:
         print(msg % a if a else msg, file=self._stream)
 
 
+_REPORT_PRODUCERS = {
+    "run.json": "run.sh",
+    "metrics-start.txt": "soak.sh",
+    "metrics-end.txt": "soak.sh",
+    "samples.jsonl": "soak.sh",
+}
+
+
+def _input_name(path: str) -> str:
+    return os.path.basename(os.fspath(path))
+
+
+def _artifact_msg(path: str, template: str) -> str:
+    name = _input_name(path)
+    msg = template.format(name=name)
+    stage = _REPORT_PRODUCERS.get(name)
+    if stage is None:
+        return msg
+    return f"{msg} (produced by {stage})"
+
+
 # ===== § 3. Prometheus text-format 0.0.4 =====
 
 _TYPE_RE = re.compile(
@@ -646,9 +667,9 @@ def _jsonl_open_flags(*, write: bool) -> int:
 
 def _refuse_non_regular(st: os.stat_result, dest: str) -> None:
     if stat.S_ISLNK(st.st_mode):
-        raise InfraError(f"{dest} is a symlink")
+        raise InfraError(_artifact_msg(dest, "{name} is a symlink"))
     if not stat.S_ISREG(st.st_mode):
-        raise InfraError(f"{dest} is not a regular file")
+        raise InfraError(_artifact_msg(dest, "{name} is not a regular file"))
 
 
 def _open_jsonl_fd(path: str | os.PathLike[str], *, write: bool) -> int:
@@ -658,29 +679,37 @@ def _open_jsonl_fd(path: str | os.PathLike[str], *, write: bool) -> int:
         existing = os.lstat(dest)
     except FileNotFoundError:
         if not write:
-            raise InfraError(f"failed to read {dest}: not found") from None
+            raise InfraError(_artifact_msg(dest, "failed to read {name}")) from None
         existing = None
     except OSError as exc:
-        raise InfraError(f"failed to {action} {dest}: {exc}") from exc
+        raise InfraError(
+            _artifact_msg(dest, f"failed to {action} {{name}}")
+        ) from exc
     if existing is not None:
         _refuse_non_regular(existing, dest)
         if existing.st_size > _MAX_JSONL_BYTES:
-            raise InfraError(f"{dest} exceeded jsonl size cap")
+            raise InfraError(
+                _artifact_msg(dest, "{name} exceeded jsonl size cap")
+            )
     try:
         fd = os.open(dest, _jsonl_open_flags(write=write), 0o644)
     except OSError as exc:
-        raise InfraError(f"failed to {action} {dest}: {exc}") from exc
+        raise InfraError(
+            _artifact_msg(dest, f"failed to {action} {{name}}")
+        ) from exc
     try:
         opened = os.fstat(fd)
     except OSError as exc:
         os.close(fd)
-        raise InfraError(f"failed to {action} {dest}: {exc}") from exc
+        raise InfraError(
+            _artifact_msg(dest, f"failed to {action} {{name}}")
+        ) from exc
     if not stat.S_ISREG(opened.st_mode):
         os.close(fd)
-        raise InfraError(f"{dest} is not a regular file")
+        raise InfraError(_artifact_msg(dest, "{name} is not a regular file"))
     if opened.st_size > _MAX_JSONL_BYTES:
         os.close(fd)
-        raise InfraError(f"{dest} exceeded jsonl size cap")
+        raise InfraError(_artifact_msg(dest, "{name} exceeded jsonl size cap"))
     return fd
 
 
@@ -691,18 +720,20 @@ def _append_jsonl_line(path: str | os.PathLike[str], obj: object) -> None:
     )
     data = (payload + "\n").encode("utf-8")
     if len(data) > _MAX_JSONL_LINE:
-        raise InfraError(f"{dest} jsonl line exceeded cap")
+        raise InfraError(_artifact_msg(dest, "{name} jsonl line exceeded cap"))
     fd = _open_jsonl_fd(dest, write=True)
     try:
         size = os.fstat(fd).st_size
         if size + len(data) > _MAX_JSONL_BYTES:
-            raise InfraError(f"{dest} exceeded jsonl size cap")
+            raise InfraError(
+                _artifact_msg(dest, "{name} exceeded jsonl size cap")
+            )
         # Single O_APPEND write so a concurrent soak tick cannot interleave.
         written = os.write(fd, data)
         if written != len(data):
-            raise InfraError(f"failed to append {dest}: short write")
+            raise InfraError(_artifact_msg(dest, "failed to append {name}"))
     except OSError as exc:
-        raise InfraError(f"failed to append {dest}: {exc}") from exc
+        raise InfraError(_artifact_msg(dest, "failed to append {name}")) from exc
     finally:
         os.close(fd)
 
@@ -714,14 +745,16 @@ def _iter_jsonl_objects(path: str | os.PathLike[str]):
         fh = os.fdopen(fd, "rb")
     except OSError as exc:
         os.close(fd)
-        raise InfraError(f"failed to read {dest}: {exc}") from exc
+        raise InfraError(_artifact_msg(dest, "failed to read {name}")) from exc
     with fh:
         while True:
             raw = fh.readline(_MAX_JSONL_LINE + 1)
             if not raw:
                 break
             if len(raw) > _MAX_JSONL_LINE:
-                raise InfraError(f"{dest} jsonl line exceeded cap")
+                raise InfraError(
+                    _artifact_msg(dest, "{name} jsonl line exceeded cap")
+                )
             try:
                 stripped = raw.decode("utf-8").strip()
             except UnicodeDecodeError:
@@ -1193,54 +1226,79 @@ _RUN_JSON_KEYS = (
     "rvc_version",
     "schema_version",
 )
-
-
-def _input_name(path: str) -> str:
-    return os.path.basename(os.fspath(path))
+_TABLE_DASH = "—"
+_CELL_CTRL_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_SECRET_LABEL_KEYS = frozenset({"password", "mnemonic", "jwt", "secret", "token"})
+_COUNTER_HEADERS = (
+    "family",
+    "labels",
+    "unit",
+    "start",
+    "end",
+    "delta",
+    "per_epoch",
+)
+_HISTOGRAM_HEADERS = (
+    "family",
+    "labels",
+    "unit",
+    "samples",
+    "mean",
+    "p50",
+    "p95",
+    "p99",
+)
+_GAUGE_HEADERS = (
+    "family",
+    "labels",
+    "unit",
+    "last",
+    "min",
+    "max",
+    "samples",
+)
 
 
 def _require_regular_file(path: str, *, cap: int) -> None:
     dest = os.fspath(path)
-    name = _input_name(dest)
     try:
         st = os.lstat(dest)
     except FileNotFoundError:
-        raise UsageError(f"failed to read {name}") from None
+        raise UsageError(_artifact_msg(dest, "failed to read {name}")) from None
     except OSError as exc:
-        raise InfraError(f"failed to read {name}") from exc
+        raise InfraError(_artifact_msg(dest, "failed to read {name}")) from exc
     if stat.S_ISLNK(st.st_mode):
-        raise InfraError(f"{name} is a symlink")
+        raise InfraError(_artifact_msg(dest, "{name} is a symlink"))
     if not stat.S_ISREG(st.st_mode):
-        raise InfraError(f"{name} is not a regular file")
+        raise InfraError(_artifact_msg(dest, "{name} is not a regular file"))
     if st.st_size > cap:
-        raise InfraError(f"{name} exceeded size cap")
+        raise InfraError(_artifact_msg(dest, "{name} exceeded size cap"))
 
 
 def _read_regular_text(path: str, *, cap: int) -> str:
     dest = os.fspath(path)
-    name = _input_name(dest)
     _require_regular_file(dest, cap=cap)
     try:
         fd = os.open(dest, _jsonl_open_flags(write=False))
     except OSError as exc:
-        raise InfraError(f"failed to read {name}") from exc
+        raise InfraError(_artifact_msg(dest, "failed to read {name}")) from exc
     try:
         opened = os.fstat(fd)
         if not stat.S_ISREG(opened.st_mode):
-            raise InfraError(f"{name} is not a regular file")
+            raise InfraError(_artifact_msg(dest, "{name} is not a regular file"))
         if opened.st_size > cap:
-            raise InfraError(f"{name} exceeded size cap")
+            raise InfraError(_artifact_msg(dest, "{name} exceeded size cap"))
         data = os.read(fd, cap + 1)
     except OSError as exc:
-        raise InfraError(f"failed to read {name}") from exc
+        raise InfraError(_artifact_msg(dest, "failed to read {name}")) from exc
     finally:
         os.close(fd)
     if len(data) > cap:
-        raise InfraError(f"{name} exceeded size cap")
+        raise InfraError(_artifact_msg(dest, "{name} exceeded size cap"))
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise InfraError(f"{name} is not valid UTF-8") from exc
+        raise InfraError(_artifact_msg(dest, "{name} is not valid UTF-8")) from exc
 
 
 def _load_json_object(path: str) -> object:
@@ -1249,7 +1307,9 @@ def _load_json_object(path: str) -> object:
             _read_regular_text(path, cap=_MAX_REPORT_JSON_BYTES)
         )
     except json.JSONDecodeError as exc:
-        raise UsageError(f"invalid JSON in {_input_name(path)}") from exc
+        raise UsageError(
+            _artifact_msg(path, "invalid JSON in {name}")
+        ) from exc
 
 
 def _validate_run_dir(run_dir: str) -> None:
@@ -1272,7 +1332,9 @@ def _copy_run(run: dict[str, object]) -> dict[str, object]:
 def _run_epochs(run: dict[str, object]) -> int:
     epochs = run.get("epochs")
     if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0:
-        raise UsageError("run.json epochs must be a positive integer")
+        raise UsageError(
+            _artifact_msg("run.json", "{name} epochs must be a positive integer")
+        )
     return epochs
 
 
@@ -1359,8 +1421,130 @@ def build_client_json(
     }
 
 
-def render_table(_client: dict[str, object]) -> str:
-    return ""
+def _fmt_number(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return _TABLE_DASH
+    number = float(value)
+    if not math.isfinite(number):
+        return _TABLE_DASH
+    if number == math.trunc(number) and abs(number) <= _JSON_SAFE_INT:
+        return str(int(number))
+    return format(number, ".10g")
+
+
+def _sanitize_cell(text: object) -> str:
+    raw = text if isinstance(text, str) else str(text)
+    return _CELL_CTRL_RE.sub("?", raw)
+
+
+def _secret_label_key(key: str) -> bool:
+    lowered = key.lower()
+    return lowered in _SECRET_LABEL_KEYS or lowered.startswith("secret")
+
+
+def _fmt_labels(labels: object) -> str:
+    if not isinstance(labels, dict) or not labels:
+        return _TABLE_DASH
+    parts: list[tuple[str, str]] = []
+    for key, value in labels.items():
+        key_s = key if isinstance(key, str) else str(key)
+        if _secret_label_key(key_s):
+            continue
+        val_s = value if isinstance(value, str) else str(value)
+        parts.append((_sanitize_cell(key_s), _sanitize_cell(val_s)))
+    if not parts:
+        return _TABLE_DASH
+    return ",".join(
+        f"{key}={value}" for key, value in sorted(parts)
+    )
+
+
+def _align_rows(rows: list[list[str]]) -> list[str]:
+    if not rows:
+        return []
+    widths = [max(len(row[i]) for row in rows) for i in range(len(rows[0]))]
+    return [
+        "  ".join(f"{cell:<{w}}" for cell, w in zip(row, widths)).rstrip()
+        for row in rows
+    ]
+
+
+def _series_rows(block: object) -> list[tuple[str, dict[str, object]]]:
+    if not isinstance(block, dict):
+        return []
+    rows: list[tuple[str, dict[str, object]]] = []
+    for name in sorted(block):
+        series = block[name]
+        if not isinstance(name, str) or not isinstance(series, list):
+            continue
+        for item in series:
+            if isinstance(item, dict):
+                rows.append((name, item))
+    return rows
+
+
+def _shown_unit(name: str, row: dict[str, object]) -> str:
+    unit = row.get("unit")
+    shown = unit if isinstance(unit, str) and unit else unit_for(name)
+    return _sanitize_cell(shown)
+
+
+def _counter_row(name: str, row: dict[str, object]) -> list[str]:
+    return [
+        _sanitize_cell(name),
+        _fmt_labels(row.get("labels")),
+        _shown_unit(name, row),
+        _fmt_number(row.get("start")),
+        _fmt_number(row.get("end")),
+        _fmt_number(row.get("delta")),
+        _fmt_number(row.get("per_epoch")),
+    ]
+
+
+def _histogram_row(name: str, row: dict[str, object]) -> list[str]:
+    return [
+        _sanitize_cell(name),
+        _fmt_labels(row.get("labels")),
+        _shown_unit(name, row),
+        _fmt_number(row.get("samples")),
+        _fmt_number(row.get("mean")),
+        _fmt_number(row.get("p50")),
+        _fmt_number(row.get("p95")),
+        _fmt_number(row.get("p99")),
+    ]
+
+
+def _gauge_row(name: str, row: dict[str, object]) -> list[str]:
+    return [
+        _sanitize_cell(name),
+        _fmt_labels(row.get("labels")),
+        _sanitize_cell(unit_for(name)),
+        _fmt_number(row.get("last")),
+        _fmt_number(row.get("min")),
+        _fmt_number(row.get("max")),
+        _fmt_number(row.get("samples")),
+    ]
+
+
+def render_table(client: dict[str, object]) -> str:
+    sections = (
+        (_COUNTER_HEADERS, _series_rows(client.get("counters")), _counter_row),
+        (
+            _HISTOGRAM_HEADERS,
+            _series_rows(client.get("histograms")),
+            _histogram_row,
+        ),
+        (_GAUGE_HEADERS, _series_rows(client.get("gauges")), _gauge_row),
+    )
+    lines: list[str] = []
+    for headers, series, build_row in sections:
+        table = _align_rows(
+            [list(headers), *[build_row(name, row) for name, row in series]]
+        )
+        if lines:
+            lines.append("")
+        lines.extend(table)
+    return "\n".join(lines).rstrip("\n") + "\n"
 
 
 def cmd_report(
@@ -1378,7 +1562,7 @@ def cmd_report(
     samples_path = os.path.join(run_dir, "samples.jsonl")
     run_obj = _load_json_object(run_path)
     if not isinstance(run_obj, dict):
-        raise UsageError("run.json must be an object")
+        raise UsageError(_artifact_msg(run_path, "{name} must be an object"))
     start = parse_metrics(
         _read_regular_text(start_path, cap=MAX_RESPONSE_BYTES)
     )
@@ -1392,13 +1576,17 @@ def cmd_report(
         run_obj, window, start, end, gauges, clock=clock
     )
     table = render_table(client)
-    if not table.endswith("\n"):
-        table += "\n"
+    client_path = os.path.join(run_dir, "client.json")
+    report_path = os.path.join(run_dir, "report.txt")
     try:
-        write_json_atomic(os.path.join(run_dir, "client.json"), client)
-        _write_text_atomic(os.path.join(run_dir, "report.txt"), table)
+        write_json_atomic(client_path, client)
     except OSError as exc:
-        raise InfraError(f"failed to write report artifacts: {exc}") from exc
+        raise InfraError(_artifact_msg(client_path, "failed to write {name}")) from exc
+    try:
+        _write_text_atomic(report_path, table)
+    except OSError as exc:
+        raise InfraError(_artifact_msg(report_path, "failed to write {name}")) from exc
+    sys.stdout.write(table)
 
 
 # ===== § 9. Compare =====

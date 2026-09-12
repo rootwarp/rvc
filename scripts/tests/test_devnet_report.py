@@ -992,6 +992,29 @@ _REPORT_INPUTS = (
 )
 
 
+_REPORT_PRODUCERS = {
+    "run.json": "run.sh",
+    "metrics-start.txt": "soak.sh",
+    "metrics-end.txt": "soak.sh",
+    "samples.jsonl": "soak.sh",
+}
+_CHAIN_HALF_MARKERS = (
+    "pubkey",
+    "DEGRADED:",
+    "window: epochs",
+    "validators:",
+    "incl/sched",
+    "part%",
+)
+_RUN_BANNER_MARKERS = (
+    "run_id",
+    "generated_at",
+    "key_range",
+    "fingerprint",
+    "schema_version",
+)
+
+
 def test_report_missing_inputs_exit_2_with_basename(dr, tmp_path, capsys):
     for name in _REPORT_INPUTS:
         run_dir = _synthetic_run_dir(tmp_path / name)
@@ -1001,6 +1024,7 @@ def test_report_missing_inputs_exit_2_with_basename(dr, tmp_path, capsys):
         assert code == 2
         err = capsys.readouterr().err
         assert name in err
+        assert _REPORT_PRODUCERS[name] in err
         assert str(run_dir) not in err
 
 
@@ -1093,3 +1117,180 @@ def test_presence_k6_always_emitted(dr):
         run, window, start, end, {}, clock=_clock
     )
     assert absent["presence"]["K6"] == "family_present_child_absent"
+
+
+def test_report_txt_matches_golden(dr, tmp_path, capsys):
+    code, _client, run_dir = _run_report(dr, tmp_path)
+    assert code == 0
+    expected = (_FIXTURES / "report_txt__golden.txt").read_bytes()
+    actual = (run_dir / "report.txt").read_bytes()
+    assert actual == expected
+    assert capsys.readouterr().out.encode("utf-8") == expected
+
+
+def test_report_txt_prints_unit_column(dr, tmp_path):
+    code, _client, run_dir = _run_report(dr, tmp_path)
+    assert code == 0
+    text = (run_dir / "report.txt").read_text(encoding="utf-8")
+    units: dict[str, str] = {}
+    header = None
+    for line in text.splitlines():
+        cols = line.split()
+        if not cols:
+            header = None
+            continue
+        if cols[0] == "family":
+            header = cols
+            assert "unit" in header
+            continue
+        if header is None:
+            continue
+        units[cols[0]] = cols[header.index("unit")]
+    assert units["rvc_signing_duration_seconds"] == "seconds"
+    assert units["rvc_orchestrator_slot_processing_duration_seconds"] == "seconds"
+    assert units["rvc_slashing_reserve_tx_hold_duration_ms"] == "milliseconds"
+    assert units["rvc_proposer_bn_latency_ms"] == "milliseconds"
+    assert units["rvc_slot_phase_block_start_offset_ms"] == "milliseconds"
+
+
+def test_report_txt_is_append_safe(dr, tmp_path):
+    code, _client, run_dir = _run_report(dr, tmp_path)
+    assert code == 0
+    text = (run_dir / "report.txt").read_text(encoding="utf-8")
+    assert text.endswith("\n")
+    assert not text.endswith("\n\n")
+    for marker in _CHAIN_HALF_MARKERS:
+        assert marker not in text
+    for marker in _RUN_BANNER_MARKERS:
+        assert marker not in text
+
+
+def test_report_missing_metrics_end_exits_2_naming_soak(dr, tmp_path, capsys):
+    run_dir = _synthetic_run_dir(tmp_path)
+    (run_dir / "metrics-end.txt").unlink()
+    capsys.readouterr()
+    code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "metrics-end.txt" in err
+    assert "soak.sh" in err
+    assert str(run_dir) not in err
+
+
+def test_report_missing_run_json_exits_2_naming_run_sh(dr, tmp_path, capsys):
+    run_dir = _synthetic_run_dir(tmp_path)
+    (run_dir / "run.json").unlink()
+    capsys.readouterr()
+    code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "run.json" in err
+    assert "run.sh" in err
+    assert str(run_dir) not in err
+
+
+def test_report_writes_only_client_json_and_report_txt(dr, tmp_path):
+    run_dir = _synthetic_run_dir(tmp_path)
+    sentinel = run_dir / "keep-me.bin"
+    sentinel.write_bytes(b"\x00\xffKEEP")
+    before = {path.name: path.read_bytes() for path in run_dir.iterdir()}
+    code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+    assert code == 0
+    after = {path.name: path.read_bytes() for path in run_dir.iterdir()}
+    assert set(after) - set(before) == {"client.json", "report.txt"}
+    for name, data in before.items():
+        assert after[name] == data
+
+
+def test_report_unreadable_inputs_exit_1_basename_producer(dr, tmp_path, capsys):
+    for name in _REPORT_INPUTS:
+        run_dir = _synthetic_run_dir(tmp_path / name)
+        target = run_dir / name
+        target.chmod(0)
+        try:
+            capsys.readouterr()
+            code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+        finally:
+            target.chmod(0o644)
+        assert code == 1
+        err = capsys.readouterr().err
+        assert name in err
+        assert _REPORT_PRODUCERS[name] in err
+        assert str(run_dir) not in err
+
+
+def test_report_samples_jsonl_line_cap_exits_1_basename(
+    dr, tmp_path, capsys, monkeypatch
+):
+    run_dir = _synthetic_run_dir(tmp_path)
+    monkeypatch.setattr(dr, "_MAX_JSONL_LINE", 8)
+    capsys.readouterr()
+    code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "samples.jsonl" in err
+    assert "soak.sh" in err
+    assert str(run_dir) not in err
+
+
+def test_report_write_failure_omits_run_dir_path(dr, tmp_path, capsys):
+    run_dir = _synthetic_run_dir(tmp_path)
+    os.chmod(run_dir, 0o555)
+    try:
+        capsys.readouterr()
+        code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+    finally:
+        os.chmod(run_dir, 0o755)
+    assert code == 1
+    err = capsys.readouterr().err
+    assert str(run_dir) not in err
+    assert "client.json" in err or "report.txt" in err
+
+
+def test_render_table_sanitizes_controls_and_drops_secret_keys(dr):
+    text = dr.render_table(
+        {
+            "counters": {
+                "rvc_attestations_total": [
+                    {
+                        "labels": {
+                            "password": "s3cret-label",
+                            "x": "line1\nrun_id=injected",
+                        },
+                        "unit": "count",
+                        "start": 0,
+                        "end": 1,
+                        "delta": 1,
+                        "per_epoch": 1,
+                    }
+                ]
+            },
+            "histograms": {},
+            "gauges": {
+                "rvc_tasks_running\nmnemonic=abandon-secret": [
+                    {
+                        "labels": {
+                            "password": "s3cret-gauge",
+                            "task": "ok\rSECRET_CR",
+                        },
+                        "last": 7,
+                        "min": 7,
+                        "max": 7,
+                        "samples": 1,
+                    }
+                ]
+            },
+        }
+    )
+    assert "\r" not in text
+    assert "password=" not in text
+    assert "s3cret-label" not in text
+    assert "s3cret-gauge" not in text
+    lines = text.splitlines()
+    assert not any(line.startswith("run_id=") for line in lines)
+    assert not any(line.startswith("mnemonic=") for line in lines)
+    assert any("line1?run_id=injected" in line for line in lines)
+    assert any(
+        "rvc_tasks_running?mnemonic=abandon-secret" in line for line in lines
+    )
+    assert any("task=ok?SECRET_CR" in line for line in lines)

@@ -1,0 +1,27 @@
+family                                  labels                        unit   start  end  delta  per_epoch
+rvc_aggregations_total                  status=success                count  10     24   14     3.5
+rvc_attestations_total                  status=failed                 count  0      1    1      0.25
+rvc_attestations_total                  status=success                count  80     192  112    28
+rvc_duties_fetched_total                —                             count  4      8    4      1
+rvc_duty_reorg_detected_total           duty_type=attester            count  0      0    0      0
+rvc_orchestrator_missed_slots_total     —                             count  3      1    -2     -0.5
+rvc_orchestrator_slots_processed_total  result=failed                 count  0      0    0      0
+rvc_orchestrator_slots_processed_total  result=no_duties              count  0      0    0      0
+rvc_orchestrator_slots_processed_total  result=success                count  100    228  128    32
+rvc_proposals_total                     outcome=envelope_late         count  0      0    0      0
+rvc_slashing_protection_checks_total    result=blocked                count  0      0    0      0
+rvc_slashing_protection_checks_total    result=safe                   count  80     192  112    28
+rvc_sse_events_dropped_total            expected=true                 count  0      0    0      0
+rvc_task_exits_total                    outcome=ok,task=orchestrator  count  0      0    0      0
+
+family                                             labels                                        unit          samples  mean         p50     p95          p99
+rvc_orchestrator_slot_processing_duration_seconds  —                                             seconds       128      0.04140625   0.0212  0.28         0.68
+rvc_proposer_bn_latency_ms                         endpoint=http://127.0.0.1:5052,pool=proposer  milliseconds  8        7.5          4       9.333333333  9.866666667
+rvc_signing_duration_seconds                       —                                             seconds       10       0.007        0.004   0.075        0.095
+rvc_slashing_reserve_tx_hold_duration_ms           kind=attestation                              milliseconds  11       8.181818182  2.5     16.75        23.35
+rvc_slot_phase_block_start_offset_ms               cache=warm                                    milliseconds  0        —            —       —            —
+
+family                        labels                                        unit   last  min   max  samples
+rvc_bn_health_tier            endpoint=http://127.0.0.1:5052                count  3     1     4    3
+rvc_proposer_bn_health_score  endpoint=http://127.0.0.1:5052,pool=proposer  count  —     0.25  1    3
+rvc_tasks_running             task=orchestrator                             count  2     1     2    3
