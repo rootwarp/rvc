@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Start geth + Lighthouse BN from generated genesis and assert an Electra head.
+# Start geth + Lighthouse BN + Lighthouse VC from generated genesis.
 
 set -euo pipefail
 
@@ -23,6 +23,9 @@ fi
 unset _OV_CHAIN_ID _KEEP_CHAIN_ID
 
 BEACON_TESTNET_DIR="${BEACON_TESTNET_DIR:-/genesis}"
+# Phase 2 narrows this to ${KEYS_DIR}/vc; keep the source in one variable.
+VC_KEYS_SRC="${VC_KEYS_SRC:-${KEYS_DIR}/valtools}"
+VALIDATOR_DATA_DIR="${CL_DATA_DIR}/validator"
 _EL_GVR_REINIT=0
 
 _require_uint() {
@@ -129,36 +132,87 @@ _jq_raw() {
 
 _scrub_container_log() {
     local path="$1"
-    if [[ ! -f "$path" || -L "$path" ]]; then
+    if [[ -L "$path" ]]; then
+        die_usage "refusing symlink container log: ${path}"
+    fi
+    if [[ ! -e "$path" ]]; then
         return 0
     fi
-    MNEMONIC="${MNEMONIC-}" python3 -c '
-import os, re, sys
+    if [[ ! -f "$path" ]]; then
+        die_infra "container log is not a regular file: ${path}"
+    fi
+    MNEMONIC="${MNEMONIC-}" \
+        VC_SCRUB_SECRET_DIRS="${VALIDATOR_DATA_DIR}/secrets:${VC_KEYS_SRC}/secrets" \
+        python3 -c '
+import os, re, stat, sys
 path = sys.argv[1]
 try:
+    st = os.lstat(path)
+except OSError as exc:
+    raise SystemExit("cannot stat log: %s" % exc)
+if stat.S_ISLNK(st.st_mode):
+    raise SystemExit("symlink log")
+if not stat.S_ISREG(st.st_mode):
+    raise SystemExit("log is not a regular file")
+try:
     text = open(path, "r", encoding="utf-8", errors="replace").read()
-except OSError:
-    raise SystemExit(0)
+except OSError as exc:
+    raise SystemExit("cannot read log: %s" % exc)
 mnemo = os.environ.get("MNEMONIC") or ""
 if mnemo:
     text = text.replace(mnemo, "<redacted>")
+for d in (os.environ.get("VC_SCRUB_SECRET_DIRS") or "").split(":"):
+    if not d or not os.path.isdir(d) or os.path.islink(d):
+        continue
+    try:
+        names = os.listdir(d)
+    except OSError:
+        continue
+    for name in names:
+        p = os.path.join(d, name)
+        try:
+            pst = os.lstat(p)
+        except OSError:
+            continue
+        if stat.S_ISLNK(pst.st_mode) or not stat.S_ISREG(pst.st_mode):
+            continue
+        try:
+            body = open(p, "r", encoding="utf-8", errors="replace").read().strip()
+        except OSError:
+            continue
+        if len(body) >= 4:
+            text = text.replace(body, "<redacted>")
 text = re.sub(r"0x[0-9a-fA-F]{64}", "0x<redacted>", text)
 text = re.sub(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])", "<redacted>", text)
+text = re.sub(r"(?i)(password[\s:=]+)[^\s,;]+", r"\1<redacted>", text)
+text = re.sub(
+    r"(?<![A-Za-z0-9+/_=-])[A-Za-z0-9+/_-]{32,}={0,2}(?![A-Za-z0-9+/_=-])",
+    "<redacted>",
+    text,
+)
 fd = os.open(path, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
 try:
     os.write(fd, text.encode("utf-8"))
 finally:
     os.close(fd)
-' "$path" || true
+' "$path" || die_infra "failed to scrub container log: ${path}"
 }
 
 _fail_chain() {
-    local log_dir
+    local log_dir path name
+    log_dir="$(resolve_run_dir)/logs"
+    mkdir -p -- "$log_dir"
+    _refuse_symlink "$log_dir" "log dir"
+    for name in "$GETH_CONTAINER" "$BEACON_CONTAINER" "$VALIDATOR_CONTAINER"; do
+        path="${log_dir}/${name}.log"
+        _refuse_symlink "$path" "container log"
+    done
     capture_container_logs "$GETH_CONTAINER"
     capture_container_logs "$BEACON_CONTAINER"
-    log_dir="$(resolve_run_dir)/logs"
+    capture_container_logs "$VALIDATOR_CONTAINER"
     _scrub_container_log "${log_dir}/${GETH_CONTAINER}.log"
     _scrub_container_log "${log_dir}/${BEACON_CONTAINER}.log"
+    _scrub_container_log "${log_dir}/${VALIDATOR_CONTAINER}.log"
     die_infra "$@"
 }
 
@@ -255,12 +309,63 @@ _geth_needs_init() {
     [[ ! -d "${EL_DATA_DIR}/geth/chaindata" ]]
 }
 
+_all_chain_running() {
+    is_container_running "$GETH_CONTAINER" \
+        && is_container_running "$BEACON_CONTAINER" \
+        && is_container_running "$VALIDATOR_CONTAINER"
+}
+
+_require_fee_recipient() {
+    local a hex
+    a="${DEV_ACCOUNT:-}"
+    a="$(printf '%s' "$a" | tr -d '[:space:]')"
+    case "$a" in
+        0x[0-9a-fA-F]*)
+            ;;
+        *)
+            die_usage "DEV_ACCOUNT must be a non-zero 0x-prefixed address"
+            ;;
+    esac
+    hex="${a#0x}"
+    hex="$(printf '%s' "$hex" | tr 'A-F' 'a-f')"
+    case "$hex" in
+        "" | *[!0-9a-f]*)
+            die_usage "DEV_ACCOUNT must be a non-zero 0x-prefixed address"
+            ;;
+    esac
+    if [[ "${#hex}" -ne 40 ]]; then
+        die_usage "DEV_ACCOUNT must be a 20-byte address (got ${#hex} hex chars)"
+    fi
+    if [[ "$hex" =~ ^0+$ ]]; then
+        die_usage "DEV_ACCOUNT must be a non-zero address"
+    fi
+}
+
+_vc_source_count() {
+    local dir="${VC_KEYS_SRC}/validators"
+    local n=0 p
+    if [[ ! -d "$dir" || -L "$dir" ]]; then
+        printf '0'
+        return 0
+    fi
+    shopt -s nullglob
+    for p in "$dir"/0x*; do
+        if [[ -d "$p" && ! -L "$p" && -f "${p}/voting-keystore.json" && ! -L "${p}/voting-keystore.json" ]]; then
+            n=$((n + 1))
+        fi
+    done
+    shopt -u nullglob
+    printf '%s' "$n"
+}
+
 print_chain_plan() {
     log_info "chain plan:"
     log_info "  1. start_geth"
     log_info "  2. start_beacon"
     log_info "  3. wait_for_chain"
     log_info "  4. assert_head_fork_electra"
+    log_info "  5. copy_vc_keys"
+    log_info "  6. start_vc"
 }
 
 start_geth() {
@@ -392,6 +497,262 @@ start_beacon() {
     log_success "beacon started"
 }
 
+_install_regular_file() {
+    local src="$1"
+    local dest="$2"
+    local rc=0
+    python3 -c '
+import os, stat, sys
+src, dest = sys.argv[1], sys.argv[2]
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+
+def check(path, missing_ok=False):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        if missing_ok:
+            return
+        raise SystemExit(1)
+    if stat.S_ISLNK(st.st_mode):
+        raise SystemExit(2)
+    if not stat.S_ISREG(st.st_mode):
+        raise SystemExit(1)
+
+check(src)
+check(dest, missing_ok=True)
+fin = os.open(src, os.O_RDONLY | nofollow)
+try:
+    chunks = []
+    while True:
+        buf = os.read(fin, 1024 * 1024)
+        if not buf:
+            break
+        chunks.append(buf)
+finally:
+    os.close(fin)
+fout = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | nofollow, 0o600)
+try:
+    os.write(fout, b"".join(chunks))
+    os.fchmod(fout, 0o600)
+finally:
+    os.close(fout)
+' "$src" "$dest" || rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+        die_usage "refusing symlink file: ${src} -> ${dest}"
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        die_infra "failed to install ${dest}"
+    fi
+}
+
+_ensure_dir() {
+    local path="$1"
+    local what="$2"
+    if [[ -e "$path" ]]; then
+        _refuse_symlink "$path" "$what"
+        if [[ ! -d "$path" ]]; then
+            die_infra "${what} is not a directory: ${path}"
+        fi
+    else
+        mkdir -p -- "$path"
+    fi
+    _chmod_dir "$path"
+}
+
+# --force only: drop VC key trees and slashing DB together, then start_vc inits.
+_reset_vc_datadir() {
+    local dest="$VALIDATOR_DATA_DIR"
+    _refuse_symlink "$CL_DATA_DIR" "CL datadir"
+    _refuse_symlink "$dest" "VC datadir"
+    if [[ -z "$dest" || "$dest" == "/" ]]; then
+        die_infra "refusing to wipe empty VC datadir"
+    fi
+    if [[ -e "$dest" && ! -d "$dest" ]]; then
+        die_infra "VC datadir is not a directory: ${dest}"
+    fi
+    if [[ -d "$dest" ]]; then
+        _refuse_symlink "${dest}/validators" "VC validators"
+        _refuse_symlink "${dest}/secrets" "VC secrets"
+        rm -rf -- "${dest}/validators" "${dest}/secrets"
+        rm -f -- \
+            "${dest}/slashing_protection.sqlite" \
+            "${dest}/slashing_protection.sqlite-journal" \
+            "${dest}/slashing_protection.sqlite-wal"
+    fi
+}
+
+_vc_slashing_db() {
+    printf '%s' "${VALIDATOR_DATA_DIR}/validators/slashing_protection.sqlite"
+}
+
+# Leftover definitions or sqlite sidecars mean this datadir already signed.
+_vc_slashing_history_present() {
+    local dest_val db defs
+    dest_val="${VALIDATOR_DATA_DIR}/validators"
+    db="$(_vc_slashing_db)"
+    defs="${dest_val}/validator_definitions.yml"
+    _refuse_symlink "$defs" "validator definitions"
+    _refuse_symlink "${db}-wal" "slashing protection wal"
+    _refuse_symlink "${db}-journal" "slashing protection journal"
+    [[ -e "$defs" || -e "${db}-wal" || -e "${db}-journal" ]]
+}
+
+copy_vc_keys() {
+    local src_val src_sec dest_val dest_sec keydir pubkey ks secret dest_ks dest_secret count
+
+    src_val="${VC_KEYS_SRC}/validators"
+    src_sec="${VC_KEYS_SRC}/secrets"
+    dest_val="${VALIDATOR_DATA_DIR}/validators"
+    dest_sec="${VALIDATOR_DATA_DIR}/secrets"
+
+    _require_uint "NUM_VALIDATORS" "${NUM_VALIDATORS:-}"
+    if [[ "$NUM_VALIDATORS" -lt 1 ]]; then
+        die_usage "NUM_VALIDATORS must be a positive integer (got ${NUM_VALIDATORS})"
+    fi
+
+    _refuse_symlink "$VC_KEYS_SRC" "VC keys source"
+    _refuse_symlink "$src_val" "VC keystores"
+    _refuse_symlink "$src_sec" "VC secrets"
+    _refuse_symlink "$CL_DATA_DIR" "CL datadir"
+    _refuse_symlink "$VALIDATOR_DATA_DIR" "VC datadir"
+
+    validate_data_exists "validator keystores" "$src_val" "02-keys.sh"
+    validate_data_exists "validator secrets" "$src_sec" "02-keys.sh"
+    if [[ ! -d "$src_val" ]]; then
+        die_usage "validator keystores not a directory: ${src_val} (produced by 02-keys.sh)"
+    fi
+    if [[ ! -d "$src_sec" ]]; then
+        die_usage "validator secrets not a directory: ${src_sec} (produced by 02-keys.sh)"
+    fi
+
+    mkdir -p -- "$VALIDATOR_DATA_DIR"
+    _chmod_dir "$VALIDATOR_DATA_DIR"
+    _ensure_dir "$dest_val" "VC validators"
+    _ensure_dir "$dest_sec" "VC secrets"
+    _refuse_symlink "${dest_val}/slashing_protection.sqlite" "slashing protection db"
+
+    count=0
+    shopt -s nullglob
+    for keydir in "$src_val"/0x*; do
+        if [[ -L "$keydir" ]]; then
+            shopt -u nullglob
+            die_usage "refusing symlink keystore dir: ${keydir}"
+        fi
+        if [[ ! -d "$keydir" ]]; then
+            continue
+        fi
+        pubkey="$(basename -- "$keydir")"
+        ks="${keydir}/voting-keystore.json"
+        secret="${src_sec}/${pubkey}"
+        dest_ks="${dest_val}/${pubkey}/voting-keystore.json"
+        dest_secret="${dest_sec}/${pubkey}"
+        if [[ -L "$ks" ]]; then
+            shopt -u nullglob
+            die_usage "refusing symlink keystore: ${ks}"
+        fi
+        if [[ ! -f "$ks" ]]; then
+            shopt -u nullglob
+            die_infra "missing voting-keystore.json in ${keydir}"
+        fi
+        if [[ -L "$secret" ]]; then
+            shopt -u nullglob
+            die_usage "refusing symlink secret: ${secret}"
+        fi
+        if [[ ! -f "$secret" ]]; then
+            shopt -u nullglob
+            die_infra "missing validator secret for ${pubkey}"
+        fi
+        if [[ -e "${dest_val}/${pubkey}" ]]; then
+            _refuse_symlink "${dest_val}/${pubkey}" "VC keystore dest dir"
+            if [[ ! -d "${dest_val}/${pubkey}" ]]; then
+                shopt -u nullglob
+                die_infra "keystore dest is not a directory: ${dest_val}/${pubkey}"
+            fi
+        fi
+        mkdir -p -- "${dest_val}/${pubkey}"
+        chmod 700 "${dest_val}/${pubkey}" || die_infra "cannot chmod 700 ${dest_val}/${pubkey}"
+        _refuse_symlink "$dest_ks" "VC keystore dest"
+        _refuse_symlink "$dest_secret" "VC secret dest"
+        _install_regular_file "$ks" "$dest_ks"
+        _install_regular_file "$secret" "$dest_secret"
+        count=$((count + 1))
+    done
+    shopt -u nullglob
+
+    if [[ "$count" -ne "$NUM_VALIDATORS" ]]; then
+        die_infra "copied ${count} keystores, expected ${NUM_VALIDATORS}"
+    fi
+    log_success "copied ${count} validator keystores"
+}
+
+_start_vc_container() {
+    docker_run_as_user -d \
+        --name "$VALIDATOR_CONTAINER" \
+        --network "$DOCKER_NETWORK" \
+        --restart unless-stopped \
+        -v "${VALIDATOR_DATA_DIR}:/data" \
+        -v "${GENESIS_DIR}:/genesis:ro" \
+        -- \
+        "$IMG_LIGHTHOUSE" \
+        lighthouse \
+        validator_client \
+        --datadir=/data \
+        --testnet-dir=/genesis \
+        --beacon-nodes="http://${BEACON_CONTAINER}:5052" \
+        --suggested-fee-recipient="${DEV_ACCOUNT}" \
+        --graffiti="eth-devnet" \
+        "$@"
+}
+
+start_vc() {
+    local uid gid db
+    uid="$(id -u)"
+    gid="$(id -g)"
+
+    if is_container_running "$VALIDATOR_CONTAINER"; then
+        log_info "validator already running"
+        return 0
+    fi
+
+    _require_fee_recipient
+
+    if [[ "$FORCE" == "1" ]]; then
+        _reset_vc_datadir
+    fi
+
+    inventory_append datadir validator "$VALIDATOR_DATA_DIR"
+    mkdir -p -- "$VALIDATOR_DATA_DIR"
+    _chmod_dir "$VALIDATOR_DATA_DIR"
+    copy_vc_keys
+
+    db="$(_vc_slashing_db)"
+    _refuse_symlink "$db" "slashing protection db"
+    if [[ ! -f "$db" && "$FORCE" != "1" ]] && _vc_slashing_history_present; then
+        die_usage "slashing protection db missing at ${db} but validator datadir is in use; re-run with --force"
+    fi
+
+    if container_exists "$VALIDATOR_CONTAINER"; then
+        remove_container "$VALIDATOR_CONTAINER"
+    fi
+
+    inventory_append container "$VALIDATOR_CONTAINER"
+
+    log_info "starting lighthouse validator_client"
+    if [[ -f "$db" ]]; then
+        if ! _start_vc_container >/dev/null; then
+            _fail_chain "failed to start ${VALIDATOR_CONTAINER}"
+        fi
+    else
+        if ! _start_vc_container --init-slashing-protection >/dev/null; then
+            _fail_chain "failed to start ${VALIDATOR_CONTAINER}"
+        fi
+    fi
+    if ! is_container_running "$VALIDATOR_CONTAINER"; then
+        _fail_chain "validator container is not running"
+    fi
+    log_success "validator started (uid ${uid}:${gid})"
+}
+
 _wait_loop() {
     local label="$1"
     local attempts sleep_s attempt
@@ -481,6 +842,7 @@ assert_head_fork_electra() {
 }
 
 _validate_inputs() {
+    local got
     if [[ -L "$DATA_DIR" ]]; then
         die_usage "refusing symlink purge root: ${DATA_DIR}"
     fi
@@ -489,21 +851,34 @@ _validate_inputs() {
     validate_data_exists "EL genesis" "${GENESIS_DIR}/genesis.json" "01-genesis.sh"
     validate_data_exists "CL genesis" "${GENESIS_DIR}/genesis.ssz" "01-genesis.sh"
     validate_data_exists "CL config" "${GENESIS_DIR}/config.yaml" "01-genesis.sh"
+    _require_uint "NUM_VALIDATORS" "${NUM_VALIDATORS:-}"
+    if [[ "$NUM_VALIDATORS" -lt 1 ]]; then
+        die_usage "NUM_VALIDATORS must be a positive integer (got ${NUM_VALIDATORS})"
+    fi
+    _require_fee_recipient
+    _refuse_symlink "$VC_KEYS_SRC" "VC keys source"
+    validate_data_exists "validator keystores" "${VC_KEYS_SRC}/validators" "02-keys.sh"
+    validate_data_exists "validator secrets" "${VC_KEYS_SRC}/secrets" "02-keys.sh"
+    got="$(_vc_source_count)"
+    if [[ "$got" -ne "$NUM_VALIDATORS" ]]; then
+        die_usage "validator keystores ${got} != ${NUM_VALIDATORS} at ${VC_KEYS_SRC}/validators (produced by 02-keys.sh)"
+    fi
 }
 
 main() {
     parse_common_flags "$@"
     require_chain_1337
     require_cmd jq
+    require_cmd python3
     resolve_run_dir >/dev/null
     _validate_inputs
 
     if [[ "$DRY_RUN" == "1" ]]; then
         print_chain_plan
-        if is_container_running "$GETH_CONTAINER" && is_container_running "$BEACON_CONTAINER" && [[ "$FORCE" != "1" ]]; then
-            log_info "would no-op (geth and beacon already running)"
+        if _all_chain_running && [[ "$FORCE" != "1" ]]; then
+            log_info "would no-op (geth, beacon and validator already running)"
         else
-            log_info "would start ${GETH_CONTAINER} and ${BEACON_CONTAINER}"
+            log_info "would start ${GETH_CONTAINER}, ${BEACON_CONTAINER} and ${VALIDATOR_CONTAINER}"
         fi
         log_success "dry-run complete"
         return 0
@@ -514,10 +889,11 @@ main() {
 
     if [[ "$FORCE" == "1" ]]; then
         _truncate_inventory
-        remove_container "$GETH_CONTAINER"
+        remove_container "$VALIDATOR_CONTAINER"
         remove_container "$BEACON_CONTAINER"
-    elif is_container_running "$GETH_CONTAINER" && is_container_running "$BEACON_CONTAINER"; then
-        log_success "geth and beacon already running"
+        remove_container "$GETH_CONTAINER"
+    elif _all_chain_running; then
+        log_success "geth, beacon and validator already running"
         return 0
     fi
 
@@ -525,6 +901,7 @@ main() {
     start_beacon
     wait_for_chain
     assert_head_fork_electra
+    start_vc
     log_success "chain ready"
 }
 

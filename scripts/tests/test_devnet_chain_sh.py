@@ -1,4 +1,4 @@
-"""Contract tests for scripts/devnet/03-chain.sh (1.5a: EL + BN).
+"""Contract tests for scripts/devnet/03-chain.sh (1.5a EL+BN, 1.5b VC).
 
 DOCKER/CURL stubs are scratch scripts (P1-A8); disable_socket() via conftest.
 Live chain is skipped unless DEVNET_LIVE=1 and the pinned images are present.
@@ -11,7 +11,10 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
+import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -19,6 +22,23 @@ import pytest
 from test_devnet_env import ENV_PATH, parse_env
 
 CHAIN = Path(__file__).resolve().parents[1] / "devnet" / "03-chain.sh"
+KEYS = Path(__file__).resolve().parents[1] / "devnet" / "02-keys.sh"
+GENESIS = Path(__file__).resolve().parents[1] / "devnet" / "01-genesis.sh"
+
+_ENV = parse_env(ENV_PATH)
+_N = int(_ENV["NUM_VALIDATORS"])
+_DEV_ACCOUNT = _ENV["DEV_ACCOUNT"]
+_ZERO_ACCOUNT = "0x" + "0" * 40
+
+_INVENTORY_ONCE = {
+    ("network", "eth-devnet-network"): 1,
+    ("container", "eth-devnet-geth"): 1,
+    ("container", "eth-devnet-beacon"): 1,
+    ("container", "eth-devnet-validator"): 1,
+    ("datadir", "el"): 1,
+    ("datadir", "cl"): 1,
+    ("datadir", "validator"): 1,
+}
 
 _ISOLATE_KEYS = (
     "DOCKER",
@@ -41,12 +61,15 @@ _ISOLATE_KEYS = (
     "CHAIN_WAIT_ATTEMPTS",
     "CHAIN_WAIT_SLEEP",
     "BEACON_TESTNET_DIR",
+    "VC_KEYS_SRC",
     "CURL_HEALTH_CODE",
     "CURL_HEAD_SLOT",
     "CURL_SYNC_DISTANCE",
     "CURL_SECONDS_PER_SLOT",
     "CURL_CURRENT_VERSION",
     "CURL_CHAIN_ID_RESULT",
+    "DEV_ACCOUNT",
+    "NUM_VALIDATORS",
 )
 
 _MNEMONIC = "test test test test test test test test test test test junk"
@@ -168,6 +191,8 @@ def write_docker_stub(tmp_path: Path) -> tuple[Path, Path]:
         "      printf 'leak-mnemonic %s\\n' \"$MNEMONIC\"\n"
         "    fi\n"
         "    printf 'leak-jwt aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\n"
+        "    printf 'password=stubVcPasswordTokenValue\\n'\n"
+        "    printf 'b64 dGVzdHBhc3N3b3JkMTIzNDU2Nzg5MDEyMzQ1\\n'\n"
         "    exit 0\n"
         "    ;;\n"
         "esac\n"
@@ -215,11 +240,37 @@ def write_curl_stub(tmp_path: Path) -> tuple[Path, Path]:
     return stub, log
 
 
-def seed_genesis(data: Path) -> None:
+def pubkey(i: int) -> str:
+    return f"0x{i:096x}"
+
+
+def seed_keys(data: Path, n: int | None = None, *, root: Path | None = None) -> Path:
+    n = _N if n is None else n
+    valtools = root if root is not None else (data / "keys" / "valtools")
+    validators = valtools / "validators"
+    secrets = valtools / "secrets"
+    validators.mkdir(parents=True, exist_ok=True)
+    secrets.mkdir(parents=True, exist_ok=True)
+    for i in range(n):
+        pk = pubkey(i)
+        d = validators / pk
+        d.mkdir(exist_ok=True)
+        ks = d / "voting-keystore.json"
+        ks.write_text(
+            '{"crypto":{"kdf":{"params":{"c":262144}}}}\n', encoding="utf-8"
+        )
+        ks.chmod(0o600)
+        sec = secrets / pk
+        sec.write_text(f"secret-{i}\n", encoding="utf-8")
+        sec.chmod(0o600)
+    return valtools
+
+
+def seed_genesis(data: Path, *, keys: bool = True) -> None:
     jwt = data / "jwt"
     genesis = data / "genesis"
-    jwt.mkdir(parents=True)
-    genesis.mkdir(parents=True)
+    jwt.mkdir(parents=True, exist_ok=True)
+    genesis.mkdir(parents=True, exist_ok=True)
     (jwt / "jwt.hex").write_text(_JWT, encoding="utf-8")
     (jwt / "jwt.hex").chmod(0o600)
     (genesis / "genesis.json").write_text("{}\n", encoding="utf-8")
@@ -229,6 +280,8 @@ def seed_genesis(data: Path) -> None:
         encoding="utf-8",
     )
     (genesis / "genesis_validators_root.txt").write_text(_GVR + "\n", encoding="utf-8")
+    if keys:
+        seed_keys(data)
 
 
 def chain_env(
@@ -381,6 +434,47 @@ def named_kinds(rows: list[dict[str, str]]) -> set[tuple[str, str]]:
     return {(r["kind"], r["name"]) for r in rows}
 
 
+def inventory_counts(rows: list[dict[str, str]]) -> Counter[tuple[str, str]]:
+    return Counter((r["kind"], r["name"]) for r in rows)
+
+
+def file_mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+def vc_cmd(cmds: list[str]) -> str:
+    found = [c for c in cmds if "validator_client" in c]
+    assert found, cmds
+    return found[0]
+
+
+def validator_dirs(root: Path) -> list[Path]:
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.glob("0x*") if p.is_dir())
+
+
+def stop_stub_container(tmp_path: Path, name: str) -> None:
+    running = tmp_path / "docker-state" / "running"
+    lines = [
+        ln
+        for ln in running.read_text(encoding="utf-8").splitlines()
+        if ln != name
+    ]
+    running.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
+
+
+def slashing_db(tmp_path: Path) -> Path:
+    return (
+        tmp_path
+        / "data"
+        / "cl"
+        / "validator"
+        / "validators"
+        / "slashing_protection.sqlite"
+    )
+
+
 def test_chain_sh_exists_and_syntax():
     assert CHAIN.is_file(), CHAIN
     proc = subprocess.run(
@@ -393,6 +487,8 @@ def test_chain_sh_exists_and_syntax():
     assert "source" in text and "lib/common.sh" in text
     assert "start_geth()" in text
     assert "start_beacon()" in text
+    assert "copy_vc_keys()" in text
+    assert "start_vc()" in text
     assert "wait_for_chain()" in text
     assert "assert_head_fork_electra()" in text
     assert "docker_run_as_user" in text
@@ -411,9 +507,14 @@ def test_chain_sh_exists_and_syntax():
     assert "127.0.0.1:${CL_METRICS_PORT}:5054" in text
     assert "127.0.0.1:${EL_AUTH_PORT}:8551" not in text
     assert "--slots-per-restore-point" not in text
-    assert "validator_client" not in text
+    assert "validator_client" in text
+    assert "--suggested-fee-recipient=" in text
+    assert "--init-slashing-protection" in text
+    assert re.search(r'(?m)^VC_KEYS_SRC=', text)
+    assert "${KEYS_DIR}/valtools" in text
     assert "head_slot + sync_distance" in text or "head_slot+sync_distance" in text
     assert re.search(r'(?m)^\s*docker\s', text) is None
+    assert re.search(r'(?m)^\s*curl\s', text) is None
     assert '"$DOCKER"' in text
     assert '"$CURL"' in text
 
@@ -427,12 +528,19 @@ def test_inventory_appended_before_create(tmp_path: Path):
     kinds = named_kinds(rows)
     assert ("network", "eth-devnet-network") in kinds
     assert ("container", "eth-devnet-geth") in kinds
+    assert ("container", "eth-devnet-beacon") in kinds
+    assert ("container", "eth-devnet-validator") in kinds
     assert ("datadir", "el") in kinds
     assert ("datadir", "cl") in kinds
+    assert ("datadir", "validator") in kinds
     el = next(r for r in rows if r["kind"] == "datadir" and r["name"] == "el")
     cl = next(r for r in rows if r["kind"] == "datadir" and r["name"] == "cl")
+    vc_dir = next(r for r in rows if r["kind"] == "datadir" and r["name"] == "validator")
     assert el["path"].endswith("/el")
     assert cl["path"].endswith("/cl")
+    assert vc_dir["path"].endswith("/cl/validator") or vc_dir["path"].endswith(
+        "/cl/validator/"
+    )
 
     net_inv = inventory_at_cmd(log, lambda c: c.startswith("network create "))
     assert net_inv is not None
@@ -456,10 +564,20 @@ def test_inventory_appended_before_create(tmp_path: Path):
     bn_kinds = named_kinds(bn_inv)
     assert ("datadir", "cl") in bn_kinds
     assert ("network", "eth-devnet-network") in bn_kinds
+
+    vc_inv = inventory_at_cmd(
+        log, lambda c: c.startswith("run ") and "validator_client" in c
+    )
+    assert vc_inv is not None, log.read_text(encoding="utf-8")
+    vc_kinds = named_kinds(vc_inv)
+    assert ("container", "eth-devnet-validator") in vc_kinds
+    assert ("datadir", "validator") in vc_kinds
     cmds = stub_cmds(log)
     create_idx = next(i for i, c in enumerate(cmds) if c.startswith("network create "))
     # inventory_append is a bash-side write; the stub snapshot at create proves the row existed.
     assert create_idx >= 0
+    vc_run_idx = next(i for i, c in enumerate(cmds) if "validator_client" in c)
+    assert vc_run_idx > create_idx
 
 
 def test_force_recreates_both_containers(tmp_path: Path):
@@ -469,6 +587,7 @@ def test_force_recreates_both_containers(tmp_path: Path):
     first_detach = detach_cmds(first)
     assert named_cmds(first_detach, "eth-devnet-geth")
     assert named_cmds(first_detach, "eth-devnet-beacon")
+    assert named_cmds(first_detach, "eth-devnet-validator")
     first_inits = [c for c in first if c.startswith("run ") and " init " in f" {c} "]
     assert len(first_inits) == 1
 
@@ -486,20 +605,18 @@ def test_force_recreates_both_containers(tmp_path: Path):
     rms = [c for c in cmds if c.startswith("rm ")]
     assert any("eth-devnet-geth" in c for c in rms)
     assert any("eth-devnet-beacon" in c for c in rms)
+    assert any("eth-devnet-validator" in c for c in rms)
     detach = detach_cmds(cmds)
     geth_d = named_cmds(detach, "eth-devnet-geth")
     bn_d = named_cmds(detach, "eth-devnet-beacon")
+    vc_d = named_cmds(detach, "eth-devnet-validator")
     assert len(geth_d) == 2, geth_d
     assert len(bn_d) == 2, bn_d
+    assert len(vc_d) == 2, vc_d
     inits = [c for c in cmds if c.startswith("run ") and " init " in f" {c} "]
     assert len(inits) == 1
     rows = inventory_rows(tmp_path / "run" / "inventory.json")
-    kinds = named_kinds(rows)
-    assert ("network", "eth-devnet-network") in kinds
-    assert ("container", "eth-devnet-geth") in kinds
-    assert ("datadir", "el") in kinds
-    assert ("datadir", "cl") in kinds
-    assert [k for k in kinds if k[0] == "container" and k[1] == "eth-devnet-geth"]
+    assert inventory_counts(rows) == _INVENTORY_ONCE
 
 
 def test_second_run_with_both_running_is_noop(tmp_path: Path):
@@ -521,6 +638,9 @@ def test_second_run_with_both_running_is_noop(tmp_path: Path):
     assert [c for c in second if c.startswith("network create ")] == [
         c for c in first if c.startswith("network create ")
     ]
+    assert inventory_counts(inventory_rows(tmp_path / "run" / "inventory.json")) == (
+        _INVENTORY_ONCE
+    )
 
 
 def test_wrong_testnet_dir_exits_1_with_logs_and_inventory(tmp_path: Path):
@@ -540,6 +660,8 @@ def test_wrong_testnet_dir_exits_1_with_logs_and_inventory(tmp_path: Path):
     assert "stub logs" in log_text
     assert _MNEMONIC not in log_text
     assert "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" not in log_text
+    assert "stubVcPasswordTokenValue" not in log_text
+    assert "dGVzdHBhc3N3b3JkMTIzNDU2Nzg5MDEyMzQ1" not in log_text
     assert "<redacted>" in log_text
     rows = inventory_rows(tmp_path / "run" / "inventory.json")
     kinds = named_kinds(rows)
@@ -577,6 +699,8 @@ def test_dry_run_exits_0_without_docker_run(tmp_path: Path):
     assert run_cmds(stub_cmds(log)) == []
     assert "chain plan" in proc.stderr
     assert "start_geth" in proc.stderr
+    assert "copy_vc_keys" in proc.stderr
+    assert "start_vc" in proc.stderr
     assert_no_secret(proc)
 
 
@@ -591,6 +715,7 @@ def test_geth_and_beacon_use_docker_run_as_user(tmp_path: Path):
     assert all(c.startswith(prefix) for c in cmds), cmds
     geth = named_cmds(detach_cmds(cmds), "eth-devnet-geth")
     bn = [c for c in cmds if "beacon_node" in c]
+    vc = vc_cmd(cmds)
     assert geth
     assert "--nodiscover" in geth[0]
     assert "--syncmode=full" in geth[0]
@@ -607,9 +732,15 @@ def test_geth_and_beacon_use_docker_run_as_user(tmp_path: Path):
     assert " -p 8551:" not in f" {geth[0]} "
     assert "127.0.0.1:5052:5052" in bn[0]
     assert "127.0.0.1:5054:5054" in bn[0]
+    assert "--init-slashing-protection" in vc
+    assert f"--suggested-fee-recipient={_DEV_ACCOUNT}" in vc
+    assert "--beacon-nodes=http://eth-devnet-beacon:5052" in vc
+    assert "--testnet-dir=/genesis" in vc
+    assert " -p " not in f" {vc} "
     img = parse_env(ENV_PATH)
     assert img["IMG_GETH"] in geth[0]
     assert img["IMG_LIGHTHOUSE"] in bn[0]
+    assert img["IMG_LIGHTHOUSE"] in vc
 
 
 def test_assert_head_fork_electra_rejects_fulu(tmp_path: Path):
@@ -755,11 +886,280 @@ def test_host_binds_loopback_and_skips_authrpc_publish(tmp_path: Path):
     cmds = run_cmds(stub_cmds(log))
     geth = named_cmds(detach_cmds(cmds), "eth-devnet-geth")
     bn = [c for c in cmds if "beacon_node" in c]
+    vc = vc_cmd(cmds)
     assert geth and bn
     assert "-p 127.0.0.1:8545:8545" in geth[0]
     assert "8551:8551" not in geth[0]
     assert "-p 127.0.0.1:5052:5052" in bn[0]
     assert "-p 127.0.0.1:5054:5054" in bn[0]
+    assert " -p " not in f" {vc} "
+
+
+def test_vc_row_appended_before_run(tmp_path: Path):
+    proc, log = run_chain(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    vc_inv = inventory_at_cmd(
+        log, lambda c: c.startswith("run ") and "validator_client" in c
+    )
+    assert vc_inv is not None
+    kinds = named_kinds(vc_inv)
+    assert ("container", "eth-devnet-validator") in kinds
+    assert ("datadir", "validator") in kinds
+
+
+def test_vc_command_has_fee_recipient_and_slashing_protection(tmp_path: Path):
+    proc, log = run_chain(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    vc = vc_cmd(run_cmds(stub_cmds(log)))
+    assert "--init-slashing-protection" in vc
+    match = re.search(r"--suggested-fee-recipient=(\S+)", vc)
+    assert match, vc
+    addr = match.group(1)
+    assert re.fullmatch(r"0x[0-9a-fA-F]{40}", addr), addr
+    assert addr.lower() != _ZERO_ACCOUNT
+    assert addr == _DEV_ACCOUNT
+
+
+def test_copy_vc_keys_count_and_owner(tmp_path: Path):
+    proc, _ = run_chain(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    dest = tmp_path / "data" / "cl" / "validator" / "validators"
+    dirs = validator_dirs(dest)
+    assert len(dirs) == _N
+    uid = os.getuid()
+    for d in dirs:
+        assert d.stat().st_uid == uid
+        assert stat.S_ISDIR(d.stat().st_mode)
+        ks = d / "voting-keystore.json"
+        assert ks.is_file()
+        assert not ks.is_symlink()
+        assert ks.stat().st_uid == uid
+        assert file_mode(ks) == 0o600
+    secrets = tmp_path / "data" / "cl" / "validator" / "secrets"
+    secs = sorted(p for p in secrets.glob("0x*") if p.is_file())
+    assert len(secs) == _N
+    for s in secs:
+        assert s.stat().st_uid == uid
+        assert file_mode(s) == 0o600
+        assert not s.is_symlink()
+
+
+def test_missing_keys_exits_2(tmp_path: Path):
+    seed_genesis(tmp_path / "data", keys=False)
+    proc, log = run_chain(tmp_path, seed=False)
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "02-keys.sh" in proc.stderr
+    assert run_cmds(stub_cmds(log)) == []
+
+
+def test_zero_fee_recipient_exits_2(tmp_path: Path):
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; resolve_run_dir >/dev/null; "
+        f"DEV_ACCOUNT={shlex.quote(_ZERO_ACCOUNT)}; start_vc",
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "non-zero" in proc.stderr
+    assert "validator_client" not in (tmp_path / "docker.log").read_text(
+        encoding="utf-8"
+    )
+
+
+def test_resume_preserves_slashing_db_skips_init(tmp_path: Path):
+    proc1, log = run_chain(tmp_path)
+    assert proc1.returncode == 0, proc1.stderr
+    db = slashing_db(tmp_path)
+    extra = db.parent / "validator_definitions.yml"
+    db.write_text("keep-slash-db\n", encoding="utf-8")
+    extra.write_text("keep-defs\n", encoding="utf-8")
+    stop_stub_container(tmp_path, "eth-devnet-validator")
+    proc2, _ = run_chain(
+        tmp_path,
+        docker=tmp_path / "docker",
+        curl=tmp_path / "curl",
+        log=log,
+        seed=False,
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    assert db.is_file()
+    assert not db.is_symlink()
+    assert db.read_text(encoding="utf-8") == "keep-slash-db\n"
+    assert extra.read_text(encoding="utf-8") == "keep-defs\n"
+    vcs = [c for c in run_cmds(stub_cmds(log)) if "validator_client" in c]
+    assert len(vcs) == 2, vcs
+    assert "--init-slashing-protection" in vcs[0]
+    assert "--init-slashing-protection" not in vcs[1]
+    assert len(validator_dirs(db.parent)) == _N
+
+
+def test_used_datadir_missing_sqlite_exits_2(tmp_path: Path):
+    dest = tmp_path / "data" / "cl" / "validator" / "validators"
+    dest.mkdir(parents=True)
+    (dest / "validator_definitions.yml").write_text("used-defs\n", encoding="utf-8")
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; resolve_run_dir >/dev/null; "
+        "start_vc",
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    assert "--force" in proc.stderr
+    log_text = (tmp_path / "docker.log").read_text(encoding="utf-8")
+    assert "validator_client" not in log_text
+    assert "--init-slashing-protection" not in log_text
+    assert (dest / "validator_definitions.yml").read_text(encoding="utf-8") == (
+        "used-defs\n"
+    )
+
+
+def test_used_datadir_wal_without_sqlite_exits_2(tmp_path: Path):
+    dest = tmp_path / "data" / "cl" / "validator" / "validators"
+    dest.mkdir(parents=True)
+    (dest / "slashing_protection.sqlite-wal").write_text("wal\n", encoding="utf-8")
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; resolve_run_dir >/dev/null; "
+        "start_vc",
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    assert "--force" in proc.stderr
+    log_text = (tmp_path / "docker.log").read_text(encoding="utf-8")
+    assert "validator_client" not in log_text
+    assert "--init-slashing-protection" not in log_text
+
+
+def test_force_resets_vc_datadir_and_inits_slashing(tmp_path: Path):
+    proc1, log = run_chain(tmp_path)
+    assert proc1.returncode == 0, proc1.stderr
+    db = slashing_db(tmp_path)
+    db.write_text("old-slash-db\n", encoding="utf-8")
+    proc2, _ = run_chain(
+        tmp_path,
+        ["--force"],
+        docker=tmp_path / "docker",
+        curl=tmp_path / "curl",
+        log=log,
+        seed=False,
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    assert not db.exists()
+    vcs = [c for c in run_cmds(stub_cmds(log)) if "validator_client" in c]
+    assert len(vcs) == 2, vcs
+    assert all("--init-slashing-protection" in c for c in vcs)
+    assert len(validator_dirs(db.parent)) == _N
+
+
+def test_copy_vc_keys_refuses_dest_secret_symlink(tmp_path: Path):
+    victim = tmp_path / "victim-secret"
+    victim.write_text("untouched\n", encoding="utf-8")
+    pk = pubkey(0)
+    proc = source_chain(
+        tmp_path,
+        "mkdir -p \"$VALIDATOR_DATA_DIR/secrets\"; "
+        f"ln -s {shlex.quote(str(victim))} \"$VALIDATOR_DATA_DIR/secrets/{pk}\"; "
+        "copy_vc_keys",
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "symlink" in proc.stderr
+    assert victim.read_text(encoding="utf-8") == "untouched\n"
+
+
+def test_copy_vc_keys_refuses_dest_keystore_symlink(tmp_path: Path):
+    victim = tmp_path / "victim-keystore"
+    victim.write_text("untouched\n", encoding="utf-8")
+    pk = pubkey(0)
+    proc = source_chain(
+        tmp_path,
+        "mkdir -p \"$VALIDATOR_DATA_DIR/validators/" + pk + "\"; "
+        f"ln -s {shlex.quote(str(victim))} "
+        f"\"$VALIDATOR_DATA_DIR/validators/{pk}/voting-keystore.json\"; "
+        "copy_vc_keys",
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "symlink" in proc.stderr
+    assert victim.read_text(encoding="utf-8") == "untouched\n"
+
+
+def test_fail_chain_refuses_log_symlink(tmp_path: Path):
+    victim = tmp_path / "victim-log"
+    victim.write_text("untouched\n", encoding="utf-8")
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; resolve_run_dir >/dev/null; "
+        "mkdir -p \"$RUN_DIR/logs\"; "
+        f"ln -s {shlex.quote(str(victim))} \"$RUN_DIR/logs/eth-devnet-validator.log\"; "
+        "assert_head_fork_electra",
+        env={"CURL_CURRENT_VERSION": "0x70000000"},
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "symlink" in proc.stderr
+    assert victim.read_text(encoding="utf-8") == "untouched\n"
+
+
+def test_fail_chain_refuses_dangling_log_symlink(tmp_path: Path):
+    victim = tmp_path / "absent-victim-log"
+    assert not victim.exists()
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; resolve_run_dir >/dev/null; "
+        "mkdir -p \"$RUN_DIR/logs\"; "
+        f"ln -s {shlex.quote(str(victim))} \"$RUN_DIR/logs/eth-devnet-validator.log\"; "
+        "assert_head_fork_electra",
+        env={"CURL_CURRENT_VERSION": "0x70000000"},
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "symlink" in proc.stderr
+    assert not victim.exists()
+    dest = tmp_path / "run" / "logs" / "eth-devnet-validator.log"
+    assert dest.is_symlink()
+
+
+def test_scrub_redacts_secret_file_and_password_token(tmp_path: Path):
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; resolve_run_dir >/dev/null; "
+        "mkdir -p \"$RUN_DIR/logs\"; "
+        "printf '%s\\n' 'leak secret-0 here' 'password=SuperSecretPasswordValue123' "
+        "> \"$RUN_DIR/logs/eth-devnet-validator.log\"; "
+        "_scrub_container_log \"$RUN_DIR/logs/eth-devnet-validator.log\"; "
+        "cat \"$RUN_DIR/logs/eth-devnet-validator.log\"",
+    )
+    assert proc.returncode == 0, proc.stderr
+    text = proc.stdout
+    assert "secret-0" not in text
+    assert "SuperSecretPasswordValue123" not in text
+    assert "<redacted>" in text
+
+
+def test_scrub_refuses_non_regular_log(tmp_path: Path):
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; resolve_run_dir >/dev/null; "
+        "mkdir -p \"$RUN_DIR/logs/eth-devnet-beacon.log\"; "
+        "_scrub_container_log \"$RUN_DIR/logs/eth-devnet-beacon.log\"",
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert "regular file" in proc.stderr
+
+
+def test_vc_keys_src_override(tmp_path: Path):
+    seed_genesis(tmp_path / "data", keys=False)
+    alt = tmp_path / "alt-keys"
+    seed_keys(tmp_path / "data", root=alt)
+    proc, log = run_chain(
+        tmp_path,
+        env={"VC_KEYS_SRC": str(alt)},
+        seed=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    dest = tmp_path / "data" / "cl" / "validator" / "validators"
+    assert len(validator_dirs(dest)) == _N
+    assert not (tmp_path / "data" / "keys" / "valtools" / "validators").exists()
+    vc = vc_cmd(run_cmds(stub_cmds(log)))
+    assert "--init-slashing-protection" in vc
 
 
 def _live_chain_available() -> bool:
@@ -789,12 +1189,41 @@ def _live_chain_available() -> bool:
     return True
 
 
+def _vc_attested(text: str) -> bool:
+    for line in text.splitlines():
+        if "Successfully published attestation" not in line:
+            continue
+        if re.search(r"count:\s*0(?:\D|$)", line):
+            continue
+        return True
+    return False
+
+
+def _live_cleanup(docker: str) -> None:
+    for name in (
+        "eth-devnet-validator",
+        "eth-devnet-beacon",
+        "eth-devnet-geth",
+    ):
+        subprocess.run(
+            [docker, "rm", "-f", "--", name],
+            capture_output=True,
+            timeout=60,
+            stdin=subprocess.DEVNULL,
+        )
+    subprocess.run(
+        [docker, "network", "rm", "--", "eth-devnet-network"],
+        capture_output=True,
+        timeout=60,
+        stdin=subprocess.DEVNULL,
+    )
+
+
 @pytest.mark.skipif(not _live_chain_available(), reason="DEVNET_LIVE=1 and pinned images required")
 def test_live_electra_head(tmp_path: Path):
     pytest.importorskip("pytest_socket")
     docker = shutil.which("docker")
     assert docker is not None
-    genesis = Path(__file__).resolve().parents[1] / "devnet" / "01-genesis.sh"
     data = tmp_path / "data"
     runs = tmp_path / "runs"
     run_dir = tmp_path / "run"
@@ -809,23 +1238,54 @@ def test_live_electra_head(tmp_path: Path):
     env["CL_METRICS_PORT"] = "15054"
     env["CHAIN_WAIT_ATTEMPTS"] = "90"
     env["CHAIN_WAIT_SLEEP"] = "2"
-    gen = subprocess.run(
-        ["bash", str(genesis), "--run-dir", str(run_dir)],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=180,
-        stdin=subprocess.DEVNULL,
-    )
-    assert gen.returncode == 0, gen.stderr
-    proc = subprocess.run(
-        ["bash", str(CHAIN), "--run-dir", str(run_dir)],
-        capture_output=True,
-        text=True,
-        env=env,
-        timeout=240,
-        stdin=subprocess.DEVNULL,
-    )
-    assert proc.returncode == 0, proc.stderr
-    assert_no_secret(proc)
-    assert "Electra" in proc.stderr or "0x60000000" in proc.stderr
+    try:
+        gen = subprocess.run(
+            ["bash", str(GENESIS), "--run-dir", str(run_dir)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=180,
+            stdin=subprocess.DEVNULL,
+        )
+        assert gen.returncode == 0, gen.stderr
+        keys = subprocess.run(
+            ["bash", str(KEYS), "--run-dir", str(run_dir)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=180,
+            stdin=subprocess.DEVNULL,
+        )
+        assert keys.returncode == 0, keys.stderr
+        proc = subprocess.run(
+            ["bash", str(CHAIN), "--run-dir", str(run_dir)],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=240,
+            stdin=subprocess.DEVNULL,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert_no_secret(proc)
+        assert "Electra" in proc.stderr or "0x60000000" in proc.stderr
+        dest = data / "cl" / "validator" / "validators"
+        assert len(validator_dirs(dest)) == _N
+        deadline = time.monotonic() + (2 * 32 * 12)
+        attested = False
+        log_blob = ""
+        while time.monotonic() < deadline:
+            logs = subprocess.run(
+                [docker, "logs", "--", "eth-devnet-validator"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                stdin=subprocess.DEVNULL,
+            )
+            log_blob = (logs.stdout or "") + (logs.stderr or "")
+            if _vc_attested(log_blob):
+                attested = True
+                break
+            time.sleep(2)
+        assert attested, log_blob[-4000:]
+    finally:
+        _live_cleanup(docker)
