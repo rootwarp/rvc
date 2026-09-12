@@ -176,7 +176,13 @@ def _parse_labels(raw: str) -> dict[str, str]:
 def _parse_le(raw: str) -> float:
     if raw == "+Inf":
         return math.inf
-    return float(raw)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise InfraError(f"invalid histogram le: {_snippet(raw)}") from exc
+    if not math.isfinite(value):
+        raise InfraError(f"invalid histogram le: {_snippet(raw)}")
+    return value
 
 
 def series_key(
@@ -831,6 +837,330 @@ def window_from_samples(path: str | os.PathLike[str]) -> dict[str, int]:
         "end_slot": end_slot,
         "slots": end_slot - start_slot,
     }
+
+
+# ===== § 7. Bucket deltas and histogram_quantile =====
+
+
+@dataclass(frozen=True)
+class HistogramDeltas:
+    name: str
+    labels: dict[str, str]
+    unit: str
+    buckets: tuple[tuple[float, float], ...]
+    sum_delta: float | None
+    count_delta: float
+
+
+@dataclass
+class _HistogramComponents:
+    buckets: dict[float, float]
+    sum_value: float | None = None
+    count_value: float | None = None
+
+
+def _labels_without_le(labels: dict[str, str]) -> dict[str, str]:
+    return {key: value for key, value in labels.items() if key != "le"}
+
+
+def _is_plus_inf(value: float) -> bool:
+    return math.isinf(value) and value > 0
+
+
+def _clamp_cumulative(
+    buckets: list[tuple[float, float]],
+) -> list[tuple[float, float]]:
+    clamped: list[tuple[float, float]] = []
+    prev: float | None = None
+    for le, count in buckets:
+        if not math.isfinite(count):
+            count = 0.0 if prev is None else prev
+        elif prev is not None and count < prev:
+            count = prev
+        clamped.append((le, count))
+        prev = count
+    return clamped
+
+
+def _coerce_le(le: object) -> float:
+    if isinstance(le, str):
+        return _parse_le(le)
+    if isinstance(le, bool) or not isinstance(le, (int, float)):
+        raise InfraError("invalid histogram le")
+    value = float(le)
+    if _is_plus_inf(value) or math.isfinite(value):
+        return value
+    raise InfraError("invalid histogram le")
+
+
+def _coerce_buckets(buckets: object) -> list[tuple[float, float]]:
+    if isinstance(buckets, HistogramDeltas):
+        items = list(buckets.buckets)
+    elif isinstance(buckets, dict):
+        items = [(_coerce_le(le), float(count)) for le, count in buckets.items()]
+    elif isinstance(buckets, (list, tuple)):
+        items = [(_coerce_le(le), float(count)) for le, count in buckets]
+    else:
+        raise TypeError(f"unsupported buckets type: {type(buckets)!r}")
+    items.sort(key=lambda pair: pair[0])
+    return _clamp_cumulative(items)
+
+
+def _finite_delta(start: float | None, end: float | None) -> float | None:
+    if start is None and end is None:
+        return None
+    start_v = 0.0 if start is None else start
+    end_v = 0.0 if end is None else end
+    if not math.isfinite(start_v) or not math.isfinite(end_v):
+        return None
+    return end_v - start_v
+
+
+def _plus_inf_count(buckets: list[tuple[float, float]]) -> float | None:
+    if buckets and _is_plus_inf(buckets[-1][0]):
+        return buckets[-1][1]
+    return None
+
+
+def _group_histogram_series(
+    family: Family,
+) -> dict[tuple[str, tuple[tuple[str, str], ...]], _HistogramComponents]:
+    groups: dict[
+        tuple[str, tuple[tuple[str, str], ...]], _HistogramComponents
+    ] = {}
+    for sample in family.samples:
+        key = series_key(family.name, _labels_without_le(sample.labels))
+        group = groups.get(key)
+        if group is None:
+            group = _HistogramComponents(buckets={})
+            groups[key] = group
+        name = sample.name
+        if name.endswith("_bucket") and "le" in sample.labels:
+            group.buckets[_parse_le(sample.labels["le"])] = sample.value
+        elif name.endswith("_sum"):
+            group.sum_value = sample.value
+        elif name.endswith("_count"):
+            group.count_value = sample.value
+    return groups
+
+
+def bucket_deltas(
+    start: dict[str, Family], end: dict[str, Family]
+) -> dict[tuple[str, tuple[tuple[str, str], ...]], HistogramDeltas]:
+    names = {n for n, f in start.items() if f.type == "histogram"} | {
+        n for n, f in end.items() if f.type == "histogram"
+    }
+    result: dict[tuple[str, tuple[tuple[str, str], ...]], HistogramDeltas] = {}
+    for name in names:
+        start_family = start.get(name)
+        end_family = end.get(name)
+        start_groups = (
+            _group_histogram_series(start_family)
+            if start_family is not None and start_family.type == "histogram"
+            else {}
+        )
+        end_groups = (
+            _group_histogram_series(end_family)
+            if end_family is not None and end_family.type == "histogram"
+            else {}
+        )
+        for key in set(start_groups) | set(end_groups):
+            start_g = start_groups.get(key)
+            end_g = end_groups.get(key)
+            start_buckets = start_g.buckets if start_g is not None else {}
+            end_buckets = end_g.buckets if end_g is not None else {}
+            raw = [
+                (le, end_buckets.get(le, 0.0) - start_buckets.get(le, 0.0))
+                for le in sorted(set(start_buckets) | set(end_buckets))
+            ]
+            clamped = _clamp_cumulative(raw)
+            sum_delta = _finite_delta(
+                start_g.sum_value if start_g is not None else None,
+                end_g.sum_value if end_g is not None else None,
+            )
+            count_delta = _finite_delta(
+                start_g.count_value if start_g is not None else None,
+                end_g.count_value if end_g is not None else None,
+            )
+            if count_delta is None:
+                count_delta = _plus_inf_count(clamped) or 0.0
+            result[key] = HistogramDeltas(
+                name=name,
+                labels=dict(key[1]),
+                unit=unit_for(name),
+                buckets=tuple(clamped),
+                sum_delta=sum_delta,
+                count_delta=count_delta,
+            )
+    return result
+
+
+def _quantile_parts(
+    buckets: object, q: float
+) -> tuple[float | None, bool, float | None, float | None]:
+    items = _coerce_buckets(buckets)
+    if len(items) < 2 or not _is_plus_inf(items[-1][0]):
+        return None, False, None, None
+    observations = items[-1][1]
+    if observations == 0 or not math.isfinite(observations):
+        return None, False, None, None
+    if not math.isfinite(q):
+        return None, False, None, None
+    rank = q * observations
+    chosen = len(items) - 1
+    for i, (_le, count) in enumerate(items[:-1]):
+        if count >= rank:
+            chosen = i
+            break
+    if chosen == len(items) - 1:
+        finite_le = items[-2][0]
+        return finite_le, True, finite_le, math.inf
+    bucket_end = items[chosen][0]
+    count = items[chosen][1]
+    if chosen == 0:
+        if bucket_end <= 0:
+            return bucket_end, False, bucket_end, bucket_end
+        bucket_start = 0.0
+    else:
+        bucket_start = items[chosen - 1][0]
+        count -= items[chosen - 1][1]
+        rank -= items[chosen - 1][1]
+    if count == 0:
+        value = bucket_start
+    else:
+        value = bucket_start + (bucket_end - bucket_start) * (rank / count)
+    return value, False, bucket_start, bucket_end
+
+
+def _json_float(value: float | None) -> float | None:
+    if value is None or not math.isfinite(value):
+        return None
+    return value
+
+
+def _json_row(row: dict[str, object]) -> dict[str, object]:
+    sanitized = _finite_or_none(row)
+    return sanitized if isinstance(sanitized, dict) else row
+
+
+def histogram_quantile(buckets: object, q: float) -> float | None:
+    value, _saturated, _lo, _hi = _quantile_parts(buckets, q)
+    return _json_float(value)
+
+
+# IEEE-754 exact integers; JSON.parse stays finite and exact in this range.
+_JSON_SAFE_INT = 2**53
+
+
+def _samples_value(count_delta: float) -> int | float:
+    if not math.isfinite(count_delta) or count_delta <= 0:
+        return 0
+    if abs(count_delta) <= _JSON_SAFE_INT and count_delta == math.floor(
+        count_delta
+    ):
+        return int(count_delta)
+    return count_delta
+
+
+def _row_label_key(row: dict[str, object]) -> tuple[tuple[str, str], ...]:
+    labels = row.get("labels") or {}
+    if not isinstance(labels, dict):
+        return ()
+    return tuple(sorted((str(k), str(v)) for k, v in labels.items()))
+
+
+def _no_observations_row(
+    delta: HistogramDeltas, sum_delta: float | None
+) -> dict[str, object]:
+    return {
+        "annotation": "no_observations",
+        "labels": dict(delta.labels),
+        "mean": None,
+        "p50": None,
+        "p50_bucket": None,
+        "p95": None,
+        "p99": None,
+        "samples": 0,
+        "saturated": False,
+        "sum_delta": sum_delta,
+        "unit": delta.unit,
+    }
+
+
+def histogram_stats(
+    source: object,
+    *,
+    sum_delta: float | None = None,
+    count_delta: float | None = None,
+    name: str = "",
+    labels: dict[str, str] | None = None,
+    unit: str | None = None,
+) -> dict[str, object]:
+    if isinstance(source, HistogramDeltas):
+        delta = source
+    else:
+        coerced = _coerce_buckets(source)
+        inf_count = _plus_inf_count(coerced) or 0.0
+        resolved_count = inf_count if count_delta is None else float(count_delta)
+        resolved_unit = unit if unit is not None else (
+            unit_for(name) if name else "count"
+        )
+        delta = HistogramDeltas(
+            name=name,
+            labels=dict(labels or {}),
+            unit=resolved_unit,
+            buckets=tuple(coerced),
+            sum_delta=sum_delta,
+            count_delta=resolved_count,
+        )
+    samples = _samples_value(delta.count_delta)
+    sum_d = _json_float(delta.sum_delta)
+    inf_count = _plus_inf_count(list(delta.buckets))
+    usable_inf = (
+        inf_count is not None and math.isfinite(inf_count) and inf_count > 0
+    )
+    if samples == 0 or not usable_inf:
+        return _json_row(_no_observations_row(delta, sum_d))
+    p50, sat50, lo, hi = _quantile_parts(delta.buckets, 0.50)
+    p95, sat95, _, _ = _quantile_parts(delta.buckets, 0.95)
+    p99, sat99, _, _ = _quantile_parts(delta.buckets, 0.99)
+    p50 = _json_float(p50)
+    p95 = _json_float(p95)
+    p99 = _json_float(p99)
+    if p50 is None and p95 is None and p99 is None:
+        return _json_row(_no_observations_row(delta, sum_d))
+    mean = None
+    if sum_d is not None and delta.count_delta != 0:
+        mean = sum_d / delta.count_delta
+    p50_bucket = None
+    if lo is not None or hi is not None:
+        p50_bucket = [_json_float(lo), _json_float(hi)]
+    return _json_row(
+        {
+            "annotation": None,
+            "labels": dict(delta.labels),
+            "mean": _json_float(mean),
+            "p50": p50,
+            "p50_bucket": p50_bucket,
+            "p95": p95,
+            "p99": p99,
+            "samples": samples,
+            "saturated": sat50 or sat95 or sat99,
+            "sum_delta": sum_d,
+            "unit": delta.unit,
+        }
+    )
+
+
+def fold_histograms(
+    start: dict[str, Family], end: dict[str, Family]
+) -> dict[str, list[dict[str, object]]]:
+    grouped: dict[str, list[dict[str, object]]] = {}
+    for delta in bucket_deltas(start, end).values():
+        grouped.setdefault(delta.name, []).append(histogram_stats(delta))
+    for rows in grouped.values():
+        rows.sort(key=_row_label_key)
+    return grouped
 
 
 # ===== § 9. Compare =====

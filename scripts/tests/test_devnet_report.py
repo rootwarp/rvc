@@ -596,3 +596,274 @@ def test_samples_jsonl_matches_committed_keypaths(dr, tmp_path):
     }
     assert actual - expected == set()
     assert expected - actual == set()
+
+
+def test_quantile_matches_hand_computed_p50_p95_p99(dr):
+    # 5 cumulative buckets. Per-interval observations:
+    # (0, 1] → 10, (1, 5] → 30, (5, 10] → 30, (10, 50] → 29, (50, +Inf] → 1
+    buckets = {
+        1.0: 10.0,
+        5.0: 40.0,
+        10.0: 70.0,
+        50.0: 99.0,
+        math.inf: 100.0,
+    }
+    count_delta = 100.0
+    rank_p50 = 0.50 * count_delta
+    expected_p50 = 5.0 + (10.0 - 5.0) * ((rank_p50 - 40.0) / (70.0 - 40.0))
+    rank_p95 = 0.95 * count_delta
+    expected_p95 = 10.0 + (50.0 - 10.0) * ((rank_p95 - 70.0) / (99.0 - 70.0))
+    rank_p99 = 0.99 * count_delta
+    expected_p99 = 10.0 + (50.0 - 10.0) * ((rank_p99 - 70.0) / (99.0 - 70.0))
+    assert dr.histogram_quantile(buckets, 0.50) == pytest.approx(
+        expected_p50, abs=1e-9, rel=0
+    )
+    assert dr.histogram_quantile(buckets, 0.95) == pytest.approx(
+        expected_p95, abs=1e-9, rel=0
+    )
+    assert dr.histogram_quantile(buckets, 0.99) == pytest.approx(
+        expected_p99, abs=1e-9, rel=0
+    )
+    row = dr.histogram_stats(buckets, count_delta=count_delta)
+    assert row["p50"] == pytest.approx(expected_p50, abs=1e-9, rel=0)
+    assert row["p95"] == pytest.approx(expected_p95, abs=1e-9, rel=0)
+    assert row["p99"] == pytest.approx(expected_p99, abs=1e-9, rel=0)
+    assert row["p50_bucket"] == [5.0, 10.0]
+
+
+def test_quantile_interpolates_from_zero_in_lowest_bucket(dr):
+    # K10-shaped: lowest le is 5.0 > 0, so the first bucket interpolates from 0.
+    buckets = {
+        5.0: 80.0,
+        10.0: 90.0,
+        25.0: 95.0,
+        50.0: 99.0,
+        math.inf: 100.0,
+    }
+    rank = 0.50 * 100.0
+    expected = 0.0 + (5.0 - 0.0) * (rank / 80.0)
+    assert dr.histogram_quantile(buckets, 0.50) == pytest.approx(
+        expected, abs=1e-9, rel=0
+    )
+    row = dr.histogram_stats(buckets)
+    assert row["p50"] == pytest.approx(expected, abs=1e-9, rel=0)
+    assert row["p50_bucket"] == [0.0, 5.0]
+
+
+def test_quantile_marks_saturated_when_rank_lands_in_plus_inf(dr):
+    largest_finite = 12.0
+    buckets = {
+        0.01: 10.0,
+        1.0: 20.0,
+        largest_finite: 30.0,
+        math.inf: 100.0,
+    }
+    rank = 0.99 * 100.0
+    assert rank > 30.0
+    assert dr.histogram_quantile(buckets, 0.99) == largest_finite
+    row = dr.histogram_stats(buckets)
+    assert row["p99"] == largest_finite
+    assert row["saturated"] is True
+
+
+def test_quantile_zero_observations_yields_null_and_no_observations(dr):
+    start = _parse_fixture(dr, "rvc_metrics__start")
+    end = _parse_fixture(dr, "rvc_metrics__end")
+    rows = dr.fold_histograms(start, end)
+    series = rows["rvc_slot_phase_block_start_offset_ms"]
+    assert len(series) == 1
+    row = series[0]
+    assert row["samples"] == 0
+    assert row["p50"] is None
+    assert row["p95"] is None
+    assert row["p99"] is None
+    assert row["mean"] is None
+    assert row["annotation"] == "no_observations"
+    assert row["unit"] == "milliseconds"
+    empty = {5.0: 0.0, 10.0: 0.0, math.inf: 0.0}
+    assert dr.histogram_quantile(empty, 0.50) is None
+
+
+def test_mean_is_sum_delta_over_count_delta(dr):
+    buckets = {1.0: 4.0, 5.0: 10.0, math.inf: 10.0}
+    sum_delta = 23.5
+    count_delta = 10.0
+    row = dr.histogram_stats(
+        buckets, sum_delta=sum_delta, count_delta=count_delta
+    )
+    assert row["mean"] == sum_delta / count_delta
+    assert row["samples"] == 10
+    assert row["sum_delta"] == sum_delta
+    start = _parse_fixture(dr, "rvc_metrics__start")
+    end = _parse_fixture(dr, "rvc_metrics__end")
+    key = dr.series_key("rvc_signing_duration_seconds", {})
+    delta = dr.bucket_deltas(start, end)[key]
+    assert delta.sum_delta == 0.12 - 0.05
+    assert delta.count_delta == 20.0 - 10.0
+    signed = dr.histogram_stats(delta)
+    assert signed["mean"] == (0.12 - 0.05) / (20.0 - 10.0)
+
+
+def test_nan_sum_yields_null_mean_not_nan(dr):
+    buckets = {1.0: 4.0, 5.0: 10.0, math.inf: 10.0}
+    row = dr.histogram_stats(
+        buckets, sum_delta=float("nan"), count_delta=10.0
+    )
+    assert row["mean"] is None
+    assert row["sum_delta"] is None
+    assert row["p50"] is not None
+    assert row["samples"] == 10
+    missing = dr.histogram_stats(buckets, count_delta=10.0)
+    assert missing["mean"] is None
+    assert missing["p50"] is not None
+
+
+def test_bucket_deltas_join_is_label_order_independent(dr):
+    start = _parse_fixture(dr, "rvc_metrics__start")
+    end = _parse_fixture(dr, "rvc_metrics__end")
+    start_sample = start["rvc_proposer_bn_latency_ms"].samples[0]
+    end_sample = end["rvc_proposer_bn_latency_ms"].samples[0]
+    assert list(start_sample.labels.items()) != list(end_sample.labels.items())
+    start_labels = {k: v for k, v in start_sample.labels.items() if k != "le"}
+    end_labels = {k: v for k, v in end_sample.labels.items() if k != "le"}
+    assert dr.series_key("rvc_proposer_bn_latency_ms", start_labels) == (
+        dr.series_key("rvc_proposer_bn_latency_ms", end_labels)
+    )
+    deltas = dr.bucket_deltas(start, end)
+    latency_key = dr.series_key(
+        "rvc_proposer_bn_latency_ms",
+        {"endpoint": "http://127.0.0.1:5052", "pool": "proposer"},
+    )
+    hold_key = dr.series_key(
+        "rvc_slashing_reserve_tx_hold_duration_ms", {"kind": "attestation"}
+    )
+    offset_key = dr.series_key(
+        "rvc_slot_phase_block_start_offset_ms", {"cache": "warm"}
+    )
+    latency = deltas[latency_key]
+    hold = deltas[hold_key]
+    offset = deltas[offset_key]
+    latency_buckets = dict(latency.buckets)
+    assert latency_buckets[5.0] == 9.0 - 4.0
+    assert latency_buckets[10.0] == 15.0 - 7.0
+    assert latency_buckets[25.0] == 16.0 - 8.0
+    assert latency.count_delta == 16.0 - 8.0
+    assert latency.sum_delta == 120.0 - 60.0
+    assert latency.unit == "milliseconds"
+    hold_buckets = dict(hold.buckets)
+    assert hold_buckets[1.0] == 7.0 - 3.0
+    assert hold_buckets[5.0] == 14.0 - 6.0
+    assert hold.count_delta == 21.0 - 10.0
+    assert hold.sum_delta == 170.0 - 80.0
+    assert hold.unit == "milliseconds"
+    assert dict(offset.buckets)[5.0] == 0.0 - 0.0
+    assert offset.count_delta == 0.0
+    assert offset.unit == "milliseconds"
+    start_hold = start["rvc_slashing_reserve_tx_hold_duration_ms"].samples[0]
+    end_hold = end["rvc_slashing_reserve_tx_hold_duration_ms"].samples[0]
+    assert list(start_hold.labels.items()) != list(end_hold.labels.items())
+    start_off = start["rvc_slot_phase_block_start_offset_ms"].samples[0]
+    end_off = end["rvc_slot_phase_block_start_offset_ms"].samples[0]
+    assert list(start_off.labels.items()) != list(end_off.labels.items())
+
+
+def _assert_json_safe(row: object) -> None:
+    json.dumps(row, allow_nan=False, sort_keys=True)
+
+
+def test_histogram_stats_json_has_no_nonfinite(dr):
+    saturated = {
+        0.01: 10.0,
+        1.0: 20.0,
+        12.0: 30.0,
+        math.inf: 100.0,
+    }
+    row = dr.histogram_stats(saturated)
+    assert row["saturated"] is True
+    assert row["p50"] == 12.0
+    assert row["p50_bucket"] == [12.0, None]
+    _assert_json_safe(row)
+    nan_counts = {1.0: float("nan"), 5.0: 10.0, math.inf: 10.0}
+    nan_row = dr.histogram_stats(nan_counts)
+    assert nan_row["p50"] is None or math.isfinite(nan_row["p50"])
+    _assert_json_safe(nan_row)
+    start = _parse_fixture(dr, "rvc_metrics__start")
+    end = _parse_fixture(dr, "rvc_metrics__end")
+    _assert_json_safe(dr.fold_histograms(start, end))
+
+
+def test_invalid_le_is_infra_error_not_valueerror(dr):
+    for raw in ("bogus", ""):
+        text = (
+            "# TYPE foo histogram\n"
+            f'foo_bucket{{le="{raw}"}} 1\n'
+            'foo_bucket{le="+Inf"} 1\n'
+            "foo_sum 1\n"
+            "foo_count 1\n"
+        )
+        families = dr.parse_metrics(text)
+        with pytest.raises(dr.InfraError):
+            dr.fold_histograms(families, families)
+        with pytest.raises(dr.InfraError):
+            dr.bucket_deltas(families, families)
+
+
+def test_overflow_le_spellings_do_not_collide_with_plus_inf(dr):
+    for raw in ("1e309", "Inf", "+inf", "Infinity", "-Inf"):
+        with pytest.raises(dr.InfraError):
+            dr._parse_le(raw)
+        text = (
+            "# TYPE foo histogram\n"
+            'foo_bucket{le="0.1"} 1\n'
+            f'foo_bucket{{le="{raw}"}} 2\n'
+            'foo_bucket{le="+Inf"} 3\n'
+            "foo_count 3\n"
+        )
+        families = dr.parse_metrics(text)
+        with pytest.raises(dr.InfraError):
+            dr.fold_histograms(families, families)
+
+
+def test_missing_plus_inf_yields_no_observations(dr):
+    buckets = {1.0: 4.0, 5.0: 10.0}
+    row = dr.histogram_stats(buckets, count_delta=10.0, sum_delta=4.0)
+    assert row["samples"] == 0
+    assert row["p50"] is None
+    assert row["p95"] is None
+    assert row["p99"] is None
+    assert row["mean"] is None
+    assert row["annotation"] == "no_observations"
+    _assert_json_safe(row)
+    assert dr.histogram_quantile(buckets, 0.50) is None
+
+
+def test_extreme_le_span_yields_no_observations_after_sanitize(dr):
+    # Finite bounds so wide that linear interpolation overflows to inf.
+    buckets = {
+        -1e308: 0.0,
+        1e308: 100.0,
+        math.inf: 100.0,
+    }
+    assert dr.histogram_quantile(buckets, 0.50) is None
+    row = dr.histogram_stats(buckets, count_delta=100.0, sum_delta=1.0)
+    assert row["samples"] == 0
+    assert row["p50"] is None
+    assert row["p95"] is None
+    assert row["p99"] is None
+    assert row["mean"] is None
+    assert row["p50_bucket"] is None
+    assert row["annotation"] == "no_observations"
+    _assert_json_safe(row)
+
+
+def test_samples_value_does_not_emit_huge_ints(dr):
+    buckets = {1.0: 1e308, math.inf: 1e308}
+    row = dr.histogram_stats(buckets, count_delta=1e308, sum_delta=1.0)
+    samples = row["samples"]
+    assert samples == 1e308
+    assert isinstance(samples, float)
+    dumped = json.dumps({"samples": samples}, allow_nan=False)
+    assert len(dumped) < 40
+    modest = dr.histogram_stats({1.0: 10.0, math.inf: 10.0})
+    assert modest["samples"] == 10
+    assert isinstance(modest["samples"], int)
