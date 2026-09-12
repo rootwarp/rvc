@@ -5016,6 +5016,7 @@ _G5_KIND_PREFIXES = (
     ("node_version__", "bootstrap"),
     ("finality_checkpoints__", "bootstrap"),
     ("cache__", "declared"),
+    ("run__", "declared"),
 )
 _G5_SKIP = {
     "failover__midrun_promotion": "scenario descriptor; exercised by VP-4a tests",
@@ -5024,6 +5025,7 @@ _G5_SKIP = {
     "spec__spe8": "SPE change would miss snapshot routes; not a G5 overlay",
     "node_syncing__is_syncing": "selection abort exit 5; no report",
     "cache__genesis_root_changed": "declared VP-5c; cache file, not a BN overlay",
+    "run__fast_n4": "devnet report run.json fixture; not a BN overlay",
 }
 
 

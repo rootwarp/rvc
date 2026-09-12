@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -867,3 +868,228 @@ def test_samples_value_does_not_emit_huge_ints(dr):
     modest = dr.histogram_stats({1.0: 10.0, math.inf: 10.0})
     assert modest["samples"] == 10
     assert isinstance(modest["samples"], int)
+
+
+def _synthetic_run_dir(tmp_path: Path, *, run: dict | None = None) -> Path:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    shutil.copyfile(
+        _FIXTURES / "rvc_metrics__start.txt", run_dir / "metrics-start.txt"
+    )
+    shutil.copyfile(
+        _FIXTURES / "rvc_metrics__end.txt", run_dir / "metrics-end.txt"
+    )
+    shutil.copyfile(
+        _FIXTURES / "samples__gauges.jsonl", run_dir / "samples.jsonl"
+    )
+    if run is None:
+        text = (_FIXTURES / "run__fast_n4.json").read_text(encoding="utf-8")
+    else:
+        text = json.dumps(run, sort_keys=True) + "\n"
+    (run_dir / "run.json").write_text(text, encoding="utf-8")
+    return run_dir
+
+
+def _run_report(dr, tmp_path: Path, *, run: dict | None = None):
+    run_dir = _synthetic_run_dir(tmp_path, run=run)
+    code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+    client_path = run_dir / "client.json"
+    client = None
+    if client_path.is_file():
+        client = json.loads(client_path.read_text(encoding="utf-8"))
+    return code, client, run_dir
+
+
+def _committed_keypaths(name: str) -> set[str]:
+    return {
+        line
+        for line in (_FIXTURES / name).read_text(encoding="utf-8").splitlines()
+        if line
+    }
+
+
+def _k_row_families() -> list[tuple[str, str]]:
+    rows: list[tuple[str, str]] = []
+    for line in (
+        (_FIXTURES / "k_rows__families.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        kid, family = stripped.split()
+        rows.append((kid, family))
+    return rows
+
+
+def _client_family_names(client: dict) -> set[str]:
+    names: set[str] = set()
+    for section in ("counters", "histograms", "gauges"):
+        block = client.get(section)
+        if isinstance(block, dict):
+            names.update(block)
+    return names
+
+
+def test_client_json_matches_committed_keypaths(dr, tmp_path):
+    code, client, _run_dir = _run_report(dr, tmp_path)
+    assert code == 0
+    actual = _json_keypaths(client)
+    expected = _committed_keypaths("client_json__keypaths.txt")
+    assert actual - expected == set()
+    assert expected - actual == set()
+
+
+def test_client_json_is_sorted_and_nan_free(dr, tmp_path):
+    code, _client, run_dir = _run_report(dr, tmp_path)
+    assert code == 0
+    text = (run_dir / "client.json").read_text(encoding="utf-8")
+    obj = json.loads(text)
+    assert text == json.dumps(obj, allow_nan=False, sort_keys=True) + "\n"
+
+
+def test_every_k_row_family_present_at_family_level(dr, tmp_path):
+    code, client, _run_dir = _run_report(dr, tmp_path)
+    assert code == 0
+    families = _client_family_names(client)
+    for kid, family in _k_row_families():
+        assert family in families
+        if kid == "K6":
+            assert client["presence"]["K6"] == "family_present_child_absent"
+
+
+def test_report_annotates_no_proposal_window_on_zero_proposals(dr, tmp_path):
+    code, client, run_dir = _run_report(dr, tmp_path)
+    assert code == 0
+    assert "no_proposal_window" in client["annotations"]
+    assert (run_dir / "client.json").is_file()
+    assert (run_dir / "report.txt").is_file()
+
+
+def test_client_json_window_comes_from_samples_not_run_json(dr, tmp_path):
+    fixture = json.loads(
+        (_FIXTURES / "run__fast_n4.json").read_text(encoding="utf-8")
+    )
+    assert "window" not in fixture
+    assert "start_slot" not in fixture
+    assert "end_slot" not in fixture
+    code, client, _run_dir = _run_report(dr, tmp_path)
+    assert code == 0
+    assert client["run"] == fixture
+    assert "window" not in client["run"]
+    assert client["window"]["start_slot"] == 10
+    assert client["window"]["end_slot"] == 12
+    assert client["window"]["slots"] == 2
+    assert client["window"]["epochs"] == fixture["epochs"]
+
+
+_REPORT_INPUTS = (
+    "run.json",
+    "metrics-start.txt",
+    "metrics-end.txt",
+    "samples.jsonl",
+)
+
+
+def test_report_missing_inputs_exit_2_with_basename(dr, tmp_path, capsys):
+    for name in _REPORT_INPUTS:
+        run_dir = _synthetic_run_dir(tmp_path / name)
+        (run_dir / name).unlink()
+        capsys.readouterr()
+        code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+        assert code == 2
+        err = capsys.readouterr().err
+        assert name in err
+        assert str(run_dir) not in err
+
+
+def test_report_refuses_symlink_inputs(dr, tmp_path, capsys):
+    for name in _REPORT_INPUTS:
+        run_dir = _synthetic_run_dir(tmp_path / name)
+        real = run_dir / f"{name}.real"
+        target = run_dir / name
+        target.rename(real)
+        target.symlink_to(real)
+        capsys.readouterr()
+        code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+        assert code == 1
+        err = capsys.readouterr().err
+        assert name in err
+        assert "symlink" in err
+
+
+def test_report_refuses_symlink_run_dir(dr, tmp_path):
+    run_dir = _synthetic_run_dir(tmp_path)
+    link = tmp_path / "link"
+    link.symlink_to(run_dir)
+    assert dr.main(["report", "--run-dir", str(link)], clock=_clock) == 1
+
+
+def test_report_refuses_fifo_input(dr, tmp_path):
+    run_dir = _synthetic_run_dir(tmp_path)
+    (run_dir / "run.json").unlink()
+    os.mkfifo(run_dir / "run.json")
+    assert dr.main(["report", "--run-dir", str(run_dir)], clock=_clock) == 1
+
+
+def test_report_invalid_utf8_metrics_exits_1(dr, tmp_path, capsys):
+    run_dir = _synthetic_run_dir(tmp_path)
+    (run_dir / "metrics-start.txt").write_bytes(b"\xff\xfe not utf-8")
+    capsys.readouterr()
+    code = dr.main(["report", "--run-dir", str(run_dir)], clock=_clock)
+    assert code == 1
+    assert "UTF-8" in capsys.readouterr().err
+
+
+def test_report_caps_metrics_read(dr, tmp_path, monkeypatch):
+    monkeypatch.setattr(dr, "MAX_RESPONSE_BYTES", 8)
+    run_dir = _synthetic_run_dir(tmp_path)
+    assert dr.main(["report", "--run-dir", str(run_dir)], clock=_clock) == 1
+
+
+def test_report_drops_unknown_run_json_keys(dr, tmp_path):
+    fixture = json.loads(
+        (_FIXTURES / "run__fast_n4.json").read_text(encoding="utf-8")
+    )
+    extra = dict(fixture)
+    extra["window"] = {"start_slot": 999, "end_slot": 1000}
+    extra["extra"] = "nope"
+    extra["fingerprint"] = fixture["fingerprint"]
+    code, client, _run_dir = _run_report(dr, tmp_path, run=extra)
+    assert code == 0
+    assert "extra" not in client["run"]
+    assert "window" not in client["run"]
+    assert client["run"]["fingerprint"] == fixture["fingerprint"]
+    assert client["run"] == fixture
+    assert client["window"]["start_slot"] == 10
+
+
+def test_presence_k6_always_emitted(dr):
+    start = _parse_fixture(dr, "rvc_metrics__start")
+    end = _parse_fixture(dr, "rvc_metrics__end")
+    run = json.loads(
+        (_FIXTURES / "run__fast_n4.json").read_text(encoding="utf-8")
+    )
+    window = {"start_slot": 10, "end_slot": 12, "slots": 2}
+    client = dr.build_client_json(
+        run, window, start, end, {}, clock=_clock
+    )
+    assert client["presence"]["K6"] == "family_present_child_absent"
+    end["rvc_proposals_total"].samples.append(
+        dr.Sample(
+            labels={"outcome": "success"},
+            value=1.0,
+            name="rvc_proposals_total",
+        )
+    )
+    with_child = dr.build_client_json(
+        run, window, start, end, {}, clock=_clock
+    )
+    assert with_child["presence"]["K6"] == "all_children_present"
+    start.pop("rvc_proposals_total")
+    end.pop("rvc_proposals_total")
+    absent = dr.build_client_json(
+        run, window, start, end, {}, clock=_clock
+    )
+    assert absent["presence"]["K6"] == "family_present_child_absent"

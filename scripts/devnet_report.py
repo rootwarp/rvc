@@ -337,10 +337,17 @@ def _validate_scrape(args: argparse.Namespace) -> None:
         raise UsageError("--slot requires --gauges-only")
 
 
+def _validate_report(args: argparse.Namespace) -> None:
+    if not args.run_dir:
+        raise UsageError("--run-dir is required")
+
+
 def build_options(argv: list[str] | None = None) -> Options:
     args = build_parser().parse_args(argv)
     if args.command == "scrape":
         _validate_scrape(args)
+    elif args.command == "report":
+        _validate_report(args)
     return Options(
         command=args.command,
         url=getattr(args, "url", None),
@@ -373,7 +380,7 @@ def main(
                 )
             cmd_scrape(opts, transport=active, clock=clock)
         elif opts.command == "report":
-            cmd_report(opts)
+            cmd_report(opts, clock=clock)
         elif opts.command == "compare":
             cmd_compare(opts)
         else:
@@ -1163,11 +1170,238 @@ def fold_histograms(
     return grouped
 
 
+# ===== § 8. client.json report =====
+
+_PROPOSALS_FAMILY = "rvc_proposals_total"
+_K6_FORCE_REGISTERED = frozenset({"envelope_late"})
+_ANN_NO_PROPOSAL = "no_proposal_window"
+_ANN_NO_OBSERVATIONS = "no_observations"
+_PRESENCE_CHILD_ABSENT = "family_present_child_absent"
+_PRESENCE_ALL_CHILDREN = "all_children_present"
+_MAX_REPORT_JSON_BYTES = 1024 * 1024
+_RUN_JSON_KEYS = (
+    "epochs",
+    "fingerprint",
+    "generated_at",
+    "genesis_validators_root",
+    "git_sha",
+    "images",
+    "key_range",
+    "profile",
+    "pubkeys",
+    "run_id",
+    "rvc_version",
+    "schema_version",
+)
+
+
+def _input_name(path: str) -> str:
+    return os.path.basename(os.fspath(path))
+
+
+def _require_regular_file(path: str, *, cap: int) -> None:
+    dest = os.fspath(path)
+    name = _input_name(dest)
+    try:
+        st = os.lstat(dest)
+    except FileNotFoundError:
+        raise UsageError(f"failed to read {name}") from None
+    except OSError as exc:
+        raise InfraError(f"failed to read {name}") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise InfraError(f"{name} is a symlink")
+    if not stat.S_ISREG(st.st_mode):
+        raise InfraError(f"{name} is not a regular file")
+    if st.st_size > cap:
+        raise InfraError(f"{name} exceeded size cap")
+
+
+def _read_regular_text(path: str, *, cap: int) -> str:
+    dest = os.fspath(path)
+    name = _input_name(dest)
+    _require_regular_file(dest, cap=cap)
+    try:
+        fd = os.open(dest, _jsonl_open_flags(write=False))
+    except OSError as exc:
+        raise InfraError(f"failed to read {name}") from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise InfraError(f"{name} is not a regular file")
+        if opened.st_size > cap:
+            raise InfraError(f"{name} exceeded size cap")
+        data = os.read(fd, cap + 1)
+    except OSError as exc:
+        raise InfraError(f"failed to read {name}") from exc
+    finally:
+        os.close(fd)
+    if len(data) > cap:
+        raise InfraError(f"{name} exceeded size cap")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InfraError(f"{name} is not valid UTF-8") from exc
+
+
+def _load_json_object(path: str) -> object:
+    try:
+        return json.loads(
+            _read_regular_text(path, cap=_MAX_REPORT_JSON_BYTES)
+        )
+    except json.JSONDecodeError as exc:
+        raise UsageError(f"invalid JSON in {_input_name(path)}") from exc
+
+
+def _validate_run_dir(run_dir: str) -> None:
+    try:
+        st = os.lstat(run_dir)
+    except FileNotFoundError:
+        raise UsageError(f"--run-dir is not a directory: {run_dir}") from None
+    except OSError as exc:
+        raise InfraError("failed to read run dir") from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise InfraError("run dir is a symlink")
+    if not stat.S_ISDIR(st.st_mode):
+        raise UsageError(f"--run-dir is not a directory: {run_dir}")
+
+
+def _copy_run(run: dict[str, object]) -> dict[str, object]:
+    return {key: run[key] for key in _RUN_JSON_KEYS if key in run}
+
+
+def _run_epochs(run: dict[str, object]) -> int:
+    epochs = run.get("epochs")
+    if isinstance(epochs, bool) or not isinstance(epochs, int) or epochs <= 0:
+        raise UsageError("run.json epochs must be a positive integer")
+    return epochs
+
+
+def _with_counter_units(
+    counters: dict[str, list[dict[str, object]]],
+) -> dict[str, list[dict[str, object]]]:
+    for name, rows in counters.items():
+        unit = unit_for(name)
+        for row in rows:
+            row["unit"] = unit
+    return counters
+
+
+def _proposals_delta(counters: dict[str, list[dict[str, object]]]) -> float:
+    total = 0.0
+    for row in counters.get(_PROPOSALS_FAMILY, []):
+        delta = row.get("delta")
+        if isinstance(delta, bool) or not isinstance(delta, (int, float)):
+            continue
+        if math.isfinite(delta):
+            total += delta
+    return total
+
+
+def _k6_presence(
+    counters: dict[str, list[dict[str, object]]],
+) -> dict[str, str]:
+    rows = counters.get(_PROPOSALS_FAMILY)
+    if rows is None:
+        return {"K6": _PRESENCE_CHILD_ABSENT}
+    outcomes: set[object] = set()
+    for row in rows:
+        labels = row.get("labels")
+        if isinstance(labels, dict) and "outcome" in labels:
+            outcomes.add(labels["outcome"])
+    if outcomes <= _K6_FORCE_REGISTERED:
+        return {"K6": _PRESENCE_CHILD_ABSENT}
+    return {"K6": _PRESENCE_ALL_CHILDREN}
+
+
+def _client_annotations(
+    counters: dict[str, list[dict[str, object]]],
+    histograms: dict[str, list[dict[str, object]]],
+) -> list[str]:
+    notes: list[str] = []
+    if _proposals_delta(counters) == 0:
+        notes.append(_ANN_NO_PROPOSAL)
+    if any(
+        row.get("annotation") == _ANN_NO_OBSERVATIONS
+        for rows in histograms.values()
+        for row in rows
+    ):
+        notes.append(_ANN_NO_OBSERVATIONS)
+    notes.sort()
+    return notes
+
+
+def build_client_json(
+    run: dict[str, object],
+    window: dict[str, object],
+    start: dict[str, Family],
+    end: dict[str, Family],
+    samples: dict[str, list[dict[str, object]]],
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> dict[str, object]:
+    epochs = _run_epochs(run)
+    counters = _with_counter_units(
+        counter_delta(start, end, epochs=float(epochs))
+    )
+    histograms = fold_histograms(start, end)
+    window_out = dict(window)
+    window_out["epochs"] = epochs
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": _generated_at(clock),
+        "run": _copy_run(run),
+        "window": window_out,
+        "counters": counters,
+        "histograms": histograms,
+        "gauges": samples,
+        "presence": _k6_presence(counters),
+        "annotations": _client_annotations(counters, histograms),
+    }
+
+
+def render_table(_client: dict[str, object]) -> str:
+    return ""
+
+
+def cmd_report(
+    opts: Options,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> None:
+    run_dir = opts.run_dir
+    if not run_dir:
+        raise UsageError("--run-dir is required")
+    _validate_run_dir(run_dir)
+    run_path = os.path.join(run_dir, "run.json")
+    start_path = os.path.join(run_dir, "metrics-start.txt")
+    end_path = os.path.join(run_dir, "metrics-end.txt")
+    samples_path = os.path.join(run_dir, "samples.jsonl")
+    run_obj = _load_json_object(run_path)
+    if not isinstance(run_obj, dict):
+        raise UsageError("run.json must be an object")
+    start = parse_metrics(
+        _read_regular_text(start_path, cap=MAX_RESPONSE_BYTES)
+    )
+    end = parse_metrics(
+        _read_regular_text(end_path, cap=MAX_RESPONSE_BYTES)
+    )
+    _require_regular_file(samples_path, cap=_MAX_JSONL_BYTES)
+    window = window_from_samples(samples_path)
+    gauges = fold_gauges(samples_path)
+    client = build_client_json(
+        run_obj, window, start, end, gauges, clock=clock
+    )
+    table = render_table(client)
+    if not table.endswith("\n"):
+        table += "\n"
+    try:
+        write_json_atomic(os.path.join(run_dir, "client.json"), client)
+        _write_text_atomic(os.path.join(run_dir, "report.txt"), table)
+    except OSError as exc:
+        raise InfraError(f"failed to write report artifacts: {exc}") from exc
+
+
 # ===== § 9. Compare =====
-
-
-def cmd_report(_opts: Options) -> None:
-    raise UsageError("report lands with DN-9 in later Phase 4 issues")
 
 
 def cmd_compare(_opts: Options) -> None:
@@ -1194,19 +1428,15 @@ def _finite_or_none(obj: object) -> object:
     return obj
 
 
-def write_json_atomic(path: str | os.PathLike[str], obj: object) -> None:
+def _write_text_atomic(path: str | os.PathLike[str], text: str) -> None:
     dest = os.path.abspath(path)
     directory = os.path.dirname(dest) or "."
-    payload = json.dumps(
-        _finite_or_none(obj), allow_nan=False, sort_keys=True
-    )
     fd, tmp = tempfile.mkstemp(
         prefix="devnet_report.", suffix=".tmp", dir=directory
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(payload)
-            fh.write("\n")
+            fh.write(text)
         os.replace(tmp, dest)
     except Exception:
         try:
@@ -1214,6 +1444,13 @@ def write_json_atomic(path: str | os.PathLike[str], obj: object) -> None:
         except OSError:
             pass
         raise
+
+
+def write_json_atomic(path: str | os.PathLike[str], obj: object) -> None:
+    payload = json.dumps(
+        _finite_or_none(obj), allow_nan=False, sort_keys=True
+    )
+    _write_text_atomic(path, payload + "\n")
 
 
 if __name__ == "__main__":
