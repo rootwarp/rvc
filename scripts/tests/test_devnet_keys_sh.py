@@ -1,7 +1,7 @@
 """Contract tests for scripts/devnet/02-keys.sh.
 
 DOCKER stubs are scratch scripts (P1-A8); disable_socket() via conftest autouse.
-Live val-tools run is skipped unless the pinned IMG_GENESIS is already present.
+Live val-tools run is skipped unless DEVNET_LIVE=1 and the pinned IMG_GENESIS is present.
 """
 
 from __future__ import annotations
@@ -301,6 +301,8 @@ def validator_dirs(tmp_path: Path) -> list[Path]:
 
 
 def _live_genesis_available() -> bool:
+    if os.environ.get("DEVNET_LIVE") != "1":
+        return False
     docker = shutil.which("docker")
     if docker is None:
         return False
@@ -660,7 +662,7 @@ def test_assert_kdf_strength_exits_1_when_no_keystores(tmp_path: Path):
 
 @pytest.mark.skipif(
     not _live_genesis_available(),
-    reason="pinned IMG_GENESIS not present (1.2 owns the pull)",
+    reason="DEVNET_LIVE=1 and pinned IMG_GENESIS required",
 )
 def test_live_valtools_count_and_kdf(tmp_path: Path):
     docker = shutil.which("docker")

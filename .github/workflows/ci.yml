@@ -364,3 +364,27 @@ jobs:
 
       - name: Run spec-vector suites
         run: cargo nextest run -p rvc-spec-vectors --locked --final-status-level pass
+
+  # P1-A5 / issue 1.6: no Rust toolchain. Glob is test_devnet_*.py on purpose
+  # (not scripts/tests/) so validator_perf is not a PR gate. No devnet job.
+  scripts:
+    name: Scripts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.13"
+          checksum: "745765a3b6e360ad76743599ae5c42e9278c7edf8bbff9fc76d05bf2623a04dd"
+
+      - name: Shellcheck
+        run: shellcheck scripts/devnet/*.sh scripts/devnet/lib/*.sh
+
+      - name: Pytest (devnet scripts)
+        run: uv run --with pytest==9.1.1 --with pytest-socket==0.8.1 pytest scripts/tests/test_devnet_*.py -q
