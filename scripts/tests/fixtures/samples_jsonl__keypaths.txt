@@ -1,0 +1,16 @@
+gauges
+gauges.rvc_bn_health_tier
+gauges.rvc_bn_health_tier[].labels
+gauges.rvc_bn_health_tier[].labels.endpoint
+gauges.rvc_bn_health_tier[].v
+gauges.rvc_proposer_bn_health_score
+gauges.rvc_proposer_bn_health_score[].labels
+gauges.rvc_proposer_bn_health_score[].labels.endpoint
+gauges.rvc_proposer_bn_health_score[].labels.pool
+gauges.rvc_proposer_bn_health_score[].v
+gauges.rvc_tasks_running
+gauges.rvc_tasks_running[].labels
+gauges.rvc_tasks_running[].labels.task
+gauges.rvc_tasks_running[].v
+slot
+t

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import math
+import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -15,6 +17,46 @@ from pytest_socket import SocketBlockedError
 from conftest import FakeTransport, raw_text
 
 _METRICS_URL = "http://127.0.0.1:5064/metrics"
+_FIXTURES = Path(__file__).resolve().parent / "fixtures"
+_CLOCK_T = datetime(2026, 9, 12, 0, 0, 0, tzinfo=timezone.utc)
+_TIER_LABELS = {"endpoint": "http://127.0.0.1:5052"}
+_SCORE_LABELS = {
+    "endpoint": "http://127.0.0.1:5052",
+    "pool": "proposer",
+}
+_TASK_LABELS = {"task": "orchestrator"}
+
+
+def _clock() -> datetime:
+    return _CLOCK_T
+
+
+def _json_keypaths(obj: object, prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            paths.add(path)
+            paths |= _json_keypaths(value, path)
+    elif isinstance(obj, list):
+        elem = f"{prefix}[]"
+        for item in obj:
+            paths |= _json_keypaths(item, elem)
+    return paths
+
+
+def _counter_series(blocks, **labels):
+    for block in blocks:
+        if block["labels"] == labels:
+            return block
+    raise AssertionError(f"no series with labels {labels}")
+
+
+def _gauge_series(folded, name, **labels):
+    for block in folded[name]:
+        if block["labels"] == labels:
+            return block
+    raise AssertionError(f"no series {name} with labels {labels}")
 
 
 def _parse_fixture(dr, name: str):
@@ -311,3 +353,246 @@ def test_parse_caps_raise_infra(dr, monkeypatch):
     monkeypatch.setattr(dr, "_MAX_LABEL_VALUE_BYTES", 4)
     with pytest.raises(dr.InfraError):
         dr.parse_metrics('foo{a="12345"} 1\n')
+
+
+def test_counter_delta_flags_monotonic_violation(dr):
+    start = _parse_fixture(dr, "rvc_metrics__start")
+    end = _parse_fixture(dr, "rvc_metrics__end")
+    missed = _counter_series(
+        dr.counter_delta(start, end, epochs=4)[
+            "rvc_orchestrator_missed_slots_total"
+        ]
+    )
+    assert missed["start"] == 3
+    assert missed["end"] == 1
+    assert missed["delta"] == -2
+    assert missed["monotonic_violation"] is True
+
+
+def test_counter_delta_treats_new_label_set_as_start_zero(dr):
+    start = _parse_fixture(dr, "rvc_metrics__start")
+    end = _parse_fixture(dr, "rvc_metrics__end")
+    blocks = dr.counter_delta(start, end, epochs=4)["rvc_attestations_total"]
+    failed = _counter_series(blocks, status="failed")
+    assert failed["start"] == 0
+    assert failed["end"] == 1
+    assert failed["delta"] == 1
+    assert failed["monotonic_violation"] is False
+    success = _counter_series(blocks, status="success")
+    assert success["start"] == 80
+    assert success["end"] == 192
+
+
+def test_counter_per_epoch_divides_by_epochs_argument(dr):
+    start = _parse_fixture(dr, "rvc_metrics__start")
+    end = _parse_fixture(dr, "rvc_metrics__end")
+    by_four = _counter_series(
+        dr.counter_delta(start, end, epochs=4)[
+            "rvc_orchestrator_slots_processed_total"
+        ],
+        result="success",
+    )
+    by_eight = _counter_series(
+        dr.counter_delta(start, end, epochs=8)[
+            "rvc_orchestrator_slots_processed_total"
+        ],
+        result="success",
+    )
+    assert by_four["delta"] == 128
+    assert by_four["per_epoch"] == 128 / 4
+    assert by_eight["per_epoch"] == 128 / 8
+    assert by_four["per_epoch"] != by_eight["per_epoch"]
+
+
+def test_gauge_fold_reports_last_min_max_samples(dr):
+    folded = dr.fold_gauges(_FIXTURES / "samples__gauges.jsonl")
+    tier = _gauge_series(folded, "rvc_bn_health_tier", **_TIER_LABELS)
+    assert tier["last"] == 3
+    assert tier["min"] == 1
+    assert tier["max"] == 4
+    assert tier["samples"] == 3
+    tasks = _gauge_series(folded, "rvc_tasks_running", **_TASK_LABELS)
+    assert tasks == {
+        "labels": _TASK_LABELS,
+        "last": 2,
+        "min": 1,
+        "max": 2,
+        "samples": 3,
+    }
+
+
+def test_gauge_fold_skips_malformed_line(dr):
+    folded = dr.fold_gauges(_FIXTURES / "samples__gauges.jsonl")
+    tier = _gauge_series(folded, "rvc_bn_health_tier", **_TIER_LABELS)
+    assert tier["samples"] == 3
+    assert tier["last"] == 3
+
+
+def test_gauge_fold_ignores_nan_for_min_max(dr):
+    folded = dr.fold_gauges(_FIXTURES / "samples__gauges.jsonl")
+    score = _gauge_series(
+        folded, "rvc_proposer_bn_health_score", **_SCORE_LABELS
+    )
+    assert score["last"] is None
+    assert score["min"] == 0.25
+    assert score["max"] == 1
+    assert score["samples"] == 3
+
+
+def test_scrape_gauges_only_appends_one_line_per_call(dr, tmp_path):
+    path = tmp_path / "samples.jsonl"
+    raw = raw_text(dr, "rvc_metrics__ok")
+    transport = FakeTransport({("GET", "/metrics"): [raw, raw, raw]})
+    assert not path.exists()
+    for i, slot in enumerate((10, 11, 12)):
+        code = dr.main(
+            [
+                "scrape",
+                "--url",
+                _METRICS_URL,
+                "--gauges-only",
+                "--slot",
+                str(slot),
+                "--append",
+                str(path),
+            ],
+            transport=transport,
+            clock=_clock,
+        )
+        assert code == 0
+        if i == 0:
+            assert path.is_file()
+    rows = [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["slot"] for row in rows] == [10, 11, 12]
+    assert all(row["t"] == "2026-09-12T00:00:00Z" for row in rows)
+    assert all(set(row) == {"t", "slot", "gauges"} for row in rows)
+
+
+def test_window_from_samples_slots_are_end_minus_start(dr):
+    assert dr.window_from_samples(_FIXTURES / "samples__gauges.jsonl") == {
+        "start_slot": 10,
+        "end_slot": 12,
+        "slots": 2,
+    }
+
+
+def test_jsonl_refuses_symlink_and_non_regular(dr, tmp_path):
+    real = tmp_path / "samples.jsonl"
+    real.write_text(
+        '{"slot": 10, "gauges": {}}\n{"slot": 11, "gauges": {}}\n',
+        encoding="utf-8",
+    )
+    link = tmp_path / "link.jsonl"
+    link.symlink_to(real)
+    with pytest.raises(dr.InfraError):
+        dr.fold_gauges(link)
+    transport = FakeTransport(
+        {("GET", "/metrics"): [raw_text(dr, "rvc_metrics__ok")]}
+    )
+    assert (
+        dr.main(
+            [
+                "scrape",
+                "--url",
+                _METRICS_URL,
+                "--gauges-only",
+                "--slot",
+                "10",
+                "--append",
+                str(link),
+            ],
+            transport=transport,
+            clock=_clock,
+        )
+        == 1
+    )
+    assert real.read_text(encoding="utf-8").count("\n") == 2
+    fifo = tmp_path / "fifo.jsonl"
+    os.mkfifo(fifo)
+    with pytest.raises(dr.InfraError):
+        dr.fold_gauges(fifo)
+    with pytest.raises(dr.InfraError):
+        dr._append_jsonl_line(fifo, {"slot": 1, "gauges": {}})
+
+
+def test_jsonl_caps_raise_infra(dr, tmp_path, monkeypatch):
+    path = tmp_path / "samples.jsonl"
+    path.write_text(
+        '{"slot": 1, "gauges": {}}\n{"slot": 2, "gauges": {}}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dr, "_MAX_JSONL_BYTES", 16)
+    with pytest.raises(dr.InfraError):
+        dr.fold_gauges(path)
+    monkeypatch.setattr(dr, "_MAX_JSONL_BYTES", 8 * 1024 * 1024)
+    monkeypatch.setattr(dr, "_MAX_JSONL_LINE", 8)
+    with pytest.raises(dr.InfraError):
+        dr.fold_gauges(path)
+    monkeypatch.setattr(dr, "_MAX_JSONL_LINE", 64 * 1024)
+    monkeypatch.setattr(dr, "_MAX_JSONL_BYTES", 16)
+    with pytest.raises(dr.InfraError):
+        dr._append_jsonl_line(path, {"slot": 3, "gauges": {}})
+
+
+def test_window_from_samples_rejects_single_row(dr, tmp_path):
+    path = tmp_path / "samples.jsonl"
+    path.write_text(
+        json.dumps({"t": "2026-09-12T00:00:00Z", "slot": 10, "gauges": {}})
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(dr.UsageError):
+        dr.window_from_samples(path)
+    assert dr.EXIT_USAGE == 2
+
+
+def test_window_from_samples_rejects_non_increasing_slots(dr, tmp_path):
+    path = tmp_path / "samples.jsonl"
+    rows = (
+        {"t": "2026-09-12T00:00:00Z", "slot": 12, "gauges": {}},
+        {"t": "2026-09-12T00:00:12Z", "slot": 11, "gauges": {}},
+    )
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    with pytest.raises(dr.UsageError):
+        dr.window_from_samples(path)
+    assert dr.EXIT_USAGE == 2
+
+
+def test_samples_jsonl_matches_committed_keypaths(dr, tmp_path):
+    path = tmp_path / "samples.jsonl"
+    transport = FakeTransport(
+        {("GET", "/metrics"): [raw_text(dr, "rvc_metrics__start")]}
+    )
+    assert (
+        dr.main(
+            [
+                "scrape",
+                "--url",
+                _METRICS_URL,
+                "--gauges-only",
+                "--slot",
+                "10",
+                "--append",
+                str(path),
+            ],
+            transport=transport,
+            clock=_clock,
+        )
+        == 0
+    )
+    obj = json.loads(path.read_text(encoding="utf-8").splitlines()[0])
+    actual = _json_keypaths(obj)
+    expected = {
+        line
+        for line in (_FIXTURES / "samples_jsonl__keypaths.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line
+    }
+    assert actual - expected == set()
+    assert expected - actual == set()
