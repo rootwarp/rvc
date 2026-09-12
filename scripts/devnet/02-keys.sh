@@ -22,8 +22,16 @@ if [[ "$_OV_CHAIN_ID" -eq 1 ]]; then
 fi
 unset _OV_CHAIN_ID _KEEP_CHAIN_ID
 
-VALTOOLS_DIR="${KEYS_DIR}/valtools"
-VALTOOLS_LOG="${KEYS_DIR}/valtools.log"
+# Fallback if the genesis-generator binary rejects --validators-mnemonic.
+_IMG_VAL_TOOLS_FALLBACK="protolambda/eth2-val-tools:0.2.2@sha256:46147228f291266148a6a21a2b9541367ad5f70e619d79cd5393459baf539f58"
+
+_bind_keys_paths() {
+    VALTOOLS_DIR="${KEYS_DIR}/valtools"
+    VALTOOLS_LOG="${KEYS_DIR}/valtools.log"
+    MANIFEST_JSON="${KEYS_DIR}/manifest.json"
+}
+
+_bind_keys_paths
 
 _refuse_symlink() {
     local path="$1"
@@ -149,6 +157,156 @@ assert_kdf_strength() {
     fi
 }
 
+manifest_has_n_rows() {
+    local got
+    if [[ ! -f "$MANIFEST_JSON" || -L "$MANIFEST_JSON" ]]; then
+        return 1
+    fi
+    got="$(jq -r '.validators|length' "$MANIFEST_JSON" 2>/dev/null)" || return 1
+    case "$got" in
+        '' | *[!0-9]*)
+            return 1
+            ;;
+    esac
+    [[ "$got" -eq "$NUM_VALIDATORS" ]]
+}
+
+_run_val_tools_pubkeys() {
+    local img="$1"
+    local entrypoint="$2"
+    "$DOCKER" run --rm \
+        --entrypoint "$entrypoint" \
+        -- \
+        "$img" \
+        pubkeys \
+        --validators-mnemonic="$MNEMONIC" \
+        --source-min=0 \
+        --source-max="$NUM_VALIDATORS" \
+        2>&1
+}
+
+_collect_pubkeys() {
+    local raw filtered
+    raw=""
+    raw="$(_run_val_tools_pubkeys "$IMG_GENESIS" "/usr/local/bin/eth2-val-tools")" || raw=""
+    filtered="$(printf '%s\n' "$raw" | grep -E '^0x[0-9a-f]{96}$' || true)"
+    if [[ -n "$filtered" ]]; then
+        printf '%s\n' "$filtered"
+        return 0
+    fi
+    # Fallback image ENTRYPOINT is ./eth2-val-tools under WORKDIR /app.
+    raw=""
+    raw="$(_run_val_tools_pubkeys "$_IMG_VAL_TOOLS_FALLBACK" "/app/eth2-val-tools")" || raw=""
+    filtered="$(printf '%s\n' "$raw" | grep -E '^0x[0-9a-f]{96}$' || true)"
+    if [[ -n "$filtered" ]]; then
+        printf '%s\n' "$filtered"
+        return 0
+    fi
+    die_infra "pubkeys failed"
+}
+
+# O_NOFOLLOW + O_EXCL temp, then replace. Do not use a PID-predictable tmp name.
+_write_manifest_atomic() {
+    MANIFEST_DEST="$1" python3 -c '
+import os, sys
+
+dest = os.environ["MANIFEST_DEST"]
+data = sys.stdin.buffer.read()
+if not data:
+    sys.exit(1)
+
+directory = os.path.dirname(os.path.abspath(dest))
+if os.path.islink(directory) or not os.path.isdir(directory):
+    sys.exit(2)
+if os.path.lexists(dest) and os.path.islink(dest):
+    sys.exit(2)
+
+tmp = dest + ".tmp." + os.urandom(16).hex()
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+fd = -1
+try:
+    fd = os.open(tmp, flags, 0o600)
+    os.write(fd, data)
+    os.close(fd)
+    fd = -1
+    if os.path.islink(tmp) or os.path.islink(dest):
+        os.unlink(tmp)
+        sys.exit(2)
+    os.replace(tmp, dest)
+    tmp = ""
+except OSError:
+    sys.exit(1)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+'
+}
+
+build_manifest() {
+    local filtered n_lines n_uniq generated_at
+    umask 077
+    mkdir -p -- "$KEYS_DIR"
+    chmod 700 "$KEYS_DIR"
+    _refuse_symlink "$KEYS_DIR" "keys dir"
+    _refuse_symlink "$MANIFEST_JSON" "manifest"
+    log_info "building key manifest"
+    filtered="$(_collect_pubkeys)"
+    n_lines="$(printf '%s\n' "$filtered" | grep -cE '^0x[0-9a-f]{96}$' || true)"
+    n_uniq="$(printf '%s\n' "$filtered" | sort -u | grep -cE '^0x[0-9a-f]{96}$' || true)"
+    if [[ "$n_lines" -ne "$NUM_VALIDATORS" ]]; then
+        die_infra "pubkeys count ${n_lines} != ${NUM_VALIDATORS}"
+    fi
+    if [[ "$n_uniq" -ne "$n_lines" ]]; then
+        die_infra "duplicated pubkeys"
+    fi
+    generated_at="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+    if ! printf '%s\n' "$filtered" | jq -Rn --arg generated_at "$generated_at" '
+        {
+          schema_version: 1,
+          generated_at: $generated_at,
+          validators: ([inputs] | to_entries | map({
+            index: .key,
+            pubkey: .value,
+            keystore_path: ("valtools/validators/" + .value + "/voting-keystore.json")
+          }))
+        }
+    ' | _write_manifest_atomic "$MANIFEST_JSON"; then
+        die_infra "manifest json encode failed"
+    fi
+    chmod 600 "$MANIFEST_JSON"
+}
+
+assert_manifest_rows() {
+    local got
+    if [[ ! -f "$MANIFEST_JSON" || -L "$MANIFEST_JSON" ]]; then
+        die_infra "manifest missing: ${MANIFEST_JSON}"
+    fi
+    if ! jq -e --argjson n "$NUM_VALIDATORS" '
+        .schema_version == 1
+        and (.generated_at | type == "string" and length > 0)
+        and (.validators | type == "array")
+        and (.validators | length) == $n
+        and ([.validators[].index] == [range($n)])
+        and ((.validators | map(.pubkey) | unique | length) == $n)
+        and all(
+              .validators[];
+              (.pubkey | type == "string" and test("^0x[0-9a-f]{96}$"))
+              and (.keystore_path == ("valtools/validators/" + .pubkey + "/voting-keystore.json"))
+            )
+    ' "$MANIFEST_JSON" >/dev/null; then
+        die_infra "manifest rows invalid"
+    fi
+    got="$(jq '.validators|length' "$MANIFEST_JSON")"
+    if [[ "$got" -ne "$NUM_VALIDATORS" ]]; then
+        die_infra "manifest row count ${got} != ${NUM_VALIDATORS}"
+    fi
+}
+
 _normalize_valtools_tree() {
     if [[ ! -d "$VALTOOLS_DIR" || -L "$VALTOOLS_DIR" ]]; then
         die_infra "valtools output missing: ${VALTOOLS_DIR}"
@@ -233,10 +391,13 @@ print_keys_plan() {
     log_info "  1. generate_keystores"
     log_info "  2. assert_key_count"
     log_info "  3. assert_kdf_strength"
+    log_info "  4. build_manifest"
+    log_info "  5. assert_manifest_rows"
 }
 
 main() {
     parse_common_flags "$@"
+    _bind_keys_paths
     require_chain_1337
     require_cmd jq
     require_cmd python3
@@ -258,26 +419,35 @@ main() {
         else
             log_info "would generate keystores via ${IMG_GENESIS}"
         fi
+        if [[ "$FORCE" != "1" ]] && manifest_has_n_rows; then
+            log_info "would skip manifest.json (already has ${NUM_VALIDATORS} rows)"
+        else
+            log_info "would build manifest.json via ${IMG_GENESIS}"
+        fi
         log_success "dry-run complete"
         return 0
     fi
 
-    if [[ "$FORCE" != "1" ]] && keys_exist; then
-        mkdir -p -- "$KEYS_DIR"
-        chmod 700 "$KEYS_DIR"
-        _lockdown_keys
-        assert_key_count
-        assert_kdf_strength
-        log_success "validator keys already present"
-        return 0
-    fi
-
-    require_cmd "$DOCKER"
     mkdir -p -- "$KEYS_DIR"
     chmod 700 "$KEYS_DIR"
-    generate_keystores
+
+    if [[ "$FORCE" == "1" ]] || ! keys_exist; then
+        require_cmd "$DOCKER"
+        generate_keystores
+    else
+        _lockdown_keys
+        log_info "validator keys already present"
+    fi
     assert_key_count
     assert_kdf_strength
+
+    if [[ "$FORCE" == "1" ]] || ! manifest_has_n_rows; then
+        require_cmd "$DOCKER"
+        build_manifest
+    else
+        log_info "skipping manifest.json (already has ${NUM_VALIDATORS} rows)"
+    fi
+    assert_manifest_rows
     log_success "validator keys ready"
 }
 

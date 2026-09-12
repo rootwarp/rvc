@@ -23,10 +23,20 @@ fi
 unset _OV_CHAIN_ID _KEEP_CHAIN_ID
 
 BEACON_TESTNET_DIR="${BEACON_TESTNET_DIR:-/genesis}"
-# Phase 2 narrows this to ${KEYS_DIR}/vc; keep the source in one variable.
-VC_KEYS_SRC="${VC_KEYS_SRC:-${KEYS_DIR}/valtools}"
-VALIDATOR_DATA_DIR="${CL_DATA_DIR}/validator"
+# Preserve an explicit VC_KEYS_SRC override; default after parse from KEYS_DIR.
+_VC_KEYS_SRC_OVERRIDE="${VC_KEYS_SRC:-}"
 _EL_GVR_REINIT=0
+
+_bind_chain_paths() {
+    if [[ -n "$_VC_KEYS_SRC_OVERRIDE" ]]; then
+        VC_KEYS_SRC="$_VC_KEYS_SRC_OVERRIDE"
+    else
+        VC_KEYS_SRC="${KEYS_DIR}/valtools"
+    fi
+    VALIDATOR_DATA_DIR="${CL_DATA_DIR}/validator"
+}
+
+_bind_chain_paths
 
 _require_uint() {
     local name="$1"
@@ -867,6 +877,7 @@ _validate_inputs() {
 
 main() {
     parse_common_flags "$@"
+    _bind_chain_paths
     require_chain_1337
     require_cmd jq
     require_cmd python3

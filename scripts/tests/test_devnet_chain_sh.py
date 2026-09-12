@@ -510,8 +510,10 @@ def test_chain_sh_exists_and_syntax():
     assert "validator_client" in text
     assert "--suggested-fee-recipient=" in text
     assert "--init-slashing-protection" in text
-    assert re.search(r'(?m)^VC_KEYS_SRC=', text)
+    assert "VC_KEYS_SRC=" in text
+    assert "_bind_chain_paths" in text
     assert "${KEYS_DIR}/valtools" in text
+    assert "${CL_DATA_DIR}/validator" in text
     assert "head_slot + sync_distance" in text or "head_slot+sync_distance" in text
     assert re.search(r'(?m)^\s*docker\s', text) is None
     assert re.search(r'(?m)^\s*curl\s', text) is None
@@ -1143,6 +1145,23 @@ def test_scrub_refuses_non_regular_log(tmp_path: Path):
     )
     assert proc.returncode == 1, proc.stderr
     assert "regular file" in proc.stderr
+
+
+def test_data_dir_flag_rebinds_vc_paths(tmp_path: Path):
+    t = tmp_path / "T"
+    t.mkdir()
+    proc = source_chain(
+        tmp_path,
+        f"parse_common_flags --data-dir {shlex.quote(str(t))}; "
+        "_bind_chain_paths; "
+        'printf "%s\\n%s\\n" "$VC_KEYS_SRC" "$VALIDATOR_DATA_DIR"',
+    )
+    assert proc.returncode == 0, proc.stderr
+    resolved = t.resolve()
+    assert proc.stdout.strip().splitlines() == [
+        f"{resolved}/keys/valtools",
+        f"{resolved}/cl/validator",
+    ]
 
 
 def test_vc_keys_src_override(tmp_path: Path):

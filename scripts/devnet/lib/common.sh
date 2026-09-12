@@ -109,6 +109,30 @@ _is_world_writable() {
     return 1
 }
 
+_resolve_data_dir() {
+    if [[ -z "${DATA_DIR:-}" ]]; then
+        die_usage "--data-dir requires a path"
+    fi
+    if [[ -L "$DATA_DIR" ]]; then
+        die_usage "refusing symlink data dir: ${DATA_DIR}"
+    fi
+    if [[ -e "$DATA_DIR" && ! -d "$DATA_DIR" ]]; then
+        die_usage "data dir is not a directory: ${DATA_DIR}"
+    fi
+    mkdir -p -- "$DATA_DIR" || die_usage "cannot create data dir: ${DATA_DIR}"
+    if [[ -L "$DATA_DIR" ]]; then
+        die_usage "refusing symlink data dir: ${DATA_DIR}"
+    fi
+    if [[ ! -d "$DATA_DIR" ]]; then
+        die_usage "data dir is not a directory: ${DATA_DIR}"
+    fi
+    if _is_world_writable "$DATA_DIR"; then
+        die_usage "refusing world-writable data dir: ${DATA_DIR}"
+    fi
+    DATA_DIR="$(cd -P -- "$DATA_DIR" >/dev/null && pwd -P)" || die_usage "cannot resolve data dir: ${DATA_DIR}"
+    export DATA_DIR
+}
+
 _require_docker_ident() {
     local name="${1:-}"
     local what="${2:-name}"
@@ -127,6 +151,7 @@ _require_docker_ident() {
 }
 
 parse_common_flags() {
+    local data_dir_from_flag=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --force)
@@ -155,6 +180,22 @@ parse_common_flags() {
                 fi
                 shift
                 ;;
+            --data-dir)
+                if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
+                    die_usage "--data-dir requires a path"
+                fi
+                DATA_DIR="$2"
+                data_dir_from_flag=1
+                shift 2
+                ;;
+            --data-dir=*)
+                DATA_DIR="${1#--data-dir=}"
+                if [[ -z "$DATA_DIR" ]]; then
+                    die_usage "--data-dir requires a path"
+                fi
+                data_dir_from_flag=1
+                shift
+                ;;
             --profile)
                 if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
                     die_usage "--profile requires a value"
@@ -181,7 +222,16 @@ parse_common_flags() {
                 ;;
         esac
     done
+    if [[ "$data_dir_from_flag" -eq 1 ]]; then
+        _resolve_data_dir
+    fi
+    JWT_DIR="${DATA_DIR}/jwt"
+    EL_DATA_DIR="${DATA_DIR}/el"
+    CL_DATA_DIR="${DATA_DIR}/cl"
+    GENESIS_DIR="${DATA_DIR}/genesis"
+    KEYS_DIR="${DATA_DIR}/keys"
     export FORCE INTERACTIVE DRY_RUN PROFILE RUN_DIR
+    export DATA_DIR JWT_DIR EL_DATA_DIR CL_DATA_DIR GENESIS_DIR KEYS_DIR
 }
 
 require_cmd() {
