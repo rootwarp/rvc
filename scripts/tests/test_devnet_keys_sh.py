@@ -25,6 +25,7 @@ _MANIFEST_KEYPATHS = _FIXTURES / "manifest_json__keypaths.txt"
 
 _ENV = parse_env(ENV_PATH)
 _N = int(_ENV["NUM_VALIDATORS"])
+_K = int(_ENV["RVC_KEYS"])
 _MNEMONIC = _ENV["MNEMONIC"]
 _IMG = _ENV["IMG_GENESIS"]
 
@@ -113,14 +114,33 @@ def _pk_snippet(style: str) -> str:
     return '      pk=$(printf \'0x%096x\' "$i")\n'
 
 
-def keystore_body(*, c: int | None = 262144, missing_c: bool = False) -> str:
+def keystore_body(
+    *,
+    c: int | None = 262144,
+    missing_c: bool = False,
+    pubkey: str | None = None,
+) -> str:
     if missing_c:
-        return '{"crypto":{"kdf":{"params":{}}}}\n'
-    return (
-        '{"crypto":{"kdf":{"function":"pbkdf2","params":{"c":'
-        + str(c)
-        + ',"dklen":32,"prf":"hmac-sha256","salt":"aa"}}},"version":4}\n'
-    )
+        doc: dict = {"crypto": {"kdf": {"params": {}}}}
+    else:
+        doc = {
+            "crypto": {
+                "kdf": {
+                    "function": "pbkdf2",
+                    "params": {
+                        "c": c,
+                        "dklen": 32,
+                        "prf": "hmac-sha256",
+                        "salt": "aa",
+                    },
+                }
+            },
+            "version": 4,
+        }
+    if pubkey is not None:
+        bare = pubkey[2:] if pubkey.startswith(("0x", "0X")) else pubkey
+        doc["pubkey"] = bare
+    return json.dumps(doc, separators=(",", ":")) + "\n"
 
 
 def write_docker_stub(
@@ -213,9 +233,9 @@ def write_docker_stub(
         "    while [ \"$i\" -lt \"$n\" ]; do\n"
         f"{pk_block}"
         "      mkdir -p \"$out/keys/$pk\" \"$out/nimbus-keys/$pk\"\n"
-        "      printf '%s\\n' "
-        "'{\"crypto\":{\"kdf\":{\"params\":{\"c\":262144}}}}' "
-        "> \"$out/keys/$pk/voting-keystore.json\"\n"
+        "      bare=${pk#0x}\n"
+        '      printf \'{"crypto":{"kdf":{"params":{"c":262144}}},"pubkey":"%s"}\\n\' '
+        '"$bare" > "$out/keys/$pk/voting-keystore.json"\n'
         "      printf 'secret-%s\\n' \"$pk\" > \"$out/secrets/$pk\"\n"
         "      chmod 644 \"$out/keys/$pk/voting-keystore.json\" \"$out/secrets/$pk\"\n"
         "      printf 'nimbus\\n' > \"$out/nimbus-keys/$pk/keystore.json\"\n"
@@ -286,9 +306,8 @@ def plant_keystores(
     validators.mkdir(parents=True, exist_ok=True)
     secrets.mkdir(parents=True, exist_ok=True)
     victim = tmp_path / "victim-keystore.json"
-    body = "" if empty_body else keystore_body(c=c, missing_c=missing_c)
     if symlink:
-        victim.write_text(body or keystore_body(c=2), encoding="utf-8")
+        victim.write_text(keystore_body(c=2, pubkey=pubkey(0)), encoding="utf-8")
     for i in range(n):
         pk = pubkey(i)
         d = validators / pk
@@ -299,7 +318,10 @@ def plant_keystores(
         elif empty_body:
             dest.write_bytes(b"")
         else:
-            dest.write_text(body, encoding="utf-8")
+            dest.write_text(
+                keystore_body(c=c, missing_c=missing_c, pubkey=pk),
+                encoding="utf-8",
+            )
         sec = secrets / pk
         sec.write_text(f"secret-{i}\n", encoding="utf-8")
         sec.chmod(secret_mode)
@@ -424,6 +446,122 @@ def assert_no_secret(proc: subprocess.CompletedProcess[str]) -> None:
     assert _MNEMONIC not in blob
 
 
+def assert_no_password(
+    proc: subprocess.CompletedProcess[str],
+    tmp_path: Path,
+    data_root: Path | None = None,
+) -> None:
+    blob = proc.stdout + proc.stderr
+    pw_path = (data_root or (tmp_path / "data")) / "keys" / "rvc" / "passwords.txt"
+    if not pw_path.is_file():
+        return
+    for line in pw_path.read_text(encoding="utf-8").splitlines():
+        if "=" not in line:
+            continue
+        password = line.split("=", 1)[1]
+        if password:
+            assert password not in blob
+            assert password not in proc.stdout
+            assert password not in proc.stderr
+
+
+def rvc_keystore_files(tmp_path: Path, data_root: Path | None = None) -> list[Path]:
+    root = data_root or (tmp_path / "data")
+    rvc = root / "keys" / "rvc"
+    if not rvc.is_dir():
+        return []
+    return sorted(
+        p
+        for p in rvc.glob("keystore-0x*.json")
+        if re.fullmatch(r"keystore-0x[0-9a-f]{96}\.json", p.name)
+    )
+
+
+def vc_validator_dirs(tmp_path: Path, data_root: Path | None = None) -> list[Path]:
+    root = data_root or (tmp_path / "data")
+    vc = root / "keys" / "vc" / "validators"
+    if not vc.is_dir():
+        return []
+    return sorted(p for p in vc.glob("0x*") if p.is_dir())
+
+
+def assert_split_tree(
+    tmp_path: Path,
+    data_root: Path | None = None,
+    *,
+    proc: subprocess.CompletedProcess[str] | None = None,
+) -> None:
+    root = data_root or (tmp_path / "data")
+    keys_dir = root / "keys"
+    vc_dirs = vc_validator_dirs(tmp_path, data_root=root)
+    rvc_files = rvc_keystore_files(tmp_path, data_root=root)
+    assert len(vc_dirs) == _N - _K
+    assert len(rvc_files) == _K
+    man = load_manifest(tmp_path, data_root=root)
+    rows = man["validators"]
+    vc_pks = {p.name for p in vc_dirs}
+    rvc_pks = set()
+    for path in rvc_files:
+        match = re.fullmatch(r"keystore-(0x[0-9a-f]{96})\.json", path.name)
+        assert match, path.name
+        rvc_pks.add(match.group(1))
+        body = json.loads(path.read_text(encoding="utf-8"))
+        assert "kdf" in body["crypto"]
+        assert file_mode(path) == 0o600
+        assert not path.is_symlink()
+    want_vc = {row["pubkey"] for row in rows[: _N - _K]}
+    want_rvc = {row["pubkey"] for row in rows[_N - _K :]}
+    assert vc_pks == want_vc
+    assert rvc_pks == want_rvc
+    assert vc_pks.isdisjoint(rvc_pks)
+    assert vc_pks | rvc_pks == {row["pubkey"] for row in rows}
+    secrets = keys_dir / "vc" / "secrets"
+    for pk in vc_pks:
+        sec = secrets / pk
+        assert sec.is_file()
+        assert not sec.is_symlink()
+        assert file_mode(sec) == 0o600
+        assert (keys_dir / "vc" / "validators" / pk / "voting-keystore.json").is_file()
+    rvc_dir = keys_dir / "rvc"
+    pw_path = rvc_dir / "passwords.txt"
+    pub_path = rvc_dir / "pubkeys.txt"
+    assert pw_path.is_file()
+    assert file_mode(pw_path) == 0o600
+    found = subprocess.run(
+        ["find", str(pw_path), "-perm", "600"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert found.returncode == 0
+    assert str(pw_path) in found.stdout
+    pw_lines = [ln for ln in pw_path.read_text(encoding="utf-8").splitlines() if ln]
+    assert len(pw_lines) == _K
+    pw_keys = []
+    for line in pw_lines:
+        assert "=" in line
+        key, value = line.split("=", 1)
+        assert key != "*"
+        assert value
+        pw_keys.append(key.lower().removeprefix("0x"))
+        ks = rvc_dir / f"keystore-0x{key.lower().removeprefix('0x')}.json"
+        assert ks.is_file()
+        ks_pk = json.loads(ks.read_text(encoding="utf-8"))["pubkey"].lower().removeprefix(
+            "0x"
+        )
+        assert pw_keys[-1] == ks_pk
+        secret = keys_dir / "valtools" / "secrets" / f"0x{ks_pk}"
+        assert value == secret.read_text(encoding="utf-8").rstrip("\n")
+    assert len(set(pw_keys)) == _K
+    pub_lines = [ln for ln in pub_path.read_text(encoding="utf-8").splitlines() if ln]
+    assert len(pub_lines) == _K
+    assert pub_lines == [row["pubkey"] for row in rows[_N - _K :]]
+    assert set(pub_lines) == rvc_pks
+    assert not (keys_dir / "passwords.txt").exists()
+    if proc is not None:
+        assert_no_password(proc, tmp_path, data_root=root)
+
+
 def file_mode(path: Path) -> int:
     return path.stat().st_mode & 0o777
 
@@ -471,7 +609,6 @@ def test_keys_sh_exists_and_syntax():
     text = KEYS.read_text(encoding="utf-8")
     assert re.search(r"(?m)^\s*read\s", text) is None
     assert "read -p" not in text
-    assert "read -r" not in text
     assert "source" in text and "lib/common.sh" in text
     assert "docker_run_as_user" in text
     assert "generate_keystores()" in text
@@ -482,13 +619,22 @@ def test_keys_sh_exists_and_syntax():
     assert "manifest_has_n_rows()" in text
     assert "require_chain_1337" in text
     assert "keys_exist()" in text
+    assert "normalize_pubkey()" in text
+    assert "split_keys()" in text
+    assert "flatten_rvc_subset()" in text
+    assert "write_password_file()" in text
+    assert "write_pubkeys_file()" in text
+    assert "assert_disjoint_keysets()" in text
+    assert "_write_file_atomic()" in text
+    assert "_copy_file_nofollow()" in text
+    assert "comm -12" in text
+    assert "passwords.txt" in text
+    assert "pubkeys.txt" in text
+    assert "keystore-0x" in text
     assert "--insecure" not in text
     assert "NUM_VALIDATORS-1" not in text
     assert "$((NUM_VALIDATORS" not in text
     assert "manifest.json" in text
-    assert "/rvc/" not in text
-    assert "passwords.txt" not in text
-    assert "split_keys" not in text
     assert "--entrypoint" in text
     assert "/usr/local/bin/eth2-val-tools" in text
     assert "--validators-mnemonic" in text
@@ -546,8 +692,7 @@ def test_stub_generate_writes_n_validator_dirs(tmp_path: Path):
     for name in _UNUSED_TREES:
         assert not (valtools / name).exists(), name
     assert (valtools / "pubkeys.json").is_file()
-    assert not (keys_dir / "vc").exists()
-    assert not (keys_dir / "rvc").exists()
+    assert_split_tree(tmp_path, proc=proc)
     assert not (keys_dir / "passwords.txt").exists()
     man_path = keys_dir / "manifest.json"
     assert man_path.is_file()
@@ -614,6 +759,8 @@ def test_second_run_is_noop_without_force(tmp_path: Path):
     man = tmp_path / "data" / "keys" / "manifest.json"
     man_mtime = man.stat().st_mtime
     first_runs = len(run_cmds(stub_cmds(log)))
+    rvc_pw = tmp_path / "data" / "keys" / "rvc" / "passwords.txt"
+    rvc_mtime = rvc_pw.stat().st_mtime
     proc2, _ = run_keys(tmp_path, docker=tmp_path / "docker", log=log)
     assert proc2.returncode == 0, proc2.stderr
     assert_no_secret(proc2)
@@ -623,6 +770,10 @@ def test_second_run_is_noop_without_force(tmp_path: Path):
     assert len(run_cmds(stub_cmds(log))) == first_runs
     assert "already present" in proc2.stderr
     assert "skipping manifest.json" in proc2.stderr
+    assert "skipping vc/ and rvc/" in proc2.stderr
+    assert rvc_pw.is_file()
+    assert rvc_pw.stat().st_mtime == rvc_mtime
+    assert_no_password(proc2, tmp_path)
 
 
 def test_stdin_devnull_twice(tmp_path: Path):
@@ -634,23 +785,30 @@ def test_stdin_devnull_twice(tmp_path: Path):
     assert len(keystore_cmds(cmds)) == 1
     assert len(pubkey_cmds(cmds)) == 1
     assert "skipping manifest.json" in proc2.stderr
+    assert "skipping vc/ and rvc/" in proc2.stderr
+    assert_split_tree(tmp_path, proc=proc2)
 
 
 def test_force_regenerates_keystores(tmp_path: Path):
     proc1, log = run_keys(tmp_path)
     assert proc1.returncode == 0, proc1.stderr
     sample = validator_dirs(tmp_path)[0] / "voting-keystore.json"
+    rvc_pw = tmp_path / "data" / "keys" / "rvc" / "passwords.txt"
     old = 1_000_000.0
     os.utime(sample, (old, old))
+    os.utime(rvc_pw, (old, old))
     proc2, _ = run_keys(
         tmp_path, ["--force"], docker=tmp_path / "docker", log=log
     )
     assert proc2.returncode == 0, proc2.stderr
     assert_no_secret(proc2)
     assert sample.stat().st_mtime > old
+    assert rvc_pw.stat().st_mtime > old
     cmds = run_cmds(stub_cmds(log))
     assert len(keystore_cmds(cmds)) == 2
     assert len(pubkey_cmds(cmds)) == 2
+    assert_split_tree(tmp_path, proc=proc2)
+    assert "skipping vc/ and rvc/" not in proc2.stderr
 
 
 def test_missing_genesis_config_exits_2_naming_stage(tmp_path: Path):
@@ -819,8 +977,13 @@ def test_dry_run_exits_0_without_docker_run(tmp_path: Path):
     assert "assert_kdf_strength" in proc.stderr
     assert "build_manifest" in proc.stderr
     assert "assert_manifest_rows" in proc.stderr
+    assert "split_keys" in proc.stderr
+    assert "assert_disjoint_keysets" in proc.stderr
+    assert "would split keys into vc/ and rvc/" in proc.stderr
     assert not (tmp_path / "data" / "keys" / "valtools").exists()
     assert not (tmp_path / "data" / "keys" / "manifest.json").exists()
+    assert not (tmp_path / "data" / "keys" / "vc").exists()
+    assert not (tmp_path / "data" / "keys" / "rvc").exists()
     assert_no_secret(proc)
 
 
@@ -829,6 +992,92 @@ def test_unknown_flag_exits_2(tmp_path: Path):
     assert proc.returncode == 2
     assert "unknown flag" in proc.stderr
     assert stub_cmds(log) == []
+
+
+def test_write_file_atomic_refuses_dest_symlink(tmp_path: Path):
+    victim = tmp_path / "victim-passwords"
+    victim.write_text("untouched\n", encoding="utf-8")
+    rvc = tmp_path / "data" / "keys" / "rvc"
+    rvc.mkdir(parents=True)
+    dest = rvc / "passwords.txt"
+    dest.symlink_to(victim)
+    proc = source_keys(
+        tmp_path,
+        "printf '0xab=s3cret-value\\n' | _write_file_atomic \"$RVC_PASSWORDS\"",
+    )
+    assert proc.returncode == 2
+    assert "symlink" in proc.stderr
+    assert victim.read_text(encoding="utf-8") == "untouched\n"
+    assert dest.is_symlink()
+    assert "s3cret-value" not in proc.stdout
+    assert "s3cret-value" not in proc.stderr
+    assert_no_secret(proc)
+
+
+def test_copy_file_nofollow_refuses_dest_symlink(tmp_path: Path):
+    plant_keystores(tmp_path, 1)
+    src = (
+        tmp_path
+        / "data"
+        / "keys"
+        / "valtools"
+        / "validators"
+        / pubkey(0)
+        / "voting-keystore.json"
+    )
+    victim = tmp_path / "victim-keystore"
+    victim.write_text("untouched\n", encoding="utf-8")
+    dest = tmp_path / "data" / "keys" / "rvc" / f"keystore-{pubkey(0)}.json"
+    dest.parent.mkdir(parents=True)
+    dest.symlink_to(victim)
+    proc = source_keys(
+        tmp_path,
+        "_copy_file_nofollow "
+        f"{shlex.quote(str(src))} {shlex.quote(str(dest))}",
+    )
+    assert proc.returncode == 2
+    assert "symlink" in proc.stderr
+    assert victim.read_text(encoding="utf-8") == "untouched\n"
+    assert dest.is_symlink()
+    assert_no_secret(proc)
+
+
+def test_copy_file_nofollow_refuses_source_symlink(tmp_path: Path):
+    real = tmp_path / "real-keystore.json"
+    real.write_text('{"crypto":{"kdf":{}}}\n', encoding="utf-8")
+    src = tmp_path / "link-keystore.json"
+    src.symlink_to(real)
+    dest = tmp_path / "data" / "keys" / "rvc" / "keystore-out.json"
+    dest.parent.mkdir(parents=True)
+    proc = source_keys(
+        tmp_path,
+        "_copy_file_nofollow "
+        f"{shlex.quote(str(src))} {shlex.quote(str(dest))}",
+    )
+    assert proc.returncode == 2
+    assert "symlink" in proc.stderr
+    assert not dest.exists()
+    assert_no_secret(proc)
+
+
+def test_flatten_does_not_follow_planted_passwords_symlink(tmp_path: Path):
+    plant_genesis(tmp_path)
+    plant_keystores(tmp_path)
+    plant_manifest(tmp_path)
+    victim = tmp_path / "victim-passwords"
+    victim.write_text("untouched\n", encoding="utf-8")
+    rvc = tmp_path / "data" / "keys" / "rvc"
+    rvc.mkdir(parents=True)
+    (rvc / "passwords.txt").symlink_to(victim)
+    proc, log = run_keys(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert victim.read_text(encoding="utf-8") == "untouched\n"
+    assert not (rvc / "passwords.txt").is_symlink()
+    assert_no_secret(proc)
+    assert_no_password(proc, tmp_path)
+    assert_split_tree(tmp_path, proc=proc)
+    assert keystore_cmds(stub_cmds(log)) == []
+    assert pubkey_cmds(stub_cmds(log)) == []
 
 
 def test_manifest_symlink_dest_exits_2(tmp_path: Path):
@@ -925,6 +1174,7 @@ def test_missing_manifest_is_built_without_regenerating_keys(tmp_path: Path):
     assert len(man["validators"]) == _N
     assert man["validators"][0]["index"] == 0
     assert man["validators"][_N - 1]["index"] == _N - 1
+    assert_split_tree(tmp_path, proc=proc)
 
 
 def test_manifest_mtime_unchanged_on_second_run(tmp_path: Path):
@@ -950,6 +1200,7 @@ def test_manifest_pubkeys_differ_from_c_sort(tmp_path: Path):
     dir_names = [p.name for p in validator_dirs(tmp_path)]
     assert dir_names == sorted(dir_names)
     assert pubs != dir_names
+    assert_split_tree(tmp_path, proc=proc)
 
 
 def test_data_dir_flag_refuses_symlink(tmp_path: Path):
@@ -989,6 +1240,7 @@ def test_data_dir_flag_writes_under_t_only(tmp_path: Path):
     assert (t / "keys" / "manifest.json").is_file()
     assert (t / "keys" / "valtools" / "validators").is_dir()
     assert len(load_manifest(tmp_path, data_root=t)["validators"]) == _N
+    assert_split_tree(tmp_path, data_root=t, proc=proc)
     assert not (default_data / "keys").exists()
     assert not (default_data / "genesis").exists()
     cmds = run_cmds(stub_cmds(log))
@@ -1034,6 +1286,33 @@ def test_path_docker_shim_not_invoked_when_artifacts_present(tmp_path: Path):
     assert "skipping manifest.json" in proc.stderr
     assert "already present" in proc.stderr
     assert not (tmp_path / "unused-default" / "keys").exists()
+    assert_split_tree(tmp_path, data_root=t, proc=proc)
+    assert_no_password(proc, tmp_path, data_root=t)
+
+
+def test_missing_rvc_is_repaired_without_force(tmp_path: Path):
+    proc1, log = run_keys(tmp_path)
+    assert proc1.returncode == 0, proc1.stderr
+    rvc = tmp_path / "data" / "keys" / "rvc"
+    pw_body = (rvc / "passwords.txt").read_text(encoding="utf-8")
+    pub_body = (rvc / "pubkeys.txt").read_text(encoding="utf-8")
+    shutil.rmtree(rvc)
+    sample = validator_dirs(tmp_path)[0] / "voting-keystore.json"
+    mtime = sample.stat().st_mtime
+    proc2, _ = run_keys(tmp_path, docker=tmp_path / "docker", log=log)
+    assert proc2.returncode == 0, proc2.stderr
+    assert_no_secret(proc2)
+    assert_no_password(proc2, tmp_path)
+    assert sample.stat().st_mtime == mtime
+    cmds = run_cmds(stub_cmds(log))
+    assert len(keystore_cmds(cmds)) == 1
+    assert len(pubkey_cmds(cmds)) == 1
+    assert_split_tree(tmp_path, proc=proc2)
+    assert (rvc / "passwords.txt").read_text(encoding="utf-8") == pw_body
+    assert (rvc / "pubkeys.txt").read_text(encoding="utf-8") == pub_body
+    assert "skipping manifest.json" in proc2.stderr
+    assert "already present" in proc2.stderr
+    assert "skipping vc/ and rvc/" not in proc2.stderr
 
 
 def test_assert_manifest_rows_accepts_n(tmp_path: Path):
@@ -1137,3 +1416,4 @@ def test_live_valtools_count_and_kdf(tmp_path: Path):
     assert man["validators"][63]["pubkey"] == KAT_PUBKEY_63
     pubs = [row["pubkey"] for row in man["validators"]]
     assert pubs != sorted(pubs)
+    assert_split_tree(tmp_path, proc=proc)
