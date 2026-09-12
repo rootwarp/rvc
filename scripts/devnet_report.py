@@ -10,6 +10,7 @@ import http.client
 import json
 import math
 import os
+import re
 import socket
 import ssl
 import sys
@@ -64,6 +65,201 @@ class Log:
 
     def _emit(self, msg: str, a: tuple[object, ...]) -> None:
         print(msg % a if a else msg, file=self._stream)
+
+
+# ===== § 3. Prometheus text-format 0.0.4 =====
+
+_TYPE_RE = re.compile(
+    r"^#\s*TYPE\s+([a-zA-Z_:][a-zA-Z0-9_:]*)\s+(\S+)\s*$"
+)
+_SAMPLE_RE = re.compile(
+    r"^([a-zA-Z_:][a-zA-Z0-9_:]*)"
+    r"(?:[ \t]*\{(.*)\})?"
+    r"[ \t]+"
+    r"(\S+)"
+    r"(?:[ \t]+\S+)?"
+    r"[ \t]*$"
+)
+_HISTOGRAM_SUFFIXES = ("_bucket", "_sum", "_count")
+_MAX_METRIC_LINE = 8 * 1024
+_MAX_METRIC_SAMPLES = 100_000
+_MAX_LABEL_VALUE_BYTES = 4 * 1024
+_ERROR_SNIPPET = 200
+
+
+@dataclass(frozen=True)
+class Sample:
+    labels: dict[str, str]
+    value: float
+    name: str = ""
+
+
+@dataclass
+class Family:
+    name: str
+    type: str
+    samples: list[Sample]
+
+
+def _unescape(raw: str) -> str:
+    return raw.replace("\\\\", "\\").replace('\\"', '"').replace("\\n", "\n")
+
+
+def _snippet(text: str) -> str:
+    if len(text) <= _ERROR_SNIPPET:
+        return text
+    return f"{text[:_ERROR_SNIPPET]}..."
+
+
+def _label_name_start(ch: str) -> bool:
+    return ("A" <= ch <= "Z") or ("a" <= ch <= "z") or ch == "_"
+
+
+def _label_name_cont(ch: str) -> bool:
+    return _label_name_start(ch) or ("0" <= ch <= "9")
+
+
+def _parse_labels(raw: str) -> dict[str, str]:
+    if not raw:
+        return {}
+    labels: dict[str, str] = {}
+    i = 0
+    n = len(raw)
+    while True:
+        while i < n and raw[i] in " \t":
+            i += 1
+        if i >= n:
+            return labels
+        if not _label_name_start(raw[i]):
+            raise InfraError(f"invalid prometheus labels: {_snippet(raw)}")
+        start = i
+        i += 1
+        while i < n and _label_name_cont(raw[i]):
+            i += 1
+        name = raw[start:i]
+        if i >= n or raw[i] != "=":
+            raise InfraError(f"invalid prometheus labels: {_snippet(raw)}")
+        i += 1
+        if i >= n or raw[i] != '"':
+            raise InfraError(f"invalid prometheus labels: {_snippet(raw)}")
+        i += 1
+        val_start = i
+        closed = False
+        while i < n:
+            ch = raw[i]
+            if ch == "\\":
+                if i + 1 >= n:
+                    break
+                i += 2
+                continue
+            if ch == '"':
+                closed = True
+                break
+            i += 1
+        if not closed:
+            raise InfraError("unclosed label value")
+        encoded = raw[val_start:i]
+        if len(encoded.encode("utf-8")) > _MAX_LABEL_VALUE_BYTES:
+            raise InfraError("label value exceeded cap")
+        i += 1
+        labels[name] = _unescape(encoded)
+        while i < n and raw[i] in " \t":
+            i += 1
+        if i >= n:
+            return labels
+        if raw[i] != ",":
+            raise InfraError(f"invalid prometheus labels: {_snippet(raw)}")
+        i += 1
+
+
+def _parse_le(raw: str) -> float:
+    if raw == "+Inf":
+        return math.inf
+    return float(raw)
+
+
+def series_key(
+    name: str, labels: dict[str, str]
+) -> tuple[str, tuple[tuple[str, str], ...]]:
+    return (name, tuple(sorted(labels.items())))
+
+
+def unit_for(name: str) -> str:
+    if name.endswith("_seconds"):
+        return "seconds"
+    if name.endswith("_ms"):
+        return "milliseconds"
+    return "count"
+
+
+def _family_name_for(sample_name: str, type_map: dict[str, str]) -> str:
+    if sample_name in type_map:
+        return sample_name
+    for suffix in _HISTOGRAM_SUFFIXES:
+        if sample_name.endswith(suffix):
+            base = sample_name[: -len(suffix)]
+            if type_map.get(base) in {"histogram", "summary"}:
+                return base
+    return sample_name
+
+
+def parse_metrics(text: str) -> dict[str, Family]:
+    if len(text) > MAX_RESPONSE_BYTES:
+        raise InfraError("metrics text exceeded MAX_RESPONSE_BYTES")
+    lines = text.splitlines()
+    type_map: dict[str, str] = {}
+    for line in lines:
+        if len(line) > _MAX_METRIC_LINE:
+            raise InfraError("metrics line exceeded cap")
+        match = _TYPE_RE.match(line.strip())
+        if match is None:
+            continue
+        name, typ = match.group(1), match.group(2)
+        if typ == "summary":
+            raise UsageError("summary families are not supported")
+        if name not in type_map:
+            type_map[name] = typ
+
+    families: dict[str, Family] = {}
+    n_samples = 0
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        match = _SAMPLE_RE.match(stripped)
+        if match is None:
+            raise InfraError(f"invalid prometheus sample: {_snippet(stripped)}")
+        sample_name, raw_labels, raw_value = (
+            match.group(1),
+            match.group(2),
+            match.group(3),
+        )
+        try:
+            labels = _parse_labels(raw_labels or "")
+        except InfraError as exc:
+            raise InfraError(
+                f"invalid prometheus labels: {_snippet(stripped)}"
+            ) from exc
+        if "quantile" in labels:
+            raise UsageError("summary families are not supported")
+        try:
+            value = float(raw_value)
+        except ValueError as exc:
+            raise InfraError(
+                f"invalid prometheus value: {_snippet(raw_value)}"
+            ) from exc
+        n_samples += 1
+        if n_samples > _MAX_METRIC_SAMPLES:
+            raise InfraError("metrics sample count exceeded cap")
+        fam_name = _family_name_for(sample_name, type_map)
+        fam_type = type_map.get(fam_name, "untyped")
+        sample = Sample(labels=labels, value=value, name=sample_name)
+        family = families.get(fam_name)
+        if family is None:
+            family = Family(name=fam_name, type=fam_type, samples=[])
+            families[fam_name] = family
+        family.samples.append(sample)
+    return families
 
 
 # ===== § 4. CLI and configuration =====

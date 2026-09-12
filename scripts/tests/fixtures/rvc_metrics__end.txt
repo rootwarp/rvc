@@ -1,0 +1,97 @@
+# TYPE rvc_orchestrator_slots_processed_total counter
+rvc_orchestrator_slots_processed_total{result="success"} 228
+rvc_orchestrator_slots_processed_total{result="failed"} 0
+rvc_orchestrator_slots_processed_total{result="no_duties"} 0
+
+# TYPE rvc_orchestrator_missed_slots_total counter
+rvc_orchestrator_missed_slots_total 1
+
+# TYPE rvc_orchestrator_slot_processing_duration_seconds histogram
+rvc_orchestrator_slot_processing_duration_seconds_bucket{le="0.01"} 90
+rvc_orchestrator_slot_processing_duration_seconds_bucket{le="0.05"} 180
+rvc_orchestrator_slot_processing_duration_seconds_bucket{le="0.1"} 210
+rvc_orchestrator_slot_processing_duration_seconds_bucket{le="0.5"} 224
+rvc_orchestrator_slot_processing_duration_seconds_bucket{le="1"} 228
+rvc_orchestrator_slot_processing_duration_seconds_bucket{le="12"} 228
+rvc_orchestrator_slot_processing_duration_seconds_bucket{le="+Inf"} 228
+rvc_orchestrator_slot_processing_duration_seconds_sum 9.5
+rvc_orchestrator_slot_processing_duration_seconds_count 228
+
+# TYPE rvc_attestations_total counter
+rvc_attestations_total{status="success"} 192
+rvc_attestations_total{status="failed"} 1
+
+# TYPE rvc_aggregations_total counter
+rvc_aggregations_total{status="success"} 24
+
+# TYPE rvc_proposals_total counter
+rvc_proposals_total{outcome="envelope_late"} 0
+
+# TYPE rvc_signing_duration_seconds histogram
+rvc_signing_duration_seconds_sum 0.12
+rvc_signing_duration_seconds_count 20
+rvc_signing_duration_seconds_bucket{le="0.001"} 4
+rvc_signing_duration_seconds_bucket{le="0.005"} 11
+rvc_signing_duration_seconds_bucket{le="0.01"} 16
+rvc_signing_duration_seconds_bucket{le="0.05"} 19
+rvc_signing_duration_seconds_bucket{le="0.1"} 20
+rvc_signing_duration_seconds_bucket{le="1"} 20
+rvc_signing_duration_seconds_bucket{le="+Inf"} 20
+
+# TYPE rvc_slashing_protection_checks_total counter
+rvc_slashing_protection_checks_total{result="safe"} 192
+rvc_slashing_protection_checks_total{result="blocked"} 0
+
+# TYPE rvc_slashing_reserve_tx_hold_duration_ms histogram
+rvc_slashing_reserve_tx_hold_duration_ms_bucket{le="1",kind="attestation"} 7
+rvc_slashing_reserve_tx_hold_duration_ms_bucket{le="5",kind="attestation"} 14
+rvc_slashing_reserve_tx_hold_duration_ms_bucket{le="10",kind="attestation"} 18
+rvc_slashing_reserve_tx_hold_duration_ms_bucket{le="25",kind="attestation"} 20
+rvc_slashing_reserve_tx_hold_duration_ms_bucket{le="50",kind="attestation"} 21
+rvc_slashing_reserve_tx_hold_duration_ms_bucket{le="+Inf",kind="attestation"} 21
+rvc_slashing_reserve_tx_hold_duration_ms_sum{kind="attestation"} 170
+rvc_slashing_reserve_tx_hold_duration_ms_count{kind="attestation"} 21
+
+# TYPE rvc_slot_phase_block_start_offset_ms histogram
+rvc_slot_phase_block_start_offset_ms_bucket{le="5",cache="warm"} 0
+rvc_slot_phase_block_start_offset_ms_bucket{le="10",cache="warm"} 0
+rvc_slot_phase_block_start_offset_ms_bucket{le="25",cache="warm"} 0
+rvc_slot_phase_block_start_offset_ms_bucket{le="50",cache="warm"} 0
+rvc_slot_phase_block_start_offset_ms_bucket{le="100",cache="warm"} 0
+rvc_slot_phase_block_start_offset_ms_bucket{le="+Inf",cache="warm"} 0
+rvc_slot_phase_block_start_offset_ms_sum{cache="warm"} 0
+rvc_slot_phase_block_start_offset_ms_count{cache="warm"} 0
+
+# TYPE rvc_duties_fetched_total counter
+rvc_duties_fetched_total 8
+
+# TYPE rvc_duty_reorg_detected_total counter
+rvc_duty_reorg_detected_total{duty_type="attester"} 0
+
+# TYPE rvc_bn_health_tier gauge
+rvc_bn_health_tier{endpoint="http://127.0.0.1:5052"} 1
+rvc_bn_health_tier{endpoint="http://bn.local:5052/\"metrics\""} 2
+
+# TYPE rvc_proposer_bn_latency_ms histogram
+rvc_proposer_bn_latency_ms_bucket{le="5",pool="proposer",endpoint="http://127.0.0.1:5052"} 9
+rvc_proposer_bn_latency_ms_bucket{le="10",pool="proposer",endpoint="http://127.0.0.1:5052"} 15
+rvc_proposer_bn_latency_ms_bucket{le="25",pool="proposer",endpoint="http://127.0.0.1:5052"} 16
+rvc_proposer_bn_latency_ms_bucket{le="50",pool="proposer",endpoint="http://127.0.0.1:5052"} 16
+rvc_proposer_bn_latency_ms_bucket{le="100",pool="proposer",endpoint="http://127.0.0.1:5052"} 16
+rvc_proposer_bn_latency_ms_bucket{le="+Inf",pool="proposer",endpoint="http://127.0.0.1:5052"} 16
+rvc_proposer_bn_latency_ms_sum{pool="proposer",endpoint="http://127.0.0.1:5052"} 120
+rvc_proposer_bn_latency_ms_count{pool="proposer",endpoint="http://127.0.0.1:5052"} 16
+
+# TYPE rvc_proposer_bn_health_score gauge
+rvc_proposer_bn_health_score{endpoint="http://127.0.0.1:5052",pool="proposer"} NaN
+
+# TYPE rvc_tasks_running gauge
+rvc_tasks_running{task="orchestrator"} 1
+
+# TYPE rvc_task_exits_total counter
+rvc_task_exits_total{outcome="ok",task="orchestrator"} 0
+
+# TYPE rvc_sse_events_dropped_total counter
+rvc_sse_events_dropped_total{expected="true"} 0
+
+rvc_scrape_orphan 1
