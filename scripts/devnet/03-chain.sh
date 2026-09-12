@@ -31,7 +31,7 @@ _bind_chain_paths() {
     if [[ -n "$_VC_KEYS_SRC_OVERRIDE" ]]; then
         VC_KEYS_SRC="$_VC_KEYS_SRC_OVERRIDE"
     else
-        VC_KEYS_SRC="${KEYS_DIR}/valtools"
+        VC_KEYS_SRC="${KEYS_DIR}/vc"
     fi
     VALIDATOR_DATA_DIR="${CL_DATA_DIR}/validator"
 }
@@ -252,6 +252,36 @@ _refuse_symlink() {
     fi
 }
 
+_normalize_pubkey() {
+    local pk="${1-}"
+    pk="${pk#0x}"
+    pk="${pk#0X}"
+    printf '%s\n' "$pk" | tr '[:upper:]' '[:lower:]'
+}
+
+# Walk dirname(path) up through VALIDATOR_DATA_DIR; each component must not be a symlink.
+_refuse_symlink_parents() {
+    local path="$1"
+    local what="$2"
+    local root="${VALIDATOR_DATA_DIR:-}"
+    local cur next
+    if [[ -z "$root" ]]; then
+        die_infra "VC datadir unset"
+    fi
+    cur="$(dirname -- "$path")"
+    while true; do
+        _refuse_symlink "$cur" "${what} parent"
+        if [[ "$cur" == "$root" ]]; then
+            return 0
+        fi
+        next="$(dirname -- "$cur")"
+        if [[ "$next" == "$cur" ]]; then
+            die_usage "refusing dest outside VC datadir: ${path}"
+        fi
+        cur="$next"
+    done
+}
+
 _require_jwt() {
     local jwt="${JWT_DIR}/jwt.hex"
     local mode uid self
@@ -366,6 +396,25 @@ _vc_source_count() {
     done
     shopt -u nullglob
     printf '%s' "$n"
+}
+
+# VC subset is [0, N-K); RVC takes the tail of K keys.
+_require_split_bounds() {
+    _require_uint "NUM_VALIDATORS" "${NUM_VALIDATORS:-}"
+    _require_uint "RVC_KEYS" "${RVC_KEYS:-}"
+    if [[ "$NUM_VALIDATORS" -lt 1 ]]; then
+        die_usage "NUM_VALIDATORS must be a positive integer (got ${NUM_VALIDATORS})"
+    fi
+    if [[ "$RVC_KEYS" -lt 1 ]]; then
+        die_usage "RVC_KEYS must be a positive integer (got ${RVC_KEYS})"
+    fi
+    if [[ "$RVC_KEYS" -ge "$NUM_VALIDATORS" ]]; then
+        die_usage "RVC_KEYS must be < NUM_VALIDATORS (got ${RVC_KEYS} >= ${NUM_VALIDATORS})"
+    fi
+}
+
+_vc_expected_count() {
+    printf '%s' "$((NUM_VALIDATORS - RVC_KEYS))"
 }
 
 print_chain_plan() {
@@ -511,12 +560,16 @@ _install_regular_file() {
     local src="$1"
     local dest="$2"
     local rc=0
+    if [[ -z "${VALIDATOR_DATA_DIR:-}" ]]; then
+        die_infra "VC datadir unset"
+    fi
+    _refuse_symlink_parents "$dest" "install dest"
     python3 -c '
 import os, stat, sys
-src, dest = sys.argv[1], sys.argv[2]
+src, dest, root = sys.argv[1], sys.argv[2], sys.argv[3]
 nofollow = getattr(os, "O_NOFOLLOW", 0)
 
-def check(path, missing_ok=False):
+def check(path, missing_ok=False, want_dir=False):
     try:
         st = os.lstat(path)
     except OSError:
@@ -525,11 +578,31 @@ def check(path, missing_ok=False):
         raise SystemExit(1)
     if stat.S_ISLNK(st.st_mode):
         raise SystemExit(2)
+    if want_dir:
+        if not stat.S_ISDIR(st.st_mode):
+            raise SystemExit(1)
+        return
     if not stat.S_ISREG(st.st_mode):
         raise SystemExit(1)
 
+src = os.path.abspath(src)
+dest = os.path.abspath(dest)
+root = os.path.abspath(root)
+sep = os.sep
+if dest != root and not dest.startswith(root + sep):
+    raise SystemExit(1)
+
 check(src)
 check(dest, missing_ok=True)
+cur = os.path.dirname(dest)
+while True:
+    check(cur, want_dir=True)
+    if cur == root:
+        break
+    nxt = os.path.dirname(cur)
+    if nxt == cur:
+        raise SystemExit(1)
+    cur = nxt
 fin = os.open(src, os.O_RDONLY | nofollow)
 try:
     chunks = []
@@ -546,7 +619,7 @@ try:
     os.fchmod(fout, 0o600)
 finally:
     os.close(fout)
-' "$src" "$dest" || rc=$?
+' "$src" "$dest" "$VALIDATOR_DATA_DIR" || rc=$?
     if [[ "$rc" -eq 2 ]]; then
         die_usage "refusing symlink file: ${src} -> ${dest}"
     fi
@@ -569,12 +642,12 @@ _ensure_dir() {
     _chmod_dir "$path"
 }
 
-# --force only: drop VC key trees and slashing DB together, then start_vc inits.
+# --force only: drop the VC datadir (definitions + slashing DB) before recopy (K-A10).
 _reset_vc_datadir() {
     local dest="$VALIDATOR_DATA_DIR"
     _refuse_symlink "$CL_DATA_DIR" "CL datadir"
     _refuse_symlink "$dest" "VC datadir"
-    if [[ -z "$dest" || "$dest" == "/" ]]; then
+    if [[ -z "$dest" || "$dest" == "/" || "$dest" == "$CL_DATA_DIR" ]]; then
         die_infra "refusing to wipe empty VC datadir"
     fi
     if [[ -e "$dest" && ! -d "$dest" ]]; then
@@ -583,11 +656,10 @@ _reset_vc_datadir() {
     if [[ -d "$dest" ]]; then
         _refuse_symlink "${dest}/validators" "VC validators"
         _refuse_symlink "${dest}/secrets" "VC secrets"
-        rm -rf -- "${dest}/validators" "${dest}/secrets"
-        rm -f -- \
-            "${dest}/slashing_protection.sqlite" \
-            "${dest}/slashing_protection.sqlite-journal" \
-            "${dest}/slashing_protection.sqlite-wal"
+        _refuse_symlink "${dest}/validators/validator_definitions.yml" "validator definitions"
+        _refuse_symlink "${dest}/validators/slashing_protection.sqlite" "slashing protection db"
+        _refuse_symlink "${dest}/slashing_protection.sqlite" "slashing protection db"
+        rm -rf -- "$dest"
     fi
 }
 
@@ -607,18 +679,131 @@ _vc_slashing_history_present() {
     [[ -e "$defs" || -e "${db}-wal" || -e "${db}-journal" ]]
 }
 
+_rvc_pubkeys_file() {
+    printf '%s' "${KEYS_DIR}/rvc/pubkeys.txt"
+}
+
+_die_rvc_in_vc_datadir() {
+    die_usage "VC datadir contains RVC pubkeys from $(_rvc_pubkeys_file); re-run with --force"
+}
+
+# True if dest validators/secrets/defs mention a pubkey from rvc/pubkeys.txt.
+_vc_datadir_contains_rvc() {
+    local dest_val dest_sec defs f pk norm
+    dest_val="${VALIDATOR_DATA_DIR}/validators"
+    dest_sec="${VALIDATOR_DATA_DIR}/secrets"
+    defs="${dest_val}/validator_definitions.yml"
+    f="$(_rvc_pubkeys_file)"
+    if [[ -L "$f" ]]; then
+        die_usage "refusing symlink rvc pubkeys: ${f}"
+    fi
+    if [[ ! -f "$f" ]]; then
+        return 1
+    fi
+    _refuse_symlink "$dest_val" "VC validators"
+    _refuse_symlink "$dest_sec" "VC secrets"
+    _refuse_symlink "$defs" "validator definitions"
+    while IFS= read -r pk || [[ -n "$pk" ]]; do
+        [[ -n "$pk" ]] || continue
+        norm="$(_normalize_pubkey "$pk")"
+        case "$norm" in
+            *[!0-9a-f]* | "")
+                continue
+                ;;
+        esac
+        if [[ "${#norm}" -ne 96 ]]; then
+            continue
+        fi
+        if [[ -e "${dest_val}/0x${norm}" || -L "${dest_val}/0x${norm}" ]]; then
+            return 0
+        fi
+        if [[ -e "${dest_sec}/0x${norm}" || -L "${dest_sec}/0x${norm}" ]]; then
+            return 0
+        fi
+        if [[ -f "$defs" ]] && grep -Fq -- "0x${norm}" "$defs"; then
+            return 0
+        fi
+    done <"$f"
+    return 1
+}
+
+# True if dest holds a 0x* tree that is not in the VC source set.
+_vc_dest_has_unlisted_keys() {
+    local src_val dest_val dest_sec p base
+    src_val="${VC_KEYS_SRC}/validators"
+    dest_val="${VALIDATOR_DATA_DIR}/validators"
+    dest_sec="${VALIDATOR_DATA_DIR}/secrets"
+    if [[ -d "$dest_val" ]]; then
+        _refuse_symlink "$dest_val" "VC validators"
+        shopt -s nullglob
+        for p in "$dest_val"/0x*; do
+            base="$(basename -- "$p")"
+            if [[ ! -f "${src_val}/${base}/voting-keystore.json" ]]; then
+                shopt -u nullglob
+                return 0
+            fi
+        done
+        shopt -u nullglob
+    fi
+    if [[ -d "$dest_sec" ]]; then
+        _refuse_symlink "$dest_sec" "VC secrets"
+        shopt -s nullglob
+        for p in "$dest_sec"/0x*; do
+            base="$(basename -- "$p")"
+            if [[ ! -f "${src_val}/${base}/voting-keystore.json" ]]; then
+                shopt -u nullglob
+                return 0
+            fi
+        done
+        shopt -u nullglob
+    fi
+    return 1
+}
+
+# Drop dest 0x* keystores/secrets that are not in the VC source set.
+_prune_unlisted_vc_keys() {
+    local src_val dest_val dest_sec p base
+    src_val="${VC_KEYS_SRC}/validators"
+    dest_val="${VALIDATOR_DATA_DIR}/validators"
+    dest_sec="${VALIDATOR_DATA_DIR}/secrets"
+    if [[ -d "$dest_val" ]]; then
+        _refuse_symlink "$dest_val" "VC validators"
+        shopt -s nullglob
+        for p in "$dest_val"/0x*; do
+            base="$(basename -- "$p")"
+            if [[ -f "${src_val}/${base}/voting-keystore.json" ]]; then
+                continue
+            fi
+            _refuse_symlink "$p" "stale VC key dest"
+            rm -rf -- "$p"
+        done
+        shopt -u nullglob
+    fi
+    if [[ -d "$dest_sec" ]]; then
+        _refuse_symlink "$dest_sec" "VC secrets"
+        shopt -s nullglob
+        for p in "$dest_sec"/0x*; do
+            base="$(basename -- "$p")"
+            if [[ -f "${src_val}/${base}/voting-keystore.json" ]]; then
+                continue
+            fi
+            _refuse_symlink "$p" "stale VC secret dest"
+            rm -f -- "$p"
+        done
+        shopt -u nullglob
+    fi
+}
+
 copy_vc_keys() {
-    local src_val src_sec dest_val dest_sec keydir pubkey ks secret dest_ks dest_secret count
+    local src_val src_sec dest_val dest_sec keydir pubkey ks secret dest_ks dest_secret count want
 
     src_val="${VC_KEYS_SRC}/validators"
     src_sec="${VC_KEYS_SRC}/secrets"
     dest_val="${VALIDATOR_DATA_DIR}/validators"
     dest_sec="${VALIDATOR_DATA_DIR}/secrets"
 
-    _require_uint "NUM_VALIDATORS" "${NUM_VALIDATORS:-}"
-    if [[ "$NUM_VALIDATORS" -lt 1 ]]; then
-        die_usage "NUM_VALIDATORS must be a positive integer (got ${NUM_VALIDATORS})"
-    fi
+    _require_split_bounds
+    want="$(_vc_expected_count)"
 
     _refuse_symlink "$VC_KEYS_SRC" "VC keys source"
     _refuse_symlink "$src_val" "VC keystores"
@@ -626,6 +811,7 @@ copy_vc_keys() {
     _refuse_symlink "$CL_DATA_DIR" "CL datadir"
     _refuse_symlink "$VALIDATOR_DATA_DIR" "VC datadir"
 
+    validate_data_exists "data/keys/vc" "$VC_KEYS_SRC" "02-keys.sh"
     validate_data_exists "validator keystores" "$src_val" "02-keys.sh"
     validate_data_exists "validator secrets" "$src_sec" "02-keys.sh"
     if [[ ! -d "$src_val" ]]; then
@@ -672,25 +858,32 @@ copy_vc_keys() {
             shopt -u nullglob
             die_infra "missing validator secret for ${pubkey}"
         fi
+        _refuse_symlink "${dest_val}/${pubkey}" "VC keystore dest dir"
         if [[ -e "${dest_val}/${pubkey}" ]]; then
-            _refuse_symlink "${dest_val}/${pubkey}" "VC keystore dest dir"
             if [[ ! -d "${dest_val}/${pubkey}" ]]; then
                 shopt -u nullglob
                 die_infra "keystore dest is not a directory: ${dest_val}/${pubkey}"
             fi
         fi
         mkdir -p -- "${dest_val}/${pubkey}"
+        _refuse_symlink "${dest_val}/${pubkey}" "VC keystore dest dir"
         chmod 700 "${dest_val}/${pubkey}" || die_infra "cannot chmod 700 ${dest_val}/${pubkey}"
         _refuse_symlink "$dest_ks" "VC keystore dest"
         _refuse_symlink "$dest_secret" "VC secret dest"
+        _refuse_symlink_parents "$dest_ks" "VC keystore dest"
+        _refuse_symlink_parents "$dest_secret" "VC secret dest"
         _install_regular_file "$ks" "$dest_ks"
         _install_regular_file "$secret" "$dest_secret"
         count=$((count + 1))
     done
     shopt -u nullglob
 
-    if [[ "$count" -ne "$NUM_VALIDATORS" ]]; then
-        die_infra "copied ${count} keystores, expected ${NUM_VALIDATORS}"
+    if [[ "$count" -ne "$want" ]]; then
+        die_infra "copied ${count} keystores, expected ${want}"
+    fi
+    _prune_unlisted_vc_keys
+    if _vc_datadir_contains_rvc; then
+        _die_rvc_in_vc_datadir
     fi
     log_success "copied ${count} validator keystores"
 }
@@ -720,8 +913,15 @@ start_vc() {
     gid="$(id -g)"
 
     if is_container_running "$VALIDATOR_CONTAINER"; then
-        log_info "validator already running"
-        return 0
+        if _vc_datadir_contains_rvc; then
+            _die_rvc_in_vc_datadir
+        fi
+        if _vc_dest_has_unlisted_keys; then
+            remove_container "$VALIDATOR_CONTAINER"
+        else
+            log_info "validator already running"
+            return 0
+        fi
     fi
 
     _require_fee_recipient
@@ -852,7 +1052,7 @@ assert_head_fork_electra() {
 }
 
 _validate_inputs() {
-    local got
+    local got want
     if [[ -L "$DATA_DIR" ]]; then
         die_usage "refusing symlink purge root: ${DATA_DIR}"
     fi
@@ -861,17 +1061,16 @@ _validate_inputs() {
     validate_data_exists "EL genesis" "${GENESIS_DIR}/genesis.json" "01-genesis.sh"
     validate_data_exists "CL genesis" "${GENESIS_DIR}/genesis.ssz" "01-genesis.sh"
     validate_data_exists "CL config" "${GENESIS_DIR}/config.yaml" "01-genesis.sh"
-    _require_uint "NUM_VALIDATORS" "${NUM_VALIDATORS:-}"
-    if [[ "$NUM_VALIDATORS" -lt 1 ]]; then
-        die_usage "NUM_VALIDATORS must be a positive integer (got ${NUM_VALIDATORS})"
-    fi
+    _require_split_bounds
     _require_fee_recipient
     _refuse_symlink "$VC_KEYS_SRC" "VC keys source"
+    validate_data_exists "data/keys/vc" "$VC_KEYS_SRC" "02-keys.sh"
     validate_data_exists "validator keystores" "${VC_KEYS_SRC}/validators" "02-keys.sh"
     validate_data_exists "validator secrets" "${VC_KEYS_SRC}/secrets" "02-keys.sh"
     got="$(_vc_source_count)"
-    if [[ "$got" -ne "$NUM_VALIDATORS" ]]; then
-        die_usage "validator keystores ${got} != ${NUM_VALIDATORS} at ${VC_KEYS_SRC}/validators (produced by 02-keys.sh)"
+    want="$(_vc_expected_count)"
+    if [[ "$got" -ne "$want" ]]; then
+        die_usage "validator keystores ${got} != ${want} at ${VC_KEYS_SRC}/validators (produced by 02-keys.sh)"
     fi
 }
 
@@ -886,7 +1085,10 @@ main() {
 
     if [[ "$DRY_RUN" == "1" ]]; then
         print_chain_plan
-        if _all_chain_running && [[ "$FORCE" != "1" ]]; then
+        if _vc_datadir_contains_rvc; then
+            _die_rvc_in_vc_datadir
+        fi
+        if _all_chain_running && [[ "$FORCE" != "1" ]] && ! _vc_dest_has_unlisted_keys; then
             log_info "would no-op (geth, beacon and validator already running)"
         else
             log_info "would start ${GETH_CONTAINER}, ${BEACON_CONTAINER} and ${VALIDATOR_CONTAINER}"
@@ -903,9 +1105,17 @@ main() {
         remove_container "$VALIDATOR_CONTAINER"
         remove_container "$BEACON_CONTAINER"
         remove_container "$GETH_CONTAINER"
+        _reset_vc_datadir
     elif _all_chain_running; then
-        log_success "geth, beacon and validator already running"
-        return 0
+        if _vc_datadir_contains_rvc; then
+            _die_rvc_in_vc_datadir
+        fi
+        if _vc_dest_has_unlisted_keys; then
+            remove_container "$VALIDATOR_CONTAINER"
+        else
+            log_success "geth, beacon and validator already running"
+            return 0
+        fi
     fi
 
     start_geth

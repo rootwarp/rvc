@@ -27,6 +27,8 @@ GENESIS = Path(__file__).resolve().parents[1] / "devnet" / "01-genesis.sh"
 
 _ENV = parse_env(ENV_PATH)
 _N = int(_ENV["NUM_VALIDATORS"])
+_K = int(_ENV["RVC_KEYS"])
+_VC = _N - _K
 _DEV_ACCOUNT = _ENV["DEV_ACCOUNT"]
 _ZERO_ACCOUNT = "0x" + "0" * 40
 
@@ -62,6 +64,7 @@ _ISOLATE_KEYS = (
     "CHAIN_WAIT_SLEEP",
     "BEACON_TESTNET_DIR",
     "VC_KEYS_SRC",
+    "RVC_KEYS",
     "CURL_HEALTH_CODE",
     "CURL_HEAD_SLOT",
     "CURL_SYNC_DISTANCE",
@@ -143,6 +146,7 @@ def write_docker_stub(tmp_path: Path) -> tuple[Path, Path]:
         "    name=\"\"\n"
         "    detached=0\n"
         "    is_init=0\n"
+        "    is_vc=0\n"
         "    prev=\"\"\n"
         "    for a in \"$@\"; do\n"
         "      if [ \"$prev\" = \"--name\" ]; then name=\"$a\"; fi\n"
@@ -150,6 +154,7 @@ def write_docker_stub(tmp_path: Path) -> tuple[Path, Path]:
         "        --name=*) name=\"${a#--name=}\" ;;\n"
         "        -d|--detach) detached=1 ;;\n"
         "        init) is_init=1 ;;\n"
+        "        validator_client) is_vc=1 ;;\n"
         "      esac\n"
         "      prev=\"$a\"\n"
         "    done\n"
@@ -160,6 +165,18 @@ def write_docker_stub(tmp_path: Path) -> tuple[Path, Path]:
         "      printf '%s\\n' \"$name\" >> \"$all\"\n"
         "      if [ \"$detached\" -eq 1 ]; then\n"
         "        printf '%s\\n' \"$name\" >> \"$running\"\n"
+        "      fi\n"
+        "    fi\n"
+        "    if [ \"${is_vc:-0}\" -eq 1 ] && [ -n \"${DATA_DIR:-}\" ]; then\n"
+        "      vdir=\"$DATA_DIR/cl/validator/validators\"\n"
+        "      defs=\"$vdir/validator_definitions.yml\"\n"
+        "      if [ -d \"$vdir\" ] && [ ! -f \"$defs\" ]; then\n"
+        "        printf '%s\\n' '---' > \"$defs\"\n"
+        "        for d in \"$vdir\"/0x*; do\n"
+        "          if [ -d \"$d\" ]; then\n"
+        "            printf -- '- voting_public_key: %s\\n' \"$(basename \"$d\")\" >> \"$defs\"\n"
+        "          fi\n"
+        "        done\n"
         "      fi\n"
         "    fi\n"
         "    exit 0\n"
@@ -245,10 +262,10 @@ def pubkey(i: int) -> str:
 
 
 def seed_keys(data: Path, n: int | None = None, *, root: Path | None = None) -> Path:
-    n = _N if n is None else n
-    valtools = root if root is not None else (data / "keys" / "valtools")
-    validators = valtools / "validators"
-    secrets = valtools / "secrets"
+    n = _VC if n is None else n
+    src = root if root is not None else (data / "keys" / "vc")
+    validators = src / "validators"
+    secrets = src / "secrets"
     validators.mkdir(parents=True, exist_ok=True)
     secrets.mkdir(parents=True, exist_ok=True)
     for i in range(n):
@@ -263,7 +280,17 @@ def seed_keys(data: Path, n: int | None = None, *, root: Path | None = None) -> 
         sec = secrets / pk
         sec.write_text(f"secret-{i}\n", encoding="utf-8")
         sec.chmod(0o600)
-    return valtools
+    return src
+
+
+def seed_rvc_pubkeys(data: Path) -> Path:
+    rvc = data / "keys" / "rvc"
+    rvc.mkdir(parents=True, exist_ok=True)
+    lines = [pubkey(i) + "\n" for i in range(_VC, _N)]
+    path = rvc / "pubkeys.txt"
+    path.write_text("".join(lines), encoding="utf-8")
+    path.chmod(0o600)
+    return path
 
 
 def seed_genesis(data: Path, *, keys: bool = True) -> None:
@@ -282,6 +309,7 @@ def seed_genesis(data: Path, *, keys: bool = True) -> None:
     (genesis / "genesis_validators_root.txt").write_text(_GVR + "\n", encoding="utf-8")
     if keys:
         seed_keys(data)
+        seed_rvc_pubkeys(data)
 
 
 def chain_env(
@@ -512,8 +540,16 @@ def test_chain_sh_exists_and_syntax():
     assert "--init-slashing-protection" in text
     assert "VC_KEYS_SRC=" in text
     assert "_bind_chain_paths" in text
-    assert "${KEYS_DIR}/valtools" in text
+    assert "${KEYS_DIR}/vc" in text
+    assert "${KEYS_DIR}/valtools" not in text
+    assert "--validators-dir" not in text
+    assert "_reset_vc_datadir" in text
+    assert "_prune_unlisted_vc_keys" in text
+    assert "_vc_datadir_contains_rvc" in text
+    assert "_refuse_symlink_parents" in text
+    assert "pubkeys.txt" in text
     assert "${CL_DATA_DIR}/validator" in text
+    assert "data/keys/vc" in text
     assert "head_slot + sync_distance" in text or "head_slot+sync_distance" in text
     assert re.search(r'(?m)^\s*docker\s', text) is None
     assert re.search(r'(?m)^\s*curl\s', text) is None
@@ -927,7 +963,7 @@ def test_copy_vc_keys_count_and_owner(tmp_path: Path):
     assert proc.returncode == 0, proc.stderr
     dest = tmp_path / "data" / "cl" / "validator" / "validators"
     dirs = validator_dirs(dest)
-    assert len(dirs) == _N
+    assert len(dirs) == _VC
     uid = os.getuid()
     for d in dirs:
         assert d.stat().st_uid == uid
@@ -939,11 +975,20 @@ def test_copy_vc_keys_count_and_owner(tmp_path: Path):
         assert file_mode(ks) == 0o600
     secrets = tmp_path / "data" / "cl" / "validator" / "secrets"
     secs = sorted(p for p in secrets.glob("0x*") if p.is_file())
-    assert len(secs) == _N
+    assert len(secs) == _VC
     for s in secs:
         assert s.stat().st_uid == uid
         assert file_mode(s) == 0o600
         assert not s.is_symlink()
+    dest_names = {d.name for d in dirs}
+    rvc_pks = {
+        ln
+        for ln in (tmp_path / "data" / "keys" / "rvc" / "pubkeys.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if ln
+    }
+    assert dest_names.isdisjoint(rvc_pks)
 
 
 def test_missing_keys_exits_2(tmp_path: Path):
@@ -951,6 +996,20 @@ def test_missing_keys_exits_2(tmp_path: Path):
     proc, log = run_chain(tmp_path, seed=False)
     assert proc.returncode == 2
     assert proc.stdout == ""
+    assert "data/keys/vc" in proc.stderr
+    assert "02-keys.sh" in proc.stderr
+    assert run_cmds(stub_cmds(log)) == []
+
+
+def test_vc_keys_moved_away_exits_2(tmp_path: Path):
+    seed_genesis(tmp_path / "data")
+    vc = tmp_path / "data" / "keys" / "vc"
+    away = tmp_path / "away-vc"
+    vc.rename(away)
+    proc, log = run_chain(tmp_path, seed=False)
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "data/keys/vc" in proc.stderr
     assert "02-keys.sh" in proc.stderr
     assert run_cmds(stub_cmds(log)) == []
 
@@ -993,7 +1052,7 @@ def test_resume_preserves_slashing_db_skips_init(tmp_path: Path):
     assert len(vcs) == 2, vcs
     assert "--init-slashing-protection" in vcs[0]
     assert "--init-slashing-protection" not in vcs[1]
-    assert len(validator_dirs(db.parent)) == _N
+    assert len(validator_dirs(db.parent)) == _VC
 
 
 def test_used_datadir_missing_sqlite_exits_2(tmp_path: Path):
@@ -1038,6 +1097,10 @@ def test_force_resets_vc_datadir_and_inits_slashing(tmp_path: Path):
     assert proc1.returncode == 0, proc1.stderr
     db = slashing_db(tmp_path)
     db.write_text("old-slash-db\n", encoding="utf-8")
+    defs = db.parent / "validator_definitions.yml"
+    rvc_pk = pubkey(_N - 1)
+    stale = defs.read_text(encoding="utf-8") if defs.is_file() else "---\n"
+    defs.write_text(stale + f"- voting_public_key: {rvc_pk}\n", encoding="utf-8")
     proc2, _ = run_chain(
         tmp_path,
         ["--force"],
@@ -1051,7 +1114,20 @@ def test_force_resets_vc_datadir_and_inits_slashing(tmp_path: Path):
     vcs = [c for c in run_cmds(stub_cmds(log)) if "validator_client" in c]
     assert len(vcs) == 2, vcs
     assert all("--init-slashing-protection" in c for c in vcs)
-    assert len(validator_dirs(db.parent)) == _N
+    assert len(validator_dirs(db.parent)) == _VC
+    assert defs.is_file()
+    text = defs.read_text(encoding="utf-8")
+    assert text.count("voting_public_key:") == _VC
+    rvc_pks = [
+        ln
+        for ln in (tmp_path / "data" / "keys" / "rvc" / "pubkeys.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if ln
+    ]
+    assert rvc_pks
+    for pk in rvc_pks:
+        assert pk not in text
 
 
 def test_copy_vc_keys_refuses_dest_secret_symlink(tmp_path: Path):
@@ -1083,6 +1159,121 @@ def test_copy_vc_keys_refuses_dest_keystore_symlink(tmp_path: Path):
     assert proc.returncode == 2, proc.stderr
     assert "symlink" in proc.stderr
     assert victim.read_text(encoding="utf-8") == "untouched\n"
+
+
+def test_copy_vc_keys_refuses_dest_parent_dir_symlink(tmp_path: Path):
+    victim = tmp_path / "victim-keydir"
+    victim.mkdir()
+    (victim / "voting-keystore.json").write_text("stolen\n", encoding="utf-8")
+    pk = pubkey(0)
+    proc = source_chain(
+        tmp_path,
+        "mkdir -p \"$VALIDATOR_DATA_DIR/validators\"; "
+        f"ln -s {shlex.quote(str(victim))} "
+        f"\"$VALIDATOR_DATA_DIR/validators/{pk}\"; "
+        "copy_vc_keys",
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert "symlink" in proc.stderr
+    assert (victim / "voting-keystore.json").read_text(encoding="utf-8") == "stolen\n"
+
+
+def test_copy_vc_keys_prunes_unlisted_dest(tmp_path: Path):
+    extra_pk = pubkey(_N - 1)
+    stray_pk = "0x" + "ee" * 48
+    proc = source_chain(
+        tmp_path,
+        "copy_vc_keys; "
+        f"mkdir -p \"$VALIDATOR_DATA_DIR/validators/{extra_pk}\" "
+        f"\"$VALIDATOR_DATA_DIR/validators/{stray_pk}\"; "
+        f"printf '{{}}\\n' > \"$VALIDATOR_DATA_DIR/validators/{extra_pk}/voting-keystore.json\"; "
+        f"printf '{{}}\\n' > \"$VALIDATOR_DATA_DIR/validators/{stray_pk}/voting-keystore.json\"; "
+        f"printf 'leftover-rvc\\n' > \"$VALIDATOR_DATA_DIR/secrets/{extra_pk}\"; "
+        "copy_vc_keys",
+    )
+    assert proc.returncode == 0, proc.stderr
+    dest = tmp_path / "data" / "cl" / "validator" / "validators"
+    assert not (dest / extra_pk).exists()
+    assert not (dest / stray_pk).exists()
+    extra_sec = tmp_path / "data" / "cl" / "validator" / "secrets" / extra_pk
+    assert not extra_sec.exists()
+    assert len(validator_dirs(dest)) == _VC
+    dest_names = {d.name for d in validator_dirs(dest)}
+    assert extra_pk not in dest_names
+    assert stray_pk not in dest_names
+
+
+def test_copy_vc_keys_refuses_rvc_pubkey_in_definitions(tmp_path: Path):
+    rvc_pk = pubkey(_N - 1)
+    proc = source_chain(
+        tmp_path,
+        "copy_vc_keys; "
+        "mkdir -p \"$VALIDATOR_DATA_DIR/validators\"; "
+        f"printf '%s\\n' '- voting_public_key: {rvc_pk}' "
+        "> \"$VALIDATOR_DATA_DIR/validators/validator_definitions.yml\"; "
+        "copy_vc_keys",
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    assert "RVC" in proc.stderr or "rvc" in proc.stderr
+    assert "--force" in proc.stderr
+    assert "pubkeys.txt" in proc.stderr
+    dest = tmp_path / "data" / "cl" / "validator" / "validators"
+    defs = dest / "validator_definitions.yml"
+    assert rvc_pk in defs.read_text(encoding="utf-8")
+    assert len(validator_dirs(dest)) == _VC
+
+
+def test_running_rvc_leftovers_refuse_without_noop(tmp_path: Path):
+    proc1, log = run_chain(tmp_path)
+    assert proc1.returncode == 0, proc1.stderr
+    dest = tmp_path / "data" / "cl" / "validator" / "validators"
+    rvc_pk = pubkey(_N - 1)
+    extra = dest / rvc_pk
+    extra.mkdir()
+    (extra / "voting-keystore.json").write_text("{}\n", encoding="utf-8")
+    defs = dest / "validator_definitions.yml"
+    body = defs.read_text(encoding="utf-8") if defs.is_file() else "---\n"
+    defs.write_text(body + f"- voting_public_key: {rvc_pk}\n", encoding="utf-8")
+    first_runs = run_cmds(stub_cmds(log))
+    proc2, _ = run_chain(
+        tmp_path,
+        docker=tmp_path / "docker",
+        curl=tmp_path / "curl",
+        log=log,
+        seed=False,
+    )
+    assert proc2.returncode == 2, proc2.stderr
+    assert proc2.stdout == ""
+    assert "--force" in proc2.stderr
+    assert "already running" not in proc2.stderr or "RVC" in proc2.stderr
+    assert extra.is_dir()
+    assert rvc_pk in defs.read_text(encoding="utf-8")
+    assert run_cmds(stub_cmds(log)) == first_runs
+
+
+def test_running_unlisted_extra_is_pruned_without_force(tmp_path: Path):
+    proc1, log = run_chain(tmp_path)
+    assert proc1.returncode == 0, proc1.stderr
+    dest = tmp_path / "data" / "cl" / "validator" / "validators"
+    stray_pk = "0x" + "ee" * 48
+    stray = dest / stray_pk
+    stray.mkdir()
+    (stray / "voting-keystore.json").write_text("{}\n", encoding="utf-8")
+    db = slashing_db(tmp_path)
+    db.write_text("keep-slash-db\n", encoding="utf-8")
+    proc2, _ = run_chain(
+        tmp_path,
+        docker=tmp_path / "docker",
+        curl=tmp_path / "curl",
+        log=log,
+        seed=False,
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    assert not stray.exists()
+    assert len(validator_dirs(dest)) == _VC
+    vcs = [c for c in run_cmds(stub_cmds(log)) if "validator_client" in c]
+    assert len(vcs) == 2, vcs
 
 
 def test_fail_chain_refuses_log_symlink(tmp_path: Path):
@@ -1159,7 +1350,7 @@ def test_data_dir_flag_rebinds_vc_paths(tmp_path: Path):
     assert proc.returncode == 0, proc.stderr
     resolved = t.resolve()
     assert proc.stdout.strip().splitlines() == [
-        f"{resolved}/keys/valtools",
+        f"{resolved}/keys/vc",
         f"{resolved}/cl/validator",
     ]
 
@@ -1175,7 +1366,8 @@ def test_vc_keys_src_override(tmp_path: Path):
     )
     assert proc.returncode == 0, proc.stderr
     dest = tmp_path / "data" / "cl" / "validator" / "validators"
-    assert len(validator_dirs(dest)) == _N
+    assert len(validator_dirs(dest)) == _VC
+    assert not (tmp_path / "data" / "keys" / "vc" / "validators").exists()
     assert not (tmp_path / "data" / "keys" / "valtools" / "validators").exists()
     vc = vc_cmd(run_cmds(stub_cmds(log)))
     assert "--init-slashing-protection" in vc
@@ -1288,7 +1480,7 @@ def test_live_electra_head(tmp_path: Path):
         assert_no_secret(proc)
         assert "Electra" in proc.stderr or "0x60000000" in proc.stderr
         dest = data / "cl" / "validator" / "validators"
-        assert len(validator_dirs(dest)) == _N
+        assert len(validator_dirs(dest)) == _VC
         deadline = time.monotonic() + (2 * 32 * 12)
         attested = False
         log_blob = ""
