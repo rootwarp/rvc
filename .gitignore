@@ -34,3 +34,7 @@ slashing_protection.sqlite
 
 # Fetched spec-vector cache (lockfile is tracked)
 crates/rvc-spec-vectors/vectors/
+
+# Local devnet artifacts
+scripts/devnet/data/
+scripts/devnet/runs/
