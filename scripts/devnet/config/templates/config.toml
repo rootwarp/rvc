@@ -1,0 +1,11 @@
+beacon_url = "@@BEACON_URL@@"
+keystore_path = "@@KEYSTORE_PATH@@"
+password_file = "@@PASSWORD_FILE@@"
+slashing_db_path = "@@SLASHING_DB_PATH@@"
+network = "@@NETWORK@@"
+genesis_time = @@GENESIS_TIME@@
+genesis_validators_root = "@@GENESIS_VALIDATORS_ROOT@@"
+validators_config = "@@VALIDATORS_CONFIG@@"
+log_level = "@@LOG_LEVEL@@"
+metrics_port = @@METRICS_PORT@@
+doppelganger_detection = @@DOPPELGANGER_DETECTION@@

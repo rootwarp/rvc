@@ -1,0 +1,11 @@
+beacon_url = "http://127.0.0.1:5052"
+keystore_path = "__DATA_DIR__/keys/rvc"
+password_file = "__DATA_DIR__/rvc/passwords.txt"
+slashing_db_path = "__DATA_DIR__/rvc/slashing_protection.sqlite"
+network = "custom"
+genesis_time = 1710000000
+genesis_validators_root = "0xabababababababababababababababababababababababababababababababab"
+validators_config = "__DATA_DIR__/rvc/validators.toml"
+log_level = "info"
+metrics_port = 8080
+doppelganger_detection = false

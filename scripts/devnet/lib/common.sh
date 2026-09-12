@@ -60,6 +60,7 @@ EL_DATA_DIR="${DATA_DIR}/el"
 CL_DATA_DIR="${DATA_DIR}/cl"
 GENESIS_DIR="${DATA_DIR}/genesis"
 KEYS_DIR="${DATA_DIR}/keys"
+RVC_DIR="${DATA_DIR}/rvc"
 
 CONTAINER_PREFIX="eth-devnet"
 GETH_CONTAINER="${CONTAINER_PREFIX}-geth"
@@ -76,7 +77,7 @@ RUN_DIR="${RUN_DIR:-}"
 export SCRIPT_DIR
 export DOCKER CURL DEVNET_STAGE_DIR
 export DATA_DIR RUNS_DIR
-export JWT_DIR EL_DATA_DIR CL_DATA_DIR GENESIS_DIR KEYS_DIR
+export JWT_DIR EL_DATA_DIR CL_DATA_DIR GENESIS_DIR KEYS_DIR RVC_DIR
 export CONTAINER_PREFIX GETH_CONTAINER BEACON_CONTAINER VALIDATOR_CONTAINER DOCKER_NETWORK
 export FORCE INTERACTIVE DRY_RUN PROFILE RUN_DIR
 
@@ -230,8 +231,9 @@ parse_common_flags() {
     CL_DATA_DIR="${DATA_DIR}/cl"
     GENESIS_DIR="${DATA_DIR}/genesis"
     KEYS_DIR="${DATA_DIR}/keys"
+    RVC_DIR="${DATA_DIR}/rvc"
     export FORCE INTERACTIVE DRY_RUN PROFILE RUN_DIR
-    export DATA_DIR JWT_DIR EL_DATA_DIR CL_DATA_DIR GENESIS_DIR KEYS_DIR
+    export DATA_DIR JWT_DIR EL_DATA_DIR CL_DATA_DIR GENESIS_DIR KEYS_DIR RVC_DIR
 }
 
 require_cmd() {
@@ -605,4 +607,390 @@ assert_gvr_matches_local() {
     if [[ "$bn_n" != "$local_n" ]]; then
         die_infra "BN genesis_validators_root ${bn_gvr} does not match local ${local_gvr} at ${path}; run 01-genesis.sh --force"
     fi
+}
+
+# Token map for render_template. Indexed arrays are the portable source of
+# truth; on bash >= 4 substitution is applied from an associative array.
+RENDER_KEYS=()
+RENDER_VALS=()
+
+_render_reset() {
+    RENDER_KEYS=()
+    RENDER_VALS=()
+}
+
+_render_reject_unsafe_value() {
+    local token="${1:-}"
+    local value="${2-}"
+    case "$value" in
+        *$'\n'* | *$'\r'* | *@@*)
+            die_usage "template value for ${token:-token} contains newline or @@"
+            ;;
+    esac
+}
+
+_render_set() {
+    local token="${1:-}"
+    local value="${2-}"
+    if [[ -z "$token" ]]; then
+        die_usage "_render_set requires a token"
+    fi
+    case "$token" in
+        *[!A-Za-z0-9_]*)
+            die_usage "invalid template token: ${token}"
+            ;;
+    esac
+    _render_reject_unsafe_value "$token" "$value"
+    RENDER_KEYS+=("$token")
+    RENDER_VALS+=("$value")
+}
+
+# Replace @@TOKEN@@ in $_RENDER_CONTENT. ${var//a/b} cannot hold '/' in b on bash 3.2.
+_render_apply() {
+    local token="$1"
+    local value="$2"
+    local needle prefix suffix
+    _render_reject_unsafe_value "$token" "$value"
+    needle="@@${token}@@"
+    prefix="${_RENDER_CONTENT%%"${needle}"*}"
+    while [[ "$prefix" != "$_RENDER_CONTENT" ]]; do
+        suffix="${_RENDER_CONTENT#*"${needle}"}"
+        _RENDER_CONTENT="${prefix}${value}${suffix}"
+        prefix="${_RENDER_CONTENT%%"${needle}"*}"
+    done
+}
+
+_doppelganger_toml_bool() {
+    case "${1:-}" in
+        on | true | 1)
+            printf 'true\n'
+            ;;
+        off | false | 0)
+            printf 'false\n'
+            ;;
+        *)
+            die_usage "DOPPELGANGER must be on or off (got ${1:-<empty>})"
+            ;;
+    esac
+}
+
+_assert_nonzero_fee_recipient() {
+    local addr="${1:-}"
+    local n
+    n="$(printf '%s' "$addr" | tr 'A-F' 'a-f' | tr -d '[:space:]')"
+    n="${n#0x}"
+    if [[ -z "$n" || ! "$n" =~ ^[0-9a-f]{40}$ ]]; then
+        die_usage "DEV_ACCOUNT must be a 20-byte hex address (got ${addr:-<empty>})"
+    fi
+    if [[ "$n" == "0000000000000000000000000000000000000000" ]]; then
+        die_usage "DEV_ACCOUNT fee_recipient must be non-zero (got ${addr})"
+    fi
+}
+
+_assert_digit_port() {
+    local name="${1:-}"
+    local val="${2:-}"
+    case "$val" in
+        '' | *[!0-9]*)
+            die_usage "${name} must be a port number (got ${val:-<empty>})"
+            ;;
+    esac
+}
+
+# O_NOFOLLOW atomic copy; refuses source, dest, and either parent symlink.
+_copy_600() {
+    local src="${1:-}"
+    local dest="${2:-}"
+    local src_parent dest_parent rc=0
+    if [[ -z "$src" || -z "$dest" ]]; then
+        die_usage "_copy_600 requires SRC and DEST"
+    fi
+    src_parent="$(dirname -- "$src")"
+    dest_parent="$(dirname -- "$dest")"
+    if [[ -L "$src" ]]; then
+        die_usage "refusing symlink: ${src}"
+    fi
+    if [[ -L "$src_parent" ]]; then
+        die_usage "refusing symlink: ${src_parent}"
+    fi
+    if [[ ! -f "$src" ]]; then
+        die_usage "${src##*/} not found at ${src} (produced by 02-keys.sh)"
+    fi
+    if [[ -L "$dest_parent" ]]; then
+        die_usage "refusing symlink: ${dest_parent}"
+    fi
+    if [[ -L "$dest" ]]; then
+        die_usage "refusing symlink: ${dest}"
+    fi
+    python3 -c '
+import os, stat, sys
+
+src, dest = sys.argv[1], sys.argv[2]
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+
+def fail_if_symlink(path, missing_ok=False):
+    try:
+        st = os.lstat(path)
+    except OSError:
+        if missing_ok:
+            return
+        raise SystemExit(1)
+    if stat.S_ISLNK(st.st_mode):
+        raise SystemExit(2)
+
+fail_if_symlink(src)
+src_dir = os.path.dirname(os.path.abspath(src))
+fail_if_symlink(src_dir)
+dest_dir = os.path.dirname(os.path.abspath(dest))
+fail_if_symlink(dest_dir)
+if not os.path.isdir(dest_dir):
+    raise SystemExit(1)
+fail_if_symlink(dest, missing_ok=True)
+
+fin = os.open(src, os.O_RDONLY | nofollow)
+try:
+    chunks = []
+    off = 0
+    while True:
+        buf = os.pread(fin, 1024 * 1024, off)
+        if not buf:
+            break
+        chunks.append(buf)
+        off += len(buf)
+finally:
+    os.close(fin)
+data = b"".join(chunks)
+if not data:
+    raise SystemExit(1)
+
+tmp = dest + ".tmp." + os.urandom(16).hex()
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+fd = -1
+try:
+    fd = os.open(tmp, flags, 0o600)
+    os.write(fd, data)
+    os.fchmod(fd, 0o600)
+    os.close(fd)
+    fd = -1
+    if os.path.islink(tmp) or os.path.islink(dest):
+        os.unlink(tmp)
+        raise SystemExit(2)
+    os.replace(tmp, dest)
+    tmp = ""
+except OSError:
+    raise SystemExit(1)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+' "$src" "$dest" || rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+        die_usage "refusing symlink: ${src} -> ${dest}"
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+        die_infra "failed to copy ${dest}"
+    fi
+    chmod 700 "$dest_parent" || die_infra "failed to chmod ${dest_parent}"
+    chmod 600 "$dest" || die_infra "failed to chmod ${dest}"
+}
+
+_assert_password_keys_match_keystores() {
+    local pw_file="${1:-}"
+    local ks_dir="${2:-}"
+    local rc=0
+    if [[ -z "$pw_file" || -z "$ks_dir" ]]; then
+        die_usage "_assert_password_keys_match_keystores requires PW_FILE and KS_DIR"
+    fi
+    PW_FILE="$pw_file" KS_DIR="$ks_dir" python3 - <<'PY' || rc=$?
+import json, os, stat, sys
+
+pw_file = os.environ["PW_FILE"]
+ks_dir = os.environ["KS_DIR"]
+
+def strip_one_0x(s: str) -> str:
+    if s.startswith("0x") or s.startswith("0X"):
+        return s[2:]
+    return s
+
+def is_reg(path: str) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISREG(st.st_mode) and not stat.S_ISLNK(st.st_mode)
+
+pubkeys = []
+try:
+    names = os.listdir(ks_dir)
+except OSError:
+    sys.stderr.write("data/keys/rvc not found (produced by 02-keys.sh)\n")
+    sys.exit(2)
+for name in names:
+    if not name.startswith("keystore-") or not name.endswith(".json"):
+        continue
+    path = os.path.join(ks_dir, name)
+    if not is_reg(path):
+        continue
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    pubkeys.append(doc.get("pubkey") or "")
+
+keys = []
+with open(pw_file, encoding="utf-8") as fh:
+    for raw in fh:
+        line = raw.rstrip("\n")
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            sys.stderr.write("passwords.txt line missing '='\n")
+            sys.exit(2)
+        key = line.split("=", 1)[0]
+        if key == "*":
+            sys.stderr.write("refusing wildcard password entry\n")
+            sys.exit(2)
+        keys.append(key)
+
+stripped = [strip_one_0x(k) for k in keys]
+for key, s in zip(keys, stripped):
+    n = sum(1 for pk in pubkeys if pk == s)
+    if n != 1:
+        sys.stderr.write(
+            "password key does not match keystore .pubkey form (prefix/case)\n"
+        )
+        sys.exit(2)
+for pk in pubkeys:
+    n = sum(1 for s in stripped if s == pk)
+    if n != 1:
+        sys.stderr.write(
+            "keystore .pubkey is not matched by exactly one passwords.txt key (prefix/case)\n"
+        )
+        sys.exit(2)
+PY
+    if [[ "$rc" -ne 0 ]]; then
+        die_usage "password key does not match keystore .pubkey form (prefix/case)"
+    fi
+}
+
+render_template() {
+    local tmpl="${1:-}"
+    local out="${2:-}"
+    local leftover token value i
+    if [[ -z "$tmpl" || -z "$out" ]]; then
+        die_usage "render_template requires TMPL and OUT"
+    fi
+    if [[ -L "$tmpl" ]]; then
+        die_usage "refusing symlink template: ${tmpl}"
+    fi
+    if [[ ! -f "$tmpl" ]]; then
+        die_usage "template not found: ${tmpl}"
+    fi
+    if [[ -L "$out" ]]; then
+        die_usage "refusing symlink output: ${out}"
+    fi
+    _RENDER_CONTENT="$(cat <"$tmpl" && printf x)"
+    _RENDER_CONTENT="${_RENDER_CONTENT%x}"
+    i=0
+    if ((BASH_VERSINFO[0] >= 4)); then
+        # shellcheck disable=SC2034,SC3045
+        local -A subst=()
+        while [[ "$i" -lt "${#RENDER_KEYS[@]}" ]]; do
+            subst["${RENDER_KEYS[$i]}"]="${RENDER_VALS[$i]}"
+            i=$((i + 1))
+        done
+        for token in "${!subst[@]}"; do
+            _render_apply "$token" "${subst[$token]}"
+        done
+    else
+        while [[ "$i" -lt "${#RENDER_KEYS[@]}" ]]; do
+            token="${RENDER_KEYS[$i]}"
+            value="${RENDER_VALS[$i]}"
+            _render_apply "$token" "$value"
+            i=$((i + 1))
+        done
+    fi
+    leftover=""
+    if printf '%s' "$_RENDER_CONTENT" | grep -q '@@'; then
+        leftover="$(printf '%s' "$_RENDER_CONTENT" | grep -oE '@@[A-Za-z0-9_]+@@' | sort -u | tr '\n' ' ' || true)"
+        leftover="${leftover% }"
+        unset _RENDER_CONTENT
+        die_usage "unsubstituted template token: ${leftover:-@@}"
+    fi
+    umask 077
+    printf '%s' "$_RENDER_CONTENT" >"$out" || die_infra "failed to write ${out}"
+    unset _RENDER_CONTENT
+    chmod 600 "$out" || die_infra "failed to chmod ${out}"
+}
+
+render_rvc_config() {
+    local genesis_json genesis_time genesis_validators_root
+    local doppelganger_toml src_pw dest_pw config_out validators_out tmpl_dir
+    local keystore_path password_file slashing_db_path validators_config beacon_url
+
+    _assert_nonzero_fee_recipient "${DEV_ACCOUNT:-}"
+    doppelganger_toml="$(_doppelganger_toml_bool "${DOPPELGANGER:-}")"
+    _assert_digit_port "RVC_METRICS_PORT" "${RVC_METRICS_PORT:-}"
+
+    validate_data_exists "manifest.json" "${KEYS_DIR}/manifest.json" "02-keys.sh"
+    if [[ -L "${KEYS_DIR}/rvc" ]]; then
+        die_usage "refusing symlink: ${KEYS_DIR}/rvc"
+    fi
+    if [[ ! -d "${KEYS_DIR}/rvc" ]]; then
+        die_usage "data/keys/rvc not found at ${KEYS_DIR}/rvc (produced by 02-keys.sh)"
+    fi
+    validate_data_exists "passwords.txt" "${KEYS_DIR}/rvc/passwords.txt" "02-keys.sh"
+
+    genesis_json="$(bn_genesis_json)"
+    genesis_time="$(printf '%s\n' "$genesis_json" | parse_genesis_time)"
+    genesis_validators_root="$(printf '%s\n' "$genesis_json" | parse_genesis_validators_root)"
+
+    RVC_DIR="${DATA_DIR}/rvc"
+    export RVC_DIR
+    if [[ -L "$RVC_DIR" ]]; then
+        die_usage "refusing symlink rvc dir: ${RVC_DIR}"
+    fi
+
+    src_pw="${KEYS_DIR}/rvc/passwords.txt"
+    dest_pw="${RVC_DIR}/passwords.txt"
+    keystore_path="${KEYS_DIR}/rvc"
+    password_file="${RVC_DIR}/passwords.txt"
+    slashing_db_path="${RVC_DIR}/slashing_protection.sqlite"
+    validators_config="${RVC_DIR}/validators.toml"
+    beacon_url="http://127.0.0.1:${CL_HTTP_PORT}"
+    tmpl_dir="${SCRIPT_DIR}/config/templates"
+    config_out="${RVC_DIR}/config.toml"
+    validators_out="${RVC_DIR}/validators.toml"
+
+    _render_reset
+    _render_set BEACON_URL "$beacon_url"
+    _render_set KEYSTORE_PATH "$keystore_path"
+    _render_set PASSWORD_FILE "$password_file"
+    _render_set SLASHING_DB_PATH "$slashing_db_path"
+    _render_set NETWORK "custom"
+    _render_set GENESIS_TIME "$genesis_time"
+    _render_set GENESIS_VALIDATORS_ROOT "$genesis_validators_root"
+    _render_set VALIDATORS_CONFIG "$validators_config"
+    _render_set LOG_LEVEL "info"
+    _render_set METRICS_PORT "${RVC_METRICS_PORT}"
+    _render_set DOPPELGANGER_DETECTION "$doppelganger_toml"
+    _render_set FEE_RECIPIENT "${DEV_ACCOUNT}"
+
+    umask 077
+    mkdir -p -- "$RVC_DIR" || die_infra "cannot create ${RVC_DIR}"
+    if [[ -L "$RVC_DIR" ]]; then
+        die_usage "refusing symlink rvc dir: ${RVC_DIR}"
+    fi
+    chmod 700 "$RVC_DIR" || die_infra "failed to chmod ${RVC_DIR}"
+
+    _copy_600 "$src_pw" "$dest_pw"
+    _assert_password_keys_match_keystores "$dest_pw" "${KEYS_DIR}/rvc"
+
+    render_template "${tmpl_dir}/config.toml" "$config_out"
+    render_template "${tmpl_dir}/validators.toml" "$validators_out"
+    chmod 600 "$config_out" "$validators_out" "$dest_pw"
+    log_info "rendered ${config_out}"
+    log_info "rendered ${validators_out}"
 }
