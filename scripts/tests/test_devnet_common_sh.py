@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 COMMON_SH = Path(__file__).resolve().parents[1] / "devnet" / "lib" / "common.sh"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 _ISOLATE_KEYS = (
     "DOCKER",
@@ -43,6 +44,7 @@ def run_common(
     env: dict[str, str] | None = None,
     timeout: float = 10,
     cwd: Path | None = None,
+    stdin: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     full = os.environ.copy()
     for key in _ISOLATE_KEYS:
@@ -58,6 +60,7 @@ def run_common(
         env=full,
         timeout=timeout,
         cwd=cwd,
+        input=stdin,
     )
 
 
@@ -583,3 +586,144 @@ def test_capture_container_logs_rejects_unsafe_name(tmp_path: Path):
         assert proc.stdout == ""
         assert "invalid" in proc.stderr
     assert not (run_dir / "logs").exists()
+
+
+def test_parse_genesis_fields_from_fixture():
+    raw = (FIXTURES / "bn_genesis.json").read_text(encoding="utf-8")
+    data = json.loads(raw)["data"]
+    expected_time = "".join(str(data["genesis_time"]).split())
+    expected_gvr = "".join(str(data["genesis_validators_root"]).split())
+    assert expected_gvr.startswith("0x")
+    assert len(bytes.fromhex(expected_gvr[2:])) == 32
+
+    time_proc = run_common(
+        "parse_genesis_time",
+        stdin=raw,
+        env={"GENESIS_TIMESTAMP": "1", "GENESIS_DELAY": "2", "CURL": "/usr/bin/false"},
+    )
+    gvr_proc = run_common(
+        "parse_genesis_validators_root",
+        stdin=raw,
+        env={"GENESIS_TIMESTAMP": "1", "GENESIS_DELAY": "2", "CURL": "/usr/bin/false"},
+    )
+    assert time_proc.returncode == 0, time_proc.stderr
+    assert gvr_proc.returncode == 0, gvr_proc.stderr
+    assert time_proc.stdout.strip() == expected_time
+    assert time_proc.stdout.strip(" \t\r\n") == expected_time
+    assert gvr_proc.stdout.strip() == expected_gvr
+    assert gvr_proc.stdout.strip(" \t\r\n") == expected_gvr
+    assert time_proc.stdout != "3"
+    assert_no_secret(time_proc)
+    assert_no_secret(gvr_proc)
+
+
+def test_assert_fork_in_schedule_accepts_electra():
+    raw = (FIXTURES / "bn_spec.json").read_text(encoding="utf-8")
+    electra = json.loads(raw)["data"]["ELECTRA_FORK_VERSION"]
+    proc = run_common(
+        "set -f; "
+        f"assert_fork_in_schedule {shlex.quote(electra)} $(parse_fork_versions)",
+        stdin=raw,
+        env={"CURL": "/usr/bin/false"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+
+
+def test_assert_fork_in_schedule_rejects_unknown():
+    raw = (FIXTURES / "bn_spec.json").read_text(encoding="utf-8")
+    data = json.loads(raw)["data"]
+    unknown = "0xffffffff"
+    proc = run_common(
+        "set -f; "
+        f"assert_fork_in_schedule {shlex.quote(unknown)} $(parse_fork_versions)",
+        stdin=raw,
+        env={"CURL": "/usr/bin/false"},
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    err = proc.stderr
+    assert unknown in err
+    for key, value in data.items():
+        if key.endswith("_FORK_VERSION"):
+            assert value in err, key
+    assert_no_secret(proc)
+
+
+def test_assert_gvr_matches_local_mismatch_exits_1(tmp_path: Path):
+    genesis = tmp_path / "genesis"
+    genesis.mkdir()
+    local_gvr = "0x" + "aa" * 32
+    bn_gvr = "0x" + "bb" * 32
+    (genesis / "genesis_validators_root.txt").write_text(f"{local_gvr}\n", encoding="utf-8")
+    proc = run_common(
+        f"assert_gvr_matches_local {shlex.quote(bn_gvr)}",
+        env={"DATA_DIR": str(tmp_path), "CURL": "/usr/bin/false"},
+    )
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+    assert "01-genesis.sh" in proc.stderr
+    assert "--force" in proc.stderr
+    assert_no_secret(proc)
+
+
+def test_assert_gvr_matches_local_match_exits_0(tmp_path: Path):
+    genesis = tmp_path / "genesis"
+    genesis.mkdir()
+    gvr = "0x" + "ab" * 32
+    (genesis / "genesis_validators_root.txt").write_text(f"  {gvr}  \n", encoding="utf-8")
+    proc = run_common(
+        f"assert_gvr_matches_local {shlex.quote(gvr)}",
+        env={"DATA_DIR": str(tmp_path), "CURL": "/usr/bin/false"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+
+
+def test_bn_get_uses_curl_fail_and_max_time(tmp_path: Path):
+    log = tmp_path / "curl.log"
+    stub = tmp_path / "curl"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    proc = run_common(
+        "bn_get /eth/v1/beacon/genesis",
+        env={"CURL": str(stub), "CL_HTTP_PORT": "5052"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    recorded = log.read_text(encoding="utf-8")
+    argv = recorded.split()
+    assert "--fail" in argv
+    assert "--max-time" in recorded
+    assert "-g" in argv
+    assert "--proto" in argv
+    assert "=http" in argv
+    assert "--path-as-is" in argv
+    assert "-- http://127.0.0.1:5052/eth/v1/beacon/genesis" in recorded
+
+
+def test_bn_head_fork_version_from_fixture(tmp_path: Path):
+    fixture = FIXTURES / "bn_head_fork.json"
+    expected = json.loads(fixture.read_text(encoding="utf-8"))["data"]["current_version"]
+    log = tmp_path / "curl.log"
+    stub = tmp_path / "curl"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+        f"cat {shlex.quote(str(fixture))}\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    proc = run_common("bn_head_fork_version", env={"CURL": str(stub)})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == expected
+    recorded = log.read_text(encoding="utf-8")
+    assert "--fail" in recorded
+    assert "/eth/v1/beacon/states/head/fork" in recorded
+    assert_no_secret(proc)

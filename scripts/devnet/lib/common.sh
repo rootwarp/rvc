@@ -445,3 +445,164 @@ capture_container_logs() {
     mkdir -p -- "$log_dir"
     "$DOCKER" logs -- "$name" >"${log_dir}/${name}.log" 2>&1 || true
 }
+
+# BN HTTP GET. Parsers and asserts below do not call curl (ADR-013).
+bn_get() {
+    local path="${1:-}"
+    local port="${CL_HTTP_PORT:-}"
+    if [[ -z "$path" ]]; then
+        die_usage "bn_get requires a path"
+    fi
+    case "$path" in
+        /eth/v1/*) ;;
+        *)
+            die_usage "bn_get path must start with /eth/v1/"
+            ;;
+    esac
+    case "$path" in
+        *..*)
+            die_usage "bn_get path must not contain .."
+            ;;
+        *[!A-Za-z0-9/_.-]*)
+            die_usage "bn_get path contains invalid characters"
+            ;;
+    esac
+    if [[ -z "$port" ]]; then
+        die_usage "CL_HTTP_PORT is not set"
+    fi
+    case "$port" in
+        *@*)
+            die_usage "CL_HTTP_PORT must not contain @"
+            ;;
+        *[!0-9]*)
+            die_usage "CL_HTTP_PORT must be a port number"
+            ;;
+    esac
+    "$CURL" -sS --fail --max-time 5 -g --proto '=http' --path-as-is -- \
+        "http://127.0.0.1:${port}${path}" \
+        || die_infra "BN GET ${path} failed"
+}
+
+bn_genesis_json() {
+    bn_get /eth/v1/beacon/genesis
+}
+
+bn_spec_json() {
+    bn_get /eth/v1/config/spec
+}
+
+bn_head_fork_version() {
+    local v
+    v="$(bn_get /eth/v1/beacon/states/head/fork \
+        | jq -r '.data.current_version // empty' \
+        | tr -d '[:space:]')" \
+        || die_infra "failed to parse BN head current_version"
+    if [[ -z "$v" || "$v" == "null" ]]; then
+        die_infra "current_version missing from BN head fork"
+    fi
+    printf '%s\n' "$v"
+}
+
+# Pure stdin/jq. Genesis facts never come from devnet.env (ADR-013).
+parse_genesis_time() {
+    local v
+    v="$(jq -r '.data.genesis_time // empty' | tr -d '[:space:]')" \
+        || die_infra "failed to parse genesis_time from BN genesis JSON"
+    if [[ -z "$v" || "$v" == "null" ]]; then
+        die_infra "genesis_time missing from BN genesis JSON"
+    fi
+    case "$v" in
+        *[!0-9]*)
+            die_infra "genesis_time is not an integer: ${v}"
+            ;;
+    esac
+    printf '%s\n' "$v"
+}
+
+parse_genesis_validators_root() {
+    local v
+    v="$(jq -r '.data.genesis_validators_root // empty' | tr -d '[:space:]')" \
+        || die_infra "failed to parse genesis_validators_root from BN genesis JSON"
+    if [[ -z "$v" || "$v" == "null" ]]; then
+        die_infra "genesis_validators_root missing from BN genesis JSON"
+    fi
+    if [[ ! "$v" =~ ^0x[0-9a-fA-F]{64}$ ]]; then
+        die_infra "genesis_validators_root is not a 32-byte 0x value: ${v}"
+    fi
+    printf '%s\n' "$v"
+}
+
+_is_hex0x() {
+    [[ "${1:-}" =~ ^0x[0-9a-fA-F]+$ ]]
+}
+
+parse_fork_versions() {
+    local out
+    out="$(jq -r '
+        (.data // {})
+        | to_entries[]
+        | select(.key | test("_FORK_VERSION$"))
+        | (.value | tostring | gsub("\\s+";""))
+        | if test("^0x[0-9a-fA-F]+$") then .
+          else error("invalid fork version: \(.)")
+          end
+    ')" || die_infra "failed to parse fork versions from BN spec JSON"
+    if [[ -n "$out" ]]; then
+        printf '%s\n' "$out"
+    fi
+}
+
+assert_fork_in_schedule() {
+    local head="${1:-}"
+    local head_n ver ver_n schedule restore_glob=0
+    if [[ -z "$head" ]]; then
+        die_usage "assert_fork_in_schedule requires a head fork version"
+    fi
+    shift
+    case "$-" in
+        *f*) ;;
+        *)
+            restore_glob=1
+            set -f
+            ;;
+    esac
+    if ! _is_hex0x "$head"; then
+        die_usage "head current_version is not a 0x hex fork version: ${head}"
+    fi
+    head_n="$(printf '%s' "$head" | tr 'A-F' 'a-f')"
+    for ver in "$@"; do
+        if ! _is_hex0x "$ver"; then
+            die_usage "fork schedule entry is not a 0x hex fork version: ${ver}"
+        fi
+        ver_n="$(printf '%s' "$ver" | tr 'A-F' 'a-f')"
+        if [[ "$head_n" == "$ver_n" ]]; then
+            if [[ "$restore_glob" -eq 1 ]]; then
+                set +f
+            fi
+            return 0
+        fi
+    done
+    schedule="$(printf '%s ' "$@")"
+    schedule="${schedule% }"
+    die_usage "head current_version ${head} is not in fork schedule: ${schedule:-<empty>}"
+}
+
+assert_gvr_matches_local() {
+    local bn_gvr="${1:-}"
+    local path local_gvr bn_n local_n
+    if [[ -z "$bn_gvr" ]]; then
+        die_usage "assert_gvr_matches_local requires a genesis_validators_root"
+    fi
+    path="${GENESIS_DIR}/genesis_validators_root.txt"
+    if [[ ! -f "$path" ]]; then
+        die_infra "genesis_validators_root.txt not found at ${path}; run 01-genesis.sh --force"
+    fi
+    local_gvr="$(tr -d '[:space:]' <"$path")"
+    bn_n="$(printf '%s' "$bn_gvr" | tr 'A-F' 'a-f' | tr -d '[:space:]')"
+    bn_n="${bn_n#0x}"
+    local_n="$(printf '%s' "$local_gvr" | tr 'A-F' 'a-f' | tr -d '[:space:]')"
+    local_n="${local_n#0x}"
+    if [[ "$bn_n" != "$local_n" ]]; then
+        die_infra "BN genesis_validators_root ${bn_gvr} does not match local ${local_gvr} at ${path}; run 01-genesis.sh --force"
+    fi
+}
