@@ -1,0 +1,831 @@
+"""Contract tests for scripts/devnet/03-chain.sh (1.5a: EL + BN).
+
+DOCKER/CURL stubs are scratch scripts (P1-A8); disable_socket() via conftest.
+Live chain is skipped unless DEVNET_LIVE=1 and the pinned images are present.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from test_devnet_env import ENV_PATH, parse_env
+
+CHAIN = Path(__file__).resolve().parents[1] / "devnet" / "03-chain.sh"
+
+_ISOLATE_KEYS = (
+    "DOCKER",
+    "CURL",
+    "RUN_DIR",
+    "FORCE",
+    "PROFILE",
+    "DRY_RUN",
+    "INTERACTIVE",
+    "DEVNET_STAGE_DIR",
+    "DATA_DIR",
+    "RUNS_DIR",
+    "CHAIN_ID",
+    "EPOCHS",
+    "DOPPELGANGER",
+    "FAIL_UNDER",
+    "IMG_GETH",
+    "IMG_LIGHTHOUSE",
+    "IMG_GENESIS",
+    "CHAIN_WAIT_ATTEMPTS",
+    "CHAIN_WAIT_SLEEP",
+    "BEACON_TESTNET_DIR",
+    "CURL_HEALTH_CODE",
+    "CURL_HEAD_SLOT",
+    "CURL_SYNC_DISTANCE",
+    "CURL_SECONDS_PER_SLOT",
+    "CURL_CURRENT_VERSION",
+    "CURL_CHAIN_ID_RESULT",
+)
+
+_MNEMONIC = "test test test test test test test test test test test junk"
+_GVR = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+_GVR_B = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+_JWT = "ab" * 32
+
+
+def write_docker_stub(tmp_path: Path) -> tuple[Path, Path]:
+    log = tmp_path / "docker.log"
+    state = tmp_path / "docker-state"
+    state.mkdir()
+    stub = tmp_path / "docker"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"log={shlex.quote(str(log))}\n"
+        f"state={shlex.quote(str(state))}\n"
+        "running=\"$state/running\"\n"
+        "all=\"$state/all\"\n"
+        "networks=\"$state/networks\"\n"
+        "touch \"$running\" \"$all\" \"$networks\"\n"
+        "printf '%s\\n' \"$*\" >> \"$log\"\n"
+        "cmd=\"$1\"\n"
+        "shift || true\n"
+        "dump_inv() {\n"
+        "  printf 'INV_BEFORE\\n' >> \"$log\"\n"
+        "  if [ -n \"${RUN_DIR:-}\" ] && [ -f \"$RUN_DIR/inventory.json\" ]; then\n"
+        "    cat \"$RUN_DIR/inventory.json\" >> \"$log\"\n"
+        "  fi\n"
+        "  printf 'INV_END\\n' >> \"$log\"\n"
+        "}\n"
+        "remove_name() {\n"
+        "  name=\"$1\"\n"
+        "  file=\"$2\"\n"
+        "  if [ -f \"$file\" ]; then\n"
+        "    grep -Fxv -- \"$name\" \"$file\" > \"$file.tmp\" || true\n"
+        "    mv \"$file.tmp\" \"$file\"\n"
+        "  fi\n"
+        "}\n"
+        "case \"$cmd\" in\n"
+        "  ps)\n"
+        "    allflag=0\n"
+        "    for a in \"$@\"; do\n"
+        "      if [ \"$a\" = \"-a\" ]; then allflag=1; fi\n"
+        "    done\n"
+        "    if [ \"$allflag\" -eq 1 ]; then cat \"$all\"; else cat \"$running\"; fi\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  network)\n"
+        "    sub=\"${1:-}\"\n"
+        "    shift || true\n"
+        "    case \"$sub\" in\n"
+        "      ls)\n"
+        "        cat \"$networks\"\n"
+        "        exit 0\n"
+        "        ;;\n"
+        "      create)\n"
+        "        dump_inv\n"
+        "        printf '%s\\n' \"$1\" >> \"$networks\"\n"
+        "        exit 0\n"
+        "        ;;\n"
+        "      rm)\n"
+        "        remove_name \"$1\" \"$networks\"\n"
+        "        exit 0\n"
+        "        ;;\n"
+        "    esac\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  run)\n"
+        "    dump_inv\n"
+        "    name=\"\"\n"
+        "    detached=0\n"
+        "    is_init=0\n"
+        "    prev=\"\"\n"
+        "    for a in \"$@\"; do\n"
+        "      if [ \"$prev\" = \"--name\" ]; then name=\"$a\"; fi\n"
+        "      case \"$a\" in\n"
+        "        --name=*) name=\"${a#--name=}\" ;;\n"
+        "        -d|--detach) detached=1 ;;\n"
+        "        init) is_init=1 ;;\n"
+        "      esac\n"
+        "      prev=\"$a\"\n"
+        "    done\n"
+        "    if [ \"$is_init\" -eq 1 ] && [ -n \"${EL_DATA_DIR:-}\" ]; then\n"
+        "      mkdir -p \"$EL_DATA_DIR/geth/chaindata\"\n"
+        "    fi\n"
+        "    if [ -n \"$name\" ]; then\n"
+        "      printf '%s\\n' \"$name\" >> \"$all\"\n"
+        "      if [ \"$detached\" -eq 1 ]; then\n"
+        "        printf '%s\\n' \"$name\" >> \"$running\"\n"
+        "      fi\n"
+        "    fi\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  rm)\n"
+        "    for a in \"$@\"; do\n"
+        "      case \"$a\" in\n"
+        "        -*|--) ;;\n"
+        "        *)\n"
+        "          remove_name \"$a\" \"$running\"\n"
+        "          remove_name \"$a\" \"$all\"\n"
+        "          ;;\n"
+        "      esac\n"
+        "    done\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  stop)\n"
+        "    for a in \"$@\"; do\n"
+        "      case \"$a\" in\n"
+        "        -*|--) ;;\n"
+        "        *) remove_name \"$a\" \"$running\" ;;\n"
+        "      esac\n"
+        "    done\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  logs)\n"
+        "    printf 'stub logs for %s\\n' \"$*\"\n"
+        "    if [ -n \"${MNEMONIC:-}\" ]; then\n"
+        "      printf 'leak-mnemonic %s\\n' \"$MNEMONIC\"\n"
+        "    fi\n"
+        "    printf 'leak-jwt aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub, log
+
+
+def write_curl_stub(tmp_path: Path) -> tuple[Path, Path]:
+    log = tmp_path / "curl.log"
+    stub = tmp_path / "curl"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+        "args=\"$*\"\n"
+        "case \"$args\" in\n"
+        "  *eth_chainId*)\n"
+        "    printf '%s\\n' \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"result\\\":\\\"${CURL_CHAIN_ID_RESULT:-0x539}\\\",\\\"id\\\":1}\"\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  *node/health*)\n"
+        "    printf '%s' \"${CURL_HEALTH_CODE:-206}\"\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  *node/syncing*)\n"
+        "    printf '%s\\n' \"{\\\"data\\\":{\\\"head_slot\\\":\\\"${CURL_HEAD_SLOT:-0}\\\",\\\"sync_distance\\\":\\\"${CURL_SYNC_DISTANCE:-2}\\\",\\\"is_syncing\\\":true,\\\"is_optimistic\\\":false,\\\"el_offline\\\":false}}\"\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  *config/spec*)\n"
+        "    printf '%s\\n' \"{\\\"data\\\":{\\\"SECONDS_PER_SLOT\\\":\\\"${CURL_SECONDS_PER_SLOT:-12}\\\",\\\"ELECTRA_FORK_VERSION\\\":\\\"${ELECTRA_FORK_VERSION:-0x60000000}\\\"}}\"\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  *states/head/fork*)\n"
+        "    printf '%s\\n' \"{\\\"data\\\":{\\\"previous_version\\\":\\\"${CURL_CURRENT_VERSION:-0x60000000}\\\",\\\"current_version\\\":\\\"${CURL_CURRENT_VERSION:-0x60000000}\\\",\\\"epoch\\\":\\\"0\\\"}}\"\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n"
+        "printf '%s\\n' '{\"error\":\"unscripted curl\"}' >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub, log
+
+
+def seed_genesis(data: Path) -> None:
+    jwt = data / "jwt"
+    genesis = data / "genesis"
+    jwt.mkdir(parents=True)
+    genesis.mkdir(parents=True)
+    (jwt / "jwt.hex").write_text(_JWT, encoding="utf-8")
+    (jwt / "jwt.hex").chmod(0o600)
+    (genesis / "genesis.json").write_text("{}\n", encoding="utf-8")
+    (genesis / "genesis.ssz").write_bytes(b"ssz")
+    (genesis / "config.yaml").write_text(
+        "PRESET_BASE: 'mainnet'\nSLOT_DURATION_MS: 12000\nELECTRA_FORK_EPOCH: 0\n",
+        encoding="utf-8",
+    )
+    (genesis / "genesis_validators_root.txt").write_text(_GVR + "\n", encoding="utf-8")
+
+
+def chain_env(
+    tmp_path: Path,
+    extra: dict[str, str] | None = None,
+    *,
+    docker: Path | None = None,
+    curl: Path | None = None,
+) -> dict[str, str]:
+    full = os.environ.copy()
+    for key in _ISOLATE_KEYS:
+        full.pop(key, None)
+    full["DOCKER"] = str(docker or (tmp_path / "docker"))
+    full["CURL"] = str(curl or (tmp_path / "curl"))
+    full["DATA_DIR"] = str(tmp_path / "data")
+    full["RUNS_DIR"] = str(tmp_path / "runs")
+    full["RUN_DIR"] = str(tmp_path / "run")
+    full["CHAIN_WAIT_ATTEMPTS"] = "1"
+    full["CHAIN_WAIT_SLEEP"] = "0"
+    if extra:
+        full.update(extra)
+    return full
+
+
+def run_chain(
+    tmp_path: Path,
+    args: list[str] | tuple[str, ...] = (),
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float = 20,
+    docker: Path | None = None,
+    curl: Path | None = None,
+    log: Path | None = None,
+    seed: bool = True,
+) -> tuple[subprocess.CompletedProcess[str], Path]:
+    if docker is None:
+        stub, log_path = write_docker_stub(tmp_path)
+    else:
+        stub = docker
+        log_path = log or (tmp_path / "docker.log")
+    if curl is None:
+        curl_stub, _ = write_curl_stub(tmp_path)
+    else:
+        curl_stub = curl
+    if seed:
+        seed_genesis(tmp_path / "data")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    full = chain_env(tmp_path, env, docker=stub, curl=curl_stub)
+    proc = subprocess.run(
+        ["bash", str(CHAIN), "--run-dir", str(run_dir), *args],
+        capture_output=True,
+        text=True,
+        env=full,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
+    )
+    return proc, log_path
+
+
+def source_chain(
+    tmp_path: Path,
+    snippet: str,
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float = 10,
+) -> subprocess.CompletedProcess[str]:
+    write_docker_stub(tmp_path)
+    write_curl_stub(tmp_path)
+    seed_genesis(tmp_path / "data")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    full = chain_env(tmp_path, env)
+    return subprocess.run(
+        ["bash", "-c", f"source {shlex.quote(str(CHAIN))}; {snippet}"],
+        capture_output=True,
+        text=True,
+        env=full,
+        timeout=timeout,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def stub_cmds(log: Path) -> list[str]:
+    if not log.is_file():
+        return []
+    return [
+        line
+        for line in log.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.startswith("INV_")
+        and not line.startswith("{")
+        and line != "INV_END"
+        and line != "INV_BEFORE"
+    ]
+
+
+def run_cmds(cmds: list[str]) -> list[str]:
+    return [c for c in cmds if c.startswith("run ")]
+
+
+def detach_cmds(cmds: list[str]) -> list[str]:
+    return [c for c in run_cmds(cmds) if " -d " in f" {c} "]
+
+
+def named_cmds(cmds: list[str], name: str) -> list[str]:
+    needle = f"--name {name}"
+    eq = f"--name={name}"
+    return [c for c in cmds if needle in c or eq in c]
+
+
+def inventory_rows(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        return []
+    return [
+        json.loads(line)
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def inventory_at_cmd(log: Path, predicate) -> list[dict[str, str]] | None:
+    lines = log.read_text(encoding="utf-8").splitlines() if log.is_file() else []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if predicate(line):
+            j = i + 1
+            while j < len(lines) and lines[j] != "INV_BEFORE":
+                j += 1
+            if j >= len(lines):
+                return None
+            rows: list[dict[str, str]] = []
+            j += 1
+            while j < len(lines) and lines[j] != "INV_END":
+                if lines[j].strip():
+                    rows.append(json.loads(lines[j]))
+                j += 1
+            return rows
+        i += 1
+    return None
+
+
+def assert_no_secret(proc: subprocess.CompletedProcess[str]) -> None:
+    blob = proc.stdout + proc.stderr
+    assert _MNEMONIC not in blob
+    assert _JWT not in blob
+
+
+def named_kinds(rows: list[dict[str, str]]) -> set[tuple[str, str]]:
+    return {(r["kind"], r["name"]) for r in rows}
+
+
+def test_chain_sh_exists_and_syntax():
+    assert CHAIN.is_file(), CHAIN
+    proc = subprocess.run(
+        ["bash", "-n", str(CHAIN)], capture_output=True, text=True
+    )
+    assert proc.returncode == 0, proc.stderr
+    text = CHAIN.read_text(encoding="utf-8")
+    assert re.search(r"(?m)^\s*read\s", text) is None
+    assert "read -p" not in text
+    assert "source" in text and "lib/common.sh" in text
+    assert "start_geth()" in text
+    assert "start_beacon()" in text
+    assert "wait_for_chain()" in text
+    assert "assert_head_fork_electra()" in text
+    assert "docker_run_as_user" in text
+    assert "inventory_append" in text
+    assert "capture_container_logs" in text
+    assert "--nodiscover" in text
+    assert "--syncmode=full" in text
+    assert "--gcmode=archive" in text
+    assert "--subscribe-all-subnets" in text
+    assert "--metrics" in text
+    assert "--testnet-dir=" in text
+    assert "--execution-endpoint=" in text
+    assert "${GETH_CONTAINER}:8551" in text
+    assert "127.0.0.1:${EL_RPC_PORT}:8545" in text
+    assert "127.0.0.1:${CL_HTTP_PORT}:5052" in text
+    assert "127.0.0.1:${CL_METRICS_PORT}:5054" in text
+    assert "127.0.0.1:${EL_AUTH_PORT}:8551" not in text
+    assert "--slots-per-restore-point" not in text
+    assert "validator_client" not in text
+    assert "head_slot + sync_distance" in text or "head_slot+sync_distance" in text
+    assert re.search(r'(?m)^\s*docker\s', text) is None
+    assert '"$DOCKER"' in text
+    assert '"$CURL"' in text
+
+
+def test_inventory_appended_before_create(tmp_path: Path):
+    proc, log = run_chain(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    assert_no_secret(proc)
+    run_dir = tmp_path / "run"
+    rows = inventory_rows(run_dir / "inventory.json")
+    kinds = named_kinds(rows)
+    assert ("network", "eth-devnet-network") in kinds
+    assert ("container", "eth-devnet-geth") in kinds
+    assert ("datadir", "el") in kinds
+    assert ("datadir", "cl") in kinds
+    el = next(r for r in rows if r["kind"] == "datadir" and r["name"] == "el")
+    cl = next(r for r in rows if r["kind"] == "datadir" and r["name"] == "cl")
+    assert el["path"].endswith("/el")
+    assert cl["path"].endswith("/cl")
+
+    net_inv = inventory_at_cmd(log, lambda c: c.startswith("network create "))
+    assert net_inv is not None
+    assert ("network", "eth-devnet-network") in named_kinds(net_inv)
+
+    geth_inv = inventory_at_cmd(
+        log,
+        lambda c: c.startswith("run ") and "eth-devnet-geth" in c and " init " not in f" {c} ",
+    )
+    if geth_inv is None:
+        geth_inv = inventory_at_cmd(log, lambda c: c.startswith("run ") and " init " in f" {c} ")
+    assert geth_inv is not None
+    geth_kinds = named_kinds(geth_inv)
+    assert ("container", "eth-devnet-geth") in geth_kinds
+    assert ("datadir", "el") in geth_kinds
+
+    bn_inv = inventory_at_cmd(
+        log, lambda c: c.startswith("run ") and "beacon_node" in c
+    )
+    assert bn_inv is not None
+    bn_kinds = named_kinds(bn_inv)
+    assert ("datadir", "cl") in bn_kinds
+    assert ("network", "eth-devnet-network") in bn_kinds
+    cmds = stub_cmds(log)
+    create_idx = next(i for i, c in enumerate(cmds) if c.startswith("network create "))
+    # inventory_append is a bash-side write; the stub snapshot at create proves the row existed.
+    assert create_idx >= 0
+
+
+def test_force_recreates_both_containers(tmp_path: Path):
+    proc1, log = run_chain(tmp_path)
+    assert proc1.returncode == 0, proc1.stderr
+    first = stub_cmds(log)
+    first_detach = detach_cmds(first)
+    assert named_cmds(first_detach, "eth-devnet-geth")
+    assert named_cmds(first_detach, "eth-devnet-beacon")
+    first_inits = [c for c in first if c.startswith("run ") and " init " in f" {c} "]
+    assert len(first_inits) == 1
+
+    proc2, _ = run_chain(
+        tmp_path,
+        ["--force"],
+        docker=tmp_path / "docker",
+        curl=tmp_path / "curl",
+        log=log,
+        seed=False,
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    assert_no_secret(proc2)
+    cmds = stub_cmds(log)
+    rms = [c for c in cmds if c.startswith("rm ")]
+    assert any("eth-devnet-geth" in c for c in rms)
+    assert any("eth-devnet-beacon" in c for c in rms)
+    detach = detach_cmds(cmds)
+    geth_d = named_cmds(detach, "eth-devnet-geth")
+    bn_d = named_cmds(detach, "eth-devnet-beacon")
+    assert len(geth_d) == 2, geth_d
+    assert len(bn_d) == 2, bn_d
+    inits = [c for c in cmds if c.startswith("run ") and " init " in f" {c} "]
+    assert len(inits) == 1
+    rows = inventory_rows(tmp_path / "run" / "inventory.json")
+    kinds = named_kinds(rows)
+    assert ("network", "eth-devnet-network") in kinds
+    assert ("container", "eth-devnet-geth") in kinds
+    assert ("datadir", "el") in kinds
+    assert ("datadir", "cl") in kinds
+    assert [k for k in kinds if k[0] == "container" and k[1] == "eth-devnet-geth"]
+
+
+def test_second_run_with_both_running_is_noop(tmp_path: Path):
+    proc1, log = run_chain(tmp_path)
+    assert proc1.returncode == 0, proc1.stderr
+    first = stub_cmds(log)
+    proc2, _ = run_chain(
+        tmp_path,
+        docker=tmp_path / "docker",
+        curl=tmp_path / "curl",
+        log=log,
+        seed=False,
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    assert_no_secret(proc2)
+    assert "already running" in proc2.stderr
+    second = stub_cmds(log)
+    assert run_cmds(second) == run_cmds(first)
+    assert [c for c in second if c.startswith("network create ")] == [
+        c for c in first if c.startswith("network create ")
+    ]
+
+
+def test_wrong_testnet_dir_exits_1_with_logs_and_inventory(tmp_path: Path):
+    proc, log = run_chain(
+        tmp_path,
+        env={
+            "BEACON_TESTNET_DIR": "/wrong",
+            "CURL_HEALTH_CODE": "503",
+        },
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    beacon_log = tmp_path / "run" / "logs" / "eth-devnet-beacon.log"
+    assert beacon_log.is_file(), proc.stderr
+    log_text = beacon_log.read_text(encoding="utf-8")
+    assert "stub logs" in log_text
+    assert _MNEMONIC not in log_text
+    assert "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" not in log_text
+    assert "<redacted>" in log_text
+    rows = inventory_rows(tmp_path / "run" / "inventory.json")
+    kinds = named_kinds(rows)
+    assert ("network", "eth-devnet-network") in kinds
+    assert ("container", "eth-devnet-geth") in kinds
+    assert ("datadir", "el") in kinds
+    assert ("datadir", "cl") in kinds
+    cmds = stub_cmds(log)
+    bn = [c for c in cmds if c.startswith("run ") and "beacon_node" in c]
+    assert bn, cmds
+    assert "--testnet-dir=/wrong" in bn[0]
+    assert "--slots-per-restore-point" not in bn[0]
+
+
+def test_missing_genesis_exits_2(tmp_path: Path):
+    proc, log = run_chain(tmp_path, seed=False)
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "01-genesis.sh" in proc.stderr
+    assert stub_cmds(log) == []
+
+
+def test_chain_id_1_exits_2(tmp_path: Path):
+    proc, log = run_chain(tmp_path, env={"CHAIN_ID": "1"})
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "1337" in proc.stderr
+    assert stub_cmds(log) == []
+    assert_no_secret(proc)
+
+
+def test_dry_run_exits_0_without_docker_run(tmp_path: Path):
+    proc, log = run_chain(tmp_path, ["--dry-run"])
+    assert proc.returncode == 0, proc.stderr
+    assert run_cmds(stub_cmds(log)) == []
+    assert "chain plan" in proc.stderr
+    assert "start_geth" in proc.stderr
+    assert_no_secret(proc)
+
+
+def test_geth_and_beacon_use_docker_run_as_user(tmp_path: Path):
+    proc, log = run_chain(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    uid = os.getuid()
+    gid = os.getgid()
+    prefix = f"run -u {uid}:{gid}"
+    cmds = run_cmds(stub_cmds(log))
+    assert cmds
+    assert all(c.startswith(prefix) for c in cmds), cmds
+    geth = named_cmds(detach_cmds(cmds), "eth-devnet-geth")
+    bn = [c for c in cmds if "beacon_node" in c]
+    assert geth
+    assert "--nodiscover" in geth[0]
+    assert "--syncmode=full" in geth[0]
+    assert "--gcmode=archive" in geth[0]
+    assert "--authrpc.jwtsecret=/jwt/jwt.hex" in geth[0]
+    assert bn
+    assert "--metrics" in bn[0]
+    assert "--subscribe-all-subnets" in bn[0]
+    assert "--execution-endpoint=http://eth-devnet-geth:8551" in bn[0]
+    assert "--testnet-dir=/genesis" in bn[0]
+    assert "--slots-per-restore-point" not in bn[0]
+    assert "127.0.0.1:8545:8545" in geth[0]
+    assert "127.0.0.1:8551:8551" not in geth[0]
+    assert " -p 8551:" not in f" {geth[0]} "
+    assert "127.0.0.1:5052:5052" in bn[0]
+    assert "127.0.0.1:5054:5054" in bn[0]
+    img = parse_env(ENV_PATH)
+    assert img["IMG_GETH"] in geth[0]
+    assert img["IMG_LIGHTHOUSE"] in bn[0]
+
+
+def test_assert_head_fork_electra_rejects_fulu(tmp_path: Path):
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; resolve_run_dir >/dev/null; "
+        "assert_head_fork_electra",
+        env={"CURL_CURRENT_VERSION": "0x70000000"},
+    )
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+    assert "0x70000000" in proc.stderr
+    assert "ELECTRA_FORK_VERSION" in proc.stderr
+    beacon_log = tmp_path / "run" / "logs" / "eth-devnet-beacon.log"
+    assert beacon_log.is_file()
+
+
+def test_assert_head_fork_electra_rejects_wrong_seconds(tmp_path: Path):
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; resolve_run_dir >/dev/null; "
+        "assert_head_fork_electra",
+        env={"CURL_SECONDS_PER_SLOT": "6"},
+    )
+    assert proc.returncode == 1
+    assert "SECONDS_PER_SLOT" in proc.stderr
+    assert "6" in proc.stderr
+
+
+def test_unknown_flag_exits_2(tmp_path: Path):
+    proc, log = run_chain(tmp_path, ["--nope"])
+    assert proc.returncode == 2
+    assert "unknown flag" in proc.stderr
+    assert stub_cmds(log) == []
+
+
+def test_health_206_clock_slot_zero_head_passes(tmp_path: Path):
+    """Live BN-only path: health 206, canonical head_slot=0, clock = sync_distance."""
+    proc, _ = run_chain(
+        tmp_path,
+        env={
+            "CURL_HEALTH_CODE": "206",
+            "CURL_HEAD_SLOT": "0",
+            "CURL_SYNC_DISTANCE": "2",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert "clock slot > 1" in proc.stderr
+    assert_no_secret(proc)
+
+
+def test_clock_slot_not_advanced_exits_1(tmp_path: Path):
+    proc, _ = run_chain(
+        tmp_path,
+        env={
+            "CURL_HEALTH_CODE": "206",
+            "CURL_HEAD_SLOT": "0",
+            "CURL_SYNC_DISTANCE": "1",
+        },
+    )
+    assert proc.returncode == 1
+    assert proc.stdout == ""
+    assert "clock slot" in proc.stderr
+    beacon_log = tmp_path / "run" / "logs" / "eth-devnet-beacon.log"
+    assert beacon_log.is_file()
+
+
+def test_gvr_mismatch_without_force_exits_2(tmp_path: Path):
+    seed_genesis(tmp_path / "data")
+    el = tmp_path / "data" / "el"
+    el.mkdir()
+    (el / "genesis_validators_root.txt").write_text(_GVR_B + "\n", encoding="utf-8")
+    (el / "geth" / "chaindata").mkdir(parents=True)
+    proc, log = run_chain(tmp_path, seed=False)
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    assert "--force" in proc.stderr
+    assert "GVR" in proc.stderr
+    assert run_cmds(stub_cmds(log)) == []
+
+
+def test_force_mismatched_gvr_reinits_geth(tmp_path: Path):
+    proc1, log = run_chain(tmp_path)
+    assert proc1.returncode == 0, proc1.stderr
+    el_gvr = tmp_path / "data" / "el" / "genesis_validators_root.txt"
+    assert el_gvr.read_text(encoding="utf-8").strip() == _GVR
+    el_gvr.write_text(_GVR_B + "\n", encoding="utf-8")
+    proc2, _ = run_chain(
+        tmp_path,
+        ["--force"],
+        docker=tmp_path / "docker",
+        curl=tmp_path / "curl",
+        log=log,
+        seed=False,
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    assert el_gvr.read_text(encoding="utf-8").strip() == _GVR
+    inits = [c for c in stub_cmds(log) if c.startswith("run ") and " init " in f" {c} "]
+    assert len(inits) == 2, inits
+
+
+def test_matching_gvr_stamp_is_not_overwritten(tmp_path: Path):
+    proc = source_chain(
+        tmp_path,
+        "parse_common_flags --run-dir \"$RUN_DIR\"; "
+        "mkdir -p \"$EL_DATA_DIR\"; "
+        "printf '%s\\n' '0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' "
+        "> \"$EL_DATA_DIR/genesis_validators_root.txt\"; "
+        "_stamp_gvr \"$EL_DATA_DIR\"; "
+        "cat \"$EL_DATA_DIR/genesis_validators_root.txt\"",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+
+def test_jwt_symlink_exits_2(tmp_path: Path):
+    seed_genesis(tmp_path / "data")
+    jwt = tmp_path / "data" / "jwt" / "jwt.hex"
+    victim = tmp_path / "victim"
+    victim.write_text("untouched\n", encoding="utf-8")
+    jwt.unlink()
+    jwt.symlink_to(victim)
+    proc, log = run_chain(tmp_path, seed=False)
+    assert proc.returncode == 2
+    assert "symlink" in proc.stderr
+    assert victim.read_text(encoding="utf-8") == "untouched\n"
+    assert stub_cmds(log) == []
+
+
+def test_jwt_mode_0644_exits_2(tmp_path: Path):
+    seed_genesis(tmp_path / "data")
+    jwt = tmp_path / "data" / "jwt" / "jwt.hex"
+    jwt.chmod(0o644)
+    proc, log = run_chain(tmp_path, seed=False)
+    assert proc.returncode == 2
+    assert "0600" in proc.stderr
+    assert stub_cmds(log) == []
+
+
+def test_host_binds_loopback_and_skips_authrpc_publish(tmp_path: Path):
+    proc, log = run_chain(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    cmds = run_cmds(stub_cmds(log))
+    geth = named_cmds(detach_cmds(cmds), "eth-devnet-geth")
+    bn = [c for c in cmds if "beacon_node" in c]
+    assert geth and bn
+    assert "-p 127.0.0.1:8545:8545" in geth[0]
+    assert "8551:8551" not in geth[0]
+    assert "-p 127.0.0.1:5052:5052" in bn[0]
+    assert "-p 127.0.0.1:5054:5054" in bn[0]
+
+
+def _live_chain_available() -> bool:
+    if os.environ.get("DEVNET_LIVE") != "1":
+        return False
+    docker = shutil.which("docker")
+    if docker is None:
+        return False
+    info = subprocess.run(
+        [docker, "info"],
+        capture_output=True,
+        timeout=15,
+        stdin=subprocess.DEVNULL,
+    )
+    if info.returncode != 0:
+        return False
+    env = parse_env(ENV_PATH)
+    for key in ("IMG_GETH", "IMG_LIGHTHOUSE", "IMG_GENESIS"):
+        inspect = subprocess.run(
+            [docker, "image", "inspect", "--", env[key]],
+            capture_output=True,
+            timeout=15,
+            stdin=subprocess.DEVNULL,
+        )
+        if inspect.returncode != 0:
+            return False
+    return True
+
+
+@pytest.mark.skipif(not _live_chain_available(), reason="DEVNET_LIVE=1 and pinned images required")
+def test_live_electra_head(tmp_path: Path):
+    pytest.importorskip("pytest_socket")
+    docker = shutil.which("docker")
+    assert docker is not None
+    genesis = Path(__file__).resolve().parents[1] / "devnet" / "01-genesis.sh"
+    data = tmp_path / "data"
+    runs = tmp_path / "runs"
+    run_dir = tmp_path / "run"
+    env = os.environ.copy()
+    for key in _ISOLATE_KEYS:
+        env.pop(key, None)
+    env["DATA_DIR"] = str(data)
+    env["RUNS_DIR"] = str(runs)
+    env["EL_RPC_PORT"] = "18545"
+    env["EL_AUTH_PORT"] = "18551"
+    env["CL_HTTP_PORT"] = "15052"
+    env["CL_METRICS_PORT"] = "15054"
+    env["CHAIN_WAIT_ATTEMPTS"] = "90"
+    env["CHAIN_WAIT_SLEEP"] = "2"
+    gen = subprocess.run(
+        ["bash", str(genesis), "--run-dir", str(run_dir)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+        stdin=subprocess.DEVNULL,
+    )
+    assert gen.returncode == 0, gen.stderr
+    proc = subprocess.run(
+        ["bash", str(CHAIN), "--run-dir", str(run_dir)],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=240,
+        stdin=subprocess.DEVNULL,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert_no_secret(proc)
+    assert "Electra" in proc.stderr or "0x60000000" in proc.stderr
