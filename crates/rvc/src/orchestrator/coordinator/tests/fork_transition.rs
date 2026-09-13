@@ -15,9 +15,16 @@ fn test_fork_name_electra_detection() {
     let fork_name = ForkName::from_epoch(50, &schedule);
     assert!(utils::zeroes_committee_index(fork_name));
 
-    // Post-Electra
-    let fork_name = ForkName::from_epoch(100, &schedule);
+    // Post-Electra: 69 is last Fulu / last EIP-7549 zeroing epoch (Gloas at 70).
+    let fork_name = ForkName::from_epoch(69, &schedule);
     assert!(utils::zeroes_committee_index(fork_name));
+}
+
+#[test]
+fn test_fork_name_gloas_detection() {
+    let schedule = create_test_fork_schedule();
+    assert_eq!(ForkName::from_epoch(69, &schedule), ForkName::Fulu);
+    assert_eq!(ForkName::from_epoch(70, &schedule), ForkName::Gloas);
 }
 
 /// Builds an orchestrator with a CapturingSubmitter for fork transition tests.
@@ -145,6 +152,118 @@ async fn mount_attestation_mocks(mock_server: &wiremock::MockServer, slot: u64, 
         })))
         .mount(mock_server)
         .await;
+}
+
+/// Mounts Gloas PTC HTTP endpoints on the mock server for a given slot.
+async fn mount_gloas_mocks(mock_server: &wiremock::MockServer, slot: u64, pubkey_hex: &str) {
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let epoch = slot / SLOTS_PER_EPOCH;
+
+    Mock::given(method("POST"))
+        .and(path(format!("/eth/v1/validator/duties/ptc/{epoch}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey_hex,
+                "validator_index": "42",
+                "slot": slot.to_string()
+            }]
+        })))
+        .mount(mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(query_param("slot", slot.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "slot": slot.to_string(),
+                "payload_present": true,
+                "blob_data_available": false
+            }
+        })))
+        .mount(mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(mock_server)
+        .await;
+}
+
+fn request_paths(requests: &[wiremock::Request]) -> Vec<String> {
+    requests.iter().map(|r| format!("{} {}", r.method, r.url.path())).collect()
+}
+
+fn hit_ptc_duty(requests: &[wiremock::Request], epoch: u64) -> bool {
+    requests.iter().any(|r| {
+        r.method == wiremock::http::Method::POST
+            && r.url.path() == format!("/eth/v1/validator/duties/ptc/{epoch}")
+    })
+}
+
+fn hit_payload_attestation_data(requests: &[wiremock::Request]) -> bool {
+    requests.iter().any(|r| {
+        r.method == wiremock::http::Method::GET
+            && r.url.path() == "/eth/v1/validator/payload_attestation_data"
+    })
+}
+
+fn hit_payload_attestation_pool(requests: &[wiremock::Request]) -> bool {
+    requests.iter().any(|r| {
+        r.method == wiremock::http::Method::POST
+            && r.url.path() == "/eth/v1/beacon/pool/payload_attestations"
+    })
+}
+
+#[tokio::test]
+async fn test_run_at_gloas_hits_payload_attestation_endpoints() {
+    let mock_server = wiremock::MockServer::start().await;
+
+    // Slot 2240 = epoch 70 = gloas_fork_epoch
+    let slot = 2240u64;
+    let epoch = slot / SLOTS_PER_EPOCH;
+    assert_eq!(epoch, 70, "Slot 2240 should be epoch 70");
+
+    let (mut orchestrator, handle, pubkey_hex, _capturing) =
+        build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+    mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+    mount_gloas_mocks(&mock_server, slot, &pubkey_hex).await;
+
+    // Park at the Gloas payload-attestation offset so `run()` does not sleep.
+    orchestrator.clock.advance_time(9);
+
+    tokio::select! {
+        biased;
+        _ = orchestrator.run() => {}
+        () = async {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            handle.shutdown();
+            std::future::pending::<()>().await;
+        } => {}
+    }
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let paths = request_paths(&requests);
+
+    assert!(
+        hit_ptc_duty(&requests, epoch),
+        "expected POST /eth/v1/validator/duties/ptc/{epoch} from run(), got {paths:?}"
+    );
+    assert!(
+        hit_payload_attestation_data(&requests),
+        "expected GET /eth/v1/validator/payload_attestation_data from run(), got {paths:?}"
+    );
+    assert!(
+        hit_payload_attestation_pool(&requests),
+        "expected POST /eth/v1/beacon/pool/payload_attestations from run(), got {paths:?}"
+    );
 }
 
 #[tokio::test]
