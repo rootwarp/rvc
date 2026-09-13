@@ -283,18 +283,57 @@ Annotate fork changes from the `Fork boundary` log (`fork`, `previous`,
 
 ## Daily soak snapshot
 
-Issue 8.7 adds a repeatable daily snapshot (zero-slashing and PTC gates) and
-documents its invocation here. Until that lands, scrape `/metrics` and evaluate
-the rules by hand. A missing series is unavailable, distinct from a failed
-gate.
+`scripts/gloas_soak_snapshot.sh` (issue 8.7 / #338) turns the soak exit
+criteria into one timestamped JSON per UTC day. It runs
+`scripts/validator_perf.py --json --fail-under target_rate=0.99` for the day's
+epoch window, scrapes rvc `GET /metrics` (`crates/metrics/src/server.rs`), and
+evaluates:
 
-Intended path, not yet written (un-backticked so docs-freshness does not
-require a file that does not exist):
+| Gate | Reads | Fail when |
+|------|-------|-----------|
+| `zero_slashing` | `rvc_validators_slashed_total`, `rvc_slashing_protection_checks_total{result="blocked"}` | any nonzero delta (increase **or** reset/decrease) |
+| `ptc_submission` | 7.6 families `rvc_ptc_attestations_total` / `rvc_ptc_duties_total` (7.6b `success / scheduled`) | rate below 0.99 |
+| `bn_capability` | 8.3 `rvc_bn_capability_state` | any present sample `== 0` |
+| `signer_rejections` | 8.4 `rvc_signer_rejections_total` | any increase |
+| `target_rate` | validator_perf `--fail-under target_rate=0.99` | estimator exit 4 |
 
-- 8.7 soak snapshot: scripts/gloas_soak_snapshot.sh (#338)
+A missing series is **unavailable**, not a failed gate and not a fake zero.
+Failed gates exit 4 and name the gate on stderr (`gate: zero_slashing`).
+Unavailable required series exit 1 (`unavailable: <family>`). Pass exits 0.
+
+Without `--metrics-start`, start is rest-`0` (process-lifetime totals). A
+single scrape after an `rvc` restart cannot see pre-restart slashes: pass
+then means no slashes **since this process started**. Pass `--metrics-start`
+(yesterday's scrape, or soak `metrics-start.txt`) for a true window; a
+decrease versus that start is a counter reset and **fails** the day.
+
+Write the artifact to an operator-named directory **outside** this repository
+— nothing under `scripts/` or the checkout. The file is
+`gloas-soak-YYYY-MM-DD.json` (UTC date; one per day).
 
 ```bash
-# 8.7: snapshot invocation
+# 8.7: snapshot invocation — live scrape, day's epoch window
+./scripts/gloas_soak_snapshot.sh \
+  --out-dir /var/lib/rvc/gloas-soak \
+  --metrics-url http://127.0.0.1:8080/metrics \
+  --from-epoch "$FROM_EPOCH" --to-epoch "$TO_EPOCH" \
+  --validators-config /etc/rvc/validators.toml \
+  --config /etc/rvc/config.toml
+
+# Windowed scrape (detects a counter reset vs yesterday)
+./scripts/gloas_soak_snapshot.sh \
+  --out-dir /var/lib/rvc/gloas-soak \
+  --metrics-url http://127.0.0.1:8080/metrics \
+  --metrics-start /var/lib/rvc/gloas-soak/metrics-yesterday.txt \
+  --from-epoch "$FROM_EPOCH" --to-epoch "$TO_EPOCH" \
+  --validators-config /etc/rvc/validators.toml \
+  --config /etc/rvc/config.toml
+
+# Offline (fixture scrape, no network)
+./scripts/gloas_soak_snapshot.sh \
+  --out-dir /var/lib/rvc/gloas-soak \
+  --metrics /path/to/metrics.txt \
+  --perf-json /path/to/validator_perf.json
 ```
 
 ---
