@@ -128,6 +128,14 @@ fn capability_endpoint_label(endpoint: &str) -> String {
 }
 
 fn publish_capability(endpoint: &str, capability: &str, capable: bool) {
+    #[cfg(not(test))]
+    debug_assert!(
+        bn_capability::ALL.contains(&capability),
+        "capability label `{capability}` is not in bn_capability::ALL"
+    );
+    if !bn_capability::ALL.contains(&capability) {
+        return;
+    }
     let endpoint_label = capability_endpoint_label(endpoint);
     crate::metrics::RVC_BN_CAPABILITY_STATE
         .with_label_values(&[endpoint_label.as_str(), capability])
@@ -2729,6 +2737,72 @@ mod tests {
             capability_endpoint_label("user:secret@host"),
             "unknown",
             "parse failure (or non-http scheme) must not emit userinfo"
+        );
+    }
+
+    #[test]
+    fn test_capability_labels_are_code_derived() {
+        let endpoint = "http://cap-hygiene.example:5052";
+        let _mgr = BnManager::new(BnManagerConfig::new(vec![endpoint.to_string()]))
+            .expect("valid endpoint");
+
+        let series = crate::metrics::gather_capability_state_series();
+        assert!(!series.is_empty(), "rvc_bn_capability_state must emit at least one series");
+        for (_ep, cap) in &series {
+            assert!(
+                bn_capability::ALL.contains(&cap.as_str()),
+                "emitted capability {cap:?} is not a member of bn_capability::ALL"
+            );
+        }
+        let caps_for_ep: Vec<&str> =
+            series.iter().filter(|(ep, _)| ep == endpoint).map(|(_, cap)| cap.as_str()).collect();
+        for expected in bn_capability::ALL {
+            assert!(
+                caps_for_ep.contains(expected),
+                "expected code-derived capability {expected} to be emitted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_endpoint_label_carries_no_credentials() {
+        let raw = "http://user:s3cretpw@cap-redact.example:5052/eth/v4/validator/blocks?token=abc";
+        let expected = "http://cap-redact.example:5052";
+        publish_capability(raw, bn_capability::PRODUCE_BLOCK_V4, true);
+        publish_capability(raw, bn_capability::FORK_RECOGNISED, true);
+
+        let series = crate::metrics::gather_capability_state_series();
+        let ours: Vec<&(String, String)> = series
+            .iter()
+            .filter(|(ep, _)| ep.contains("cap-redact.example") || ep.contains("s3cretpw"))
+            .collect();
+        assert!(!ours.is_empty(), "credentialed URL must emit a series; got {series:?}");
+        for (ep, cap) in &ours {
+            assert_eq!(ep, expected, "endpoint must be scheme://host:port without userinfo");
+            assert!(
+                bn_capability::ALL.contains(&cap.as_str()),
+                "emitted capability {cap:?} is not a member of bn_capability::ALL"
+            );
+        }
+        assert!(
+            ours.iter().any(|(_, cap)| cap == bn_capability::PRODUCE_BLOCK_V4),
+            "produce_block_v4 must be labelled with the redacted endpoint"
+        );
+        assert!(
+            !series.iter().any(|(ep, _)| ep.as_str() == raw),
+            "raw userinfo URL must not be a label"
+        );
+    }
+
+    #[test]
+    fn test_unknown_capability_is_not_emitted() {
+        let endpoint = "http://cap-unknown.example:5052";
+        let request_derived = "/eth/v4/validator/blocks";
+        publish_capability(endpoint, request_derived, false);
+        let series = crate::metrics::gather_capability_state_series();
+        assert!(
+            series.iter().all(|(_, cap)| cap != request_derived),
+            "request-derived capability must not be emitted; got {series:?}"
         );
     }
 

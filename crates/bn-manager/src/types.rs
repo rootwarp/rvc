@@ -39,13 +39,13 @@ impl fmt::Display for HealthTier {
     }
 }
 
-/// Bounded `capability` label values for `rvc_bn_capability_state` (issue 6.7).
+/// Bounded `capability` label values for `rvc_bn_capability_state`.
 ///
-/// Code-derived only — never request-derived (cardinality). Issue 8.3 owns
-/// `ALL` membership tests and endpoint-label redaction checks.
+/// Code-derived only — never request-derived (cardinality).
 pub mod bn_capability {
     pub const FORK_RECOGNISED: &str = "fork_recognised";
     pub const PRODUCE_BLOCK_V4: &str = "produce_block_v4";
+    pub const ALL: &[&str] = &[FORK_RECOGNISED, PRODUCE_BLOCK_V4];
 }
 
 /// Tier threshold configuration.
@@ -203,6 +203,14 @@ mod tests {
         assert_eq!(HealthTier::SmallLag.to_string(), "small-lag");
         assert_eq!(HealthTier::LargeLag.to_string(), "large-lag");
         assert_eq!(HealthTier::Unsynced.to_string(), "unsynced");
+    }
+
+    #[test]
+    fn test_bn_capability_all_is_the_closed_code_derived_set() {
+        assert_eq!(
+            bn_capability::ALL,
+            &[bn_capability::FORK_RECOGNISED, bn_capability::PRODUCE_BLOCK_V4]
+        );
     }
 
     #[test]

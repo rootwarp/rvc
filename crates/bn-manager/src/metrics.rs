@@ -60,6 +60,29 @@ pub fn init() {
 }
 
 #[cfg(test)]
+pub(crate) fn gather_capability_state_series() -> Vec<(String, String)> {
+    let gathered = metrics::REGISTRY.gather();
+    let Some(mf) = gathered.iter().find(|m| m.name() == "rvc_bn_capability_state") else {
+        return Vec::new();
+    };
+    mf.get_metric()
+        .iter()
+        .filter_map(|metric| {
+            let mut endpoint = None;
+            let mut capability = None;
+            for label in metric.get_label() {
+                match label.name() {
+                    "endpoint" => endpoint = Some(label.value().to_string()),
+                    "capability" => capability = Some(label.value().to_string()),
+                    _ => {}
+                }
+            }
+            Some((endpoint?, capability?))
+        })
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn init_twice_does_not_panic() {
