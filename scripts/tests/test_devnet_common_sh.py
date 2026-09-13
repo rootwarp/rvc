@@ -83,7 +83,7 @@ def test_source_is_silent_and_hides_mnemonic():
     assert proc.stdout == ""
     assert_no_secret(proc)
     text = COMMON_SH.read_text(encoding="utf-8")
-    assert re.search(r"\bread\b", text) is None
+    assert re.search(r"(?m)^\s*read\s", text) is None
 
 
 def test_wait_for_service_keeps_reference_name():
@@ -232,7 +232,10 @@ def test_resolve_profile_safe():
         '"$EPOCHS" "$DOPPELGANGER" "${FAIL_UNDER-UNSET}"'
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout.strip() == "EPOCHS=8 DOPPELGANGER=on FAIL_UNDER=UNSET"
+    assert proc.stdout.strip() == (
+        "EPOCHS=8 DOPPELGANGER=on "
+        "FAIL_UNDER=participation_rate=0.95,target_rate=0.95"
+    )
     assert_no_secret(proc)
 
 
@@ -586,6 +589,35 @@ def test_capture_container_logs_rejects_unsafe_name(tmp_path: Path):
         assert proc.stdout == ""
         assert "invalid" in proc.stderr
     assert not (run_dir / "logs").exists()
+
+
+def test_capture_container_logs_refuses_symlink_dest(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    logs = run_dir / "logs"
+    logs.mkdir(parents=True)
+    victim = tmp_path / "victim"
+    victim.write_text("UNTOUCHED\n", encoding="utf-8")
+    (logs / "eth-devnet-geth.log").symlink_to(victim)
+    proc = run_common(
+        "parse_common_flags --run-dir \"$RUN_DIR\"; "
+        "capture_container_logs eth-devnet-geth",
+        env={"DOCKER": "/bin/echo", "RUN_DIR": str(run_dir)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert victim.read_text(encoding="utf-8") == "UNTOUCHED\n"
+    assert (logs / "eth-devnet-geth.log").is_symlink()
+
+
+def test_capture_container_logs_skips_file_run_dir(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    run_dir.write_text("not-a-dir\n", encoding="utf-8")
+    proc = run_common(
+        "capture_container_logs eth-devnet-geth",
+        env={"DOCKER": "/bin/echo", "RUN_DIR": str(run_dir)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert run_dir.is_file()
+    assert not Path("/logs/eth-devnet-geth.log").exists()
 
 
 def test_parse_genesis_fields_from_fixture():

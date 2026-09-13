@@ -279,10 +279,13 @@ resolve_profile() {
         fast)
             EPOCHS="${FAST_EPOCHS}"
             DOPPELGANGER="${FAST_DOPPELGANGER}"
+            unset FAIL_UNDER
             ;;
         safe)
             EPOCHS="${SAFE_EPOCHS}"
             DOPPELGANGER="${SAFE_DOPPELGANGER}"
+            FAIL_UNDER="${REPORT_FAIL_UNDER:-}"
+            export FAIL_UNDER
             ;;
         *)
             die_usage "unknown profile: ${profile:-<empty>} (expected fast|safe)"
@@ -792,15 +795,114 @@ remove_resource() {
     return 0
 }
 
+# stdin → DEST. O_NOFOLLOW + O_EXCL random tmp + os.replace. 2 = symlink.
+_atomic_replace_stdin() {
+    local dest="${1:-}"
+    if [[ -z "$dest" ]]; then
+        return 1
+    fi
+    python3 -c '
+import os, sys
+
+dest = sys.argv[1]
+data = sys.stdin.buffer.read()
+directory = os.path.dirname(os.path.abspath(dest))
+if os.path.islink(directory):
+    sys.exit(2)
+if not os.path.isdir(directory):
+    sys.exit(1)
+if os.path.lexists(dest) and os.path.islink(dest):
+    sys.exit(2)
+
+tmp = dest + ".tmp." + os.urandom(16).hex()
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+fd = -1
+try:
+    fd = os.open(tmp, flags, 0o600)
+    if data:
+        os.write(fd, data)
+    os.fchmod(fd, 0o600)
+    os.close(fd)
+    fd = -1
+    if os.path.islink(tmp) or os.path.islink(dest):
+        os.unlink(tmp)
+        sys.exit(2)
+    os.replace(tmp, dest)
+    tmp = ""
+except OSError:
+    sys.exit(1)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    if tmp:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+' "$dest"
+}
+
 capture_container_logs() {
     local name="${1:-}"
-    local log_dir
+    local log_dir dest
+    local -a _pipe
 
     _require_docker_ident "$name" "container name"
 
-    log_dir="$(resolve_run_dir)/logs"
-    mkdir -p -- "$log_dir"
-    "$DOCKER" logs -- "$name" >"${log_dir}/${name}.log" 2>&1 || true
+    # Never $() resolve_run_dir: a failed resolve must not mkdir /logs or
+    # replace a caller's exit code. Return on a bad RUN_DIR.
+    if [[ -z "${RUN_DIR:-}" || "$RUN_DIR" == "/" ]]; then
+        return 0
+    fi
+    if [[ -L "$RUN_DIR" ]]; then
+        return 0
+    fi
+    if [[ -e "$RUN_DIR" && ! -d "$RUN_DIR" ]]; then
+        return 0
+    fi
+    if [[ ! -d "$RUN_DIR" ]]; then
+        mkdir -p -- "$RUN_DIR" || return 0
+        if [[ -L "$RUN_DIR" || ! -d "$RUN_DIR" ]]; then
+            return 0
+        fi
+    fi
+    if ! _mode_octal "$RUN_DIR" >/dev/null; then
+        return 0
+    fi
+    if _is_world_writable "$RUN_DIR"; then
+        return 0
+    fi
+
+    log_dir="${RUN_DIR}/logs"
+    if [[ "$log_dir" == "/logs" ]]; then
+        return 0
+    fi
+    if [[ -L "$log_dir" ]]; then
+        return 0
+    fi
+    if [[ ! -e "$log_dir" ]]; then
+        mkdir -p -- "$log_dir" || return 0
+        if [[ -L "$log_dir" ]]; then
+            return 0
+        fi
+    fi
+    if [[ ! -d "$log_dir" ]]; then
+        return 0
+    fi
+
+    dest="${log_dir}/${name}.log"
+    if [[ -L "$dest" ]]; then
+        return 0
+    fi
+
+    set +e
+    "$DOCKER" logs -- "$name" 2>&1 | _atomic_replace_stdin "$dest"
+    _pipe=("${PIPESTATUS[@]}" 1)
+    set -e
+    if [[ "${_pipe[1]}" -eq 2 ]]; then
+        return 0
+    fi
+    return 0
 }
 
 # Ignore ~/.curlrc (location would turn 302 into 200). Same proto/path flags as BN GET.
