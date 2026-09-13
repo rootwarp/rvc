@@ -176,6 +176,11 @@ impl PayloadAttestationService {
 
         (matching_duties, matching_pubkeys)
     }
+
+    #[cfg(test)]
+    pub(crate) fn slashing_db(&self) -> &slashing::SlashingDb {
+        self.signer.slashing_db()
+    }
 }
 
 #[cfg(test)]

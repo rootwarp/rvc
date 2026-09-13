@@ -156,6 +156,16 @@ async fn mount_attestation_mocks(mock_server: &wiremock::MockServer, slot: u64, 
 
 /// Mounts Gloas PTC HTTP endpoints on the mock server for a given slot.
 async fn mount_gloas_mocks(mock_server: &wiremock::MockServer, slot: u64, pubkey_hex: &str) {
+    mount_gloas_mocks_with_payload_data(mock_server, slot, pubkey_hex, true).await;
+}
+
+/// Same as [`mount_gloas_mocks`], optionally serving HTTP 204 for payload data.
+async fn mount_gloas_mocks_with_payload_data(
+    mock_server: &wiremock::MockServer,
+    slot: u64,
+    pubkey_hex: &str,
+    payload_data_available: bool,
+) {
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, ResponseTemplate};
 
@@ -175,17 +185,22 @@ async fn mount_gloas_mocks(mock_server: &wiremock::MockServer, slot: u64, pubkey
         .mount(mock_server)
         .await;
 
-    Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/payload_attestation_data"))
-        .and(query_param("slot", slot.to_string()))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+    let data_response = if payload_data_available {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": {
                 "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
                 "slot": slot.to_string(),
                 "payload_present": true,
                 "blob_data_available": false
             }
-        })))
+        }))
+    } else {
+        ResponseTemplate::new(204)
+    };
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(query_param("slot", slot.to_string()))
+        .respond_with(data_response)
         .mount(mock_server)
         .await;
 
@@ -219,6 +234,84 @@ fn hit_payload_attestation_pool(requests: &[wiremock::Request]) -> bool {
         r.method == wiremock::http::Method::POST
             && r.url.path() == "/eth/v1/beacon/pool/payload_attestations"
     })
+}
+
+fn ptc_duty_request_count(requests: &[wiremock::Request], epoch: u64) -> usize {
+    requests
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path() == format!("/eth/v1/validator/duties/ptc/{epoch}")
+        })
+        .count()
+}
+
+fn payload_attestation_pool_messages(requests: &[wiremock::Request]) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path() == "/eth/v1/beacon/pool/payload_attestations"
+        })
+        .flat_map(|r| {
+            serde_json::from_slice::<Vec<serde_json::Value>>(&r.body).unwrap_or_else(|e| {
+                panic!("pool/payload_attestations body must be a JSON array: {e}")
+            })
+        })
+        .collect()
+}
+
+fn slashing_row_count(db: &SlashingDb, pubkey_hex: &str) -> usize {
+    let pubkey = pubkey_hex.trim_start_matches("0x");
+    db.get_attestations(pubkey).expect("attestations").len()
+        + db.get_blocks(pubkey).expect("blocks").len()
+}
+
+type ForkTransitionOrchestrator =
+    DutyOrchestrator<MockSlotClock, CapturingSubmitter, MockBlockBeacon>;
+
+fn payload_attestation_due_bps(orchestrator: &ForkTransitionOrchestrator, slot: Slot) -> u64 {
+    let epoch = slot / SLOTS_PER_EPOCH;
+    let fork = ForkName::from_epoch(epoch, &orchestrator.config.fork_schedule);
+    orchestrator.config.deadline_schedule.for_fork(fork).payload_attestation
+}
+
+fn park_at_due_bps(orchestrator: &ForkTransitionOrchestrator, slot: Slot, bps: u64) {
+    use timing::{due_ms, SlotClock};
+
+    let slot_duration_ms = orchestrator.clock.slot_duration().as_millis() as u64;
+    let wait = orchestrator.clock.time_until_due(slot, bps).expect("due");
+    assert_eq!(
+        wait,
+        Duration::from_millis(due_ms(bps, slot_duration_ms)),
+        "MockSlotClock wait must come from the given bps via due_ms"
+    );
+    orchestrator.clock.advance_time(wait.as_secs());
+    assert!(
+        orchestrator.clock.time_until_due(slot, bps).expect("due after park").is_zero(),
+        "MockSlotClock must sit at the configured bps deadline"
+    );
+}
+
+fn park_at_payload_attestation_deadline(orchestrator: &ForkTransitionOrchestrator, slot: Slot) {
+    park_at_due_bps(orchestrator, slot, payload_attestation_due_bps(orchestrator, slot));
+}
+
+async fn run_until_shutdown(
+    orchestrator: &mut ForkTransitionOrchestrator,
+    handle: &OrchestratorHandle,
+) {
+    tokio::select! {
+        biased;
+        result = orchestrator.run() => {
+            result.expect("run() must not error");
+        }
+        () = async {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            handle.shutdown();
+            std::future::pending::<()>().await;
+        } => {}
+    }
 }
 
 #[tokio::test]
@@ -263,6 +356,161 @@ async fn test_run_at_gloas_hits_payload_attestation_endpoints() {
     assert!(
         hit_payload_attestation_pool(&requests),
         "expected POST /eth/v1/beacon/pool/payload_attestations from run(), got {paths:?}"
+    );
+}
+
+/// PTC phase is skipped at epoch 69 (no data GET / pool POST) even though
+/// ungated post-duty fetch POSTs duties/ptc/69. At Gloas, PTC waits for the
+/// configured bps deadline then submits one pool message per validator
+/// without writing a slashing row.
+#[tokio::test]
+async fn test_ptc_duties_absent_before_gloas_fire_at_configured_bps() {
+    use timing::{due_ms, SlotClock};
+
+    // Park at the pre-Gloas aggregate offset so att/agg remaining are zero and
+    // post-duty `fetch_epoch_duties` runs. Fetch is ungated; the phase is not.
+    let pre_slot = 2208u64;
+    let pre_epoch = pre_slot / SLOTS_PER_EPOCH;
+    assert_eq!(pre_epoch, 69, "Slot 2208 should be epoch 69");
+
+    let pre_server = wiremock::MockServer::start().await;
+    let (mut pre_orch, pre_handle, pre_pubkey, _capturing) =
+        build_fork_transition_orchestrator(&pre_server.uri(), pre_slot).await;
+    mount_attestation_mocks(&pre_server, pre_slot, &pre_pubkey).await;
+    mount_gloas_mocks(&pre_server, pre_slot, &pre_pubkey).await;
+
+    let pre_fork = ForkName::from_epoch(pre_epoch, &pre_orch.config.fork_schedule);
+    assert_eq!(pre_fork, ForkName::Fulu);
+    let pre_agg_bps = pre_orch.config.deadline_schedule.for_fork(pre_fork).aggregate;
+    park_at_due_bps(&pre_orch, pre_slot, pre_agg_bps);
+
+    run_until_shutdown(&mut pre_orch, &pre_handle).await;
+
+    let pre_requests = pre_server.received_requests().await.unwrap();
+    let pre_paths = request_paths(&pre_requests);
+    assert!(
+        ptc_duty_request_count(&pre_requests, pre_epoch) >= 1,
+        "ungated fetch_epoch_duties must POST /eth/v1/validator/duties/ptc/{pre_epoch}, got {pre_paths:?}"
+    );
+    assert!(
+        !hit_payload_attestation_data(&pre_requests),
+        "pre-Gloas PTC phase skip: no GET payload_attestation_data, got {pre_paths:?}"
+    );
+    assert!(
+        !hit_payload_attestation_pool(&pre_requests),
+        "pre-Gloas PTC phase skip: no POST pool/payload_attestations, got {pre_paths:?}"
+    );
+
+    // Gloas slot start: MockSlotClock has not reached the configured bps, so
+    // the 1s shutdown must interrupt the wait and skip produce.
+    let slot = 2240u64;
+    let epoch = slot / SLOTS_PER_EPOCH;
+    assert_eq!(epoch, 70, "Slot 2240 should be epoch 70");
+
+    let early_server = wiremock::MockServer::start().await;
+    let (mut early_orch, early_handle, early_pubkey, _early_capturing) =
+        build_fork_transition_orchestrator(&early_server.uri(), slot).await;
+    mount_attestation_mocks(&early_server, slot, &early_pubkey).await;
+    mount_gloas_mocks(&early_server, slot, &early_pubkey).await;
+
+    let early_bps = payload_attestation_due_bps(&early_orch, slot);
+    let slot_duration_ms = early_orch.clock.slot_duration().as_millis() as u64;
+    let early_wait = early_orch.clock.time_until_due(slot, early_bps).expect("gloas due");
+    assert_eq!(
+        early_wait,
+        Duration::from_millis(due_ms(early_bps, slot_duration_ms)),
+        "Gloas slot-start wait must equal config payload_attestation bps via due_ms"
+    );
+    assert!(
+        !early_wait.is_zero(),
+        "Gloas slot start must be before payload_attestation bps={early_bps}"
+    );
+
+    run_until_shutdown(&mut early_orch, &early_handle).await;
+
+    let early_requests = early_server.received_requests().await.unwrap();
+    let early_paths = request_paths(&early_requests);
+    assert!(
+        payload_attestation_pool_messages(&early_requests).is_empty(),
+        "PTC must not submit before the configured bps deadline, got {early_paths:?}"
+    );
+
+    // Park MockSlotClock at the config/bps deadline, then run().
+    let mock_server = wiremock::MockServer::start().await;
+    let (mut orchestrator, handle, pubkey_hex, _capturing) =
+        build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+    mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+    mount_gloas_mocks(&mock_server, slot, &pubkey_hex).await;
+
+    // Attesting off so the slashing snapshot is PTC-only; coexistence with
+    // attestation is the 204 test.
+    orchestrator.attesting_enabled.store(false, Ordering::Relaxed);
+    orchestrator.set_sync_enabled(false);
+
+    let rows_before =
+        slashing_row_count(orchestrator.payload_attestation_service.slashing_db(), &pubkey_hex);
+    park_at_payload_attestation_deadline(&orchestrator, slot);
+    run_until_shutdown(&mut orchestrator, &handle).await;
+    let rows_after =
+        slashing_row_count(orchestrator.payload_attestation_service.slashing_db(), &pubkey_hex);
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let paths = request_paths(&requests);
+    assert!(
+        ptc_duty_request_count(&requests, epoch) >= 1,
+        "expected ≥ 1 POST /eth/v1/validator/duties/ptc/{epoch} at Gloas, got {paths:?}"
+    );
+    let messages = payload_attestation_pool_messages(&requests);
+    assert_eq!(
+        messages.len(),
+        1,
+        "exactly one pool/payload_attestations message per assigned validator, got {messages:?}"
+    );
+    assert_eq!(
+        rows_after, rows_before,
+        "PTC must not write a slashing DB row (before={rows_before} after={rows_after})"
+    );
+}
+
+/// HTTP 204 from payload_attestation_data skips PTC with no fallback; the
+/// attestation duty for the same Gloas slot still succeeds.
+#[tokio::test]
+async fn test_payload_attestation_204_skips_submission_attestation_still_succeeds() {
+    let slot = 2240u64;
+    let epoch = slot / SLOTS_PER_EPOCH;
+    assert_eq!(epoch, 70, "Slot 2240 should be epoch 70");
+
+    let mock_server = wiremock::MockServer::start().await;
+    let (mut orchestrator, handle, pubkey_hex, capturing) =
+        build_fork_transition_orchestrator(&mock_server.uri(), slot).await;
+
+    mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
+    mount_gloas_mocks_with_payload_data(&mock_server, slot, &pubkey_hex, false).await;
+
+    park_at_payload_attestation_deadline(&orchestrator, slot);
+    run_until_shutdown(&mut orchestrator, &handle).await;
+
+    let captured = capturing.captured();
+    assert_eq!(captured.len(), 1, "attestation duty must still submit on PTC 204");
+    match &captured[0] {
+        VersionedAttestation::Gloas(atts) => {
+            assert_eq!(atts.len(), 1, "one Gloas attestation");
+        }
+        other => panic!(
+            "expected Gloas attestation after PTC 204, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let paths = request_paths(&requests);
+    assert!(
+        hit_payload_attestation_data(&requests),
+        "204 path must still GET payload_attestation_data, got {paths:?}"
+    );
+    assert!(
+        payload_attestation_pool_messages(&requests).is_empty(),
+        "204 must not POST pool/payload_attestations (no fallback), got {paths:?}"
     );
 }
 
