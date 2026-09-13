@@ -52,6 +52,8 @@ source "${SCRIPT_DIR}/devnet.env"
 DOCKER="${DOCKER:-docker}"
 CURL="${CURL:-curl}"
 DEVNET_STAGE_DIR="${DEVNET_STAGE_DIR:-$SCRIPT_DIR}"
+VALIDATOR_PERF="${VALIDATOR_PERF:-${SCRIPT_DIR}/../validator_perf.py}"
+DEVNET_REPORT="${DEVNET_REPORT:-${SCRIPT_DIR}/../devnet_report.py}"
 
 DATA_DIR="${DATA_DIR:-${SCRIPT_DIR}/data}"
 RUNS_DIR="${RUNS_DIR:-${SCRIPT_DIR}/runs}"
@@ -75,7 +77,7 @@ PROFILE="${PROFILE:-}"
 RUN_DIR="${RUN_DIR:-}"
 
 export SCRIPT_DIR
-export DOCKER CURL DEVNET_STAGE_DIR
+export DOCKER CURL DEVNET_STAGE_DIR VALIDATOR_PERF DEVNET_REPORT
 export DATA_DIR RUNS_DIR
 export JWT_DIR EL_DATA_DIR CL_DATA_DIR GENESIS_DIR KEYS_DIR RVC_DIR
 export CONTAINER_PREFIX GETH_CONTAINER BEACON_CONTAINER VALIDATOR_CONTAINER DOCKER_NETWORK
@@ -435,6 +437,359 @@ inventory_append() {
     fi
     chmod 0600 "$inventory"
     printf '%s\n' "$row" >>"$inventory"
+}
+
+# Canonical absolute path (symlinks, .., Darwin /tmp → /private/tmp). Empty on failure.
+_canon_path() {
+    local path="${1:-}"
+    local out=""
+    if [[ -z "$path" ]]; then
+        return 0
+    fi
+    out="$(
+        PATH_TO_CANON="$path" python3 -c \
+            'import os,sys; sys.stdout.write(os.path.realpath(os.environ["PATH_TO_CANON"])+"\n")' \
+            2>/dev/null || true
+    )"
+    printf '%s\n' "$out"
+}
+
+# True iff canonical path is DATA_DIR or a descendant, and not under RUNS_DIR.
+_is_under_data_dir() {
+    local path data runs
+    path="$(_canon_path "${1:-}")"
+    data="$(_canon_path "${DATA_DIR:-}")"
+    runs="$(_canon_path "${RUNS_DIR:-}")"
+    path="${path%/}"
+    data="${data%/}"
+    runs="${runs%/}"
+    if [[ -z "$path" || -z "$data" || "$data" == "/" ]]; then
+        return 1
+    fi
+    case "$path" in
+        "$data" | "$data"/*)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    if [[ -n "$runs" && "$runs" != "/" ]]; then
+        case "$path" in
+            "$runs" | "$runs"/*)
+                return 1
+                ;;
+        esac
+    fi
+    return 0
+}
+
+_is_devnet_container_name() {
+    local name="${1:-}"
+    case "$name" in
+        "${CONTAINER_PREFIX}-"*)
+            case "$name" in
+                *[!A-Za-z0-9_.-]*)
+                    return 1
+                    ;;
+            esac
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+# Live process, not a zombie. kill -0 succeeds on zombies (macOS/Linux).
+_pid_live() {
+    local pid="${1:-}"
+    local st
+    case "$pid" in
+        '' | *[!0-9]* | 0 | 1 | "$$")
+            return 1
+            ;;
+    esac
+    kill -0 "$pid" 2>/dev/null || return 1
+    st="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
+    st="$(printf '%s' "$st" | tr -d '[:space:]')"
+    case "$st" in
+        '' | Z*)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+_trim() {
+    local s="${1-}"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+_pid_comm() {
+    local pid="${1:-}"
+    local comm
+    comm="$(ps -p "$pid" -o comm= 2>/dev/null || true)"
+    _trim "$comm"
+}
+
+_pid_args0() {
+    local pid="${1:-}"
+    local out
+    out="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if [[ -z "$(_trim "$out")" ]]; then
+        out="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    fi
+    out="$(_trim "$out")"
+    out="${out%%[[:space:]]*}"
+    printf '%s' "$out"
+}
+
+# Darwin comm= is often an absolute path; Linux is the 15-char basename.
+_basename_is_rvc() {
+    local s="${1:-}"
+    s="${s##*/}"
+    [[ "$s" == "rvc" ]]
+}
+
+_pid_is_rvc() {
+    local pid="${1:-}"
+    _basename_is_rvc "$(_pid_comm "$pid")" && return 0
+    _basename_is_rvc "$(_pid_args0 "$pid")" && return 0
+    return 1
+}
+
+# TERM, poll <= 10s, KILL. Stale (dead or comm/args basename != rvc): skip, no signal.
+stop_rvc() {
+    local pidfile="${1:-}"
+    local pid="" comm="" end
+
+    if [[ -z "$pidfile" ]]; then
+        log_info "skip pid: empty pidfile path"
+        return 0
+    fi
+    if [[ -L "$pidfile" ]]; then
+        log_info "skip pid: refusing symlink ${pidfile}"
+        return 0
+    fi
+    if ! _is_under_data_dir "$pidfile"; then
+        log_info "skip pid: path outside data dir ${pidfile}"
+        return 0
+    fi
+    if [[ ! -f "$pidfile" ]]; then
+        log_info "skip pid: ${pidfile} absent"
+        return 0
+    fi
+
+    pid="$(tr -d '[:space:]' <"$pidfile" 2>/dev/null || true)"
+    case "$pid" in
+        '' | *[!0-9]* | 0 | 1)
+            log_info "skip pid: stale pidfile ${pidfile}"
+            rm -f -- "$pidfile" || true
+            return 0
+            ;;
+    esac
+
+    if ! _pid_live "$pid"; then
+        log_info "skip pid ${pid}: not running"
+        rm -f -- "$pidfile" || true
+        return 0
+    fi
+
+    comm="$(_pid_comm "$pid")"
+    if ! _pid_is_rvc "$pid"; then
+        log_info "skip pid ${pid}: comm=${comm:-unknown} is not rvc"
+        rm -f -- "$pidfile" || true
+        return 0
+    fi
+
+    log_info "stopping rvc pid ${pid}"
+    kill -TERM "$pid" 2>/dev/null || true
+    end=$((SECONDS + 10))
+    while _pid_live "$pid" && ((SECONDS < end)); do
+        sleep 1
+    done
+    if _pid_live "$pid"; then
+        log_warn "rvc pid ${pid} still alive after TERM; sending KILL"
+        kill -KILL "$pid" 2>/dev/null || true
+        end=$((SECONDS + 2))
+        while _pid_live "$pid" && ((SECONDS < end)); do
+            sleep 1
+        done
+    fi
+    if _pid_live "$pid"; then
+        log_warn "rvc pid ${pid} still alive; leaving pidfile"
+        return 0
+    fi
+    rm -f -- "$pidfile" || true
+    return 0
+}
+
+_docker_has_container() {
+    local name="${1:-}"
+    local names ids
+    if [[ -z "$name" ]]; then
+        return 1
+    fi
+    names="$("$DOCKER" ps -a --format '{{.Names}}' 2>/dev/null || true)"
+    if printf '%s\n' "$names" | grep -Fxq -- "$name"; then
+        return 0
+    fi
+    ids="$("$DOCKER" ps -aq 2>/dev/null || true)"
+    if printf '%s\n' "$ids" | grep -Fxq -- "$name"; then
+        return 0
+    fi
+    return 1
+}
+
+_docker_has_network() {
+    local name="${1:-}"
+    local names
+    if [[ -z "$name" ]]; then
+        return 1
+    fi
+    names="$("$DOCKER" network ls --format '{{.Name}}' 2>/dev/null || true)"
+    if printf '%s\n' "$names" | grep -Fxq -- "$name"; then
+        return 0
+    fi
+    return 1
+}
+
+# NDJSON rows from runs/<id>/inventory.json, pid before slashing_db/datadir.
+inventory_rows() {
+    local inventory="${1:-}"
+    local run_dir
+    if [[ -z "$inventory" ]]; then
+        run_dir="${RUN_DIR:-${RUNS_DIR}/standalone}"
+        inventory="${run_dir}/inventory.json"
+    fi
+    if [[ -L "$inventory" || ! -f "$inventory" ]]; then
+        return 0
+    fi
+    jq -s -c '
+        def rank:
+            {"pid":0,"container":1,"network":2,"slashing_db":3,"datadir":4}[.kind] // 5;
+        to_entries
+        | sort_by((.value | rank), -.key)
+        | .[].value
+    ' "$inventory" 2>/dev/null || true
+}
+
+# Fallback when no inventory exists: eth-devnet-* container names + the network.
+inventory_name_scan() {
+    local names
+    names="$("$DOCKER" ps -a --filter "name=${CONTAINER_PREFIX}-" --format '{{.Names}}' 2>/dev/null || true)"
+    printf '%s\n' "$names" | jq -R -c '
+        gsub("\\s+";"") | select(length > 0) | {kind:"container",name:.}
+    ' 2>/dev/null || true
+    jq -nc --arg name "${DOCKER_NETWORK}" '{kind:"network",name:$name}' 2>/dev/null || true
+}
+
+# kinds: container|network|datadir|slashing_db|pid. Absent entries are skips.
+remove_resource() {
+    local kind="${1:-}"
+    local name="${2:-}"
+    local path="${3:-}"
+    local data="" target=""
+
+    case "$kind" in
+        container)
+            name="${name#/}"
+            if [[ -z "$name" ]]; then
+                log_info "skip container: empty name"
+                return 0
+            fi
+            if ! _is_devnet_container_name "$name"; then
+                log_info "skip container ${name}: not ${CONTAINER_PREFIX}-*"
+                return 0
+            fi
+            if _docker_has_container "$name"; then
+                log_info "removing container ${name}"
+                "$DOCKER" rm -f -- "$name" >/dev/null 2>&1 || true
+            else
+                log_info "skip container ${name}: already absent"
+            fi
+            ;;
+        network)
+            if [[ -z "$name" ]]; then
+                log_info "skip network: empty name"
+                return 0
+            fi
+            if [[ "$name" != "$DOCKER_NETWORK" ]]; then
+                log_info "skip network ${name}: not ${DOCKER_NETWORK}"
+                return 0
+            fi
+            if _docker_has_network "$name"; then
+                log_info "removing network ${name}"
+                "$DOCKER" network rm -- "$name" >/dev/null 2>&1 || true
+            else
+                log_info "skip network ${name}: already absent"
+            fi
+            ;;
+        datadir)
+            if [[ -z "$path" ]]; then
+                log_info "skip datadir ${name:-unknown}: no path"
+                return 0
+            fi
+            if [[ -L "$path" ]]; then
+                log_info "skip datadir ${name:-unknown}: refusing symlink ${path}"
+                return 0
+            fi
+            if ! _is_under_data_dir "$path"; then
+                log_info "skip datadir ${name:-unknown}: path outside data dir"
+                return 0
+            fi
+            data="$(_canon_path "${DATA_DIR:-}")"
+            target="$(_canon_path "$path")"
+            data="${data%/}"
+            target="${target%/}"
+            if [[ -z "$target" || "$target" == "/" || "$target" == "$data" ]]; then
+                log_info "skip datadir ${name:-unknown}: refusing data dir root"
+                return 0
+            fi
+            if [[ ! -e "$target" ]]; then
+                log_info "skip datadir ${name:-unknown}: already absent"
+                return 0
+            fi
+            log_info "removing datadir ${name:-unknown} (${target})"
+            rm -rf -- "$target" || true
+            ;;
+        slashing_db)
+            if [[ -z "$path" ]]; then
+                log_info "skip slashing_db ${name:-unknown}: no path"
+                return 0
+            fi
+            if [[ -L "$path" ]]; then
+                log_info "skip slashing_db ${name:-unknown}: refusing symlink ${path}"
+                return 0
+            fi
+            if ! _is_under_data_dir "$path"; then
+                log_info "skip slashing_db ${name:-unknown}: path outside data dir"
+                return 0
+            fi
+            target="$(_canon_path "$path")"
+            if [[ -z "$target" || "$target" == "/" ]]; then
+                log_info "skip slashing_db ${name:-unknown}: path outside data dir"
+                return 0
+            fi
+            if [[ ! -e "$target" && ! -e "${target}-wal" && ! -e "${target}-shm" ]]; then
+                log_info "skip slashing_db ${name:-unknown}: already absent"
+                return 0
+            fi
+            log_info "removing slashing_db ${name:-unknown} (${target})"
+            rm -f -- "$target" "${target}-wal" "${target}-shm" || true
+            ;;
+        pid)
+            if [[ -z "$path" ]]; then
+                log_info "skip pid ${name:-unknown}: no pidfile path"
+                return 0
+            fi
+            stop_rvc "$path"
+            ;;
+        *)
+            log_info "skip unknown inventory kind: ${kind:-<empty>}"
+            ;;
+    esac
+    return 0
 }
 
 capture_container_logs() {
