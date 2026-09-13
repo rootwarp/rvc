@@ -1,0 +1,15 @@
+# TYPE rvc_ptc_duties_total counter
+rvc_ptc_duties_total{outcome="scheduled"} 0
+rvc_ptc_duties_total{outcome="skipped_no_data"} 12
+rvc_ptc_duties_total{outcome="dropped"} 0
+
+# TYPE rvc_ptc_attestations_total counter
+rvc_ptc_attestations_total{status="success"} 0
+rvc_ptc_attestations_total{status="failed"} 0
+
+# TYPE rvc_validators_slashed_total counter
+rvc_validators_slashed_total 0
+
+# TYPE rvc_slashing_protection_checks_total counter
+rvc_slashing_protection_checks_total{result="safe"} 0
+rvc_slashing_protection_checks_total{result="blocked"} 0

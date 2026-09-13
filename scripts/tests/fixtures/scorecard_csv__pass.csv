@@ -1,0 +1,2 @@
+pubkey,index,status,active_epochs,attester_effectiveness,proposals.scheduled,proposals.included,proposals.missed
+0x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111,1,active_ongoing,32,1.0,1,1,0
