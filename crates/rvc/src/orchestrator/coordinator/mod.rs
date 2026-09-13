@@ -19,8 +19,9 @@ use eth_types::{ForkName, ForkSchedule, Root, Slot};
 use metrics::definitions::{slot_phase_cache, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS};
 
 use crate::metrics::{
-    attestation_status, pre_proposal_cold_fetch, RVC_ATTESTATIONS_TOTAL,
-    RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS, RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
+    attestation_status, pre_proposal_cold_fetch, RVC_ATTESTATIONS_TOTAL, RVC_FORK_CURRENT_ID,
+    RVC_FORK_NEXT_ACTIVATION_EPOCH, RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS,
+    RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
 };
 use signer::{CircuitBreakerState, SignerService, ValidatorSigner};
 use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, SLOTS_PER_EPOCH};
@@ -321,6 +322,10 @@ where
     phase_block_cache_cold: bool,
     /// Phase-2 wait: timer-only until ARCH-3m races the SSE head event.
     head_gate: HeadEventGate,
+    /// Last fork recorded for the slot loop; a boundary log fires on change.
+    last_resolved_fork: Option<ForkName>,
+    /// `fork` label currently attached to `rvc_fork_next_activation_epoch`.
+    next_activation_fork: Option<ForkName>,
 }
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
@@ -442,6 +447,8 @@ where
             validator_store,
             phase_block_cache_cold: true,
             head_gate,
+            last_resolved_fork: None,
+            next_activation_fork: None,
         };
 
         let handle = OrchestratorHandle { shutdown_tx };
@@ -477,6 +484,7 @@ where
             // One resolved fork per slot; wait sites consume `deadlines`, not
             // `from_epoch` or a BN response shape.
             let fork = ForkName::from_epoch(current_epoch, &self.config.fork_schedule);
+            self.record_fork_resolution(current_epoch, fork);
             let deadlines = self.config.deadline_schedule.for_fork(fork);
 
             let slot_span = info_span!("slot.process", slot = current_slot, epoch = current_epoch,);
@@ -1248,6 +1256,41 @@ where
                 .await;
         }
         WaitOutcome::Continue
+    }
+
+    /// Updates fork-resolution gauges and logs one info line per fork change.
+    fn record_fork_resolution(&mut self, epoch: u64, fork: ForkName) {
+        RVC_FORK_CURRENT_ID.set(i64::from(fork.id()));
+
+        match self.config.fork_schedule.next_activation(epoch) {
+            Some((name, activation)) => {
+                if let Some(prev) = self.next_activation_fork {
+                    if prev != name {
+                        let _ =
+                            RVC_FORK_NEXT_ACTIVATION_EPOCH.remove_label_values(&[prev.as_ref()]);
+                    }
+                }
+                RVC_FORK_NEXT_ACTIVATION_EPOCH.with_label_values(&[name.as_ref()]).set(
+                    i64::try_from(activation).expect("non-sentinel activation epoch fits i64"),
+                );
+                self.next_activation_fork = Some(name);
+            }
+            None => {
+                if let Some(prev) = self.next_activation_fork.take() {
+                    let _ = RVC_FORK_NEXT_ACTIVATION_EPOCH.remove_label_values(&[prev.as_ref()]);
+                }
+            }
+        }
+
+        if self.last_resolved_fork != Some(fork) {
+            info!(
+                epoch,
+                fork = fork.as_ref(),
+                previous = self.last_resolved_fork.as_ref().map(|f| f.as_ref()),
+                "Fork boundary"
+            );
+            self.last_resolved_fork = Some(fork);
+        }
     }
 }
 

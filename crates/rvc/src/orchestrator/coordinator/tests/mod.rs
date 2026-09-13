@@ -613,6 +613,7 @@ mod circuit_breaker;
 mod cold_cache;
 mod core;
 mod duty_management;
+mod fork_resolution;
 mod fork_transition;
 mod phase_block_offset;
 mod proposal;

@@ -15,6 +15,7 @@
 //! Issue 6.20 adds `rvc_proposals_total` (family delta +1; `outcome=envelope_late`).
 //! Issue 7.6 adds `rvc_ptc_duties_total` and `rvc_ptc_attestations_total` (family delta +2).
 //! Issue 8.4 adds `rvc_signer_rejections_total` (family delta +1).
+//! Issue 8.1 adds `rvc_fork_current_id` and `rvc_fork_next_activation_epoch` (family delta +2).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -66,6 +67,8 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_builder_epoch_misses",
     "rvc_duties_fetched_total",
     "rvc_duty_reorg_detected_total",
+    "rvc_fork_current_id", // operator-facing: resolved current fork id (issue 8.1)
+    "rvc_fork_next_activation_epoch", // operator-facing: next fork activation epoch (issue 8.1)
     "rvc_monitoring_push_failures_total",
     "rvc_monitoring_push_success_total",
     "rvc_orchestrator_active_attestations",
@@ -201,8 +204,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        43,
-        "issue 8.4 +1 family (rvc_signer_rejections_total) on the branch-time 42-family pin"
+        45,
+        "issue 8.1 +2 families (rvc_fork_current_id, rvc_fork_next_activation_epoch) on the 8.4 43-family pin"
     );
 }
 

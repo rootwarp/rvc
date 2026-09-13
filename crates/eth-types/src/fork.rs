@@ -108,6 +108,18 @@ impl ForkSchedule {
             (ForkName::Gloas, self.gloas_fork_epoch, self.gloas_fork_version),
         ]
     }
+
+    /// Next scheduled fork after `epoch`.
+    ///
+    /// Far-future sentinels (`u64::MAX`) are skipped so an unscheduled trailing
+    /// fork does not produce a next activation. Returns `None` when no later
+    /// non-sentinel fork exists.
+    pub fn next_activation(&self, epoch: Epoch) -> Option<(ForkName, Epoch)> {
+        self.entries()
+            .into_iter()
+            .find(|(_, activation, _)| *activation > epoch && *activation != u64::MAX)
+            .map(|(name, activation, _)| (name, activation))
+    }
 }
 
 impl AsRef<str> for ForkName {
@@ -633,5 +645,22 @@ mod tests {
             let count = entries.iter().filter(|(n, _, _)| *n == name).count();
             assert_eq!(count, 1, "{name:?} must appear exactly once in entries()");
         }
+    }
+
+    #[test]
+    fn test_next_activation_skips_far_future_sentinel() {
+        let schedule = test_schedule();
+        assert_eq!(schedule.next_activation(0), Some((ForkName::Altair, 74240)));
+        assert_eq!(schedule.next_activation(74239), Some((ForkName::Altair, 74240)));
+        assert_eq!(schedule.next_activation(74240), Some((ForkName::Bellatrix, 144896)));
+        assert_eq!(schedule.next_activation(499_999), Some((ForkName::Fulu, 500_000)));
+        assert_eq!(schedule.next_activation(500_000), None);
+        assert_eq!(schedule.next_activation(u64::MAX - 1), None);
+        assert_eq!(schedule.next_activation(u64::MAX), None);
+
+        let unscheduled = ForkSchedule::unscheduled_gloas();
+        assert_eq!(unscheduled.next_activation(0), None);
+        assert_eq!(unscheduled.next_activation(u64::MAX - 1), None);
+        assert_eq!(unscheduled.next_activation(u64::MAX), None);
     }
 }

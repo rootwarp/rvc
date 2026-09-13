@@ -4,7 +4,8 @@ use std::sync::LazyLock;
 
 use metrics::{
     define_gauge, define_histogram_vec, define_int_counter, define_int_counter_vec,
-    define_int_gauge_vec, Gauge, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec,
+    define_int_gauge, define_int_gauge_vec, Gauge, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec,
 };
 
 pub use bn_manager::metrics::RVC_ATTESTATIONS_TOTAL;
@@ -183,6 +184,23 @@ pub static RVC_SIGNER_CAPABILITY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
 });
 
+/// Resolved current fork as [`eth_types::ForkName::id`] (PHASE0=0 … GLOAS=7).
+pub static RVC_FORK_CURRENT_ID: LazyLock<IntGauge> = LazyLock::new(|| {
+    define_int_gauge("rvc_fork_current_id", "Numeric id of the fork resolved for the current epoch")
+});
+
+/// Activation epoch of the next scheduled fork.
+///
+/// Labels: `fork` (lowercase [`eth_types::ForkName`] name). The child is omitted
+/// when the next activation is the far-future sentinel (`u64::MAX`).
+pub static RVC_FORK_NEXT_ACTIVATION_EPOCH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    define_int_gauge_vec(
+        "rvc_fork_next_activation_epoch",
+        "Activation epoch of the next scheduled fork",
+        &["fork"],
+    )
+});
+
 /// Force-register orchestrator families and the other owners rvc composes.
 pub fn init() {
     metrics::definitions::init_metrics();
@@ -207,6 +225,8 @@ pub fn init() {
     LazyLock::force(&RVC_SIGNER_CAPABILITY);
     LazyLock::force(&RVC_PTC_DUTIES_TOTAL);
     LazyLock::force(&RVC_PTC_ATTESTATIONS_TOTAL);
+    LazyLock::force(&RVC_FORK_CURRENT_ID);
+    LazyLock::force(&RVC_FORK_NEXT_ACTIVATION_EPOCH);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SCHEDULED]);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SKIPPED_NO_DATA]);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::DROPPED]);
