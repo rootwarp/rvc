@@ -167,6 +167,9 @@ fn truncate_error_body(msg: &str, max: usize) -> String {
 
 impl From<SigningError> for SignerError {
     fn from(e: SigningError) -> Self {
+        // Issue 8.4: increment at classifying call sites (`record_signing_error`),
+        // not here. A `From` impl is a pure conversion; recording here would
+        // double-count `Backend(e).into()` and fire on `#[cfg(test)]` `.into()`.
         match e {
             SigningError::KeyNotFound(pk) => SignerError::KeyNotFound(pk),
             SigningError::LocalRejected(msg) => {
@@ -649,6 +652,7 @@ impl SignerService {
         signing_root: Root,
         op_name: &str,
         backend: Arc<dyn Signer>,
+        fork_name: Option<ForkName>,
     ) -> Result<Signature, SignerError> {
         // Same gate point as slashable early check (Result, not a bool).
         self.ensure_signing_enabled(pubkey)?;
@@ -703,6 +707,11 @@ impl SignerService {
                     error = %e,
                     signing_type = op_name,
                     "Signing failed"
+                );
+                crate::metrics::record_signing_error(
+                    &e,
+                    crate::metrics::sign_type_from_op_name(op_name),
+                    crate::metrics::version_label(fork_name),
                 );
                 Err(e.into())
             }
@@ -803,6 +812,7 @@ impl ValidatorSigner for SignerService {
             client_cn: AUDIT_CN_VC.to_string(),
             gvr,
             kind: SlashableKind::Attestation { source_epoch, target_epoch },
+            fork_name: Some(ForkName::from_epoch(data.target.epoch, fork_schedule)),
         })
         .await;
 
@@ -880,6 +890,7 @@ impl ValidatorSigner for SignerService {
             client_cn: AUDIT_CN_VC.to_string(),
             gvr,
             kind: SlashableKind::Block { slot },
+            fork_name: Some(ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule)),
         })
         .await;
 
@@ -946,6 +957,7 @@ impl ValidatorSigner for SignerService {
         let header_owned = header.clone();
         let sign_ctx =
             sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             // Gloas: always SignBlockHeader so Gloas body SSZ never enters a
             // legacy decoder RPC. Pre-Gloas: legacy SSZ RPCs when body bytes
@@ -988,6 +1000,7 @@ impl ValidatorSigner for SignerService {
             client_cn: AUDIT_CN_VC.to_string(),
             gvr,
             kind: SlashableKind::Block { slot },
+            fork_name: Some(fork_name),
         })
         .await;
 
@@ -1032,11 +1045,12 @@ impl ValidatorSigner for SignerService {
         let gvr = *genesis_validators_root;
         let epoch_c = epoch;
         let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_randao_reveal(epoch_c, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "randao", backend).await
+        self.sign_nonslashable(pubkey, signing_root, "randao", backend, Some(fork_name)).await
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
@@ -1056,11 +1070,19 @@ impl ValidatorSigner for SignerService {
         let root = *beacon_block_root;
         let sign_ctx =
             sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_sync_committee_message(slot, root, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "sync_committee_message", backend).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "sync_committee_message",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs payload attestation data with `DOMAIN_PTC_ATTESTER`.
@@ -1081,11 +1103,19 @@ impl ValidatorSigner for SignerService {
         let data_owned = data.clone();
         let sign_ctx =
             sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, data.slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_payload_attestation(&data_owned, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "payload_attestation", backend).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "payload_attestation",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs proposer preferences with `DOMAIN_PROPOSER_PREFERENCES`.
@@ -1114,11 +1144,19 @@ impl ValidatorSigner for SignerService {
             gvr,
             prefs.proposal_slot / SLOTS_PER_EPOCH,
         );
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_proposer_preferences(&prefs_owned, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "proposer_preferences", backend).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "proposer_preferences",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs a builder request auth with `DOMAIN_BUILDER_REQUEST_AUTH`.
@@ -1154,7 +1192,14 @@ impl ValidatorSigner for SignerService {
             grpc.sign_builder_request_auth(&auth_owned, fv, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "builder_request_auth", backend).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "builder_request_auth",
+            backend,
+            Some(ForkName::Phase0),
+        )
+        .await
     }
 
     /// Signs a self-build envelope root with `DOMAIN_BEACON_BUILDER`.
@@ -1181,6 +1226,7 @@ impl ValidatorSigner for SignerService {
         let root = *object_root;
         let sign_ctx =
             sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_execution_payload_envelope_root(&root, slot, &sign_ctx).await
         });
@@ -1188,7 +1234,13 @@ impl ValidatorSigner for SignerService {
 
         let mut guard = EnvelopeSlotGuard::reserve(&self.envelope_slots, pubkey.to_bytes(), slot)?;
         let result = self
-            .sign_nonslashable(pubkey, signing_root, "execution_payload_envelope", backend)
+            .sign_nonslashable(
+                pubkey,
+                signing_root,
+                "execution_payload_envelope",
+                backend,
+                Some(fork_name),
+            )
             .await;
         if let Err(e) = &result {
             if envelope_slot_is_unambiguous_no_signature(e) {
@@ -1210,7 +1262,14 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::SelectionProof(slot), &ctx);
         let backend = self.bls_backend_for_duty(pubkey, signing_root, None);
-        self.sign_nonslashable(pubkey, signing_root, "selection_proof", backend).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "selection_proof",
+            backend,
+            Some(ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule)),
+        )
+        .await
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -1227,6 +1286,11 @@ impl ValidatorSigner for SignerService {
     ) -> Result<Signature, SignerError> {
         let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
         if ForkName::from_epoch(epoch, fork_schedule) >= ForkName::Gloas {
+            crate::metrics::record_rejection(
+                crate::metrics::rejection_reason::UNSUPPORTED_TYPE,
+                crate::metrics::rejection_sign_type::AGGREGATE_AND_PROOF,
+                crate::metrics::version_label(Some(ForkName::from_epoch(epoch, fork_schedule))),
+            );
             return Err(SignerError::UnsupportedDuty { duty: "aggregate_and_proof" });
         }
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
@@ -1234,11 +1298,19 @@ impl ValidatorSigner for SignerService {
         let gvr = *genesis_validators_root;
         let agg = aggregate_and_proof.clone();
         let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_aggregate_and_proof(&agg, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "aggregate_and_proof", backend).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "aggregate_and_proof",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs a precomputed aggregate-and-proof root with DOMAIN_AGGREGATE_AND_PROOF.
@@ -1261,11 +1333,19 @@ impl ValidatorSigner for SignerService {
         let root = *object_root;
         let sign_ctx =
             sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_aggregate_and_proof_root(&root, slot, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "aggregate_and_proof_root", backend).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "aggregate_and_proof_root",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -1281,11 +1361,17 @@ impl ValidatorSigner for SignerService {
     ) -> Result<Signature, SignerError> {
         let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
         if ForkName::from_epoch(epoch, fork_schedule) >= ForkName::Gloas {
+            crate::metrics::record_rejection(
+                crate::metrics::rejection_reason::UNSUPPORTED_TYPE,
+                crate::metrics::rejection_sign_type::AGGREGATE_AND_PROOF,
+                crate::metrics::version_label(Some(ForkName::from_epoch(epoch, fork_schedule))),
+            );
             return Err(SignerError::UnsupportedDuty { duty: "electra_aggregate_and_proof" });
         }
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let gvr = *genesis_validators_root;
         let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let fork_name = sign_ctx.fork_name;
         let pk = pubkey.to_bytes();
         if self.signer.has_grpc_remote(&pk) {
             // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
@@ -1295,14 +1381,26 @@ impl ValidatorSigner for SignerService {
                 grpc.sign_aggregate_and_proof(&legacy, &sign_ctx).await
             });
             let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-            self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
-                .await
+            self.sign_nonslashable(
+                pubkey,
+                signing_root,
+                "electra_aggregate_and_proof",
+                backend,
+                Some(fork_name),
+            )
+            .await
         } else {
             let signing_root =
                 signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
             let backend = self.bls_backend_for_duty(pubkey, signing_root, None);
-            self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof", backend)
-                .await
+            self.sign_nonslashable(
+                pubkey,
+                signing_root,
+                "electra_aggregate_and_proof",
+                backend,
+                Some(fork_name),
+            )
+            .await
         }
     }
 
@@ -1333,11 +1431,13 @@ impl ValidatorSigner for SignerService {
         let exit = voluntary_exit.clone();
         let sign_ctx =
             sign_context_for_exit(pubkey.clone(), fork_schedule, gvr, voluntary_exit.epoch);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_voluntary_exit(&exit, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "voluntary_exit", backend).await
+        self.sign_nonslashable(pubkey, signing_root, "voluntary_exit", backend, Some(fork_name))
+            .await
     }
 
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
@@ -1373,7 +1473,14 @@ impl ValidatorSigner for SignerService {
             grpc.sign_builder_registration(&reg, fv, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "builder_registration", backend).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "builder_registration",
+            backend,
+            Some(ForkName::Phase0),
+        )
+        .await
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
@@ -1392,12 +1499,19 @@ impl ValidatorSigner for SignerService {
         let gvr = *genesis_validators_root;
         let sign_ctx =
             sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_sync_aggregator_selection(slot, subcommittee_index, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "sync_committee_selection_proof", backend)
-            .await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "sync_committee_selection_proof",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
@@ -1416,11 +1530,19 @@ impl ValidatorSigner for SignerService {
         let cap = contribution_and_proof.clone();
         let epoch = contribution_and_proof.contribution.slot / SLOTS_PER_EPOCH;
         let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let fork_name = sign_ctx.fork_name;
         let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
             grpc.sign_contribution_and_proof(&cap, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "contribution_and_proof", backend).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "contribution_and_proof",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 }
 

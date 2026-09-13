@@ -270,6 +270,8 @@ impl SigningGate {
             client_cn: client_cn.to_string(),
             gvr,
             kind: SlashableKind::Block { slot },
+            // Gate APIs take a precomputed root; fork is not on this surface.
+            fork_name: None,
         })
         .await
     }
@@ -339,6 +341,7 @@ impl SigningGate {
             client_cn: client_cn.to_string(),
             gvr,
             kind: SlashableKind::Attestation { source_epoch, target_epoch },
+            fork_name: None,
         })
         .await
     }
@@ -414,6 +417,13 @@ impl SigningGate {
                     op = op_name,
                     error = %e,
                     "SigningGate: non-slashable signer error"
+                );
+                // Public gate methods take a precomputed signing_root; fork is not
+                // on this API. Bounded `unknown` rather than a request string.
+                crate::metrics::record_signing_error(
+                    &e,
+                    crate::metrics::sign_type_from_op_name(op_name),
+                    crate::metrics::rejection_reason::UNKNOWN,
                 );
                 Err(SigningGateError::SigningFailed(e.to_string()))
             }

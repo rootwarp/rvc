@@ -76,6 +76,10 @@ pub struct SignerMetrics {
     /// HTTP (Web3Signer) sign latency in seconds (Issue 4.5), separate from the
     /// gRPC `sign_duration_seconds` histogram.
     pub http_sign_duration_seconds: HistogramVec,
+    /// Fail-closed type/version rejections (issue 8.4). Same family name as
+    /// `signer::metrics::RVC_SIGNER_REJECTIONS_TOTAL`; this handle is registered
+    /// on the process-local `:9101` registry (not the VC global `REGISTRY`).
+    pub rejections_total: IntCounterVec,
     #[cfg(feature = "dvt")]
     pub dvt: DvtMetrics,
 }
@@ -157,6 +161,18 @@ impl SignerMetrics {
             .register(Box::new(http_sign_duration_seconds.clone()))
             .expect("failed to register rvc_signer_http_sign_duration_seconds");
 
+        let rejections_total = IntCounterVec::new(
+            Opts::new(
+                "rvc_signer_rejections_total",
+                "Fail-closed signer rejections by reason, sign type, and consensus version",
+            ),
+            &["reason", "sign_type", "version"],
+        )
+        .expect("failed to create rvc_signer_rejections_total");
+        registry
+            .register(Box::new(rejections_total.clone()))
+            .expect("failed to register rvc_signer_rejections_total");
+
         #[cfg(feature = "dvt")]
         let dvt = {
             let coordination_duration_seconds = HistogramVec::new(
@@ -226,9 +242,15 @@ impl SignerMetrics {
             keys_loaded,
             http_sign_total,
             http_sign_duration_seconds,
+            rejections_total,
             #[cfg(feature = "dvt")]
             dvt,
         }
+    }
+
+    /// Increment the `:9101` twin of `rvc_signer_rejections_total`.
+    pub fn record_rejection(&self, reason: &str, sign_type: &str, version: &str) {
+        self.rejections_total.with_label_values(&[reason, sign_type, version]).inc();
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, prometheus::Error> {
@@ -369,6 +391,7 @@ mod tests {
         // HTTP-path series (Issue 4.5) — registered in the same registry.
         m.http_sign_total.with_label_values(&["ATTESTATION", "success"]).inc();
         m.http_sign_duration_seconds.with_label_values(&[] as &[&str]).observe(0.0);
+        m.record_rejection("unsupported_version", "beacon_block", "unknown");
 
         let gathered = m.registry.gather();
         let names: Vec<&str> = gathered.iter().map(|mf| mf.name()).collect();
@@ -378,6 +401,7 @@ mod tests {
         assert!(names.contains(&"rvc_signer_keys_loaded"));
         assert!(names.contains(&"rvc_signer_http_sign_total"));
         assert!(names.contains(&"rvc_signer_http_sign_duration_seconds"));
+        assert!(names.contains(&"rvc_signer_rejections_total"));
     }
 
     #[test]

@@ -283,6 +283,15 @@ async fn sign_inner(
         // every other decoder failure stay the fixed SEC-INFO-01 body.
         match web3signer_wire::WireVersionError::from_serde_display(&e.to_string()) {
             Some(web3signer_wire::WireVersionError::Unknown(value)) => {
+                // 8.4: fail-closed unknown version. Increment the `:9101`
+                // SignerMetrics registry this process serves — not the VC
+                // global REGISTRY. Version label is bounded "unknown", never
+                // the request token (`NOT_A_FORK`, …).
+                state.metrics.record_rejection(
+                    signer::metrics::rejection_reason::UNSUPPORTED_VERSION,
+                    peek_http_sign_type(body),
+                    signer::metrics::rejection_reason::UNKNOWN,
+                );
                 HttpSignError::BadRequest(format!("unknown version: {value}"))
             }
             _ => HttpSignError::BadRequest("invalid sign request body".to_string()),
@@ -326,6 +335,23 @@ async fn sign_inner(
 
     // 5. Shape the success body per Accept (FR-17).
     Ok(sign_response(accept, &sig))
+}
+
+/// Bounded `sign_type` from a decode-failed body. Unknown `type` tokens map to
+/// [`signer::metrics::rejection_sign_type::UNKNOWN`], never the raw string.
+fn peek_http_sign_type(body: &[u8]) -> &'static str {
+    #[derive(serde::Deserialize)]
+    struct TypeOnly {
+        #[serde(rename = "type")]
+        type_name: Option<String>,
+    }
+    let Ok(partial) = serde_json::from_slice::<TypeOnly>(body) else {
+        return signer::metrics::rejection_sign_type::UNKNOWN;
+    };
+    match partial.type_name.as_deref() {
+        Some(name) => signer::metrics::sign_type_from_web3signer_type(name),
+        None => signer::metrics::rejection_sign_type::UNKNOWN,
+    }
 }
 
 /// Map Web3Signer payload types onto the bounded A7 `sign_*` type labels so HTTP

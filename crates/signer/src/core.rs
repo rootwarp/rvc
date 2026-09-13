@@ -47,13 +47,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::metrics::{
-    attestation_status, slashing_result, tx_hold_kind, RVC_ATTESTATIONS_TOTAL,
-    RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS, RVC_SIGNING_DURATION_SECONDS,
-    RVC_SLASHING_PROTECTION_CHECKS_TOTAL, RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS,
+    attestation_status, record_signing_error, sign_type_from_op_name, slashing_result,
+    tx_hold_kind, version_label, RVC_ATTESTATIONS_TOTAL, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS,
+    RVC_SIGNING_DURATION_SECONDS, RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
+    RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS,
 };
 use crypto::{PublicKey, Signature, Signer, SigningError};
 use doppelganger::SigningEnablement;
-use eth_types::Root;
+use eth_types::{ForkName, Root};
 use observability::logging::TruncatedPubkey;
 use slashing::{
     CommittedReservation, PendingAudit, PubkeyScopedDb, ReconcileOutcome, ReservationKind,
@@ -364,6 +365,8 @@ pub struct SlashableSignSession {
     client_cn: String,
     /// Genesis validators root for the scoped handle (M-6 pin; unused by delete).
     gvr: Root,
+    /// Resolved fork when the caller knows it; `None` → version label `unknown`.
+    fork_name: Option<ForkName>,
 }
 
 impl SlashableSignSession {
@@ -399,6 +402,7 @@ impl SlashableSignSession {
             // Tests that pass a raw db still reconcile via a scoped handle.
             client_cn: "test".to_string(),
             gvr: [0u8; 32],
+            fork_name: None,
         }
     }
 
@@ -467,6 +471,7 @@ impl SlashableSignSession {
 
             // Unambiguous no-signature outcomes — always discard (local-safe).
             Ok(Err(e)) if e.is_unambiguous_no_signature() => {
+                self.record_backend_rejection(&e);
                 staged.discard_row();
                 self.hooks.on_tx_hold_ms(tx_hold_ms);
                 match e {
@@ -492,7 +497,10 @@ impl SlashableSignSession {
 
             // Ambiguous signer errors — policy decides discard vs retain.
             // Remote may already have signed (transport/HTTP after possible sign).
-            Ok(Err(e)) => self.finish_ambiguous_error(staged, tx_hold_ms, e),
+            Ok(Err(e)) => {
+                self.record_backend_rejection(&e);
+                self.finish_ambiguous_error(staged, tx_hold_ms, e)
+            }
         }
     }
 
@@ -554,6 +562,7 @@ impl SlashableSignSession {
             // VD-5.3: `is_unambiguous_no_signature` lives on `crypto::SigningError`,
             // not `SignerError`. `e` here is that type (bound by `Signer::sign`).
             Ok(Err(e)) if e.is_unambiguous_no_signature() => {
+                self.record_backend_rejection(&e);
                 let reconciled = self.reconcile_reservation(&reservation);
                 self.hooks.on_tx_hold_ms(tx_hold_ms);
                 match e {
@@ -581,8 +590,19 @@ impl SlashableSignSession {
                 }
             }
 
-            Ok(Err(e)) => self.finish_reserve_ambiguous(reservation, tx_hold_ms, e),
+            Ok(Err(e)) => {
+                self.record_backend_rejection(&e);
+                self.finish_reserve_ambiguous(reservation, tx_hold_ms, e)
+            }
         }
+    }
+
+    fn record_backend_rejection(&self, err: &SigningError) {
+        record_signing_error(
+            err,
+            sign_type_from_op_name(self.op_name),
+            version_label(self.fork_name),
+        );
     }
 
     fn map_reserve_error(&self, err: SlashingError) -> SigningGateError {
@@ -845,6 +865,8 @@ pub struct SignSlashableRequest<'a> {
     pub gvr: Root,
     /// Block vs attestation reserve parameters.
     pub kind: SlashableKind,
+    /// Resolved fork when known (VC path). Gate callers pass `None`.
+    pub fork_name: Option<ForkName>,
 }
 
 /// Shared slashable-signing core.
@@ -1011,6 +1033,7 @@ where
         slashing_db: Arc::clone(&req.slashing_db),
         client_cn: req.client_cn,
         gvr: req.gvr,
+        fork_name: req.fork_name,
     };
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1151,6 +1174,7 @@ mod tests {
             client_cn: "test".into(),
             gvr: GVR,
             kind: SlashableKind::Block { slot: 7 },
+            fork_name: None,
         })
         .await;
 
@@ -1224,6 +1248,7 @@ mod tests {
             client_cn: "test".into(),
             gvr: GVR,
             kind: SlashableKind::Block { slot: 15 },
+            fork_name: None,
         })
         .await;
 
@@ -1261,6 +1286,7 @@ mod tests {
             client_cn: "test".into(),
             gvr: GVR,
             kind: SlashableKind::Block { slot: 13 },
+            fork_name: None,
         })
         .await;
 
@@ -1308,6 +1334,7 @@ mod tests {
             client_cn: "test".into(),
             gvr: GVR,
             kind: SlashableKind::Block { slot: 9 },
+            fork_name: None,
         })
         .await;
 
@@ -1347,6 +1374,7 @@ mod tests {
             client_cn: "test".into(),
             gvr: GVR,
             kind: SlashableKind::Block { slot: 11 },
+            fork_name: None,
         })
         .await;
 
@@ -1389,6 +1417,7 @@ mod tests {
                 client_cn: "test".into(),
                 gvr: GVR,
                 kind: SlashableKind::Block { slot: 13 },
+                fork_name: None,
             })
             .await
         });
@@ -1482,6 +1511,7 @@ mod tests {
             slashing_db,
             client_cn: "test".to_string(),
             gvr: GVR,
+            fork_name: None,
         }
     }
 

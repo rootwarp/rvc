@@ -53,13 +53,34 @@ async fn malformed_identifier_returns_400() {
 async fn invalid_body_returns_400_without_decoder_detail() {
     let (sk, pk_bytes) = test_keypair();
     let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+    let metrics = Arc::clone(&state.metrics);
     let id = format!("0x{}", hex::encode(pk_bytes));
+    let before = metrics
+        .rejections_total
+        .with_label_values(&[
+            signer::metrics::rejection_reason::UNSUPPORTED_TYPE,
+            signer::metrics::rejection_sign_type::UNKNOWN,
+            signer::metrics::rejection_reason::UNKNOWN,
+        ])
+        .get();
     let resp = post_sign(state, &id, None, "{ this is not json".to_string()).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let body = String::from_utf8(body_bytes(resp).await).unwrap();
     // SEC-INFO-01: a fixed body, no serde decoder text (no line/column/"expected").
     assert_eq!(body, "invalid sign request body");
     assert!(!body.contains("column") && !body.contains("expected"), "no decoder detail: {body}");
+    assert_eq!(
+        metrics
+            .rejections_total
+            .with_label_values(&[
+                signer::metrics::rejection_reason::UNSUPPORTED_TYPE,
+                signer::metrics::rejection_sign_type::UNKNOWN,
+                signer::metrics::rejection_reason::UNKNOWN,
+            ])
+            .get(),
+        before,
+        "HTTP 400 must not increment unsupported_type"
+    );
 }
 
 #[tokio::test]
@@ -221,6 +242,7 @@ async fn unknown_version_returns_400_naming_value_and_skips_backend() {
     let (_, pk_bytes) = test_keypair();
     let backend = Arc::new(MockBackend::with_keys(vec![pk_bytes]));
     let state = test_state(backend.clone());
+    let metrics = Arc::clone(&state.metrics);
     let id = format!("0x{}", hex::encode(pk_bytes));
     let req = format!(
         r#"{{ "type": "BLOCK_V2", {fi},
@@ -233,11 +255,23 @@ async fn unknown_version_returns_400_naming_value_and_skips_backend() {
         fi = fork_info_json(),
         aa = "aa".repeat(32),
     );
+    let labels = [
+        signer::metrics::rejection_reason::UNSUPPORTED_VERSION,
+        signer::metrics::rejection_sign_type::BEACON_BLOCK,
+        signer::metrics::rejection_reason::UNKNOWN,
+    ];
+    let before = metrics.rejections_total.with_label_values(&labels).get();
     let resp = post_sign(state, &id, None, req).await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let text = String::from_utf8(body_bytes(resp).await).unwrap();
     assert!(text.contains("NOT_A_FORK"), "names the version: {text}");
     assert_eq!(backend.sign_call_count(), 0, "backend must not be invoked");
+    assert!(
+        metrics.rejections_total.with_label_values(&labels).get() > before,
+        "4.9 unknown version must increment :9101 rvc_signer_rejections_total"
+    );
+    let scrape = String::from_utf8(metrics.encode().unwrap()).unwrap();
+    assert!(!scrape.contains("NOT_A_FORK"), "version label must not be the raw request token");
 }
 
 /// Empty `version` is a generic 400 — never serde `at line N column M`.
