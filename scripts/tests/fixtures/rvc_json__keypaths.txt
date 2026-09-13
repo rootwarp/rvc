@@ -1,0 +1,7 @@
+config_path
+endpoint
+generated_at
+key_range
+pid
+pubkeys
+schema_version
