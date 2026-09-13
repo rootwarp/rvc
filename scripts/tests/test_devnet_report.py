@@ -88,8 +88,17 @@ def test_exit_codes_follow_prd_section_4(dr):
     )
 
 
-def test_compare_subcommand_registered_but_deferred(dr):
-    assert dr.main(["compare", "a", "b"]) == 2
+def test_compare_subcommand_registered_but_deferred(dr, capsys):
+    # Inverted (P6-A13): compare is implemented. Exit 0/4, never the DN-17 deferral.
+    a = _FIXTURES / "run_a"
+    b = _FIXTURES / "run_b"
+    capsys.readouterr()
+    code = dr.main(["compare", str(a), str(b)])
+    captured = capsys.readouterr()
+    assert code in (dr.EXIT_OK, dr.EXIT_KPI)
+    assert "lands with DN-17" not in captured.err
+    assert "kpi" in captured.out
+    assert "gate" in captured.out
 
 
 def test_scrape_http_503_exits_1(dr, tmp_path):

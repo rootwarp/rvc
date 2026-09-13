@@ -3,7 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Scrape RVC /metrics and render client-side reports for the local devnet testbed."""
+"""Scrape RVC /metrics, render client-side reports, and compare finished run dirs."""
 
 import argparse
 import http.client
@@ -73,6 +73,8 @@ _REPORT_PRODUCERS = {
     "metrics-start.txt": "soak.sh",
     "metrics-end.txt": "soak.sh",
     "samples.jsonl": "soak.sh",
+    "client.json": "report.sh",
+    "chain.json": "report.sh",
 }
 
 
@@ -323,6 +325,7 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("b")
     compare.add_argument("--rel", type=float)
     compare.add_argument("--abs-floor")
+    compare.add_argument("--json", action="store_true")
     return p
 
 
@@ -339,6 +342,7 @@ class Options:
     b: str | None
     rel: float | None
     abs_floor: str | None
+    as_json: bool
 
 
 def _validate_scrape(args: argparse.Namespace) -> None:
@@ -363,12 +367,26 @@ def _validate_report(args: argparse.Namespace) -> None:
         raise UsageError("--run-dir is required")
 
 
+def _validate_compare(args: argparse.Namespace) -> None:
+    if args.rel is not None and (
+        isinstance(args.rel, bool)
+        or not isinstance(args.rel, (int, float))
+        or not math.isfinite(args.rel)
+        or args.rel < 0
+    ):
+        raise UsageError("--rel must be a non-negative finite number")
+    if args.abs_floor is not None:
+        parse_abs_floor(args.abs_floor)
+
+
 def build_options(argv: list[str] | None = None) -> Options:
     args = build_parser().parse_args(argv)
     if args.command == "scrape":
         _validate_scrape(args)
     elif args.command == "report":
         _validate_report(args)
+    elif args.command == "compare":
+        _validate_compare(args)
     return Options(
         command=args.command,
         url=getattr(args, "url", None),
@@ -381,6 +399,7 @@ def build_options(argv: list[str] | None = None) -> Options:
         b=getattr(args, "b", None),
         rel=getattr(args, "rel", None),
         abs_floor=getattr(args, "abs_floor", None),
+        as_json=bool(getattr(args, "json", False)),
     )
 
 
@@ -394,6 +413,7 @@ def main(
     active = transport
     try:
         opts = build_options(argv)
+        code = EXIT_OK
         if opts.command == "scrape":
             if active is None:
                 active = HttpTransport(
@@ -403,10 +423,10 @@ def main(
         elif opts.command == "report":
             cmd_report(opts, clock=clock)
         elif opts.command == "compare":
-            cmd_compare(opts)
+            code = cmd_compare(opts)
         else:
             raise UsageError(f"unknown command: {opts.command!r}")
-        return EXIT_OK
+        return code
     except UsageError as exc:
         log.error("%s", exc)
         return EXIT_USAGE
@@ -1591,9 +1611,695 @@ def cmd_report(
 
 # ===== § 9. Compare =====
 
+DEFAULT_REL = 0.25
+DEFAULT_ABS_FLOOR_S = 0.001
+_ABS_FLOOR_RE = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*(ms|s|us|µs|μs)?\s*$",
+    re.IGNORECASE,
+)
+_FINGERPRINT_KEYS = (
+    "epochs",
+    "fingerprint",
+    "genesis_validators_root",
+    "images",
+    "key_range",
+    "profile",
+)
+_CHAIN_SKIP_TOP = frozenset(
+    {
+        "aggregate",
+        "beacon",
+        "degradations",
+        "exit_code",
+        "generated_at",
+        "network",
+        "schema_version",
+        "threshold_breaches",
+        "validators",
+        "window",
+    }
+)
+_COMPARE_HEADERS = ("kpi", "A", "B", "delta", "%", "gate")
+_GATE_FAIL = "fail"
+_GATE_PASS = "pass"
+_GATE_ABSENT = "absent"
+_GATE_FALSE = "false"
 
-def cmd_compare(_opts: Options) -> None:
-    raise UsageError("compare lands with DN-17 in Phase 6")
+
+@dataclass(frozen=True)
+class KpiSpec:
+    kpi: str
+    source: str
+    direction: str
+    gating: str
+    section: str = ""
+    family: str = ""
+    field: str = ""
+    unit: str = "count"
+    reduce: str = "sum"
+    match_labels: tuple[tuple[str, str], ...] = ()
+    exclude_label: tuple[str, str] | None = None
+    chain_key: str = ""
+
+
+KPI_SPECS: tuple[KpiSpec, ...] = (
+    KpiSpec(
+        "K1",
+        "client.json",
+        "lower",
+        "none",
+        section="counters",
+        family="rvc_orchestrator_slots_processed_total",
+        field="per_epoch",
+        match_labels=(("result", "success"),),
+    ),
+    KpiSpec(
+        "K2",
+        "client.json",
+        "higher",
+        "failure",
+        section="counters",
+        family="rvc_orchestrator_missed_slots_total",
+        field="delta",
+    ),
+    KpiSpec(
+        "K3.p95",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_orchestrator_slot_processing_duration_seconds",
+        field="p95",
+        unit="seconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K3.mean",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_orchestrator_slot_processing_duration_seconds",
+        field="mean",
+        unit="seconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K4",
+        "client.json",
+        "lower",
+        "none",
+        section="counters",
+        family="rvc_attestations_total",
+        field="per_epoch",
+        match_labels=(("status", "success"),),
+    ),
+    KpiSpec(
+        "K5",
+        "client.json",
+        "lower",
+        "none",
+        section="counters",
+        family="rvc_aggregations_total",
+        field="per_epoch",
+        match_labels=(("status", "success"),),
+    ),
+    KpiSpec(
+        "K6.failure",
+        "client.json",
+        "higher",
+        "failure",
+        section="counters",
+        family="rvc_proposals_total",
+        field="delta",
+        exclude_label=("outcome", "success"),
+    ),
+    KpiSpec(
+        "K7.p95",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_signing_duration_seconds",
+        field="p95",
+        unit="seconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K7.mean",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_signing_duration_seconds",
+        field="mean",
+        unit="seconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K8.blocked",
+        "client.json",
+        "higher",
+        "failure",
+        section="counters",
+        family="rvc_slashing_protection_checks_total",
+        field="delta",
+        match_labels=(("result", "blocked"),),
+    ),
+    KpiSpec(
+        "K9.p95",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_slashing_reserve_tx_hold_duration_ms",
+        field="p95",
+        unit="milliseconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K9.mean",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_slashing_reserve_tx_hold_duration_ms",
+        field="mean",
+        unit="milliseconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K10.p95",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_slot_phase_block_start_offset_ms",
+        field="p95",
+        unit="milliseconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K10.mean",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_slot_phase_block_start_offset_ms",
+        field="mean",
+        unit="milliseconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K11.fetched",
+        "client.json",
+        "lower",
+        "none",
+        section="counters",
+        family="rvc_duties_fetched_total",
+        field="per_epoch",
+    ),
+    KpiSpec(
+        "K11.reorgs",
+        "client.json",
+        "higher",
+        "none",
+        section="counters",
+        family="rvc_duty_reorg_detected_total",
+        field="delta",
+    ),
+    KpiSpec(
+        "K12.tier",
+        "client.json",
+        "lower",
+        "none",
+        section="gauges",
+        family="rvc_bn_health_tier",
+        field="max",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K12.p95",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_proposer_bn_latency_ms",
+        field="p95",
+        unit="milliseconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K12.mean",
+        "client.json",
+        "higher",
+        "latency",
+        section="histograms",
+        family="rvc_proposer_bn_latency_ms",
+        field="mean",
+        unit="milliseconds",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K13.exits",
+        "client.json",
+        "higher",
+        "failure",
+        section="counters",
+        family="rvc_task_exits_total",
+        field="delta",
+    ),
+    KpiSpec(
+        "K13.running",
+        "client.json",
+        "lower",
+        "none",
+        section="gauges",
+        family="rvc_tasks_running",
+        field="max",
+        reduce="max",
+    ),
+    KpiSpec(
+        "K13.dropped",
+        "client.json",
+        "higher",
+        "none",
+        section="counters",
+        family="rvc_sse_events_dropped_total",
+        field="delta",
+    ),
+    KpiSpec(
+        "participation_rate",
+        "chain.json",
+        "lower",
+        "ratio",
+        unit="ratio",
+        chain_key="participation_rate",
+    ),
+    KpiSpec(
+        "target_rate",
+        "chain.json",
+        "lower",
+        "ratio",
+        unit="ratio",
+        chain_key="target_rate",
+    ),
+)
+
+
+def parse_abs_floor(raw: str | None) -> float:
+    if raw is None:
+        return DEFAULT_ABS_FLOOR_S
+    if not isinstance(raw, str) or not raw.strip():
+        raise UsageError("invalid --abs-floor")
+    match = _ABS_FLOOR_RE.match(raw)
+    if match is None:
+        raise UsageError(f"invalid --abs-floor: {raw}")
+    value = float(match.group(1))
+    if not math.isfinite(value) or value < 0:
+        raise UsageError(f"invalid --abs-floor: {raw}")
+    unit = (match.group(2) or "ms").lower()
+    if unit == "s":
+        return value
+    if unit == "ms":
+        return value / 1000.0
+    return value / 1_000_000.0
+
+
+def _as_finite_number(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
+
+
+def _schema_version_of(obj: object) -> object:
+    if isinstance(obj, dict):
+        return obj.get("schema_version")
+    return None
+
+
+def load_run(run_dir: str) -> dict[str, object]:
+    _validate_run_dir(run_dir)
+    run_path = os.path.join(run_dir, "run.json")
+    client_path = os.path.join(run_dir, "client.json")
+    chain_path = os.path.join(run_dir, "chain.json")
+    run_obj = _load_json_object(run_path)
+    client_obj = _load_json_object(client_path)
+    chain_obj = _load_json_object(chain_path)
+    if not isinstance(run_obj, dict):
+        raise UsageError(_artifact_msg(run_path, "{name} must be an object"))
+    if not isinstance(client_obj, dict):
+        raise UsageError(_artifact_msg(client_path, "{name} must be an object"))
+    if not isinstance(chain_obj, dict):
+        raise UsageError(_artifact_msg(chain_path, "{name} must be an object"))
+    return {"run": run_obj, "client": client_obj, "chain": chain_obj}
+
+
+def run_fingerprint(run_json: object) -> dict[str, object]:
+    # Hash plus the run.json fields that feed it; rvc_version is excluded.
+    if not isinstance(run_json, dict):
+        return {}
+    payload: dict[str, object] = {}
+    for key in _FINGERPRINT_KEYS:
+        if key in run_json:
+            payload[key] = run_json[key]
+    return payload
+
+
+def _value_delta(
+    left: object, right: object, prefix: str
+) -> dict[str, dict[str, object]]:
+    if left == right:
+        return {}
+    if isinstance(left, dict) and isinstance(right, dict):
+        out: dict[str, dict[str, object]] = {}
+        keys = sorted(set(left) | set(right), key=str)
+        for key in keys:
+            path = f"{prefix}.{key}" if prefix else str(key)
+            out.update(_value_delta(left.get(key), right.get(key), path))
+        return out
+    return {prefix: {"a": left, "b": right}}
+
+
+def _topology_delta(
+    left: dict[str, object], right: dict[str, object]
+) -> dict[str, dict[str, object]] | None:
+    delta = _value_delta(left, right, "")
+    return delta or None
+
+
+def _labels_of(row: dict[str, object]) -> dict[str, object]:
+    labels = row.get("labels")
+    return labels if isinstance(labels, dict) else {}
+
+
+def _series_matches(row: dict[str, object], spec: KpiSpec) -> bool:
+    labels = _labels_of(row)
+    for key, value in spec.match_labels:
+        if labels.get(key) != value:
+            return False
+    if spec.exclude_label is not None:
+        key, value = spec.exclude_label
+        if labels.get(key) == value:
+            return False
+    return True
+
+
+def _reduce_numbers(values: list[float], how: str) -> float | None:
+    if not values:
+        return None
+    if how == "max":
+        return max(values)
+    if how == "first":
+        return values[0]
+    return sum(values)
+
+
+def _extract_client(client: object, spec: KpiSpec) -> float | None:
+    if not isinstance(client, dict):
+        return None
+    section = client.get(spec.section)
+    if not isinstance(section, dict) or spec.family not in section:
+        return None
+    series = section.get(spec.family)
+    if not isinstance(series, list):
+        return None
+    values: list[float] = []
+    matched = False
+    for item in series:
+        if not isinstance(item, dict) or not _series_matches(item, spec):
+            continue
+        matched = True
+        number = _as_finite_number(item.get(spec.field))
+        if number is not None:
+            values.append(number)
+    if not matched:
+        return None
+    return _reduce_numbers(values, spec.reduce)
+
+
+def _record_chain_number(
+    out: dict[str, float | None], key: object, value: object
+) -> None:
+    if not isinstance(key, str):
+        return
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return
+    # Keep the key even when non-finite so unknown keys still render
+    # gated=false; the value is None (absent), never 0.
+    out[key] = _as_finite_number(value)
+
+
+def _chain_numeric_maps(
+    chain: object,
+) -> dict[str, float | None]:
+    out: dict[str, float | None] = {}
+    if not isinstance(chain, dict):
+        return out
+    aggregate = chain.get("aggregate")
+    if isinstance(aggregate, dict):
+        for key, value in aggregate.items():
+            _record_chain_number(out, key, value)
+    for key, value in chain.items():
+        if key in _CHAIN_SKIP_TOP or key in out:
+            continue
+        _record_chain_number(out, key, value)
+    return out
+
+
+def _extract_chain(chain: object, spec: KpiSpec) -> float | None:
+    return _chain_numeric_maps(chain).get(spec.chain_key)
+
+
+def _extract_kpi(loaded: dict[str, object], spec: KpiSpec) -> float | None:
+    if spec.source == "chain.json":
+        return _extract_chain(loaded.get("chain"), spec)
+    return _extract_client(loaded.get("client"), spec)
+
+
+def _abs_floor_for(spec: KpiSpec, abs_floor_s: float) -> float:
+    if spec.gating == "failure" or spec.gating == "none":
+        return 0.0
+    if spec.unit == "milliseconds":
+        return abs_floor_s * 1000.0
+    return abs_floor_s
+
+
+def _exceeds_rel(spec: KpiSpec, a: float, b: float, rel: float) -> bool:
+    # Q4 is strictly beyond rel. (b-a) > rel*|a| false-fails exact +25%
+    # on a 0.01 s baseline because 0.01+0.0025 - 0.01 > 0.25*0.01.
+    if spec.direction == "lower":
+        return b < a * (1.0 - rel)
+    return b > a * (1.0 + rel)
+
+
+def _pct(a: float | None, delta: float | None) -> float | None:
+    if a is None or delta is None or a == 0:
+        return None
+    value = (delta / a) * 100.0
+    if not math.isfinite(value):
+        return None
+    return value
+
+
+def _gate_for(
+    spec: KpiSpec,
+    a: float | None,
+    b: float | None,
+    rel: float,
+    abs_floor_s: float,
+) -> str:
+    if a is None or b is None:
+        return _GATE_ABSENT
+    if spec.gating == "none":
+        return _GATE_FALSE
+    delta = b - a
+    worsening = -delta if spec.direction == "lower" else delta
+    if worsening <= 0:
+        return _GATE_PASS
+    if spec.gating == "failure":
+        return _GATE_FAIL
+    if worsening <= _abs_floor_for(spec, abs_floor_s):
+        return _GATE_PASS
+    if _exceeds_rel(spec, a, b, rel):
+        return _GATE_FAIL
+    return _GATE_PASS
+
+
+def _row_dict(
+    spec: KpiSpec,
+    a: float | None,
+    b: float | None,
+    rel: float,
+    abs_floor_s: float,
+) -> dict[str, object]:
+    delta = None if a is None or b is None else b - a
+    gate = _gate_for(spec, a, b, rel, abs_floor_s)
+    return {
+        "a": a,
+        "b": b,
+        "delta": delta,
+        "gate": gate,
+        "gated": spec.gating != "none" and gate != _GATE_ABSENT,
+        "kpi": spec.kpi,
+        "pct": _pct(a, delta),
+    }
+
+
+def _extra_chain_specs(
+    a: dict[str, object], b: dict[str, object]
+) -> list[KpiSpec]:
+    known = {spec.chain_key for spec in KPI_SPECS if spec.chain_key}
+    keys = set(_chain_numeric_maps(a.get("chain"))) | set(
+        _chain_numeric_maps(b.get("chain"))
+    )
+    extras = sorted(key for key in keys if key not in known)
+    return [
+        KpiSpec(
+            kpi=key,
+            source="chain.json",
+            direction="lower",
+            gating="none",
+            unit="ratio",
+            chain_key=key,
+        )
+        for key in extras
+    ]
+
+
+def compare_kpis(
+    a: dict[str, object],
+    b: dict[str, object],
+    rel: float,
+    abs_floor: float,
+) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    for spec in (*KPI_SPECS, *_extra_chain_specs(a, b)):
+        rows.append(
+            _row_dict(
+                spec,
+                _extract_kpi(a, spec),
+                _extract_kpi(b, spec),
+                rel,
+                abs_floor,
+            )
+        )
+    return rows
+
+
+def render_compare_table(rows: list[dict[str, object]]) -> str:
+    body: list[list[str]] = []
+    for row in rows:
+        body.append(
+            [
+                _sanitize_cell(row.get("kpi")),
+                _fmt_number(row.get("a")),
+                _fmt_number(row.get("b")),
+                _fmt_number(row.get("delta")),
+                _fmt_number(row.get("pct")),
+                _sanitize_cell(row.get("gate")),
+            ]
+        )
+    table = _align_rows([list(_COMPARE_HEADERS), *body])
+    return "\n".join(table).rstrip("\n") + "\n"
+
+
+def _render_topology_delta(delta: dict[str, dict[str, object]]) -> str:
+    body: list[list[str]] = [["subkey", "A", "B"]]
+    for key in sorted(delta):
+        pair = delta[key]
+        left = pair.get("a")
+        right = pair.get("b")
+        body.append(
+            [
+                _sanitize_cell(key),
+                _sanitize_cell(
+                    left if isinstance(left, str) else json.dumps(left)
+                ),
+                _sanitize_cell(
+                    right if isinstance(right, str) else json.dumps(right)
+                ),
+            ]
+        )
+    return "topology_delta\n" + "\n".join(_align_rows(body)).rstrip("\n") + "\n"
+
+
+def _refuse_gate(rows: list[dict[str, object]]) -> None:
+    for row in rows:
+        row["gated"] = False
+        if row.get("gate") == _GATE_FAIL:
+            row["gate"] = _GATE_PASS
+
+
+def _fingerprint_usable(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value)
+    return True
+
+
+def _stored_fingerprint(run_obj: object) -> object:
+    if not isinstance(run_obj, dict):
+        return None
+    return run_obj.get("fingerprint")
+
+
+def cmd_compare(opts: Options) -> int:
+    if not opts.a or not opts.b:
+        raise UsageError("compare requires two run directories")
+    run_a = load_run(opts.a)
+    run_b = load_run(opts.b)
+    client_a = run_a["client"]
+    client_b = run_b["client"]
+    if _schema_version_of(client_a) != _schema_version_of(client_b):
+        raise UsageError("schema_version mismatch")
+    if _schema_version_of(run_a["run"]) != _schema_version_of(run_b["run"]):
+        raise UsageError("schema_version mismatch")
+    rel = DEFAULT_REL if opts.rel is None else float(opts.rel)
+    abs_floor_s = parse_abs_floor(opts.abs_floor)
+    fp_a = run_fingerprint(run_a["run"])
+    fp_b = run_fingerprint(run_b["run"])
+    stored_a = _stored_fingerprint(run_a["run"])
+    stored_b = _stored_fingerprint(run_b["run"])
+    # None == None would still gate; a missing fingerprint is incomparable.
+    comparable = (
+        _fingerprint_usable(stored_a)
+        and _fingerprint_usable(stored_b)
+        and stored_a == stored_b
+    )
+    topology_delta = None if comparable else _topology_delta(fp_a, fp_b)
+    if topology_delta is None and not comparable:
+        topology_delta = {"fingerprint": {"a": stored_a, "b": stored_b}}
+    rows = compare_kpis(run_a, run_b, rel, abs_floor_s)
+    if not comparable:
+        _refuse_gate(rows)
+    payload = _finite_or_none(
+        {
+            "abs_floor": abs_floor_s,
+            "gated": comparable,
+            "kpis": rows,
+            "rel": rel,
+            "schema_version": SCHEMA_VERSION,
+            "topology_delta": topology_delta,
+        }
+    )
+    if opts.as_json:
+        sys.stdout.write(
+            json.dumps(payload, allow_nan=False, sort_keys=True) + "\n"
+        )
+    else:
+        chunks: list[str] = []
+        if topology_delta:
+            chunks.append(_render_topology_delta(topology_delta))
+        chunks.append(render_compare_table(rows))
+        sys.stdout.write("".join(chunks))
+    if comparable and any(row.get("gate") == _GATE_FAIL for row in rows):
+        return EXIT_KPI
+    return EXIT_OK
 
 
 # ===== § 10. JSON writer =====

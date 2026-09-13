@@ -358,6 +358,24 @@ Key paths: [`scripts/tests/fixtures/verdict_json__keypaths.txt`](../scripts/test
 
 Human two-halves table: client KPI rows, then `--- chain ---` with the same columns as [validator-perf.md](validator-perf.md) (`pubkey`, `index`, `status`, `part%`, `src%`, `tgt%`, `head%`, …). `null` renders as `—`, never `0`.
 
+## Comparing two runs
+
+`scripts/devnet_report.py compare` diffs two **finished** run directories. It is read-only and opens no socket.
+
+```bash
+scripts/devnet_report.py compare scripts/devnet/runs/<a> scripts/devnet/runs/<b>
+scripts/devnet_report.py compare A B --rel 0.25 --abs-floor 1ms
+scripts/devnet_report.py compare A B --json
+```
+
+Prints a per-KPI table (`kpi`, `A`, `B`, `delta`, `%`, `gate`). Exit **4** if any gated KPI regresses; **0** otherwise.
+
+Default tolerances (Q4): latency and ratio KPIs use `rel=0.25` and `abs_floor=1ms`. A regression must exceed **both** the relative bound (strictly beyond: higher-is-worse `B > A × (1+rel)`, lower-is-worse `B < A × (1−rel)`) **and** `abs_floor` in the KPI's unit. Exact +25% does not fail. Failure-only KPIs gate at absolute 0 — K2 missed slots, K6 proposal failures, K8 `blocked`, K13 task exits. Only the worsening direction gates; an improvement is exit 0.
+
+Chain half: gate only `participation_rate` and `target_rate`. Unknown `chain.json` keys render `gated=false` (including non-finite values, which are `absent`, never `0`). A missing KPI is `absent`, never `0`.
+
+When the two `run.json` fingerprints differ **or either is missing**, compare prints `topology_delta` with the differing subkeys, sets `gated=false`, and exits **0** — it refuses to gate across topologies (ADR-010). `rvc_version` is not a fingerprint input.
+
 ## Measured wall-clocks (issue 5.6)
 
 **Not observed.** The first live `run.sh --profile fast` end-to-end on the developer host is **blocked** — see [`plan/devnet-testbed-2026-09-12/milestone-s3-s8.md`](../plan/devnet-testbed-2026-09-12/milestone-s3-s8.md). Do not treat the arithmetic below as a measurement.

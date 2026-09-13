@@ -1,0 +1,20 @@
+{
+  "aggregate": {
+    "attester_effectiveness": 1.0,
+    "consensus_reward_gwei": 2000000,
+    "estimated_apr": 0.04,
+    "head_rate": 1.0,
+    "missed_attestations": 0,
+    "participation_rate": 1.0,
+    "proposals": {"included": 0, "missed": 0, "scheduled": 0},
+    "reward_source": "rewards_api",
+    "source_rate": 1.0,
+    "target_rate": 1.0,
+    "validators": 2
+  },
+  "degradations": [],
+  "exit_code": 0,
+  "generated_at": "2026-09-12T00:00:00Z",
+  "schema_version": 1,
+  "threshold_breaches": []
+}

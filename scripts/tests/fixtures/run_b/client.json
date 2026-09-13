@@ -1,0 +1,145 @@
+{
+  "annotations": [],
+  "counters": {
+    "rvc_aggregations_total": [
+      {
+        "delta": 14,
+        "labels": {"status": "success"},
+        "per_epoch": 3.5
+      }
+    ],
+    "rvc_attestations_total": [
+      {
+        "delta": 112,
+        "labels": {"status": "success"},
+        "per_epoch": 28
+      }
+    ],
+    "rvc_duties_fetched_total": [
+      {
+        "delta": 4,
+        "labels": {},
+        "per_epoch": 1
+      }
+    ],
+    "rvc_duty_reorg_detected_total": [
+      {
+        "delta": 0,
+        "labels": {"duty_type": "attester"},
+        "per_epoch": 0
+      }
+    ],
+    "rvc_orchestrator_missed_slots_total": [
+      {
+        "delta": 0,
+        "labels": {},
+        "per_epoch": 0
+      }
+    ],
+    "rvc_orchestrator_slots_processed_total": [
+      {
+        "delta": 128,
+        "labels": {"result": "success"},
+        "per_epoch": 32
+      }
+    ],
+    "rvc_proposals_total": [
+      {
+        "delta": 0,
+        "labels": {"outcome": "envelope_late"},
+        "per_epoch": 0
+      }
+    ],
+    "rvc_slashing_protection_checks_total": [
+      {
+        "delta": 112,
+        "labels": {"result": "safe"},
+        "per_epoch": 28
+      },
+      {
+        "delta": 0,
+        "labels": {"result": "blocked"},
+        "per_epoch": 0
+      }
+    ],
+    "rvc_sse_events_dropped_total": [
+      {
+        "delta": 0,
+        "labels": {"expected": "head"},
+        "per_epoch": 0
+      }
+    ],
+    "rvc_task_exits_total": [
+      {
+        "delta": 0,
+        "labels": {"outcome": "ok", "task": "orchestrator"},
+        "per_epoch": 0
+      }
+    ]
+  },
+  "gauges": {
+    "rvc_bn_health_tier": [
+      {
+        "labels": {"endpoint": "http://127.0.0.1:5052"},
+        "last": 1,
+        "max": 1,
+        "min": 1,
+        "samples": 2
+      }
+    ],
+    "rvc_tasks_running": [
+      {
+        "labels": {"task": "orchestrator"},
+        "last": 1,
+        "max": 1,
+        "min": 1,
+        "samples": 2
+      }
+    ]
+  },
+  "generated_at": "2026-09-12T00:00:01Z",
+  "histograms": {
+    "rvc_orchestrator_slot_processing_duration_seconds": [
+      {
+        "labels": {},
+        "mean": 0.04,
+        "p95": 0.05,
+        "unit": "seconds"
+      }
+    ],
+    "rvc_proposer_bn_latency_ms": [
+      {
+        "labels": {"endpoint": "http://127.0.0.1:5052", "pool": "proposer"},
+        "mean": 7.0,
+        "p95": 12.0,
+        "unit": "milliseconds"
+      }
+    ],
+    "rvc_signing_duration_seconds": [
+      {
+        "labels": {},
+        "mean": 0.005,
+        "p95": 0.0104,
+        "unit": "seconds"
+      }
+    ],
+    "rvc_slashing_reserve_tx_hold_duration_ms": [
+      {
+        "labels": {"kind": "attestation"},
+        "mean": 5.0,
+        "p95": 8.0,
+        "unit": "milliseconds"
+      }
+    ],
+    "rvc_slot_phase_block_start_offset_ms": [
+      {
+        "labels": {"cache": "warm"},
+        "mean": 6.0,
+        "p95": 10.0,
+        "unit": "milliseconds"
+      }
+    ]
+  },
+  "presence": {"K6": "family_present_child_absent"},
+  "schema_version": 1
+}
