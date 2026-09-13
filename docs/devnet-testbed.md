@@ -127,9 +127,31 @@ scripts/devnet/attach-rvc.sh --profile fast --run-dir scripts/devnet/runs/manual
 
 Success writes `runs/<id>/rvc.json` (endpoint, pid, pubkey set, key range, config path). **Timeout is exit 5 and no `rvc.json` is written** — soak and report then fail closed (usage 2, naming `attach-rvc.sh`). Already-attached (live pid + `/health` 200 owned by that pid) is a no-op; `--force` kills our rvc first.
 
-`--docker` / `--docker=*` exits 2: *attach-rvc.sh --docker is not implemented (Phase 6 / DN-15)*. `run.sh --docker` passes that flag through and fails the same way.
-
 `--profile fast` turns doppelganger **off** in the rendered config. Detection is **on only under `--profile safe`**. A latent key overlap will not be caught on `fast`.
+
+## Docker attach
+
+`attach-rvc.sh --docker` is the same verb with a different launch (ADR-007): a container on `eth-devnet-network` instead of `target/release/rvc`. `run.sh --docker` forwards the flag. Every other edge is unchanged — BN probes, GVR, health URL on the published host port, timeout 5 / no `rvc.json`, inventory-before-create (ADR-009).
+
+```bash
+scripts/devnet/attach-rvc.sh --profile fast --run-dir scripts/devnet/runs/manual --docker < /dev/null
+```
+
+| Piece | Native | `--docker` |
+|-------|--------|------------|
+| Launch | `target/release/rvc start … --metrics-address 127.0.0.1` | `docker run -d --name eth-devnet-rvc --network eth-devnet-network --no-healthcheck -u "$(id -u):$(id -g)"` |
+| Image | — | `rvc:latest` via `make docker-rvc` (`docker build --target rvc -t rvc:latest`), **built only when absent** |
+| Metrics | loopback | `--metrics-address 0.0.0.0` plus `-e RVC_METRICS_ALLOW_NON_LOOPBACK=true` (a non-loopback bind is *refused* without it) and `-p 127.0.0.1:${RVC_METRICS_PORT}:8080` |
+| Config | host `data/rvc/` and `data/keys/rvc/` | `beacon_url = "http://eth-devnet-beacon:5052"`; `keystore_path` / `password_file` / `slashing_db_path` rebased under `/data/`; GVR still byte-copied from the BN |
+| Bind | — | `data/rvc:/data` and `data/keys/rvc:/data/keys/rvc` |
+| Inventory | `{kind:pid,name:rvc}` | `{kind:container,name:eth-devnet-rvc}` **before** `docker run` |
+| `rvc.json` | `pid` | plus `launch_mode` and `container_id` |
+| Logs | process stdout → `data/rvc/rvc.log` | `docker logs -f` teed into the same file |
+| Idempotency | live pid + `/health` 200 owned by that pid | running container + HTTP `/health` 200. Not `State.Health` — the image probes `/healthz`, which RVC does not serve, so the run uses `--no-healthcheck` |
+
+`--force` removes **both** a live pidfile rvc and `eth-devnet-rvc`, and a second attach no-ops if either occupant is healthy, regardless of `--docker`. A kill between inventory append and readiness still leaves `down.sh` able to `docker rm -f` the name; `down.sh --data` then leaves no container and no `data/rvc/slashing_protection.sqlite`. `-u "$(id -u):$(id -g)"` overrides `USER rvc` (uid 10001) so that bind-mounted sqlite stays host-owned.
+
+Timeout, missing `--run-dir`, and stdin-closed (`< /dev/null`) behave as on the native path.
 
 ## Gather
 
@@ -197,7 +219,7 @@ Every operator verb sources `parse_common_flags`. Space and `=` forms are accept
 | `--data-dir PATH` | `scripts/devnet/data` | Override the purge root. Not `--data` (that is `down.sh` only). Refuses a symlink or world-writable dir. |
 | `--profile {fast\|safe}` | unset (`attach-rvc.sh` defaults `fast`) | **Required on `run.sh`**. Sets `EPOCHS`, `DOPPELGANGER`, and (safe only) `FAIL_UNDER`. |
 
-`--dry-run` still runs that verb's flag parse and preconditions, then prints a plan. `run.sh` / `up.sh` / `down.sh` skip the binary and live artifacts (`run.sh --dry-run` does not resolve `RVC_BIN`; `up.sh --dry-run` does not call `require_chain_1337`). `attach-rvc.sh --dry-run` still requires `--run-dir`, still resolves `RVC_BIN` (infra **1** if missing), and still validates keys. `soak.sh --dry-run` still requires `--epochs` and `rvc.json`. `report.sh --dry-run` still requires `--run-dir`.
+`--dry-run` still runs that verb's flag parse and preconditions, then prints a plan. `run.sh` / `up.sh` / `down.sh` skip the binary and live artifacts (`run.sh --dry-run` does not resolve `RVC_BIN`; `up.sh --dry-run` does not call `require_chain_1337`). `attach-rvc.sh --dry-run` still requires `--run-dir` and still validates keys. Native dry-run still resolves `RVC_BIN` (infra **1** if missing); `--docker --dry-run` requires `docker` instead and does not resolve the binary. `soak.sh --dry-run` still requires `--epochs` and `rvc.json`. `report.sh --dry-run` still requires `--run-dir`.
 
 ### `up.sh`
 
@@ -208,7 +230,7 @@ Common flags only. Forwards `--force`, `--interactive`, `--run-dir`, `--profile`
 | Flag | Default | Notes |
 |------|---------|--------|
 | `--timeout N` | `120` | Positive integer. `/health` not 200 within N s → exit **5**, no `rvc.json`. |
-| `--docker` | off | **Not implemented** (Phase 6 / DN-15). Any `--docker` / `--docker=*` → usage **2**. |
+| `--docker` | off | Container on `eth-devnet-network` (see [Docker attach](#docker-attach)). Same `--run-dir` / timeout / `--force` contracts as native. |
 
 `--run-dir` is required (no `runs/standalone` fallback).
 
@@ -247,7 +269,7 @@ Does not call `require_chain_1337` (teardown must still run). Unsets `MNEMONIC`.
 | `--stages LIST` | `up,attach,soak,report` (teardown via trap) | Comma-separated `up\|attach\|soak\|report\|down`. Requires `--run-id`. |
 | `--run-id ID` | minted `<UTC>-<git sha>` | `[A-Za-z0-9._-]+`, no leading `.`/`-`, no `..`. Directory is `scripts/devnet/runs/<id>/`. |
 | `--keep` | off | Skip the EXIT-trap `down.sh`. |
-| `--docker` | off | Forwarded to `attach-rvc.sh` → currently usage **2** (Phase 6). |
+| `--docker` | off | Forwarded to `attach-rvc.sh` (container on `eth-devnet-network`; see [Docker attach](#docker-attach)). |
 | `--strict` | off | Forwarded to `report.sh`. |
 | `--fail-under METRIC=VALUE` | profile / none | Repeatable; joined with commas and forwarded to `report.sh`. |
 
@@ -304,7 +326,7 @@ PRD §4 vocabulary, emitted only through `die_infra` / `die_usage` / `die_health
 |------|--------|---------|----------------|
 | `0` | — | Pass | All gates green. `"degraded"` annotation is still `0` unless `--strict`. |
 | `1` | `die_infra` | Infrastructure | Docker pull, genesis generator, keystore count, weak KDF, BN GET, `validator_perf.py` 1/2/5. |
-| `2` | `die_usage` | Usage / preflight | Bad flag, missing tool, `CHAIN_ID ≠ 1337`, Docker VM &lt; 8 GiB, stale datadirs, missing `rvc.json`/`run.json`, missing `target/release/rvc` on `run.sh`, fork-schedule mismatch, `--docker`. |
+| `2` | `die_usage` | Usage / preflight | Bad flag, missing tool, `CHAIN_ID ≠ 1337`, Docker VM &lt; 8 GiB, stale datadirs, missing `rvc.json`/`run.json`, missing `target/release/rvc` on `run.sh`, fork-schedule mismatch. |
 | `3` | `die_health` | Health gate | RVC/BN unhealthy during soak, K8 `blocked` &gt; 0 (live or post-hoc), S5a missing family, S5b liveness, `--strict` + validator_perf `3`. |
 | `4` | `die_kpi` | KPI threshold | `validator_perf.py` exit `4` (`--fail-under` breach). |
 | `5` | `die_notready` | RVC never became ready | Attach `/health` timeout. **No `rvc.json`.** |
@@ -350,7 +372,7 @@ Start snapshot + end rewrite. Key paths: `schema_version`, `run_id`, `generated_
 
 ### `rvc.json` (writer: `attach-rvc.sh`)
 
-`schema_version`, `generated_at`, `endpoint`, `pid`, `key_range`, `pubkeys`, `config_path`. Full list: [`scripts/tests/fixtures/rvc_json__keypaths.txt`](../scripts/tests/fixtures/rvc_json__keypaths.txt). No `genesis_time` — soak reads that from the BN (ADR-013).
+`schema_version`, `generated_at`, `endpoint`, `pid`, `key_range`, `pubkeys`, `config_path`. `--docker` also writes `launch_mode` and `container_id`. Full list (native): [`scripts/tests/fixtures/rvc_json__keypaths.txt`](../scripts/tests/fixtures/rvc_json__keypaths.txt). No `genesis_time` — soak reads that from the BN (ADR-013).
 
 ### `client.json` (writer: `devnet_report.py report`)
 

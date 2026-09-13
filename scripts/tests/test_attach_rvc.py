@@ -47,6 +47,8 @@ _ISOLATE_KEYS = (
     "ATTACH_TIMEOUT",
     "NUM_VALIDATORS",
     "RVC_KEYS",
+    "LAUNCH_MODE",
+    "RVC_IMAGE",
 )
 
 _READ_CMD_RE = re.compile(r"(?m)^\s*read\s")
@@ -396,11 +398,18 @@ def test_attach_rvc_sh_exists_and_syntax():
     assert "render_rvc_config" in text
     assert "assert_slashing_db_gvr" in text
     assert "spawn_rvc" in text
+    assert "launch_rvc_native" in text
+    assert "launch_rvc_docker" in text
+    assert "LAUNCH_MODE" in text
     assert "is_rvc_attached" in text
     assert "--init-slashing-db" in text
     assert "--metrics-address 127.0.0.1" in text
+    assert "--metrics-address 0.0.0.0" in text
+    assert "--no-healthcheck" in text
+    assert "RVC_METRICS_ALLOW_NON_LOOPBACK" in text
+    assert "State.Health" not in text
     assert "die_notready" in text
-    assert "Phase 6" in text and "DN-15" in text
+    assert "not implemented" not in text
     assert _READ_CMD_RE.search(text) is None
     main_src = text.split("main() {", 1)[1]
     assert main_src.index("_inventory_attach_rows") < main_src.index("spawn_rvc")
@@ -417,6 +426,8 @@ def test_attach_rvc_shellcheck():
 
 
 def test_attach_docker_flag_exits_2(tmp_path: Path):
+    # P6-A13: inverted from Phase 3's "not implemented" stub. --docker is
+    # accepted; usage-2 is --run-dir / missing inputs, never DN-15.
     proc = run_attach(
         tmp_path,
         ["--docker"],
@@ -426,9 +437,11 @@ def test_attach_docker_flag_exits_2(tmp_path: Path):
     )
     assert proc.returncode == 2
     assert proc.stdout == ""
-    assert "Phase 6" in proc.stderr
-    assert "DN-15" in proc.stderr
     assert "unknown flag" not in proc.stderr
+    assert "not implemented" not in proc.stderr
+    assert "Phase 6" not in proc.stderr
+    assert "DN-15" not in proc.stderr
+    assert "--run-dir" in proc.stderr
     assert _MNEMONIC not in proc.stdout + proc.stderr
 
     run_dir = tmp_path / "run"
@@ -440,8 +453,30 @@ def test_attach_docker_flag_exits_2(tmp_path: Path):
         port=9,
     )
     assert proc2.returncode == 2
-    assert "Phase 6" in proc2.stderr
-    assert "DN-15" in proc2.stderr
+    assert proc2.stdout == ""
+    assert "unknown flag" not in proc2.stderr
+    assert "not implemented" not in proc2.stderr
+    assert "Phase 6" not in proc2.stderr
+    assert "DN-15" not in proc2.stderr
+
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    curl, _ = write_curl_stub(tmp_path)
+    dry = run_attach(
+        tmp_path,
+        ["--run-dir", str(run_dir), "--docker", "--dry-run"],
+        rvc=tmp_path / "missing-rvc",
+        curl=curl,
+        port=9,
+    )
+    assert dry.returncode == 0, dry.stderr
+    assert dry.stdout == ""
+    assert "unknown flag" not in dry.stderr
+    assert "not implemented" not in dry.stderr
+    assert "launch_rvc_docker" in dry.stderr
+    assert "eth-devnet-rvc" in dry.stderr
+    assert not (run_dir / "rvc.json").exists()
+    assert_no_secrets(dry, data_dir)
 
 
 def test_attach_requires_run_dir(tmp_path: Path):
@@ -952,3 +987,650 @@ def test_attach_omits_no_doppelganger_flag_under_safe(tmp_path: Path):
             raw = pid_out.read_text(encoding="utf-8").strip()
             if raw.isdigit():
                 kill_pid(int(raw))
+
+
+DOWN = Path(__file__).resolve().parents[1] / "devnet" / "down.sh"
+_FAKE_CID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+
+def write_docker_rvc_stub(
+    tmp_path: Path,
+    *,
+    mode: str = "healthy",
+    port: int,
+) -> tuple[Path, Path, Path, Path]:
+    log = tmp_path / "docker.log"
+    inv_snap = tmp_path / "inv-at-docker-run.json"
+    pid_out = tmp_path / "docker-stub.pid"
+    state = tmp_path / "docker-state"
+    state.mkdir(exist_ok=True)
+    running = state / "running"
+    allc = state / "all"
+    cidf = state / "cid"
+    running.write_text("", encoding="utf-8")
+    allc.write_text("", encoding="utf-8")
+    cidf.write_text(_FAKE_CID + "\n", encoding="utf-8")
+    server_py = tmp_path / "docker-health.py"
+    server_py.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys, time\n"
+        "from http.server import BaseHTTPRequestHandler, HTTPServer\n"
+        f"PORT = {int(port)}\n"
+        f"PID_OUT = {str(pid_out)!r}\n"
+        "\n"
+        "class Handler(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        path = self.path.split('?', 1)[0]\n"
+        "        if path in ('/health', '/readyz', '/livez'):\n"
+        "            self.send_response(200)\n"
+        "            self.send_header('Content-Type', 'application/json')\n"
+        "            self.end_headers()\n"
+        "            self.wfile.write(b'{\"healthy\":true}\\n')\n"
+        "        else:\n"
+        "            self.send_response(404)\n"
+        "            self.end_headers()\n"
+        "    def log_message(self, fmt, *args):\n"
+        "        return\n"
+        "\n"
+        "class Server(HTTPServer):\n"
+        "    allow_reuse_address = True\n"
+        "\n"
+        "def main():\n"
+        "    port = int(os.environ.get('RVC_METRICS_PORT') or PORT)\n"
+        "    httpd = Server(('127.0.0.1', port), Handler)\n"
+        "    with open(PID_OUT, 'w', encoding='utf-8') as fh:\n"
+        "        fh.write(str(os.getpid()) + '\\n')\n"
+        "    httpd.serve_forever()\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+    server_py.chmod(0o755)
+    stub = tmp_path / "docker"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"log={shlex.quote(str(log))}\n"
+        f"running={shlex.quote(str(running))}\n"
+        f"all={shlex.quote(str(allc))}\n"
+        f"cidf={shlex.quote(str(cidf))}\n"
+        f"invsnap={shlex.quote(str(inv_snap))}\n"
+        f"pidout={shlex.quote(str(pid_out))}\n"
+        f"server={shlex.quote(str(server_py))}\n"
+        f"mode={shlex.quote(mode)}\n"
+        "printf '%s\\n' \"$*\" >> \"$log\"\n"
+        "cmd=\"$1\"\n"
+        "shift || true\n"
+        "remove_name() {\n"
+        "  name=\"$1\"\n"
+        "  file=\"$2\"\n"
+        "  if [ -f \"$file\" ]; then\n"
+        "    grep -Fxv -- \"$name\" \"$file\" > \"$file.tmp\" || true\n"
+        "    mv \"$file.tmp\" \"$file\"\n"
+        "  fi\n"
+        "}\n"
+        "kill_server() {\n"
+        "  if [ -f \"$pidout\" ]; then\n"
+        "    spid=$(tr -d '[:space:]' < \"$pidout\")\n"
+        "    if [ -n \"$spid\" ]; then kill -KILL \"$spid\" 2>/dev/null || true; fi\n"
+        "  fi\n"
+        "}\n"
+        "case \"$cmd\" in\n"
+        "  image)\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  ps)\n"
+        "    allflag=0\n"
+        "    for a in \"$@\"; do\n"
+        "      if [ \"$a\" = \"-a\" ]; then allflag=1; fi\n"
+        "    done\n"
+        "    if [ \"$allflag\" -eq 1 ]; then cat \"$all\"; else cat \"$running\"; fi\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  inspect)\n"
+        "    fmt=\"\"\n"
+        "    prev=\"\"\n"
+        "    name=\"\"\n"
+        "    for a in \"$@\"; do\n"
+        "      if [ \"$prev\" = \"-f\" ] || [ \"$prev\" = \"--format\" ]; then fmt=\"$a\"; fi\n"
+        "      case \"$a\" in\n"
+        "        -f=*|--format=*) fmt=\"${a#*=}\" ;;\n"
+        "        --|-f|--format) ;;\n"
+        "        -*) ;;\n"
+        "        *) name=\"$a\" ;;\n"
+        "      esac\n"
+        "      prev=\"$a\"\n"
+        "    done\n"
+        "    if ! grep -Fxq -- \"$name\" \"$all\" 2>/dev/null; then exit 1; fi\n"
+        "    case \"$fmt\" in\n"
+        "      '{{.Id}}'|\"{{.Id}}\") cat \"$cidf\"; exit 0 ;;\n"
+        "      '{{.State.Pid}}'|\"{{.State.Pid}}\")\n"
+        "        if [ -f \"$pidout\" ]; then cat \"$pidout\"; else printf '4242\\n'; fi\n"
+        "        exit 0\n"
+        "        ;;\n"
+        "    esac\n"
+        "    printf '%s\\n' '[]'\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  run)\n"
+        "    if [ -n \"${RUN_DIR:-}\" ] && [ -f \"$RUN_DIR/inventory.json\" ]; then\n"
+        "      cp \"$RUN_DIR/inventory.json\" \"$invsnap\"\n"
+        "    fi\n"
+        "    name=\"\"\n"
+        "    detached=0\n"
+        "    prev=\"\"\n"
+        "    for a in \"$@\"; do\n"
+        "      if [ \"$prev\" = \"--name\" ]; then name=\"$a\"; fi\n"
+        "      case \"$a\" in\n"
+        "        --name=*) name=\"${a#--name=}\" ;;\n"
+        "        -d|--detach) detached=1 ;;\n"
+        "      esac\n"
+        "      prev=\"$a\"\n"
+        "    done\n"
+        "    if [ \"$mode\" = \"fail\" ]; then exit 1; fi\n"
+        "    if [ -n \"$name\" ]; then\n"
+        "      printf '%s\\n' \"$name\" >> \"$all\"\n"
+        "      if [ \"$detached\" -eq 1 ]; then printf '%s\\n' \"$name\" >> \"$running\"; fi\n"
+        "    fi\n"
+        "    if [ \"$mode\" != \"never\" ]; then\n"
+        "      rm -f \"$pidout\"\n"
+        "      nohup python3 \"$server\" >/dev/null 2>&1 &\n"
+        "      i=0\n"
+        "      while [ \"$i\" -lt 50 ]; do\n"
+        "        if [ -f \"$pidout\" ]; then break; fi\n"
+        "        i=$((i + 1))\n"
+        "        sleep 0.05\n"
+        "      done\n"
+        "    fi\n"
+        "    cat \"$cidf\"\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  rm)\n"
+        "    kill_server\n"
+        "    for a in \"$@\"; do\n"
+        "      case \"$a\" in\n"
+        "        -*|--) ;;\n"
+        "        *)\n"
+        "          remove_name \"$a\" \"$running\"\n"
+        "          remove_name \"$a\" \"$all\"\n"
+        "          ;;\n"
+        "      esac\n"
+        "    done\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  logs)\n"
+        "    printf 'rvc-docker-stub log\\n'\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub, log, inv_snap, pid_out
+
+
+def _kill_stub_pidfile(pid_out: Path) -> None:
+    if not pid_out.is_file():
+        return
+    raw = pid_out.read_text(encoding="utf-8").strip()
+    if raw.isdigit():
+        kill_pid(int(raw))
+
+
+def test_attach_sh_has_no_state_health():
+    text = ATTACH.read_text(encoding="utf-8")
+    assert text.count("State.Health") == 0
+
+
+def test_attach_docker_inventory_precedes_run(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    docker, dlog, inv_snap, pid_out = write_docker_rvc_stub(
+        tmp_path, mode="never", port=port
+    )
+    run_dir = tmp_path / "run"
+    try:
+        proc = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--docker", "--timeout", "4"],
+            rvc=tmp_path / "unused-rvc",
+            curl=curl,
+            port=port,
+            extra={"DOCKER": str(docker)},
+        )
+        assert proc.returncode == 5, proc.stderr
+        assert not (run_dir / "rvc.json").exists()
+        assert inv_snap.is_file(), proc.stderr
+        snap_rows = inventory_rows(inv_snap)
+        snap_kinds = {(r.get("kind"), r.get("name")) for r in snap_rows}
+        assert ("container", "eth-devnet-rvc") in snap_kinds
+        assert ("slashing_db", "slashing_protection.sqlite") in snap_kinds
+        rows = inventory_rows(run_dir / "inventory.json")
+        kinds = {(r.get("kind"), r.get("name")) for r in rows}
+        assert ("container", "eth-devnet-rvc") in kinds
+        argv = dlog.read_text(encoding="utf-8")
+        run_lines = [
+            ln
+            for ln in argv.splitlines()
+            if ln.startswith("run ") or ln.startswith("run\t")
+        ]
+        assert run_lines, argv
+        run_argv = "\n".join(run_lines)
+        assert "--no-healthcheck" in run_argv
+        assert "RVC_METRICS_ALLOW_NON_LOOPBACK=true" in run_argv
+        assert "--init-slashing-db" in run_argv
+        assert "--metrics-address 0.0.0.0" in run_argv
+        assert "-c /data/config.toml" in run_argv
+        assert "eth-devnet-network" in run_argv
+        assert "eth-devnet-rvc" in run_argv
+        assert "rvc:latest" in run_argv
+        assert f"127.0.0.1:{port}:8080" in run_argv
+        assert re.search(r"(?:^|\s)-u\s+\d+:\d+(?:\s|$)", run_argv), run_argv
+        assert f"-u {os.getuid()}:{os.getgid()}" in run_argv
+        assert re.search(
+            rf"(?:^|\s)-v\s+{re.escape(str(data_dir / 'rvc'))}:/data(?:\s|$)",
+            run_argv,
+        ), run_argv
+        assert re.search(
+            rf"(?:^|\s)-v\s+{re.escape(str(data_dir / 'keys' / 'rvc'))}"
+            r":/data/keys/rvc(?:\s|$)",
+            run_argv,
+        ), run_argv
+        assert "--metrics-address 127.0.0.1" not in run_argv
+        assert "State.Health" not in argv
+        assert_no_secrets(proc, data_dir)
+        cfg = (data_dir / "rvc" / "config.toml").read_text(encoding="utf-8")
+        assert 'beacon_url = "http://eth-devnet-beacon:5052"' in cfg
+        assert 'keystore_path = "/data/keys/rvc"' in cfg
+        assert 'password_file = "/data/passwords.txt"' in cfg
+        assert 'slashing_db_path = "/data/slashing_protection.sqlite"' in cfg
+        assert _GENESIS_GVR in cfg
+    finally:
+        _kill_stub_pidfile(pid_out)
+
+
+def test_attach_docker_timeout_exits_5_and_writes_no_rvc_json(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    docker, _, _, pid_out = write_docker_rvc_stub(
+        tmp_path, mode="never", port=port
+    )
+    run_dir = tmp_path / "run"
+    try:
+        proc = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--docker", "--timeout", "4"],
+            rvc=tmp_path / "unused-rvc",
+            curl=curl,
+            port=port,
+            extra={"DOCKER": str(docker)},
+        )
+        assert proc.returncode == 5, proc.stderr
+        assert not (run_dir / "rvc.json").exists()
+        copied = run_dir / "logs" / "rvc.log"
+        assert copied.is_file(), proc.stderr
+        assert_no_secrets(proc, data_dir)
+    finally:
+        _kill_stub_pidfile(pid_out)
+
+
+def test_attach_docker_twice_is_noop(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    docker, dlog, _, pid_out = write_docker_rvc_stub(
+        tmp_path, mode="healthy", port=port
+    )
+    run_dir = tmp_path / "run"
+    args = ["--run-dir", str(run_dir), "--docker", "--timeout", "8"]
+    try:
+        first = run_attach(
+            tmp_path,
+            args,
+            rvc=tmp_path / "unused-rvc",
+            curl=curl,
+            port=port,
+            extra={"DOCKER": str(docker)},
+        )
+        assert first.returncode == 0, first.stderr
+        assert_no_secrets(first, data_dir)
+        rvc_json = run_dir / "rvc.json"
+        assert rvc_json.is_file()
+        first_doc = json.loads(rvc_json.read_text(encoding="utf-8"))
+        assert first_doc["launch_mode"] == "docker"
+        assert first_doc["container_id"] == _FAKE_CID
+        first_runs = dlog.read_text(encoding="utf-8").count("\nrun ") + (
+            1 if dlog.read_text(encoding="utf-8").startswith("run ") else 0
+        )
+        assert first_runs >= 1
+
+        second = run_attach(
+            tmp_path,
+            args,
+            rvc=tmp_path / "unused-rvc",
+            curl=curl,
+            port=port,
+            extra={"DOCKER": str(docker)},
+        )
+        assert second.returncode == 0, second.stderr
+        assert "already attached" in second.stderr
+        second_doc = json.loads(rvc_json.read_text(encoding="utf-8"))
+        assert second_doc == first_doc
+        assert_no_secrets(second, data_dir)
+        runs_after = dlog.read_text(encoding="utf-8").count("\nrun ") + (
+            1 if dlog.read_text(encoding="utf-8").startswith("run ") else 0
+        )
+        assert runs_after == first_runs
+    finally:
+        _kill_stub_pidfile(pid_out)
+
+
+def test_attach_docker_safe_omits_no_doppelganger_flag(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    docker, dlog, _, pid_out = write_docker_rvc_stub(
+        tmp_path, mode="never", port=port
+    )
+    run_dir = tmp_path / "run"
+    try:
+        proc_safe = run_attach(
+            tmp_path,
+            [
+                "--run-dir",
+                str(run_dir),
+                "--docker",
+                "--profile",
+                "safe",
+                "--timeout",
+                "4",
+            ],
+            rvc=tmp_path / "unused-rvc",
+            curl=curl,
+            port=port,
+            extra={"DOCKER": str(docker)},
+        )
+        assert proc_safe.returncode == 5, proc_safe.stderr
+        argv_safe = dlog.read_text(encoding="utf-8")
+        assert "--init-slashing-db" in argv_safe
+        assert "--no-doppelganger-detection" not in argv_safe
+        assert_no_secrets(proc_safe, data_dir)
+
+        dlog.write_text("", encoding="utf-8")
+        proc_fast = run_attach(
+            tmp_path,
+            [
+                "--run-dir",
+                str(run_dir),
+                "--docker",
+                "--profile",
+                "fast",
+                "--force",
+                "--timeout",
+                "4",
+            ],
+            rvc=tmp_path / "unused-rvc",
+            curl=curl,
+            port=port,
+            extra={"DOCKER": str(docker)},
+        )
+        assert proc_fast.returncode == 5, proc_fast.stderr
+        argv_fast = dlog.read_text(encoding="utf-8")
+        assert "--init-slashing-db" in argv_fast
+        assert "--no-doppelganger-detection" in argv_fast
+        assert_no_secrets(proc_fast, data_dir)
+    finally:
+        _kill_stub_pidfile(pid_out)
+
+
+def test_attach_docker_down_can_remove_container(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    db = data_dir / "rvc" / "slashing_protection.sqlite"
+    write_slashing_db(db, _GENESIS_GVR)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    docker, dlog, _, pid_out = write_docker_rvc_stub(
+        tmp_path, mode="never", port=port
+    )
+    run_dir = tmp_path / "run"
+    try:
+        proc = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--docker", "--timeout", "4"],
+            rvc=tmp_path / "unused-rvc",
+            curl=curl,
+            port=port,
+            extra={"DOCKER": str(docker)},
+        )
+        assert proc.returncode == 5, proc.stderr
+        assert not (run_dir / "rvc.json").exists()
+        rows = inventory_rows(run_dir / "inventory.json")
+        assert any(
+            r.get("kind") == "container" and r.get("name") == "eth-devnet-rvc"
+            for r in rows
+        )
+        env = attach_env(
+            tmp_path,
+            rvc=tmp_path / "unused-rvc",
+            curl=curl,
+            port=port,
+            extra={"DOCKER": str(docker), "PURGE_DATA": "1"},
+        )
+        down = subprocess.run(
+            ["bash", str(DOWN), "--run-dir", str(run_dir), "--data"],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=20,
+            stdin=subprocess.DEVNULL,
+        )
+        assert down.returncode == 0, down.stderr
+        cmds = [
+            line
+            for line in dlog.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert any("rm " in c and "eth-devnet-rvc" in c for c in cmds), cmds
+        assert not db.exists()
+        assert not data_dir.exists()
+        assert_no_secrets(proc, data_dir)
+    finally:
+        _kill_stub_pidfile(pid_out)
+
+
+def test_attach_native_noops_when_docker_healthy(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    docker, dlog, _, pid_out = write_docker_rvc_stub(
+        tmp_path, mode="healthy", port=port
+    )
+    rvc, _, _, rvc_pid_out = write_rvc_stub(tmp_path, mode="healthy", port=port)
+    run_dir = tmp_path / "run"
+    extra = {"DOCKER": str(docker)}
+    try:
+        first = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--docker", "--timeout", "8"],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+            extra=extra,
+        )
+        assert first.returncode == 0, first.stderr
+        runs_before = sum(
+            1 for ln in dlog.read_text(encoding="utf-8").splitlines() if ln.startswith("run ")
+        )
+        second = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--timeout", "8"],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+            extra=extra,
+        )
+        assert second.returncode == 0, second.stderr
+        assert "already attached" in second.stderr
+        runs_after = sum(
+            1 for ln in dlog.read_text(encoding="utf-8").splitlines() if ln.startswith("run ")
+        )
+        assert runs_after == runs_before
+        assert_no_secrets(second, data_dir)
+    finally:
+        _kill_stub_pidfile(pid_out)
+        _kill_stub_pidfile(rvc_pid_out)
+
+
+def test_attach_docker_noops_when_native_healthy(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    docker, dlog, _, pid_out = write_docker_rvc_stub(
+        tmp_path, mode="healthy", port=port
+    )
+    rvc, _, _, rvc_pid_out = write_rvc_stub(tmp_path, mode="healthy", port=port)
+    run_dir = tmp_path / "run"
+    extra = {"DOCKER": str(docker)}
+    live: list[int] = []
+    try:
+        first = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--timeout", "8"],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+            extra=extra,
+        )
+        assert first.returncode == 0, first.stderr
+        native_pid = read_pidfile(data_dir)
+        assert native_pid is not None
+        live.append(native_pid)
+        runs_before = sum(
+            1 for ln in dlog.read_text(encoding="utf-8").splitlines() if ln.startswith("run ")
+        )
+        second = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--docker", "--timeout", "8"],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+            extra=extra,
+        )
+        assert second.returncode == 0, second.stderr
+        assert "already attached" in second.stderr
+        assert read_pidfile(data_dir) == native_pid
+        assert pid_alive(native_pid)
+        runs_after = sum(
+            1 for ln in dlog.read_text(encoding="utf-8").splitlines() if ln.startswith("run ")
+        )
+        assert runs_after == runs_before
+        assert_no_secrets(second, data_dir)
+    finally:
+        for pid in live:
+            kill_pid(pid)
+        _kill_stub_pidfile(pid_out)
+        _kill_stub_pidfile(rvc_pid_out)
+
+
+def test_attach_force_native_removes_docker_container(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    docker, dlog, _, pid_out = write_docker_rvc_stub(
+        tmp_path, mode="healthy", port=port
+    )
+    rvc, _, _, rvc_pid_out = write_rvc_stub(tmp_path, mode="healthy", port=port)
+    run_dir = tmp_path / "run"
+    extra = {"DOCKER": str(docker)}
+    live: list[int] = []
+    try:
+        first = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--docker", "--timeout", "8"],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+            extra=extra,
+        )
+        assert first.returncode == 0, first.stderr
+        forced = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--force", "--timeout", "8"],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+            extra=extra,
+        )
+        assert forced.returncode == 0, forced.stderr
+        cmds = dlog.read_text(encoding="utf-8").splitlines()
+        assert any("rm " in c and "eth-devnet-rvc" in c for c in cmds), cmds
+        new_pid = read_pidfile(data_dir)
+        assert new_pid is not None
+        live.append(new_pid)
+        assert pid_alive(new_pid)
+        assert_no_secrets(forced, data_dir)
+    finally:
+        for pid in live:
+            kill_pid(pid)
+        _kill_stub_pidfile(pid_out)
+        _kill_stub_pidfile(rvc_pid_out)
+
+
+def test_attach_force_docker_kills_native_pid(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    docker, dlog, _, pid_out = write_docker_rvc_stub(
+        tmp_path, mode="healthy", port=port
+    )
+    rvc, _, _, rvc_pid_out = write_rvc_stub(tmp_path, mode="healthy", port=port)
+    run_dir = tmp_path / "run"
+    extra = {"DOCKER": str(docker)}
+    native_pid = None
+    try:
+        first = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--timeout", "8"],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+            extra=extra,
+        )
+        assert first.returncode == 0, first.stderr
+        native_pid = read_pidfile(data_dir)
+        assert native_pid is not None
+        assert pid_alive(native_pid)
+        forced = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--docker", "--force", "--timeout", "8"],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+            extra=extra,
+        )
+        assert forced.returncode == 0, forced.stderr
+        assert "killing rvc pid" in forced.stderr
+        assert not pid_alive(native_pid)
+        doc = json.loads((run_dir / "rvc.json").read_text(encoding="utf-8"))
+        assert doc["launch_mode"] == "docker"
+        assert any(
+            ln.startswith("run ") for ln in dlog.read_text(encoding="utf-8").splitlines()
+        )
+        assert_no_secrets(forced, data_dir)
+    finally:
+        if native_pid is not None:
+            kill_pid(native_pid)
+        _kill_stub_pidfile(pid_out)
+        _kill_stub_pidfile(rvc_pid_out)

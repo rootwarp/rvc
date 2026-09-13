@@ -402,6 +402,71 @@ def test_render_rejects_newline_or_token_in_value(tmp_path: Path):
     assert_no_secret(tok)
 
 
+def test_render_native_mode_unchanged(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    data_dir.chmod(0o700)
+    plant_rvc_tree(data_dir)
+    curl = _curl_genesis_stub(tmp_path)
+    proc = run_common(
+        "LAUNCH_MODE=native; resolve_profile fast; render_rvc_config",
+        env=_render_env(data_dir, curl),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    assert_no_password(proc, data_dir)
+    got = (data_dir / "rvc" / "config.toml").read_text(encoding="utf-8")
+    want = (FIXTURES / "expected_config.toml").read_text(encoding="utf-8")
+    want = want.replace("__DATA_DIR__", str(data_dir))
+    assert got == want
+    assert f"genesis_time = {_GENESIS_TIME}" in got
+    assert f'genesis_validators_root = "{_GENESIS_GVR}"' in got
+    assert "eth-devnet-beacon" not in got
+    assert 'keystore_path = "/data/keys/rvc"' not in got
+    assert 'password_file = "/data/passwords.txt"' not in got
+    assert 'slashing_db_path = "/data/slashing_protection.sqlite"' not in got
+
+
+def test_render_docker_mode_rebases_all_three_paths(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    data_dir.chmod(0o700)
+    plant_rvc_tree(data_dir)
+    curl = _curl_genesis_stub(tmp_path)
+    proc = run_common(
+        "LAUNCH_MODE=docker; resolve_profile fast; render_rvc_config",
+        env=_render_env(data_dir, curl),
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    assert_no_password(proc, data_dir)
+    got = (data_dir / "rvc" / "config.toml").read_text(encoding="utf-8")
+    want = (FIXTURES / "expected_config_docker.toml").read_text(encoding="utf-8")
+    assert got == want
+    native = (FIXTURES / "expected_config.toml").read_text(encoding="utf-8")
+    native = native.replace("__DATA_DIR__", str(data_dir))
+    native_gvr = re.search(
+        r'^genesis_validators_root = "(.*)"$', native, re.M
+    )
+    docker_gvr = re.search(r'^genesis_validators_root = "(.*)"$', got, re.M)
+    assert native_gvr and docker_gvr
+    assert docker_gvr.group(1) == native_gvr.group(1)
+    assert docker_gvr.group(1) == _GENESIS_GVR
+    assert 'beacon_url = "http://eth-devnet-beacon:5052"' in got
+    assert 'keystore_path = "/data/keys/rvc"' in got
+    assert 'password_file = "/data/passwords.txt"' in got
+    assert 'slashing_db_path = "/data/slashing_protection.sqlite"' in got
+    for key in ("keystore_path", "password_file", "slashing_db_path"):
+        match = re.search(rf'^{key} = "(.*)"$', got, re.M)
+        assert match, key
+        assert match.group(1).startswith("/data/"), (key, match.group(1))
+    validators = (data_dir / "rvc" / "validators.toml").read_text(encoding="utf-8")
+    expected_v = (FIXTURES / "expected_validators.toml").read_text(encoding="utf-8")
+    assert validators == expected_v
+
+
 def test_render_rejects_nondigit_metrics_port(tmp_path: Path):
     data_dir = tmp_path / "data"
     data_dir.mkdir()

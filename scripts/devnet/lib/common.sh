@@ -68,7 +68,9 @@ CONTAINER_PREFIX="eth-devnet"
 GETH_CONTAINER="${CONTAINER_PREFIX}-geth"
 BEACON_CONTAINER="${CONTAINER_PREFIX}-beacon"
 VALIDATOR_CONTAINER="${CONTAINER_PREFIX}-validator"
+RVC_CONTAINER="${CONTAINER_PREFIX}-rvc"
 DOCKER_NETWORK="${CONTAINER_PREFIX}-network"
+LAUNCH_MODE="${LAUNCH_MODE:-native}"
 
 FORCE="${FORCE:-0}"
 INTERACTIVE="${INTERACTIVE:-0}"
@@ -80,7 +82,8 @@ export SCRIPT_DIR
 export DOCKER CURL DEVNET_STAGE_DIR VALIDATOR_PERF DEVNET_REPORT
 export DATA_DIR RUNS_DIR
 export JWT_DIR EL_DATA_DIR CL_DATA_DIR GENESIS_DIR KEYS_DIR RVC_DIR
-export CONTAINER_PREFIX GETH_CONTAINER BEACON_CONTAINER VALIDATOR_CONTAINER DOCKER_NETWORK
+export CONTAINER_PREFIX GETH_CONTAINER BEACON_CONTAINER VALIDATOR_CONTAINER RVC_CONTAINER DOCKER_NETWORK
+export LAUNCH_MODE
 export FORCE INTERACTIVE DRY_RUN PROFILE RUN_DIR
 
 _mode_octal() {
@@ -1685,6 +1688,7 @@ render_rvc_config() {
     local genesis_json genesis_time genesis_validators_root
     local doppelganger_toml src_pw dest_pw config_out validators_out tmpl_dir
     local keystore_path password_file slashing_db_path validators_config beacon_url
+    local metrics_port
 
     _assert_nonzero_fee_recipient "${DEV_ACCOUNT:-}"
     doppelganger_toml="$(_doppelganger_toml_bool "${DOPPELGANGER:-}")"
@@ -1711,14 +1715,31 @@ render_rvc_config() {
 
     src_pw="${KEYS_DIR}/rvc/passwords.txt"
     dest_pw="${RVC_DIR}/passwords.txt"
-    keystore_path="${KEYS_DIR}/rvc"
-    password_file="${RVC_DIR}/passwords.txt"
-    slashing_db_path="${RVC_DIR}/slashing_protection.sqlite"
-    validators_config="${RVC_DIR}/validators.toml"
-    beacon_url="http://127.0.0.1:${CL_HTTP_PORT}"
     tmpl_dir="${SCRIPT_DIR}/config/templates"
     config_out="${RVC_DIR}/config.toml"
     validators_out="${RVC_DIR}/validators.toml"
+    case "${LAUNCH_MODE:-native}" in
+        docker)
+            # Container sees data/rvc at /data and keys/rvc at /data/keys/rvc.
+            beacon_url="http://${BEACON_CONTAINER}:5052"
+            keystore_path="/data/keys/rvc"
+            password_file="/data/passwords.txt"
+            slashing_db_path="/data/slashing_protection.sqlite"
+            validators_config="/data/validators.toml"
+            metrics_port="8080"
+            ;;
+        native)
+            keystore_path="${KEYS_DIR}/rvc"
+            password_file="${RVC_DIR}/passwords.txt"
+            slashing_db_path="${RVC_DIR}/slashing_protection.sqlite"
+            validators_config="${RVC_DIR}/validators.toml"
+            beacon_url="http://127.0.0.1:${CL_HTTP_PORT}"
+            metrics_port="${RVC_METRICS_PORT}"
+            ;;
+        *)
+            die_usage "unknown LAUNCH_MODE: ${LAUNCH_MODE:-<empty>} (expected native|docker)"
+            ;;
+    esac
 
     _render_reset
     _render_set BEACON_URL "$beacon_url"
@@ -1730,7 +1751,7 @@ render_rvc_config() {
     _render_set GENESIS_VALIDATORS_ROOT "$genesis_validators_root"
     _render_set VALIDATORS_CONFIG "$validators_config"
     _render_set LOG_LEVEL "info"
-    _render_set METRICS_PORT "${RVC_METRICS_PORT}"
+    _render_set METRICS_PORT "$metrics_port"
     _render_set DOPPELGANGER_DETECTION "$doppelganger_toml"
     _render_set FEE_RECIPIENT "${DEV_ACCOUNT}"
 

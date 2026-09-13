@@ -34,6 +34,8 @@ _ISOLATE_KEYS = (
     "DOPPELGANGER",
     "FAIL_UNDER",
     "SOAK_START_OFFSET_EPOCHS",
+    "LAUNCH_MODE",
+    "RVC_IMAGE",
 )
 
 _MNEMONIC = "test test test test test test test test test test test junk"

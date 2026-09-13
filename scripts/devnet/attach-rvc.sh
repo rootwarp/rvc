@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Render RVC config from the live BN, start the native binary, wait for /health.
+# Render RVC config from the live BN, start native or docker RVC, wait for /health.
 
 set -euo pipefail
 
@@ -33,10 +33,15 @@ fi
 unset _OV_CHAIN_ID _OV_METRICS _KEEP_CHAIN_ID _KEEP_METRICS
 
 # Stub tests override RVC_BIN. Relative paths resolve against the repo root,
-# never CWD. This script never builds the binary.
+# never CWD. Native attach never builds the binary; docker builds rvc:latest
+# only when that image is absent.
 RVC_BIN="${RVC_BIN:-target/release/rvc}"
+RVC_IMAGE="${RVC_IMAGE:-rvc:latest}"
+LAUNCH_MODE="${LAUNCH_MODE:-native}"
 ATTACH_TIMEOUT="${ATTACH_TIMEOUT:-120}"
 RVC_PID=""
+RVC_CONTAINER_ID=""
+RVC_LOG_PID=""
 _REPO_ROOT=""
 
 _refuse_symlink() {
@@ -384,7 +389,9 @@ parse_attach_flags() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --docker | --docker=*)
-                die_usage "attach-rvc.sh --docker is not implemented (Phase 6 / DN-15)"
+                LAUNCH_MODE=docker
+                export LAUNCH_MODE
+                shift
                 ;;
             --timeout)
                 if [[ $# -lt 2 || -z "${2:-}" || "${2:-}" == --* ]]; then
@@ -404,6 +411,13 @@ parse_attach_flags() {
         esac
     done
     _require_uint "--timeout" "${ATTACH_TIMEOUT:-}"
+    case "${LAUNCH_MODE}" in
+        native | docker) ;;
+        *)
+            die_usage "unknown LAUNCH_MODE: ${LAUNCH_MODE} (expected native|docker)"
+            ;;
+    esac
+    export LAUNCH_MODE
     if [[ ${#rest[@]} -eq 0 ]]; then
         parse_common_flags
     else
@@ -571,7 +585,7 @@ raise SystemExit(1)
 PY
 }
 
-is_rvc_attached() {
+_native_rvc_attached() {
     local pid url
     pid="$(_pidfile_pid)" || return 1
     _pid_is_our_rvc "$pid" || return 1
@@ -580,9 +594,44 @@ is_rvc_attached() {
     _health_owned_by_pid "$pid"
 }
 
+_docker_rvc_attached() {
+    local url
+    is_container_running "$RVC_CONTAINER" || return 1
+    url="$(_rvc_health_url)"
+    "$CURL" -sS --fail --max-time 2 -- "$url" >/dev/null 2>&1
+}
+
+# Either a live pidfile rvc or a running eth-devnet-rvc, independent of LAUNCH_MODE.
+is_rvc_attached() {
+    _native_rvc_attached && return 0
+    _docker_rvc_attached
+}
+
+_stop_rvc_log_follow() {
+    local pid="${RVC_LOG_PID:-}"
+    RVC_LOG_PID=""
+    if _pid_alive "$pid"; then
+        kill -KILL "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
 _kill_rvc() {
     local pidfile="${RVC_DIR}/rvc.pid"
-    local pid=""
+    local pid="" log="${RVC_DIR}/rvc.log"
+
+    # Both occupants, regardless of LAUNCH_MODE: native --force must rm a
+    # leftover eth-devnet-rvc, and --docker --force must SIGKILL our pidfile.
+    if container_exists "$RVC_CONTAINER"; then
+        if [[ -f "$log" && ! -L "$log" ]]; then
+            "$DOCKER" logs -- "$RVC_CONTAINER" >>"$log" 2>/dev/null || true
+        fi
+        log_info "removing container ${RVC_CONTAINER}"
+        "$DOCKER" rm -f -- "$RVC_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    _stop_rvc_log_follow
+    RVC_CONTAINER_ID=""
+
     pid="$(_pidfile_pid)" || pid=""
     if [[ -n "$pid" ]]; then
         if _pid_is_our_rvc "$pid"; then
@@ -632,12 +681,23 @@ _wait_attempts() {
     printf '%s' "$a"
 }
 
-spawn_rvc() {
-    local config="${RVC_DIR}/config.toml"
-    local log="${RVC_DIR}/rvc.log"
-    local pidfile="${RVC_DIR}/rvc.pid"
+_ensure_rvc_image() {
+    if "$DOCKER" image inspect -- "$RVC_IMAGE" >/dev/null 2>&1; then
+        return 0
+    fi
+    log_info "rvc image ${RVC_IMAGE} absent; building via make docker-rvc"
+    require_cmd make
+    if ! make -C "$(_repo_root)" docker-rvc; then
+        die_infra "failed to build ${RVC_IMAGE} (make docker-rvc)"
+    fi
+    if ! "$DOCKER" image inspect -- "$RVC_IMAGE" >/dev/null 2>&1; then
+        die_infra "built ${RVC_IMAGE} but docker image inspect still fails"
+    fi
+}
 
-    validate_data_exists "config.toml" "$config" "attach-rvc.sh"
+_prepare_rvc_log() {
+    local log="${RVC_DIR}/rvc.log"
+    validate_data_exists "config.toml" "${RVC_DIR}/config.toml" "attach-rvc.sh"
     _refuse_symlink "$RVC_DIR" "rvc dir"
     mkdir -p -- "$RVC_DIR"
     umask 077
@@ -645,6 +705,14 @@ spawn_rvc() {
     if [[ -L "$log" ]]; then
         die_usage "refusing symlink rvc.log: ${log}"
     fi
+}
+
+launch_rvc_native() {
+    local config="${RVC_DIR}/config.toml"
+    local log="${RVC_DIR}/rvc.log"
+    local pidfile="${RVC_DIR}/rvc.pid"
+
+    _prepare_rvc_log
     if [[ -L "$pidfile" ]]; then
         die_usage "refusing symlink pidfile: ${pidfile}"
     fi
@@ -666,6 +734,79 @@ spawn_rvc() {
     printf '%s\n' "$RVC_PID" >"$pidfile"
     chmod 600 "$pidfile"
     log_info "spawned rvc pid ${RVC_PID}"
+}
+
+launch_rvc_docker() {
+    local log="${RVC_DIR}/rvc.log"
+    local cid="" pid=""
+
+    _prepare_rvc_log
+    _ensure_rvc_image
+    if [[ "${DOPPELGANGER:-off}" == "on" ]]; then
+        set --
+    else
+        set -- --no-doppelganger-detection
+    fi
+
+    if container_exists "$RVC_CONTAINER"; then
+        log_info "removing leftover container ${RVC_CONTAINER}"
+        "$DOCKER" rm -f -- "$RVC_CONTAINER" >/dev/null 2>&1 || true
+    fi
+
+    # --no-healthcheck: image HEALTHCHECK probes /healthz, which RVC does not
+    # serve. -u overrides USER rvc (uid 10001) so the bind-mounted slashing DB
+    # stays host-owned. Non-loopback metrics bind is refused without the env.
+    # "$@" is empty-safe under bash 3.2 `set -u`; "${arr[@]}" is not.
+    if ! cid="$(
+        docker_run_as_user -d \
+            --name "$RVC_CONTAINER" \
+            --network "$DOCKER_NETWORK" \
+            --no-healthcheck \
+            -e RVC_METRICS_ALLOW_NON_LOOPBACK=true \
+            -p "127.0.0.1:${RVC_METRICS_PORT}:8080" \
+            -v "${RVC_DIR}:/data" \
+            -v "${KEYS_DIR}/rvc:/data/keys/rvc" \
+            -- \
+            "$RVC_IMAGE" \
+            start -c /data/config.toml --init-slashing-db --metrics-address 0.0.0.0 \
+            "$@"
+    )"; then
+        die_infra "failed to start ${RVC_CONTAINER}"
+    fi
+    cid="$(printf '%s' "$cid" | tr -d '[:space:]')"
+    if [[ -z "$cid" ]]; then
+        cid="$("$DOCKER" inspect -f '{{.Id}}' -- "$RVC_CONTAINER" 2>/dev/null || true)"
+        cid="$(printf '%s' "$cid" | tr -d '[:space:]')"
+    fi
+    if [[ -z "$cid" ]]; then
+        die_infra "failed to start ${RVC_CONTAINER}"
+    fi
+    RVC_CONTAINER_ID="$cid"
+    pid="$("$DOCKER" inspect -f '{{.State.Pid}}' -- "$RVC_CONTAINER" 2>/dev/null || true)"
+    pid="$(printf '%s' "$pid" | tr -d '[:space:]')"
+    case "$pid" in
+        '' | *[!0-9]*)
+            pid="0"
+            ;;
+    esac
+    RVC_PID="$pid"
+    "$DOCKER" logs -f -- "$RVC_CONTAINER" >>"$log" 2>&1 &
+    RVC_LOG_PID=$!
+    log_info "started container ${RVC_CONTAINER} id ${RVC_CONTAINER_ID}"
+}
+
+spawn_rvc() {
+    case "${LAUNCH_MODE:-native}" in
+        docker)
+            launch_rvc_docker
+            ;;
+        native)
+            launch_rvc_native
+            ;;
+        *)
+            die_usage "unknown LAUNCH_MODE: ${LAUNCH_MODE} (expected native|docker)"
+            ;;
+    esac
 }
 
 write_rvc_json() {
@@ -695,6 +836,8 @@ write_rvc_json() {
         RVC_JSON_END="$NUM_VALIDATORS" \
         RVC_JSON_CONFIG="$config_path" \
         RVC_JSON_PUBKEYS="$pubkeys" \
+        RVC_JSON_LAUNCH="${LAUNCH_MODE:-native}" \
+        RVC_JSON_CONTAINER="${RVC_CONTAINER_ID:-}" \
         python3 - <<'PY' || die_infra "failed to write rvc.json"
 import json, os, sys
 from datetime import datetime, timezone
@@ -719,6 +862,11 @@ doc = {
     "pubkeys": pubkeys,
     "config_path": os.environ["RVC_JSON_CONFIG"],
 }
+if os.environ.get("RVC_JSON_LAUNCH") == "docker":
+    doc["launch_mode"] = "docker"
+    cid = os.environ.get("RVC_JSON_CONTAINER") or ""
+    if cid:
+        doc["container_id"] = cid
 try:
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
 except OSError:
@@ -749,7 +897,11 @@ _copy_run_tomls() {
 }
 
 _inventory_attach_rows() {
-    inventory_append pid rvc "${RVC_DIR}/rvc.pid"
+    if [[ "${LAUNCH_MODE:-native}" == "docker" ]]; then
+        inventory_append container "$RVC_CONTAINER"
+    else
+        inventory_append pid rvc "${RVC_DIR}/rvc.pid"
+    fi
     inventory_append slashing_db slashing_protection.sqlite \
         "${RVC_DIR}/slashing_protection.sqlite"
 }
@@ -758,8 +910,13 @@ print_attach_plan() {
     log_info "attach plan:"
     log_info "  1. probe BN genesis / fork schedule"
     log_info "  2. render_rvc_config"
-    log_info "  3. inventory_append pidfile + slashing DB"
-    log_info "  4. spawn_rvc"
+    if [[ "${LAUNCH_MODE:-native}" == "docker" ]]; then
+        log_info "  3. inventory_append container ${RVC_CONTAINER} + slashing DB"
+        log_info "  4. launch_rvc_docker (${RVC_IMAGE} on ${DOCKER_NETWORK})"
+    else
+        log_info "  3. inventory_append pidfile + slashing DB"
+        log_info "  4. launch_rvc_native"
+    fi
     log_info "  5. wait_for_service /health"
     log_info "  6. write rvc.json"
 }
@@ -775,7 +932,11 @@ main() {
     require_cmd jq
     require_cmd "$CURL"
     resolve_profile "${PROFILE:-fast}"
-    _resolve_rvc_bin
+    if [[ "${LAUNCH_MODE}" == "docker" ]]; then
+        require_cmd "$DOCKER"
+    else
+        _resolve_rvc_bin
+    fi
     unset MNEMONIC || true
 
     _validate_inputs
@@ -803,13 +964,22 @@ main() {
     if ! wait_for_service "$(_rvc_health_url)" "$(_wait_attempts)"; then
         _fail_timeout
     fi
-    if ! _pid_is_our_rvc "${RVC_PID}"; then
-        _fail_timeout
+    if [[ "${LAUNCH_MODE}" == "docker" ]]; then
+        if ! is_container_running "$RVC_CONTAINER"; then
+            _fail_timeout
+        fi
+        if [[ -n "${RVC_LOG_PID}" ]]; then
+            disown "$RVC_LOG_PID" 2>/dev/null || true
+        fi
+    else
+        if ! _pid_is_our_rvc "${RVC_PID}"; then
+            _fail_timeout
+        fi
+        if ! _health_owned_by_pid "${RVC_PID}"; then
+            _fail_timeout
+        fi
+        disown "$RVC_PID" 2>/dev/null || true
     fi
-    if ! _health_owned_by_pid "${RVC_PID}"; then
-        _fail_timeout
-    fi
-    disown "$RVC_PID" 2>/dev/null || true
     write_rvc_json
     _copy_run_tomls
     log_success "rvc attached"

@@ -1,0 +1,11 @@
+beacon_url = "http://eth-devnet-beacon:5052"
+keystore_path = "/data/keys/rvc"
+password_file = "/data/passwords.txt"
+slashing_db_path = "/data/slashing_protection.sqlite"
+network = "custom"
+genesis_time = 1710000000
+genesis_validators_root = "0xabababababababababababababababababababababababababababababababab"
+validators_config = "/data/validators.toml"
+log_level = "info"
+metrics_port = 8080
+doppelganger_detection = false
