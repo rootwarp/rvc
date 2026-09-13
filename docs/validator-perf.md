@@ -4,6 +4,8 @@
 
 The script is stdlib-only Python 3.11+. It prints a human table on stdout by default. Diagnostics go to stderr.
 
+To drive the same script from a local geth + Lighthouse + `rvc` stack (Launch / Attach / Gather, `verdict.json`), see [devnet-testbed.md](devnet-testbed.md).
+
 ## Prerequisites
 
 - Python 3.11 or newer (`python3 --version`)

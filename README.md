@@ -50,6 +50,8 @@ See `config.example.toml` for all options including multi-BN failover, Keymanage
 
 To estimate consensus-layer performance of a key set from a beacon node (without running `rvc`), see [docs/validator-perf.md](docs/validator-perf.md).
 
+To run `rvc` against a local Electra chain (geth + Lighthouse) and collect client-side plus chain-side reports, see [docs/devnet-testbed.md](docs/devnet-testbed.md).
+
 ## Binaries
 
 | Binary | Description |
