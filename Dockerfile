@@ -1,7 +1,7 @@
 # === Tier 1: Dependency Preparation ===
 
 # Stage 1: chef — base image with cargo-chef
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.97
 FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-bookworm AS chef
 WORKDIR /app
 
