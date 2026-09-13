@@ -270,9 +270,31 @@ RVC omits `--no-doppelganger-detection` when `DOPPELGANGER=on` (CLI polarity; th
 
 RVC withholds signing for 2 epochs (`DEFAULT_MONITORING_EPOCHS = 2`). A window that starts at genesis reports ≈ 0 attestations and fails S6. `soak.sh` therefore holds the DN-8 health gates for `SOAK_START_OFFSET_EPOCHS=3` (2 + 1 margin) **without sampling**, takes `metrics-start.txt` at that boundary, samples for `EPOCHS=8`, then holds **2 more epochs** of DN-8 gates (no sampling) so `validator_perf.py`'s `to_epoch ≤ head − 2` clamp does not pull the chain half back into the dark window. A dead BN during either hold still aborts **3**.
 
-`validator_perf.py` is invoked with `--epochs` from `run.json` (not `--from-epoch`/`--to-epoch`). After offset 3 + sample 8 + clamp 2 the chain head is epoch **13 ≈ 83.2 min** (13 × 32 slots × 12 s) and the measured window is epochs 4…11. Live proof of the split is issue 6.6, not this wiring. `soak.sh` and `report.sh` call `resolve_profile` when `--profile` is set (`--epochs` on soak still wins). Re-report without `--profile` reads `fail_under` from `run.json`.
+`validator_perf.py` is invoked with `--epochs` from `run.json` (not `--from-epoch`/`--to-epoch`). After offset 3 + sample 8 + clamp 2 the chain head is epoch **13 ≈ 83.2 min** (13 × 32 slots × 12 s) and the measured window is epochs 4…11. Live proof of the split is issue 6.6, not this wiring — and that live proof is **blocked** on this host (see below). `soak.sh` and `report.sh` call `resolve_profile` when `--profile` is set (`--epochs` on soak still wins). Re-report without `--profile` reads `fail_under` from `run.json`.
 
 If `03-chain.sh`'s block-production health gate trips in the first ~2 epochs with Lighthouse VC doppelganger protection on (P6-A12, unverified at genesis), drop `--enable-doppelganger-protection` from the Lighthouse VC and record that DN-5 is proven from RVC's side only.
+
+### Live S6 soak (issue 6.6)
+
+**Not observed.** The first live `run.sh --profile safe --keep` on the developer host is **blocked** — see [`plan/devnet-testbed-2026-09-12/milestone-s6.md`](../plan/devnet-testbed-2026-09-12/milestone-s6.md). Do not treat the P6-A2 arithmetic (head epoch 13, 83.2 min, window 4…11) as a measurement.
+
+| Field | P6-A2 / S6 predicted | Live |
+|-------|----------------------|------|
+| offset boundary (`SOAK_START_OFFSET_EPOCHS`) | epoch 3 | not observed |
+| sample window | epochs 4…11 | not observed |
+| chain head epoch | **13** | not observed |
+| chain time (13 × 32 × 12 s) | 83.2 min | not measured |
+| wall-clock (issue budget ~95 min) | — | not measured |
+| Lighthouse VC DP delayed block production (P6-A12) | unverified at genesis | not observed |
+| `rvc_attestations_total{status="success"}` delta | increase (disjoint keys) | not observed |
+| `verdict.json` `participation_rate` / `target_rate` | ≥ 0.95 | not observed |
+| `run.json` `profile` / `soak_start_offset_epochs` / `fail_under` | `safe` / `3` / `participation_rate=0.95,target_rate=0.95` | not written |
+| `grep -c 'doppelganger Detected' data/rvc/rvc.log` | 0 on a non-empty log with startup markers | not observed (no log) |
+| `report.sh --fail-under participation_rate=1.01` | exit 4, chain still up | not reached |
+
+The live command stopped at `_resolve_rvc_bin` (usage **2**, missing `target/release/rvc`, `/usr/bin/time -p` real **0.52 s** on 2026-09-13T07:47:18Z). That 0.52 s is the usage-2 command, **not** a soak wall-clock. Even a release binary would still fail `00-preflight.sh` on this Docker VM (`docker info --format '{{.NCPU}} {{.MemTotal}}'` → `4 4107141120` → 3 GiB < 8). `--keep`, soak, KPI-breach re-report, and `down.sh --data` were not reached. Per-stage `run.json` `stages.*.seconds` do not exist. Do not invent them.
+
+If a later host clears both gates (printed Docker VM GiB ≥ 8 **and** `target/release/rvc` present) and a `safe` run exits 0, write the measured head epoch, offset boundary, wall-clocks, and P6-A12 outcome in this table and in the S6 milestone. Do not edit these blocked cells in place. Do not lower `PREFLIGHT_MIN_RAM_GIB`.
 
 ## Exit codes
 
@@ -454,14 +476,14 @@ Attach timeout (`--timeout`, default 120 s) kills the spawned pid, copies `rvc.l
 
 `fast` sets `FAST_DOPPELGANGER=off` so S1/S3 fit in one sitting (~2 epochs ≈ 12.8 min otherwise). `--profile safe` turns detection on (`SAFE_DOPPELGANGER=on`) and is what proves the DN-5 disjoint split (DN-18, Phase 6). A `fast` green run does **not** prove "no key overlap".
 
-### Docker VM RAM / missing binary (this host's 5.6 snag)
+### Docker VM RAM / missing binary (this host's 5.6 / 6.6 snag)
 
 ```
 [ERROR] RVC binary not found at …/target/release/rvc; cargo build --release     # run.sh, exit 2
 [ERROR] need >= 8 GiB RAM (docker VM has 3 GiB)                                  # 00-preflight, exit 2
 ```
 
-Both are usage **2**. Building RVC does not clear the RAM gate. Raise Docker Desktop until `docker info --format '{{.MemTotal}}'` integer-divided by `1024 ** 3` is **≥ 8**. Desktop “8 GiB” / `MemoryMiB=8192` is **not** enough (~7 GiB after VM overhead). On this host that is likely **≥ 9216 MiB**. Restart Docker so `MemTotal` updates. Do not lower `PREFLIGHT_MIN_RAM_GIB`.
+Both are usage **2**. Building RVC does not clear the RAM gate. Raise Docker Desktop until `docker info --format '{{.MemTotal}}'` integer-divided by `1024 ** 3` is **≥ 8**. Desktop “8 GiB” / `MemoryMiB=8192` is **not** enough (~7 GiB after VM overhead). On this host that is likely **≥ 9216 MiB**. Restart Docker so `MemTotal` updates. Do not lower `PREFLIGHT_MIN_RAM_GIB`. Issue 6.6 (`run.sh --profile safe --keep`) hit the same two gates; see [`milestone-s6.md`](../plan/devnet-testbed-2026-09-12/milestone-s6.md).
 
 ### `CHAIN_ID` leaked from the shell
 
