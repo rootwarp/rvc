@@ -252,7 +252,7 @@ jobs:
           COVERAGE=$(jq '.data[0].totals.lines.percent' coverage.json)
           COVERED=$(jq '.data[0].totals.lines.covered' coverage.json)
           TOTAL=$(jq '.data[0].totals.lines.count' coverage.json)
-          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "coverage=$COVERAGE" >> "$GITHUB_OUTPUT"
 
           {
             echo "## Coverage Report"
@@ -365,8 +365,8 @@ jobs:
       - name: Run spec-vector suites
         run: cargo nextest run -p rvc-spec-vectors --locked --final-status-level pass
 
-  # P1-A5 / issue 1.6: no Rust toolchain. Glob is test_devnet_*.py on purpose
-  # (not scripts/tests/) so validator_perf is not a PR gate. No devnet job.
+  # P1-A5 / issue 1.6: no Rust toolchain. Issue 6.5 widens pytest to
+  # scripts/tests/ (validator_perf + attach + devnet). No cargo, no live job.
   scripts:
     name: Scripts
     runs-on: ubuntu-latest
@@ -384,7 +384,7 @@ jobs:
           checksum: "745765a3b6e360ad76743599ae5c42e9278c7edf8bbff9fc76d05bf2623a04dd"
 
       - name: Shellcheck
-        run: shellcheck scripts/devnet/*.sh scripts/devnet/lib/*.sh
+        run: shellcheck scripts/devnet/*.sh scripts/devnet/lib/common.sh
 
-      - name: Pytest (devnet scripts)
-        run: uv run --with pytest==9.1.1 --with pytest-socket==0.8.1 pytest scripts/tests/test_devnet_*.py -q
+      - name: Pytest (scripts)
+        run: uv run --with pytest==9.1.1 --with pytest-socket==0.8.1 pytest scripts/tests/ -q

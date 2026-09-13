@@ -1,0 +1,5 @@
+{"kind":"container","name":"eth-devnet-geth"}
+{"kind":"container","name":"eth-devnet-already-gone"}
+{"kind":"datadir","name":"el","path":"__DATA_DIR__/el"}
+{"kind":"slashing_db","name":"slashing_protection.sqlite","path":"__DATA_DIR__/rvc/slashing_protection.sqlite"}
+{"kind":"pid","name":"rvc","path":"__DATA_DIR__/rvc/rvc.pid"}

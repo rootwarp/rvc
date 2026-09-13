@@ -58,7 +58,7 @@ That key is asserted, not decorative. `00-preflight.sh` calls `assert_image_plat
 
 A host whose platform is missing from an index, or an index missing a required platform the host is not running on, both fail closed the same way. Do not pin a per-arch blob to "make it smaller": the other platform then has no index entry and preflight refuses to start.
 
-Live `00-preflight.sh < /dev/null` on this F9 host (2026-09-13) exits **2** in 1 s: `need >= 8 GiB RAM (docker VM has 3 GiB)`. The RAM gate runs before the index-entry check; `PREFLIGHT_MIN_RAM_GIB` was not lowered. The platform matrix is proven offline by the stub tests; the linux/amd64 half is the nightly (issue 6.5).
+Live `00-preflight.sh < /dev/null` on this F9 host (2026-09-13) exits **2** in 1 s: `need >= 8 GiB RAM (docker VM has 3 GiB)`. The RAM gate runs before the index-entry check; `PREFLIGHT_MIN_RAM_GIB` was not lowered. The platform matrix is proven offline by the stub tests. The linux/amd64 half is the nightly workflow (issue 6.5); a dispatched `ubuntu-latest` proof is **not observed** — see [Nightly CI](#nightly-ci).
 
 ## Quick start
 
@@ -440,6 +440,44 @@ Default tolerances (Q4): latency and ratio KPIs use `rel=0.25` and `abs_floor=1m
 Chain half: gate only `participation_rate` and `target_rate`. Unknown `chain.json` keys render `gated=false` (including non-finite values, which are `absent`, never `0`). A missing KPI is `absent`, never `0`.
 
 When the two `run.json` fingerprints differ **or either is missing**, compare prints `topology_delta` with the differing subkeys, sets `gated=false`, and exits **0** — it refuses to gate across topologies (ADR-010). `rvc_version` is not a fingerprint input.
+
+## Nightly CI
+
+Unattended `--profile safe` on `ubuntu-latest`. Workflow: [`.github/workflows/devnet-nightly.yml`](../.github/workflows/devnet-nightly.yml). It is **not** a PR gate (R2): triggers are `schedule` (`cron: "0 2 * * *"` — 02:00 UTC; GitHub fires `schedule` only on the default branch) and `workflow_dispatch` (inputs `profile`, `epochs`). `concurrency` group `devnet-nightly` with `cancel-in-progress: true`. The PR path that keeps the scripts reviewable is the existing `scripts` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) (`shellcheck` + `pytest scripts/tests/ -q`, no cargo, no live chain).
+
+Two jobs:
+
+| Job | Timeout | What |
+|-----|---------|------|
+| `build` | 60 min | `dtolnay/rust-toolchain@stable`, `arduino/setup-protoc@v3`, `actions/cache@v4` keyed as the CI `check` job, `cargo build --release --locked -p rvc-bin`, upload `target/release/rvc` as artifact `rvc-bin`. |
+| `soak` | **110 min** | Download that artifact to `target/release/` (so `run.sh` finds `target/release/rvc`), `chmod +x`, `run.sh --profile safe --epochs 8 --run-id "$GITHUB_RUN_ID"`. |
+
+`upload-artifact@v4` strips common leading directories, so a path of `target/release/rvc` stores a file named `rvc`. `download-artifact` therefore uses `path: target/release`. The executable bit does not survive the round trip; `chmod +x` is a required step — omitting it is usage **2** (`RVC_BIN is not executable`) before a run dir is minted.
+
+`--run-id` is `${GITHUB_RUN_ID}` (ADR-012) so the upload path is the single `scripts/devnet/runs/<id>/`. The soak step has no `continue-on-error`: orchestrator exit ≠ 0 fails the job. `if: always()` then uploads that run dir (`include-hidden-files: true`, `retention-days: 7`) and runs `down.sh --data`.
+
+### 110-minute soak timeout (P6-A2 / P6-A3)
+
+Architecture's 75 minutes predates the safe-profile offset. P6-A2: RVC withholds signing for 2 epochs, so the soak holds 3 (`SOAK_START_OFFSET_EPOCHS`), samples 8, then holds 2 more for `validator_perf.py`'s `to_epoch ≤ head − 2` clamp. Head epoch **13** × 32 slots × 12 s = **83.2 min** of chain time. P6-A3 adds ~10 min for image pulls, genesis, attach, and report, plus margin → `timeout-minutes: 110` on `soak`. `build` is a separate 60-minute job so a cold `cargo build --release` does not eat the soak budget.
+
+### Artifact
+
+A finished run dir contains `run.json`, `client.json`, `chain.json`, `report.txt`, `verdict.json`, `metrics-start.txt`, `metrics-end.txt`, `samples.jsonl`. `logs/` is written only when a stage exits non-zero (`run.sh` dumps `docker logs` into `runs/<id>/logs/<container>.log`). Default teardown (and the `if: always()` `down.sh --data`) leaves no `eth-devnet-*` container or network; `runs/` is kept (ADR-005).
+
+Dispatch from Actions → **Devnet (nightly)** → Run workflow. `profile` default `safe`, `epochs` default `8`.
+
+### Live dispatch (issue 6.5)
+
+**Not observed.** This host cannot complete a ~2 h `ubuntu-latest` `workflow_dispatch` (starved Docker VM; same 3 GiB RAM gate as 5.6 / 6.6). YAML was checked locally with `actionlint` / `yq`. Do not treat the rows below as a green run.
+
+| AC | Live |
+|----|------|
+| `workflow_dispatch` green on `ubuntu-latest`; log shows `00-preflight.sh` platform assertion on `linux/amd64` (`image index ok: host linux/amd64`) | not observed |
+| Soak finds executable `target/release/rvc`; `chmod +x` removed is red first | not observed |
+| Uploaded artifact has the files listed above; `logs/` only on a failing run | not observed |
+| Teardown `if: always()`; runner ends with no `eth-devnet-*` container or network | not observed |
+
+The linux/amd64 half of DN-19 is therefore still open until a real dispatch lands. Do not invent a log.
 
 ## Measured wall-clocks (issue 5.6)
 

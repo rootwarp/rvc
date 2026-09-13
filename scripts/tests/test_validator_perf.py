@@ -5030,6 +5030,13 @@ _G5_SKIP = {
     "manifest__amd64_only": "devnet preflight docker index fixture; not a BN overlay",
     "manifest__single": "devnet preflight docker index fixture; not a BN overlay",
     "manifest__unknown_only": "devnet preflight docker index fixture; not a BN overlay",
+    "bn_genesis": "devnet attach BN stub; not a G5 overlay",
+    "bn_head_fork": "devnet attach BN stub; not a G5 overlay",
+    "bn_spec": "devnet attach BN stub; not a G5 overlay",
+    "validator_perf__ok": "devnet report golden; not a BN overlay",
+    "validator_perf__degraded": "devnet report golden; not a BN overlay",
+    "validator_perf__threshold": "devnet report golden; not a BN overlay",
+    "inventory__partial": "devnet down.sh inventory fixture; not a BN overlay",
 }
 
 

@@ -448,9 +448,9 @@ def test_ci_scripts_job_no_cargo_no_devnet():
     assert "pytest==9.1.1" in body
     assert "pytest-socket==0.8.1" in body
     assert "shellcheck scripts/devnet/" in body
-    assert "test_devnet_*.py" in body
-    assert "pytest scripts/tests/ -q" not in body
-    assert "pytest scripts/tests/\n" not in body
+    assert "scripts/devnet/lib/common.sh" in body
+    assert "pytest scripts/tests/ -q" in body
+    assert "test_devnet_*.py" not in body
     on_block = text.split("jobs:", 1)[0]
     assert "pull_request" in on_block
     for wf in WORKFLOWS.glob("*.yml"):
