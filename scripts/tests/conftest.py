@@ -52,6 +52,11 @@ def dr():
     return load_script("devnet_report")
 
 
+@pytest.fixture(scope="session")
+def dp():
+    return load_script("devnet_preflight")
+
+
 @pytest.fixture
 def load():
     return lambda name: json.loads((_FIXTURES / f"{name}.json").read_text())
