@@ -68,7 +68,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 675 | 2 | — | test-only | Signing-root fixture zeros index by hand. Not a production guard. | 2.3 |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 683 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 417. | 2.8 |
 | `crates/rvc/src/orchestrator/utils.rs` 163 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the half-open `Electra..Gloas` predicate (2.3 / 2.8). | 2.3 |
-| `bin/rvc/tests/common/mock_bn.rs` 268 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
+| `bin/rvc/tests/common/mock_bn.rs` 267 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
 | `crates/block-service/src/service/mod.rs` 623 | 3 | exhaustive | inherit-intentionally | `ssz_block_format` named Gloas `BeaconBlock` arm; exhaustive `match fork` so a new variant is a compile error, not a silent `BlockContents`/`BeaconBlock` inherit. Unknown version strings fail closed before the match. | 6.4 |
 | `crates/eth-types/src/fork.rs` 178 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
 | `crates/eth-types/src/fork.rs` 196 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |

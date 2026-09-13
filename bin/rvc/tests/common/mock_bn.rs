@@ -89,7 +89,6 @@ impl MockBn {
     }
 
     /// Convenience: builder with a known fork (see [`MockBnBuilder::with_fork`]).
-    #[allow(dead_code)] // known-fork ready path still covered by default Electra
     pub fn with_fork(fork: ForkName) -> MockBnBuilder {
         MockBnBuilder::default().with_fork(fork)
     }

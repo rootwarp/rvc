@@ -96,10 +96,10 @@ Two-source Gloas schedule reconciliation (D12) is a separate fail-closed gate wi
 |---|---|---|---|
 | `EXIT_UNSUPPORTED_FORK_VERSION` | `crates/rvc/src/startup.rs` | 30 | Exit code 13. |
 | `StartupError::UnsupportedForkVersion` | `crates/rvc/src/startup.rs` | 42–43 | `"unsupported consensus fork version {version}; upgrade rvc"`. |
-| `check_fork_compatibility` | `crates/rvc/src/startup.rs` | 171–196 | Head `current_version` must be in the seven schedule versions (includes `fulu_fork_version` at 187). |
+| `check_fork_compatibility` | `crates/rvc/src/startup.rs` | 172–198 | Head `current_version` must be in the eight schedule versions (includes `gloas_fork_version` at 189). |
 | Apply + opt-out | `crates/rvc/src/bootstrap/services.rs` | 64–82, 168–171 | Fatal unless `allow_unsupported_fork`. Do not weaken `check_fork_compatibility`. |
 | CLI / config knob | `crates/rvc-config/src/sections/safety.rs` | 79–84 | `--allow-unsupported-fork`. Testnets / experimental forks only. |
-| Fail-closed integration test | `bin/rvc/tests/integration_test.rs` | 530 | Head `0xdeadbeef` → non-zero exit. |
+| Fail-closed integration test | `bin/rvc/tests/integration_test.rs` | 584 | Head `0xdeadbeef` → exit 13. |
 | `StartupError::ForkScheduleMismatch` | `crates/rvc/src/startup.rs` | 45–46, 67–80 | Names `rvc-config` and `/eth/v1/config/spec` plus both epoch and version values. |
 | Two-source Gloas apply (no opt-out) | `crates/rvc/src/bootstrap/services.rs` | 157–163 | After `build_fork_schedule`, before SEC-9. Not routed through `apply_fork_compatibility_result`. |
 
@@ -260,13 +260,13 @@ variant and new body structs.
 
 ### Startup gate
 
-- [ ] `check_fork_compatibility` known-versions array (`crates/rvc/src/startup.rs` 180–188)
+- [ ] `check_fork_compatibility` known-versions array (`crates/rvc/src/startup.rs` 181–190)
       includes the new `*_fork_version`. An unknown head version still exits 13.
 - [ ] `allow_unsupported_fork` remains the only opt-out
       (`crates/rvc/src/bootstrap/services.rs` 168–171). Do not make unknown
       versions a warning by default. Two-source Gloas reconciliation is not this knob.
 - [ ] `test_startup_fails_closed_on_unsupported_fork`
-      (`bin/rvc/tests/integration_test.rs` 530) stays green.
+      (`bin/rvc/tests/integration_test.rs` 584) stays green.
 
 ### Conformance fixtures
 

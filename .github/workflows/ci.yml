@@ -315,6 +315,14 @@ jobs:
       - name: Run signer-server DVT enumeration gate
         run: cargo nextest run -p rvc-signer-server --features dvt --final-status-level pass
 
+      # 7.5: Gloas boundary suite + rvc-bin Gloas-head smoke. Whole packages
+      # (a fork_transition filter would drop the binary smoke). Non-skippable.
+      # Run even if architecture-tests is red (unrelated class-1 inventory debt
+      # must not hide this gate).
+      - name: Run fork-transition gate
+        if: ${{ !cancelled() }}
+        run: make test-fork-transition
+
   # REQUIRED is job-local: coverage runs --workspace without fetching vectors
   # and must keep skipping (3.3b). A top-level env would turn that skip into RED.
   spec-vectors:

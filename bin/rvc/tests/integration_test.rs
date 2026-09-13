@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use common::MockBn;
 use crypto::{EncryptionKdf, Keystore, SecretKey};
+use eth_types::ForkName;
 use tempfile::{NamedTempFile, TempDir};
 
 /// Ordered log markers that define a successful ready path with a loaded key.
@@ -419,6 +420,20 @@ async fn test_startup_reaches_ready_against_mock_bn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_startup_reaches_ready_against_gloas_mock_bn() {
+    let mock_bn = MockBn::with_fork(ForkName::Gloas).start().await;
+    let mut harness = SmokeHarness::start_with_bn(mock_bn).await;
+    harness.wait_until_ready().await;
+    assert_health_json_healthy(&harness.health_url()).await;
+
+    let (status, logs) = harness.shutdown_cleanly().await;
+    assert_startup_sequence(&logs);
+    #[cfg(unix)]
+    assert!(status.success(), "expected exit 0 on SIGTERM, got {status}\n--- stdout ---\n{logs}");
+    let _ = status;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_startup_sequence_markers_in_order() {
     let mut harness = SmokeHarness::start().await;
     let (_status, logs) = harness.shutdown_cleanly().await;
@@ -594,6 +609,11 @@ async fn test_startup_fails_closed_on_unsupported_fork() {
     assert!(
         !status.success(),
         "unsupported fork must exit non-zero, got {status}\n--- stdout ---\n{logs}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(13),
+        "unsupported fork must exit 13, got {status}\n--- stdout ---\n{logs}"
     );
     assert!(
         logs.contains("Fork compatibility")

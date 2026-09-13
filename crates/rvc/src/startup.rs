@@ -186,6 +186,7 @@ pub async fn check_fork_compatibility(
         schedule.deneb_fork_version,
         schedule.electra_fork_version,
         schedule.fulu_fork_version,
+        schedule.gloas_fork_version,
     ];
 
     if !known_versions.contains(&version_bytes) {
@@ -681,6 +682,14 @@ builder_boost_factor = 80
     #[tokio::test]
     async fn test_check_fork_compatibility_fulu_version() {
         let beacon = mock_with_fork_version("0x06000000");
+        let schedule = test_fork_schedule();
+        let result = check_fork_compatibility(&beacon, &schedule).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_fork_compatibility_gloas_version() {
+        let beacon = mock_with_fork_version("0x07000000");
         let schedule = test_fork_schedule();
         let result = check_fork_compatibility(&beacon, &schedule).await;
         assert!(result.is_ok());

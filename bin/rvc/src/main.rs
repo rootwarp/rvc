@@ -20,12 +20,12 @@ fn main() -> anyhow::Result<()> {
         .expect("failed to build tokio runtime")
         .block_on(cli::dispatch(cli::Cli::parse()));
 
-    // Runtime dropped. Keystore-lock contention keeps EXIT_KEYSTORE_LOCKED (14);
-    // process::exit here is the only legitimate site on the binary path (ARCH-2i).
+    // Runtime dropped. Named startup codes (NFR-3) map here — never mid-async (ARCH-2i).
     if let Err(ref e) = result {
         if let Some(be) = e.downcast_ref::<rvc::bootstrap::BootstrapError>() {
-            if be.is_keystore_locked() {
-                std::process::exit(be.exit_code());
+            let code = be.exit_code();
+            if be.is_keystore_locked() || code != 1 {
+                std::process::exit(code);
             }
         }
     }

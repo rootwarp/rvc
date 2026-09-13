@@ -255,8 +255,9 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             // Logging guards drop after run returns (flush last).
             let _ = &logging_guards;
 
-            // Keystore-lock → EXIT_KEYSTORE_LOCKED is mapped in synchronous main
-            // after the runtime drops (ARCH-2i); never hard-exit mid-async here.
+            // Named BootstrapError codes (unsupported-fork 13, keystore-lock 14, …)
+            // map in synchronous main after the runtime drops (ARCH-2i); never
+            // hard-exit mid-async here.
             run_result?;
         }
         Commands::VoluntaryExit {

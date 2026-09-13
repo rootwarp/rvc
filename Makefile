@@ -1,6 +1,7 @@
 .PHONY: build build-release check fmt clippy test test-fast coverage clean \
        docker-rvc docker-signer docker-keygen docker-all architecture-doc \
-       spec-vectors spec-vectors-verify spec-vectors-regen spec-kat
+       spec-vectors spec-vectors-verify spec-vectors-regen spec-kat \
+       test-fork-transition
 
 # Build
 build:
@@ -41,6 +42,23 @@ test:
 
 test-verbose:
 	cargo test -- --nocapture
+
+# Named Gloas boundary gate (issue 7.5). Whole packages: a bare
+# `test(fork_transition)` filter would drop the rvc-bin Gloas-head smoke.
+test-fork-transition:
+	@count=$$(CARGO_TERM_COLOR=never cargo nextest list -p rvc -E 'test(fork_transition)' | grep -c fork_transition || true); \
+	if [ "$$count" -eq 0 ]; then \
+		echo "error: cargo nextest list -p rvc -E 'test(fork_transition)' matched 0 tests" >&2; \
+		exit 1; \
+	fi; \
+	echo "fork_transition tests: $$count"; \
+	smoke=$$(CARGO_TERM_COLOR=never cargo nextest list -p rvc-bin -E 'test(test_startup_reaches_ready_against_gloas_mock_bn)' | grep -c test_startup_reaches_ready_against_gloas_mock_bn || true); \
+	if [ "$$smoke" -eq 0 ]; then \
+		echo "error: cargo nextest list -p rvc-bin -E 'test(test_startup_reaches_ready_against_gloas_mock_bn)' matched 0 tests" >&2; \
+		exit 1; \
+	fi; \
+	echo "gloas smoke tests: $$smoke"; \
+	cargo nextest run -p rvc -p rvc-bin --final-status-level pass
 
 # Fast tests via cargo-nextest (install once: cargo install cargo-nextest --locked).
 # Falls back to plain cargo test if nextest is missing.

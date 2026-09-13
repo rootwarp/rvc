@@ -47,10 +47,9 @@ pub struct RunOptions {
 ///
 /// # Errors
 ///
-/// Returns [`BootstrapError`] for phase failures. Keystore-lock contention
-/// sets [`BootstrapError::is_keystore_locked`]; the synchronous binary `main`
-/// maps that flag to exit code [`crate::startup::EXIT_KEYSTORE_LOCKED`] (14)
-/// after the Tokio runtime is dropped (ARCH-2i / NFR-3).
+/// Returns [`BootstrapError`] for phase failures. Named `EXIT_*` codes (10, 11,
+/// 13 unsupported-fork, 14 keystore-lock) are mapped by the synchronous binary
+/// `main` after the Tokio runtime is dropped (ARCH-2i / NFR-3).
 pub async fn run(
     config: Config,
     options: RunOptions,
@@ -87,8 +86,8 @@ pub async fn run(
         }
         Err(e) if e.is_keystore_locked() => {
             // No drain is required: this is steps 1–2d, before any task is spawned.
-            // Synchronous main maps is_keystore_locked() → EXIT_KEYSTORE_LOCKED (14)
-            // after the runtime is dropped (ARCH-2i / NFR-3).
+            // Synchronous main maps named BootstrapError codes (14 here) after
+            // the runtime is dropped (ARCH-2i / NFR-3).
             return Err(e);
         }
         Err(e) => {
