@@ -181,7 +181,8 @@ Gloas-scheduled networks need extra keys that this sample does not set. See
 [gloas-upgrade.md](gloas-upgrade.md) for `[fork_schedule]`, the six Gloas
 `*_DUE_BPS*` timing keys, the `SECONDS_PER_SLOT` → `SLOT_DURATION_MS` diff,
 the `network = "custom"` devnet fragment, rollback status, and the remote-signer
-gap.
+gap. Pre-fork alerting rules and dashboard panels:
+[gloas-observability.md](gloas-observability.md).
 
 ```toml
 beacon_url = "http://localhost:5052"

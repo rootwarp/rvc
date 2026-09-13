@@ -231,6 +231,7 @@ string to put in a runbook.
 
 - [running-guide.md](running-guide.md) — `[timing]` defaults and CLI
 - [forks.md](forks.md) — Gloas dispatch sites and the `Electra..Gloas` EIP-7549 guard
+- [gloas-observability.md](gloas-observability.md) — pre-fork alerts and dashboard panels
 - [gloas-fork-hazard-audit.md](gloas-fork-hazard-audit.md) — class inventory
 - [validator-perf.md](validator-perf.md) — `SLOT_DURATION_MS` in the estimator
 - [web3signer-http-api.md](web3signer-http-api.md) — in-tree HTTP signer (not Consensys Web3Signer Gloas support)

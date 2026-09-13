@@ -12,6 +12,7 @@ Line numbers were opened on `develop` @ `bc1f63d`. Docs-freshness
 the backticks — a colon inside `` `…` `` is not a path token.
 
 Operator keys for a Gloas-scheduled network: [gloas-upgrade.md](gloas-upgrade.md).
+Pre-fork alerts and dashboard panels: [gloas-observability.md](gloas-observability.md).
 
 ---
 
@@ -329,4 +330,5 @@ variant and new body structs.
 - [ ] This file: every new path is backticked without a line-number colon;
       `cargo nextest run -p rvc-architecture-tests --test docs_freshness` is green.
       Operator keys for the new fork go in a dedicated upgrade note (Gloas:
-      [gloas-upgrade.md](gloas-upgrade.md)), not only here.
+      [gloas-upgrade.md](gloas-upgrade.md)), not only here. Pre-fork alerts:
+      [gloas-observability.md](gloas-observability.md).
