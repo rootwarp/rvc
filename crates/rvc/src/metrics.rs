@@ -137,6 +137,33 @@ pub static RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL: LazyLock<IntCounterVec> = Lazy
     )
 });
 
+/// `outcome` label values for [`RVC_PTC_DUTIES_TOTAL`].
+pub mod ptc_duty_outcome {
+    pub const SCHEDULED: &str = "scheduled";
+    pub const SKIPPED_NO_DATA: &str = "skipped_no_data";
+    pub const DROPPED: &str = "dropped";
+}
+
+/// PTC duty outcomes (issue 7.6 / 8.2).
+/// Labels: outcome (scheduled, skipped_no_data, dropped)
+pub static RVC_PTC_DUTIES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_ptc_duties_total",
+        "Total number of payload-attestation (PTC) duties by outcome",
+        &["outcome"],
+    )
+});
+
+/// PTC pool-post outcomes (issue 7.6 / 8.2).
+/// Labels: status (success, failed)
+pub static RVC_PTC_ATTESTATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_ptc_attestations_total",
+        "Total number of payload-attestation (PTC) pool submissions by status",
+        &["status"],
+    )
+});
+
 /// `sign_type` label values for [`RVC_SIGNER_CAPABILITY`].
 pub mod signer_sign_type {
     pub const PAYLOAD_ATTESTATION: &str = "PAYLOAD_ATTESTATION";
@@ -178,6 +205,13 @@ pub fn init() {
     LazyLock::force(&RVC_SYNC_COMMITTEE_SKIPPED_TOTAL);
     LazyLock::force(&RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL);
     LazyLock::force(&RVC_SIGNER_CAPABILITY);
+    LazyLock::force(&RVC_PTC_DUTIES_TOTAL);
+    LazyLock::force(&RVC_PTC_ATTESTATIONS_TOTAL);
+    let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SCHEDULED]);
+    let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SKIPPED_NO_DATA]);
+    let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::DROPPED]);
+    let _ = RVC_PTC_ATTESTATIONS_TOTAL.with_label_values(&[attestation_status::SUCCESS]);
+    let _ = RVC_PTC_ATTESTATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]);
 }
 
 #[cfg(test)]

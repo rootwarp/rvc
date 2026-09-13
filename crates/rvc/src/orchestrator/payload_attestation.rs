@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use crate::metrics::{payload_attestation_skip_reason, RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL};
+use crate::metrics::{
+    attestation_status, payload_attestation_skip_reason, ptc_duty_outcome,
+    RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL, RVC_PTC_ATTESTATIONS_TOTAL, RVC_PTC_DUTIES_TOTAL,
+};
 use bn_manager::{BeaconNodeClient, PtcDuty};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
@@ -76,10 +79,12 @@ impl PayloadAttestationService {
                 RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL
                     .with_label_values(&[payload_attestation_skip_reason::NO_DATA])
                     .inc();
+                inc_ptc_duty_by(ptc_duty_outcome::SKIPPED_NO_DATA, matching_duties.len() as u64);
                 return;
             }
             Ok(Err(e)) => {
                 warn!(slot, error = %e, "Failed to get payload attestation data");
+                inc_ptc_duty_by(ptc_duty_outcome::DROPPED, matching_duties.len() as u64);
                 return;
             }
             Err(_) => {
@@ -88,6 +93,7 @@ impl PayloadAttestationService {
                     "Payload attestation data fetch timed out after {}s",
                     self.config.timeouts.attestation_fetch.as_secs()
                 );
+                inc_ptc_duty_by(ptc_duty_outcome::DROPPED, matching_duties.len() as u64);
                 return;
             }
         };
@@ -103,6 +109,7 @@ impl PayloadAttestationService {
                         error = %e,
                         "Failed to parse PTC validator_index"
                     );
+                    inc_ptc_duty(ptc_duty_outcome::DROPPED);
                     continue;
                 }
             };
@@ -122,6 +129,7 @@ impl PayloadAttestationService {
                         data: data.clone(),
                         signature: sig.to_bytes().to_vec(),
                     });
+                    inc_ptc_duty(ptc_duty_outcome::SCHEDULED);
                 }
                 Err(e) => {
                     // H6: one signer failure must not abort the remaining validators.
@@ -131,6 +139,7 @@ impl PayloadAttestationService {
                         error = %e,
                         "Failed to sign payload attestation"
                     );
+                    inc_ptc_duty(ptc_duty_outcome::DROPPED);
                 }
             }
         }
@@ -143,13 +152,22 @@ impl PayloadAttestationService {
             )
             .await
             {
-                Ok(Ok(_)) => info!(slot, count, "Submitted payload attestations"),
-                Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit payload attestations"),
-                Err(_) => warn!(
-                    slot,
-                    "Payload attestation submit timed out after {}s",
-                    self.config.timeouts.attestation_submit.as_secs()
-                ),
+                Ok(Ok(_)) => {
+                    info!(slot, count, "Submitted payload attestations");
+                    inc_ptc_attestation_by(attestation_status::SUCCESS, count as u64);
+                }
+                Ok(Err(e)) => {
+                    warn!(slot, error = %e, "Failed to submit payload attestations");
+                    inc_ptc_attestation_by(attestation_status::FAILED, count as u64);
+                }
+                Err(_) => {
+                    warn!(
+                        slot,
+                        "Payload attestation submit timed out after {}s",
+                        self.config.timeouts.attestation_submit.as_secs()
+                    );
+                    inc_ptc_attestation_by(attestation_status::FAILED, count as u64);
+                }
             }
         }
     }
@@ -183,20 +201,84 @@ impl PayloadAttestationService {
     }
 }
 
+fn inc_ptc_duty(outcome: &str) {
+    #[cfg(test)]
+    if !ptc_counter_lock::enabled() {
+        return;
+    }
+    RVC_PTC_DUTIES_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+fn inc_ptc_duty_by(outcome: &str, n: u64) {
+    #[cfg(test)]
+    if !ptc_counter_lock::enabled() {
+        return;
+    }
+    RVC_PTC_DUTIES_TOTAL.with_label_values(&[outcome]).inc_by(n);
+}
+
+fn inc_ptc_attestation_by(status: &str, n: u64) {
+    #[cfg(test)]
+    if !ptc_counter_lock::enabled() {
+        return;
+    }
+    RVC_PTC_ATTESTATIONS_TOTAL.with_label_values(&[status]).inc_by(n);
+}
+
+/// Serializes PTC counter delta tests without blocking other PTC callers.
+#[cfg(test)]
+mod ptc_counter_lock {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+
+    tokio::task_local! {
+        static HELD: ();
+    }
+
+    static DELTA_TESTS: AtomicUsize = AtomicUsize::new(0);
+
+    fn mutex() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    pub fn enabled() -> bool {
+        if DELTA_TESTS.load(Ordering::SeqCst) == 0 {
+            true
+        } else {
+            HELD.try_with(|_| ()).is_ok()
+        }
+    }
+
+    pub async fn with_held<Fut: Future>(fut: Fut) -> Fut::Output {
+        DELTA_TESTS.fetch_add(1, Ordering::SeqCst);
+        let _guard = mutex().lock().await;
+        let out = HELD.scope((), fut).await;
+        DELTA_TESTS.fetch_sub(1, Ordering::SeqCst);
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{
         collections::HashMap,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
             Arc, Mutex,
         },
     };
 
-    use crate::metrics::{payload_attestation_skip_reason, RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL};
+    use crate::metrics::{
+        attestation_status, payload_attestation_skip_reason, ptc_duty_outcome,
+        RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL, RVC_PTC_ATTESTATIONS_TOTAL, RVC_PTC_DUTIES_TOTAL,
+    };
     use beacon::PayloadAttestationDataResponse;
-    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient, PtcDutiesResponse, PtcDuty};
+    use bn_manager::{
+        BeaconError, BeaconNodeClient, MockBeaconNodeClient, PtcDutiesResponse, PtcDuty,
+    };
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
     use eth_types::{ForkSchedule, PayloadAttestationData, PayloadAttestationMessage};
@@ -307,144 +389,404 @@ mod tests {
             .get()
     }
 
+    fn ptc_duty_count(outcome: &str) -> u64 {
+        RVC_PTC_DUTIES_TOTAL.with_label_values(&[outcome]).get()
+    }
+
+    fn ptc_attestation_count(status: &str) -> u64 {
+        RVC_PTC_ATTESTATIONS_TOTAL.with_label_values(&[status]).get()
+    }
+
     #[tokio::test]
     async fn test_payload_attestation_204_skips_without_signature_or_submission() {
-        let k = test_key(10);
-        let submitted: Arc<Mutex<Vec<PayloadAttestationMessage>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let fetch_count = Arc::new(AtomicUsize::new(0));
-        let mock = Arc::new(
-            MockBeaconNodeClient::new()
-                .with_post_ptc_duties({
-                    let duty = ptc_duty(0, 10, &k.pk);
-                    move |_epoch, _indices| Ok(ptc_response(vec![duty.clone()]))
-                })
-                .with_get_payload_attestation_data({
-                    let fetch_count = fetch_count.clone();
-                    move |_slot| {
-                        fetch_count.fetch_add(1, Ordering::SeqCst);
-                        Ok(None)
-                    }
-                })
-                .with_submit_payload_attestations({
-                    let submitted = submitted.clone();
-                    move |msgs| {
-                        submitted.lock().unwrap().extend(msgs);
-                        Ok(())
-                    }
-                }),
-        );
-        let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
-        let service = setup_service(beacon, vec![k], &[]).await;
+        super::ptc_counter_lock::with_held(async {
+            let k = test_key(10);
+            let submitted: Arc<Mutex<Vec<PayloadAttestationMessage>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let fetch_count = Arc::new(AtomicUsize::new(0));
+            let mock = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_ptc_duties({
+                        let duty = ptc_duty(0, 10, &k.pk);
+                        move |_epoch, _indices| Ok(ptc_response(vec![duty.clone()]))
+                    })
+                    .with_get_payload_attestation_data({
+                        let fetch_count = fetch_count.clone();
+                        move |_slot| {
+                            fetch_count.fetch_add(1, Ordering::SeqCst);
+                            Ok(None)
+                        }
+                    })
+                    .with_submit_payload_attestations({
+                        let submitted = submitted.clone();
+                        move |msgs| {
+                            submitted.lock().unwrap().extend(msgs);
+                            Ok(())
+                        }
+                    }),
+            );
+            let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+            let service = setup_service(beacon, vec![k], &[]).await;
 
-        let before = skip_count();
-        service.maybe_produce_payload_attestations(0, 0).await;
+            let before = skip_count();
+            service.maybe_produce_payload_attestations(0, 0).await;
 
-        assert_eq!(fetch_count.load(Ordering::SeqCst), 1, "204 path must still fetch once");
-        assert!(submitted.lock().unwrap().is_empty(), "204 must not submit payload attestations");
-        assert_eq!(
-            skip_count(),
-            before + 1,
-            "204 must increment rvc_payload_attestation_skipped_total{{reason=no_data}}"
-        );
-        assert!(
-            mock.submit_payload_attestations_calls().is_empty(),
-            "204 must not call submit_payload_attestations"
-        );
+            assert_eq!(fetch_count.load(Ordering::SeqCst), 1, "204 path must still fetch once");
+            assert!(
+                submitted.lock().unwrap().is_empty(),
+                "204 must not submit payload attestations"
+            );
+            assert_eq!(
+                skip_count(),
+                before + 1,
+                "204 must increment rvc_payload_attestation_skipped_total{{reason=no_data}}"
+            );
+            assert!(
+                mock.submit_payload_attestations_calls().is_empty(),
+                "204 must not call submit_payload_attestations"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_one_signer_failure_does_not_abort_remaining_ptc_validators() {
-        let a = test_key(10);
-        let b = test_key(11);
-        let c = test_key(12);
-        let submitted_indices: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
-        let data = ptc_data(0);
-        let mock = Arc::new(
-            MockBeaconNodeClient::new()
-                .with_post_ptc_duties({
-                    let duties = vec![
-                        ptc_duty(0, 10, &a.pk),
-                        ptc_duty(0, 11, &b.pk),
-                        ptc_duty(0, 12, &c.pk),
-                    ];
-                    move |_epoch, _indices| Ok(ptc_response(duties.clone()))
-                })
-                .with_get_payload_attestation_data({
-                    let data = data.clone();
-                    move |_slot| Ok(Some(PayloadAttestationDataResponse { data: data.clone() }))
-                })
-                .with_submit_payload_attestations({
-                    let submitted_indices = submitted_indices.clone();
-                    move |msgs| {
-                        submitted_indices
-                            .lock()
-                            .unwrap()
-                            .extend(msgs.iter().map(|m| m.validator_index));
-                        Ok(())
-                    }
-                }),
-        );
-        let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
-        let service = setup_service(beacon, vec![a, b, c], &[11]).await;
+        super::ptc_counter_lock::with_held(async {
+            let a = test_key(10);
+            let b = test_key(11);
+            let c = test_key(12);
+            let submitted_indices: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+            let data = ptc_data(0);
+            let mock = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_ptc_duties({
+                        let duties = vec![
+                            ptc_duty(0, 10, &a.pk),
+                            ptc_duty(0, 11, &b.pk),
+                            ptc_duty(0, 12, &c.pk),
+                        ];
+                        move |_epoch, _indices| Ok(ptc_response(duties.clone()))
+                    })
+                    .with_get_payload_attestation_data({
+                        let data = data.clone();
+                        move |_slot| Ok(Some(PayloadAttestationDataResponse { data: data.clone() }))
+                    })
+                    .with_submit_payload_attestations({
+                        let submitted_indices = submitted_indices.clone();
+                        move |msgs| {
+                            submitted_indices
+                                .lock()
+                                .unwrap()
+                                .extend(msgs.iter().map(|m| m.validator_index));
+                            Ok(())
+                        }
+                    }),
+            );
+            let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+            let service = setup_service(beacon, vec![a, b, c], &[11]).await;
 
-        service.maybe_produce_payload_attestations(0, 0).await;
+            service.maybe_produce_payload_attestations(0, 0).await;
 
-        let mut indices = submitted_indices.lock().unwrap().clone();
-        indices.sort_unstable();
-        assert_eq!(
-            indices,
-            vec![10, 12],
-            "H6: A and C must submit; B (KeyNotFound) must be skipped"
-        );
+            let mut indices = submitted_indices.lock().unwrap().clone();
+            indices.sort_unstable();
+            assert_eq!(
+                indices,
+                vec![10, 12],
+                "H6: A and C must submit; B (KeyNotFound) must be skipped"
+            );
+        })
+        .await;
     }
 
     #[tokio::test]
     async fn test_payload_attestation_data_fetched_once_identical_bytes_to_every_signer() {
-        let a = test_key(10);
-        let b = test_key(11);
-        let fetch_count = Arc::new(AtomicUsize::new(0));
-        let expected = ptc_data(0);
-        let submitted: Arc<Mutex<Vec<PayloadAttestationMessage>>> =
-            Arc::new(Mutex::new(Vec::new()));
-        let mock = Arc::new(
-            MockBeaconNodeClient::new()
-                .with_post_ptc_duties({
-                    let duties = vec![ptc_duty(0, 10, &a.pk), ptc_duty(0, 11, &b.pk)];
-                    move |_epoch, _indices| Ok(ptc_response(duties.clone()))
-                })
-                .with_get_payload_attestation_data({
-                    let fetch_count = fetch_count.clone();
-                    let expected = expected.clone();
-                    move |_slot| {
-                        let n = fetch_count.fetch_add(1, Ordering::SeqCst);
-                        assert_eq!(n, 0, "payload attestation data must be fetched once per slot");
-                        Ok(Some(PayloadAttestationDataResponse { data: expected.clone() }))
-                    }
-                })
-                .with_submit_payload_attestations({
-                    let submitted = submitted.clone();
-                    move |msgs| {
-                        submitted.lock().unwrap().extend(msgs);
-                        Ok(())
-                    }
-                }),
-        );
-        let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
-        let service = setup_service(beacon, vec![a, b], &[]).await;
-
-        service.maybe_produce_payload_attestations(0, 0).await;
-
-        assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
-        assert_eq!(mock.get_payload_attestation_data_calls(), vec![0]);
-        let messages = submitted.lock().unwrap().clone();
-        assert_eq!(messages.len(), 2);
-        for msg in &messages {
-            assert_eq!(
-                msg.data, expected,
-                "identical PayloadAttestationData bytes must go to every signer"
+        super::ptc_counter_lock::with_held(async {
+            let a = test_key(10);
+            let b = test_key(11);
+            let fetch_count = Arc::new(AtomicUsize::new(0));
+            let expected = ptc_data(0);
+            let submitted: Arc<Mutex<Vec<PayloadAttestationMessage>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let mock = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_ptc_duties({
+                        let duties = vec![ptc_duty(0, 10, &a.pk), ptc_duty(0, 11, &b.pk)];
+                        move |_epoch, _indices| Ok(ptc_response(duties.clone()))
+                    })
+                    .with_get_payload_attestation_data({
+                        let fetch_count = fetch_count.clone();
+                        let expected = expected.clone();
+                        move |_slot| {
+                            let n = fetch_count.fetch_add(1, Ordering::SeqCst);
+                            assert_eq!(
+                                n, 0,
+                                "payload attestation data must be fetched once per slot"
+                            );
+                            Ok(Some(PayloadAttestationDataResponse { data: expected.clone() }))
+                        }
+                    })
+                    .with_submit_payload_attestations({
+                        let submitted = submitted.clone();
+                        move |msgs| {
+                            submitted.lock().unwrap().extend(msgs);
+                            Ok(())
+                        }
+                    }),
             );
-        }
-        assert_eq!(messages[0].data, messages[1].data);
+            let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+            let service = setup_service(beacon, vec![a, b], &[]).await;
+
+            service.maybe_produce_payload_attestations(0, 0).await;
+
+            assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+            assert_eq!(mock.get_payload_attestation_data_calls(), vec![0]);
+            let messages = submitted.lock().unwrap().clone();
+            assert_eq!(messages.len(), 2);
+            for msg in &messages {
+                assert_eq!(
+                    msg.data, expected,
+                    "identical PayloadAttestationData bytes must go to every signer"
+                );
+            }
+            assert_eq!(messages[0].data, messages[1].data);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_ptc_success_increments_only_after_pool_post() {
+        super::ptc_counter_lock::with_held(async {
+            let k = test_key(10);
+            let success_at_post = Arc::new(AtomicU64::new(0));
+            let data = ptc_data(0);
+            let mock = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_ptc_duties({
+                        let duty = ptc_duty(0, 10, &k.pk);
+                        move |_epoch, _indices| Ok(ptc_response(vec![duty.clone()]))
+                    })
+                    .with_get_payload_attestation_data({
+                        let data = data.clone();
+                        move |_slot| Ok(Some(PayloadAttestationDataResponse { data: data.clone() }))
+                    })
+                    .with_submit_payload_attestations({
+                        let success_at_post = success_at_post.clone();
+                        move |msgs| {
+                            assert_eq!(msgs.len(), 1, "success path posts one payload attestation");
+                            success_at_post.store(
+                                ptc_attestation_count(attestation_status::SUCCESS),
+                                Ordering::SeqCst,
+                            );
+                            Ok(())
+                        }
+                    }),
+            );
+            let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+            let service = setup_service(beacon, vec![k], &[]).await;
+
+            let before_success = ptc_attestation_count(attestation_status::SUCCESS);
+            let before_failed = ptc_attestation_count(attestation_status::FAILED);
+            let before_scheduled = ptc_duty_count(ptc_duty_outcome::SCHEDULED);
+            let before_skipped = ptc_duty_count(ptc_duty_outcome::SKIPPED_NO_DATA);
+            let before_dropped = ptc_duty_count(ptc_duty_outcome::DROPPED);
+
+            service.maybe_produce_payload_attestations(0, 0).await;
+
+            assert_eq!(
+                success_at_post.load(Ordering::SeqCst),
+                before_success,
+                "rvc_ptc_attestations_total{{status=success}} must not increment until pool POST returns"
+            );
+            assert_eq!(
+                ptc_attestation_count(attestation_status::SUCCESS),
+                before_success + 1,
+                "success increments after pool POST"
+            );
+            assert_eq!(
+                ptc_attestation_count(attestation_status::FAILED),
+                before_failed,
+                "successful pool POST must not increment failed"
+            );
+            assert_eq!(
+                ptc_duty_count(ptc_duty_outcome::SCHEDULED),
+                before_scheduled + 1,
+                "signed PTC duty counts as scheduled"
+            );
+            assert_eq!(ptc_duty_count(ptc_duty_outcome::SKIPPED_NO_DATA), before_skipped);
+            assert_eq!(ptc_duty_count(ptc_duty_outcome::DROPPED), before_dropped);
+            assert_eq!(mock.submit_payload_attestations_calls().len(), 1);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_ptc_204_counts_as_skipped_not_failed() {
+        super::ptc_counter_lock::with_held(async {
+            let k = test_key(10);
+            let mock = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_ptc_duties({
+                        let duty = ptc_duty(0, 10, &k.pk);
+                        move |_epoch, _indices| Ok(ptc_response(vec![duty.clone()]))
+                    })
+                    .with_get_payload_attestation_data(move |_slot| Ok(None))
+                    .with_submit_payload_attestations(|_msgs| {
+                        panic!("204 must not POST pool/payload_attestations")
+                    }),
+            );
+            let beacon: Arc<dyn BeaconNodeClient> = mock;
+            let service = setup_service(beacon, vec![k], &[]).await;
+
+            let before_skipped = ptc_duty_count(ptc_duty_outcome::SKIPPED_NO_DATA);
+            let before_scheduled = ptc_duty_count(ptc_duty_outcome::SCHEDULED);
+            let before_dropped = ptc_duty_count(ptc_duty_outcome::DROPPED);
+            let before_success = ptc_attestation_count(attestation_status::SUCCESS);
+            let before_failed = ptc_attestation_count(attestation_status::FAILED);
+
+            service.maybe_produce_payload_attestations(0, 0).await;
+
+            assert_eq!(
+                ptc_duty_count(ptc_duty_outcome::SKIPPED_NO_DATA),
+                before_skipped + 1,
+                "204 must increment rvc_ptc_duties_total{{outcome=skipped_no_data}}"
+            );
+            assert_eq!(
+                ptc_attestation_count(attestation_status::FAILED),
+                before_failed,
+                "204 must not count as a failed PTC attestation"
+            );
+            assert_eq!(ptc_attestation_count(attestation_status::SUCCESS), before_success);
+            assert_eq!(ptc_duty_count(ptc_duty_outcome::SCHEDULED), before_scheduled);
+            assert_eq!(ptc_duty_count(ptc_duty_outcome::DROPPED), before_dropped);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_ptc_duty_dropped_when_signer_rejects_increments_dropped() {
+        super::ptc_counter_lock::with_held(async {
+            let k = test_key(10);
+            let mock = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_ptc_duties({
+                        let duty = ptc_duty(0, 10, &k.pk);
+                        move |_epoch, _indices| Ok(ptc_response(vec![duty.clone()]))
+                    })
+                    .with_get_payload_attestation_data({
+                        let data = ptc_data(0);
+                        move |_slot| Ok(Some(PayloadAttestationDataResponse { data: data.clone() }))
+                    })
+                    .with_submit_payload_attestations(|_msgs| {
+                        panic!("signer reject must not POST pool/payload_attestations")
+                    }),
+            );
+            let beacon: Arc<dyn BeaconNodeClient> = mock;
+            let service = setup_service(beacon, vec![k], &[10]).await;
+
+            let before_dropped = ptc_duty_count(ptc_duty_outcome::DROPPED);
+            let before_scheduled = ptc_duty_count(ptc_duty_outcome::SCHEDULED);
+            let before_skipped = ptc_duty_count(ptc_duty_outcome::SKIPPED_NO_DATA);
+            let before_success = ptc_attestation_count(attestation_status::SUCCESS);
+            let before_failed = ptc_attestation_count(attestation_status::FAILED);
+
+            service.maybe_produce_payload_attestations(0, 0).await;
+
+            assert_eq!(
+                ptc_duty_count(ptc_duty_outcome::DROPPED),
+                before_dropped + 1,
+                "signer reject must increment rvc_ptc_duties_total{{outcome=dropped}}"
+            );
+            assert_eq!(ptc_duty_count(ptc_duty_outcome::SCHEDULED), before_scheduled);
+            assert_eq!(ptc_duty_count(ptc_duty_outcome::SKIPPED_NO_DATA), before_skipped);
+            assert_eq!(ptc_attestation_count(attestation_status::SUCCESS), before_success);
+            assert_eq!(ptc_attestation_count(attestation_status::FAILED), before_failed);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_ptc_get_data_error_increments_dropped() {
+        super::ptc_counter_lock::with_held(async {
+            let k = test_key(10);
+            let mock = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_ptc_duties({
+                        let duty = ptc_duty(0, 10, &k.pk);
+                        move |_epoch, _indices| Ok(ptc_response(vec![duty.clone()]))
+                    })
+                    .with_get_payload_attestation_data(|_slot| {
+                        Err(BeaconError::HttpError("bn down".to_string()))
+                    })
+                    .with_submit_payload_attestations(|_msgs| {
+                        panic!("GET error must not POST pool/payload_attestations")
+                    }),
+            );
+            let beacon: Arc<dyn BeaconNodeClient> = mock;
+            let service = setup_service(beacon, vec![k], &[]).await;
+
+            let before_dropped = ptc_duty_count(ptc_duty_outcome::DROPPED);
+            let before_scheduled = ptc_duty_count(ptc_duty_outcome::SCHEDULED);
+            let before_skipped = ptc_duty_count(ptc_duty_outcome::SKIPPED_NO_DATA);
+            let before_success = ptc_attestation_count(attestation_status::SUCCESS);
+            let before_failed = ptc_attestation_count(attestation_status::FAILED);
+
+            service.maybe_produce_payload_attestations(0, 0).await;
+
+            assert_eq!(
+                ptc_duty_count(ptc_duty_outcome::DROPPED),
+                before_dropped + 1,
+                "GET error must increment rvc_ptc_duties_total{{outcome=dropped}}"
+            );
+            assert_eq!(ptc_duty_count(ptc_duty_outcome::SCHEDULED), before_scheduled);
+            assert_eq!(ptc_duty_count(ptc_duty_outcome::SKIPPED_NO_DATA), before_skipped);
+            assert_eq!(ptc_attestation_count(attestation_status::SUCCESS), before_success);
+            assert_eq!(ptc_attestation_count(attestation_status::FAILED), before_failed);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_ptc_pool_post_error_increments_failed() {
+        super::ptc_counter_lock::with_held(async {
+            let k = test_key(10);
+            let data = ptc_data(0);
+            let mock = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_ptc_duties({
+                        let duty = ptc_duty(0, 10, &k.pk);
+                        move |_epoch, _indices| Ok(ptc_response(vec![duty.clone()]))
+                    })
+                    .with_get_payload_attestation_data({
+                        let data = data.clone();
+                        move |_slot| Ok(Some(PayloadAttestationDataResponse { data: data.clone() }))
+                    })
+                    .with_submit_payload_attestations(|_msgs| {
+                        Err(BeaconError::HttpError("pool rejected".to_string()))
+                    }),
+            );
+            let beacon: Arc<dyn BeaconNodeClient> = mock;
+            let service = setup_service(beacon, vec![k], &[]).await;
+
+            let before_failed = ptc_attestation_count(attestation_status::FAILED);
+            let before_success = ptc_attestation_count(attestation_status::SUCCESS);
+            let before_scheduled = ptc_duty_count(ptc_duty_outcome::SCHEDULED);
+            let before_dropped = ptc_duty_count(ptc_duty_outcome::DROPPED);
+
+            service.maybe_produce_payload_attestations(0, 0).await;
+
+            assert_eq!(
+                ptc_attestation_count(attestation_status::FAILED),
+                before_failed + 1,
+                "failed pool POST must increment rvc_ptc_attestations_total{{status=failed}}"
+            );
+            assert_eq!(ptc_attestation_count(attestation_status::SUCCESS), before_success);
+            assert_eq!(
+                ptc_duty_count(ptc_duty_outcome::SCHEDULED),
+                before_scheduled + 1,
+                "signed duty is still scheduled when pool POST fails"
+            );
+            assert_eq!(ptc_duty_count(ptc_duty_outcome::DROPPED), before_dropped);
+        })
+        .await;
     }
 }

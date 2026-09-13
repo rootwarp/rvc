@@ -103,6 +103,9 @@ pub fn spawn_background_tasks(
 
     check_metrics_bind_gate(metrics_address)?;
 
+    // Force-register families (including PTC zero-children) before the scrape listener.
+    crate::metrics::init();
+
     info!(addr = %metrics_address, port = metrics_port, "Starting metrics server");
     // P1-2: Telemetry tier; no cooperative token (abort-drain).
     executor.spawn("metrics_server", ShutdownTier::Telemetry, async move {

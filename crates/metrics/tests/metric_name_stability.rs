@@ -13,6 +13,7 @@
 //! Issue 4.12 adds `rvc_signer_capability` (family delta +1).
 //! Issue 6.7 adds `rvc_bn_capability_state` (family delta +1).
 //! Issue 6.20 adds `rvc_proposals_total` (family delta +1; `outcome=envelope_late`).
+//! Issue 7.6 adds `rvc_ptc_duties_total` and `rvc_ptc_attestations_total` (family delta +2).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -78,7 +79,9 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_proposer_bn_latency_ms",
     "rvc_proposer_config_refresh_failures_total",
     "rvc_proposer_config_refresh_success_total",
+    "rvc_ptc_attestations_total", // operator-facing: PTC pool-post status (issue 7.6 / 8.2)
     "rvc_ptc_duties_fetched_total",
+    "rvc_ptc_duties_total", // operator-facing: PTC duty outcomes (issue 7.6 / 8.2)
     "rvc_signer_capability",
     "rvc_signer_slashing_tx_hold_duration_ms",
     "rvc_signing_duration_seconds",
@@ -193,6 +196,11 @@ fn expected_metric_names_is_sorted_and_unique() {
         EXPECTED_METRIC_NAMES,
         sorted.as_slice(),
         "EXPECTED_METRIC_NAMES must be sorted and unique (edit-only list)"
+    );
+    assert_eq!(
+        EXPECTED_METRIC_NAMES.len(),
+        42,
+        "issue 7.6 +2 families (rvc_ptc_duties_total, rvc_ptc_attestations_total) on the 6.20 40-family pin"
     );
 }
 
