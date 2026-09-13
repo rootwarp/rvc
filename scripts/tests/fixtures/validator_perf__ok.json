@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-12T00:00:00Z",
+  "network": {
+    "name": "devnet",
+    "genesis_time": 1710000000,
+    "slots_per_epoch": 32,
+    "seconds_per_slot": 12
+  },
+  "window": {
+    "from_epoch": 2,
+    "to_epoch": 5,
+    "epochs": 4,
+    "head_epoch": 7,
+    "finalized_epoch": 5,
+    "finalized_only": false
+  },
+  "beacon": {
+    "endpoint": "http://127.0.0.1:5052",
+    "version": "Lighthouse/v8.2.2",
+    "rewards_api": "available",
+    "endpoints_used": ["http://127.0.0.1:5052"]
+  },
+  "validators": [
+    {
+      "pubkey": "0x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+      "index": 48,
+      "status": "active_ongoing",
+      "active_epochs": 4,
+      "participation_rate": 1.0,
+      "source_rate": 1.0,
+      "target_rate": 1.0,
+      "head_rate": 1.0,
+      "missed_attestations": 0,
+      "attester_effectiveness": 1.0,
+      "effectiveness_method": "reward_ratio",
+      "leak_epochs_excluded": 0,
+      "proposals": {"scheduled": 0, "included": 0, "missed": 0},
+      "sync": null,
+      "balance": {
+        "start_gwei": 32000000000,
+        "end_gwei": 32001000000,
+        "delta_gwei": 1000000,
+        "effective_balance_gwei": 32000000000,
+        "effective_balance_changed": false,
+        "start_slot": 64,
+        "end_slot": 192,
+        "reconciliation": "consistent"
+      },
+      "rewards_gwei": {
+        "source": 400000,
+        "target": 400000,
+        "head": 200000,
+        "inactivity": 0,
+        "proposer": 0,
+        "sync": 0,
+        "total": 1000000
+      },
+      "estimated_apr": 0.04,
+      "reward_source": "rewards_api",
+      "degradations": [],
+      "threshold_breaches": []
+    },
+    {
+      "pubkey": "0x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+      "index": 49,
+      "status": "active_ongoing",
+      "active_epochs": 4,
+      "participation_rate": 1.0,
+      "source_rate": 1.0,
+      "target_rate": 1.0,
+      "head_rate": 1.0,
+      "missed_attestations": 0,
+      "attester_effectiveness": 1.0,
+      "effectiveness_method": "reward_ratio",
+      "leak_epochs_excluded": 0,
+      "proposals": {"scheduled": 0, "included": 0, "missed": 0},
+      "sync": null,
+      "balance": {
+        "start_gwei": 32000000000,
+        "end_gwei": 32001000000,
+        "delta_gwei": 1000000,
+        "effective_balance_gwei": 32000000000,
+        "effective_balance_changed": false,
+        "start_slot": 64,
+        "end_slot": 192,
+        "reconciliation": "consistent"
+      },
+      "rewards_gwei": {
+        "source": 400000,
+        "target": 400000,
+        "head": 200000,
+        "inactivity": 0,
+        "proposer": 0,
+        "sync": 0,
+        "total": 1000000
+      },
+      "estimated_apr": 0.04,
+      "reward_source": "rewards_api",
+      "degradations": [],
+      "threshold_breaches": []
+    }
+  ],
+  "aggregate": {
+    "validators": 2,
+    "by_status": {"active_ongoing": 2},
+    "participation_rate": 1.0,
+    "source_rate": 1.0,
+    "target_rate": 1.0,
+    "head_rate": 1.0,
+    "attester_effectiveness": 1.0,
+    "missed_attestations": 0,
+    "proposals": {"scheduled": 0, "included": 0, "missed": 0},
+    "consensus_reward_gwei": 2000000,
+    "estimated_apr": 0.04,
+    "reward_source": "rewards_api"
+  },
+  "degradations": [],
+  "threshold_breaches": [],
+  "exit_code": 0
+}

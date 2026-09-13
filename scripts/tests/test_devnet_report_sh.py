@@ -1,6 +1,7 @@
-"""Contract tests for scripts/devnet/report.sh chain half (issue 5.3).
+"""Contract tests for scripts/devnet/report.sh (issues 5.3 and 5.4).
 
 VALIDATOR_PERF is a stub that echoes a fixture and exits a parameterised code.
+DEVNET_REPORT wraps the real devnet_report.py (issue 5.4) unless overridden.
 disable_socket() via conftest autouse. No live BN, no sockets.
 """
 
@@ -10,13 +11,16 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
 REPORT = Path(__file__).resolve().parents[1] / "devnet" / "report.sh"
+DEVNET_REPORT_PY = Path(__file__).resolve().parents[1] / "devnet_report.py"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+KEYPATHS = FIXTURES / "verdict_json__keypaths.txt"
 
 _ISOLATE_KEYS = (
     "DOCKER",
@@ -61,6 +65,24 @@ def _fixture_json(name: str) -> Path:
     return FIXTURES / f"validator_perf__{name}.json"
 
 
+def write_devnet_report_wrapper(tmp_path: Path) -> tuple[Path, Path]:
+    argv_log = tmp_path / "devnet_report.argv"
+    stub = tmp_path / "devnet_report"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"log={shlex.quote(str(argv_log))}\n"
+        f"py={shlex.quote(str(DEVNET_REPORT_PY))}\n"
+        ": > \"$log\"\n"
+        "for a in \"$@\"; do\n"
+        "  printf '%s\\n' \"$a\" >> \"$log\"\n"
+        "done\n"
+        "exec python3 \"$py\" \"$@\"\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub, argv_log
+
+
 def write_perf_stub(tmp_path: Path) -> tuple[Path, Path]:
     argv_log = tmp_path / "validator_perf.argv"
     stub = tmp_path / "validator_perf"
@@ -99,6 +121,9 @@ def report_env(
     full["VALIDATOR_PERF"] = str(stub or (tmp_path / "validator_perf"))
     full["VP_BODY"] = str(_fixture_json("ok"))
     full["VP_EXIT"] = "0"
+    if extra is None or "DEVNET_REPORT" not in extra:
+        dr_stub, _ = write_devnet_report_wrapper(tmp_path)
+        full["DEVNET_REPORT"] = str(dr_stub)
     if extra:
         full.update(extra)
     return full
@@ -112,6 +137,8 @@ def plant_run_dir(
     phase2: bool = True,
     run_json: bool = True,
     rvc_json: bool = True,
+    soak: bool = True,
+    metrics_end: Path | None = None,
 ) -> Path:
     run_dir = tmp_path / "run"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -142,6 +169,17 @@ def plant_run_dir(
             parsed["pubkeys"] = keys
             text = json.dumps(parsed, sort_keys=True) + "\n"
         (run_dir / "run.json").write_text(text, encoding="utf-8")
+    if soak:
+        shutil.copyfile(
+            FIXTURES / "rvc_metrics__start.txt", run_dir / "metrics-start.txt"
+        )
+        shutil.copyfile(
+            metrics_end or (FIXTURES / "rvc_metrics__end.txt"),
+            run_dir / "metrics-end.txt",
+        )
+        shutil.copyfile(
+            FIXTURES / "samples__gauges.jsonl", run_dir / "samples.jsonl"
+        )
     return run_dir
 
 
@@ -153,7 +191,7 @@ def run_report(
     stub: Path | None = None,
     vp_exit: int = 0,
     vp_body: str = "ok",
-    timeout: float = 15,
+    timeout: float = 30,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     if stub is None:
         stub, argv_log = write_perf_stub(tmp_path)
@@ -204,6 +242,57 @@ def assert_no_secret(proc: subprocess.CompletedProcess[str]) -> None:
     assert _MNEMONIC not in blob
 
 
+def json_keypaths(obj: object, prefix: str = "") -> set[str]:
+    paths: set[str] = set()
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            paths.add(path)
+            paths |= json_keypaths(value, path)
+    elif isinstance(obj, list):
+        elem = f"{prefix}[]"
+        for item in obj:
+            paths |= json_keypaths(item, elem)
+    return paths
+
+
+def _strip_metric_family(path: Path, family: str) -> None:
+    lines = [
+        line
+        for line in path.read_text(encoding="utf-8").splitlines(keepends=True)
+        if family not in line
+    ]
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def _committed_keypaths() -> list[str]:
+    return KEYPATHS.read_text(encoding="utf-8").splitlines()
+
+
+def _load_verdict(run_dir: Path) -> dict:
+    return json.loads((run_dir / "verdict.json").read_text(encoding="utf-8"))
+
+
+def _rewrite_blocked(
+    run_dir: Path,
+    value: str | None,
+    *,
+    files: tuple[str, ...] = ("metrics-end.txt",),
+) -> None:
+    needle = 'rvc_slashing_protection_checks_total{result="blocked"}'
+    for name in files:
+        path = run_dir / name
+        out: list[str] = []
+        for line in path.read_text(encoding="utf-8").splitlines(True):
+            if needle in line:
+                if value is None:
+                    continue
+                out.append(f"{needle} {value}\n")
+                continue
+            out.append(line)
+        path.write_text("".join(out), encoding="utf-8")
+
+
 def test_report_sh_syntax():
     assert REPORT.is_file(), REPORT
     assert os.access(REPORT, os.X_OK)
@@ -224,8 +313,18 @@ def test_report_sh_syntax():
     assert "--json" in text
     assert "--pubkeys-file" in text
     assert re.search(r"(?m)^\s*docker\s", text) is None
-    assert "verdict.json" not in text
-    assert "client.json" not in text
+    assert "verdict.json" in text
+    assert "client.json" in text
+    assert "write_verdict()" in text
+    assert "assert_no_blocked()" in text
+    assert "DEVNET_REPORT" in text
+    after = text.split("write_verdict()", 1)[1]
+    match = re.match(r"(?s) \{.*?\n\}\n", after)
+    assert match is not None
+    verdict_fn = match.group(0)
+    assert "jq" in verdict_fn
+    assert "python3" not in verdict_fn
+    assert "_render_chain_half" not in verdict_fn
     assert "O_NOFOLLOW" in text
     assert ".tmp.$$" not in text
     assert "KEYS_DIR}/rvc/pubkeys" not in text
@@ -368,6 +467,14 @@ def test_report_sh_exit_map_table(
     if child == 3 and strict:
         assert proc.returncode == 3
         assert "degraded" in proc.stderr
+    if child == 4:
+        verdict = _load_verdict(run_dir)
+        assert verdict["exit_code"] == 4
+        assert verdict["verdict"] == "fail"
+        assert verdict["gates"]["chain_thresholds"] == "fail"
+        assert verdict["gates"]["s5a_presence"] == "pass"
+        assert verdict["gates"]["s5b_liveness"] == "pass"
+        assert verdict["gates"]["s7_blocked"] == "pass"
     assert_no_secret(proc)
 
 
@@ -406,6 +513,11 @@ def test_report_sh_fail_under_passthrough(tmp_path: Path):
     assert (run_dir / "chain.json").read_bytes() == _fixture_json(
         "threshold"
     ).read_bytes()
+    verdict = _load_verdict(run_dir)
+    assert verdict["exit_code"] == 4
+    assert verdict["verdict"] == "fail"
+    assert verdict["gates"]["chain_thresholds"] == "fail"
+    assert verdict["gates"]["s7_blocked"] == "pass"
     assert_no_secret(proc)
 
 
@@ -499,3 +611,263 @@ def test_report_sh_rvc_pubkeys_refuses_dest_symlink(tmp_path: Path):
     assert argv_list(argv_log) == []
     assert not (run_dir / "chain.json").exists()
     assert_no_secret(proc)
+
+
+def test_report_sh_verdict_key_paths(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path)
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    for name in ("client.json", "chain.json", "report.txt", "verdict.json"):
+        assert (run_dir / name).is_file(), name
+    report_txt = (run_dir / "report.txt").read_text(encoding="utf-8")
+    assert "rvc_attestations_total" in report_txt
+    assert "--- chain ---" in report_txt
+    assert "soak window" in report_txt
+    assert "key_range" in report_txt
+    assert "part%" in report_txt
+    text = (run_dir / "verdict.json").read_text(encoding="utf-8")
+    assert "NaN" not in text
+    assert "Infinity" not in text
+    doc = json.loads(text)
+    json.dumps(doc, allow_nan=False)
+    actual = json_keypaths(doc)
+    expected = _committed_keypaths()
+    assert "" not in expected
+    assert expected == sorted(expected)
+    assert sorted(actual) == expected
+    assert doc["schema_version"] == 1
+    assert doc["verdict"] == "pass"
+    assert doc["exit_code"] == 0
+    assert doc["run_id"] == "20260912T000000Z-f110c1e"
+    assert doc["gates"]["s5a_presence"] == "pass"
+    assert doc["gates"]["s5b_liveness"] == "pass"
+    assert doc["gates"]["s7_blocked"] == "pass"
+    assert doc["gates"]["chain_thresholds"] == "pass"
+    dr_argv = argv_list(tmp_path / "devnet_report.argv")
+    assert dr_argv[:1] == ["report"]
+    assert "--run-dir" in dr_argv
+
+
+def test_report_sh_blocked_in_metrics_end_exits_3(tmp_path: Path):
+    run_dir = plant_run_dir(
+        tmp_path, metrics_end=FIXTURES / "rvc_metrics__end_blocked.txt"
+    )
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert "blocked" in proc.stderr.lower()
+    assert_no_secret(proc)
+    verdict = json.loads((run_dir / "verdict.json").read_text(encoding="utf-8"))
+    assert verdict["gates"]["s7_blocked"] == "fail"
+    assert verdict["verdict"] == "fail"
+    assert verdict["exit_code"] == 3
+    assert verdict["gates"]["s5b_liveness"] == "pass"
+
+
+def test_report_sh_missing_family_fails_s5a(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path)
+    family = "rvc_slashing_reserve_tx_hold_duration_ms"
+    _strip_metric_family(run_dir / "metrics-start.txt", family)
+    _strip_metric_family(run_dir / "metrics-end.txt", family)
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert family in proc.stderr
+    assert "K9" in proc.stderr
+    assert_no_secret(proc)
+    verdict = json.loads((run_dir / "verdict.json").read_text(encoding="utf-8"))
+    assert verdict["gates"]["s5a_presence"] == "fail"
+    assert verdict["verdict"] == "fail"
+    assert verdict["exit_code"] == 3
+
+
+def test_report_sh_no_proposal_window_annotation(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path)
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    client = json.loads((run_dir / "client.json").read_text(encoding="utf-8"))
+    verdict = json.loads((run_dir / "verdict.json").read_text(encoding="utf-8"))
+    assert "no_proposal_window" in client["annotations"]
+    assert "no_proposal_window" in verdict["annotations"]
+    assert client["presence"]["K6"] == "family_present_child_absent"
+    assert verdict["gates"]["s5a_presence"] == "pass"
+    assert verdict["verdict"] == "pass"
+    assert verdict["exit_code"] == 0
+
+
+def test_report_sh_k_rows_match_committed_families():
+    text = REPORT.read_text(encoding="utf-8")
+    match = re.search(r"(?ms)^_K_ROWS=\(\n(.*?)^\)\s*$", text)
+    assert match is not None
+    got = []
+    for raw in match.group(1).splitlines():
+        line = raw.strip().strip('"')
+        if line:
+            got.append(line)
+    want = [
+        ln
+        for ln in (FIXTURES / "k_rows__families.txt")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if ln.strip()
+    ]
+    assert got == want
+
+
+@pytest.mark.parametrize("value", ["1e2", "+1"])
+def test_report_sh_blocked_nonzero_forms_exit_3(tmp_path: Path, value: str):
+    run_dir = plant_run_dir(tmp_path)
+    _rewrite_blocked(run_dir, value)
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert "blocked" in proc.stderr.lower()
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["gates"]["s7_blocked"] == "fail"
+    assert verdict["verdict"] == "fail"
+    assert verdict["exit_code"] == 3
+
+
+@pytest.mark.parametrize("value", ["+Inf", "NaN", None])
+def test_report_sh_blocked_unreadable_not_pass(tmp_path: Path, value: str | None):
+    run_dir = plant_run_dir(tmp_path)
+    if value is None:
+        _rewrite_blocked(
+            run_dir,
+            None,
+            files=("metrics-start.txt", "metrics-end.txt"),
+        )
+    else:
+        _rewrite_blocked(run_dir, value)
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["verdict"] != "pass"
+    assert verdict["gates"]["s7_blocked"] == "fail"
+    assert verdict["exit_code"] == 3
+
+
+def test_report_sh_blocked_missing_from_end_only_exits_3(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path)
+    start = (run_dir / "metrics-start.txt").read_text(encoding="utf-8")
+    assert 'result="blocked"} 0' in start
+    _rewrite_blocked(run_dir, None, files=("metrics-end.txt",))
+    assert 'result="blocked"}' in (
+        run_dir / "metrics-start.txt"
+    ).read_text(encoding="utf-8")
+    assert 'result="blocked"}' not in (
+        run_dir / "metrics-end.txt"
+    ).read_text(encoding="utf-8")
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["gates"]["s7_blocked"] == "fail"
+    assert verdict["verdict"] != "pass"
+    assert verdict["exit_code"] == 3
+
+
+def test_report_sh_blocked_end_then_deleted_exits_3(tmp_path: Path):
+    run_dir = plant_run_dir(
+        tmp_path, metrics_end=FIXTURES / "rvc_metrics__end_blocked.txt"
+    )
+    assert 'result="blocked"} 1' in (
+        run_dir / "metrics-end.txt"
+    ).read_text(encoding="utf-8")
+    _rewrite_blocked(run_dir, None, files=("metrics-end.txt",))
+    assert 'result="blocked"}' not in (
+        run_dir / "metrics-end.txt"
+    ).read_text(encoding="utf-8")
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["gates"]["s7_blocked"] == "fail"
+    assert verdict["verdict"] != "pass"
+    assert verdict["exit_code"] == 3
+
+
+def test_report_sh_s5b_zero_k1_exits_3(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path)
+    path = run_dir / "metrics-end.txt"
+    text = path.read_text(encoding="utf-8")
+    text = text.replace(
+        'rvc_orchestrator_slots_processed_total{result="success"} 228',
+        'rvc_orchestrator_slots_processed_total{result="success"} 100',
+    )
+    path.write_text(text, encoding="utf-8")
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert "S5b" in proc.stderr or "liveness" in proc.stderr.lower()
+    assert "K1" in proc.stderr
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["gates"]["s5b_liveness"] == "fail"
+    assert verdict["gates"]["s5a_presence"] == "pass"
+    assert verdict["verdict"] == "fail"
+    assert verdict["exit_code"] == 3
+
+
+def test_report_sh_blocked_precedes_kpi_4(tmp_path: Path):
+    run_dir = plant_run_dir(
+        tmp_path, metrics_end=FIXTURES / "rvc_metrics__end_blocked.txt"
+    )
+    proc, _ = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        vp_exit=4,
+        vp_body="threshold",
+    )
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["exit_code"] == 3
+    assert verdict["verdict"] == "fail"
+    assert verdict["gates"]["s7_blocked"] == "fail"
+    assert verdict["gates"]["chain_thresholds"] == "fail"
+
+
+def test_report_sh_chain_half_sanitizes_control_chars(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path)
+    doc = json.loads(_fixture_json("ok").read_text(encoding="utf-8"))
+    injected = "active_ongoing\nDEGRADED:\ninjected  forged  all"
+    doc["validators"][0]["status"] = injected
+    doc["degradations"] = [
+        {
+            "metric": "rewards_gwei",
+            "scope": "scope",
+            "reason": "state_unavailable\nDEGRADED:\nforged",
+            "detail": "detail",
+        }
+    ]
+    body = tmp_path / "injected-status.json"
+    body.write_text(json.dumps(doc) + "\n", encoding="utf-8")
+    proc, _ = run_report(
+        tmp_path, ["--run-dir", str(run_dir)], env={"VP_BODY": str(body)}
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert_no_secret(proc)
+    report_txt = (run_dir / "report.txt").read_text(encoding="utf-8")
+    heading_lines = [
+        ln for ln in report_txt.splitlines() if ln.strip() == "DEGRADED:"
+    ]
+    assert len(heading_lines) == 1
+    assert "\nDEGRADED:\ninjected" not in report_txt
+    assert "injected" in report_txt
+    assert any(
+        "injected" in ln and ln.strip() != "DEGRADED:"
+        for ln in report_txt.splitlines()
+    )
+
+

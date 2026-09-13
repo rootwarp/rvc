@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "generated_at": "2026-09-12T00:00:00Z",
+  "network": {
+    "name": "devnet",
+    "genesis_time": 1710000000,
+    "slots_per_epoch": 32,
+    "seconds_per_slot": 12
+  },
+  "window": {
+    "from_epoch": 2,
+    "to_epoch": 5,
+    "epochs": 4,
+    "head_epoch": 7,
+    "finalized_epoch": 5,
+    "finalized_only": false
+  },
+  "beacon": {
+    "endpoint": "http://127.0.0.1:5052",
+    "version": "Lighthouse/v8.2.2",
+    "rewards_api": "available",
+    "endpoints_used": ["http://127.0.0.1:5052"]
+  },
+  "validators": [
+    {
+      "pubkey": "0x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+      "index": 48,
+      "status": "active_ongoing",
+      "active_epochs": 4,
+      "participation_rate": 0.5,
+      "source_rate": 0.5,
+      "target_rate": 0.5,
+      "head_rate": 0.5,
+      "missed_attestations": 8,
+      "attester_effectiveness": 0.5,
+      "effectiveness_method": "reward_ratio",
+      "leak_epochs_excluded": 0,
+      "proposals": {"scheduled": 0, "included": 0, "missed": 0},
+      "sync": null,
+      "balance": {
+        "start_gwei": 32000000000,
+        "end_gwei": 32000500000,
+        "delta_gwei": 500000,
+        "effective_balance_gwei": 32000000000,
+        "effective_balance_changed": false,
+        "start_slot": 64,
+        "end_slot": 192,
+        "reconciliation": "consistent"
+      },
+      "rewards_gwei": {
+        "source": 200000,
+        "target": 200000,
+        "head": 100000,
+        "inactivity": 0,
+        "proposer": 0,
+        "sync": 0,
+        "total": 500000
+      },
+      "estimated_apr": 0.02,
+      "reward_source": "rewards_api",
+      "degradations": [],
+      "threshold_breaches": ["participation_rate"]
+    }
+  ],
+  "aggregate": {
+    "validators": 1,
+    "by_status": {"active_ongoing": 1},
+    "participation_rate": 0.5,
+    "source_rate": 0.5,
+    "target_rate": 0.5,
+    "head_rate": 0.5,
+    "attester_effectiveness": 0.5,
+    "missed_attestations": 8,
+    "proposals": {"scheduled": 0, "included": 0, "missed": 0},
+    "consensus_reward_gwei": 500000,
+    "estimated_apr": 0.02,
+    "reward_source": "rewards_api"
+  },
+  "degradations": [],
+  "threshold_breaches": ["aggregate:participation_rate"],
+  "exit_code": 4
+}
