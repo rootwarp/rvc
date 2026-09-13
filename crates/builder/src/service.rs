@@ -122,6 +122,14 @@ impl BuilderService {
         }
     }
 
+    /// Drop cached registrations so the next [`Self::register_validators`] re-submits.
+    ///
+    /// Preference caches are left intact. Used by boundary tests so a missing
+    /// Gloas gate cannot hide behind `CachedRegistration`.
+    pub async fn clear_cached_registrations(&self) {
+        self.cache.write().await.clear();
+    }
+
     #[tracing::instrument(name = "builder.register", skip_all, fields(builder.batch_size, epoch = epoch))]
     pub async fn register_validators(&self, epoch: u64) -> Result<(), BuilderServiceError> {
         let fork = ForkName::from_epoch(epoch, &self.fork_schedule);

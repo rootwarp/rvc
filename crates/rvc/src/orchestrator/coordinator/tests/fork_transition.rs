@@ -56,16 +56,57 @@ async fn build_fork_transition_orchestrator_with_schedule(
     String,
     Arc<CapturingSubmitter>,
 ) {
+    // Existing 7.1–7.4 callers keep `builder_service: None`.
+    build_fork_transition_orchestrator_with(mock_server_uri, slot, schedule, false).await
+}
+
+async fn build_fork_transition_orchestrator_with_builder(
+    mock_server_uri: &str,
+    slot: u64,
+) -> (
+    DutyOrchestrator<MockSlotClock, CapturingSubmitter, MockBlockBeacon>,
+    OrchestratorHandle,
+    String,
+    Arc<CapturingSubmitter>,
+) {
+    build_fork_transition_orchestrator_with(
+        mock_server_uri,
+        slot,
+        create_test_fork_schedule(),
+        true,
+    )
+    .await
+}
+
+async fn build_fork_transition_orchestrator_with(
+    mock_server_uri: &str,
+    slot: u64,
+    schedule: Arc<ForkSchedule>,
+    attach_builder: bool,
+) -> (
+    DutyOrchestrator<MockSlotClock, CapturingSubmitter, MockBlockBeacon>,
+    OrchestratorHandle,
+    String,
+    Arc<CapturingSubmitter>,
+) {
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(slot);
 
     let beacon_config = BeaconClientConfig::new(mock_server_uri);
-    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let beacon: Arc<dyn BeaconNodeClient> = Arc::new(BeaconClient::new(beacon_config).unwrap());
 
     let secret_key = SecretKey::generate();
     let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
 
-    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+    let duty_tracker = {
+        let tracker = DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]);
+        // Production pins the reconciled schedule (v1 pre-Gloas, v2 at Gloas).
+        Arc::new(if attach_builder {
+            tracker.with_fork_schedule((*schedule).clone())
+        } else {
+            tracker
+        })
+    };
 
     let pubkey = secret_key.public_key();
     let mut key_manager = KeyManager::new();
@@ -78,7 +119,7 @@ async fn build_fork_transition_orchestrator_with_schedule(
     let capturing_submitter = Arc::new(CapturingSubmitter::new());
     let propagator = Arc::new(Propagator::new(capturing_submitter.clone()));
 
-    let config = OrchestratorConfig::new([0xaa; 32], schedule);
+    let config = OrchestratorConfig::new([0xaa; 32], schedule.clone());
     let pubkey_bytes = pubkey.to_bytes();
     let mut pubkey_map_inner = HashMap::new();
     pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
@@ -87,20 +128,39 @@ async fn build_fork_transition_orchestrator_with_schedule(
     // D-3 fail-closed: register the loaded validator so the per-validator
     // signing gate permits its duties (mirrors startup registration).
     let validator_store = create_mock_validator_store();
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes)).unwrap();
+    let mut validator_cfg = validator_store::ValidatorConfig::new(pubkey_bytes);
+    if attach_builder {
+        validator_cfg.builder_proposals = true;
+    }
+    validator_store.add_validator(validator_cfg).unwrap();
 
-    let (orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+    let builder_service: Option<Arc<BuilderService>> = attach_builder.then(|| {
+        let vs: Arc<dyn ValidatorSigner> = signer.clone();
+        Arc::new(BuilderService::new(
+            Arc::new(vs),
+            Arc::new(beacon.clone()),
+            validator_store.clone(),
+            schedule.genesis_fork_version,
+            schedule,
+        ))
+    });
+
+    let deps = OrchestratorDeps::for_test(
         clock,
         duty_tracker,
         signer,
         propagator,
         beacon,
         create_mock_block_beacon(),
-        None,
+        builder_service,
         validator_store,
         config,
         pubkey_map,
-    ));
+    );
+    if attach_builder {
+        deps.pubkey_index.write().insert(pubkey_bytes, PROPOSER_INDEX.to_string());
+    }
+    let (orchestrator, handle) = DutyOrchestrator::new(deps);
 
     (orchestrator, handle, pubkey_hex, capturing_submitter)
 }
@@ -2382,4 +2442,193 @@ async fn test_gloas_builder_win_skips_envelope_and_echoes_builder_url() {
     let publish = block_beacon.publish_block_calls();
     assert_eq!(publish.len(), 1);
     assert_eq!(publish[0].1.as_deref(), Some(builder_url));
+}
+
+// --- Issue 7.4b: Preferences broadcast across the Gloas boundary ---
+
+fn post_hits(requests: &[wiremock::Request], path: &str) -> usize {
+    requests
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::POST && r.url.path() == path)
+        .count()
+}
+
+fn signed_proposer_preferences(
+    requests: &[wiremock::Request],
+) -> Vec<eth_types::SignedProposerPreferences> {
+    requests
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path() == "/eth/v1/validator/proposer_preferences"
+        })
+        .flat_map(|r| {
+            serde_json::from_slice::<Vec<eth_types::SignedProposerPreferences>>(&r.body)
+                .unwrap_or_else(|e| panic!("proposer_preferences body must be a JSON array: {e}"))
+        })
+        .collect()
+}
+
+async fn setup_proposer_duty_http(
+    mock_server: &wiremock::MockServer,
+    epoch: u64,
+    slot: u64,
+    pubkey_hex: &str,
+    validator_index: u64,
+    version: &str,
+) {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    Mock::given(method("GET"))
+        .and(path(format!("/eth/{version}/validator/duties/proposer/{epoch}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey_hex,
+                "validator_index": validator_index.to_string(),
+                "slot": slot.to_string()
+            }]
+        })))
+        .mount(mock_server)
+        .await;
+}
+
+/// `SignedProposerPreferences` is advertised one epoch ahead of a Gloas
+/// proposal (slot 2240 during epoch 69) and supersedes
+/// `prepare_beacon_proposer` / `register_validator` at epoch 70.
+///
+/// RED: with `builder_service: None` the slot-2240 preferences assertion fails.
+#[tokio::test]
+async fn test_gloas_preferences_broadcast_one_epoch_ahead() {
+    use crypto::{signing_root_for, DutyRef, Signature, SigningCtx};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let mock_server = wiremock::MockServer::start().await;
+    let fulu_slot = PRE_GLOAS_SLOT;
+    let gloas_slot = GLOAS_SLOT;
+    let fulu_epoch = fulu_slot / SLOTS_PER_EPOCH;
+    let gloas_epoch = gloas_slot / SLOTS_PER_EPOCH;
+    assert_eq!(fulu_epoch, 69, "slot 2208 is epoch 69");
+    assert_eq!(gloas_epoch, 70, "slot 2240 is epoch 70");
+
+    let (orchestrator, _handle, pubkey_hex, _capturing) =
+        build_fork_transition_orchestrator_with_builder(&mock_server.uri(), fulu_slot).await;
+
+    // Pinned test schedule routes Gloas proposer duties to v2.
+    setup_proposer_duty_http(
+        &mock_server,
+        gloas_epoch,
+        gloas_slot,
+        &pubkey_hex,
+        PROPOSER_INDEX,
+        "v2",
+    )
+    .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/prepare_beacon_proposer"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/register_validator"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_server)
+        .await;
+
+    orchestrator.duty_tracker.fetch_proposer_duties(gloas_epoch).await.unwrap();
+
+    orchestrator.duty_management.on_epoch_boundary(fulu_epoch, fulu_slot).await;
+    orchestrator.run_builder_epoch_boundary(fulu_epoch).await;
+
+    let after_69 = mock_server.received_requests().await.unwrap();
+    let prefs_69 = signed_proposer_preferences(&after_69);
+    let slots_69: Vec<u64> = prefs_69.iter().map(|p| p.message.proposal_slot).collect();
+    assert_eq!(
+        slots_69.iter().filter(|slot| **slot == gloas_slot).count(),
+        1,
+        "SignedProposerPreferences for slot 2240 must be observed exactly once during epoch 69, got {slots_69:?}"
+    );
+    assert_eq!(prefs_69.len(), 1, "epoch 69 must broadcast only the upcoming Gloas slot");
+    assert_eq!(prefs_69[0].message.proposal_slot, gloas_slot);
+    assert_eq!(prefs_69[0].message.validator_index, PROPOSER_INDEX);
+    assert_eq!(prefs_69[0].message.fee_recipient, [0u8; 20]);
+    assert_eq!(prefs_69[0].message.target_gas_limit, 100);
+
+    let pubkey_bytes: [u8; 48] = hex::decode(pubkey_hex.trim_start_matches("0x"))
+        .expect("pubkey hex")
+        .try_into()
+        .expect("compressed pubkey is 48 bytes");
+    let pubkey = PublicKey::from_bytes(&pubkey_bytes).expect("pubkey");
+    let sig = Signature::from_bytes(&prefs_69[0].signature).expect("preferences signature");
+    let schedule = create_test_fork_schedule();
+    let ctx = SigningCtx { fork_schedule: schedule.as_ref(), genesis_validators_root: [0xaa; 32] };
+    let prefs_signing = signing_root_for(&DutyRef::ProposerPreferences(&prefs_69[0].message), &ctx);
+    sig.verify(&pubkey, &prefs_signing).expect(
+        "preferences must verify under DOMAIN_PROPOSER_PREFERENCES at the proposal-slot fork",
+    );
+    let proposer_signing =
+        signing_root_for(&DutyRef::BlockRoot { root: &[0u8; 32], slot: gloas_slot }, &ctx);
+    assert!(
+        sig.verify(&pubkey, &proposer_signing).is_err(),
+        "preferences must not verify under DOMAIN_BEACON_PROPOSER"
+    );
+
+    assert_eq!(
+        post_hits(&after_69, "/eth/v1/validator/prepare_beacon_proposer"),
+        1,
+        "pre-Gloas epoch 69 must issue prepare_beacon_proposer once"
+    );
+    assert_eq!(
+        post_hits(&after_69, "/eth/v1/validator/register_validator"),
+        1,
+        "pre-Gloas epoch 69 must issue register_validator once"
+    );
+
+    // Cold registration cache: a missing Gloas gate would POST register again.
+    orchestrator
+        .builder_service
+        .as_ref()
+        .expect("builder attached")
+        .clear_cached_registrations()
+        .await;
+
+    orchestrator.clock.set_slot(gloas_slot);
+    orchestrator.duty_management.on_epoch_boundary(gloas_epoch, gloas_slot).await;
+    orchestrator.run_builder_epoch_boundary(gloas_epoch).await;
+
+    let after_70 = mock_server.received_requests().await.unwrap();
+    let epoch_70 = &after_70[after_69.len()..];
+    let prefs_70_slots: Vec<u64> =
+        signed_proposer_preferences(epoch_70).iter().map(|p| p.message.proposal_slot).collect();
+    assert!(
+        !prefs_70_slots.contains(&gloas_slot),
+        "slot 2240 must not be re-broadcast at epoch 70, got {prefs_70_slots:?}"
+    );
+    assert_eq!(
+        signed_proposer_preferences(&after_70)
+            .iter()
+            .filter(|p| p.message.proposal_slot == gloas_slot)
+            .count(),
+        1,
+        "slot 2240 preferences must remain exactly once after epoch 70"
+    );
+    assert_eq!(
+        post_hits(epoch_70, "/eth/v1/validator/prepare_beacon_proposer"),
+        0,
+        "epoch 70 must not call prepare_beacon_proposer"
+    );
+    assert_eq!(
+        post_hits(epoch_70, "/eth/v1/validator/register_validator"),
+        0,
+        "epoch 70 must not call register_validator"
+    );
 }
