@@ -1984,3 +1984,402 @@ async fn test_boundary_attestation_and_aggregate_continuity() {
         }
     }
 }
+
+// --- Issue 7.4: Boundary proposal v3 → v4 dispatch + slashing record ---
+
+const PRE_GLOAS_SLOT: Slot = 2208;
+const GLOAS_SLOT: Slot = 2240;
+const PROPOSER_INDEX: u64 = 42;
+
+async fn build_proposal_boundary_orchestrator(
+    mock_server_uri: &str,
+    slot: u64,
+    block_beacon: Arc<MockBlockBeacon>,
+    slashing_db: Arc<SlashingDb>,
+) -> (
+    DutyOrchestrator<MockSlotClock, CapturingSubmitter, MockBlockBeacon>,
+    OrchestratorHandle,
+    PublicKey,
+    String,
+    Arc<MockSlotClock>,
+) {
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(slot);
+
+    let beacon_config = BeaconClientConfig::new(mock_server_uri);
+    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+    let secret_key = SecretKey::generate();
+    let pubkey = secret_key.public_key();
+    let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]));
+
+    let mut key_manager = KeyManager::new();
+    key_manager.insert(secret_key);
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+    let capturing_submitter = Arc::new(CapturingSubmitter::new());
+    let propagator = Arc::new(Propagator::new(capturing_submitter));
+
+    let config = create_test_config();
+    let pubkey_bytes = pubkey.to_bytes();
+    let mut pubkey_map_inner = HashMap::new();
+    pubkey_map_inner.insert(pubkey_bytes, pubkey.clone());
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+    let validator_store = create_mock_validator_store();
+    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey_bytes)).unwrap();
+
+    let (orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock.clone(),
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        block_beacon,
+        None,
+        validator_store,
+        config,
+        pubkey_map,
+    ));
+
+    (orchestrator, handle, pubkey, pubkey_hex, clock)
+}
+
+fn proposal_ctx(slot: Slot) -> SlotContext {
+    SlotContext { slot, epoch: slot / SLOTS_PER_EPOCH, parent_root: None, head_root: None }
+}
+
+fn gloas_beacon_block(slot: Slot) -> eth_types::BeaconBlock {
+    gloas_beacon_block_with_state(slot, [2u8; 32])
+}
+
+fn gloas_beacon_block_with_state(slot: Slot, state_root: Root) -> eth_types::BeaconBlock {
+    eth_types::BeaconBlock {
+        slot,
+        proposer_index: PROPOSER_INDEX,
+        parent_root: [1u8; 32],
+        state_root,
+        body: hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap(),
+    }
+}
+
+fn gloas_envelope_hex() -> String {
+    format!("0x{}", rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ)
+}
+
+fn gloas_block_contents_response(slot: Slot) -> ProduceBlockResponse {
+    gloas_block_contents_response_for(gloas_beacon_block(slot))
+}
+
+fn gloas_block_contents_response_for(block: eth_types::BeaconBlock) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data: serde_json::json!({
+            "block": block,
+            "execution_payload_envelope": gloas_envelope_hex(),
+            "kzg_proofs": ["0xaa"],
+            "blobs": ["0xbb"],
+        }),
+        is_blinded: false,
+        // Shared canned body: 2208 is dispatch-only and fail-closes on this
+        // version (`ConsensusVersionMismatch`), not a JSON parse error.
+        consensus_version: "gloas".to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: true,
+        builder_url: None,
+        consensus_block_value: None,
+    }
+}
+
+fn gloas_builder_win_response(slot: Slot, builder_url: &str) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data: serde_json::to_value(gloas_beacon_block(slot)).unwrap(),
+        is_blinded: false,
+        consensus_version: "gloas".to_string(),
+        execution_payload_value: Some("99999".to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: Some(builder_url.to_string()),
+        consensus_block_value: None,
+    }
+}
+
+fn island_block_signing_root(block: &eth_types::BeaconBlock, schedule: &ForkSchedule) -> Root {
+    use crypto::{signing_root_for, DutyRef, SigningCtx};
+
+    let island_root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("Gloas island block root");
+    let ctx = SigningCtx { fork_schedule: schedule, genesis_validators_root: [0xaa; 32] };
+    signing_root_for(&DutyRef::BlockRoot { root: &island_root, slot: block.slot }, &ctx)
+}
+
+fn block_records_for_slot(db: &SlashingDb, pubkey_hex: &str, slot: Slot) -> Vec<Option<String>> {
+    db.get_blocks(pubkey_hex)
+        .expect("slashing block query")
+        .into_iter()
+        .filter(|block| block.slot == slot)
+        .map(|block| block.signing_root.map(|root| root.as_hex().to_string()))
+        .collect()
+}
+
+/// Slot 2208 stays on v3; first Gloas slot uses v4, records slashing, and
+/// publishes the self-build envelope after the block (D20).
+#[tokio::test]
+async fn test_gloas_slot_dispatches_produce_block_v4() {
+    use crypto::{signing_root_for, DutyRef, Signature, SigningCtx};
+
+    let mock_server = wiremock::MockServer::start().await;
+    // One canned Gloas BlockContents for both slots. 2208 only records v3 then
+    // fail-closes on consensus_version (successful Fulu propose is covered in
+    // block-service); 2240 is the success path.
+    let block_beacon =
+        Arc::new(MockBlockBeacon::with_response(gloas_block_contents_response(GLOAS_SLOT)));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+
+    let (orchestrator, _handle, pubkey, pubkey_hex, clock) = build_proposal_boundary_orchestrator(
+        &mock_server.uri(),
+        PRE_GLOAS_SLOT,
+        block_beacon.clone(),
+        slashing_db.clone(),
+    )
+    .await;
+
+    setup_proposer_duty(
+        &mock_server,
+        PRE_GLOAS_SLOT / SLOTS_PER_EPOCH,
+        PRE_GLOAS_SLOT,
+        &pubkey_hex,
+        PROPOSER_INDEX,
+    )
+    .await;
+    setup_proposer_duty(
+        &mock_server,
+        GLOAS_SLOT / SLOTS_PER_EPOCH,
+        GLOAS_SLOT,
+        &pubkey_hex,
+        PROPOSER_INDEX,
+    )
+    .await;
+    orchestrator
+        .duty_tracker
+        .fetch_proposer_duties(PRE_GLOAS_SLOT / SLOTS_PER_EPOCH)
+        .await
+        .unwrap();
+    orchestrator.duty_tracker.fetch_proposer_duties(GLOAS_SLOT / SLOTS_PER_EPOCH).await.unwrap();
+
+    // Dispatch-only: v3 is recorded, then ConsensusVersionMismatch on the
+    // canned Gloas version. No publish / slashing row at 2208.
+    orchestrator
+        .maybe_propose_block(
+            PRE_GLOAS_SLOT,
+            PRE_GLOAS_SLOT / SLOTS_PER_EPOCH,
+            &proposal_ctx(PRE_GLOAS_SLOT),
+        )
+        .await;
+
+    assert_eq!(
+        block_beacon.produce_v3_slots(),
+        vec![PRE_GLOAS_SLOT],
+        "pre-Gloas slot must call produce_block_v3 exactly once"
+    );
+    assert!(
+        block_beacon.produce_v4_calls().is_empty(),
+        "pre-Gloas slot must not call produce_block_v4"
+    );
+
+    clock.set_slot(GLOAS_SLOT);
+    orchestrator
+        .maybe_propose_block(GLOAS_SLOT, GLOAS_SLOT / SLOTS_PER_EPOCH, &proposal_ctx(GLOAS_SLOT))
+        .await;
+
+    assert_eq!(
+        block_beacon.produce_v3_slots(),
+        vec![PRE_GLOAS_SLOT],
+        "Gloas slot must not add a produce_block_v3 call"
+    );
+    let v4 = block_beacon.produce_v4_calls();
+    assert_eq!(v4.len(), 1, "Gloas slot must call produce_block_v4 exactly once");
+    assert_eq!(v4[0].0, GLOAS_SLOT);
+    let builder_config = &v4[0].1;
+    assert_eq!(builder_config.builder_boost_factor, 100);
+    assert_eq!(builder_config.min_bid, 0);
+
+    assert_eq!(
+        block_beacon.publish_blinded_count(),
+        0,
+        "Gloas slot must not publish a blinded block"
+    );
+
+    let publish = block_beacon.publish_block_calls();
+    assert_eq!(publish.len(), 1, "self-build must publish the unblinded block once");
+    assert_eq!(publish[0].0, GLOAS_SLOT);
+    assert!(publish[0].1.is_none(), "self-build must not echo Eth-Builder-Url");
+
+    let envelopes = block_beacon.envelope_publish_calls();
+    assert_eq!(envelopes.len(), 1, "BlockContents self-build must publish one envelope");
+    let publish_idx = block_beacon
+        .recorded_calls()
+        .iter()
+        .position(|call| matches!(call, BlockBeaconCall::PublishBlock { .. }))
+        .expect("block publish recorded");
+    let envelope_idx = block_beacon
+        .recorded_calls()
+        .iter()
+        .position(|call| matches!(call, BlockBeaconCall::PublishExecutionPayloadEnvelope { .. }))
+        .expect("envelope publish recorded");
+    assert!(envelope_idx > publish_idx, "envelope publish must follow the block publish");
+
+    match &envelopes[0] {
+        BlockBeaconCall::PublishExecutionPayloadEnvelope {
+            signed_envelope,
+            blobs,
+            kzg_proofs,
+            consensus_version,
+        } => {
+            assert_eq!(blobs, &WireBody::Json(serde_json::json!(["0xbb"])));
+            assert_eq!(kzg_proofs, &WireBody::Json(serde_json::json!(["0xaa"])));
+            assert_eq!(consensus_version, "gloas");
+            let WireBody::Json(value) = signed_envelope else {
+                panic!("expected JSON signed envelope, got {signed_envelope:?}");
+            };
+            assert_eq!(value["message"], serde_json::json!(gloas_envelope_hex()));
+            let sig_hex = value["signature"].as_str().expect("envelope signature hex");
+            let sig_bytes = hex::decode(sig_hex.trim_start_matches("0x")).expect("sig hex");
+            let sig = Signature::from_bytes(&sig_bytes).expect("envelope signature");
+            let envelope_ssz =
+                hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ)
+                    .unwrap();
+            let envelope_root =
+                rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz).unwrap();
+            let schedule = create_test_fork_schedule();
+            let ctx = SigningCtx {
+                fork_schedule: schedule.as_ref(),
+                genesis_validators_root: [0xaa; 32],
+            };
+            let builder_signing = signing_root_for(
+                &DutyRef::ExecutionPayloadEnvelopeRoot { root: &envelope_root, slot: GLOAS_SLOT },
+                &ctx,
+            );
+            sig.verify(&pubkey, &builder_signing)
+                .expect("envelope must verify under DOMAIN_BEACON_BUILDER");
+            let proposer_signing = signing_root_for(
+                &DutyRef::BlockRoot { root: &envelope_root, slot: GLOAS_SLOT },
+                &ctx,
+            );
+            assert!(
+                sig.verify(&pubkey, &proposer_signing).is_err(),
+                "envelope must not verify under DOMAIN_BEACON_PROPOSER"
+            );
+        }
+        other => panic!("expected envelope publish, got {other:?}"),
+    }
+
+    let block = gloas_beacon_block(GLOAS_SLOT);
+    assert!(
+        block.try_tree_hash_root().is_err(),
+        "Gloas body must not merkleize through the Electra/Deneb tree_hash bridge"
+    );
+    let expected_signing = island_block_signing_root(&block, create_test_fork_schedule().as_ref());
+    let block_sig = Signature::from_bytes(&publish[0].2).expect("block signature");
+    block_sig
+        .verify(&pubkey, &expected_signing)
+        .expect("block signature must verify over DutyRef::BlockRoot island output");
+
+    let slot_blocks = block_records_for_slot(&slashing_db, &pubkey_hex, GLOAS_SLOT);
+    assert_eq!(slot_blocks.len(), 1, "slashing DB must hold exactly one block record for 2240");
+    assert_eq!(
+        slot_blocks[0].as_deref(),
+        Some(hex::encode(expected_signing).as_str()),
+        "slashing row must store the DutyRef::BlockRoot signing root"
+    );
+
+    let publish_before = block_beacon.publish_block_calls().len();
+    let envelopes_before = block_beacon.envelope_publish_calls().len();
+    // Same slot, different signing root — EIP-3076 double proposal, not a re-sign.
+    block_beacon.set_response(gloas_block_contents_response_for(gloas_beacon_block_with_state(
+        GLOAS_SLOT, [3u8; 32],
+    )));
+    orchestrator
+        .maybe_propose_block(GLOAS_SLOT, GLOAS_SLOT / SLOTS_PER_EPOCH, &proposal_ctx(GLOAS_SLOT))
+        .await;
+    assert_eq!(
+        block_beacon.publish_block_calls().len(),
+        publish_before,
+        "replay must not publish a second block"
+    );
+    assert_eq!(
+        block_beacon.envelope_publish_calls().len(),
+        envelopes_before,
+        "replay must not publish a second envelope"
+    );
+    let after_replay = block_records_for_slot(&slashing_db, &pubkey_hex, GLOAS_SLOT);
+    assert_eq!(after_replay.len(), 1, "replay of slot 2240 must be refused");
+    assert_eq!(
+        after_replay[0].as_deref(),
+        Some(hex::encode(expected_signing).as_str()),
+        "remaining slashing row must still be the original DutyRef::BlockRoot hex"
+    );
+}
+
+/// Bare-block (builder-win) Gloas produce: no envelope, Eth-Builder-Url echoed.
+#[tokio::test]
+async fn test_gloas_builder_win_skips_envelope_and_echoes_builder_url() {
+    let mock_server = wiremock::MockServer::start().await;
+    let builder_url = "https://relay.example/v1";
+    let block_beacon = Arc::new(MockBlockBeacon::with_response(gloas_builder_win_response(
+        GLOAS_SLOT,
+        builder_url,
+    )));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+
+    let (orchestrator, _handle, _pubkey, pubkey_hex, _clock) =
+        build_proposal_boundary_orchestrator(
+            &mock_server.uri(),
+            GLOAS_SLOT,
+            block_beacon.clone(),
+            slashing_db,
+        )
+        .await;
+
+    setup_proposer_duty(
+        &mock_server,
+        GLOAS_SLOT / SLOTS_PER_EPOCH,
+        GLOAS_SLOT,
+        &pubkey_hex,
+        PROPOSER_INDEX,
+    )
+    .await;
+    orchestrator.duty_tracker.fetch_proposer_duties(GLOAS_SLOT / SLOTS_PER_EPOCH).await.unwrap();
+
+    orchestrator
+        .maybe_propose_block(GLOAS_SLOT, GLOAS_SLOT / SLOTS_PER_EPOCH, &proposal_ctx(GLOAS_SLOT))
+        .await;
+
+    assert!(block_beacon.produce_v3_slots().is_empty());
+    let v4 = block_beacon.produce_v4_calls();
+    assert_eq!(v4.len(), 1);
+    assert_eq!(v4[0].0, GLOAS_SLOT);
+
+    assert_eq!(block_beacon.publish_blinded_count(), 0);
+    assert!(
+        block_beacon.envelope_publish_calls().is_empty(),
+        "builder-win must not publish an execution payload envelope"
+    );
+    let publish = block_beacon.publish_block_calls();
+    assert_eq!(publish.len(), 1);
+    assert_eq!(publish[0].1.as_deref(), Some(builder_url));
+}
