@@ -803,6 +803,18 @@ capture_container_logs() {
     "$DOCKER" logs -- "$name" >"${log_dir}/${name}.log" 2>&1 || true
 }
 
+# Ignore ~/.curlrc (location would turn 302 into 200). Same proto/path flags as BN GET.
+_curl_hardened() {
+    local timeout="${1:-5}"
+    shift
+    case "$timeout" in
+        '' | *[!0-9]*)
+            timeout=5
+            ;;
+    esac
+    "$CURL" -q --no-location -sS -g --proto '=http' --path-as-is --max-time "$timeout" "$@"
+}
+
 # BN HTTP GET. Parsers and asserts below do not call curl (ADR-013).
 bn_get() {
     local path="${1:-}"
@@ -835,7 +847,7 @@ bn_get() {
             die_usage "CL_HTTP_PORT must be a port number"
             ;;
     esac
-    "$CURL" -sS --fail --max-time 5 -g --proto '=http' --path-as-is -- \
+    _curl_hardened 5 --fail -- \
         "http://127.0.0.1:${port}${path}" \
         || die_infra "BN GET ${path} failed"
 }
@@ -874,6 +886,118 @@ parse_genesis_time() {
             ;;
     esac
     printf '%s\n' "$v"
+}
+
+_now_unix() {
+    local now="${NOW_UNIX:-}"
+    if [[ -n "$now" ]]; then
+        case "$now" in
+            *[!0-9]*)
+                die_infra "NOW_UNIX must be an integer (got ${now})"
+                ;;
+        esac
+        printf '%s\n' "$now"
+        return 0
+    fi
+    date +%s
+}
+
+_seconds_per_slot() {
+    local spe="${SECONDS_PER_SLOT:-12}"
+    case "$spe" in
+        '' | *[!0-9]* | 0)
+            die_usage "SECONDS_PER_SLOT must be a positive integer (got ${spe:-<empty>})"
+            ;;
+    esac
+    printf '%s\n' "$spe"
+}
+
+bn_url() {
+    _assert_digit_port "CL_HTTP_PORT" "${CL_HTTP_PORT:-}"
+    printf 'http://127.0.0.1:%s' "${CL_HTTP_PORT}"
+}
+
+rvc_url() {
+    _assert_digit_port "RVC_METRICS_PORT" "${RVC_METRICS_PORT:-}"
+    printf 'http://127.0.0.1:%s' "${RVC_METRICS_PORT}"
+}
+
+# Cached once per process. Genesis facts come from the BN (ADR-013).
+# Export so $(current_slot) subshells reuse the value.
+bn_genesis_time() {
+    if [[ -n "${_BN_GENESIS_TIME:-}" ]]; then
+        printf '%s\n' "$_BN_GENESIS_TIME"
+        return 0
+    fi
+    _BN_GENESIS_TIME="$(bn_genesis_json | parse_genesis_time)"
+    export _BN_GENESIS_TIME
+    printf '%s\n' "$_BN_GENESIS_TIME"
+}
+
+current_slot() {
+    local genesis now spe
+    genesis="$(bn_genesis_time)"
+    now="$(_now_unix)"
+    spe="$(_seconds_per_slot)"
+    if [[ "$now" -lt "$genesis" ]]; then
+        printf '0\n'
+        return 0
+    fi
+    printf '%s\n' "$(((now - genesis) / spe))"
+}
+
+sleep_until_slot() {
+    local target="${1:-}"
+    local genesis now due wait_s spe
+    case "$target" in
+        '' | *[!0-9]*)
+            die_usage "sleep_until_slot requires a non-negative slot"
+            ;;
+    esac
+    spe="$(_seconds_per_slot)"
+    genesis="$(bn_genesis_time)"
+    now="$(_now_unix)"
+    due=$((genesis + target * spe))
+    if [[ "$now" -ge "$due" ]]; then
+        return 0
+    fi
+    wait_s=$((due - now))
+    sleep "$wait_s"
+}
+
+k8_blocked_total() {
+    local bodyfile code body val url timeout
+    timeout="${SCRAPE_TIMEOUT_S:-5}"
+    case "$timeout" in
+        '' | *[!0-9]*)
+            timeout=5
+            ;;
+    esac
+    url="$(rvc_url)/metrics"
+    bodyfile="$(mktemp "${TMPDIR:-/tmp}/rvc-k8.XXXXXX")" || return 1
+    code="$(_curl_hardened "$timeout" -o "$bodyfile" -w '%{http_code}' -- "$url" 2>/dev/null || true)"
+    body="$(cat -- "$bodyfile" 2>/dev/null || true)"
+    rm -f -- "$bodyfile"
+    case "$code" in
+        200) ;;
+        *)
+            return 1
+            ;;
+    esac
+    val="$(
+        printf '%s\n' "$body" \
+            | grep -E '^rvc_slashing_protection_checks_total\{[^}]*result="blocked"' \
+            | awk '{print $NF}' \
+            | tail -n 1 || true
+    )"
+    val="${val%%.*}"
+    case "$val" in
+        '' | *[!0-9]*)
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$val"
+    return 0
 }
 
 parse_genesis_validators_root() {
