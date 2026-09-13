@@ -82,3 +82,7 @@ def test_no_bare_64_hex_literal():
     stripped = SHA256_PIN_RE.sub("", text)
     match = BARE_64_HEX_RE.search(stripped)
     assert match is None, f"bare 64-hex literal: {match.group(0)}"
+
+
+def test_required_platforms_matrix(env: dict[str, str]):
+    assert env["REQUIRED_PLATFORMS"].split() == ["linux/amd64", "linux/arm64"]

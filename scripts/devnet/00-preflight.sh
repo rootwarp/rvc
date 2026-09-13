@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host, tooling, pin and chain-id gate. Owns the image pull later stages consume.
+# Host, tooling, pin, platform and chain-id gate. Owns the image pull later stages consume.
 
 set -euo pipefail
 
@@ -9,10 +9,12 @@ _OV_CHAIN_ID=0
 _OV_IMG_GETH=0
 _OV_IMG_LIGHTHOUSE=0
 _OV_IMG_GENESIS=0
+_OV_REQUIRED_PLATFORMS=0
 _KEEP_CHAIN_ID=""
 _KEEP_IMG_GETH=""
 _KEEP_IMG_LIGHTHOUSE=""
 _KEEP_IMG_GENESIS=""
+_KEEP_REQUIRED_PLATFORMS=""
 if [[ "${CHAIN_ID+x}" == "x" ]]; then
     _OV_CHAIN_ID=1
     _KEEP_CHAIN_ID="$CHAIN_ID"
@@ -28,6 +30,10 @@ fi
 if [[ "${IMG_GENESIS+x}" == "x" ]]; then
     _OV_IMG_GENESIS=1
     _KEEP_IMG_GENESIS="$IMG_GENESIS"
+fi
+if [[ "${REQUIRED_PLATFORMS+x}" == "x" ]]; then
+    _OV_REQUIRED_PLATFORMS=1
+    _KEEP_REQUIRED_PLATFORMS="$REQUIRED_PLATFORMS"
 fi
 
 _PREFLIGHT_DIR="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null && pwd -P)"
@@ -50,8 +56,14 @@ if [[ "$_OV_IMG_GENESIS" -eq 1 ]]; then
     IMG_GENESIS="$_KEEP_IMG_GENESIS"
     export IMG_GENESIS
 fi
+if [[ "$_OV_REQUIRED_PLATFORMS" -eq 1 ]]; then
+    REQUIRED_PLATFORMS="$_KEEP_REQUIRED_PLATFORMS"
+    export REQUIRED_PLATFORMS
+fi
 unset _OV_CHAIN_ID _OV_IMG_GETH _OV_IMG_LIGHTHOUSE _OV_IMG_GENESIS
+unset _OV_REQUIRED_PLATFORMS
 unset _KEEP_CHAIN_ID _KEEP_IMG_GETH _KEEP_IMG_LIGHTHOUSE _KEEP_IMG_GENESIS
+unset _KEEP_REQUIRED_PLATFORMS
 
 # Same shape as test_devnet_env.IMG_PIN_RE / 1.1a.
 _IMG_PIN_RE='^[a-z0-9./-]+:[^@]+@sha256:[0-9a-f]{64}$'
@@ -225,7 +237,8 @@ print_check_plan() {
     log_info "  4. check_resources"
     log_info "  5. check_write_access"
     log_info "  6. check_pins"
-    log_info "  7. pull_images"
+    log_info "  7. would assert_image_platforms (daemon)"
+    log_info "  8. pull_images"
 }
 
 pull_images() {
@@ -273,6 +286,7 @@ main() {
     check_resources
     check_write_access
     check_pins
+    assert_image_platforms
     pull_images
     log_success "preflight ok"
 }

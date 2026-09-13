@@ -41,6 +41,25 @@ Images are pinned in `scripts/devnet/devnet.env` as `repo:tag@sha256:<index dige
 
 Defaults: `NUM_VALIDATORS=64`, `RVC_KEYS=16` (Lighthouse VC gets derivation `[0, 48)`, RVC gets `[48, 64)`), `CHAIN_ID=1337`, Electra at epoch 0, 12 s × 32 slots.
 
+## Platform support
+
+Pinned images are **manifest-list (index) digests**, never a per-arch `images[].digest`. `devnet.env` records the matrix both this host and `ubuntu-latest` must run:
+
+```
+REQUIRED_PLATFORMS="linux/amd64 linux/arm64"
+```
+
+That key is asserted, not decorative. `00-preflight.sh` calls `assert_image_platforms` **before any `docker pull`**, against the `@sha256:`-pinned ref (never the floating tag — that would inspect a different image):
+
+1. Read the **Docker daemon** platform (`docker version -f '{{.Server.Os}}/{{.Server.Arch}}'`). Docker Desktop on macOS arm64 reports `linux/arm64`; that is what a pull resolves against, not `darwin/arm64`.
+2. Inspect each pin's index **from the registry** (`docker manifest inspect`, falling back to `docker buildx imagetools inspect --raw`). This is not an offline probe of a locally cached image: a present pin still needs Hub (or the fallback) and a Hub 401 / missing `buildx` is named on the usage-2 line.
+3. Drop `unknown/unknown` attestation rows. Every `REQUIRED_PLATFORMS` entry must appear in every index, and the host platform must be one of them.
+4. Exit **2** (`die_usage`) naming the image and platform if either check fails, or if the digest is a single-arch manifest (`not a multi-arch index`) rather than a list. **No layers are pulled.**
+
+A host whose platform is missing from an index, or an index missing a required platform the host is not running on, both fail closed the same way. Do not pin a per-arch blob to "make it smaller": the other platform then has no index entry and preflight refuses to start.
+
+Live `00-preflight.sh < /dev/null` on this F9 host (2026-09-13) exits **2** in 1 s: `need >= 8 GiB RAM (docker VM has 3 GiB)`. The RAM gate runs before the index-entry check; `PREFLIGHT_MIN_RAM_GIB` was not lowered. The platform matrix is proven offline by the stub tests; the linux/amd64 half is the nightly (issue 6.5).
+
 ## Quick start
 
 One command, stdin closed, from a clean checkout with the purge root removed. `--profile` is required.

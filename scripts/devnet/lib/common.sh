@@ -405,6 +405,178 @@ docker_run_as_user() {
     "$DOCKER" run -u "$(id -u):$(id -g)" "$@"
 }
 
+# Daemon OS/Arch (what a pull resolves against), not the client (darwin/…).
+host_platform() {
+    local plat
+    plat="$("$DOCKER" version -f '{{.Server.Os}}/{{.Server.Arch}}')" \
+        || die_usage "cannot determine docker server platform"
+    plat="$(printf '%s' "$plat" | tr -d '[:space:]')"
+    case "$plat" in
+        "" | "/" | unknown/unknown)
+            die_usage "cannot determine docker server platform"
+            ;;
+        */*)
+            ;;
+        *)
+            die_usage "cannot determine docker server platform (${plat})"
+            ;;
+    esac
+    printf '%s\n' "$plat"
+}
+
+# Print os/arch rows from a pinned index. Drops unknown/unknown attestation
+# manifests. Empty output means the digest is not a multi-arch index.
+# docker manifest inspect [MANIFEST_LIST] MANIFEST — a bare -- is a list name.
+image_index_platforms() {
+    local ref="${1:-}"
+    local raw="" platforms="" errfile="" last_err=""
+
+    if [[ -z "$ref" ]]; then
+        die_usage "image_index_platforms requires a ref"
+    fi
+    case "$ref" in
+        *@sha256:*)
+            ;;
+        *)
+            die_usage "image ref is not pinned by @sha256: (${ref})"
+            ;;
+    esac
+
+    # Keep the last docker stderr line: Hub 401 / missing buildx otherwise
+    # collapse into a generic cannot-inspect.
+    errfile="$(mktemp "${TMPDIR:-/tmp}/rvc-idx.XXXXXX")" \
+        || die_usage "cannot inspect manifest index for ${ref}"
+    if raw="$("$DOCKER" manifest inspect "$ref" 2>"$errfile")"; then
+        last_err=""
+    else
+        raw=""
+        last_err="$(_trim "$(tail -n 1 "$errfile" | tr -d '\r')")"
+    fi
+    if [[ -z "$raw" ]]; then
+        if raw="$("$DOCKER" buildx imagetools inspect --raw "$ref" 2>"$errfile")"; then
+            last_err=""
+        else
+            raw=""
+            last_err="$(_trim "$(tail -n 1 "$errfile" | tr -d '\r')")"
+        fi
+    fi
+    rm -f -- "$errfile"
+    if [[ -z "$raw" ]]; then
+        if [[ -n "$last_err" ]]; then
+            die_usage "cannot inspect manifest index for ${ref}: ${last_err}"
+        fi
+        die_usage "cannot inspect manifest index for ${ref}"
+    fi
+
+    platforms="$(
+        printf '%s\n' "$raw" | jq -r '
+            if (.manifests | type) != "array" then
+                empty
+            else
+                .manifests[]
+                | .platform
+                | select(. != null)
+                | ((.os // "") + "/" + (.architecture // ""))
+                | select(. != "unknown/unknown" and . != "/" and length > 0)
+            end
+        '
+    )" || die_usage "failed to parse manifest index for ${ref}"
+
+    if [[ -n "$platforms" ]]; then
+        printf '%s\n' "$platforms"
+    fi
+}
+
+_required_platforms() {
+    local plat restore_glob=0
+    if [[ -z "${REQUIRED_PLATFORMS:-}" ]]; then
+        die_usage "REQUIRED_PLATFORMS is empty"
+    fi
+    case "$-" in
+        *f*)
+            ;;
+        *)
+            restore_glob=1
+            set -f
+            ;;
+    esac
+    # shellcheck disable=SC2086
+    for plat in $REQUIRED_PLATFORMS; do
+        case "$plat" in
+            unknown/unknown)
+                die_usage "REQUIRED_PLATFORMS must not include unknown/unknown"
+                ;;
+            */*/*)
+                die_usage "REQUIRED_PLATFORMS entry is not os/arch: ${plat}"
+                ;;
+            */*)
+                printf '%s\n' "$plat"
+                ;;
+            *)
+                die_usage "REQUIRED_PLATFORMS entry is not os/arch: ${plat:-<empty>}"
+                ;;
+        esac
+    done
+    if [[ "$restore_glob" -eq 1 ]]; then
+        set +f
+    fi
+}
+
+assert_image_platforms() {
+    local host var img plats plat required found
+
+    required="$(_required_platforms)"
+    if [[ -z "$required" ]]; then
+        die_usage "REQUIRED_PLATFORMS is empty"
+    fi
+
+    host="$(host_platform)"
+    found=0
+    while IFS= read -r plat; do
+        if [[ -z "$plat" ]]; then
+            continue
+        fi
+        if [[ "$plat" == "$host" ]]; then
+            found=1
+            break
+        fi
+    done <<EOF
+${required}
+EOF
+    if [[ "$found" -eq 0 ]]; then
+        die_usage "host platform ${host} is not in REQUIRED_PLATFORMS (${REQUIRED_PLATFORMS})"
+    fi
+
+    for var in IMG_GETH IMG_LIGHTHOUSE IMG_GENESIS; do
+        img="${!var}"
+        case "$img" in
+            *@sha256:*)
+                ;;
+            *)
+                die_usage "${var} is not pinned by @sha256: (${img:-unset})"
+                ;;
+        esac
+        plats="$(image_index_platforms "$img")"
+        if [[ -z "$plats" ]]; then
+            die_usage "${var} ${img} is not a multi-arch index"
+        fi
+        if ! printf '%s\n' "$plats" | grep -Fxq -- "$host"; then
+            die_usage "${var} ${img} has no index entry for host platform ${host}"
+        fi
+        while IFS= read -r plat; do
+            if [[ -z "$plat" ]]; then
+                continue
+            fi
+            if ! printf '%s\n' "$plats" | grep -Fxq -- "$plat"; then
+                die_usage "${var} ${img} is missing required platform ${plat}"
+            fi
+        done <<EOF
+${required}
+EOF
+    done
+    log_info "image index ok: host ${host}, required ${REQUIRED_PLATFORMS}"
+}
+
 inventory_append() {
     local kind="${1:-}"
     local name="${2:-}"

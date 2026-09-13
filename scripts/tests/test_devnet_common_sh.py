@@ -759,3 +759,180 @@ def test_bn_head_fork_version_from_fixture(tmp_path: Path):
     assert "--fail" in recorded
     assert "/eth/v1/beacon/states/head/fork" in recorded
     assert_no_secret(proc)
+
+
+_PINNED = "example.net/img:v1@sha256:" + ("ab" * 32)
+
+
+def test_host_platform_uses_docker_server_os_arch(tmp_path: Path):
+    from test_devnet_preflight_sh import write_docker_stub
+
+    stub, log = write_docker_stub(tmp_path, server_os="linux", server_arch="amd64")
+    proc = run_common("host_platform", env={"DOCKER": str(stub)})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "linux/amd64"
+    recorded = log.read_text(encoding="utf-8")
+    assert "version -f" in recorded
+    assert "Server.Os" in recorded
+    assert "Server.Arch" in recorded
+    assert_no_secret(proc)
+
+
+def test_image_index_platforms_drops_unknown_unknown(tmp_path: Path):
+    from test_devnet_preflight_sh import write_docker_stub
+
+    stub, log = write_docker_stub(
+        tmp_path, manifest_fixture="manifest__multiarch.json"
+    )
+    proc = run_common(
+        f"image_index_platforms {shlex.quote(_PINNED)}",
+        env={"DOCKER": str(stub)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    plats = [line for line in proc.stdout.splitlines() if line.strip()]
+    assert "linux/amd64" in plats
+    assert "linux/arm64" in plats
+    assert "unknown/unknown" not in plats
+    recorded = log.read_text(encoding="utf-8")
+    assert "manifest inspect" in recorded
+    assert _PINNED in recorded
+    assert "imagetools" not in recorded
+    assert_no_secret(proc)
+
+    amd64_dir = tmp_path / "amd64"
+    amd64_dir.mkdir()
+    stub2, _ = write_docker_stub(
+        amd64_dir, manifest_fixture="manifest__amd64_only.json"
+    )
+    proc2 = run_common(
+        f"image_index_platforms {shlex.quote(_PINNED)}",
+        env={"DOCKER": str(stub2)},
+    )
+    assert proc2.returncode == 0, proc2.stderr
+    assert [line for line in proc2.stdout.splitlines() if line.strip()] == [
+        "linux/amd64"
+    ]
+    assert_no_secret(proc2)
+
+    unknown_dir = tmp_path / "unknown"
+    unknown_dir.mkdir()
+    stub3, _ = write_docker_stub(
+        unknown_dir, manifest_fixture="manifest__unknown_only.json"
+    )
+    proc3 = run_common(
+        f"image_index_platforms {shlex.quote(_PINNED)}",
+        env={"DOCKER": str(stub3)},
+    )
+    assert proc3.returncode == 0, proc3.stderr
+    assert proc3.stdout.strip() == ""
+    assert_no_secret(proc3)
+
+
+def test_image_index_platforms_empty_on_single_manifest(tmp_path: Path):
+    from test_devnet_preflight_sh import write_docker_stub
+
+    stub, _ = write_docker_stub(
+        tmp_path, manifest_fixture="manifest__single.json"
+    )
+    proc = run_common(
+        f"image_index_platforms {shlex.quote(_PINNED)}",
+        env={"DOCKER": str(stub)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == ""
+    assert_no_secret(proc)
+
+
+def test_image_index_platforms_names_last_error(tmp_path: Path):
+    from test_devnet_preflight_sh import write_docker_stub
+
+    stub, _ = write_docker_stub(
+        tmp_path,
+        manifest_ok=False,
+        imagetools_ok=False,
+        manifest_stderr="STUB_MANIFEST_ERR: experimental disabled",
+        imagetools_stderr="STUB_IMAGETOOLS_ERR: 401 Unauthorized",
+    )
+    proc = run_common(
+        f"image_index_platforms {shlex.quote(_PINNED)}",
+        env={"DOCKER": str(stub)},
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "cannot inspect manifest index" in proc.stderr
+    assert _PINNED in proc.stderr
+    assert "STUB_IMAGETOOLS_ERR: 401 Unauthorized" in proc.stderr
+    assert_no_secret(proc)
+
+
+def test_image_index_platforms_falls_back_to_imagetools(tmp_path: Path):
+    from test_devnet_preflight_sh import write_docker_stub
+
+    stub, log = write_docker_stub(
+        tmp_path,
+        manifest_ok=False,
+        imagetools_ok=True,
+        imagetools_fixture="manifest__multiarch.json",
+    )
+    proc = run_common(
+        f"image_index_platforms {shlex.quote(_PINNED)}",
+        env={"DOCKER": str(stub)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    plats = proc.stdout.split()
+    assert "linux/amd64" in plats
+    assert "linux/arm64" in plats
+    recorded = log.read_text(encoding="utf-8")
+    assert "manifest inspect" in recorded
+    assert "imagetools inspect --raw" in recorded
+    assert _PINNED in recorded
+    assert_no_secret(proc)
+
+
+def test_image_index_platforms_rejects_unpinned(tmp_path: Path):
+    from test_devnet_preflight_sh import write_docker_stub
+
+    stub, log = write_docker_stub(tmp_path)
+    proc = run_common(
+        "image_index_platforms example.net/img:v1",
+        env={"DOCKER": str(stub)},
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "@sha256:" in proc.stderr
+    assert not log.exists()
+    assert_no_secret(proc)
+
+
+def test_assert_image_platforms_rejects_unpinned(tmp_path: Path):
+    from test_devnet_preflight_sh import write_docker_stub
+
+    stub, log = write_docker_stub(tmp_path)
+    proc = run_common(
+        "IMG_GETH=ethereum/client-go:v1.17.5 assert_image_platforms",
+        env={"DOCKER": str(stub)},
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "IMG_GETH" in proc.stderr
+    assert "@sha256:" in proc.stderr
+    recorded = log.read_text(encoding="utf-8")
+    assert "version -f" in recorded
+    assert "manifest inspect" not in recorded
+    assert "pull" not in recorded
+    assert_no_secret(proc)
+
+
+def test_assert_image_platforms_single_manifest_message(tmp_path: Path):
+    from test_devnet_preflight_sh import write_docker_stub
+
+    stub, log = write_docker_stub(
+        tmp_path, manifest_fixture="manifest__single.json"
+    )
+    proc = run_common("assert_image_platforms", env={"DOCKER": str(stub)})
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "not a multi-arch index" in proc.stderr
+    assert "no index entry" not in proc.stderr
+    assert "pull" not in log.read_text(encoding="utf-8")
+    assert_no_secret(proc)

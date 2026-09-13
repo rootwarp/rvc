@@ -5026,6 +5026,10 @@ _G5_SKIP = {
     "node_syncing__is_syncing": "selection abort exit 5; no report",
     "cache__genesis_root_changed": "declared VP-5c; cache file, not a BN overlay",
     "run__fast_n4": "devnet report run.json fixture; not a BN overlay",
+    "manifest__multiarch": "devnet preflight docker index fixture; not a BN overlay",
+    "manifest__amd64_only": "devnet preflight docker index fixture; not a BN overlay",
+    "manifest__single": "devnet preflight docker index fixture; not a BN overlay",
+    "manifest__unknown_only": "devnet preflight docker index fixture; not a BN overlay",
 }
 
 

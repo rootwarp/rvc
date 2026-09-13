@@ -18,6 +18,7 @@ import pytest
 from test_devnet_env import ENV_PATH, IMG_PIN_RE, parse_env
 
 PREFLIGHT = Path(__file__).resolve().parents[1] / "devnet" / "00-preflight.sh"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 _ISOLATE_KEYS = (
     "DOCKER",
@@ -37,6 +38,7 @@ _ISOLATE_KEYS = (
     "IMG_GETH",
     "IMG_LIGHTHOUSE",
     "IMG_GENESIS",
+    "REQUIRED_PLATFORMS",
     "PREFLIGHT_MIN_CPUS",
     "PREFLIGHT_MIN_RAM_GIB",
     "PREFLIGHT_MIN_FREE_GIB",
@@ -52,6 +54,15 @@ def _images() -> dict[str, str]:
     return {k: v for k, v in env.items() if k.startswith("IMG_")}
 
 
+def _manifest_fixture(name: str) -> Path:
+    path = Path(name)
+    if not path.is_absolute():
+        path = FIXTURES / name
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    return path
+
+
 def write_docker_stub(
     tmp_path: Path,
     *,
@@ -60,15 +71,30 @@ def write_docker_stub(
     pull_ok: bool = True,
     info_stderr: str = "",
     info_format: str = "",
+    server_os: str = "linux",
+    server_arch: str = "arm64",
+    manifest_fixture: str = "manifest__multiarch.json",
+    manifest_ok: bool = True,
+    imagetools_ok: bool = False,
+    imagetools_fixture: str | None = None,
+    manifest_stderr: str = "",
+    imagetools_stderr: str = "",
 ) -> tuple[Path, Path]:
     log = tmp_path / "docker.log"
     stub = tmp_path / "docker"
+    manifest_path = _manifest_fixture(manifest_fixture)
+    tools_path = _manifest_fixture(imagetools_fixture or manifest_fixture)
+    platform = f"{server_os}/{server_arch}"
     stub.write_text(
         "#!/bin/sh\n"
         f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
         "cmd=\"$1\"\n"
         "shift || true\n"
         "case \"$cmd\" in\n"
+        "  version)\n"
+        f"    printf '%s\\n' {shlex.quote(platform)}\n"
+        "    exit 0\n"
+        "    ;;\n"
         "  info)\n"
         f"    if [ {0 if info_ok else 1} -ne 0 ]; then\n"
         f"      printf '%s\\n' {shlex.quote(info_stderr)} >&2\n"
@@ -86,6 +112,25 @@ def write_docker_stub(
         "    ;;\n"
         "  pull)\n"
         f"    exit {0 if pull_ok else 1}\n"
+        "    ;;\n"
+        "  manifest)\n"
+        "    if [ \"${1:-}\" = inspect ]; then\n"
+        f"      if [ {0 if manifest_ok else 1} -ne 0 ]; then\n"
+        f"        printf '%s\\n' {shlex.quote(manifest_stderr)} >&2\n"
+        "        exit 1\n"
+        "      fi\n"
+        f"      cat -- {shlex.quote(str(manifest_path))} || exit 1\n"
+        "      exit 0\n"
+        "    fi\n"
+        "    exit 1\n"
+        "    ;;\n"
+        "  buildx)\n"
+        f"    if [ {0 if imagetools_ok else 1} -ne 0 ]; then\n"
+        f"      printf '%s\\n' {shlex.quote(imagetools_stderr)} >&2\n"
+        "      exit 1\n"
+        "    fi\n"
+        f"    cat -- {shlex.quote(str(tools_path))} || exit 1\n"
+        "    exit 0\n"
         "    ;;\n"
         "esac\n"
         "exit 0\n",
@@ -152,6 +197,14 @@ def run_preflight(
     pull_ok: bool = True,
     info_stderr: str = "",
     info_format: str = "",
+    server_os: str = "linux",
+    server_arch: str = "arm64",
+    manifest_fixture: str = "manifest__multiarch.json",
+    manifest_ok: bool = True,
+    imagetools_ok: bool = False,
+    imagetools_fixture: str | None = None,
+    manifest_stderr: str = "",
+    imagetools_stderr: str = "",
     timeout: float = 15,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     stub, log = write_docker_stub(
@@ -161,6 +214,14 @@ def run_preflight(
         pull_ok=pull_ok,
         info_stderr=info_stderr,
         info_format=info_format,
+        server_os=server_os,
+        server_arch=server_arch,
+        manifest_fixture=manifest_fixture,
+        manifest_ok=manifest_ok,
+        imagetools_ok=imagetools_ok,
+        imagetools_fixture=imagetools_fixture,
+        manifest_stderr=manifest_stderr,
+        imagetools_stderr=imagetools_stderr,
     )
     full = preflight_env(tmp_path, env, docker=stub)
     return (
@@ -183,11 +244,23 @@ def stub_cmds(log: Path) -> list[str]:
 
 
 def pull_cmds(cmds: list[str]) -> list[str]:
-    return [c for c in cmds if c.startswith("pull -- ")]
+    out: list[str] = []
+    for c in cmds:
+        first = c.split(None, 1)[0] if c.strip() else ""
+        if first == "pull":
+            out.append(c)
+    return out
 
 
 def inspect_cmds(cmds: list[str]) -> list[str]:
     return [c for c in cmds if c.startswith("image inspect -- ")]
+
+
+def assert_pull_images_not_entered(log: Path) -> None:
+    """image inspect is pull_images's first docker call; empty ⇒ gate died first."""
+    cmds = stub_cmds(log)
+    assert pull_cmds(cmds) == []
+    assert inspect_cmds(cmds) == []
 
 
 def assert_no_secret(proc: subprocess.CompletedProcess[str]) -> None:
@@ -209,6 +282,13 @@ def test_preflight_sh_exists_and_syntax():
     assert IMG_PIN_RE.pattern in text
     assert 'image inspect --' in text
     assert 'pull --' in text
+    assert "assert_image_platforms" in text
+    main_fn = text[text.index("main() {") :]
+    live = re.search(
+        r"(?m)^    check_pins\n    assert_image_platforms\n    pull_images\n",
+        main_fn,
+    )
+    assert live is not None, "main() must call assert_image_platforms immediately before pull_images"
 
 
 def test_inspect_hit_skips_pull(tmp_path: Path):
@@ -297,6 +377,9 @@ def test_dry_run_exits_0_inspect_only(tmp_path: Path):
     assert "check plan" in proc.stderr
     assert "check_tools" in proc.stderr
     assert "pull_images" in proc.stderr
+    assert "would assert_image_platforms (daemon)" in proc.stderr
+    assert not any("version -f" in c for c in cmds)
+    assert not any("manifest inspect" in c for c in cmds)
     assert_no_secret(proc)
 
 
@@ -455,4 +538,190 @@ def test_docker_vm_low_ram_exits_2(tmp_path: Path):
     assert "docker VM" in proc.stderr
     assert "RAM" in proc.stderr
     assert pull_cmds(stub_cmds(log)) == []
+    assert_no_secret(proc)
+
+
+def test_preflight_passes_on_multiarch_index(tmp_path: Path):
+    proc, log = run_preflight(
+        tmp_path,
+        server_arch="arm64",
+        manifest_fixture="manifest__multiarch.json",
+    )
+    assert proc.returncode == 0, proc.stderr
+    cmds = stub_cmds(log)
+    assert pull_cmds(cmds) == []
+    inspects = [c for c in cmds if "manifest inspect" in c]
+    assert len(inspects) == len(_images())
+    for value in _images().values():
+        assert any(value in line for line in inspects), value
+        assert "@sha256:" in value
+    for line in inspects:
+        assert "@sha256:" in line
+        assert "imagetools" not in line
+    assert not any("imagetools" in c for c in cmds)
+    assert any(
+        "version -f" in c and "Server.Os" in c and "Server.Arch" in c for c in cmds
+    )
+    assert "image index ok" in proc.stderr
+    assert "linux/arm64" in proc.stderr
+    assert_no_secret(proc)
+
+
+def test_preflight_exits_2_on_amd64_only_index(tmp_path: Path):
+    proc, log = run_preflight(
+        tmp_path,
+        inspect_ok=False,
+        server_os="linux",
+        server_arch="arm64",
+        manifest_fixture="manifest__amd64_only.json",
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    err = proc.stderr
+    assert "linux/arm64" in err
+    assert "IMG_GETH" in err
+    assert "ethereum/client-go" in err
+    assert "no index entry" in err
+    assert "not a multi-arch index" not in err
+    assert_pull_images_not_entered(log)
+    assert_no_secret(proc)
+
+
+def test_preflight_exits_2_when_required_platform_missing(tmp_path: Path):
+    proc, log = run_preflight(
+        tmp_path,
+        inspect_ok=False,
+        server_os="linux",
+        server_arch="amd64",
+        manifest_fixture="manifest__amd64_only.json",
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    err = proc.stderr
+    assert "linux/arm64" in err
+    assert "missing required platform" in err
+    assert "IMG_GETH" in err
+    assert_pull_images_not_entered(log)
+    assert_no_secret(proc)
+
+
+def test_single_manifest_digest_message(tmp_path: Path):
+    proc, log = run_preflight(
+        tmp_path,
+        inspect_ok=False,
+        manifest_fixture="manifest__single.json",
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    err = proc.stderr
+    assert "not a multi-arch index" in err
+    assert "no index entry" not in err
+    assert "missing required platform" not in err
+    assert "platform missing" not in err.lower()
+    assert "IMG_GETH" in err
+    assert_pull_images_not_entered(log)
+    assert_no_secret(proc)
+
+
+def test_preflight_falls_back_to_imagetools(tmp_path: Path):
+    proc, log = run_preflight(
+        tmp_path,
+        manifest_ok=False,
+        imagetools_ok=True,
+        imagetools_fixture="manifest__multiarch.json",
+    )
+    assert proc.returncode == 0, proc.stderr
+    cmds = stub_cmds(log)
+    assert any("manifest inspect" in c for c in cmds)
+    tools = [c for c in cmds if "imagetools inspect" in c]
+    assert len(tools) == len(_images())
+    for value in _images().values():
+        assert any(value in line and "@sha256:" in line for line in tools), value
+    assert pull_cmds(cmds) == []
+    assert "image index ok" in proc.stderr
+    assert_no_secret(proc)
+
+
+def test_unknown_unknown_never_counts_as_platform(tmp_path: Path):
+    # linux/amd64 + unknown/unknown only. Host amd64 is in the index; linux/arm64
+    # is required and present iff attestation rows were kept as a fill-in.
+    proc, log = run_preflight(
+        tmp_path,
+        inspect_ok=False,
+        server_os="linux",
+        server_arch="amd64",
+        manifest_fixture="manifest__amd64_only.json",
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "linux/arm64" in proc.stderr
+    assert "missing required platform" in proc.stderr
+    assert "unknown/unknown" not in proc.stderr
+    assert_pull_images_not_entered(log)
+    assert_no_secret(proc)
+
+    only_dir = tmp_path / "unknown_only"
+    only_dir.mkdir()
+    only_attest, attest_log = run_preflight(
+        only_dir,
+        inspect_ok=False,
+        server_arch="arm64",
+        manifest_fixture="manifest__unknown_only.json",
+    )
+    assert only_attest.returncode == 2
+    assert "not a multi-arch index" in only_attest.stderr
+    assert "no index entry" not in only_attest.stderr
+    assert_pull_images_not_entered(attest_log)
+    assert_no_secret(only_attest)
+
+
+def test_gate_fails_if_ref_lacks_sha256(tmp_path: Path):
+    proc, log = run_preflight(
+        tmp_path,
+        inspect_ok=False,
+        env={"IMG_GETH": "ethereum/client-go:v1.17.5"},
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "IMG_GETH" in proc.stderr
+    assert "@sha256:" in proc.stderr
+    cmds = stub_cmds(log)
+    assert_pull_images_not_entered(log)
+    assert not any("manifest inspect" in c for c in cmds)
+    assert_no_secret(proc)
+
+
+def test_preflight_exits_2_when_host_not_in_required(tmp_path: Path):
+    proc, log = run_preflight(
+        tmp_path,
+        inspect_ok=False,
+        server_os="linux",
+        server_arch="ppc64le",
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "linux/ppc64le" in proc.stderr
+    assert "REQUIRED_PLATFORMS" in proc.stderr
+    cmds = stub_cmds(log)
+    assert_pull_images_not_entered(log)
+    assert any("version -f" in c for c in cmds)
+    assert not any("manifest inspect" in c for c in cmds)
+    assert not any("imagetools" in c for c in cmds)
+    assert_no_secret(proc)
+
+
+def test_cannot_inspect_names_last_error(tmp_path: Path):
+    proc, log = run_preflight(
+        tmp_path,
+        inspect_ok=False,
+        manifest_ok=False,
+        imagetools_ok=False,
+        manifest_stderr="STUB_MANIFEST_ERR: experimental disabled",
+        imagetools_stderr="STUB_IMAGETOOLS_ERR: 401 Unauthorized",
+    )
+    assert proc.returncode == 2
+    assert proc.stdout == ""
+    assert "cannot inspect manifest index" in proc.stderr
+    assert "STUB_IMAGETOOLS_ERR: 401 Unauthorized" in proc.stderr
+    assert_pull_images_not_entered(log)
     assert_no_secret(proc)
