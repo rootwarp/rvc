@@ -1136,13 +1136,15 @@ async fn mount_attestation_mocks_with_bn_index(
     pubkey_hex: &str,
     bn_index: &str,
 ) {
-    use wiremock::matchers::{method, path, path_regex, query_param};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, ResponseTemplate};
 
     let epoch = slot / SLOTS_PER_EPOCH;
 
+    // Exact epoch path: a regex `attester/.*` would match first and steal the
+    // epoch-70 fetch when 69 and 70 are mounted on one server.
     Mock::given(method("POST"))
-        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+        .and(path(format!("/eth/v1/validator/duties/attester/{epoch}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
             "execution_optimistic": false,
@@ -1464,6 +1466,273 @@ async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
                     "{label}: Deneb aggregate must not include committee_index, got: {query}"
                 );
             }
+        }
+    }
+}
+
+fn electra_aggregate_response(slot: u64, epoch: u64, index: &str) -> serde_json::Value {
+    serde_json::json!({
+        "data": {
+            "aggregation_bits": "0xff01",
+            "data": {
+                "slot": slot.to_string(),
+                "index": index,
+                "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "source": {
+                    "epoch": epoch.saturating_sub(1).to_string(),
+                    "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                },
+                "target": {
+                    "epoch": epoch.to_string(),
+                    "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                }
+            },
+            "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "committee_bits": "0x0800000000000000"
+        }
+    })
+}
+
+async fn mount_electra_plus_aggregate_mocks(
+    mock_server: &wiremock::MockServer,
+    slot: u64,
+    epoch: u64,
+    query_index: u64,
+    consensus_version: &str,
+) {
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, ResponseTemplate};
+
+    let expected_root = format!(
+        "0x{}",
+        hex::encode(expected_attestation_data(slot, epoch, query_index).tree_hash_root().0)
+    );
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(query_param("slot", slot.to_string()))
+        .and(query_param("committee_index", "3"))
+        .and(query_param("attestation_data_root", expected_root.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(electra_aggregate_response(
+            slot,
+            epoch,
+            &query_index.to_string(),
+        )))
+        .expect(1)
+        .mount(mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/validator/aggregate_and_proofs"))
+        .and(header("Eth-Consensus-Version", consensus_version))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(mock_server)
+        .await;
+}
+
+fn submitted_index(att: &VersionedAttestation, expected_fork: ForkName) -> &str {
+    match att {
+        VersionedAttestation::Fulu(atts) => {
+            assert_eq!(expected_fork, ForkName::Fulu, "Fulu wrapper");
+            assert_eq!(atts.len(), 1);
+            atts[0].data.index.as_str()
+        }
+        VersionedAttestation::Gloas(atts) => {
+            assert_eq!(expected_fork, ForkName::Gloas, "Gloas wrapper");
+            assert_eq!(atts.len(), 1);
+            atts[0].data.index.as_str()
+        }
+        VersionedAttestation::Electra(atts) => {
+            assert_eq!(expected_fork, ForkName::Electra, "Electra wrapper");
+            assert_eq!(atts.len(), 1);
+            atts[0].data.index.as_str()
+        }
+        VersionedAttestation::PreElectra(atts) => {
+            assert_eq!(expected_fork, ForkName::Deneb, "pre-Electra wrapper");
+            assert_eq!(atts.len(), 1);
+            atts[0].data.index.as_str()
+        }
+    }
+}
+
+fn submitted_attestation_data(att: &VersionedAttestation) -> &beacon::AttestationData {
+    match att {
+        VersionedAttestation::Electra(atts)
+        | VersionedAttestation::Fulu(atts)
+        | VersionedAttestation::Gloas(atts) => &atts[0].data,
+        VersionedAttestation::PreElectra(atts) => &atts[0].data,
+    }
+}
+
+fn submitted_signature_hex(att: &VersionedAttestation) -> &str {
+    match att {
+        VersionedAttestation::Electra(atts)
+        | VersionedAttestation::Fulu(atts)
+        | VersionedAttestation::Gloas(atts) => atts[0].signature.as_str(),
+        VersionedAttestation::PreElectra(atts) => atts[0].signature.as_str(),
+    }
+}
+
+/// One orchestrator instance crossing Fulu slot 2208 → Gloas slot 2240 without
+/// restart. EIP-7549 still zeros `data.index` at Fulu; Gloas preserves the BN
+/// payload-status bit on both signing and submission. Aggregate submit after
+/// the boundary uses the Gloas arm.
+#[tokio::test]
+async fn test_boundary_attestation_and_aggregate_continuity() {
+    use crypto::{signing_root_for, DutyRef, Signature, SigningCtx};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let schedule = create_test_fork_schedule();
+    let fulu_slot = 2208u64;
+    let gloas_slot = 2240u64;
+    let fulu_epoch = fulu_slot / SLOTS_PER_EPOCH;
+    let gloas_epoch = gloas_slot / SLOTS_PER_EPOCH;
+    assert_eq!(fulu_epoch, 69, "slot 2208 is epoch 69");
+    assert_eq!(gloas_epoch, 70, "slot 2240 is epoch 70");
+
+    let fulu_fork = ForkName::from_epoch(fulu_epoch, &schedule);
+    let gloas_fork = ForkName::from_epoch(gloas_epoch, &schedule);
+    assert_eq!(fulu_fork, ForkName::Fulu);
+    assert_eq!(gloas_fork, ForkName::Gloas);
+    assert_eq!(
+        fulu_fork.fork_version(&schedule),
+        schedule.fulu_fork_version,
+        "slot 2208 must resolve via from_epoch → fulu_fork_version"
+    );
+    assert_eq!(
+        gloas_fork.fork_version(&schedule),
+        schedule.gloas_fork_version,
+        "slot 2240 must resolve via from_epoch → gloas_fork_version"
+    );
+
+    // Two crossings: one instance cannot submit two 2240 attestations
+    // (EIP-3076 double vote on the same target epoch).
+    for (gloas_bn_index, expected_gloas_index) in [("1", "1"), ("0", "0")] {
+        let mock_server = MockServer::start().await;
+        let (orchestrator, _handle, pubkey_hex, capturing) =
+            build_fork_transition_orchestrator_with_schedule(
+                &mock_server.uri(),
+                fulu_slot,
+                schedule.clone(),
+            )
+            .await;
+
+        mount_attestation_mocks_with_bn_index(&mock_server, fulu_slot, &pubkey_hex, "3").await;
+        mount_attestation_mocks_with_bn_index(
+            &mock_server,
+            gloas_slot,
+            &pubkey_hex,
+            gloas_bn_index,
+        )
+        .await;
+
+        mount_electra_plus_aggregate_mocks(
+            &mock_server,
+            fulu_slot,
+            fulu_epoch,
+            0,
+            fulu_fork.as_ref(),
+        )
+        .await;
+        let gloas_query_index: u64 = gloas_bn_index.parse().unwrap();
+        mount_electra_plus_aggregate_mocks(
+            &mock_server,
+            gloas_slot,
+            gloas_epoch,
+            gloas_query_index,
+            gloas_fork.as_ref(),
+        )
+        .await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/aggregate_and_proofs"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        orchestrator.duty_tracker.fetch_duties_for_epoch(fulu_epoch).await.unwrap();
+        let fulu_results = orchestrator.process_slot(fulu_slot).await.unwrap();
+        assert_eq!(fulu_results.len(), 1);
+        assert!(
+            fulu_results[0].success,
+            "Fulu slot 2208 attestation should succeed: {:?}",
+            fulu_results[0].error
+        );
+        orchestrator.aggregation_service.maybe_produce_aggregations(fulu_slot, fulu_epoch).await;
+
+        orchestrator.clock.set_slot(gloas_slot);
+        orchestrator.duty_tracker.fetch_duties_for_epoch(gloas_epoch).await.unwrap();
+        let gloas_results = orchestrator.process_slot(gloas_slot).await.unwrap();
+        assert_eq!(gloas_results.len(), 1);
+        assert!(
+            gloas_results[0].success,
+            "Gloas slot 2240 attestation should succeed: {:?}",
+            gloas_results[0].error
+        );
+        orchestrator.aggregation_service.maybe_produce_aggregations(gloas_slot, gloas_epoch).await;
+
+        let captured = capturing.captured();
+        assert_eq!(
+            captured.len(),
+            2,
+            "one orchestrator must submit at 2208 and 2240 without restart"
+        );
+
+        assert_eq!(
+            submitted_index(&captured[0], ForkName::Fulu),
+            "0",
+            "slot 2208: EIP-7549 still zeros data.index at Fulu (BN index was 3)"
+        );
+        assert_eq!(
+            submitted_index(&captured[1], ForkName::Gloas),
+            expected_gloas_index,
+            "slot 2240: submitted data.index must equal BN index {gloas_bn_index}"
+        );
+        assert_eq!(
+            submitted_attestation_data(&captured[0]).target.epoch,
+            fulu_epoch.to_string(),
+            "captured Fulu target.epoch must match slot/32"
+        );
+        assert_eq!(
+            submitted_attestation_data(&captured[1]).target.epoch,
+            gloas_epoch.to_string(),
+            "captured Gloas target.epoch must match slot/32"
+        );
+
+        let ctx =
+            SigningCtx { fork_schedule: schedule.as_ref(), genesis_validators_root: [0xaa; 32] };
+        let pk_bytes = hex::decode(pubkey_hex.trim_start_matches("0x")).expect("pubkey hex");
+        let pk = PublicKey::from_bytes(&pk_bytes).expect("pubkey");
+
+        for (label, att, fork_name, bn_index, expected_index) in [
+            ("fulu-2208", &captured[0], fulu_fork, "3", "0"),
+            ("gloas-2240", &captured[1], gloas_fork, gloas_bn_index, expected_gloas_index),
+        ] {
+            let mut bn_data = submitted_attestation_data(att).clone();
+            bn_data.index = bn_index.to_string();
+            let signed = utils::convert_and_normalize_attestation_data(&bn_data, fork_name)
+                .unwrap_or_else(|e| panic!("{label}: convert_and_normalize: {e}"));
+            assert_eq!(
+                signed.index.to_string(),
+                expected_index,
+                "{label}: signing-path index must be {expected_index}"
+            );
+            assert_eq!(
+                submitted_attestation_data(att).index,
+                expected_index,
+                "{label}: submission-path index must be {expected_index}"
+            );
+
+            let sig_bytes = hex::decode(submitted_signature_hex(att).trim_start_matches("0x"))
+                .expect("sig hex");
+            let sig = Signature::from_bytes(&sig_bytes).expect("signature");
+            let root = signing_root_for(&DutyRef::Attestation(&signed), &ctx);
+            sig.verify(&pk, &root).unwrap_or_else(|e| {
+                panic!("{label}: signature must verify over signed index={expected_index}: {e}")
+            });
         }
     }
 }
