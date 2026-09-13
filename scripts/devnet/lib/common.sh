@@ -279,12 +279,15 @@ resolve_profile() {
         fast)
             EPOCHS="${FAST_EPOCHS}"
             DOPPELGANGER="${FAST_DOPPELGANGER}"
+            SOAK_START_OFFSET_EPOCHS=0
             unset FAIL_UNDER
             ;;
         safe)
             EPOCHS="${SAFE_EPOCHS}"
             DOPPELGANGER="${SAFE_DOPPELGANGER}"
             FAIL_UNDER="${REPORT_FAIL_UNDER:-}"
+            # 2 doppelganger monitoring epochs + 1 margin (P6-A2)
+            SOAK_START_OFFSET_EPOCHS=3
             export FAIL_UNDER
             ;;
         *)
@@ -292,7 +295,7 @@ resolve_profile() {
             ;;
     esac
     PROFILE="$profile"
-    export PROFILE EPOCHS DOPPELGANGER
+    export PROFILE EPOCHS DOPPELGANGER SOAK_START_OFFSET_EPOCHS
 }
 
 validate_data_exists() {

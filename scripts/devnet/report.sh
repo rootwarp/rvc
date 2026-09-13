@@ -95,6 +95,43 @@ parse_report_flags() {
     fi
 }
 
+_split_fail_under() {
+    local blob="${1:-}"
+    local item
+    while [[ -n "$blob" ]]; do
+        item="${blob%%,*}"
+        blob="${blob#"$item"}"
+        blob="${blob#,}"
+        if [[ -n "$item" ]]; then
+            FAIL_UNDER_ARGS+=("$item")
+        fi
+    done
+}
+
+_apply_fail_under_from_env() {
+    if [[ ${#FAIL_UNDER_ARGS[@]} -gt 0 ]]; then
+        return 0
+    fi
+    _split_fail_under "${FAIL_UNDER:-}"
+}
+
+_apply_fail_under_from_run_json() {
+    local path="${RUN_DIR}/run.json"
+    local raw
+    if [[ ${#FAIL_UNDER_ARGS[@]} -gt 0 ]]; then
+        return 0
+    fi
+    # Explicit --profile owns FAIL_UNDER; do not mix in a previous run's value.
+    if [[ -n "${PROFILE:-}" ]]; then
+        return 0
+    fi
+    if [[ ! -f "$path" || -L "$path" ]]; then
+        return 0
+    fi
+    raw="$(jq -r '.fail_under // empty' "$path" 2>/dev/null || true)"
+    _split_fail_under "$raw"
+}
+
 _epochs_from_run_json() {
     local path="${RUN_DIR}/run.json"
     local epochs
@@ -763,6 +800,10 @@ main() {
     require_cmd jq
     require_cmd python3
     unset MNEMONIC || true
+    if [[ -n "${PROFILE:-}" ]]; then
+        resolve_profile "$PROFILE"
+    fi
+    _apply_fail_under_from_env
 
     if [[ "$DRY_RUN" == "1" ]]; then
         print_report_plan
@@ -772,6 +813,7 @@ main() {
 
     validate_data_exists "rvc.json" "${RUN_DIR}/rvc.json" "attach-rvc.sh"
     validate_data_exists "run.json" "${RUN_DIR}/run.json" "run.sh"
+    _apply_fail_under_from_run_json
 
     write_rvc_pubkeys
     run_chain_report

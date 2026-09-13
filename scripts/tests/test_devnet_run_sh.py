@@ -49,6 +49,7 @@ _ISOLATE_KEYS = (
     "EPOCHS",
     "DOPPELGANGER",
     "FAIL_UNDER",
+    "SOAK_START_OFFSET_EPOCHS",
     "IMG_GETH",
     "IMG_LIGHTHOUSE",
     "IMG_GENESIS",
@@ -460,6 +461,8 @@ def test_run_json_key_paths(tmp_path: Path):
     assert doc["schema_version"] == 1
     assert isinstance(doc["fingerprint"], str)
     assert re.fullmatch(r"[0-9a-f]{64}", doc["fingerprint"])
+    assert doc["soak_start_offset_epochs"] == 0
+    assert doc["fail_under"] == ""
     assert doc["key_range"] == [48, 64]
     assert doc["pubkeys"] == _PUBKEYS
     assert doc["genesis_validators_root"] == _GVR
@@ -773,3 +776,24 @@ def test_run_sh_dump_skips_when_run_dir_is_file(tmp_path: Path):
     assert not any(line.startswith("logs ") for line in docker_lines)
     assert "report.sh" not in stage_names(slog)
     assert_no_secret(proc)
+
+
+def test_run_json_safe_records_offset_and_fail_under(tmp_path: Path):
+    proc, slog, runs = run_run(tmp_path, ["--profile", "safe"])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    doc = load_run_json(runs)
+    assert doc["profile"] == "safe"
+    assert doc["epochs"] == 8
+    assert doc["soak_start_offset_epochs"] == 3
+    assert doc["fail_under"] == "participation_rate=0.95,target_rate=0.95"
+    actual = json_keypaths(doc)
+    expected = _committed_keypaths()
+    assert sorted(actual) == expected
+    soak_cmd = next(c for c in stub_cmds(slog) if c.startswith("soak.sh "))
+    report_cmd = next(c for c in stub_cmds(slog) if c.startswith("report.sh "))
+    assert "--epochs 8" in soak_cmd
+    assert "--fail-under participation_rate=0.95" in report_cmd
+    assert "--fail-under target_rate=0.95" in report_cmd
+    assert_no_secret(proc)
+

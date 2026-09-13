@@ -9,6 +9,8 @@ source "${_SOAK_DIR}/lib/common.sh"
 
 SOAK_EPOCHS="${SOAK_EPOCHS:-}"
 GATE_INTERVAL="${GATE_INTERVAL_SLOTS:-1}"
+# validator_perf.py to_epoch ≤ head−2 (P6-A2); hold after sampling when offset > 0
+_SOAK_END_CLAMP_EPOCHS=2
 _SOAK_TRIPPED=0
 _SOAK_TRIP_MSG=""
 _K8_BASE=""
@@ -222,26 +224,64 @@ print_soak_plan() {
     log_info "soak plan:"
     log_info "  run dir: ${RUN_DIR}"
     log_info "  epochs: ${SOAK_EPOCHS}"
+    log_info "  soak start offset epochs: ${SOAK_START_OFFSET_EPOCHS:-0}"
+    if [[ "${SOAK_START_OFFSET_EPOCHS:-0}" -gt 0 ]]; then
+        log_info "  end clamp epochs: ${_SOAK_END_CLAMP_EPOCHS}"
+    fi
     log_info "  gate interval: ${GATE_INTERVAL}"
     log_info "  1. scrape metrics-start.txt"
     log_info "  2. per-slot gates + samples.jsonl"
     log_info "  3. scrape metrics-end.txt"
 }
 
+_soak_gate_loop() {
+    local slot="$1"
+    local end_slot="$2"
+    local step="$3"
+    local do_sleep="$4"
+    local sample="$5"
+    local samples="$6"
+    while [[ "$slot" -lt "$end_slot" ]]; do
+        if [[ "$do_sleep" -eq 1 ]]; then
+            sleep_until_slot "$slot"
+        fi
+        if ! _check_gates; then
+            _SOAK_TRIPPED=1
+            return 0
+        fi
+        if [[ "$sample" -eq 1 ]]; then
+            _scrape_gauges "$slot" "$samples" || true
+        fi
+        slot=$((slot + step))
+    done
+}
+
 main() {
-    local start_slot end_slot slot step do_sleep samples spe total
+    local start_slot step do_sleep samples spe total
+    local offset offset_slots sample_start
 
     parse_soak_flags "$@"
     unset MNEMONIC || true
     require_chain_1337
     _require_rvc_json
+    if [[ -n "${PROFILE:-}" ]]; then
+        resolve_profile "$PROFILE"
+        if [[ -z "${SOAK_EPOCHS}" ]]; then
+            SOAK_EPOCHS="${EPOCHS}"
+        else
+            EPOCHS="${SOAK_EPOCHS}"
+        fi
+    fi
     if [[ -z "${SOAK_EPOCHS}" ]]; then
         die_usage "--epochs requires a non-negative integer"
     fi
     _require_nnint "--epochs" "$SOAK_EPOCHS"
     _require_nnint "--gate-interval" "$GATE_INTERVAL"
+    offset="${SOAK_START_OFFSET_EPOCHS:-0}"
+    _require_nnint "SOAK_START_OFFSET_EPOCHS" "$offset"
+    SOAK_START_OFFSET_EPOCHS="$offset"
     EPOCHS="$SOAK_EPOCHS"
-    export EPOCHS GATE_INTERVAL
+    export EPOCHS GATE_INTERVAL SOAK_START_OFFSET_EPOCHS
 
     if [[ "$DRY_RUN" == "1" ]]; then
         print_soak_plan
@@ -259,7 +299,11 @@ main() {
     _soak_truncate "${RUN_DIR}/metrics-start.txt"
     _soak_truncate "${RUN_DIR}/metrics-end.txt"
 
-    _scrape_raw "${RUN_DIR}/metrics-start.txt" || true
+    # Offset 0 keeps the Phase-5 start scrape before the genesis clock so a
+    # dead BN is still health 3 (not bn_get infra 1) with metrics-start present.
+    if [[ "$offset" -eq 0 ]]; then
+        _scrape_raw "${RUN_DIR}/metrics-start.txt" || true
+    fi
 
     # DN-8 health before the BN genesis clock, so a dead BN is exit 3
     # with metrics-end.txt present rather than bn_get infra 1.
@@ -269,6 +313,7 @@ main() {
 
     spe="$(_slots_per_epoch)"
     total=$((SOAK_EPOCHS * spe))
+    offset_slots=$((offset * spe))
     step="$GATE_INTERVAL"
     do_sleep=1
     if [[ "$step" -eq 0 ]]; then
@@ -279,19 +324,26 @@ main() {
     if [[ "$_SOAK_TRIPPED" -eq 0 ]]; then
         bn_genesis_time >/dev/null
         start_slot="$(current_slot)"
-        end_slot=$((start_slot + total))
-        slot="$start_slot"
-        while [[ "$slot" -lt "$end_slot" ]]; do
-            if [[ "$do_sleep" -eq 1 ]]; then
-                sleep_until_slot "$slot"
+        sample_start="$start_slot"
+        # Offset hold: DN-8 gates stay live; sampling and start scrape wait.
+        if [[ "$offset_slots" -gt 0 ]]; then
+            _soak_gate_loop "$start_slot" "$((start_slot + offset_slots))" \
+                "$step" "$do_sleep" 0 "$samples"
+            sample_start=$((start_slot + offset_slots))
+            if [[ "$_SOAK_TRIPPED" -eq 0 ]]; then
+                _scrape_raw "${RUN_DIR}/metrics-start.txt" || true
             fi
-            if ! _check_gates; then
-                _SOAK_TRIPPED=1
-                break
-            fi
-            _scrape_gauges "$slot" "$samples" || true
-            slot=$((slot + step))
-        done
+        fi
+        if [[ "$_SOAK_TRIPPED" -eq 0 ]]; then
+            _soak_gate_loop "$sample_start" "$((sample_start + total))" \
+                "$step" "$do_sleep" 1 "$samples"
+        fi
+        # P6-A2: DN-8 gates stay live through validator_perf's head−2 clamp.
+        if [[ "$_SOAK_TRIPPED" -eq 0 && "$offset_slots" -gt 0 ]]; then
+            _soak_gate_loop "$((sample_start + total))" \
+                "$((sample_start + total + _SOAK_END_CLAMP_EPOCHS * spe))" \
+                "$step" "$do_sleep" 0 "$samples"
+        fi
     fi
 
     _scrape_raw "${RUN_DIR}/metrics-end.txt" || true

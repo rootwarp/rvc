@@ -948,12 +948,18 @@ start_vc() {
     inventory_append container "$VALIDATOR_CONTAINER"
 
     log_info "starting lighthouse validator_client"
+    # Lighthouse VC doppelganger protection only when DOPPELGANGER=on (P6-A12).
+    if [[ "${DOPPELGANGER:-off}" == "on" ]]; then
+        set -- --enable-doppelganger-protection
+    else
+        set --
+    fi
     if [[ -f "$db" ]]; then
-        if ! _start_vc_container >/dev/null; then
+        if ! _start_vc_container "$@" >/dev/null; then
             _fail_chain "failed to start ${VALIDATOR_CONTAINER}"
         fi
     else
-        if ! _start_vc_container --init-slashing-protection >/dev/null; then
+        if ! _start_vc_container "$@" --init-slashing-protection >/dev/null; then
             _fail_chain "failed to start ${VALIDATOR_CONTAINER}"
         fi
     fi
@@ -1077,6 +1083,9 @@ _validate_inputs() {
 main() {
     parse_common_flags "$@"
     _bind_chain_paths
+    if [[ -n "${PROFILE:-}" ]]; then
+        resolve_profile "$PROFILE"
+    fi
     require_chain_1337
     require_cmd jq
     require_cmd python3

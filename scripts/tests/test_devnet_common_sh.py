@@ -33,6 +33,7 @@ _ISOLATE_KEYS = (
     "EPOCHS",
     "DOPPELGANGER",
     "FAIL_UNDER",
+    "SOAK_START_OFFSET_EPOCHS",
 )
 
 _MNEMONIC = "test test test test test test test test test test test junk"
@@ -237,6 +238,31 @@ def test_resolve_profile_safe():
         "FAIL_UNDER=participation_rate=0.95,target_rate=0.95"
     )
     assert_no_secret(proc)
+
+
+def test_resolve_profile_safe_sets_four_values():
+    safe = run_common(
+        "resolve_profile safe; "
+        'printf "EPOCHS=%s DOPPELGANGER=%s SOAK_START_OFFSET_EPOCHS=%s FAIL_UNDER=%s\\n" '
+        '"$EPOCHS" "$DOPPELGANGER" "$SOAK_START_OFFSET_EPOCHS" "${FAIL_UNDER-UNSET}"'
+    )
+    assert safe.returncode == 0, safe.stderr
+    assert safe.stdout.strip() == (
+        "EPOCHS=8 DOPPELGANGER=on SOAK_START_OFFSET_EPOCHS=3 "
+        "FAIL_UNDER=participation_rate=0.95,target_rate=0.95"
+    )
+    assert_no_secret(safe)
+
+    fast = run_common(
+        "resolve_profile fast; "
+        'printf "EPOCHS=%s DOPPELGANGER=%s SOAK_START_OFFSET_EPOCHS=%s FAIL_UNDER=%s\\n" '
+        '"$EPOCHS" "$DOPPELGANGER" "$SOAK_START_OFFSET_EPOCHS" "${FAIL_UNDER-UNSET}"'
+    )
+    assert fast.returncode == 0, fast.stderr
+    assert fast.stdout.strip() == (
+        "EPOCHS=4 DOPPELGANGER=off SOAK_START_OFFSET_EPOCHS=0 FAIL_UNDER=UNSET"
+    )
+    assert_no_secret(fast)
 
 
 def test_resolve_profile_unknown_exits_2():

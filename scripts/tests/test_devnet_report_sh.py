@@ -37,6 +37,7 @@ _ISOLATE_KEYS = (
     "EPOCHS",
     "DOPPELGANGER",
     "FAIL_UNDER",
+    "SOAK_START_OFFSET_EPOCHS",
     "VALIDATOR_PERF",
     "DEVNET_REPORT",
     "STRICT",
@@ -869,5 +870,56 @@ def test_report_sh_chain_half_sanitizes_control_chars(tmp_path: Path):
         "injected" in ln and ln.strip() != "DEGRADED:"
         for ln in report_txt.splitlines()
     )
+
+
+def test_report_sh_reads_fail_under_not_report_fail_under(tmp_path: Path):
+    text = REPORT.read_text(encoding="utf-8")
+    assert text.count("REPORT_FAIL_UNDER") == 0
+    run_dir = plant_run_dir(tmp_path)
+    proc, argv_log = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        env={"FAIL_UNDER": "participation_rate=0.95,target_rate=0.95"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    argv = argv_list(argv_log)
+    pairs = argv_pairs(argv)
+    assert pairs["--fail-under"] == [
+        "participation_rate=0.95",
+        "target_rate=0.95",
+    ]
+    assert "REPORT_FAIL_UNDER" not in argv
+    assert_no_secret(proc)
+
+
+def test_report_sh_reads_fail_under_from_run_json(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path)
+    path = run_dir / "run.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    doc["fail_under"] = "participation_rate=0.95,target_rate=0.95"
+    path.write_text(json.dumps(doc, sort_keys=True) + "\n", encoding="utf-8")
+    proc, argv_log = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 0, proc.stderr
+    pairs = argv_pairs(argv_list(argv_log))
+    assert pairs["--fail-under"] == [
+        "participation_rate=0.95",
+        "target_rate=0.95",
+    ]
+    assert_no_secret(proc)
+
+
+def test_report_sh_profile_safe_applies_fail_under(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path)
+    proc, argv_log = run_report(
+        tmp_path, ["--run-dir", str(run_dir), "--profile", "safe"]
+    )
+    assert proc.returncode == 0, proc.stderr
+    pairs = argv_pairs(argv_list(argv_log))
+    assert pairs["--fail-under"] == [
+        "participation_rate=0.95",
+        "target_rate=0.95",
+    ]
+    assert_no_secret(proc)
 
 

@@ -57,6 +57,7 @@ _ISOLATE_KEYS = (
     "EPOCHS",
     "DOPPELGANGER",
     "FAIL_UNDER",
+    "SOAK_START_OFFSET_EPOCHS",
     "IMG_GETH",
     "IMG_LIGHTHOUSE",
     "IMG_GENESIS",
@@ -956,6 +957,31 @@ def test_vc_command_has_fee_recipient_and_slashing_protection(tmp_path: Path):
     assert re.fullmatch(r"0x[0-9a-fA-F]{40}", addr), addr
     assert addr.lower() != _ZERO_ACCOUNT
     assert addr == _DEV_ACCOUNT
+
+
+def test_chain_adds_lh_dp_flag_under_safe(tmp_path: Path):
+    proc_fast, log = run_chain(tmp_path)
+    assert proc_fast.returncode == 0, proc_fast.stderr
+    fast_vc = vc_cmd(run_cmds(stub_cmds(log)))
+    assert "--enable-doppelganger-protection" not in fast_vc
+    assert "--init-slashing-protection" in fast_vc
+    assert f"--suggested-fee-recipient={_DEV_ACCOUNT}" in fast_vc
+
+    proc_safe, _ = run_chain(
+        tmp_path,
+        ["--force", "--profile", "safe"],
+        docker=tmp_path / "docker",
+        curl=tmp_path / "curl",
+        log=log,
+        seed=False,
+    )
+    assert proc_safe.returncode == 0, proc_safe.stderr
+    vcs = [c for c in run_cmds(stub_cmds(log)) if "validator_client" in c]
+    assert len(vcs) >= 2, vcs
+    assert "--enable-doppelganger-protection" not in vcs[0]
+    assert "--enable-doppelganger-protection" in vcs[-1]
+    assert "--init-slashing-protection" in vcs[-1]
+
 
 
 def test_copy_vc_keys_count_and_owner(tmp_path: Path):

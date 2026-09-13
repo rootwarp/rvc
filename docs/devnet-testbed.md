@@ -253,6 +253,27 @@ Does not call `require_chain_1337` (teardown must still run). Unsets `MNEMONIC`.
 
 Missing `target/release/rvc` → usage **2** naming `cargo build --release`, **before** a run dir is minted. First non-zero child code is kept; teardown never overwrites it. Non-zero stages dump `docker logs` into `runs/<id>/logs/<container>.log`.
 
+## Safe profile
+
+`--profile safe` is the DN-18 path that proves the Phase 2 key split (DN-5) with doppelganger detection **on**. `resolve_profile` in `lib/common.sh` is the only producer of the four values; `03-chain.sh` / `attach-rvc.sh` / `soak.sh` / `report.sh` consume the variables, never `REPORT_FAIL_UNDER` and never the raw `--profile` flag.
+
+| Knob | `fast` | `safe` |
+|------|--------|--------|
+| `EPOCHS` | 4 (`FAST_EPOCHS`) | 8 (`SAFE_EPOCHS`) |
+| `DOPPELGANGER` | off | **on** |
+| `SOAK_START_OFFSET_EPOCHS` | 0 | 3 |
+| `FAIL_UNDER` | unset | `$REPORT_FAIL_UNDER` (`participation_rate=0.95,target_rate=0.95`) |
+
+RVC omits `--no-doppelganger-detection` when `DOPPELGANGER=on` (CLI polarity; the TOML key is `[safety] doppelganger_detection`). The Lighthouse VC gets `--enable-doppelganger-protection` only under `safe`. Detection does **not** exit the process: it permanently closes the gate and logs `error!` once; that log line is the only detection signal. `run.json` records `soak_start_offset_epochs` and `fail_under`. `report.sh` forwards `--fail-under` from `FAIL_UNDER` (comma-split), never from `REPORT_FAIL_UNDER`.
+
+### Why the soak starts at epoch 3 (P6-A2)
+
+RVC withholds signing for 2 epochs (`DEFAULT_MONITORING_EPOCHS = 2`). A window that starts at genesis reports ≈ 0 attestations and fails S6. `soak.sh` therefore holds the DN-8 health gates for `SOAK_START_OFFSET_EPOCHS=3` (2 + 1 margin) **without sampling**, takes `metrics-start.txt` at that boundary, samples for `EPOCHS=8`, then holds **2 more epochs** of DN-8 gates (no sampling) so `validator_perf.py`'s `to_epoch ≤ head − 2` clamp does not pull the chain half back into the dark window. A dead BN during either hold still aborts **3**.
+
+`validator_perf.py` is invoked with `--epochs` from `run.json` (not `--from-epoch`/`--to-epoch`). After offset 3 + sample 8 + clamp 2 the chain head is epoch **13 ≈ 83.2 min** (13 × 32 slots × 12 s) and the measured window is epochs 4…11. Live proof of the split is issue 6.6, not this wiring. `soak.sh` and `report.sh` call `resolve_profile` when `--profile` is set (`--epochs` on soak still wins). Re-report without `--profile` reads `fail_under` from `run.json`.
+
+If `03-chain.sh`'s block-production health gate trips in the first ~2 epochs with Lighthouse VC doppelganger protection on (P6-A12, unverified at genesis), drop `--enable-doppelganger-protection` from the Lighthouse VC and record that DN-5 is proven from RVC's side only.
+
 ## Exit codes
 
 PRD §4 vocabulary, emitted only through `die_infra` / `die_usage` / `die_health` / `die_kpi` / `die_notready` in `lib/common.sh`.

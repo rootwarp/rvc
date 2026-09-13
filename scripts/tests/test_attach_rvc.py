@@ -41,6 +41,7 @@ _ISOLATE_KEYS = (
     "EPOCHS",
     "DOPPELGANGER",
     "FAIL_UNDER",
+    "SOAK_START_OFFSET_EPOCHS",
     "RVC_BIN",
     "RVC_METRICS_PORT",
     "ATTACH_TIMEOUT",
@@ -896,6 +897,57 @@ def test_mnemonic_not_exported_to_child(tmp_path: Path):
     finally:
         if pid is not None:
             kill_pid(pid)
+        if pid_out.is_file():
+            raw = pid_out.read_text(encoding="utf-8").strip()
+            if raw.isdigit():
+                kill_pid(int(raw))
+
+
+def test_attach_omits_no_doppelganger_flag_under_safe(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    plant_attach_tree(data_dir)
+    port = free_port()
+    curl, _ = write_curl_stub(tmp_path)
+    rvc, argv_log, _, pid_out = write_rvc_stub(tmp_path, mode="fail", port=port)
+    run_dir = tmp_path / "run"
+    try:
+        proc_safe = run_attach(
+            tmp_path,
+            ["--run-dir", str(run_dir), "--profile", "safe", "--timeout", "4"],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+        )
+        assert proc_safe.returncode == 5, proc_safe.stderr
+        argv_safe = argv_log.read_text(encoding="utf-8")
+        assert " start " in f" {argv_safe} "
+        assert "--init-slashing-db" in argv_safe
+        assert "--no-doppelganger-detection" not in argv_safe
+        assert_no_secrets(proc_safe, data_dir)
+
+        argv_log.write_text("", encoding="utf-8")
+        proc_fast = run_attach(
+            tmp_path,
+            [
+                "--run-dir",
+                str(run_dir),
+                "--profile",
+                "fast",
+                "--force",
+                "--timeout",
+                "4",
+            ],
+            rvc=rvc,
+            curl=curl,
+            port=port,
+        )
+        assert proc_fast.returncode == 5, proc_fast.stderr
+        argv_fast = argv_log.read_text(encoding="utf-8")
+        assert " start " in f" {argv_fast} "
+        assert "--init-slashing-db" in argv_fast
+        assert "--no-doppelganger-detection" in argv_fast
+        assert_no_secrets(proc_fast, data_dir)
+    finally:
         if pid_out.is_file():
             raw = pid_out.read_text(encoding="utf-8").strip()
             if raw.isdigit():

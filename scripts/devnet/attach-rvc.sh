@@ -652,8 +652,15 @@ spawn_rvc() {
     # Capture stdout/stderr into rvc.log. A pipeline `tee` would own $! and
     # die when this script exits, SIGPIPE-ing a live RVC. MNEMONIC is dropped
     # so the child cannot inherit the dev mnemonic from devnet.env.
+    # CLI polarity: default-on; --no-doppelganger-detection only when off.
+    if [[ "${DOPPELGANGER:-off}" == "on" ]]; then
+        set --
+    else
+        set -- --no-doppelganger-detection
+    fi
     env -u MNEMONIC \
         "$RVC_BIN" start -c "$config" --init-slashing-db --metrics-address 127.0.0.1 \
+        "$@" \
         >>"$log" 2>&1 &
     RVC_PID=$!
     printf '%s\n' "$RVC_PID" >"$pidfile"

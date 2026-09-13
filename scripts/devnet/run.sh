@@ -197,6 +197,7 @@ _fingerprint_payload() {
         --arg epochs "${EPOCHS:-}" \
         --arg doppelganger "${DOPPELGANGER:-}" \
         --arg fail_under "${FAIL_UNDER:-}" \
+        --arg soak_start_offset_epochs "${SOAK_START_OFFSET_EPOCHS:-0}" \
         '{
             chain: {
                 ALTAIR_FORK_VERSION: $altair_fork,
@@ -229,7 +230,8 @@ _fingerprint_payload() {
                 doppelganger: $doppelganger,
                 epochs: $epochs,
                 fail_under: $fail_under,
-                name: $profile
+                name: $profile,
+                soak_start_offset_epochs: $soak_start_offset_epochs
             }
         }'
 }
@@ -467,8 +469,11 @@ write_run_json_start() {
         --arg img_lighthouse "${IMG_LIGHTHOUSE:-}" \
         --arg img_genesis "${IMG_GENESIS:-}" \
         --arg fingerprint "$fingerprint" \
+        --arg fail_under "${FAIL_UNDER:-}" \
+        --argjson soak_start_offset_epochs "${SOAK_START_OFFSET_EPOCHS:-0}" \
         '{
             epochs: $epochs,
+            fail_under: $fail_under,
             fingerprint: $fingerprint,
             generated_at: $generated_at,
             genesis_validators_root: $gvr,
@@ -483,7 +488,8 @@ write_run_json_start() {
             pubkeys: $pubkeys,
             run_id: $run_id,
             rvc_version: $rvc_version,
-            schema_version: 1
+            schema_version: 1,
+            soak_start_offset_epochs: $soak_start_offset_epochs
         }' | _atomic_replace_stdin "$dest"
     _pipe=("${PIPESTATUS[@]}" 1)
     set -e
@@ -825,6 +831,7 @@ print_run_plan() {
     log_info "run plan:"
     log_info "  profile: ${PROFILE}"
     log_info "  epochs: ${EPOCHS}"
+    log_info "  soak start offset epochs: ${SOAK_START_OFFSET_EPOCHS:-0}"
     log_info "  1. up.sh"
     log_info "  2. attach-rvc.sh"
     log_info "  3. soak.sh"

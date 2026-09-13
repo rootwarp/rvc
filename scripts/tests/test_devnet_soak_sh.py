@@ -43,6 +43,8 @@ _ISOLATE_KEYS = (
     "EPOCHS",
     "DOPPELGANGER",
     "FAIL_UNDER",
+    "SOAK_START_OFFSET_EPOCHS",
+    "SOAK_EVENTS",
     "VALIDATOR_PERF",
     "DEVNET_REPORT",
     "NOW_UNIX",
@@ -128,8 +130,19 @@ def write_curl_stub(tmp_path: Path) -> tuple[Path, Path]:
         "    exit 0\n"
         "    ;;\n"
         "  */eth/v1/node/health)\n"
+        "    if [ -n \"${SOAK_EVENTS:-}\" ]; then\n"
+        "      printf 'bn-health\\n' >> \"$SOAK_EVENTS\"\n"
+        "    fi\n"
+        "    if [ -f \"$state/bn-health-seq\" ]; then\n"
+        "      code=$(head -n 1 \"$state/bn-health-seq\")\n"
+        "      tail -n +2 \"$state/bn-health-seq\" > \"$state/bn-health-seq.tmp\" || true\n"
+        "      mv \"$state/bn-health-seq.tmp\" \"$state/bn-health-seq\"\n"
+        "      [ -n \"$code\" ] || code=$(tr -d '[:space:]' < \"$state/bn-health\")\n"
+        "    else\n"
+        "      code=$(tr -d '[:space:]' < \"$state/bn-health\")\n"
+        "    fi\n"
         "    if [ \"$want_code\" -eq 1 ]; then\n"
-        "      tr -d '[:space:]' < \"$state/bn-health\"\n"
+        "      printf '%s' \"$code\"\n"
         "    fi\n"
         "    exit 0\n"
         "    ;;\n"
@@ -197,6 +210,9 @@ def write_report_stub(tmp_path: Path) -> tuple[Path, Path]:
         "  prev=\"$a\"\n"
         "done\n"
         "if [ \"$gauges\" -eq 1 ]; then\n"
+        "  if [ -n \"${SOAK_EVENTS:-}\" ]; then\n"
+        "    printf 'gauge %s\\n' \"$slot\" >> \"$SOAK_EVENTS\"\n"
+        "  fi\n"
         "  if [ -f \"$fail_once\" ]; then\n"
         "    rm -f \"$fail_once\"\n"
         "    exit 1\n"
@@ -206,6 +222,12 @@ def write_report_stub(tmp_path: Path) -> tuple[Path, Path]:
         "  exit 0\n"
         "fi\n"
         "if [ -n \"$out\" ]; then\n"
+        "  if [ -n \"${SOAK_EVENTS:-}\" ]; then\n"
+        "    case \"$out\" in\n"
+        "      *metrics-start.txt) printf 'start-scrape\\n' >> \"$SOAK_EVENTS\" ;;\n"
+        "      *metrics-end.txt) printf 'end-scrape\\n' >> \"$SOAK_EVENTS\" ;;\n"
+        "    esac\n"
+        "  fi\n"
         "  case \"$out\" in\n"
         "    *metrics-end.txt) cp \"$end\" \"$out\" ;;\n"
         "    *) cp \"$start\" \"$out\" ;;\n"
@@ -675,3 +697,140 @@ def test_soak_curl_uses_hardened_flags(tmp_path: Path):
         assert "-g" in line
         assert "--path-as-is" in line
         assert "--proto" in line
+
+
+def test_soak_offset_delays_start_scrape_and_sampling(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    plant_rvc_json(run_dir)
+    events = tmp_path / "events.log"
+    events.write_text("", encoding="utf-8")
+    offset_epochs = 1
+    offset_slots = offset_epochs * int(_SLOTS_PER_EPOCH)
+    proc, _, rlog = run_soak(
+        tmp_path,
+        soak_args(run_dir),
+        env={
+            "SOAK_START_OFFSET_EPOCHS": str(offset_epochs),
+            "SOAK_EVENTS": str(events),
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    assert_artifacts(run_dir)
+    assert (run_dir / "metrics-start.txt").stat().st_size > 0
+    rows = sample_rows(run_dir)
+    first_sample = _START_SLOT + offset_slots
+    assert [row["slot"] for row in rows] == list(
+        range(first_sample, first_sample + _GATED_SLOTS)
+    )
+    assert all(row["slot"] >= first_sample for row in rows)
+    event_lines = [
+        ln for ln in events.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
+    assert "start-scrape" in event_lines
+    start_idx = event_lines.index("start-scrape")
+    gauge_idxs = [
+        i for i, ln in enumerate(event_lines) if ln.startswith("gauge ")
+    ]
+    assert gauge_idxs
+    assert start_idx < gauge_idxs[0]
+    hold_health = event_lines[:start_idx].count("bn-health")
+    assert hold_health >= 1 + offset_slots
+    cmds = stub_cmds(rlog)
+    gauges = [c for c in cmds if "--gauges-only" in c]
+    assert len(gauges) == _GATED_SLOTS
+
+
+def test_soak_offset_still_aborts_3_on_dead_bn_during_hold(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    plant_rvc_json(run_dir)
+    events = tmp_path / "events.log"
+    events.write_text("", encoding="utf-8")
+    write_curl_stub(tmp_path)
+    write_report_stub(tmp_path)
+    (tmp_path / "curl-state" / "bn-health-seq").write_text(
+        "200\n200\n500\n", encoding="utf-8"
+    )
+    proc, _, _ = run_soak(
+        tmp_path,
+        soak_args(run_dir),
+        env={
+            "SOAK_START_OFFSET_EPOCHS": "1",
+            "SOAK_EVENTS": str(events),
+        },
+        reset_stubs=False,
+    )
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert "node/health" in proc.stderr
+    assert "500" in proc.stderr
+    assert_no_secret(proc)
+    assert_artifacts(run_dir)
+    event_lines = [
+        ln for ln in events.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
+    assert "start-scrape" not in event_lines
+    assert not any(ln.startswith("gauge ") for ln in event_lines)
+    assert sample_rows(run_dir) == []
+
+
+def test_soak_offset_holds_clamp_after_sampling(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    plant_rvc_json(run_dir)
+    events = tmp_path / "events.log"
+    events.write_text("", encoding="utf-8")
+    clamp_slots = 2 * int(_SLOTS_PER_EPOCH)
+    proc, _, rlog = run_soak(
+        tmp_path,
+        soak_args(run_dir),
+        env={
+            "SOAK_START_OFFSET_EPOCHS": "1",
+            "SOAK_EVENTS": str(events),
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert_no_secret(proc)
+    event_lines = [
+        ln for ln in events.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
+    gauge_idxs = [
+        i for i, ln in enumerate(event_lines) if ln.startswith("gauge ")
+    ]
+    assert len(gauge_idxs) == _GATED_SLOTS
+    assert "end-scrape" in event_lines
+    after = event_lines[gauge_idxs[-1] + 1 :]
+    assert not any(ln.startswith("gauge ") for ln in after)
+    assert after.count("bn-health") >= clamp_slots
+    assert after.index("end-scrape") > 0
+    cmds = stub_cmds(rlog)
+    assert len([c for c in cmds if "--gauges-only" in c]) == _GATED_SLOTS
+
+
+def test_soak_profile_safe_sets_offset(tmp_path: Path):
+    run_dir = tmp_path / "run"
+    plant_rvc_json(run_dir)
+    events = tmp_path / "events.log"
+    events.write_text("", encoding="utf-8")
+    offset_slots = 3 * int(_SLOTS_PER_EPOCH)
+    proc, _, rlog = run_soak(
+        tmp_path,
+        soak_args(run_dir, ["--profile", "safe"]),
+        env={"SOAK_EVENTS": str(events)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    rows = sample_rows(run_dir)
+    first_sample = _START_SLOT + offset_slots
+    assert [row["slot"] for row in rows] == list(
+        range(first_sample, first_sample + _GATED_SLOTS)
+    )
+    cmds = stub_cmds(rlog)
+    assert len([c for c in cmds if "--gauges-only" in c]) == _GATED_SLOTS
+    event_lines = [
+        ln for ln in events.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
+    start_idx = event_lines.index("start-scrape")
+    assert event_lines[:start_idx].count("bn-health") >= 1 + offset_slots
+
