@@ -128,8 +128,9 @@ fn capability_endpoint_label(endpoint: &str) -> String {
 }
 
 fn publish_capability(endpoint: &str, capability: &str, capable: bool) {
+    let endpoint_label = capability_endpoint_label(endpoint);
     crate::metrics::RVC_BN_CAPABILITY_STATE
-        .with_label_values(&[&capability_endpoint_label(endpoint), capability])
+        .with_label_values(&[endpoint_label.as_str(), capability])
         .set(i64::from(capable));
 }
 
