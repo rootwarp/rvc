@@ -1732,6 +1732,53 @@ def test_non_positive_slots_per_epoch_names_the_key(vp, load):
     assert "SLOTS_PER_EPOCH" in str(ei.value)
 
 
+def test_slot_duration_ms_preferred_over_seconds_per_slot(vp, load):
+    payload = load("spec__gloas")
+    assert "SLOT_DURATION_MS" in payload["data"]
+    assert "SECONDS_PER_SLOT" not in payload["data"]
+    ctx, _, _ = _load_ctx(vp, spec="spec__gloas")
+    assert ctx.spec.seconds_per_slot == 12
+    payload["data"]["SECONDS_PER_SLOT"] = "6"
+    ctx, _, _ = _load_ctx(vp, spec_body=json.dumps(payload).encode())
+    assert ctx.spec.seconds_per_slot == 12
+    assert ctx.spec.epochs_per_year == 82181.25
+
+
+def test_seconds_per_slot_still_accepted_when_ms_absent(vp):
+    ctx, _, _ = _load_ctx(vp, spec="spec__mainnet")
+    assert "SLOT_DURATION_MS" not in ctx.spec.raw
+    assert ctx.spec.raw["SECONDS_PER_SLOT"] == "12"
+    assert ctx.spec.seconds_per_slot == 12
+
+
+def test_missing_both_slot_duration_keys_exits_2_naming_both(vp, load):
+    payload = load("spec__mainnet")
+    payload["data"].pop("SECONDS_PER_SLOT", None)
+    payload["data"].pop("SLOT_DURATION_MS", None)
+    transport = _chain_transport(vp, spec_body=json.dumps(payload).encode())
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.load_chain_context(client)
+    msg = str(ei.value)
+    assert "SLOT_DURATION_MS" in msg
+    assert "SECONDS_PER_SLOT" in msg
+    assert ei.type is vp.UsageError
+    assert vp.EXIT_USAGE == 2
+
+
+@pytest.mark.parametrize("ms", ["12500", "0"])
+def test_non_integral_slot_duration_ms_is_rejected(vp, load, ms):
+    payload = load("spec__gloas")
+    payload["data"]["SLOT_DURATION_MS"] = ms
+    transport = _chain_transport(vp, spec_body=json.dumps(payload).encode())
+    client, _ = _client(vp, transport)
+    with pytest.raises(vp.UsageError) as ei:
+        vp.load_chain_context(client)
+    msg = str(ei.value)
+    assert "SLOT_DURATION_MS" in msg
+    assert "invalid" in msg
+
+
 # ----- VP-1k: §8 resolve_window -----
 
 
@@ -5023,6 +5070,7 @@ _G5_SKIP = {
     "failover__first_503": "scenario descriptor; exercised by VP-4b tests",
     "liveness__head_window": "scenario descriptor; exercised by VP-4e tests",
     "spec__spe8": "SPE change would miss snapshot routes; not a G5 overlay",
+    "spec__gloas": "ms-only spec; not a G5 overlay",
     "node_syncing__is_syncing": "selection abort exit 5; no report",
     "cache__genesis_root_changed": "declared VP-5c; cache file, not a BN overlay",
     "run__fast_n4": "devnet report run.json fixture; not a BN overlay",

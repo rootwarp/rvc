@@ -881,9 +881,23 @@ def _spec_uint(raw: dict, key: str) -> int:
     if key not in raw:
         raise UsageError(f"missing spec key {key}")
     value = parse_uint(raw[key], key)
-    if key in ("SLOTS_PER_EPOCH", "SECONDS_PER_SLOT") and value < 1:
+    if (
+        key in ("SLOTS_PER_EPOCH", "SECONDS_PER_SLOT", "SLOT_DURATION_MS")
+        and value < 1
+    ):
         raise UsageError(f"invalid {key}: {raw[key]!r}")
     return value
+
+
+def _spec_seconds_per_slot(raw: dict) -> int:
+    if "SLOT_DURATION_MS" in raw:
+        ms = _spec_uint(raw, "SLOT_DURATION_MS")
+        if ms % 1000 != 0:
+            raise UsageError(f"invalid SLOT_DURATION_MS: {raw['SLOT_DURATION_MS']!r}")
+        return ms // 1000
+    if "SECONDS_PER_SLOT" in raw:
+        return _spec_uint(raw, "SECONDS_PER_SLOT")
+    raise UsageError("missing spec key SLOT_DURATION_MS and SECONDS_PER_SLOT")
 
 
 def _nested_uint(obj: object, keys: tuple[str, ...], field: str) -> int:
@@ -968,7 +982,7 @@ def load_chain_context(client: BeaconClient) -> ChainContext:
     raw = _require_data(client.spec(), "spec")
     spec = Spec(
         slots_per_epoch=_spec_uint(raw, "SLOTS_PER_EPOCH"),
-        seconds_per_slot=_spec_uint(raw, "SECONDS_PER_SLOT"),
+        seconds_per_slot=_spec_seconds_per_slot(raw),
         epochs_per_sync_committee_period=_spec_uint(
             raw, "EPOCHS_PER_SYNC_COMMITTEE_PERIOD"
         ),

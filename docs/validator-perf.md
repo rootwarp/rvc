@@ -73,7 +73,7 @@ The script picks the first node that answers `node/version` and is not syncing. 
 
 ### Epoch window
 
-Inclusive `[from_epoch, to_epoch]`. Spec constants (`SLOTS_PER_EPOCH`, `SECONDS_PER_SLOT`, …) come from `GET /eth/v1/config/spec`, not hardcoded mainnet values.
+Inclusive `[from_epoch, to_epoch]`. Spec constants (`SLOTS_PER_EPOCH`, `SLOT_DURATION_MS`, `SECONDS_PER_SLOT`, …) come from `GET /eth/v1/config/spec`, not hardcoded mainnet values. `SLOT_DURATION_MS` is preferred; `SECONDS_PER_SLOT` is accepted when the millisecond key is absent. Non-whole-second millisecond values are rejected.
 
 Default:
 
