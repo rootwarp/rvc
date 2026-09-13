@@ -175,7 +175,13 @@ rvc voluntary-exit \
 
 ## Configuration File
 
-Create a TOML file (see `config.example.toml`):
+Create a TOML file (see `config.example.toml`).
+
+Gloas-scheduled networks need extra keys that this sample does not set. See
+[gloas-upgrade.md](gloas-upgrade.md) for `[fork_schedule]`, the six Gloas
+`*_DUE_BPS*` timing keys, the `SECONDS_PER_SLOT` → `SLOT_DURATION_MS` diff,
+the `network = "custom"` devnet fragment, rollback status, and the remote-signer
+gap.
 
 ```toml
 beacon_url = "http://localhost:5052"
@@ -226,9 +232,10 @@ converted (`seconds * 1000`). Deadline milliseconds are
 defaults are 3999 ms (attestation) and 8000 ms (aggregation).
 
 Gloas keys parse and validate at startup so a devnet can change
-`aggregate_due_bps_gloas` without a rebuild. They are not selected at
-runtime until fork-aware deadline resolution lands; pre-Gloas deadlines
-stay 3999 / 8000 ms on a 12 s slot.
+`aggregate_due_bps_gloas` without a rebuild. Runtime selection is
+`DeadlineSchedule::for_fork` (`>= Gloas` takes the Gloas set). Pre-Gloas
+deadlines stay 3999 / 8000 ms on a 12 s slot. Full Gloas operator keys,
+rollback status, and the remote-signer gap: [gloas-upgrade.md](gloas-upgrade.md).
 
 Unknown keys under `[timing]` fail startup and name the offending key.
 
