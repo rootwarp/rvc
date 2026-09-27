@@ -321,3 +321,15 @@ validator. Files get smaller. Protection is non-weakening.
 Electra+ aggregate fetch uses `/eth/v2`; BNs without v2 fall back once, logged.
 
 ## Wire: `SingleAttestation` sends quoted integers.
+
+## Breaking / safety: keys that reach the pubkey map earn duties
+
+Keys that reach the pubkey map — keystore load, keymanager import, and
+secret-provider refresh — now receive duties.
+
+With doppelganger enabled, signing waits on the validator-store `enabled`
+flag and the forward window. With doppelganger disabled, signing waits only
+on the store `enabled` flag — confirm these keys are not active elsewhere
+before upgrading. A pubkey already stored with `enabled = false` is not held
+there: admission inserts it enabled, and the keymanager zero-window task
+sets `enabled` true.

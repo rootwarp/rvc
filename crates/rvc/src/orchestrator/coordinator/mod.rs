@@ -1258,6 +1258,14 @@ where
         WaitOutcome::Continue
     }
 
+    /// Committee subscriptions for one epoch.
+    ///
+    /// A validator with `ValidatorStore::is_signing_enabled == false` is skipped
+    /// before any selection proof (same store gate as aggregate production).
+    pub async fn submit_committee_subscriptions(&self, epoch: u64) {
+        self.duty_management.submit_committee_subscriptions(epoch).await;
+    }
+
     /// Updates fork-resolution gauges and logs one info line per fork change.
     fn record_fork_resolution(&mut self, epoch: u64, fork: ForkName) {
         RVC_FORK_CURRENT_ID.set(i64::from(fork.id()));

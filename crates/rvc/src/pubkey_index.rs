@@ -13,7 +13,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use duty_tracker::ValidatorIndexSource;
 use parking_lot::RwLock;
+
+use crate::orchestrator::PubkeyMap;
 
 /// Shared handle for the pubkey→index registry.
 pub type SharedPubkeyIndexRegistry = Arc<RwLock<PubkeyIndexRegistry>>;
@@ -138,6 +141,29 @@ pub fn pubkey_bytes_to_0x(bytes: &[u8; 48]) -> String {
     format!("0x{}", hex::encode(bytes))
 }
 
+/// Duty indices are [`PubkeyIndexRegistry`] ∩ [`PubkeyMap`] (ADR-R06).
+///
+/// [`PubkeyIndexRegistry`] has no `remove`. A deleted key stays in the registry
+/// and drops out of this set when it leaves the pubkey map. `indices` holds one
+/// read lock on each map for the whole intersection, then returns one snapshot.
+/// Order is lexicographic (`sort` then `dedup`), a total order on the strings.
+pub struct PubkeyIndexSource {
+    pub registry: SharedPubkeyIndexRegistry,
+    pub pubkey_map: PubkeyMap,
+}
+
+impl ValidatorIndexSource for PubkeyIndexSource {
+    fn indices(&self) -> Vec<String> {
+        let map = self.pubkey_map.read();
+        let registry = self.registry.read();
+        let mut indices: Vec<String> =
+            map.keys().filter_map(|pk| registry.index_of(pk).map(str::to_owned)).collect();
+        indices.sort();
+        indices.dedup();
+        indices
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +214,45 @@ mod tests {
         m.insert(format!("0x{}", hex::encode(pk)), "99".to_string());
         reg.merge_hex_map(&m);
         assert_eq!(reg.index_of(&pk), Some("99"));
+    }
+
+    #[test]
+    fn indices_are_registry_intersect_pubkey_map() {
+        use crypto::SecretKey;
+
+        let registry = PubkeyIndexRegistry::shared();
+        let kept = SecretKey::generate().public_key();
+        let registry_only = SecretKey::generate().public_key();
+        let map_only = SecretKey::generate().public_key();
+        registry.write().insert(kept.to_bytes(), "10".to_string());
+        registry.write().insert(registry_only.to_bytes(), "2".to_string());
+
+        let mut map = HashMap::new();
+        map.insert(kept.to_bytes(), kept);
+        map.insert(map_only.to_bytes(), map_only);
+        let source = PubkeyIndexSource {
+            registry: Arc::clone(&registry),
+            pubkey_map: Arc::new(RwLock::new(map)),
+        };
+
+        assert_eq!(source.indices(), vec!["10".to_string()]);
+        assert_eq!(registry.read().index_of(&registry_only.to_bytes()), Some("2"));
+    }
+
+    #[test]
+    fn index_snapshot_order_is_lexicographic() {
+        use crypto::SecretKey;
+
+        let registry = PubkeyIndexRegistry::shared();
+        let two = SecretKey::generate().public_key();
+        let ten = SecretKey::generate().public_key();
+        registry.write().insert(two.to_bytes(), "2".to_string());
+        registry.write().insert(ten.to_bytes(), "10".to_string());
+        let mut map = HashMap::new();
+        map.insert(two.to_bytes(), two);
+        map.insert(ten.to_bytes(), ten);
+        let source = PubkeyIndexSource { registry, pubkey_map: Arc::new(RwLock::new(map)) };
+        // Total order: "10" < "2". Numeric order would panic or cycle on mixed keys.
+        assert_eq!(source.indices(), vec!["10".to_string(), "2".to_string()]);
     }
 }

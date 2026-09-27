@@ -11,6 +11,7 @@ use bn_manager::BeaconNodeClient;
 use builder::legacy_proposer_ops_retired;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, Slot};
+use observability::logging::TruncatedPubkey;
 use signer::{is_aggregator, SignerService, ValidatorSigner};
 use timing::SLOTS_PER_EPOCH;
 
@@ -444,6 +445,19 @@ impl DutyManagementService {
                 let Some(pubkey) = pubkey_snapshot.get(&duty_bytes).cloned() else {
                     continue;
                 };
+
+                // Same store gate as aggregate production: doppelganger-off
+                // signing allows every pubkey, so `enabled = false` must skip
+                // before `sign_selection_proof`.
+                let pk_bytes = pubkey.to_bytes();
+                if !self.validator_store.is_signing_enabled(&pk_bytes) {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                        slot,
+                        "Skipping committee subscription: validator signing is disabled"
+                    );
+                    continue;
+                }
 
                 let committee_length: u64 = match duty.committee_length.parse() {
                     Ok(cl) => cl,

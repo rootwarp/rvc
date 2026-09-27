@@ -126,8 +126,6 @@ pub async fn build_services(
     // block production.
     let main_beacon: Arc<dyn BeaconNodeClient> =
         Arc::clone(&beacon.bn_manager) as Arc<dyn BeaconNodeClient>;
-    let validator_indices: Vec<String> =
-        enablement.pubkey_index.read().indices().cloned().collect();
 
     let slot_duration_ms = match builder.resolve_slot_duration_ms(main_beacon.as_ref()).await {
         Ok(ms) => ms,
@@ -161,10 +159,15 @@ pub async fn build_services(
         return Err(e.into());
     }
 
-    let duty_tracker = builder.build_duty_tracker(
-        main_beacon.clone(),
-        validator_indices,
-        fork_schedule.as_ref().clone(),
+    // ADR-R06: registry ∩ PubkeyMap, one snapshot per fetch. The registry has
+    // no remove, so a deleted key leaves the effective set through this read.
+    let index_source = Arc::new(crate::pubkey_index::PubkeyIndexSource {
+        registry: Arc::clone(&enablement.pubkey_index),
+        pubkey_map: Arc::clone(&keys.pubkey_map),
+    });
+    let duty_tracker = Arc::new(
+        DutyTracker::new_with_source(main_beacon.clone(), index_source)
+            .with_fork_schedule(fork_schedule.as_ref().clone()),
     );
 
     // SEC-9 / M-15: fork mismatch is fatal by default (mirrors the GVR chain-swap
