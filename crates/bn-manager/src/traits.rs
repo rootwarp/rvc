@@ -13,7 +13,7 @@ use beacon::{
     VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
-    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
     SignedProposerPreferences, SignedValidatorRegistration,
 };
 
@@ -160,11 +160,16 @@ pub trait AttestationApi: Send + Sync {
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError>;
 
+    /// Fetch an aggregate attestation.
+    ///
+    /// The caller supplies the resolved fork for the slot, not the configured
+    /// head fork.
     async fn get_aggregate_attestation(
         &self,
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
+        fork: ForkName,
     ) -> Result<VersionedAggregateAttestation, BeaconError>;
 
     async fn submit_aggregate_and_proofs(

@@ -352,7 +352,7 @@ fn test_make_aggregation_bits_invalid_validator_committee_index() {
 
 #[tokio::test]
 async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
-    use wiremock::matchers::{method, path, path_regex, query_param};
+    use wiremock::matchers::{header, method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
@@ -403,12 +403,17 @@ async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
         .mount(&mock_server)
         .await;
 
-    // Electra aggregate response (has committee_bits field)
+    // Electra aggregate fetch is /eth/v2 with Eth-Consensus-Version.
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(header("Eth-Consensus-Version", "electra"))
         .and(query_param("slot", slot.to_string()))
         .and(query_param("committee_index", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "electra")
+                .set_body_json(serde_json::json!({
+            "version": "electra",
             "data": {
                 "aggregation_bits": "0xffffffff",
                 "data": {
@@ -427,7 +432,8 @@ async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
                 "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "committee_bits": "0x0200000000000000"
             }
-        })))
+        })),
+        )
         .mount(&mock_server)
         .await;
 
@@ -602,12 +608,17 @@ async fn test_aggregation_fulu_dispatches_as_fulu() {
         .mount(&mock_server)
         .await;
 
-    // Fulu aggregate (same structure as Electra)
+    // Fulu aggregate fetch is /eth/v2 with Eth-Consensus-Version.
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(header("Eth-Consensus-Version", "fulu"))
         .and(query_param("slot", slot.to_string()))
         .and(query_param("committee_index", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "fulu")
+                .set_body_json(serde_json::json!({
+            "version": "fulu",
             "data": {
                 "aggregation_bits": "0xffffffff",
                 "data": {
@@ -626,7 +637,8 @@ async fn test_aggregation_fulu_dispatches_as_fulu() {
                 "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "committee_bits": "0x0200000000000000"
             }
-        })))
+        })),
+        )
         .mount(&mock_server)
         .await;
 
@@ -707,10 +719,15 @@ async fn test_aggregation_gloas_dispatches_as_gloas() {
         .await;
 
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(header("Eth-Consensus-Version", "gloas"))
         .and(query_param("slot", slot.to_string()))
         .and(query_param("committee_index", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "gloas")
+                .set_body_json(serde_json::json!({
+            "version": "gloas",
             "data": {
                 "aggregation_bits": "0xffffffff",
                 "data": {
@@ -729,7 +746,8 @@ async fn test_aggregation_gloas_dispatches_as_gloas() {
                 "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "committee_bits": "0x0200000000000000"
             }
-        })))
+        })),
+        )
         .mount(&mock_server)
         .await;
 
@@ -805,21 +823,10 @@ async fn test_aggregation_mismatched_response_logs_warning() {
         .mount(&mock_server)
         .await;
 
-    // Return a pre-Electra aggregate (no committee_index param in mock)
-    // but the orchestrator expects Electra because is_electra=true.
-    // The BeaconClient uses committee_index presence to determine response type;
-    // since is_electra=true, committee_index is Some(...), so the client will request
-    // with committee_index and deserialize as ElectraAttestation.
-    // To simulate a mismatch, we need to force the beacon to return PreElectra.
-    // This is tricky with real HTTP mocks since the client decides the type based on
-    // committee_index param. Instead, we test the reverse: pre-Electra slot gets
-    // an Electra response. But that won't happen either because the client controls it.
-    //
-    // The mismatch scenario is guarded by the match arms in the orchestrator.
-    // We can verify the code compiles and handles the branch by checking that
-    // no submit endpoints are called when the aggregate fetch fails (returns 500).
+    // Electra slot fetches /eth/v2. A 500 is retried, not fallen back to v1,
+    // and nothing is submitted.
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
         .and(query_param("slot", slot.to_string()))
         .respond_with(ResponseTemplate::new(500))
         .mount(&mock_server)

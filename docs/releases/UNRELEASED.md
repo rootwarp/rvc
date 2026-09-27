@@ -315,3 +315,7 @@ Each BN attempt gets a floored share of the operation budget; timeouts degrade n
 
 Interchange exports collapse sub-watermark rows into one synthetic record per
 validator. Files get smaller. Protection is non-weakening.
+
+## Wire: Electra+ aggregate fetch
+
+Electra+ aggregate fetch uses `/eth/v2`; BNs without v2 fall back once, logged.

@@ -3867,7 +3867,10 @@ async fn test_get_aggregate_attestation_success() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, None).await.unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, None, ForkName::Phase0)
+        .await
+        .unwrap();
 
     match result {
         VersionedAggregateAttestation::PreElectra(att) => {
@@ -3896,7 +3899,8 @@ async fn test_get_aggregate_attestation_not_found() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, None).await;
+    let result =
+        client.get_aggregate_attestation(100, &att_data_root, None, ForkName::Phase0).await;
 
     match result {
         Err(BeaconError::ApiError { status, message }) => {
@@ -4030,6 +4034,7 @@ async fn test_get_aggregate_attestation_with_committee_index() {
     let sig_hex = format!("0x{}", "aa".repeat(96));
     let committee_bits_hex = "0x2000000000000000";
     let response_body = serde_json::json!({
+        "version": "electra",
         "data": {
             "aggregation_bits": format!("0x{}", "ff".repeat(4)),
             "data": {
@@ -4051,11 +4056,16 @@ async fn test_get_aggregate_attestation_with_committee_index() {
     });
 
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
         .and(wiremock::matchers::query_param("slot", "100"))
         .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
         .and(wiremock::matchers::query_param("committee_index", "5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&response_body)
+                .insert_header("Eth-Consensus-Version", "electra"),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -4063,7 +4073,10 @@ async fn test_get_aggregate_attestation_with_committee_index() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, Some(5)).await.unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
+        .await
+        .unwrap();
     match result {
         VersionedAggregateAttestation::Electra(att) => {
             assert_eq!(att.data.slot, 100);
@@ -4800,7 +4813,8 @@ async fn test_get_aggregate_attestation_pre_electra() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, None).await.unwrap();
+    let result =
+        client.get_aggregate_attestation(100, &att_data_root, None, ForkName::Deneb).await.unwrap();
     match result {
         VersionedAggregateAttestation::PreElectra(att) => {
             assert_eq!(att.data.slot, 100);
@@ -4825,6 +4839,7 @@ async fn test_get_aggregate_attestation_electra() {
     let committee_bits_hex = "0x2000000000000000";
 
     let response_body = serde_json::json!({
+        "version": "electra",
         "data": {
             "aggregation_bits": bits_hex,
             "data": {
@@ -4840,11 +4855,16 @@ async fn test_get_aggregate_attestation_electra() {
     });
 
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
         .and(wiremock::matchers::query_param("slot", "100"))
         .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
         .and(wiremock::matchers::query_param("committee_index", "5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&response_body)
+                .insert_header("Eth-Consensus-Version", "electra"),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -4852,7 +4872,10 @@ async fn test_get_aggregate_attestation_electra() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, Some(5)).await.unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
+        .await
+        .unwrap();
     match result {
         VersionedAggregateAttestation::Electra(att) => {
             assert_eq!(att.data.slot, 100);
@@ -5999,7 +6022,7 @@ async fn test_submit_builder_preferences_400_indexed_is_not_retried() {
     }
 }
 
-// RR-3.2: fork-aware aggregate fetch. The v1 tests above stay on v1 until RR-3.3.
+// Pre-Electra aggregate fetch stays on v1. Electra+ uses v2.
 
 fn sample_attestation_data_root() -> String {
     format!("0x{}", "ab".repeat(32))
@@ -6084,7 +6107,7 @@ async fn fetch_aggregate_v2(fork: ForkName, version: &str) -> AggregateV2Fetch {
 
     let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
     let result = client
-        .get_aggregate_attestation_v2(100, &att_data_root, Some(5), fork)
+        .get_aggregate_attestation(100, &att_data_root, Some(5), fork)
         .await
         .unwrap_or_else(|e| panic!("{version} aggregate fetch failed: {e}"));
     let requests = mock_server.received_requests().await.unwrap();
@@ -6110,7 +6133,7 @@ fn assert_v2_wire(fetch: &AggregateV2Fetch, header: &str) {
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_uses_v2_for_electra() {
+async fn aggregate_fetch_uses_v2_for_electra() {
     let fetch = fetch_aggregate_v2(ForkName::Electra, "electra").await;
     assert_v2_wire(&fetch, "electra");
     match fetch.result {
@@ -6123,7 +6146,7 @@ async fn aggregate_fetch_v2_uses_v2_for_electra() {
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_uses_v2_for_fulu() {
+async fn aggregate_fetch_uses_v2_for_fulu() {
     let fetch = fetch_aggregate_v2(ForkName::Fulu, "fulu").await;
     assert_v2_wire(&fetch, "fulu");
     match fetch.result {
@@ -6136,7 +6159,7 @@ async fn aggregate_fetch_v2_uses_v2_for_fulu() {
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_uses_v2_for_gloas() {
+async fn aggregate_fetch_uses_v2_for_gloas() {
     let fetch = fetch_aggregate_v2(ForkName::Gloas, "gloas").await;
     assert_v2_wire(&fetch, "gloas");
     match fetch.result {
@@ -6150,7 +6173,7 @@ async fn aggregate_fetch_v2_uses_v2_for_gloas() {
 
 #[tokio::test]
 #[tracing_test::traced_test]
-async fn aggregate_fetch_v2_falls_back_to_v1_once_on_405() {
+async fn aggregate_fetch_falls_back_to_v1_once_on_405() {
     let mock_server = MockServer::start().await;
     let att_data_root = sample_attestation_data_root();
 
@@ -6173,7 +6196,7 @@ async fn aggregate_fetch_v2_falls_back_to_v1_once_on_405() {
     let client =
         BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(3)).unwrap();
     let result = client
-        .get_aggregate_attestation_v2(100, &att_data_root, Some(5), ForkName::Electra)
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
         .await
         .unwrap_or_else(|e| panic!("405 must fall back to v1: {e}"));
     match result {
@@ -6202,7 +6225,7 @@ async fn aggregate_fetch_v2_falls_back_to_v1_once_on_405() {
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_stays_v1_pre_electra() {
+async fn aggregate_fetch_stays_v1_pre_electra() {
     let mock_server = MockServer::start().await;
     let att_data_root = sample_attestation_data_root();
 
@@ -6226,7 +6249,7 @@ async fn aggregate_fetch_v2_stays_v1_pre_electra() {
     let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
     let before = bn_capability_state(client.endpoint(), "aggregate_attestation_v2");
     let result = client
-        .get_aggregate_attestation_v2(100, &att_data_root, None, ForkName::Deneb)
+        .get_aggregate_attestation(100, &att_data_root, None, ForkName::Deneb)
         .await
         .unwrap_or_else(|e| panic!("pre-Electra fetch failed: {e}"));
     match result {
@@ -6249,7 +6272,7 @@ async fn aggregate_fetch_v2_stays_v1_pre_electra() {
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_falls_back_to_v1_once_on_501() {
+async fn aggregate_fetch_falls_back_to_v1_once_on_501() {
     let result = fallback_once(501, ForkName::Electra, "electra").await;
     match result {
         VersionedAggregateAttestation::Electra(att) => assert_eq!(att.data.slot, 100),
@@ -6258,7 +6281,7 @@ async fn aggregate_fetch_v2_falls_back_to_v1_once_on_501() {
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_gloas_405_returns_electra_not_gloas() {
+async fn aggregate_fetch_gloas_405_returns_electra_not_gloas() {
     let result = fallback_once(405, ForkName::Gloas, "gloas").await;
     match result {
         VersionedAggregateAttestation::Electra(att) => assert_eq!(att.data.slot, 100),
@@ -6296,7 +6319,7 @@ async fn fallback_once(
     let client =
         BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(3)).unwrap();
     let result = client
-        .get_aggregate_attestation_v2(100, &att_data_root, Some(5), fork)
+        .get_aggregate_attestation(100, &att_data_root, Some(5), fork)
         .await
         .unwrap_or_else(|e| panic!("{status} must fall back to v1: {e}"));
 
@@ -6324,7 +6347,7 @@ async fn fallback_once(
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_requires_committee_index_before_get() {
+async fn aggregate_fetch_requires_committee_index_before_get() {
     for fork in [ForkName::Electra, ForkName::Fulu, ForkName::Gloas] {
         let mock_server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -6334,7 +6357,7 @@ async fn aggregate_fetch_v2_requires_committee_index_before_get() {
             .await;
         let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
         let err = client
-            .get_aggregate_attestation_v2(100, &sample_attestation_data_root(), None, fork)
+            .get_aggregate_attestation(100, &sample_attestation_data_root(), None, fork)
             .await
             .expect_err("Electra+ without committee_index must fail before the GET");
         assert!(
@@ -6346,7 +6369,7 @@ async fn aggregate_fetch_v2_requires_committee_index_before_get() {
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_rejects_fork_disagreement() {
+async fn aggregate_fetch_rejects_fork_disagreement() {
     // Body says electra while the request is Gloas. Must not return Electra.
     let err = v2_disagreement(Some("electra"), Some("gloas")).await;
     assert!(matches!(err, BeaconError::ParseError(_)), "{err:?}");
@@ -6385,7 +6408,7 @@ async fn v2_disagreement(body_version: Option<&str>, response_header: Option<&st
     let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
     let before = bn_capability_state(client.endpoint(), "aggregate_attestation_v2");
     let err = client
-        .get_aggregate_attestation_v2(100, &att_data_root, Some(5), ForkName::Gloas)
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Gloas)
         .await
         .expect_err("disagreeing v2 response must be ParseError");
     assert_eq!(
@@ -6399,7 +6422,7 @@ async fn v2_disagreement(body_version: Option<&str>, response_header: Option<&st
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_rejects_committee_bits_without_index() {
+async fn aggregate_fetch_rejects_committee_bits_without_index() {
     let mock_server = MockServer::start().await;
     let att_data_root = sample_attestation_data_root();
     // Bit 0 of every byte, not bit 5.
@@ -6420,7 +6443,7 @@ async fn aggregate_fetch_v2_rejects_committee_bits_without_index() {
     let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
     let before = bn_capability_state(client.endpoint(), "aggregate_attestation_v2");
     let err = client
-        .get_aggregate_attestation_v2(100, &att_data_root, Some(5), ForkName::Electra)
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
         .await
         .expect_err("committee_bits missing index 5 must fail");
     assert!(
@@ -6435,7 +6458,7 @@ async fn aggregate_fetch_v2_rejects_committee_bits_without_index() {
 }
 
 #[tokio::test]
-async fn aggregate_fetch_v2_retries_503_then_succeeds() {
+async fn aggregate_fetch_retries_503_then_succeeds() {
     let mock_server = MockServer::start().await;
     let att_data_root = sample_attestation_data_root();
     let hits = std::sync::Arc::new(AtomicUsize::new(0));
@@ -6466,7 +6489,7 @@ async fn aggregate_fetch_v2_retries_503_then_succeeds() {
     )
     .unwrap();
     let result = client
-        .get_aggregate_attestation_v2(100, &att_data_root, Some(5), ForkName::Electra)
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
         .await
         .unwrap_or_else(|e| panic!("503 must be retried into a 200: {e}"));
     match result {

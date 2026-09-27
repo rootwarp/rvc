@@ -1135,39 +1135,11 @@ impl BeaconClient {
 
     /// Fetches an aggregate attestation for the given slot and attestation data root.
     ///
-    /// The `committee_index` parameter is required for Electra and later forks.
-    /// Pass `None` for pre-Electra requests.
-    #[tracing::instrument(name = "beacon.get_aggregate_attestation", skip_all, fields(slot = slot))]
-    pub async fn get_aggregate_attestation(
-        &self,
-        slot: u64,
-        attestation_data_root: &str,
-        committee_index: Option<u64>,
-    ) -> Result<VersionedAggregateAttestation, BeaconError> {
-        let slot_s = slot.to_string();
-        let ci_s = committee_index.map(|ci| ci.to_string());
-        let mut query: Vec<(&str, &str)> =
-            vec![("slot", &slot_s), ("attestation_data_root", attestation_data_root)];
-        if let Some(ref ci) = ci_s {
-            query.push(("committee_index", ci.as_str()));
-        }
-        let path = Self::build_path(&["eth", "v1", "validator", "aggregate_attestation"], &query);
-
-        if committee_index.is_some() {
-            let resp: DataResponse<eth_types::ElectraAttestation> = self.get(&path).await?;
-            Ok(VersionedAggregateAttestation::Electra(resp.data))
-        } else {
-            let resp: DataResponse<eth_types::Attestation> = self.get(&path).await?;
-            Ok(VersionedAggregateAttestation::PreElectra(resp.data))
-        }
-    }
-
-    /// Fork-aware aggregate fetch.
+    /// The caller supplies the resolved fork for the slot, not the configured
+    /// head fork. `committee_index` is required for Electra and later. Pass
+    /// `None` for pre-Electra requests.
     ///
-    /// Migration target for [`Self::get_aggregate_attestation`]. The v1-only
-    /// method is removed in RR-3.3; nothing in production calls this until then.
-    ///
-    /// Electra, Fulu, and Gloas require `committee_index` and send
+    /// Electra, Fulu, and Gloas send
     /// `GET /eth/v2/validator/aggregate_attestation` with
     /// `Eth-Consensus-Version` set to `fork`. A 200 is accepted only when that
     /// header, the body `version`, and `fork` are the same [`ForkName`]. The
@@ -1183,13 +1155,10 @@ impl BeaconClient {
     ///
     /// v1 has no fork field. A Fulu or Gloas 405/501 with `committee_index`
     /// therefore returns [`VersionedAggregateAttestation::Electra`], not Fulu
-    /// or Gloas. The v1 body is not re-wrapped.
-    #[tracing::instrument(
-        name = "beacon.get_aggregate_attestation_v2",
-        skip_all,
-        fields(slot = slot)
-    )]
-    pub async fn get_aggregate_attestation_v2(
+    /// or Gloas. The v1 body is not re-wrapped. Phase0 through Deneb stay on
+    /// v1 and do not send `Eth-Consensus-Version`.
+    #[tracing::instrument(name = "beacon.get_aggregate_attestation", skip_all, fields(slot = slot))]
+    pub async fn get_aggregate_attestation(
         &self,
         slot: u64,
         attestation_data_root: &str,
@@ -1203,7 +1172,16 @@ impl BeaconClient {
             | ForkName::Bellatrix
             | ForkName::Capella
             | ForkName::Deneb => {
-                self.get_aggregate_attestation(slot, attestation_data_root, committee_index).await
+                let slot_s = slot.to_string();
+                let ci_s = committee_index.map(|ci| ci.to_string());
+                let mut query: Vec<(&str, &str)> =
+                    vec![("slot", &slot_s), ("attestation_data_root", attestation_data_root)];
+                if let Some(ref ci) = ci_s {
+                    query.push(("committee_index", ci.as_str()));
+                }
+                let path =
+                    Self::build_path(&["eth", "v1", "validator", "aggregate_attestation"], &query);
+                self.read_v1_aggregate(&path, committee_index).await
             }
             ForkName::Electra => {
                 self.fetch_aggregate_attestation_v2(
@@ -1232,6 +1210,21 @@ impl BeaconClient {
                 )
                 .await
             }
+        }
+    }
+
+    /// v1 body: `Some(committee_index)` is Electra. Pre-Electra has no fork field.
+    async fn read_v1_aggregate(
+        &self,
+        path: &str,
+        committee_index: Option<u64>,
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
+        if committee_index.is_some() {
+            let resp: DataResponse<eth_types::ElectraAttestation> = self.get(path).await?;
+            Ok(VersionedAggregateAttestation::Electra(resp.data))
+        } else {
+            let resp: DataResponse<eth_types::Attestation> = self.get(path).await?;
+            Ok(VersionedAggregateAttestation::PreElectra(resp.data))
         }
     }
 
@@ -1367,7 +1360,15 @@ impl BeaconClient {
         );
         // v1 classifies Some(committee_index) as Electra. Fulu/Gloas are not
         // re-wrapped onto that body.
-        self.get_aggregate_attestation(slot, attestation_data_root, Some(committee_index)).await
+        let slot_s = slot.to_string();
+        let ci_s = committee_index.to_string();
+        let query = [
+            ("slot", slot_s.as_str()),
+            ("attestation_data_root", attestation_data_root),
+            ("committee_index", ci_s.as_str()),
+        ];
+        let path = Self::build_path(&["eth", "v1", "validator", "aggregate_attestation"], &query);
+        self.read_v1_aggregate(&path, Some(committee_index)).await
     }
 
     fn record_aggregate_v2_capability(&self, capable: bool) {
@@ -2399,10 +2400,10 @@ mod tests {
                 expected: "/eth/v3/validator/blocks/42?randao_reveal=0xabc&builder_boost_factor=50",
             },
             Case {
-                segments: &["eth", "v1", "validator", "aggregate_attestation"],
+                segments: &["eth", "v2", "validator", "aggregate_attestation"],
                 query: &[("slot", "100"), ("attestation_data_root", "0xdeadbeef")],
                 expected:
-                    "/eth/v1/validator/aggregate_attestation?slot=100&attestation_data_root=0xdeadbeef",
+                    "/eth/v2/validator/aggregate_attestation?slot=100&attestation_data_root=0xdeadbeef",
             },
         ];
 

@@ -701,7 +701,7 @@ async fn test_fork_boundary_last_pre_electra_slot() {
 
 #[tokio::test]
 async fn test_electra_aggregation_passes_committee_index() {
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
@@ -714,12 +714,17 @@ async fn test_electra_aggregation_passes_committee_index() {
 
     mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
 
-    // Mock aggregate attestation endpoint — expect committee_index query param for Electra
+    // Electra aggregate fetch is /eth/v2 and carries the committee index.
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(header("Eth-Consensus-Version", "electra"))
         .and(query_param("slot", slot.to_string()))
         .and(query_param("committee_index", "3"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "electra")
+                .set_body_json(serde_json::json!({
+            "version": "electra",
             "data": {
                 "aggregation_bits": "0xff01",
                 "data": {
@@ -738,7 +743,8 @@ async fn test_electra_aggregation_passes_committee_index() {
                 "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "committee_bits": "0x0800000000000000"
             }
-        })))
+        })),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -1367,7 +1373,7 @@ async fn test_attestation_still_zeroes_index_at_electra_and_fulu() {
 #[tokio::test]
 async fn test_aggregation_still_zeroes_index_at_electra_and_fulu() {
     use eth_types::{AttestationData, Checkpoint};
-    use wiremock::matchers::{method, path, query_param};
+    use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let schedule = mainnet_shaped_fork_schedule();
@@ -1397,12 +1403,18 @@ async fn test_aggregation_still_zeroes_index_at_electra_and_fulu() {
             .await;
         mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
 
+        let version = expected_fork.as_ref();
         Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(path("/eth/v2/validator/aggregate_attestation"))
+            .and(header("Eth-Consensus-Version", version))
             .and(query_param("slot", slot.to_string()))
             .and(query_param("committee_index", "3"))
             .and(query_param("attestation_data_root", expected_root.as_str()))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Eth-Consensus-Version", version)
+                    .set_body_json(serde_json::json!({
+                "version": version,
                 "data": {
                     "aggregation_bits": "0xff01",
                     "data": {
@@ -1421,7 +1433,8 @@ async fn test_aggregation_still_zeroes_index_at_electra_and_fulu() {
                     "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                     "committee_bits": "0x0800000000000000"
                 }
-            })))
+            })),
+            )
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -1635,15 +1648,23 @@ async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
             hex::encode(expected_attestation_data(slot, epoch, query_index).tree_hash_root().0)
         );
 
+        let aggregate_path = if electra_wire {
+            "/eth/v2/validator/aggregate_attestation"
+        } else {
+            "/eth/v1/validator/aggregate_attestation"
+        };
         let mut aggregate_mock = Mock::given(method("GET"))
-            .and(path("/eth/v1/validator/aggregate_attestation"))
+            .and(path(aggregate_path))
             .and(query_param("slot", slot.to_string()))
             .and(query_param("attestation_data_root", expected_root.as_str()));
         if electra_wire {
-            aggregate_mock = aggregate_mock.and(query_param("committee_index", "3"));
+            aggregate_mock = aggregate_mock
+                .and(query_param("committee_index", "3"))
+                .and(header("Eth-Consensus-Version", expected_fork.as_ref()));
         }
         let aggregate_body = if electra_wire {
             serde_json::json!({
+                "version": expected_fork.as_ref(),
                 "data": {
                     "aggregation_bits": "0xff01",
                     "data": {
@@ -1684,11 +1705,12 @@ async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
                 }
             })
         };
-        aggregate_mock
-            .respond_with(ResponseTemplate::new(200).set_body_json(aggregate_body))
-            .expect(1)
-            .mount(&mock_server)
-            .await;
+        let mut aggregate_response = ResponseTemplate::new(200).set_body_json(aggregate_body);
+        if electra_wire {
+            aggregate_response =
+                aggregate_response.insert_header("Eth-Consensus-Version", expected_fork.as_ref());
+        }
+        aggregate_mock.respond_with(aggregate_response).expect(1).mount(&mock_server).await;
 
         let submit_v1 = if electra_wire {
             Mock::given(method("POST"))
@@ -1755,10 +1777,7 @@ async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
         let requests = mock_server.received_requests().await.unwrap();
         let aggregate_requests: Vec<_> = requests
             .iter()
-            .filter(|r| {
-                r.url.path() == "/eth/v1/validator/aggregate_attestation"
-                    && r.method == wiremock::http::Method::GET
-            })
+            .filter(|r| r.url.path() == aggregate_path && r.method == wiremock::http::Method::GET)
             .collect();
         assert!(!aggregate_requests.is_empty(), "{label}: expected aggregate_attestation request");
         for req in &aggregate_requests {
@@ -1768,18 +1787,32 @@ async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
                     query.contains("committee_index=3"),
                     "{label}: Electra+ aggregate branch must pass committee_index, got: {query}"
                 );
+                let got = req
+                    .headers
+                    .get("Eth-Consensus-Version")
+                    .expect("Eth-Consensus-Version")
+                    .to_str()
+                    .unwrap();
+                assert_eq!(got, expected_fork.as_ref(), "{label}: aggregate fetch fork header");
             } else {
                 assert!(
                     !query.contains("committee_index"),
                     "{label}: Deneb aggregate must not include committee_index, got: {query}"
                 );
+                assert_eq!(aggregate_path, "/eth/v1/validator/aggregate_attestation");
             }
         }
     }
 }
 
-fn electra_aggregate_response(slot: u64, epoch: u64, index: &str) -> serde_json::Value {
+fn electra_aggregate_response(
+    slot: u64,
+    epoch: u64,
+    index: &str,
+    version: &str,
+) -> serde_json::Value {
     serde_json::json!({
+        "version": version,
         "data": {
             "aggregation_bits": "0xff01",
             "data": {
@@ -1817,15 +1850,21 @@ async fn mount_electra_plus_aggregate_mocks(
     );
 
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(header("Eth-Consensus-Version", consensus_version))
         .and(query_param("slot", slot.to_string()))
         .and(query_param("committee_index", "3"))
         .and(query_param("attestation_data_root", expected_root.as_str()))
-        .respond_with(ResponseTemplate::new(200).set_body_json(electra_aggregate_response(
-            slot,
-            epoch,
-            &query_index.to_string(),
-        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", consensus_version)
+                .set_body_json(electra_aggregate_response(
+                    slot,
+                    epoch,
+                    &query_index.to_string(),
+                    consensus_version,
+                )),
+        )
         .expect(1)
         .mount(mock_server)
         .await;

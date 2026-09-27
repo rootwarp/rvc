@@ -41,7 +41,7 @@ use bn_manager::{
 use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 use duty_tracker::DutyTracker;
 use eth_types::{
-    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
     SignedProposerPreferences, SignedValidatorRegistration, Slot,
 };
 use metrics::definitions::{slot_phase_cache, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS};
@@ -322,8 +322,11 @@ impl AttestationApi for DutyStallBeacon {
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
+        fork: ForkName,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
-        self.inner.get_aggregate_attestation(slot, attestation_data_root, committee_index).await
+        self.inner
+            .get_aggregate_attestation(slot, attestation_data_root, committee_index, fork)
+            .await
     }
     async fn submit_aggregate_and_proofs(
         &self,

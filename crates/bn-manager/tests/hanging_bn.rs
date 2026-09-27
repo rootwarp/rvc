@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use beacon::{BeaconClient, BeaconClientConfig};
-use eth_types::ForkSchedule;
+use eth_types::{ForkName, ForkSchedule};
 use wiremock::matchers::any;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -82,7 +82,9 @@ fn op_submit_attestation(manager: &BnManager) -> OpFut<'_> {
 }
 
 fn op_get_aggregate_attestation(manager: &BnManager) -> OpFut<'_> {
-    Box::pin(async { manager.get_aggregate_attestation(1, "0x11", Some(0)).await.map(|_| ()) })
+    Box::pin(async {
+        manager.get_aggregate_attestation(1, "0x11", Some(0), ForkName::Electra).await.map(|_| ())
+    })
 }
 
 fn op_get_payload_attestation_data(manager: &BnManager) -> OpFut<'_> {

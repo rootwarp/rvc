@@ -315,6 +315,7 @@ impl AggregationService {
                 slot,
                 &att_data_root_hex,
                 electra_committee_index,
+                fork_name,
             ),
         )
         .instrument(agg_span.clone())
@@ -691,7 +692,10 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use beacon::{DataResponse, DependentRootResponse, VersionedAggregateAttestation};
+    use beacon::{
+        DataResponse, DependentRootResponse, VersionedAggregateAttestation,
+        VersionedSignedAggregateAndProof,
+    };
     use bn_manager::MockBeaconNodeClient;
     use crypto::{
         signing_root_for, CompositeSigner, DutyRef, KeyManager, LocalSigner, PublicKey, SecretKey,
@@ -780,6 +784,26 @@ mod tests {
         duty_slot: Slot,
         aggregate: VersionedAggregateAttestation,
     ) -> MockBeaconNodeClient {
+        capturing_tracking_beacon(
+            duty_pubkey,
+            submit_agg_calls,
+            duty_slot,
+            aggregate,
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    }
+
+    /// Same fixture as [`tracking_beacon`], plus the fork passed to the fetch
+    /// and the submitted proof batch.
+    fn capturing_tracking_beacon(
+        duty_pubkey: String,
+        submit_agg_calls: Arc<AtomicUsize>,
+        duty_slot: Slot,
+        aggregate: VersionedAggregateAttestation,
+        fetched_forks: Arc<Mutex<Vec<ForkName>>>,
+        submitted: Arc<Mutex<Vec<VersionedSignedAggregateAndProof>>>,
+    ) -> MockBeaconNodeClient {
         MockBeaconNodeClient::new()
             .with_slot_aware_block_root(0, &[], |_queried| {
                 "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()
@@ -822,7 +846,8 @@ mod tests {
                     },
                 })
             })
-            .with_get_aggregate_attestation(move |slot, _root, _idx| {
+            .with_get_aggregate_attestation(move |slot, _root, _idx, fork| {
+                fetched_forks.lock().unwrap().push(fork);
                 let mut agg = aggregate.clone();
                 match &mut agg {
                     VersionedAggregateAttestation::PreElectra(a) => a.data.slot = slot,
@@ -832,7 +857,8 @@ mod tests {
                 }
                 Ok(agg)
             })
-            .with_submit_aggregate_and_proofs(move |_proofs| {
+            .with_submit_aggregate_and_proofs(move |proofs| {
+                submitted.lock().unwrap().push(proofs);
                 submit_agg_calls.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
@@ -1337,5 +1363,99 @@ mod tests {
             );
             assert_eq!(submit_calls.load(Ordering::SeqCst), 0, "{label}: must not submit");
         }
+    }
+
+    async fn produce_captured(
+        config: OrchestratorConfig,
+        epoch: u64,
+        aggregate: VersionedAggregateAttestation,
+    ) -> (Vec<ForkName>, Vec<VersionedSignedAggregateAndProof>) {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let slot = epoch * SLOTS_PER_EPOCH;
+        let fetched = Arc::new(Mutex::new(Vec::new()));
+        let submitted = Arc::new(Mutex::new(Vec::new()));
+        let beacon = Arc::new(capturing_tracking_beacon(
+            pk_hex,
+            Arc::new(AtomicUsize::new(0)),
+            slot,
+            aggregate,
+            fetched.clone(),
+            submitted.clone(),
+        ));
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        let mut map = HashMap::new();
+        map.insert(pk.to_bytes(), pk);
+        let service = AggregationService::new(
+            local_signer_service(sk),
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            config,
+            enabled_store(pk_bytes),
+        );
+        service.maybe_produce_aggregations(slot, epoch).await;
+        let forks = fetched.lock().unwrap().clone();
+        let proofs = submitted.lock().unwrap().clone();
+        (forks, proofs)
+    }
+
+    #[tokio::test]
+    async fn gloas_aggregate_is_fetched_and_dispatched_end_to_end() {
+        let gloas_epoch = 70;
+        let slot = gloas_epoch * SLOTS_PER_EPOCH;
+        let mut aggregate = electra_attestation(slot);
+        aggregate.signature = vec![0xcd; 96];
+        let (forks, submitted) = produce_captured(
+            gloas_config(gloas_epoch),
+            gloas_epoch,
+            VersionedAggregateAttestation::Gloas(aggregate),
+        )
+        .await;
+
+        assert_eq!(forks, vec![ForkName::Gloas], "fetch must see the slot's Gloas fork");
+        assert_eq!(submitted.len(), 1, "Gloas aggregate must be submitted once");
+        match &submitted[0] {
+            VersionedSignedAggregateAndProof::Gloas(proofs) => {
+                assert_eq!(proofs.len(), 1);
+                assert_eq!(proofs[0].message.aggregate.signature, vec![0xcd; 96]);
+                assert_eq!(proofs[0].message.aggregate.data.slot, slot);
+            }
+            other => panic!("fetched Gloas aggregate must be dispatched as Gloas, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_fork_passed_to_the_fetch_is_the_fork_resolved_for_the_slot() {
+        let fulu_epoch = 60;
+        let fulu_slot = fulu_epoch * SLOTS_PER_EPOCH;
+        let (fulu_forks, _) = produce_captured(
+            create_test_config(),
+            fulu_epoch,
+            VersionedAggregateAttestation::Fulu(electra_attestation(fulu_slot)),
+        )
+        .await;
+        assert_eq!(
+            fulu_forks,
+            vec![ForkName::Fulu],
+            "Fulu slot must not pass Phase0, Electra, or a stale head fork"
+        );
+
+        let gloas_epoch = 70;
+        let gloas_slot = gloas_epoch * SLOTS_PER_EPOCH;
+        let (gloas_forks, _) = produce_captured(
+            gloas_config(gloas_epoch),
+            gloas_epoch,
+            VersionedAggregateAttestation::Gloas(electra_attestation(gloas_slot)),
+        )
+        .await;
+        assert_eq!(
+            gloas_forks,
+            vec![ForkName::Gloas],
+            "Gloas slot must not keep the previous Fulu fork"
+        );
     }
 }

@@ -19,7 +19,7 @@ use beacon::{
     VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
-    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
     SignedProposerPreferences, SignedValidatorRegistration, Slot,
 };
 
@@ -104,7 +104,7 @@ pub struct MockBeaconNodeClient {
     get_attestation_data: MethodHook<(u64, u64), AttestationDataResponse>,
     submit_attestation: MethodHook<VersionedAttestation, SubmitAttestationResult>,
     get_aggregate_attestation:
-        MethodHook<(u64, String, Option<u64>), VersionedAggregateAttestation>,
+        MethodHook<(u64, String, Option<u64>, ForkName), VersionedAggregateAttestation>,
     submit_aggregate_and_proofs: MethodHook<VersionedSignedAggregateAndProof, ()>,
     submit_beacon_committee_subscriptions: MethodHook<Vec<BeaconCommitteeSubscription>, ()>,
     // PayloadAttestationApi
@@ -403,13 +403,18 @@ impl MockBeaconNodeClient {
 
     pub fn with_get_aggregate_attestation(
         self,
-        f: impl Fn(u64, String, Option<u64>) -> Result<VersionedAggregateAttestation, BeaconError>
+        f: impl Fn(
+                u64,
+                String,
+                Option<u64>,
+                ForkName,
+            ) -> Result<VersionedAggregateAttestation, BeaconError>
             + Send
             + Sync
             + 'static,
     ) -> Self {
         self.get_aggregate_attestation
-            .set_handler(Arc::new(move |(slot, root, idx)| f(slot, root, idx)));
+            .set_handler(Arc::new(move |(slot, root, idx, fork)| f(slot, root, idx, fork)));
         self
     }
 
@@ -790,10 +795,11 @@ impl AttestationApi for MockBeaconNodeClient {
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
+        fork: ForkName,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
         self.get_aggregate_attestation.invoke(
             "get_aggregate_attestation",
-            (slot, attestation_data_root.to_string(), committee_index),
+            (slot, attestation_data_root.to_string(), committee_index, fork),
         )
     }
 

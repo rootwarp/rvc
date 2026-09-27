@@ -16,7 +16,7 @@ use beacon::{
     WireBody,
 };
 use eth_types::{
-    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
     SignedProposerPreferences, SignedValidatorRegistration,
 };
 use futures::future::join_all;
@@ -2045,6 +2045,7 @@ impl AttestationApi for BnManager {
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
+        fork: ForkName,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
         let deadline = self
             .op_timeout(|t| t.aggregate_fetch)
@@ -2054,7 +2055,14 @@ impl AttestationApi for BnManager {
             BnRole::Aggregation,
             HealthTier::SmallLag,
             deadline,
-            |c| Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index)),
+            |c| {
+                Box::pin(c.get_aggregate_attestation(
+                    slot,
+                    attestation_data_root,
+                    committee_index,
+                    fork,
+                ))
+            },
         )
         .await
     }
@@ -2389,6 +2397,7 @@ impl_beacon_client_passthrough! {
             slot: u64,
             attestation_data_root: &str,
             committee_index: Option<u64>,
+            fork: ForkName,
         ) -> Result<VersionedAggregateAttestation, BeaconError>;
         async fn submit_aggregate_and_proofs(
             &self,
