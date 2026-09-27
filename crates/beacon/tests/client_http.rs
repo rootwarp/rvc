@@ -3305,6 +3305,58 @@ fn publish_builder_url_header(request: &wiremock::Request) -> Option<&str> {
     request.headers.get(HEADER_ETH_BUILDER_URL).and_then(|v| v.to_str().ok())
 }
 
+fn electra_signed_block_contents() -> eth_types::SignedBlockContentsJson {
+    let signed = eth_types::SignedBeaconBlock {
+        message: eth_types::external_vector_electra_block(),
+        signature: vec![0xab; eth_types::SIGNATURE_BYTES_LEN],
+    };
+    eth_types::SignedBlockContentsJson::from_signed_block(
+        &signed,
+        vec![vec![0x11; 48], vec![0x12; 48]],
+        vec![vec![0x22; 16]],
+        eth_types::BodyForkLayout::Electra,
+    )
+    .expect("electra body encodes")
+}
+
+#[tokio::test]
+async fn publish_block_contents_posts_the_three_field_container() {
+    let mock_server = MockServer::start().await;
+    let contents = electra_signed_block_contents();
+    let expected = serde_json::to_value(&contents).expect("serialize contents");
+    assert!(expected["signed_block"].is_object());
+    assert!(expected["kzg_proofs"].is_array());
+    assert!(expected["blobs"].is_array());
+    assert!(expected["signed_block"]["message"]["body"].is_object());
+    let builder = "https://builder.example/echo";
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .and(body_json(&expected))
+        .and(wiremock::matchers::header(HEADER_ETH_CONSENSUS_VERSION, "electra"))
+        .and(wiremock::matchers::header(HEADER_ETH_BUILDER_URL, builder))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    client.publish_block_contents(&contents, "electra", Some(builder)).await.unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let posted: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(posted["signed_block"].is_object());
+    assert!(posted["kzg_proofs"].is_array());
+    assert!(posted["blobs"].is_array());
+    assert!(posted["signed_block"]["message"]["body"].is_object());
+    assert_eq!(
+        requests[0].headers.get(HEADER_ETH_CONSENSUS_VERSION).and_then(|v| v.to_str().ok()),
+        Some("electra")
+    );
+    assert_eq!(publish_builder_url_header(&requests[0]), Some(builder));
+}
+
 #[tokio::test]
 async fn test_publish_block_echoes_builder_url_from_produce_response() {
     let mock_server = MockServer::start().await;

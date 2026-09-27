@@ -82,15 +82,15 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 358 | 2 | — | test-only | Gloas round-trip builds a zeroed index to prove the signing path did not zero it. | — |
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 385 | 2 | — | test-only | Electra/Fulu round-trip expects the submitted index to be zeroed. | — |
 | `bin/rvc/tests/common/mock_bn.rs` 267 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
-| `crates/beacon/src/client.rs` 1169 | 3 | exhaustive | inherit-intentionally | Aggregate fetch v2 request table. Exhaustive `match fork` so a new variant is a compile error, not a silent v1 or v2 inherit. | RR-3.2 |
-| `crates/beacon/src/client.rs` 2006 | 3 | exhaustive | inherit-intentionally | v2 200 is accepted only when the response header, body `version`, and the requested fork agree. Pre-Electra is not decoded on this path. | RR-3.2 |
+| `crates/beacon/src/client.rs` 1189 | 3 | exhaustive | inherit-intentionally | Aggregate fetch v2 request table. Exhaustive `match fork` so a new variant is a compile error, not a silent v1 or v2 inherit. | RR-3.2 |
+| `crates/beacon/src/client.rs` 2026 | 3 | exhaustive | inherit-intentionally | v2 200 is accepted only when the response header, body `version`, and the requested fork agree. Pre-Electra is not decoded on this path. | RR-3.2 |
 | `crates/block-service/src/service/mod.rs` 1042 | 3 | exhaustive | inherit-intentionally | `ssz_block_format` named Gloas `BeaconBlock` arm; exhaustive `match fork` so a new variant is a compile error, not a silent `BlockContents`/`BeaconBlock` inherit. Unknown version strings fail closed before the match. | 6.4 |
 | `crates/eth-types/src/fork.rs` 190 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
 | `crates/eth-types/src/fork.rs` 208 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 78 | 3 | exhaustive | test-only | Test maps Electra/Fulu/Gloas epochs. `other` panics; not a production dispatch. | — |
-| `crates/block-service/src/service/tests/mocks.rs` 922 | 4 | _ | test-only | Test body SSZ picker. Wildcard `_ =>` Deneb body. Mirrors production string dispatch. | — |
-| `crates/block-service/src/service/tests/mocks.rs` 936 | 4 | _ | test-only | Blinded-body twin of 922. | — |
-| `crates/block-service/src/service/tests/mocks.rs` 1029 | 4 | exhaustive | test-only | `matches!` on deneb/electra/fulu for `BlockContents` bytes. Closed string set; `"gloas"` is false. | — |
+| `crates/block-service/src/service/tests/mocks.rs` 952 | 4 | _ | test-only | Test body SSZ picker. Wildcard `_ =>` Deneb body. Mirrors production string dispatch. | — |
+| `crates/block-service/src/service/tests/mocks.rs` 966 | 4 | _ | test-only | Blinded-body twin of 952. | — |
+| `crates/block-service/src/service/tests/mocks.rs` 1059 | 4 | exhaustive | test-only | `matches!` on deneb/electra/fulu for `BlockContents` bytes. Closed string set; `"gloas"` is false. | — |
 | `crates/block-service/src/service/tests/propose.rs` 262 | 4 | exhaustive | test-only | Asserts `ConsensusVersionMismatch` for a Gloas slot advertised as deneb. | — |
 | `crates/block-service/src/service/tests/ssz.rs` 292 | 4 | exhaustive | test-only | SSZ twin of the propose.rs version-mismatch assert. | — |
 | `crates/block-service/src/service/tests/v4.rs` 138 | 4 | exhaustive | test-only | Fulu slot with a gloas JSON version must fail closed. | — |

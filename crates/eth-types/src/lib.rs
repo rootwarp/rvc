@@ -24,6 +24,8 @@ pub mod networks;
 mod payload_attestation;
 mod proposer_preferences;
 pub(crate) mod serde_signature;
+/// Beacon-API `SignedBlockContents` JSON. Body is an object; no production caller yet.
+pub mod signed_block_contents_json;
 pub mod ssz_helpers;
 mod sync_committee;
 pub(crate) mod tree_hash_utils;
@@ -44,6 +46,7 @@ pub use block_body::{
     BeaconBlockBodyElectra, BlindedBeaconBlockBodyDeneb, BlindedBeaconBlockBodyElectra,
     BodySszError, ExecutionPayload, ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
 };
+pub use signed_block_contents_json::SignedBlockContentsJson;
 
 /// Deterministic SSZ/KAT bodies and known roots for tests (RF3-19 / G5).
 ///

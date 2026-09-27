@@ -55,6 +55,14 @@ pub enum BlockServiceError {
     /// Envelope sign/publish failed after the block was already published.
     #[error("self-build envelope failed after block publish: {0}")]
     EnvelopeAfterPublish(String),
+
+    /// This client does not implement the named operation.
+    ///
+    /// `publish_block_contents` returns this by default so a test double fails
+    /// closed instead of dropping sidecars. Override that method on any client
+    /// used for a live JSON publish path.
+    #[error("{0} is unsupported; override it on any client used for a live JSON publish path")]
+    Unsupported(&'static str),
 }
 
 impl From<BeaconError> for BlockServiceError {

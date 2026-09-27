@@ -11,8 +11,8 @@ use tracing::{debug, error, trace, warn, Instrument};
 use observability::logging::RedactedUrl;
 
 use eth_types::{
-    ForkName, ForkSchedule, PayloadAttestationMessage, SignedProposerPreferences,
-    SignedValidatorRegistration, SignedVoluntaryExit,
+    ForkName, ForkSchedule, PayloadAttestationMessage, SignedBlockContentsJson,
+    SignedProposerPreferences, SignedValidatorRegistration, SignedVoluntaryExit,
 };
 
 use crate::http_caps::{read_body_capped, read_body_capped_lossy, ResponseCaps};
@@ -928,6 +928,26 @@ impl BeaconClient {
             },
         )
         .await
+    }
+
+    /// Publishes `{signed_block, kzg_proofs, blobs}` as JSON.
+    ///
+    /// Same headers as [`Self::publish_block`]: `Eth-Consensus-Version`, and the
+    /// produce-time `Eth-Builder-Url` echo when `builder_url` is `Some`.
+    /// No production caller yet.
+    pub async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        let mut headers = vec![(HEADER_ETH_CONSENSUS_VERSION, consensus_version)];
+        if let Some(url) = builder_url {
+            headers.push((HEADER_ETH_BUILDER_URL, url));
+        }
+        self.post_empty_with_headers("/eth/v2/beacon/blocks", contents, &headers)
+            .instrument(tracing::info_span!("beacon.publish_block_contents"))
+            .await
     }
 
     /// Publishes a signed execution payload envelope with blobs and proofs.

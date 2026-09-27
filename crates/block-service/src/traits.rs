@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
+use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContentsJson, Slot};
 
 use crate::BlockServiceError;
 
@@ -58,6 +58,20 @@ pub trait BeaconBlockClient: Send + Sync {
         is_blinded: bool,
         builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError>;
+
+    /// Publish `{signed_block, kzg_proofs, blobs}` as JSON.
+    ///
+    /// Overriding is required for any client on a live JSON publish path. The
+    /// default exists so test doubles fail closed rather than silently dropping
+    /// sidecars.
+    async fn publish_block_contents(
+        &self,
+        _contents: &SignedBlockContentsJson,
+        _consensus_version: &str,
+        _builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        Err(BlockServiceError::Unsupported("publish_block_contents"))
+    }
 
     async fn publish_execution_payload_envelope(
         &self,
@@ -132,5 +146,92 @@ mod tests {
             [expected.as_str()],
             "ProduceBlockResponse must have exactly one struct definition under crates/**/src; found: {hits:?}"
         );
+    }
+}
+
+#[cfg(test)]
+struct BareClient;
+
+#[cfg(test)]
+#[async_trait]
+impl BeaconBlockClient for BareClient {
+    async fn produce_block_v3(
+        &self,
+        _slot: eth_types::Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_boost_factor: Option<u64>,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        unreachable!("unused")
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: eth_types::Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        unreachable!("unused")
+    }
+
+    async fn publish_block(
+        &self,
+        _signed_block: &eth_types::SignedBeaconBlock,
+        _consensus_version: &str,
+        _builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        unreachable!("unused")
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        _signed_block: &eth_types::SignedBlindedBeaconBlock,
+        _consensus_version: &str,
+    ) -> Result<(), BlockServiceError> {
+        unreachable!("unused")
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        _ssz_bytes: &[u8],
+        _consensus_version: &str,
+        _is_blinded: bool,
+        _builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        unreachable!("unused")
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &WireBody,
+        _blobs: &WireBody,
+        _kzg_proofs: &WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        unreachable!("unused")
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn default_publish_block_contents_is_an_error() {
+    let signed = eth_types::SignedBeaconBlock {
+        message: eth_types::external_vector_electra_block(),
+        signature: vec![0x11; eth_types::SIGNATURE_BYTES_LEN],
+    };
+    let contents = eth_types::SignedBlockContentsJson::from_signed_block(
+        &signed,
+        Vec::new(),
+        Vec::new(),
+        eth_types::BodyForkLayout::Electra,
+    )
+    .expect("electra body encodes");
+
+    let err = BareClient.publish_block_contents(&contents, "electra", None).await.unwrap_err();
+    match err {
+        BlockServiceError::Unsupported(op) => assert_eq!(op, "publish_block_contents"),
+        other => panic!("expected Unsupported, got {other}"),
     }
 }

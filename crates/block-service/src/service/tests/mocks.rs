@@ -3,7 +3,10 @@
 use super::*;
 use async_trait::async_trait;
 use beacon::WireBody;
-use eth_types::{BeaconBlock, BlindedBeaconBlock, SignedBeaconBlock, SignedBlindedBeaconBlock};
+use eth_types::{
+    BeaconBlock, BlindedBeaconBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SignedBlockContentsJson,
+};
 use signer::{BeaconBlockHeaderFields, SignerError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -55,6 +58,13 @@ pub(crate) struct CapturedSszPublish {
     pub(crate) bytes: Vec<u8>,
     pub(crate) consensus_version: String,
     pub(crate) is_blinded: bool,
+    pub(crate) builder_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct CapturedContentsPublish {
+    pub(crate) contents: SignedBlockContentsJson,
+    pub(crate) consensus_version: String,
     pub(crate) builder_url: Option<String>,
 }
 
@@ -392,6 +402,7 @@ pub(crate) struct MockBeaconClient {
     pub(crate) publish_calls: Mutex<Vec<String>>,
     pub(crate) publish_blinded_calls: Mutex<Vec<String>>,
     pub(crate) publish_ssz_calls: Mutex<Vec<CapturedSszPublish>>,
+    pub(crate) publish_contents_calls: Mutex<Vec<CapturedContentsPublish>>,
     pub(crate) produce_full_calls: Mutex<Vec<CapturedProduceCall>>,
     pub(crate) produce_v3_calls: Mutex<Vec<CapturedProduceCall>>,
     pub(crate) produce_v4_calls: Mutex<Vec<CapturedProduceV4Call>>,
@@ -412,6 +423,7 @@ impl MockBeaconClient {
             publish_calls: Mutex::new(Vec::new()),
             publish_blinded_calls: Mutex::new(Vec::new()),
             publish_ssz_calls: Mutex::new(Vec::new()),
+            publish_contents_calls: Mutex::new(Vec::new()),
             produce_full_calls: Mutex::new(Vec::new()),
             produce_v3_calls: Mutex::new(Vec::new()),
             produce_v4_calls: Mutex::new(Vec::new()),
@@ -736,6 +748,24 @@ impl BeaconBlockClient for MockBeaconClient {
             bytes: ssz_bytes.to_vec(),
             consensus_version: consensus_version.to_string(),
             is_blinded,
+            builder_url: builder_url.map(str::to_string),
+        });
+        if self.fail_publish {
+            return Err(BlockServiceError::Beacon("publish failed".to_string()));
+        }
+        Ok(())
+    }
+
+    async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        self.trace("publish_block_contents");
+        self.publish_contents_calls.lock().unwrap().push(CapturedContentsPublish {
+            contents: contents.clone(),
+            consensus_version: consensus_version.to_string(),
             builder_url: builder_url.map(str::to_string),
         });
         if self.fail_publish {
@@ -1109,6 +1139,40 @@ pub(crate) async fn test_publish_call_captures_block_fields() {
     let calls = beacon_arc.publish_full_calls.lock().unwrap();
     assert_eq!(calls[0].consensus_version, "deneb");
     assert_eq!(calls[0].signature_bytes, mock_block_sig().to_bytes().to_vec());
+}
+
+#[tokio::test]
+async fn capture_mock_records_published_contents() {
+    let client = MockBeaconClient::unblinded(test_block(1));
+    let signed = SignedBeaconBlock {
+        message: eth_types::external_vector_electra_block(),
+        signature: vec![0xab; eth_types::SIGNATURE_BYTES_LEN],
+    };
+    let proofs = vec![vec![0x11; 48]];
+    let blobs = vec![vec![0x22; 8]];
+    let contents = SignedBlockContentsJson::from_signed_block(
+        &signed,
+        proofs.clone(),
+        blobs.clone(),
+        eth_types::BodyForkLayout::Electra,
+    )
+    .expect("electra body encodes");
+
+    client
+        .publish_block_contents(&contents, "electra", Some("https://builder.example/echo"))
+        .await
+        .unwrap();
+
+    let calls = client.publish_contents_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "capture mock must record publish_block_contents");
+    assert_eq!(calls[0].consensus_version, "electra");
+    assert_eq!(calls[0].builder_url.as_deref(), Some("https://builder.example/echo"));
+    assert_eq!(calls[0].contents.kzg_proofs, proofs);
+    assert_eq!(calls[0].contents.blobs, blobs);
+    let body = serde_json::to_value(&calls[0].contents).unwrap();
+    assert!(body["signed_block"]["message"]["body"].is_object());
+    assert!(body["kzg_proofs"].is_array());
+    assert!(body["blobs"].is_array());
 }
 
 #[tokio::test]
