@@ -86,7 +86,7 @@ fn read_process_metrics_linux() -> (u64, u64) {
     let utime: u64 = fields[13].parse().unwrap_or(0);
     let stime: u64 = fields[14].parse().unwrap_or(0);
     let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-    let cpu_seconds = if ticks_per_sec > 0 { (utime + stime) / ticks_per_sec } else { 0 };
+    let cpu_seconds = (utime + stime).checked_div(ticks_per_sec).unwrap_or(0);
 
     // Field 23 = rss (pages)
     let rss_pages: u64 = fields[23].parse().unwrap_or(0);

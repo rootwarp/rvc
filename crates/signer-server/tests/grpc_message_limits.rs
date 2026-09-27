@@ -69,7 +69,7 @@ impl TestService {
         Arc::clone(&self.handler_started)
     }
 
-    async fn run_instrumented_handler(&self) -> Result<Response<SignResponse>, Status> {
+    async fn run_instrumented_handler(&self) -> Response<SignResponse> {
         let prev = self.concurrent.fetch_add(1, Ordering::SeqCst);
         let cur = prev + 1;
 
@@ -94,7 +94,7 @@ impl TestService {
         }
 
         self.concurrent.fetch_sub(1, Ordering::SeqCst);
-        Ok(Response::new(SignResponse { signature: vec![0u8; 96] }))
+        Response::new(SignResponse { signature: vec![0u8; 96] })
     }
 }
 
@@ -104,7 +104,7 @@ impl SignerServiceV2 for TestService {
         &self,
         _request: Request<SignBeaconBlockRequest>,
     ) -> Result<Response<SignResponse>, Status> {
-        self.run_instrumented_handler().await
+        Ok(self.run_instrumented_handler().await)
     }
 
     async fn sign_blinded_beacon_block(
