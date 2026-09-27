@@ -222,6 +222,15 @@ keep working even if an example snippet later adds a nested table beside them.
 
 ---
 
+## Behaviour: `rvc slashing prune` source watermark
+
+`rvc slashing prune` now raises the source floor before it deletes rows below
+the target watermark. A database already pruned under the old code is not
+repaired: those deleted rows cannot be reconstructed, and this change only
+affects later prunes.
+
+---
+
 ## Config: no knob removed, renamed, or re-defaulted (section collapse)
 
 **The section-table collapse did not remove, rename, or re-default a knob.**

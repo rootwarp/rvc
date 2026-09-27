@@ -3,7 +3,7 @@
 use std::process::Command;
 
 use eth_types::Root;
-use slashing::SlashingDb;
+use slashing::{SlashingDb, SlashingError};
 use tempfile::TempDir;
 
 const TEST_GVR: Root = [0u8; 32];
@@ -144,6 +144,40 @@ fn prune_no_watermarks_is_actionable() {
         combined.contains("no watermarks") || combined.contains("import"),
         "expected NoWatermarksSet operator message, got: {combined}"
     );
+}
+
+#[test]
+fn prune_then_surround_is_refused() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("slashing.db");
+    {
+        let db = SlashingDb::open(&path).unwrap();
+        db.seed_attestation("0x1234", 5, 10, None, &TEST_GVR).unwrap();
+        db.set_attestation_watermark("0x1234", 1, 11).unwrap();
+    }
+
+    let output = Command::new(rvc_bin())
+        .args(["slashing", "prune", "--slashing-db-path", path.to_str().unwrap(), "--yes"])
+        .output()
+        .expect("run rvc");
+
+    assert!(
+        output.status.success(),
+        "stderr={} stdout={}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let db = SlashingDb::open(&path).unwrap();
+    assert!(db.get_attestations("0x1234").unwrap().is_empty(), "pruned row must be gone");
+    let err = db
+        .check_and_record_attestation("0x1234", 2, 12, None, &TEST_GVR)
+        .expect_err("surround of a pruned row must be refused");
+    assert!(
+        matches!(err, SlashingError::BelowAttestationSourceWatermark { source_epoch: 2, .. }),
+        "expected source-watermark refusal of (2, 12), got {err:?}"
+    );
+    assert_eq!(db.get_attestation_watermark("0x1234").unwrap(), Some((5, 11)));
 }
 
 #[test]

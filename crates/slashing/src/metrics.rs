@@ -2,7 +2,7 @@
 
 use std::sync::LazyLock;
 
-use metrics::{define_int_counter_vec, IntCounterVec};
+use metrics::{define_int_counter, define_int_counter_vec, IntCounter, IntCounterVec};
 
 pub use metrics::definitions::{prune_type, reconcile_outcome, tx_hold_kind};
 
@@ -15,6 +15,19 @@ pub static RVC_SLASHING_DB_PRUNE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
         &["type"],
     )
 });
+
+/// Attestation source watermarks prune actually raised.
+///
+/// One increment per pubkey whose stored source floor strictly increased
+/// (including a floor that was absent). An equal or higher existing floor is
+/// not a raise and does not increment.
+pub static RVC_SLASHING_PRUNE_SOURCE_BOUND_RAISED_TOTAL: LazyLock<IntCounter> =
+    LazyLock::new(|| {
+        define_int_counter(
+            "rvc_slashing_prune_source_bound_raised_total",
+            "Total attestation source watermarks raised by slashing DB prune",
+        )
+    });
 
 /// Compensating-delete outcomes for a reserved slashing history row.
 ///
@@ -31,6 +44,7 @@ pub static RVC_SLASHING_RECONCILE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
 pub fn init() {
     LazyLock::force(&RVC_SLASHING_DB_PRUNE_TOTAL);
     LazyLock::force(&RVC_SLASHING_RECONCILE_TOTAL);
+    LazyLock::force(&RVC_SLASHING_PRUNE_SOURCE_BOUND_RAISED_TOTAL);
 }
 
 #[cfg(test)]

@@ -16,6 +16,7 @@
 //! Issue 7.6 adds `rvc_ptc_duties_total` and `rvc_ptc_attestations_total` (family delta +2).
 //! Issue 8.4 adds `rvc_signer_rejections_total` (family delta +1).
 //! Issue 8.1 adds `rvc_fork_current_id` and `rvc_fork_next_activation_epoch` (family delta +2).
+//! RR-4.1 adds `rvc_slashing_prune_source_bound_raised_total` (family delta +1).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -92,6 +93,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_signing_duration_seconds",
     "rvc_slashing_db_prune_total",
     "rvc_slashing_protection_checks_total",
+    "rvc_slashing_prune_source_bound_raised_total", // operator-facing: prune raised an attestation source floor (RR-4.1)
     "rvc_slashing_reconcile_total",
     "rvc_slashing_reserve_tx_hold_duration_ms",
     "rvc_slot_context_parent_fallback_total",
@@ -204,8 +206,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        45,
-        "issue 8.1 +2 families (rvc_fork_current_id, rvc_fork_next_activation_epoch) on the 8.4 43-family pin"
+        46,
+        "RR-4.1 +1 family (rvc_slashing_prune_source_bound_raised_total) on the 8.1 45-family pin"
     );
 }
 

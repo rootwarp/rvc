@@ -199,6 +199,18 @@ impl SlashingDb {
     /// Delete slashing protection records below all set watermarks.
     ///
     /// Returns an error if no watermarks are set (safety: prevents accidental deletion of all records).
+    ///
+    /// Prune is a second production writer of watermarks; interchange import is the
+    /// other. Before deleting attestation rows it raises each pubkey's
+    /// attestation-source watermark to the maximum source among the rows that
+    /// delete will remove. The write goes through `raise_watermark_max`, so prune
+    /// only ever raises a watermark and never lowers one.
+    ///
+    /// The redundancy lemma (a non-slashable history always still contains the
+    /// floor row `(S_wm, T_wm)`, so a target-only delete cannot enable a surround)
+    /// assumed watermarks have a single production writer. That premise no longer
+    /// holds — do not re-derive prune safety from it. The source bound raised here
+    /// is what refuses a later attestation that would surround a deleted row.
     #[tracing::instrument(name = "slashing.db.prune", skip_all)]
     pub fn prune_below_watermarks(&self) -> Result<PruneStats, SlashingError> {
         let mut conn = self.conn.lock();
@@ -209,6 +221,44 @@ impl SlashingDb {
 
         if watermark_count == 0 {
             return Err(SlashingError::NoWatermarksSet);
+        }
+
+        // Those rows are the only surround witnesses for their (source, target).
+        // Raise the source floor before the DELETE removes them.
+        let mut source_bounds_raised: u64 = 0;
+        let target_floors: Vec<(String, i64)> = {
+            let mut stmt =
+                tx.prepare("SELECT pubkey, value FROM watermarks WHERE watermark_type = ?1")?;
+            let rows = stmt.query_map([WatermarkKind::AttestationTarget.as_sql_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        for (pubkey, target_wm) in target_floors {
+            let max_source: Option<i64> = tx.query_row(
+                "SELECT MAX(source_epoch) FROM attestations \
+                 WHERE pubkey = ?1 AND target_epoch < ?2",
+                (pubkey.as_str(), target_wm),
+                |row| row.get(0),
+            )?;
+            let Some(max_source) = max_source else {
+                continue;
+            };
+            let max_source = max_source as u64;
+            let before = read_watermark(&tx, pubkey.as_str(), WatermarkKind::AttestationSource)?;
+            raise_watermark_max(
+                &tx,
+                pubkey.as_str(),
+                WatermarkKind::AttestationSource,
+                max_source,
+            )?;
+            let raised = match before {
+                Some(current) => max_source > current,
+                None => true,
+            };
+            if raised {
+                source_bounds_raised += 1;
+            }
         }
 
         // Delete blocks below each validator's block watermark
@@ -234,6 +284,10 @@ impl SlashingDb {
         )?;
 
         tx.commit()?;
+
+        if source_bounds_raised > 0 {
+            metrics::RVC_SLASHING_PRUNE_SOURCE_BOUND_RAISED_TOTAL.inc_by(source_bounds_raised);
+        }
 
         // Increment prune metrics
         metrics::RVC_SLASHING_DB_PRUNE_TOTAL
@@ -437,12 +491,25 @@ mod tests {
 
 #[cfg(test)]
 mod db_api_tests {
+    use std::collections::HashSet;
+
     use super::*;
     use crate::db::SlashingDb;
     use eth_types::Root;
+    use parking_lot::Mutex;
+    use proptest::prelude::*;
     use tempfile::tempdir;
 
     const TEST_GVR: Root = [0u8; 32];
+
+    /// Serializes prunes that bump `RVC_SLASHING_PRUNE_SOURCE_BOUND_RAISED_TOTAL`
+    /// so the "increments only when raised" deltas are not racy under nextest.
+    static PRUNE_SOURCE_METRIC_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Below `history.rs` (10_000 / 2_000). Each case opens a DB and stages candidates.
+    const PRUNE_PROPTEST_CASES: u32 = 256;
+
+    const PROP_PKS: [&str; 3] = ["0x1111", "0x2222", "0x3333"];
 
     #[test]
     fn test_prune_set_and_get_block_watermark() {
@@ -607,6 +674,226 @@ mod db_api_tests {
 
         // Should not have recorded anything
         assert!(db.get_attestations("0x1234").unwrap().is_empty());
+    }
+
+    /// Rows `(5, 10)` with a hand-set floor `(1, 11)` must not become surroundable
+    /// once prune deletes them. `(2, 12)` surrounds `(5, 10)` and clears a target
+    /// floor of 11, so only a raised source floor refuses it.
+    #[test]
+    fn prune_raises_the_source_bound_over_deleted_rows() {
+        let _metric = PRUNE_SOURCE_METRIC_LOCK.lock();
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+        let pk = "0x1234";
+        db.seed_attestation(pk, 5, 10, None, &TEST_GVR).expect("seed");
+        db.set_attestation_watermark(pk, 1, 11).expect("set watermark");
+
+        db.prune_below_watermarks().expect("prune");
+
+        let err = db
+            .check_and_record_attestation(pk, 2, 12, None, &TEST_GVR)
+            .expect_err("request (2, 12) must be refused after prune");
+        assert!(
+            matches!(err, SlashingError::BelowAttestationSourceWatermark { source_epoch: 2, .. }),
+            "expected source-watermark refusal of (2, 12), got {err:?}"
+        );
+        assert_eq!(db.get_attestation_watermark(pk).unwrap(), Some((5, 11)));
+    }
+
+    /// NFR-2: a second prune must not move any watermark backwards.
+    #[test]
+    fn prune_twice_never_lowers_watermarks() {
+        let _metric = PRUNE_SOURCE_METRIC_LOCK.lock();
+        let db = SlashingDb::open_in_memory().expect("failed to open db");
+
+        db.seed_attestation("0x1111", 5, 10, None, &TEST_GVR).expect("seed");
+        db.set_attestation_watermark("0x1111", 1, 11).expect("set");
+        db.set_block_watermark("0x1111", 50).expect("set block");
+
+        // Deleted max source (3) is below the stored source floor (9).
+        db.seed_attestation("0x2222", 3, 8, None, &TEST_GVR).expect("seed");
+        db.set_attestation_watermark("0x2222", 9, 12).expect("set");
+
+        let a0 = db.get_attestation_watermark("0x1111").unwrap().unwrap();
+        let b0 = db.get_attestation_watermark("0x2222").unwrap().unwrap();
+        let block0 = db.get_block_watermark("0x1111").unwrap().unwrap();
+
+        db.prune_below_watermarks().expect("first prune");
+        let a1 = db.get_attestation_watermark("0x1111").unwrap().unwrap();
+        let b1 = db.get_attestation_watermark("0x2222").unwrap().unwrap();
+        let block1 = db.get_block_watermark("0x1111").unwrap().unwrap();
+        assert!(a1.0 >= a0.0 && a1.1 >= a0.1, "source/target lowered: {a0:?} -> {a1:?}");
+        assert!(b1.0 >= b0.0 && b1.1 >= b0.1, "source/target lowered: {b0:?} -> {b1:?}");
+        assert!(block1 >= block0, "block watermark lowered: {block0} -> {block1}");
+        assert_eq!(a1, (5, 11));
+        assert_eq!(b1, (9, 12));
+
+        db.prune_below_watermarks().expect("second prune");
+        let a2 = db.get_attestation_watermark("0x1111").unwrap().unwrap();
+        let b2 = db.get_attestation_watermark("0x2222").unwrap().unwrap();
+        let block2 = db.get_block_watermark("0x1111").unwrap().unwrap();
+        assert!(a2.0 >= a1.0 && a2.1 >= a1.1, "second prune lowered {a1:?} -> {a2:?}");
+        assert!(b2.0 >= b1.0 && b2.1 >= b1.1, "second prune lowered {b1:?} -> {b2:?}");
+        assert!(block2 >= block1, "second prune lowered block {block1} -> {block2}");
+        assert_eq!((a2, b2, block2), (a1, b1, block1));
+    }
+
+    #[test]
+    fn prune_source_bound_counter_increments_only_when_raised() {
+        let _metric = PRUNE_SOURCE_METRIC_LOCK.lock();
+        let counter = || metrics::RVC_SLASHING_PRUNE_SOURCE_BOUND_RAISED_TOTAL.get();
+
+        // Equal to the deleted max: not a raise.
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            db.seed_attestation("0x1234", 5, 10, None, &TEST_GVR).unwrap();
+            db.set_attestation_watermark("0x1234", 5, 11).unwrap();
+            let before = counter();
+            db.prune_below_watermarks().unwrap();
+            assert_eq!(counter(), before, "equal bound must not increment");
+            assert_eq!(db.get_attestation_watermark("0x1234").unwrap(), Some((5, 11)));
+        }
+
+        // Stored floor already above the deleted max: not a raise.
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            db.seed_attestation("0x1234", 4, 10, None, &TEST_GVR).unwrap();
+            db.set_attestation_watermark("0x1234", 8, 11).unwrap();
+            let before = counter();
+            db.prune_below_watermarks().unwrap();
+            assert_eq!(counter(), before, "lower deleted max must not increment");
+            assert_eq!(db.get_attestation_watermark("0x1234").unwrap(), Some((8, 11)));
+        }
+
+        // Nothing deleted: not a raise.
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            db.seed_attestation("0x1234", 12, 20, None, &TEST_GVR).unwrap();
+            db.set_attestation_watermark("0x1234", 1, 11).unwrap();
+            let before = counter();
+            db.prune_below_watermarks().unwrap();
+            assert_eq!(counter(), before, "no deleted row must not increment");
+            assert_eq!(db.get_attestation_watermark("0x1234").unwrap(), Some((1, 11)));
+        }
+
+        // Absent source floor: inserting one is a raise. Per pubkey, not a global max.
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            db.seed_attestation("0x1111", 5, 10, None, &TEST_GVR).unwrap();
+            db.seed_attestation("0x2222", 7, 9, None, &TEST_GVR).unwrap();
+            {
+                let conn = db.conn.lock();
+                raise_watermark(&conn, "0x1111", WatermarkKind::AttestationTarget, 11).unwrap();
+                raise_watermark(&conn, "0x2222", WatermarkKind::AttestationTarget, 11).unwrap();
+            }
+            let before = counter();
+            db.prune_below_watermarks().unwrap();
+            assert_eq!(counter(), before + 2, "one increment per pubkey whose bound rose");
+            assert_eq!(db.get_attestation_watermark("0x1111").unwrap(), Some((5, 11)));
+            assert_eq!(db.get_attestation_watermark("0x2222").unwrap(), Some((7, 11)));
+
+            let mid = counter();
+            db.prune_below_watermarks().unwrap();
+            assert_eq!(counter(), mid, "second prune must not increment");
+        }
+    }
+
+    // No attestation the post-prune DB accepts may surround a row prune deleted.
+    // Not the lemma "every row with target <= T_wm has source <= S_wm": a local
+    // (10, 12) next to an imported floor (5, 20) makes that false.
+    //
+    // Explicit witnesses use target >= T_wm + 1. A deleted row has target < T_wm,
+    // so target = dt + 1 is still rejected by the target floor and never tests
+    // the source bound (an off-by-one source floor would stay green).
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(PRUNE_PROPTEST_CASES))]
+
+        #[test]
+        fn proptest_prune_never_enables_a_surround(
+            raw_rows in prop::collection::vec((0usize..3, 0u64..28, 0u64..28), 0..8),
+            wm0 in (0u64..36, 0u64..36),
+            wm1 in prop::option::of((0u64..36, 0u64..36)),
+            wm2 in prop::option::of((0u64..36, 0u64..36)),
+            raw_cands in prop::collection::vec((0usize..3, 0u64..40, 0u64..48), 0..6),
+        ) {
+            let _metric = PRUNE_SOURCE_METRIC_LOCK.lock();
+            let db = SlashingDb::open_in_memory().unwrap();
+            let wms = [Some(wm0), wm1, wm2];
+            let mut target_floors = [None; 3];
+
+            let mut seen_targets = HashSet::new();
+            let mut stored: Vec<(String, u64, u64)> = Vec::new();
+            for (pk_i, source, target) in raw_rows {
+                let pk = PROP_PKS[pk_i].to_string();
+                if !seen_targets.insert((pk.clone(), target)) {
+                    continue;
+                }
+                db.seed_attestation(&pk, source, target, None, &TEST_GVR).unwrap();
+                stored.push((pk, source, target));
+            }
+            for (pk_i, wm) in wms.iter().enumerate() {
+                if let Some((source_wm, target_wm)) = wm {
+                    db.set_attestation_watermark(PROP_PKS[pk_i], *source_wm, *target_wm).unwrap();
+                    target_floors[pk_i] = Some(*target_wm);
+                }
+            }
+
+            db.prune_below_watermarks().unwrap();
+
+            let mut remaining = HashSet::new();
+            for pk in PROP_PKS {
+                for att in db.get_attestations(pk).unwrap() {
+                    remaining.insert((pk.to_string(), att.source_epoch, att.target_epoch));
+                }
+            }
+            let deleted: Vec<_> =
+                stored.into_iter().filter(|row| !remaining.contains(row)).collect::<Vec<_>>();
+
+            let mut cands = Vec::new();
+            for (pk_i, source, target) in raw_cands {
+                cands.push((PROP_PKS[pk_i].to_string(), source, target));
+            }
+            for (pk, ds, dt) in &deleted {
+                if *ds == 0 {
+                    continue;
+                }
+                let pk_i = PROP_PKS.iter().position(|p| pk == *p).expect("known pubkey");
+                let t_wm = target_floors[pk_i].unwrap_or_else(|| {
+                    panic!("deleted ({ds}, {dt}) on {pk} without an attestation target watermark")
+                });
+                // Clears the target floor (`target <= T_wm` is refused) so only the
+                // source bound can reject a surround of this deleted row.
+                let Some(clear_target) = t_wm.checked_add(1) else {
+                    continue;
+                };
+                prop_assert!(*dt < t_wm && clear_target > *dt);
+                cands.push((pk.clone(), ds - 1, clear_target));
+                cands.push((pk.clone(), 0, clear_target));
+            }
+
+            let mut seen_cands = HashSet::new();
+            let mut seq = 0u64;
+            for (pk, source, target) in cands {
+                if !seen_cands.insert((pk.clone(), source, target)) {
+                    continue;
+                }
+                seq += 1;
+                let root = format!("0x{seq:064x}");
+                // Discard: judge acceptance against the post-prune DB, not one
+                // mutated by an earlier accepted candidate.
+                if let Ok(staged) =
+                    db.stage_attestation(&pk, source, target, Some(root), &TEST_GVR)
+                {
+                    drop(staged);
+                    let surrounds = deleted.iter().any(|(dpk, ds, dt)| {
+                        dpk == &pk && source < *ds && target > *dt
+                    });
+                    prop_assert!(
+                        !surrounds,
+                        "accepted ({source}, {target}) on {pk} surrounds a deleted row {deleted:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
