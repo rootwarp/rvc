@@ -116,7 +116,7 @@ const fn inv(
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
     (Class::GeForkName, 24),
     (Class::IndexZero, 8),
-    (Class::MatchForkName, 7),
+    (Class::MatchForkName, 8),
     (Class::StringDispatch, 9),
     (Class::Entries, 8),
 ];
@@ -171,7 +171,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1064,
+        1088,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -180,7 +180,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1076,
+        1100,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -189,7 +189,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1080,
+        1104,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -443,12 +443,21 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1042,
+        1066,
         Class::MatchForkName,
         false,
         "match fork {",
         Verdict::InheritIntentionally,
         "6.4",
+    ),
+    inv(
+        "crates/eth-types/src/block.rs",
+        42,
+        Class::MatchForkName,
+        false,
+        "match fork {",
+        Verdict::InheritIntentionally,
+        "RR-3.9",
     ),
     inv(
         "crates/eth-types/src/fork.rs",

@@ -784,10 +784,34 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         // The signing scope is the spec block root (`hash_tree_root` over the
         // typed Electra body — SEC-6c). Here we additionally parse the
         // commitments, compute an internal list fingerprint, and verify that the
-        // commitment count in the body matches the number of blob sidecars.
+        // commitment count in the body matches the number of blobs.
         // This does NOT change the BN-facing signing scope; it is a rvc-internal
         // consistency check performed before the signature is created.
-        if let eth_types::BlockContents::BlockAndBlobs { ref blob_sidecars, .. } = block_contents {
+        //
+        // Proof cardinality is separate and fail-closed, before the signer is
+        // called. It uses the fork name: `body_fork_layout` maps Fulu to Electra,
+        // which would apply the one-proof rule to cell proofs. The commitment-count
+        // check below stays warn-only.
+        if let eth_types::BlockContents::BlockAndBlobs { ref kzg_proofs, ref blobs, .. } =
+            block_contents
+        {
+            let proof_count = kzg_proofs.len();
+            let blob_count = blobs.len();
+            let fork = ForkName::from_str(consensus_version).map_err(|_| {
+                BlockServiceError::Parse(format!(
+                    "kzg proof cardinality: unknown fork {consensus_version} ({proof_count} proofs, {blob_count} blobs)"
+                ))
+            })?;
+            let expected = eth_types::expected_kzg_proof_count(fork, blob_count).map_err(|e| {
+                BlockServiceError::Parse(format!(
+                    "kzg proof cardinality is not defined for fork {consensus_version} ({proof_count} proofs, {blob_count} blobs): {e}"
+                ))
+            })?;
+            if proof_count != expected {
+                return Err(BlockServiceError::Parse(format!(
+                    "kzg proof cardinality mismatch for fork {consensus_version}: expected {expected} proofs, got {proof_count} proofs for {blob_count} blobs"
+                )));
+            }
             if let Some(layout) = eth_types::body_fork_layout(consensus_version) {
                 // Fail closed: malformed body must not fingerprint as empty list.
                 let kzg_commitments = block_contents
@@ -796,7 +820,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 let commitment_root = eth_types::kzg_commitment_list_root(&kzg_commitments);
                 debug!(
                     slot = slot,
-                    blob_sidecars = blob_sidecars.len(),
+                    blobs = blob_count,
                     kzg_in_body = kzg_commitments.len(),
                     commitment_root = %TruncatedRoot::new(&commitment_root),
                     "BlockAndBlobs: internal KZG commitment binding (ISSUE-4.3)"
@@ -805,12 +829,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 // (self-consistent). Sidecar propagation is the BN's responsibility.
                 // Aborting here would drop proposals on legitimate BN inconsistencies
                 // during fork transitions.
-                if kzg_commitments.len() != blob_sidecars.len() {
+                if kzg_commitments.len() != blob_count {
                     warn!(
                         slot = slot,
                         kzg_in_body = kzg_commitments.len(),
-                        sidecars = blob_sidecars.len(),
-                        "blob KZG commitment count mismatch — body inconsistent with sidecars"
+                        blobs = blob_count,
+                        "blob KZG commitment count mismatch — body inconsistent with blobs"
                     );
                 }
             }

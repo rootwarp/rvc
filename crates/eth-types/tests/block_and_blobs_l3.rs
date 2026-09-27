@@ -24,7 +24,8 @@ fn block_and_blobs(commitments: &[[u8; 48]]) -> BlockContents {
             state_root: [0x22; 32],
             body: body_with_commitments(commitments),
         },
-        blob_sidecars: vec![],
+        kzg_proofs: vec![],
+        blobs: vec![],
     }
 }
 
@@ -127,7 +128,8 @@ fn test_short_body_yields_error_not_empty_list() {
             state_root: [0; 32],
             body: vec![0u8; 100], // shorter than a valid Deneb body
         },
-        blob_sidecars: vec![],
+        kzg_proofs: vec![],
+        blobs: vec![],
     };
     assert!(
         contents.blob_kzg_commitments(BodyForkLayout::Deneb).is_err(),

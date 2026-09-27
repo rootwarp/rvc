@@ -6,9 +6,51 @@ use crate::block_body::{
     body_tree_hash_root_for_layout, decode_beacon_block_body_deneb,
     decode_beacon_block_body_electra, BodySszError,
 };
+use crate::fork::ForkName;
 use crate::hex_fixed::bytes_32_hex;
 use crate::tree_hash_utils::{impl_container_tree_hash, TreeHashError};
 use crate::{Root, Signature, Slot};
+
+/// Cells in one extended blob. Fulu `kzg_proofs` carries this many cell proofs per blob.
+///
+/// consensus-specs Fulu sampling preset `CELLS_PER_EXT_BLOB` in
+/// `specs/fulu/polynomial-commitments-sampling.md`
+/// (`FIELD_ELEMENTS_PER_EXT_BLOB // FIELD_ELEMENTS_PER_CELL`).
+/// `specs/fulu/das-core.md` sets `NUMBER_OF_COLUMNS = CELLS_PER_EXT_BLOB` (= 128).
+/// Pinned at ethereum/consensus-specs `v1.6.0` (`f96d3e7acf35125295d234da4b0c67591fdef49c`).
+pub const CELLS_PER_EXT_BLOB: usize = 128;
+
+/// Fork has no Beacon-API proof-count rule, or the product does not fit `usize`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum KzgProofCountError {
+    /// Gloas and pre-Deneb. Not [`crate::BodyForkLayout`]: that map sends Fulu to Electra.
+    #[error("fork {fork:?} has no kzg proof cardinality")]
+    UnsupportedFork { fork: ForkName },
+    /// `blobs * CELLS_PER_EXT_BLOB` overflowed.
+    #[error("kzg proof count overflow for {blobs} blobs")]
+    Overflow { blobs: usize },
+}
+
+/// Expected `kzg_proofs.len()` for `blobs` blobs on `fork`.
+///
+/// Keyed on [`ForkName`], not [`BodyForkLayout`]. `body_fork_layout` maps Fulu
+/// onto Electra, which would reject every valid Fulu cell-proof list.
+/// Deneb and Electra are one proof per blob. Fulu is `blobs * CELLS_PER_EXT_BLOB`.
+/// Gloas and pre-Deneb are errors.
+/// The [`BlockContents`] deserializer has no fork and does not call this.
+pub fn expected_kzg_proof_count(fork: ForkName, blobs: usize) -> Result<usize, KzgProofCountError> {
+    match fork {
+        ForkName::Deneb | ForkName::Electra => Ok(blobs),
+        ForkName::Fulu => {
+            blobs.checked_mul(CELLS_PER_EXT_BLOB).ok_or(KzgProofCountError::Overflow { blobs })
+        }
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Gloas => Err(KzgProofCountError::UnsupportedFork { fork }),
+    }
+}
 
 /// Fork variants relevant to `BeaconBlockBody` SSZ layout for KZG extraction.
 ///
@@ -35,8 +77,6 @@ pub enum BodyForkLayout {
 /// Unrecognised strings (including wrong case) yield `None`.
 pub fn body_fork_layout(consensus_version: &str) -> Option<BodyForkLayout> {
     use std::str::FromStr;
-
-    use crate::fork::ForkName;
 
     ForkName::from_str(consensus_version).ok().and_then(ForkName::body_layout)
 }
@@ -179,19 +219,32 @@ pub struct BlindedBeaconBlock {
     pub body: BlindedBeaconBlockBody,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlobSidecar {
-    #[serde(with = "serde_utils::quoted_u64")]
-    pub index: u64,
-    #[serde(with = "serde_utils::hex_vec")]
-    pub blob: Vec<u8>,
-}
-
+/// Beacon-API Deneb+ block contents: `{block, kzg_proofs, blobs}`.
+///
+/// `kzg_proofs` and `blobs` stay independent `0x` hex byte strings. They are
+/// not re-paired. The variant is selected only when both keys are present; one
+/// key alone is [`BlockContentsShapeError`]. Cardinality is not checked here —
+/// there is no fork. [`expected_kzg_proof_count`] is applied before signing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum BlockContents {
-    BlockAndBlobs { block: BeaconBlock, blob_sidecars: Vec<BlobSidecar> },
+    BlockAndBlobs {
+        block: BeaconBlock,
+        #[serde(with = "serde_utils::list_of_bytes_lists")]
+        kzg_proofs: Vec<Vec<u8>>,
+        #[serde(with = "serde_utils::list_of_bytes_lists")]
+        blobs: Vec<Vec<u8>>,
+    },
     Block(BeaconBlock),
+}
+
+/// Exactly one of `kzg_proofs` or `blobs` was present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BlockContentsShapeError {
+    #[error("BlockContents has kzg_proofs without blobs")]
+    KzgProofsWithoutBlobs,
+    #[error("BlockContents has blobs without kzg_proofs")]
+    BlobsWithoutKzgProofs,
 }
 
 impl<'de> serde::Deserialize<'de> for BlockContents {
@@ -200,28 +253,38 @@ impl<'de> serde::Deserialize<'de> for BlockContents {
         D: serde::Deserializer<'de>,
     {
         let value = serde_json::Value::deserialize(deserializer)?;
-
-        // Try BlockAndBlobs first (has both "block" and "blob_sidecars" keys)
-        if value.get("blob_sidecars").is_some() {
-            #[derive(Deserialize)]
-            struct BlockAndBlobsHelper {
-                block: BeaconBlock,
-                blob_sidecars: Vec<BlobSidecar>,
+        let has_proofs = value.get("kzg_proofs").is_some();
+        let has_blobs = value.get("blobs").is_some();
+        match (has_proofs, has_blobs) {
+            (true, true) => {
+                #[derive(Deserialize)]
+                struct BlockAndBlobsHelper {
+                    block: BeaconBlock,
+                    #[serde(with = "serde_utils::list_of_bytes_lists")]
+                    kzg_proofs: Vec<Vec<u8>>,
+                    #[serde(with = "serde_utils::list_of_bytes_lists")]
+                    blobs: Vec<Vec<u8>>,
+                }
+                serde_json::from_value::<BlockAndBlobsHelper>(value)
+                    .map(|h| BlockContents::BlockAndBlobs {
+                        block: h.block,
+                        kzg_proofs: h.kzg_proofs,
+                        blobs: h.blobs,
+                    })
+                    .map_err(|e| {
+                        serde::de::Error::custom(format!("invalid BlockAndBlobs variant: {e}"))
+                    })
             }
-            return serde_json::from_value::<BlockAndBlobsHelper>(value.clone())
-                .map(|h| BlockContents::BlockAndBlobs {
-                    block: h.block,
-                    blob_sidecars: h.blob_sidecars,
-                })
-                .map_err(|e| {
-                    serde::de::Error::custom(format!("invalid BlockAndBlobs variant: {e}"))
-                });
+            (true, false) => Err(serde::de::Error::custom(
+                BlockContentsShapeError::KzgProofsWithoutBlobs.to_string(),
+            )),
+            (false, true) => Err(serde::de::Error::custom(
+                BlockContentsShapeError::BlobsWithoutKzgProofs.to_string(),
+            )),
+            (false, false) => serde_json::from_value::<BeaconBlock>(value)
+                .map(BlockContents::Block)
+                .map_err(|e| serde::de::Error::custom(format!("invalid Block variant: {e}"))),
         }
-
-        // Fall back to Block (bare BeaconBlock)
-        serde_json::from_value::<BeaconBlock>(value)
-            .map(BlockContents::Block)
-            .map_err(|e| serde::de::Error::custom(format!("invalid Block variant: {e}")))
     }
 }
 
@@ -444,8 +507,8 @@ mod tests {
         }
     }
 
-    fn sample_blob_sidecar() -> BlobSidecar {
-        BlobSidecar { index: 0, blob: vec![0xab; 8] }
+    fn sample_proofs_and_blobs() -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        (vec![vec![0xab; 48]], vec![vec![0xcd; 8]])
     }
 
     /// Pin `body_fork_layout` behaviour: exact, case-sensitive fork names only.
@@ -514,22 +577,6 @@ mod tests {
     }
 
     #[test]
-    fn test_blob_sidecar_serde_roundtrip() {
-        let sidecar = sample_blob_sidecar();
-        let json = serde_json::to_string(&sidecar).unwrap();
-        let deserialized: BlobSidecar = serde_json::from_str(&json).unwrap();
-        assert_eq!(sidecar, deserialized);
-    }
-
-    #[test]
-    fn test_blob_sidecar_quoted_index() {
-        let sidecar = sample_blob_sidecar();
-        let json = serde_json::to_string(&sidecar).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["index"], serde_json::Value::String("0".to_string()));
-    }
-
-    #[test]
     fn test_block_contents_block_only_serde_roundtrip() {
         let contents = BlockContents::Block(sample_block());
         let json = serde_json::to_string(&contents).unwrap();
@@ -539,10 +586,8 @@ mod tests {
 
     #[test]
     fn test_block_contents_with_blobs_serde_roundtrip() {
-        let contents = BlockContents::BlockAndBlobs {
-            block: sample_block(),
-            blob_sidecars: vec![sample_blob_sidecar()],
-        };
+        let (kzg_proofs, blobs) = sample_proofs_and_blobs();
+        let contents = BlockContents::BlockAndBlobs { block: sample_block(), kzg_proofs, blobs };
         let json = serde_json::to_string(&contents).unwrap();
         let deserialized: BlockContents = serde_json::from_str(&json).unwrap();
         assert_eq!(contents, deserialized);
@@ -554,17 +599,19 @@ mod tests {
         let contents_block = BlockContents::Block(block.clone());
         assert_eq!(contents_block.block(), &block);
 
-        let contents_blobs = BlockContents::BlockAndBlobs {
-            block: block.clone(),
-            blob_sidecars: vec![sample_blob_sidecar()],
-        };
+        let (kzg_proofs, blobs) = sample_proofs_and_blobs();
+        let contents_blobs =
+            BlockContents::BlockAndBlobs { block: block.clone(), kzg_proofs, blobs };
         assert_eq!(contents_blobs.block(), &block);
     }
 
     #[test]
     fn test_block_contents_empty_blobs() {
-        let contents =
-            BlockContents::BlockAndBlobs { block: sample_block(), blob_sidecars: vec![] };
+        let contents = BlockContents::BlockAndBlobs {
+            block: sample_block(),
+            kzg_proofs: vec![],
+            blobs: vec![],
+        };
         let json = serde_json::to_string(&contents).unwrap();
         let deserialized: BlockContents = serde_json::from_str(&json).unwrap();
         assert_eq!(contents, deserialized);
@@ -644,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_block_contents_invalid_json_error_has_context() {
-        let json = r#"{"blob_sidecars": "not-an-array"}"#;
+        let json = r#"{"kzg_proofs": "not-an-array", "blobs": []}"#;
         let err = serde_json::from_str::<BlockContents>(json).unwrap_err();
         assert!(
             err.to_string().contains("BlockAndBlobs"),
@@ -978,7 +1025,8 @@ mod tests {
                 state_root: [0; 32],
                 body,
             },
-            blob_sidecars: vec![],
+            kzg_proofs: vec![],
+            blobs: vec![],
         };
         assert_eq!(contents.blob_kzg_commitments(BodyForkLayout::Deneb).unwrap(), vec![c]);
     }
@@ -995,7 +1043,8 @@ mod tests {
                 state_root: [0; 32],
                 body,
             },
-            blob_sidecars: vec![],
+            kzg_proofs: vec![],
+            blobs: vec![],
         };
 
         let root_orig = make_block(body_orig).kzg_commitment_root(BodyForkLayout::Deneb).unwrap();
@@ -1035,7 +1084,8 @@ mod tests {
                 state_root: [0; 32],
                 body: vec![0u8; 50],
             },
-            blob_sidecars: vec![],
+            kzg_proofs: vec![],
+            blobs: vec![],
         };
         assert!(contents.kzg_commitment_root(BodyForkLayout::Deneb).is_err());
         assert!(contents.blob_kzg_commitments(BodyForkLayout::Deneb).is_err());
@@ -1188,6 +1238,123 @@ mod tests {
             ("body_root", bo),
         ] {
             assert_ne!(header_root(&v), base_root, "root must change when {label} changes");
+        }
+    }
+
+    fn decode_hex_list(value: &serde_json::Value) -> Vec<Vec<u8>> {
+        value
+            .as_array()
+            .expect("hex list")
+            .iter()
+            .map(|item| {
+                let text = item.as_str().expect("hex string").trim_start_matches("0x");
+                hex::decode(text).expect("hex bytes")
+            })
+            .collect()
+    }
+
+    fn hex_body_contents(
+        fixture: &str,
+        body: &[u8],
+    ) -> (serde_json::Value, Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let doc: serde_json::Value = serde_json::from_str(fixture).expect("fixture json");
+        let proofs = decode_hex_list(&doc["data"]["kzg_proofs"]);
+        let blobs = decode_hex_list(&doc["data"]["blobs"]);
+        let mut data = doc["data"].clone();
+        data["block"]["body"] = serde_json::Value::String(format!("0x{}", hex::encode(body)));
+        (data, proofs, blobs)
+    }
+
+    /// Real Deneb and Fulu `kzg_proofs` / `blobs`, paired with a hex body this
+    /// deserializer can parse. Arrays are not re-paired or re-encoded.
+    #[test]
+    fn block_and_blobs_preserves_kzg_proofs_and_blobs_byte_for_byte() {
+        const DENEB: &str = include_str!("../tests/fixtures/beacon_api/deneb_block_contents.json");
+        const FULU: &str = include_str!("../tests/fixtures/beacon_api/fulu_block_contents.json");
+        let deneb_body = external_vector_deneb_body().as_ssz_bytes();
+        let fulu_body = external_vector_electra_body().as_ssz_bytes();
+        for (label, fixture, body) in [("deneb", DENEB, deneb_body), ("fulu", FULU, fulu_body)] {
+            let (data, proofs, blobs) = hex_body_contents(fixture, &body);
+            assert!(!proofs.is_empty() && !blobs.is_empty(), "{label}");
+            let contents: BlockContents = serde_json::from_value(data).expect(label);
+            match contents {
+                BlockContents::BlockAndBlobs { kzg_proofs, blobs: got, .. } => {
+                    assert_eq!(kzg_proofs, proofs, "{label} proofs");
+                    assert_eq!(got, blobs, "{label} blobs");
+                }
+                BlockContents::Block(_) => panic!("{label}: expected BlockAndBlobs"),
+            }
+        }
+    }
+
+    #[test]
+    fn expected_kzg_proof_count_is_per_fork() {
+        use crate::ForkName;
+        assert_eq!(CELLS_PER_EXT_BLOB, 128);
+        for fork in [ForkName::Deneb, ForkName::Electra] {
+            assert_eq!(expected_kzg_proof_count(fork, 0).unwrap(), 0, "{fork:?}");
+            assert_eq!(expected_kzg_proof_count(fork, 1).unwrap(), 1, "{fork:?}");
+            assert_eq!(expected_kzg_proof_count(fork, 3).unwrap(), 3, "{fork:?}");
+        }
+        for n in [0usize, 1, 2, 3] {
+            assert_eq!(expected_kzg_proof_count(ForkName::Fulu, n).unwrap(), 128 * n, "fulu n={n}");
+        }
+        for fork in [
+            ForkName::Phase0,
+            ForkName::Altair,
+            ForkName::Bellatrix,
+            ForkName::Capella,
+            ForkName::Gloas,
+        ] {
+            let err = expected_kzg_proof_count(fork, 1).expect_err("unsupported");
+            assert!(matches!(err, KzgProofCountError::UnsupportedFork { .. }), "{fork:?} {err:?}");
+        }
+    }
+
+    #[test]
+    fn only_one_of_kzg_proofs_or_blobs_is_an_error() {
+        let block = serde_json::to_value(sample_block()).unwrap();
+        let proofs_only = serde_json::json!({
+            "block": block,
+            "kzg_proofs": ["0xab"],
+        });
+        let err = serde_json::from_value::<BlockContents>(proofs_only).unwrap_err();
+        assert!(
+            err.to_string().contains("kzg_proofs without blobs"),
+            "named missing-blobs error, got {err}"
+        );
+
+        let blobs_only = serde_json::json!({
+            "blobs": ["0x01"],
+        });
+        let err = serde_json::from_value::<BlockContents>(blobs_only).unwrap_err();
+        assert!(
+            err.to_string().contains("blobs without kzg_proofs"),
+            "named missing-proofs error, got {err}"
+        );
+        assert!(
+            !err.to_string().contains("invalid Block variant"),
+            "one key must not fall through to Block: {err}"
+        );
+    }
+
+    /// The produce `data` object from RR-3.5's fixtures. `block.body` is still
+    /// a JSON object, so this deserializer rejects it. RR-3.7 routes the body
+    /// through `block_body_json::decode`.
+    #[test]
+    fn real_json_contents_are_still_rejected_until_rr_3_7() {
+        const DENEB: &str = include_str!("../tests/fixtures/beacon_api/deneb_block_contents.json");
+        const FULU: &str = include_str!("../tests/fixtures/beacon_api/fulu_block_contents.json");
+        for (label, fixture) in [("deneb", DENEB), ("fulu", FULU)] {
+            let doc: serde_json::Value = serde_json::from_str(fixture).expect(label);
+            assert!(doc["data"]["block"]["body"].is_object(), "{label}");
+            let err = serde_json::from_value::<BlockContents>(doc["data"].clone()).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("BlockAndBlobs"), "{label}: {msg}");
+            assert!(
+                msg.contains("invalid type") || msg.contains("expected a string"),
+                "{label} object body must still fail hex decode: {msg}"
+            );
         }
     }
 }

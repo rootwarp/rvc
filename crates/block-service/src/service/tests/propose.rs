@@ -734,31 +734,30 @@ fn test_block_and_blobs_json_deserialization() {
             "state_root": format!("0x{}", hex::encode([0x22u8; 32])),
             "body": format!("0x{}", hex::encode([0xab; 8])),
         },
-        "blob_sidecars": [
-            {
-                "index": "0",
-                "blob": format!("0x{}", hex::encode([0xdd; 128])),
-            },
-            {
-                "index": "1",
-                "blob": format!("0x{}", hex::encode([0xee; 128])),
-            },
+        "kzg_proofs": [
+            format!("0x{}", hex::encode([0x11u8; 48])),
+            format!("0x{}", hex::encode([0x22u8; 48])),
+        ],
+        "blobs": [
+            format!("0x{}", hex::encode([0xdd; 128])),
+            format!("0x{}", hex::encode([0xee; 128])),
         ]
     });
 
     let contents: BlockContents = serde_json::from_value(json).unwrap();
     match &contents {
-        BlockContents::BlockAndBlobs { block, blob_sidecars } => {
+        BlockContents::BlockAndBlobs { block, kzg_proofs, blobs } => {
             assert_eq!(block.slot, 1000);
             assert_eq!(block.proposer_index, 42);
             assert_eq!(block.parent_root, [0x11u8; 32]);
             assert_eq!(block.state_root, [0x22u8; 32]);
             assert_eq!(block.body, vec![0xab; 8]);
-            assert_eq!(blob_sidecars.len(), 2);
-            assert_eq!(blob_sidecars[0].index, 0);
-            assert_eq!(blob_sidecars[0].blob, vec![0xdd; 128]);
-            assert_eq!(blob_sidecars[1].index, 1);
-            assert_eq!(blob_sidecars[1].blob, vec![0xee; 128]);
+            assert_eq!(kzg_proofs.len(), 2);
+            assert_eq!(kzg_proofs[0], vec![0x11; 48]);
+            assert_eq!(kzg_proofs[1], vec![0x22; 48]);
+            assert_eq!(blobs.len(), 2);
+            assert_eq!(blobs[0], vec![0xdd; 128]);
+            assert_eq!(blobs[1], vec![0xee; 128]);
         }
         BlockContents::Block(_) => {
             panic!("expected BlockAndBlobs variant, got Block");
@@ -776,12 +775,8 @@ fn test_block_and_blobs_json_through_produce_response() {
             "state_root": format!("0x{}", hex::encode([0xbb; 32])),
             "body": format!("0x{}", hex::encode([0xde, 0xad])),
         },
-        "blob_sidecars": [
-            {
-                "index": "0",
-                "blob": format!("0x{}", hex::encode([0xff; 64])),
-            },
-        ]
+        "kzg_proofs": [format!("0x{}", hex::encode([0xaa; 48]))],
+        "blobs": [format!("0x{}", hex::encode([0xff; 64]))],
     });
 
     let response = ProduceBlockResponse {
@@ -801,9 +796,10 @@ fn test_block_and_blobs_json_through_produce_response() {
     assert_eq!(block.slot, 500);
     assert_eq!(block.proposer_index, 10);
     match &contents {
-        eth_types::BlockContents::BlockAndBlobs { blob_sidecars, .. } => {
-            assert_eq!(blob_sidecars.len(), 1);
-            assert_eq!(blob_sidecars[0].blob, vec![0xff; 64]);
+        eth_types::BlockContents::BlockAndBlobs { kzg_proofs, blobs, .. } => {
+            assert_eq!(kzg_proofs.len(), 1);
+            assert_eq!(kzg_proofs[0], vec![0xaa; 48]);
+            assert_eq!(blobs, &vec![vec![0xff; 64]]);
         }
         _ => panic!("expected BlockAndBlobs"),
     }
@@ -819,15 +815,17 @@ fn test_block_and_blobs_json_empty_sidecars() {
             "state_root": format!("0x{}", hex::encode([0u8; 32])),
             "body": "0x",
         },
-        "blob_sidecars": []
+        "kzg_proofs": [],
+        "blobs": []
     });
 
     let contents: eth_types::BlockContents = serde_json::from_value(json).unwrap();
     match &contents {
-        eth_types::BlockContents::BlockAndBlobs { blob_sidecars, .. } => {
-            assert!(blob_sidecars.is_empty());
+        eth_types::BlockContents::BlockAndBlobs { kzg_proofs, blobs, .. } => {
+            assert!(kzg_proofs.is_empty());
+            assert!(blobs.is_empty());
         }
-        _ => panic!("expected BlockAndBlobs variant even with empty sidecars"),
+        _ => panic!("expected BlockAndBlobs variant even with empty arrays"),
     }
 }
 // --- Issue 3.4: Rewrite tautological block root test (Finding #25) ---
@@ -1189,22 +1187,17 @@ fn electra_body_with_kzg_commitments_for_test(commitments: &[[u8; 48]]) -> Vec<u
     body.as_ssz_bytes()
 }
 
-/// Build a mock `ProduceBlockResponse` for an Electra `BlockAndBlobs` payload
-/// where the body contains `commitments` and the `blob_sidecars` has one entry
-/// per commitment. Body is a valid Electra typed container (SEC-6c).
+/// Build a mock `ProduceBlockResponse` for an Electra `BlockAndBlobs` payload.
+///
+/// One proof and one blob per commitment, so fork cardinality matches. Body is
+/// a valid Electra typed container (SEC-6c).
 fn block_and_blobs_response(slot: Slot, commitments: &[[u8; 48]]) -> ProduceBlockResponse {
     let body = electra_body_with_kzg_commitments_for_test(commitments);
     let body_hex = format!("0x{}", hex::encode(&body));
-    let blob_sidecars: Vec<serde_json::Value> = commitments
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            serde_json::json!({
-                "index": i.to_string(),
-                "blob": format!("0x{}", hex::encode([0u8; 64])),
-            })
-        })
-        .collect();
+    let kzg_proofs: Vec<String> =
+        commitments.iter().map(|c| format!("0x{}", hex::encode(c))).collect();
+    let blobs: Vec<String> =
+        commitments.iter().map(|_| format!("0x{}", hex::encode([0u8; 64]))).collect();
     let data = serde_json::json!({
         "block": {
             "slot": slot.to_string(),
@@ -1213,7 +1206,8 @@ fn block_and_blobs_response(slot: Slot, commitments: &[[u8; 48]]) -> ProduceBloc
             "state_root": format!("0x{}", hex::encode([0x22u8; 32])),
             "body": body_hex,
         },
-        "blob_sidecars": blob_sidecars,
+        "kzg_proofs": kzg_proofs,
+        "blobs": blobs,
     });
     ProduceBlockResponse {
         data,
@@ -1291,18 +1285,19 @@ async fn test_l3_propose_block_and_blobs_succeeds_with_matching_commitment_count
 }
 
 /// L-3 (ISSUE-4.3): a mismatch between commitment count in the body and the
-/// number of blob sidecars must only warn (not abort signing).
+/// number of blobs must only warn (not abort signing). Proof cardinality still
+/// has to match, or the new check fails closed first.
 #[tokio::test]
-async fn test_l3_propose_block_and_blobs_warns_on_commitment_count_mismatch() {
+async fn commitment_count_mismatch_still_warns_only() {
     let pubkey = test_pubkey();
     let slot = 2000;
 
-    // Body has 2 commitments but blob_sidecars will have 1 entry (mismatch).
+    // Body has 2 commitments. One blob and one proof: cardinality passes, the
+    // commitment count does not.
     let two_commits = [[0x11; 48], [0x22; 48]];
     let body = electra_body_with_kzg_commitments_for_test(&two_commits);
     let body_hex = format!("0x{}", hex::encode(&body));
 
-    // Only one sidecar despite two commitments in the body.
     let data = serde_json::json!({
         "block": {
             "slot": slot.to_string(),
@@ -1311,9 +1306,8 @@ async fn test_l3_propose_block_and_blobs_warns_on_commitment_count_mismatch() {
             "state_root": format!("0x{}", hex::encode([0x22u8; 32])),
             "body": body_hex,
         },
-        "blob_sidecars": [
-            { "index": "0", "blob": format!("0x{}", hex::encode([0u8; 64])) },
-        ],
+        "kzg_proofs": [format!("0x{}", hex::encode([0x11u8; 48]))],
+        "blobs": [format!("0x{}", hex::encode([0u8; 64]))],
     });
     let response = ProduceBlockResponse {
         data,
@@ -1327,13 +1321,194 @@ async fn test_l3_propose_block_and_blobs_warns_on_commitment_count_mismatch() {
         consensus_block_value: None,
     };
 
-    let beacon = MockBeaconClient::from_response(response);
-    let signer = MockSigner::new();
-    let service = build_service(signer, beacon, &pubkey);
+    let signer = Arc::new(MockSigner::new());
+    let beacon = Arc::new(MockBeaconClient::from_response(response));
+    let service = BlockService::new(
+        signer.clone(),
+        beacon,
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
 
     // Signing must NOT fail — the count mismatch is a warn, not an error.
     let result = service.propose_block(slot, &pubkey, 42, None).await;
     assert!(result.is_ok(), "commitment count mismatch must not abort signing, got: {result:?}");
+    assert_eq!(
+        signer.block_calls.lock().unwrap().len(),
+        1,
+        "warn-only commitment mismatch must still reach the signer"
+    );
+}
+
+const DENEB_CONTENTS_JSON: &str =
+    include_str!("../../../../eth-types/tests/fixtures/beacon_api/deneb_block_contents.json");
+const FULU_CONTENTS_JSON: &str =
+    include_str!("../../../../eth-types/tests/fixtures/beacon_api/fulu_block_contents.json");
+
+fn fixture_data_with_hex_body(text: &str, consensus_version: &str) -> serde_json::Value {
+    let doc: serde_json::Value = serde_json::from_str(text).expect("fixture json");
+    let mut data = doc["data"].clone();
+    let body = test_body_ssz_for_version(consensus_version);
+    data["block"]["body"] = serde_json::Value::String(format!("0x{}", hex::encode(body)));
+    data
+}
+
+fn quoted_u64(value: &serde_json::Value) -> u64 {
+    value.as_str().expect("quoted integer").parse().expect("u64")
+}
+
+fn contents_response(data: serde_json::Value, version: &str) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data,
+        is_blinded: false,
+        consensus_version: version.to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+    }
+}
+
+struct ContentsHarness {
+    service: BlockService<MockSigner, MockBeaconClient>,
+    signer: Arc<MockSigner>,
+    beacon: Arc<MockBeaconClient>,
+}
+
+fn contents_harness(response: ProduceBlockResponse, pubkey: &PublicKey) -> ContentsHarness {
+    let signer = Arc::new(MockSigner::new());
+    let beacon = Arc::new(MockBeaconClient::from_response(response));
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    ContentsHarness { service, signer, beacon }
+}
+
+fn assert_no_block_sign(harness: &ContentsHarness) {
+    assert!(harness.signer.block_calls.lock().unwrap().is_empty(), "signer must not be called");
+    assert!(
+        harness.signer.header_calls.lock().unwrap().is_empty(),
+        "header signer must not be called"
+    );
+    assert!(harness.beacon.publish_calls.lock().unwrap().is_empty(), "must not publish");
+}
+
+/// Real Fulu arrays are `128 * blobs` cell proofs. A layout-keyed check would
+/// require one proof per blob and reject this.
+#[tokio::test]
+async fn real_fulu_contents_pass_cardinality_and_reach_the_signer() {
+    let data = fixture_data_with_hex_body(FULU_CONTENTS_JSON, "fulu");
+    let proofs = data["kzg_proofs"].as_array().unwrap().len();
+    let blobs = data["blobs"].as_array().unwrap().len();
+    assert_eq!(eth_types::CELLS_PER_EXT_BLOB, 128);
+    assert_eq!(proofs, blobs * 128, "fixture must carry 128 proofs per blob");
+    assert_ne!(blobs, 0, "fulu blobs must be non-empty");
+    let slot = quoted_u64(&data["block"]["slot"]);
+    let proposer = quoted_u64(&data["block"]["proposer_index"]);
+    let pubkey = test_pubkey();
+    let harness = contents_harness(contents_response(data, "fulu"), &pubkey);
+
+    let result = harness.service.propose_block(slot, &pubkey, proposer, None).await;
+    assert!(result.is_ok(), "fulu cell proofs must pass cardinality, got {result:?}");
+    assert_eq!(harness.signer.block_calls.lock().unwrap().len(), 1, "signer must be called");
+}
+
+#[tokio::test]
+async fn truncated_fulu_proofs_fail_before_signing() {
+    let mut data = fixture_data_with_hex_body(FULU_CONTENTS_JSON, "fulu");
+    let blobs = data["blobs"].as_array().unwrap().len();
+    data["kzg_proofs"].as_array_mut().unwrap().pop();
+    let proofs = data["kzg_proofs"].as_array().unwrap().len();
+    let expected = blobs * 128;
+    assert_eq!(proofs, expected - 1);
+    let slot = quoted_u64(&data["block"]["slot"]);
+    let proposer = quoted_u64(&data["block"]["proposer_index"]);
+    let pubkey = test_pubkey();
+    let harness = contents_harness(contents_response(data, "fulu"), &pubkey);
+
+    let err = harness.service.propose_block(slot, &pubkey, proposer, None).await.unwrap_err();
+    let BlockServiceError::Parse(msg) = err else {
+        panic!("expected Parse, got {err:?}");
+    };
+    assert!(msg.contains("fulu"), "{msg}");
+    assert!(msg.contains(&format!("expected {expected}")), "{msg}");
+    assert!(msg.contains(&format!("got {proofs}")), "{msg}");
+    assert!(msg.contains(&format!("{blobs} blobs")), "{msg}");
+    assert_no_block_sign(&harness);
+}
+
+/// Deneb (and Electra) require one proof per blob. The real fixture satisfies
+/// that and reaches the signer; an extra proof does not.
+#[tokio::test]
+async fn deneb_contents_require_one_proof_per_blob() {
+    let data = fixture_data_with_hex_body(DENEB_CONTENTS_JSON, "deneb");
+    let blobs = data["blobs"].as_array().unwrap().len();
+    let proofs = data["kzg_proofs"].as_array().unwrap().len();
+    assert_eq!(proofs, blobs);
+    assert_ne!(blobs, 0);
+    let slot = quoted_u64(&data["block"]["slot"]);
+    let proposer = quoted_u64(&data["block"]["proposer_index"]);
+    let pubkey = test_pubkey();
+    let harness = contents_harness(contents_response(data.clone(), "deneb"), &pubkey);
+    let result = harness.service.propose_block(slot, &pubkey, proposer, None).await;
+    assert!(result.is_ok(), "one deneb proof per blob must sign, got {result:?}");
+    assert_eq!(harness.signer.block_calls.lock().unwrap().len(), 1);
+
+    let mut extra = data;
+    extra["kzg_proofs"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::Value::String(format!("0x{}", hex::encode([0xab; 48]))));
+    let got = extra["kzg_proofs"].as_array().unwrap().len();
+    let pubkey = test_pubkey();
+    let harness = contents_harness(contents_response(extra, "deneb"), &pubkey);
+    let err = harness.service.propose_block(slot, &pubkey, proposer, None).await.unwrap_err();
+    let BlockServiceError::Parse(msg) = err else {
+        panic!("expected Parse, got {err:?}");
+    };
+    assert!(msg.contains("deneb"), "{msg}");
+    assert!(msg.contains(&format!("expected {blobs}")), "{msg}");
+    assert!(msg.contains(&format!("got {got}")), "{msg}");
+    assert!(msg.contains(&format!("{blobs} blobs")), "{msg}");
+    assert_no_block_sign(&harness);
+}
+
+#[tokio::test]
+async fn wrong_proof_cardinality_fails_before_signing() {
+    let slot = 50 * SLOTS_PER_EPOCH;
+    let body = format!("0x{}", hex::encode(test_body_ssz_for_version("electra")));
+    let data = serde_json::json!({
+        "block": {
+            "slot": slot.to_string(),
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", hex::encode([0x11u8; 32])),
+            "state_root": format!("0x{}", hex::encode([0x22u8; 32])),
+            "body": body,
+        },
+        "kzg_proofs": [format!("0x{}", hex::encode([0xaa; 48]))],
+        "blobs": [
+            format!("0x{}", hex::encode([0x01; 8])),
+            format!("0x{}", hex::encode([0x02; 8])),
+        ],
+    });
+    let pubkey = test_pubkey();
+    let harness = contents_harness(contents_response(data, "electra"), &pubkey);
+    let err = harness.service.propose_block(slot, &pubkey, 42, None).await.unwrap_err();
+    let BlockServiceError::Parse(msg) = err else {
+        panic!("expected Parse, got {err:?}");
+    };
+    assert!(msg.contains("electra"), "{msg}");
+    assert!(msg.contains("expected 2"), "{msg}");
+    assert!(msg.contains("got 1"), "{msg}");
+    assert!(msg.contains("2 blobs"), "{msg}");
+    assert_no_block_sign(&harness);
 }
 
 // GREEN (CQ-3.2): formerly RED test for ISSUE-CQ-3.2 (C3).

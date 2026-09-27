@@ -34,9 +34,10 @@ pub use aggregation::{
     SignedAggregateAndProof, SignedElectraAggregateAndProof,
 };
 pub use block::{
-    body_fork_layout, kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BeaconBlockHeader,
-    BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout,
-    ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    body_fork_layout, expected_kzg_proof_count, kzg_commitment_list_root, BeaconBlock,
+    BeaconBlockBody, BeaconBlockHeader, BlindedBeaconBlock, BlindedBeaconBlockBody, BlockContents,
+    BlockContentsShapeError, BodyForkLayout, KzgProofCountError, ProducedBlock, SignedBeaconBlock,
+    SignedBlindedBeaconBlock, CELLS_PER_EXT_BLOB,
 };
 pub use block_body::{
     blinded_body_tree_hash_root, blinded_body_tree_hash_root_for_layout, body_tree_hash_root,
