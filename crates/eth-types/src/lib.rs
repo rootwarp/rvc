@@ -10,6 +10,8 @@ mod block;
 /// Path C (ARCH-7h): one struct per container. Crate-root types carry both
 /// `ssz` 0.9 and `ssz08` 0.8 codecs; see `block_body` module docs.
 pub mod block_body;
+/// JSON ↔ SSZ block-body codec. SSZ stays canonical; no production caller yet.
+pub mod block_body_json;
 mod builder;
 mod builder_request_auth;
 pub mod canonical;
