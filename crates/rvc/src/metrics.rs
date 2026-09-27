@@ -64,6 +64,14 @@ pub static RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS: LazyLock<Histogram
         )
     });
 
+/// Live size of the pubkey→index registry written by IndexResolver (ADR-R05).
+pub static RVC_DUTY_INDEX_SET_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
+    define_int_gauge(
+        "rvc_duty_index_set_size",
+        "Number of validator pubkeys with a resolved beacon index",
+    )
+});
+
 /// Counter for duty reorg detections.
 /// Labels: duty_type (attester, proposer, ptc)
 pub static RVC_DUTY_REORG_DETECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
@@ -214,6 +222,7 @@ pub fn init() {
     LazyLock::force(&RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS);
     LazyLock::force(&RVC_AGGREGATIONS_TOTAL);
     LazyLock::force(&RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS);
+    LazyLock::force(&RVC_DUTY_INDEX_SET_SIZE);
     LazyLock::force(&RVC_DUTY_REORG_DETECTED_TOTAL);
     LazyLock::force(&RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL);
     LazyLock::force(&RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL);

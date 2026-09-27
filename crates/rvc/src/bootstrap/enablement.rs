@@ -133,10 +133,10 @@ pub async fn wire_signing_enablement(
         &keys.pubkey_map,
     );
 
-    // SEC-2c: spawn the per-slot liveness observation loop (sole production mechanism).
+    // SEC-2c: spawn the per-slot liveness observation loop when doppelganger is on.
     // bn_manager is Arc; clone for the loop and keep the original for later duties.
-    // Pass pubkey_map so the loop re-resolves indices after keymanager import /
-    // delayed activation (review Finding 3).
+    // pubkey_map stays attached for the retained refresh helper. IndexResolver,
+    // spawned from `run`, is the production index writer (ADR-R05).
     let liveness_task = if doppelganger_enabled {
         spawn_liveness_loop(
             forward_window_machine.clone(),

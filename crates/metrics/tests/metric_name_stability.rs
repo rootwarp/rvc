@@ -27,6 +27,9 @@
 //! RR-4.3 adds `rvc_slashing_export_synthetic_records_total` (family delta +1):
 //! one increment per synthetic attestation or block floor in an interchange
 //! export. It has no labels.
+//! RR-2.2 adds `rvc_duty_index_set_size` (family delta +1): live size of the
+//! pubkey→index registry. Dashboards that watch duty coverage should bind this
+//! gauge; it has no labels.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -78,6 +81,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_builder_consecutive_misses",
     "rvc_builder_epoch_misses",
     "rvc_duties_fetched_total",
+    "rvc_duty_index_set_size", // operator-facing: pubkey-index registry size (RR-2.2)
     "rvc_duty_reorg_detected_total",
     "rvc_fork_current_id", // operator-facing: resolved current fork id (issue 8.1)
     "rvc_fork_next_activation_epoch", // operator-facing: next fork activation epoch (issue 8.1)
@@ -219,8 +223,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        49,
-        "RR-1.2 and RR-4.3 each add one family on the RR-4.1/RR-4.2 47-family pin"
+        50,
+        "RR-1.2, RR-4.3, and RR-2.2 each add one family on the 47-family pin"
     );
 }
 

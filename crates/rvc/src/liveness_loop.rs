@@ -4,11 +4,12 @@
 //! (`BeaconNodeClient::post_validator_liveness_merged`, multi-BN OR-merge).
 //!
 //! Each cycle (once per slot):
-//! 1. Periodically re-resolve numeric indices from the live [`PubkeyMap`] (import /
-//!    activation refresh — review Finding 3)
-//! 2. Query liveness for recently completed epochs that still need observation
-//! 3. Translate numeric validator indices → bare pubkey-hex (SEC-001)
-//! 4. `observe_liveness` then `tick`
+//! 1. Query liveness for recently completed epochs that still need observation
+//! 2. Translate numeric validator indices → bare pubkey-hex (SEC-001)
+//! 3. `observe_liveness` then `tick`
+//!
+//! Index refresh is not done here. [`crate::index_resolver::IndexResolver`] is the
+//! single production writer (ADR-R05).
 //!
 //! Detected liveness permanently closes the gate for that key (machine semantics).
 //! A clean fully-observed window opens the gate. This loop is the sole production
@@ -50,8 +51,7 @@ const LIVENESS_LOOKBACK_EPOCHS: u64 = DEFAULT_MONITORING_EPOCHS + 2;
 
 /// Merge `pubkey-hex → numeric index` entries into the shared registry.
 ///
-/// Safe to call from import/refresh paths so newly registered keys become
-/// observable without waiting for the next BN re-resolve cycle.
+/// [`crate::index_resolver::IndexResolver`] is the only production caller (ADR-R05).
 pub fn merge_validator_indices(
     registry: &SharedPubkeyIndexRegistry,
     pubkey_to_index: &HashMap<String, String>,
@@ -82,6 +82,51 @@ pub struct LivenessObservationLoop {
     cancel: CancellationToken,
 }
 
+/// Body of the retained liveness index refresh. Expanded only from the test helper
+/// (and, under `cfg(test)`, from `refresh_indices_from_pubkey_map`).
+macro_rules! refresh_indices_from_pubkey_map_impl {
+    ($self:ident) => {{
+        let Some(ref pm) = $self.pubkey_map else {
+            return;
+        };
+        let pubkeys: Vec<String> = {
+            let map = pm.read();
+            if map.is_empty() {
+                return;
+            }
+            map.keys().map(pubkey_bytes_to_0x).collect()
+        };
+
+        match $self.beacon.get_validators(&pubkeys).await {
+            Ok(resp) => {
+                let mut w = $self.pubkey_index.write();
+                let before = w.len();
+                for v in resp.data {
+                    if let Some(bytes) = parse_pubkey_bytes(&v.validator.pubkey) {
+                        w.insert(bytes, v.index);
+                    }
+                }
+                let after = w.len();
+                if after > before {
+                    info!(
+                        added = after - before,
+                        total = after,
+                        "SEC-2c: refreshed liveness index map from BN (import/activation)"
+                    );
+                } else {
+                    debug!(total = after, "SEC-2c: index re-resolve complete (no new indices)");
+                }
+            }
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "SEC-2c: index re-resolve failed; will retry next epoch (fail-closed)"
+                );
+            }
+        }
+    }};
+}
+
 impl LivenessObservationLoop {
     pub fn new(
         machine: Arc<ForwardWindowMachine>,
@@ -101,7 +146,10 @@ impl LivenessObservationLoop {
         }
     }
 
-    /// Attach the production pubkey map so the loop re-resolves indices periodically.
+    /// Attach the pubkey map used by [`Self::refresh_indices_for_test`].
+    ///
+    /// Production index writes belong to [`crate::index_resolver::IndexResolver`]
+    /// (ADR-R05), not this loop.
     pub fn with_pubkey_map(mut self, pubkey_map: PubkeyMap) -> Self {
         self.pubkey_map = Some(pubkey_map);
         self
@@ -131,7 +179,6 @@ impl LivenessObservationLoop {
         // Detect after an earlier complete not-live (review Finding 1).
         let mut observed_epochs: HashSet<Epoch> = HashSet::new();
         let mut has_pending = true;
-        let mut last_refresh_epoch: Option<Epoch> = None;
 
         loop {
             if self.cancel.is_cancelled() {
@@ -141,13 +188,6 @@ impl LivenessObservationLoop {
 
             let current_epoch = self.epoch_clock.current_epoch();
             let slot_in_epoch = self.epoch_clock.slot_in_epoch();
-
-            // Finding 3: re-resolve indices from the live pubkey set at least once
-            // per epoch (covers keymanager import + delayed activation).
-            if last_refresh_epoch != Some(current_epoch) {
-                self.refresh_indices_from_pubkey_map().await;
-                last_refresh_epoch = Some(current_epoch);
-            }
 
             // Observe completed epochs that may still be needed by Pending keys.
             if current_epoch > 0 {
@@ -212,46 +252,15 @@ impl LivenessObservationLoop {
         }
     }
 
-    /// Re-resolve validator indices for every key currently in the pubkey map.
+    /// Test-only index refresh. Production [`Self::run`] does not call this;
+    /// [`crate::index_resolver::IndexResolver`] is the ongoing writer (ADR-R05).
+    ///
+    /// Unit tests call it through [`Self::refresh_indices_for_test`]. Integration
+    /// tests build this crate without `cfg(test)`, so the helper inlines the same
+    /// body.
+    #[cfg(test)]
     async fn refresh_indices_from_pubkey_map(&self) {
-        let Some(ref pm) = self.pubkey_map else {
-            return;
-        };
-        let pubkeys: Vec<String> = {
-            let map = pm.read();
-            if map.is_empty() {
-                return;
-            }
-            map.keys().map(pubkey_bytes_to_0x).collect()
-        };
-
-        match self.beacon.get_validators(&pubkeys).await {
-            Ok(resp) => {
-                let mut w = self.pubkey_index.write();
-                let before = w.len();
-                for v in resp.data {
-                    if let Some(bytes) = parse_pubkey_bytes(&v.validator.pubkey) {
-                        w.insert(bytes, v.index);
-                    }
-                }
-                let after = w.len();
-                if after > before {
-                    info!(
-                        added = after - before,
-                        total = after,
-                        "SEC-2c: refreshed liveness index map from BN (import/activation)"
-                    );
-                } else {
-                    debug!(total = after, "SEC-2c: index re-resolve complete (no new indices)");
-                }
-            }
-            Err(e) => {
-                debug!(
-                    error = %e,
-                    "SEC-2c: index re-resolve failed; will retry next epoch (fail-closed)"
-                );
-            }
-        }
+        refresh_indices_from_pubkey_map_impl!(self);
     }
 
     /// Query BN liveness for `epoch`, translate indices, feed the machine.
@@ -314,8 +323,17 @@ impl LivenessObservationLoop {
     }
 
     /// Test helper: run one index refresh from the attached pubkey map.
+    ///
+    /// Not a production writer. [`Self::run`] must not call this.
     pub async fn refresh_indices_for_test(&self) {
-        self.refresh_indices_from_pubkey_map().await;
+        #[cfg(test)]
+        {
+            self.refresh_indices_from_pubkey_map().await;
+        }
+        #[cfg(not(test))]
+        {
+            refresh_indices_from_pubkey_map_impl!(self);
+        }
     }
 }
 
@@ -323,8 +341,9 @@ impl LivenessObservationLoop {
 /// keys (resolved indices and/or a non-empty pubkey map for later re-resolve).
 ///
 /// `pubkey_index` is the workspace-shared registry (same handle used by
-/// `prepare_proposers` / duty tracking). Callers must seed it before spawn or
-/// attach a non-empty `pubkey_map` so re-resolve can fill it later.
+/// `prepare_proposers` / duty tracking). Production index refresh is
+/// [`crate::index_resolver::IndexResolver`]; `pubkey_map` stays attached for
+/// [`LivenessObservationLoop::refresh_indices_for_test`].
 ///
 /// The loop is registered on `executor` at Orchestrator tier (ARCH-2g P1-7).
 pub fn spawn_liveness_loop(
@@ -347,8 +366,8 @@ pub fn spawn_liveness_loop(
     }
     if !has_indices {
         info!(
-            "SEC-2c: starting liveness loop with empty indices; will re-resolve from pubkey_map \
-             (pending activation / post-import)"
+            "SEC-2c: starting liveness loop with empty indices \
+             (IndexResolver owns index refresh; pending activation / post-import)"
         );
     }
 
@@ -793,7 +812,38 @@ mod tests {
             Arc::new(MonotonicEpochClock::new(0)),
             &exec,
         );
-        assert!(spawn.is_some(), "must start so pending-activation keys can re-resolve");
+        assert!(
+            spawn.is_some(),
+            "must start with an empty index set and a pubkey map; IndexResolver re-resolves \
+             pending-activation keys, not this loop"
+        );
         let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
+    }
+
+    /// Production `run` must not refresh indices. The refresh method is `cfg(test)`.
+    #[test]
+    fn has_no_index_refresh_call() {
+        let src = include_str!("liveness_loop.rs");
+        let run_body = src
+            .split("pub async fn run(self)")
+            .nth(1)
+            .expect("run")
+            .split("/// Test-only index refresh")
+            .next()
+            .expect("refresh docs follow run");
+        assert!(
+            !run_body.contains("refresh_indices_from_pubkey_map"),
+            "production liveness loop must not refresh indices"
+        );
+        assert!(
+            !run_body.contains("refresh_indices_for_test"),
+            "production liveness loop must not call the test helper"
+        );
+        let fn_at = src.find("async fn refresh_indices_from_pubkey_map").expect("method");
+        assert!(
+            src[..fn_at].lines().rev().take(12).any(|line| line.trim() == "#[cfg(test)]"),
+            "refresh_indices_from_pubkey_map must be test-only"
+        );
+        assert!(src.contains("fn refresh_indices_for_test"));
     }
 }

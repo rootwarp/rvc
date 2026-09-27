@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use bn_manager::OperationTimeouts;
+use bn_manager::{BeaconNodeClient, OperationTimeouts};
 use metrics::{new_health_status, SharedHealthStatus};
 use secret_provider::SecretProvider;
 use tokio::sync::mpsc;
@@ -21,6 +21,7 @@ use super::{
 };
 use crate::config::{redact_url, Config};
 use crate::deletion_denylist::DeletionDenylist;
+use crate::index_resolver::{spawn_index_resolver, IndexResolverDeps};
 use crate::key_admission::{AdmissionSource, KeyAdmissionService};
 use crate::keymanager_adapters::{spawn_keymanager_api, KeymanagerApiDeps};
 use crate::startup;
@@ -193,8 +194,21 @@ pub async fn run(
     } = services;
 
     // RF1-06/07: single key-generation watch channel shared by keymanager
-    // adapters (tx) and DutyOrchestrator (rx).
+    // adapters (tx), the index resolver, and DutyOrchestrator (rx).
     let (key_gen_tx, key_gen_rx) = tokio::sync::watch::channel(0u64);
+
+    // ADR-R05: one index writer, including when doppelganger detection is off.
+    spawn_index_resolver(
+        IndexResolverDeps {
+            registry: Arc::clone(&pubkey_index),
+            pubkey_map: Arc::clone(&pubkey_map),
+            beacon: Arc::clone(&bn_manager) as Arc<dyn BeaconNodeClient>,
+            key_gen_tx: key_gen_tx.clone(),
+            key_gen_rx: key_gen_rx.clone(),
+            epoch_clock: Arc::clone(&epoch_clock),
+        },
+        &executor,
+    );
 
     // ARCH-2c: single admission choke point for provider refresh + keymanager import.
     let admissions = Arc::new(KeyAdmissionService::new(
