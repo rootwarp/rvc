@@ -7,8 +7,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crypto::{CompositeSigner, KeyManager, LocalSigner};
+use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey};
 use grpc_signer::{GrpcRemoteSigner, GrpcRemoteSignerConfig};
+use observability::logging::TruncatedPubkey;
 use secret_provider::SecretProvider;
 use tracing::{info, warn};
 
@@ -28,25 +29,36 @@ pub struct LoadedKeys {
     /// secret-provider and gRPC remote keys — matches prior `run_validator`).
     pub validator_count: usize,
     /// Local (keystore-dir + secret-provider) public keys as raw 48-byte sets.
-    /// Used by secret-provider refresh as the “already known” set.
+    /// Used by secret-provider refresh as the “already known” set. gRPC remote
+    /// pubkeys are not included.
     pub local_pubkeys: HashSet<[u8; 48]>,
-    /// Hex-keyed pubkey map for enablement, duties, and keymanager adapters.
+    /// Pubkey map for enablement, duties, and keymanager adapters. Includes
+    /// local keys and, when connect succeeds, gRPC remote pubkeys.
     pub pubkey_map: PubkeyMap,
     /// Configured secret providers (may be empty). Retained for refresh wiring.
     pub secret_providers: Vec<Arc<dyn SecretProvider>>,
     /// Connected gRPC remote signer when configured and connect succeeded.
-    /// Connect failure is non-fatal: `None` with a warn log (lazy retry path).
+    /// Connect failure is non-fatal (`None` and a warning) and terminal for
+    /// this startup: the connection is not retried.
     pub grpc_signer: Option<Arc<GrpcRemoteSigner>>,
 }
 
-/// Load local keys (keystore-dir + secret providers), build one
-/// [`CompositeSigner`] by value, and optionally connect a gRPC remote signer.
+/// Load local keys, then connect a configured gRPC remote signer, then build
+/// the [`PubkeyMap`] and [`CompositeSigner`].
 ///
-/// `denylist` skips Keymanager-deleted pubkeys for both keystore-dir and
-/// secret-provider sources (SEC-1b). Health-status updates remain the caller's
-/// responsibility (see module docs on [`super`]).
+/// Order: keystore-dir, secret providers, gRPC connect, then
+/// [`ServiceBuilder::build_pubkey_map`] and `local_pubkeys`. Remote pubkeys
+/// that parse as BLS points and are not denylisted are inserted into
+/// `PubkeyMap` and registered on the composite signer. They are not added to
+/// `local_pubkeys` (the secret-provider refresh known-set).
 ///
-/// Log lines and order match the former inline `run_validator` key-load block.
+/// `denylist` skips Keymanager-deleted pubkeys for keystore-dir, secret
+/// providers, and gRPC `ListPublicKeys` (SEC-1b). Health-status updates remain
+/// the caller's responsibility (see module docs on [`super`]).
+///
+/// A gRPC connect failure is logged as `Failed to connect to gRPC remote
+/// signer` and is terminal for this startup: the connection is not retried.
+/// TLS material that cannot be read is fatal.
 pub async fn load_signing_keys(
     config: &Config,
     denylist: &DeletionDenylist,
@@ -105,6 +117,10 @@ pub async fn load_signing_keys(
         );
     }
 
+    // Connect before the pubkey map so remote keys can be inserted without
+    // joining `local_pubkeys` (secret-provider refresh known-set).
+    let connected = connect_grpc_remote_signer(config).await?;
+
     let pubkey_map = builder.build_pubkey_map(&key_manager);
     let local_pubkeys: HashSet<[u8; 48]> =
         key_manager.list_public_keys().iter().map(|pk| pk.to_bytes()).collect();
@@ -113,8 +129,14 @@ pub async fn load_signing_keys(
     let local_signer = LocalSigner::new(key_manager);
     let composite_signer = Arc::new(CompositeSigner::new(local_signer));
 
-    // Connect gRPC remote signer if configured (non-fatal: lazy connection).
-    let grpc_signer = connect_grpc_remote_signer(config, &composite_signer).await?;
+    let grpc_signer = match connected {
+        Some((signer, remote_pubkeys)) => {
+            let accepted = accept_remote_pubkeys(&pubkey_map, &remote_pubkeys, &denylist_snapshot);
+            composite_signer.add_grpc_remote_signer(accepted, signer.clone());
+            Some(signer)
+        }
+        None => None,
+    };
 
     super::signer_probe::probe_configured_remote_signer(config).await;
 
@@ -128,14 +150,17 @@ pub async fn load_signing_keys(
     })
 }
 
-/// Configure and connect the gRPC remote signer; register its keys on success.
+/// Connect the configured gRPC remote signer.
 ///
-/// Connect failure logs a warning and returns `Ok(None)` — same as prior
-/// `run_validator` behavior. TLS material read failures are fatal.
+/// The success arm populates [`PubkeyMap`] with listed pubkeys that parse as
+/// BLS points and are not on the deletion denylist. Those keys are registered
+/// on the composite signer and are not added to `local_pubkeys`. The failure
+/// arm is terminal for this startup — the connection is not retried
+/// (`Ok(None)` after a warning). TLS material that cannot be read is still
+/// fatal.
 async fn connect_grpc_remote_signer(
     config: &Config,
-    composite_signer: &CompositeSigner,
-) -> Result<Option<Arc<GrpcRemoteSigner>>, BootstrapError> {
+) -> Result<Option<(Arc<GrpcRemoteSigner>, Vec<[u8; 48]>)>, BootstrapError> {
     let Some(ref grpc_url) = config.grpc_signer.url else {
         return Ok(None);
     };
@@ -170,27 +195,72 @@ async fn connect_grpc_remote_signer(
 
     match GrpcRemoteSigner::connect(grpc_config).await {
         Ok(signer) => {
-            let key_count = signer.public_keys().len();
+            let remote_pubkeys = signer.public_keys();
             info!(
                 url = %redact_url(grpc_url),
-                key_count,
+                key_count = remote_pubkeys.len(),
                 "gRPC remote signer connected (v2 typed RPCs)"
             );
-
-            let pubkeys = signer.public_keys();
-            let signer = Arc::new(signer);
-            composite_signer.add_grpc_remote_signer(pubkeys, signer.clone());
-            Ok(Some(signer))
+            Ok(Some((Arc::new(signer), remote_pubkeys)))
         }
         Err(e) => {
+            // Terminal for this startup: nothing retries the connection.
             warn!(
                 url = %redact_url(grpc_url),
                 error = %e,
-                "Failed to connect to gRPC remote signer; will retry on demand"
+                "Failed to connect to gRPC remote signer"
             );
             Ok(None)
         }
     }
+}
+
+/// Pubkeys that belong in `PubkeyMap` and on the composite signer.
+///
+/// Denylisted keys and points that fail [`PublicKey::from_bytes`] are omitted
+/// from both. Each distinct rejected point is logged once.
+fn accept_remote_pubkeys(
+    pubkey_map: &PubkeyMap,
+    remote_pubkeys: &[[u8; 48]],
+    denylist: &HashSet<[u8; 48]>,
+) -> Vec<[u8; 48]> {
+    let mut accepted = Vec::new();
+    let mut to_insert = Vec::new();
+    let mut warned_denied = HashSet::new();
+    let mut warned_invalid = HashSet::new();
+    for bytes in remote_pubkeys {
+        if denylist.contains(bytes) {
+            if warned_denied.insert(*bytes) {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&format!("0x{}", hex::encode(bytes))),
+                    "Skipping denylisted gRPC remote pubkey"
+                );
+            }
+            continue;
+        }
+        match PublicKey::from_bytes(bytes) {
+            Ok(pk) => {
+                accepted.push(*bytes);
+                to_insert.push((*bytes, pk));
+            }
+            Err(e) => {
+                if warned_invalid.insert(*bytes) {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&format!("0x{}", hex::encode(bytes))),
+                        error = %e,
+                        "gRPC remote pubkey is not a valid BLS key; omitted from PubkeyMap and the signer"
+                    );
+                }
+            }
+        }
+    }
+    if !to_insert.is_empty() {
+        let mut map = pubkey_map.write();
+        for (bytes, pk) in to_insert {
+            map.insert(bytes, pk);
+        }
+    }
+    accepted
 }
 
 #[cfg(test)]

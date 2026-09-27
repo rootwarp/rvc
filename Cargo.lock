@@ -4198,6 +4198,7 @@ dependencies = [
  "tree_hash",
  "url",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]

@@ -358,7 +358,7 @@ Requires bearer token authentication.
 11. Load validator keys from keystores
 12. Load keys from secret providers (if `--secret-provider` configured)
 13. Start periodic key refresh (if `--secret-refresh-interval` > 0)
-14. Connect gRPC remote signer (if `--grpc-signer-url` configured, lazy, non-fatal)
+14. Connect gRPC remote signer (if `--grpc-signer-url` configured). Failure is non-fatal and is not retried until the next process start.
 15. Run doppelganger detection (if enabled, ~2 epochs)
 16. Build services (signer, propagator, duty tracker, builder)
 17. Start Keymanager API server (if enabled)

@@ -79,6 +79,7 @@ tracing-test.workspace = true
 # ARCH-7b: `start_paused` / `time::pause` for virtual multi-second duty stalls.
 tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
+zeroize.workspace = true
 criterion.workspace = true
 
 # Per-slot latency-sanity companion (issue 2.13). Run via `cargo bench`; NOT a
