@@ -24,6 +24,7 @@ use super::BootstrapError;
 use crate::beacon_adapter::BeaconBlockAdapter;
 use crate::config::{Config, ServiceBuilder};
 use crate::orchestrator::OrchestratorConfig;
+use crate::quiesce::QuiesceRegistry;
 use crate::startup::{self, StartupError};
 
 /// Handles produced by [`build_services`].
@@ -34,6 +35,11 @@ use crate::startup::{self, StartupError};
 pub struct ServiceHandles {
     /// Production signer with slashing protection and signing enablement.
     pub signer: Arc<SignerService>,
+    /// Quiesce set read by the signer's [`crate::quiesce::QuiescingEnablement`].
+    ///
+    /// Same `Arc` the decorator holds. This issue exposes no removal; re-admission
+    /// is a later change.
+    pub quiesce_registry: Arc<QuiesceRegistry>,
     /// Per-validator config store (fee recipient, enabled, gas limit).
     pub validator_store: Arc<ValidatorStore>,
     /// Attestation propagator over the main-pool `BnManager`.
@@ -104,7 +110,7 @@ pub async fn build_services(
 ) -> Result<ServiceHandles, BootstrapError> {
     let builder = ServiceBuilder::new(config.clone());
 
-    let signer = builder.build_signer(
+    let (signer, quiesce_registry) = builder.build_signer(
         Arc::clone(&keys.composite_signer),
         slashing_db,
         Arc::clone(&enablement.signing_enablement),
@@ -240,6 +246,7 @@ pub async fn build_services(
 
     Ok(ServiceHandles {
         signer,
+        quiesce_registry,
         validator_store,
         propagator,
         beacon: main_beacon,

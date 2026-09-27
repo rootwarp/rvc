@@ -727,6 +727,37 @@ impl SignerService {
     pub fn slashing_db(&self) -> &SlashingDb {
         &self.slashing_db
     }
+
+    /// Wait until the slashable per-pubkey lock is free, then drop it.
+    /// Returns `false` if `timeout` elapses first.
+    ///
+    /// Slashable duties (`sign_block`, `sign_attestation`) hold this lock across
+    /// the under-lock enablement re-check and the signature. Non-slashable
+    /// duties do not take it, so a `true` result does not mean those signatures
+    /// have finished. On timeout this wait is dropped; the task that holds the
+    /// lock is not cancelled.
+    #[must_use = "false means the slashable-lock drain timed out; the holder may still be signing"]
+    pub async fn drain_pubkey(&self, pubkey: &[u8; 48], timeout: Duration) -> bool {
+        // Acquire-and-drop. Dropping the wait on timeout removes only this waiter.
+        match tokio::time::timeout(timeout, self.validator_locks.lock(pubkey)).await {
+            Ok(guard) => {
+                drop(guard);
+                true
+            }
+            Err(_elapsed) => false,
+        }
+    }
+
+    /// Hold the per-pubkey signing lock. Test stand-in for an in-flight signature:
+    /// drop the guard to let [`Self::drain_pubkey`] proceed. Not a signing API.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub async fn acquire_signing_lock_for_test(
+        &self,
+        pubkey: &[u8; 48],
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.validator_locks.lock(pubkey).await
+    }
 }
 
 // Single surface: sign methods live only on [`ValidatorSigner`] (RF4-12 / F44).

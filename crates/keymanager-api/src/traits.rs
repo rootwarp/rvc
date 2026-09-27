@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -163,4 +165,43 @@ pub trait VoluntaryExitManager: Send + Sync {
         pubkey: &Pubkey,
         epoch: Option<u64>,
     ) -> Result<eth_types::SignedVoluntaryExit, ApiError>;
+}
+
+/// A drain that did not see the per-pubkey signing lock become free.
+///
+/// Not a success variant. The pubkey stays quiesced; callers must not export
+/// or delete it.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum QuiesceError {
+    /// `waited` is how long the drain blocked before giving up.
+    #[error("signing drain timed out after {waited:?}")]
+    DrainTimedOut { waited: Duration },
+}
+
+/// Close the under-lock signing gate for one pubkey and drain the slashable lock.
+///
+/// This trait lives in `rvc-keymanager-api` because that crate is Infra and
+/// must not depend on `rvc-signer` (Domain). A direct dependency would fail
+/// the G-5b `layer_edges` gate. The VC (`rvc`) implements the trait and calls
+/// the signer's per-pubkey drain; keymanager handlers depend only on this trait.
+///
+/// `Ok` means the pubkey is quiesced, so the enablement gate re-checked under
+/// the slashable per-pubkey lock is closed, and that lock was acquired and
+/// dropped. It does **not** mean every in-flight non-slashable signature has
+/// finished: randao, sync committee, aggregate, and voluntary exit check
+/// enablement and then sign without taking that lock. A later DELETE must not
+/// treat `Ok` as "all duties are idle".
+///
+/// [`QuiesceError::DrainTimedOut`] is an error. A timed-out drain leaves the
+/// pubkey quiesced and must not be ignored.
+#[async_trait]
+pub trait SigningQuiesce: Send + Sync {
+    /// Quiesce `pubkey` and wait up to `timeout` for the slashable per-pubkey lock.
+    ///
+    /// `Ok` — the under-lock gate is closed and that lock was acquired and
+    /// dropped. Non-slashable duties do not hold the lock, so `Ok` does not
+    /// mean they are idle. DELETE must not treat `Ok` as "all duties are idle".
+    ///
+    /// The pubkey remains quiesced on both `Ok` and [`QuiesceError::DrainTimedOut`].
+    async fn quiesce(&self, pubkey: &Pubkey, timeout: Duration) -> Result<(), QuiesceError>;
 }

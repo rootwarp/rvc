@@ -181,6 +181,7 @@ pub async fn run(
 
     let ServiceHandles {
         signer,
+        quiesce_registry: _quiesce_registry,
         validator_store,
         propagator,
         beacon,

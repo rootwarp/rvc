@@ -33,6 +33,11 @@
 //! RR-1.6 adds `rvc_dvt_peer_ready` (family delta +1): 0 until the first
 //! successful RPC to a configured DVT peer, then 1. Label `peer` is that
 //! address. Scraped on `rvc-signer`'s registry.
+//! RR-5.1 adds `rvc_keymanager_quiesce_wait_ms` (family delta +1): milliseconds
+//! spent waiting to acquire the slashable per-pubkey lock while quiescing.
+//! The sample is that wait on both success and timeout; a timeout is still an
+//! error. `Ok` from quiesce does not mean non-slashable duties are idle.
+//! It has no labels.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -90,6 +95,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_dvt_peer_ready", // operator-facing: 0 until the first successful DVT peer RPC (RR-1.6)
     "rvc_fork_current_id", // operator-facing: resolved current fork id (issue 8.1)
     "rvc_fork_next_activation_epoch", // operator-facing: next fork activation epoch (issue 8.1)
+    "rvc_keymanager_quiesce_wait_ms", // operator-facing: drain wait while quiescing a pubkey (RR-5.1)
     "rvc_monitoring_push_failures_total",
     "rvc_monitoring_push_success_total",
     "rvc_orchestrator_active_attestations",
@@ -228,8 +234,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        51,
-        "RR-1.6 adds rvc_dvt_peer_ready; count is the list length"
+        52,
+        "RR-5.1 adds rvc_keymanager_quiesce_wait_ms; count is the list length"
     );
 }
 

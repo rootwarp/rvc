@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 use observability::logging::RedactedUrl;
 
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
+use crate::quiesce::{QuiesceRegistry, QuiescingEnablement};
 use beacon::{parse_slot_duration_ms, BeaconClient, BeaconClientConfig};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, Propagator};
 use builder::BuilderService;
@@ -389,17 +390,25 @@ impl ServiceBuilder {
     /// Build the production [`SignerService`] with the given signing enablement.
     ///
     /// Callers must supply the enablement produced by
-    /// [`Self::build_signing_enablement`] (or an equivalent). The enablement is
-    /// the doppelganger gate consulted on every duty-signing path (SEC-2a/2b).
+    /// [`Self::build_signing_enablement`] (or an equivalent). That value is
+    /// wrapped in [`QuiescingEnablement`] before [`SignerService::with_enablement`],
+    /// so the signer re-checks the quiesce gate under the per-pubkey lock. The
+    /// returned registry is the one the wrapper reads.
+    ///
+    /// `ValidatorStore`'s `enabled` flag is a different gate and is not installed
+    /// here (SEC-2a/2b).
     pub fn build_signer(
         &self,
         composite_signer: Arc<CompositeSigner>,
         slashing_db: Arc<SlashingDb>,
         enablement: Arc<dyn SigningEnablement>,
-    ) -> Arc<SignerService> {
+    ) -> (Arc<SignerService>, Arc<QuiesceRegistry>) {
+        let registry = Arc::new(QuiesceRegistry::new());
+        let enablement: Arc<dyn SigningEnablement> =
+            Arc::new(QuiescingEnablement::new(enablement, Arc::clone(&registry)));
         let signer = SignerService::new(composite_signer, slashing_db).with_enablement(enablement);
         info!("Created signer service with signing enablement (SEC-2b)");
-        Arc::new(signer)
+        (Arc::new(signer), registry)
     }
 
     /// Construct the production [`SigningEnablement`] (SEC-2b).
@@ -1093,7 +1102,7 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
-        let signer = builder.build_signer(composite, slashing_db, enablement);
+        let (signer, _quiesce_registry) = builder.build_signer(composite, slashing_db, enablement);
 
         assert!(signer.signer().public_keys().is_empty());
     }
@@ -1478,7 +1487,7 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
-        let signer = builder.build_signer(composite, slashing_db, enablement);
+        let (signer, _quiesce_registry) = builder.build_signer(composite, slashing_db, enablement);
 
         // Build a temp validators config with a non-zero fee_recipient to satisfy the guard.
         let temp_dir = TempDir::new().unwrap();

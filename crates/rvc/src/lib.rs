@@ -13,5 +13,6 @@ pub mod liveness_loop;
 pub mod metrics;
 pub mod orchestrator;
 pub mod pubkey_index;
+pub mod quiesce;
 pub mod slashing_monitor;
 pub mod startup;

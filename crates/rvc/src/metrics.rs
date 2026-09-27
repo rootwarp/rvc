@@ -4,8 +4,8 @@ use std::sync::LazyLock;
 
 use metrics::{
     define_gauge, define_histogram_vec, define_int_counter, define_int_counter_vec,
-    define_int_gauge, define_int_gauge_vec, Gauge, HistogramVec, IntCounter, IntCounterVec,
-    IntGauge, IntGaugeVec,
+    define_int_gauge, define_int_gauge_vec, Gauge, Histogram, HistogramOpts, HistogramVec,
+    IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
 };
 
 pub use bn_manager::metrics::RVC_ATTESTATIONS_TOTAL;
@@ -197,6 +197,21 @@ pub static RVC_FORK_CURRENT_ID: LazyLock<IntGauge> = LazyLock::new(|| {
     define_int_gauge("rvc_fork_current_id", "Numeric id of the fork resolved for the current epoch")
 });
 
+/// Milliseconds spent waiting for an in-flight signature to finish while quiescing
+/// a pubkey. Recorded on both a finished drain and a timeout; the timeout is
+/// still an error (`QuiesceError::DrainTimedOut`), not a success sample.
+pub static RVC_KEYMANAGER_QUIESCE_WAIT_MS: LazyLock<Histogram> = LazyLock::new(|| {
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "rvc_keymanager_quiesce_wait_ms",
+            "Milliseconds spent draining in-flight signatures during keymanager signing quiesce",
+        )
+        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]),
+    )
+    .unwrap_or_else(|e| panic!("Failed to create rvc_keymanager_quiesce_wait_ms: {e}"));
+    metrics::register_metric("rvc_keymanager_quiesce_wait_ms", histogram)
+});
+
 /// Activation epoch of the next scheduled fork.
 ///
 /// Labels: `fork` (lowercase [`eth_types::ForkName`] name). The child is omitted
@@ -236,6 +251,7 @@ pub fn init() {
     LazyLock::force(&RVC_PTC_ATTESTATIONS_TOTAL);
     LazyLock::force(&RVC_FORK_CURRENT_ID);
     LazyLock::force(&RVC_FORK_NEXT_ACTIVATION_EPOCH);
+    LazyLock::force(&RVC_KEYMANAGER_QUIESCE_WAIT_MS);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SCHEDULED]);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SKIPPED_NO_DATA]);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::DROPPED]);
