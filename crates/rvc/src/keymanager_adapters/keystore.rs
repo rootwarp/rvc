@@ -1,6 +1,6 @@
 //! Local keystore manager adapter for the Keymanager API.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,6 +17,7 @@ use tracing::{error, info, warn};
 use crate::deletion_denylist::DeletionDenylist;
 use crate::key_admission::{AdmissionOutcome, AdmissionSource, KeyAdmissionService};
 use crate::orchestrator::PubkeyMap;
+use crate::quiesce::{QuiesceRegistry, TrackedKeys};
 
 use super::notifier::{pubkey_hex, KeyChangeNotifier};
 
@@ -31,8 +32,8 @@ use super::notifier::{pubkey_hex, KeyChangeNotifier};
 /// secret-provider refresh). `list_keys` / `has_key` / `delete_keystore` all
 /// consult that set.
 ///
-/// `tracked_keys` is retained only as an import serialization lock and a record of
-/// keys imported through this adapter (for concurrent import TOCTOU safety); it is
+/// `tracked_keys` serializes import, `delete_keystore`, and DELETE's quiesce
+/// insert. It is shared with [`crate::quiesce::SigningQuiesceAdapter`] and is
 /// **not** the registry for list/has/delete.
 ///
 /// # Deletion denylist (SEC-1b)
@@ -43,12 +44,22 @@ use super::notifier::{pubkey_hex, KeyChangeNotifier};
 pub struct KeystoreManagerAdapter {
     keystore_dir: PathBuf,
     composite_signer: Arc<CompositeSigner>,
-    /// API-imported keys; also serializes concurrent `import_keystore` / `delete_keystore`.
-    pub(crate) tracked_keys: Mutex<Vec<Pubkey>>,
-    /// When `Some`, `delete_keystore` will not remove a local key outside this
-    /// set. Installed for one DELETE, under no extra lock order with
-    /// `tracked_keys`: callers take `tracked_keys` first, then this mutex.
-    delete_export: Mutex<Option<HashSet<Pubkey>>>,
+    /// API-imported keys; also serializes import, delete, and quiesce insert.
+    pub(crate) tracked_keys: Arc<TrackedKeys>,
+    /// Cleared by [`QuiesceRegistry::readmit`] after a successful import.
+    quiesce: Option<Arc<QuiesceRegistry>>,
+    #[cfg(test)]
+    after_admit: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_readmit: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_delete_unlock: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// In-flight DELETE counts. Touched only while `tracked_keys` is held.
+    ///
+    /// `requests` is how many `begin_delete_export` calls have not yet ended.
+    /// `per_key` counts snapshotted pubkeys. One request's end decrements only
+    /// the pubkeys that request began with.
+    delete_inflight: Mutex<DeleteInflight>,
     /// Shared pubkey map + generation notifier for the orchestrator (RF1-06 / RF1-07).
     /// Used for DELETE (`remove_and_notify`); import goes through [`KeyAdmissionService`].
     notifier: KeyChangeNotifier,
@@ -96,11 +107,18 @@ impl KeystoreManagerAdapter {
         Self {
             keystore_dir,
             composite_signer,
-            tracked_keys: Mutex::new(Vec::new()),
-            delete_export: Mutex::new(None),
+            tracked_keys: Arc::new(TrackedKeys::new()),
+            delete_inflight: Mutex::new(DeleteInflight::default()),
             notifier: KeyChangeNotifier::new(pubkey_map, key_gen_tx),
             denylist: None,
             admissions,
+            quiesce: None,
+            #[cfg(test)]
+            after_admit: Mutex::new(None),
+            #[cfg(test)]
+            after_readmit: Mutex::new(None),
+            #[cfg(test)]
+            after_delete_unlock: Mutex::new(None),
         }
     }
 
@@ -117,6 +135,42 @@ impl KeystoreManagerAdapter {
     pub fn with_admission_service(mut self, admissions: Arc<KeyAdmissionService>) -> Self {
         self.admissions = admissions;
         self
+    }
+
+    /// Registry a successful import clears after the denylist update.
+    pub fn with_quiesce_registry(mut self, registry: Arc<QuiesceRegistry>) -> Self {
+        self.quiesce = Some(registry);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_admit_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.after_admit.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_readmit_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.after_readmit.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_delete_unlock_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.after_delete_unlock.lock() = Some(hook);
+    }
+}
+
+/// Per-pubkey DELETE snapshots that have not yet finished.
+#[derive(Debug, Default)]
+struct DeleteInflight {
+    requests: u32,
+    per_key: HashMap<Pubkey, u32>,
+}
+
+#[cfg(test)]
+fn run_hook(slot: &Mutex<Option<Arc<dyn Fn() + Send + Sync>>>) {
+    let hook = slot.lock().clone();
+    if let Some(hook) = hook {
+        hook();
     }
 }
 
@@ -248,11 +302,27 @@ impl KeystoreManager for KeystoreManagerAdapter {
     }
 
     fn begin_delete_export(&self, members: &[Pubkey]) {
-        *self.delete_export.lock() = Some(members.iter().copied().collect());
+        let _keys = self.tracked_keys.lock();
+        let mut inflight = self.delete_inflight.lock();
+        inflight.requests = inflight.requests.saturating_add(1);
+        for pubkey in members {
+            let count = inflight.per_key.entry(*pubkey).or_insert(0);
+            *count = count.saturating_add(1);
+        }
     }
 
-    fn end_delete_export(&self) {
-        *self.delete_export.lock() = None;
+    fn end_delete_export(&self, members: &[Pubkey]) {
+        let _keys = self.tracked_keys.lock();
+        let mut inflight = self.delete_inflight.lock();
+        inflight.requests = inflight.requests.saturating_sub(1);
+        for pubkey in members {
+            let next = inflight.per_key.get(pubkey).copied().unwrap_or(0).saturating_sub(1);
+            if next == 0 {
+                inflight.per_key.remove(pubkey);
+            } else {
+                inflight.per_key.insert(*pubkey, next);
+            }
+        }
     }
 
     fn import_keystore(
@@ -274,6 +344,11 @@ impl KeystoreManager for KeystoreManagerAdapter {
         let mut keys = self.tracked_keys.lock();
         if self.composite_signer.has_local_key(&pubkey_bytes) {
             return Err(ImportKeystoreError::Duplicate);
+        }
+        // Absent, but a DELETE that snapshotted this key has not finished.
+        // Admitting here would `readmit` during that request's export.
+        if self.delete_inflight.lock().per_key.get(&pubkey_bytes).copied().unwrap_or(0) > 0 {
+            return Err(ImportKeystoreError::DeleteInProgress);
         }
 
         // Save keystore file to disk with restricted permissions (0o600)
@@ -356,6 +431,9 @@ impl KeystoreManager for KeystoreManagerAdapter {
             }
         }
 
+        #[cfg(test)]
+        run_hook(&self.after_admit);
+
         // Track the key (lock still held)
         keys.push(pubkey_bytes);
 
@@ -366,9 +444,26 @@ impl KeystoreManager for KeystoreManagerAdapter {
             if let Err(e) = denylist.remove(&pubkey_bytes) {
                 // Key is already loaded and signable; surface IO so operators
                 // can repair the denylist file. Do not roll back the import.
+                // Do not readmit: a failed clear leaves the key quiesced.
                 return Err(ImportKeystoreError::Io(e.to_string()));
             }
         }
+
+        let delete_still_in_flight =
+            self.delete_inflight.lock().per_key.get(&pubkey_bytes).copied().unwrap_or(0) > 0;
+        if let Some(registry) = &self.quiesce {
+            if !delete_still_in_flight {
+                // admit's register_for_import leaves a deleted key Pending.
+                // Unmonitored (post-cancel, before that register) is closed too.
+                registry.readmit(&pubkey_bytes);
+            }
+        }
+
+        #[cfg(test)]
+        run_hook(&self.after_readmit);
+        // Hold `tracked_keys` through readmit. Releasing earlier would let a
+        // DELETE insert a quiescence that this readmit then erases.
+        drop(keys);
 
         info!(
             pubkey = %TruncatedPubkey::new(&hex::encode(pubkey_bytes)),
@@ -381,8 +476,11 @@ impl KeystoreManager for KeystoreManagerAdapter {
         // Serialize with import via the same lock so concurrent import/delete
         // cannot race. Registry membership is the real local signing set.
         let mut keys = self.tracked_keys.lock();
-        if let Some(allowed) = self.delete_export.lock().as_ref() {
-            if self.composite_signer.has_local_key(pubkey) && !allowed.contains(pubkey) {
+        {
+            let inflight = self.delete_inflight.lock();
+            let snapshotted = inflight.per_key.get(pubkey).copied().unwrap_or(0) > 0;
+            if inflight.requests > 0 && self.composite_signer.has_local_key(pubkey) && !snapshotted
+            {
                 return Err(DeleteKeystoreError::Io(
                     "refusing to delete a key absent from the slashing-protection export".into(),
                 ));
@@ -436,7 +534,13 @@ impl KeystoreManager for KeystoreManagerAdapter {
         // mutation (S1). If we released the lock first, a concurrent re-import
         // could re-insert the map entry and then be erased by our late remove.
         self.notifier.remove_and_notify(pubkey);
+        // Machine mutex only, while `tracked_keys` is still held: the same
+        // order as `register_for_import` inside `admit`. `on_delete` still
+        // calls `cancel_monitoring` after this returns.
+        self.admissions.cancel_forward_window(pubkey);
         drop(keys);
+        #[cfg(test)]
+        run_hook(&self.after_delete_unlock);
 
         // After a positive membership check under this lock, `!removed` is an
         // inconsistency (or an external concurrent remover). Disk side effects

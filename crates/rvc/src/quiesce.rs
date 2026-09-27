@@ -10,17 +10,82 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use crypto::PublicKey;
+use crypto::{CompositeSigner, PublicKey};
 use doppelganger::SigningEnablement;
 use keymanager_api::traits::{Pubkey, QuiesceError, SigningQuiesce};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use signer::SignerService;
 
-/// Pubkeys whose signing gate is closed.
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
+
+/// Import/delete lock shared with the keystore adapter.
 ///
-/// Only [`Self::insert`] and [`Self::contains`] are exposed. Clearing an entry
-/// is re-admission and is intentionally not available here: a failed drain must
-/// leave the key quiesced, and no other caller may remove it.
+/// DELETE's presence check and quiesce insert take it and drop it before the
+/// drain. [`QuiesceRegistry::readmit`] runs under the same mutex inside import.
+pub(crate) struct TrackedKeys {
+    keys: Mutex<Vec<Pubkey>>,
+    #[cfg(test)]
+    contended: AtomicU64,
+    #[cfg(test)]
+    stall_ms: AtomicU64,
+}
+
+impl TrackedKeys {
+    pub(crate) fn new() -> Self {
+        Self {
+            keys: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            contended: AtomicU64::new(0),
+            #[cfg(test)]
+            stall_ms: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Vec<Pubkey>> {
+        let guard = self.lock_inner();
+        #[cfg(test)]
+        {
+            let ms = self.stall_ms.load(Ordering::Relaxed);
+            if ms > 0 {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+        }
+        guard
+    }
+
+    fn lock_inner(&self) -> MutexGuard<'_, Vec<Pubkey>> {
+        #[cfg(test)]
+        {
+            if let Some(guard) = self.keys.try_lock() {
+                guard
+            } else {
+                self.contended.fetch_add(1, Ordering::SeqCst);
+                self.keys.lock()
+            }
+        }
+        #[cfg(not(test))]
+        {
+            self.keys.lock()
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contended(&self) -> u64 {
+        self.contended.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_stall_ms(&self, ms: u64) {
+        self.stall_ms.store(ms, Ordering::Relaxed);
+    }
+}
+
+/// Pubkeys whose signing gate is closed until a successful re-admission.
+///
+/// [`Self::insert`] and [`Self::contains`] record and query that set.
+/// [`Self::readmit`] is the only removal. The set is process-local; a restart
+/// does not restore it.
 #[derive(Debug, Default)]
 pub struct QuiesceRegistry {
     pubkeys: RwLock<HashSet<[u8; 48]>>,
@@ -41,6 +106,23 @@ impl QuiesceRegistry {
     #[must_use]
     pub fn contains(&self, pubkey: &[u8; 48]) -> bool {
         self.pubkeys.read().contains(pubkey)
+    }
+
+    /// Drop `pubkey` after a successful keystore admission.
+    ///
+    /// This is the only public removal. The only legal caller is the keystore
+    /// import path, after [`crate::key_admission::AdmissionOutcome::Admitted`]
+    /// and a successful SEC-1b denylist clear, while that path still holds
+    /// `tracked_keys`.
+    ///
+    /// Never call it for `AlreadyPresent` / `Duplicate`, `SkippedDenylisted`,
+    /// an admission or persistence error, or the raw-secret provider path.
+    /// Remote-key import does not use it.
+    ///
+    /// In-memory only. A process restart starts from an empty registry; this
+    /// method does not change that.
+    pub fn readmit(&self, pubkey: &[u8; 48]) {
+        self.pubkeys.write().remove(pubkey);
     }
 }
 
@@ -86,19 +168,85 @@ impl SigningEnablement for QuiescingEnablement {
 pub struct SigningQuiesceAdapter {
     registry: Arc<QuiesceRegistry>,
     signer: Arc<SignerService>,
+    tracked_keys: Arc<TrackedKeys>,
+    /// `Some` — insert only while this composite still has the local key.
+    /// `None` — insert unconditionally (no shared keystore membership).
+    membership: Option<Arc<CompositeSigner>>,
+    #[cfg(test)]
+    inserts: AtomicU64,
+    #[cfg(test)]
+    after_insert: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl SigningQuiesceAdapter {
     #[must_use]
     pub fn new(registry: Arc<QuiesceRegistry>, signer: Arc<SignerService>) -> Self {
-        Self { registry, signer }
+        Self {
+            registry,
+            signer,
+            tracked_keys: Arc::new(TrackedKeys::new()),
+            membership: None,
+            #[cfg(test)]
+            inserts: AtomicU64::new(0),
+            #[cfg(test)]
+            after_insert: Mutex::new(None),
+        }
+    }
+
+    /// Presence-check and insert under the keystore adapter's `tracked_keys`.
+    ///
+    /// The lock is not held across [`SignerService::drain_pubkey`].
+    #[must_use]
+    pub(crate) fn with_keystore_membership(
+        mut self,
+        tracked_keys: Arc<TrackedKeys>,
+        composite: Arc<CompositeSigner>,
+    ) -> Self {
+        self.tracked_keys = tracked_keys;
+        self.membership = Some(composite);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn quiesce_inserts(&self) -> u64 {
+        self.inserts.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_insert_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self.after_insert.lock() = Some(hook);
     }
 }
 
 #[async_trait]
 impl SigningQuiesce for SigningQuiesceAdapter {
     async fn quiesce(&self, pubkey: &Pubkey, timeout: Duration) -> Result<(), QuiesceError> {
-        self.registry.insert(pubkey);
+        // Same mutex as import's readmit, dropped before the drain so an import
+        // is not blocked for the wait. readmit can only clear an entry inserted
+        // before its own critical section.
+        let inserted = {
+            let _guard = self.tracked_keys.lock();
+            let present = match &self.membership {
+                Some(composite) => composite.has_local_key(pubkey),
+                None => true,
+            };
+            if present {
+                self.registry.insert(pubkey);
+                true
+            } else {
+                false
+            }
+        };
+        #[cfg(test)]
+        if inserted {
+            self.inserts.fetch_add(1, Ordering::SeqCst);
+            let hook = self.after_insert.lock().clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        #[cfg(not(test))]
+        let _ = inserted;
         let started = Instant::now();
         let drained = self.signer.drain_pubkey(pubkey, timeout).await;
         let waited = started.elapsed();

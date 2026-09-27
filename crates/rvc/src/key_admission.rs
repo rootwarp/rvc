@@ -97,6 +97,21 @@ impl KeyAdmissionService {
         }
     }
 
+    /// Drop forward-window state for a key just removed from the signer.
+    ///
+    /// Takes only the machine mutex, not the doppelganger lifecycle lock.
+    /// Callers already holding `tracked_keys` keep that order: this mutex is
+    /// the same one [`ForwardWindowMachine::register_for_import`] takes.
+    pub fn cancel_forward_window(&self, pubkey: &[u8; 48]) {
+        let Some(machine) = &self.machine else {
+            return;
+        };
+        let Ok(pk) = crypto::PublicKey::from_bytes(pubkey) else {
+            return;
+        };
+        machine.cancel(&pk);
+    }
+
     /// Admit `secret` into every store that must observe a live key.
     ///
     /// Order (generation bump **last** so no orchestrator wake sees a

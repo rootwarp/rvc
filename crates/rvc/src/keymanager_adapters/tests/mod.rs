@@ -74,6 +74,7 @@ mod export_floor;
 mod keystore;
 mod misc_adapters;
 mod pubkey_map;
+mod quiesce;
 mod remote;
 mod server;
 mod spawn;

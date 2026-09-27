@@ -161,6 +161,13 @@ pub async fn import_keystores(
                     message: "key already exists".into(),
                 });
             }
+            Err(ImportKeystoreError::DeleteInProgress) => {
+                info!(status = "error", "Keystore import result");
+                results.push(ImportKeystoreResult {
+                    status: ImportStatus::Error,
+                    message: map_import_keystore_item_error(ImportKeystoreError::DeleteInProgress),
+                });
+            }
             Err(e) => {
                 results.push(ImportKeystoreResult {
                     status: ImportStatus::Error,
@@ -173,15 +180,16 @@ pub async fn import_keystores(
     Ok(Json(ImportKeystoresResponse { data: results }))
 }
 
-/// Clears [`KeystoreManager::begin_delete_export`] on every exit, including
-/// a drain timeout.
+/// Clears [`KeystoreManager::begin_delete_export`] for this request's pubkeys
+/// on every exit, including a drain timeout.
 struct DeleteExportGuard {
     keys: Arc<dyn KeystoreManager>,
+    members: Vec<Pubkey>,
 }
 
 impl Drop for DeleteExportGuard {
     fn drop(&mut self) {
-        self.keys.end_delete_export();
+        self.keys.end_delete_export(&self.members);
     }
 }
 
@@ -213,7 +221,10 @@ async fn delete_keystores_inner(
     let candidates: Vec<Pubkey> = parsed.iter().filter_map(|r| r.as_ref().ok().copied()).collect();
     let existing_keys = state.keystore_manager.membership_for_delete(&candidates);
     state.keystore_manager.begin_delete_export(&existing_keys);
-    let _export_guard = DeleteExportGuard { keys: Arc::clone(&state.keystore_manager) };
+    let _export_guard = DeleteExportGuard {
+        keys: Arc::clone(&state.keystore_manager),
+        members: existing_keys.clone(),
+    };
 
     // Disable, then drain, then export, then delete. Disable goes through
     // `ValidatorManager::set_validator_enabled` (the keymanager entry), which

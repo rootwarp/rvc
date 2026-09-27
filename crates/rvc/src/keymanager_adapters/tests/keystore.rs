@@ -38,7 +38,7 @@ fn delete_refuses_a_local_key_absent_from_the_armed_export() {
     let err = adapter.delete_keystore(&pk).expect_err("outside the export");
     assert!(matches!(err, keymanager_api::traits::DeleteKeystoreError::Io(_)));
     assert!(adapter.has_key(&pk), "admitted key is not removed");
-    adapter.end_delete_export();
+    adapter.end_delete_export(&[]);
     assert!(adapter.delete_keystore(&pk).unwrap(), "unarmed delete still removes");
     assert!(!adapter.has_key(&pk));
 }

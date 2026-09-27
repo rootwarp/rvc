@@ -9,7 +9,10 @@ DELETE `/eth/v1/keystores` disables the validator and drains the slashable
 signing lock before exporting slashing protection (added latency, surfaced as
 `rvc_keymanager_quiesce_wait_ms`). If a signature does not finish within the
 drain timeout, DELETE fails, exports nothing, and leaves the key disabled;
-retry it.
+retry it. A deleted key can be re-imported and signs again after the normal
+doppelganger window, without a restart. When doppelganger detection is off,
+re-import reopens signing immediately because the handler imports the
+slashing-protection interchange before any keystore.
 
 ## Dev process
 

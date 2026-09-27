@@ -139,7 +139,10 @@ pub fn map_slashing_export_error(err: SlashingProtectionError) -> ApiError {
 ///
 /// All variants may embed paths/errno from the backend, so they are sanitized.
 pub fn map_import_keystore_item_error(err: ImportKeystoreError) -> String {
-    map_backend_to_item_message(&err.to_string(), "keystore import failed")
+    match err {
+        ImportKeystoreError::DeleteInProgress => "delete in progress".into(),
+        other => map_backend_to_item_message(&other.to_string(), "keystore import failed"),
+    }
 }
 
 /// Map a keystore-delete per-item error to a client-safe message.

@@ -17,6 +17,11 @@ pub enum ImportKeystoreError {
     InvalidKeystore(String),
     #[error("I/O error: {0}")]
     Io(String),
+    /// A DELETE has snapshotted this pubkey and has not finished yet.
+    ///
+    /// The key is not present. This is not [`Self::Duplicate`].
+    #[error("delete in progress")]
+    DeleteInProgress,
 }
 
 #[derive(Debug, Error)]
@@ -52,14 +57,18 @@ pub trait KeystoreManager: Send + Sync {
         members
     }
 
-    /// Arm `delete_keystore` so it will not remove a local key outside `members`.
+    /// Arm `delete_keystore` and count `members` as an in-flight DELETE.
     ///
-    /// Paired with [`Self::end_delete_export`]. Default is a no-op for test
-    /// doubles that do not share an import/delete lock.
+    /// Paired with [`Self::end_delete_export`] for the same pubkeys. The count
+    /// stays up through export, deletion, drain timeout, and every other
+    /// return. Overlapping DELETEs each increment and decrement only their own
+    /// pubkeys. Default is a no-op for test doubles that do not share an
+    /// import/delete lock.
     fn begin_delete_export(&self, _members: &[Pubkey]) {}
 
-    /// Drop the arm installed by [`Self::begin_delete_export`].
-    fn end_delete_export(&self) {}
+    /// Drop the in-flight count installed by [`Self::begin_delete_export`]
+    /// for `members`.
+    fn end_delete_export(&self, _members: &[Pubkey]) {}
 }
 
 /// Errors from [`SlashingProtection`] trait methods.

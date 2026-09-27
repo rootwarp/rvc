@@ -157,13 +157,16 @@ pub fn build_keymanager_api(
     let keystore_mgr = Arc::new(
         KeystoreManagerAdapter::new(
             config.keystore_path.clone(),
-            km_composite.clone(),
+            Arc::clone(&km_composite),
             deps.pubkey_map.clone(),
             deps.key_gen_tx.clone(),
         )
         .with_denylist(Arc::clone(&deps.deletion_denylist))
-        .with_admission_service(deps.admissions),
+        .with_admission_service(deps.admissions)
+        .with_quiesce_registry(Arc::clone(&deps.quiesce_registry)),
     );
+    let tracked_keys = Arc::clone(&keystore_mgr.tracked_keys);
+    let membership = Arc::clone(&km_composite);
     let slashing_prot =
         Arc::new(SlashingProtectionAdapter::new(deps.slashing_db, deps.genesis_validators_root));
     let validator_mgr = Arc::new(ValidatorManagerAdapter::new(deps.validator_store.clone()));
@@ -204,8 +207,10 @@ pub fn build_keymanager_api(
             deps.genesis_validators_root,
         )));
 
-    let signing_quiesce: Arc<dyn SigningQuiesce> =
-        Arc::new(SigningQuiesceAdapter::new(Arc::clone(&deps.quiesce_registry), deps.signer));
+    let signing_quiesce: Arc<dyn SigningQuiesce> = Arc::new(
+        SigningQuiesceAdapter::new(Arc::clone(&deps.quiesce_registry), deps.signer)
+            .with_keystore_membership(tracked_keys, membership),
+    );
 
     let server = keymanager_api::KeymanagerServer::new(
         keymanager_api::KeymanagerDeps {
