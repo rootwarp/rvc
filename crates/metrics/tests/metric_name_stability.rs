@@ -24,6 +24,9 @@
 //! per pre-Gloas SSZ proposal published as `SignedBlockContents`. Label `fork` is
 //! the consensus version (`deneb`, `electra`, `fulu`). Blinded and Gloas publishes
 //! do not increment it.
+//! RR-4.3 adds `rvc_slashing_export_synthetic_records_total` (family delta +1):
+//! one increment per synthetic attestation or block floor in an interchange
+//! export. It has no labels.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -100,6 +103,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_signer_slashing_tx_hold_duration_ms",
     "rvc_signing_duration_seconds",
     "rvc_slashing_db_prune_total",
+    "rvc_slashing_export_synthetic_records_total", // operator-facing: synthetic floors in an interchange export (RR-4.3)
     "rvc_slashing_import_conflicts_total", // operator-facing: dropped interchange import rows (RR-4.2)
     "rvc_slashing_protection_checks_total",
     "rvc_slashing_prune_source_bound_raised_total", // operator-facing: prune raised an attestation source floor (RR-4.1)
@@ -215,8 +219,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        48,
-        "RR-1.2 +1 (rvc_blob_sidecars_published_total) on the RR-4.1/RR-4.2 47-family pin"
+        49,
+        "RR-1.2 and RR-4.3 each add one family on the RR-4.1/RR-4.2 47-family pin"
     );
 }
 

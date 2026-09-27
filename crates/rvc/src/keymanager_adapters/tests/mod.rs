@@ -69,6 +69,7 @@ fn test_remote_adapter(
 mod config;
 mod denylist;
 mod exit;
+mod export_floor;
 mod keystore;
 mod misc_adapters;
 mod pubkey_map;

@@ -310,3 +310,8 @@ Deneb/Electra/Fulu blocks are published as full SignedBlockContents with sidecar
 ## Behaviour: BN attempt budgets
 
 Each BN attempt gets a floored share of the operation budget; timeouts degrade node health, including when every node hangs.
+
+## Breaking (wire): interchange exports shrink
+
+Interchange exports collapse sub-watermark rows into one synthetic record per
+validator. Files get smaller. Protection is non-weakening.

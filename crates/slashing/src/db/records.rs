@@ -182,11 +182,15 @@ impl SlashingDb {
     /// Read all distinct pubkeys from the DB using a caller-held `Connection`.
     ///
     /// Private helper for `export` so the full export runs under one lock.
+    /// Attestations, blocks, and watermarks: a pruned validator has no rows
+    /// left, and omitting the watermark table would drop it from the file.
     pub(crate) fn read_all_pubkeys(conn: &Connection) -> Result<Vec<String>, SlashingError> {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT pubkey FROM attestations
              UNION
-             SELECT DISTINCT pubkey FROM blocks",
+             SELECT DISTINCT pubkey FROM blocks
+             UNION
+             SELECT DISTINCT pubkey FROM watermarks",
         )?;
 
         let rows = stmt.query_map([], |row| row.get(0))?;

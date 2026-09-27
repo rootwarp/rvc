@@ -6,15 +6,130 @@ use rusqlite::{OptionalExtension, TransactionBehavior};
 
 use observability::logging::TruncatedPubkey;
 
-use super::watermarks::{raise_watermark_max, WatermarkKind};
+use super::watermarks::{raise_watermark_max, read_watermark, WatermarkKind};
 use super::{normalize_pubkey, SlashingDb};
 use crate::error::SlashingError;
 use crate::metrics;
 use crate::types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
-    ValidatorRecord,
+    SignedAttestation, SignedBlock, ValidatorRecord,
 };
 use eth_types::{Epoch, Root, Slot};
+
+fn wire_attestation(attestation: SignedAttestation) -> InterchangeAttestation {
+    InterchangeAttestation {
+        source_epoch: attestation.source_epoch.to_string(),
+        target_epoch: attestation.target_epoch.to_string(),
+        signing_root: attestation.signing_root.map(String::from),
+    }
+}
+
+fn wire_block(block: SignedBlock) -> InterchangeBlock {
+    InterchangeBlock {
+        slot: block.slot.to_string(),
+        signing_root: block.signing_root.map(String::from),
+    }
+}
+
+/// Fixed point `(S*, T*)`. `Err` is that pair when `S* > T*`.
+fn attestation_synthetic_bounds(
+    rows: &[(Epoch, Epoch)],
+    source_wm: Epoch,
+    target_wm: Epoch,
+) -> Result<(Epoch, Epoch), (Epoch, Epoch)> {
+    let mut target_bound = target_wm;
+    let mut source_bound;
+    loop {
+        source_bound = source_wm;
+        for &(source, target) in rows {
+            if target <= target_bound {
+                source_bound = source_bound.max(source);
+            }
+        }
+        let mut raised: Option<Epoch> = None;
+        for &(source, target) in rows {
+            if target > target_bound && source < source_bound {
+                raised = Some(raised.map_or(target, |current| current.max(target)));
+            }
+        }
+        match raised {
+            Some(next) => target_bound = next,
+            None => break,
+        }
+    }
+    if source_bound > target_bound {
+        Err((source_bound, target_bound))
+    } else {
+        Ok((source_bound, target_bound))
+    }
+}
+
+fn export_validator(
+    conn: &rusqlite::Connection,
+    pubkey: String,
+) -> Result<(ValidatorRecord, u64), SlashingError> {
+    let attestations = SlashingDb::read_attestations(conn, &pubkey)?;
+    let blocks = SlashingDb::read_blocks(conn, &pubkey)?;
+    let source_wm = read_watermark(conn, &pubkey, WatermarkKind::AttestationSource)?;
+    let target_wm = read_watermark(conn, &pubkey, WatermarkKind::AttestationTarget)?;
+    let block_wm = read_watermark(conn, &pubkey, WatermarkKind::Block)?;
+
+    let mut synthetics = 0u64;
+    let signed_attestations = match (source_wm, target_wm) {
+        (None, None) => attestations.into_iter().map(wire_attestation).collect(),
+        (Some(source_wm), Some(target_wm)) => {
+            let rows: Vec<(Epoch, Epoch)> =
+                attestations.iter().map(|att| (att.source_epoch, att.target_epoch)).collect();
+            let (source_bound, target_bound) =
+                match attestation_synthetic_bounds(&rows, source_wm, target_wm) {
+                    Ok(bounds) => bounds,
+                    Err((source_bound, target_bound)) => {
+                        return Err(SlashingError::UnrepresentableFloor {
+                            pubkey,
+                            source_bound,
+                            target_bound,
+                        });
+                    }
+                };
+            synthetics += 1;
+            let mut out = Vec::with_capacity(1 + attestations.len());
+            out.push(InterchangeAttestation {
+                source_epoch: source_bound.to_string(),
+                target_epoch: target_bound.to_string(),
+                signing_root: None,
+            });
+            for attestation in attestations {
+                if attestation.target_epoch > target_bound {
+                    out.push(wire_attestation(attestation));
+                }
+            }
+            out
+        }
+        (source_wm, target_wm) => {
+            return Err(SlashingError::UnrepresentableFloor {
+                pubkey,
+                source_bound: source_wm.unwrap_or(0),
+                target_bound: target_wm.unwrap_or(0),
+            });
+        }
+    };
+
+    let signed_blocks = if let Some(slot_wm) = block_wm {
+        synthetics += 1;
+        let mut out = Vec::with_capacity(1 + blocks.len());
+        out.push(InterchangeBlock { slot: slot_wm.to_string(), signing_root: None });
+        for block in blocks {
+            if block.slot > slot_wm {
+                out.push(wire_block(block));
+            }
+        }
+        out
+    } else {
+        blocks.into_iter().map(wire_block).collect()
+    };
+
+    Ok((ValidatorRecord { pubkey, signed_blocks, signed_attestations }, synthetics))
+}
 
 impl SlashingDb {
     /// Parse a hex string (with or without `0x` prefix) into a `Root`.
@@ -72,14 +187,41 @@ impl SlashingDb {
 
     /// Export all slashing-protection records as an EIP-3076 interchange.
     ///
+    /// # Drop-and-synthesise
+    ///
+    /// Sub-watermark rows are not copied out. For each validator with
+    /// attestation watermarks `(S_wm, T_wm)`, export derives a fixed point
+    /// `(S*, T*)`: start at `T* = T_wm`, set `S*` to the max of `S_wm` and
+    /// the sources of rows with `target <= T*`, and if any row has
+    /// `target > T*` and `source < S*` raise `T*` to the largest such target
+    /// and repeat. Rows with `target <= T*` are dropped and replaced by one
+    /// synthetic attestation `{source: S*, target: T*, signing_root: null}`.
+    /// Rows with `target > T*` are kept. Block rows with `slot <= B_wm` are
+    /// dropped and replaced by one synthetic block `{slot: B_wm, signing_root: null}`.
+    ///
+    /// Appending `(S_wm, T_wm)` beside the lower rows was rejected. Importers
+    /// floor on the file's **minimum**, so a lower neighbour keeps that
+    /// minimum below the watermark — the floor never travels — and the two
+    /// records are a double vote or a surround inside the file.
+    ///
+    /// `S* > T*`, or only one of the two attestation watermarks, fails the
+    /// whole export with [`SlashingError::UnrepresentableFloor`]. No partial
+    /// interchange is returned. A validator with neither attestation
+    /// watermark exports its attestation rows unchanged.
+    ///
+    /// The protection invariant is non-weakening: if this database would
+    /// refuse a candidate, an EIP-3076 importer of the file refuses it too.
+    /// Exported minima are at least the database watermarks, not necessarily
+    /// equal to them.
+    ///
     /// # Consistent-snapshot guarantee (KM-1/ADR-008)
     ///
     /// The lock on `self.conn` is acquired ONCE and held for the entire
-    /// duration of the export — `read_all_pubkeys`, `read_attestations`, and
-    /// `read_blocks` all operate on the already-borrowed `&Connection`.
-    /// Because `parking_lot::Mutex` is NOT reentrant, calling the public
-    /// `get_all_pubkeys`/`get_attestations`/`get_blocks` methods from here
-    /// would deadlock; the private `read_*` helpers avoid re-locking.
+    /// duration of the export — `read_all_pubkeys`, watermark reads,
+    /// `read_attestations`, and `read_blocks` all operate on the
+    /// already-borrowed `&Connection`. Because `parking_lot::Mutex` is NOT
+    /// reentrant, calling the public getters from here would deadlock; the
+    /// private `read_*` helpers avoid re-locking.
     ///
     /// Holding a single lock = no concurrent `seed_attestation` or
     /// `seed_block` write can interleave between the pubkey scan and the
@@ -95,29 +237,15 @@ impl SlashingDb {
 
         let pubkeys = Self::read_all_pubkeys(&conn)?;
 
-        let mut data = Vec::new();
+        let mut data = Vec::with_capacity(pubkeys.len());
+        let mut synthetic_records = 0u64;
         for pubkey in pubkeys {
-            let attestations = Self::read_attestations(&conn, &pubkey)?;
-            let blocks = Self::read_blocks(&conn, &pubkey)?;
-
-            let signed_attestations: Vec<InterchangeAttestation> = attestations
-                .into_iter()
-                .map(|a| InterchangeAttestation {
-                    source_epoch: a.source_epoch.to_string(),
-                    target_epoch: a.target_epoch.to_string(),
-                    signing_root: a.signing_root.map(String::from),
-                })
-                .collect();
-
-            let signed_blocks: Vec<InterchangeBlock> = blocks
-                .into_iter()
-                .map(|b| InterchangeBlock {
-                    slot: b.slot.to_string(),
-                    signing_root: b.signing_root.map(String::from),
-                })
-                .collect();
-
-            data.push(ValidatorRecord { pubkey, signed_blocks, signed_attestations });
+            let (record, synthetics) = export_validator(&conn, pubkey)?;
+            synthetic_records += synthetics;
+            data.push(record);
+        }
+        if synthetic_records > 0 {
+            metrics::RVC_SLASHING_EXPORT_SYNTHETIC_RECORDS_TOTAL.inc_by(synthetic_records);
         }
 
         let record_count = data.len();

@@ -69,10 +69,11 @@ impl SlashingProtection for SlashingProtectionAdapter {
     ///
     /// # Completeness (KM-1(a))
     ///
-    /// Every requested pubkey is represented in the output.  Keys with no
-    /// slashing rows in the DB receive an explicit empty
-    /// `ValidatorRecord { signed_blocks: [], signed_attestations: [] }` so
-    /// that a re-importing node sees a clean (rather than absent) record.
+    /// Every requested pubkey is represented in the output. A key that
+    /// [`SlashingDb::export`](slashing::SlashingDb::export) already emitted —
+    /// including a watermark-only synthetic floor — is kept as exported.
+    /// A requested key with neither rows nor watermarks is absent from that
+    /// export and is filled in as an explicit empty record.
     fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
         let interchange = self
             .slashing_db

@@ -52,11 +52,24 @@ pub static RVC_SLASHING_IMPORT_CONFLICTS_TOTAL: LazyLock<IntCounter> = LazyLock:
     )
 });
 
+/// Synthetic floors written by interchange export.
+///
+/// One increment per synthesised attestation or block record. A failed export
+/// (unrepresentable floor) increments nothing.
+pub static RVC_SLASHING_EXPORT_SYNTHETIC_RECORDS_TOTAL: LazyLock<IntCounter> =
+    LazyLock::new(|| {
+        define_int_counter(
+            "rvc_slashing_export_synthetic_records_total",
+            "Total synthetic attestation and block floors written by slashing interchange export",
+        )
+    });
+
 pub fn init() {
     LazyLock::force(&RVC_SLASHING_DB_PRUNE_TOTAL);
     LazyLock::force(&RVC_SLASHING_RECONCILE_TOTAL);
     LazyLock::force(&RVC_SLASHING_PRUNE_SOURCE_BOUND_RAISED_TOTAL);
     LazyLock::force(&RVC_SLASHING_IMPORT_CONFLICTS_TOTAL);
+    LazyLock::force(&RVC_SLASHING_EXPORT_SYNTHETIC_RECORDS_TOTAL);
 }
 
 #[cfg(test)]

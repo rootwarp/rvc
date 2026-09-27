@@ -38,6 +38,17 @@ pub enum SlashingError {
     #[error("invalid interchange format: {0}")]
     InvalidInterchangeFormat(String),
 
+    /// Attestation floor cannot be encoded as one interchange record.
+    ///
+    /// The derived bounds have `source_bound > target_bound`, or only one of
+    /// the source and target watermarks is set (the missing side is `0`).
+    /// The whole export fails; no partial interchange is returned.
+    #[error(
+        "attestation floor for {pubkey} cannot be represented \
+         (source_bound={source_bound}, target_bound={target_bound})"
+    )]
+    UnrepresentableFloor { pubkey: String, source_bound: Epoch, target_bound: Epoch },
+
     /// Pubkey rejected at internal-record construction ([`crate::SignedBlock::new`] /
     /// [`crate::SignedAttestation::new`]).
     #[error("invalid slashing-record pubkey ({0})")]
