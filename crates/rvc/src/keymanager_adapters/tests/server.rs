@@ -27,6 +27,7 @@ fn build_test_server() -> keymanager_api::KeymanagerServer {
             remote_key_manager: remote_key_mgr,
             config_manager: config_mgr,
             exit_manager: None,
+            signing_quiesce: None,
         },
         keymanager_api::KeymanagerSettings {
             token,
@@ -143,6 +144,7 @@ async fn test_keymanager_server_import_remote_key_lifecycle() {
             remote_key_manager: remote_key_mgr,
             config_manager: config_mgr,
             exit_manager: None,
+            signing_quiesce: None,
         },
         keymanager_api::KeymanagerSettings {
             token: token.clone(),

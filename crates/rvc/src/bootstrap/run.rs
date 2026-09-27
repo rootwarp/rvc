@@ -181,7 +181,7 @@ pub async fn run(
 
     let ServiceHandles {
         signer,
-        quiesce_registry: _quiesce_registry,
+        quiesce_registry,
         validator_store,
         propagator,
         beacon,
@@ -252,6 +252,7 @@ pub async fn run(
             pubkey_map: pubkey_map.clone(),
             key_gen_tx,
             admissions,
+            quiesce_registry,
         },
         &executor,
     )?;

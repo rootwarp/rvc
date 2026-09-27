@@ -867,6 +867,24 @@ pub struct SignSlashableRequest<'a> {
     pub kind: SlashableKind,
     /// Resolved fork when known (VC path). Gate callers pass `None`.
     pub fork_name: Option<ForkName>,
+    /// Park after the under-lock enablement check and before reserve.
+    ///
+    /// `None` in every production call. The field itself is compiled out of
+    /// builds that do not enable `test-utils` (and are not this crate's tests).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub pre_reserve_barrier: Option<Arc<dyn PreReserveBarrier>>,
+}
+
+/// Test-only park on the slashable path, between the under-lock enablement
+/// re-check and reserve.
+///
+/// Present only under `cfg(test)` or `rvc-signer`'s `test-utils` feature so a
+/// release build of `rvc-bin` does not contain it. `None` does not park.
+#[cfg(any(test, feature = "test-utils"))]
+#[async_trait::async_trait]
+pub trait PreReserveBarrier: Send + Sync {
+    /// Called while the slashable per-pubkey lock is held.
+    async fn wait(&self);
 }
 
 /// Shared slashable-signing core.
@@ -874,6 +892,8 @@ pub struct SignSlashableRequest<'a> {
 /// 1. Acquire the per-validator async lock (moved into `spawn_blocking` so a
 ///    dropped caller cannot release it while the blocking body is still running).
 /// 2. Re-check `enablement` **under the lock** (closes Safe→Detected TOCTOU).
+///    Test builds may then park on a pre-reserve barrier while that lock is
+///    still held. The hook is compiled out unless `test` / `test-utils` is on.
 /// 3. Resolve [`TimeoutPolicy`] under the lock (and re-check before sign when
 ///    using [`TimeoutPolicySource::ResolveUnderLock`] — SEC-1).
 /// 4. `spawn_blocking`: build `PubkeyScopedDb`, reserve per [`SlashableKind`],
@@ -1005,6 +1025,13 @@ where
             "sign_slashable: blocked by doppelganger gate (under lock)"
         );
         return Err(SigningGateError::BlockedByDoppelganger);
+    }
+
+    // Test-only: still holding the per-pubkey lock, after the enablement
+    // re-check and before reserve. Production builds skip this entirely.
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(barrier) = req.pre_reserve_barrier.clone() {
+        barrier.wait().await;
     }
 
     // Step 3: resolve policy under the lock (SEC-1). Keep Arc recheck for pre-sign.
@@ -1175,6 +1202,8 @@ mod tests {
             gvr: GVR,
             kind: SlashableKind::Block { slot: 7 },
             fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
         })
         .await;
 
@@ -1249,6 +1278,8 @@ mod tests {
             gvr: GVR,
             kind: SlashableKind::Block { slot: 15 },
             fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
         })
         .await;
 
@@ -1287,6 +1318,8 @@ mod tests {
             gvr: GVR,
             kind: SlashableKind::Block { slot: 13 },
             fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
         })
         .await;
 
@@ -1335,6 +1368,8 @@ mod tests {
             gvr: GVR,
             kind: SlashableKind::Block { slot: 9 },
             fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
         })
         .await;
 
@@ -1375,6 +1410,8 @@ mod tests {
             gvr: GVR,
             kind: SlashableKind::Block { slot: 11 },
             fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
         })
         .await;
 
@@ -1418,6 +1455,8 @@ mod tests {
                 gvr: GVR,
                 kind: SlashableKind::Block { slot: 13 },
                 fork_name: None,
+                #[cfg(any(test, feature = "test-utils"))]
+                pre_reserve_barrier: None,
             })
             .await
         });

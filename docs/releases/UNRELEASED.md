@@ -3,6 +3,14 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Behaviour: DELETE drains signing before export
+
+DELETE `/eth/v1/keystores` disables the validator and drains the slashable
+signing lock before exporting slashing protection (added latency, surfaced as
+`rvc_keymanager_quiesce_wait_ms`). If a signature does not finish within the
+drain timeout, DELETE fails, exports nothing, and leaves the key disabled;
+retry it.
+
 ## Dev process
 
 CI now builds `develop` on push (compile job only).

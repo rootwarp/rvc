@@ -27,6 +27,23 @@ fn test_keystore_manager_adapter_delete_nonexistent() {
 }
 
 #[test]
+fn delete_refuses_a_local_key_absent_from_the_armed_export() {
+    let composite = create_empty_composite_signer();
+    let dir = TempDir::new().unwrap();
+    let (adapter, _, _) = test_keystore_adapter(dir.path().to_path_buf(), Arc::clone(&composite));
+    let secret = SecretKey::generate();
+    let pk = secret.public_key().to_bytes();
+    adapter.begin_delete_export(&[]);
+    composite.add_local_key(secret);
+    let err = adapter.delete_keystore(&pk).expect_err("outside the export");
+    assert!(matches!(err, keymanager_api::traits::DeleteKeystoreError::Io(_)));
+    assert!(adapter.has_key(&pk), "admitted key is not removed");
+    adapter.end_delete_export();
+    assert!(adapter.delete_keystore(&pk).unwrap(), "unarmed delete still removes");
+    assert!(!adapter.has_key(&pk));
+}
+
+#[test]
 fn test_keystore_manager_adapter_import_invalid_json() {
     let dir = TempDir::new().unwrap();
     let (adapter, _, _) =

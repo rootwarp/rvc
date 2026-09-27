@@ -272,6 +272,8 @@ impl SigningGate {
             kind: SlashableKind::Block { slot },
             // Gate APIs take a precomputed root; fork is not on this surface.
             fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
         })
         .await
     }
@@ -342,6 +344,8 @@ impl SigningGate {
             gvr,
             kind: SlashableKind::Attestation { source_epoch, target_epoch },
             fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
         })
         .await
     }

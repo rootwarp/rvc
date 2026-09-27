@@ -35,6 +35,31 @@ pub trait KeystoreManager: Send + Sync {
         password: &str,
     ) -> Result<Pubkey, ImportKeystoreError>;
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError>;
+
+    /// Which of `candidates` are members, decided under the same lock as
+    /// [`Self::import_keystore`] and [`Self::delete_keystore`] when the
+    /// implementor has one.
+    ///
+    /// The default is a `has_key` filter. A key that appears after this
+    /// snapshot must not be removed by a DELETE whose export omitted it.
+    fn membership_for_delete(&self, candidates: &[Pubkey]) -> Vec<Pubkey> {
+        let mut members = Vec::new();
+        for pubkey in candidates {
+            if self.has_key(pubkey) && !members.contains(pubkey) {
+                members.push(*pubkey);
+            }
+        }
+        members
+    }
+
+    /// Arm `delete_keystore` so it will not remove a local key outside `members`.
+    ///
+    /// Paired with [`Self::end_delete_export`]. Default is a no-op for test
+    /// doubles that do not share an import/delete lock.
+    fn begin_delete_export(&self, _members: &[Pubkey]) {}
+
+    /// Drop the arm installed by [`Self::begin_delete_export`].
+    fn end_delete_export(&self) {}
 }
 
 /// Errors from [`SlashingProtection`] trait methods.

@@ -67,6 +67,7 @@ fn test_remote_adapter(
 }
 
 mod config;
+mod delete_quiesce;
 mod denylist;
 mod exit;
 mod export_floor;

@@ -69,6 +69,7 @@ fn spawn_test_deps(
         pubkey_map,
         key_gen_tx,
         admissions,
+        quiesce_registry: Arc::new(crate::quiesce::QuiesceRegistry::new()),
     }
 }
 

@@ -1,5 +1,6 @@
 //! Local keystore manager adapter for the Keymanager API.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -44,6 +45,10 @@ pub struct KeystoreManagerAdapter {
     composite_signer: Arc<CompositeSigner>,
     /// API-imported keys; also serializes concurrent `import_keystore` / `delete_keystore`.
     pub(crate) tracked_keys: Mutex<Vec<Pubkey>>,
+    /// When `Some`, `delete_keystore` will not remove a local key outside this
+    /// set. Installed for one DELETE, under no extra lock order with
+    /// `tracked_keys`: callers take `tracked_keys` first, then this mutex.
+    delete_export: Mutex<Option<HashSet<Pubkey>>>,
     /// Shared pubkey map + generation notifier for the orchestrator (RF1-06 / RF1-07).
     /// Used for DELETE (`remove_and_notify`); import goes through [`KeyAdmissionService`].
     notifier: KeyChangeNotifier,
@@ -92,6 +97,7 @@ impl KeystoreManagerAdapter {
             keystore_dir,
             composite_signer,
             tracked_keys: Mutex::new(Vec::new()),
+            delete_export: Mutex::new(None),
             notifier: KeyChangeNotifier::new(pubkey_map, key_gen_tx),
             denylist: None,
             admissions,
@@ -228,6 +234,27 @@ impl KeystoreManager for KeystoreManagerAdapter {
         self.composite_signer.has_local_key(pubkey)
     }
 
+    fn membership_for_delete(&self, candidates: &[Pubkey]) -> Vec<Pubkey> {
+        // Same lock import holds across check-and-admit, so this set cannot
+        // tear an in-flight import.
+        let _keys = self.tracked_keys.lock();
+        let mut members = Vec::new();
+        for pubkey in candidates {
+            if self.composite_signer.has_local_key(pubkey) && !members.contains(pubkey) {
+                members.push(*pubkey);
+            }
+        }
+        members
+    }
+
+    fn begin_delete_export(&self, members: &[Pubkey]) {
+        *self.delete_export.lock() = Some(members.iter().copied().collect());
+    }
+
+    fn end_delete_export(&self) {
+        *self.delete_export.lock() = None;
+    }
+
     fn import_keystore(
         &self,
         keystore_json: &str,
@@ -354,6 +381,13 @@ impl KeystoreManager for KeystoreManagerAdapter {
         // Serialize with import via the same lock so concurrent import/delete
         // cannot race. Registry membership is the real local signing set.
         let mut keys = self.tracked_keys.lock();
+        if let Some(allowed) = self.delete_export.lock().as_ref() {
+            if self.composite_signer.has_local_key(pubkey) && !allowed.contains(pubkey) {
+                return Err(DeleteKeystoreError::Io(
+                    "refusing to delete a key absent from the slashing-protection export".into(),
+                ));
+            }
+        }
         if !self.composite_signer.has_local_key(pubkey) {
             // Retry / break-glass: a prior DELETE may have removed the key from
             // the registry before denylist durability failed. Allow authenticated

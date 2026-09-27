@@ -24,6 +24,8 @@ mod test_utils;
 pub use eth_types::is_aggregator;
 // SigningEnablement was relocated from rvc-signer to rvc-doppelganger (Issue 2.6)
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
+#[cfg(any(test, feature = "test-utils"))]
+pub use core::PreReserveBarrier;
 #[allow(deprecated)]
 pub use core::StagedRow;
 pub use core::{
@@ -257,6 +259,12 @@ pub struct SignerService {
     ///
     /// Per-slot uniqueness is VC-only: SignRoot/PartialSignRoot carry no slot.
     envelope_slots: parking_lot::Mutex<HashMap<([u8; 48], Slot), EnvelopeSlotState>>,
+    /// Test-only park between the under-lock enablement check and reserve.
+    ///
+    /// Compiled out unless this crate is built as a test or with `test-utils`.
+    /// Release `rvc-bin` does not enable that feature.
+    #[cfg(any(test, feature = "test-utils"))]
+    pre_reserve_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
 }
 
 /// Per-slot envelope reservation. In-flight is refused the same as signed so
@@ -473,7 +481,24 @@ impl SignerService {
             enablement: Arc::new(FailClosedEnablement),
             sign_timeout: DEFAULT_SIGN_TIMEOUT,
             envelope_slots: parking_lot::Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Install a test barrier on later slashable signs.
+    ///
+    /// The sign waits after the under-lock enablement re-check and before
+    /// reserve, while holding the per-pubkey lock. `None` clears it. Absent
+    /// from production builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_pre_reserve_barrier(&self, barrier: Option<Arc<dyn core::PreReserveBarrier>>) {
+        *self.pre_reserve_barrier.lock() = barrier;
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn pre_reserve_barrier(&self) -> Option<Arc<dyn core::PreReserveBarrier>> {
+        self.pre_reserve_barrier.lock().clone()
     }
 
     /// Replace the signing enablement gate (builder style).
@@ -828,6 +853,8 @@ impl ValidatorSigner for SignerService {
             grpc.sign_attestation(&data_owned, &sign_ctx).await
         });
         let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        #[cfg(any(test, feature = "test-utils"))]
+        let pre_reserve_barrier = self.pre_reserve_barrier();
 
         let result = sign_slashable(SignSlashableRequest {
             locks: &self.validator_locks,
@@ -844,6 +871,8 @@ impl ValidatorSigner for SignerService {
             gvr,
             kind: SlashableKind::Attestation { source_epoch, target_epoch },
             fork_name: Some(ForkName::from_epoch(data.target.epoch, fork_schedule)),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier,
         })
         .await;
 
@@ -906,6 +935,8 @@ impl ValidatorSigner for SignerService {
         // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
         let policy = self.timeout_policy_source(pubkey);
         let signer = self.bls_backend_for_duty(pubkey, signing_root, None);
+        #[cfg(any(test, feature = "test-utils"))]
+        let pre_reserve_barrier = self.pre_reserve_barrier();
 
         let result = sign_slashable(SignSlashableRequest {
             locks: &self.validator_locks,
@@ -922,6 +953,8 @@ impl ValidatorSigner for SignerService {
             gvr,
             kind: SlashableKind::Block { slot },
             fork_name: Some(ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule)),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier,
         })
         .await;
 
@@ -1016,6 +1049,8 @@ impl ValidatorSigner for SignerService {
             }
         });
         let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        #[cfg(any(test, feature = "test-utils"))]
+        let pre_reserve_barrier = self.pre_reserve_barrier();
 
         let result = sign_slashable(SignSlashableRequest {
             locks: &self.validator_locks,
@@ -1032,6 +1067,8 @@ impl ValidatorSigner for SignerService {
             gvr,
             kind: SlashableKind::Block { slot },
             fork_name: Some(fork_name),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier,
         })
         .await;
 

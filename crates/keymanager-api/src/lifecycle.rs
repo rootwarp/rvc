@@ -11,7 +11,7 @@
 //!
 //! # Lock-ordering invariant
 //!
-//! `state_lock` is the OUTERMOST doppelganger-state lock.  All three paths
+//! `state_lock` is the OUTERMOST doppelganger-state lock.  The paths below
 //! follow: acquire `state_lock` first, then (if needed) `cancel_tokens` — never
 //! the reverse — to avoid deadlock.
 //!
@@ -21,9 +21,11 @@
 //!   synchronous (the spawned enable task acquires it AFTER its `sleep_until`
 //!   future resolves).
 //!
-//! The three protected paths are:
+//! The protected paths take the locks in that order:
 //! - **import** ([`Self::on_import`]): holds the lock across `add_validator`
 //!   (Local only) + `start_monitoring` + cancel-token insert (PRD §KM-2 (a)+(b)).
+//! - **disable** ([`Self::disable_for_delete`]): holds `state_lock` across
+//!   `set_validator_enabled(false)` and cancel-token remove/cancel. No `.await`.
 //! - **delete** ([`Self::on_delete`]): holds the lock across the caller's remove
 //!   operation + unconditional cancel-token remove/cancel, and on success across
 //!   `remove_validator` (Local) + `cancel_monitoring` (PRD §KM-2 (b)+(Finding 3)).
@@ -40,7 +42,27 @@ use observability::logging::TruncatedPubkey;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::traits::{DoppelgangerMonitor, Pubkey, ValidatorManager};
+use crate::traits::{DoppelgangerMonitor, Pubkey, QuiesceError, SigningQuiesce, ValidatorManager};
+
+/// How long DELETE waits for the slashable per-pubkey lock.
+///
+/// Longer than the signer's default sign timeout so a signature that already
+/// passed the under-lock enablement check can reserve and finish. A timeout
+/// is [`QuiesceError::DrainTimedOut`] and fails the DELETE.
+pub const DEFAULT_DELETE_QUIESCE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Drain used when no VC [`SigningQuiesce`] is installed.
+///
+/// Handler tests that build [`DoppelgangerLifecycle`] directly keep the old
+/// export-then-delete behaviour. Production replaces this before serving.
+struct NoopSigningQuiesce;
+
+#[async_trait::async_trait]
+impl SigningQuiesce for NoopSigningQuiesce {
+    async fn quiesce(&self, _pubkey: &Pubkey, _timeout: Duration) -> Result<(), QuiesceError> {
+        Ok(())
+    }
+}
 
 /// Whether an import registers with [`ValidatorManager`].
 ///
@@ -61,6 +83,8 @@ pub struct DoppelgangerLifecycle {
     state_lock: Mutex<()>,
     monitor: Arc<dyn DoppelgangerMonitor>,
     validator_manager: Arc<dyn ValidatorManager>,
+    signing_quiesce: Arc<dyn SigningQuiesce>,
+    quiesce_timeout: Duration,
 }
 
 impl DoppelgangerLifecycle {
@@ -79,7 +103,46 @@ impl DoppelgangerLifecycle {
             state_lock: Mutex::new(()),
             monitor,
             validator_manager,
+            signing_quiesce: Arc::new(NoopSigningQuiesce),
+            quiesce_timeout: DEFAULT_DELETE_QUIESCE_TIMEOUT,
         }
+    }
+
+    /// Replace the no-op drain. `timeout` bounds [`Self::quiesce_for_delete`].
+    #[must_use]
+    pub fn with_signing_quiesce(
+        mut self,
+        quiesce: Arc<dyn SigningQuiesce>,
+        timeout: Duration,
+    ) -> Self {
+        self.signing_quiesce = quiesce;
+        self.quiesce_timeout = timeout;
+        self
+    }
+
+    /// Disable `pubkey` and cancel a pending doppelganger enable task.
+    ///
+    /// The enable task is the path that would set `enabled` back to true.
+    /// Cancelling it here, before the drain, means a failed delete is not
+    /// undone by a window that elapses during export. Does not remove the
+    /// validator; [`Self::on_delete`] still owns removal.
+    pub fn disable_for_delete(&self, pubkey: &Pubkey) {
+        let _guard = self.state_lock.lock().expect("doppelganger state_lock poisoned");
+        self.validator_manager.set_validator_enabled(pubkey, false);
+        if let Some(token) =
+            self.cancel_tokens.lock().expect("cancel_tokens poisoned").remove(pubkey)
+        {
+            token.cancel();
+        }
+    }
+
+    /// Quiesce `pubkey` and wait up to the configured drain timeout.
+    ///
+    /// `Ok` means the slashable lock was free and the under-lock gate is
+    /// closed. It does not mean non-slashable duties are idle. `Err` is only
+    /// [`QuiesceError::DrainTimedOut`]; the key stays quiesced either way.
+    pub async fn quiesce_for_delete(&self, pubkey: &Pubkey) -> Result<(), QuiesceError> {
+        self.signing_quiesce.quiesce(pubkey, self.quiesce_timeout).await
     }
 
     /// Duration of the post-import enablement hold.

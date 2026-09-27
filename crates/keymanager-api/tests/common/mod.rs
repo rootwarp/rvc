@@ -602,6 +602,7 @@ impl TestApp {
             remote_key_manager: self.remote_key_manager.clone(),
             config_manager: self.config_manager.clone(),
             exit_manager: self.exit_manager.clone(),
+            signing_quiesce: None,
         }
     }
 

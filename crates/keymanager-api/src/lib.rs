@@ -7,7 +7,7 @@ pub mod traits;
 pub mod types;
 pub mod url_validator;
 
-pub use lifecycle::{DoppelgangerLifecycle, ImportKind};
+pub use lifecycle::{DoppelgangerLifecycle, ImportKind, DEFAULT_DELETE_QUIESCE_TIMEOUT};
 pub use server::{
     KeymanagerDeps, KeymanagerServer, KeymanagerSettings, DEFAULT_ADDR, DEFAULT_BODY_LIMIT,
 };

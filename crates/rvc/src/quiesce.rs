@@ -2,7 +2,8 @@
 //!
 //! Closes the doppelganger enablement gate the signer re-checks under the
 //! slashable per-pubkey lock, then acquires and drops that lock. `Ok` does not
-//! mean non-slashable duties are idle. DELETE does not call this yet.
+//! mean non-slashable duties are idle. DELETE calls [`SigningQuiesceAdapter`]
+//! before it exports.
 
 use std::collections::HashSet;
 use std::sync::Arc;

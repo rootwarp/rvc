@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use observability::logging::{RedactedUrl, TruncatedPubkey};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{info, warn, Instrument};
 
 use crate::error::{
     map_delete_keystore_item_error, map_delete_remote_key_item_error,
@@ -16,8 +16,9 @@ use crate::error::{
 };
 use crate::lifecycle::{DoppelgangerLifecycle, ImportKind};
 use crate::traits::{
-    ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager,
-    SlashingProtection, ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
+    ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, QuiesceError,
+    RemoteKeyManager, SlashingProtection, ValidatorConfigManager, ValidatorManager,
+    VoluntaryExitManager,
 };
 use crate::types::{
     DeleteKeystoreResult, DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteRemoteKeyResult,
@@ -172,6 +173,18 @@ pub async fn import_keystores(
     Ok(Json(ImportKeystoresResponse { data: results }))
 }
 
+/// Clears [`KeystoreManager::begin_delete_export`] on every exit, including
+/// a drain timeout.
+struct DeleteExportGuard {
+    keys: Arc<dyn KeystoreManager>,
+}
+
+impl Drop for DeleteExportGuard {
+    fn drop(&mut self) {
+        self.keys.end_delete_export();
+    }
+}
+
 pub async fn delete_keystores(
     State(state): State<Arc<AppState>>,
     Json(request): Json<DeleteKeystoresRequest>,
@@ -180,20 +193,54 @@ pub async fn delete_keystores(
         "keymanager.delete_keystores",
         keymanager.count = request.pubkeys.len(),
     );
-    let _guard = span.enter();
+    // `Instrument` enters the span per poll. A `Span::enter` guard must not
+    // be held across the drain await.
+    async move { delete_keystores_inner(state, request).await }.instrument(span).await
+}
 
+async fn delete_keystores_inner(
+    state: Arc<AppState>,
+    request: DeleteKeystoresRequest,
+) -> Result<Json<DeleteKeystoresResponse>, ApiError> {
     warn!(count = request.pubkeys.len(), "Deleting keystores");
 
-    // Parse all pubkeys and identify which ones exist for slashing export
+    // Parse all pubkeys. Membership is decided under the import/delete lock
+    // (`membership_for_delete`), not a racy `has_key` snapshot. Only that set
+    // is disabled, drained, and exported. A key admitted afterwards must not
+    // be removed.
     let parsed: Vec<Result<Pubkey, String>> =
         request.pubkeys.iter().map(|s| parse_pubkey(s)).collect();
+    let candidates: Vec<Pubkey> = parsed.iter().filter_map(|r| r.as_ref().ok().copied()).collect();
+    let existing_keys = state.keystore_manager.membership_for_delete(&candidates);
+    state.keystore_manager.begin_delete_export(&existing_keys);
+    let _export_guard = DeleteExportGuard { keys: Arc::clone(&state.keystore_manager) };
 
-    let existing_keys: Vec<Pubkey> = parsed
-        .iter()
-        .filter_map(|r| r.as_ref().ok())
-        .filter(|pk| state.keystore_manager.has_key(pk))
-        .copied()
-        .collect();
+    // Disable, then drain, then export, then delete. Disable goes through
+    // `ValidatorManager::set_validator_enabled` (the keymanager entry), which
+    // also cancels a pending enable task so a failed delete cannot be turned
+    // back on. `quiesce` `Ok` means the slashable lock was free and the
+    // under-lock gate is closed — not that non-slashable duties are idle. A
+    // drain timeout aborts before export: nothing is migrated and nothing is
+    // deleted.
+    for pubkey in &existing_keys {
+        state.doppelganger.disable_for_delete(pubkey);
+    }
+    let mut timed_out: Vec<Pubkey> = Vec::new();
+    for pubkey in &existing_keys {
+        match state.doppelganger.quiesce_for_delete(pubkey).await {
+            Ok(()) => {}
+            Err(err) => match err {
+                QuiesceError::DrainTimedOut { .. } => {
+                    if !timed_out.contains(pubkey) {
+                        timed_out.push(*pubkey);
+                    }
+                }
+            },
+        }
+    }
+    if !timed_out.is_empty() {
+        return Err(drain_timed_out(&timed_out));
+    }
 
     // Export slashing protection BEFORE any deletions.
     //
@@ -222,6 +269,17 @@ pub async fn delete_keystores(
         let pubkey_hex = &request.pubkeys[i];
         match parse_result {
             Ok(pubkey) => {
+                // Admitted after the membership snapshot: not in the export.
+                // Do not call `delete_keystore` (it would remove the key).
+                // The adapter also refuses if this check loses the race.
+                if !existing_keys.contains(pubkey) && state.keystore_manager.has_key(pubkey) {
+                    results.push(DeleteKeystoreResult {
+                        status: DeleteStatus::Error,
+                        message: "key appeared after the slashing-protection export; not deleted"
+                            .into(),
+                    });
+                    continue;
+                }
                 // KM-2 (b)+(Finding 3): keystore removal + token cancel (+
                 // remove_validator / cancel_monitoring on success) are one
                 // critical section inside DoppelgangerLifecycle::on_delete.
@@ -665,6 +723,32 @@ pub async fn prepare_exit(
     query: Query<VoluntaryExitQuery>,
 ) -> Result<Json<VoluntaryExitResponse>, ApiError> {
     handle_exit(state, path, query, ExitIntent::SignOnly).await
+}
+
+/// HTTP 500. Pubkeys are truncated; the list itself is capped.
+fn drain_timed_out(pubkeys: &[Pubkey]) -> ApiError {
+    const SHOW: usize = 8;
+    let shown: Vec<String> = pubkeys
+        .iter()
+        .take(SHOW)
+        .map(|pk| {
+            let hex = format!("0x{}", hex::encode(pk));
+            TruncatedPubkey::new(&hex).to_string()
+        })
+        .collect();
+    let mut list = shown.join(", ");
+    let rest = pubkeys.len().saturating_sub(shown.len());
+    if rest > 0 {
+        list.push_str(&format!(", and {rest} more"));
+    }
+    tracing::error!(
+        count = pubkeys.len(),
+        pubkeys = %list,
+        "DELETE aborted: signing drain timed out; no slashing-protection export and no keystores deleted"
+    );
+    ApiError::Internal(format!(
+        "signing drain timed out; no keystores exported or deleted; timed-out pubkeys: {list}"
+    ))
 }
 
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {

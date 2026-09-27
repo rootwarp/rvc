@@ -16,7 +16,7 @@ use crate::auth;
 use crate::handlers::{self, AppState};
 use crate::lifecycle::DoppelgangerLifecycle;
 use crate::traits::{
-    DoppelgangerMonitor, KeystoreManager, RemoteKeyManager, SlashingProtection,
+    DoppelgangerMonitor, KeystoreManager, RemoteKeyManager, SigningQuiesce, SlashingProtection,
     ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
 };
 
@@ -37,6 +37,10 @@ pub struct KeymanagerDeps {
     pub remote_key_manager: Arc<dyn RemoteKeyManager>,
     pub config_manager: Arc<dyn ValidatorConfigManager>,
     pub exit_manager: Option<Arc<dyn VoluntaryExitManager>>,
+    /// Slashable-lock drain for DELETE. `None` keeps the lifecycle no-op so
+    /// direct `AppState` tests stay on export-then-delete. Production
+    /// `build_keymanager_api` always passes the VC adapter.
+    pub signing_quiesce: Option<Arc<dyn SigningQuiesce>>,
 }
 
 /// Transport and policy settings for a [`KeymanagerServer`].
@@ -78,11 +82,16 @@ pub struct KeymanagerServer {
 impl KeymanagerServer {
     pub fn new(deps: KeymanagerDeps, settings: KeymanagerSettings) -> Self {
         let validator_manager = deps.validator_manager;
-        let doppelganger = Arc::new(DoppelgangerLifecycle::new(
+        let mut doppelganger = DoppelgangerLifecycle::new(
             settings.doppelganger_window,
             deps.doppelganger_monitor,
             Arc::clone(&validator_manager),
-        ));
+        );
+        if let Some(quiesce) = deps.signing_quiesce {
+            doppelganger = doppelganger
+                .with_signing_quiesce(quiesce, crate::lifecycle::DEFAULT_DELETE_QUIESCE_TIMEOUT);
+        }
+        let doppelganger = Arc::new(doppelganger);
         Self {
             state: Arc::new(AppState {
                 keystore_manager: deps.keystore_manager,
@@ -352,6 +361,7 @@ mod tests {
             remote_key_manager: Arc::new(StubRemote),
             config_manager: Arc::new(StubConfig),
             exit_manager: None,
+            signing_quiesce: None,
         }
     }
 
