@@ -378,6 +378,80 @@ pub fn encode_signed_envelope_contents(
     out
 }
 
+/// Pre-Gloas `BlockContents`: parsed `BeaconBlock` plus the three SSZ regions.
+///
+/// `kzg_proofs` and `blobs` borrow the input. Their lengths are not checked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockContentsSsz<'a> {
+    pub block: BeaconBlock,
+    /// Inner `BeaconBlock` SSZ, ending at the `kzg_proofs` offset.
+    pub block_ssz: &'a [u8],
+    /// Opaque proof bytes, `[kzg_offset, blobs_offset)`.
+    pub kzg_proofs: &'a [u8],
+    /// Opaque blob bytes, `[blobs_offset, len)`.
+    pub blobs: &'a [u8],
+}
+
+/// Deserialize a pre-Gloas SSZ `BlockContents` (`BeaconBlock`, `kzg_proofs`, `blobs`).
+///
+/// The container is a 3-offset table: little-endian `u32` offsets at `bytes[0..4]`
+/// (`block`), `bytes[4..8]` (`kzg_proofs`), and `bytes[8..12]` (`blobs`), followed
+/// by those three variable-length regions. `block_ssz` is bounded by the
+/// `kzg_proofs` offset, so proof and blob bytes are not part of the block.
+/// `kzg_proofs` and `blobs` are returned as slices of `bytes` with no element-count
+/// or `maxItems` bound — Deneb and Fulu share this container, and callers copy
+/// those regions byte-for-byte.
+///
+/// `format` must be [`SszBlockFormat::BlockContents`].
+///
+/// # Errors
+///
+/// Returns [`BeaconError::ParseError`] when `format` is not `BlockContents`, the
+/// buffer is shorter than the 12-byte offset table, an offset is not monotonic or
+/// lies outside the buffer, or the inner `BeaconBlock` is truncated.
+pub fn deserialize_block_contents_ssz(
+    bytes: &[u8],
+    format: SszBlockFormat,
+) -> Result<BlockContentsSsz<'_>, BeaconError> {
+    if format != SszBlockFormat::BlockContents {
+        return Err(BeaconError::ParseError(
+            "SSZ BlockContents split requires BlockContents format".to_string(),
+        ));
+    }
+    let block_offset = resolve_block_offset(bytes, format)?;
+    let kzg_offset = resolve_block_region_end(bytes, format, block_offset)?;
+    let blobs_offset =
+        u32::from_le_bytes(bytes[8..12].try_into().expect("slice length verified above")) as usize;
+    if blobs_offset < kzg_offset || blobs_offset > bytes.len() {
+        return Err(BeaconError::ParseError(format!(
+            "SSZ BlockContents offsets not monotonic or out of bounds: block={block_offset} kzg={kzg_offset} blobs={blobs_offset} len={}",
+            bytes.len()
+        )));
+    }
+    let block = deserialize_block_fields(bytes, block_offset, kzg_offset)?;
+    Ok(BlockContentsSsz {
+        block,
+        block_ssz: &bytes[block_offset..kzg_offset],
+        kzg_proofs: &bytes[kzg_offset..blobs_offset],
+        blobs: &bytes[blobs_offset..],
+    })
+}
+
+/// Frame SSZ `SignedBlockContents` as a 3-offset container.
+///
+/// Layout matches [`encode_signed_envelope_contents`]: three little-endian `u32`
+/// offsets (`signed_block` starts at byte 12, `kzg_proofs` follows it, `blobs`
+/// follows the proofs), then `signed_block`, `proofs`, and `blobs` copied
+/// byte-for-byte. Proof bytes are not parsed and no length bound is applied.
+/// The returned length is `12 + signed_block.len() + proofs.len() + blobs.len()`.
+pub fn serialize_signed_block_contents_ssz(
+    signed_block: &[u8],
+    proofs: &[u8],
+    blobs: &[u8],
+) -> Vec<u8> {
+    encode_signed_envelope_contents(signed_block, proofs, blobs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
