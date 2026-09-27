@@ -17,7 +17,7 @@ use beacon::{
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedProposerPreferences, SignedValidatorRegistration,
+    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration,
 };
 use futures::future::join_all;
 use tracing::Instrument;
@@ -1815,6 +1815,23 @@ impl BlockProducer for BnManager {
         .await
     }
 
+    async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        self.submit(
+            "publish_block_contents",
+            self.broadcast_topics.blocks,
+            BnRole::Submission,
+            HealthTier::LargeLag,
+            self.op_timeout(|t| t.block_publication),
+            |c| Box::pin(c.publish_block_contents(contents, consensus_version, builder_url)),
+        )
+        .await
+    }
+
     async fn publish_blinded_block(
         &self,
         signed_blinded_block: &SignedBlindedBeaconBlock,
@@ -2345,6 +2362,12 @@ impl_beacon_client_passthrough! {
             consensus_version: &str,
             builder_url: Option<&str>,
         ) -> Result<(), BeaconError>;
+        async fn publish_block_contents(
+            &self,
+            contents: &SignedBlockContentsJson,
+            consensus_version: &str,
+            builder_url: Option<&str>,
+        ) -> Result<(), BeaconError>;
         async fn publish_blinded_block(
             &self,
             signed_blinded_block: &SignedBlindedBeaconBlock,
@@ -2467,10 +2490,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 34 methods across the seven role traits (see impl_beacon_client_passthrough!).
+        // 35 methods across the seven role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            34,
+            35,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -2490,6 +2513,8 @@ mod tests {
             "post_ptc_duties",
             "produce_block_v3",
             "produce_block_v4",
+            "publish_block",
+            "publish_block_contents",
             "publish_block_ssz",
             "publish_execution_payload_envelope",
             "submit_proposer_preferences",
@@ -3803,5 +3828,98 @@ mod tests {
             }
         }
         panic!("unbalanced with_op_timeout call");
+    }
+
+    fn sample_block_contents() -> SignedBlockContentsJson {
+        SignedBlockContentsJson {
+            signed_block: eth_types::signed_block_contents_json::SignedBeaconBlockJson {
+                message: eth_types::signed_block_contents_json::BeaconBlockJson {
+                    slot: 1,
+                    proposer_index: 0,
+                    parent_root: [1u8; 32],
+                    state_root: [2u8; 32],
+                    body: serde_json::json!({"randao_reveal": "0x01"}),
+                },
+                signature: vec![0xaa; 96],
+            },
+            kzg_proofs: vec![vec![0x11; 48]],
+            blobs: vec![vec![0x22; 8]],
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_block_contents_broadcasts_when_the_blocks_topic_is_enabled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        for bn in [&bn1, &bn2] {
+            Mock::given(method("POST"))
+                .and(path("/eth/v2/beacon/blocks"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(bn)
+                .await;
+        }
+        let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+        config.broadcast_topics.blocks = true;
+        let manager = BnManager::new(config).expect("BnManager");
+        manager
+            .publish_block_contents(&sample_block_contents(), "electra", None)
+            .await
+            .expect("broadcast publish_block_contents");
+        assert_eq!(bn1.received_requests().await.unwrap().len(), 1);
+        assert_eq!(bn2.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// Hanging BN, blocks topic off so `query_first` owns the deadline.
+    /// Real time: budget + the RR-1.3 ε, not `tokio::time::pause`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_block_contents_uses_the_block_publication_timeout() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let budget = Duration::from_millis(40);
+        let epsilon = Duration::from_millis(50);
+        let hang = Duration::from_millis(400);
+        assert!(hang > ATTEMPT_TIMEOUT_FLOOR, "hang must outlast an uncapped floor");
+        assert!(
+            ATTEMPT_TIMEOUT_FLOOR.saturating_sub(budget) > epsilon * 3,
+            "FLOOR ({ATTEMPT_TIMEOUT_FLOOR:?}) - budget ({budget:?}) must be several times ε ({epsilon:?})"
+        );
+
+        let bn = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}").set_delay(hang))
+            .mount(&bn)
+            .await;
+
+        let mut config = BnManagerConfig::new(vec![bn.uri()]);
+        config.broadcast_topics.blocks = false;
+        let manager =
+            BnManager::new(config).expect("BnManager").with_operation_timeouts(OperationTimeouts {
+                block_publication: budget,
+                ..OperationTimeouts::default()
+            });
+
+        let started = std::time::Instant::now();
+        let err = manager
+            .publish_block_contents(&sample_block_contents(), "electra", None)
+            .await
+            .expect_err("hanging BN must time out");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                err,
+                BeaconError::OperationTimeout { ref operation, .. } if operation == "publish_block_contents"
+            ),
+            "{err:?}"
+        );
+        assert!(
+            elapsed <= budget + epsilon,
+            "elapsed {elapsed:?} exceeded block_publication budget+ε ({:?})",
+            budget + epsilon
+        );
     }
 }

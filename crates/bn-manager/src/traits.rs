@@ -14,7 +14,7 @@ use beacon::{
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedProposerPreferences, SignedValidatorRegistration,
+    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration,
 };
 
 // ---------------------------------------------------------------------------
@@ -80,6 +80,22 @@ pub trait BlockProducer: Send + Sync {
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError>;
+
+    /// Publish `{signed_block, kzg_proofs, blobs}` as JSON.
+    ///
+    /// Same policy as [`Self::publish_block`]: `Submission` role, `LargeLag`
+    /// tier, the `block_publication` timeout, and the blocks broadcast topic.
+    /// Broadcast when that topic is enabled; `query_first` failover otherwise,
+    /// with an absolute deadline on the failover arm.
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
         consensus_version: &str,
         builder_url: Option<&str>,
     ) -> Result<(), BeaconError>;

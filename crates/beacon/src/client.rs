@@ -934,7 +934,7 @@ impl BeaconClient {
     ///
     /// Same headers as [`Self::publish_block`]: `Eth-Consensus-Version`, and the
     /// produce-time `Eth-Builder-Url` echo when `builder_url` is `Some`.
-    /// No production caller yet.
+    /// `BnManager` fans out here. Block-service does not call it yet.
     pub async fn publish_block_contents(
         &self,
         contents: &SignedBlockContentsJson,

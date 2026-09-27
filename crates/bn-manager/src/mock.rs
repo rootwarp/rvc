@@ -20,7 +20,7 @@ use beacon::{
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedProposerPreferences, SignedValidatorRegistration, Slot,
+    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration, Slot,
 };
 
 use crate::traits::{
@@ -91,6 +91,7 @@ pub struct MockBeaconNodeClient {
     produce_block_v4:
         MethodHook<(u64, String, Option<String>, BuilderConfig), ProduceBlockResponse>,
     publish_block: MethodHook<(SignedBeaconBlock, String, Option<String>), ()>,
+    publish_block_contents: MethodHook<(SignedBlockContentsJson, String, Option<String>), ()>,
     publish_blinded_block: MethodHook<(SignedBlindedBeaconBlock, String), ()>,
     publish_block_ssz: MethodHook<(Vec<u8>, String, bool, Option<String>), ()>,
     publish_execution_payload_envelope:
@@ -305,6 +306,19 @@ impl MockBeaconNodeClient {
         self.publish_block.set_handler(Arc::new(move |(block, version, builder_url)| {
             f(block, version, builder_url)
         }));
+        self
+    }
+
+    pub fn with_publish_block_contents(
+        self,
+        f: impl Fn(SignedBlockContentsJson, String, Option<String>) -> Result<(), BeaconError>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        self.publish_block_contents.set_handler(Arc::new(
+            move |(contents, version, builder_url)| f(contents, version, builder_url),
+        ));
         self
     }
 
@@ -565,6 +579,12 @@ impl MockBeaconNodeClient {
         self.produce_block_v4.calls()
     }
 
+    pub fn publish_block_contents_calls(
+        &self,
+    ) -> Vec<(SignedBlockContentsJson, String, Option<String>)> {
+        self.publish_block_contents.calls()
+    }
+
     pub fn publish_execution_payload_envelope_calls(
         &self,
     ) -> Vec<(WireBody, WireBody, WireBody, String, Option<String>)> {
@@ -692,6 +712,18 @@ impl BlockProducer for MockBeaconNodeClient {
         self.publish_block.invoke(
             "publish_block",
             (signed_block.clone(), consensus_version.to_string(), builder_url.map(str::to_string)),
+        )
+    }
+
+    async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        self.publish_block_contents.invoke(
+            "publish_block_contents",
+            (contents.clone(), consensus_version.to_string(), builder_url.map(str::to_string)),
         )
     }
 
@@ -991,6 +1023,35 @@ mod tests {
         assert_eq!(
             mock.produce_block_v4_calls(),
             vec![(7, "0xrandao".to_string(), Some("0xgraf".to_string()), cfg)]
+        );
+    }
+
+    fn sample_block_contents() -> SignedBlockContentsJson {
+        SignedBlockContentsJson {
+            signed_block: eth_types::signed_block_contents_json::SignedBeaconBlockJson {
+                message: eth_types::signed_block_contents_json::BeaconBlockJson {
+                    slot: 1,
+                    proposer_index: 0,
+                    parent_root: [1u8; 32],
+                    state_root: [2u8; 32],
+                    body: serde_json::json!({"randao_reveal": "0x01"}),
+                },
+                signature: vec![0xaa; 96],
+            },
+            kzg_proofs: vec![vec![0x11; 48]],
+            blobs: vec![vec![0x22; 8]],
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_block_contents_is_recorded() {
+        let contents = sample_block_contents();
+        let builder = "https://builder.example/echo";
+        let mock = MockBeaconNodeClient::new().with_publish_block_contents(|_c, _v, _u| Ok(()));
+        mock.publish_block_contents(&contents, "electra", Some(builder)).await.unwrap();
+        assert_eq!(
+            mock.publish_block_contents_calls(),
+            vec![(contents, "electra".to_string(), Some(builder.to_string()))]
         );
     }
 

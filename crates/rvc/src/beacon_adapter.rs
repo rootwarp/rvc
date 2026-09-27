@@ -11,7 +11,7 @@ use block_service::{
     BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse, WireBody,
 };
 use bn_manager::BeaconNodeClient;
-use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
+use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContentsJson, Slot};
 
 /// Newtype adapter that implements [`BeaconBlockClient`] for any
 /// [`BeaconNodeClient`] (typically a proposer or main-pool `BnManager`).
@@ -53,6 +53,18 @@ impl BeaconBlockClient for BeaconBlockAdapter {
     ) -> Result<(), BlockServiceError> {
         self.0
             .publish_block(signed_block, consensus_version, builder_url)
+            .await
+            .map_err(|e| BlockServiceError::Beacon(e.to_string()))
+    }
+
+    async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        self.0
+            .publish_block_contents(contents, consensus_version, builder_url)
             .await
             .map_err(|e| BlockServiceError::Beacon(e.to_string()))
     }
@@ -476,5 +488,68 @@ mod tests {
         assert!(!produced.payload_included);
         assert!(produced.builder_url.is_none());
         assert!(produced.consensus_block_value.is_none());
+    }
+
+    fn electra_signed_block_contents() -> SignedBlockContentsJson {
+        let signed = SignedBeaconBlock {
+            message: eth_types::external_vector_electra_block(),
+            signature: vec![0xaa; eth_types::SIGNATURE_BYTES_LEN],
+        };
+        SignedBlockContentsJson::from_signed_block(
+            &signed,
+            vec![vec![0x11; 48]],
+            vec![vec![0x22; 8]],
+            eth_types::BodyForkLayout::Electra,
+        )
+        .expect("electra body encodes")
+    }
+
+    /// Blocks topic off, so a 503 on BN-1 must fail over instead of broadcasting.
+    #[tokio::test]
+    async fn publish_block_contents_reaches_a_healthy_bn_when_the_first_is_down() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        let contents = electra_signed_block_contents();
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+            .expect(1)
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&secondary)
+            .await;
+
+        let mut config = BnManagerConfig::new(vec![primary.uri(), secondary.uri()]);
+        config.broadcast_topics.blocks = false;
+        let manager = Arc::new(BnManager::new(config).expect("BnManager"));
+        let adapter = BeaconBlockAdapter(manager.clone() as Arc<dyn BeaconNodeClient>);
+
+        adapter
+            .publish_block_contents(&contents, "electra", None)
+            .await
+            .expect("failover publish_block_contents");
+
+        let primary_reqs = primary.received_requests().await.unwrap();
+        let secondary_reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(primary_reqs.len(), 1, "BN-1 is attempted once");
+        assert_eq!(secondary_reqs.len(), 1, "healthy BN receives exactly one POST");
+        let body: serde_json::Value =
+            serde_json::from_slice(&secondary_reqs[0].body).expect("json body");
+        let expected = serde_json::to_value(&contents).expect("serialize contents");
+        assert_eq!(body, expected);
+        assert!(body["signed_block"].is_object(), "{body}");
+        assert!(
+            body["kzg_proofs"].is_array() && !body["kzg_proofs"].as_array().unwrap().is_empty()
+        );
+        assert!(body["blobs"].is_array() && !body["blobs"].as_array().unwrap().is_empty());
+
+        let trackers = manager.health_trackers().read().await;
+        assert_eq!(trackers[0].endpoint(), primary.uri());
+        assert!(trackers[0].error_rate() > 0.0, "BN-1's health tracker must record the 503");
     }
 }

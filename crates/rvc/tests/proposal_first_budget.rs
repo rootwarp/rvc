@@ -42,7 +42,7 @@ use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 use duty_tracker::DutyTracker;
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedProposerPreferences, SignedValidatorRegistration, Slot,
+    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration, Slot,
 };
 use metrics::definitions::{slot_phase_cache, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS};
 use rvc::orchestrator::{
@@ -241,6 +241,14 @@ impl BlockProducer for DutyStallBeacon {
         builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
         self.inner.publish_block(signed_block, consensus_version, builder_url).await
+    }
+    async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        self.inner.publish_block_contents(contents, consensus_version, builder_url).await
     }
     async fn publish_blinded_block(
         &self,
