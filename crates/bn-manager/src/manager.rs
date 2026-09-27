@@ -286,9 +286,10 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 /// Every underlying `BeaconClient` is constructed with **`max_retries = 0`**.
 /// Transient failures are handled by this manager (try the next healthy BN /
 /// broadcast to peers), not by per-client HTTP retries. Stacking both would
-/// multiply tail latency on a dead primary. Single-client tooling that bypasses
-/// `BnManager` (e.g. voluntary-exit helpers via `ServiceBuilder::build_beacon`)
-/// may set a non-zero retry budget; that is the only intentional exception.
+/// multiply tail latency on a dead primary. Callers that bypass this pool may
+/// set a non-zero retry budget; that is the only intentional exception. The CLI
+/// exit helper `build_signed_exit` in `bin/rvc` still builds its own
+/// `BeaconClient`. The keymanager exit path does not.
 /// Other call sites that need the same policy should link here rather than
 /// restate it.
 ///
@@ -1608,6 +1609,39 @@ impl NodeStatusApi for BnManager {
         .await
     }
 
+    async fn get_genesis_matching_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<GenesisResponse, BeaconError> {
+        // no budget: same startup-style read as get_genesis. A 200 whose
+        // validators root is not the configured one must not win the pool.
+        let expected = expected_root_hex.to_string();
+        let found = self
+            .query_first_prefer_some(
+                "get_genesis_matching_validators_root",
+                BnRole::All,
+                HealthTier::SmallLag,
+                None,
+                move |c| {
+                    let expected = expected.clone();
+                    Box::pin(async move {
+                        let genesis = c.get_genesis().await?;
+                        if beacon::hex_ids_equal(&genesis.data.genesis_validators_root, &expected) {
+                            Ok(Some(genesis))
+                        } else {
+                            Ok(None)
+                        }
+                    })
+                },
+            )
+            .await?;
+        found.ok_or_else(|| {
+            BeaconError::HttpError(
+                "no beacon node returned the configured genesis_validators_root".into(),
+            )
+        })
+    }
+
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
         // no budget: startup spec read; OperationTimeouts has no field for it
         self.query_first("get_config_spec", BnRole::All, HealthTier::SmallLag, None, |c| {
@@ -1634,10 +1668,41 @@ impl NodeStatusApi for BnManager {
 
     async fn get_validators(&self, pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError> {
         // no budget: validator registry read; OperationTimeouts has no field for it
-        self.query_first("get_validators", BnRole::All, HealthTier::SmallLag, None, |c| {
-            Box::pin(c.get_validators(pubkeys))
-        })
-        .await
+        // An empty or non-matching 200 is not the cluster answer: voluntary exit
+        // must not sign `data.first()` from the wrong node, and `{"data":[]}`
+        // must not hide a later BN. Other endpoints stay on `query_first`.
+        if pubkeys.is_empty() {
+            return self
+                .query_first("get_validators", BnRole::All, HealthTier::SmallLag, None, |c| {
+                    Box::pin(c.get_validators(pubkeys))
+                })
+                .await;
+        }
+        let requested = pubkeys.to_vec();
+        let found = self
+            .query_first_prefer_some(
+                "get_validators",
+                BnRole::All,
+                HealthTier::SmallLag,
+                None,
+                move |c| {
+                    let requested = requested.clone();
+                    Box::pin(async move {
+                        let resp = c.get_validators(&requested).await?;
+                        if resp.data.iter().any(|v| {
+                            requested
+                                .iter()
+                                .any(|pk| beacon::hex_ids_equal(&v.validator.pubkey, pk))
+                        }) {
+                            Ok(Some(resp))
+                        } else {
+                            Ok(None)
+                        }
+                    })
+                },
+            )
+            .await?;
+        Ok(found.unwrap_or(ValidatorsResponse { data: Vec::new() }))
     }
 
     // -- Blocks --
@@ -2305,6 +2370,10 @@ macro_rules! impl_beacon_client_passthrough {
 impl_beacon_client_passthrough! {
     NodeStatusApi {
         async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError>;
+        async fn get_genesis_matching_validators_root(
+            &self,
+            expected_root_hex: &str,
+        ) -> Result<GenesisResponse, BeaconError>;
         async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError>;
         async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError>;
         async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError>;
@@ -2490,10 +2559,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 35 methods across the seven role traits (see impl_beacon_client_passthrough!).
+        // 36 methods across the seven role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            35,
+            36,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -2509,6 +2578,7 @@ mod tests {
         // Spot-check that each role trait is represented.
         for required in [
             "get_genesis",
+            "get_genesis_matching_validators_root",
             "get_attester_duties",
             "post_ptc_duties",
             "produce_block_v3",

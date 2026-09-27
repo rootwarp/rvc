@@ -281,6 +281,13 @@ pub trait LivenessApi: Send + Sync {
 pub trait NodeStatusApi: Send + Sync {
     async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError>;
 
+    /// [`Self::get_genesis`], but a body whose `genesis_validators_root` is not
+    /// `expected_root_hex` is not success. Pooled clients try the next node.
+    async fn get_genesis_matching_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<GenesisResponse, BeaconError>;
+
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError>;
 
     async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError>;

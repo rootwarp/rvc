@@ -154,7 +154,7 @@ pub async fn run(
     .await?;
 
     let BeaconHandles {
-        beacon_client,
+        beacon_client: _,
         bn_manager,
         genesis_validators_root,
         genesis_validators_root_hex: _,
@@ -242,7 +242,8 @@ pub async fn run(
             slashing_db: slashing_db.clone(),
             genesis_validators_root,
             validator_store: validator_store.clone(),
-            beacon_client: beacon_client.clone(),
+            // Pool, not the single-endpoint client: exit must fail over with the rest of the VC.
+            beacon_client: bn_manager.clone(),
             signer: signer.clone(),
             fork_schedule: orchestrator_config.fork_schedule.clone(),
             deletion_denylist: Arc::clone(&deletion_denylist),

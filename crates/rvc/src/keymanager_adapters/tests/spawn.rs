@@ -38,7 +38,8 @@ fn spawn_test_deps(
             .with_enablement(always_enabled()),
     );
     let beacon_config = beacon::BeaconClientConfig::new("http://127.0.0.1:9");
-    let beacon_client = Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
+    let beacon_client: Arc<dyn bn_manager::BeaconNodeClient> =
+        Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
     let (key_gen_tx, _rx) = watch::channel(0u64);
     let pubkey_map = create_pubkey_map();
     let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));

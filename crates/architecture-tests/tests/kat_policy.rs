@@ -39,7 +39,6 @@ use std::path::{Path, PathBuf};
 // - name-pattern false positives (genesis_root, dependent_root, wire paths, …)
 // - self-consistency / relative root coverage (H5 targets; test-audit 3.4 shrinks block-service rows)
 const EXEMPTIONS: &[(&str, &str)] = &[
-    ("bin/rvc-keygen/src/bls_to_execution.rs", "test_bls_to_execution_uses_actual_genesis_root"),
     ("bin/rvc-keygen/src/deposit.rs", "test_sign_deposit_uses_zeroed_genesis_root"),
     ("bin/rvc-keygen/src/deposit.rs", "test_to_launchpad_json_deposit_data_root"),
     ("bin/rvc-keygen/src/deposit.rs", "test_to_launchpad_json_deposit_message_root"),
@@ -411,11 +410,10 @@ fn kat_policy_no_unanchored_root_tests() {
 
 /// Shrinking-only ratchet (ARCH-7l). Never raise this bound.
 #[test]
-#[allow(non_snake_case)]
-fn kat_policy_exemptions_count_is_at_most_N() {
+fn exemptions_count_is_at_most_37() {
     assert!(
-        EXEMPTIONS.len() <= 38,
-        "EXEMPTIONS is shrinking-only; len={} exceeds ratchet 38",
+        EXEMPTIONS.len() <= 37,
+        "EXEMPTIONS is shrinking-only; len={} exceeds ratchet 37",
         EXEMPTIONS.len()
     );
 }

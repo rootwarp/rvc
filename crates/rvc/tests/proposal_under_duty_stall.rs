@@ -165,6 +165,12 @@ impl NodeStatusApi for DutyStallBeacon {
     async fn get_genesis(&self) -> Result<beacon::GenesisResponse, BeaconError> {
         self.inner.get_genesis().await
     }
+    async fn get_genesis_matching_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<beacon::GenesisResponse, BeaconError> {
+        beacon::ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
+    }
     async fn get_config_spec(&self) -> Result<beacon::ConfigSpecResponse, BeaconError> {
         self.inner.get_config_spec().await
     }

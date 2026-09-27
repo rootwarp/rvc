@@ -99,8 +99,9 @@ mod proposer_nodes {
         );
     }
 
-    /// Call-site guard: `build_beacon` in the VC runtime path is limited to exit
-    /// tooling (keymanager voluntary exit), not block production or the propagator.
+    /// Call-site guard: the single-endpoint `build_beacon()` client is still
+    /// constructed and is not the keymanager exit path, block production, or
+    /// the propagator.
     ///
     /// RF5-10: production path is `crates/rvc` bootstrap phases.
     #[test]
@@ -139,7 +140,11 @@ mod proposer_nodes {
         );
         assert!(
             km_src.contains("VoluntaryExitManagerAdapter::new"),
-            "build_beacon() client should remain available for exit tooling via keymanager adapters"
+            "keymanager still constructs VoluntaryExitManagerAdapter"
+        );
+        assert!(
+            !km_src.contains("build_beacon()"),
+            "keymanager exit must not call build_beacon(); it uses the BN pool"
         );
     }
 }

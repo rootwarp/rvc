@@ -4,7 +4,8 @@ use super::*;
 
 fn create_exit_adapter(beacon_url: &str, secret_key: SecretKey) -> VoluntaryExitManagerAdapter {
     let beacon_config = beacon::BeaconClientConfig::new(beacon_url);
-    let beacon_client = Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
+    let beacon_client: Arc<dyn bn_manager::BeaconNodeClient> =
+        Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
 
     let key_manager = crypto::KeyManager::new();
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));

@@ -5,7 +5,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use beacon::BeaconClient;
+use bn_manager::BeaconNodeClient;
 use crypto::CompositeSigner;
 use doppelganger::{ForwardWindowMachine, MonotonicEpochClock};
 use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
@@ -39,7 +39,8 @@ pub struct KeymanagerApiDeps {
     pub slashing_db: Arc<SlashingDb>,
     pub genesis_validators_root: Root,
     pub validator_store: Arc<ValidatorStore>,
-    pub beacon_client: Arc<BeaconClient>,
+    /// Beacon-node pool. Voluntary exit reads fail over across `beacon_nodes`.
+    pub beacon_client: Arc<dyn BeaconNodeClient>,
     pub signer: Arc<SignerService>,
     pub fork_schedule: Arc<ForkSchedule>,
     pub deletion_denylist: Arc<DeletionDenylist>,

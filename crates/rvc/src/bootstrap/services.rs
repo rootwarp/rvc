@@ -124,9 +124,9 @@ pub async fn build_services(
     builder.register_loaded_validators(&validator_store, &keys.pubkey_map);
 
     // Attestation submit path uses the main-pool BnManager (failover-aware).
-    // `build_beacon` remains only for single-client exit tooling
-    // (keymanager voluntary exit). Propagator needs a Sized submitter, so keep
-    // the concrete BnManager here rather than `dyn BeaconNodeClient`.
+    // `build_beacon`'s client is still constructed and is not the keymanager
+    // exit path. Propagator needs a Sized submitter, so keep the concrete
+    // BnManager here rather than `dyn BeaconNodeClient`.
     let propagator = builder.build_propagator(Arc::clone(&beacon.bn_manager));
     // Main-pool trait object for duties and (when no dedicated proposer pool)
     // block production.

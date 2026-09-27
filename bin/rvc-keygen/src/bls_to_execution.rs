@@ -169,32 +169,40 @@ mod tests {
         assert!(signature.verify(&withdrawal_pubkey, &capella_root).is_err());
     }
 
-    #[test]
-    fn test_bls_to_execution_uses_actual_genesis_root() {
-        let (withdrawal_key, withdrawal_pubkey) = test_withdrawal_key(0);
+    /// EIP-7044 `BLSToExecutionChange` signing root.
+    ///
+    /// Document: ethereum/consensus-specs v1.5.0, commit
+    /// `b5c3b619887c7850a8c1d3540b471092be73ad84`.
+    /// `specs/capella/beacon-chain.md` `process_bls_to_execution_change` signs with
+    /// `compute_domain(DOMAIN_BLS_TO_EXECUTION_CHANGE, genesis_validators_root=...)`,
+    /// and `specs/phase0/beacon-chain.md` `compute_domain` defaults the fork version to
+    /// `GENESIS_FORK_VERSION`. Mainnet inputs are `configs/mainnet.yaml` at that tag:
+    /// fork version `0x00000000`, genesis validators root
+    /// `0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95`.
+    /// Message: validator index 42, `from_bls_pubkey` 48×`0xdd`, `to_execution_address` 20×`0xee`.
+    /// The root was produced by remerkleable 0.1.28 (protolambda/remerkleable commit
+    /// `1099d0ab038ea25ece506bbed1e8357aba1295be`), not by this crate's `compute_domain`.
+    const KAT_BLS_TO_EXECUTION_CHANGE_SIGNING_ROOT: [u8; 32] = [
+        0xff, 0x5e, 0x9f, 0x65, 0xe5, 0xd5, 0xd7, 0x57, 0x11, 0xee, 0x5c, 0x0d, 0x32, 0xfc, 0x78,
+        0xcc, 0x7e, 0x84, 0x1c, 0x98, 0x56, 0x44, 0x29, 0xd7, 0xc1, 0xda, 0xeb, 0xc7, 0xd2, 0x6b,
+        0xb7, 0x4a,
+    ];
 
+    #[test]
+    fn external_bls_to_execution_change_signing_root() {
         let change = BLSToExecutionChange {
             validator_index: 42,
-            from_bls_pubkey: withdrawal_pubkey.to_bytes(),
-            to_execution_address: [0x71; 20],
+            from_bls_pubkey: [0xdd; 48],
+            to_execution_address: [0xee; 20],
         };
-
         let network = network::from_name("mainnet").unwrap();
-
-        // Sign with actual genesis_validators_root (correct)
-        let correct_domain = compute_domain(
+        let domain = compute_domain(
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
             network.genesis_fork_version,
             network.genesis_validators_root,
         );
-        let correct_root = compute_signing_root(&change, correct_domain);
-        let signature = withdrawal_key.sign(&correct_root);
-
-        // Verify with zeroed root fails (proves we use actual root)
-        let zeroed_domain =
-            compute_domain(DOMAIN_BLS_TO_EXECUTION_CHANGE, network.genesis_fork_version, [0u8; 32]);
-        let zeroed_root = compute_signing_root(&change, zeroed_domain);
-        assert!(signature.verify(&withdrawal_pubkey, &zeroed_root).is_err());
+        let signing_root = compute_signing_root(&change, domain);
+        assert_eq!(signing_root, KAT_BLS_TO_EXECUTION_CHANGE_SIGNING_ROOT);
     }
 
     #[test]

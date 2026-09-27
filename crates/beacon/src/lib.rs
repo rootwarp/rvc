@@ -10,7 +10,7 @@ pub mod ssz_deser;
 mod types;
 mod v4_wire;
 
-pub use client::{BeaconClient, BeaconClientConfig};
+pub use client::{ensure_genesis_validators_root, hex_ids_equal, BeaconClient, BeaconClientConfig};
 pub use error::BeaconError;
 pub use http_caps::ResponseCaps;
 pub use retry::RetryPolicy;

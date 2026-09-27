@@ -3,6 +3,10 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Behaviour: keymanager voluntary exit uses the beacon-node pool
+
+The keymanager voluntary exit now uses the beacon-node pool instead of a single endpoint. A beacon node that answers HTTP 200 without the requested validator, or a genesis body whose validators root is not the configured root, is skipped; the next node is tried. The exit is not signed from that body.
+
 ## Behaviour: DELETE drains signing before export
 
 DELETE `/eth/v1/keystores` disables the validator and drains the slashable

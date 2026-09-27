@@ -192,6 +192,30 @@ fn optional_header_str(
     Ok(Some(value.to_string()))
 }
 
+/// Case-insensitive equality of two hex ids, each with an optional `0x`/`0X` prefix.
+pub fn hex_ids_equal(left: &str, right: &str) -> bool {
+    fn body(s: &str) -> &str {
+        let s = s.trim();
+        s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s)
+    }
+    body(left).eq_ignore_ascii_case(body(right))
+}
+
+/// `Ok(genesis)` only when its validators root equals `expected_root_hex`.
+pub fn ensure_genesis_validators_root(
+    genesis: GenesisResponse,
+    expected_root_hex: &str,
+) -> Result<GenesisResponse, BeaconError> {
+    if hex_ids_equal(&genesis.data.genesis_validators_root, expected_root_hex) {
+        Ok(genesis)
+    } else {
+        Err(BeaconError::HttpError(format!(
+            "genesis_validators_root {} does not match configured root",
+            genesis.data.genesis_validators_root
+        )))
+    }
+}
+
 /// Async HTTP client wrapper for beacon node communication.
 #[derive(Clone)]
 pub struct BeaconClient {
@@ -459,6 +483,15 @@ impl BeaconClient {
     #[tracing::instrument(name = "beacon.get_genesis", skip_all)]
     pub async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
         self.get("/eth/v1/beacon/genesis").await
+    }
+
+    /// [`Self::get_genesis`], rejecting a body whose validators root is not
+    /// `expected_root_hex`. A single client has no peer to fail over to.
+    pub async fn get_genesis_matching_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<GenesisResponse, BeaconError> {
+        ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
     }
 
     /// Fetches fork information for the given state.

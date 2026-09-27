@@ -610,6 +610,13 @@ impl NodeStatusApi for MockBeaconNodeClient {
         self.get_genesis.invoke("get_genesis", ())
     }
 
+    async fn get_genesis_matching_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<GenesisResponse, BeaconError> {
+        beacon::ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
+    }
+
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
         self.get_config_spec.invoke("get_config_spec", ())
     }

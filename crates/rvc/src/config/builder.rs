@@ -179,12 +179,12 @@ impl ServiceBuilder {
         }
     }
 
-    /// Build a single-endpoint [`BeaconClient`] for exit tooling.
+    /// Build a single-endpoint [`BeaconClient`].
     ///
-    /// Runtime block production, duties, and attestation paths must use
-    /// [`Self::build_bn_manager`] / [`Self::build_proposer_bn_manager`] so
-    /// multi-BN failover applies. This helper is intentionally limited to
-    /// single-client needs (keymanager voluntary exit and similar).
+    /// Still constructed at startup. Not the keymanager voluntary-exit path:
+    /// that uses [`Self::build_bn_manager`]. Runtime block production, duties,
+    /// and attestation use the pool as well ([`Self::build_proposer_bn_manager`]
+    /// when a proposer pool is configured).
     ///
     /// Unlike `BnManager` (which sets `max_retries = 0` and relies on pool
     /// failover — see `bn_manager::BnManager`), a standalone client keeps a
@@ -199,7 +199,7 @@ impl ServiceBuilder {
         info!(
             url = %self.config.beacon_url,
             max_body_bytes = self.config.beacon_max_body_bytes,
-            "Created beacon client (exit tooling)"
+            "Created single-endpoint beacon client (not the keymanager exit path)"
         );
         Ok(Arc::new(client))
     }
