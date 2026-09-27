@@ -116,7 +116,7 @@ const fn inv(
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
     (Class::GeForkName, 24),
     (Class::IndexZero, 8),
-    (Class::MatchForkName, 5),
+    (Class::MatchForkName, 7),
     (Class::StringDispatch, 9),
     (Class::Entries, 8),
 ];
@@ -135,7 +135,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/beacon/src/client.rs",
-        489,
+        490,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -422,6 +422,24 @@ const INVENTORY: &[Inv] = &[
         "match fork {",
         Verdict::TestOnly,
         "2.5b",
+    ),
+    inv(
+        "crates/beacon/src/client.rs",
+        1200,
+        Class::MatchForkName,
+        false,
+        "match fork {",
+        Verdict::InheritIntentionally,
+        "RR-3.2",
+    ),
+    inv(
+        "crates/beacon/src/client.rs",
+        2005,
+        Class::MatchForkName,
+        false,
+        "match requested {",
+        Verdict::InheritIntentionally,
+        "RR-3.2",
     ),
     inv(
         "crates/block-service/src/service/mod.rs",

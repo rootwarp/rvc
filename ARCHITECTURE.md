@@ -46,6 +46,7 @@ graph TD
     RVC_WEB3SIGNER_WIRE["web3signer-wire<br/><i>remote sign wire</i>"]
 
     BEACON --> RVC_ETH_TYPES
+    BEACON --> RVC_METRICS
     BEACON --> RVC_OBSERVABILITY
     BEACON --> RVC_TELEMETRY
     RVC --> BEACON

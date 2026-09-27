@@ -1,8 +1,9 @@
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use metrics::{define_int_gauge_vec, IntGaugeVec};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, error, trace, warn, Instrument};
@@ -1161,6 +1162,221 @@ impl BeaconClient {
         }
     }
 
+    /// Fork-aware aggregate fetch.
+    ///
+    /// Migration target for [`Self::get_aggregate_attestation`]. The v1-only
+    /// method is removed in RR-3.3; nothing in production calls this until then.
+    ///
+    /// Electra, Fulu, and Gloas require `committee_index` and send
+    /// `GET /eth/v2/validator/aggregate_attestation` with
+    /// `Eth-Consensus-Version` set to `fork`. A 200 is accepted only when that
+    /// header, the body `version`, and `fork` are the same [`ForkName`]. The
+    /// payload is not coerced into the requested fork. `committee_bits` must
+    /// include `committee_index`.
+    ///
+    /// HTTP 405 or 501 is one terminal v2 attempt, then one v1 fallback (not a
+    /// retry loop). Other 429/5xx responses, timeouts, and connect failures use
+    /// [`RetryPolicy`](crate::RetryPolicy) and do not fall back. The gap is
+    /// logged at `warn`. `rvc_bn_capability_state` for
+    /// `aggregate_attestation_v2` is set to 0. That 0 means "used v1 once", not
+    /// "drop this BN". A successful agreeing v2 response sets the series to 1.
+    ///
+    /// v1 has no fork field. A Fulu or Gloas 405/501 with `committee_index`
+    /// therefore returns [`VersionedAggregateAttestation::Electra`], not Fulu
+    /// or Gloas. The v1 body is not re-wrapped.
+    #[tracing::instrument(
+        name = "beacon.get_aggregate_attestation_v2",
+        skip_all,
+        fields(slot = slot)
+    )]
+    pub async fn get_aggregate_attestation_v2(
+        &self,
+        slot: u64,
+        attestation_data_root: &str,
+        committee_index: Option<u64>,
+        fork: ForkName,
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
+        // Same fork split as `submit_aggregate_and_proofs`: one table per endpoint.
+        match fork {
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb => {
+                self.get_aggregate_attestation(slot, attestation_data_root, committee_index).await
+            }
+            ForkName::Electra => {
+                self.fetch_aggregate_attestation_v2(
+                    slot,
+                    attestation_data_root,
+                    committee_index,
+                    ForkName::Electra,
+                )
+                .await
+            }
+            ForkName::Fulu => {
+                self.fetch_aggregate_attestation_v2(
+                    slot,
+                    attestation_data_root,
+                    committee_index,
+                    ForkName::Fulu,
+                )
+                .await
+            }
+            ForkName::Gloas => {
+                self.fetch_aggregate_attestation_v2(
+                    slot,
+                    attestation_data_root,
+                    committee_index,
+                    ForkName::Gloas,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Electra+ v2 GET. 405/501 are a capability gap (one attempt, then v1).
+    /// 501 is a 5xx, so it must not go through the shared engine's 5xx retry.
+    async fn fetch_aggregate_attestation_v2(
+        &self,
+        slot: u64,
+        attestation_data_root: &str,
+        committee_index: Option<u64>,
+        fork: ForkName,
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
+        let Some(committee_index) = committee_index else {
+            return Err(BeaconError::ParseError(
+                "committee_index is required for an Electra+ aggregate fetch".to_string(),
+            ));
+        };
+        let slot_s = slot.to_string();
+        let ci_s = committee_index.to_string();
+        let query = [
+            ("slot", slot_s.as_str()),
+            ("attestation_data_root", attestation_data_root),
+            ("committee_index", ci_s.as_str()),
+        ];
+        let path = Self::build_path(&["eth", "v2", "validator", "aggregate_attestation"], &query);
+        let url = self.resolve_url(&path)?;
+        let policy = self.retry_policy();
+        let mut last_error = None;
+
+        for attempt in 0..=policy.max_retries {
+            if attempt > 0 {
+                let backoff = policy.calculate_backoff(attempt - 1);
+                debug!(
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "Retrying aggregate attestation v2"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+
+            let response = match Self::traced(
+                self.client.get(&url).header(HEADER_ETH_CONSENSUS_VERSION, fork.as_ref()),
+            )
+            .send()
+            .await
+            {
+                Ok(response) => response,
+                Err(e) if e.is_timeout() => {
+                    last_error = Some(BeaconError::Timeout);
+                    warn!(attempt, "Aggregate attestation v2 timed out, will retry");
+                    continue;
+                }
+                Err(e) if e.is_connect() || e.is_request() => {
+                    last_error = Some(BeaconError::HttpError(e.to_string()));
+                    warn!(attempt, error = %e, "Aggregate attestation v2 connect failed, will retry");
+                    continue;
+                }
+                Err(e) => return Err(BeaconError::HttpError(e.to_string())),
+            };
+
+            let status = response.status();
+            if status.as_u16() == 405 || status.as_u16() == 501 {
+                let _ = Self::api_error_from_response(response).await;
+                return self
+                    .fallback_aggregate_attestation_v1(
+                        slot,
+                        attestation_data_root,
+                        committee_index,
+                        status.as_u16(),
+                    )
+                    .await;
+            }
+            if status.as_u16() == 429 {
+                last_error = Some(BeaconError::ApiError {
+                    status: 429,
+                    message: "Too Many Requests".to_string(),
+                });
+                if attempt >= policy.max_retries {
+                    break;
+                }
+                let delay =
+                    RetryPolicy::retry_after_delay(&response, policy.calculate_backoff(attempt));
+                warn!(
+                    attempt,
+                    delay_ms = ?delay.as_millis(),
+                    "Aggregate attestation v2 rate limited (429), backing off"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            if status.is_server_error() {
+                let message = read_body_capped_lossy(response, 16 * 1024).await;
+                last_error = Some(BeaconError::ApiError { status: status.as_u16(), message });
+                warn!(
+                    attempt,
+                    status = status.as_u16(),
+                    "Aggregate attestation v2 server error, will retry"
+                );
+                continue;
+            }
+            if !status.is_success() {
+                return Err(Self::api_error_from_response(response).await);
+            }
+
+            let header_fork = required_consensus_version(response.headers())?;
+            let body = read_body_capped(response, self.config.max_body_bytes).await?;
+            let parsed =
+                serde_json::from_slice::<AggregateAttestationV2Response>(&body).map_err(|e| {
+                    BeaconError::ParseError(format!("error decoding response body: {e}"))
+                })?;
+            let aggregate =
+                decode_versioned_aggregate(fork, header_fork, &parsed.version, parsed.data)?;
+            ensure_requested_committee_bit(&aggregate, committee_index)?;
+            self.record_aggregate_v2_capability(true);
+            return Ok(aggregate);
+        }
+
+        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+    }
+
+    async fn fallback_aggregate_attestation_v1(
+        &self,
+        slot: u64,
+        attestation_data_root: &str,
+        committee_index: u64,
+        status: u16,
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
+        self.record_aggregate_v2_capability(false);
+        warn!(
+            bn_url = %RedactedUrl(self.endpoint()),
+            http.status_code = status,
+            "aggregate attestation v2 unavailable; falling back to v1 once"
+        );
+        // v1 classifies Some(committee_index) as Electra. Fulu/Gloas are not
+        // re-wrapped onto that body.
+        self.get_aggregate_attestation(slot, attestation_data_root, Some(committee_index)).await
+    }
+
+    fn record_aggregate_v2_capability(&self, capable: bool) {
+        let endpoint = capability_endpoint_label(self.endpoint());
+        RVC_BN_CAPABILITY_STATE
+            .with_label_values(&[endpoint.as_str(), CAPABILITY_AGGREGATE_ATTESTATION_V2])
+            .set(i64::from(capable));
+    }
+
     /// Submits signed aggregate and proofs to the beacon node.
     pub async fn submit_aggregate_and_proofs(
         &self,
@@ -1730,6 +1946,118 @@ impl BeaconClient {
     }
 }
 
+/// `capability` label on the existing `rvc_bn_capability_state` family.
+const CAPABILITY_AGGREGATE_ATTESTATION_V2: &str = "aggregate_attestation_v2";
+
+/// Same family bn-manager owns. `register_metric` returns the existing handle
+/// when that crate registered first, so this is not a second Prometheus family.
+static RVC_BN_CAPABILITY_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    define_int_gauge_vec(
+        "rvc_bn_capability_state",
+        "Whether a beacon node can serve a capability (1=capable, 0=incapable)",
+        &["endpoint", "capability"],
+    )
+});
+
+#[derive(Debug, Deserialize)]
+struct AggregateAttestationV2Response {
+    version: String,
+    data: serde_json::Value,
+}
+
+/// `scheme://host:port` without userinfo or path, matching the series label.
+fn capability_endpoint_label(endpoint: &str) -> String {
+    match url::Url::parse(endpoint) {
+        Ok(mut parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_path("");
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string().trim_end_matches('/').to_string()
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Accept a v2 body only when header, body `version`, and the request fork agree.
+///
+/// Phase0–Deneb is not decoded as [`VersionedAggregateAttestation::PreElectra`]
+/// on this path: an Electra+ request never takes that arm, and a pre-Electra
+/// `fork` here is a programming error rather than a v1 payload.
+fn decode_versioned_aggregate(
+    requested: ForkName,
+    header_fork: ForkName,
+    version: &str,
+    data: serde_json::Value,
+) -> Result<VersionedAggregateAttestation, BeaconError> {
+    let body_fork = ForkName::from_str(version).map_err(|_| {
+        BeaconError::ParseError(format!("invalid aggregate attestation version: {version}"))
+    })?;
+    if header_fork != requested || body_fork != requested {
+        return Err(BeaconError::ParseError(format!(
+            "aggregate attestation fork mismatch: requested {}, header {}, body {}",
+            requested.as_ref(),
+            header_fork.as_ref(),
+            body_fork.as_ref()
+        )));
+    }
+    match requested {
+        ForkName::Electra => {
+            Ok(VersionedAggregateAttestation::Electra(decode_aggregate_data(data)?))
+        }
+        ForkName::Fulu => Ok(VersionedAggregateAttestation::Fulu(decode_aggregate_data(data)?)),
+        ForkName::Gloas => Ok(VersionedAggregateAttestation::Gloas(decode_aggregate_data(data)?)),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => Err(BeaconError::ParseError(
+            "pre-Electra aggregate fetch does not use the v2 decoder".to_string(),
+        )),
+    }
+}
+
+/// SSZ `Bitvector`: bit `index` is the LSB-first bit of `bits[index / 8]`.
+fn committee_bits_include_index(bits: &[u8], index: u64) -> bool {
+    let Some(byte_index) = usize::try_from(index / 8).ok() else {
+        return false;
+    };
+    let Some(byte) = bits.get(byte_index) else {
+        return false;
+    };
+    let shift = u32::try_from(index % 8).unwrap_or(0);
+    byte & (1u8 << shift) != 0
+}
+
+fn ensure_requested_committee_bit(
+    aggregate: &VersionedAggregateAttestation,
+    index: u64,
+) -> Result<(), BeaconError> {
+    let bits = match aggregate {
+        VersionedAggregateAttestation::Electra(att)
+        | VersionedAggregateAttestation::Fulu(att)
+        | VersionedAggregateAttestation::Gloas(att) => att.committee_bits.as_slice(),
+        VersionedAggregateAttestation::PreElectra(_) => {
+            return Err(BeaconError::ParseError(
+                "Electra+ aggregate response decoded as pre-Electra".to_string(),
+            ));
+        }
+    };
+    if committee_bits_include_index(bits, index) {
+        Ok(())
+    } else {
+        Err(BeaconError::ParseError(format!(
+            "aggregate committee_bits does not include committee_index {index}"
+        )))
+    }
+}
+
+fn decode_aggregate_data<T: DeserializeOwned>(data: serde_json::Value) -> Result<T, BeaconError> {
+    serde_json::from_value(data)
+        .map_err(|e| BeaconError::ParseError(format!("error decoding response body: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1797,6 +2125,16 @@ mod tests {
         let config = BeaconClientConfig::new("localhost:5052");
         let result = BeaconClient::new(config);
         assert!(matches!(result, Err(BeaconError::InvalidUrl(_))));
+    }
+
+    #[test]
+    fn committee_bits_include_index_is_little_endian() {
+        let bits = [0x20, 0, 0, 0, 0, 0, 0, 0];
+        assert!(committee_bits_include_index(&bits, 5));
+        assert!(!committee_bits_include_index(&bits, 0));
+        assert!(!committee_bits_include_index(&bits, 8));
+        assert!(!committee_bits_include_index(&bits, 64));
+        assert!(!committee_bits_include_index(&[], 0));
     }
 
     #[test]

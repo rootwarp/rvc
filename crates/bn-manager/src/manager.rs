@@ -349,8 +349,9 @@ impl BnManager {
         let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
         let health_trackers = new_shared_health_trackers(&endpoints);
         for ep in &endpoints {
-            publish_capability(ep, bn_capability::PRODUCE_BLOCK_V4, true);
-            publish_capability(ep, bn_capability::FORK_RECOGNISED, true);
+            for capability in bn_capability::ALL {
+                publish_capability(ep, capability, true);
+            }
         }
         Ok(Self {
             clients,

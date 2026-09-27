@@ -42,10 +42,18 @@ impl fmt::Display for HealthTier {
 /// Bounded `capability` label values for `rvc_bn_capability_state`.
 ///
 /// Code-derived only — never request-derived (cardinality).
+/// `publish_capability` drops any label outside [`ALL`].
 pub mod bn_capability {
     pub const FORK_RECOGNISED: &str = "fork_recognised";
     pub const PRODUCE_BLOCK_V4: &str = "produce_block_v4";
-    pub const ALL: &[&str] = &[FORK_RECOGNISED, PRODUCE_BLOCK_V4];
+    /// `/eth/v2/validator/aggregate_attestation`.
+    ///
+    /// `0` means the BN returned 405 or 501 and the client fell back to v1
+    /// once. It does **not** mean drop this BN from the pool. The
+    /// `RvcBnCapabilityIncapable` page is unfiltered
+    /// (`rvc_bn_capability_state == 0`), so that `0` pages once the fetch runs.
+    pub const AGGREGATE_ATTESTATION_V2: &str = "aggregate_attestation_v2";
+    pub const ALL: &[&str] = &[FORK_RECOGNISED, PRODUCE_BLOCK_V4, AGGREGATE_ATTESTATION_V2];
 }
 
 /// Tier threshold configuration.
@@ -209,7 +217,11 @@ mod tests {
     fn test_bn_capability_all_is_the_closed_code_derived_set() {
         assert_eq!(
             bn_capability::ALL,
-            &[bn_capability::FORK_RECOGNISED, bn_capability::PRODUCE_BLOCK_V4]
+            &[
+                bn_capability::FORK_RECOGNISED,
+                bn_capability::PRODUCE_BLOCK_V4,
+                bn_capability::AGGREGATE_ATTESTATION_V2,
+            ]
         );
     }
 

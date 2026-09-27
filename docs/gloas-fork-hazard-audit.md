@@ -39,10 +39,10 @@ Line numbers were opened on `feature/216-fork-hazard-audit` after 2.1
 |-------|------:|
 | 1 `>= ForkName::X` | 24 |
 | 2 `.index = 0` | 8 |
-| 3 `match ForkName` | 5 |
+| 3 `match ForkName` | 7 |
 | 4 string-literal dispatch | 9 |
 | 5 `.entries()` | 8 |
-| **Total** | **54** |
+| **Total** | **56** |
 
 Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 
@@ -50,7 +50,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | Site | Class | Kind | Verdict | Rationale | Issue |
 |---|---|---|---|---|---|
 | `bin/rvc-keygen/src/exit.rs` 107 | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 301. | — |
-| `crates/beacon/src/client.rs` 489 | 1 | — | inherit-intentionally | Proposer-duties v1/v2 routing (4.5). Open-ended `>= Gloas` keeps later forks on v2 rather than silently falling back to deprecated v1. | 4.5 |
+| `crates/beacon/src/client.rs` 490 | 1 | — | inherit-intentionally | Proposer-duties v1/v2 routing (4.5). Open-ended `>= Gloas` keeps later forks on v2 rather than silently falling back to deprecated v1. | 4.5 |
 | `crates/block-service/src/service/mod.rs` 309 | 1 | — | inherit-intentionally | Produce dispatch: open-ended `>= Gloas` stays on V4 so a later fork does not fall back to V3. | — |
 | `crates/block-service/src/service/mod.rs` 367 | 1 | — | inherit-intentionally | Response log omits the pre-Gloas blinded field once `>= Gloas`. Later forks keep that shape. | — |
 | `crates/block-service/src/service/mod.rs` 389 | 1 | — | inherit-intentionally | Sign/publish dispatch: open-ended `>= Gloas` stays on `sign_and_publish_v4`. | — |
@@ -82,6 +82,8 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 358 | 2 | — | test-only | Gloas round-trip builds a zeroed index to prove the signing path did not zero it. | — |
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 385 | 2 | — | test-only | Electra/Fulu round-trip expects the submitted index to be zeroed. | — |
 | `bin/rvc/tests/common/mock_bn.rs` 267 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
+| `crates/beacon/src/client.rs` 1200 | 3 | exhaustive | inherit-intentionally | Aggregate fetch v2 request table. Exhaustive `match fork` so a new variant is a compile error, not a silent v1 or v2 inherit. | RR-3.2 |
+| `crates/beacon/src/client.rs` 2005 | 3 | exhaustive | inherit-intentionally | v2 200 is accepted only when the response header, body `version`, and the requested fork agree. Pre-Electra is not decoded on this path. | RR-3.2 |
 | `crates/block-service/src/service/mod.rs` 1006 | 3 | exhaustive | inherit-intentionally | `ssz_block_format` named Gloas `BeaconBlock` arm; exhaustive `match fork` so a new variant is a compile error, not a silent `BlockContents`/`BeaconBlock` inherit. Unknown version strings fail closed before the match. | 6.4 |
 | `crates/eth-types/src/fork.rs` 190 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
 | `crates/eth-types/src/fork.rs` 208 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
