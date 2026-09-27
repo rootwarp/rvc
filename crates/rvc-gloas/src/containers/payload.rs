@@ -92,7 +92,9 @@ mod tests {
         assert!(!hex.starts_with("0x"), "SPEC_* hex follows EXTERNAL_* style (no 0x prefix)");
         assert_eq!(hex.len() % 2, 0, "SPEC_* hex must have even length, got {}", hex.len());
         hex.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| {
                 let s = core::str::from_utf8(chunk).expect("hex digits are utf8");
                 u8::from_str_radix(s, 16).unwrap_or_else(|e| panic!("hex {s}: {e}"))

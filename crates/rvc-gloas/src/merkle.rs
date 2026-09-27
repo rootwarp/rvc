@@ -56,7 +56,7 @@ mod tests {
         assert_eq!(hex.len(), 64, "SPEC_* hex must be 64 chars, got {} ({hex:?})", hex.len());
         assert!(!hex.starts_with("0x"), "SPEC_* hex follows EXTERNAL_* style (no 0x prefix)");
         let mut out = [0u8; 32];
-        for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let s = core::str::from_utf8(chunk).expect("hex digits are utf8");
             out[i] = u8::from_str_radix(s, 16).unwrap_or_else(|e| panic!("hex {s}: {e}"));
         }
