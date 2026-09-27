@@ -25,11 +25,13 @@ pub struct DutyCacheKey {
 struct EpochDutyCache {
     duties: HashMap<DutyCacheKey, AttesterDuty>,
     dependent_root: String,
+    /// Index list posted to produce `duties`. `dependent_root` does not cover it.
+    indices: Vec<String>,
 }
 
 impl EpochDutyCache {
     fn new(dependent_root: String) -> Self {
-        Self { duties: HashMap::new(), dependent_root }
+        Self { duties: HashMap::new(), dependent_root, indices: Vec::new() }
     }
 
     /// Parse attester duties from a BN response into a keyed epoch cache.
@@ -120,11 +122,13 @@ impl ProposerEpochDutyCache {
 struct PtcEpochDutyCache {
     duties: HashMap<u64, Vec<PtcDuty>>,
     dependent_root: String,
+    /// Index list posted to produce `duties`. `dependent_root` does not cover it.
+    indices: Vec<String>,
 }
 
 impl PtcEpochDutyCache {
     fn new(dependent_root: String) -> Self {
-        Self { duties: HashMap::new(), dependent_root }
+        Self { duties: HashMap::new(), dependent_root, indices: Vec::new() }
     }
 
     /// Parse PTC duties from a BN response into a slot-keyed epoch cache.
@@ -162,18 +166,41 @@ impl PtcEpochDutyCache {
 #[derive(Debug)]
 struct SyncPeriodDutyCache {
     duties: Vec<SyncCommitteeDuty>,
+    /// Index list posted to produce `duties`.
+    indices: Vec<String>,
 }
 
 impl SyncPeriodDutyCache {
     /// Construct a period cache from a BN sync-committee duties response body.
     fn from_response(duties: Vec<SyncCommitteeDuty>) -> Self {
-        Self { duties }
+        Self { duties, indices: Vec::new() }
+    }
+}
+
+/// Validator indices a [`DutyTracker`] reads when it fetches duties.
+///
+/// The set may change between [`Self::indices`] calls. Each fetch snapshots it
+/// once, at the start of that call, and uses that `Vec` for every beacon
+/// request the call makes — one duty request never observes two sets.
+/// A cached epoch or sync period stays fresh only while that stored snapshot
+/// still equals the current set; `dependent_root` does not identify the posted
+/// indices. [`DutyTracker::new`] is the static-set convenience wrapper.
+pub trait ValidatorIndexSource: Send + Sync {
+    /// Snapshot of the validator indices to query, as decimal strings.
+    fn indices(&self) -> Vec<String>;
+}
+
+struct StaticIndexSource(Vec<String>);
+
+impl ValidatorIndexSource for StaticIndexSource {
+    fn indices(&self) -> Vec<String> {
+        self.0.clone()
     }
 }
 
 pub struct DutyTracker {
     beacon: Arc<dyn BeaconNodeClient>,
-    validator_indices: Vec<String>,
+    index_source: Arc<dyn ValidatorIndexSource>,
     cache: RwLock<HashMap<u64, EpochDutyCache>>,
     /// Proposer duties keyed by epoch -> ProposerEpochDutyCache.
     proposer_cache: RwLock<HashMap<u64, ProposerEpochDutyCache>>,
@@ -188,10 +215,26 @@ pub struct DutyTracker {
 }
 
 impl DutyTracker {
+    /// Track duties for a fixed validator index set.
+    ///
+    /// Convenience wrapper around [`Self::new_with_source`]: the set does not
+    /// change between fetches.
     pub fn new(beacon: Arc<dyn BeaconNodeClient>, validator_indices: Vec<String>) -> Self {
+        Self::new_with_source(beacon, Arc::new(StaticIndexSource(validator_indices)))
+    }
+
+    /// Track duties for an index set that may change between fetches.
+    ///
+    /// Each fetch calls [`ValidatorIndexSource::indices`] once and uses that
+    /// snapshot for every beacon request the call makes. [`Self::new`] wraps a
+    /// static set.
+    pub fn new_with_source(
+        beacon: Arc<dyn BeaconNodeClient>,
+        index_source: Arc<dyn ValidatorIndexSource>,
+    ) -> Self {
         Self {
             beacon,
-            validator_indices,
+            index_source,
             cache: RwLock::new(HashMap::new()),
             proposer_cache: RwLock::new(HashMap::new()),
             ptc_cache: RwLock::new(HashMap::new()),
@@ -217,11 +260,12 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<Vec<AttesterDuty>, DutyTrackerError> {
+        let indices = self.index_source.indices();
         debug!(epoch = epoch, "Fetching duties for epoch");
 
         let response = self
             .beacon
-            .get_attester_duties(epoch, &self.validator_indices)
+            .get_attester_duties(epoch, &indices)
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
@@ -240,8 +284,9 @@ impl DutyTracker {
             }
         }
 
-        let epoch_cache =
+        let mut epoch_cache =
             EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
+        epoch_cache.indices = indices;
 
         info!(
             epoch = epoch,
@@ -282,33 +327,42 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<bool, DutyTrackerError> {
+        let indices = self.index_source.indices();
         // Fetch from BN first (no lock held) to avoid TOCTOU race
         let response = self
             .beacon
-            .get_attester_duties(epoch, &self.validator_indices)
+            .get_attester_duties(epoch, &indices)
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
         // Acquire write lock and compare-and-swap atomically
         let mut cache = self.cache.write().await;
-        let cached_root = cache.get(&epoch).map(|c| c.dependent_root.clone());
-
-        if cached_root.as_ref() == Some(&response.dependent_root) {
+        let cached = cache.get(&epoch);
+        let same_snapshot = cached
+            .is_some_and(|c| c.dependent_root == response.dependent_root && c.indices == indices);
+        if same_snapshot {
             return Ok(false);
         }
 
-        info!(
-            epoch = epoch,
-            old_root = ?cached_root,
-            new_root = %response.dependent_root,
-            "Dependent root changed, refetching duties"
-        );
+        let root_changed =
+            cached.map(|c| c.dependent_root != response.dependent_root).unwrap_or(true);
+        if root_changed {
+            info!(
+                epoch = epoch,
+                old_root = ?cached.map(|c| c.dependent_root.clone()),
+                new_root = %response.dependent_root,
+                "Dependent root changed, refetching duties"
+            );
+        } else {
+            debug!(epoch, "Index snapshot changed, replacing cached attester duties");
+        }
 
-        let epoch_cache =
+        let mut epoch_cache =
             EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
+        epoch_cache.indices = indices;
 
         cache.insert(epoch, epoch_cache);
-        Ok(true)
+        Ok(root_changed)
     }
 
     #[tracing::instrument(name = "duty_tracker.evict_old_caches", level = "debug", skip_all, fields(epoch =current_epoch))]
@@ -391,8 +445,9 @@ impl DutyTracker {
     }
 
     pub async fn is_epoch_cached(&self, epoch: u64) -> bool {
+        let indices = self.index_source.indices();
         let cache = self.cache.read().await;
-        cache.contains_key(&epoch)
+        cache.get(&epoch).is_some_and(|entry| entry.indices == indices)
     }
 
     pub async fn get_cached_dependent_root(&self, epoch: u64) -> Option<String> {
@@ -513,8 +568,9 @@ impl DutyTracker {
 
         RVC_PTC_DUTIES_FETCHED_TOTAL.with_label_values(&[] as &[&str]).inc();
 
-        let epoch_cache =
+        let mut epoch_cache =
             PtcEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
+        epoch_cache.indices = validator_indices.to_vec();
 
         info!(epoch = epoch, count = response.data.len(), "Cached PTC duties for epoch");
 
@@ -529,7 +585,8 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<Vec<PtcDuty>, DutyTrackerError> {
-        self.fetch_ptc_duties(epoch, &self.validator_indices).await
+        let indices = self.index_source.indices();
+        self.fetch_ptc_duties(epoch, &indices).await
     }
 
     pub async fn get_ptc_duties_for_slot(&self, slot: u64) -> Vec<PtcDuty> {
@@ -557,44 +614,52 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<bool, DutyTrackerError> {
-        let cached_root = {
+        let indices = self.index_source.indices();
+        let cached = {
             let cache = self.ptc_cache.read().await;
-            cache.get(&epoch).map(|c| c.dependent_root.clone())
+            cache.get(&epoch).map(|c| (c.dependent_root.clone(), c.indices.clone()))
         };
 
-        if cached_root.is_none() {
-            self.fetch_ptc_duties(epoch, &self.validator_indices).await?;
+        let Some((cached_root, cached_indices)) = cached else {
+            self.fetch_ptc_duties(epoch, &indices).await?;
             return Ok(true);
-        }
+        };
 
         let response = self
             .beacon
-            .post_ptc_duties(epoch, &self.validator_indices)
+            .post_ptc_duties(epoch, &indices)
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
-        if cached_root.as_ref() != Some(&response.dependent_root) {
+        if cached_root == response.dependent_root && cached_indices == indices {
+            return Ok(false);
+        }
+
+        let root_changed = cached_root != response.dependent_root;
+        if root_changed {
             info!(
                 epoch = epoch,
-                old_root = ?cached_root,
+                old_root = %cached_root,
                 new_root = %response.dependent_root,
                 "PTC dependent root changed, refetching duties"
             );
-
-            let epoch_cache =
-                PtcEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
-
-            let mut cache = self.ptc_cache.write().await;
-            cache.insert(epoch, epoch_cache);
-            return Ok(true);
+        } else {
+            debug!(epoch, "Index snapshot changed, replacing cached PTC duties");
         }
 
-        Ok(false)
+        let mut epoch_cache =
+            PtcEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
+        epoch_cache.indices = indices;
+
+        let mut cache = self.ptc_cache.write().await;
+        cache.insert(epoch, epoch_cache);
+        Ok(root_changed)
     }
 
     pub async fn is_ptc_epoch_cached(&self, epoch: u64) -> bool {
+        let indices = self.index_source.indices();
         let cache = self.ptc_cache.read().await;
-        cache.contains_key(&epoch)
+        cache.get(&epoch).is_some_and(|entry| entry.indices == indices)
     }
 
     #[tracing::instrument(name = "duty_tracker.fetch_sync_committee_duties", level = "debug", skip_all, fields(epoch =epoch))]
@@ -602,12 +667,13 @@ impl DutyTracker {
         &self,
         epoch: u64,
     ) -> Result<Vec<SyncCommitteeDuty>, DutyTrackerError> {
+        let indices = self.index_source.indices();
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         debug!(epoch = epoch, period = period, "Fetching sync committee duties");
 
         let response = self
             .beacon
-            .post_sync_committee_duties(epoch, &self.validator_indices)
+            .post_sync_committee_duties(epoch, &indices)
             .await
             .map_err(DutyTrackerError::BeaconError)?;
 
@@ -618,7 +684,8 @@ impl DutyTracker {
             "Cached sync committee duties for period"
         );
 
-        let period_cache = SyncPeriodDutyCache::from_response(response.data.clone());
+        let mut period_cache = SyncPeriodDutyCache::from_response(response.data.clone());
+        period_cache.indices = indices;
         let mut cache = self.sync_committee_cache.write().await;
         cache.insert(period, period_cache);
 
@@ -642,9 +709,10 @@ impl DutyTracker {
     }
 
     pub async fn is_sync_period_cached(&self, epoch: u64) -> bool {
+        let indices = self.index_source.indices();
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
         let cache = self.sync_committee_cache.read().await;
-        cache.contains_key(&period)
+        cache.get(&period).is_some_and(|entry| entry.indices == indices)
     }
 
     pub fn sync_committee_period(epoch: u64) -> u64 {
@@ -673,6 +741,262 @@ impl DutyTracker {
         let ptc_count = self.ptc_cache.read().await.get(&epoch).map_or(0, |c| c.duty_count());
         (attester_count, proposer_count, sync_count, ptc_count)
     }
+}
+
+#[cfg(test)]
+struct Flipping(std::sync::Mutex<Vec<Vec<String>>>);
+
+#[cfg(test)]
+impl ValidatorIndexSource for Flipping {
+    fn indices(&self) -> Vec<String> {
+        self.0.lock().expect("index sequence").pop().expect("index sequence exhausted")
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_changed_source_is_reflected_in_the_next_duty_request() {
+    use bn_manager::MockBeaconNodeClient;
+
+    let first = vec!["111".to_string()];
+    let second = vec!["222".to_string()];
+    let source = Arc::new(Flipping(std::sync::Mutex::new(vec![second.clone(), first.clone()])));
+    let mock = Arc::new(
+        MockBeaconNodeClient::new()
+            .with_get_attester_duties(|_epoch, _indices| Ok(empty_attester_response())),
+    );
+    let tracker = DutyTracker::new_with_source(mock.clone(), source);
+
+    tracker.fetch_duties_for_epoch(1).await.unwrap();
+    tracker.fetch_duties_for_epoch(2).await.unwrap();
+
+    let calls = mock.get_attester_duties_calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0], (1, first));
+    assert_eq!(calls[1], (2, second));
+}
+
+#[cfg(test)]
+fn empty_attester_response() -> bn_manager::AttesterDutiesResponse {
+    bn_manager::AttesterDutiesResponse {
+        dependent_root: "0xroot".to_string(),
+        execution_optimistic: false,
+        data: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+fn empty_sync_response() -> bn_manager::SyncCommitteeDutiesResponse {
+    bn_manager::SyncCommitteeDutiesResponse { execution_optimistic: false, data: Vec::new() }
+}
+
+#[cfg(test)]
+fn empty_ptc_response() -> bn_manager::PtcDutiesResponse {
+    bn_manager::PtcDutiesResponse {
+        dependent_root: "0xroot".to_string(),
+        execution_optimistic: false,
+        data: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn one_fetch_call_sees_one_snapshot() {
+    use std::sync::Mutex;
+
+    use bn_manager::MockBeaconNodeClient;
+
+    // Pop order is back-to-front. Each set is one indices() result; a fetch
+    // that sampled twice would send a later set or exhaust the sequence.
+    let attester = vec!["1".to_string(), "1b".to_string()];
+    let sync = vec!["2".to_string(), "2b".to_string()];
+    let ptc = vec!["3".to_string(), "3b".to_string()];
+    let attester_reorg = vec!["4".to_string(), "4b".to_string()];
+    let ptc_warm = vec!["5".to_string(), "5b".to_string()];
+    let ptc_cold = vec!["6".to_string(), "6b".to_string()];
+    let source = Arc::new(Flipping(Mutex::new(vec![
+        ptc_cold.clone(),
+        ptc_warm.clone(),
+        attester_reorg.clone(),
+        ptc.clone(),
+        sync.clone(),
+        attester.clone(),
+    ])));
+
+    let sync_seen = Arc::new(Mutex::new(Vec::new()));
+    let sync_seen_for_handler = Arc::clone(&sync_seen);
+    let mock = Arc::new(
+        MockBeaconNodeClient::new()
+            .with_get_attester_duties(|_epoch, _indices| Ok(empty_attester_response()))
+            .with_post_sync_committee_duties(move |_epoch, indices| {
+                sync_seen_for_handler.lock().expect("sync calls").push(indices);
+                Ok(empty_sync_response())
+            })
+            .with_post_ptc_duties(|_epoch, _indices| Ok(empty_ptc_response())),
+    );
+    let index_source: Arc<dyn ValidatorIndexSource> = source.clone();
+    let tracker = DutyTracker::new_with_source(mock.clone(), index_source);
+
+    tracker.fetch_duties_for_epoch(10).await.unwrap();
+    tracker.fetch_sync_committee_duties(10).await.unwrap();
+    tracker.fetch_ptc_duties_for_epoch(10).await.unwrap();
+    tracker.check_and_refetch_if_root_changed(10).await.unwrap();
+    tracker.check_and_refetch_ptc_if_root_changed(10).await.unwrap();
+    tracker.check_and_refetch_ptc_if_root_changed(11).await.unwrap();
+
+    let attester_calls = mock.get_attester_duties_calls();
+    assert_eq!(attester_calls[0].1, attester);
+    assert_eq!(attester_calls[1].1, attester_reorg);
+    assert_eq!(sync_seen.lock().expect("sync calls").as_slice(), &[sync]);
+    let ptc_calls = mock.post_ptc_duties_calls();
+    assert_eq!(ptc_calls[0].1, ptc);
+    assert_eq!(ptc_calls[1].1, ptc_warm);
+    assert_eq!(ptc_calls[2].1, ptc_cold);
+    assert!(source.0.lock().expect("index sequence").is_empty());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn vec_string_wrapper_preserves_existing_behaviour() {
+    use std::sync::Mutex;
+
+    use bn_manager::MockBeaconNodeClient;
+
+    let indices = vec!["1234".to_string(), "5678".to_string()];
+    let sync_seen = Arc::new(Mutex::new(Vec::new()));
+    let sync_seen_for_handler = Arc::clone(&sync_seen);
+    let mock = Arc::new(
+        MockBeaconNodeClient::new()
+            .with_get_attester_duties(|_epoch, _indices| Ok(empty_attester_response()))
+            .with_post_sync_committee_duties(move |_epoch, got| {
+                sync_seen_for_handler.lock().expect("sync calls").push(got);
+                Ok(empty_sync_response())
+            })
+            .with_post_ptc_duties(|_epoch, _indices| Ok(empty_ptc_response())),
+    );
+    let tracker = DutyTracker::new(mock.clone(), indices.clone());
+
+    tracker.fetch_duties_for_epoch(10).await.unwrap();
+    tracker.fetch_sync_committee_duties(10).await.unwrap();
+    tracker.fetch_ptc_duties_for_epoch(10).await.unwrap();
+    tracker.check_and_refetch_if_root_changed(10).await.unwrap();
+    tracker.check_and_refetch_ptc_if_root_changed(10).await.unwrap();
+    tracker.check_and_refetch_ptc_if_root_changed(11).await.unwrap();
+
+    let attester_calls = mock.get_attester_duties_calls();
+    assert_eq!(attester_calls[0], (10, indices.clone()));
+    assert_eq!(attester_calls[1], (10, indices.clone()));
+    let sync_calls = sync_seen.lock().expect("sync calls");
+    assert_eq!(sync_calls.len(), 1);
+    assert_eq!(sync_calls[0], indices.clone());
+    let ptc_calls = mock.post_ptc_duties_calls();
+    assert_eq!(ptc_calls[0], (10, indices.clone()));
+    assert_eq!(ptc_calls[1], (10, indices.clone()));
+    assert_eq!(ptc_calls[2], (11, indices));
+}
+
+#[cfg(test)]
+struct HeldIndices(std::sync::Mutex<Vec<String>>);
+
+#[cfg(test)]
+impl ValidatorIndexSource for HeldIndices {
+    fn indices(&self) -> Vec<String> {
+        self.0.lock().expect("indices").clone()
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn changed_source_replaces_cached_duties_for_the_same_root() {
+    use bn_manager::{
+        AttesterDutiesResponse, AttesterDuty, MockBeaconNodeClient, PtcDutiesResponse, PtcDuty,
+        SyncCommitteeDutiesResponse,
+    };
+    use eth_types::SyncCommitteeDuty;
+
+    let source = Arc::new(HeldIndices(std::sync::Mutex::new(vec!["111".to_string()])));
+    let mock = Arc::new(
+        MockBeaconNodeClient::new()
+            .with_get_attester_duties(|_epoch, indices| {
+                Ok(AttesterDutiesResponse {
+                    dependent_root: "0xroot".to_string(),
+                    execution_optimistic: false,
+                    data: indices
+                        .into_iter()
+                        .map(|validator_index| AttesterDuty {
+                            pubkey: format!("0x{validator_index}"),
+                            validator_index,
+                            committee_index: "1".to_string(),
+                            committee_length: "128".to_string(),
+                            committees_at_slot: "64".to_string(),
+                            validator_committee_index: "0".to_string(),
+                            slot: "320".to_string(),
+                        })
+                        .collect(),
+                })
+            })
+            .with_post_ptc_duties(|_epoch, indices| {
+                Ok(PtcDutiesResponse {
+                    dependent_root: "0xroot".to_string(),
+                    execution_optimistic: false,
+                    data: indices
+                        .into_iter()
+                        .map(|validator_index| PtcDuty {
+                            pubkey: format!("0x{validator_index}"),
+                            validator_index,
+                            slot: "320".to_string(),
+                        })
+                        .collect(),
+                })
+            })
+            .with_post_sync_committee_duties(|_epoch, indices| {
+                Ok(SyncCommitteeDutiesResponse {
+                    execution_optimistic: false,
+                    data: indices
+                        .into_iter()
+                        .map(|validator_index| SyncCommitteeDuty {
+                            pubkey: [0x22; 48],
+                            validator_index: validator_index.parse().expect("numeric index"),
+                            validator_sync_committee_indices: vec![0],
+                        })
+                        .collect(),
+                })
+            }),
+    );
+    let index_source: Arc<dyn ValidatorIndexSource> = source.clone();
+    let tracker = DutyTracker::new_with_source(mock, index_source);
+
+    tracker.fetch_duties_for_epoch(10).await.unwrap();
+    tracker.fetch_ptc_duties_for_epoch(10).await.unwrap();
+    tracker.fetch_sync_committee_duties(10).await.unwrap();
+    assert!(tracker.is_epoch_cached(10).await);
+    assert!(tracker.is_ptc_epoch_cached(10).await);
+    assert!(tracker.is_sync_period_cached(10).await);
+    assert_eq!(tracker.get_duties_for_slot(320).await[0].validator_index, "111");
+    assert_eq!(tracker.get_ptc_duties_for_slot(320).await[0].validator_index, "111");
+    assert_eq!(tracker.get_sync_committee_duties(320).await[0].validator_index, 111);
+
+    *source.0.lock().expect("indices") = vec!["222".to_string()];
+
+    assert!(!tracker.is_epoch_cached(10).await);
+    assert!(!tracker.is_ptc_epoch_cached(10).await);
+    assert!(!tracker.is_sync_period_cached(10).await);
+
+    let attester_root_changed = tracker.check_and_refetch_if_root_changed(10).await.unwrap();
+    assert!(!attester_root_changed);
+    let ptc_root_changed = tracker.check_and_refetch_ptc_if_root_changed(10).await.unwrap();
+    assert!(!ptc_root_changed);
+    tracker.fetch_sync_committee_duties(10).await.unwrap();
+
+    let attester = tracker.get_duties_for_slot(320).await;
+    assert_eq!(attester.len(), 1);
+    assert_eq!(attester[0].validator_index, "222");
+    let ptc = tracker.get_ptc_duties_for_slot(320).await;
+    assert_eq!(ptc.len(), 1);
+    assert_eq!(ptc[0].validator_index, "222");
+    let sync = tracker.get_sync_committee_duties(320).await;
+    assert_eq!(sync.len(), 1);
+    assert_eq!(sync[0].validator_index, 222);
 }
 
 #[cfg(test)]

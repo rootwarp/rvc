@@ -5,4 +5,4 @@ pub mod metrics;
 mod tracker;
 
 pub use error::DutyTrackerError;
-pub use tracker::{DutyCacheKey, DutyTracker};
+pub use tracker::{DutyCacheKey, DutyTracker, ValidatorIndexSource};
