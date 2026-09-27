@@ -907,7 +907,7 @@ impl ValidatorIndexSource for HeldIndices {
 
 #[cfg(test)]
 #[tokio::test]
-async fn changed_source_replaces_cached_duties_for_the_same_root() {
+async fn changed_source_replaces_cached_duties_for_the_same_head() {
     use bn_manager::{
         AttesterDutiesResponse, AttesterDuty, MockBeaconNodeClient, PtcDutiesResponse, PtcDuty,
         SyncCommitteeDutiesResponse,

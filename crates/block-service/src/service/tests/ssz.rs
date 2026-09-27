@@ -375,12 +375,13 @@ async fn test_ssz_published_payload_contains_signature() {
     assert_eq!(ssz_calls.len(), 1);
     let published = &ssz_calls[0].bytes;
 
-    // First 4 bytes: message_offset = 100 (4 + 96)
-    let message_offset = u32::from_le_bytes(published[0..4].try_into().unwrap());
+    // Deneb unblinded is SignedBlockContents. The signature lives in the signed block.
+    let signed_off = u32::from_le_bytes(published[0..4].try_into().unwrap()) as usize;
+    let signed = &published[signed_off..];
+    let message_offset = u32::from_le_bytes(signed[0..4].try_into().unwrap());
     assert_eq!(message_offset, 100);
 
-    // Bytes 4..100: 96-byte signature (typed crypto::Signature at wire boundary)
-    let sig = &published[4..100];
+    let sig = &signed[4..100];
     assert_eq!(sig.len(), 96);
     assert_eq!(
         sig,
@@ -388,8 +389,7 @@ async fn test_ssz_published_payload_contains_signature() {
         "SSZ payload must carry mock block signature bytes"
     );
 
-    // Bytes 100..: BeaconBlock SSZ data
-    assert!(published.len() > 100, "published payload should contain block data after signature");
+    assert!(signed.len() > 100, "published payload should contain block data after signature");
 }
 
 #[tokio::test]
@@ -397,10 +397,6 @@ async fn test_ssz_published_payload_is_signed_beacon_block() {
     let pubkey = test_pubkey();
     let slot = 100;
     let beacon = MockBeaconClient::ssz(slot, 42, false);
-    let original_ssz = beacon.produce_response.as_ref().unwrap().ssz_bytes.clone().unwrap();
-
-    // For BlockContents (deneb), block starts at offset 12
-    let block_ssz_len = original_ssz.len() - 12; // block data starts at offset 12
 
     let beacon_arc = Arc::new(beacon);
     let store = test_validator_store(&pubkey);
@@ -416,10 +412,7 @@ async fn test_ssz_published_payload_is_signed_beacon_block() {
     assert!(result.is_ok());
 
     let ssz_calls = beacon_arc.publish_ssz_calls.lock().unwrap();
-    let published = &ssz_calls[0].bytes;
-
-    // Published length = 100 (4 offset + 96 sig) + block_ssz_len
-    assert_eq!(published.len(), 100 + block_ssz_len);
+    assert_eq!(ssz_calls.len(), 1);
 }
 
 #[tokio::test]
@@ -599,4 +592,233 @@ fn test_ssz_propose_with_large_body_through_pipeline() {
     assert_eq!(block.proposer_index, 42);
     assert_eq!(block.body.len(), body.len());
     assert_ne!(block.tree_hash_root().0, [0u8; 32]);
+}
+
+fn le_u32_at(bytes: &[u8], at: usize) -> usize {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
+}
+
+fn blob_sidecars_published(fork: &str) -> u64 {
+    crate::metrics::RVC_BLOB_SIDECARS_PUBLISHED_TOTAL.with_label_values(&[fork]).get()
+}
+
+/// Sidecar bytes from an RR-1.1 `BlockContents` fixture. Offsets are read here,
+/// not through `deserialize_block_contents_ssz`.
+fn fixture_sidecars(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let kzg = le_u32_at(bytes, 4);
+    let blobs = le_u32_at(bytes, 8);
+    (bytes[kzg..blobs].to_vec(), bytes[blobs..].to_vec())
+}
+
+fn contents_client(version: &str, slot: Slot, fixture: &[u8]) -> (MockBeaconClient, Vec<u8>) {
+    let (proofs, blobs) = fixture_sidecars(fixture);
+    assert!(!proofs.is_empty(), "{version} kzg_proofs empty");
+    assert!(!blobs.is_empty(), "{version} blobs empty");
+    let body = test_body_ssz_for_version(version);
+    let ssz = build_ssz_bytes_with_kzg(slot, 42, &body, &proofs, &blobs);
+    let client = MockBeaconClient::from_response(ProduceBlockResponse {
+        data: serde_json::Value::Null,
+        is_blinded: false,
+        consensus_version: version.to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: true,
+        ssz_bytes: Some(ssz.clone()),
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+    });
+    (client, ssz)
+}
+
+fn service_for(
+    beacon: MockBeaconClient,
+    pubkey: &PublicKey,
+    fork: ForkSchedule,
+) -> (BlockService<MockSigner, MockBeaconClient>, Arc<MockBeaconClient>) {
+    let beacon = Arc::new(beacon);
+    let service = BlockService::new(
+        Arc::new(MockSigner::new()),
+        beacon.clone(),
+        Arc::new(test_validator_store(pubkey)),
+        Arc::new(fork),
+        [0xaa; 32],
+    );
+    (service, beacon)
+}
+
+#[tokio::test]
+async fn published_payload_is_a_signed_block_contents_container() {
+    const DENEB: &[u8] =
+        include_bytes!("../../../../beacon/tests/fixtures/deneb_block_contents.ssz");
+    const FULU: &[u8] = include_bytes!("../../../../beacon/tests/fixtures/fulu_block_contents.ssz");
+    let pubkey = test_pubkey();
+
+    for (version, fixture) in [("deneb", DENEB), ("fulu", FULU)] {
+        let slot = 100;
+        let (client, produced) = contents_client(version, slot, fixture);
+        let (proofs, blobs) = fixture_sidecars(fixture);
+        let block_off = le_u32_at(&produced, 0);
+        let kzg_off = le_u32_at(&produced, 4);
+        let block_len = kzg_off - block_off;
+        let bn_block = produced[block_off..kzg_off].to_vec();
+
+        let (service, beacon) = service_for(client, &pubkey, test_fork_schedule());
+        let result = service.propose_block(slot, &pubkey, 42, None).await;
+        assert!(result.is_ok(), "{version}: {result:?}");
+
+        let calls = beacon.publish_ssz_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "{version}");
+        let published = &calls[0].bytes;
+        let signed_len = 100 + block_len;
+        assert_eq!(
+            published.len(),
+            12 + signed_len + proofs.len() + blobs.len(),
+            "{version} length"
+        );
+        let signed_off = le_u32_at(published, 0);
+        let proofs_off = le_u32_at(published, 4);
+        let blobs_off = le_u32_at(published, 8);
+        assert_eq!(proofs_off - signed_off, signed_len, "{version} signed_block region");
+        assert_eq!(blobs_off - proofs_off, proofs.len(), "{version} proofs");
+        assert_eq!(published.len() - blobs_off, blobs.len(), "{version} blobs");
+        let signed = &published[signed_off..proofs_off];
+        assert_eq!(le_u32_at(signed, 0), 100, "{version} message offset");
+        assert_eq!(
+            &signed[100..],
+            bn_block.as_slice(),
+            "{version} message bit-identical to BN block"
+        );
+        assert_eq!(blob_sidecars_published(version), 1, "{version}");
+    }
+}
+
+#[tokio::test]
+async fn sidecars_reach_publish_block_ssz() {
+    const DENEB: &[u8] =
+        include_bytes!("../../../../beacon/tests/fixtures/deneb_block_contents.ssz");
+    const FULU: &[u8] = include_bytes!("../../../../beacon/tests/fixtures/fulu_block_contents.ssz");
+    let pubkey = test_pubkey();
+
+    for (version, fixture) in [("deneb", DENEB), ("fulu", FULU)] {
+        let slot = 100;
+        let (client, produced) = contents_client(version, slot, fixture);
+        let (proofs, blobs) = fixture_sidecars(fixture);
+        let block_off = le_u32_at(&produced, 0);
+        let kzg_off = le_u32_at(&produced, 4);
+        let bn_block = &produced[block_off..kzg_off];
+
+        let (service, beacon) = service_for(client, &pubkey, test_fork_schedule());
+        service.propose_block(slot, &pubkey, 42, None).await.unwrap();
+        let published = beacon.publish_ssz_calls.lock().unwrap()[0].bytes.clone();
+        let signed_off = le_u32_at(&published, 0);
+        let proofs_off = le_u32_at(&published, 4);
+        let blobs_off = le_u32_at(&published, 8);
+        assert_eq!(
+            &published[proofs_off..blobs_off],
+            proofs.as_slice(),
+            "{version} proofs at offset 2"
+        );
+        assert_eq!(&published[blobs_off..], blobs.as_slice(), "{version} blobs at offset 3");
+        let message = &published[signed_off + 100..proofs_off];
+        assert_eq!(message, bn_block, "{version} sidecars are outside the block region");
+        assert!(proofs_off == signed_off + 100 + bn_block.len(), "{version}");
+    }
+}
+
+#[tokio::test]
+async fn gloas_payload_still_routes_through_sign_and_publish_v4() {
+    let pubkey = test_pubkey();
+    let slot = test_gloas_slot();
+    let block_ssz =
+        build_gloas_beacon_block_ssz(slot, 42, [0x11; 32], [0x22; 32], &gloas_body_ssz());
+    let beacon = MockBeaconClient::from_response(ProduceBlockResponse {
+        data: serde_json::Value::Null,
+        is_blinded: false,
+        consensus_version: "gloas".to_string(),
+        execution_payload_value: Some("99999".to_string()),
+        is_ssz: true,
+        ssz_bytes: Some(block_ssz.clone()),
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+    });
+    let (service, beacon) = service_for(beacon, &pubkey, test_fork_schedule_with_near_gloas());
+    let result = service.propose_block(slot, &pubkey, 42, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    assert!(beacon.produce_v3_calls.lock().unwrap().is_empty());
+    assert_eq!(beacon.produce_v4_calls.lock().unwrap().len(), 1);
+    let calls = beacon.publish_ssz_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].consensus_version, "gloas");
+    assert!(!calls[0].is_blinded);
+    let expected = beacon::ssz_deser::serialize_signed_beacon_block_ssz(
+        &block_ssz,
+        &mock_block_sig().to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(calls[0].bytes, expected);
+    assert_eq!(blob_sidecars_published("gloas"), 0);
+    assert_eq!(blob_sidecars_published("deneb"), 0);
+}
+
+#[tokio::test]
+async fn blinded_payload_is_unchanged() {
+    let pubkey = test_pubkey();
+    let slot = 200;
+    let beacon = MockBeaconClient::ssz(slot, 42, true);
+    let original = beacon.produce_response.as_ref().unwrap().ssz_bytes.clone().unwrap();
+    assert_eq!(
+        ssz_block_format(true, "deneb").unwrap(),
+        beacon::ssz_deser::SszBlockFormat::BeaconBlock
+    );
+    let (service, beacon) = service_for(beacon, &pubkey, test_fork_schedule());
+    let result = service.propose_block(slot, &pubkey, 42, None).await;
+    assert!(result.is_ok(), "{result:?}");
+    let calls = beacon.publish_ssz_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].is_blinded);
+    let expected = beacon::ssz_deser::serialize_signed_beacon_block_ssz(
+        &original,
+        &mock_block_sig().to_bytes(),
+    )
+    .unwrap();
+    assert_eq!(calls[0].bytes, expected);
+    assert_eq!(blob_sidecars_published("deneb"), 0);
+}
+
+#[tokio::test]
+async fn corrupt_blobs_offset_fails_before_the_header_is_signed() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let body = test_body_ssz_for_version("deneb");
+    let mut ssz = build_ssz_bytes_with_kzg(slot, 42, &body, &[0xcc; 48], &[]);
+    let past = (ssz.len() as u32).saturating_add(64);
+    ssz[8..12].copy_from_slice(&past.to_le_bytes());
+
+    let beacon = Arc::new(MockBeaconClient::from_response(ProduceBlockResponse {
+        data: serde_json::Value::Null,
+        is_blinded: false,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: true,
+        ssz_bytes: Some(ssz),
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+    }));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("bad blobs offset");
+    assert!(err.to_string().contains("blobs="), "{err}");
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+    assert!(signer.block_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_ssz_calls.lock().unwrap().is_empty());
+    assert_eq!(blob_sidecars_published("deneb"), 0);
 }

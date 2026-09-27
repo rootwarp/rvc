@@ -20,6 +20,10 @@
 //! RR-4.2 adds `rvc_slashing_import_conflicts_total` (family delta +1): dropped
 //! EIP-3076 import rows are counted once each. Dashboards that alert on silent
 //! interchange conflicts should bind this name; it has no labels.
+//! RR-1.2 adds `rvc_blob_sidecars_published_total` (family delta +1): one increment
+//! per pre-Gloas SSZ proposal published as `SignedBlockContents`. Label `fork` is
+//! the consensus version (`deneb`, `electra`, `fulu`). Blinded and Gloas publishes
+//! do not increment it.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -64,6 +68,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_attestation_trigger_total",
     "rvc_attestations_total",
     "rvc_attesting_enabled",
+    "rvc_blob_sidecars_published_total", // operator-facing: pre-Gloas SSZ SignedBlockContents publishes (RR-1.2)
     "rvc_bn_capability_state",
     "rvc_bn_health_tier",
     "rvc_builder_circuit_breaker_trips_total",
@@ -210,8 +215,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        47,
-        "RR-4.1 +1 (rvc_slashing_prune_source_bound_raised_total) and RR-4.2 +1 (rvc_slashing_import_conflicts_total) on the 8.1 45-family pin"
+        48,
+        "RR-1.2 +1 (rvc_blob_sidecars_published_total) on the RR-4.1/RR-4.2 47-family pin"
     );
 }
 

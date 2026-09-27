@@ -54,9 +54,9 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/block-service/src/service/mod.rs` 309 | 1 | — | inherit-intentionally | Produce dispatch: open-ended `>= Gloas` stays on V4 so a later fork does not fall back to V3. | — |
 | `crates/block-service/src/service/mod.rs` 367 | 1 | — | inherit-intentionally | Response log omits the pre-Gloas blinded field once `>= Gloas`. Later forks keep that shape. | — |
 | `crates/block-service/src/service/mod.rs` 389 | 1 | — | inherit-intentionally | Sign/publish dispatch: open-ended `>= Gloas` stays on `sign_and_publish_v4`. | — |
-| `crates/block-service/src/service/mod.rs` 1028 | 1 | — | inherit-intentionally | `reject_blinded_at_gloas`: open-ended `>= Gloas` so later forks keep the no-blinded gate rather than silently re-entering pre-Gloas blinded sign/publish. | 6.4 |
-| `crates/block-service/src/service/mod.rs` 1040 | 1 | — | inherit-intentionally | `reject_gloas_version_pre_gloas`: a Gloas-or-later slot is not a pre-Gloas version mismatch. | — |
-| `crates/block-service/src/service/mod.rs` 1044 | 1 | — | inherit-intentionally | Pre-Gloas slot rejects a Gloas-or-later consensus version so a later fork is not hashed as Electra/Deneb. | — |
+| `crates/block-service/src/service/mod.rs` 1064 | 1 | — | inherit-intentionally | `reject_blinded_at_gloas`: open-ended `>= Gloas` so later forks keep the no-blinded gate rather than silently re-entering pre-Gloas blinded sign/publish. | 6.4 |
+| `crates/block-service/src/service/mod.rs` 1076 | 1 | — | inherit-intentionally | `reject_gloas_version_pre_gloas`: a Gloas-or-later slot is not a pre-Gloas version mismatch. | — |
+| `crates/block-service/src/service/mod.rs` 1080 | 1 | — | inherit-intentionally | Pre-Gloas slot rejects a Gloas-or-later consensus version so a later fork is not hashed as Electra/Deneb. | — |
 | `crates/builder/src/service.rs` 27 | 1 | — | inherit-intentionally | `legacy_proposer_ops_retired`: open-ended `>= Gloas` so later forks keep prepare/register retired rather than silently restoring the pre-Gloas BN calls. | 6.10 |
 | `crates/crypto/src/signing_root.rs` 301 | 1 | — | inherit-intentionally | EIP-7044: voluntary-exit domain stays Capella-capped however many post-Capella forks exist. Open-ended `>=` is the spec. | — |
 | `crates/crypto/src/signing_root.rs` 350 | 1 | — | inherit-intentionally | Test mirror of 301 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
@@ -84,7 +84,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `bin/rvc/tests/common/mock_bn.rs` 267 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
 | `crates/beacon/src/client.rs` 1200 | 3 | exhaustive | inherit-intentionally | Aggregate fetch v2 request table. Exhaustive `match fork` so a new variant is a compile error, not a silent v1 or v2 inherit. | RR-3.2 |
 | `crates/beacon/src/client.rs` 2005 | 3 | exhaustive | inherit-intentionally | v2 200 is accepted only when the response header, body `version`, and the requested fork agree. Pre-Electra is not decoded on this path. | RR-3.2 |
-| `crates/block-service/src/service/mod.rs` 1006 | 3 | exhaustive | inherit-intentionally | `ssz_block_format` named Gloas `BeaconBlock` arm; exhaustive `match fork` so a new variant is a compile error, not a silent `BlockContents`/`BeaconBlock` inherit. Unknown version strings fail closed before the match. | 6.4 |
+| `crates/block-service/src/service/mod.rs` 1042 | 3 | exhaustive | inherit-intentionally | `ssz_block_format` named Gloas `BeaconBlock` arm; exhaustive `match fork` so a new variant is a compile error, not a silent `BlockContents`/`BeaconBlock` inherit. Unknown version strings fail closed before the match. | 6.4 |
 | `crates/eth-types/src/fork.rs` 190 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
 | `crates/eth-types/src/fork.rs` 208 | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 78 | 3 | exhaustive | test-only | Test maps Electra/Fulu/Gloas epochs. `other` panics; not a production dispatch. | — |

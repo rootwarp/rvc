@@ -19,10 +19,23 @@ pub static RVC_PROPOSALS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     )
 });
 
+/// Pre-Gloas SSZ proposals published as `SignedBlockContents`.
+///
+/// Label `fork` is the consensus version (`deneb`, `electra`, `fulu`). One
+/// increment per published proposal. Blinded blocks and Gloas do not increment.
+pub static RVC_BLOB_SIDECARS_PUBLISHED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_blob_sidecars_published_total",
+        "Pre-Gloas SSZ block proposals published as SignedBlockContents with sidecars",
+        &["fork"],
+    )
+});
+
 /// Force-register the family (and the `envelope_late` child) so scrapes see it before an overrun.
 pub fn init() {
     LazyLock::force(&RVC_PROPOSALS_TOTAL);
     let _ = RVC_PROPOSALS_TOTAL.with_label_values(&[proposal_outcome::ENVELOPE_LATE]);
+    LazyLock::force(&RVC_BLOB_SIDECARS_PUBLISHED_TOTAL);
 }
 
 #[cfg(test)]

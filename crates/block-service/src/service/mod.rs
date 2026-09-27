@@ -626,63 +626,84 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         })?;
 
         let format = ssz_block_format(is_blinded, consensus_version)?;
-        let (block_root, block_data_offset, header): (Root, usize, BeaconBlockHeaderFields) =
-            if is_blinded {
-                let (block, offset) =
-                    beacon::ssz_deser::deserialize_blinded_beacon_block_from_ssz(ssz_bytes, format)
-                        .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-                if block.slot != slot {
-                    return Err(BlockServiceError::Parse(format!(
-                        "SSZ block slot mismatch: header has {}, expected {}",
-                        block.slot, slot,
-                    )));
-                }
-                if let Some(v) = validator {
-                    v.validate_blinded(&block).map_err(|e| {
+        // Blobs-offset failures must happen before the header is signed.
+        let contents = if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
+            Some(
+                beacon::ssz_deser::deserialize_block_contents_ssz(ssz_bytes, format)
+                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        let (block_root, header): (Root, BeaconBlockHeaderFields) = if is_blinded {
+            let (block, _) =
+                beacon::ssz_deser::deserialize_blinded_beacon_block_from_ssz(ssz_bytes, format)
+                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+            if block.slot != slot {
+                return Err(BlockServiceError::Parse(format!(
+                    "SSZ block slot mismatch: header has {}, expected {}",
+                    block.slot, slot,
+                )));
+            }
+            if let Some(v) = validator {
+                v.validate_blinded(&block).map_err(|e| {
                     error!(slot = slot, error = %e, "BN SSZ blinded block validation failed — dropping duty");
                     e
                 })?;
-                }
-                (compute_blinded_block_root(&block)?, offset, header_from_blinded(&block)?)
-            } else {
-                let (block, offset) =
-                    beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
-                        .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-                if block.slot != slot {
-                    return Err(BlockServiceError::Parse(format!(
-                        "SSZ block slot mismatch: header has {}, expected {}",
-                        block.slot, slot,
-                    )));
-                }
-                if let Some(v) = validator {
-                    v.validate_full(&block).map_err(|e| {
+            }
+            (compute_blinded_block_root(&block)?, header_from_blinded(&block)?)
+        } else if let Some(contents) = contents.as_ref() {
+            let block = &contents.block;
+            if block.slot != slot {
+                return Err(BlockServiceError::Parse(format!(
+                    "SSZ block slot mismatch: header has {}, expected {}",
+                    block.slot, slot,
+                )));
+            }
+            if let Some(v) = validator {
+                v.validate_full(block).map_err(|e| {
                     error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
                     e
                 })?;
-                }
-                // ISSUE-4.3 (L-3) defense-in-depth: log internal KZG commitment binding.
-                // For Deneb+ BlockContents payloads the body includes blob_kzg_commitments;
-                // this fingerprint is an rvc-internal binding (NOT spec-aligned —
-                // see kzg_commitment_list_root doc) separate from the signing scope.
-                if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
-                    if let Some(layout) = eth_types::body_fork_layout(consensus_version) {
-                        // Fail closed: malformed body must not fingerprint as empty list.
-                        let kzg_count = block
-                            .blob_kzg_count(layout)
-                            .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-                        let commitment_root = block
-                            .kzg_commitment_root(layout)
-                            .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-                        debug!(
-                            slot = slot,
-                            kzg_count = kzg_count,
-                            commitment_root = %TruncatedRoot::new(&commitment_root),
-                            "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
-                        );
-                    }
-                }
-                (compute_block_root(&block)?, offset, header_from_full(&block)?)
-            };
+            }
+            // ISSUE-4.3 (L-3) defense-in-depth: log internal KZG commitment binding.
+            // For Deneb+ BlockContents payloads the body includes blob_kzg_commitments;
+            // this fingerprint is an rvc-internal binding (NOT spec-aligned —
+            // see kzg_commitment_list_root doc) separate from the signing scope.
+            if let Some(layout) = eth_types::body_fork_layout(consensus_version) {
+                // Fail closed: malformed body must not fingerprint as empty list.
+                let kzg_count = block
+                    .blob_kzg_count(layout)
+                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+                let commitment_root = block
+                    .kzg_commitment_root(layout)
+                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+                debug!(
+                    slot = slot,
+                    kzg_count = kzg_count,
+                    commitment_root = %TruncatedRoot::new(&commitment_root),
+                    "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
+                );
+            }
+            (compute_block_root(block)?, header_from_full(block)?)
+        } else {
+            let (block, _) =
+                beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
+                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+            if block.slot != slot {
+                return Err(BlockServiceError::Parse(format!(
+                    "SSZ block slot mismatch: header has {}, expected {}",
+                    block.slot, slot,
+                )));
+            }
+            if let Some(v) = validator {
+                v.validate_full(&block).map_err(|e| {
+                    error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
+                    e
+                })?;
+            }
+            (compute_block_root(&block)?, header_from_full(&block)?)
+        };
 
         let sign_start = std::time::Instant::now();
         let sig = self
@@ -697,15 +718,24 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             "Block signing duration"
         );
 
-        // Construct SignedBeaconBlock SSZ:
-        // [message_offset: 4 bytes LE] [signature: 96 bytes] [BeaconBlock SSZ bytes]
-        let block_ssz = &ssz_bytes[block_data_offset..];
-        let message_offset: u32 = 100; // 4 (offset) + 96 (signature)
-        let mut signed_ssz = Vec::with_capacity(100 + block_ssz.len());
-        signed_ssz.extend_from_slice(&message_offset.to_le_bytes());
-        // Wire boundary: SSZ SignedBeaconBlock encodes raw 96-byte BLS signature.
-        signed_ssz.extend_from_slice(&sig.to_bytes());
-        signed_ssz.extend_from_slice(block_ssz);
+        // BlockContents was split before signing. Frame that bounded block and
+        // copy proofs and blobs outside it. Blinded and pre-Deneb stay a bare
+        // SignedBeaconBlock (the whole buffer).
+        let signed_ssz = if let Some(contents) = contents.as_ref() {
+            let signed_block = beacon::ssz_deser::serialize_signed_beacon_block_ssz(
+                contents.block_ssz,
+                &sig.to_bytes(),
+            )
+            .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+            beacon::ssz_deser::serialize_signed_block_contents_ssz(
+                &signed_block,
+                contents.kzg_proofs,
+                contents.blobs,
+            )
+        } else {
+            beacon::ssz_deser::serialize_signed_beacon_block_ssz(ssz_bytes, &sig.to_bytes())
+                .map_err(|e| BlockServiceError::Parse(e.to_string()))?
+        };
 
         self.beacon
             .publish_block_ssz(
@@ -716,6 +746,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             )
             .instrument(tracing::info_span!("beacon.publish_block"))
             .await?;
+
+        if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
+            crate::metrics::RVC_BLOB_SIDECARS_PUBLISHED_TOTAL
+                .with_label_values(&[consensus_version])
+                .inc();
+        }
 
         Ok((block_root, is_blinded))
     }

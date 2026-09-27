@@ -302,3 +302,7 @@ fatal. Startup logs those peers as configured and not yet dialled.
 ## Observability
 
 Import conflicts are logged and counted (`rvc_slashing_import_conflicts_total`).
+
+## Breaking (wire): Deneb/Electra/Fulu blocks are published as full SignedBlockContents with sidecars
+
+Deneb/Electra/Fulu blocks are published as full SignedBlockContents with sidecars. Nodes that accepted the prior malformed payload may behave differently.
