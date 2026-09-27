@@ -277,3 +277,9 @@ the target validator count on the validator-client path. Attestation in
 latency is **40 s (ten mainnet slots) with a free slashing DB**. VC-path
 attestation concurrency is a separate, unscheduled requirement. Do not read
 this cycle as delivering G6.
+
+---
+
+## Behaviour: `--graffiti` applies to validator-store defaults
+
+`--graffiti` is an in-memory validator-store default. Per-validator graffiti and keymanager-set values still win. Startup does not rewrite the validators file. The next `save_config` — a keymanager fee-recipient, gas-limit, or graffiti save, or any other snapshot of the in-memory defaults — persists that value over `[defaults].graffiti`. A later start without `--graffiti` keeps the persisted value. A save while the flag is absent leaves the file default unchanged.

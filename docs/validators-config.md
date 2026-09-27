@@ -143,7 +143,7 @@ These are separate, MEV-boost/Prysm-style config options (`Config.proposer_confi
 - `proposer_config_url` is fetched and parsed on a timer, but the only call site logs the parsed updates and never applies them to `ValidatorStore`.
 - `proposer_config_file` is parsed as a config field but never read from disk by any code path.
 
-**Neither currently affects `validators_config`/`ValidatorStore` state.** `validators_config` (plus the Keymanager HTTP API) is the only mechanism today that actually populates and updates fee recipient / gas limit / graffiti / builder settings.
+**Neither currently affects `validators_config`/`ValidatorStore` state.** `validators_config` and the Keymanager HTTP API populate fee recipient, gas limit, and builder settings. `--graffiti` is an in-memory validator-store default at startup; a per-validator `graffiti` and a keymanager-set default still win. Startup does not rewrite this file. The next keymanager save persists that in-memory default over `[defaults].graffiti`.
 
 ---
 

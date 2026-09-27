@@ -337,6 +337,13 @@ impl ValidatorStore {
         self.state.write().global_builder_boost_factor = Some(factor);
     }
 
+    /// Write the defaults-tier graffiti. Same field as [`Self::apply_default_update`].
+    ///
+    /// [`Self::save_config`] persists this value over `[defaults].graffiti`.
+    pub fn set_default_graffiti(&self, graffiti: [u8; 32]) {
+        self.state.write().defaults.graffiti = Some(graffiti);
+    }
+
     #[tracing::instrument(name = "validator_store.list_enabled_pubkeys", skip_all)]
     pub fn list_enabled_pubkeys(&self) -> Vec<[u8; 48]> {
         self.state.read().validators.values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
@@ -607,7 +614,8 @@ fn parse_validator(v: &TomlValidator) -> Result<ValidatorConfig, ValidatorStoreE
     Ok(config)
 }
 
-fn parse_graffiti(s: &str) -> [u8; 32] {
+/// Truncate to 32 bytes and zero-pad. Used by the validators file and `--graffiti`.
+pub fn parse_graffiti(s: &str) -> [u8; 32] {
     let mut graffiti = [0u8; 32];
     let bytes = s.as_bytes();
     let len = bytes.len().min(32);
@@ -777,6 +785,15 @@ mod tests {
         store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
         assert!(store.effective_graffiti(&pk).is_none());
+    }
+
+    #[test]
+    fn test_set_default_graffiti() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let graffiti = parse_graffiti("rvc");
+        store.set_default_graffiti(graffiti);
+        assert_eq!(store.state.read().defaults.graffiti, Some(graffiti));
+        assert_eq!(store.effective_graffiti(&test_pubkey(9)), Some(graffiti));
     }
 
     #[test]

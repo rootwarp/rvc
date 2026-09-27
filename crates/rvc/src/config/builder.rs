@@ -600,7 +600,15 @@ impl ServiceBuilder {
 
         crate::startup::apply_builder_settings(&store, &self.config.builder)?;
 
-        info!("Created validator store");
+        if let Some(raw) = self.config.graffiti.as_deref() {
+            let applied = validator_store::parse_graffiti(raw);
+            store.set_default_graffiti(applied);
+            // Hex, not Display: CR/LF/ESC in the 32-byte field must not split this line.
+            let graffiti = hex::encode(applied);
+            info!(graffiti = ?graffiti, "Created validator store");
+        } else {
+            info!("Created validator store");
+        }
         Ok(Arc::new(store))
     }
 
