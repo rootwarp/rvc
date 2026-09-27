@@ -619,6 +619,8 @@ rvc-signer serve \
 # Node 2 and Node 3 similar with their own shares and index
 ```
 
+An unreachable peer is not a startup failure. `rvc-signer` logs one warning per configured peer (`DVT peer configured, not yet reachable`) and keeps serving; `rvc_dvt_peer_ready{peer}` is 0 until the first successful RPC to that address, then 1. A misconfigured peer is fatal: a missing allow-list entry, or an empty SNI hostname when TLS is on, still aborts startup.
+
 ### gRPC Services
 
 | Service | RPC | Description |

@@ -30,6 +30,9 @@
 //! RR-2.2 adds `rvc_duty_index_set_size` (family delta +1): live size of the
 //! pubkey→index registry. Dashboards that watch duty coverage should bind this
 //! gauge; it has no labels.
+//! RR-1.6 adds `rvc_dvt_peer_ready` (family delta +1): 0 until the first
+//! successful RPC to a configured DVT peer, then 1. Label `peer` is that
+//! address. Scraped on `rvc-signer`'s registry.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -65,6 +68,7 @@ const DEFINITION_FILES: &[&str] = &[
     "crates/rvc/src/metrics.rs",
     "crates/signer/src/metrics.rs",
     "crates/slashing/src/metrics.rs",
+    "crates/signer-server/src/dvt/peer_ready.rs",
 ];
 
 /// Prometheus family names registered by `definitions::init_metrics` on the
@@ -83,6 +87,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_duties_fetched_total",
     "rvc_duty_index_set_size", // operator-facing: pubkey-index registry size (RR-2.2)
     "rvc_duty_reorg_detected_total",
+    "rvc_dvt_peer_ready", // operator-facing: 0 until the first successful DVT peer RPC (RR-1.6)
     "rvc_fork_current_id", // operator-facing: resolved current fork id (issue 8.1)
     "rvc_fork_next_activation_epoch", // operator-facing: next fork activation epoch (issue 8.1)
     "rvc_monitoring_push_failures_total",
@@ -223,8 +228,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        50,
-        "RR-1.2, RR-4.3, and RR-2.2 each add one family on the 47-family pin"
+        51,
+        "RR-1.6 adds rvc_dvt_peer_ready; count is the list length"
     );
 }
 

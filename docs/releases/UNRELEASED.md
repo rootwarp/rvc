@@ -297,7 +297,7 @@ this cycle as delivering G6.
 
 `rvc-signer` DVT peers connect lazily with an explicit connect timeout; an
 unreachable peer no longer fails startup. Allow-list and SNI errors remain
-fatal. Startup logs those peers as configured and not yet dialled.
+fatal. Startup logs those peers as configured and not yet dialled; `rvc_dvt_peer_ready{peer}` stays 0 until the first successful RPC.
 
 ## Observability
 

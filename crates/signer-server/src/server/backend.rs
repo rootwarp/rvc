@@ -184,7 +184,9 @@ pub(crate) async fn build_dvt_backend(
                     ServerError::backend(format!("failed to connect to DVT peers: {e}"))
                 })?;
 
-        tracing::info!(peers = ?requester.peer_addrs(), "DVT peers configured, not yet dialled");
+        for addr in requester.peer_addrs() {
+            tracing::warn!(peer = %addr, "DVT peer configured, not yet reachable");
+        }
         Some(Arc::new(requester) as Arc<dyn backend::dvt::PeerRequester>)
     } else {
         tracing::info!("No DVT peers configured; running in standalone mode");

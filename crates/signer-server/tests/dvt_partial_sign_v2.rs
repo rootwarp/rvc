@@ -221,7 +221,9 @@ async fn test_partial_sign_replay_rejected() {
 #[tokio::test]
 async fn test_partial_sign_different_peers_independent() {
     let (pk, share_a) = make_share(1);
-    let share_b = share_a.clone();
+    // Response share_index is this node's Shamir index, not the requester allow-list index.
+    let mut share_b = share_a.clone();
+    share_b.index = 2;
 
     // Two separate DBs — each peer has its own slashing namespace
     let db_a = make_db();

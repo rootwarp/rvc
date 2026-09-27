@@ -262,6 +262,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // borrow checker sees the borrow of `shares` is finished before spawn_blocking.
         let share =
             shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
         drop(shares);
 
         // 5. Stage → sign → commit.
@@ -307,7 +309,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
             share_index,
             "partial_sign_beacon_block: success"
         );
-        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
     }
 
     // ── PartialSignAttestationData ────────────────────────────────────────────
@@ -362,6 +367,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 4. Get share — clone to own, explicitly drop Arc<HashMap>.
         let share =
             shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
         drop(shares);
 
         // 5. Stage → sign → commit.
@@ -408,7 +415,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
             share_index,
             "partial_sign_attestation_data: success"
         );
-        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
     }
 
     // ── PartialSignSyncCommittee ──────────────────────────────────────────────
@@ -461,6 +471,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 4. Get share — clone to own, explicitly drop Arc<HashMap>.
         let share =
             shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
         drop(shares);
 
         // 5. Sign directly — no slashing check for sync committee (FR-P0-3).
@@ -473,7 +485,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
             share_index,
             "partial_sign_sync_committee: success"
         );
-        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
     }
 
     // ── PartialSignPayloadAttestation ─────────────────────────────────────────
@@ -529,6 +544,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 4. Get share — clone to own, explicitly drop Arc<HashMap>.
         let share =
             shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
         drop(shares);
 
         // 5. Sign directly — no slashing check for PTC.
@@ -541,7 +558,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
             share_index,
             "partial_sign_payload_attestation: success"
         );
-        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
     }
 
     /// `signer.v2.PeerSignerService/PartialSignBlockHeader` (4.20b).
@@ -591,6 +611,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
         let share =
             shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
         drop(shares);
 
         let scoped = PubkeyScopedDb::new(db_arc, peer_cn.clone(), gvr);
@@ -633,7 +655,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
             share_index,
             "partial_sign_block_header: success"
         );
-        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
     }
 
     /// `signer.v2.PeerSignerService/PartialSignRoot` (4.20b).
@@ -679,6 +704,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
         let share =
             shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
         drop(shares);
 
         let sig = partial_sign_with_share(&signing_root, &share)?;
@@ -690,7 +717,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
             share_index,
             "partial_sign_root: success"
         );
-        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
     }
 }
 

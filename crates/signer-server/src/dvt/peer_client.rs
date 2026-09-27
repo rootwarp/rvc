@@ -186,7 +186,7 @@ impl GrpcPeerRequester {
 
             let channel = endpoint.connect_timeout(connect_timeout).connect_lazy();
 
-            connected.push((peer.addr.clone(), PeerSignerServiceClient::new(channel)));
+            connected.push((Self::mark_peer(&peer.addr), PeerSignerServiceClient::new(channel)));
         }
 
         Ok(Self { peers: connected, timeout })
@@ -202,6 +202,11 @@ impl GrpcPeerRequester {
 
     fn uses_gloas_rpc(fork_id: u32) -> bool {
         matches!(ForkName::try_from(fork_id), Ok(name) if name >= ForkName::Gloas)
+    }
+
+    fn mark_peer(addr: &str) -> String {
+        super::peer_ready::record_configured(addr);
+        addr.to_string()
     }
 
     #[allow(clippy::result_large_err)]
@@ -365,7 +370,8 @@ impl GrpcPeerRequester {
         let mut results = Vec::new();
         while let Some(join_result) = handles.join_next().await {
             match join_result {
-                Ok(Ok((_addr, share_index, sig))) => {
+                Ok(Ok((addr, share_index, sig))) => {
+                    super::peer_ready::record_ready(&addr);
                     results.push((share_index, sig));
                 }
                 Ok(Err(e)) => {
@@ -409,6 +415,7 @@ impl PeerRequester for GrpcPeerRequester {
         let sig: [u8; 96] = inner.partial_signature.try_into().map_err(|_| {
             PeerRequestError::RequestFailed("invalid signature length from peer".to_string())
         })?;
+        super::peer_ready::record_ready(peer_addr);
 
         // gRPC `PartialSignResponse` has no session fields. Do not stamp the
         // request session onto the response (that made the 4.11c tag filter a

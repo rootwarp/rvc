@@ -54,6 +54,9 @@ pub mod grpc_sign_type {
 }
 
 #[cfg(feature = "dvt")]
+pub use crate::dvt::peer_ready::RVC_DVT_PEER_READY;
+
+#[cfg(feature = "dvt")]
 #[derive(Clone)]
 pub struct DvtMetrics {
     pub coordination_duration_seconds: HistogramVec,
@@ -225,6 +228,11 @@ impl SignerMetrics {
             registry
                 .register(Box::new(partial_sign_duration_seconds.clone()))
                 .expect("failed to register rvc_signer_dvt_partial_sign_duration_seconds");
+
+            crate::dvt::peer_ready::init();
+            registry
+                .register(Box::new(crate::dvt::peer_ready::RVC_DVT_PEER_READY.clone()))
+                .expect("failed to register rvc_dvt_peer_ready");
 
             DvtMetrics {
                 coordination_duration_seconds,

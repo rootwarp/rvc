@@ -6,7 +6,12 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use tracing::field::{Field, Visit};
+use tracing_subscriber::layer::{Context, SubscriberExt};
+use tracing_subscriber::Layer;
 
 use crypto::{EncryptionKdf, Keystore, SecretKey};
 use signer_server::backend::dvt::{PartialSignDuty, PeerRequestError, PeerRequester};
@@ -200,6 +205,74 @@ addr = "127.0.0.1:1"
 "#,
     );
     run_until_serving(resolved(&tmp, peers, Some(allow))).await;
+}
+
+#[derive(Debug)]
+struct Captured {
+    level: tracing::Level,
+    text: String,
+}
+
+struct Capture(Arc<Mutex<Vec<Captured>>>);
+
+struct TextVisit(String);
+
+impl Visit for TextVisit {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
+}
+
+impl<S> Layer<S> for Capture
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        let mut visit = TextVisit(String::new());
+        event.record(&mut visit);
+        self.0.lock().unwrap().push(Captured { level: *event.metadata().level(), text: visit.0 });
+    }
+}
+
+/// One unreachable peer is a startup warning, not an error, and the listener still serves.
+#[test]
+fn unreachable_peer_logs_warn_not_error() {
+    allow_insecure();
+    let tmp = TempDir::new().unwrap();
+    let peer = closed_peer();
+    let allow = allow_list(
+        tmp.path(),
+        r#"
+[[peer]]
+peer_cn = "peer-a.local"
+share_index = 1
+addr = "127.0.0.1:1"
+"#,
+    );
+    let resolved = resolved(&tmp, vec![peer.clone()], Some(allow));
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    tracing::subscriber::with_default(subscriber, || {
+        rt.block_on(async { run_until_serving(resolved).await });
+    });
+
+    let events = events.lock().unwrap();
+    let warns: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.level == tracing::Level::WARN
+                && event.text.contains("not yet reachable")
+                && event.text.contains(&peer)
+        })
+        .collect();
+    assert_eq!(warns.len(), 1, "expected one warn for {peer}, captured {events:?}");
+    assert!(
+        events
+            .iter()
+            .all(|event| event.level != tracing::Level::ERROR || !event.text.contains(&peer)),
+        "unreachable peer must not be logged at error: {events:?}"
+    );
 }
 
 /// Listener is up while a peer has accepted TCP and stays silent.
