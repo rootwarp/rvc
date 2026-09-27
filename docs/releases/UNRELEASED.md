@@ -3,6 +3,10 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Dev process
+
+CI now builds `develop` on push (compile job only).
+
 ## Slashing-DB group commit (issue #205)
 
 Concurrent `reserve_*` checks share one `BEGIN IMMEDIATE` → rule check →

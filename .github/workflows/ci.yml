@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [main, develop]
     types: [opened, synchronize, reopened]
+  push:
+    branches: [develop, main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -49,21 +51,25 @@ jobs:
       # Dependency hygiene (SEC-10): fail closed on unignored RustSec advisories.
       # Policy ignores for known-blocked transitive crates live in `.cargo/audit.toml`.
       - name: Install cargo-audit
+        if: github.event_name == 'pull_request'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
 
       - name: Run cargo audit
+        if: github.event_name == 'pull_request'
         run: cargo audit
 
       # Unused declared deps (ARCH-P2-6 / ARCH-5). cargo-udeps is not adopted:
       # it needs nightly; CI pins dtolnay/rust-toolchain@stable (A-E3).
       - name: Install cargo-machete
+        if: github.event_name == 'pull_request'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-machete
 
       - name: Run cargo machete
+        if: github.event_name == 'pull_request'
         run: cargo machete
 
       # 3.9b + 5.15 / #290: graph assertion on a real libssz consumer.
@@ -137,6 +143,7 @@ jobs:
 
   secret-scan:
     name: Secret Scan
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -207,6 +214,7 @@ jobs:
 
   coverage:
     name: Coverage
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -275,6 +283,7 @@ jobs:
 
   arch-gates:
     name: Architecture Gates
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -327,6 +336,7 @@ jobs:
   # and must keep skipping (3.3b). A top-level env would turn that skip into RED.
   spec-vectors:
     name: Spec Vectors
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     env:
       RVC_SPEC_VECTORS_REQUIRED: "1"
@@ -377,6 +387,7 @@ jobs:
   # scripts/tests/ (validator_perf + attach + devnet). No cargo, no live job.
   scripts:
     name: Scripts
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
