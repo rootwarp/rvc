@@ -4,7 +4,6 @@ use tree_hash_derive::TreeHash;
 
 mod aggregation;
 mod aggregator;
-mod attestation;
 mod block;
 /// Typed BeaconBlockBody containers + SSZ decode (SEC-6b; foundation for SEC-6c wire).
 ///
@@ -30,7 +29,6 @@ pub use aggregation::{
     AggregateAndProof, Attestation, ElectraAggregateAndProof, ElectraAttestation,
     SignedAggregateAndProof, SignedElectraAggregateAndProof,
 };
-pub use attestation::SingleAttestation;
 pub use block::{
     body_fork_layout, kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BeaconBlockHeader,
     BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout,

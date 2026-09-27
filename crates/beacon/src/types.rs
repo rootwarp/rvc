@@ -57,7 +57,10 @@ pub struct AttestationData {
 /// A single attestation in the Electra (v2) `SingleAttestation` format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SingleAttestation {
+    // `quoted_u64` still accepts a bare integer; Beacon-API Uint64 does not.
+    #[serde(with = "serde_utils::quoted_u64::require_quotes")]
     pub committee_index: u64,
+    #[serde(with = "serde_utils::quoted_u64::require_quotes")]
     pub attester_index: u64,
     pub data: AttestationData,
     pub signature: String,
@@ -816,8 +819,8 @@ mod tests {
     #[test]
     fn test_attestation_deserialize() {
         let json = r#"{
-            "committee_index": 1,
-            "attester_index": 42,
+            "committee_index": "1",
+            "attester_index": "42",
             "data": {
                 "slot": "1000",
                 "index": "1",
@@ -839,6 +842,27 @@ mod tests {
         assert_eq!(attestation.attester_index, 42);
         assert_eq!(attestation.data.slot, "1000");
         assert_eq!(attestation.signature, "0xsignature");
+    }
+
+    #[test]
+    fn single_attestation_quoted_form_round_trips() {
+        let json = r#"{"committee_index":"3","attester_index":"42","data":{"slot":"1000","index":"1","beacon_block_root":"0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","source":{"epoch":"100","root":"0x1111111111111111111111111111111111111111111111111111111111111111"},"target":{"epoch":"101","root":"0x2222222222222222222222222222222222222222222222222222222222222222"}},"signature":"0xsignature"}"#;
+        let attestation: SingleAttestation = serde_json::from_str(json).unwrap();
+        let reserialized = serde_json::to_string(&attestation).unwrap();
+        assert_eq!(reserialized, json);
+        let again: SingleAttestation = serde_json::from_str(&reserialized).unwrap();
+        assert_eq!(again, attestation);
+    }
+
+    #[test]
+    fn single_attestation_rejects_an_unquoted_integer() {
+        let committee = r#"{"committee_index":3,"attester_index":"42","data":{"slot":"1000","index":"1","beacon_block_root":"0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","source":{"epoch":"100","root":"0x1111111111111111111111111111111111111111111111111111111111111111"},"target":{"epoch":"101","root":"0x2222222222222222222222222222222222222222222222222222222222222222"}},"signature":"0xsignature"}"#;
+        let err = serde_json::from_str::<SingleAttestation>(committee).unwrap_err();
+        assert!(err.to_string().contains("unquoted"), "{err}");
+
+        let attester = r#"{"committee_index":"3","attester_index":42,"data":{"slot":"1000","index":"1","beacon_block_root":"0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","source":{"epoch":"100","root":"0x1111111111111111111111111111111111111111111111111111111111111111"},"target":{"epoch":"101","root":"0x2222222222222222222222222222222222222222222222222222222222222222"}},"signature":"0xsignature"}"#;
+        let err = serde_json::from_str::<SingleAttestation>(attester).unwrap_err();
+        assert!(err.to_string().contains("unquoted"), "{err}");
     }
 
     #[test]

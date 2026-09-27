@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_json, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use beacon::{
@@ -972,6 +972,40 @@ async fn test_submit_attestation_success() {
             },
         },
         committee_index: 0,
+        signature: "0xsignature".to_string(),
+    };
+
+    let versioned = VersionedAttestation::Electra(vec![attestation]);
+    let result = client.submit_attestation(&versioned).await.unwrap();
+    assert!(result.is_success());
+}
+
+#[tokio::test]
+async fn single_attestation_submission_body_has_quoted_integers() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .and(body_string_contains(r#""committee_index":"3""#))
+        .and(body_string_contains(r#""attester_index":"7""#))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let attestation = SingleAttestation {
+        committee_index: 3,
+        attester_index: 7,
+        data: AttestationData {
+            slot: "1000".to_string(),
+            index: "1".to_string(),
+            beacon_block_root: "0xabcdef".to_string(),
+            source: Checkpoint { epoch: "100".to_string(), root: "0x1111".to_string() },
+            target: Checkpoint { epoch: "101".to_string(), root: "0x2222".to_string() },
+        },
         signature: "0xsignature".to_string(),
     };
 

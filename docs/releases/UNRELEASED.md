@@ -319,3 +319,5 @@ validator. Files get smaller. Protection is non-weakening.
 ## Wire: Electra+ aggregate fetch
 
 Electra+ aggregate fetch uses `/eth/v2`; BNs without v2 fall back once, logged.
+
+## Wire: `SingleAttestation` sends quoted integers.
