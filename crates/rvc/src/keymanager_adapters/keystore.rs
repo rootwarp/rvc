@@ -56,9 +56,10 @@ pub struct KeystoreManagerAdapter {
     after_delete_unlock: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// In-flight DELETE counts. Touched only while `tracked_keys` is held.
     ///
-    /// `requests` is how many `begin_delete_export` calls have not yet ended.
-    /// `per_key` counts snapshotted pubkeys. One request's end decrements only
-    /// the pubkeys that request began with.
+    /// `requests` is how many [`KeystoreManager::membership_for_delete`]
+    /// snapshots have not yet been ended. `per_key` counts the pubkeys in
+    /// those snapshots. [`KeystoreManager::end_delete_export`] decrements
+    /// only the pubkeys that snapshot returned.
     delete_inflight: Mutex<DeleteInflight>,
     /// Shared pubkey map + generation notifier for the orchestrator (RF1-06 / RF1-07).
     /// Used for DELETE (`remove_and_notify`); import goes through [`KeyAdmissionService`].
@@ -289,8 +290,9 @@ impl KeystoreManager for KeystoreManagerAdapter {
     }
 
     fn membership_for_delete(&self, candidates: &[Pubkey]) -> Vec<Pubkey> {
-        // Same lock import holds across check-and-admit, so this set cannot
-        // tear an in-flight import.
+        // Same lock import holds across check-and-admit. The in-flight count
+        // is taken before this guard drops, so a re-import cannot `readmit`
+        // between the scan and `begin_delete_export`.
         let _keys = self.tracked_keys.lock();
         let mut members = Vec::new();
         for pubkey in candidates {
@@ -298,17 +300,19 @@ impl KeystoreManager for KeystoreManagerAdapter {
                 members.push(*pubkey);
             }
         }
-        members
-    }
-
-    fn begin_delete_export(&self, members: &[Pubkey]) {
-        let _keys = self.tracked_keys.lock();
         let mut inflight = self.delete_inflight.lock();
         inflight.requests = inflight.requests.saturating_add(1);
-        for pubkey in members {
+        for pubkey in &members {
             let count = inflight.per_key.entry(*pubkey).or_insert(0);
             *count = count.saturating_add(1);
         }
+        members
+    }
+
+    fn begin_delete_export(&self, _members: &[Pubkey]) {
+        // The count was taken in `membership_for_delete` under the scan's
+        // `tracked_keys` guard. Incrementing again would leak a count of 1
+        // after one `end_delete_export` and block re-import.
     }
 
     fn end_delete_export(&self, members: &[Pubkey]) {

@@ -45,8 +45,12 @@ pub trait KeystoreManager: Send + Sync {
     /// [`Self::import_keystore`] and [`Self::delete_keystore`] when the
     /// implementor has one.
     ///
-    /// The default is a `has_key` filter. A key that appears after this
-    /// snapshot must not be removed by a DELETE whose export omitted it.
+    /// The VC adapter also records the in-flight DELETE count for that
+    /// snapshot before releasing the lock. [`Self::begin_delete_export`] must
+    /// not count those pubkeys again. [`Self::end_delete_export`] drops the
+    /// count. The default is a `has_key` filter with no count. A key that
+    /// appears after this snapshot must not be removed by a DELETE whose
+    /// export omitted it.
     fn membership_for_delete(&self, candidates: &[Pubkey]) -> Vec<Pubkey> {
         let mut members = Vec::new();
         for pubkey in candidates {
@@ -57,16 +61,16 @@ pub trait KeystoreManager: Send + Sync {
         members
     }
 
-    /// Arm `delete_keystore` and count `members` as an in-flight DELETE.
+    /// Mark the start of a DELETE whose membership snapshot is already counted.
     ///
-    /// Paired with [`Self::end_delete_export`] for the same pubkeys. The count
+    /// Must not increment the in-flight count. That count is taken in
+    /// [`Self::membership_for_delete`] under the same lock as the scan.
+    /// Paired with [`Self::end_delete_export`] for the same pubkeys, which
     /// stays up through export, deletion, drain timeout, and every other
-    /// return. Overlapping DELETEs each increment and decrement only their own
-    /// pubkeys. Default is a no-op for test doubles that do not share an
-    /// import/delete lock.
+    /// return. Default is a no-op.
     fn begin_delete_export(&self, _members: &[Pubkey]) {}
 
-    /// Drop the in-flight count installed by [`Self::begin_delete_export`]
+    /// Drop the in-flight count installed by [`Self::membership_for_delete`]
     /// for `members`.
     fn end_delete_export(&self, _members: &[Pubkey]) {}
 }

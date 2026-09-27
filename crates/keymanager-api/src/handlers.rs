@@ -180,8 +180,8 @@ pub async fn import_keystores(
     Ok(Json(ImportKeystoresResponse { data: results }))
 }
 
-/// Clears [`KeystoreManager::begin_delete_export`] for this request's pubkeys
-/// on every exit, including a drain timeout.
+/// Drops the in-flight count taken by [`KeystoreManager::membership_for_delete`]
+/// for this request's pubkeys on every exit, including a drain timeout.
 struct DeleteExportGuard {
     keys: Arc<dyn KeystoreManager>,
     members: Vec<Pubkey>,
@@ -213,9 +213,10 @@ async fn delete_keystores_inner(
     warn!(count = request.pubkeys.len(), "Deleting keystores");
 
     // Parse all pubkeys. Membership is decided under the import/delete lock
-    // (`membership_for_delete`), not a racy `has_key` snapshot. Only that set
-    // is disabled, drained, and exported. A key admitted afterwards must not
-    // be removed.
+    // (`membership_for_delete`), which also records the in-flight count before
+    // releasing that lock. Only that set is disabled, drained, and exported.
+    // A key admitted afterwards must not be removed. `begin_delete_export`
+    // must not count again.
     let parsed: Vec<Result<Pubkey, String>> =
         request.pubkeys.iter().map(|s| parse_pubkey(s)).collect();
     let candidates: Vec<Pubkey> = parsed.iter().filter_map(|r| r.as_ref().ok().copied()).collect();
