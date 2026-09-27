@@ -181,6 +181,63 @@ fn split_attempt_timeout(remaining: Duration, remaining_bns: usize) -> Duration 
     }
 }
 
+/// Lower bound on a useful attempt when the deadline can still afford it.
+///
+/// Composed in [`attempt_timeout`] as `min(remaining, max(split, FLOOR))`.
+/// A remainder below the floor is not raised (REV-07).
+const ATTEMPT_TIMEOUT_FLOOR: Duration = Duration::from_millis(250);
+
+/// Per-attempt bound: `min(remaining, max(split, FLOOR))`.
+///
+/// `None` when `remaining` is zero. Callers must not start the attempt in that
+/// case: `tokio::time::timeout(Duration::ZERO, fut)` still polls `fut` once and
+/// can emit the HTTP request. `remaining < FLOOR` yields `remaining`, not the floor.
+fn attempt_timeout(remaining: Duration, bns_left: usize) -> Option<Duration> {
+    if remaining.is_zero() {
+        return None;
+    }
+    let split = split_attempt_timeout(remaining, bns_left);
+    Some(remaining.min(split.max(ATTEMPT_TIMEOUT_FLOOR)))
+}
+
+/// `Ok(None)` when the caller passed no deadline (attempts stay unbounded).
+/// `Err` when that absolute deadline is already exhausted.
+fn attempt_limit(
+    op_name: &str,
+    deadline: Option<tokio::time::Instant>,
+    bns_left: usize,
+) -> Result<Option<Duration>, BeaconError> {
+    let Some(end) = deadline else {
+        return Ok(None);
+    };
+    let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+    match attempt_timeout(remaining, bns_left) {
+        Some(bound) => Ok(Some(bound)),
+        None => Err(BeaconError::OperationTimeout {
+            operation: op_name.to_string(),
+            timeout: Duration::ZERO,
+        }),
+    }
+}
+
+/// Await one attempt. Expiry becomes [`BeaconError::OperationTimeout`].
+/// `None` means the caller supplied no deadline.
+async fn await_attempt<T>(
+    op_name: &str,
+    bound: Option<Duration>,
+    fut: impl Future<Output = Result<T, BeaconError>>,
+) -> Result<T, BeaconError> {
+    match bound {
+        Some(d) => match tokio::time::timeout(d, fut).await {
+            Ok(inner) => inner,
+            Err(_) => {
+                Err(BeaconError::OperationTimeout { operation: op_name.to_string(), timeout: d })
+            }
+        },
+        None => fut.await,
+    }
+}
+
 /// Default sync check interval: once per epoch (~384 seconds).
 const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 
@@ -347,10 +404,11 @@ impl BnManager {
         self.operation_timeouts.as_ref().map(f)
     }
 
-    /// Apply health-tracker updates under a single write lock.
+    /// Apply health-tracker updates. Each call takes the write lock once.
     ///
-    /// Selection strategies collect outcomes during the round and call this once
-    /// so the health write lock is taken at most once per selection round.
+    /// Sequential strategies flush per attempt so cancellation cannot drop
+    /// earlier failures. [`Self::query_best_inner`] still batches at the end
+    /// of the round.
     async fn record_outcomes(&self, op_name: &str, outcomes: &[(usize, TrackerOutcome)]) {
         if outcomes.is_empty() {
             return;
@@ -654,14 +712,20 @@ impl BnManager {
             strategy = "first",
             tried = tracing::field::Empty,
         );
-        self.query_first_inner(op_name, role, min_tier, &op).instrument(strategy_span).await
+        self.query_first_inner(op_name, role, min_tier, None, &op).instrument(strategy_span).await
     }
 
+    /// `deadline`, when `Some`, is an absolute [`tokio::time::Instant`] and must
+    /// be captured before the first `.await` of the calling operation (ADR-R03).
+    /// Each attempt is bounded by [`attempt_timeout`]; an exhausted deadline
+    /// returns [`BeaconError::OperationTimeout`] without starting that attempt.
+    /// `None` leaves attempts unbounded — those callers keep `with_op_timeout`.
     async fn query_first_inner<'s, T, F>(
         &'s self,
         op_name: &str,
         role: BnRole,
         min_tier: HealthTier,
+        deadline: Option<tokio::time::Instant>,
         op: &F,
     ) -> Result<T, BeaconError>
     where
@@ -674,9 +738,16 @@ impl BnManager {
         }
         let mut last_err = None;
         let mut tried: usize = 0;
-        let mut failed: Vec<(usize, TrackerOutcome)> = Vec::new();
 
         for (pos, i) in indices.iter().copied().enumerate() {
+            let bns_left = indices.len() - pos;
+            let bound = match attempt_limit(op_name, deadline, bns_left) {
+                Ok(bound) => bound,
+                Err(e) => {
+                    tracing::Span::current().record("tried", tried);
+                    return Err(e);
+                }
+            };
             let client = &self.clients[i];
             tried += 1;
             let attempt_span = tracing::info_span!(
@@ -684,13 +755,14 @@ impl BnManager {
                 bn_url = %RedactedUrl(client.endpoint()),
             );
             let start = tokio::time::Instant::now();
-            match op(client).instrument(attempt_span).await {
+            // Build the future only after the deadline check. A zero timeout
+            // still polls once and would send the request.
+            let fut = op(client).instrument(attempt_span);
+            match await_attempt(op_name, bound, fut).await {
                 Ok(result) => {
                     let elapsed = start.elapsed();
-                    // Batch update: record success + all prior errors in one lock acquisition
-                    let mut outcomes = failed;
-                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    self.record_outcomes(op_name, &outcomes).await;
+                    // Earlier failures were recorded before this attempt.
+                    self.record_outcomes(op_name, &[(i, TrackerOutcome::Success(elapsed))]).await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -702,7 +774,7 @@ impl BnManager {
                     return Ok(result);
                 }
                 Err(e) => {
-                    failed.push((i, error_outcome(op_name, &e)));
+                    self.record_outcomes(op_name, &[(i, error_outcome(op_name, &e))]).await;
                     if let Some(&next_i) = indices.get(pos + 1) {
                         let next_client = &self.clients[next_i];
                         warn!(
@@ -724,9 +796,6 @@ impl BnManager {
                 }
             }
         }
-
-        // All failed — batch record errors
-        self.record_outcomes(op_name, &failed).await;
 
         tracing::Span::current().record("tried", tried);
         Err(last_err.unwrap_or_else(|| no_eligible_bn(op_name, role)))
@@ -753,16 +822,24 @@ impl BnManager {
             strategy = "first",
             tried = tracing::field::Empty,
         );
-        self.query_first_prefer_some_inner(op_name, role, min_tier, &op)
+        self.query_first_prefer_some_inner(op_name, role, min_tier, None, &op)
             .instrument(strategy_span)
             .await
     }
 
+    /// `deadline`, when `Some`, is an absolute [`tokio::time::Instant`] and must
+    /// be captured before the first `.await` of the calling operation (ADR-R03).
+    /// Each attempt is bounded by [`attempt_timeout`]; an exhausted deadline
+    /// returns [`BeaconError::OperationTimeout`] without starting that attempt.
+    /// `None` leaves attempts unbounded — those callers keep `with_op_timeout`.
+    ///
+    /// `Ok(None)` (HTTP 204) is not a health outcome and is not a cluster answer.
     async fn query_first_prefer_some_inner<'s, T, F>(
         &'s self,
         op_name: &str,
         role: BnRole,
         min_tier: HealthTier,
+        deadline: Option<tokio::time::Instant>,
         op: &F,
     ) -> Result<Option<T>, BeaconError>
     where
@@ -776,9 +853,16 @@ impl BnManager {
         let mut last_err = None;
         let mut saw_none = false;
         let mut tried: usize = 0;
-        let mut failed: Vec<(usize, TrackerOutcome)> = Vec::new();
 
         for (pos, i) in indices.iter().copied().enumerate() {
+            let bns_left = indices.len() - pos;
+            let bound = match attempt_limit(op_name, deadline, bns_left) {
+                Ok(bound) => bound,
+                Err(e) => {
+                    tracing::Span::current().record("tried", tried);
+                    return Err(e);
+                }
+            };
             let client = &self.clients[i];
             tried += 1;
             let attempt_span = tracing::info_span!(
@@ -786,12 +870,14 @@ impl BnManager {
                 bn_url = %RedactedUrl(client.endpoint()),
             );
             let start = tokio::time::Instant::now();
-            match op(client).instrument(attempt_span).await {
+            // Build the future only after the deadline check. A zero timeout
+            // still polls once and would send the request.
+            let fut = op(client).instrument(attempt_span);
+            match await_attempt(op_name, bound, fut).await {
                 Ok(Some(result)) => {
                     let elapsed = start.elapsed();
-                    let mut outcomes = failed;
-                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    self.record_outcomes(op_name, &outcomes).await;
+                    // Earlier failures were recorded before this attempt.
+                    self.record_outcomes(op_name, &[(i, TrackerOutcome::Success(elapsed))]).await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -812,7 +898,12 @@ impl BnManager {
                     );
                 }
                 Err(e) => {
-                    failed.push((i, error_outcome(op_name, &e)));
+                    self.record_outcomes(op_name, &[(i, error_outcome(op_name, &e))]).await;
+                    // Deadline expiry is not "no data". A prior 204 must not hide it.
+                    if matches!(e, BeaconError::OperationTimeout { .. }) {
+                        tracing::Span::current().record("tried", tried);
+                        return Err(e);
+                    }
                     if let Some(&next_i) = indices.get(pos + 1) {
                         let next_client = &self.clients[next_i];
                         warn!(
@@ -835,7 +926,6 @@ impl BnManager {
             }
         }
 
-        self.record_outcomes(op_name, &failed).await;
         tracing::Span::current().record("tried", tried);
 
         if saw_none {
@@ -849,9 +939,9 @@ impl BnManager {
     /// never after a 2xx (including a 2xx whose body later fails to parse) and
     /// never in parallel.
     ///
-    /// `budget` is the slot-budget remaining for the whole round; each attempt
-    /// is capped at `remaining / remaining_bns` so a hung primary cannot consume
-    /// `t.block_production` alone.
+    /// `budget` is the slot-budget remaining for the whole round. Each attempt
+    /// uses [`attempt_timeout`] so a hung primary cannot consume it alone, and
+    /// the floor never extends past that deadline.
     ///
     /// One-in-flight is the client future this method polls. A per-attempt
     /// timeout drops that future before the next POST; a cancelled reqwest
@@ -898,20 +988,26 @@ impl BnManager {
         let deadline = budget.map(|d| (tokio::time::Instant::now() + d, d));
         let mut last_err = None;
         let mut tried: usize = 0;
-        let mut failed: Vec<(usize, TrackerOutcome)> = Vec::new();
+        let mut failure_count: usize = 0;
+        let mut incapable_count: usize = 0;
 
         for (pos, i) in indices.iter().copied().enumerate() {
             let remaining_bns = indices.len() - pos;
-            let attempt_timeout = if let Some((end, total)) = deadline {
-                let now = tokio::time::Instant::now();
-                if now >= end {
-                    last_err = Some(BeaconError::OperationTimeout {
-                        operation: op_name.to_string(),
-                        timeout: total,
-                    });
-                    break;
+            // Per-attempt expiry stays `BeaconError::Timeout` (failover-retryable).
+            // `OperationTimeout` here is only the already-exhausted deadline, which
+            // must not start the attempt.
+            let bound = if let Some((end, total)) = deadline {
+                let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+                match attempt_timeout(remaining, remaining_bns) {
+                    Some(d) => Some(d),
+                    None => {
+                        last_err = Some(BeaconError::OperationTimeout {
+                            operation: op_name.to_string(),
+                            timeout: total,
+                        });
+                        break;
+                    }
                 }
-                Some(split_attempt_timeout(end.saturating_duration_since(now), remaining_bns))
             } else {
                 None
             };
@@ -924,17 +1020,16 @@ impl BnManager {
             );
             let start = tokio::time::Instant::now();
             let fut = op(client).instrument(attempt_span);
-            let result = match attempt_timeout {
+            let result = match bound {
                 Some(d) => tokio::time::timeout(d, fut).await.unwrap_or(Err(BeaconError::Timeout)),
                 None => fut.await,
             };
 
             match result {
                 Ok(value) => {
-                    let mut outcomes = failed;
                     let elapsed = start.elapsed();
-                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    self.record_outcomes(op_name, &outcomes).await;
+                    // Earlier failures were recorded before this attempt.
+                    self.record_outcomes(op_name, &[(i, TrackerOutcome::Success(elapsed))]).await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -946,7 +1041,12 @@ impl BnManager {
                     return Ok(value);
                 }
                 Err(e) => {
-                    failed.push((i, error_outcome(op_name, &e)));
+                    let outcome = error_outcome(op_name, &e);
+                    failure_count += 1;
+                    if matches!(outcome, TrackerOutcome::Incapable { .. }) {
+                        incapable_count += 1;
+                    }
+                    self.record_outcomes(op_name, &[(i, outcome)]).await;
                     if is_production_failover_error(&e) {
                         if let Some(&next_i) = indices.get(pos + 1) {
                             warn!(
@@ -980,10 +1080,8 @@ impl BnManager {
             }
         }
 
-        self.record_outcomes(op_name, &failed).await;
         tracing::Span::current().record("tried", tried);
-        let all_incapable = !failed.is_empty()
-            && failed.iter().all(|(_, o)| matches!(o, TrackerOutcome::Incapable { .. }));
+        let all_incapable = failure_count > 0 && incapable_count == failure_count;
         if all_incapable
             && last_err
                 .as_ref()
@@ -2855,5 +2953,507 @@ mod tests {
             consensus_block_value: None,
         };
         assert!(!is_better_block(&a, &b));
+    }
+
+    /// BN-1 fails fast, BN-2 hangs past the outer operation budget. The fast
+    /// failure must already be on BN-1's tracker when `with_op_timeout` cancels
+    /// the rest of the round (the batched `failed` vec used to be dropped).
+    #[tokio::test]
+    async fn outer_timeout_no_longer_drops_a_recorded_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        let budget = Duration::from_millis(200);
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/1"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("primary down"))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"dependent_root":"0xabc","execution_optimistic":false,"data":[]}"#,
+                    )
+                    .set_delay(Duration::from_secs(3)),
+            )
+            .mount(&bn2)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]))
+            .unwrap()
+            .with_operation_timeouts(OperationTimeouts {
+                duty_fetch: budget,
+                ..OperationTimeouts::default()
+            });
+
+        let err = manager.get_attester_duties(1, &["1".to_string()]).await.unwrap_err();
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { ref operation, .. } if operation == "get_attester_duties"),
+            "outer with_op_timeout must still fire, got {err:?}"
+        );
+
+        let trackers = manager.health_trackers().read().await;
+        assert!(
+            trackers[0].error_rate() > 0.0,
+            "BN-1's fast 500 must be recorded before the outer timeout drops the round; error_rate={}",
+            trackers[0].error_rate()
+        );
+    }
+
+    /// A 400 is not failover-retryable on `query_failover`, but `query_first`
+    /// must still reach BN-2.
+    #[tokio::test]
+    async fn a_400_from_bn1_still_reaches_bn2() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"genesis_time":"1606824999","genesis_validators_root":"0xdef","genesis_fork_version":"0x00000000"}}"#,
+            ))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![bn1.uri(), bn2.uri()])).unwrap();
+        let result = manager.get_genesis().await.expect("400 must fail over to BN-2");
+        assert_eq!(result.data.genesis_time, "1606824999");
+        assert_eq!(bn1.received_requests().await.unwrap().len(), 1);
+        assert_eq!(bn2.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// 204 is not a cluster answer and is not a health success.
+    #[tokio::test]
+    async fn query_first_prefer_some_204_semantics_are_unchanged() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let root = "11".repeat(32);
+        let body = format!(
+            r#"{{"data":{{"beacon_block_root":"0x{root}","slot":"7","payload_present":true,"blob_data_available":false}}}}"#
+        );
+
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/payload_attestation_data"))
+            .and(query_param("slot", "7"))
+            .respond_with(ResponseTemplate::new(204))
+            .expect(1)
+            .mount(&bn1)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/payload_attestation_data"))
+            .and(query_param("slot", "7"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&body))
+            .expect(1)
+            .mount(&bn2)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![bn1.uri(), bn2.uri()])).unwrap();
+        let data = manager
+            .get_payload_attestation_data(7)
+            .await
+            .expect("204 must fail over")
+            .expect("peer data is the cluster answer");
+        assert!(data.data.payload_present);
+        {
+            let trackers = manager.health_trackers().read().await;
+            assert_eq!(trackers[0].error_rate(), 0.0, "204 must not be recorded as an error");
+            assert!(trackers[0].latency_ema_ms().is_none(), "204 must not be recorded as success");
+            assert!(trackers[1].latency_ema_ms().is_some(), "BN-2 success must be recorded");
+        }
+
+        let only_empty = [MockServer::start().await, MockServer::start().await];
+        for server in &only_empty {
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/validator/payload_attestation_data"))
+                .and(query_param("slot", "7"))
+                .respond_with(ResponseTemplate::new(204))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![only_empty[0].uri(), only_empty[1].uri()]))
+                .unwrap();
+        let result = manager.get_payload_attestation_data(7).await.expect("all-204 is Ok(None)");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn split_attempt_timeout_is_floored() {
+        let n = 8;
+        // N = 8 and a small per-BN slice. Twice the floor still divides below it,
+        // and the budget can pay the floor.
+        let remaining = ATTEMPT_TIMEOUT_FLOOR * 2;
+        assert!(remaining > ATTEMPT_TIMEOUT_FLOOR);
+        let split = split_attempt_timeout(remaining, n);
+        assert!(split < ATTEMPT_TIMEOUT_FLOOR, "raw split {split:?} should be the starvation case");
+        assert_eq!(attempt_timeout(remaining, n), Some(ATTEMPT_TIMEOUT_FLOOR));
+    }
+
+    #[test]
+    fn attempt_timeout_never_exceeds_the_remaining_budget() {
+        let floor = ATTEMPT_TIMEOUT_FLOOR;
+        let below = floor / 4;
+        assert!(!below.is_zero() && below < floor);
+        assert_eq!(attempt_timeout(below, 8), Some(below), "remaining < FLOOR yields remaining");
+        assert_eq!(attempt_timeout(below, 1), Some(below));
+
+        assert_eq!(attempt_timeout(Duration::ZERO, 1), None);
+        assert_eq!(attempt_timeout(Duration::ZERO, 8), None);
+
+        let one_left = floor + Duration::from_millis(25);
+        assert_eq!(attempt_timeout(one_left, 1), Some(one_left), "one BN left gets remaining");
+
+        let ample = floor * 8;
+        let n = 4;
+        let split = split_attempt_timeout(ample, n);
+        assert!(split > floor);
+        assert_eq!(attempt_timeout(ample, n), Some(split.max(floor)));
+
+        let tight = floor * 2;
+        let split_tight = split_attempt_timeout(tight, 8);
+        assert!(split_tight < floor);
+        assert!(tight > floor);
+        let bound = attempt_timeout(tight, 8).unwrap();
+        assert_eq!(bound, split_tight.max(floor));
+        assert!(bound <= tight);
+    }
+
+    #[tokio::test]
+    async fn exhausted_deadline_returns_operation_timeout_without_starting_an_attempt() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let bn = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0xabc","genesis_fork_version":"0x00000000"}}"#,
+            ))
+            .mount(&bn)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/payload_attestation_data"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&bn)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![bn.uri()])).unwrap();
+        let past = tokio::time::Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        let epsilon = Duration::from_millis(50);
+        assert!(ATTEMPT_TIMEOUT_FLOOR > epsilon * 3, "a floor-sized sleep must miss this bound");
+
+        let started = std::time::Instant::now();
+        let err = manager
+            .query_first_inner("get_genesis", BnRole::All, HealthTier::SmallLag, Some(past), &|c| {
+                Box::pin(c.get_genesis())
+            })
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { ref operation, .. } if operation == "get_genesis"),
+            "{err:?}"
+        );
+        assert!(elapsed <= epsilon, "elapsed {elapsed:?} exceeded {epsilon:?}");
+
+        let started = std::time::Instant::now();
+        let err = manager
+            .query_first_prefer_some_inner(
+                "get_payload_attestation_data",
+                BnRole::Attestation,
+                HealthTier::SmallLag,
+                Some(past),
+                &|c| Box::pin(c.get_payload_attestation_data(7)),
+            )
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { ref operation, .. } if operation == "get_payload_attestation_data"),
+            "{err:?}"
+        );
+        assert!(elapsed <= epsilon, "elapsed {elapsed:?} exceeded {epsilon:?}");
+
+        assert!(
+            bn.received_requests().await.unwrap().is_empty(),
+            "exhausted deadline must not send a request"
+        );
+    }
+
+    /// A 204 from BN-1 must not turn BN-2's deadline expiry into `Ok(None)`.
+    #[tokio::test]
+    async fn prefer_some_204_then_hang_is_operation_timeout() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        use wiremock::MockServer;
+
+        let epsilon = Duration::from_millis(50);
+        let budget = Duration::from_millis(20);
+        assert!(ATTEMPT_TIMEOUT_FLOOR.saturating_sub(budget) > epsilon * 3);
+
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        let primary_ep = primary.uri();
+        let secondary_ep = secondary.uri();
+        let secondary_started = Arc::new(AtomicBool::new(false));
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![primary_ep.clone(), secondary_ep.clone()]))
+                .unwrap();
+
+        let flag = Arc::clone(&secondary_started);
+        let hang = ATTEMPT_TIMEOUT_FLOOR + Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + budget;
+        let started = std::time::Instant::now();
+        let err = manager
+            .query_first_prefer_some_inner(
+                "get_payload_attestation_data",
+                BnRole::Attestation,
+                HealthTier::SmallLag,
+                Some(deadline),
+                &move |c| {
+                    let ep = c.endpoint().to_string();
+                    let secondary_ep = secondary_ep.clone();
+                    let flag = Arc::clone(&flag);
+                    Box::pin(async move {
+                        let result: Result<Option<()>, BeaconError> = if ep == secondary_ep {
+                            flag.store(true, Ordering::SeqCst);
+                            tokio::time::sleep(hang).await;
+                            Err(BeaconError::HttpError("hung".into()))
+                        } else {
+                            Ok(None)
+                        };
+                        result
+                    })
+                },
+            )
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { .. }),
+            "204 then hang must stay OperationTimeout, got {err:?}"
+        );
+        assert!(secondary_started.load(Ordering::SeqCst), "BN-2's attempt must start");
+        assert!(
+            elapsed <= budget + epsilon,
+            "elapsed {elapsed:?} exceeded deadline+ε ({:?}); floor is {:?}",
+            budget + epsilon,
+            ATTEMPT_TIMEOUT_FLOOR
+        );
+    }
+
+    #[tokio::test]
+    async fn remaining_below_floor_bounds_the_whole_operation() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let epsilon = Duration::from_millis(50);
+        let budget = Duration::from_millis(20);
+        assert!(
+            ATTEMPT_TIMEOUT_FLOOR.saturating_sub(budget) > epsilon * 3,
+            "FLOOR - remaining must be several times ε"
+        );
+
+        let bn = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0xabc","genesis_fork_version":"0x00000000"}}"#,
+                    )
+                    .set_delay(ATTEMPT_TIMEOUT_FLOOR + Duration::from_millis(500)),
+            )
+            .mount(&bn)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![bn.uri()])).unwrap();
+        let deadline = tokio::time::Instant::now() + budget;
+        let started = std::time::Instant::now();
+        let err = manager
+            .query_first_inner(
+                "get_genesis",
+                BnRole::All,
+                HealthTier::SmallLag,
+                Some(deadline),
+                &|c| Box::pin(c.get_genesis()),
+            )
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { ref operation, .. } if operation == "get_genesis"),
+            "{err:?}"
+        );
+        assert!(
+            elapsed <= budget + epsilon,
+            "elapsed {elapsed:?} exceeded deadline+ε ({:?}); a bare floor would overshoot by {:?}",
+            budget + epsilon,
+            ATTEMPT_TIMEOUT_FLOOR.saturating_sub(budget)
+        );
+    }
+
+    #[tokio::test]
+    async fn single_remaining_bn_is_bounded_by_the_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        use wiremock::MockServer;
+
+        let epsilon = Duration::from_millis(50);
+        let budget = Duration::from_millis(20);
+        assert!(ATTEMPT_TIMEOUT_FLOOR.saturating_sub(budget) > epsilon * 3);
+
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        let primary_ep = primary.uri();
+        let secondary_ep = secondary.uri();
+        let secondary_started = Arc::new(AtomicBool::new(false));
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![primary_ep.clone(), secondary_ep.clone()]))
+                .unwrap();
+
+        let flag = Arc::clone(&secondary_started);
+        let hang = ATTEMPT_TIMEOUT_FLOOR + Duration::from_millis(500);
+        let deadline = tokio::time::Instant::now() + budget;
+        let started = std::time::Instant::now();
+        let err = manager
+            .query_first_inner(
+                "get_genesis",
+                BnRole::All,
+                HealthTier::SmallLag,
+                Some(deadline),
+                &move |c| {
+                    let ep = c.endpoint().to_string();
+                    let primary_ep = primary_ep.clone();
+                    let secondary_ep = secondary_ep.clone();
+                    let flag = Arc::clone(&flag);
+                    Box::pin(async move {
+                        let result: Result<(), BeaconError> = if ep == secondary_ep {
+                            flag.store(true, Ordering::SeqCst);
+                            tokio::time::sleep(hang).await;
+                            Err(BeaconError::HttpError("hung".into()))
+                        } else {
+                            assert_eq!(ep, primary_ep);
+                            Err(BeaconError::ApiError { status: 500, message: "fast".into() })
+                        };
+                        result
+                    })
+                },
+            )
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { .. }),
+            "last BN must end at the deadline, got {err:?}"
+        );
+        assert!(secondary_started.load(Ordering::SeqCst), "BN-2's attempt must start");
+        assert!(
+            elapsed <= budget + epsilon,
+            "elapsed {elapsed:?} exceeded deadline+ε ({:?}), not deadline+FLOOR ({:?})",
+            budget + epsilon,
+            budget + ATTEMPT_TIMEOUT_FLOOR
+        );
+    }
+
+    /// The other two accumulators: a fast failure is on the tracker when the
+    /// outer wrapper cancels the hung attempt.
+    #[tokio::test]
+    async fn eager_recording_on_prefer_some_and_failover_survives_outer_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let budget = Duration::from_millis(200);
+        let hang = Duration::from_secs(3);
+
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        for (server, status, delay) in [(&bn1, 500u16, Duration::ZERO), (&bn2, 200, hang)] {
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/validator/payload_attestation_data"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .set_body_string(if status == 200 {
+                            r#"{"data":{"beacon_block_root":"0x11","slot":"7","payload_present":true,"blob_data_available":false}}"#
+                        } else {
+                            "down"
+                        })
+                        .set_delay(delay),
+                )
+                .mount(server)
+                .await;
+        }
+        let manager = BnManager::new(BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]))
+            .unwrap()
+            .with_operation_timeouts(OperationTimeouts {
+                attestation_fetch: budget,
+                ..OperationTimeouts::default()
+            });
+        let err = manager.get_payload_attestation_data(7).await.unwrap_err();
+        assert!(matches!(err, BeaconError::OperationTimeout { .. }), "{err:?}");
+        assert!(manager.health_trackers().read().await[0].error_rate() > 0.0);
+
+        // Inner budget stays long so BN-2's attempt is cut by the outer wrapper,
+        // not by `query_failover`'s own per-attempt timeout (that path records on
+        // the way out and would not prove the eager write).
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        let secondary = bn2.uri();
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![bn1.uri(), secondary.clone()])).unwrap();
+        let err = manager
+            .with_op_timeout(
+                "produce_block_v4",
+                Some(budget),
+                manager.query_failover(
+                    "produce_block_v4",
+                    BnRole::Proposal,
+                    HealthTier::Synced,
+                    Some(hang),
+                    move |c| {
+                        let ep = c.endpoint().to_string();
+                        let secondary = secondary.clone();
+                        Box::pin(async move {
+                            let result: Result<(), BeaconError> = if ep == secondary {
+                                tokio::time::sleep(hang).await;
+                                Err(BeaconError::Timeout)
+                            } else {
+                                Err(BeaconError::ApiError { status: 500, message: "fast".into() })
+                            };
+                            result
+                        })
+                    },
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BeaconError::OperationTimeout { .. }), "{err:?}");
+        assert!(
+            manager.health_trackers().read().await[0].error_rate() > 0.0,
+            "produce_block_v4 must record the earlier BN before its outer wrapper cancels the hang"
+        );
     }
 }
