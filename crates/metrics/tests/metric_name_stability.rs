@@ -21,9 +21,9 @@
 //! EIP-3076 import rows are counted once each. Dashboards that alert on silent
 //! interchange conflicts should bind this name; it has no labels.
 //! RR-1.2 adds `rvc_blob_sidecars_published_total` (family delta +1): one increment
-//! per pre-Gloas SSZ proposal published as `SignedBlockContents`. Label `fork` is
-//! the consensus version (`deneb`, `electra`, `fulu`). Blinded and Gloas publishes
-//! do not increment it.
+//! per pre-Gloas proposal published as `SignedBlockContents`, JSON or SSZ. Label
+//! `fork` is the consensus version (`deneb`, `electra`, `fulu`). Blinded and Gloas
+//! publishes do not increment it.
 //! RR-4.3 adds `rvc_slashing_export_synthetic_records_total` (family delta +1):
 //! one increment per synthetic attestation or block floor in an interchange
 //! export. It has no labels.
@@ -83,7 +83,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_attestation_trigger_total",
     "rvc_attestations_total",
     "rvc_attesting_enabled",
-    "rvc_blob_sidecars_published_total", // operator-facing: pre-Gloas SSZ SignedBlockContents publishes (RR-1.2)
+    "rvc_blob_sidecars_published_total", // operator-facing: pre-Gloas JSON or SSZ SignedBlockContents publishes (RR-1.2)
     "rvc_bn_capability_state",
     "rvc_bn_health_tier",
     "rvc_builder_circuit_breaker_trips_total",

@@ -23,6 +23,7 @@ pub(crate) use mocks::*;
 
 mod boost;
 mod envelope;
+mod json;
 mod propose;
 mod ssz;
 mod v4;

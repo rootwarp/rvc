@@ -856,13 +856,40 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             "Block signing duration"
         );
 
-        // Wire boundary: eth_types::Signature is Vec<u8> for JSON/SSZ serde.
-        let signed =
-            eth_types::SignedBeaconBlock { message: block, signature: sig.to_bytes().to_vec() };
-        self.beacon
-            .publish_block(&signed, consensus_version, response.builder_url.as_deref())
-            .instrument(tracing::info_span!("beacon.publish_block"))
-            .await?;
+        // Wire boundary. `BlockAndBlobs` publishes `SignedBlockContents` with the
+        // original arrays moved in, not a bare signed block. A response without
+        // those arrays (pre-Deneb, or a block that never carried sidecars) stays
+        // a single block. Gloas has no JSON body codec and errors before publish.
+        let signature = sig.to_bytes().to_vec();
+        match block_contents {
+            eth_types::BlockContents::BlockAndBlobs { block, kzg_proofs, blobs } => {
+                let layout = eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
+                    BlockServiceError::Parse(format!(
+                        "no JSON body layout for consensus version {consensus_version}"
+                    ))
+                })?;
+                let contents =
+                    signed_block_contents_json(block, signature, kzg_proofs, blobs, layout)?;
+                self.beacon
+                    .publish_block_contents(
+                        &contents,
+                        consensus_version,
+                        response.builder_url.as_deref(),
+                    )
+                    .instrument(tracing::info_span!("beacon.publish_block_contents"))
+                    .await?;
+                crate::metrics::RVC_BLOB_SIDECARS_PUBLISHED_TOTAL
+                    .with_label_values(&[consensus_version])
+                    .inc();
+            }
+            eth_types::BlockContents::Block(block) => {
+                let signed = eth_types::SignedBeaconBlock { message: block, signature };
+                self.beacon
+                    .publish_block(&signed, consensus_version, response.builder_url.as_deref())
+                    .instrument(tracing::info_span!("beacon.publish_block"))
+                    .await?;
+            }
+        }
 
         Ok((block_root, false))
     }
@@ -917,6 +944,19 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         Ok((block_root, true))
     }
+}
+
+/// Encode a signed block plus the produce-time arrays. The signed block is not published.
+fn signed_block_contents_json(
+    block: eth_types::BeaconBlock,
+    signature: Vec<u8>,
+    kzg_proofs: Vec<Vec<u8>>,
+    blobs: Vec<Vec<u8>>,
+    layout: eth_types::BodyForkLayout,
+) -> Result<eth_types::SignedBlockContentsJson, BlockServiceError> {
+    let signed = eth_types::SignedBeaconBlock { message: block, signature };
+    eth_types::SignedBlockContentsJson::from_signed_block(&signed, kzg_proofs, blobs, layout)
+        .map_err(|err| BlockServiceError::Parse(err.to_string()))
 }
 
 /// Island envelope root needs SSZ. JSON is accepted only as hex-encoded SSZ.

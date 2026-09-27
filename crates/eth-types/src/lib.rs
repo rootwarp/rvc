@@ -10,7 +10,7 @@ mod block;
 /// Path C (ARCH-7h): one struct per container. Crate-root types carry both
 /// `ssz` 0.9 and `ssz08` 0.8 codecs; see `block_body` module docs.
 pub mod block_body;
-/// JSON ↔ SSZ block-body codec. SSZ stays canonical; no production caller yet.
+/// JSON ↔ SSZ block-body codec. SSZ stays canonical. Produce and JSON publish call it.
 pub mod block_body_json;
 mod builder;
 mod builder_request_auth;
@@ -24,7 +24,7 @@ pub mod networks;
 mod payload_attestation;
 mod proposer_preferences;
 pub(crate) mod serde_signature;
-/// Beacon-API `SignedBlockContents` JSON. Body is an object; no production caller yet.
+/// Beacon-API `SignedBlockContents` JSON. Body is an object. JSON publish sends this.
 pub mod signed_block_contents_json;
 pub mod ssz_helpers;
 mod sync_committee;

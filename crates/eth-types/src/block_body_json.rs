@@ -7,7 +7,8 @@
 //! a parse failure cannot become a signature. Pre-Deneb forks have no layout
 //! ([`crate::body_fork_layout`] returns `None`) and are unsupported.
 //!
-//! No production path calls this yet. RR-3.7 is the wiring.
+//! `ProduceBlockResponse::parse_full_block` decodes object bodies here.
+//! `SignedBlockContentsJson` encodes them back on publish. SSZ stays canonical.
 
 use serde::Deserialize;
 use serde_json::Value;

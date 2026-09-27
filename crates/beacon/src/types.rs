@@ -195,10 +195,17 @@ pub struct ProduceBlockResponse {
 }
 
 impl ProduceBlockResponse {
-    /// Parses the raw `data` field into a full block with blob sidecars.
+    /// Parses `data` into block contents, keeping [`eth_types::BeaconBlock::body`] as SSZ bytes.
+    ///
+    /// A JSON object body is decoded with [`eth_types::body_fork_layout`] of
+    /// `consensus_version` through [`eth_types::block_body_json::decode`]. Hex
+    /// bodies are unchanged. Gloas and pre-Deneb object bodies fail closed.
+    /// `BeaconBlock`'s `hex_vec` serde is not used on the object itself.
     pub fn parse_full_block(&self) -> Result<BlockContents, BeaconError> {
-        serde_json::from_value(self.data.clone())
-            .map_err(|e| BeaconError::ParseError(format!("invalid block contents: {}", e)))
+        let mut data = self.data.clone();
+        replace_json_body_with_ssz(&mut data, &self.consensus_version)?;
+        serde_json::from_value(data)
+            .map_err(|e| BeaconError::ParseError(format!("invalid block contents: {e}")))
     }
 
     /// Parses the raw `data` field into a blinded block.
@@ -275,6 +282,38 @@ impl ProduceBlockResponse {
                     .to_string(),
             )),
         }
+    }
+}
+
+/// Swap a Beacon-API object body for canonical SSZ hex so `BeaconBlock` serde stays `hex_vec`.
+///
+/// String bodies (pre-Deneb, and any already-SSZ payload) are left in place.
+fn replace_json_body_with_ssz(
+    data: &mut serde_json::Value,
+    consensus_version: &str,
+) -> Result<(), BeaconError> {
+    let Some(body) = json_body_field(data) else {
+        return Ok(());
+    };
+    if !body.is_object() {
+        return Ok(());
+    }
+    let layout = eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
+        BeaconError::ParseError(format!(
+            "JSON block body is unsupported for consensus version {consensus_version}"
+        ))
+    })?;
+    let ssz = eth_types::block_body_json::decode(body, layout)
+        .map_err(|err| BeaconError::ParseError(format!("invalid JSON block body: {err}")))?;
+    *body = serde_json::Value::String(format!("0x{}", hex::encode(ssz)));
+    Ok(())
+}
+
+fn json_body_field(data: &mut serde_json::Value) -> Option<&mut serde_json::Value> {
+    if data.get("block").is_some() {
+        data.get_mut("block")?.get_mut("body")
+    } else {
+        data.get_mut("body")
     }
 }
 

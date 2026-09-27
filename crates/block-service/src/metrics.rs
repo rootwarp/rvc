@@ -19,14 +19,14 @@ pub static RVC_PROPOSALS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     )
 });
 
-/// Pre-Gloas SSZ proposals published as `SignedBlockContents`.
+/// Pre-Gloas proposals published as `SignedBlockContents`.
 ///
 /// Label `fork` is the consensus version (`deneb`, `electra`, `fulu`). One
-/// increment per published proposal. Blinded blocks and Gloas do not increment.
+/// increment per successful JSON or SSZ publish. Blinded blocks and Gloas do not increment.
 pub static RVC_BLOB_SIDECARS_PUBLISHED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     define_int_counter_vec(
         "rvc_blob_sidecars_published_total",
-        "Pre-Gloas SSZ block proposals published as SignedBlockContents with sidecars",
+        "Pre-Gloas block proposals published as SignedBlockContents with kzg_proofs and blobs",
         &["fork"],
     )
 });

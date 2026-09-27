@@ -3,7 +3,7 @@
 //! `signed_block.message.body` is a JSON object from [`crate::block_body_json::encode`],
 //! not the hex string [`crate::BeaconBlock`] emits. SSZ stays canonical on
 //! [`crate::SignedBeaconBlock`]. [`crate::BodyForkLayout::Gloas`] fails closed.
-//! No production path publishes this yet.
+//! The JSON block publish path sends this container, proofs and blobs included.
 
 use serde::Serialize;
 

@@ -171,7 +171,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1088,
+        1128,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -180,7 +180,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1100,
+        1140,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -189,7 +189,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1104,
+        1144,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -306,7 +306,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        965,
+        996,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -315,7 +315,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1288,
+        1319,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -324,7 +324,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1363,
+        1394,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -443,7 +443,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1066,
+        1106,
         Class::MatchForkName,
         false,
         "match fork {",

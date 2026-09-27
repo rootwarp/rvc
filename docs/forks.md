@@ -71,8 +71,8 @@ Proposal path that already has the BN `consensus_version`:
 |---|---|---|---|
 | SSZ `BlockContents` KZG bind | `crates/block-service/src/service/mod.rs` | 673–687 | `body_fork_layout` → `blob_kzg_count` / `kzg_commitment_root`. Fail-closed on bad SSZ. Skipped unless `ssz_block_format` returned `BlockContents`. |
 | JSON `BlockAndBlobs` KZG bind | `crates/block-service/src/service/mod.rs` | 790–796 | Same `body_fork_layout` dispatch. |
-| `ssz_block_format` | `crates/block-service/src/service/mod.rs` | 1028–1050 | Exhaustive `match ForkName`. Blinded → always `BeaconBlock`. Unblinded Deneb/Electra/Fulu → `BlockContents`. **Named Gloas `BeaconBlock` arm** (bare `SignedBeaconBlock`; must not share a catch-all with pre-Deneb). Unknown version strings fail closed via `ForkName::from_str`. |
-| `reject_blinded_at_gloas` | `crates/block-service/src/service/mod.rs` | 1054–1069 | Open-ended `>= Gloas` (slot fork or `consensus_version == "gloas"`) drops blinded production. |
+| `ssz_block_format` | `crates/block-service/src/service/mod.rs` | 1092–1113 | Exhaustive `match ForkName`. Blinded → always `BeaconBlock`. Unblinded Deneb/Electra/Fulu → `BlockContents`. **Named Gloas `BeaconBlock` arm** (bare `SignedBeaconBlock`; must not share a catch-all with pre-Deneb). Unknown version strings fail closed via `ForkName::from_str`. |
+| `reject_blinded_at_gloas` | `crates/block-service/src/service/mod.rs` | 1118–1132 | Open-ended `>= Gloas` (slot fork or `consensus_version == "gloas"`) drops blinded production. |
 | produceBlockV4 / v3 | `crates/block-service/src/service/mod.rs` | 307–320 | Slot fork `>= Gloas` calls `produce_block_v4` (`POST /eth/v4/validator/blocks/{slot}`); pre-Gloas stays `produce_block_v3` (`GET /eth/v3/validator/blocks/{slot}`). Dispatch is on the slot fork, never on response headers. |
 | V4 HTTP | `crates/beacon/src/client.rs` | 643–693 | `produce_block_v4`; path prefix in `crates/beacon/src/v4_wire.rs` 13. Pre-Gloas v3 is 526. |
 | V4 sign/publish | `crates/block-service/src/service/mod.rs` | 367–398 | Slot fork `>= Gloas` uses `sign_and_publish_v4`; pre-Gloas keeps V3 blinded/unblinded. |
@@ -264,7 +264,7 @@ variant and new body structs.
       A body-changing fork adds a `BodyForkLayout` variant and arms in
       `extract_blob_kzg_commitments` (`crates/eth-types/src/block.rs` 57) and both `*_for_layout` functions
       (Gloas → `GloasUnsupported`).
-- [ ] Arm `ssz_block_format` (`crates/block-service/src/service/mod.rs` 1028–1050) with a
+- [ ] Arm `ssz_block_format` (`crates/block-service/src/service/mod.rs` 1092–1113) with a
       **named** exhaustive `match ForkName` arm. Do not reintroduce a `"deneb" | "electra" | "fulu"`
       string table or a catch-all `BeaconBlock` inherit (Gloas's named `BeaconBlock` arm is
       separate from pre-Deneb on purpose).
