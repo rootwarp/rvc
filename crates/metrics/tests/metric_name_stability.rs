@@ -17,6 +17,9 @@
 //! Issue 8.4 adds `rvc_signer_rejections_total` (family delta +1).
 //! Issue 8.1 adds `rvc_fork_current_id` and `rvc_fork_next_activation_epoch` (family delta +2).
 //! RR-4.1 adds `rvc_slashing_prune_source_bound_raised_total` (family delta +1).
+//! RR-4.2 adds `rvc_slashing_import_conflicts_total` (family delta +1): dropped
+//! EIP-3076 import rows are counted once each. Dashboards that alert on silent
+//! interchange conflicts should bind this name; it has no labels.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -92,6 +95,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_signer_slashing_tx_hold_duration_ms",
     "rvc_signing_duration_seconds",
     "rvc_slashing_db_prune_total",
+    "rvc_slashing_import_conflicts_total", // operator-facing: dropped interchange import rows (RR-4.2)
     "rvc_slashing_protection_checks_total",
     "rvc_slashing_prune_source_bound_raised_total", // operator-facing: prune raised an attestation source floor (RR-4.1)
     "rvc_slashing_reconcile_total",
@@ -206,8 +210,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        46,
-        "RR-4.1 +1 family (rvc_slashing_prune_source_bound_raised_total) on the 8.1 45-family pin"
+        47,
+        "RR-4.1 +1 (rvc_slashing_prune_source_bound_raised_total) and RR-4.2 +1 (rvc_slashing_import_conflicts_total) on the 8.1 45-family pin"
     );
 }
 

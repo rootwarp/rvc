@@ -41,10 +41,22 @@ pub static RVC_SLASHING_RECONCILE_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
     )
 });
 
+/// Interchange rows dropped on import (`WHERE NOT EXISTS` changed 0 rows).
+///
+/// One increment per dropped attestation or block. The parsed maxima still
+/// raise the watermark; there is no audit table.
+pub static RVC_SLASHING_IMPORT_CONFLICTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_slashing_import_conflicts_total",
+        "Total interchange import rows dropped because a conflicting record already existed",
+    )
+});
+
 pub fn init() {
     LazyLock::force(&RVC_SLASHING_DB_PRUNE_TOTAL);
     LazyLock::force(&RVC_SLASHING_RECONCILE_TOTAL);
     LazyLock::force(&RVC_SLASHING_PRUNE_SOURCE_BOUND_RAISED_TOTAL);
+    LazyLock::force(&RVC_SLASHING_IMPORT_CONFLICTS_TOTAL);
 }
 
 #[cfg(test)]

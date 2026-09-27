@@ -4,9 +4,12 @@
 
 use rusqlite::{OptionalExtension, TransactionBehavior};
 
+use observability::logging::TruncatedPubkey;
+
 use super::watermarks::{raise_watermark_max, WatermarkKind};
 use super::{normalize_pubkey, SlashingDb};
 use crate::error::SlashingError;
+use crate::metrics;
 use crate::types::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata,
     ValidatorRecord,
@@ -151,6 +154,10 @@ impl SlashingDb {
     /// re-importing an older (lower-maxima) interchange **does not lower**
     /// watermarks and **does not fail** the import (EIP-3076 import is additive;
     /// `WatermarkLowered` is reserved for the explicit `set_*_watermark` APIs).
+    ///
+    /// A `WHERE NOT EXISTS` conflict drops the row and still raises the watermark
+    /// from the parsed maxima. An audit table for those drops was rejected: no
+    /// schema migration; the drop is a `warn` plus `rvc_slashing_import_conflicts_total`.
     pub fn import(
         &self,
         interchange: &InterchangeFormat,
@@ -219,7 +226,7 @@ impl SlashingDb {
                 max_source = Some(max_source.map_or(source_epoch, |m| m.max(source_epoch)));
                 max_target = Some(max_target.map_or(target_epoch, |m| m.max(target_epoch)));
 
-                tx.execute(
+                let inserted = tx.execute(
                     "INSERT INTO attestations \
                      (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
                      SELECT 'local-vc', ?1, ?2, ?3, ?4, ?5
@@ -234,6 +241,15 @@ impl SlashingDb {
                         &gvr_hex,
                     ),
                 )?;
+                if inserted == 0 {
+                    tracing::warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey.as_ref()),
+                        source_epoch,
+                        target_epoch,
+                        "dropped conflicting interchange attestation (source, target)=({source_epoch}, {target_epoch}); watermark still raised"
+                    );
+                    metrics::RVC_SLASHING_IMPORT_CONFLICTS_TOTAL.inc();
+                }
             }
 
             for block in &validator.signed_blocks {
@@ -243,7 +259,7 @@ impl SlashingDb {
 
                 max_slot = Some(max_slot.map_or(slot, |m| m.max(slot)));
 
-                tx.execute(
+                let inserted = tx.execute(
                     "INSERT INTO blocks \
                      (client_cn, pubkey, slot, signing_root, genesis_validators_root)
                      SELECT 'local-vc', ?1, ?2, ?3, ?4
@@ -252,6 +268,14 @@ impl SlashingDb {
                      )",
                     (pubkey.as_ref(), slot as i64, &block.signing_root, &gvr_hex),
                 )?;
+                if inserted == 0 {
+                    tracing::warn!(
+                        pubkey = %TruncatedPubkey::new(pubkey.as_ref()),
+                        slot,
+                        "dropped conflicting interchange block slot={slot}"
+                    );
+                    metrics::RVC_SLASHING_IMPORT_CONFLICTS_TOTAL.inc();
+                }
             }
 
             // Raise watermarks from this interchange's maxima (same transaction).

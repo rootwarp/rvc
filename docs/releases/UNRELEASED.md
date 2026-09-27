@@ -298,3 +298,7 @@ this cycle as delivering G6.
 `rvc-signer` DVT peers connect lazily with an explicit connect timeout; an
 unreachable peer no longer fails startup. Allow-list and SNI errors remain
 fatal. Startup logs those peers as configured and not yet dialled.
+
+## Observability
+
+Import conflicts are logged and counted (`rvc_slashing_import_conflicts_total`).
