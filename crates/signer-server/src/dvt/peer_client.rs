@@ -136,10 +136,13 @@ impl GrpcPeerRequester {
     /// If `peer.sni_cn` is empty and TLS is active, `connect` returns
     /// `Err(PeerClientError::Tls)`.  Callers must go through
     /// [`build_peer_connect_infos`] to guarantee `sni_cn` is populated.
+    /// Dial is lazy: tonic 0.12 `connect_lazy` re-dials after a failed RPC once the peer is listening (Q1), so an unreachable peer does not fail startup. `connect_timeout` bounds only the TCP handshake on the first RPC.
+    #[allow(clippy::unused_async)] // `connect_lazy` is infallible; callers still `.await`.
     pub async fn connect(
         peers: &[PeerConnectInfo],
         tls_config: Option<&TlsConfig>,
         timeout: Duration,
+        connect_timeout: Duration,
     ) -> Result<Self, PeerClientError> {
         let client_tls = match tls_config {
             Some(tls) => {
@@ -181,10 +184,7 @@ impl GrpcPeerRequester {
                     .map_err(|e| PeerClientError::Connect { addr: peer.addr.clone(), source: e })?;
             }
 
-            let channel = endpoint
-                .connect()
-                .await
-                .map_err(|e| PeerClientError::Connect { addr: peer.addr.clone(), source: e })?;
+            let channel = endpoint.connect_timeout(connect_timeout).connect_lazy();
 
             connected.push((peer.addr.clone(), PeerSignerServiceClient::new(channel)));
         }
@@ -192,7 +192,7 @@ impl GrpcPeerRequester {
         Ok(Self { peers: connected, timeout })
     }
 
-    /// Return the list of connected peer addresses.
+    /// Configured peer addresses. `connect_lazy` has not dialled them yet.
     pub fn peer_addrs(&self) -> Vec<&str> {
         self.peers
             .iter()
@@ -567,6 +567,7 @@ mod tests {
             &[PeerConnectInfo { addr: addr.to_string(), sni_cn: String::new() }],
             None,
             Duration::from_secs(2),
+            Duration::from_secs(2),
         )
         .await
         .unwrap();
@@ -621,6 +622,7 @@ mod tests {
             &[PeerConnectInfo { addr: addr.to_string(), sni_cn: String::new() }],
             None,
             Duration::from_secs(2),
+            Duration::from_secs(2),
         )
         .await
         .unwrap();
@@ -659,6 +661,7 @@ mod tests {
         let requester = GrpcPeerRequester::connect(
             &[PeerConnectInfo { addr: addr.to_string(), sni_cn: String::new() }],
             None,
+            Duration::from_secs(2),
             Duration::from_secs(2),
         )
         .await

@@ -178,13 +178,13 @@ pub(crate) async fn build_dvt_backend(
 
     let peer_requester = if !peer_infos.is_empty() {
         let requester =
-            dvt::peer_client::GrpcPeerRequester::connect(&peer_infos, tls_config, timeout)
+            dvt::peer_client::GrpcPeerRequester::connect(&peer_infos, tls_config, timeout, timeout)
                 .await
                 .map_err(|e| {
                     ServerError::backend(format!("failed to connect to DVT peers: {e}"))
                 })?;
 
-        tracing::info!(peers = ?requester.peer_addrs(), "Connected to DVT peers");
+        tracing::info!(peers = ?requester.peer_addrs(), "DVT peers configured, not yet dialled");
         Some(Arc::new(requester) as Arc<dyn backend::dvt::PeerRequester>)
     } else {
         tracing::info!("No DVT peers configured; running in standalone mode");
