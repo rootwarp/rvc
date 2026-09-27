@@ -2970,10 +2970,15 @@ async fn test_operation_timeout_fires_on_slow_bn() {
 
     assert!(result.is_err());
     let err = result.unwrap_err();
+    // The absolute deadline is taken before the attempt, so the recorded bound
+    // is the time still left: at most the configured 100ms, not that duration
+    // exactly, and not the attempt floor.
     assert!(
         matches!(&err, BeaconError::OperationTimeout { operation, timeout }
-            if operation == "get_attestation_data" && *timeout == Duration::from_millis(100)),
-        "expected OperationTimeout, got: {err}"
+            if operation == "get_attestation_data"
+                && *timeout <= Duration::from_millis(100)
+                && *timeout > Duration::from_millis(50)),
+        "expected OperationTimeout inside the 100ms budget, got: {err}"
     );
     assert!(elapsed < Duration::from_secs(2), "should have timed out quickly, took {elapsed:?}");
 }

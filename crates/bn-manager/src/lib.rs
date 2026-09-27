@@ -14,7 +14,7 @@ mod traits;
 pub mod types;
 
 pub use error::BnManagerError;
-pub use manager::BnManager;
+pub use manager::{BnManager, ATTEMPT_TIMEOUT_FLOOR};
 #[cfg(any(test, feature = "test-utils"))]
 pub use mock::MockBeaconNodeClient;
 pub use sse::{

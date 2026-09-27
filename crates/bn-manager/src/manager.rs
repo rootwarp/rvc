@@ -183,9 +183,28 @@ fn split_attempt_timeout(remaining: Duration, remaining_bns: usize) -> Duration 
 
 /// Lower bound on a useful attempt when the deadline can still afford it.
 ///
-/// Composed in [`attempt_timeout`] as `min(remaining, max(split, FLOOR))`.
+/// Each attempt uses `min(remaining, max(split, ATTEMPT_TIMEOUT_FLOOR))`.
 /// A remainder below the floor is not raised (REV-07).
-const ATTEMPT_TIMEOUT_FLOOR: Duration = Duration::from_millis(250);
+pub const ATTEMPT_TIMEOUT_FLOOR: Duration = Duration::from_millis(250);
+
+// G7 scales this below the production floor so a tens-of-ms budget can still
+// reach a second BN. Unset in production and in tests that do not call the setter.
+#[cfg(test)]
+thread_local! {
+    static TEST_ATTEMPT_FLOOR: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn current_attempt_floor() -> Duration {
+    #[cfg(test)]
+    {
+        TEST_ATTEMPT_FLOOR.with(|slot| slot.get().unwrap_or(ATTEMPT_TIMEOUT_FLOOR))
+    }
+    #[cfg(not(test))]
+    {
+        ATTEMPT_TIMEOUT_FLOOR
+    }
+}
 
 /// Per-attempt bound: `min(remaining, max(split, FLOOR))`.
 ///
@@ -197,7 +216,7 @@ fn attempt_timeout(remaining: Duration, bns_left: usize) -> Option<Duration> {
         return None;
     }
     let split = split_attempt_timeout(remaining, bns_left);
-    Some(remaining.min(split.max(ATTEMPT_TIMEOUT_FLOOR)))
+    Some(remaining.min(split.max(current_attempt_floor())))
 }
 
 /// `Ok(None)` when the caller passed no deadline (attempts stay unbounded).
@@ -376,9 +395,10 @@ impl BnManager {
 
     /// Sets per-operation timeouts for BN API calls.
     ///
-    /// When set, each BN operation is wrapped in `tokio::time::timeout` using the
-    /// corresponding field from `OperationTimeouts`. If an operation exceeds its
-    /// timeout, `BeaconError::OperationTimeout` is returned.
+    /// Query-first sites turn the matching field into an absolute deadline
+    /// before their first await and bound each BN attempt inside it. Broadcast,
+    /// best-of, and `produce_block_v4` keep an outer `tokio::time::timeout`.
+    /// Exceeding the budget returns `BeaconError::OperationTimeout`.
     pub fn with_operation_timeouts(mut self, timeouts: OperationTimeouts) -> Self {
         self.operation_timeouts = Some(timeouts);
         self
@@ -447,7 +467,8 @@ impl BnManager {
     /// Dispatch a submission via broadcast or query_first based on the topic flag.
     ///
     /// Encapsulates the repeated `if broadcast_topics.X { broadcast } else { query_first }`
-    /// branch and wraps it in the per-operation timeout.
+    /// branch. The broadcast arm keeps [`Self::with_op_timeout`]. The query_first
+    /// arm takes an absolute deadline from `timeout` before it awaits (ADR-R03).
     async fn submit<'s, T, F>(
         &'s self,
         op_name: &str,
@@ -465,8 +486,8 @@ impl BnManager {
             self.with_op_timeout(op_name, timeout, self.broadcast_with_result(op_name, role, op))
                 .await
         } else {
-            self.with_op_timeout(op_name, timeout, self.query_first(op_name, role, min_tier, op))
-                .await
+            let deadline = timeout.map(|budget| tokio::time::Instant::now() + budget);
+            self.query_first(op_name, role, min_tier, deadline, op).await
         }
     }
 
@@ -697,11 +718,15 @@ impl BnManager {
     }
 
     /// Query using the `First` strategy: try synced BNs in order, fail over on error.
+    ///
+    /// `deadline`, when `Some`, is an absolute [`tokio::time::Instant`] captured
+    /// before this call's first `.await` (ADR-R03). `None` leaves attempts unbounded.
     async fn query_first<'s, T, F>(
         &'s self,
         op_name: &str,
         role: BnRole,
         min_tier: HealthTier,
+        deadline: Option<tokio::time::Instant>,
         op: F,
     ) -> Result<T, BeaconError>
     where
@@ -713,14 +738,16 @@ impl BnManager {
             strategy = "first",
             tried = tracing::field::Empty,
         );
-        self.query_first_inner(op_name, role, min_tier, None, &op).instrument(strategy_span).await
+        self.query_first_inner(op_name, role, min_tier, deadline, &op)
+            .instrument(strategy_span)
+            .await
     }
 
     /// `deadline`, when `Some`, is an absolute [`tokio::time::Instant`] and must
     /// be captured before the first `.await` of the calling operation (ADR-R03).
     /// Each attempt is bounded by [`attempt_timeout`]; an exhausted deadline
     /// returns [`BeaconError::OperationTimeout`] without starting that attempt.
-    /// `None` leaves attempts unbounded — those callers keep `with_op_timeout`.
+    /// `None` leaves attempts unbounded (the caller has no operation budget).
     async fn query_first_inner<'s, T, F>(
         &'s self,
         op_name: &str,
@@ -812,6 +839,7 @@ impl BnManager {
         op_name: &str,
         role: BnRole,
         min_tier: HealthTier,
+        deadline: Option<tokio::time::Instant>,
         op: F,
     ) -> Result<Option<T>, BeaconError>
     where
@@ -823,7 +851,7 @@ impl BnManager {
             strategy = "first",
             tried = tracing::field::Empty,
         );
-        self.query_first_prefer_some_inner(op_name, role, min_tier, None, &op)
+        self.query_first_prefer_some_inner(op_name, role, min_tier, deadline, &op)
             .instrument(strategy_span)
             .await
     }
@@ -832,9 +860,15 @@ impl BnManager {
     /// be captured before the first `.await` of the calling operation (ADR-R03).
     /// Each attempt is bounded by [`attempt_timeout`]; an exhausted deadline
     /// returns [`BeaconError::OperationTimeout`] without starting that attempt.
-    /// `None` leaves attempts unbounded — those callers keep `with_op_timeout`.
+    /// `None` leaves attempts unbounded (the caller has no operation budget).
     ///
     /// `Ok(None)` (HTTP 204) is not a health outcome and is not a cluster answer.
+    ///
+    /// A per-attempt [`BeaconError::OperationTimeout`] fails over while a later
+    /// beacon node remains and [`attempt_limit`] still yields a bound. It is
+    /// returned only when that deadline is already exhausted or the timed-out
+    /// attempt is the last one. A stored `OperationTimeout` wins over
+    /// `Ok(None)`, so an earlier HTTP 204 cannot hide a hang.
     async fn query_first_prefer_some_inner<'s, T, F>(
         &'s self,
         op_name: &str,
@@ -900,10 +934,17 @@ impl BnManager {
                 }
                 Err(e) => {
                     self.record_outcomes(op_name, &[(i, error_outcome(op_name, &e))]).await;
-                    // Deadline expiry is not "no data". A prior 204 must not hide it.
                     if matches!(e, BeaconError::OperationTimeout { .. }) {
-                        tracing::Span::current().record("tried", tried);
-                        return Err(e);
+                        let has_next = pos + 1 < indices.len();
+                        if !has_next {
+                            tracing::Span::current().record("tried", tried);
+                            return Err(e);
+                        }
+                        let next_left = indices.len() - (pos + 1);
+                        if let Err(exhausted) = attempt_limit(op_name, deadline, next_left) {
+                            tracing::Span::current().record("tried", tried);
+                            return Err(exhausted);
+                        }
                     }
                     if let Some(&next_i) = indices.get(pos + 1) {
                         let next_client = &self.clients[next_i];
@@ -929,10 +970,17 @@ impl BnManager {
 
         tracing::Span::current().record("tried", tried);
 
-        if saw_none {
-            return Ok(None);
+        // A hang is not "no data". An earlier 204 must not hide it.
+        match last_err {
+            Some(err @ BeaconError::OperationTimeout { .. }) => Err(err),
+            other => {
+                if saw_none {
+                    Ok(None)
+                } else {
+                    Err(other.unwrap_or_else(|| no_eligible_bn(op_name, role)))
+                }
+            }
         }
-        Err(last_err.unwrap_or_else(|| no_eligible_bn(op_name, role)))
     }
 
     /// Sequential production failover (D29): one in-flight request, health-score
@@ -1553,35 +1601,40 @@ impl NodeStatusApi for BnManager {
     // -- State / Config: query(First), any role, accept SmallLag --
 
     async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
-        self.query_first("get_genesis", BnRole::All, HealthTier::SmallLag, |c| {
+        // no budget: startup chain identity; OperationTimeouts has no field for it
+        self.query_first("get_genesis", BnRole::All, HealthTier::SmallLag, None, |c| {
             Box::pin(c.get_genesis())
         })
         .await
     }
 
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
-        self.query_first("get_config_spec", BnRole::All, HealthTier::SmallLag, |c| {
+        // no budget: startup spec read; OperationTimeouts has no field for it
+        self.query_first("get_config_spec", BnRole::All, HealthTier::SmallLag, None, |c| {
             Box::pin(c.get_config_spec())
         })
         .await
     }
 
     async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
-        self.query_first("get_fork_schedule", BnRole::All, HealthTier::SmallLag, |c| {
+        // no budget: startup fork table; OperationTimeouts has no field for it
+        self.query_first("get_fork_schedule", BnRole::All, HealthTier::SmallLag, None, |c| {
             Box::pin(c.get_fork_schedule())
         })
         .await
     }
 
     async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
-        self.query_first("get_fork", BnRole::All, HealthTier::SmallLag, |c| {
+        // no budget: state fork read; OperationTimeouts has no field for it
+        self.query_first("get_fork", BnRole::All, HealthTier::SmallLag, None, |c| {
             Box::pin(c.get_fork(state_id))
         })
         .await
     }
 
     async fn get_validators(&self, pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError> {
-        self.query_first("get_validators", BnRole::All, HealthTier::SmallLag, |c| {
+        // no budget: validator registry read; OperationTimeouts has no field for it
+        self.query_first("get_validators", BnRole::All, HealthTier::SmallLag, None, |c| {
             Box::pin(c.get_validators(pubkeys))
         })
         .await
@@ -1590,7 +1643,8 @@ impl NodeStatusApi for BnManager {
     // -- Blocks --
 
     async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        self.query_first("get_block_root", BnRole::All, HealthTier::SmallLag, |c| {
+        // no budget: block-root lookup; OperationTimeouts has no field for it
+        self.query_first("get_block_root", BnRole::All, HealthTier::SmallLag, None, |c| {
             Box::pin(c.get_block_root(block_id))
         })
         .await
@@ -1599,14 +1653,16 @@ impl NodeStatusApi for BnManager {
     // -- Node status: query(First), any role --
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
-        self.query_first("get_node_syncing", BnRole::All, HealthTier::Unsynced, |c| {
+        // no budget: sync probe must not inherit a duty budget; OperationTimeouts has no field for it
+        self.query_first("get_node_syncing", BnRole::All, HealthTier::Unsynced, None, |c| {
             Box::pin(c.get_node_syncing())
         })
         .await
     }
 
     async fn get_node_version(&self) -> Result<String, BeaconError> {
-        self.query_first("get_node_version", BnRole::All, HealthTier::Unsynced, |c| {
+        // no budget: version probe; OperationTimeouts has no field for it
+        self.query_first("get_node_version", BnRole::All, HealthTier::Unsynced, None, |c| {
             Box::pin(c.get_node_version())
         })
         .await
@@ -1622,15 +1678,14 @@ impl DutiesProvider for BnManager {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<AttesterDutiesResponse, BeaconError> {
-        self.with_op_timeout(
+        let deadline =
+            self.op_timeout(|t| t.duty_fetch).map(|budget| tokio::time::Instant::now() + budget);
+        self.query_first(
             "get_attester_duties",
-            self.op_timeout(|t| t.duty_fetch),
-            self.query_first(
-                "get_attester_duties",
-                BnRole::Attestation,
-                HealthTier::SmallLag,
-                |c| Box::pin(c.get_attester_duties(epoch, validator_indices)),
-            ),
+            BnRole::Attestation,
+            HealthTier::SmallLag,
+            deadline,
+            |c| Box::pin(c.get_attester_duties(epoch, validator_indices)),
         )
         .await
     }
@@ -1640,12 +1695,14 @@ impl DutiesProvider for BnManager {
         epoch: u64,
         schedule: &ForkSchedule,
     ) -> Result<ProposerDutiesResponse, BeaconError> {
-        self.with_op_timeout(
+        let deadline =
+            self.op_timeout(|t| t.duty_fetch).map(|budget| tokio::time::Instant::now() + budget);
+        self.query_first(
             "get_proposer_duties",
-            self.op_timeout(|t| t.duty_fetch),
-            self.query_first("get_proposer_duties", BnRole::Proposal, HealthTier::Synced, |c| {
-                Box::pin(c.get_proposer_duties(epoch, schedule))
-            }),
+            BnRole::Proposal,
+            HealthTier::Synced,
+            deadline,
+            |c| Box::pin(c.get_proposer_duties(epoch, schedule)),
         )
         .await
     }
@@ -1655,15 +1712,14 @@ impl DutiesProvider for BnManager {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-        self.with_op_timeout(
+        let deadline =
+            self.op_timeout(|t| t.duty_fetch).map(|budget| tokio::time::Instant::now() + budget);
+        self.query_first(
             "post_sync_committee_duties",
-            self.op_timeout(|t| t.duty_fetch),
-            self.query_first(
-                "post_sync_committee_duties",
-                BnRole::SyncCommittee,
-                HealthTier::SmallLag,
-                |c| Box::pin(c.post_sync_committee_duties(epoch, validator_indices)),
-            ),
+            BnRole::SyncCommittee,
+            HealthTier::SmallLag,
+            deadline,
+            |c| Box::pin(c.post_sync_committee_duties(epoch, validator_indices)),
         )
         .await
     }
@@ -1673,12 +1729,14 @@ impl DutiesProvider for BnManager {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<PtcDutiesResponse, BeaconError> {
-        self.with_op_timeout(
+        let deadline =
+            self.op_timeout(|t| t.duty_fetch).map(|budget| tokio::time::Instant::now() + budget);
+        self.query_first(
             "post_ptc_duties",
-            self.op_timeout(|t| t.duty_fetch),
-            self.query_first("post_ptc_duties", BnRole::Attestation, HealthTier::SmallLag, |c| {
-                Box::pin(c.post_ptc_duties(epoch, validator_indices))
-            }),
+            BnRole::Attestation,
+            HealthTier::SmallLag,
+            deadline,
+            |c| Box::pin(c.post_ptc_duties(epoch, validator_indices)),
         )
         .await
     }
@@ -1795,22 +1853,22 @@ impl BlockProducer for BnManager {
             )
             .await
         } else {
-            self.with_op_timeout(
+            let deadline = self
+                .op_timeout(|t| t.block_publication)
+                .map(|budget| tokio::time::Instant::now() + budget);
+            self.query_first(
                 "publish_block_ssz",
-                self.op_timeout(|t| t.block_publication),
-                self.query_first(
-                    "publish_block_ssz",
-                    BnRole::Submission,
-                    HealthTier::LargeLag,
-                    |c| {
-                        Box::pin(c.publish_block_ssz(
-                            ssz_bytes,
-                            consensus_version,
-                            is_blinded,
-                            builder_url,
-                        ))
-                    },
-                ),
+                BnRole::Submission,
+                HealthTier::LargeLag,
+                deadline,
+                |c| {
+                    Box::pin(c.publish_block_ssz(
+                        ssz_bytes,
+                        consensus_version,
+                        is_blinded,
+                        builder_url,
+                    ))
+                },
             )
             .await
         }
@@ -1936,15 +1994,15 @@ impl AttestationApi for BnManager {
         slot: u64,
         committee_index: u64,
     ) -> Result<AttestationDataResponse, BeaconError> {
-        self.with_op_timeout(
+        let deadline = self
+            .op_timeout(|t| t.attestation_fetch)
+            .map(|budget| tokio::time::Instant::now() + budget);
+        self.query_first(
             "get_attestation_data",
-            self.op_timeout(|t| t.attestation_fetch),
-            self.query_first(
-                "get_attestation_data",
-                BnRole::Attestation,
-                HealthTier::SmallLag,
-                |c| Box::pin(c.get_attestation_data(slot, committee_index)),
-            ),
+            BnRole::Attestation,
+            HealthTier::SmallLag,
+            deadline,
+            |c| Box::pin(c.get_attestation_data(slot, committee_index)),
         )
         .await
     }
@@ -1966,15 +2024,15 @@ impl AttestationApi for BnManager {
             )
             .await
         } else {
-            self.with_op_timeout(
+            let deadline = self
+                .op_timeout(|t| t.attestation_submit)
+                .map(|budget| tokio::time::Instant::now() + budget);
+            self.query_first(
                 "submit_attestation",
-                self.op_timeout(|t| t.attestation_submit),
-                self.query_first(
-                    "submit_attestation",
-                    BnRole::Submission,
-                    HealthTier::LargeLag,
-                    |c| Box::pin(c.submit_attestation(attestations)),
-                ),
+                BnRole::Submission,
+                HealthTier::LargeLag,
+                deadline,
+                |c| Box::pin(c.submit_attestation(attestations)),
             )
             .await
         }
@@ -1988,21 +2046,15 @@ impl AttestationApi for BnManager {
         attestation_data_root: &str,
         committee_index: Option<u64>,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
-        self.with_op_timeout(
+        let deadline = self
+            .op_timeout(|t| t.aggregate_fetch)
+            .map(|budget| tokio::time::Instant::now() + budget);
+        self.query_first(
             "get_aggregate_attestation",
-            self.op_timeout(|t| t.aggregate_fetch),
-            self.query_first(
-                "get_aggregate_attestation",
-                BnRole::Aggregation,
-                HealthTier::SmallLag,
-                |c| {
-                    Box::pin(c.get_aggregate_attestation(
-                        slot,
-                        attestation_data_root,
-                        committee_index,
-                    ))
-                },
-            ),
+            BnRole::Aggregation,
+            HealthTier::SmallLag,
+            deadline,
+            |c| Box::pin(c.get_aggregate_attestation(slot, attestation_data_root, committee_index)),
         )
         .await
     }
@@ -2045,15 +2097,15 @@ impl PayloadAttestationApi for BnManager {
         &self,
         slot: u64,
     ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError> {
-        self.with_op_timeout(
+        let deadline = self
+            .op_timeout(|t| t.attestation_fetch)
+            .map(|budget| tokio::time::Instant::now() + budget);
+        self.query_first_prefer_some(
             "get_payload_attestation_data",
-            self.op_timeout(|t| t.attestation_fetch),
-            self.query_first_prefer_some(
-                "get_payload_attestation_data",
-                BnRole::Attestation,
-                HealthTier::SmallLag,
-                |c| Box::pin(c.get_payload_attestation_data(slot)),
-            ),
+            BnRole::Attestation,
+            HealthTier::SmallLag,
+            deadline,
+            |c| Box::pin(c.get_payload_attestation_data(slot)),
         )
         .await
     }
@@ -2072,15 +2124,15 @@ impl PayloadAttestationApi for BnManager {
             )
             .await
         } else {
-            self.with_op_timeout(
+            let deadline = self
+                .op_timeout(|t| t.attestation_submit)
+                .map(|budget| tokio::time::Instant::now() + budget);
+            self.query_first(
                 "submit_payload_attestations",
-                self.op_timeout(|t| t.attestation_submit),
-                self.query_first(
-                    "submit_payload_attestations",
-                    BnRole::Submission,
-                    HealthTier::LargeLag,
-                    |c| Box::pin(c.submit_payload_attestations(messages)),
-                ),
+                BnRole::Submission,
+                HealthTier::LargeLag,
+                deadline,
+                |c| Box::pin(c.submit_payload_attestations(messages)),
             )
             .await
         }
@@ -2112,21 +2164,21 @@ impl SyncCommitteeApi for BnManager {
         subcommittee_index: u64,
         beacon_block_root: &str,
     ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
-        self.with_op_timeout(
+        let deadline = self
+            .op_timeout(|t| t.sync_contribution)
+            .map(|budget| tokio::time::Instant::now() + budget);
+        self.query_first(
             "get_sync_committee_contribution",
-            self.op_timeout(|t| t.sync_contribution),
-            self.query_first(
-                "get_sync_committee_contribution",
-                BnRole::SyncCommittee,
-                HealthTier::SmallLag,
-                |c| {
-                    Box::pin(c.get_sync_committee_contribution(
-                        slot,
-                        subcommittee_index,
-                        beacon_block_root,
-                    ))
-                },
-            ),
+            BnRole::SyncCommittee,
+            HealthTier::SmallLag,
+            deadline,
+            |c| {
+                Box::pin(c.get_sync_committee_contribution(
+                    slot,
+                    subcommittee_index,
+                    beacon_block_root,
+                ))
+            },
         )
         .await
     }
@@ -2155,7 +2207,8 @@ impl LivenessApi for BnManager {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<ValidatorLivenessResponse, BeaconError> {
-        self.query_first("post_validator_liveness", BnRole::All, HealthTier::SmallLag, |c| {
+        // no budget: doppelganger liveness is off the slot hot path; OperationTimeouts has no field for it
+        self.query_first("post_validator_liveness", BnRole::All, HealthTier::SmallLag, None, |c| {
             Box::pin(c.post_validator_liveness(epoch, validator_indices))
         })
         .await
@@ -3264,6 +3317,73 @@ mod tests {
         );
     }
 
+    /// Budget above the production floor, so a hung primary's slice leaves time
+    /// for the secondary. Real elapsed time; the test floor override stays unset.
+    #[tokio::test]
+    async fn get_payload_attestation_data_hung_primary_secondary_answers() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let budget = Duration::from_millis(600);
+        let epsilon = Duration::from_millis(150);
+        let hang = Duration::from_secs(2);
+        assert!(budget > ATTEMPT_TIMEOUT_FLOOR);
+        assert_eq!(current_attempt_floor(), ATTEMPT_TIMEOUT_FLOOR);
+        assert!(hang > budget);
+
+        let root = "11".repeat(32);
+        let body = format!(
+            r#"{{"data":{{"beacon_block_root":"0x{root}","slot":"7","payload_present":true,"blob_data_available":false}}}}"#
+        );
+
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/payload_attestation_data"))
+            .and(query_param("slot", "7"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&body).set_delay(hang))
+            .mount(&primary)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/validator/payload_attestation_data"))
+            .and(query_param("slot", "7"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&body))
+            .expect(1)
+            .mount(&secondary)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![primary.uri(), secondary.uri()]))
+            .unwrap()
+            .with_operation_timeouts(OperationTimeouts {
+                attestation_fetch: budget,
+                ..OperationTimeouts::default()
+            });
+
+        let started = std::time::Instant::now();
+        let data = manager
+            .get_payload_attestation_data(7)
+            .await
+            .expect("hung primary must fail over")
+            .expect("secondary has payload attestation data");
+        let elapsed = started.elapsed();
+
+        assert!(data.data.payload_present);
+        assert!(
+            !secondary.received_requests().await.unwrap().is_empty(),
+            "the healthy secondary must be contacted"
+        );
+        assert!(
+            manager.health_trackers().read().await[0].error_rate() > 0.0,
+            "the hung primary must record an error"
+        );
+        assert!(
+            elapsed <= budget + epsilon,
+            "elapsed {elapsed:?} exceeded budget+ε ({:?})",
+            budget + epsilon
+        );
+        assert!(elapsed < hang, "elapsed {elapsed:?} waited for the primary hang {hang:?}");
+    }
+
     #[tokio::test]
     async fn remaining_below_floor_bounds_the_whole_operation() {
         use wiremock::matchers::{method, path};
@@ -3456,5 +3576,223 @@ mod tests {
             manager.health_trackers().read().await[0].error_rate() > 0.0,
             "produce_block_v4 must record the earlier BN before its outer wrapper cancels the hang"
         );
+    }
+
+    const G7_EPSILON: Duration = Duration::from_millis(50);
+    const ATTESTER_DUTIES_BODY: &str =
+        r#"{"dependent_root":"0xabc","execution_optimistic":false,"data":[]}"#;
+
+    struct AttemptFloorGuard {
+        previous: Option<Duration>,
+    }
+
+    impl Drop for AttemptFloorGuard {
+        fn drop(&mut self) {
+            let previous = self.previous;
+            TEST_ATTEMPT_FLOOR.with(|slot| slot.set(previous));
+        }
+    }
+
+    /// Scale the attempt floor for this thread. Production stays at
+    /// [`ATTEMPT_TIMEOUT_FLOOR`]; G7(a)/(b) need a floor below a tens-of-ms
+    /// split so a hung primary still leaves time for the next BN.
+    fn set_attempt_floor_for_test(floor: Duration) -> AttemptFloorGuard {
+        AttemptFloorGuard { previous: TEST_ATTEMPT_FLOOR.with(|slot| slot.replace(Some(floor))) }
+    }
+
+    fn assert_within_budget(elapsed: Duration, budget: Duration) {
+        assert!(
+            ATTEMPT_TIMEOUT_FLOOR.saturating_sub(budget) > G7_EPSILON * 3,
+            "FLOOR ({ATTEMPT_TIMEOUT_FLOOR:?}) - budget ({budget:?}) must be several times ε ({G7_EPSILON:?})"
+        );
+        assert!(
+            elapsed <= budget + G7_EPSILON,
+            "elapsed {elapsed:?} exceeded budget+ε ({:?}); an uncapped floor is {:?}",
+            budget + G7_EPSILON,
+            ATTEMPT_TIMEOUT_FLOOR
+        );
+    }
+
+    async fn mount_attester_duties(server: &wiremock::MockServer, delay: Duration) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/duties/attester/1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(ATTESTER_DUTIES_BODY).set_delay(delay),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn attester_manager(endpoints: Vec<String>, budget: Duration) -> BnManager {
+        BnManager::new(BnManagerConfig::new(endpoints)).unwrap().with_operation_timeouts(
+            OperationTimeouts { duty_fetch: budget, ..OperationTimeouts::default() },
+        )
+    }
+
+    /// Primary hangs, secondary answers. The primary's health drops and the
+    /// secondary is actually contacted. Real elapsed time, budget below the
+    /// production floor, test floor small enough that the split still reaches BN-2.
+    #[tokio::test(flavor = "current_thread")]
+    async fn g7a_primary_hung_secondary_serves_and_primary_is_demoted() {
+        use wiremock::MockServer;
+
+        let budget = Duration::from_millis(60);
+        let test_floor = Duration::from_millis(8);
+        let hang = Duration::from_millis(400);
+        assert!(test_floor < budget / 2, "test floor must leave a slice for the secondary");
+        assert!(hang > budget);
+        let _floor = set_attempt_floor_for_test(test_floor);
+
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        mount_attester_duties(&primary, hang).await;
+        mount_attester_duties(&secondary, Duration::ZERO).await;
+        let manager = attester_manager(vec![primary.uri(), secondary.uri()], budget);
+
+        let started = std::time::Instant::now();
+        let duties =
+            manager.get_attester_duties(1, &["1".to_string()]).await.expect("secondary must serve");
+        let elapsed = started.elapsed();
+        assert!(duties.data.is_empty());
+        assert_within_budget(elapsed, budget);
+        assert!(
+            !secondary.received_requests().await.unwrap().is_empty(),
+            "at least one request must reach the secondary"
+        );
+
+        let trackers = manager.health_trackers().read().await;
+        assert!(trackers[0].error_rate() > 0.0, "hung primary must record an error");
+        assert!(!trackers[0].is_healthy(), "primary must drop below the healthy threshold");
+        assert!(
+            trackers[0].score() < trackers[1].score(),
+            "primary score {} must be demoted below secondary {}",
+            trackers[0].score(),
+            trackers[1].score()
+        );
+    }
+
+    /// Every hung BN is attempted and records an error, and the call still
+    /// ends by the absolute deadline rather than the production floor.
+    #[tokio::test(flavor = "current_thread")]
+    async fn g7b_all_bns_hung_returns_operation_timeout_and_every_tracker_records_an_error() {
+        use wiremock::MockServer;
+
+        let budget = Duration::from_millis(60);
+        let test_floor = Duration::from_millis(8);
+        let hang = Duration::from_millis(400);
+        assert!(test_floor < budget / 2);
+        let _floor = set_attempt_floor_for_test(test_floor);
+
+        let bn1 = MockServer::start().await;
+        let bn2 = MockServer::start().await;
+        mount_attester_duties(&bn1, hang).await;
+        mount_attester_duties(&bn2, hang).await;
+        let manager = attester_manager(vec![bn1.uri(), bn2.uri()], budget);
+
+        let started = std::time::Instant::now();
+        let err = manager.get_attester_duties(1, &["1".to_string()]).await.unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { ref operation, .. } if operation == "get_attester_duties"),
+            "{err:?}"
+        );
+        assert_within_budget(elapsed, budget);
+
+        let trackers = manager.health_trackers().read().await;
+        assert_eq!(trackers.len(), 2);
+        for (i, tracker) in trackers.iter().enumerate() {
+            assert!(tracker.error_rate() > 0.0, "BN {i} must record the hang");
+        }
+    }
+
+    /// One hung BN is bounded by the caller's budget, not the production floor,
+    /// and that single error drops it below the healthy threshold.
+    #[tokio::test(flavor = "current_thread")]
+    async fn g7c_single_bn_hung_drops_its_tier() {
+        use wiremock::MockServer;
+
+        let budget = Duration::from_millis(40);
+        let hang = Duration::from_millis(400);
+        assert!(hang > ATTEMPT_TIMEOUT_FLOOR, "hang must outlast an uncapped floor");
+
+        let bn = MockServer::start().await;
+        mount_attester_duties(&bn, hang).await;
+        let manager = attester_manager(vec![bn.uri()], budget);
+        assert!(manager.health_trackers().read().await[0].is_healthy());
+
+        let started = std::time::Instant::now();
+        let err = manager.get_attester_duties(1, &["1".to_string()]).await.unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { ref operation, .. } if operation == "get_attester_duties"),
+            "{err:?}"
+        );
+        assert_within_budget(elapsed, budget);
+
+        let trackers = manager.health_trackers().read().await;
+        assert!(trackers[0].error_rate() > 0.0, "the hung BN must record an error");
+        assert!(
+            !trackers[0].is_healthy(),
+            "a single hang must drop the BN below the healthy threshold"
+        );
+        assert!(trackers[0].score() < 0.8, "score must fall from the no-sample baseline");
+    }
+
+    #[test]
+    fn retained_with_op_timeout_does_not_enclose_query_first() {
+        let src = include_str!("manager.rs");
+        let production = src.split("#[cfg(test)]\nmod tests {").next().expect("test module");
+        let calls = with_op_timeout_calls(production);
+        assert_eq!(
+            calls.len(),
+            12,
+            "expected the broadcast arm, query_best, query_failover, and nine broadcast wrappers"
+        );
+        for call in &calls {
+            assert!(
+                !call.contains("query_first"),
+                "with_op_timeout must not enclose query_first or query_first_prefer_some:\n{call}"
+            );
+        }
+        assert_eq!(production.matches("// no budget:").count(), 9);
+        assert_eq!(
+            production.matches("tokio::time::Instant::now() + budget").count(),
+            12,
+            "each converted site takes an absolute deadline before it awaits"
+        );
+    }
+
+    fn with_op_timeout_calls(src: &str) -> Vec<&str> {
+        let mut calls = Vec::new();
+        let mut rest = src;
+        let needle = "with_op_timeout(";
+        while let Some(idx) = rest.find(needle) {
+            let args_and_rest = &rest[idx + "with_op_timeout".len()..];
+            let end = balanced_paren_end(args_and_rest);
+            calls.push(&args_and_rest[..=end]);
+            rest = &args_and_rest[end + 1..];
+        }
+        calls
+    }
+
+    fn balanced_paren_end(src: &str) -> usize {
+        let bytes = src.as_bytes();
+        assert_eq!(bytes.first().copied(), Some(b'('), "with_op_timeout call must open with '('");
+        let mut depth = 0i32;
+        for (i, &byte) in bytes.iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i;
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unbalanced with_op_timeout call");
     }
 }

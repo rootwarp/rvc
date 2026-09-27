@@ -306,3 +306,7 @@ Import conflicts are logged and counted (`rvc_slashing_import_conflicts_total`).
 ## Breaking (wire): Deneb/Electra/Fulu blocks are published as full SignedBlockContents with sidecars
 
 Deneb/Electra/Fulu blocks are published as full SignedBlockContents with sidecars. Nodes that accepted the prior malformed payload may behave differently.
+
+## Behaviour: BN attempt budgets
+
+Each BN attempt gets a floored share of the operation budget; timeouts degrade node health, including when every node hangs.
