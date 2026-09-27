@@ -137,7 +137,10 @@ impl GrpcPeerRequester {
     /// `Err(PeerClientError::Tls)`.  Callers must go through
     /// [`build_peer_connect_infos`] to guarantee `sni_cn` is populated.
     /// Dial is lazy: tonic 0.12 `connect_lazy` re-dials after a failed RPC once the peer is listening (Q1), so an unreachable peer does not fail startup. `connect_timeout` bounds only the TCP handshake on the first RPC.
-    #[allow(clippy::unused_async)] // `connect_lazy` is infallible; callers still `.await`.
+    // `connect_lazy` is infallible; callers still `.await`.
+    // `PeerClientError::Rpc` holds `tonic::Status` (~200 bytes). Rustc 1.98
+    // lints that on async fns; the public error shape stays unchanged.
+    #[allow(clippy::unused_async, clippy::result_large_err)]
     pub async fn connect(
         peers: &[PeerConnectInfo],
         tls_config: Option<&TlsConfig>,
