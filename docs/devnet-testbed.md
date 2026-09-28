@@ -183,7 +183,7 @@ Shells out to `scripts/validator_perf.py` for RVC's pubkeys only (`--pubkeys-fil
 scripts/devnet/report.sh --run-dir scripts/devnet/runs/manual < /dev/null
 ```
 
-Writes `rvc-pubkeys.txt`, `chain.json`, `client.json`, `report.txt`, `verdict.json`. Re-report an old dir the same way; K8 `blocked` in `metrics-end.txt` still exits **3** (S7).
+Writes `rvc-pubkeys.txt`, `chain.json`, `client.json`, `report.txt`, `verdict.json`. Re-report an old dir the same way; K8 `blocked` &gt; 0 in `metrics-end.txt` still exits **3** (S7). A valid end scrape with the `blocked` child **absent** is treated as end=0 (absent-as-0); an empty, missing, or malformed scrape never passes via absence.
 
 Inspect:
 
@@ -192,7 +192,20 @@ jq '{verdict, exit_code, gates, annotations}' scripts/devnet/runs/manual/verdict
 jq '.gates' scripts/devnet/runs/manual/verdict.json
 ```
 
-Gates: `s5a_presence` (all 13 K families in `client.json`), `s5b_liveness` (K1, K3, K4, K5, K7, `rvc_duties_fetched_total`, `rvc_bn_health_tier` non-zero), `s7_blocked` (K8 `blocked` end == 0), `chain_thresholds` (validator_perf). A missing K family is health **3**, not KPI **4**.
+Gates: `s5a_presence` (all 13 K families in `client.json`), `s5b_liveness` (K1, K3, K4, K5, K7, `rvc_duties_fetched_total`, `rvc_bn_health_tier` non-zero), `s7_blocked` (K8 `blocked` end == 0, including absent-as-0 on a valid scrape), `chain_thresholds` (validator_perf). A missing K family is health **3**, not KPI **4**.
+
+### S7 slashing gate (absent-as-0)
+
+Report `assert_no_blocked` and soak `k8_blocked_total` share one rule (DSR-0.1 / FR-P1-1):
+
+| Scrape condition | Gate behavior |
+|------------------|---------------|
+| Valid scrape; `blocked` child **absent** | Treat as end=0 (absent-as-0); may pass S7 |
+| Valid scrape; `blocked` child present with value **0** | Pass S7 |
+| Valid scrape; `blocked` child present with value **&gt; 0** | **Fail** S7 (exit **3**) |
+| Scrape **unavailable**, empty, or **malformed** / unparseable | **Fail** (never healthy via absent-as-zero) |
+
+`blocked` must be an **exact non-negative integer** sample value (Prometheus `metric{labels} &lt;value&gt; [&lt;timestamp&gt;]`); optional timestamps are ignored. Fractional / exponent / `+N` forms fail closed (never truncate to 0). “Valid scrape” for report means a readable non-empty `metrics-end.txt`; for soak it means HTTP **200** with a non-empty `/metrics` body. Fixtures under `scripts/tests/fixtures/` cover absent · zero · positive · timestamp · fractional · empty · malformed (`k8_metrics__*.txt`, `rvc_metrics__end_k8_absent.txt`).
 
 ### Teardown
 
@@ -327,7 +340,7 @@ PRD §4 vocabulary, emitted only through `die_infra` / `die_usage` / `die_health
 | `0` | — | Pass | All gates green. `"degraded"` annotation is still `0` unless `--strict`. |
 | `1` | `die_infra` | Infrastructure | Docker pull, genesis generator, keystore count, weak KDF, BN GET, `validator_perf.py` 1/2/5. |
 | `2` | `die_usage` | Usage / preflight | Bad flag, missing tool, `CHAIN_ID ≠ 1337`, Docker VM &lt; 8 GiB, stale datadirs, missing `rvc.json`/`run.json`, missing `target/release/rvc` on `run.sh`, fork-schedule mismatch. |
-| `3` | `die_health` | Health gate | RVC/BN unhealthy during soak, K8 `blocked` &gt; 0 (live or post-hoc), S5a missing family, S5b liveness, `--strict` + validator_perf `3`. |
+| `3` | `die_health` | Health gate | RVC/BN unhealthy during soak, K8 `blocked` &gt; 0 or unreadable scrape (live or post-hoc S7), S5a missing family, S5b liveness, `--strict` + validator_perf `3`. |
 | `4` | `die_kpi` | KPI threshold | `validator_perf.py` exit `4` (`--fail-under` breach). |
 | `5` | `die_notready` | RVC never became ready | Attach `/health` timeout. **No `rvc.json`.** |
 
@@ -389,7 +402,7 @@ K families (S5a presence is **family**-level; S5b non-zero required only where n
 | K5 | `rvc_aggregations_total` | yes |
 | K6 | `rvc_proposals_total` | no (`fast` may be 0 → `no_proposal_window`) |
 | K7 | `rvc_signing_duration_seconds` | yes |
-| K8 | `rvc_slashing_protection_checks_total` | `blocked` must be 0 (S7) |
+| K8 | `rvc_slashing_protection_checks_total` | `blocked` must be 0 (S7; absent child on a valid scrape counts as 0) |
 | K9 | `rvc_slashing_reserve_tx_hold_duration_ms` | no |
 | K10 | `rvc_slot_phase_block_start_offset_ms` | no |
 | K11 | `rvc_duties_fetched_total` / `rvc_duty_reorg_detected_total` | fetched yes; reorgs no |

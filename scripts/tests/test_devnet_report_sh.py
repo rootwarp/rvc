@@ -734,17 +734,11 @@ def test_report_sh_blocked_nonzero_forms_exit_3(tmp_path: Path, value: str):
     assert verdict["exit_code"] == 3
 
 
-@pytest.mark.parametrize("value", ["+Inf", "NaN", None])
-def test_report_sh_blocked_unreadable_not_pass(tmp_path: Path, value: str | None):
+@pytest.mark.parametrize("value", ["+Inf", "NaN", "0.5", "1e-1", "0.0"])
+def test_report_sh_blocked_unreadable_not_pass(tmp_path: Path, value: str):
+    """Non-exact-integer samples fail closed (never truncate to 0)."""
     run_dir = plant_run_dir(tmp_path)
-    if value is None:
-        _rewrite_blocked(
-            run_dir,
-            None,
-            files=("metrics-start.txt", "metrics-end.txt"),
-        )
-    else:
-        _rewrite_blocked(run_dir, value)
+    _rewrite_blocked(run_dir, value)
     proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
     assert proc.returncode == 3, proc.stderr
     assert proc.stdout == ""
@@ -755,28 +749,83 @@ def test_report_sh_blocked_unreadable_not_pass(tmp_path: Path, value: str | None
     assert verdict["exit_code"] == 3
 
 
-def test_report_sh_blocked_missing_from_end_only_exits_3(tmp_path: Path):
+def test_report_sh_blocked_zero_with_timestamp_passes_s7(tmp_path: Path):
+    """Optional Prometheus timestamp must not be read as the blocked count."""
     run_dir = plant_run_dir(tmp_path)
-    start = (run_dir / "metrics-start.txt").read_text(encoding="utf-8")
-    assert 'result="blocked"} 0' in start
-    _rewrite_blocked(run_dir, None, files=("metrics-end.txt",))
-    assert 'result="blocked"}' in (
+    _rewrite_blocked(run_dir, "0 1710000000000")
+    assert 'result="blocked"} 0 1710000000000' in (
+        run_dir / "metrics-end.txt"
+    ).read_text(encoding="utf-8")
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 0, proc.stderr
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["gates"]["s7_blocked"] == "pass"
+    assert verdict["verdict"] == "pass"
+    assert verdict["exit_code"] == 0
+
+
+def test_report_sh_blocked_positive_with_timestamp_exits_3(tmp_path: Path):
+    """Value field drives S7; trailing timestamp is ignored."""
+    run_dir = plant_run_dir(tmp_path)
+    _rewrite_blocked(run_dir, "1 1710000000000")
+    assert 'result="blocked"} 1 1710000000000' in (
+        run_dir / "metrics-end.txt"
+    ).read_text(encoding="utf-8")
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 3, proc.stderr
+    assert "blocked" in proc.stderr.lower()
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["gates"]["s7_blocked"] == "fail"
+    assert verdict["verdict"] == "fail"
+    assert verdict["exit_code"] == 3
+
+
+def test_report_sh_blocked_absent_from_both_passes_s7(tmp_path: Path):
+    """Valid scrapes with no blocked child → S7 absent-as-0 (DSR-0.1)."""
+    run_dir = plant_run_dir(
+        tmp_path, metrics_end=FIXTURES / "rvc_metrics__end_k8_absent.txt"
+    )
+    _rewrite_blocked(run_dir, None, files=("metrics-start.txt",))
+    assert 'result="blocked"}' not in (
         run_dir / "metrics-start.txt"
     ).read_text(encoding="utf-8")
     assert 'result="blocked"}' not in (
         run_dir / "metrics-end.txt"
     ).read_text(encoding="utf-8")
     proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
-    assert proc.returncode == 3, proc.stderr
+    assert proc.returncode == 0, proc.stderr
     assert proc.stdout == ""
     assert_no_secret(proc)
     verdict = _load_verdict(run_dir)
-    assert verdict["gates"]["s7_blocked"] == "fail"
-    assert verdict["verdict"] != "pass"
-    assert verdict["exit_code"] == 3
+    assert verdict["gates"]["s7_blocked"] == "pass"
+    assert verdict["verdict"] == "pass"
+    assert verdict["exit_code"] == 0
 
 
-def test_report_sh_blocked_end_then_deleted_exits_3(tmp_path: Path):
+def test_report_sh_blocked_missing_from_end_only_passes_s7(tmp_path: Path):
+    """Valid end scrape without blocked child → treat end as 0 (DSR-0.1)."""
+    run_dir = plant_run_dir(
+        tmp_path, metrics_end=FIXTURES / "rvc_metrics__end_k8_absent.txt"
+    )
+    start = (run_dir / "metrics-start.txt").read_text(encoding="utf-8")
+    assert 'result="blocked"} 0' in start
+    assert 'result="blocked"}' not in (
+        run_dir / "metrics-end.txt"
+    ).read_text(encoding="utf-8")
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["gates"]["s7_blocked"] == "pass"
+    assert verdict["verdict"] == "pass"
+    assert verdict["exit_code"] == 0
+
+
+def test_report_sh_blocked_end_then_deleted_passes_s7(tmp_path: Path):
+    """Deleting blocked from an otherwise valid end scrape is absent-as-0."""
     run_dir = plant_run_dir(
         tmp_path, metrics_end=FIXTURES / "rvc_metrics__end_blocked.txt"
     )
@@ -788,6 +837,22 @@ def test_report_sh_blocked_end_then_deleted_exits_3(tmp_path: Path):
         run_dir / "metrics-end.txt"
     ).read_text(encoding="utf-8")
     proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    verdict = _load_verdict(run_dir)
+    assert verdict["gates"]["s7_blocked"] == "pass"
+    assert verdict["verdict"] == "pass"
+    assert verdict["exit_code"] == 0
+
+
+def test_report_sh_blocked_empty_end_scrape_exits_3(tmp_path: Path):
+    """Empty metrics-end must not pass S7 via absent-as-zero."""
+    run_dir = plant_run_dir(
+        tmp_path, metrics_end=FIXTURES / "rvc_metrics__end_empty.txt"
+    )
+    assert (run_dir / "metrics-end.txt").read_text(encoding="utf-8") == ""
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
     assert proc.returncode == 3, proc.stderr
     assert proc.stdout == ""
     assert_no_secret(proc)
@@ -795,6 +860,20 @@ def test_report_sh_blocked_end_then_deleted_exits_3(tmp_path: Path):
     assert verdict["gates"]["s7_blocked"] == "fail"
     assert verdict["verdict"] != "pass"
     assert verdict["exit_code"] == 3
+
+
+def test_report_sh_blocked_missing_end_file_exits_nonzero(tmp_path: Path):
+    """Unavailable metrics-end must not pass via absent-as-zero (infra fail)."""
+    run_dir = plant_run_dir(tmp_path)
+    (run_dir / "metrics-end.txt").unlink()
+    proc, _ = run_report(tmp_path, ["--run-dir", str(run_dir)])
+    assert proc.returncode != 0, proc.stderr
+    assert proc.returncode in (1, 2, 3), proc.returncode
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    assert not (run_dir / "verdict.json").is_file() or (
+        _load_verdict(run_dir)["gates"]["s7_blocked"] == "fail"
+    )
 
 
 def test_report_sh_s5b_zero_k1_exits_3(tmp_path: Path):

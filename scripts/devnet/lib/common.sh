@@ -1245,8 +1245,13 @@ sleep_until_slot() {
     sleep "$wait_s"
 }
 
+# K8 blocked total from a live /metrics scrape (DSR-0.1). HTTP 200 with a
+# non-empty body is a valid scrape: absent blocked child → 0. Empty body,
+# non-200, or a non-integer blocked value → fail (never healthy via absence).
+# Prometheus text: metric{labels} <value> [<timestamp>]; use field 2 (value),
+# not $NF, and require an exact non-negative integer (no fraction/exponent).
 k8_blocked_total() {
-    local bodyfile code body val url timeout
+    local bodyfile code body line val url timeout
     timeout="${SCRAPE_TIMEOUT_S:-5}"
     case "$timeout" in
         '' | *[!0-9]*)
@@ -1264,13 +1269,20 @@ k8_blocked_total() {
             return 1
             ;;
     esac
-    val="$(
+    if [[ -z "${body//[[:space:]]/}" ]]; then
+        return 1
+    fi
+    line="$(
         printf '%s\n' "$body" \
             | grep -E '^rvc_slashing_protection_checks_total\{[^}]*result="blocked"' \
-            | awk '{print $NF}' \
             | tail -n 1 || true
     )"
-    val="${val%%.*}"
+    if [[ -z "$line" ]]; then
+        printf '0\n'
+        return 0
+    fi
+    # Field 2 is the sample value; optional timestamp is field 3+.
+    val="$(printf '%s\n' "$line" | awk '{print $2}')"
     case "$val" in
         '' | *[!0-9]*)
             return 1
