@@ -95,7 +95,14 @@ pub fn new_shared_sync_statuses(count: usize) -> SharedSyncStatuses {
 }
 
 /// Polls the sync status of all beacon nodes in parallel and updates the shared state.
-pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &SharedSyncStatuses) {
+///
+/// Also updates [`metrics::definitions::RVC_BN_HEALTH_TIER`] per endpoint from the
+/// polled detail (DSR-2.2). Tier values follow [`BnSyncDetail::tier`].
+pub async fn check_all_sync_statuses(
+    clients: &[BeaconClient],
+    statuses: &SharedSyncStatuses,
+    thresholds: &TierThresholds,
+) {
     let futs: Vec<_> = clients
         .iter()
         .enumerate()
@@ -143,6 +150,12 @@ pub async fn check_all_sync_statuses(clients: &[BeaconClient], statuses: &Shared
             }
             BnSyncStatus::Unknown => {}
         }
+        let tier = detail.tier(thresholds);
+        // Issue 8.3 label hygiene — never put userinfo/path/query on /metrics.
+        let endpoint_label = crate::metrics::endpoint_label(&endpoint);
+        metrics::definitions::RVC_BN_HEALTH_TIER
+            .with_label_values(&[endpoint_label.as_str()])
+            .set(tier.as_metric_value());
         new_statuses[i] = detail;
     }
 
@@ -184,16 +197,18 @@ async fn check_single_sync_status(client: &BeaconClient) -> BnSyncDetail {
 
 /// Starts a background task that periodically polls sync status of all BNs.
 ///
-/// The task runs until the shutdown signal fires.
+/// The task runs until the shutdown signal fires. Each poll updates
+/// `rvc_bn_health_tier` via [`check_all_sync_statuses`].
 pub fn start_sync_monitor(
     clients: Vec<BeaconClient>,
     statuses: SharedSyncStatuses,
+    thresholds: TierThresholds,
     interval: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            check_all_sync_statuses(&clients, &statuses).await;
+            check_all_sync_statuses(&clients, &statuses, &thresholds).await;
 
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -594,7 +609,7 @@ mod tests {
         let clients = vec![make_client(&server1.uri()), make_client(&server2.uri())];
         let statuses = new_shared_sync_statuses(2);
 
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::Synced);
@@ -624,7 +639,7 @@ mod tests {
         let clients = vec![make_client(&server1.uri()), make_client(&server2.uri())];
         let statuses = new_shared_sync_statuses(2);
 
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::Synced);
@@ -647,7 +662,7 @@ mod tests {
         let clients = vec![make_client(&server1.uri())];
         let statuses = new_shared_sync_statuses(1);
 
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::Unreachable);
@@ -670,8 +685,13 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let handle =
-            start_sync_monitor(clients, statuses.clone(), Duration::from_millis(50), shutdown_rx);
+        let handle = start_sync_monitor(
+            clients,
+            statuses.clone(),
+            TierThresholds::default(),
+            Duration::from_millis(50),
+            shutdown_rx,
+        );
 
         // Wait a bit for at least one poll
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -702,8 +722,13 @@ mod tests {
 
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let handle =
-            start_sync_monitor(clients, statuses.clone(), Duration::from_millis(50), shutdown_rx);
+        let handle = start_sync_monitor(
+            clients,
+            statuses.clone(),
+            TierThresholds::default(),
+            Duration::from_millis(50),
+            shutdown_rx,
+        );
 
         // Wait for initial poll
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -731,7 +756,7 @@ mod tests {
         let clients = vec![make_client(&server.uri())];
         let statuses = new_shared_sync_statuses(1);
 
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::ElOffline);
@@ -751,7 +776,7 @@ mod tests {
         let clients = vec![make_client(&server.uri())];
         let statuses = new_shared_sync_statuses(1);
 
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::Syncing);
@@ -788,7 +813,7 @@ mod tests {
         let statuses = new_shared_sync_statuses(2);
 
         let start = tokio::time::Instant::now();
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
         let elapsed = start.elapsed();
 
         // If sequential, would take >= 400ms. Parallel should complete in ~200ms.
@@ -844,7 +869,7 @@ mod tests {
         let clients = vec![make_client(&server.uri())];
         let statuses = new_shared_sync_statuses(1);
 
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::Syncing);
@@ -866,7 +891,7 @@ mod tests {
         let clients = vec![make_client(&server.uri())];
         let statuses = new_shared_sync_statuses(1);
 
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].status, BnSyncStatus::Syncing);
@@ -912,7 +937,7 @@ mod tests {
         let clients = vec![make_client(&server.uri())];
         let statuses = new_shared_sync_statuses(1);
 
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].sync_distance, Some(5));
@@ -934,10 +959,209 @@ mod tests {
         let clients = vec![make_client(&server.uri())];
         let statuses = new_shared_sync_statuses(1);
 
-        check_all_sync_statuses(&clients, &statuses).await;
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
 
         let guard = statuses.read().await;
         assert_eq!(guard[0].sync_distance, Some(100));
         assert_eq!(guard[0].tier(&TierThresholds::default()), HealthTier::Unsynced);
+    }
+
+    // -- DSR-2.2: rvc_bn_health_tier updates from sync poller --
+
+    fn health_tier_gauge(endpoint: &str) -> i64 {
+        let label = crate::metrics::endpoint_label(endpoint);
+        metrics::definitions::RVC_BN_HEALTH_TIER.with_label_values(&[label.as_str()]).get()
+    }
+
+    #[tokio::test]
+    async fn test_health_tier_gauge_updates_to_synced_on_poll() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+        let endpoint = clients[0].endpoint().to_string();
+
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
+
+        assert_eq!(
+            health_tier_gauge(&endpoint),
+            HealthTier::Synced.as_metric_value(),
+            "synced BN /eth/v1/node/syncing must set rvc_bn_health_tier=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_tier_gauge_updates_to_unsynced_when_syncing() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+        let endpoint = clients[0].endpoint().to_string();
+
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
+
+        assert_eq!(
+            health_tier_gauge(&endpoint),
+            HealthTier::Unsynced.as_metric_value(),
+            "syncing BN (large sync_distance) must set rvc_bn_health_tier=4"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_tier_gauge_transitions_match_syncing_endpoint() {
+        let server = MockServer::start().await;
+
+        // First poll: synced
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+        let endpoint = clients[0].endpoint().to_string();
+
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
+        assert_eq!(health_tier_gauge(&endpoint), HealthTier::Synced.as_metric_value());
+
+        // Second poll: unsynced / syncing
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_RESPONSE))
+            .mount(&server)
+            .await;
+
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
+        assert_eq!(
+            health_tier_gauge(&endpoint),
+            HealthTier::Unsynced.as_metric_value(),
+            "gauge must transition synced→unsynced when BN syncing endpoint flips"
+        );
+
+        // Third poll: back to synced
+        server.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&server)
+            .await;
+
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
+        assert_eq!(
+            health_tier_gauge(&endpoint),
+            HealthTier::Synced.as_metric_value(),
+            "gauge must transition unsynced→synced when BN reports synced again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_tier_gauge_endpoint_label_strips_credentials() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&server)
+            .await;
+
+        // Inject userinfo into the mock URI — mirrors issue 8.3 capability hygiene.
+        let credentialed = server.uri().replacen("http://", "http://user:s3cretpw@", 1);
+        let expected = crate::metrics::endpoint_label(&credentialed);
+        assert!(
+            !expected.contains("s3cretpw") && !expected.contains("user:"),
+            "sanitizer must strip userinfo; got {expected}"
+        );
+
+        let clients = vec![make_client(&credentialed)];
+        let statuses = new_shared_sync_statuses(1);
+
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
+
+        assert_eq!(
+            health_tier_gauge(&expected),
+            HealthTier::Synced.as_metric_value(),
+            "gauge must be keyed on the sanitized endpoint"
+        );
+
+        let series = crate::metrics::gather_health_tier_series();
+        let ours: Vec<&(String, i64)> = series
+            .iter()
+            .filter(|(ep, _)| ep.contains("s3cretpw") || ep == &expected || ep.contains("user:"))
+            .collect();
+        assert!(!ours.is_empty(), "credentialed URL must emit a series; got {series:?}");
+        for (ep, _) in &ours {
+            assert_eq!(ep, &expected, "endpoint must be scheme://host:port without userinfo");
+        }
+        assert!(
+            !series.iter().any(|(ep, _)| ep.contains("s3cretpw")),
+            "raw userinfo must not appear in rvc_bn_health_tier labels; got {series:?}"
+        );
+        assert!(
+            !series.iter().any(|(ep, _)| ep.as_str() == credentialed),
+            "raw credentialed URL must not be a label"
+        );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_synced_bn_logs_and_metric_stay_truthful() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+            .mount(&server)
+            .await;
+
+        let clients = vec![make_client(&server.uri())];
+        let statuses = new_shared_sync_statuses(1);
+        let endpoint = clients[0].endpoint().to_string();
+
+        check_all_sync_statuses(&clients, &statuses, &TierThresholds::default()).await;
+
+        let tier = health_tier_gauge(&endpoint);
+        assert_ne!(
+            tier,
+            HealthTier::Unsynced.as_metric_value(),
+            "must not claim unsynced metric while BN /eth/v1/node/syncing reports synced"
+        );
+        assert_eq!(tier, HealthTier::Synced.as_metric_value());
+        assert!(logs_contain("BN is synced"));
+        assert!(
+            !logs_contain("BN is still syncing"),
+            "must not claim syncing in logs while BN reports synced"
+        );
+        logs_assert(|lines: &[&str]| {
+            // Inspect message bodies only — the test span name is prefixed on every line.
+            let bad: Vec<_> = lines
+                .iter()
+                .filter(|l| l.contains("rvc_bn_manager::sync_status:"))
+                .filter(|l| {
+                    l.split("rvc_bn_manager::sync_status:")
+                        .nth(1)
+                        .is_some_and(|msg| msg.contains("unsynced"))
+                })
+                .collect();
+            if !bad.is_empty() {
+                return Err(format!(
+                    "sync_status messages must not claim unsynced while BN is synced: {bad:?}"
+                ));
+            }
+            Ok(())
+        });
     }
 }
