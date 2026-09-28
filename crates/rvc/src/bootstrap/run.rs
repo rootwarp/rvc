@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::executor::{ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
-use super::tasks::{spawn_background_tasks, spawn_sse_subscriber};
+use super::tasks::{spawn_background_tasks, spawn_sse_subscriber, spawn_sync_monitor};
 use super::{
     build_services, connect_beacon, load_signing_keys, open_slashing_db, wire_signing_enablement,
     BeaconHandles, BootstrapError, EnablementHandles, LoadedKeys, ServiceHandles,
@@ -274,6 +274,8 @@ pub async fn run(
     // ARCH-3l/3i: register bn.sse (Background) and hand the gate to the slot loop.
     let head_gate = spawn_sse_subscriber(Some(Arc::clone(&bn_manager)), &executor)
         .unwrap_or_else(|| crate::orchestrator::HeadEventGate::pair().1);
+    // DSR-2.1 / FR-P1-3: register bn.sync_monitor (Background).
+    spawn_sync_monitor(Some(Arc::clone(&bn_manager)), &executor, None);
     let (mut orchestrator, orchestrator_handle) =
         crate::orchestrator::DutyOrchestrator::new(crate::orchestrator::OrchestratorDeps {
             clock: slot_clock,
@@ -599,6 +601,14 @@ mod tests {
             "ARCH-3l must start the SSE subscriber from production run()"
         );
         assert!(body.contains("bn.sse"), "ARCH-3l must name the registered SSE task bn.sse");
+        assert!(
+            body.contains("spawn_sync_monitor"),
+            "DSR-2.1 must start the sync monitor from production run()"
+        );
+        assert!(
+            body.contains("bn.sync_monitor"),
+            "DSR-2.1 must name the registered sync-monitor task bn.sync_monitor"
+        );
     }
 
     fn test_admissions(
