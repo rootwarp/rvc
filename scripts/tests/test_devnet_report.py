@@ -314,7 +314,11 @@ def test_family_list_comes_from_scrape_not_source(dr):
         assert list(families).count("rvc_attestations_total") == 1
         proposals = families["rvc_proposals_total"]
         children = {tuple(sorted(sample.labels.items())) for sample in proposals.samples}
-        assert children == {(("outcome", "envelope_late"),)}
+        assert children == {
+            (("outcome", "envelope_late"),),
+            (("outcome", "failed"),),
+            (("outcome", "success"),),
+        }
 
 
 def test_unit_carried_per_family(dr):
@@ -974,6 +978,39 @@ def test_report_annotates_no_proposal_window_on_zero_proposals(dr, tmp_path):
     assert "no_proposal_window" in client["annotations"]
     assert (run_dir / "client.json").is_file()
     assert (run_dir / "report.txt").is_file()
+
+
+def test_report_omits_no_proposal_window_when_success_delta(dr):
+    start = _parse_fixture(dr, "rvc_metrics__start")
+    end = _parse_fixture(dr, "rvc_metrics__end")
+    run = json.loads(
+        (_FIXTURES / "run__fast_n4.json").read_text(encoding="utf-8")
+    )
+    window = {"start_slot": 10, "end_slot": 12, "slots": 2}
+    end["rvc_proposals_total"].samples = [
+        sample
+        if sample.labels.get("outcome") != "success"
+        else dr.Sample(
+            labels={"outcome": "success"},
+            value=1.0,
+            name="rvc_proposals_total",
+        )
+        for sample in end["rvc_proposals_total"].samples
+    ]
+    if not any(
+        s.labels.get("outcome") == "success"
+        for s in end["rvc_proposals_total"].samples
+    ):
+        end["rvc_proposals_total"].samples.append(
+            dr.Sample(
+                labels={"outcome": "success"},
+                value=1.0,
+                name="rvc_proposals_total",
+            )
+        )
+    client = dr.build_client_json(run, window, start, end, {}, clock=_clock)
+    assert "no_proposal_window" not in client["annotations"]
+    assert client["presence"]["K6"] == "all_children_present"
 
 
 def test_client_json_window_comes_from_samples_not_run_json(dr, tmp_path):

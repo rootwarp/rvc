@@ -48,6 +48,16 @@
         "delta": 0,
         "labels": {"outcome": "envelope_late"},
         "per_epoch": 0
+      },
+      {
+        "delta": 0,
+        "labels": {"outcome": "failed"},
+        "per_epoch": 0
+      },
+      {
+        "delta": 0,
+        "labels": {"outcome": "success"},
+        "per_epoch": 0
       }
     ],
     "rvc_slashing_protection_checks_total": [

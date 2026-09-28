@@ -13,6 +13,8 @@
 //! Issue 4.12 adds `rvc_signer_capability` (family delta +1).
 //! Issue 6.7 adds `rvc_bn_capability_state` (family delta +1).
 //! Issue 6.20 adds `rvc_proposals_total` (family delta +1; `outcome=envelope_late`).
+//! DSR-1.2 / issue #377 force-registers `outcome=success` and `outcome=failed`
+//! children and increments them on the propose path (family name unchanged).
 //! Issue 7.6 adds `rvc_ptc_duties_total` and `rvc_ptc_attestations_total` (family delta +2).
 //! Issue 8.4 adds `rvc_signer_rejections_total` (family delta +1).
 //! Issue 8.1 adds `rvc_fork_current_id` and `rvc_fork_next_activation_epoch` (family delta +2).
@@ -105,7 +107,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_payload_attestation_skipped_total",
     "rvc_pre_proposal_cold_fetch_duration_seconds",
     "rvc_pre_proposal_cold_fetch_total",
-    "rvc_proposals_total", // operator-facing: self-build envelope_late (issue 6.20)
+    "rvc_proposals_total", // operator-facing: proposal outcomes success/failed/envelope_late (issue 6.20 / #377)
     "rvc_proposer_bn_health_score",
     "rvc_proposer_bn_latency_ms",
     "rvc_proposer_config_refresh_failures_total",

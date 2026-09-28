@@ -3,6 +3,15 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Metrics: `rvc_proposals_total` success / failed outcomes (DSR-1.2 / #377)
+
+`rvc_proposals_total` now force-registers `outcome=success` and `outcome=failed`
+(alongside `envelope_late`) at process init. The orchestrator increments
+`success` on a completed propose+publish and `failed` on error or outer
+timeout. Devnet report K6 presence treats zero-delta force-registered children
+as absent and clears `no_proposal_window` when any proposal outcome delta is
+non-zero.
+
 ## Behaviour: keymanager voluntary exit uses the beacon-node pool
 
 The keymanager voluntary exit now uses the beacon-node pool instead of a single endpoint. A beacon node that answers HTTP 200 without the requested validator, or a genesis body whose validators root is not the configured root, is skipped; the next node is tried. The exit is not signed from that body.
