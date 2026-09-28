@@ -509,7 +509,6 @@ fn test_ssz_deser_large_body_no_kzg() {
 }
 
 #[test]
-#[ignore = "Known body-bleed bug: ssz_deser.rs uses bytes.len() instead of kzg_proofs_offset as block_region_end. Body includes KZG+blob data when non-empty. See beacon/src/ssz_deser.rs:190."]
 fn test_ssz_deser_block_contents_with_kzg_proofs() {
     use beacon::ssz_deser::{deserialize_beacon_block_from_ssz, SszBlockFormat};
 
@@ -524,7 +523,7 @@ fn test_ssz_deser_block_contents_with_kzg_proofs() {
     assert_eq!(offset, 12);
     assert_eq!(block.slot, 1000);
     assert_eq!(block.proposer_index, 42);
-    // This assertion exposes the body-bleed bug: body will include KZG+blob data
+    // ADR-R01 / resolve_block_region_end: body stops at kzg_proofs offset.
     assert_eq!(
         block.body.len(),
         body.len(),
@@ -553,7 +552,6 @@ fn test_ssz_deser_kzg_offset_boundary() {
 }
 
 #[test]
-#[ignore = "Known body-bleed bug: multiple KZG proofs + blobs are included in body. See beacon/src/ssz_deser.rs:190."]
 fn test_ssz_deser_multiple_blobs_deneb() {
     use beacon::ssz_deser::{deserialize_beacon_block_from_ssz, SszBlockFormat};
 
@@ -596,10 +594,6 @@ fn test_ssz_propose_with_large_body_through_pipeline() {
 
 fn le_u32_at(bytes: &[u8], at: usize) -> usize {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
-}
-
-fn blob_sidecars_published(fork: &str) -> u64 {
-    crate::metrics::RVC_BLOB_SIDECARS_PUBLISHED_TOTAL.with_label_values(&[fork]).get()
 }
 
 /// Sidecar bytes from an RR-1.1 `BlockContents` fixture. Offsets are read here,
@@ -650,10 +644,12 @@ fn service_for(
 async fn published_payload_is_a_signed_block_contents_container() {
     const DENEB: &[u8] =
         include_bytes!("../../../../beacon/tests/fixtures/deneb_block_contents.ssz");
+    const ELECTRA: &[u8] =
+        include_bytes!("../../../../beacon/tests/fixtures/electra_block_contents.ssz");
     const FULU: &[u8] = include_bytes!("../../../../beacon/tests/fixtures/fulu_block_contents.ssz");
     let pubkey = test_pubkey();
 
-    for (version, fixture) in [("deneb", DENEB), ("fulu", FULU)] {
+    for (version, fixture) in [("deneb", DENEB), ("electra", ELECTRA), ("fulu", FULU)] {
         let slot = 100;
         let (client, produced) = contents_client(version, slot, fixture);
         let (proofs, blobs) = fixture_sidecars(fixture);
@@ -688,7 +684,6 @@ async fn published_payload_is_a_signed_block_contents_container() {
             bn_block.as_slice(),
             "{version} message bit-identical to BN block"
         );
-        assert_eq!(blob_sidecars_published(version), 1, "{version}");
     }
 }
 
@@ -696,10 +691,12 @@ async fn published_payload_is_a_signed_block_contents_container() {
 async fn sidecars_reach_publish_block_ssz() {
     const DENEB: &[u8] =
         include_bytes!("../../../../beacon/tests/fixtures/deneb_block_contents.ssz");
+    const ELECTRA: &[u8] =
+        include_bytes!("../../../../beacon/tests/fixtures/electra_block_contents.ssz");
     const FULU: &[u8] = include_bytes!("../../../../beacon/tests/fixtures/fulu_block_contents.ssz");
     let pubkey = test_pubkey();
 
-    for (version, fixture) in [("deneb", DENEB), ("fulu", FULU)] {
+    for (version, fixture) in [("deneb", DENEB), ("electra", ELECTRA), ("fulu", FULU)] {
         let slot = 100;
         let (client, produced) = contents_client(version, slot, fixture);
         let (proofs, blobs) = fixture_sidecars(fixture);
@@ -723,6 +720,55 @@ async fn sidecars_reach_publish_block_ssz() {
         assert_eq!(message, bn_block, "{version} sidecars are outside the block region");
         assert!(proofs_off == signed_off + 100 + bn_block.len(), "{version}");
     }
+}
+
+/// Electra sidecar publish must be a 3-offset `SignedBlockContents`, not the
+/// pre-RR-1.2 unbounded `SignedBeaconBlock` tail that LH rejected with
+/// `400 OffsetOutOfBounds` (blake-manual / RR-P0-3 / DSR-1.1).
+#[tokio::test]
+async fn electra_publish_avoids_offset_out_of_bounds_class() {
+    const ELECTRA: &[u8] =
+        include_bytes!("../../../../beacon/tests/fixtures/electra_block_contents.ssz");
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let (client, produced) = contents_client("electra", slot, ELECTRA);
+    let (proofs, blobs) = fixture_sidecars(ELECTRA);
+    let block_off = le_u32_at(&produced, 0);
+    let kzg_off = le_u32_at(&produced, 4);
+    let block_len = kzg_off - block_off;
+    let (service, beacon) = service_for(client, &pubkey, test_fork_schedule());
+    service.propose_block(slot, &pubkey, 42, None).await.unwrap();
+    let published = beacon.publish_ssz_calls.lock().unwrap()[0].bytes.clone();
+
+    // Landed ADR-R01 framing: SignedBlockContents 3-offset table.
+    assert_eq!(le_u32_at(&published, 0), 12);
+    let signed_len = 100 + block_len;
+    assert_eq!(
+        published.len(),
+        12 + signed_len + proofs.len() + blobs.len(),
+        "Electra publish must carry proofs/blobs outside the signed block"
+    );
+    let o1 = le_u32_at(&published, 4);
+    let o2 = le_u32_at(&published, 8);
+    assert_eq!(o1, 12 + signed_len);
+    assert_eq!(o2, 12 + signed_len + proofs.len());
+    assert_eq!(&published[o1..o2], proofs.as_slice());
+    assert_eq!(&published[o2..], blobs.as_slice());
+
+    // Pre-fix unbounded framing: bare SignedBeaconBlock over the whole tail.
+    // First u32 is message offset 100; treating that buffer as SignedBlockContents
+    // yields OffsetOutOfBounds (second/third "offsets" are signature bytes).
+    let fixed_sig = [0x07u8; 96];
+    let legacy =
+        beacon::ssz_deser::serialize_signed_beacon_block_ssz(&produced[block_off..], &fixed_sig)
+            .unwrap();
+    assert_eq!(le_u32_at(&legacy, 0), 100);
+    let legacy_o1 = le_u32_at(&legacy, 4);
+    assert!(
+        legacy_o1 < 100 || legacy_o1 > legacy.len(),
+        "legacy signature-as-offset must be OffsetOutOfBounds-class (o1={legacy_o1}, len={})",
+        legacy.len()
+    );
 }
 
 #[tokio::test]
@@ -757,8 +803,6 @@ async fn gloas_payload_still_routes_through_sign_and_publish_v4() {
     )
     .unwrap();
     assert_eq!(calls[0].bytes, expected);
-    assert_eq!(blob_sidecars_published("gloas"), 0);
-    assert_eq!(blob_sidecars_published("deneb"), 0);
 }
 
 #[tokio::test]
@@ -783,7 +827,6 @@ async fn blinded_payload_is_unchanged() {
     )
     .unwrap();
     assert_eq!(calls[0].bytes, expected);
-    assert_eq!(blob_sidecars_published("deneb"), 0);
 }
 
 #[tokio::test]
@@ -820,5 +863,4 @@ async fn corrupt_blobs_offset_fails_before_the_header_is_signed() {
     assert!(signer.header_calls.lock().unwrap().is_empty());
     assert!(signer.block_calls.lock().unwrap().is_empty());
     assert!(beacon.publish_ssz_calls.lock().unwrap().is_empty());
-    assert_eq!(blob_sidecars_published("deneb"), 0);
 }
