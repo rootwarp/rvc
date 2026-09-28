@@ -259,5 +259,6 @@ The suite is offline (`pytest-socket` blocks DNS). A `UserWarning` about `socket
 | `--liveness-check` | off | Head-window sanity only |
 | `--dry-run` | off | Window + keys, no metrics |
 | `--no-cache` | off | Skip index cache |
+| `--proposer-duties-dir PATH` | — | Prefer soak-persisted `{epoch}.json` over live BN proposer-duties GETs (DSR-0.2) |
 | `-v` / `-vv` | 0 | Per-request diagnostics, redacted |
 | `-q` | off | Silent stderr on a healthy run |

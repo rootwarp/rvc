@@ -355,6 +355,7 @@ _DOCUMENTED_FLAGS = {
     "--liveness-check",
     "--dry-run",
     "--no-cache",
+    "--proposer-duties-dir",
     "-v",
     "-q",
 }
@@ -5881,6 +5882,7 @@ def _collect_prop(
     budget=None,
     pool=None,
     rewards_api="available",
+    duties_dir=None,
 ):
     transport = _inclusion_transport(vp, routes)
     client, _ = _client(vp, transport)
@@ -5888,14 +5890,35 @@ def _collect_prop(
         budget = vp.RequestBudget()
     if pool is not None:
         outcomes, degs, available = vp.collect_proposals(
-            client, w, index_set, pool, budget, rewards_api
+            client,
+            w,
+            index_set,
+            pool,
+            budget,
+            rewards_api,
+            duties_dir=duties_dir,
         )
         return outcomes, degs, available, transport, budget
     with ThreadPoolExecutor(max_workers=concurrency) as owned:
         outcomes, degs, available = vp.collect_proposals(
-            client, w, index_set, owned, budget, rewards_api
+            client,
+            w,
+            index_set,
+            owned,
+            budget,
+            rewards_api,
+            duties_dir=duties_dir,
         )
     return outcomes, degs, available, transport, budget
+
+
+def _plant_proposer_duties_snapshot(tmp_path, epoch, payload):
+    root = tmp_path / "proposer_duties"
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{epoch}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    path.chmod(0o600)
+    return root
 
 
 def _assert_duties_unavailable(vp, outcomes, degs, available, epoch):
@@ -6033,6 +6056,75 @@ def test_unavailable_duties_emit_proposer_duties_unavailable_and_exit_3(vp, load
     assert vp.decide_exit_code(run, _window_opts(vp)) == vp.EXIT_DEGRADED == 3
     assert vp.EXIT_ERROR == 1
     assert vp.decide_exit_code(run, _window_opts(vp)) != vp.EXIT_ERROR
+
+
+def test_proposer_duties_dir_flag_is_accepted(vp):
+    opts = vp.build_options(
+        _minimal_opts_argv("--proposer-duties-dir", "/tmp/proposer_duties")
+    )
+    assert opts.proposer_duties_dir == "/tmp/proposer_duties"
+    assert vp.build_options(_minimal_opts_argv()).proposer_duties_dir is None
+
+
+def test_snapshot_duties_survive_pruned_bn_404(vp, load, tmp_path):
+    """Post-pruning blake-manual: live BN 404s, soak snapshot still supplies duties."""
+    w = _att_window(vp, 100, 100)
+    payload = load("duties_proposer__ok")
+    duties_dir = _plant_proposer_duties_snapshot(tmp_path, 100, payload)
+    fail = _duty_error(vp, "duties_proposer__404", 404)
+    routes = _duty_routes(w, fail)
+    routes[("GET", _blocks_path(3200))] = [raw_response(vp, "rewards_blocks__ok")]
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, routes, duties_dir=str(duties_dir)
+    )
+    assert available is True
+    assert not any(d.reason == "proposer_duties_unavailable" for d in degs)
+    assert 1 in outcomes
+    assert any(o.slot == 3200 for o in outcomes[1])
+    gets = [c for c in transport.calls if "duties/proposer/" in c[2]]
+    assert gets == []
+
+
+def test_missing_snapshot_falls_back_to_live_bn(vp, tmp_path):
+    w = _att_window(vp, 100, 100)
+    duties_dir = tmp_path / "proposer_duties"
+    duties_dir.mkdir()
+    ok = raw_response(vp, "duties_proposer__ok")
+    routes = _duty_routes(w, ok)
+    routes[("GET", _blocks_path(3200))] = [raw_response(vp, "rewards_blocks__ok")]
+    outcomes, degs, available, transport, _budget = _collect_prop(
+        vp, w, {1}, routes, duties_dir=str(duties_dir)
+    )
+    assert available is True
+    assert not any(d.reason == "proposer_duties_unavailable" for d in degs)
+    gets = [c for c in transport.calls if "duties/proposer/" in c[2]]
+    assert len(gets) == 1
+    assert outcomes.get(1)
+
+
+def test_load_proposer_duties_snapshot_rejects_symlink(vp, tmp_path):
+    duties_dir = tmp_path / "proposer_duties"
+    duties_dir.mkdir()
+    target = tmp_path / "elsewhere.json"
+    target.write_text('{"data":[]}\n', encoding="utf-8")
+    link = duties_dir / "100.json"
+    link.symlink_to(target)
+    assert vp.load_proposer_duties_snapshot(str(duties_dir), 100) is None
+
+
+def test_load_proposer_duties_snapshot_rejects_oversized(vp, tmp_path, monkeypatch):
+    duties_dir = _plant_proposer_duties_snapshot(
+        tmp_path, 100, {"data": [{"slot": "1", "validator_index": "1"}]}
+    )
+    monkeypatch.setattr(vp, "MAX_RESPONSE_BYTES", 8)
+    assert vp.load_proposer_duties_snapshot(str(duties_dir), 100) is None
+
+
+def test_load_proposer_duties_snapshot_ok(vp, load, tmp_path):
+    payload = load("duties_proposer__ok")
+    duties_dir = _plant_proposer_duties_snapshot(tmp_path, 100, payload)
+    rows = vp.load_proposer_duties_snapshot(str(duties_dir), 100)
+    assert rows == payload["data"]
 
 
 def test_one_duties_request_per_epoch(vp):

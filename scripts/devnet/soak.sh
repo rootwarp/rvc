@@ -14,6 +14,7 @@ _SOAK_END_CLAMP_EPOCHS=2
 _SOAK_TRIPPED=0
 _SOAK_TRIP_MSG=""
 _K8_BASE=""
+_PROPOSER_DUTIES_DIR=""
 
 _require_nnint() {
     local name="$1"
@@ -195,6 +196,166 @@ _scrape_gauges() {
     return 0
 }
 
+# DSR-0.2 / FR-P1-2: persist proposer duties while the epoch is still live so
+# post-soak validator_perf does not 404 on Lighthouse-pruned states.
+_ensure_proposer_duties_dir() {
+    local parent
+    if [[ -z "${RUN_DIR:-}" ]]; then
+        die_usage "_ensure_proposer_duties_dir requires RUN_DIR"
+    fi
+    _PROPOSER_DUTIES_DIR="${RUN_DIR}/proposer_duties"
+    parent="$(dirname -- "$_PROPOSER_DUTIES_DIR")"
+    if [[ -L "$parent" || -L "$_PROPOSER_DUTIES_DIR" ]]; then
+        die_usage "refusing symlink: ${_PROPOSER_DUTIES_DIR}"
+    fi
+    mkdir -p -- "$_PROPOSER_DUTIES_DIR" || die_infra "cannot create ${_PROPOSER_DUTIES_DIR}"
+    chmod 700 "$_PROPOSER_DUTIES_DIR" || true
+}
+
+# Wipe reused run-dir snapshots (e.g. runs/manual) so skip-if-exists cannot
+# keep prior-chain or partial {epoch}.json across soak starts.
+_reset_proposer_duties_dir() {
+    local parent
+    if [[ -z "${RUN_DIR:-}" ]]; then
+        die_usage "_reset_proposer_duties_dir requires RUN_DIR"
+    fi
+    _PROPOSER_DUTIES_DIR="${RUN_DIR}/proposer_duties"
+    parent="$(dirname -- "$_PROPOSER_DUTIES_DIR")"
+    if [[ -L "$parent" ]]; then
+        die_usage "refusing symlink: ${parent}"
+    fi
+    if [[ -L "$_PROPOSER_DUTIES_DIR" ]]; then
+        die_usage "refusing symlink: ${_PROPOSER_DUTIES_DIR}"
+    fi
+    if [[ -e "$_PROPOSER_DUTIES_DIR" && ! -d "$_PROPOSER_DUTIES_DIR" ]]; then
+        die_infra "proposer_duties is not a directory: ${_PROPOSER_DUTIES_DIR}"
+    fi
+    if [[ -d "$_PROPOSER_DUTIES_DIR" ]]; then
+        rm -rf -- "$_PROPOSER_DUTIES_DIR" || die_infra "cannot clear ${_PROPOSER_DUTIES_DIR}"
+    fi
+    mkdir -p -- "$_PROPOSER_DUTIES_DIR" || die_infra "cannot create ${_PROPOSER_DUTIES_DIR}"
+    chmod 700 "$_PROPOSER_DUTIES_DIR" || true
+}
+
+_snapshot_proposer_duties() {
+    local epoch="${1:-}"
+    local dest url tmp code rc=0
+    case "$epoch" in
+        '' | *[!0-9]*)
+            return 1
+            ;;
+    esac
+    if [[ -z "${_PROPOSER_DUTIES_DIR:-}" ]]; then
+        _ensure_proposer_duties_dir
+    fi
+    dest="${_PROPOSER_DUTIES_DIR}/${epoch}.json"
+    if [[ -L "$dest" ]]; then
+        die_usage "refusing symlink: ${dest}"
+    fi
+    if [[ -f "$dest" ]]; then
+        return 0
+    fi
+    url="$(bn_url)/eth/v1/validator/duties/proposer/${epoch}"
+    tmp="$(mktemp "${TMPDIR:-/tmp}/rvc-proposer-duties.XXXXXX")" || return 1
+    code="$(_curl_hardened "${SCRAPE_TIMEOUT_S:-5}" -o "$tmp" -w '%{http_code}' -- "$url" 2>/dev/null || true)"
+    case "$code" in
+        200)
+            # Same-dir O_EXCL temp + os.replace (validator_perf cache / common.sh
+            # _atomic_replace_stdin). Short os.write fails and unlinks the temp so
+            # skip-if-exists cannot lock in an empty/partial {epoch}.json.
+            python3 -c '
+import json, os, stat, sys
+
+src, dest = sys.argv[1], sys.argv[2]
+nofollow = getattr(os, "O_NOFOLLOW", 0)
+try:
+    with open(src, encoding="utf-8") as fh:
+        payload = json.load(fh)
+except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    raise SystemExit(1)
+data = payload.get("data") if isinstance(payload, dict) else payload
+if not isinstance(data, list):
+    raise SystemExit(1)
+directory = os.path.dirname(os.path.abspath(dest))
+if os.path.islink(directory):
+    raise SystemExit(2)
+try:
+    st = os.lstat(dest)
+except OSError:
+    st = None
+if st is not None and stat.S_ISLNK(st.st_mode):
+    raise SystemExit(2)
+body = (json.dumps(payload) + "\n").encode()
+tmp_path = dest + ".tmp." + os.urandom(16).hex()
+fd = -1
+try:
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow, 0o600)
+    written = os.write(fd, body) if body else 0
+    if written != len(body):
+        raise OSError("short write")
+    os.fchmod(fd, 0o600)
+    os.close(fd)
+    fd = -1
+    if os.path.islink(tmp_path) or (os.path.lexists(dest) and os.path.islink(dest)):
+        os.unlink(tmp_path)
+        raise SystemExit(2)
+    os.replace(tmp_path, dest)
+    tmp_path = ""
+except OSError:
+    raise SystemExit(1)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    if tmp_path:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+' "$tmp" "$dest" || rc=$?
+            rm -f -- "$tmp"
+            if [[ "$rc" -eq 2 ]]; then
+                die_usage "refusing symlink: ${dest}"
+            fi
+            if [[ "$rc" -ne 0 ]]; then
+                log_warn "proposer duties snapshot epoch ${epoch}: invalid body"
+                return 1
+            fi
+            return 0
+            ;;
+        *)
+            rm -f -- "$tmp"
+            log_warn "proposer duties snapshot epoch ${epoch}: HTTP ${code:-000}"
+            return 1
+            ;;
+    esac
+}
+
+_snapshot_proposer_duties_for_slot() {
+    local slot="$1"
+    local spe epoch
+    spe="$(_slots_per_epoch)"
+    epoch=$((slot / spe))
+    _snapshot_proposer_duties "$epoch" || true
+    if [[ "$epoch" -gt 0 ]]; then
+        _snapshot_proposer_duties "$((epoch - 1))" || true
+    fi
+}
+
+_backfill_proposer_duties() {
+    local start_slot="$1"
+    local end_slot="$2"
+    local spe start_ep end_ep ep
+    if [[ "$end_slot" -le "$start_slot" ]]; then
+        return 0
+    fi
+    spe="$(_slots_per_epoch)"
+    start_ep=$((start_slot / spe))
+    end_ep=$(((end_slot - 1) / spe))
+    for ((ep = start_ep; ep <= end_ep; ep++)); do
+        _snapshot_proposer_duties "$ep" || true
+    done
+}
+
 _check_gates() {
     local rvc_code bn_code k8_now
     rvc_code="$(_soak_http_status "$(rvc_url)/health")"
@@ -231,7 +392,8 @@ print_soak_plan() {
     log_info "  gate interval: ${GATE_INTERVAL}"
     log_info "  1. scrape metrics-start.txt"
     log_info "  2. per-slot gates + samples.jsonl"
-    log_info "  3. scrape metrics-end.txt"
+    log_info "  3. snapshot proposer duties → proposer_duties/"
+    log_info "  4. scrape metrics-end.txt"
 }
 
 _soak_gate_loop() {
@@ -251,6 +413,7 @@ _soak_gate_loop() {
         fi
         if [[ "$sample" -eq 1 ]]; then
             _scrape_gauges "$slot" "$samples" || true
+            _snapshot_proposer_duties_for_slot "$slot"
         fi
         slot=$((slot + step))
     done
@@ -298,6 +461,7 @@ main() {
     _soak_truncate "$samples"
     _soak_truncate "${RUN_DIR}/metrics-start.txt"
     _soak_truncate "${RUN_DIR}/metrics-end.txt"
+    _reset_proposer_duties_dir
 
     # Offset 0 keeps the Phase-5 start scrape before the genesis clock so a
     # dead BN is still health 3 (not bn_get infra 1) with metrics-start present.
@@ -344,10 +508,17 @@ main() {
                 "$((sample_start + total + _SOAK_END_CLAMP_EPOCHS * spe))" \
                 "$step" "$do_sleep" 0 "$samples"
         fi
+        if [[ "$_SOAK_TRIPPED" -eq 0 ]]; then
+            _backfill_proposer_duties "$sample_start" "$((sample_start + total))"
+        fi
     fi
 
     _scrape_raw "${RUN_DIR}/metrics-end.txt" || true
     chmod 600 "${RUN_DIR}/metrics-start.txt" "${RUN_DIR}/metrics-end.txt" "$samples" || true
+    if [[ -d "${_PROPOSER_DUTIES_DIR:-}" ]]; then
+        chmod 700 "$_PROPOSER_DUTIES_DIR" || true
+        chmod 600 "${_PROPOSER_DUTIES_DIR}"/*.json 2>/dev/null || true
+    fi
 
     if [[ "$_SOAK_TRIPPED" -eq 1 ]]; then
         die_health "${_SOAK_TRIP_MSG}"

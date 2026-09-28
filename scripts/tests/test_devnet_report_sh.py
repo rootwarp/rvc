@@ -354,6 +354,22 @@ def test_report_sh_chain_json_is_child_stdout(tmp_path: Path):
     assert "--json" in argv
     assert pairs["--beacon-url"] == ["http://127.0.0.1:5052"]
     assert "--degraded-ok" not in argv
+    assert "--proposer-duties-dir" not in pairs
+
+
+def test_report_sh_forwards_proposer_duties_dir_when_present(tmp_path: Path):
+    """DSR-0.2: report feeds soak snapshots into validator_perf."""
+    run_dir = plant_run_dir(tmp_path)
+    duties = run_dir / "proposer_duties"
+    duties.mkdir()
+    (duties / "4.json").write_text('{"data":[]}\n', encoding="utf-8")
+    proc, argv_log = run_report(
+        tmp_path, ["--run-dir", str(run_dir)], vp_body="ok", vp_exit=0
+    )
+    assert proc.returncode == 0, proc.stderr
+    pairs = argv_pairs(argv_list(argv_log))
+    assert "--proposer-duties-dir" in pairs
+    assert Path(pairs["--proposer-duties-dir"][0]).resolve() == duties.resolve()
 
 
 def test_report_sh_rvc_pubkeys_is_bare_hex_from_rvc_json(tmp_path: Path):
