@@ -322,6 +322,8 @@ Import conflicts are logged and counted (`rvc_slashing_import_conflicts_total`).
 
 Deneb/Electra/Fulu blocks are published as full SignedBlockContents with sidecars. The JSON produce/publish path is now live and publishes `SignedBlockContents` with `kzg_proofs` and `blobs`. Nodes that accepted the prior malformed payload may behave differently.
 
+Electra SSZ publish relies on the landed RR ADR-R01 path (`resolve_block_region_end` / `deserialize_block_contents_ssz` in #345 `02336892`, and `sign_and_publish_ssz` SignedBlockContents framing in #346 `acb9d997`). DSR-1.1 (#376) verified that path with an Electra BlockContents fixture: the pre-fix unbounded `SignedBeaconBlock` framing is OffsetOutOfBounds-class against a 3-offset decoder; the landed framing is not. No additional wire change in DSR-1.1.
+
 ## Behaviour: BN attempt budgets
 
 Each BN attempt gets a floored share of the operation budget; timeouts degrade node health, including when every node hangs.

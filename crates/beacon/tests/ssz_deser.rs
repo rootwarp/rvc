@@ -1,8 +1,8 @@
 //! Pre-Gloas `BlockContents` split and 3-offset framing.
 //!
-//! Fixtures in `tests/fixtures/` are Deneb and Fulu `BlockContents` with two
-//! 48-byte proofs and two 64-byte blobs. The blob region is opaque and smaller
-//! than a consensus blob; the decoder copies it byte-for-byte.
+//! Fixtures in `tests/fixtures/` are Deneb, Electra, and Fulu `BlockContents`
+//! with two 48-byte proofs and two 64-byte blobs. The blob region is opaque and
+//! smaller than a consensus blob; the decoder copies it byte-for-byte.
 
 use beacon::ssz_deser::{
     deserialize_block_contents_ssz, deserialize_gloas_block_contents,
@@ -11,9 +11,11 @@ use beacon::ssz_deser::{
 };
 
 const DENEB_BLOCK_CONTENTS: &[u8] = include_bytes!("fixtures/deneb_block_contents.ssz");
+const ELECTRA_BLOCK_CONTENTS: &[u8] = include_bytes!("fixtures/electra_block_contents.ssz");
 const FULU_BLOCK_CONTENTS: &[u8] = include_bytes!("fixtures/fulu_block_contents.ssz");
 
 const DENEB_BODY: &[u8] = &[0xAB; 32];
+const ELECTRA_BODY: &[u8] = &[0xEE; 32];
 const FULU_BODY: &[u8] = &[0xCC; 32];
 
 fn le_u32(bytes: &[u8], at: usize) -> usize {
@@ -41,6 +43,7 @@ fn beacon_block_ssz(
 fn block_contents_split_bounds_block_by_the_kzg_offset() {
     for (label, bytes, slot, body) in [
         ("deneb", DENEB_BLOCK_CONTENTS, 7_000_000_u64, DENEB_BODY),
+        ("electra", ELECTRA_BLOCK_CONTENTS, 11_649_024, ELECTRA_BODY),
         ("fulu", FULU_BLOCK_CONTENTS, 15_000_000, FULU_BODY),
     ] {
         let block_off = le_u32(bytes, 0);
@@ -69,7 +72,7 @@ fn block_contents_split_bounds_block_by_the_kzg_offset() {
 
 #[test]
 fn serialize_signed_block_contents_round_trips() {
-    for bytes in [DENEB_BLOCK_CONTENTS, FULU_BLOCK_CONTENTS] {
+    for bytes in [DENEB_BLOCK_CONTENTS, ELECTRA_BLOCK_CONTENTS, FULU_BLOCK_CONTENTS] {
         let parsed = deserialize_block_contents_ssz(bytes, SszBlockFormat::BlockContents).unwrap();
         let framed =
             serialize_signed_block_contents_ssz(parsed.block_ssz, parsed.kzg_proofs, parsed.blobs);
@@ -166,4 +169,69 @@ fn gloas_path_is_unchanged() {
     assert_eq!(parsed.block.parent_root, [0x11; 32]);
     assert_eq!(parsed.block.state_root, [0x22; 32]);
     assert_eq!(parsed.block.body, vec![0xde, 0xad]);
+}
+
+/// LH-style monotonicity check for a 3-offset `SignedBlockContents` / `BlockContents`
+/// table. Returns `Err` with an `OffsetOutOfBounds`-class message when offsets are
+/// not monotonic or exceed the buffer — the blake-manual / RR-P0-3 failure mode.
+fn signed_block_contents_offsets_ok(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() < 12 {
+        return Err(format!("OffsetOutOfBounds: buffer {} < 12", bytes.len()));
+    }
+    let o0 = le_u32(bytes, 0);
+    let o1 = le_u32(bytes, 4);
+    let o2 = le_u32(bytes, 8);
+    if o0 < 12 {
+        return Err(format!("OffsetOutOfBounds: signed_block offset {o0} < 12"));
+    }
+    if o1 < o0 || o1 > bytes.len() {
+        return Err(format!(
+            "OffsetOutOfBounds: kzg_proofs offset {o1} (signed_block={o0}, len={})",
+            bytes.len()
+        ));
+    }
+    if o2 < o1 || o2 > bytes.len() {
+        return Err(format!(
+            "OffsetOutOfBounds: blobs offset {o2} (kzg={o1}, len={})",
+            bytes.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Pre-RR-1.2 Electra publish bug: frame a bare `SignedBeaconBlock` over the
+/// unbounded `BlockContents` tail (`ssz_bytes[block_offset..]`), then hand that
+/// buffer to a BN that expects `SignedBlockContents`. The first u32 is the
+/// message offset `100`, so the second/third "offsets" are signature bytes and
+/// fail the 3-offset table check (`OffsetOutOfBounds` / RR-P0-3).
+#[test]
+fn electra_legacy_unbounded_signed_framing_is_offset_out_of_bounds() {
+    let parsed =
+        deserialize_block_contents_ssz(ELECTRA_BLOCK_CONTENTS, SszBlockFormat::BlockContents)
+            .expect("electra fixture");
+    assert!(!parsed.kzg_proofs.is_empty());
+    assert!(!parsed.blobs.is_empty());
+
+    // Legacy: unbounded tail from the produce-block BlockContents offset.
+    let block_off = le_u32(ELECTRA_BLOCK_CONTENTS, 0);
+    let unbounded_tail = &ELECTRA_BLOCK_CONTENTS[block_off..];
+    let legacy = serialize_signed_beacon_block_ssz(unbounded_tail, &[0x07; 96]).unwrap();
+    let err = signed_block_contents_offsets_ok(&legacy).expect_err("legacy framing");
+    assert!(
+        err.contains("OffsetOutOfBounds"),
+        "legacy Electra publish must be OffsetOutOfBounds-class: {err}"
+    );
+
+    // ADR-R01 / RR-1.1+1.2: bounded block + sidecars as SignedBlockContents.
+    let signed_block = serialize_signed_beacon_block_ssz(parsed.block_ssz, &[0x07; 96]).unwrap();
+    let framed =
+        serialize_signed_block_contents_ssz(&signed_block, parsed.kzg_proofs, parsed.blobs);
+    signed_block_contents_offsets_ok(&framed).expect("ADR-R01 framing");
+    let signed_off = le_u32(&framed, 0);
+    let proofs_off = le_u32(&framed, 4);
+    let blobs_off = le_u32(&framed, 8);
+    assert_eq!(&framed[signed_off..proofs_off], signed_block.as_slice());
+    assert_eq!(&framed[proofs_off..blobs_off], parsed.kzg_proofs);
+    assert_eq!(&framed[blobs_off..], parsed.blobs);
+    assert_eq!(&framed[signed_off + 100..proofs_off], parsed.block_ssz);
 }
