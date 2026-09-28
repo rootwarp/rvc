@@ -61,6 +61,29 @@ pub static RVC_PROPOSER_BN_LATENCY_MS: LazyLock<HistogramVec> = LazyLock::new(||
     )
 });
 
+/// Op names whose successful BN attempts feed [`RVC_PROPOSER_BN_LATENCY_MS`].
+///
+/// Limited to block-production produce/publish RPCs (DSR-2.3 / FR-P1-5).
+pub(crate) fn is_proposer_block_production_op(op_name: &str) -> bool {
+    matches!(
+        op_name,
+        "produce_block_v3"
+            | "produce_block_v4"
+            | "publish_block"
+            | "publish_block_contents"
+            | "publish_blinded_block"
+            | "publish_block_ssz"
+            | "publish_execution_payload_envelope"
+    )
+}
+
+/// Record elapsed duration for a successful proposer BN RPC used in block production.
+pub(crate) fn observe_proposer_bn_latency(endpoint: &str, latency: std::time::Duration) {
+    let endpoint_label = endpoint_label(endpoint);
+    let ms = latency.as_secs_f64() * 1000.0;
+    RVC_PROPOSER_BN_LATENCY_MS.with_label_values(&[endpoint_label.as_str()]).observe(ms);
+}
+
 /// Per-BN per-capability serving state (1=capable, 0=incapable).
 ///
 /// Labels: endpoint, capability. Owned by issue 6.7; issue 8.3 consumes this
@@ -122,7 +145,11 @@ pub(crate) fn gather_health_tier_series() -> Vec<(String, i64)> {
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_label;
+    use super::{
+        endpoint_label, is_proposer_block_production_op, observe_proposer_bn_latency,
+        RVC_PROPOSER_BN_LATENCY_MS,
+    };
+    use std::time::Duration;
 
     #[test]
     fn init_twice_does_not_panic() {
@@ -142,6 +169,34 @@ mod tests {
             endpoint_label("user:secret@host"),
             "unknown",
             "parse failure (or non-http scheme) must not emit userinfo"
+        );
+    }
+
+    #[test]
+    fn test_is_proposer_block_production_op_covers_produce_and_publish() {
+        assert!(is_proposer_block_production_op("produce_block_v3"));
+        assert!(is_proposer_block_production_op("produce_block_v4"));
+        assert!(is_proposer_block_production_op("publish_block"));
+        assert!(is_proposer_block_production_op("publish_block_ssz"));
+        assert!(!is_proposer_block_production_op("get_genesis"));
+        assert!(!is_proposer_block_production_op("submit_attestation"));
+        assert!(!is_proposer_block_production_op("get_proposer_duties"));
+    }
+
+    #[test]
+    fn test_observe_proposer_bn_latency_increments_histogram_count() {
+        let endpoint = "http://127.0.0.1:18552";
+        let label = endpoint_label(endpoint);
+        let before =
+            RVC_PROPOSER_BN_LATENCY_MS.with_label_values(&[label.as_str()]).get_sample_count();
+
+        observe_proposer_bn_latency(endpoint, Duration::from_millis(12));
+
+        let after =
+            RVC_PROPOSER_BN_LATENCY_MS.with_label_values(&[label.as_str()]).get_sample_count();
+        assert!(
+            after > before,
+            "observe must bump histogram count; before={before}, after={after}"
         );
     }
 }

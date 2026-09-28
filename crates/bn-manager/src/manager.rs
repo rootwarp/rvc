@@ -417,10 +417,17 @@ impl BnManager {
         if outcomes.is_empty() {
             return;
         }
+        let observe_latency = crate::metrics::is_proposer_block_production_op(op_name);
         let mut trackers = self.health_trackers.write().await;
         for &(idx, outcome) in outcomes {
             match outcome {
                 TrackerOutcome::Success(latency) => {
+                    if observe_latency {
+                        crate::metrics::observe_proposer_bn_latency(
+                            trackers[idx].endpoint(),
+                            latency,
+                        );
+                    }
                     trackers[idx].record_success(latency);
                     trackers[idx].mark_capable(op_name);
                     if op_name == bn_capability::PRODUCE_BLOCK_V4 {
