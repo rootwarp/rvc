@@ -964,3 +964,89 @@ def test_assert_image_platforms_single_manifest_message(tmp_path: Path):
     assert "no index entry" not in proc.stderr
     assert "pull" not in log.read_text(encoding="utf-8")
     assert_no_secret(proc)
+
+
+def _k8_curl_stub(tmp_path: Path, *, body: str, code: str = "200", exit_rc: int = 0) -> Path:
+    log = tmp_path / "k8-curl.log"
+    stub = tmp_path / "k8-curl"
+    body_file = tmp_path / "k8-curl-body.txt"
+    body_file.write_text(body, encoding="utf-8")
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"log={shlex.quote(str(log))}\n"
+        f"bodyf={shlex.quote(str(body_file))}\n"
+        f"code={shlex.quote(code)}\n"
+        f"rc={exit_rc}\n"
+        "printf '%s\\n' \"$*\" >> \"$log\"\n"
+        "out=\"\"\n"
+        "want_code=0\n"
+        "prev=\"\"\n"
+        "for a in \"$@\"; do\n"
+        "  if [ \"$prev\" = \"-o\" ]; then out=\"$a\"; fi\n"
+        "  case \"$a\" in\n"
+        "    *http_code*) want_code=1 ;;\n"
+        "  esac\n"
+        "  prev=\"$a\"\n"
+        "done\n"
+        "if [ -n \"$out\" ] && [ \"$out\" != /dev/null ]; then\n"
+        "  cat \"$bodyf\" > \"$out\"\n"
+        "fi\n"
+        "if [ \"$want_code\" -eq 1 ]; then printf '%s' \"$code\"; fi\n"
+        "exit \"$rc\"\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+@pytest.mark.parametrize(
+    ("fixture", "want"),
+    [
+        ("k8_metrics__absent.txt", "0"),
+        ("k8_metrics__zero.txt", "0"),
+        ("k8_metrics__positive.txt", "1"),
+        # Optional Prometheus timestamp is ignored; value field is used.
+        ("k8_metrics__zero_with_timestamp.txt", "0"),
+        ("k8_metrics__positive_with_timestamp.txt", "1"),
+    ],
+)
+def test_k8_blocked_total_valid_scrape(tmp_path: Path, fixture: str, want: str):
+    body = (FIXTURES / fixture).read_text(encoding="utf-8")
+    stub = _k8_curl_stub(tmp_path, body=body, code="200")
+    proc = run_common(
+        "k8_blocked_total",
+        env={
+            "CURL": str(stub),
+            "RVC_METRICS_PORT": "8080",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == want
+    assert_no_secret(proc)
+
+
+@pytest.mark.parametrize(
+    ("fixture", "code"),
+    [
+        ("k8_metrics__empty.txt", "200"),
+        ("k8_metrics__malformed.txt", "200"),
+        ("k8_metrics__fractional.txt", "200"),
+        ("k8_metrics__zero.txt", "404"),
+        ("k8_metrics__absent.txt", "500"),
+    ],
+)
+def test_k8_blocked_total_invalid_scrape_fails(
+    tmp_path: Path, fixture: str, code: str
+):
+    body = (FIXTURES / fixture).read_text(encoding="utf-8")
+    stub = _k8_curl_stub(tmp_path, body=body, code=code)
+    proc = run_common(
+        "k8_blocked_total",
+        env={
+            "CURL": str(stub),
+            "RVC_METRICS_PORT": "8080",
+        },
+    )
+    assert proc.returncode == 1, proc.stderr
+    assert proc.stdout.strip() == ""
+    assert_no_secret(proc)

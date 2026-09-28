@@ -1,0 +1,2 @@
+# TYPE rvc_slashing_protection_checks_total counter
+rvc_slashing_protection_checks_total{result="safe"} 80
