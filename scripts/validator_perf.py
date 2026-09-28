@@ -186,6 +186,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--liveness-check", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-cache", action="store_true")
+    p.add_argument("--proposer-duties-dir")
     p.add_argument("-v", action="count", default=0, dest="verbose")
     p.add_argument("-q", action="store_true", dest="quiet")
     return p
@@ -391,6 +392,7 @@ class Options:
     fail_under: tuple[str, ...]
     liveness_check: bool
     no_cache: bool
+    proposer_duties_dir: str | None
 
 
 def build_options(argv: list[str] | None = None) -> Options:
@@ -423,6 +425,7 @@ def build_options(argv: list[str] | None = None) -> Options:
         fail_under=fail_under,
         liveness_check=args.liveness_check,
         no_cache=args.no_cache,
+        proposer_duties_dir=args.proposer_duties_dir,
     )
 
 
@@ -1876,6 +1879,39 @@ def _confirm_inclusion(
     return True, None, _reward_unreadable(epoch, slot)
 
 
+def load_proposer_duties_snapshot(
+    duties_dir: str | None, epoch: int
+) -> list | None:
+    """Load soak-persisted proposer duties for an epoch, if present (DSR-0.2)."""
+    if not duties_dir:
+        return None
+    path = os.path.join(duties_dir, f"{epoch}.json")
+    fd = -1
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags)
+        raw = os.read(fd, MAX_RESPONSE_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+            fd = -1
+    if len(raw) > MAX_RESPONSE_BYTES:
+        return None
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if isinstance(payload, dict) and "data" in payload:
+        data = payload["data"]
+    else:
+        data = payload
+    if not isinstance(data, list):
+        return None
+    return data
+
+
 def collect_proposals(
     client: BeaconClient,
     w: Window,
@@ -1883,6 +1919,8 @@ def collect_proposals(
     pool,
     budget,
     rewards_api: str = "available",
+    *,
+    duties_dir: str | None = None,
 ) -> tuple[dict[int, list[ProposalOutcome]], list[Degradation], bool]:
     degs: list[Degradation] = []
     out: dict[int, list[ProposalOutcome]] = {idx: [] for idx in index_set}
@@ -1891,7 +1929,9 @@ def collect_proposals(
     template = "/eth/v1/validator/duties/proposer/{epoch}"
 
     def worker(epoch: int) -> list[ProposalOutcome]:
-        rows = client.proposer_duties(epoch)
+        rows = load_proposer_duties_snapshot(duties_dir, epoch)
+        if rows is None:
+            rows = client.proposer_duties(epoch)
         if not isinstance(rows, list):
             # Empty-list would report scheduled=0 with no degradation.
             raise BeaconStatus(200, template, client._endpoint().label)
@@ -3329,7 +3369,13 @@ def main(
         )
         index_set = {ref.index for ref in refs if ref.index is not None}
         proposals, prop_degs, duties_available = collect_proposals(
-            client, window, index_set, pool, budget, ctx.rewards_api
+            client,
+            window,
+            index_set,
+            pool,
+            budget,
+            ctx.rewards_api,
+            duties_dir=opts.proposer_duties_dir,
         )
         snaps, bal_degs = collect_balances(
             client, window, refs, start=start_balances

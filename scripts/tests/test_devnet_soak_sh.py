@@ -175,6 +175,28 @@ def write_curl_stub(tmp_path: Path) -> tuple[Path, Path]:
         "    fi\n"
         "    exit 0\n"
         "    ;;\n"
+        "  */validator/duties/proposer/*)\n"
+        "    if [ -n \"${SOAK_EVENTS:-}\" ]; then\n"
+        "      epoch=${url##*/}\n"
+        "      printf 'proposer-duties %s\\n' \"$epoch\" >> \"$SOAK_EVENTS\"\n"
+        "    fi\n"
+        "    if [ -f \"$state/proposer-duties-code\" ]; then\n"
+        "      code=$(tr -d '[:space:]' < \"$state/proposer-duties-code\")\n"
+        "    else\n"
+        "      code=200\n"
+        "    fi\n"
+        "    if [ \"$code\" = 200 ]; then\n"
+        "      if [ -f \"$state/proposer-duties-body\" ]; then\n"
+        "        emit \"$(cat \"$state/proposer-duties-body\")\"\n"
+        "      else\n"
+        "        emit '{\"dependent_root\":\"0x00\",\"data\":[]}'\n"
+        "      fi\n"
+        "    fi\n"
+        "    if [ \"$want_code\" -eq 1 ]; then\n"
+        "      printf '%s' \"$code\"\n"
+        "    fi\n"
+        "    exit 0\n"
+        "    ;;\n"
         "esac\n"
         "printf '%s\\n' 'unscripted curl' >&2\n"
         "exit 1\n",
@@ -367,6 +389,12 @@ def test_soak_sh_syntax():
     assert "O_NOFOLLOW" in text
     assert "die_health" in text
     assert "attach-rvc.sh" in text
+    assert "proposer_duties" in text
+    assert "_snapshot_proposer_duties" in text
+    assert "_reset_proposer_duties_dir" in text
+    assert "os.replace" in text
+    assert "short write" in text
+    assert "O_EXCL" in text
     assert re.search(r"(?m)^\s*docker\s", text) is None
     common = COMMON.read_text(encoding="utf-8")
     assert "bn_url()" in common
@@ -907,4 +935,106 @@ def test_soak_profile_safe_sets_offset(tmp_path: Path):
     ]
     start_idx = event_lines.index("start-scrape")
     assert event_lines[:start_idx].count("bn-health") >= 1 + offset_slots
+
+
+def test_soak_persists_proposer_duties_snapshots(tmp_path: Path):
+    """DSR-0.2: soak writes per-epoch proposer duty JSON for the report window."""
+    run_dir = tmp_path / "runs" / "manual"
+    plant_rvc_json(run_dir)
+    events = tmp_path / "events.log"
+    body = FIXTURES / "duties_proposer__ok.json"
+    state = tmp_path / "curl-state"
+    write_curl_stub(tmp_path)
+    state.mkdir(exist_ok=True)
+    (state / "proposer-duties-body").write_text(
+        body.read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    proc, clog, _rlog = run_soak(
+        tmp_path,
+        soak_args(run_dir),
+        env={"SOAK_EVENTS": str(events)},
+        reset_stubs=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert_artifacts(run_dir)
+    duties_dir = run_dir / "proposer_duties"
+    assert duties_dir.is_dir()
+    # START_SLOT=10, SPE=6 → epoch 1 during the sampled window.
+    snap = duties_dir / "1.json"
+    assert snap.is_file()
+    payload = json.loads(snap.read_text(encoding="utf-8"))
+    assert isinstance(payload.get("data"), list)
+    event_lines = [
+        ln for ln in events.read_text(encoding="utf-8").splitlines() if ln.strip()
+    ]
+    assert any(ln.startswith("proposer-duties ") for ln in event_lines)
+    assert any("duties/proposer/" in c for c in stub_cmds(clog))
+
+
+def test_soak_proposer_duties_404_does_not_trip_soak(tmp_path: Path):
+    run_dir = tmp_path / "runs" / "manual"
+    plant_rvc_json(run_dir)
+    write_curl_stub(tmp_path)
+    state = tmp_path / "curl-state"
+    state.mkdir(exist_ok=True)
+    (state / "proposer-duties-code").write_text("404", encoding="utf-8")
+    proc, _clog, _rlog = run_soak(
+        tmp_path, soak_args(run_dir), reset_stubs=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert_artifacts(run_dir)
+    duties_dir = run_dir / "proposer_duties"
+    assert duties_dir.is_dir()
+    assert list(duties_dir.glob("*.json")) == []
+
+
+def test_soak_clears_stale_proposer_duties_on_reuse(tmp_path: Path):
+    """DSR-0.2 should-fix: reused runs/manual must not keep prior-chain snapshots."""
+    run_dir = tmp_path / "runs" / "manual"
+    plant_rvc_json(run_dir)
+    duties_dir = run_dir / "proposer_duties"
+    duties_dir.mkdir(parents=True)
+    stale = duties_dir / "99.json"
+    stale.write_text('{"data":[{"slot":"999","validator_index":"0"}]}\n', encoding="utf-8")
+    stale.chmod(0o600)
+    poison = duties_dir / "1.json"
+    poison.write_text("", encoding="utf-8")  # empty partial from a prior crash
+    poison.chmod(0o600)
+
+    body = FIXTURES / "duties_proposer__ok.json"
+    write_curl_stub(tmp_path)
+    state = tmp_path / "curl-state"
+    state.mkdir(exist_ok=True)
+    fresh = body.read_text(encoding="utf-8")
+    (state / "proposer-duties-body").write_text(fresh, encoding="utf-8")
+
+    proc, _clog, _rlog = run_soak(
+        tmp_path, soak_args(run_dir), reset_stubs=False
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert_artifacts(run_dir)
+    assert duties_dir.is_dir()
+    assert not stale.exists(), "prior-epoch snapshot must be cleared at soak start"
+    snap = duties_dir / "1.json"
+    assert snap.is_file()
+    payload = json.loads(snap.read_text(encoding="utf-8"))
+    assert isinstance(payload.get("data"), list)
+    assert payload != json.loads('{"data":[]}')
+    # Poison empty file must be replaced by a fresh atomic snapshot.
+    assert snap.stat().st_size > 0
+    assert payload == json.loads(fresh)
+
+
+def test_soak_proposer_duties_snapshot_write_is_atomic():
+    """Snapshot path must use same-dir temp + os.replace; short writes fail closed."""
+    text = SOAK.read_text(encoding="utf-8")
+    snap_fn = text.split("\n_snapshot_proposer_duties()")[1].split(
+        "\n_snapshot_proposer_duties_for_slot"
+    )[0]
+    assert "os.replace" in snap_fn
+    assert "O_EXCL" in snap_fn
+    assert "short write" in snap_fn
+    # Direct O_TRUNC into the final path is the Harper failure mode.
+    assert "O_TRUNC" not in snap_fn
+    assert "_reset_proposer_duties_dir" in text
 
