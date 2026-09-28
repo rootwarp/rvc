@@ -372,11 +372,17 @@ run_client_report() {
     fi
 }
 
-# Presence of K8 result="blocked" in metrics-end.txt. lstat + O_NOFOLLOW;
-# does not follow a leaf symlink. 0 = present, 1 = missing/unreadable.
-_end_scrape_has_k8_blocked() {
+# K8 blocked total from metrics-end.txt (DSR-0.1). lstat + O_NOFOLLOW;
+# does not follow a leaf symlink. Prints integer total; absent child on a
+# non-empty readable scrape → 0. Exit 1 on missing/empty/malformed scrape.
+# Sample line is Prometheus text: metric{labels} <value> [<timestamp>];
+# parse the value field (not $NF), require an exact non-negative integer.
+_end_scrape_k8_blocked_total() {
     python3 -c '
-import os, re, stat, sys
+import os
+import re
+import stat
+import sys
 
 path = sys.argv[1]
 nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -406,21 +412,41 @@ try:
     text = data.decode("utf-8")
 except UnicodeDecodeError:
     sys.exit(1)
+if not text.strip():
+    sys.exit(1)
 pat = re.compile(
-    r"^rvc_slashing_protection_checks_total\{[^}]*result=\"blocked\"",
+    r"^rvc_slashing_protection_checks_total\{[^}]*result=\"blocked\".*$",
     re.M,
 )
-sys.exit(0 if pat.search(text) else 1)
+lines = pat.findall(text)
+if not lines:
+    print(0)
+    sys.exit(0)
+# metric{labels} <value> [<optional timestamp>] — value is field 2.
+parts = lines[-1].split()
+if len(parts) < 2:
+    sys.exit(1)
+raw = parts[1]
+if not re.fullmatch(r"[0-9]+", raw):
+    sys.exit(1)
+print(int(raw))
+sys.exit(0)
 ' "${RUN_DIR}/metrics-end.txt"
 }
 
 assert_no_blocked() {
-    # End-scrape presence (not a synthesized client.json end=0.0), then
-    # client.json numeric check. Fail closed on missing child, null /
-    # non-number end, end != 0, or monotonic_violation.
-    if ! _end_scrape_has_k8_blocked; then
+    # Valid end scrape: absent blocked → end=0 (absent-as-0). Empty /
+    # unreadable / malformed scrape fails closed (never healthy via absence).
+    # client.json: no blocked rows OR all end==0 without monotonic_violation.
+    local blocked_end
+    if ! blocked_end="$(_end_scrape_k8_blocked_total)"; then
         S7_BLOCKED="fail"
-        log_warn "K8 blocked missing or unreadable in metrics-end.txt"
+        log_warn "K8 blocked scrape missing or unreadable in metrics-end.txt"
+        return 0
+    fi
+    if [[ "$blocked_end" -gt 0 ]]; then
+        S7_BLOCKED="fail"
+        log_warn "K8 blocked > 0 in metrics-end.txt (${blocked_end})"
         return 0
     fi
     if jq -e '
@@ -428,8 +454,8 @@ assert_no_blocked() {
         | ($rows | type) == "array"
           and (
               [$rows[] | select(.labels.result == "blocked")] as $blocked
-              | ($blocked | length) > 0
-                and ($blocked | all(
+              | ($blocked | length) == 0
+                or ($blocked | all(
                     (.end | type == "number")
                     and (.end == 0)
                     and (.monotonic_violation != true)

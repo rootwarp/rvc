@@ -636,13 +636,87 @@ def test_soak_k8_unreadable_exits_3(tmp_path: Path):
     assert_artifacts(run_dir)
 
 
-def test_soak_k8_missing_series_exits_3(tmp_path: Path):
+def test_soak_k8_missing_series_treated_as_zero(tmp_path: Path):
+    """Valid HTTP 200 scrape without blocked child → absent-as-0 (DSR-0.1)."""
     run_dir = tmp_path / "run"
     plant_rvc_json(run_dir)
     write_curl_stub(tmp_path)
     write_report_stub(tmp_path)
     (tmp_path / "curl-state" / "metrics-body").write_text(
-        'rvc_slashing_protection_checks_total{result="safe"} 80\n',
+        (FIXTURES / "k8_metrics__absent.txt").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    proc, _, _ = run_soak(tmp_path, soak_args(run_dir), reset_stubs=False)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    assert_artifacts(run_dir)
+
+
+def test_soak_k8_empty_body_exits_3(tmp_path: Path):
+    """Empty metrics body must not pass K8 via absent-as-zero."""
+    run_dir = tmp_path / "run"
+    plant_rvc_json(run_dir)
+    write_curl_stub(tmp_path)
+    write_report_stub(tmp_path)
+    (tmp_path / "curl-state" / "metrics-body").write_text(
+        (FIXTURES / "k8_metrics__empty.txt").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    proc, _, _ = run_soak(tmp_path, soak_args(run_dir), reset_stubs=False)
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert "K8" in proc.stderr
+    assert "unreadable" in proc.stderr
+    assert_no_secret(proc)
+    assert_artifacts(run_dir)
+
+
+def test_soak_k8_malformed_blocked_exits_3(tmp_path: Path):
+    """Malformed blocked value must not pass K8 via absent-as-zero."""
+    run_dir = tmp_path / "run"
+    plant_rvc_json(run_dir)
+    write_curl_stub(tmp_path)
+    write_report_stub(tmp_path)
+    (tmp_path / "curl-state" / "metrics-body").write_text(
+        (FIXTURES / "k8_metrics__malformed.txt").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    proc, _, _ = run_soak(tmp_path, soak_args(run_dir), reset_stubs=False)
+    assert proc.returncode == 3, proc.stderr
+    assert proc.stdout == ""
+    assert "K8" in proc.stderr
+    assert_no_secret(proc)
+    assert_artifacts(run_dir)
+
+
+def test_soak_k8_zero_with_timestamp_passes(tmp_path: Path):
+    """Optional Prometheus timestamp is ignored; value 0 keeps K8 green."""
+    run_dir = tmp_path / "run"
+    plant_rvc_json(run_dir)
+    write_curl_stub(tmp_path)
+    write_report_stub(tmp_path)
+    (tmp_path / "curl-state" / "metrics-body").write_text(
+        (FIXTURES / "k8_metrics__zero_with_timestamp.txt").read_text(
+            encoding="utf-8"
+        ),
+        encoding="utf-8",
+    )
+    proc, _, _ = run_soak(tmp_path, soak_args(run_dir), reset_stubs=False)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+    assert_no_secret(proc)
+    assert_artifacts(run_dir)
+
+
+def test_soak_k8_fractional_blocked_exits_3(tmp_path: Path):
+    """Fractional blocked must not truncate to 0 and pass K8."""
+    run_dir = tmp_path / "run"
+    plant_rvc_json(run_dir)
+    write_curl_stub(tmp_path)
+    write_report_stub(tmp_path)
+    (tmp_path / "curl-state" / "metrics-body").write_text(
+        (FIXTURES / "k8_metrics__fractional.txt").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     proc, _, _ = run_soak(tmp_path, soak_args(run_dir), reset_stubs=False)
