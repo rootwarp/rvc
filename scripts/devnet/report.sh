@@ -311,6 +311,7 @@ translate_perf_exit() {
 run_chain_report() {
     local out="${RUN_DIR}/chain.json"
     local epochs child_rc=0 write_rc=0 item
+    local duties_dir="${RUN_DIR}/proposer_duties"
     local -a cmd _pipe
 
     epochs="$(_epochs_from_run_json)"
@@ -322,6 +323,10 @@ run_chain_report() {
         --allow-unfinalized
         --json
     )
+    # DSR-0.2: prefer soak-persisted duties over live BN (pruned LH 404).
+    if [[ -d "$duties_dir" && ! -L "$duties_dir" ]]; then
+        cmd+=(--proposer-duties-dir "$duties_dir")
+    fi
     if [[ ${#FAIL_UNDER_ARGS[@]} -gt 0 ]]; then
         for item in "${FAIL_UNDER_ARGS[@]}"; do
             cmd+=(--fail-under "$item")

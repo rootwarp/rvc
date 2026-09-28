@@ -173,11 +173,11 @@ Holds N epochs behind per-slot health gates. Aborts **3** if RVC `/health` ≠ 2
 scripts/devnet/soak.sh --run-dir scripts/devnet/runs/manual --epochs 4 < /dev/null
 ```
 
-Writes `metrics-start.txt`, `metrics-end.txt`, `samples.jsonl`.
+Writes `metrics-start.txt`, `metrics-end.txt`, `samples.jsonl`, and `proposer_duties/<epoch>.json` (DSR-0.2 — see [Proposer duty snapshots](#proposer-duty-snapshots-dsr-02)).
 
 ### Report
 
-Shells out to `scripts/validator_perf.py` for RVC's pubkeys only (`--pubkeys-file`, `--epochs` from `run.json`, `--allow-unfinalized`, `--json`) and to `scripts/devnet_report.py report` for the client half. Never passes `--degraded-ok` — it must observe validator_perf's `3` to annotate it.
+Shells out to `scripts/validator_perf.py` for RVC's pubkeys only (`--pubkeys-file`, `--epochs` from `run.json`, `--allow-unfinalized`, `--json`, and `--proposer-duties-dir` when `proposer_duties/` exists) and to `scripts/devnet_report.py report` for the client half. Never passes `--degraded-ok` — it must observe validator_perf's `3` to annotate it.
 
 ```bash
 scripts/devnet/report.sh --run-dir scripts/devnet/runs/manual < /dev/null
@@ -206,6 +206,20 @@ Report `assert_no_blocked` and soak `k8_blocked_total` share one rule (DSR-0.1 /
 | Scrape **unavailable**, empty, or **malformed** / unparseable | **Fail** (never healthy via absent-as-zero) |
 
 `blocked` must be an **exact non-negative integer** sample value (Prometheus `metric{labels} &lt;value&gt; [&lt;timestamp&gt;]`); optional timestamps are ignored. Fractional / exponent / `+N` forms fail closed (never truncate to 0). “Valid scrape” for report means a readable non-empty `metrics-end.txt`; for soak it means HTTP **200** with a non-empty `/metrics` body. Fixtures under `scripts/tests/fixtures/` cover absent · zero · positive · timestamp · fractional · empty · malformed (`k8_metrics__*.txt`, `rvc_metrics__end_k8_absent.txt`).
+
+### Proposer duty snapshots (DSR-0.2)
+
+Post-soak `validator_perf` used to hit HTTP **404** on Lighthouse-pruned `/eth/v1/validator/duties/proposer/{epoch}` for soak epochs that were live during the run, which surfaced as unexplained `proposer_duties_unavailable` in `chain.json`.
+
+**Operator behavior:** each soak start clears (recreates) `proposer_duties/` alongside truncating `samples.jsonl` / `metrics-*.txt`, so a reused `runs/manual` cannot keep stale or partial `{epoch}.json` from a prior chain. During the sampling gate loop (and a final backfill), `soak.sh` GETs proposer duties for each live epoch and writes `runs/<id>/proposer_duties/<epoch>.json` atomically (temp + `os.replace`). `report.sh` passes `--proposer-duties-dir` to `validator_perf.py` when that directory exists. Snapshotted epochs are served from disk; missing epochs still fall back to the live BN. A transient snapshot failure is a warning only — soak does not abort.
+
+Cost vs alternatives: one GET per epoch (~KB JSON under the run dir) is cheaper than enabling Lighthouse historic-state restore, and keeps the full report window (no shrink-to-retained-states).
+
+### Decision Log
+
+| Date (UTC) | Decision |
+|------------|----------|
+| 2026-09-28 | **DSR-0.2 / FR-P1-2 — approach (1) persist proposer duties during soak.** Rejected (2) LH historic restore flags (BN disk/CPU) and (3) shrink report window to retained states (loses soak-epoch proposal coverage). Soak writes `proposer_duties/<epoch>.json`; report/`validator_perf` prefer those snapshots over live BN for in-window epochs. |
 
 ### Teardown
 
