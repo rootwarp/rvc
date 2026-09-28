@@ -3,6 +3,20 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Metrics: S5A zero children force-registered at init (DSR-2.4 / #383)
+
+Process init force-registers numeric zero samples (same pattern as PTC /
+`envelope_late`) for rare-event / presence families that blake-manual S5A missed:
+
+- `rvc_orchestrator_missed_slots_total`
+- `rvc_task_exits_total{task,outcome}` (known tasks × `ok`/`panic`/`cancelled`)
+- `rvc_bn_health_tier{endpoint="unknown"}` (real BN endpoints still come from the
+  sync poller)
+- `rvc_slashing_protection_checks_total{result="blocked"}`
+
+**Decision (FR-P2-1):** those families stay **hard-required** in S5A once zeros
+land. Soften S5A (FR-P2-2) is not done. See `docs/devnet-testbed.md` Decision Log.
+
 ## Metrics: `rvc_proposals_total` success / failed outcomes (DSR-1.2 / #377)
 
 `rvc_proposals_total` now force-registers `outcome=success` and `outcome=failed`

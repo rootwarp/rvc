@@ -165,6 +165,13 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_SSE_EVENTS_DROPPED_TOTAL);
     lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
     lazy_static::initialize(&RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL);
+    // DSR-2.4: force-register S5A zero children so scrapes see numeric samples.
+    let _ = RVC_BN_HEALTH_TIER.with_label_values(&[bn_health_tier::UNCONFIGURED_ENDPOINT]);
+    for task in task_exit_tasks::ALL {
+        for outcome in task_exit_outcome::ALL {
+            let _ = RVC_TASK_EXITS_TOTAL.with_label_values(&[task, outcome]);
+        }
+    }
 }
 
 /// Attestation status label values.
@@ -210,6 +217,35 @@ pub mod task_exit_outcome {
     pub const OK: &str = "ok";
     pub const PANIC: &str = "panic";
     pub const CANCELLED: &str = "cancelled";
+    /// Children force-registered at process init so scrapes see them at zero.
+    pub const ALL: &[&str] = &[OK, PANIC, CANCELLED];
+}
+
+/// Production TaskExecutor task names force-registered for
+/// [`RVC_TASK_EXITS_TOTAL`] zero children (DSR-2.4 / A-A5 ≈13 × 3).
+pub mod task_exit_tasks {
+    pub const ALL: &[&str] = &[
+        "metrics_server",
+        "monitoring_push",
+        "proposer_config_refresh",
+        "bn.sse",
+        "bn.sse.cancel",
+        "bn.sync_monitor",
+        "bn.sync_monitor.cancel",
+        "slashing_monitor",
+        "duty_orchestrator",
+        "liveness_loop",
+        "index.resolve",
+        "keymanager_api",
+        "secret_provider_refresh",
+    ];
+}
+
+/// Sentinel `endpoint` for [`RVC_BN_HEALTH_TIER`] force-register at init (DSR-2.4).
+///
+/// Real BN endpoints overwrite/add their own children from the sync poller.
+pub mod bn_health_tier {
+    pub const UNCONFIGURED_ENDPOINT: &str = "unknown";
 }
 
 /// `reason` label values for `rvc_slot_context_parent_fallback_total`.
@@ -281,6 +317,69 @@ mod tests {
         assert!(
             metric_names.contains(&"rvc_signer_slashing_tx_hold_duration_ms"),
             "rvc_signer_slashing_tx_hold_duration_ms should be registered"
+        );
+    }
+
+    #[test]
+    fn init_force_registers_task_exits_and_bn_health_tier_samples() {
+        init_metrics();
+        let gathered = REGISTRY.gather();
+
+        let exits = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_task_exits_total")
+            .expect("rvc_task_exits_total must be gatherable after init");
+        assert!(!exits.get_metric().is_empty(), "task_exits must expose numeric samples at init");
+        let mut outcomes = std::collections::BTreeSet::new();
+        let mut tasks = std::collections::BTreeSet::new();
+        for metric in exits.get_metric() {
+            for label in metric.get_label() {
+                match label.name() {
+                    "outcome" => {
+                        outcomes.insert(label.value());
+                    }
+                    "task" => {
+                        tasks.insert(label.value());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for expected in task_exit_outcome::ALL {
+            assert!(
+                outcomes.contains(expected),
+                "task_exits outcome={expected} must be force-registered, got {outcomes:?}"
+            );
+        }
+        for expected in task_exit_tasks::ALL {
+            assert!(
+                tasks.contains(expected),
+                "task_exits task={expected} must be force-registered, got {tasks:?}"
+            );
+        }
+
+        let health = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_bn_health_tier")
+            .expect("rvc_bn_health_tier must be gatherable after init");
+        assert!(
+            !health.get_metric().is_empty(),
+            "bn_health_tier must expose a numeric sample at init"
+        );
+        let endpoints: std::collections::BTreeSet<&str> = health
+            .get_metric()
+            .iter()
+            .filter_map(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|label| label.name() == "endpoint")
+                    .map(|label| label.value())
+            })
+            .collect();
+        assert!(
+            endpoints.contains(bn_health_tier::UNCONFIGURED_ENDPOINT),
+            "bn_health_tier unknown endpoint must be force-registered, got {endpoints:?}"
         );
     }
 
