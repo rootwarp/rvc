@@ -3,6 +3,22 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## DevNet: canonical green soak pins (DSR-3.1 / #386)
+
+Canonical fast-profile Docker soak+report archived after Phases 0–2:
+
+- tip `909a705e6717d1a6323770c6c8b71d1251643902`
+- `rvc:latest` `sha256:0d709ef8cececc10b3f6dfb774da5b13da463fcb9f003e3fec9f39d62dde6e3f`
+- Lighthouse `sigp/lighthouse:v8.2.2@sha256:9a62bb8705455136e1cf96613460960f80dc2faa9d75b5c16a3bfcc9210dcdd1`
+- run-id `dsr31-20260929-0408` (prior S5 roll-up `dsr25-20260929-0111`; aborted attempt `dsr31-20260929-0248` superseded)
+
+Operator harness/metrics behavior relied on for green verdicts:
+
+- **S5A** requires force-registered zero children (`missed_slots`, `task_exits`, `bn_health_tier`, slashing `blocked`)
+- **S5B** liveness includes `bn_health_tier` / latency observations
+- **S7** absent-as-0 for `blocked` on a valid scrape (empty/malformed scrape never passes)
+
+
 ## Metrics: S5A zero children force-registered at init (DSR-2.4 / #383)
 
 Process init force-registers numeric zero samples (same pattern as PTC /
