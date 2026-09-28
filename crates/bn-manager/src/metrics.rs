@@ -6,6 +6,27 @@ use metrics::{
     define_gauge_vec, define_histogram_vec, define_int_counter_vec, define_int_gauge_vec, GaugeVec,
     HistogramVec, IntCounterVec, IntGaugeVec,
 };
+use url::Url;
+
+/// `scheme://host:port` with userinfo and path stripped — dashboards key on host,
+/// not credentials or request path (issue 8.3 label hygiene).
+///
+/// Shared by `rvc_bn_capability_state` and `rvc_bn_health_tier`.
+pub(crate) fn endpoint_label(endpoint: &str) -> String {
+    match Url::parse(endpoint) {
+        Ok(mut parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_path("");
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string().trim_end_matches('/').to_string()
+        }
+        // Unparseable (or non-http) input must not become a label — userinfo
+        // can sit in a raw string that `Url::parse` rejects.
+        _ => "unknown".to_string(),
+    }
+}
 
 /// Counter for attestation operations.
 /// Labels: status (success, failed, skipped)
@@ -83,10 +104,44 @@ pub(crate) fn gather_capability_state_series() -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
+pub(crate) fn gather_health_tier_series() -> Vec<(String, i64)> {
+    let gathered = metrics::REGISTRY.gather();
+    let Some(mf) = gathered.iter().find(|m| m.name() == "rvc_bn_health_tier") else {
+        return Vec::new();
+    };
+    mf.get_metric()
+        .iter()
+        .filter_map(|metric| {
+            let endpoint = metric.get_label().iter().find_map(|label| {
+                (label.name() == "endpoint").then(|| label.value().to_string())
+            })?;
+            Some((endpoint, metric.get_gauge().get_value() as i64))
+        })
+        .collect()
+}
+
+#[cfg(test)]
 mod tests {
+    use super::endpoint_label;
+
     #[test]
     fn init_twice_does_not_panic() {
         super::init();
         super::init();
+    }
+
+    #[test]
+    fn test_endpoint_label_strips_userinfo_and_path() {
+        assert_eq!(endpoint_label("http://127.0.0.1:5052"), "http://127.0.0.1:5052");
+        assert_eq!(
+            endpoint_label("http://user:secret@bn.example:5052/eth/v4"),
+            "http://bn.example:5052"
+        );
+        assert_eq!(endpoint_label("not a url"), "unknown");
+        assert_eq!(
+            endpoint_label("user:secret@host"),
+            "unknown",
+            "parse failure (or non-http scheme) must not emit userinfo"
+        );
     }
 }

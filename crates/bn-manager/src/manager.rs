@@ -109,24 +109,6 @@ fn no_eligible_bn(op_name: &str, role: BnRole) -> BeaconError {
     BeaconError::NoEligibleBn { operation: op_name.to_string(), role: role.to_string() }
 }
 
-/// `scheme://host:port` with userinfo and path stripped — dashboards key on host,
-/// not credentials or request path (issue 8.3 label hygiene).
-fn capability_endpoint_label(endpoint: &str) -> String {
-    match Url::parse(endpoint) {
-        Ok(mut parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {
-            let _ = parsed.set_username("");
-            let _ = parsed.set_password(None);
-            parsed.set_path("");
-            parsed.set_query(None);
-            parsed.set_fragment(None);
-            parsed.to_string().trim_end_matches('/').to_string()
-        }
-        // Unparseable (or non-http) input must not become a label — userinfo
-        // can sit in a raw string that `Url::parse` rejects.
-        _ => "unknown".to_string(),
-    }
-}
-
 fn publish_capability(endpoint: &str, capability: &str, capable: bool) {
     #[cfg(not(test))]
     debug_assert!(
@@ -136,7 +118,7 @@ fn publish_capability(endpoint: &str, capability: &str, capable: bool) {
     if !bn_capability::ALL.contains(&capability) {
         return;
     }
-    let endpoint_label = capability_endpoint_label(endpoint);
+    let endpoint_label = crate::metrics::endpoint_label(endpoint);
     crate::metrics::RVC_BN_CAPABILITY_STATE
         .with_label_values(&[endpoint_label.as_str(), capability])
         .set(i64::from(capable));
@@ -521,21 +503,30 @@ impl BnManager {
     }
 
     /// Checks sync status of all configured BNs immediately.
+    ///
+    /// Updates `rvc_bn_health_tier` for each endpoint from the polled sync detail.
     #[tracing::instrument(name = "bn_manager.check_sync_status", skip_all)]
     pub async fn check_sync_status(&self) {
-        check_all_sync_statuses(&self.clients, &self.sync_statuses).await;
+        check_all_sync_statuses(&self.clients, &self.sync_statuses, &self.tier_thresholds).await;
     }
 
     /// Starts a background task that periodically polls sync status.
     ///
     /// Uses the default interval of one epoch (~384 seconds) if `interval` is None.
+    /// Each poll refreshes `rvc_bn_health_tier` (DSR-2.2).
     pub fn start_sync_monitor(
         &self,
         interval: Option<Duration>,
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         let interval = interval.unwrap_or(DEFAULT_SYNC_CHECK_INTERVAL);
-        start_sync_monitor(self.clients.clone(), self.sync_statuses.clone(), interval, shutdown)
+        start_sync_monitor(
+            self.clients.clone(),
+            self.sync_statuses.clone(),
+            self.tier_thresholds.clone(),
+            interval,
+            shutdown,
+        )
     }
 
     /// Returns the endpoint URL of the first (primary) client.
@@ -2979,21 +2970,6 @@ mod tests {
             message: "x".to_string(),
         }));
         assert!(!is_production_failover_error(&BeaconError::ParseError("bad json".to_string())));
-    }
-
-    #[test]
-    fn test_capability_endpoint_label_strips_userinfo_and_path() {
-        assert_eq!(capability_endpoint_label("http://127.0.0.1:5052"), "http://127.0.0.1:5052");
-        assert_eq!(
-            capability_endpoint_label("http://user:secret@bn.example:5052/eth/v4"),
-            "http://bn.example:5052"
-        );
-        assert_eq!(capability_endpoint_label("not a url"), "unknown");
-        assert_eq!(
-            capability_endpoint_label("user:secret@host"),
-            "unknown",
-            "parse failure (or non-http scheme) must not emit userinfo"
-        );
     }
 
     #[test]
