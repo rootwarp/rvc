@@ -120,7 +120,9 @@ struct Registered {
 /// `register` wraps Infra `JoinHandle`s at the composition root (DAG). ARCH-3l
 /// registers `BnManager::start_sse`'s handle as `"bn.sse"`; a separate
 /// `"bn.sse.cancel"` forwarder maps the process token onto `watch<bool>`.
-/// Sync-monitor remains unwired; `keymanager-api` lifecycle is per-pubkey/C5-owned.
+/// DSR-2.1 likewise registers `BnManager::start_sync_monitor` as
+/// `"bn.sync_monitor"` (+ `"bn.sync_monitor.cancel"`). `keymanager-api`
+/// lifecycle is per-pubkey/C5-owned.
 pub struct TaskExecutor {
     token: CancellationToken,
     shutdown_tx: mpsc::Sender<ShutdownReason>,
@@ -174,7 +176,8 @@ impl TaskExecutor {
     /// # Call-site status (VD-2d)
     ///
     /// ARCH-3l calls `register("bn.sse", Background, start_sse_handle)` at the
-    /// call site so `bn-manager` stays Infra. Sync-monitor is still unwired;
+    /// call site so `bn-manager` stays Infra. DSR-2.1 registers
+    /// `start_sync_monitor` the same way (`"bn.sync_monitor"`).
     /// `keymanager-api` lifecycle is per-pubkey/C5-owned.
     ///
     /// # Monitor / registry split

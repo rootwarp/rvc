@@ -21,7 +21,7 @@
 //! |---|---|
 //! | `crates/bn-manager/src/manager.rs` (`start_sse`) | Infra crate; cannot depend on the composition-root executor without violating the DAG gate. ARCH-3l `register`s the returned `JoinHandle` from `bootstrap/tasks.rs` (`"bn.sse"`). |
 //! | `crates/bn-manager/src/sse.rs` | Same, plus: nested inside `subscribe_events`, whose handle is **discarded**. ARCH-3l makes the subscriber live (the inner dispatch task still exits when `subscribe_events` returns). |
-//! | `crates/bn-manager/src/sync_status.rs` (`start_sync_monitor`) | Same; **no production caller at HEAD**. |
+//! | `crates/bn-manager/src/sync_status.rs` (`start_sync_monitor`) | Same; DSR-2.1 `register`s the returned `JoinHandle` from `bootstrap/tasks.rs` (`"bn.sync_monitor"`). |
 //! | `crates/keymanager-api/src/lifecycle.rs` | Live, but **per-pubkey/per-import**: a `&'static str`-named registry entry per key is the wrong shape, and its cancellation is the C5 `stop_monitoring`/`cancel_monitoring` contract, unguarded until **G-6 lands in Phase 7**. |
 //!
 //! ## `spawn_blocking` (C9 anchor 7)

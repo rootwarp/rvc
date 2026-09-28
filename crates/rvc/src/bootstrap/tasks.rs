@@ -1,4 +1,4 @@
-//! Bootstrap phase: metrics, monitoring, proposer-config, and BN SSE tasks.
+//! Bootstrap phase: metrics, monitoring, proposer-config, BN SSE, and sync-monitor tasks.
 //!
 //! Extracted from the former `run_validator` tail so the ISSUE-4.10 metrics bind
 //! gate and task cancel/drain sequence can be unit-tested without the full
@@ -25,6 +25,12 @@ pub const SSE_TASK_NAME: &str = "bn.sse";
 
 /// Cancel-forwarder that maps the process token onto `start_sse`'s `watch<bool>`.
 pub const SSE_CANCEL_TASK_NAME: &str = "bn.sse.cancel";
+
+/// Executor name for the BN sync monitor (DSR-2.1 / FR-P1-3).
+pub const SYNC_MONITOR_TASK_NAME: &str = "bn.sync_monitor";
+
+/// Cancel-forwarder that maps the process token onto `start_sync_monitor`'s `watch<bool>`.
+pub const SYNC_MONITOR_CANCEL_TASK_NAME: &str = "bn.sync_monitor.cancel";
 
 /// Env var that opts in to non-loopback metrics binds (ISSUE-4.10 / L-10).
 pub const METRICS_ALLOW_NON_LOOPBACK_ENV: &str = "RVC_METRICS_ALLOW_NON_LOOPBACK";
@@ -205,6 +211,42 @@ pub fn spawn_sse_subscriber(
         sse_abort.abort();
     });
     Some(gate)
+}
+
+/// Register the BN sync-status monitor at tier [`ShutdownTier::Background`].
+///
+/// `None` / unconfigured uses [`TaskExecutor::register_opt`] so
+/// `rvc_tasks_running{task="bn.sync_monitor"}` stays honest. `start_sync_monitor`
+/// is Infra and cannot depend on the executor (DAG): its `JoinHandle` is passed
+/// to [`TaskExecutor::register`]. A small [`SYNC_MONITOR_CANCEL_TASK_NAME`]
+/// forwarder maps the process token onto `start_sync_monitor`'s `watch<bool>`
+/// and then aborts the Infra handle so drain does not wait on an in-flight poll.
+/// A panic in that handle is `ShutdownReason::Failure("bn.sync_monitor")`.
+///
+/// `interval` is forwarded to [`BnManager::start_sync_monitor`]; `None` uses the
+/// default one-epoch poll cadence.
+pub fn spawn_sync_monitor(
+    bn_manager: Option<Arc<BnManager>>,
+    executor: &TaskExecutor,
+    interval: Option<Duration>,
+) {
+    let Some(bn_manager) = bn_manager else {
+        executor.register_opt::<()>(SYNC_MONITOR_TASK_NAME, ShutdownTier::Background, None);
+        return;
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    info!("Starting beacon-node sync monitor");
+    let sync_handle = bn_manager.start_sync_monitor(interval, shutdown_rx);
+    let sync_abort = sync_handle.abort_handle();
+    executor.register(SYNC_MONITOR_TASK_NAME, ShutdownTier::Background, sync_handle);
+
+    let token = executor.token();
+    executor.spawn(SYNC_MONITOR_CANCEL_TASK_NAME, ShutdownTier::Background, async move {
+        token.cancelled().await;
+        let _ = shutdown_tx.send(true);
+        sync_abort.abort();
+    });
 }
 
 #[cfg(test)]
@@ -648,6 +690,175 @@ mod tests {
         assert!(
             !body.contains("executor.spawn(SSE_TASK_NAME"),
             "bn.sse must not be an adapter wrapper around start_sse"
+        );
+    }
+
+    // -- DSR-2.1: sync monitor bootstrap wiring --
+
+    #[tokio::test]
+    async fn test_sync_monitor_is_started_at_bootstrap() {
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_sync_monitor(Some(test_bn_manager()), &executor, Some(Duration::from_millis(50)));
+        let names = executor.registered_names();
+        assert!(
+            names.contains(&SYNC_MONITOR_TASK_NAME),
+            "missing registered task {SYNC_MONITOR_TASK_NAME}: {names:?}"
+        );
+        assert!(
+            names.contains(&SYNC_MONITOR_CANCEL_TASK_NAME),
+            "missing cancel-forwarder {SYNC_MONITOR_CANCEL_TASK_NAME}: {names:?}"
+        );
+        let entries = executor.registry_entries();
+        assert!(
+            entries.contains(&(SYNC_MONITOR_TASK_NAME, ShutdownTier::Background)),
+            "bn.sync_monitor must be Background, got {entries:?}"
+        );
+        assert!(
+            entries.contains(&(SYNC_MONITOR_CANCEL_TASK_NAME, ShutdownTier::Background)),
+            "bn.sync_monitor.cancel must be Background, got {entries:?}"
+        );
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    async fn test_sync_monitor_unconfigured_uses_register_opt() {
+        use metrics::definitions::RVC_TASKS_RUNNING;
+
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let before = RVC_TASKS_RUNNING.with_label_values(&[SYNC_MONITOR_TASK_NAME]).get();
+        spawn_sync_monitor(None, &executor, None);
+        assert!(
+            !executor.registered_names().contains(&SYNC_MONITOR_TASK_NAME),
+            "unconfigured sync monitor must not register {SYNC_MONITOR_TASK_NAME}"
+        );
+        assert!(
+            !executor.registered_names().contains(&SYNC_MONITOR_CANCEL_TASK_NAME),
+            "unconfigured sync monitor must not register {SYNC_MONITOR_CANCEL_TASK_NAME}"
+        );
+        assert_eq!(
+            RVC_TASKS_RUNNING.with_label_values(&[SYNC_MONITOR_TASK_NAME]).get(),
+            before,
+            "register_opt(None) must not touch rvc_tasks_running{{task={SYNC_MONITOR_TASK_NAME}}}"
+        );
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    async fn test_sync_monitor_alive_after_start() {
+        use bn_manager::BnSyncStatus;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"1000","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let bn_manager = Arc::new(
+            BnManager::new(bn_manager::BnManagerConfig::new(vec![server.uri()]))
+                .expect("test BnManager"),
+        );
+        {
+            let guard = bn_manager.sync_statuses().read().await;
+            assert_eq!(guard[0].status, BnSyncStatus::Unknown);
+        }
+
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_sync_monitor(
+            Some(Arc::clone(&bn_manager)),
+            &executor,
+            Some(Duration::from_millis(50)),
+        );
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = bn_manager.sync_statuses().read().await[0].status;
+            if status == BnSyncStatus::Synced {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sync monitor must poll and update status to Synced while registered"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        assert!(
+            executor.registered_names().contains(&SYNC_MONITOR_TASK_NAME),
+            "sync monitor task must still be registered after first poll"
+        );
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    async fn test_sync_monitor_task_stops_on_cancellation_within_its_tier_budget() {
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_sync_monitor(Some(test_bn_manager()), &executor, Some(Duration::from_millis(50)));
+
+        let budget = TierBudget::new([
+            Duration::from_millis(50),
+            Duration::from_millis(50),
+            Duration::from_millis(500),
+            Duration::from_millis(50),
+        ]);
+        let start = std::time::Instant::now();
+        let outcome = executor.shutdown(budget).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            outcome.joined.contains(&SYNC_MONITOR_TASK_NAME)
+                || outcome.aborted.contains(&SYNC_MONITOR_TASK_NAME),
+            "bn.sync_monitor must finish within Background budget, joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "sync monitor cancel took {elapsed:?}, expected inside Background budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_registered_sync_monitor_handle_panic_surfaces_failure_reason() {
+        let (executor, mut rx) = TaskExecutor::new(CancellationToken::new());
+        executor.register(
+            SYNC_MONITOR_TASK_NAME,
+            ShutdownTier::Background,
+            tokio::spawn(async { panic!("injected start_sync_monitor JoinHandle panic") }),
+        );
+
+        let reason = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout waiting for ShutdownReason")
+            .expect("channel closed without reason");
+        assert_eq!(reason, ShutdownReason::Failure(SYNC_MONITOR_TASK_NAME));
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    #[test]
+    fn test_spawn_sync_monitor_registers_the_start_sync_monitor_handle() {
+        let src = include_str!("tasks.rs");
+        let body = src.split("#[cfg(test)]").next().expect("production body");
+        assert!(
+            body.contains("executor.register(SYNC_MONITOR_TASK_NAME")
+                && body.contains("sync_handle"),
+            "DSR-2.1 must register the start_sync_monitor JoinHandle as bn.sync_monitor"
+        );
+        assert!(
+            body.contains("executor.spawn(SYNC_MONITOR_CANCEL_TASK_NAME"),
+            "token→watch mapping must be a named cancel-forwarder, not the bn.sync_monitor work"
+        );
+        assert!(
+            !body.contains("executor.spawn(SYNC_MONITOR_TASK_NAME"),
+            "bn.sync_monitor must not be an adapter wrapper around start_sync_monitor"
+        );
+        assert!(
+            body.contains("bn_manager.start_sync_monitor"),
+            "bootstrap must call BnManager::start_sync_monitor"
         );
     }
 }
