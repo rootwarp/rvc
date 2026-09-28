@@ -18,7 +18,7 @@ use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use rvc_bn_manager::metrics::RVC_BN_CAPABILITY_STATE;
+use rvc_bn_manager::metrics::{RVC_BN_CAPABILITY_STATE, RVC_PROPOSER_BN_LATENCY_MS};
 use rvc_bn_manager::types::bn_capability;
 use rvc_bn_manager::{
     AttestationApi, BeaconError, BeaconNodeClient, BlockProducer, BnManager, BnManagerConfig,
@@ -3873,5 +3873,83 @@ async fn test_broadcast_is_not_health_score_filtered() {
     assert!(
         result.is_ok(),
         "unhealthy role-matching BN must still receive the publish: {result:?}"
+    );
+}
+
+// ===================================================================
+// DSR-2.3: rvc_proposer_bn_latency_ms observes proposer BN RPCs
+// ===================================================================
+
+fn proposer_bn_latency_count(endpoint: &str) -> u64 {
+    RVC_PROPOSER_BN_LATENCY_MS.with_label_values(&[endpoint]).get_sample_count()
+}
+
+fn proposer_bn_latency_family_has_samples() -> bool {
+    metrics::REGISTRY.gather().iter().any(|mf| {
+        mf.name() == "rvc_proposer_bn_latency_ms"
+            && mf.get_metric().iter().any(|m| m.get_histogram().get_sample_count() > 0)
+    })
+}
+
+/// DSR-2.3 / #382: exercising `produce_block_v3` must bump
+/// `rvc_proposer_bn_latency_ms` count and leave gatherable histogram samples
+/// (not HELP/TYPE-only).
+#[tokio::test]
+async fn test_produce_block_v3_observes_proposer_bn_latency_ms() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "1000")
+                .set_body_string(
+                    r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
+                ),
+        )
+        .mount(&server)
+        .await;
+
+    let endpoint = server.uri();
+    let manager = make_manager(&endpoint);
+
+    let count_before = proposer_bn_latency_count(&endpoint);
+
+    manager.produce_block_v3(1, "0xrandao", None, None).await.expect("produce_block_v3");
+
+    let count_after = proposer_bn_latency_count(&endpoint);
+    assert!(
+        count_after > count_before,
+        "produce_block_v3 must observe rvc_proposer_bn_latency_ms; before={count_before}, after={count_after}"
+    );
+    assert!(
+        proposer_bn_latency_family_has_samples(),
+        "rvc_proposer_bn_latency_ms must expose histogram samples on gather (not HELP/TYPE-only)"
+    );
+}
+
+/// Non-proposer RPCs must not pollute the proposer BN latency histogram.
+#[tokio::test]
+async fn test_get_genesis_does_not_observe_proposer_bn_latency_ms() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/genesis"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_RESPONSE))
+        .mount(&server)
+        .await;
+
+    let endpoint = server.uri();
+    let manager = make_manager(&endpoint);
+    let count_before = proposer_bn_latency_count(&endpoint);
+
+    manager.get_genesis().await.expect("get_genesis");
+
+    assert_eq!(
+        proposer_bn_latency_count(&endpoint),
+        count_before,
+        "non-proposer BN RPCs must not observe rvc_proposer_bn_latency_ms"
     );
 }
