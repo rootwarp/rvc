@@ -26,6 +26,8 @@ rvc_aggregations_total{status="success"} 24
 
 # TYPE rvc_proposals_total counter
 rvc_proposals_total{outcome="envelope_late"} 0
+rvc_proposals_total{outcome="failed"} 0
+rvc_proposals_total{outcome="success"} 0
 
 # TYPE rvc_signing_duration_seconds histogram
 rvc_signing_duration_seconds_sum 0.12

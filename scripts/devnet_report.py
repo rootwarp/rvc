@@ -1226,7 +1226,8 @@ def fold_histograms(
 # ===== § 8. client.json report =====
 
 _PROPOSALS_FAMILY = "rvc_proposals_total"
-_K6_FORCE_REGISTERED = frozenset({"envelope_late"})
+# Force-registered at process init (may be zero without a proposal attempt).
+_K6_FORCE_REGISTERED = frozenset({"envelope_late", "success", "failed"})
 _ANN_NO_PROPOSAL = "no_proposal_window"
 _ANN_NO_OBSERVATIONS = "no_observations"
 _PRESENCE_CHILD_ABSENT = "family_present_child_absent"
@@ -1390,7 +1391,11 @@ def _k6_presence(
         labels = row.get("labels")
         if isinstance(labels, dict) and "outcome" in labels:
             outcomes.add(labels["outcome"])
-    if outcomes <= _K6_FORCE_REGISTERED:
+    if not outcomes:
+        return {"K6": _PRESENCE_CHILD_ABSENT}
+    # Force-registered children alone are not observations; require a
+    # non-zero proposal delta (or an unexpected outcome label).
+    if outcomes <= _K6_FORCE_REGISTERED and _proposals_delta(counters) == 0:
         return {"K6": _PRESENCE_CHILD_ABSENT}
     return {"K6": _PRESENCE_ALL_CHILDREN}
 

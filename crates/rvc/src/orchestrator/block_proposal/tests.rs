@@ -2,8 +2,8 @@
 
 use crate::orchestrator::coordinator::{
     tests::{
-        always_enabled, create_mock_validator_store, create_test_config, BadProposerBlockBeacon,
-        MockSubmitter, TEST_GENESIS_TIME,
+        always_enabled, create_mock_block_beacon, create_mock_validator_store, create_test_config,
+        BadProposerBlockBeacon, MockSubmitter, TEST_GENESIS_TIME,
     },
     DutyOrchestrator, OrchestratorDeps,
 };
@@ -448,4 +448,286 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
         "propose_block 4th arg must be slot N-1 (parent_root); passing head_root \
          rejects a valid previous-slot parent with ParentRootMismatch"
     );
+}
+
+// ── DSR-1.2: proposal outcome metrics ─────────────────────────────────────
+
+fn proposal_outcome_count(outcome: &str) -> u64 {
+    block_service::metrics::RVC_PROPOSALS_TOTAL.with_label_values(&[outcome]).get()
+}
+
+/// Successful propose+publish must increment `rvc_proposals_total{outcome=success}`.
+#[tokio::test]
+async fn test_successful_proposal_increments_success_outcome() {
+    use async_trait::async_trait;
+    use block_service::{
+        BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse,
+    };
+    use bn_manager::MockBeaconNodeClient;
+    use eth_types::SignedBeaconBlock;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct OkBlockBeacon {
+        validator_index: u64,
+        published: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl BeaconBlockClient for OkBlockBeacon {
+        async fn produce_block_v3(
+            &self,
+            slot: Slot,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_boost_factor: Option<u64>,
+        ) -> Result<ProduceBlockResponse, BlockServiceError> {
+            let mut block = eth_types::external_vector_deneb_block();
+            block.slot = slot;
+            block.proposer_index = self.validator_index;
+            Ok(ProduceBlockResponse {
+                data: serde_json::to_value(&block)
+                    .map_err(|e| BlockServiceError::Parse(e.to_string()))?,
+                is_blinded: false,
+                consensus_version: "deneb".to_string(),
+                execution_payload_value: Some("0".to_string()),
+                is_ssz: false,
+                ssz_bytes: None,
+                payload_included: false,
+                builder_url: None,
+                consensus_block_value: None,
+            })
+        }
+
+        async fn produce_block_v4(
+            &self,
+            _slot: Slot,
+            _randao_reveal: &str,
+            _graffiti: Option<&str>,
+            _builder_config: &BuilderConfig,
+        ) -> Result<ProduceBlockResponse, BlockServiceError> {
+            Err(BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
+        }
+
+        async fn publish_block(
+            &self,
+            _signed_block: &SignedBeaconBlock,
+            _consensus_version: &str,
+            _builder_url: Option<&str>,
+        ) -> Result<(), BlockServiceError> {
+            self.published.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish_blinded_block(
+            &self,
+            _signed_block: &eth_types::SignedBlindedBeaconBlock,
+            _consensus_version: &str,
+        ) -> Result<(), BlockServiceError> {
+            self.published.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish_block_ssz(
+            &self,
+            _ssz_bytes: &[u8],
+            _consensus_version: &str,
+            _is_blinded: bool,
+            _builder_url: Option<&str>,
+        ) -> Result<(), BlockServiceError> {
+            self.published.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn publish_execution_payload_envelope(
+            &self,
+            _signed_envelope: &block_service::WireBody,
+            _blobs: &block_service::WireBody,
+            _kzg_proofs: &block_service::WireBody,
+            _consensus_version: &str,
+            _broadcast_validation: Option<&str>,
+        ) -> Result<(), BlockServiceError> {
+            Ok(())
+        }
+    }
+
+    super::proposal_counter_lock::with_held(async {
+        let mock_server = MockServer::start().await;
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 1u64;
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/validator/duties/proposer/{epoch}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": validator_index.to_string(),
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        let published = Arc::new(AtomicBool::new(false));
+        let block_beacon = Arc::new(OkBlockBeacon {
+            validator_index,
+            published: published.clone(),
+        });
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        validator_store
+            .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+            .unwrap();
+        validator_store
+            .set_global_block_selection_mode(validator_store::BlockSelectionMode::ExecutionOnly);
+
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+            clock,
+            duty_tracker,
+            signer,
+            Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+            Arc::new(MockBeaconNodeClient::new()),
+            block_beacon,
+            None,
+            validator_store,
+            create_test_config(),
+            pubkey_map,
+        ));
+
+        let before_success =
+            proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS);
+        let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
+
+        let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+
+        assert!(published.load(Ordering::SeqCst), "success path must publish");
+        assert_eq!(
+            proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS),
+            before_success + 1,
+            "rvc_proposals_total{{outcome=success}} must increment after a successful proposal"
+        );
+        assert_eq!(
+            proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED),
+            before_failed,
+            "successful proposal must not increment failed"
+        );
+    })
+    .await;
+}
+
+/// A BN produce error on the publish path must increment `outcome=failed`.
+#[tokio::test]
+async fn test_failed_proposal_increments_failed_outcome() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    super::proposal_counter_lock::with_held(async {
+        let mock_server = MockServer::start().await;
+        let slot = 100u64;
+        let epoch = slot / SLOTS_PER_EPOCH;
+        let validator_index = 1u64;
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/validator/duties/proposer/{epoch}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "execution_optimistic": false,
+                "data": [{
+                    "pubkey": pubkey_hex,
+                    "validator_index": validator_index.to_string(),
+                    "slot": slot.to_string()
+                }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let beacon_config = BeaconClientConfig::new(mock_server.uri());
+        let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex]));
+        duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(secret_key);
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+        let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
+        validator_store
+            .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+            .unwrap();
+        validator_store
+            .set_global_block_selection_mode(validator_store::BlockSelectionMode::ExecutionOnly);
+
+        let mut pubkey_map_inner = HashMap::new();
+        pubkey_map_inner.insert(pubkey.to_bytes(), pubkey);
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+        let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+        clock.set_slot(slot);
+
+        let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+            clock,
+            duty_tracker,
+            signer,
+            Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+            beacon,
+            create_mock_block_beacon(),
+            None,
+            validator_store,
+            create_test_config(),
+            pubkey_map,
+        ));
+
+        let before_success =
+            proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS);
+        let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
+
+        let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
+        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+
+        assert_eq!(
+            proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED),
+            before_failed + 1,
+            "rvc_proposals_total{{outcome=failed}} must increment after a failed proposal attempt"
+        );
+        assert_eq!(
+            proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS),
+            before_success,
+            "failed proposal must not increment success"
+        );
+    })
+    .await;
 }
