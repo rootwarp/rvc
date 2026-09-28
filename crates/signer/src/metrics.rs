@@ -129,6 +129,8 @@ pub fn init() {
     LazyLock::force(&RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS);
     LazyLock::force(&RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS);
     LazyLock::force(&RVC_SIGNER_REJECTIONS_TOTAL);
+    // DSR-2.4: force-register S7 `blocked` zero child (same pattern as PTC / envelope_late).
+    let _ = RVC_SLASHING_PROTECTION_CHECKS_TOTAL.with_label_values(&[slashing_result::BLOCKED]);
 }
 
 /// `version` label: [`ForkName::as_ref`] or [`rejection_reason::UNKNOWN`].
@@ -254,6 +256,31 @@ mod tests {
     fn init_twice_does_not_panic() {
         super::init();
         super::init();
+    }
+
+    #[test]
+    fn init_registers_slashing_blocked_child() {
+        super::init();
+        let gathered = metrics::REGISTRY.gather();
+        let family = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_slashing_protection_checks_total")
+            .expect("rvc_slashing_protection_checks_total must be gatherable after init");
+        let results: std::collections::BTreeSet<&str> = family
+            .get_metric()
+            .iter()
+            .filter_map(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|label| label.name() == "result")
+                    .map(|label| label.value())
+            })
+            .collect();
+        assert!(
+            results.contains(slashing_result::BLOCKED),
+            "blocked child must be force-registered at init, got {results:?}"
+        );
     }
 
     #[test]

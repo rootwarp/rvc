@@ -257,13 +257,91 @@ pub fn init() {
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::DROPPED]);
     let _ = RVC_PTC_ATTESTATIONS_TOTAL.with_label_values(&[attestation_status::SUCCESS]);
     let _ = RVC_PTC_ATTESTATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]);
+    // DSR-2.4: force-register missed-slots zero child (empty label set).
+    let _ = RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL.with_label_values(&[] as &[&str]);
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    use metrics::definitions::{slashing_result, task_exit_outcome};
+
     #[test]
     fn init_twice_does_not_panic() {
         super::init();
         super::init();
+    }
+
+    /// DSR-2.4 / #383: S5A rare-event families must expose numeric samples at init
+    /// (zeros OK) — HELP/TYPE-only is insufficient for scrape presence.
+    #[test]
+    fn init_force_registers_s5a_zero_children_with_samples() {
+        super::init();
+        let gathered = metrics::REGISTRY.gather();
+
+        let missed = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_orchestrator_missed_slots_total")
+            .expect("rvc_orchestrator_missed_slots_total must be gatherable after init");
+        assert!(
+            !missed.get_metric().is_empty(),
+            "missed_slots must expose a numeric sample at init, got HELP/TYPE-only"
+        );
+
+        let exits = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_task_exits_total")
+            .expect("rvc_task_exits_total must be gatherable after init");
+        assert!(
+            !exits.get_metric().is_empty(),
+            "task_exits must expose numeric samples at init, got HELP/TYPE-only"
+        );
+        let outcomes: BTreeSet<&str> = exits
+            .get_metric()
+            .iter()
+            .filter_map(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|label| label.name() == "outcome")
+                    .map(|label| label.value())
+            })
+            .collect();
+        for expected in task_exit_outcome::ALL {
+            assert!(
+                outcomes.contains(expected),
+                "task_exits outcome={expected} must be force-registered at init, got {outcomes:?}"
+            );
+        }
+
+        let health = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_bn_health_tier")
+            .expect("rvc_bn_health_tier must be gatherable after init");
+        assert!(
+            !health.get_metric().is_empty(),
+            "bn_health_tier must expose a numeric sample at init, got HELP/TYPE-only"
+        );
+
+        let slashing = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_slashing_protection_checks_total")
+            .expect("rvc_slashing_protection_checks_total must be gatherable after init");
+        let results: BTreeSet<&str> = slashing
+            .get_metric()
+            .iter()
+            .filter_map(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|label| label.name() == "result")
+                    .map(|label| label.value())
+            })
+            .collect();
+        assert!(
+            results.contains(slashing_result::BLOCKED),
+            "slashing blocked child must be force-registered at init, got {results:?}"
+        );
     }
 }

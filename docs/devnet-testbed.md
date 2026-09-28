@@ -220,6 +220,7 @@ Cost vs alternatives: one GET per epoch (~KB JSON under the run dir) is cheaper 
 | Date (UTC) | Decision |
 |------------|----------|
 | 2026-09-28 | **DSR-0.2 / FR-P1-2 — approach (1) persist proposer duties during soak.** Rejected (2) LH historic restore flags (BN disk/CPU) and (3) shrink report window to retained states (loses soak-epoch proposal coverage). Soak writes `proposer_duties/<epoch>.json`; report/`validator_perf` prefer those snapshots over live BN for in-window epochs. |
+| 2026-09-28 | **DSR-2.4 / FR-P2-1 — rare-event S5A families stay hard-required.** Once force-registered zero children land (`rvc_orchestrator_missed_slots_total`, `rvc_task_exits_total{…}`, `rvc_bn_health_tier`, `rvc_slashing_protection_checks_total{result="blocked"}`), S5A continues to require those families present with numeric samples. Soften S5A (FR-P2-2) is **not** done. |
 
 ### Teardown
 
