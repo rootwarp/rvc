@@ -10,7 +10,7 @@ use libssz_types::ProgressiveList;
 use super::body_leaves::{ConsolidationRequest, DepositRequest, WithdrawalRequest};
 use super::builder_requests::{BuilderDepositRequest, BuilderExitRequest};
 
-/// Gloas `ExecutionRequests` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `ExecutionRequests` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class ExecutionRequests(ProgressiveContainer)` with
 /// `ACTIVE_FIELDS = active_fields(width=5)`: deposits, withdrawals,
@@ -83,7 +83,7 @@ mod tests {
         assert_eq!(crate::ACTIVE_FIELDS_EXECUTION_REQUESTS.len(), 5);
         assert!(
             crate::ACTIVE_FIELDS_EXECUTION_REQUESTS.iter().all(|bit| *bit),
-            "v1.7.0-beta.0 ExecutionRequests ACTIVE_FIELDS is all-ones width 5"
+            "v1.7.0-beta.2 ExecutionRequests ACTIVE_FIELDS is all-ones width 5"
         );
     }
 }

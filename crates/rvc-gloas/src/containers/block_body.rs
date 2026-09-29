@@ -14,7 +14,7 @@ use super::payload::{PayloadAttestation, SignedExecutionPayloadBid};
 use super::requests::ExecutionRequests;
 use crate::error::GloasError;
 
-/// Gloas `BeaconBlockBody` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `BeaconBlockBody` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class BeaconBlockBody(ProgressiveContainer)` with
 /// `ACTIVE_FIELDS = active_fields(width=13)`. Electra ordering is used only as
@@ -157,7 +157,7 @@ mod tests {
         assert_eq!(BEACON_BLOCK_BODY_FIELDS.len(), crate::ACTIVE_FIELDS_BEACON_BLOCK_BODY.len());
         assert!(
             crate::ACTIVE_FIELDS_BEACON_BLOCK_BODY.iter().all(|bit| *bit),
-            "v1.7.0-beta.0 BeaconBlockBody ACTIVE_FIELDS is all-ones width 13"
+            "v1.7.0-beta.2 BeaconBlockBody ACTIVE_FIELDS is all-ones width 13"
         );
         for name in BEACON_BLOCK_BODY_FIELDS {
             let lower = name.to_ascii_lowercase();

@@ -2,11 +2,11 @@
 # Generated artifacts: [[generated]] KEY=VALUE blocks (not TOML). Empty field fails verify.
 # A digest mismatch is a spec signal: re-pin this file, do not "fix" the hash.
 
-SPEC_TAG=v1.7.0-beta.0
+SPEC_TAG=v1.7.0-beta.2
 SSZ_SPECS_TAG=v0.1.0
 
-archive minimal v1.7.0-beta.0 https://github.com/ethereum/consensus-specs/releases/download/v1.7.0-beta.0/minimal.tar.gz ba9203686b7312cddf160bfd3d4ad55e531dace6662e0223fe9b13b979535441
-archive mainnet v1.7.0-beta.0 https://github.com/ethereum/consensus-specs/releases/download/v1.7.0-beta.0/mainnet.tar.gz 0ef9c069293e2171dd75c5593faf7b97e32b9bcdce9285e870959938747c0774
+archive minimal v1.7.0-beta.2 https://github.com/ethereum/consensus-specs/releases/download/v1.7.0-beta.2/minimal.tar.gz 86645aa51423de5dadcc279c785c1f0d03b0e07e054232c7f36ce0e3ec7ffa37
+archive mainnet v1.7.0-beta.2 https://github.com/ethereum/consensus-specs/releases/download/v1.7.0-beta.2/mainnet.tar.gz 0047b48f19fe6f74114291a46d0a16804871338ebec7166de6f3e4690da4313b
 archive ssz v0.1.0 https://github.com/ethereum/ssz-specs/releases/download/v0.1.0/ssz-test-vectors-v0.1.0.tar.gz e2a65f032b59835c26127295293ea1bc07d7ca0ea1fe0e4f1128dffed333f878
 
 # L1 primitive roots from eth-ssz-specs==0.1.0 (pyspec).
@@ -27,9 +27,9 @@ id=signing-roots
 python=3.13.7
 pip=eth-ssz-specs==0.1.0 -r crates/rvc-spec-vectors/vectors-generated/signing-roots/requirements.txt
 script=scripts/gen_signing_roots.py
-argv=--out crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.0
+argv=--out crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.2
 output=crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml
-sha256=864ff5176a0b83e9b3e12e2bc03688e32def59e39cbde8816be4a0b15d7962eb
+sha256=ed6ddbabb85f37f3bb5d82ca44f3962aa9d75a4c3f6b1c84850478d38fabc135
 
 # Island L3 signing roots (block, aggregate, envelope, AttestationData index=1).
 # Same recipe as signing-roots; fork version and GVR remain argv (D28).
@@ -38,6 +38,6 @@ id=gloas-signing-roots
 python=3.13.7
 pip=eth-ssz-specs==0.1.0 -r crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/requirements.txt
 script=scripts/gen_signing_roots.py
-argv=--out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.0
+argv=--out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.2
 output=crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml
-sha256=0d25fdbf4718bba760ab7bfae358b726c340ea89b98741d0764b3ca4e363c9e1
+sha256=a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067

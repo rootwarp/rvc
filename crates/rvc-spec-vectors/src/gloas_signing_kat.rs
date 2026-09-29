@@ -4,16 +4,16 @@
 //!
 //! # Provenance
 //!
-//! provenance-source: ethereum/consensus-specs@v1.7.0-beta.0 ethereum/ssz-specs@v0.1.0
-//! provenance-pyspec-revision: ethereum/consensus-specs@v1.7.0-beta.0
+//! provenance-source: ethereum/consensus-specs@v1.7.0-beta.2 ethereum/ssz-specs@v0.1.0
+//! provenance-pyspec-revision: ethereum/consensus-specs@v1.7.0-beta.2
 //! provenance-eth-ssz-specs: eth-ssz-specs==0.1.0
 //! provenance-python: 3.13.7
-//! provenance-argv: --out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.0
-//! provenance-generated: id=gloas-signing-roots sha256=0d25fdbf4718bba760ab7bfae358b726c340ea89b98741d0764b3ca4e363c9e1
+//! provenance-argv: --out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.2
+//! provenance-generated: id=gloas-signing-roots sha256=a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067
 //! provenance-generator: gen-spec-kat 0.7.0
-//! provenance-date: 2026-09-06
-//! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:0d25fdbf4718bba760ab7bfae358b726c340ea89b98741d0764b3ca4e363c9e1
-//! provenance-input-spec: phase0+gloas beacon-chain.md sha256:73b0b1b9eb58198ac80e23df2e6fd861413b059f1782c9f5a4f70cad0b3e7d2a
+//! provenance-date: 2026-09-29
+//! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067
+//! provenance-input-spec: phase0+gloas beacon-chain.md sha256:e70936c2b4b0ef8e1986ca7507d3ac13746d456f4cebe6aca4ed8a403ba134fe
 //! provenance-fork-version: 0x07000001
 //! provenance-genesis-validators-root: 0x0000000000000000000000000000000000000000000000000000000000000000
 

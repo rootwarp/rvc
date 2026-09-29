@@ -3,7 +3,7 @@
 # DOMAIN_PTC_ATTESTER / DOMAIN_PROPOSER_PREFERENCES parsed from gloas beacon-chain.md.
 # Do not copy mix_in_length-wrapped list roots into this file.
 package: eth-ssz-specs==0.1.0
-spec_tag: v1.7.0-beta.0
+spec_tag: v1.7.0-beta.2
 fork_version: '0x07000001'
 genesis_validators_root: '0x0000000000000000000000000000000000000000000000000000000000000000'
 domain_ptc_attester: '0x0c000000'

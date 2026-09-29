@@ -13,7 +13,7 @@
 //! ```
 
 /// Pinned `ethereum/consensus-specs` release this island is generated against.
-pub const SPEC_TAG: &str = "v1.7.0-beta.0";
+pub const SPEC_TAG: &str = "v1.7.0-beta.2";
 
 /// Gloas `Attestation` EIP-7495 `active_fields` at `SPEC_TAG` (width 4, all-ones).
 pub const ACTIVE_FIELDS_ATTESTATION: &[bool] = &[true, true, true, true];
@@ -168,7 +168,7 @@ mod spec_kat_tests {
     /// width or sparse bitvector must name the container and `SPEC_TAG`.
     #[test]
     fn test_active_fields_width_table_at_spec_tag() {
-        const FROZEN_TAG: &str = "v1.7.0-beta.0";
+        const FROZEN_TAG: &str = "v1.7.0-beta.2";
         assert_eq!(
             crate::SPEC_TAG, FROZEN_TAG,
             "SPEC_TAG must stay the frozen consensus-specs tag {FROZEN_TAG}; do not invent a new tag"

@@ -16,7 +16,7 @@ const MAX_EXTRA_DATA_BYTES: usize = 32;
 /// Gloas `Transaction` = `ProgressiveList[Byte]`.
 type Transaction = ProgressiveList<u8>;
 
-/// Capella `Withdrawal` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Capella `Withdrawal` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class Withdrawal(Container)` — not a `ProgressiveContainer`.
 #[derive(Clone, Debug, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
@@ -27,7 +27,7 @@ pub(crate) struct Withdrawal {
     pub(crate) amount: u64,
 }
 
-/// Gloas `ExecutionPayload` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `ExecutionPayload` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class ExecutionPayload(ProgressiveContainer)` with
 /// `ACTIVE_FIELDS = active_fields(width=19)`. Embed-only: merkleized inside

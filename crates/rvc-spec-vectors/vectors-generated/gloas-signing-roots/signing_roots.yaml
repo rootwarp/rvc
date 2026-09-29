@@ -7,11 +7,11 @@
 # Do not copy mix_in_length-wrapped list roots into this file.
 package: eth-ssz-specs==0.1.0
 python: 3.13.7
-spec_tag: v1.7.0-beta.0
+spec_tag: v1.7.0-beta.2
 fork_version: '0x07000001'
 genesis_validators_root: '0x0000000000000000000000000000000000000000000000000000000000000000'
-argv: '--out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.0'
-input_sha256: '73b0b1b9eb58198ac80e23df2e6fd861413b059f1782c9f5a4f70cad0b3e7d2a'
+argv: '--out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.2'
+input_sha256: 'e70936c2b4b0ef8e1986ca7507d3ac13746d456f4cebe6aca4ed8a403ba134fe'
 domain_beacon_proposer: '0x00000000'
 domain_beacon_attester: '0x01000000'
 domain_aggregate_and_proof: '0x06000000'

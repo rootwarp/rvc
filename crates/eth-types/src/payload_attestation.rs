@@ -6,7 +6,7 @@ use tree_hash_derive::TreeHash;
 use crate::tree_hash_utils::{impl_container_tree_hash, vec_u8_tree_hash_root};
 use crate::{Root, Signature, Slot};
 
-/// Gloas `PayloadAttestationData` (`consensus-specs` `SPEC_TAG` v1.7.0-beta.0).
+/// Gloas `PayloadAttestationData` (`consensus-specs` `SPEC_TAG` v1.7.0-beta.2).
 ///
 /// Field order: `beacon_block_root`, `slot`, `payload_present`, `blob_data_available`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, TreeHash)]
@@ -19,7 +19,7 @@ pub struct PayloadAttestationData {
     pub blob_data_available: bool,
 }
 
-/// Gloas `PayloadAttestationMessage` (`consensus-specs` `SPEC_TAG` v1.7.0-beta.0).
+/// Gloas `PayloadAttestationMessage` (`consensus-specs` `SPEC_TAG` v1.7.0-beta.2).
 ///
 /// Field order: `validator_index`, `data`, `signature`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

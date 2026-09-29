@@ -1,7 +1,7 @@
 //! P5 L3 signing-root KATs. Re-exported under `test-fixtures` (issue 6.8).
 //!
 //! Hex matches `rvc-spec-vectors` `gloas_signing_kat` at consensus-specs
-//! `v1.7.0-beta.0` (`--fork-version 0x07000001`, zero GVR). Defined here so
+//! `v1.7.0-beta.2` (`--fork-version 0x07000001`, zero GVR). Defined here so
 //! `rvc-gloas` production out-edges stay `{rvc-eth-types}`.
 
 /// BeaconBlock signing root under `DOMAIN_BEACON_PROPOSER`.
