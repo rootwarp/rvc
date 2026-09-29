@@ -6,7 +6,7 @@
 
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 
-/// Gloas `BuilderDepositRequest` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `BuilderDepositRequest` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class BuilderDepositRequest(Container)` — not a `ProgressiveContainer`.
 #[derive(Clone, Debug, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]
@@ -17,7 +17,7 @@ pub(crate) struct BuilderDepositRequest {
     pub(crate) signature: [u8; 96],
 }
 
-/// Gloas `BuilderExitRequest` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `BuilderExitRequest` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class BuilderExitRequest(Container)` — not a `ProgressiveContainer`.
 #[derive(Clone, Debug, PartialEq, Eq, SszEncode, SszDecode, HashTreeRoot)]

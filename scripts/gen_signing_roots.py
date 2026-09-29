@@ -4,7 +4,7 @@
 Pinned to eth-ssz-specs==0.1.0. Imports that package and the stdlib only.
 Implements pyspec compute_domain / get_domain / compute_signing_root and the
 Gloas containers using eth-ssz-specs types (the SSZ library pyspec uses at
-v1.7.0-beta.0). Fork version, genesis validators root, and spec tag come
+the pinned SPEC_TAG). Fork version, genesis validators root, and spec tag come
 from argv. DOMAIN_* bytes are parsed from the pinned beacon-chain spec
 (not hardcoded).
 
@@ -61,7 +61,9 @@ PREFS_VALIDATOR_INDEX = 3
 PREFS_FEE_RECIPIENT = bytes.fromhex("44" * 20)
 PREFS_TARGET_GAS_LIMIT = 36_000_000
 
-# Official ssz_static minimal gloas ssz_random/case_0 object roots.
+# Official ssz_static minimal gloas ssz_random/case_0 object roots at SPEC_TAG.
+# BeaconBlock object root intentionally still the pre-#340 / beta.0 expected
+# value — observed drift at v1.7.0-beta.2 is listed for #341, not re-baselined here.
 OBJECT_BEACON_BLOCK_ROOT = bytes.fromhex(
     "797bb319a7a349213dcab18f6145424682894193e2fca77ba748b283e5353f52"
 )

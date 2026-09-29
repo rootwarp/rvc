@@ -6,7 +6,7 @@ use tree_hash_derive::TreeHash;
 use crate::tree_hash_utils::{impl_container_tree_hash, vec_u8_tree_hash_root};
 use crate::{Root, Signature, Slot};
 
-/// Gloas `ProposerPreferences` (`consensus-specs` `SPEC_TAG` v1.7.0-beta.0).
+/// Gloas `ProposerPreferences` (`consensus-specs` `SPEC_TAG` v1.7.0-beta.2).
 ///
 /// Field order: `dependent_root`, `proposal_slot`, `validator_index`,
 /// `fee_recipient`, `target_gas_limit`.
@@ -24,7 +24,7 @@ pub struct ProposerPreferences {
     pub target_gas_limit: u64,
 }
 
-/// Gloas `SignedProposerPreferences` (`consensus-specs` `SPEC_TAG` v1.7.0-beta.0).
+/// Gloas `SignedProposerPreferences` (`consensus-specs` `SPEC_TAG` v1.7.0-beta.2).
 ///
 /// Field order: `message`, `signature`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

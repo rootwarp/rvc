@@ -10,7 +10,7 @@ use libssz_types::{ProgressiveBitlist, ProgressiveList, SszBitvector};
 
 use super::leaves::AttestationData;
 
-/// Gloas `Attestation` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `Attestation` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class Attestation(ProgressiveContainer)` with
 /// `ACTIVE_FIELDS = active_fields(width=4)`. `N` is `MAX_COMMITTEES_PER_SLOT`
@@ -24,7 +24,7 @@ pub(crate) struct Attestation<const N: usize> {
     pub(crate) committee_bits: SszBitvector<N>,
 }
 
-/// Gloas `IndexedAttestation` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `IndexedAttestation` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class IndexedAttestation(ProgressiveContainer)` with
 /// `ACTIVE_FIELDS = active_fields(width=3)`. `attesting_indices` is
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(crate::ACTIVE_FIELDS_ATTESTATION.len(), 4);
         assert!(
             crate::ACTIVE_FIELDS_ATTESTATION.iter().all(|bit| *bit),
-            "v1.7.0-beta.0 Attestation ACTIVE_FIELDS is all-ones width 4"
+            "v1.7.0-beta.2 Attestation ACTIVE_FIELDS is all-ones width 4"
         );
     }
 
@@ -192,7 +192,7 @@ mod tests {
         assert_eq!(crate::ACTIVE_FIELDS_INDEXED_ATTESTATION.len(), 3);
         assert!(
             crate::ACTIVE_FIELDS_INDEXED_ATTESTATION.iter().all(|bit| *bit),
-            "v1.7.0-beta.0 IndexedAttestation ACTIVE_FIELDS is all-ones width 3"
+            "v1.7.0-beta.2 IndexedAttestation ACTIVE_FIELDS is all-ones width 3"
         );
     }
 

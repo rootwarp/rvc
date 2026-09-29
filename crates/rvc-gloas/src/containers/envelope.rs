@@ -13,7 +13,7 @@ use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use super::execution_payload::ExecutionPayload;
 use super::requests::ExecutionRequests;
 
-/// Gloas `ExecutionPayloadEnvelope` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `ExecutionPayloadEnvelope` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class ExecutionPayloadEnvelope(ProgressiveContainer)` with
 /// `ACTIVE_FIELDS = active_fields(width=5)`. `execution_requests` is the
@@ -28,7 +28,7 @@ pub(crate) struct ExecutionPayloadEnvelope {
     pub(crate) parent_beacon_block_root: Root,
 }
 
-/// Gloas `SignedExecutionPayloadEnvelope` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `SignedExecutionPayloadEnvelope` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class SignedExecutionPayloadEnvelope(Container)` — not a
 /// `ProgressiveContainer`.
@@ -156,7 +156,7 @@ mod tests {
         );
         assert!(
             crate::ACTIVE_FIELDS_EXECUTION_PAYLOAD_ENVELOPE.iter().all(|bit| *bit),
-            "v1.7.0-beta.0 ExecutionPayloadEnvelope ACTIVE_FIELDS is all-ones width 5"
+            "v1.7.0-beta.2 ExecutionPayloadEnvelope ACTIVE_FIELDS is all-ones width 5"
         );
     }
 

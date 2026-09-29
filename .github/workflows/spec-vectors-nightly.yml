@@ -12,13 +12,13 @@ jobs:
   # Schedule: 05:00 UTC daily (`cron: "0 5 * * *"`). `schedule` runs only on
   # the default branch and has no PR check; `workflow_dispatch` is the
   # pre-merge proof.
-  # Archive: consensus-specs v1.7.0-beta.0 mainnet.tar.gz is 902712950 bytes
-  # (~861 MiB). Expected runtime ~15–40 min cold (download + extract dominate);
+  # Archive: consensus-specs v1.7.0-beta.2 mainnet.tar.gz is 910914643 bytes
+  # (~869 MiB). Expected runtime ~15–40 min cold (download + extract dominate);
   # timeout-minutes is 120.
   # Cache/steps: reuse 3.10a — archives-only (no restore-keys), always
   # re-extract from digest-checked tarballs. Same lock-hash key as the PR job
   # (a prior minimal save of that key omits mainnet.tar.gz; nightly then
-  # re-downloads ~861 MiB, which timeout-minutes covers).
+  # re-downloads ~869 MiB, which timeout-minutes covers).
   # Failures surface as a red run on the Actions tab for this workflow
   # (Actions → Spec vectors (nightly)); GitHub also emails users who have
   # Actions failure notifications. Nothing is posted to a PR.

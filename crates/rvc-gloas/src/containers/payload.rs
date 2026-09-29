@@ -12,7 +12,7 @@ use eth_types::{Root, Slot};
 use libssz_derive::{HashTreeRoot, SszDecode, SszEncode};
 use libssz_types::{ProgressiveList, SszBitvector};
 
-/// Island embed-only `PayloadAttestationData` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Island embed-only `PayloadAttestationData` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class PayloadAttestationData(Container)` — not a `ProgressiveContainer`.
 ///
@@ -29,7 +29,7 @@ pub(crate) struct PayloadAttestationData {
     pub(crate) blob_data_available: bool,
 }
 
-/// Gloas `PayloadAttestation` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `PayloadAttestation` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class PayloadAttestation(ProgressiveContainer)` with
 /// `ACTIVE_FIELDS = active_fields(width=3)`. `N` is `PTC_SIZE`
@@ -43,7 +43,7 @@ pub(crate) struct PayloadAttestation<const N: usize> {
     pub(crate) signature: [u8; 96],
 }
 
-/// Gloas `ExecutionPayloadBid` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `ExecutionPayloadBid` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class ExecutionPayloadBid(ProgressiveContainer)` with
 /// `ACTIVE_FIELDS = active_fields(width=12)`. Embed-only: merkleized inside
@@ -66,7 +66,7 @@ pub(crate) struct ExecutionPayloadBid {
     pub(crate) execution_requests_root: Root,
 }
 
-/// Gloas `SignedExecutionPayloadBid` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.0`).
+/// Gloas `SignedExecutionPayloadBid` at consensus-specs `SPEC_TAG` (`v1.7.0-beta.2`).
 ///
 /// Spec `class SignedExecutionPayloadBid(Container)` — not a `ProgressiveContainer`.
 /// Embed-only: merkleized inside the body, never signed by rs-vc and never exported.
@@ -182,7 +182,7 @@ mod tests {
         assert_eq!(crate::ACTIVE_FIELDS_PAYLOAD_ATTESTATION.len(), 3);
         assert!(
             crate::ACTIVE_FIELDS_PAYLOAD_ATTESTATION.iter().all(|bit| *bit),
-            "v1.7.0-beta.0 PayloadAttestation ACTIVE_FIELDS is all-ones width 3"
+            "v1.7.0-beta.2 PayloadAttestation ACTIVE_FIELDS is all-ones width 3"
         );
     }
 
