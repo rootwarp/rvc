@@ -19,10 +19,10 @@ domain_beacon_builder: '0x0b000000'
 containers:
   - name: BeaconBlock
     domain: DOMAIN_BEACON_PROPOSER
-    object_root: '0x797bb319a7a349213dcab18f6145424682894193e2fca77ba748b283e5353f52'
-    root: '0x797bb319a7a349213dcab18f6145424682894193e2fca77ba748b283e5353f52'
-    signing_root: '0xcb806d0b3ff015d77bc5b320e8066894e37ec38be25f5acb178b65bad3250dc3'
-    argv_flip_signing_root: '0xa33f39b07a3bdb52b529d8d8f4f01a5ec7eb4468644715f151b77fc4353c41ad'
+    object_root: '0x48a53d64787571e6ebcc38394e3ee340e1345676d809b7eefe7dce9f1b79e9da'
+    root: '0x48a53d64787571e6ebcc38394e3ee340e1345676d809b7eefe7dce9f1b79e9da'
+    signing_root: '0x40f71e572549ec0853899d6d7ecd2b78384c24de492863f1af8f5cd523037d74'
+    argv_flip_signing_root: '0x3566b3d65b8ebab4b6fa07d1754fb3fb09e8115c9170334aeeb96e63cb91f2cc'
   - name: AggregateAndProof
     domain: DOMAIN_AGGREGATE_AND_PROOF
     object_root: '0x8e20d3aab21ae5374ec249d072afa489e501d89e5c098f6792b2771cf5509bd1'

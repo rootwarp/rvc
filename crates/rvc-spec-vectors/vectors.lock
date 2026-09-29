@@ -40,4 +40,4 @@ pip=eth-ssz-specs==0.1.0 -r crates/rvc-spec-vectors/vectors-generated/gloas-sign
 script=scripts/gen_signing_roots.py
 argv=--out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.2
 output=crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml
-sha256=a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067
+sha256=4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803

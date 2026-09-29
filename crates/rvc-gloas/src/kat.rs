@@ -6,7 +6,7 @@
 
 /// BeaconBlock signing root under `DOMAIN_BEACON_PROPOSER`.
 pub const KAT_GLOAS_BLOCK_SIGNING_ROOT: &str =
-    "cb806d0b3ff015d77bc5b320e8066894e37ec38be25f5acb178b65bad3250dc3";
+    "40f71e572549ec0853899d6d7ecd2b78384c24de492863f1af8f5cd523037d74";
 
 /// AggregateAndProof signing root under `DOMAIN_AGGREGATE_AND_PROOF`.
 pub const KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT: &str =

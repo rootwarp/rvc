@@ -5,12 +5,12 @@
 //! # Provenance
 //!
 //! provenance-source: ethereum/consensus-specs@v1.7.0-beta.2 ethereum/ssz-specs@v0.1.0
-//! provenance-generated: id=gloas-signing-roots sha256=a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067
+//! provenance-generated: id=gloas-signing-roots sha256=4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-generated: id=progressive sha256=af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-generated: id=signing-roots sha256=ed6ddbabb85f37f3bb5d82ca44f3962aa9d75a4c3f6b1c84850478d38fabc135
 //! provenance-generator: gen-spec-kat 0.7.0
 //! provenance-date: 2026-09-29
-//! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067
+//! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/progressive/roots.yaml sha256:af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml sha256:ed6ddbabb85f37f3bb5d82ca44f3962aa9d75a4c3f6b1c84850478d38fabc135
 //! provenance-input: crates/rvc-spec-vectors/vectors/v1.7.0-beta.2/mainnet.tar.gz sha256:0047b48f19fe6f74114291a46d0a16804871338ebec7166de6f3e4690da4313b
@@ -703,7 +703,7 @@ pub mod minimal {
 
     /// Official `ssz_static` `BeaconBlockBody` root from `tests/minimal/gloas/ssz_static/BeaconBlockBody/ssz_random/case_0` (preset minimal).
     pub const SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT: &str =
-        "af0e2c9f803d056b767619ba304a33f8d7ce7620e12edb8e3e5a1fba977fcfac";
+        "c1b03af7f7e44459577d0d5dd8c43f209f25aa69fd5d917c91d2514536a1329e";
 
     /// Decoded `serialized.ssz_snappy` for `BeaconBlockBody` from `tests/minimal/gloas/ssz_static/BeaconBlockBody/ssz_random/case_0` (preset minimal, lowercase hex).
     pub const SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ: &str = concat!(
@@ -1013,7 +1013,7 @@ pub mod minimal {
 
     /// Official `ssz_static` `BeaconBlock` root from `tests/minimal/gloas/ssz_static/BeaconBlock/ssz_random/case_0` (preset minimal).
     pub const SPEC_GLOAS_BEACON_BLOCK_ROOT: &str =
-        "797bb319a7a349213dcab18f6145424682894193e2fca77ba748b283e5353f52";
+        "48a53d64787571e6ebcc38394e3ee340e1345676d809b7eefe7dce9f1b79e9da";
 
     /// Decoded `serialized.ssz_snappy` for `BeaconBlock` from `tests/minimal/gloas/ssz_static/BeaconBlock/ssz_random/case_0` (preset minimal, lowercase hex).
     pub const SPEC_GLOAS_BEACON_BLOCK_SSZ: &str = concat!(
@@ -2304,7 +2304,7 @@ pub mod mainnet {
 
     /// Official `ssz_static` `BeaconBlockBody` root from `tests/mainnet/gloas/ssz_static/BeaconBlockBody/ssz_random/case_0` (preset mainnet).
     pub const SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT: &str =
-        "bcc9c7282c844a9ce1894ca1d345f6670ddab8e4804dbcbf6c9994f84a120158";
+        "1d9d2624034c4bd5c0dea7595edff0e5e7cc6e3bcf13ef0b8776cc3499b807f2";
 
     /// Decoded `serialized.ssz_snappy` for `BeaconBlockBody` from `tests/mainnet/gloas/ssz_static/BeaconBlockBody/ssz_random/case_0` (preset mainnet, lowercase hex).
     pub const SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ: &str = concat!(
@@ -2498,7 +2498,7 @@ pub mod mainnet {
 
     /// Official `ssz_static` `BeaconBlock` root from `tests/mainnet/gloas/ssz_static/BeaconBlock/ssz_random/case_0` (preset mainnet).
     pub const SPEC_GLOAS_BEACON_BLOCK_ROOT: &str =
-        "8e007c75b39a8449f16120e7b2ba0836f9e0621fcd19f7eb235461d978854d38";
+        "44aaea2c3966fc59b085a176d7bfd01d7748ffd6f6201d6d022721ff13c715e3";
 
     /// Decoded `serialized.ssz_snappy` for `BeaconBlock` from `tests/mainnet/gloas/ssz_static/BeaconBlock/ssz_random/case_0` (preset mainnet, lowercase hex).
     pub const SPEC_GLOAS_BEACON_BLOCK_SSZ: &str = concat!(
