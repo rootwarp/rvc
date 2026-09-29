@@ -9,17 +9,17 @@
 //! provenance-eth-ssz-specs: eth-ssz-specs==0.1.0
 //! provenance-python: 3.13.7
 //! provenance-argv: --out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.2
-//! provenance-generated: id=gloas-signing-roots sha256=a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067
+//! provenance-generated: id=gloas-signing-roots sha256=4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-generator: gen-spec-kat 0.7.0
 //! provenance-date: 2026-09-29
-//! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067
+//! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-input-spec: phase0+gloas beacon-chain.md sha256:e70936c2b4b0ef8e1986ca7507d3ac13746d456f4cebe6aca4ed8a403ba134fe
 //! provenance-fork-version: 0x07000001
 //! provenance-genesis-validators-root: 0x0000000000000000000000000000000000000000000000000000000000000000
 
 /// BeaconBlock signing root under DOMAIN_BEACON_PROPOSER, copied from the pyspec artifact.
 pub const KAT_GLOAS_BLOCK_SIGNING_ROOT: &str =
-    "cb806d0b3ff015d77bc5b320e8066894e37ec38be25f5acb178b65bad3250dc3";
+    "40f71e572549ec0853899d6d7ecd2b78384c24de492863f1af8f5cd523037d74";
 
 /// AggregateAndProof signing root under DOMAIN_AGGREGATE_AND_PROOF, copied from the pyspec artifact.
 pub const KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT: &str =
@@ -35,4 +35,4 @@ pub const KAT_GLOAS_ATTESTATION_DATA_SIGNING_ROOT: &str =
 
 /// BeaconBlock signing root with argv --fork-version last byte xor 1 (not a KAT).
 pub const GLOAS_SIGNING_ROOT_ARGV_FLIP_WITNESS: &str =
-    "a33f39b07a3bdb52b529d8d8f4f01a5ec7eb4468644715f151b77fc4353c41ad";
+    "3566b3d65b8ebab4b6fa07d1754fb3fb09e8115c9170334aeeb96e63cb91f2cc";

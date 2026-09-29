@@ -5,7 +5,7 @@
 //! # Provenance
 //!
 //! provenance-source: ethereum/consensus-specs@v1.7.0-beta.2 ethereum/ssz-specs@v0.1.0
-//! provenance-generated: id=gloas-signing-roots sha256=a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067
+//! provenance-generated: id=gloas-signing-roots sha256=4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-generated: id=progressive sha256=af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-generated: id=signing-roots sha256=ed6ddbabb85f37f3bb5d82ca44f3962aa9d75a4c3f6b1c84850478d38fabc135
 //! provenance-generator: gen-spec-kat 0.7.0
@@ -14,7 +14,7 @@
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_0/serialized.ssz_snappy sha256:cac01c86ff78e57ad395c9e3bf0d0dfbb3dd41640a009b2a0cb8dc95509b3b51
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_1/roots.yaml sha256:64150d0e41e95c1a47bf3e67cc36ff1cfb48077e05d6e3ed3e18f814d85a0a72
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_1/serialized.ssz_snappy sha256:b9db39ec6d2d1add2c11d9ee7c24e98fd88ee3db80c81a0b2417416fabb2f608
-//! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:a76b893682635c1102290197ed36a67fd13a678aa21944a59e6be5c4f264c067
+//! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/progressive/roots.yaml sha256:af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml sha256:ed6ddbabb85f37f3bb5d82ca44f3962aa9d75a4c3f6b1c84850478d38fabc135
 

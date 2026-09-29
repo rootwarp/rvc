@@ -62,10 +62,10 @@ PREFS_FEE_RECIPIENT = bytes.fromhex("44" * 20)
 PREFS_TARGET_GAS_LIMIT = 36_000_000
 
 # Official ssz_static minimal gloas ssz_random/case_0 object roots at SPEC_TAG.
-# BeaconBlock object root intentionally still the pre-#340 / beta.0 expected
-# value — observed drift at v1.7.0-beta.2 is listed for #341, not re-baselined here.
+# BeaconBlock object root at v1.7.0-beta.2 (8.9b / #341 triage: official roots.yaml
+# moved vs v1.7.0-beta.0; container schema unchanged — ssz_random fixtures regen).
 OBJECT_BEACON_BLOCK_ROOT = bytes.fromhex(
-    "797bb319a7a349213dcab18f6145424682894193e2fca77ba748b283e5353f52"
+    "48a53d64787571e6ebcc38394e3ee340e1345676d809b7eefe7dce9f1b79e9da"
 )
 OBJECT_AGGREGATE_AND_PROOF_ROOT = bytes.fromhex(
     "8e20d3aab21ae5374ec249d072afa489e501d89e5c098f6792b2771cf5509bd1"
