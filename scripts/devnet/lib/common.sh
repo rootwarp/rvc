@@ -1269,9 +1269,14 @@ k8_blocked_total() {
             return 1
             ;;
     esac
-    if [[ -z "${body//[[:space:]]/}" ]]; then
-        return 1
-    fi
+    # Presence check only — do not rewrite the body with ${body//[[:space:]]/}.
+    # On bash 3.2 that expansion is pathological on ~20KB Prometheus scrapes (#401).
+    case "$body" in
+        *[![:space:]]*) ;;
+        *)
+            return 1
+            ;;
+    esac
     line="$(
         printf '%s\n' "$body" \
             | grep -E '^rvc_slashing_protection_checks_total\{[^}]*result="blocked"' \
