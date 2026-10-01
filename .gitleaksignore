@@ -12,9 +12,9 @@ crates/crypto/src/keystore.rs:generic-api-key:546
 crates/grpc-signer/src/client.rs:private-key:1356
 crates/keymanager-api/src/auth.rs:generic-api-key:339
 crates/keymanager-api/src/auth.rs:generic-api-key:353
-crates/observability/src/logging.rs:generic-api-key:357
-crates/observability/src/logging.rs:generic-api-key:364
-crates/observability/src/logging.rs:generic-api-key:413
+crates/observability/src/logging.rs:generic-api-key:363
+crates/observability/src/logging.rs:generic-api-key:370
+crates/observability/src/logging.rs:generic-api-key:419
 crates/rvc-spec-vectors/src/builder_request_auth_kat.rs:generic-api-key:14
 crates/signer-server/src/http_api/tls_config/tests.rs:private-key:224
 crates/signer-server/src/http_api/tls_config/tests.rs:private-key:225
