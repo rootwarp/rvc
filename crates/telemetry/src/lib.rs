@@ -27,10 +27,11 @@ pub use trace_id::{TraceIdLayer, TraceIds, SPAN_ID_KEY, TRACE_ID_KEY};
 
 /// Guard that keeps the tracing pipeline alive.
 ///
-/// Must be held for the lifetime of the application. When dropped or
-/// passed to [`shutdown_tracing`], the underlying trace provider is
-/// shut down and pending spans are flushed.
-#[must_use = "dropping TracingGuard shuts down the tracing pipeline"]
+/// Hold it for process lifetime, then pass it to [`shutdown_tracing`].
+/// Dropping the guard does **not** shut the provider down or flush pending
+/// spans: the OpenTelemetry layer keeps its own provider clone, so the batch
+/// processor's worker keeps running until [`shutdown_tracing`] is awaited.
+#[must_use = "pass TracingGuard to shutdown_tracing; dropping it does not flush spans"]
 pub struct TracingGuard {
     /// The SDK tracer provider backing the pipeline.
     pub(crate) provider: opentelemetry_sdk::trace::SdkTracerProvider,
