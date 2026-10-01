@@ -4282,6 +4282,7 @@ name = "rvc-architecture-tests"
 version = "0.7.0"
 dependencies = [
  "rvc-observability",
+ "rvc-telemetry",
  "serde_json",
  "tracing",
  "tracing-subscriber",
