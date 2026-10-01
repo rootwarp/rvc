@@ -51,6 +51,9 @@ pub struct TraceIds {
 /// Subscriber layer that lazily caches [`TraceIds`] on sampled spans.
 ///
 /// Does **not** implement `on_new_span` (ADR-001 option B is forbidden).
+/// Guarded by `set_parent_continues_inbound_with_trace_id_layer` (T13 / TRC-2e):
+/// resolving in `on_new_span` would activate the OTel builder before
+/// `set_parent_from_headers` can attach an inbound parent.
 #[derive(Debug, Clone, Default)]
 pub struct TraceIdLayer {
     /// Weak handle to the installed `Dispatch`, needed by `get_otel_context`.
@@ -94,7 +97,8 @@ where
     }
 
     // Intentionally no `on_new_span` — ADR-001 option B is forbidden (lazy
-    // on_event only; see architecture ADR-001 option D).
+    // on_event only; see architecture ADR-001 option D). Guarded by
+    // `set_parent_continues_inbound_with_trace_id_layer` (T13 / TRC-2e).
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         // Soft P2 / TRC-2d: event parent via event_span (== Format's parent_span),
