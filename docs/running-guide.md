@@ -508,6 +508,38 @@ rvc start -c config.toml \
   --tracing-sample-rate 0.01
 ```
 
+#### Local Jaeger v2 (docker compose `tracing` profile)
+
+Bare `docker compose up` stays on `rvc` + `rvc-signer` only. Jaeger v2 is
+opt-in behind `profiles: ["tracing"]`. Compose already wires path-less
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` and
+`OTEL_TRACES_SAMPLER_ARG=1.0` on both services (signer remains inert until
+Phase 2B).
+
+Four-step recipe:
+
+1. Start the stack with the profile:
+   `docker compose --profile tracing up -d`
+2. Open the Jaeger UI at `http://127.0.0.1:16686` (loopback-bound).
+3. Confirm OTLP/HTTP accepts spans (Compose publishes host-local `:4318` only):
+   `curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:4318/v1/traces -H 'Content-Type: application/json' -d '{}'`
+   — expect HTTP 200 when the collector is up; connection refused means the
+   profile is down.
+4. In the UI, open the **Service** dropdown, select `rvc`, and click
+   **Find Traces**. With sample rate `1.0` you should see spans from
+   `bin/rvc`.
+
+> **Warning:** Compose binds the Jaeger UI to `127.0.0.1:16686` only. Do not
+> republish `16686` on all interfaces. Remote access needs an SSH tunnel
+> (e.g. `ssh -L 16686:127.0.0.1:16686 …`) or an authenticated reverse proxy.
+
+**4317 by design:** OTLP/gRPC port `4317` is **not** published. Use
+OTLP/HTTP on `4318` only. Do not set `COLLECTOR_OTLP_ENABLED` — that is a
+Jaeger v1 env trap; v2 enables OTLP by default.
+
+Tear down with `docker compose --profile tracing down` (or plain
+`docker compose down` after stopping).
+
 ### With gRPC Remote Signer (rvc-signer)
 
 ```bash
