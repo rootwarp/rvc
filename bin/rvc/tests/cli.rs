@@ -443,3 +443,72 @@ fn tracing_sample_rate_below_one_warns_after_subscriber_init() {
         "resolved 1.0 must not emit the sample-rate warn.\n--- combined ---\n{text_10}"
     );
 }
+
+/// TRC-1b: path-less OTLP endpoint is rewritten to `…/v1/traces` in the enable
+/// line, and the non-localhost `http://` warn fires only for dotted remotes
+/// (Compose host `jaeger` and loopback stay silent).
+fn run_start_with_tracing_endpoint(endpoint: &str) -> String {
+    let dir = TempDir::new().expect("temp dir");
+    let slashing_path = dir.path().join("missing-slashing.db");
+    let metrics = free_port();
+    let config = write_start_config(&dir, &slashing_path, "http://127.0.0.1:9", metrics, "");
+
+    let output = run_with_timeout(
+        Command::new(rvc_bin())
+            .args([
+                "start",
+                "--config",
+                config.path().to_str().unwrap(),
+                "--tracing-endpoint",
+                endpoint,
+                "--tracing-sample-rate",
+                "1.0",
+                "--metrics-port",
+                &metrics.to_string(),
+            ])
+            .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .env_remove("OTEL_TRACES_SAMPLER_ARG"),
+        Duration::from_secs(25),
+    );
+
+    combined(&output)
+}
+
+#[test]
+fn tracing_otlp_path_append_and_compose_host_http_warn() {
+    const HTTP_WARN: &str = "tracing endpoint uses http:// with non-localhost host";
+
+    // Path-less Compose host → `/v1/traces` appended; no http warn.
+    let jaeger = run_start_with_tracing_endpoint("http://jaeger:4318");
+    assert!(
+        jaeger.contains("http://jaeger:4318/v1/traces"),
+        "path-less jaeger endpoint must append /v1/traces.\n--- combined ---\n{jaeger}"
+    );
+    assert!(
+        !jaeger.contains(HTTP_WARN),
+        "dot-less compose host must not emit non-localhost http warn.\n--- combined ---\n{jaeger}"
+    );
+
+    // Loopback → path append; no http warn.
+    let loopback = format!("http://127.0.0.1:{}", free_port());
+    let local = run_start_with_tracing_endpoint(&loopback);
+    assert!(
+        local.contains(&format!("{loopback}/v1/traces")),
+        "path-less loopback must append /v1/traces.\n--- combined ---\n{local}"
+    );
+    assert!(
+        !local.contains(HTTP_WARN),
+        "localhost must not emit non-localhost http warn.\n--- combined ---\n{local}"
+    );
+
+    // Dotted remote → warn after subscriber init.
+    let remote = run_start_with_tracing_endpoint("http://collector.example.invalid:9");
+    assert!(
+        remote.contains("http://collector.example.invalid:9/v1/traces"),
+        "path-less remote must append /v1/traces.\n--- combined ---\n{remote}"
+    );
+    assert!(
+        remote.contains(HTTP_WARN),
+        "dotted remote http:// must warn after subscriber init.\n--- combined ---\n{remote}"
+    );
+}
