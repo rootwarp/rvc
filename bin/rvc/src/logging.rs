@@ -127,24 +127,91 @@ pub fn warn_if_sample_rate_below_one(sample_rate: f64) {
     }
 }
 
+/// Startup-only warn when the tracing endpoint uses `http://` to a real remote
+/// host (TRC-1b / CD-12).
+///
+/// Must run **after** [`init_logging`]: a `warn!` emitted while building the
+/// tracing config (before the subscriber is installed) is silently dropped.
+/// Call once per process start — never on a per-slot path.
+///
+/// Skips localhost (`localhost` / `127.0.0.1` / `::1`) and Docker Compose
+/// service names (hosts without a `.`, e.g. `jaeger`). Real remotes with a
+/// dotted hostname still warn.
+///
+/// The logged `endpoint` field is [`redact_tracing_endpoint_for_log`] — never the
+/// raw URL — so userinfo credentials cannot reach post-init sinks.
+pub fn warn_if_insecure_remote_tracing_endpoint(endpoint: &str) {
+    if should_warn_insecure_remote_http(endpoint) {
+        warn!(
+            endpoint = %redact_tracing_endpoint_for_log(endpoint),
+            "tracing endpoint uses http:// with non-localhost host; consider using https://"
+        );
+    }
+}
+
+/// Log-safe view of an OTLP endpoint: `scheme://host:port` only.
+///
+/// Strips userinfo, path, query, and fragment so credentials never reach sinks.
+/// Unparseable input is replaced (never echoed raw).
+fn redact_tracing_endpoint_for_log(endpoint: &str) -> String {
+    let Ok(mut url) = url::Url::parse(endpoint) else {
+        return "<unparseable>".to_string();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string().trim_end_matches('/').to_string()
+}
+
+/// Append `/v1/traces` when the OTLP HTTP endpoint path is empty or `/` (TRC-1b).
+///
+/// Path-less collector URLs (e.g. Compose `http://jaeger:4318` /
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`) otherwise miss the OTLP HTTP traces route.
+/// Already-pathful endpoints (`/v1/traces`, gateway prefixes like
+/// `/otlp/v1/traces`) are left unchanged.
+fn ensure_otlp_http_traces_path(endpoint: String) -> String {
+    let Ok(mut url) = url::Url::parse(&endpoint) else {
+        return endpoint;
+    };
+    let path = url.path();
+    if path.is_empty() || path == "/" {
+        url.set_path("/v1/traces");
+        url.into()
+    } else {
+        endpoint
+    }
+}
+
+/// Whether `endpoint` should emit the insecure-remote `http://` startup warn.
+///
+/// Returns `false` for non-`http://`, localhost, and dot-less Compose hosts.
+fn should_warn_insecure_remote_http(endpoint: &str) -> bool {
+    if !endpoint.starts_with("http://") {
+        return false;
+    }
+    let Ok(url) = url::Url::parse(endpoint) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        return false;
+    }
+    // Compose DNS names like `jaeger` have no `.` — treat as local stack.
+    if !host.contains('.') {
+        return false;
+    }
+    true
+}
+
 pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
     // OTEL env precedence lives on TracingConfig (RF5-15); the binary only maps.
     let endpoint = config.tracing.resolve_endpoint()?;
+    let endpoint = ensure_otlp_http_traces_path(endpoint);
     let sample_rate = config.tracing.resolve_sample_rate();
-
-    // Warn on non-localhost http://
-    if endpoint.starts_with("http://") {
-        if let Ok(url) = url::Url::parse(&endpoint) {
-            if let Some(host) = url.host_str() {
-                if host != "localhost" && host != "127.0.0.1" && host != "::1" {
-                    warn!(
-                        endpoint = %endpoint,
-                        "tracing endpoint uses http:// with non-localhost host; consider using https://"
-                    );
-                }
-            }
-        }
-    }
 
     let exporter = match config.tracing.exporter {
         rvc::config::TracingExporter::Otlp => telemetry::ExporterKind::Otlp,
@@ -308,6 +375,93 @@ mod tests {
     }
 
     #[test]
+    fn test_ensure_otlp_http_traces_path_table() {
+        let cases = [
+            ("http://jaeger:4318", "http://jaeger:4318/v1/traces"),
+            ("http://jaeger:4318/", "http://jaeger:4318/v1/traces"),
+            ("http://jaeger:4318/v1/traces", "http://jaeger:4318/v1/traces"),
+            ("http://gateway:4318/otlp/v1/traces", "http://gateway:4318/otlp/v1/traces"),
+            ("http://localhost:4318", "http://localhost:4318/v1/traces"),
+            ("https://collector.example.com:4318", "https://collector.example.com:4318/v1/traces"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(ensure_otlp_http_traces_path(input.to_string()), expected, "input={input}");
+        }
+    }
+
+    #[test]
+    fn test_should_warn_insecure_remote_http_table() {
+        let cases = [
+            ("http://jaeger:4318", false),
+            ("http://jaeger:4318/v1/traces", false),
+            ("http://otel-collector:4318", false),
+            ("http://localhost:4318", false),
+            ("http://localhost:4318/v1/traces", false),
+            ("http://127.0.0.1:4318", false),
+            ("http://[::1]:4318", false),
+            ("https://collector.example.com:4318", false),
+            ("http://collector.example.com:4318", true),
+            ("http://collector.example.com:4318/v1/traces", true),
+            ("http://192.168.1.10:4318", true),
+            ("http://user:s3cret@collector.example.com:4318/v1/traces", true),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(should_warn_insecure_remote_http(input), expected, "input={input}");
+        }
+    }
+
+    #[test]
+    fn test_redact_tracing_endpoint_for_log_strips_userinfo_and_path() {
+        let cases = [
+            (
+                "http://user:s3cret@collector.example.com:4318/v1/traces",
+                "http://collector.example.com:4318",
+            ),
+            ("http://user@collector.example.com:4318", "http://collector.example.com:4318"),
+            ("http://collector.example.com:4318/v1/traces", "http://collector.example.com:4318"),
+            ("http://127.0.0.1:4318", "http://127.0.0.1:4318"),
+            ("not a url", "<unparseable>"),
+        ];
+        for (input, expected) in cases {
+            let redacted = redact_tracing_endpoint_for_log(input);
+            assert_eq!(redacted, expected, "input={input}");
+            assert!(!redacted.contains("s3cret"), "must not leak password: {redacted}");
+            assert!(!redacted.contains("user:"), "must not leak userinfo: {redacted}");
+        }
+    }
+
+    /// Warn path must log the redacted form — capture proves userinfo never reaches the sink.
+    #[test]
+    fn test_warn_if_insecure_remote_tracing_endpoint_redacts_userinfo() {
+        use tracing_subscriber::prelude::*;
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("warn");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()).with_ansi(false))
+            .with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            warn_if_insecure_remote_tracing_endpoint(
+                "http://user:s3cret@collector.example.com:4318/v1/traces",
+            );
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            out.contains("tracing endpoint uses http:// with non-localhost host"),
+            "warn must fire for dotted remote.\n--- captured ---\n{out}"
+        );
+        assert!(
+            out.contains("collector.example.com:4318"),
+            "redacted host:port must appear.\n--- captured ---\n{out}"
+        );
+        assert!(!out.contains("s3cret"), "password must not reach sink.\n--- captured ---\n{out}");
+        assert!(!out.contains("user:"), "userinfo must not reach sink.\n--- captured ---\n{out}");
+        assert!(!out.contains("/v1/traces"), "path must be stripped.\n--- captured ---\n{out}");
+    }
+
+    #[test]
     fn test_build_tracing_config_with_endpoint_returns_some() {
         let _guard = env_lock();
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
@@ -321,9 +475,44 @@ mod tests {
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should return Some");
-        assert_eq!(tc.endpoint, "http://localhost:4318");
+        assert_eq!(tc.endpoint, "http://localhost:4318/v1/traces");
         assert_eq!(tc.exporter, telemetry::ExporterKind::Otlp);
         assert!((tc.sample_rate - 0.01).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_build_tracing_config_pathful_endpoint_unchanged() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing: TracingConfig {
+                endpoint: Some("http://gateway:4318/otlp/v1/traces".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.endpoint, "http://gateway:4318/otlp/v1/traces");
+    }
+
+    #[test]
+    fn test_build_tracing_config_jaeger_compose_appends_traces_path() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing: TracingConfig {
+                endpoint: Some("http://jaeger:4318".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.endpoint, "http://jaeger:4318/v1/traces");
+        assert!(!should_warn_insecure_remote_http(&tc.endpoint));
     }
 
     #[test]
@@ -334,7 +523,7 @@ mod tests {
 
         let config = Config::default(); // no tracing_endpoint set
         let tc = build_tracing_config(&config).expect("should fall back to env var");
-        assert_eq!(tc.endpoint, "http://env-collector:4318");
+        assert_eq!(tc.endpoint, "http://env-collector:4318/v1/traces");
 
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
     }
@@ -352,7 +541,7 @@ mod tests {
             ..Default::default()
         };
         let tc = build_tracing_config(&config).expect("should use config value");
-        assert_eq!(tc.endpoint, "http://cli-collector:4318");
+        assert_eq!(tc.endpoint, "http://cli-collector:4318/v1/traces");
 
         std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
     }
