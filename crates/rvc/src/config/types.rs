@@ -30,7 +30,7 @@ pub use rvc_config::{
     MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig, ProposerConfigArgs,
     ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs, SecretProviderConfig,
     ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig, TimingConfig,
-    TracingArgs, TracingConfig, TracingExporter,
+    TracingArgs, TracingConfig, TracingExporter, DEFAULT_TRACING_SAMPLE_RATE,
 };
 
 /// Message types that may be broadcast to all beacon nodes.

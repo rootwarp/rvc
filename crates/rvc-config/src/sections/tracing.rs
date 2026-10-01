@@ -10,6 +10,12 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
+/// Built-in head-based sample rate when neither config/CLI nor
+/// `OTEL_TRACES_SAMPLER_ARG` sets one (ADR-005 / TRC-1a).
+///
+/// Names the production default — does not change it.
+pub const DEFAULT_TRACING_SAMPLE_RATE: f64 = 0.01;
+
 /// OpenTelemetry exporter backend selected in config / CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -43,7 +49,7 @@ impl FromStr for TracingExporter {
 }
 
 fn default_tracing_sample_rate() -> f64 {
-    0.01
+    DEFAULT_TRACING_SAMPLE_RATE
 }
 
 /// Clap + serde declaration for the tracing knobs (ADR-008).
@@ -63,7 +69,8 @@ pub struct TracingArgs {
     #[serde(alias = "tracing_exporter", skip_serializing_if = "Option::is_none")]
     pub exporter: Option<TracingExporter>,
 
-    /// Head-based sampling ratio 0.0–1.0 (default: 0.01 when unset; see OTEL_TRACES_SAMPLER_ARG)
+    /// Head-based sampling ratio 0.0–1.0 (default: [`DEFAULT_TRACING_SAMPLE_RATE`] when unset;
+    /// see `OTEL_TRACES_SAMPLER_ARG`)
     #[arg(id = "tracing_sample_rate", long = "tracing-sample-rate")]
     #[serde(alias = "tracing_sample_rate", skip_serializing_if = "Option::is_none")]
     pub sample_rate: Option<f64>,
@@ -98,9 +105,10 @@ impl TracingArgs {
 
 /// Distributed tracing / OpenTelemetry settings (resolved / `Config` field).
 ///
-/// `sample_rate` is `Option` end-to-end so an explicit `0.01` is distinguishable
-/// from "unset" (RF5-15 / F20). Resolve with [`TracingConfig::resolve_sample_rate`]
-/// / [`TracingConfig::resolve_endpoint`] — precedence is CLI > file > `OTEL_*` env >
+/// `sample_rate` is `Option` end-to-end so an explicit
+/// [`DEFAULT_TRACING_SAMPLE_RATE`] is distinguishable from "unset" (RF5-15 / F20).
+/// Resolve with [`TracingConfig::resolve_sample_rate`] /
+/// [`TracingConfig::resolve_endpoint`] — precedence is CLI > file > `OTEL_*` env >
 /// built-in default.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -110,7 +118,7 @@ pub struct TracingConfig {
     #[serde(default)]
     pub exporter: TracingExporter,
     /// Head-based sampling ratio when set. `None` means "not configured" so
-    /// `OTEL_TRACES_SAMPLER_ARG` and the 0.01 built-in default can apply at
+    /// `OTEL_TRACES_SAMPLER_ARG` and [`DEFAULT_TRACING_SAMPLE_RATE`] can apply at
     /// resolution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample_rate: Option<f64>,
@@ -128,7 +136,8 @@ impl TracingConfig {
         self.endpoint.clone().or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
     }
 
-    /// Resolve the sample rate: explicit config/CLI > `OTEL_TRACES_SAMPLER_ARG` > 0.01.
+    /// Resolve the sample rate: explicit config/CLI > `OTEL_TRACES_SAMPLER_ARG` >
+    /// [`DEFAULT_TRACING_SAMPLE_RATE`].
     ///
     /// Values outside `0.0..=1.0` are clamped with a warning.
     pub fn resolve_sample_rate(&self) -> f64 {
