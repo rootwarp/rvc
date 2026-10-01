@@ -146,6 +146,12 @@ pub mod fields {
         BLOCK_ROOT = "block_root",
         /// Time into slot (duration / ms) — operator timing signal.
         TIME_INTO_SLOT = "time_into_slot",
+        /// OpenTelemetry trace id. Kept equal to `rvc-telemetry`'s literal by
+        /// `telemetry_field_keys_match_registry` (ADR-002 pin / TRC-2e).
+        TRACE_ID = "trace_id",
+        /// OpenTelemetry span id. Kept equal to `rvc-telemetry`'s literal by
+        /// `telemetry_field_keys_match_registry` (ADR-002 pin / TRC-2e).
+        SPAN_ID = "span_id",
     }
 
     /// Canonical `duty` value strings.
@@ -347,7 +353,7 @@ mod tests {
         assert_eq!(conformance::CANONICAL, fields::ALL);
         assert!(conformance::CANONICAL.contains(&fields::SLOT));
         assert!(conformance::CANONICAL.contains(&fields::TIME_INTO_SLOT));
-        assert_eq!(conformance::CANONICAL.len(), 12);
+        assert_eq!(conformance::CANONICAL.len(), 14);
     }
 
     // --- TruncatedPubkey tests ---
@@ -522,6 +528,8 @@ mod tests {
         assert_eq!(fields::HEAD, "head");
         assert_eq!(fields::BLOCK_ROOT, "block_root");
         assert_eq!(fields::TIME_INTO_SLOT, "time_into_slot");
+        assert_eq!(fields::TRACE_ID, "trace_id");
+        assert_eq!(fields::SPAN_ID, "span_id");
     }
 
     #[test]
