@@ -4115,9 +4115,9 @@ mod tests {
     }
     impl SigningEnablement for AllowOnceThenDeny {
         fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-            // fetch_update / swap: first caller sees 1 → true, subsequent → false.
+            // try_update / swap: first caller sees 1 → true, subsequent → false.
             self.remaining
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |n| Some(n.saturating_sub(1)),

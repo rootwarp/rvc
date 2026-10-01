@@ -48,7 +48,7 @@ rvc-test-support = { path = "crates/rvc-test-support" }
 rvc-spec-vectors = { path = "crates/rvc-spec-vectors" }
 
 # External
-async-trait = "0.1"
+async-trait = "0.1.92"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
