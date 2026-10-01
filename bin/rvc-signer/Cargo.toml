@@ -26,6 +26,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing = { workspace = true, features = ["release_max_level_debug"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+url.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
@@ -33,6 +34,7 @@ zeroize.workspace = true
 crypto = { workspace = true, features = ["test-utils"] }
 hex.workspace = true
 libc = "0.2"
+rvc-config.workspace = true
 rvc-test-support.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
