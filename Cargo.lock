@@ -4692,6 +4692,7 @@ dependencies = [
  "clap",
  "hex",
  "libc",
+ "rvc-config",
  "rvc-crypto",
  "rvc-signer-server",
  "rvc-telemetry",
@@ -4702,6 +4703,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+ "url",
  "zeroize",
 ]
 

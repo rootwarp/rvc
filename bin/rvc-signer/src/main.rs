@@ -8,13 +8,31 @@ use signer_server::{config, server, ServerError};
 
 use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser)]
 #[command(name = "rvc-signer")]
 #[command(version)]
 #[command(about = "Remote BLS signer for rvc validator client", long_about = None)]
 struct Cli {
+    /// OTLP HTTP endpoint (for example `http://jaeger:4318`). Enables tracing when set.
+    ///
+    /// Explicit flag wins over `OTEL_EXPORTER_OTLP_ENDPOINT`. A path-less URL gets
+    /// `/v1/traces` appended.
+    #[arg(long, global = true)]
+    tracing_endpoint: Option<String>,
+
+    /// Head-based sample rate in `0.0..=1.0`.
+    ///
+    /// Explicit flag wins over `OTEL_TRACES_SAMPLER_ARG`, which wins over the
+    /// built-in default `0.01`. A resolved rate below `1.0` warns at startup.
+    #[arg(long, global = true)]
+    tracing_sample_rate: Option<f64>,
+
+    /// OpenTelemetry `service.name`. Unset leaves the telemetry built-in (`rvc`).
+    #[arg(long, global = true)]
+    tracing_service_name: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -101,11 +119,18 @@ async fn main() {
         Command::SplitKey(_) => telemetry::LogFormat::resolve(None),
     };
 
-    // Tracing config stays `None` until the flag/resolver follow-up. The guard
-    // is a named binding (not `_`) held until `shutdown_tracing_guard`. Drop
-    // does not flush: `TracingGuard` has no `Drop` shutdown, and the OTel
+    // Flag → `OTEL_*` env → default (ADR-006 duplicate of `TracingConfig::resolve_*`).
+    // The guard is a named binding (not `_`) held until `shutdown_tracing_guard`.
+    // Drop does not flush: `TracingGuard` has no `Drop` shutdown, and the OTel
     // layer keeps its own provider clone.
-    let (reload_handle, mut tracing_guard) = init_logging(log_format, None);
+    let tracing_config = build_signer_tracing_config(&SignerTracingFlags::from_cli(&cli));
+    // Sample-rate warn is after subscriber init (TRC-1a / CD-12). A `warn!`
+    // emitted while resolving, before `init_logging`, would be dropped.
+    let sample_rate = tracing_config.as_ref().map(|config| config.sample_rate);
+    let (reload_handle, mut tracing_guard) = init_logging(log_format, tracing_config);
+    if let Some(sample_rate) = sample_rate {
+        warn_if_sample_rate_below_one(sample_rate);
+    }
 
     match cli.command {
         Command::Serve(args) => {
@@ -174,6 +199,183 @@ async fn shutdown_tracing_guard(guard: Option<telemetry::TracingGuard>) {
     }
 }
 
+/// Built-in head-based sample rate when neither the flag nor
+/// `OTEL_TRACES_SAMPLER_ARG` sets one (ADR-005 / TRC-1a).
+///
+/// Same value as `rvc_config::DEFAULT_TRACING_SAMPLE_RATE`. The parity test
+/// locks the two together.
+const DEFAULT_TRACING_SAMPLE_RATE: f64 = 0.01;
+
+fn default_tracing_sample_rate() -> f64 {
+    DEFAULT_TRACING_SAMPLE_RATE
+}
+
+/// Signer-local tracing inputs (ADR-006).
+///
+/// Deliberate duplicate of the sibling resolver, not a shared helper.
+/// Sibling: `TracingConfig::resolve_endpoint` / `resolve_sample_rate`, cited by
+/// #417 at `crates/rvc/src/config/types.rs:437-458`. Those methods now live in
+/// `crates/rvc-config/src/sections/tracing.rs` (re-exported through `rvc::config`).
+/// `test_signer_tracing_flag_env_default_parity_table` is the lock that keeps
+/// this copy equal to `rvc_config::TracingConfig::resolve_*`.
+///
+/// Precedence is explicit flag → `OTEL_*` env → built-in default. The env names
+/// are string literals so G-3 classifies them as ecosystem config-else-env reads.
+///
+/// `service_name` is explicit flag → `None`. G-3 allow-lists only
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_TRACES_SAMPLER_ARG`, and the sibling
+/// stores `service_name` as the explicit value with no env read. Telemetry's
+/// `"rvc"` fallback applies when this is `None`. The signer default
+/// `"rvc-signer"` is TRC-2h (#418).
+struct SignerTracingFlags {
+    endpoint: Option<String>,
+    sample_rate: Option<f64>,
+    service_name: Option<String>,
+}
+
+impl SignerTracingFlags {
+    fn from_cli(cli: &Cli) -> Self {
+        Self {
+            endpoint: cli.tracing_endpoint.clone(),
+            sample_rate: cli.tracing_sample_rate,
+            service_name: cli.tracing_service_name.clone(),
+        }
+    }
+
+    /// Resolve the OTLP endpoint: explicit flag > `OTEL_EXPORTER_OTLP_ENDPOINT`.
+    ///
+    /// Returns `None` when neither source provides a value (tracing stays disabled).
+    /// Does not append `/v1/traces`; [`ensure_otlp_http_traces_path`] does that,
+    /// matching `bin/rvc`'s split between `resolve_endpoint` and path rewrite.
+    fn resolve_endpoint(&self) -> Option<String> {
+        self.endpoint.clone().or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
+    }
+
+    /// Resolve the sample rate: explicit flag > `OTEL_TRACES_SAMPLER_ARG` >
+    /// [`DEFAULT_TRACING_SAMPLE_RATE`].
+    ///
+    /// Values outside `0.0..=1.0` are clamped with a warning.
+    fn resolve_sample_rate(&self) -> f64 {
+        let mut rate = match self.sample_rate {
+            Some(rate) => rate,
+            None => match std::env::var("OTEL_TRACES_SAMPLER_ARG") {
+                Ok(env_rate) => {
+                    env_rate.parse::<f64>().unwrap_or_else(|_| default_tracing_sample_rate())
+                }
+                Err(_) => default_tracing_sample_rate(),
+            },
+        };
+
+        if !(0.0..=1.0).contains(&rate) {
+            warn!(sample_rate = rate, "tracing_sample_rate out of range 0.0..=1.0, clamping");
+            rate = rate.clamp(0.0, 1.0);
+        }
+        rate
+    }
+
+    /// Explicit `--tracing-service-name`, or `None` when the flag was omitted.
+    fn resolve_service_name(&self) -> Option<String> {
+        self.service_name.clone()
+    }
+}
+
+/// Append `/v1/traces` when the OTLP HTTP endpoint path is empty or `/` (TRC-1b).
+///
+/// Path-less collector URLs (for example Compose `http://jaeger:4318` /
+/// `OTEL_EXPORTER_OTLP_ENDPOINT`) otherwise miss the OTLP HTTP traces route.
+/// Already-pathful endpoints (`/v1/traces`, gateway prefixes like
+/// `/otlp/v1/traces`) are left unchanged. Structural parallel of
+/// `bin/rvc`'s `ensure_otlp_http_traces_path`.
+fn ensure_otlp_http_traces_path(endpoint: String) -> String {
+    let Ok(mut url) = url::Url::parse(&endpoint) else {
+        return endpoint;
+    };
+    let path = url.path();
+    if path.is_empty() || path == "/" {
+        url.set_path("/v1/traces");
+        url.into()
+    } else {
+        // Pathful input is the exporter URL and is returned unchanged, userinfo
+        // included. Print it only through `redact_endpoint_userinfo_for_log`.
+        endpoint
+    }
+}
+
+/// Map resolved flags into the telemetry config `init_logging` consumes.
+///
+/// `None` when no endpoint is configured (tracing stays off), same as
+/// `bin/rvc`'s `build_tracing_config`.
+fn build_signer_tracing_config(flags: &SignerTracingFlags) -> Option<telemetry::TelemetryConfig> {
+    let endpoint = flags.resolve_endpoint()?;
+    let endpoint = ensure_otlp_http_traces_path(endpoint);
+    let sample_rate = flags.resolve_sample_rate();
+    Some(telemetry::TelemetryConfig {
+        endpoint,
+        sample_rate,
+        service_name: flags.resolve_service_name(),
+        service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        ..Default::default()
+    })
+}
+
+/// Startup-only warn when the resolved head sample rate is below 1.0 (TRC-1a).
+///
+/// Must run **after** [`init_logging`]: a `warn!` emitted while building the
+/// tracing config (before the subscriber is installed) is silently dropped.
+/// Call once per process start. `1.0` is silent; `0.0` names that the exporter
+/// receives nothing. Structural parallel of `bin/rvc`'s
+/// `warn_if_sample_rate_below_one`.
+fn warn_if_sample_rate_below_one(sample_rate: f64) {
+    if sample_rate < 1.0 {
+        if sample_rate == 0.0 {
+            warn!(sample_rate, "tracing sample_rate is 0.0; exporter receives nothing");
+        } else {
+            warn!(sample_rate, "tracing sample_rate is below 1.0; most traces will be dropped");
+        }
+    }
+}
+
+/// Log-only view of an OTLP endpoint.
+///
+/// Parses a separate [`url::Url`], clears the entire username and password
+/// (the parser's userinfo, which ends at the last `@` in the authority), then
+/// serializes. Scheme, host, port, path, query, and fragment stay, so
+/// `/v1/traces` remains visible. This value is never written back to
+/// [`telemetry::TelemetryConfig::endpoint`].
+///
+/// Input [`url::Url::parse`] rejects, and that still contains `@`, becomes the
+/// literal `<unparseable>` — the raw string is not echoed.
+fn redact_endpoint_userinfo_for_log(endpoint: &str) -> String {
+    let Ok(mut url) = url::Url::parse(endpoint) else {
+        return unparseable_or_raw(endpoint);
+    };
+    // OTLP endpoints are http(s). Any other scheme that still carries `@`
+    // (`user:s3cret@host` parses as scheme `user`) is not a loggable URL.
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return unparseable_or_raw(endpoint);
+    }
+    if url.username().is_empty() && url.password().is_none() {
+        // No authority userinfo. Keep the caller's string so a path `@` and
+        // other credential-free forms are not rewritten.
+        return endpoint.to_string();
+    }
+    // Drop password before username. An empty username removes userinfo.
+    let _ = url.set_password(None);
+    if url.set_username("").is_err() {
+        return "<unparseable>".to_string();
+    }
+    url.into()
+}
+
+/// `<unparseable>` when `raw` might still hold userinfo; otherwise `raw`.
+fn unparseable_or_raw(raw: &str) -> String {
+    if raw.contains('@') {
+        "<unparseable>".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
 /// Initialize the console-only tracing subscriber.
 ///
 /// Returns the type-erased runtime-reloadable log-filter handle (issue 5.4 /
@@ -231,7 +433,8 @@ fn init_logging(
             // config even if exporter construction fails (same as bin/rvc).
             eprintln!(
                 "OpenTelemetry tracing config (endpoint: {}, sample_rate: {})",
-                config.endpoint, config.sample_rate
+                redact_endpoint_userinfo_for_log(&config.endpoint),
+                config.sample_rate
             );
             match telemetry::init_tracing(config) {
                 Ok((otel_layer, guard)) => {
@@ -246,7 +449,10 @@ fn init_logging(
                     // `register_dispatch` after `.init()`. Not done here.
                     let trace_id_layer = telemetry::TraceIdLayer::new();
                     boxed_layers.push(Box::new(trace_id_layer));
-                    eprintln!("OpenTelemetry tracing enabled (endpoint: {})", config.endpoint);
+                    eprintln!(
+                        "OpenTelemetry tracing enabled (endpoint: {})",
+                        redact_endpoint_userinfo_for_log(&config.endpoint)
+                    );
                     Some(guard)
                 }
                 Err(e) => {
@@ -839,6 +1045,542 @@ mod tests {
         assert!(
             rendered.contains("signer_server::http_api=trace"),
             "padded per-module directive not preserved verbatim (target must bind to trace): {rendered}"
+        );
+    }
+
+    struct EnvSlot {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvSlot {
+        fn set(key: &'static str, value: Option<&str>) -> Self {
+            let prev = std::env::var(key).ok();
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvSlot {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var(self.key, v),
+                    None => std::env::remove_var(self.key),
+                }
+            }
+        }
+    }
+
+    fn capture_sample_rate_warn(sample_rate: f64) -> String {
+        use tracing_subscriber::prelude::*;
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("warn");
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::fmt::layer().with_writer(buf.clone()).with_ansi(false))
+            .with(filter);
+        tracing::subscriber::with_default(subscriber, || {
+            super::warn_if_sample_rate_below_one(sample_rate);
+        });
+        let captured = buf.0.lock().unwrap().clone();
+        String::from_utf8(captured).unwrap()
+    }
+
+    struct ParityRow {
+        label: &'static str,
+        flag_endpoint: Option<&'static str>,
+        env_endpoint: Option<&'static str>,
+        flag_sample_rate: Option<f64>,
+        env_sample_rate: Option<&'static str>,
+        flag_service_name: Option<&'static str>,
+        /// Composed endpoint after `/v1/traces` append. `None` = tracing stays off.
+        expect_endpoint: Option<&'static str>,
+        expect_sample_rate: f64,
+        expect_service_name: Option<&'static str>,
+        /// Substring the post-init sample-rate warn must contain.
+        /// `None` means that warn must not fire.
+        expect_warn: Option<&'static str>,
+    }
+
+    /// TRC-2g shared-behavior lock.
+    ///
+    /// Every row is flag → `OTEL_*` env → default, checked against
+    /// `rvc_config::TracingConfig::resolve_*` (the sibling at
+    /// `crates/rvc/src/config/types.rs:437-458`, now
+    /// `crates/rvc-config/src/sections/tracing.rs`). The composed endpoint
+    /// covers TRC-1b path append. The captured `warn!` covers TRC-1a
+    /// (`< 1.0` including `0.0` warns; `1.0` does not) and only runs when an
+    /// endpoint resolved, matching `main`.
+    #[test]
+    fn test_signer_tracing_flag_env_default_parity_table() {
+        use clap::Parser;
+
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        assert_eq!(super::DEFAULT_TRACING_SAMPLE_RATE, rvc_config::DEFAULT_TRACING_SAMPLE_RATE);
+
+        let src = include_str!("main.rs");
+        let resolver_at = src.find("fn resolve_endpoint(&self)").expect("resolve_endpoint");
+        let resolver_end = src[resolver_at..]
+            .find("fn ensure_otlp_http_traces_path")
+            .expect("path append follows the resolver");
+        let resolver = &src[resolver_at..resolver_at + resolver_end];
+        assert!(
+            resolver.contains("std::env::var(\"OTEL_EXPORTER_OTLP_ENDPOINT\")"),
+            "endpoint env read must be the G-3 literal"
+        );
+        assert!(
+            resolver.contains("std::env::var(\"OTEL_TRACES_SAMPLER_ARG\")"),
+            "sample-rate env read must be the G-3 literal"
+        );
+        assert!(
+            !resolver.contains("OTEL_SERVICE_NAME"),
+            "service name has no sanctioned OTEL env; #418 owns the signer default"
+        );
+
+        let main_start = src.find("async fn main()").expect("main");
+        let main_end = src.find("async fn shutdown_tracing_guard").expect("helper");
+        let main_body = &src[main_start..main_end];
+        let init_at = main_body.find("init_logging(").expect("init_logging call");
+        let warn_at = main_body.find("warn_if_sample_rate_below_one(").expect("startup warn");
+        assert!(init_at < warn_at, "TRC-1a warn must run after the subscriber is installed");
+
+        let init_fn = src.find("fn init_logging(").expect("init_logging");
+        let init_fn_end = src[init_fn..].find("\nfn spawn_log_reload_handler").expect("next fn");
+        let init_body = &src[init_fn..init_fn + init_fn_end];
+        assert_eq!(
+            init_body.matches("redact_endpoint_userinfo_for_log(&config.endpoint)").count(),
+            2,
+            "pre-init and enabled eprintln lines must redact endpoint userinfo"
+        );
+
+        let parsed = super::Cli::try_parse_from([
+            "rvc-signer",
+            "serve",
+            "--log-format",
+            "json",
+            "--tracing-endpoint",
+            "http://jaeger:4318",
+            "--tracing-sample-rate",
+            "0.0",
+            "--tracing-service-name",
+            "custom-signer",
+        ])
+        .expect("serve accepts the three tracing flags next to --log-format");
+        let parsed_flags = super::SignerTracingFlags::from_cli(&parsed);
+        assert_eq!(parsed_flags.endpoint.as_deref(), Some("http://jaeger:4318"));
+        assert_eq!(parsed_flags.sample_rate, Some(0.0));
+        assert_eq!(parsed_flags.service_name.as_deref(), Some("custom-signer"));
+
+        let omitted = super::Cli::try_parse_from(["rvc-signer", "serve"]).expect("serve");
+        let omitted_flags = super::SignerTracingFlags::from_cli(&omitted);
+        assert!(omitted_flags.endpoint.is_none());
+        assert!(omitted_flags.sample_rate.is_none());
+        assert!(omitted_flags.service_name.is_none());
+
+        let rows = [
+            ParityRow {
+                label: "unset flag and env disables tracing; rate stays the built-in default",
+                flag_endpoint: None,
+                env_endpoint: None,
+                flag_sample_rate: None,
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: None,
+                expect_sample_rate: 0.01,
+                expect_service_name: None,
+                expect_warn: None,
+            },
+            ParityRow {
+                label: "path-less jaeger endpoint appends /v1/traces",
+                flag_endpoint: Some("http://jaeger:4318"),
+                env_endpoint: None,
+                flag_sample_rate: None,
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://jaeger:4318/v1/traces"),
+                expect_sample_rate: 0.01,
+                expect_service_name: None,
+                expect_warn: Some("tracing sample_rate is below 1.0"),
+            },
+            ParityRow {
+                label: "path-less endpoint with a trailing slash appends /v1/traces",
+                flag_endpoint: Some("http://jaeger:4318/"),
+                env_endpoint: None,
+                flag_sample_rate: None,
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://jaeger:4318/v1/traces"),
+                expect_sample_rate: 0.01,
+                expect_service_name: None,
+                expect_warn: Some("tracing sample_rate is below 1.0"),
+            },
+            ParityRow {
+                label: "pathful /v1/traces endpoint is untouched",
+                flag_endpoint: Some("http://jaeger:4318/v1/traces"),
+                env_endpoint: None,
+                flag_sample_rate: None,
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://jaeger:4318/v1/traces"),
+                expect_sample_rate: 0.01,
+                expect_service_name: None,
+                expect_warn: Some("tracing sample_rate is below 1.0"),
+            },
+            ParityRow {
+                label: "pathful gateway prefix is untouched",
+                flag_endpoint: Some("http://gateway:4318/otlp/v1/traces"),
+                env_endpoint: None,
+                flag_sample_rate: None,
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://gateway:4318/otlp/v1/traces"),
+                expect_sample_rate: 0.01,
+                expect_service_name: None,
+                expect_warn: Some("tracing sample_rate is below 1.0"),
+            },
+            ParityRow {
+                label: "explicit endpoint wins over OTEL_EXPORTER_OTLP_ENDPOINT",
+                flag_endpoint: Some("http://cli:4318"),
+                env_endpoint: Some("http://env:4318"),
+                flag_sample_rate: None,
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://cli:4318/v1/traces"),
+                expect_sample_rate: 0.01,
+                expect_service_name: None,
+                expect_warn: Some("tracing sample_rate is below 1.0"),
+            },
+            ParityRow {
+                label: "env endpoint is used when the flag is omitted",
+                flag_endpoint: None,
+                env_endpoint: Some("http://jaeger:4318"),
+                flag_sample_rate: None,
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://jaeger:4318/v1/traces"),
+                expect_sample_rate: 0.01,
+                expect_service_name: None,
+                expect_warn: Some("tracing sample_rate is below 1.0"),
+            },
+            ParityRow {
+                label: "sample rate 0.0 warns that the exporter receives nothing",
+                flag_endpoint: Some("http://jaeger:4318"),
+                env_endpoint: None,
+                flag_sample_rate: Some(0.0),
+                env_sample_rate: Some("0.5"),
+                flag_service_name: None,
+                expect_endpoint: Some("http://jaeger:4318/v1/traces"),
+                expect_sample_rate: 0.0,
+                expect_service_name: None,
+                expect_warn: Some("exporter receives nothing"),
+            },
+            ParityRow {
+                label: "sample rate 1.0 does not warn and wins over env",
+                flag_endpoint: Some("http://jaeger:4318"),
+                env_endpoint: None,
+                flag_sample_rate: Some(1.0),
+                env_sample_rate: Some("0.5"),
+                flag_service_name: None,
+                expect_endpoint: Some("http://jaeger:4318/v1/traces"),
+                expect_sample_rate: 1.0,
+                expect_service_name: None,
+                expect_warn: None,
+            },
+            ParityRow {
+                label: "explicit 0.01 survives OTEL_TRACES_SAMPLER_ARG",
+                flag_endpoint: Some("http://jaeger:4318"),
+                env_endpoint: None,
+                flag_sample_rate: Some(0.01),
+                env_sample_rate: Some("0.5"),
+                flag_service_name: None,
+                expect_endpoint: Some("http://jaeger:4318/v1/traces"),
+                expect_sample_rate: 0.01,
+                expect_service_name: None,
+                expect_warn: Some("tracing sample_rate is below 1.0"),
+            },
+            ParityRow {
+                label: "env sample rate applies when the flag is omitted",
+                flag_endpoint: Some("http://localhost:4318"),
+                env_endpoint: None,
+                flag_sample_rate: None,
+                env_sample_rate: Some("0.5"),
+                flag_service_name: None,
+                expect_endpoint: Some("http://localhost:4318/v1/traces"),
+                expect_sample_rate: 0.5,
+                expect_service_name: None,
+                expect_warn: Some("tracing sample_rate is below 1.0"),
+            },
+            ParityRow {
+                label: "malformed env sample rate falls back to the built-in default",
+                flag_endpoint: Some("http://localhost:4318"),
+                env_endpoint: None,
+                flag_sample_rate: None,
+                env_sample_rate: Some("nope"),
+                flag_service_name: None,
+                expect_endpoint: Some("http://localhost:4318/v1/traces"),
+                expect_sample_rate: 0.01,
+                expect_service_name: None,
+                expect_warn: Some("tracing sample_rate is below 1.0"),
+            },
+            ParityRow {
+                label: "sample rate above 1 is clamped to 1.0 and does not warn",
+                flag_endpoint: Some("http://localhost:4318"),
+                env_endpoint: None,
+                flag_sample_rate: Some(2.0),
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://localhost:4318/v1/traces"),
+                expect_sample_rate: 1.0,
+                expect_service_name: None,
+                expect_warn: None,
+            },
+            ParityRow {
+                label: "negative sample rate clamps to 0.0 and warns",
+                flag_endpoint: Some("http://localhost:4318"),
+                env_endpoint: None,
+                flag_sample_rate: Some(-0.5),
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://localhost:4318/v1/traces"),
+                expect_sample_rate: 0.0,
+                expect_service_name: None,
+                expect_warn: Some("exporter receives nothing"),
+            },
+            ParityRow {
+                label: "explicit service name is passed through",
+                flag_endpoint: Some("http://jaeger:4318"),
+                env_endpoint: None,
+                flag_sample_rate: Some(1.0),
+                env_sample_rate: None,
+                flag_service_name: Some("custom-signer"),
+                expect_endpoint: Some("http://jaeger:4318/v1/traces"),
+                expect_sample_rate: 1.0,
+                expect_service_name: Some("custom-signer"),
+                expect_warn: None,
+            },
+            ParityRow {
+                label: "omitted service name stays None",
+                flag_endpoint: Some("http://jaeger:4318"),
+                env_endpoint: None,
+                flag_sample_rate: Some(1.0),
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://jaeger:4318/v1/traces"),
+                expect_sample_rate: 1.0,
+                expect_service_name: None,
+                expect_warn: None,
+            },
+            ParityRow {
+                label: "credentialed path-less endpoint keeps userinfo and appends /v1/traces",
+                flag_endpoint: Some("http://user:s3cret@jaeger:4318"),
+                env_endpoint: None,
+                flag_sample_rate: Some(1.0),
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://user:s3cret@jaeger:4318/v1/traces"),
+                expect_sample_rate: 1.0,
+                expect_service_name: None,
+                expect_warn: None,
+            },
+            ParityRow {
+                label: "pathful endpoint is the original exporter URL, userinfo included",
+                flag_endpoint: Some("http://user:s3cret@gateway:4318/otlp/v1/traces"),
+                env_endpoint: None,
+                flag_sample_rate: Some(1.0),
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://user:s3cret@gateway:4318/otlp/v1/traces"),
+                expect_sample_rate: 1.0,
+                expect_service_name: None,
+                expect_warn: None,
+            },
+            ParityRow {
+                label: "pathful multi-@ userinfo stays on the exporter URL",
+                flag_endpoint: Some("http://user:s3cret@pass@gateway:4318/otlp/v1/traces"),
+                env_endpoint: None,
+                flag_sample_rate: Some(1.0),
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("http://user:s3cret@pass@gateway:4318/otlp/v1/traces"),
+                expect_sample_rate: 1.0,
+                expect_service_name: None,
+                expect_warn: None,
+            },
+            ParityRow {
+                label: "https path-less endpoint appends /v1/traces",
+                flag_endpoint: Some("https://collector.example.com:4318"),
+                env_endpoint: None,
+                flag_sample_rate: Some(1.0),
+                env_sample_rate: None,
+                flag_service_name: None,
+                expect_endpoint: Some("https://collector.example.com:4318/v1/traces"),
+                expect_sample_rate: 1.0,
+                expect_service_name: None,
+                expect_warn: None,
+            },
+        ];
+
+        for row in rows {
+            let _endpoint_env = EnvSlot::set("OTEL_EXPORTER_OTLP_ENDPOINT", row.env_endpoint);
+            let _rate_env = EnvSlot::set("OTEL_TRACES_SAMPLER_ARG", row.env_sample_rate);
+            let flags = super::SignerTracingFlags {
+                endpoint: row.flag_endpoint.map(str::to_string),
+                sample_rate: row.flag_sample_rate,
+                service_name: row.flag_service_name.map(str::to_string),
+            };
+            let sibling = rvc_config::TracingConfig {
+                endpoint: flags.endpoint.clone(),
+                sample_rate: flags.sample_rate,
+                service_name: flags.service_name.clone(),
+                ..Default::default()
+            };
+            assert_eq!(
+                flags.resolve_endpoint(),
+                sibling.resolve_endpoint(),
+                "{}: resolve_endpoint drifted from TracingConfig",
+                row.label
+            );
+            let ours = flags.resolve_sample_rate();
+            let theirs = sibling.resolve_sample_rate();
+            assert!(
+                (ours - theirs).abs() < f64::EPSILON,
+                "{}: resolve_sample_rate drifted ({ours} vs {theirs})",
+                row.label
+            );
+
+            let built = super::build_signer_tracing_config(&flags);
+            assert_eq!(
+                built.as_ref().map(|config| config.endpoint.as_str()),
+                row.expect_endpoint,
+                "{}: composed endpoint",
+                row.label
+            );
+            assert!(
+                (ours - row.expect_sample_rate).abs() < f64::EPSILON,
+                "{}: sample rate {} != {}",
+                row.label,
+                ours,
+                row.expect_sample_rate
+            );
+            assert_eq!(
+                flags.resolve_service_name().as_deref(),
+                row.expect_service_name,
+                "{}: service name",
+                row.label
+            );
+            if let Some(config) = &built {
+                assert!(
+                    (config.sample_rate - row.expect_sample_rate).abs() < f64::EPSILON,
+                    "{}: TelemetryConfig sample rate",
+                    row.label
+                );
+                assert_eq!(
+                    config.service_name.as_deref(),
+                    row.expect_service_name,
+                    "{}: TelemetryConfig service name",
+                    row.label
+                );
+                let logged = super::redact_endpoint_userinfo_for_log(&config.endpoint);
+                assert!(
+                    !logged.contains("s3cret")
+                        && !logged.contains("user")
+                        && !logged.contains("pass"),
+                    "{}: eprintln leaked userinfo: {logged}",
+                    row.label
+                );
+                if config.endpoint.contains('@') {
+                    let authority = logged
+                        .split_once("://")
+                        .map(|(_, rest)| rest)
+                        .unwrap_or(logged.as_str())
+                        .split(['/', '?', '#'])
+                        .next()
+                        .unwrap_or("");
+                    assert!(
+                        !authority.contains('@') && logged.contains("/v1/traces"),
+                        "{}: log URL must drop authority userinfo and keep the traces path: {logged}",
+                        row.label
+                    );
+                } else {
+                    assert_eq!(logged, config.endpoint, "{}: credential-free endpoint", row.label);
+                }
+                let warned = capture_sample_rate_warn(config.sample_rate);
+                match row.expect_warn {
+                    Some(needle) => {
+                        assert!(
+                            warned.contains(needle),
+                            "{}: startup warn missing {needle:?}.\n--- captured ---\n{warned}",
+                            row.label
+                        );
+                        if needle.contains("exporter receives nothing") {
+                            assert!(
+                                !warned.contains("below 1.0"),
+                                "{}: 0.0 must use the exporter-receives-nothing warn.\n{warned}",
+                                row.label
+                            );
+                        }
+                    }
+                    None => assert!(
+                        !warned.contains("tracing sample_rate is below 1.0")
+                            && !warned.contains("exporter receives nothing"),
+                        "{}: rate 1.0 must not warn.\n--- captured ---\n{warned}",
+                        row.label
+                    ),
+                }
+            } else {
+                assert!(
+                    row.expect_warn.is_none(),
+                    "{}: tracing-off must not expect a startup warn",
+                    row.label
+                );
+            }
+        }
+
+        assert_eq!(
+            super::redact_endpoint_userinfo_for_log("http://user:s3cret@jaeger:4318/v1/traces"),
+            "http://jaeger:4318/v1/traces"
+        );
+        assert_eq!(
+            super::redact_endpoint_userinfo_for_log("http://jaeger:4318/v1/traces"),
+            "http://jaeger:4318/v1/traces"
+        );
+        assert_eq!(super::redact_endpoint_userinfo_for_log("user:s3cret@host"), "<unparseable>");
+        let unparseable = super::redact_endpoint_userinfo_for_log("user:pass@s3cret");
+        assert_eq!(unparseable, "<unparseable>");
+        assert!(
+            !unparseable.contains("user")
+                && !unparseable.contains("pass")
+                && !unparseable.contains("s3cret")
+                && !unparseable.contains('@')
+        );
+        assert_eq!(
+            super::redact_endpoint_userinfo_for_log("http://jaeger:4318/path@not-userinfo"),
+            "http://jaeger:4318/path@not-userinfo"
+        );
+
+        // Pathful branch returns the original string (exporter contract). The
+        // log URL is a second parse that drops userinfo at the last authority `@`.
+        let pathful = "http://user:s3cret@gateway:4318/otlp/v1/traces?q=1#frag";
+        assert_eq!(super::ensure_otlp_http_traces_path(pathful.to_string()), pathful);
+        assert_eq!(
+            super::redact_endpoint_userinfo_for_log(pathful),
+            "http://gateway:4318/otlp/v1/traces?q=1#frag"
+        );
+        let multi_at = "http://user:s3cret@pass@gateway:4318/otlp/v1/traces";
+        assert_eq!(super::ensure_otlp_http_traces_path(multi_at.to_string()), multi_at);
+        let multi_logged = super::redact_endpoint_userinfo_for_log(multi_at);
+        assert_eq!(multi_logged, "http://gateway:4318/otlp/v1/traces");
+        assert!(
+            !multi_logged.contains("user")
+                && !multi_logged.contains("pass")
+                && !multi_logged.contains("s3cret")
         );
     }
 }
