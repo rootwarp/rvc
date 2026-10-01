@@ -111,6 +111,22 @@ pub fn init_logging(
     LoggingGuards { _tracing_guard: tracing_guard, _file_guard: file_guard, reload_handle }
 }
 
+/// Startup-only warn when the resolved head sample rate is below 1.0 (TRC-1a /
+/// ADR-005 / CD-12).
+///
+/// Must run **after** [`init_logging`]: a `warn!` emitted while building the
+/// tracing config (before the subscriber is installed) is silently dropped.
+/// Call once per process start — never on a per-slot path.
+pub fn warn_if_sample_rate_below_one(sample_rate: f64) {
+    if sample_rate < 1.0 {
+        if sample_rate == 0.0 {
+            warn!(sample_rate, "tracing sample_rate is 0.0; exporter receives nothing");
+        } else {
+            warn!(sample_rate, "tracing sample_rate is below 1.0; most traces will be dropped");
+        }
+    }
+}
+
 pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfig> {
     // OTEL env precedence lives on TracingConfig (RF5-15); the binary only maps.
     let endpoint = config.tracing.resolve_endpoint()?;

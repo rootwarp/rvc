@@ -19,7 +19,7 @@ pub use sections::{
     MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig, ProposerConfigArgs,
     ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs, SecretProviderConfig,
     ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig, TimingConfig,
-    TracingArgs, TracingConfig, TracingExporter,
+    TracingArgs, TracingConfig, TracingExporter, DEFAULT_TRACING_SAMPLE_RATE,
 };
 
 #[cfg(test)]

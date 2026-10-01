@@ -12,8 +12,8 @@
 //!    and** inline literals.
 //! 2. [`GRANDFATHERED`] — shrinking-only non-security (`RVC_LOG_FORMAT`).
 //! 3. [`ECOSYSTEM_CONFIG_WINS`] — `RUST_LOG` / `OTEL_*`. Precedence is
-//!    **config-else-env** (config wins, env fills `None`; `tracing.rs:128`
-//!    `or_else`, `:137` `None =>`). This is the **opposite** of figment's
+//!    **config-else-env** (config wins, env fills `None`; `tracing.rs:136`
+//!    `or_else`, `:146` `None =>`). This is the **opposite** of figment's
 //!    idiomatic `Env` layer. Adopting a figment-style `Env` layer would
 //!    violate this gate; ADR-008 avoids it by not taking the dependency at
 //!    all (C3).
@@ -125,13 +125,13 @@ const GRANDFATHERED: &[(&str, &str)] = &[(
 /// Class 3 — ecosystem-standard **config-else-env** fallbacks.
 ///
 /// Precedence is **config-else-env**: config wins, env only fills a `None`
-/// (`tracing.rs:128` `or_else`, `:137` `None =>`). This is the **opposite** of
+/// (`tracing.rs:136` `or_else`, `:146` `None =>`). This is the **opposite** of
 /// figment's idiomatic `Env` layer (env-wins overlay). Adopting a figment-style
 /// `Env` layer would violate this gate; ADR-008 avoids it by not taking the
 /// dependency at all (C3).
 const ECOSYSTEM_CONFIG_WINS: &[(&str, &str)] = &[
-    ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTLP endpoint; config-else-env (`tracing.rs:128` `or_else`)"),
-    ("OTEL_TRACES_SAMPLER_ARG", "OTLP sampler; config-else-env (`tracing.rs:137` `None =>`)"),
+    ("OTEL_EXPORTER_OTLP_ENDPOINT", "OTLP endpoint; config-else-env (`tracing.rs:136` `or_else`)"),
+    ("OTEL_TRACES_SAMPLER_ARG", "OTLP sampler; config-else-env (`tracing.rs:146` `None =>`)"),
     (
         "RUST_LOG",
         "tracing-subscriber filter; ecosystem default, env fills unset (`telemetry/src/init.rs`)",
@@ -1529,8 +1529,8 @@ fn grandfathered_table_is_documented_shrinking_only() {
         window.contains("config-else-env"),
         "class 3 must state config-else-env; window={window}"
     );
-    assert!(window.contains("tracing.rs:128"), "class 3 must cite tracing.rs:128; window={window}");
-    assert!(window.contains(":137"), "class 3 must cite :137; window={window}");
+    assert!(window.contains("tracing.rs:136"), "class 3 must cite tracing.rs:136; window={window}");
+    assert!(window.contains(":146"), "class 3 must cite :146; window={window}");
     assert!(
         window.contains("figment") && window.contains("ADR-008"),
         "C3: class 3 must say a figment Env layer would violate this gate and ADR-008 avoids the dep; window={window}"

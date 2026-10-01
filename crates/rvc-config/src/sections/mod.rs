@@ -42,7 +42,7 @@ pub use secret_provider::{
 pub use server::{ServerArgs, ServerConfig};
 pub use slashing::{SlashingArgs, SlashingConfig};
 pub use timing::TimingConfig;
-pub use tracing::{TracingArgs, TracingConfig, TracingExporter};
+pub use tracing::{TracingArgs, TracingConfig, TracingExporter, DEFAULT_TRACING_SAMPLE_RATE};
 
 #[cfg(test)]
 mod tests {

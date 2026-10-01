@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 use crate::commands;
 use crate::logging::{
     build_file_layer_config, build_tracing_config, init_logging, spawn_log_reload_handler,
+    warn_if_sample_rate_below_one,
 };
 
 #[derive(Parser)]
@@ -213,6 +214,11 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 tracing_config.as_ref(),
                 file_layer_config.as_ref(),
             );
+            // CD-12 / TRC-1a: warn after subscriber init (not inside
+            // build_tracing_config — that path is silent).
+            if let Some(ref tc) = tracing_config {
+                warn_if_sample_rate_below_one(tc.sample_rate);
+            }
 
             info!(
                 version = env!("CARGO_PKG_VERSION"),

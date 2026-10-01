@@ -387,3 +387,59 @@ fn tracing_sample_rate_cli_survives_otel_env() {
         "env sample rate must not override explicit CLI 0.01.\n--- combined ---\n{text}"
     );
 }
+
+/// TRC-1a / ADR-005: resolved sample_rate < 1.0 emits a startup `warn!`
+/// **after** subscriber init (CD-12). Rate `1.0` stays silent; `0.0` names
+/// exporter-receives-nothing.
+fn run_start_with_tracing_sample_rate(rate: &str) -> String {
+    let dir = TempDir::new().expect("temp dir");
+    let slashing_path = dir.path().join("missing-slashing.db");
+    let metrics = free_port();
+    let otlp = format!("http://127.0.0.1:{}", free_port());
+    let config = write_start_config(&dir, &slashing_path, "http://127.0.0.1:9", metrics, "");
+
+    let output = run_with_timeout(
+        Command::new(rvc_bin())
+            .args([
+                "start",
+                "--config",
+                config.path().to_str().unwrap(),
+                "--tracing-endpoint",
+                &otlp,
+                "--tracing-sample-rate",
+                rate,
+                "--metrics-port",
+                &metrics.to_string(),
+            ])
+            .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .env_remove("OTEL_TRACES_SAMPLER_ARG"),
+        Duration::from_secs(25),
+    );
+
+    combined(&output)
+}
+
+#[test]
+fn tracing_sample_rate_below_one_warns_after_subscriber_init() {
+    // Case 1: 0.9 → warn after init (visible on the subscriber).
+    let text_09 = run_start_with_tracing_sample_rate("0.9");
+    assert!(
+        text_09.contains("tracing sample_rate is below 1.0"),
+        "resolved 0.9 must warn after subscriber init.\n--- combined ---\n{text_09}"
+    );
+
+    // Case 2: 0.0 → warn naming exporter-receives-nothing.
+    let text_00 = run_start_with_tracing_sample_rate("0.0");
+    assert!(
+        text_00.contains("exporter receives nothing"),
+        "resolved 0.0 must warn that exporter receives nothing.\n--- combined ---\n{text_00}"
+    );
+
+    // Case 3: 1.0 → silent (no below-1.0 / exporter-nothing warn).
+    let text_10 = run_start_with_tracing_sample_rate("1.0");
+    assert!(
+        !text_10.contains("tracing sample_rate is below 1.0")
+            && !text_10.contains("exporter receives nothing"),
+        "resolved 1.0 must not emit the sample-rate warn.\n--- combined ---\n{text_10}"
+    );
+}
