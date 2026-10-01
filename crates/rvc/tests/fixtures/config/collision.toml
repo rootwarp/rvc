@@ -15,6 +15,7 @@ tracing_exporter = "gcp"
 tracing_sample_rate = 0.77
 tracing_max_queue_size = 7777
 tracing_max_export_batch_size = 777
+tracing_service_name = "rvc-flat"
 
 grpc_signer_url = "https://flat-grpc:50051"
 grpc_signer_tls_cert = "/flat/client.crt"
@@ -56,6 +57,7 @@ exporter = "otlp"
 sample_rate = 0.11
 max_queue_size = 11
 max_export_batch_size = 11
+service_name = "rvc-nested"
 
 [grpc_signer]
 url = "https://nested-grpc:50051"

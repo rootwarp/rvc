@@ -253,7 +253,7 @@ fn absent_timing_section_uses_pre_gloas_defaults() {
 // M4: exactly one clap/section declaration per knob across rvc-config (+ leftover cli groups)
 // ---------------------------------------------------------------------------
 
-const KNOBS_69: &[&str] = &[
+const KNOBS_70: &[&str] = &[
     "beacon_url",
     "beacon_nodes",
     "keystore_path",
@@ -282,6 +282,7 @@ const KNOBS_69: &[&str] = &[
     "tracing_sample_rate",
     "tracing_max_queue_size",
     "tracing_max_export_batch_size",
+    "tracing_service_name",
     "secret_provider",
     "gcp_project_id",
     "gcp_secret_prefix",
@@ -427,10 +428,10 @@ fn leaf_declarations(src: &str, struct_name: &str) -> Vec<(String, String)> {
 }
 
 #[test]
-fn every_one_of_the_69_knobs_has_exactly_one_declaration() {
-    assert_eq!(KNOBS_69.len(), 69);
-    let unique: BTreeSet<_> = KNOBS_69.iter().copied().collect();
-    assert_eq!(unique.len(), 69);
+fn every_one_of_the_70_knobs_has_exactly_one_declaration() {
+    assert_eq!(KNOBS_70.len(), 70);
+    let unique: BTreeSet<_> = KNOBS_70.iter().copied().collect();
+    assert_eq!(unique.len(), 70);
 
     let root = workspace_root();
     let section_dir = root.join("crates/rvc-config/src/sections");
@@ -468,7 +469,7 @@ fn every_one_of_the_69_knobs_has_exactly_one_declaration() {
     ];
 
     let mut counts: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for k in KNOBS_69 {
+    for k in KNOBS_70 {
         counts.insert(*k, Vec::new());
     }
     let mut extras = Vec::new();
@@ -492,7 +493,7 @@ fn every_one_of_the_69_knobs_has_exactly_one_declaration() {
         counts.iter().filter(|(_, v)| v.len() > 1).map(|(k, v)| (*k, v)).collect();
     assert!(
         extras.is_empty(),
-        "scanner found clap fields that are not in the 69 knobs or NOT_A_KNOB: {extras:?}"
+        "scanner found clap fields that are not in the 70 knobs or NOT_A_KNOB: {extras:?}"
     );
     assert!(missing.is_empty(), "knobs with zero clap/section declarations: {missing:?}");
     assert!(dupes.is_empty(), "knobs with more than one declaration: {dupes:?}");

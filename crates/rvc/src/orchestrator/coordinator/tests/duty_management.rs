@@ -287,8 +287,15 @@ async fn test_submit_committee_subscriptions_sends_subscriptions() {
     // and keep the mock duty string at exactly 96 hex digits.
     let duty_pk_bytes = [0xccu8; 48];
     let mut pubkey_map_inner = HashMap::new();
-    pubkey_map_inner.insert(duty_pk_bytes, pubkey);
+    pubkey_map_inner.insert(duty_pk_bytes, pubkey.clone());
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+
+    // D-3 fail-closed: register the mapped local pubkey so the per-validator
+    // signing gate permits committee subscription (mirrors startup registration).
+    let validator_store = create_mock_validator_store();
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+        .unwrap();
 
     let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
         clock,
@@ -298,7 +305,7 @@ async fn test_submit_committee_subscriptions_sends_subscriptions() {
         beacon,
         create_mock_block_beacon(),
         None,
-        create_mock_validator_store(),
+        validator_store,
         config,
         pubkey_map,
     ));

@@ -399,6 +399,7 @@ mod tests {
         "--tracing-sample-rate",
         "--tracing-max-queue-size",
         "--tracing-max-export-batch-size",
+        "--tracing-service-name",
         "--keymanager-enabled",
         "--no-keymanager",
         "--keymanager-address",
@@ -502,6 +503,8 @@ mod tests {
             "100",
             "--tracing-max-export-batch-size",
             "50",
+            "--tracing-service-name",
+            "rvc-signer",
             "--secret-provider",
             "gcp",
             "--gcp-project-id",
@@ -607,6 +610,7 @@ mod tests {
         assert_eq!(cfg.tracing.sample_rate, Some(0.5));
         assert_eq!(cfg.tracing.max_queue_size, Some(100));
         assert_eq!(cfg.tracing.max_export_batch_size, Some(50));
+        assert_eq!(cfg.tracing.service_name.as_deref(), Some("rvc-signer"));
         assert_eq!(cfg.secret_provider.providers, vec!["gcp".to_string()]);
         assert_eq!(cfg.secret_provider.gcp.project_id.as_deref(), Some("proj"));
         assert_eq!(cfg.secret_provider.gcp.secret_prefix, "vk-");
@@ -835,7 +839,15 @@ metrics_port = 9090
         // the operator-facing flag names (not the nested TOML field names).
         let groups: &[(&str, &[&str])] = &[
             ("LoggingArgs", &["--log-level", "--logfile", "--logfile-max-size"]),
-            ("TracingArgs", &["--tracing-endpoint", "--tracing-exporter", "--tracing-sample-rate"]),
+            (
+                "TracingArgs",
+                &[
+                    "--tracing-endpoint",
+                    "--tracing-exporter",
+                    "--tracing-sample-rate",
+                    "--tracing-service-name",
+                ],
+            ),
             (
                 "KeymanagerArgs",
                 &["--keymanager-enabled", "--keymanager-address", "--remote-signer-url"],

@@ -1,7 +1,7 @@
 //! Global builder URLs and `min_bid` for `produceBlockV4`. TOML `[builder]` only.
 //!
 //! Empty `builders` is legal (local-only). Unknown keys fail deserialize so a
-//! typo cannot sit inert. No clap group — `OPERATOR_KNOB_NAMES` stays at 69.
+//! typo cannot sit inert. No clap group — `OPERATOR_KNOB_NAMES` stays at 70.
 
 use serde::{Deserialize, Serialize};
 

@@ -132,6 +132,10 @@ log_level = "info"
 # Maximum number of spans per export batch (OTel SDK default: 512).
 # tracing_max_export_batch_size = 512
 
+# OpenTelemetry service.name (default: "rvc" when unset). Distinguishes VC vs
+# signer in Jaeger / OTLP (ADR-007 / TRC-1c). No OTEL_SERVICE_NAME env fallback.
+# tracing_service_name = "rvc"
+
 # GCP Cloud Trace: set tracing_exporter = "gcp" (requires --features gcp-trace).
 # Uses Application Default Credentials (ADC) — no endpoint needed.
 # On shutdown, pending spans are flushed with a 5-second timeout.

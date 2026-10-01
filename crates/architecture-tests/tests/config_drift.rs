@@ -27,7 +27,7 @@
 //! Every operator knob — a **section-struct field path** in `rvc-config`
 //! (plus the six wrapper knobs on `start.rs`) — appears in `Config::validate`
 //! (`types.rs`) **or** on the shrinking-only [`UNVALIDATED`] list. Inventory is
-//! **69** (`OPERATOR_KNOB_NAMES` in `crates/rvc/src/config/knobs.rs`). Adding
+//! **70** (`OPERATOR_KNOB_NAMES` in `crates/rvc/src/config/knobs.rs`). Adding
 //! a section field without a check or a list entry fails CI.
 //!
 //! ## Clause (iv) — clap default clobber (ADR-009 / F9)
@@ -173,6 +173,7 @@ const UNVALIDATED: &[(&str, &str)] = &[
     ("tracing.max_export_batch_size", "no field-name check in Config::validate"),
     ("tracing.max_queue_size", "no field-name check in Config::validate"),
     ("tracing.sample_rate", "no field-name check in Config::validate"),
+    ("tracing.service_name", "no field-name check in Config::validate"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -798,15 +799,15 @@ fn clause_iii_covers_every_section_field() {
     let paths = collect_section_field_paths(&root);
     assert_eq!(
         paths.len(),
-        69,
-        "clause (iii) must cover every section-struct field path (OPERATOR_KNOB_NAMES is 69); \
+        70,
+        "clause (iii) must cover every section-struct field path (OPERATOR_KNOB_NAMES is 70); \
          got {paths:?}"
     );
     let fields = collect_section_fields(&root);
 
     let knobs_src = std::fs::read_to_string(root.join(KNOBS_RS)).expect("knobs.rs");
     let knobs = operator_knob_names(&knobs_src);
-    assert_eq!(knobs.len(), 69, "OPERATOR_KNOB_NAMES count drifted; expected 69");
+    assert_eq!(knobs.len(), 70, "OPERATOR_KNOB_NAMES count drifted; expected 70");
 
     let field_knobs: HashSet<&str> = fields.iter().map(|f| f.knob.as_str()).collect();
     let knob_set: HashSet<&str> = knobs.iter().map(String::as_str).collect();

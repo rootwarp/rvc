@@ -135,7 +135,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/beacon/src/client.rs",
-        490,
+        523,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -297,7 +297,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer-server/src/dvt/peer_client.rs",
-        204,
+        207,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -306,7 +306,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        996,
+        1029,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -315,7 +315,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1319,
+        1356,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -324,7 +324,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1394,
+        1431,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -425,7 +425,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/beacon/src/client.rs",
-        1189,
+        1222,
         Class::MatchForkName,
         false,
         "match fork {",
@@ -434,7 +434,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/beacon/src/client.rs",
-        2026,
+        2059,
         Class::MatchForkName,
         false,
         "match requested {",

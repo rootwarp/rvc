@@ -86,6 +86,11 @@ const DEFAULT_IS_SAFE: &[(&str, &str, &str)] = &[
         "opt-out always-safe; log-only, no teardown state",
     ),
     (
+        "crates/rvc/src/keymanager_adapters/tests/export_floor.rs",
+        "NoopMonitor",
+        "test double; no-op monitor for export-floor tests, cancel defaults to stop",
+    ),
+    (
         "crates/rvc/tests/post_import_doppelganger_signing_block_m12.rs",
         "RecordingMonitor",
         "test double; records start_monitoring for re-arm scan",

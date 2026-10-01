@@ -16,6 +16,7 @@ exporter = "gcp"
 sample_rate = 0.37
 max_queue_size = 3333
 max_export_batch_size = 444
+service_name = "rvc-wire"
 
 [grpc_signer]
 url = "https://wire-grpc:50051"

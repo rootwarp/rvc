@@ -447,6 +447,7 @@ struct ConfigWire {
     tracing_sample_rate: Option<f64>,
     tracing_max_queue_size: Option<usize>,
     tracing_max_export_batch_size: Option<usize>,
+    tracing_service_name: Option<String>,
     grpc_signer_url: Option<String>,
     grpc_signer_tls_cert: Option<PathBuf>,
     grpc_signer_tls_key: Option<PathBuf>,
@@ -512,6 +513,9 @@ impl Config {
         }
         if let Some(v) = w.tracing_max_export_batch_size {
             tracing.max_export_batch_size = Some(v);
+        }
+        if let Some(v) = w.tracing_service_name {
+            tracing.service_name = Some(v);
         }
 
         let mut keymanager = w.keymanager;
@@ -1230,6 +1234,9 @@ impl Config {
         }
         if let Some(v) = tracing.max_export_batch_size {
             self.tracing.max_export_batch_size = Some(v);
+        }
+        if let Some(v) = &tracing.service_name {
+            self.tracing.service_name = Some(v.clone());
         }
 
         if keymanager.no_keymanager {
@@ -2317,6 +2324,7 @@ log_level = "info"
         let config = Config::default();
         assert!(config.tracing.max_queue_size.is_none());
         assert!(config.tracing.max_export_batch_size.is_none());
+        assert!(config.tracing.service_name.is_none());
     }
 
     #[test]
@@ -2336,10 +2344,19 @@ log_level = "info"
     }
 
     #[test]
+    fn test_merge_with_cli_tracing_service_name() {
+        let config = overlay(|cli| {
+            cli.tracing.service_name = Some("rvc-signer".into());
+        });
+        assert_eq!(config.tracing.service_name.as_deref(), Some("rvc-signer"));
+    }
+
+    #[test]
     fn test_merge_with_cli_tracing_batch_none_preserves_defaults() {
         let config = overlay(|_| {});
         assert!(config.tracing.max_queue_size.is_none());
         assert!(config.tracing.max_export_batch_size.is_none());
+        assert!(config.tracing.service_name.is_none());
     }
 
     #[test]
@@ -2365,6 +2382,26 @@ tracing_max_export_batch_size = 1024
     }
 
     #[test]
+    fn test_config_from_file_with_tracing_service_name() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+tracing_service_name = "rvc-signer"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.tracing.service_name.as_deref(), Some("rvc-signer"));
+    }
+
+    #[test]
     fn test_config_from_file_without_tracing_batch_uses_defaults() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
@@ -2382,6 +2419,7 @@ log_level = "info"
         let config = Config::from_file(file.path()).unwrap();
         assert!(config.tracing.max_queue_size.is_none());
         assert!(config.tracing.max_export_batch_size.is_none());
+        assert!(config.tracing.service_name.is_none());
     }
 
     // -- redact_url tests --
@@ -3318,6 +3356,7 @@ builders = ["not a url"]
             "tracing_sample_rate",
             "tracing_max_queue_size",
             "tracing_max_export_batch_size",
+            "tracing_service_name",
             "grpc_signer_url",
             "grpc_signer_tls_cert",
             "grpc_signer_tls_key",
