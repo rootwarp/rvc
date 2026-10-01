@@ -53,6 +53,10 @@ pub fn init_logging(
     let mut boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
         Vec::new();
 
+    // Soft P2: TraceIdLayer::new() per subscriber. Clone shares the OnceLock so we
+    // can prime on_register_dispatch after install — Vec<Layer> does not forward it.
+    let mut trace_id_registrar: Option<telemetry::TraceIdLayer> = None;
+
     let tracing_guard = match tracing_config {
         Some(config) => {
             // Log resolved sample_rate before init so operators (and CLI e2e
@@ -65,6 +69,15 @@ pub fn init_logging(
             match telemetry::init_tracing(config) {
                 Ok((otel_layer, guard)) => {
                     boxed_layers.push(otel_layer);
+                    // Ordering (T5): OpenTelemetryLayer → TraceIdLayer → console/file
+                    // fmt. Layered::on_event runs inner before layer, so TraceIdLayer
+                    // must sit in boxed_layers (before console) to cache on the first
+                    // event. Do not reorder relative to otel_layer or console_layer.
+                    // TraceIdLayer::new() per subscriber (Soft P2 — do not share
+                    // across subscriber installs).
+                    let trace_id_layer = telemetry::TraceIdLayer::new();
+                    trace_id_registrar = Some(trace_id_layer.clone());
+                    boxed_layers.push(Box::new(trace_id_layer));
                     eprintln!("OpenTelemetry tracing enabled (endpoint: {})", config.endpoint);
                     Some(guard)
                 }
@@ -103,6 +116,15 @@ pub fn init_logging(
     let console_layer = telemetry::console_fmt_layer(log_format, std::io::stdout);
 
     tracing_subscriber::registry().with(boxed_layers).with(console_layer).with(filter).init();
+
+    // TRC-2d / Soft P2: Vec does not forward on_register_dispatch. After `.init()`
+    // installs the global default, prime TraceIdLayer's OnceLock so first-event
+    // caching (T5) works. No-endpoint / Err paths leave registrar None.
+    if let Some(registrar) = trace_id_registrar {
+        tracing::dispatcher::get_default(|dispatch| {
+            registrar.register_dispatch(dispatch);
+        });
+    }
 
     // Erase the concrete reload handle (its subscriber type is the unspellable
     // layered stack above) so it can be stored and moved into the SIGHUP task.
@@ -969,5 +991,161 @@ mod tests {
             serde_json::from_str(line).expect("JSON arm must emit parseable JSON");
         assert_eq!(v["slot"], 42, "canonical field must be a top-level JSON key");
         assert_eq!(v["message"], "json arm marker");
+    }
+
+    // ── TRC-2d / T5: TraceIdLayer in bin/rvc boxed_layers composition ─────────
+
+    /// Strip ANSI CSI sequences from a pretty log line for field assertions.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' && chars.peek() == Some(&'[') {
+                chars.next();
+                for ch in chars.by_ref() {
+                    if ch.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// T5: first event inside a fresh span already carries `trace_id`, asserted
+    /// over bin/rvc's composition order (`boxed_layers`-then-console).
+    ///
+    /// Mirrors `init_logging`: OTel then `TraceIdLayer` inside `boxed_layers`,
+    /// then `console_fmt_layer`, then the filter. Pins Layered::on_event order
+    /// (inner before layer) so TraceIdLayer caches before Format reads.
+    #[test]
+    fn t5_first_event_inside_fresh_span_carries_trace_id_over_bin_rvc_composition() {
+        use tracing_subscriber::layer::Layer;
+        use tracing_subscriber::prelude::*;
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("info");
+        let config = telemetry::TelemetryConfig {
+            sample_rate: 1.0,
+            ..telemetry::TelemetryConfig::default()
+        };
+        let (otel, guard) = telemetry::init_tracing(&config).expect("init_tracing");
+
+        // Same shape as init_logging's success arm: OTel → TraceIdLayer in Vec,
+        // then console, then filter (do not reorder — T5). Soft P2: new() per
+        // subscriber; Clone shares OnceLock so we can prime after install (Vec
+        // does not forward on_register_dispatch).
+        let mut boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+            Vec::new();
+        boxed_layers.push(otel);
+        let trace_id_layer = telemetry::TraceIdLayer::new();
+        let registrar = trace_id_layer.clone();
+        boxed_layers.push(Box::new(trace_id_layer));
+
+        let console_layer = telemetry::console_fmt_layer(telemetry::LogFormat::Pretty, buf.clone());
+        let subscriber =
+            tracing_subscriber::registry().with(boxed_layers).with(console_layer).with(filter);
+
+        let (line, injected) = tracing::subscriber::with_default(subscriber, || {
+            // Mirror init_logging post-init priming (Vec skips on_register_dispatch).
+            tracing::dispatcher::get_default(|dispatch| {
+                registrar.register_dispatch(dispatch);
+            });
+
+            let span = tracing::info_span!("t5_fresh");
+            let _enter = span.enter();
+            // First event in a fresh span must already carry trace_id (lazy cache).
+            tracing::info!("t5 first event");
+
+            let mut headers = reqwest::header::HeaderMap::new();
+            telemetry::inject_trace_context(&mut headers);
+            let tp = headers
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok())
+                .expect("inject_trace_context must yield traceparent under a sampled span");
+            let injected = tp.split('-').nth(1).expect("trace-id field").to_string();
+
+            let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+            let line = out
+                .lines()
+                .find(|l| l.contains("t5 first event"))
+                .expect("t5 first event line present")
+                .to_string();
+            (line, injected)
+        });
+
+        let plain = strip_ansi(&line);
+        assert!(
+            plain.contains(telemetry::TRACE_ID_KEY),
+            "T5: first event must carry {}; got: {plain:?}",
+            telemetry::TRACE_ID_KEY
+        );
+        assert!(
+            plain.contains(telemetry::SPAN_ID_KEY),
+            "T5: first event must carry {}; got: {plain:?}",
+            telemetry::SPAN_ID_KEY
+        );
+        let marker = format!("{}=", telemetry::TRACE_ID_KEY);
+        let rendered = plain
+            .find(&marker)
+            .map(|i| {
+                let rest = &plain[i + marker.len()..];
+                rest.split_whitespace().next().unwrap_or(rest)
+            })
+            .expect("T5: trace_id= value must be present");
+        assert_eq!(
+            rendered, injected,
+            "T5: rendered trace_id must equal inject_trace_context (got {rendered}, injected={injected})"
+        );
+
+        // Keep the provider alive for the duration of the assertion; drop after.
+        drop(guard);
+    }
+
+    /// No-endpoint / no-OTel path (T4 shape at binary composition): Identity-
+    /// padded `boxed_layers` + console — no `trace_id`/`span_id`, no zeroed ids.
+    /// TraceIdLayer is not pushed when `resolve_endpoint() == None`.
+    #[test]
+    fn t4_no_endpoint_bin_rvc_composition_emits_no_trace_id_or_zeros() {
+        use tracing_subscriber::layer::Layer;
+        use tracing_subscriber::prelude::*;
+
+        let buf = SharedBuf::default();
+        let filter = tracing_subscriber::EnvFilter::new("info");
+        // Same Identity-padded boxed_layers as init_logging when tracing_config
+        // is None (no endpoint) — TraceIdLayer must not appear on this path.
+        let boxed_layers: Vec<Box<dyn Layer<tracing_subscriber::Registry> + Send + Sync>> =
+            vec![Box::new(tracing_subscriber::layer::Identity::new())];
+        // without_time avoids timestamp false-positives on the literal `00000000`
+        // scan (same rationale as telemetry T4).
+        let console_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .event_format(telemetry::TraceIdFormat(
+                tracing_subscriber::fmt::format().without_time().with_ansi(false),
+            ))
+            .with_writer(buf.clone());
+
+        let subscriber =
+            tracing_subscriber::registry().with(boxed_layers).with(console_layer).with(filter);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("t4_bin_no_otel");
+            let _enter = span.enter();
+            tracing::info!("t4 bin no otel event");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line =
+            out.lines().find(|l| l.contains("t4 bin no otel event")).expect("event line present");
+        assert!(
+            !line.contains(telemetry::TRACE_ID_KEY) && !line.contains(telemetry::SPAN_ID_KEY),
+            "T4 binary: keys must be absent without OTel; got: {line:?}"
+        );
+        assert!(
+            !line.contains("00000000"),
+            "T4 binary: zeroed-id substring must never appear; got: {line:?}"
+        );
     }
 }

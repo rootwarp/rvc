@@ -11,6 +11,7 @@
 //! cached; this layer does not record same-name fields onto events (avoids
 //! dual `trace_id`/`span_id` keys — rendering is TRC-2c's job).
 
+#[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -54,7 +55,8 @@ pub struct TraceIds {
 pub struct TraceIdLayer {
     /// Weak handle to the installed `Dispatch`, needed by `get_otel_context`.
     dispatch: Arc<OnceLock<WeakDispatch>>,
-    /// Count of `get_otel_context` invocations (cache misses only).
+    /// Count of `get_otel_context` invocations (cache misses only; test probe).
+    #[cfg(test)]
     otel_lookups: Arc<AtomicUsize>,
 }
 
@@ -62,6 +64,18 @@ impl TraceIdLayer {
     /// Create a new [`TraceIdLayer`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Record the installed [`tracing::Dispatch`] for later `get_otel_context` calls.
+    ///
+    /// Prefer letting `on_register_dispatch` do this automatically on Layered
+    /// stacks. When the layer lives inside a `Vec<Box<dyn Layer>>` (bin/rvc
+    /// `boxed_layers`), tracing-subscriber does not forward
+    /// `on_register_dispatch` — call this after the subscriber is installed,
+    /// typically via a [`Clone`] that shares the same `OnceLock` (Soft P2 /
+    /// TRC-2d).
+    pub fn register_dispatch(&self, dispatch: &tracing::Dispatch) {
+        let _ = self.dispatch.set(dispatch.downgrade());
     }
 
     /// Number of times this layer called `get_otel_context` (cache misses).
@@ -76,15 +90,16 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_register_dispatch(&self, subscriber: &tracing::Dispatch) {
-        let _ = self.dispatch.set(subscriber.downgrade());
+        self.register_dispatch(subscriber);
     }
 
     // Intentionally no `on_new_span` — ADR-001 option B is forbidden (lazy
     // on_event only; see architecture ADR-001 option D).
 
-    fn on_event(&self, _event: &Event<'_>, ctx: Context<'_, S>) {
-        // L2: event outside any span — return before touching extensions.
-        let Some(span) = ctx.lookup_current() else {
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+        // Soft P2 / TRC-2d: event parent via event_span (== Format's parent_span),
+        // not bare lookup_current. Fail-closed if the parent span is missing.
+        let Some(span) = ctx.event_span(event) else {
             return;
         };
 
@@ -93,11 +108,20 @@ where
             return;
         }
 
-        let Some(weak) = self.dispatch.get() else {
-            return;
-        };
-        let Some(dispatch) = weak.upgrade() else {
-            return;
+        // Prefer the Dispatch captured in on_register_dispatch (Layered stacks, or
+        // primed after install when living in a Vec — see bin/rvc init_logging).
+        // Soft P2 / TRC-2d: tracing-subscriber's `Vec<L: Layer>` does not forward
+        // `on_register_dispatch`. Fall back to the active dispatcher when the
+        // OnceLock is empty; under a *global* default (`.init()`) this works even
+        // during on_event. Under a scoped `with_default`, get_default returns
+        // NONE while delivering an event — callers must prime via a Clone.
+        let dispatch = match self.dispatch.get().and_then(|weak| weak.upgrade()) {
+            Some(dispatch) => dispatch,
+            None => {
+                // Under a scoped with_default, get_default returns NONE while
+                // delivering an event — get_otel_context then yields None.
+                tracing::dispatcher::get_default(|d| d.clone())
+            }
         };
 
         let mut extensions = span.extensions_mut();
@@ -106,6 +130,7 @@ where
             return;
         }
 
+        #[cfg(test)]
         self.otel_lookups.fetch_add(1, Ordering::Relaxed);
 
         // L4: no OTel / WithContext → None; never insert zeroed TraceIds.
@@ -114,8 +139,7 @@ where
         };
 
         // Soft P2: validated OTel SpanContext only (correlators, not auth).
-        let otel_span = otel_cx.span();
-        let span_context = otel_span.span_context();
+        let span_context = otel_cx.span().span_context().clone();
         // L3: unsampled (sample_rate 0.0) → is_sampled == false → no cache.
         if !(span_context.is_valid() && span_context.is_sampled()) {
             return;
@@ -263,6 +287,45 @@ mod tests {
         let ids = extension_trace_ids(&span).expect("cached after first event");
         assert_eq!(probe.otel_lookup_count(), 1, "exactly one get_otel_context per span");
         assert_eq!(extension_trace_ids(&span), Some(ids));
+
+        guard.provider.shutdown().ok();
+    }
+
+    /// TRC-2d: TraceIdLayer inside a Vec (bin/rvc boxed_layers shape) must
+    /// still cache on the first event. Vec does not forward
+    /// `on_register_dispatch`; prime via a Clone (shared OnceLock) after
+    /// install — same Soft P2 pattern as bin/rvc `init_logging`.
+    #[test]
+    fn vec_boxed_layers_caches_on_first_event() {
+        use tracing_subscriber::layer::Layer;
+        use tracing_subscriber::prelude::*;
+
+        let config = TelemetryConfig { sample_rate: 1.0, ..TelemetryConfig::default() };
+        let (otel, guard) = init_tracing(&config).expect("init_tracing");
+        let layer = TraceIdLayer::new();
+        let registrar = layer.clone();
+        let probe = layer.clone();
+
+        let boxed: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![otel, Box::new(layer)];
+
+        let subscriber = Registry::default().with(boxed);
+        let _default = tracing::subscriber::set_default(subscriber);
+        tracing::dispatcher::get_default(|dispatch| {
+            registrar.register_dispatch(dispatch);
+        });
+
+        let span = tracing::info_span!("vec_compose");
+        let _enter = span.enter();
+        tracing::info!("vec first event");
+
+        let ids = extension_trace_ids(&span);
+        assert!(
+            ids.is_some(),
+            "Vec boxed_layers must cache TraceIds on first event (got lookups={}, once={})",
+            probe.otel_lookup_count(),
+            probe.dispatch.get().is_some()
+        );
+        assert_eq!(probe.otel_lookup_count(), 1);
 
         guard.provider.shutdown().ok();
     }
