@@ -135,6 +135,7 @@ All three TLS flags are required when `--grpc-signer-url` is set.
 | `--tracing-sample-rate <FLOAT>` | `0.01` | Head-based sampling ratio (0.0–1.0) |
 | `--tracing-max-queue-size <N>` | `2048` | Max spans queued for export |
 | `--tracing-max-export-batch-size <N>` | `512` | Max spans per export batch |
+| `--tracing-service-name <NAME>` | `rvc` | OpenTelemetry `service.name` (Jaeger Service dropdown) |
 
 #### Genesis Overrides (for custom networks)
 
@@ -525,9 +526,11 @@ Four-step recipe:
    `curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:4318/v1/traces -H 'Content-Type: application/json' -d '{}'`
    — expect HTTP 200 when the collector is up; connection refused means the
    profile is down.
-4. In the UI, open the **Service** dropdown, select `rvc`, and click
-   **Find Traces**. With sample rate `1.0` you should see spans from
-   `bin/rvc`.
+4. In the UI, open the **Service** dropdown, select `rvc` (or the name passed
+   via `--tracing-service-name`), and click **Find Traces**. With sample rate
+   `1.0` you should see spans from `bin/rvc`. To distinguish VC and signer
+   processes later, start each with a distinct `--tracing-service-name`
+   (e.g. `rvc` / `rvc-signer`).
 
 > **Warning:** Compose binds the Jaeger UI to `127.0.0.1:16686` only. Do not
 > republish `16686` on all interfaces. Remote access needs an SSH tunnel

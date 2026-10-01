@@ -84,6 +84,12 @@ pub struct TracingArgs {
     #[arg(id = "tracing_max_export_batch_size", long = "tracing-max-export-batch-size")]
     #[serde(alias = "tracing_max_export_batch_size", skip_serializing_if = "Option::is_none")]
     pub max_export_batch_size: Option<usize>,
+
+    /// OpenTelemetry `service.name` (default: `"rvc"` when unset). Distinguishes
+    /// VC vs signer in Jaeger/OTLP (ADR-007 / TRC-1c).
+    #[arg(id = "tracing_service_name", long = "tracing-service-name")]
+    #[serde(alias = "tracing_service_name", skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
 }
 
 impl TracingArgs {
@@ -99,6 +105,7 @@ impl TracingArgs {
             sample_rate: self.sample_rate,
             max_queue_size: self.max_queue_size,
             max_export_batch_size: self.max_export_batch_size,
+            service_name: self.service_name.clone(),
         }
     }
 }
@@ -126,6 +133,10 @@ pub struct TracingConfig {
     pub max_queue_size: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_export_batch_size: Option<usize>,
+    /// OpenTelemetry `service.name`. `None` means use the built-in `"rvc"`
+    /// fallback in `telemetry::init_tracing` (ADR-007 / TRC-1c).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
 }
 
 impl TracingConfig {

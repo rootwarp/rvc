@@ -135,9 +135,9 @@ const REQUIRED_CORPUS: &[&str] = &[
 #[test]
 fn every_knob_appears_in_the_parity_corpus() {
     let names = cli_override_field_names();
-    assert_eq!(names.len(), 69, "operator knob count is 69 after group-commit knobs");
+    assert_eq!(names.len(), 70, "operator knob count is 70 after tracing_service_name");
     let unique: BTreeSet<_> = names.iter().copied().collect();
-    assert_eq!(unique.len(), 69, "operator knob names must be unique");
+    assert_eq!(unique.len(), 70, "operator knob names must be unique");
 
     for name in REQUIRED_CORPUS {
         let path = fixture_path(name);
@@ -192,6 +192,7 @@ fn flat_key_wins_over_nested_table() {
     assert_eq!(config.tracing.sample_rate, Some(0.77));
     assert_eq!(config.tracing.max_queue_size, Some(7777));
     assert_eq!(config.tracing.max_export_batch_size, Some(777));
+    assert_eq!(config.tracing.service_name.as_deref(), Some("rvc-flat"));
     assert_eq!(config.grpc_signer.url.as_deref(), Some("https://flat-grpc:50051"));
     assert_eq!(config.grpc_signer.tls_cert.as_deref(), Some(Path::new("/flat/client.crt")));
     assert_eq!(config.grpc_signer.tls_key.as_deref(), Some(Path::new("/flat/client.key")));
@@ -371,6 +372,7 @@ fn assert_legacy_group_values(config: &Config) {
     assert_eq!(config.tracing.sample_rate, Some(0.37));
     assert_eq!(config.tracing.max_queue_size, Some(3333));
     assert_eq!(config.tracing.max_export_batch_size, Some(444));
+    assert_eq!(config.tracing.service_name.as_deref(), Some("rvc-wire"));
     assert_eq!(config.grpc_signer.url.as_deref(), Some("https://wire-grpc:50051"));
     assert_eq!(config.grpc_signer.tls_cert.as_deref(), Some(Path::new("/etc/rvc/wire/client.crt")));
     assert_eq!(config.grpc_signer.tls_key.as_deref(), Some(Path::new("/etc/rvc/wire/client.key")));

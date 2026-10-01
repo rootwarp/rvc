@@ -233,6 +233,7 @@ pub fn build_tracing_config(config: &Config) -> Option<telemetry::TelemetryConfi
         sample_rate,
         network: config.network.to_string(),
         service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        service_name: config.tracing.service_name.clone(),
         max_queue_size: config.tracing.max_queue_size,
         max_export_batch_size: config.tracing.max_export_batch_size,
     })
@@ -713,6 +714,25 @@ mod tests {
         let tc = build_tracing_config(&config).expect("should return Some");
         assert!(tc.max_queue_size.is_none());
         assert!(tc.max_export_batch_size.is_none());
+        assert!(tc.service_name.is_none());
+    }
+
+    #[test]
+    fn test_build_tracing_config_service_name_passthrough() {
+        let _guard = env_lock();
+        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
+        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
+
+        let config = Config {
+            tracing: TracingConfig {
+                endpoint: Some("http://localhost:4318".to_string()),
+                service_name: Some("rvc-signer".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let tc = build_tracing_config(&config).expect("should return Some");
+        assert_eq!(tc.service_name.as_deref(), Some("rvc-signer"));
     }
 
     // H-07: binary-local mapping — `build_tracing_config` produces a config

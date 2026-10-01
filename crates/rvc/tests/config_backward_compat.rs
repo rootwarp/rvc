@@ -49,6 +49,7 @@ fn expected_production_config() -> Config {
             sample_rate: Some(0.05),
             max_queue_size: Some(4096),
             max_export_batch_size: Some(1024),
+            service_name: None,
         },
         grpc_signer: GrpcSignerConfig {
             url: Some("https://signer:50051".to_string()),

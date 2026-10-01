@@ -50,7 +50,7 @@ mod tests {
 
     use super::*;
 
-    /// Pre-move `rvc start` long flags for the four clean groups (20 knobs).
+    /// Pre-move `rvc start` long flags for the four clean groups (21 knobs).
     const PRE_MOVE_LONG_FLAGS_4F: &[&str] = &[
         "--allow-insecure-remote-signer",
         "--grpc-signer-tls-ca-cert",
@@ -72,6 +72,7 @@ mod tests {
         "--tracing-max-export-batch-size",
         "--tracing-max-queue-size",
         "--tracing-sample-rate",
+        "--tracing-service-name",
     ];
 
     /// Pre-move longs for the ARCH-4h clap groups (22 knobs + 4 BN timeouts +
@@ -228,7 +229,7 @@ mod tests {
         for flag in PRE_MOVE_LONG_FLAGS_4H {
             assert!(actual.contains(flag), "ARCH-4h section missing pre-move flag {flag}");
         }
-        assert_eq!(PRE_MOVE_LONG_FLAGS_4F.len(), 20, "ARCH-4f migrates 20 knobs");
+        assert_eq!(PRE_MOVE_LONG_FLAGS_4F.len(), 21, "ARCH-4f migrates 21 knobs");
         assert_eq!(PRE_MOVE_LONG_FLAGS_4G.len(), 17, "ARCH-4g migrates 17 dotted knobs");
         assert_eq!(actual, expected, "unexpected extra or renamed long flags: {actual:?}");
     }

@@ -15,6 +15,7 @@ tracing_exporter = "gcp"
 tracing_sample_rate = 0.37
 tracing_max_queue_size = 3333
 tracing_max_export_batch_size = 444
+tracing_service_name = "rvc-wire"
 
 grpc_signer_url = "https://wire-grpc:50051"
 grpc_signer_tls_cert = "/etc/rvc/wire/client.crt"

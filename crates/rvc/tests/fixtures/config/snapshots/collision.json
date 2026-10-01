@@ -34,7 +34,8 @@
     "exporter": "gcp",
     "sample_rate": 0.77,
     "max_queue_size": 7777,
-    "max_export_batch_size": 777
+    "max_export_batch_size": 777,
+    "service_name": "rvc-flat"
   },
   "keymanager": {
     "enabled": true,
