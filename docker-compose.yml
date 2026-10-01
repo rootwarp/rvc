@@ -1,9 +1,10 @@
 # Docker Compose for rvc validator client + remote signer
 #
 # Usage:
-#   docker compose up        # Start services (build from source)
-#   docker compose build     # Build images only
-#   docker compose down      # Stop and remove containers
+#   docker compose up                           # Start services (build from source)
+#   docker compose --profile tracing up -d      # Also start Jaeger v2 (UI/OTLP loopback)
+#   docker compose build                        # Build images only
+#   docker compose down                         # Stop and remove containers
 #
 # For production, replace 'build' with 'image' directives:
 #   image: ghcr.io/rootwarp/rvc/rvc:latest
@@ -21,8 +22,12 @@ services:
     volumes:
       - ./config:/config:ro
       - rvc-data:/data
-    # environment:
-    #   - RUST_LOG=info
+    environment:
+      # Path-less endpoint — TRC-1b appends /v1/traces. Sample rate 1.0 for
+      # local visibility (compose recipe); override for production.
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_TRACES_SAMPLER_ARG=1.0
+      # - RUST_LOG=info
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
       interval: 30s
@@ -48,6 +53,10 @@ services:
       - ./config:/config:ro
       - ./certs:/certs:ro
       - signer-data:/data
+    environment:
+      # Wired for Phase 2B; signer ignores OTEL until then (inert).
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+      - OTEL_TRACES_SAMPLER_ARG=1.0
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9101/healthz"]
       interval: 30s
@@ -57,6 +66,22 @@ services:
     restart: unless-stopped
     networks:
       - rvc-net
+
+  # Jaeger v2 all-in-one — opt-in via --profile tracing so bare
+  # `docker compose up` is unchanged (service set stays rvc + rvc-signer).
+  #
+  # Do NOT set COLLECTOR_OTLP_ENABLED — that is a Jaeger v1 env trap; v2
+  # enables OTLP by default and ignores / misleads with that variable.
+  jaeger:
+    profiles: ["tracing"]
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.11.0@sha256:b585df1b6299bbbd16bf7c679da30389349736e4b6bc8f4f500142a75bf26ca8
+    ports:
+      - "127.0.0.1:16686:16686" # Jaeger UI (loopback only)
+      - "127.0.0.1:4318:4318"   # OTLP/HTTP (host-local only)
+      # 4317 (OTLP/gRPC) intentionally unpublished — HTTP-only by design.
+    networks:
+      - rvc-net
+    restart: unless-stopped
 
 volumes:
   rvc-data:
