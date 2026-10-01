@@ -20,11 +20,9 @@ gcp-secret = ["rvc/gcp-secret", "dep:rustls"]
 
 [dependencies]
 beacon.workspace = true
-bn-manager.workspace = true
 crypto.workspace = true
 eth-types.workspace = true
 hex.workspace = true
-keymanager-api.workspace = true
 metrics.workspace = true
 rvc.workspace = true
 signer.workspace = true
