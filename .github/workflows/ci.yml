@@ -16,7 +16,11 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so the A-12 pin commit is reachable for the T19 stage.rs
+      # byte-identity guard below (shallow tip alone cannot `git diff <pin>`).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -38,6 +42,27 @@ jobs:
         uses: arduino/setup-protoc@v3
         with:
           version: "27.x"
+
+      # T19 / TRC-1e: crates/slashing/src/stage.rs must stay byte-identical to the
+      # A-12 pin (initiative-start / post-ADR-005 redesign). Do not instrument
+      # stage.rs; see plan/tracing-2026-08-06/A-12-stage-rs-repin.md.
+      - name: T19 — stage.rs byte-identical to A-12 pin
+        run: |
+          set -euo pipefail
+          PIN=22aa3de5bf5ed0c03ed571694dc3a5652e460613
+          if ! git cat-file -e "${PIN}^{commit}"; then
+            echo "T19 / A-12: pin commit ${PIN} is not reachable; deepen the checkout."
+            exit 1
+          fi
+          if ! git diff --quiet "${PIN}" -- crates/slashing/src/stage.rs; then
+            echo "T19 / A-12 FAILURE: crates/slashing/src/stage.rs is not byte-identical to the A-12 pin."
+            echo "A-12 pin: ${PIN}"
+            echo "Record: plan/tracing-2026-08-06/A-12-stage-rs-repin.md"
+            echo "Tracing must not instrument stage.rs. Authorized redesigns re-pin via A-12; do not weaken this guard."
+            git diff "${PIN}" -- crates/slashing/src/stage.rs
+            exit 1
+          fi
+          echo "T19: stage.rs byte-identical to A-12 pin ${PIN}"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
