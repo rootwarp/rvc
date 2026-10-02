@@ -4461,10 +4461,12 @@ dependencies = [
  "rvc-bn-manager",
  "rvc-eth-types",
  "rvc-metrics",
+ "rvc-observability",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "tracing-test",
  "wiremock",
 ]
