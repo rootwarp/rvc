@@ -645,54 +645,54 @@ impl SignerServiceV2 for SignerServiceImpl {
     // ── SignAttestationData ───────────────────────────────────────────────────
 
     #[allow(clippy::result_large_err)]
-    #[tracing::instrument(
-        name = "signer.v2.sign_attestation_data",
-        skip_all,
-        fields(pubkey, source_epoch, target_epoch)
-    )]
     async fn sign_attestation_data(
         &self,
         req: Request<SignAttestationDataRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_attestation_data", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        // EIP-7549 index-zeroing is the client's responsibility (H-2 / Phase 2).
-        let (att_data, source_epoch, target_epoch) = decode_attestation_data(r.data)?;
-        Span::current().record("source_epoch", source_epoch);
-        Span::current().record("target_epoch", target_epoch);
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            // EIP-7549 index-zeroing is the client's responsibility (H-2 / Phase 2).
+            let (att_data, source_epoch, target_epoch) = decode_attestation_data(r.data)?;
+            Span::current().record("source_epoch", source_epoch);
+            Span::current().record("target_epoch", target_epoch);
 
-        let plan = plan_sign(&PlanInput::Attestation { data: att_data, fork_version, gvr });
-        let ctx = self.request_ctx(
-            client_cn.clone(),
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::ATTESTATION_DATA,
-        );
-        let sig = dispatch_slashable(
-            self.require_gate()?,
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-        )
+            let plan = plan_sign(&PlanInput::Attestation { data: att_data, fork_version, gvr });
+            let ctx = self.request_ctx(
+                client_cn.clone(),
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::ATTESTATION_DATA,
+            );
+            let sig = dispatch_slashable(
+                self.require_gate()?,
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                source_epoch,
+                target_epoch,
+                client_cn = %client_cn,
+                "sign_attestation_data: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            source_epoch,
-            target_epoch,
-            client_cn = %client_cn,
-            "sign_attestation_data: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignAggregateAndProof ─────────────────────────────────────────────────
@@ -700,72 +700,72 @@ impl SignerServiceV2 for SignerServiceImpl {
     // SS-2/SS-3: non-slashable. Aggregate staging is intentionally NOT performed.
 
     #[allow(clippy::result_large_err)]
-    #[tracing::instrument(
-        name = "signer.v2.sign_aggregate_and_proof",
-        skip_all,
-        fields(pubkey, source_epoch, target_epoch)
-    )]
     async fn sign_aggregate_and_proof(
         &self,
         req: Request<SignAggregateAndProofRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_aggregate_and_proof", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let attestation = decode_attestation(&r.aggregate_ssz, r.fork_id)?;
-        let source_epoch = attestation.data.source.epoch;
-        let target_epoch = attestation.data.target.epoch;
-        Span::current().record("source_epoch", source_epoch);
-        Span::current().record("target_epoch", target_epoch);
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let attestation = decode_attestation(&r.aggregate_ssz, r.fork_id)?;
+            let source_epoch = attestation.data.source.epoch;
+            let target_epoch = attestation.data.target.epoch;
+            Span::current().record("source_epoch", source_epoch);
+            Span::current().record("target_epoch", target_epoch);
 
-        let selection_proof = validate_selection_proof(&r.selection_proof)?;
-        let agg_and_proof = AggregateAndProof {
-            aggregator_index: r.aggregator_index,
-            aggregate: attestation,
-            selection_proof,
-        };
-        // Fallible HTR — match HTTP: oversize aggregation_bits → 400, never panic.
-        let object_root = agg_and_proof
-            .try_tree_hash_root()
-            .map_err(|_| Status::invalid_argument("invalid aggregate_and_proof"))?;
-        let plan = plan_sign(&PlanInput::AggregateAndProof {
-            object_root: object_root.0,
-            fork_version,
-            gvr,
-        });
+            let selection_proof = validate_selection_proof(&r.selection_proof)?;
+            let agg_and_proof = AggregateAndProof {
+                aggregator_index: r.aggregator_index,
+                aggregate: attestation,
+                selection_proof,
+            };
+            // Fallible HTR — match HTTP: oversize aggregation_bits → 400, never panic.
+            let object_root = agg_and_proof
+                .try_tree_hash_root()
+                .map_err(|_| Status::invalid_argument("invalid aggregate_and_proof"))?;
+            let plan = plan_sign(&PlanInput::AggregateAndProof {
+                object_root: object_root.0,
+                fork_version,
+                gvr,
+            });
 
-        let ctx = self.request_ctx(
-            client_cn.clone(),
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::AGGREGATE_AND_PROOF,
-        );
-        let sig = dispatch_non_slashable(
-            self.gate.as_deref(),
-            self.backend.as_ref(),
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-            NonSlashableOp::AggregateAndProof,
-        )
+            let ctx = self.request_ctx(
+                client_cn.clone(),
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::AGGREGATE_AND_PROOF,
+            );
+            let sig = dispatch_non_slashable(
+                self.gate.as_deref(),
+                self.backend.as_ref(),
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+                NonSlashableOp::AggregateAndProof,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                source_epoch,
+                target_epoch,
+                client_cn = %client_cn,
+                "sign_aggregate_and_proof: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            source_epoch,
-            target_epoch,
-            client_cn = %client_cn,
-            "sign_aggregate_and_proof: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignSyncCommitteeMessage ──────────────────────────────────────────────
@@ -773,55 +773,58 @@ impl SignerServiceV2 for SignerServiceImpl {
     /// Sign a sync committee message over `beacon_block_root`.
     ///
     /// Per FR-P0-3 / NFR-1: sync messages are **not slashable** — no staging.
-    #[tracing::instrument(
-        name = "signer.v2.sign_sync_committee_message",
-        skip_all,
-        fields(pubkey, slot)
-    )]
     async fn sign_sync_committee_message(
         &self,
         req: Request<SignSyncCommitteeMessageRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_sync_committee_message", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let slot = r.slot;
-        Span::current().record("slot", slot);
-        let beacon_block_root = validate_root32(&r.beacon_block_root, "beacon_block_root")?;
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let slot = r.slot;
+            Span::current().record("slot", slot);
+            let beacon_block_root = validate_root32(&r.beacon_block_root, "beacon_block_root")?;
 
-        let plan =
-            plan_sign(&PlanInput::SyncCommitteeMessage { beacon_block_root, fork_version, gvr });
-        let ctx = self.request_ctx(
-            client_cn.clone(),
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
-        );
-        let sig = dispatch_non_slashable(
-            self.gate.as_deref(),
-            self.backend.as_ref(),
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-            NonSlashableOp::SyncCommitteeMessage,
-        )
+            let plan = plan_sign(&PlanInput::SyncCommitteeMessage {
+                beacon_block_root,
+                fork_version,
+                gvr,
+            });
+            let ctx = self.request_ctx(
+                client_cn.clone(),
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::SYNC_COMMITTEE_MESSAGE,
+            );
+            let sig = dispatch_non_slashable(
+                self.gate.as_deref(),
+                self.backend.as_ref(),
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+                NonSlashableOp::SyncCommitteeMessage,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                slot,
+                client_cn = %client_cn,
+                "sign_sync_committee_message: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            slot,
-            client_cn = %client_cn,
-            "sign_sync_committee_message: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignSyncAggregatorSelectionData ───────────────────────────────────────
@@ -829,58 +832,62 @@ impl SignerServiceV2 for SignerServiceImpl {
     /// Sign a sync aggregator selection proof over `(slot, subcommittee_index)`.
     ///
     /// Per FR-P0-3 / NFR-1: not slashable — no staging.
-    #[tracing::instrument(
-        name = "signer.v2.sign_sync_aggregator_selection_data",
-        skip_all,
-        fields(pubkey, slot)
-    )]
     async fn sign_sync_aggregator_selection_data(
         &self,
         req: Request<SignSyncAggregatorSelectionDataRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span =
+            trace_ctx::server_span("signer.v2.sign_sync_aggregator_selection_data", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let slot = r.slot;
-        Span::current().record("slot", slot);
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let slot = r.slot;
+            Span::current().record("slot", slot);
 
-        let plan = plan_sign(&PlanInput::SyncCommitteeSelection {
-            data: SyncAggregatorSelectionData { slot, subcommittee_index: r.subcommittee_index },
-            fork_version,
-            gvr,
-        });
-        let ctx = self.request_ctx(
-            client_cn.clone(),
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
-        );
-        let sig = dispatch_non_slashable(
-            self.gate.as_deref(),
-            self.backend.as_ref(),
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-            NonSlashableOp::SelectionProof,
-        )
+            let plan = plan_sign(&PlanInput::SyncCommitteeSelection {
+                data: SyncAggregatorSelectionData {
+                    slot,
+                    subcommittee_index: r.subcommittee_index,
+                },
+                fork_version,
+                gvr,
+            });
+            let ctx = self.request_ctx(
+                client_cn.clone(),
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::SYNC_AGGREGATOR_SELECTION_DATA,
+            );
+            let sig = dispatch_non_slashable(
+                self.gate.as_deref(),
+                self.backend.as_ref(),
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+                NonSlashableOp::SelectionProof,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                slot,
+                subcommittee_index = r.subcommittee_index,
+                client_cn = %client_cn,
+                "sign_sync_aggregator_selection_data: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            slot,
-            subcommittee_index = r.subcommittee_index,
-            client_cn = %client_cn,
-            "sign_sync_aggregator_selection_data: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignContributionAndProof ───────────────────────────────────────────────
@@ -892,63 +899,64 @@ impl SignerServiceV2 for SignerServiceImpl {
     /// contribution, selection_proof }` before signing.
     ///
     /// Per FR-P0-3 / NFR-1: not slashable — no staging.
-    #[tracing::instrument(
-        name = "signer.v2.sign_contribution_and_proof",
-        skip_all,
-        fields(pubkey, slot)
-    )]
     async fn sign_contribution_and_proof(
         &self,
         req: Request<SignContributionAndProofRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_contribution_and_proof", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let contribution = decode_sync_committee_contribution(&r.contribution_ssz, r.fork_id)?;
-        let slot = contribution.slot;
-        Span::current().record("slot", slot);
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let contribution = decode_sync_committee_contribution(&r.contribution_ssz, r.fork_id)?;
+            let slot = contribution.slot;
+            Span::current().record("slot", slot);
 
-        let selection_proof = validate_selection_proof(&r.selection_proof)?;
-        let cap = ContributionAndProof {
-            aggregator_index: r.aggregator_index,
-            contribution,
-            selection_proof,
-        };
-        let object_root = cap.tree_hash_root().0;
-        let plan = plan_sign(&PlanInput::ContributionAndProof { object_root, fork_version, gvr });
+            let selection_proof = validate_selection_proof(&r.selection_proof)?;
+            let cap = ContributionAndProof {
+                aggregator_index: r.aggregator_index,
+                contribution,
+                selection_proof,
+            };
+            let object_root = cap.tree_hash_root().0;
+            let plan =
+                plan_sign(&PlanInput::ContributionAndProof { object_root, fork_version, gvr });
 
-        let ctx = self.request_ctx(
-            client_cn.clone(),
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::CONTRIBUTION_AND_PROOF,
-        );
-        let sig = dispatch_non_slashable(
-            self.gate.as_deref(),
-            self.backend.as_ref(),
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-            NonSlashableOp::ContributionAndProof,
-        )
+            let ctx = self.request_ctx(
+                client_cn.clone(),
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::CONTRIBUTION_AND_PROOF,
+            );
+            let sig = dispatch_non_slashable(
+                self.gate.as_deref(),
+                self.backend.as_ref(),
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+                NonSlashableOp::ContributionAndProof,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                slot,
+                aggregator_index = r.aggregator_index,
+                client_cn = %client_cn,
+                "sign_contribution_and_proof: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            slot,
-            aggregator_index = r.aggregator_index,
-            client_cn = %client_cn,
-            "sign_contribution_and_proof: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignBuilderRegistration ────────────────────────────────────────────────
@@ -956,117 +964,121 @@ impl SignerServiceV2 for SignerServiceImpl {
     // domain = DOMAIN_APPLICATION_BUILDER + network genesis fork version + ZERO_HASH.
     // Network genesis comes from server config (NetworkPreset); request field if
     // present must match. Not slashable.
-    #[tracing::instrument(name = "signer.v2.sign_builder_registration", skip_all, fields(pubkey))]
     async fn sign_builder_registration(
         &self,
         req: Request<SignBuilderRegistrationRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_builder_registration", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let fee_recipient: [u8; 20] = r.fee_recipient.as_slice().try_into().map_err(|_| {
-            Status::invalid_argument(format!(
-                "fee_recipient must be 20 bytes, got {}",
-                r.fee_recipient.len()
-            ))
-        })?;
+            let fee_recipient: [u8; 20] = r.fee_recipient.as_slice().try_into().map_err(|_| {
+                Status::invalid_argument(format!(
+                    "fee_recipient must be 20 bytes, got {}",
+                    r.fee_recipient.len()
+                ))
+            })?;
 
-        let registration = ValidatorRegistrationV1 {
-            fee_recipient,
-            gas_limit: r.gas_limit,
-            timestamp: r.timestamp,
-            pubkey: pubkey_bytes,
-        };
+            let registration = ValidatorRegistrationV1 {
+                fee_recipient,
+                gas_limit: r.gas_limit,
+                timestamp: r.timestamp,
+                pubkey: pubkey_bytes,
+            };
 
-        // Sole source: server network config. Non-empty request must match.
-        let genesis_fork_version =
-            self.resolve_builder_genesis_fork_version(&r.genesis_fork_version)?;
-        let plan = plan_builder_registration(&registration, genesis_fork_version);
+            // Sole source: server network config. Non-empty request must match.
+            let genesis_fork_version =
+                self.resolve_builder_genesis_fork_version(&r.genesis_fork_version)?;
+            let plan = plan_builder_registration(&registration, genesis_fork_version);
 
-        let ctx = self.request_ctx(
-            client_cn,
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::BUILDER_REGISTRATION,
-        );
-        let sig = dispatch_non_slashable(
-            self.gate.as_deref(),
-            self.backend.as_ref(),
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-            NonSlashableOp::BuilderRegistration,
-        )
+            let ctx = self.request_ctx(
+                client_cn,
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::BUILDER_REGISTRATION,
+            );
+            let sig = dispatch_non_slashable(
+                self.gate.as_deref(),
+                self.backend.as_ref(),
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+                NonSlashableOp::BuilderRegistration,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                "sign_builder_registration: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            "sign_builder_registration: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignVoluntaryExit ──────────────────────────────────────────────────────
     //
     // EIP-7044: caller supplies Capella-capped current_version. Not slashable.
-    #[tracing::instrument(
-        name = "signer.v2.sign_voluntary_exit",
-        skip_all,
-        fields(pubkey, epoch, validator_index)
-    )]
     async fn sign_voluntary_exit(
         &self,
         req: Request<SignVoluntaryExitRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_voluntary_exit", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let epoch = r.epoch;
-        let validator_index = r.validator_index;
-        Span::current().record("epoch", epoch);
-        Span::current().record("validator_index", validator_index);
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let epoch = r.epoch;
+            let validator_index = r.validator_index;
+            Span::current().record("epoch", epoch);
+            Span::current().record("validator_index", validator_index);
 
-        let exit = VoluntaryExit { epoch, validator_index };
-        let plan = plan_voluntary_exit(&exit, fork_version, gvr);
+            let exit = VoluntaryExit { epoch, validator_index };
+            let plan = plan_voluntary_exit(&exit, fork_version, gvr);
 
-        let ctx = self.request_ctx(
-            client_cn,
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::VOLUNTARY_EXIT,
-        );
-        let sig = dispatch_non_slashable(
-            self.gate.as_deref(),
-            self.backend.as_ref(),
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-            NonSlashableOp::VoluntaryExit,
-        )
+            let ctx = self.request_ctx(
+                client_cn,
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::VOLUNTARY_EXIT,
+            );
+            let sig = dispatch_non_slashable(
+                self.gate.as_deref(),
+                self.backend.as_ref(),
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+                NonSlashableOp::VoluntaryExit,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                epoch,
+                validator_index,
+                "sign_voluntary_exit: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            epoch,
-            validator_index,
-            "sign_voluntary_exit: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignBlockHeader (Gloas-safe slashable block) ──────────────────────────
@@ -2686,5 +2698,61 @@ mod tests {
             trace_id, "0af7651916cd43dd8448eb211c80319c",
             "absent traceparent must not continue the T10 fixture trace"
         );
+    }
+
+    fn assert_t10_child_span(
+        hit: &GrpcSignHit,
+        otel_name: &str,
+        trace_id: &str,
+        parent_span_id: &str,
+    ) {
+        assert_eq!(hit.otel_name.as_deref(), Some(otel_name));
+        assert_eq!(
+            hit.trace_id.as_deref(),
+            Some(trace_id),
+            "handler span must continue the caller trace, not a link or fresh root: {hit:?}"
+        );
+        let child_span = hit.span_id.as_deref().expect("handler span id");
+        assert_ne!(child_span, parent_span_id, "child span id must differ from the caller");
+        assert!(!child_span.chars().all(|c| c == '0'), "child span id must be non-zero");
+    }
+
+    /// T10 on a handler converted in TRC-3d: seeded `traceparent` parents
+    /// `sign_attestation_data` (same trace id, distinct span id).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_t10_sign_attestation_data_span_is_child_of_caller() {
+        let guard = install_otel_capture();
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let parent_span_id = "00f067aa0ba902b7";
+        let mut req = Request::new(SignAttestationDataRequest::default());
+        req.metadata_mut().insert("traceparent", traceparent_value(trace_id, parent_span_id));
+
+        let svc = SignerServiceImpl::new(Arc::new(MockBackend::empty()), "test".to_string());
+        let err =
+            SignerServiceV2::sign_attestation_data(&svc, req).await.expect_err("empty pubkey");
+        assert!(err.message().contains("pubkey"));
+
+        let hits = guard.hits.lock().expect("hits");
+        let hit = hits.last().expect("handler span recorded");
+        assert_t10_child_span(hit, "signer.v2.sign_attestation_data", trace_id, parent_span_id);
+    }
+
+    /// T10 on a second newly converted handler, independent of the attestation
+    /// oracle (its own trace id and its own `otel.name`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_t10_sign_voluntary_exit_span_is_child_of_caller() {
+        let guard = install_otel_capture();
+        let trace_id = "6e4a2c1b90f847d5a3b2c1d0e9f84756";
+        let parent_span_id = "c2d3e4f506172839";
+        let mut req = Request::new(SignVoluntaryExitRequest::default());
+        req.metadata_mut().insert("traceparent", traceparent_value(trace_id, parent_span_id));
+
+        let svc = SignerServiceImpl::new(Arc::new(MockBackend::empty()), "test".to_string());
+        let err = SignerServiceV2::sign_voluntary_exit(&svc, req).await.expect_err("empty pubkey");
+        assert!(err.message().contains("pubkey"));
+
+        let hits = guard.hits.lock().expect("hits");
+        let hit = hits.last().expect("handler span recorded");
+        assert_t10_child_span(hit, "signer.v2.sign_voluntary_exit", trace_id, parent_span_id);
     }
 }
