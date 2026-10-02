@@ -1,0 +1,10 @@
+{
+  "data": {
+    "beacon_node": {
+      "code": "FX",
+      "name": "trace-e2e-fixture",
+      "version": "trc-5a",
+      "commit": "00000000"
+    }
+  }
+}

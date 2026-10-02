@@ -1,0 +1,13 @@
+{
+  "execution_optimistic": false,
+  "finalized": false,
+  "data": [
+    {
+      "index": "__VALIDATOR_INDEX__",
+      "status": "active_ongoing",
+      "validator": {
+        "pubkey": "__PUBKEY__"
+      }
+    }
+  ]
+}

@@ -5086,6 +5086,18 @@ _G5_SKIP = {
     "validator_perf__degraded": "devnet report golden; not a BN overlay",
     "validator_perf__threshold": "devnet report golden; not a BN overlay",
     "inventory__partial": "devnet down.sh inventory fixture; not a BN overlay",
+    "trace_e2e_bn__attestation_data": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__block_root": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__duties_attester": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__duties_proposer": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__genesis": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__node_syncing": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__node_version_v2": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__pool_attestations": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__spec": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__state_fork": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_bn__validators": "trace-e2e fixture BN; not a G5 overlay",
+    "trace_e2e_validator_keystore": "trace-e2e fixture BN; not a G5 overlay",
 }
 
 
