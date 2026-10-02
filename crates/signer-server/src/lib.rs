@@ -26,6 +26,8 @@ pub(crate) mod sign_plan;
 pub mod slashing;
 /// Shared TLS PEM file I/O with path-preserving errors (used by gRPC and HTTP).
 pub(crate) mod tls_io;
+/// Per-RPC gRPC handler spans (`server_span`). Crate-private.
+pub(crate) mod trace_ctx;
 
 pub use error::ServerError;
 

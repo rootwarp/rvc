@@ -43,7 +43,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tonic::{Request, Response, Status};
-use tracing::Span;
+use tracing::{Instrument, Span};
 use tree_hash::TreeHash;
 
 use crate::audit;
@@ -60,6 +60,7 @@ use crate::sign_plan::{
     dispatch_non_slashable, dispatch_slashable, plan_builder_registration, plan_sign,
     plan_voluntary_exit, DispatchError, NonSlashableOp, PlanInput, RequestCtx,
 };
+use crate::trace_ctx;
 
 // V2 imports
 use crate::proto::signer_v2::signer_service_server::SignerService as SignerServiceV2;
@@ -471,156 +472,174 @@ impl SignerServiceV2 for SignerServiceImpl {
     // ── SignBeaconBlock ───────────────────────────────────────────────────────
 
     #[allow(clippy::result_large_err)]
-    #[tracing::instrument(name = "signer.v2.sign_beacon_block", skip_all, fields(pubkey, slot))]
     async fn sign_beacon_block(
         &self,
         req: Request<SignBeaconBlockRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_beacon_block", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let block = decode_beacon_block(&r.block_ssz, r.fork_id)?;
-        let slot = block.slot;
-        Span::current().record("slot", slot);
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let block = decode_beacon_block(&r.block_ssz, r.fork_id)?;
+            let slot = block.slot;
+            Span::current().record("slot", slot);
 
-        // SEC-6c: typed body leaf — malformed Electra body SSZ must error, not panic.
-        let object_root = block.try_tree_hash_root().map_err(|e| {
-            Status::invalid_argument(format!("invalid block body for tree_hash_root: {e}"))
-        })?;
-        let plan =
-            plan_sign(&PlanInput::Block { object_root: object_root.0, slot, fork_version, gvr });
+            // SEC-6c: typed body leaf — malformed Electra body SSZ must error, not panic.
+            let object_root = block.try_tree_hash_root().map_err(|e| {
+                Status::invalid_argument(format!("invalid block body for tree_hash_root: {e}"))
+            })?;
+            let plan = plan_sign(&PlanInput::Block {
+                object_root: object_root.0,
+                slot,
+                fork_version,
+                gvr,
+            });
 
-        let ctx = self.request_ctx(
-            client_cn.clone(),
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::BEACON_BLOCK,
-        );
-        let sig = dispatch_slashable(
-            self.require_gate()?,
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-        )
+            let ctx = self.request_ctx(
+                client_cn.clone(),
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::BEACON_BLOCK,
+            );
+            let sig = dispatch_slashable(
+                self.require_gate()?,
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                slot,
+                client_cn = %client_cn,
+                "sign_beacon_block: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            slot,
-            client_cn = %client_cn,
-            "sign_beacon_block: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignBlindedBeaconBlock ────────────────────────────────────────────────
 
     #[allow(clippy::result_large_err)]
-    #[tracing::instrument(
-        name = "signer.v2.sign_blinded_beacon_block",
-        skip_all,
-        fields(pubkey, slot)
-    )]
     async fn sign_blinded_beacon_block(
         &self,
         req: Request<SignBlindedBeaconBlockRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_blinded_beacon_block", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let block = decode_blinded_beacon_block(&r.block_ssz, r.fork_id)?;
-        let slot = block.slot;
-        Span::current().record("slot", slot);
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let block = decode_blinded_beacon_block(&r.block_ssz, r.fork_id)?;
+            let slot = block.slot;
+            Span::current().record("slot", slot);
 
-        let object_root = block.try_tree_hash_root().map_err(|e| {
-            Status::invalid_argument(format!("invalid blinded block body for tree_hash_root: {e}"))
-        })?;
-        let plan =
-            plan_sign(&PlanInput::Block { object_root: object_root.0, slot, fork_version, gvr });
+            let object_root = block.try_tree_hash_root().map_err(|e| {
+                Status::invalid_argument(format!(
+                    "invalid blinded block body for tree_hash_root: {e}"
+                ))
+            })?;
+            let plan = plan_sign(&PlanInput::Block {
+                object_root: object_root.0,
+                slot,
+                fork_version,
+                gvr,
+            });
 
-        let ctx = self.request_ctx(
-            client_cn.clone(),
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::BLINDED_BEACON_BLOCK,
-        );
-        let sig = dispatch_slashable(
-            self.require_gate()?,
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-        )
+            let ctx = self.request_ctx(
+                client_cn.clone(),
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::BLINDED_BEACON_BLOCK,
+            );
+            let sig = dispatch_slashable(
+                self.require_gate()?,
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                slot,
+                client_cn = %client_cn,
+                "sign_blinded_beacon_block: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            slot,
-            client_cn = %client_cn,
-            "sign_blinded_beacon_block: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignRandaoReveal ──────────────────────────────────────────────────────
 
-    #[tracing::instrument(name = "signer.v2.sign_randao_reveal", skip_all, fields(pubkey, epoch))]
     async fn sign_randao_reveal(
         &self,
         req: Request<SignRandaoRevealRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_randao_reveal", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let epoch = r.epoch;
-        Span::current().record("epoch", epoch);
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let epoch = r.epoch;
+            Span::current().record("epoch", epoch);
 
-        let plan = plan_sign(&PlanInput::Randao { epoch, fork_version, gvr });
-        let ctx = self.request_ctx(
-            client_cn,
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::RANDAO_REVEAL,
-        );
-        let sig = dispatch_non_slashable(
-            self.gate.as_deref(),
-            self.backend.as_ref(),
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-            NonSlashableOp::RandaoReveal,
-        )
+            let plan = plan_sign(&PlanInput::Randao { epoch, fork_version, gvr });
+            let ctx = self.request_ctx(
+                client_cn,
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::RANDAO_REVEAL,
+            );
+            let sig = dispatch_non_slashable(
+                self.gate.as_deref(),
+                self.backend.as_ref(),
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+                NonSlashableOp::RandaoReveal,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                epoch,
+                "sign_randao_reveal: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            epoch,
-            "sign_randao_reveal: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignAttestationData ───────────────────────────────────────────────────
@@ -1057,102 +1076,110 @@ impl SignerServiceV2 for SignerServiceImpl {
     // is not on this path.
 
     #[allow(clippy::result_large_err)]
-    #[tracing::instrument(name = "signer.v2.sign_block_header", skip_all, fields(pubkey, slot))]
     async fn sign_block_header(
         &self,
         req: Request<SignBlockHeaderRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_block_header", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
 
-        validate_transport_fork_id(r.fork_id)?;
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let header = decode_beacon_block_header(r.header)?;
-        let slot = header.slot;
-        Span::current().record("slot", slot);
+            validate_transport_fork_id(r.fork_id)?;
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let header = decode_beacon_block_header(r.header)?;
+            let slot = header.slot;
+            Span::current().record("slot", slot);
 
-        let object_root = header.tree_hash_root().0;
-        let plan = plan_sign(&PlanInput::Block { object_root, slot, fork_version, gvr });
+            let object_root = header.tree_hash_root().0;
+            let plan = plan_sign(&PlanInput::Block { object_root, slot, fork_version, gvr });
 
-        let ctx = self.request_ctx(
-            client_cn.clone(),
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            grpc_sign_type::BEACON_BLOCK,
-        );
-        let sig = dispatch_slashable(
-            self.require_gate()?,
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-        )
+            let ctx = self.request_ctx(
+                client_cn.clone(),
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                grpc_sign_type::BEACON_BLOCK,
+            );
+            let sig = dispatch_slashable(
+                self.require_gate()?,
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                slot,
+                client_cn = %client_cn,
+                "sign_block_header: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            slot,
-            client_cn = %client_cn,
-            "sign_block_header: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     // ── SignRoot (Gloas-safe non-slashable duties) ────────────────────────────
 
     #[allow(clippy::result_large_err)]
-    #[tracing::instrument(name = "signer.v2.sign_root", skip_all, fields(pubkey, duty))]
     async fn sign_root(
         &self,
         req: Request<SignRootRequest>,
     ) -> Result<Response<SignResponseV2>, Status> {
-        let client_cn = audit::cn::extract_client_cn(&req);
-        self.authorize_client_cn(&client_cn)?;
-        let r = req.into_inner();
+        let span = trace_ctx::server_span("signer.v2.sign_root", req.metadata());
+        async move {
+            let client_cn = audit::cn::extract_client_cn(&req);
+            self.authorize_client_cn(&client_cn)?;
+            let r = req.into_inner();
 
-        let pubkey_bytes = validate_pubkey(&r.pubkey)?;
-        let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
-        Span::current().record("duty", r.duty);
+            let pubkey_bytes = validate_pubkey(&r.pubkey)?;
+            let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
+            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            Span::current().record("duty", r.duty);
 
-        validate_transport_fork_id(r.fork_id)?;
-        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
-        let object_root = validate_root32(&r.object_root, "object_root")?;
-        let planned =
-            root_duty_plan(r.duty, object_root, fork_version, gvr, self.genesis_fork_version)?;
-        let plan = plan_sign(&planned.input);
+            validate_transport_fork_id(r.fork_id)?;
+            let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+            let object_root = validate_root32(&r.object_root, "object_root")?;
+            let planned =
+                root_duty_plan(r.duty, object_root, fork_version, gvr, self.genesis_fork_version)?;
+            let plan = plan_sign(&planned.input);
 
-        let ctx = self.request_ctx(
-            client_cn.clone(),
-            pubkey_from_bytes(&pubkey_bytes)?,
-            pubkey_bytes,
-            planned.rpc_type,
-        );
-        let sig = dispatch_non_slashable(
-            self.gate.as_deref(),
-            self.backend.as_ref(),
-            self.metrics.as_deref(),
-            &self.backend_name,
-            &ctx,
-            &plan,
-            planned.op,
-        )
+            let ctx = self.request_ctx(
+                client_cn.clone(),
+                pubkey_from_bytes(&pubkey_bytes)?,
+                pubkey_bytes,
+                planned.rpc_type,
+            );
+            let sig = dispatch_non_slashable(
+                self.gate.as_deref(),
+                self.backend.as_ref(),
+                self.metrics.as_deref(),
+                &self.backend_name,
+                &ctx,
+                &plan,
+                planned.op,
+            )
+            .await
+            .map_err(dispatch_err_to_status)?;
+
+            tracing::info!(
+                pubkey = %pubkey_hex_str,
+                duty = r.duty,
+                client_cn = %client_cn,
+                "sign_root: success"
+            );
+            Ok(Response::new(SignResponseV2 { signature: sig }))
+        }
+        .instrument(span)
         .await
-        .map_err(dispatch_err_to_status)?;
-
-        tracing::info!(
-            pubkey = %pubkey_hex_str,
-            duty = r.duty,
-            client_cn = %client_cn,
-            "sign_root: success"
-        );
-        Ok(Response::new(SignResponseV2 { signature: sig }))
     }
 
     async fn list_public_keys(
@@ -2491,5 +2518,173 @@ mod tests {
             // share_index binding is DVT-only — primary has no equivalent field.
             assert_ne!(dvt.lookup_by_cn("peer-A").unwrap().share_index, 0);
         }
+    }
+
+    // ── TRC-3c T10 / T11: handler span parents from inbound traceparent ─────
+
+    #[derive(Debug)]
+    struct GrpcSignHit {
+        otel_name: Option<String>,
+        trace_id: Option<String>,
+        span_id: Option<String>,
+    }
+
+    struct GrpcSignCapture {
+        hits: Arc<std::sync::Mutex<Vec<GrpcSignHit>>>,
+    }
+
+    impl GrpcSignCapture {
+        fn record_otel<S>(&self, span: &tracing_subscriber::registry::SpanRef<'_, S>)
+        where
+            S: for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+        {
+            if span.name() != "grpc.sign" {
+                return;
+            }
+            let extensions = span.extensions();
+            let Some(data) = extensions.get::<tracing_opentelemetry::OtelData>() else {
+                return;
+            };
+            let trace_id = data.trace_id().map(|id| id.to_string());
+            let span_id = data.span_id().map(|id| id.to_string());
+            let mut hits = self.hits.lock().expect("grpc sign hits");
+            if let Some(hit) = hits.iter_mut().rev().find(|hit| hit.trace_id.is_none()) {
+                hit.trace_id = trace_id;
+                hit.span_id = span_id;
+            }
+        }
+    }
+
+    struct OtelNameVisitor {
+        otel_name: Option<String>,
+    }
+
+    impl tracing::field::Visit for OtelNameVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "otel.name" {
+                self.otel_name = Some(value.to_string());
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "otel.name" && self.otel_name.is_none() {
+                let rendered = format!("{value:?}");
+                self.otel_name = Some(rendered.trim_matches('"').to_string());
+            }
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for GrpcSignCapture
+    where
+        S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if attrs.metadata().name() != "grpc.sign" {
+                return;
+            }
+            let mut visitor = OtelNameVisitor { otel_name: None };
+            attrs.record(&mut visitor);
+            self.hits.lock().expect("grpc sign hits").push(GrpcSignHit {
+                otel_name: visitor.otel_name,
+                trace_id: None,
+                span_id: None,
+            });
+        }
+
+        fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if let Some(span) = ctx.span(id) {
+                self.record_otel(&span);
+            }
+        }
+    }
+
+    struct OtelGuard {
+        hits: Arc<std::sync::Mutex<Vec<GrpcSignHit>>>,
+        _default: tracing::subscriber::DefaultGuard,
+        _provider: opentelemetry_sdk::trace::SdkTracerProvider,
+    }
+
+    fn install_otel_capture() -> OtelGuard {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let hits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = GrpcSignCapture { hits: Arc::clone(&hits) };
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
+            .build();
+        let tracer = provider.tracer("rvc-signer-server-test");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+        // Capture sits under the OTel layer so `on_enter` reads a built context.
+        let subscriber =
+            tracing_subscriber::registry::Registry::default().with(capture).with(otel_layer);
+        let default = tracing::subscriber::set_default(subscriber);
+        OtelGuard { hits, _default: default, _provider: provider }
+    }
+
+    fn traceparent_value(
+        trace_id: &str,
+        span_id: &str,
+    ) -> tonic::metadata::MetadataValue<tonic::metadata::Ascii> {
+        format!("00-{trace_id}-{span_id}-01").parse().expect("traceparent")
+    }
+
+    /// T10: seeded `traceparent` → `sign_randao_reveal`'s handler span is a child
+    /// of the caller (same trace id, distinct span id), not a link and not a
+    /// fresh root.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_t10_sign_randao_reveal_span_is_child_of_caller() {
+        let guard = install_otel_capture();
+        let trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let parent_span_id = "b7ad6b7169203331";
+        let mut req = Request::new(SignRandaoRevealRequest::default());
+        req.metadata_mut().insert("traceparent", traceparent_value(trace_id, parent_span_id));
+
+        let svc = SignerServiceImpl::new(Arc::new(MockBackend::empty()), "test".to_string());
+        let err = SignerServiceV2::sign_randao_reveal(&svc, req).await.expect_err("empty pubkey");
+        assert!(err.message().contains("pubkey"));
+
+        let hits = guard.hits.lock().expect("hits");
+        let hit = hits.last().expect("handler span recorded");
+        assert_eq!(hit.otel_name.as_deref(), Some("signer.v2.sign_randao_reveal"));
+        assert_eq!(
+            hit.trace_id.as_deref(),
+            Some(trace_id),
+            "handler span must continue the caller trace, not a link or fresh root: {hit:?}"
+        );
+        let child_span = hit.span_id.as_deref().expect("handler span id");
+        assert_ne!(child_span, parent_span_id, "child span id must differ from the caller");
+        assert!(!child_span.chars().all(|c| c == '0'), "child span id must be non-zero");
+    }
+
+    /// T11: no `traceparent` → the handler span is a fresh non-zero root and
+    /// the call does not panic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_t11_sign_randao_reveal_without_traceparent_is_fresh_trace() {
+        let guard = install_otel_capture();
+        let req = Request::new(SignRandaoRevealRequest::default());
+        let svc = SignerServiceImpl::new(Arc::new(MockBackend::empty()), "test".to_string());
+        let err = SignerServiceV2::sign_randao_reveal(&svc, req)
+            .await
+            .expect_err("empty pubkey must fail, not panic");
+        assert!(err.message().contains("pubkey"));
+
+        let hits = guard.hits.lock().expect("hits");
+        let hit = hits.last().expect("handler span recorded");
+        assert_eq!(hit.otel_name.as_deref(), Some("signer.v2.sign_randao_reveal"));
+        let trace_id = hit.trace_id.as_deref().expect("fresh root trace id");
+        assert_ne!(trace_id, "00000000000000000000000000000000", "fresh root must be non-zero");
+        assert_ne!(
+            trace_id, "0af7651916cd43dd8448eb211c80319c",
+            "absent traceparent must not continue the T10 fixture trace"
+        );
     }
 }
