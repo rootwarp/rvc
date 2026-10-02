@@ -38,6 +38,7 @@ reqwest.workspace = true
 rvc-config.workspace = true
 rvc-test-support.workspace = true
 serde_json.workspace = true
+telemetry.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing.workspace = true
