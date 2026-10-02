@@ -76,7 +76,13 @@ rcgen = "0.13"
 # OpenTelemetry
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+# `reqwest-blocking-client`, not `reqwest-client`: BatchSpanProcessor exports on
+# its own thread via `futures_executor::block_on` (no Tokio reactor). The SDK
+# documents the async reqwest client as unsupported there — it panics with
+# "no reactor running", so spans never leave the process. Do not also enable
+# `reqwest-client`; the HTTP exporter selects the blocking client only when
+# that feature is off.
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 
 # Metrics
 prometheus = { version = "0.14", default-features = false }

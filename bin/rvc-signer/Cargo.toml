@@ -34,6 +34,7 @@ zeroize.workspace = true
 crypto = { workspace = true, features = ["test-utils"] }
 hex.workspace = true
 libc = "0.2"
+reqwest.workspace = true
 rvc-config.workspace = true
 rvc-test-support.workspace = true
 serde_json.workspace = true

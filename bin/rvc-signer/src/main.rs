@@ -29,7 +29,7 @@ struct Cli {
     #[arg(long, global = true)]
     tracing_sample_rate: Option<f64>,
 
-    /// OpenTelemetry `service.name`. Unset leaves the telemetry built-in (`rvc`).
+    /// OpenTelemetry `service.name`. Unset defaults to `rvc-signer`.
     #[arg(long, global = true)]
     tracing_service_name: Option<String>,
 
@@ -206,6 +206,13 @@ async fn shutdown_tracing_guard(guard: Option<telemetry::TracingGuard>) {
 /// locks the two together.
 const DEFAULT_TRACING_SAMPLE_RATE: f64 = 0.01;
 
+/// Default OTel `service.name` for this process (TRC-2h / ADR-007).
+///
+/// Distinct from the validator client's `rvc` so a shared collector lists two
+/// services. Overridden by `--tracing-service-name`. Not read from
+/// `OTEL_SERVICE_NAME` (G-3 does not allow-list that variable).
+const DEFAULT_SIGNER_SERVICE_NAME: &str = "rvc-signer";
+
 fn default_tracing_sample_rate() -> f64 {
     DEFAULT_TRACING_SAMPLE_RATE
 }
@@ -224,9 +231,10 @@ fn default_tracing_sample_rate() -> f64 {
 ///
 /// `service_name` is explicit flag → `None`. G-3 allow-lists only
 /// `OTEL_EXPORTER_OTLP_ENDPOINT` and `OTEL_TRACES_SAMPLER_ARG`, and the sibling
-/// stores `service_name` as the explicit value with no env read. Telemetry's
-/// `"rvc"` fallback applies when this is `None`. The signer default
-/// `"rvc-signer"` is TRC-2h (#418).
+/// stores `service_name` as the explicit value with no env read. The signer
+/// default `"rvc-signer"` is applied in [`build_signer_tracing_config`]
+/// (TRC-2h / #418), not here, so an omitted flag does not fall through to
+/// telemetry's `"rvc"` name.
 struct SignerTracingFlags {
     endpoint: Option<String>,
     sample_rate: Option<f64>,
@@ -312,7 +320,9 @@ fn build_signer_tracing_config(flags: &SignerTracingFlags) -> Option<telemetry::
     Some(telemetry::TelemetryConfig {
         endpoint,
         sample_rate,
-        service_name: flags.resolve_service_name(),
+        service_name: flags
+            .resolve_service_name()
+            .or_else(|| Some(DEFAULT_SIGNER_SERVICE_NAME.to_string())),
         service_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         ..Default::default()
     })
@@ -788,9 +798,9 @@ mod tests {
     /// line — the OTel layer still holds the provider.
     ///
     /// The span is unsampled (`sample_rate` 0.0) so shutdown does not export.
-    /// Export runs on the processor thread via `futures_executor::block_on`,
-    /// which has no Tokio reactor; a sampled batch is a pre-existing exporter
-    /// constraint, not this shutdown path.
+    /// A sampled batch is posted from the processor thread by the blocking
+    /// OTLP client (workspace `reqwest-blocking-client`). This test only locks
+    /// the shutdown log line, so it does not stand up a collector.
     ///
     /// Also locks `main`: every pre-exit path and the success path await the
     /// helper, and `main` does not `drop` the guard.
@@ -1102,7 +1112,6 @@ mod tests {
         /// Composed endpoint after `/v1/traces` append. `None` = tracing stays off.
         expect_endpoint: Option<&'static str>,
         expect_sample_rate: f64,
-        expect_service_name: Option<&'static str>,
         /// Substring the post-init sample-rate warn must contain.
         /// `None` means that warn must not fire.
         expect_warn: Option<&'static str>,
@@ -1194,7 +1203,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: None,
                 expect_sample_rate: 0.01,
-                expect_service_name: None,
                 expect_warn: None,
             },
             ParityRow {
@@ -1206,7 +1214,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://jaeger:4318/v1/traces"),
                 expect_sample_rate: 0.01,
-                expect_service_name: None,
                 expect_warn: Some("tracing sample_rate is below 1.0"),
             },
             ParityRow {
@@ -1218,7 +1225,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://jaeger:4318/v1/traces"),
                 expect_sample_rate: 0.01,
-                expect_service_name: None,
                 expect_warn: Some("tracing sample_rate is below 1.0"),
             },
             ParityRow {
@@ -1230,7 +1236,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://jaeger:4318/v1/traces"),
                 expect_sample_rate: 0.01,
-                expect_service_name: None,
                 expect_warn: Some("tracing sample_rate is below 1.0"),
             },
             ParityRow {
@@ -1242,7 +1247,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://gateway:4318/otlp/v1/traces"),
                 expect_sample_rate: 0.01,
-                expect_service_name: None,
                 expect_warn: Some("tracing sample_rate is below 1.0"),
             },
             ParityRow {
@@ -1254,7 +1258,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://cli:4318/v1/traces"),
                 expect_sample_rate: 0.01,
-                expect_service_name: None,
                 expect_warn: Some("tracing sample_rate is below 1.0"),
             },
             ParityRow {
@@ -1266,7 +1269,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://jaeger:4318/v1/traces"),
                 expect_sample_rate: 0.01,
-                expect_service_name: None,
                 expect_warn: Some("tracing sample_rate is below 1.0"),
             },
             ParityRow {
@@ -1278,7 +1280,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://jaeger:4318/v1/traces"),
                 expect_sample_rate: 0.0,
-                expect_service_name: None,
                 expect_warn: Some("exporter receives nothing"),
             },
             ParityRow {
@@ -1290,7 +1291,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://jaeger:4318/v1/traces"),
                 expect_sample_rate: 1.0,
-                expect_service_name: None,
                 expect_warn: None,
             },
             ParityRow {
@@ -1302,7 +1302,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://jaeger:4318/v1/traces"),
                 expect_sample_rate: 0.01,
-                expect_service_name: None,
                 expect_warn: Some("tracing sample_rate is below 1.0"),
             },
             ParityRow {
@@ -1314,7 +1313,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://localhost:4318/v1/traces"),
                 expect_sample_rate: 0.5,
-                expect_service_name: None,
                 expect_warn: Some("tracing sample_rate is below 1.0"),
             },
             ParityRow {
@@ -1326,7 +1324,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://localhost:4318/v1/traces"),
                 expect_sample_rate: 0.01,
-                expect_service_name: None,
                 expect_warn: Some("tracing sample_rate is below 1.0"),
             },
             ParityRow {
@@ -1338,7 +1335,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://localhost:4318/v1/traces"),
                 expect_sample_rate: 1.0,
-                expect_service_name: None,
                 expect_warn: None,
             },
             ParityRow {
@@ -1350,7 +1346,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://localhost:4318/v1/traces"),
                 expect_sample_rate: 0.0,
-                expect_service_name: None,
                 expect_warn: Some("exporter receives nothing"),
             },
             ParityRow {
@@ -1362,11 +1357,10 @@ mod tests {
                 flag_service_name: Some("custom-signer"),
                 expect_endpoint: Some("http://jaeger:4318/v1/traces"),
                 expect_sample_rate: 1.0,
-                expect_service_name: Some("custom-signer"),
                 expect_warn: None,
             },
             ParityRow {
-                label: "omitted service name stays None",
+                label: "omitted service name defaults TelemetryConfig to rvc-signer",
                 flag_endpoint: Some("http://jaeger:4318"),
                 env_endpoint: None,
                 flag_sample_rate: Some(1.0),
@@ -1374,7 +1368,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://jaeger:4318/v1/traces"),
                 expect_sample_rate: 1.0,
-                expect_service_name: None,
                 expect_warn: None,
             },
             ParityRow {
@@ -1386,7 +1379,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://user:s3cret@jaeger:4318/v1/traces"),
                 expect_sample_rate: 1.0,
-                expect_service_name: None,
                 expect_warn: None,
             },
             ParityRow {
@@ -1398,7 +1390,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://user:s3cret@gateway:4318/otlp/v1/traces"),
                 expect_sample_rate: 1.0,
-                expect_service_name: None,
                 expect_warn: None,
             },
             ParityRow {
@@ -1410,7 +1401,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("http://user:s3cret@pass@gateway:4318/otlp/v1/traces"),
                 expect_sample_rate: 1.0,
-                expect_service_name: None,
                 expect_warn: None,
             },
             ParityRow {
@@ -1422,7 +1412,6 @@ mod tests {
                 flag_service_name: None,
                 expect_endpoint: Some("https://collector.example.com:4318/v1/traces"),
                 expect_sample_rate: 1.0,
-                expect_service_name: None,
                 expect_warn: None,
             },
         ];
@@ -1471,8 +1460,8 @@ mod tests {
             );
             assert_eq!(
                 flags.resolve_service_name().as_deref(),
-                row.expect_service_name,
-                "{}: service name",
+                row.flag_service_name,
+                "{}: resolve_service_name stays the explicit flag",
                 row.label
             );
             if let Some(config) = &built {
@@ -1481,9 +1470,13 @@ mod tests {
                     "{}: TelemetryConfig sample rate",
                     row.label
                 );
+                // TRC-2h: omitted flag defaults the constructed config to
+                // `rvc-signer`. An explicit `--tracing-service-name` wins.
+                // `resolve_service_name` itself stays flag-only (no OTEL env).
+                let expect_config_service = row.flag_service_name.or(Some("rvc-signer"));
                 assert_eq!(
                     config.service_name.as_deref(),
-                    row.expect_service_name,
+                    expect_config_service,
                     "{}: TelemetryConfig service name",
                     row.label
                 );
