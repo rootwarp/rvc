@@ -1,0 +1,15 @@
+{
+  "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000003",
+  "execution_optimistic": false,
+  "data": [
+    {
+      "pubkey": "__PUBKEY__",
+      "validator_index": "__VALIDATOR_INDEX__",
+      "committee_index": "0",
+      "committee_length": "128",
+      "committees_at_slot": "1",
+      "validator_committee_index": "0",
+      "slot": "__SLOT__"
+    }
+  ]
+}

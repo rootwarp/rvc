@@ -1,0 +1,7 @@
+{
+  "data": {
+    "genesis_time": "__GENESIS_TIME__",
+    "genesis_validators_root": "__GENESIS_VALIDATORS_ROOT__",
+    "genesis_fork_version": "0x00000000"
+  }
+}
