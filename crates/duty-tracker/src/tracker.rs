@@ -300,6 +300,17 @@ impl DutyTracker {
         Ok(response.data)
     }
 
+    #[tracing::instrument(
+        name = "duty_tracker.get_duty",
+        level = "debug",
+        skip_all,
+        fields(
+            slot = slot,
+            epoch = slot / SLOTS_PER_EPOCH,
+            validator_index = validator_index,
+            committee_index = committee_index
+        )
+    )]
     pub async fn get_duty(
         &self,
         slot: u64,
@@ -409,6 +420,12 @@ impl DutyTracker {
         }
     }
 
+    #[tracing::instrument(
+        name = "duty_tracker.get_duties_for_slot",
+        level = "debug",
+        skip_all,
+        fields(slot = slot, epoch = slot / SLOTS_PER_EPOCH)
+    )]
     pub async fn get_duties_for_slot(&self, slot: u64) -> Vec<AttesterDuty> {
         self.slot_duty_lookups.fetch_add(1, Ordering::Relaxed);
         let epoch = slot / SLOTS_PER_EPOCH;
@@ -493,6 +510,12 @@ impl DutyTracker {
         Ok(response.data)
     }
 
+    #[tracing::instrument(
+        name = "duty_tracker.get_proposer_duty",
+        level = "debug",
+        skip_all,
+        fields(slot = slot, epoch = slot / SLOTS_PER_EPOCH)
+    )]
     pub async fn get_proposer_duty(&self, slot: u64) -> Option<ProposerDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.proposer_cache.read().await;
@@ -692,6 +715,12 @@ impl DutyTracker {
         Ok(response.data)
     }
 
+    #[tracing::instrument(
+        name = "duty_tracker.get_sync_committee_duties",
+        level = "debug",
+        skip_all,
+        fields(slot = slot, epoch = slot / SLOTS_PER_EPOCH)
+    )]
     pub async fn get_sync_committee_duties(&self, slot: u64) -> Vec<SyncCommitteeDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let period = epoch / EPOCHS_PER_SYNC_COMMITTEE_PERIOD;
@@ -1270,10 +1299,11 @@ mod tests {
         });
     }
 
-    /// T14 (partial, TRC-4a / #427): exact field key-set of each duty-tracker epoch span at debug.
+    /// T14 (complete, TRC-4b / #428): exact field key-set of each duty-tracker span at debug.
     ///
-    /// Six epoch spans: five duty-bearing `{epoch, duty}` plus `evict_old_caches` `{epoch}` only.
-    /// PTC `fetch_ptc_duties` / `check_ptc_reorg` stay `{epoch}` (unchanged instrument sites).
+    /// Ten sites: six epoch spans (five duty-bearing `{epoch, duty}` plus `evict_old_caches`
+    /// `{epoch}` only) and four per-slot lookups. PTC `fetch_ptc_duties` / `check_ptc_reorg`
+    /// stay `{epoch}`. `get_ptc_duties_for_slot` stays unspanned.
     /// `evict_old_caches` keeps `fields(epoch = current_epoch)` with no `duty` — a recorded decision.
     #[tokio::test(flavor = "current_thread")]
     async fn test_t14_epoch_span_exact_key_sets_at_debug() {
@@ -1315,6 +1345,14 @@ mod tests {
         tracker.check_and_refetch_ptc_if_root_changed(10).await.expect("ptc reorg");
         tracker.evict_old_caches(10).await;
 
+        // Four new lookup spans. PTC lookup is called and must not appear.
+        let _ = tracker.get_duty(320, 1, 1234).await.expect("attester hit");
+        let slot_duties = tracker.get_duties_for_slot(320).await;
+        assert_eq!(slot_duties.len(), 1);
+        let _ = tracker.get_proposer_duty(320).await.expect("proposer hit");
+        assert_eq!(tracker.get_sync_committee_duties(320).await.len(), 1);
+        assert_eq!(tracker.get_ptc_duties_for_slot(320).await.len(), 1);
+
         let spans = capture.state.lock().expect("spans").spans.clone();
         let names: BTreeSet<&str> = spans.iter().map(|s| s.name.as_str()).collect();
         let expected_names: BTreeSet<&str> = [
@@ -1326,10 +1364,18 @@ mod tests {
             "duty_tracker.evict_old_caches",
             "duty_tracker.fetch_ptc_duties",
             "duty_tracker.check_ptc_reorg",
+            "duty_tracker.get_duty",
+            "duty_tracker.get_duties_for_slot",
+            "duty_tracker.get_proposer_duty",
+            "duty_tracker.get_sync_committee_duties",
         ]
         .into_iter()
         .collect();
-        assert_eq!(names, expected_names, "epoch span name set (8)");
+        assert_eq!(names, expected_names, "eight epoch/ptc spans plus four lookups; no PTC lookup");
+        assert!(
+            !names.contains("duty_tracker.get_ptc_duties_for_slot"),
+            "PTC lookup stays unspanned"
+        );
 
         let duty_bearing = [
             ("duty_tracker.fetch_attester_duties", "attestation"),
@@ -1364,6 +1410,113 @@ mod tests {
             assert!(!span.values.contains_key("duty"), "{name} must not carry duty");
             assert_eq!(span.values.get("epoch").map(String::as_str), Some("10"), "{name} epoch");
         }
+
+        let lookups: &[(&str, &[&str])] = &[
+            ("duty_tracker.get_duty", &["committee_index", "epoch", "slot", "validator_index"]),
+            ("duty_tracker.get_duties_for_slot", &["epoch", "slot"]),
+            ("duty_tracker.get_proposer_duty", &["epoch", "slot"]),
+            ("duty_tracker.get_sync_committee_duties", &["epoch", "slot"]),
+        ];
+        for (name, keys) in lookups {
+            let matched: Vec<_> = spans.iter().filter(|s| s.name == *name).collect();
+            assert_eq!(matched.len(), 1, "expected one {name} span, got {matched:?}");
+            let span = matched[0];
+            assert_eq!(span.level, tracing::Level::DEBUG, "{name} must be debug");
+            assert_eq!(span.keys, key_set(keys), "{name} key-set");
+            assert!(!span.keys.contains("pubkey"), "{name} must not carry pubkey");
+            assert_eq!(span.values.get("slot").map(String::as_str), Some("320"), "{name} slot");
+            assert_eq!(span.values.get("epoch").map(String::as_str), Some("10"), "{name} epoch");
+        }
+        let get_duty = spans.iter().find(|s| s.name == "duty_tracker.get_duty").expect("get_duty");
+        assert_eq!(get_duty.values.get("validator_index").map(String::as_str), Some("1234"));
+        assert_eq!(get_duty.values.get("committee_index").map(String::as_str), Some("1"));
+    }
+
+    /// Negative answer (TRC-4b / #428): a lookup miss is traceable.
+    ///
+    /// `get_duty` carries `slot`, `validator_index`, and `committee_index` on the span and the
+    /// existing "Cache miss" event inside it. `get_duties_for_slot` carries `slot` and `epoch`
+    /// and the existing "Cache miss for slot" event.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_lookup_miss_span_carries_fields_and_cache_miss_event() {
+        let tracker = DutyTracker::new(empty_beacon(), vec!["1234".to_string()]);
+        let capture = EpochSpanCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(capture.clone().with_filter(tracing_subscriber::filter::LevelFilter::DEBUG));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let missed = tracker.get_duty(320, 1, 1234).await;
+        assert!(matches!(missed, Err(DutyTrackerError::DutyNotFound { .. })));
+        assert!(tracker.get_duties_for_slot(320).await.is_empty());
+
+        let state = capture.state.lock().expect("spans");
+        let get_duty: Vec<_> =
+            state.spans.iter().filter(|s| s.name == "duty_tracker.get_duty").collect();
+        assert_eq!(get_duty.len(), 1, "get_duty miss must open one span");
+        assert_eq!(get_duty[0].level, tracing::Level::DEBUG);
+        assert_eq!(
+            get_duty[0].keys,
+            key_set(&["committee_index", "epoch", "slot", "validator_index"])
+        );
+        assert_eq!(get_duty[0].values.get("slot").map(String::as_str), Some("320"));
+        assert_eq!(get_duty[0].values.get("epoch").map(String::as_str), Some("10"));
+        assert_eq!(get_duty[0].values.get("validator_index").map(String::as_str), Some("1234"));
+        assert_eq!(get_duty[0].values.get("committee_index").map(String::as_str), Some("1"));
+        assert!(!get_duty[0].keys.contains("pubkey"));
+
+        let duty_miss: Vec<_> = state
+            .events
+            .iter()
+            .filter(|e| e.parent_name.as_deref() == Some("duty_tracker.get_duty"))
+            .collect();
+        assert_eq!(duty_miss.len(), 1, "Cache miss must sit inside get_duty, got {duty_miss:?}");
+        assert_eq!(duty_miss[0].message, "Cache miss");
+        assert!(duty_miss[0].keys.contains("cache_type"));
+
+        let slot_span: Vec<_> =
+            state.spans.iter().filter(|s| s.name == "duty_tracker.get_duties_for_slot").collect();
+        assert_eq!(slot_span.len(), 1);
+        assert_eq!(slot_span[0].keys, key_set(&["epoch", "slot"]));
+        assert_eq!(slot_span[0].values.get("slot").map(String::as_str), Some("320"));
+        assert_eq!(slot_span[0].values.get("epoch").map(String::as_str), Some("10"));
+        let slot_miss: Vec<_> = state
+            .events
+            .iter()
+            .filter(|e| e.parent_name.as_deref() == Some("duty_tracker.get_duties_for_slot"))
+            .collect();
+        assert_eq!(slot_miss.len(), 1, "slot miss event must sit inside the span");
+        assert_eq!(slot_miss[0].message, "Cache miss for slot");
+    }
+
+    /// At info, no `duty_tracker.get_*` span is constructed. An info probe proves the
+    /// subscriber is live, so an empty capture is not a vacuous pass.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_info_level_constructs_no_duty_tracker_get_spans() {
+        let tracker = DutyTracker::new(empty_beacon(), vec!["1234".to_string()]);
+        let capture = EpochSpanCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(capture.clone().with_filter(tracing_subscriber::filter::LevelFilter::INFO));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let _probe = tracing::info_span!("info_probe");
+        let _ = tracker.get_duty(320, 1, 1234).await;
+        let _ = tracker.get_duties_for_slot(320).await;
+        let _ = tracker.get_proposer_duty(320).await;
+        let _ = tracker.get_sync_committee_duties(320).await;
+        let _ = tracker.get_ptc_duties_for_slot(320).await;
+
+        let spans = capture.state.lock().expect("spans").spans.clone();
+        let names: Vec<&str> = spans.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names.contains(&"info_probe"),
+            "info subscriber must record an info span (non-vacuous), got {names:?}"
+        );
+        let constructed: Vec<_> =
+            names.iter().copied().filter(|n| n.starts_with("duty_tracker.get_")).collect();
+        assert!(
+            constructed.is_empty(),
+            "info must not construct duty_tracker.get_* spans, got {constructed:?}"
+        );
     }
 
     #[tokio::test]
@@ -2433,9 +2586,17 @@ mod tests {
         state: Arc<Mutex<CaptureState>>,
     }
 
+    #[derive(Clone, Debug)]
+    struct CapturedEvent {
+        parent_name: Option<String>,
+        message: String,
+        keys: BTreeSet<String>,
+    }
+
     #[derive(Default)]
     struct CaptureState {
         spans: Vec<CapturedSpan>,
+        events: Vec<CapturedEvent>,
         index: HashMap<u64, usize>,
     }
 
@@ -2484,6 +2645,27 @@ mod tests {
                 return;
             };
             values.record(&mut FieldVisitor(&mut state.spans[idx]));
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut recorded = CapturedSpan {
+                name: String::new(),
+                level: *event.metadata().level(),
+                keys: BTreeSet::new(),
+                values: BTreeMap::new(),
+            };
+            event.record(&mut FieldVisitor(&mut recorded));
+            let parent_id = event.parent().cloned().or_else(|| ctx.current_span().id().cloned());
+            let mut state = self.state.lock().expect("span capture");
+            let parent_name = parent_id.as_ref().and_then(|id| {
+                state.index.get(&id.into_u64()).map(|idx| state.spans[*idx].name.clone())
+            });
+            let message = recorded.values.get("message").cloned().unwrap_or_default();
+            state.events.push(CapturedEvent { parent_name, message, keys: recorded.keys });
         }
     }
 }
