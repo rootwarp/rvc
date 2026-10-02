@@ -150,9 +150,14 @@ impl RemoteSigner {
         );
 
         async {
-            let response = self.client.post(&url).json(request).send().await.map_err(|e| {
-                SigningError::RemoteSignerError(format!("HTTP request failed: {e}"))
-            })?;
+            // Inside `.instrument(span)` so traceparent's span-id is
+            // `sign.remote`, not the caller's parent (T12).
+            let mut headers = reqwest::header::HeaderMap::new();
+            telemetry::inject_trace_context(&mut headers);
+            let response =
+                self.client.post(&url).headers(headers).json(request).send().await.map_err(
+                    |e| SigningError::RemoteSignerError(format!("HTTP request failed: {e}")),
+                )?;
 
             let status = response.status();
             tracing::Span::current().record("http.status_code", status.as_u16());
