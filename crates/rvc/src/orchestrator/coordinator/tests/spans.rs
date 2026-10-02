@@ -570,3 +570,282 @@ async fn test_beacon_http_span_created() {
         *span_names
     );
 }
+
+// --- T15 / TRC-4c: time_into_slot stamped when the phase fires ---
+
+use timing::{due_ms, DeadlineBps, DeadlineSchedule};
+use tracing::field::{Field, Visit};
+
+const PHASE_BLOCK: &str = "slot.phase.block";
+const PHASE_ATTESTATION: &str = "slot.phase.attestation";
+const PHASE_AGGREGATION: &str = "slot.phase.aggregation";
+const PHASE_PTC: &str = "slot.phase.payload_attestation";
+
+/// Whole-second truncation a `SlotClock` stamp can represent
+/// (`(seconds_into_slot) * 1000`). Sub-second bps offsets are not in this set.
+fn slot_clock_ms(elapsed_ms: u64) -> u64 {
+    (elapsed_ms / 1000) * 1000
+}
+
+fn gloas_at_epoch(epoch: u64) -> Arc<ForkSchedule> {
+    let mut schedule = ForkSchedule::unscheduled_gloas();
+    schedule.gloas_fork_epoch = epoch;
+    Arc::new(schedule)
+}
+
+fn t15_config(pre_gloas: DeadlineBps, gloas: DeadlineBps) -> OrchestratorConfig {
+    OrchestratorConfig::new([0xaa; 32], gloas_at_epoch(1))
+        .with_deadline_schedule(DeadlineSchedule { pre_gloas, gloas })
+        .with_pre_proposal_deadline(Duration::ZERO)
+        .with_cold_proposer_fetch_deadline(Duration::ZERO)
+}
+
+fn t15_orchestrator(
+    slot: Slot,
+    config: OrchestratorConfig,
+) -> (DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>, OrchestratorHandle) {
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(slot);
+    let beacon = Arc::new(bn_manager::MockBeaconNodeClient::new());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
+    DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        config,
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+    ))
+}
+
+struct TimeIntoSlotVisitor {
+    value: Option<u64>,
+}
+
+impl Visit for TimeIntoSlotVisitor {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        if field.name() == observability::logging::fields::TIME_INTO_SLOT {
+            self.value = Some(value);
+        }
+    }
+
+    fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
+}
+
+#[derive(Clone, Debug)]
+struct PhaseStamp {
+    name: String,
+    /// Milliseconds passed to `Span::record`.
+    value: u64,
+    /// Tokio time when `on_record` ran. Equals `value` only if the stamp is
+    /// the fire-time elapsed, not a bps constant written early.
+    at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ConstructedPhase {
+    name: String,
+    time_into_slot: Option<u64>,
+}
+
+struct FireTimeCapture {
+    origin: tokio::time::Instant,
+    names: Arc<Mutex<SpanMap<u64, String>>>,
+    constructed: Arc<Mutex<Vec<ConstructedPhase>>>,
+    recorded: Arc<Mutex<Vec<PhaseStamp>>>,
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FireTimeCapture {
+    fn on_new_span(
+        &self,
+        attrs: &tracing::span::Attributes<'_>,
+        id: &Id,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let name = attrs.metadata().name().to_string();
+        let mut visitor = TimeIntoSlotVisitor { value: None };
+        attrs.record(&mut visitor);
+        self.names.lock().insert(id.into_u64(), name.clone());
+        if name.starts_with("slot.phase.") {
+            self.constructed.lock().push(ConstructedPhase { name, time_into_slot: visitor.value });
+        }
+    }
+
+    fn on_record(
+        &self,
+        id: &Id,
+        values: &tracing::span::Record<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let Some(name) = self.names.lock().get(&id.into_u64()).cloned() else {
+            return;
+        };
+        if !name.starts_with("slot.phase.") {
+            return;
+        }
+        let mut visitor = TimeIntoSlotVisitor { value: None };
+        values.record(&mut visitor);
+        if let Some(value) = visitor.value {
+            let at_ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+            self.recorded.lock().push(PhaseStamp { name, value, at_ms });
+        }
+    }
+}
+
+async fn drive_phase_stamps(
+    slot: Slot,
+    config: OrchestratorConfig,
+    shutdown_after_ms: u64,
+) -> (Vec<ConstructedPhase>, Vec<PhaseStamp>) {
+    let (mut orchestrator, handle) = t15_orchestrator(slot, config);
+    let constructed = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let layer = FireTimeCapture {
+        origin: tokio::time::Instant::now(),
+        names: Arc::new(Mutex::new(SpanMap::new())),
+        constructed: constructed.clone(),
+        recorded: recorded.clone(),
+    };
+    let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    tokio::select! {
+        biased;
+        _ = orchestrator.run() => {}
+        () = async {
+            tokio::time::sleep(Duration::from_millis(shutdown_after_ms)).await;
+            handle.shutdown();
+            std::future::pending::<()>().await;
+        } => {}
+    }
+
+    let constructed = constructed.lock().clone();
+    let recorded = recorded.lock().clone();
+    (constructed, recorded)
+}
+
+fn constructed_field<'a>(constructed: &'a [ConstructedPhase], name: &str) -> &'a Option<u64> {
+    let hits: Vec<_> = constructed.iter().filter(|phase| phase.name == name).collect();
+    assert_eq!(hits.len(), 1, "{name} constructed once, got {constructed:?}");
+    &hits[0].time_into_slot
+}
+
+fn phase_stamp<'a>(recorded: &'a [PhaseStamp], name: &str) -> &'a PhaseStamp {
+    let hits: Vec<_> = recorded.iter().filter(|s| s.name == name).collect();
+    assert_eq!(hits.len(), 1, "{name} records time_into_slot once, got {recorded:?}");
+    hits[0]
+}
+
+fn assert_fire_stamp(stamp: &PhaseStamp, expected_ms: u64) {
+    assert_eq!(
+        stamp.value, expected_ms,
+        "{} time_into_slot must match the configured bps offset",
+        stamp.name
+    );
+    assert_eq!(
+        stamp.at_ms, stamp.value,
+        "{} time_into_slot must be the elapsed ms at fire (on_record at {}, value {})",
+        stamp.name, stamp.at_ms, stamp.value
+    );
+}
+
+/// Pre-Gloas: block / attestation / aggregation stamp `time_into_slot` at fire.
+/// Attestation's 3999 ms is not a whole second, so a SlotClock reimplementation
+/// (`current_time_secs` truncated) cannot satisfy it. PTC does not fire.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_t15_time_into_slot_matches_bps_when_phase_fires() {
+    let slot_ms = 12_000u64;
+    let pre = DeadlineBps::default();
+    let expected_att = due_ms(pre.attestation, slot_ms);
+    let expected_agg = due_ms(pre.aggregate, slot_ms);
+    assert_eq!(expected_att, 3999, "fixture: spec 1/3 is 3999 ms");
+    assert_eq!(expected_agg, 8000);
+    assert_ne!(
+        expected_att,
+        slot_clock_ms(expected_att),
+        "fixture must reject a whole-second SlotClock stamp"
+    );
+
+    let (constructed, recorded) =
+        drive_phase_stamps(31, t15_config(pre, DeadlineBps::default()), 8_500).await;
+
+    for name in [PHASE_BLOCK, PHASE_ATTESTATION, PHASE_AGGREGATION, PHASE_PTC] {
+        assert!(
+            constructed_field(&constructed, name).is_none(),
+            "{name} must declare time_into_slot empty at construction, got {constructed:?}"
+        );
+    }
+
+    let block = phase_stamp(&recorded, PHASE_BLOCK);
+    let att = phase_stamp(&recorded, PHASE_ATTESTATION);
+    let agg = phase_stamp(&recorded, PHASE_AGGREGATION);
+    assert_fire_stamp(block, 0);
+    assert_fire_stamp(att, expected_att);
+    assert_fire_stamp(agg, expected_agg);
+    assert!(
+        recorded.iter().all(|s| s.name != PHASE_PTC),
+        "pre-Gloas PTC phase must not stamp time_into_slot, got {recorded:?}"
+    );
+    assert_ne!(block.value, att.value);
+    assert_ne!(att.value, agg.value);
+}
+
+/// Gloas+: PTC is the fourth phase. Attestation and aggregation offsets differ
+/// by 100 ms, so a 1-second clock cannot tell them apart.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn test_t15_ptc_time_into_slot_when_gloas_active() {
+    let slot_ms = 12_000u64;
+    // Attestation 3333 → 3999 and aggregate 3416 → 4099 differ by 100 ms.
+    // Sync and contribution use different bps so those duties take the split
+    // wait; the phase stamp must stay on the phase's own offset.
+    // PTC 4166 → 4999.
+    let gloas = DeadlineBps {
+        attestation: 3333,
+        aggregate: 3416,
+        sync_message: 2500,
+        contribution: 5000,
+        payload: 4166,
+        payload_attestation: 4166,
+    };
+    let expected_att = due_ms(gloas.attestation, slot_ms);
+    let expected_agg = due_ms(gloas.aggregate, slot_ms);
+    let expected_ptc = due_ms(gloas.payload_attestation, slot_ms);
+    assert_eq!(expected_att, 3999);
+    assert_eq!(expected_agg, 4099);
+    assert_eq!(expected_ptc, 4999);
+    assert_ne!(expected_att, due_ms(gloas.sync_message, slot_ms));
+    assert_ne!(expected_agg, due_ms(gloas.contribution, slot_ms));
+    let gap = expected_agg.abs_diff(expected_att);
+    assert!(gap > 0 && gap < 1000, "fixture offsets must be sub-second-distinguishable");
+    assert_ne!(slot_clock_ms(expected_att), expected_att);
+    assert_ne!(slot_clock_ms(expected_agg), expected_agg);
+    assert_eq!(
+        slot_clock_ms(expected_agg),
+        slot_clock_ms(expected_ptc),
+        "fixture: a whole-second clock collapses aggregation and PTC"
+    );
+
+    let (constructed, recorded) =
+        drive_phase_stamps(32, t15_config(DeadlineBps::default(), gloas), 6_500).await;
+
+    for name in [PHASE_BLOCK, PHASE_ATTESTATION, PHASE_AGGREGATION, PHASE_PTC] {
+        assert!(
+            constructed_field(&constructed, name).is_none(),
+            "{name} must declare time_into_slot empty at construction, got {constructed:?}"
+        );
+    }
+
+    assert_fire_stamp(phase_stamp(&recorded, PHASE_BLOCK), 0);
+    assert_fire_stamp(phase_stamp(&recorded, PHASE_ATTESTATION), expected_att);
+    assert_fire_stamp(phase_stamp(&recorded, PHASE_AGGREGATION), expected_agg);
+    assert_fire_stamp(phase_stamp(&recorded, PHASE_PTC), expected_ptc);
+}

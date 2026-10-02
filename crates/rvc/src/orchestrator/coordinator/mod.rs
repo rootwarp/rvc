@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::watch;
-use tracing::{debug, error, info, info_span, warn, Instrument};
+use tracing::{debug, error, field, info, info_span, warn, Instrument};
 
 use async_trait::async_trait;
 use block_service::{BeaconBlockClient, BlockService, BuilderConfig, BuilderConfigProvider};
@@ -488,6 +488,10 @@ where
             let deadlines = self.config.deadline_schedule.for_fork(fork);
 
             let slot_span = info_span!("slot.process", slot = current_slot, epoch = current_epoch,);
+            // One Instant per slot. Phase spans stamp `time_into_slot` from this
+            // anchor when they fire. A SlotClock read is whole seconds, so it
+            // cannot represent sub-second bps offsets.
+            let slot_started = tokio::time::Instant::now();
 
             // Check if keys changed (dynamic key import/delete via keymanager API).
             // has_changed() does NOT mark the value as seen — mark_unchanged() so
@@ -522,7 +526,13 @@ where
             {
                 // M2: offset from slot start to entry of maybe_propose_block.
                 self.record_phase_block_start_offset(current_slot);
-                let phase_span = info_span!(parent: &slot_span, "slot.phase.block");
+                let phase_span = info_span!(
+                    parent: &slot_span,
+                    "slot.phase.block",
+                    time_into_slot = field::Empty,
+                );
+                // Block fires at t=0: no bps wait, stamp at entry.
+                Self::record_time_into_slot(&phase_span, slot_started);
                 self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx).instrument(phase_span).await;
             }
 
@@ -535,9 +545,21 @@ where
             // frozen MockSlotClock would fire aggregates at att+agg instead of
             // agg, and wall-clock production already uses remaining time.
             let ctx = tokio::sync::Mutex::new(ctx);
-            let att_phase_span = info_span!(parent: &slot_span, "slot.phase.attestation");
-            let agg_phase_span = info_span!(parent: &slot_span, "slot.phase.aggregation");
-            let ptc_phase_span = info_span!(parent: &slot_span, "slot.phase.payload_attestation");
+            let att_phase_span = info_span!(
+                parent: &slot_span,
+                "slot.phase.attestation",
+                time_into_slot = field::Empty,
+            );
+            let agg_phase_span = info_span!(
+                parent: &slot_span,
+                "slot.phase.aggregation",
+                time_into_slot = field::Empty,
+            );
+            let ptc_phase_span = info_span!(
+                parent: &slot_span,
+                "slot.phase.payload_attestation",
+                time_into_slot = field::Empty,
+            );
             let (att_outcome, agg_outcome, ptc_outcome) = tokio::join!(
                 self.run_attestation_and_sync_phases(
                     current_slot,
@@ -545,6 +567,7 @@ where
                     &ctx,
                     deadlines,
                     att_phase_span,
+                    slot_started,
                 ),
                 self.run_aggregation_and_contribution_phases(
                     current_slot,
@@ -552,6 +575,7 @@ where
                     &ctx,
                     deadlines,
                     agg_phase_span,
+                    slot_started,
                 ),
                 self.run_payload_attestation_phase(
                     current_slot,
@@ -559,6 +583,7 @@ where
                     fork,
                     deadlines,
                     ptc_phase_span,
+                    slot_started,
                 ),
             );
             if matches!(att_outcome, WaitOutcome::Shutdown)
@@ -968,6 +993,19 @@ where
         ctx.lock().await.clone()
     }
 
+    /// Stamps `time_into_slot` when a phase fires.
+    ///
+    /// One [`tokio::time::Instant::now`] per call, measured from the per-slot
+    /// anchor taken after `slot.process`. The slot clock is whole seconds and
+    /// cannot represent a sub-second bps offset such as 3999 ms.
+    fn record_time_into_slot(span: &tracing::Span, slot_started: tokio::time::Instant) {
+        let elapsed_ms = u64::try_from(
+            tokio::time::Instant::now().saturating_duration_since(slot_started).as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        span.record(observability::logging::fields::TIME_INTO_SLOT, elapsed_ms);
+    }
+
     async fn run_attestation_phase(&self, current_slot: Slot, att_phase_span: &tracing::Span) {
         if self.attesting_enabled.load(Ordering::Relaxed) {
             if let Err(e) = self
@@ -1022,6 +1060,7 @@ where
         ctx: &tokio::sync::Mutex<SlotContext>,
         deadlines: DeadlineBps,
         att_phase_span: tracing::Span,
+        slot_started: tokio::time::Instant,
     ) -> WaitOutcome {
         if deadlines.attestation == deadlines.sync_message {
             if matches!(
@@ -1040,6 +1079,7 @@ where
             if self.check_shutdown() {
                 return WaitOutcome::Shutdown;
             }
+            Self::record_time_into_slot(&att_phase_span, slot_started);
             self.capture_head_if_needed(ctx).await;
             self.warn_if_attestation_overrun(current_slot, deadlines.attestation);
             self.run_attestation_phase(current_slot, &att_phase_span).await;
@@ -1065,6 +1105,7 @@ where
                 ) {
                     return WaitOutcome::Shutdown;
                 }
+                Self::record_time_into_slot(&att_phase_span, slot_started);
                 self.capture_head_if_needed(ctx).await;
                 self.warn_if_attestation_overrun(current_slot, deadlines.attestation);
                 self.run_attestation_phase(current_slot, &att_phase_span).await;
@@ -1110,6 +1151,7 @@ where
         ctx: &tokio::sync::Mutex<SlotContext>,
         deadlines: DeadlineBps,
         agg_phase_span: tracing::Span,
+        slot_started: tokio::time::Instant,
     ) -> WaitOutcome {
         if deadlines.contribution == deadlines.aggregate {
             if matches!(
@@ -1128,6 +1170,7 @@ where
             if self.check_shutdown() {
                 return WaitOutcome::Shutdown;
             }
+            Self::record_time_into_slot(&agg_phase_span, slot_started);
             let snapshot = self.snapshot_ctx(ctx).await;
             self.run_sync_contributions_phase(current_slot, current_epoch, &snapshot)
                 .instrument(agg_phase_span.clone())
@@ -1172,6 +1215,7 @@ where
                 ) {
                     return WaitOutcome::Shutdown;
                 }
+                Self::record_time_into_slot(&agg_phase_span, slot_started);
                 self.run_aggregation_phase(current_slot, current_epoch, agg_phase_span.clone())
                     .await;
                 WaitOutcome::Continue
@@ -1232,6 +1276,7 @@ where
         fork: ForkName,
         deadlines: DeadlineBps,
         ptc_phase_span: tracing::Span,
+        slot_started: tokio::time::Instant,
     ) -> WaitOutcome {
         if fork >= ForkName::Gloas {
             if matches!(
@@ -1250,6 +1295,7 @@ where
             if self.check_shutdown() {
                 return WaitOutcome::Shutdown;
             }
+            Self::record_time_into_slot(&ptc_phase_span, slot_started);
             self.payload_attestation_service
                 .maybe_produce_payload_attestations(current_slot, current_epoch)
                 .instrument(ptc_phase_span)
