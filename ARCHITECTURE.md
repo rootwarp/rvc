@@ -110,6 +110,7 @@ graph TD
     RVC_GRPC_SIGNER --> RVC_ETH_TYPES
     RVC_GRPC_SIGNER --> RVC_OBSERVABILITY
     RVC_GRPC_SIGNER --> RVC_SIGNER_PROTO
+    RVC_GRPC_SIGNER --> RVC_TELEMETRY
     RVC_KEYGEN --> RVC_CRYPTO
     RVC_KEYGEN --> RVC_ETH_TYPES
     RVC_KEYGEN --> RVC_OBSERVABILITY
@@ -677,6 +678,7 @@ Client library for connecting `bin/rvc` to `bin/rvc-signer` via gRPC with mTLS:
 - **`GrpcRemoteSignerConfig`** — mTLS configuration (client cert, key, CA cert).
 - **Proto stubs** — Re-exports `SignerServiceClient` and `PeerSignerServiceClient` generated from `proto/signer.proto`.
 - **Integration** — Added to `CompositeSigner` via `add_remote_signer()` during startup.
+- **Trace propagation** — `sign_rpc` injects W3C `traceparent` into outbound gRPC metadata inside the `sign.grpc_remote_typed` span (`telemetry::inject_trace_context_metadata`, `telemetry` feature `grpc`). Infra → Base.
 
 ### `crates/telemetry` — OpenTelemetry Distributed Tracing
 
@@ -686,7 +688,7 @@ Provides distributed tracing infrastructure using OpenTelemetry:
 - **`ExporterKind`** — `Otlp` (OTLP/HTTP on port 4318) or `Gcp` (Cloud Trace, gated behind `gcp-trace` feature).
 - **`init_tracing`** — Sets up `tracing-opentelemetry` layer with `ParentBased(TraceIdRatioBased)` sampler. Returns `TracingGuard`.
 - **`TracingGuard`** — RAII `#[must_use]` guard that flushes pending spans on drop (5-second timeout).
-- **W3C propagation** — Injects `traceparent` headers into outbound beacon node HTTP requests.
+- **W3C propagation** — Injects `traceparent` into outbound beacon-node HTTP headers and, behind feature `grpc`, into outbound gRPC signer metadata.
 - **Instrumentation pattern** — `#[tracing::instrument(name = "rvc.xxx", skip_all, fields(...))]` with dynamic field recording via `Span::current().record()`.
 
 ## Key Design Patterns
@@ -703,7 +705,7 @@ Provides distributed tracing infrastructure using OpenTelemetry:
   - Prefer typed `Result` flows with explicit allow-lists for any intentional degradation.
 - **Downward-only dependencies** — Binary → Orchestrator → Domain → Base/Infra. Never upward. The generated graph and `architecture_no_cycles` gate enforce this.
 - **Shutdown idiom** — **`tokio_util::sync::CancellationToken`** is the workspace standard for service lifecycle (supports `child_token` hierarchies). Older loops still use `tokio::sync::watch` (orchestrator coordinator, bn-manager SSE/sync, timing); `bin/rvc` bridges the two. New code and opportunistic rewrites adopt `CancellationToken`; do not introduce new `watch`-based shutdown channels.
-- **Distributed tracing** — OpenTelemetry spans across slot lifecycle, block proposals, attestations, signing, and beacon HTTP requests with W3C trace context propagation.
+- **Distributed tracing** — OpenTelemetry spans across slot lifecycle, block proposals, attestations, signing, beacon HTTP requests, and gRPC signer calls with W3C trace context propagation.
 - **Pluggable secret providers** — `SecretProvider` trait enables cloud key management (GCP Secret Manager) with periodic refresh and `Zeroizing` key material.
 - **Remote signing isolation** — `rvc-signer` runs as a standalone process with mTLS; keys never leave the signer. Slashing protection remains in `rvc`.
 - **DVT threshold signing** — Optional Shamir Secret Sharing backend with peer-to-peer partial signature coordination and Lagrange interpolation.
