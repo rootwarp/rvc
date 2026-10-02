@@ -24,9 +24,8 @@
 /// historical `signer.v2.*` instrument name. The tracing span name is
 /// `grpc.sign`. Correlation fields are the union of every v2 sign handler's
 /// `fields(...)` set, declared `tracing::field::Empty` and late-bound with
-/// `Span::current().record` after the payload parses. Handlers this change
-/// does not convert still carry `#[tracing::instrument]` (TRC-3d); their field
-/// names are declared here so one builder is the union.
+/// `Span::current().record` after the payload parses. All twelve
+/// `SignerServiceV2` sign handlers use this builder (TRC-3c / TRC-3d).
 pub(crate) fn server_span(
     otel_name: &'static str,
     metadata: &tonic::metadata::MetadataMap,
@@ -53,15 +52,11 @@ mod tests {
 
     use super::*;
 
-    const CONVERTED_OTEL_NAMES: &[&str] = &[
+    /// Ten names from `0ae9a09`, plus `sign_block_header` and `sign_root`.
+    const V2_SIGN_OTEL_NAMES: &[&str] = &[
         "signer.v2.sign_beacon_block",
         "signer.v2.sign_blinded_beacon_block",
         "signer.v2.sign_randao_reveal",
-        "signer.v2.sign_block_header",
-        "signer.v2.sign_root",
-    ];
-
-    const UNCONVERTED_OTEL_NAMES: &[&str] = &[
         "signer.v2.sign_attestation_data",
         "signer.v2.sign_aggregate_and_proof",
         "signer.v2.sign_sync_committee_message",
@@ -69,6 +64,8 @@ mod tests {
         "signer.v2.sign_contribution_and_proof",
         "signer.v2.sign_builder_registration",
         "signer.v2.sign_voluntary_exit",
+        "signer.v2.sign_block_header",
+        "signer.v2.sign_root",
     ];
 
     /// Union of `SignerServiceV2` sign-handler span fields, plus the OTel
@@ -104,14 +101,15 @@ mod tests {
     }
 
     #[test]
-    fn test_first_five_handlers_use_server_span_remaining_seven_keep_instrument() {
+    fn test_all_v2_sign_handlers_use_server_span_and_no_instrument() {
         let src = include_str!("service.rs");
         assert_eq!(
-            src.matches("#[tracing::instrument").count(),
-            UNCONVERTED_OTEL_NAMES.len(),
-            "only the seven not-yet-converted handlers may keep #[tracing::instrument]"
+            src.matches("tracing::instrument").count(),
+            0,
+            "SignerServiceV2 must not carry #[tracing::instrument] (TRC-3d)"
         );
-        for name in CONVERTED_OTEL_NAMES {
+        assert_eq!(V2_SIGN_OTEL_NAMES.len(), 12);
+        for name in V2_SIGN_OTEL_NAMES {
             assert!(
                 src.contains(&format!("server_span(\"{name}\"")),
                 "{name} must be passed to server_span"
@@ -119,16 +117,6 @@ mod tests {
             assert!(
                 !src.contains(&format!("name = \"{name}\"")),
                 "{name} must not keep #[tracing::instrument]"
-            );
-        }
-        for name in UNCONVERTED_OTEL_NAMES {
-            assert!(
-                src.contains(&format!("name = \"{name}\"")),
-                "{name} must still use #[tracing::instrument] (TRC-3d)"
-            );
-            assert!(
-                !src.contains(&format!("server_span(\"{name}\"")),
-                "{name} must not be converted in TRC-3c"
             );
         }
     }
