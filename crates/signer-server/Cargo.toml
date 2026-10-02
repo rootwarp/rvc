@@ -82,7 +82,7 @@ tower = { workspace = true, features = ["util"] }
 rustls-pemfile = "2"
 prometheus.workspace = true
 rvc-config.workspace = true
-telemetry.workspace = true
+telemetry = { workspace = true, features = ["grpc"] }
 # release_max_level_debug: trace! (and below-cap spans) compile to nothing in
 # --release; debug! stays RUST_LOG-switchable. The `log` bridge feature is NOT
 # enabled (it reintroduces cost under a static cap; ADR-001).
@@ -104,7 +104,10 @@ libc = "0.2"
 async-trait.workspace = true
 hex.workspace = true
 reqwest.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 tracing-subscriber = { workspace = true, features = ["registry"] }
+tracing-opentelemetry.workspace = true
 parking_lot.workspace = true
 rvc-test-support.workspace = true
 tempfile.workspace = true
