@@ -356,30 +356,47 @@ impl GrpcRemoteSigner {
     #[cfg(test)]
     fn with_pubkeys_for_test(pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>) -> Self {
         let channel = Channel::from_static("http://127.0.0.1:1").connect_lazy();
+        Self::with_channel_for_test("http://127.0.0.1:1".to_string(), channel, pubkeys)
+    }
+
+    /// Test helper: signer bound to an already-built channel (no `connect` / env gate).
+    #[cfg(test)]
+    fn with_channel_for_test(
+        url: String,
+        channel: Channel,
+        pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,
+    ) -> Self {
         Self {
             client_v2: SignerServiceClientV2::new(channel),
             pubkeys,
-            url: "http://127.0.0.1:1".to_string(),
+            url,
             genesis_fork_version: [0; 4],
         }
     }
 
     /// Shared pipeline for every typed gRPC signing RPC.
     ///
-    /// Owns `ensure_pubkey`, span, timing, status→error mapping, and
-    /// `extract_signature`. Callers only build the request and supply a lazy
-    /// local-verify root (evaluated only after the pubkey guard passes).
-    async fn sign_rpc<R, F, Fut>(
+    /// Owns `ensure_pubkey`, span, W3C trace-context injection, timing,
+    /// status→error mapping, and `extract_signature`. Callers build the proto
+    /// message and supply a lazy local-verify root (evaluated only after the
+    /// pubkey guard passes).
+    ///
+    /// Shape (b): this function owns the [`tonic::Request`] and injects while
+    /// `sign.grpc_remote_typed` is the current span. The send closure only
+    /// transmits that request.
+    async fn sign_rpc<M, R, F, Fut>(
         &self,
         ctx: &SignContext,
         duty_type: &'static str,
         rpc_name: &'static str,
         signing_root: R,
+        message: M,
         call: F,
     ) -> Result<Signature, SigningError>
     where
+        M: Send,
         R: FnOnce() -> [u8; 32],
-        F: FnOnce(SignerServiceClientV2<Channel>) -> Fut + Send,
+        F: FnOnce(SignerServiceClientV2<Channel>, tonic::Request<M>) -> Fut + Send,
         Fut: std::future::Future<Output = Result<tonic::Response<SignResponse>, tonic::Status>>
             + Send,
     {
@@ -404,8 +421,13 @@ impl GrpcRemoteSigner {
             );
             let start = Instant::now();
 
+            // Inside `.instrument(span)` so traceparent's span-id is
+            // `sign.grpc_remote_typed`, not the caller's parent.
+            let mut request = tonic::Request::new(message);
+            telemetry::inject_trace_context_metadata(request.metadata_mut());
+
             let client = self.client_v2.clone();
-            let response = call(client).await.map_err(|status| {
+            let response = call(client, request).await.map_err(|status| {
                 tracing::warn!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     duty_type,
@@ -449,7 +471,8 @@ impl GrpcRemoteSigner {
             "block_header",
             "SignBlockHeader",
             || signing_root_with_fork_version(header, DOMAIN_BEACON_PROPOSER, fork_version, gvr),
-            move |mut client| async move { client.sign_block_header(req).await },
+            req,
+            move |mut client, request| async move { client.sign_block_header(request).await },
         )
         .await
     }
@@ -474,7 +497,8 @@ impl GrpcRemoteSigner {
             "sign_root",
             "SignRoot",
             move || signing_root,
-            move |mut client| async move { client.sign_root(req).await },
+            req,
+            move |mut client, request| async move { client.sign_root(request).await },
         )
         .await
     }
@@ -560,7 +584,8 @@ impl TypedSigner for GrpcRemoteSigner {
             "block",
             "sign_block",
             || signing_root_with_fork_version(block, DOMAIN_BEACON_PROPOSER, fork_version, gvr),
-            move |mut client| async move { client.sign_beacon_block(req).await },
+            req,
+            move |mut client, request| async move { client.sign_beacon_block(request).await },
         )
         .await
     }
@@ -610,7 +635,8 @@ impl TypedSigner for GrpcRemoteSigner {
             "blinded_block",
             "sign_blinded_beacon_block",
             || signing_root_with_fork_version(block, DOMAIN_BEACON_PROPOSER, fork_version, gvr),
-            move |mut client| async move { client.sign_blinded_beacon_block(req).await },
+            req,
+            move |mut client, request| async move { client.sign_blinded_beacon_block(request).await },
         )
         .await
     }
@@ -647,7 +673,8 @@ impl TypedSigner for GrpcRemoteSigner {
             "attestation",
             "sign_attestation_data",
             || signing_root_with_fork_version(data, DOMAIN_BEACON_ATTESTER, fork_version, gvr),
-            move |mut client| async move { client.sign_attestation_data(req).await },
+            req,
+            move |mut client, request| async move { client.sign_attestation_data(request).await },
         )
         .await
     }
@@ -678,7 +705,8 @@ impl TypedSigner for GrpcRemoteSigner {
             "aggregate_and_proof",
             "sign_aggregate_and_proof",
             || signing_root_with_fork_version(agg, DOMAIN_AGGREGATE_AND_PROOF, fork_version, gvr),
-            move |mut client| async move { client.sign_aggregate_and_proof(req).await },
+            req,
+            move |mut client, request| async move { client.sign_aggregate_and_proof(request).await },
         )
         .await
     }
@@ -733,7 +761,8 @@ impl TypedSigner for GrpcRemoteSigner {
                     gvr,
                 )
             },
-            move |mut client| async move { client.sign_sync_committee_message(req).await },
+            req,
+            move |mut client, request| async move { client.sign_sync_committee_message(request).await },
         )
         .await
     }
@@ -767,7 +796,10 @@ impl TypedSigner for GrpcRemoteSigner {
                     gvr,
                 )
             },
-            move |mut client| async move { client.sign_sync_aggregator_selection_data(req).await },
+            req,
+            move |mut client, request| async move {
+                client.sign_sync_aggregator_selection_data(request).await
+            },
         )
         .await
     }
@@ -804,7 +836,8 @@ impl TypedSigner for GrpcRemoteSigner {
             "contribution_and_proof",
             "sign_contribution_and_proof",
             || signing_root_with_fork_version(c, DOMAIN_CONTRIBUTION_AND_PROOF, fork_version, gvr),
-            move |mut client| async move { client.sign_contribution_and_proof(req).await },
+            req,
+            move |mut client, request| async move { client.sign_contribution_and_proof(request).await },
         )
         .await
     }
@@ -834,7 +867,8 @@ impl TypedSigner for GrpcRemoteSigner {
                     [0u8; 32],
                 )
             },
-            move |mut client| async move { client.sign_builder_registration(req).await },
+            req,
+            move |mut client, request| async move { client.sign_builder_registration(request).await },
         )
         .await
     }
@@ -858,7 +892,8 @@ impl TypedSigner for GrpcRemoteSigner {
             "randao_reveal",
             "sign_randao_reveal",
             || signing_root_with_fork_version(&epoch, DOMAIN_RANDAO, fork_version, gvr),
-            move |mut client| async move { client.sign_randao_reveal(req).await },
+            req,
+            move |mut client, request| async move { client.sign_randao_reveal(request).await },
         )
         .await
     }
@@ -885,7 +920,8 @@ impl TypedSigner for GrpcRemoteSigner {
             "voluntary_exit",
             "sign_voluntary_exit",
             || signing_root_with_fork_version(exit, DOMAIN_VOLUNTARY_EXIT, fork_version, gvr),
-            move |mut client| async move { client.sign_voluntary_exit(req).await },
+            req,
+            move |mut client, request| async move { client.sign_voluntary_exit(request).await },
         )
         .await
     }
@@ -1583,5 +1619,336 @@ mod tests {
         }
         // All fifteen share the same error *shape* (shared map_err in sign_rpc).
         assert!(messages.iter().all(|m| m.contains("failed (")));
+    }
+
+    // ---- TRC-3b: outbound traceparent span-id is sign.grpc_remote_typed ----
+
+    use std::sync::{Arc, Mutex};
+
+    use opentelemetry::trace::TracerProvider as _;
+    use tonic::transport::Server;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::registry::LookupSpan;
+    use tracing_subscriber::{Layer, Registry};
+
+    use crate::proto::signer_v2::signer_service_server::{SignerService, SignerServiceServer};
+    use crate::proto::signer_v2::{
+        GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
+        SignAggregateAndProofRequest, SignAttestationDataRequest, SignBeaconBlockRequest,
+        SignBlindedBeaconBlockRequest, SignBlockHeaderRequest, SignBuilderRegistrationRequest,
+        SignContributionAndProofRequest, SignRandaoRevealRequest, SignResponse, SignRootRequest,
+        SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
+        SignVoluntaryExitRequest,
+    };
+
+    struct CapturedMetadata {
+        seen: Arc<std::sync::atomic::AtomicBool>,
+        traceparent: Arc<Mutex<Option<String>>>,
+    }
+
+    #[tonic::async_trait]
+    impl SignerService for CapturedMetadata {
+        async fn sign_randao_reveal(
+            &self,
+            request: tonic::Request<SignRandaoRevealRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            self.seen.store(true, std::sync::atomic::Ordering::SeqCst);
+            let traceparent = request
+                .metadata()
+                .get("traceparent")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            *self.traceparent.lock().expect("traceparent slot") = traceparent;
+            Err(tonic::Status::unimplemented("traceparent captured"))
+        }
+
+        async fn list_public_keys(
+            &self,
+            _request: tonic::Request<ListPublicKeysRequest>,
+        ) -> Result<tonic::Response<ListPublicKeysResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn get_status(
+            &self,
+            _request: tonic::Request<GetStatusRequest>,
+        ) -> Result<tonic::Response<GetStatusResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_beacon_block(
+            &self,
+            _request: tonic::Request<SignBeaconBlockRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_blinded_beacon_block(
+            &self,
+            _request: tonic::Request<SignBlindedBeaconBlockRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_attestation_data(
+            &self,
+            _request: tonic::Request<SignAttestationDataRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_aggregate_and_proof(
+            &self,
+            _request: tonic::Request<SignAggregateAndProofRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_sync_committee_message(
+            &self,
+            _request: tonic::Request<SignSyncCommitteeMessageRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_sync_aggregator_selection_data(
+            &self,
+            _request: tonic::Request<SignSyncAggregatorSelectionDataRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_contribution_and_proof(
+            &self,
+            _request: tonic::Request<SignContributionAndProofRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_builder_registration(
+            &self,
+            _request: tonic::Request<SignBuilderRegistrationRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_voluntary_exit(
+            &self,
+            _request: tonic::Request<SignVoluntaryExitRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_block_header(
+            &self,
+            _request: tonic::Request<SignBlockHeaderRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+
+        async fn sign_root(
+            &self,
+            _request: tonic::Request<SignRootRequest>,
+        ) -> Result<tonic::Response<SignResponse>, tonic::Status> {
+            Err(tonic::Status::unimplemented("unused in traceparent test"))
+        }
+    }
+
+    /// W3C `traceparent` span-id, or `None` when the header is absent or not a
+    /// sampled non-zero context (`00-{trace}-{span}-{flags}`).
+    fn traceparent_span_id(traceparent: &str) -> Option<&str> {
+        let mut parts = traceparent.split('-');
+        let version = parts.next()?;
+        let trace_id = parts.next()?;
+        let span_id = parts.next()?;
+        let flags = parts.next()?;
+        if parts.next().is_some()
+            || version != "00"
+            || trace_id.len() != 32
+            || span_id.len() != 16
+            || flags.len() != 2
+            || trace_id.chars().all(|c| c == '0')
+            || span_id.chars().all(|c| c == '0')
+        {
+            return None;
+        }
+        Some(span_id)
+    }
+
+    struct LiveSpanIds {
+        ids: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl LiveSpanIds {
+        fn record_ref<S>(&self, span: &tracing_subscriber::registry::SpanRef<'_, S>)
+        where
+            S: for<'a> LookupSpan<'a>,
+        {
+            let name = span.name();
+            if name != "sign.grpc_remote_typed" && name != "duty.parent" {
+                return;
+            }
+            let extensions = span.extensions();
+            let Some(data) = extensions.get::<tracing_opentelemetry::OtelData>() else {
+                return;
+            };
+            let Some(span_id) = data.span_id() else {
+                return;
+            };
+            let hex = format!("{span_id:016x}");
+            let mut ids = self.ids.lock().expect("span ids");
+            if !ids.iter().any(|(recorded, _)| recorded == name) {
+                ids.push((name.to_string(), hex));
+            }
+        }
+    }
+
+    impl<S> Layer<S> for LiveSpanIds
+    where
+        S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+            if let Some(span) = ctx.span(id) {
+                self.record_ref(&span);
+            }
+        }
+
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if let Some(span) = ctx.event_span(event) {
+                self.record_ref(&span);
+            }
+        }
+    }
+
+    async fn signer_against_capturing_server() -> (
+        GrpcRemoteSigner,
+        crypto::PublicKey,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<Mutex<Option<String>>>,
+    ) {
+        let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let traceparent = Arc::new(Mutex::new(None));
+        let service =
+            CapturedMetadata { seen: Arc::clone(&seen), traceparent: Arc::clone(&traceparent) };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(SignerServiceServer::new(service))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .ok();
+        });
+
+        let url = format!("http://{addr}");
+        let channel = Channel::from_shared(url.clone()).expect("url").connect_lazy();
+        let pubkey = dummy_pubkey();
+        let signer = GrpcRemoteSigner::with_channel_for_test(url, channel, vec![pubkey.to_bytes()]);
+        (signer, pubkey, seen, traceparent)
+    }
+
+    fn deneb_ctx(pubkey: crypto::PublicKey) -> SignContext {
+        SignContext::new(
+            pubkey,
+            ForkInfo {
+                previous_version: [0x04, 0, 0, 0],
+                current_version: [0x04, 0, 0, 0],
+                genesis_validators_root: [0xaa; 32],
+            },
+            ForkName::Deneb,
+        )
+    }
+
+    /// Strong assertion: with an OTel layer and a live `sign.grpc_remote_typed`
+    /// span, outbound `traceparent`'s span-id is that span, not `duty.parent`.
+    ///
+    /// Moving `inject_trace_context_metadata` outside the `.instrument(span)`
+    /// block makes this red: the header then carries the parent span-id.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_traceparent_span_id_matches_sign_grpc_remote_typed() {
+        let ids = Arc::new(Mutex::new(Vec::new()));
+        let capture = LiveSpanIds { ids: Arc::clone(&ids) };
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
+            .build();
+        let tracer = provider.tracer("rvc-grpc-signer-test");
+        let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        let subscriber = Registry::default().with(capture).with(otel_layer);
+        // Thread-local subscriber; `current_thread` keeps the RPC on this thread.
+        let _guard = tracing::subscriber::set_default(subscriber);
+        opentelemetry::global::set_text_map_propagator(
+            opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+        );
+
+        let (signer, pubkey, seen, traceparent) = signer_against_capturing_server().await;
+        let ctx = deneb_ctx(pubkey);
+
+        let parent = tracing::info_span!("duty.parent");
+        let _enter = parent.enter();
+        tracing::debug!("parent span live");
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TypedSigner::sign_randao_reveal(&signer, 1, &ctx),
+        )
+        .await
+        .expect("sign_randao_reveal timed out");
+        assert!(result.is_err(), "mock rejects the RPC after capturing metadata; got {result:?}");
+        drop(_enter);
+
+        assert!(seen.load(std::sync::atomic::Ordering::SeqCst), "RPC was not issued");
+        let header = traceparent.lock().expect("traceparent").clone().expect(
+            "outgoing metadata must carry traceparent while sign.grpc_remote_typed is current",
+        );
+        let header_span = traceparent_span_id(&header)
+            .unwrap_or_else(|| panic!("traceparent must be a non-zero W3C value, got {header}"))
+            .to_string();
+
+        let recorded = ids.lock().expect("span ids").clone();
+        let child = recorded
+            .iter()
+            .find(|(name, _)| name == "sign.grpc_remote_typed")
+            .unwrap_or_else(|| panic!("live sign.grpc_remote_typed span id missing: {recorded:?}"))
+            .1
+            .clone();
+        let parent_id = recorded
+            .iter()
+            .find(|(name, _)| name == "duty.parent")
+            .unwrap_or_else(|| panic!("live duty.parent span id missing: {recorded:?}"))
+            .1
+            .clone();
+
+        assert_ne!(child, parent_id, "child and parent OTel span ids must differ");
+        assert_eq!(
+            header_span, child,
+            "traceparent span-id must be sign.grpc_remote_typed ({child}), not duty.parent ({parent_id}); header={header}"
+        );
+        assert_ne!(
+            header_span, parent_id,
+            "traceparent must not carry the parent span-id ({parent_id})"
+        );
+
+        provider.shutdown().ok();
+    }
+
+    /// No OTel layer: inject is a no-op (no valid `traceparent`) and does not panic.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_sign_rpc_inject_without_otel_is_noop() {
+        let (signer, pubkey, seen, traceparent) = signer_against_capturing_server().await;
+        let ctx = deneb_ctx(pubkey);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            TypedSigner::sign_randao_reveal(&signer, 1, &ctx),
+        )
+        .await
+        .expect("sign_randao_reveal timed out");
+        assert!(result.is_err(), "mock rejects the RPC; got {result:?}");
+        assert!(seen.load(std::sync::atomic::Ordering::SeqCst), "RPC was not issued");
+        let header = traceparent.lock().expect("traceparent").clone();
+        let valid = header.as_deref().and_then(traceparent_span_id).is_some();
+        assert!(!valid, "no-OTel inject must not write a valid traceparent, got {header:?}");
     }
 }
