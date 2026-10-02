@@ -22,6 +22,8 @@ pub use file_appender::{create_file_layer, FileAppenderConfig};
 pub use format::{console_fmt_layer, LogFormat, TraceIdFormat, LOG_FORMAT_ENV};
 pub use init::{env_filter_or, init_tracing, reloadable_env_filter, LogReloadHandle};
 pub use propagation::{inject_trace_context, set_parent_from_headers};
+#[cfg(feature = "grpc")]
+pub use propagation::{inject_trace_context_metadata, set_parent_from_metadata};
 pub use shutdown::shutdown_tracing;
 pub use trace_id::{TraceIdLayer, TraceIds, SPAN_ID_KEY, TRACE_ID_KEY};
 

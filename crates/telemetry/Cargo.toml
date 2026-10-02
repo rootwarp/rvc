@@ -12,6 +12,7 @@ workspace = true
 [features]
 default = []
 gcp-trace = ["dep:opentelemetry-gcloud-trace"]
+grpc = ["dep:tonic"]
 
 [dependencies]
 opentelemetry = { workspace = true }
@@ -28,6 +29,8 @@ logroller = { workspace = true }
 
 # GCP (optional)
 opentelemetry-gcloud-trace = { version = "0.22", optional = true }
+# gRPC metadata propagation (optional; TRC-3a). Not pulled unless `grpc` is on.
+tonic = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
