@@ -5,7 +5,10 @@ use eth_types::{
     ProposerPreferences,
 };
 use observability::logging::RedactedUrl;
+use opentelemetry::trace::TracerProvider as _;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{Layer, Registry};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1090,4 +1093,157 @@ async fn test_remote_signer_sign_builder_request_auth_success() {
         RemoteSigner::new_unchecked(RemoteSignerConfig::new(mock_server.uri()), vec![pk_bytes]);
     let sig = TypedSigner::sign_builder_request_auth(&signer, &data, [0; 4], &ctx).await.unwrap();
     assert_eq!(sig.to_bytes(), expected_sig.to_bytes());
+}
+
+// ---- TRC-3e / T12: outbound traceparent span-id is sign.remote ----
+
+/// W3C `traceparent` span-id, or `None` when the header is absent or not a
+/// sampled non-zero context (`00-{trace}-{span}-{flags}`).
+fn traceparent_span_id(traceparent: &str) -> Option<&str> {
+    let mut parts = traceparent.split('-');
+    let version = parts.next()?;
+    let trace_id = parts.next()?;
+    let span_id = parts.next()?;
+    let flags = parts.next()?;
+    if parts.next().is_some()
+        || version != "00"
+        || trace_id.len() != 32
+        || span_id.len() != 16
+        || flags.len() != 2
+        || trace_id.chars().all(|c| c == '0')
+        || span_id.chars().all(|c| c == '0')
+    {
+        return None;
+    }
+    Some(span_id)
+}
+
+struct LiveSpanIds {
+    ids: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl LiveSpanIds {
+    fn record_ref<S>(&self, span: &tracing_subscriber::registry::SpanRef<'_, S>)
+    where
+        S: for<'a> LookupSpan<'a>,
+    {
+        let name = span.name();
+        if name != "sign.remote" && name != "duty.parent" {
+            return;
+        }
+        let extensions = span.extensions();
+        let Some(data) = extensions.get::<tracing_opentelemetry::OtelData>() else {
+            return;
+        };
+        let Some(span_id) = data.span_id() else {
+            return;
+        };
+        let hex = format!("{span_id:016x}");
+        let mut ids = self.ids.lock().expect("span ids");
+        if !ids.iter().any(|(recorded, _)| recorded == name) {
+            ids.push((name.to_string(), hex));
+        }
+    }
+}
+
+impl<S> Layer<S> for LiveSpanIds
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_enter(&self, id: &tracing::span::Id, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if let Some(span) = ctx.span(id) {
+            self.record_ref(&span);
+        }
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, ctx: tracing_subscriber::layer::Context<'_, S>) {
+        if let Some(span) = ctx.event_span(event) {
+            self.record_ref(&span);
+        }
+    }
+}
+
+fn captured_traceparent(requests: &[wiremock::Request]) -> Option<String> {
+    let header = requests.first()?.headers.get("traceparent")?;
+    Some(header.to_str().ok()?.to_string())
+}
+
+/// Strong assertion: with an OTel layer and a live `sign.remote` span,
+/// outbound `traceparent`'s span-id is that span, not `duty.parent`.
+///
+/// Moving `telemetry::inject_trace_context` outside the `.instrument(span)`
+/// block makes this red: the header then carries the parent span-id.
+#[tokio::test(flavor = "current_thread")]
+async fn test_traceparent_span_id_matches_sign_remote() {
+    let ids = Arc::new(Mutex::new(Vec::new()));
+    let capture = LiveSpanIds { ids: Arc::clone(&ids) };
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
+        .build();
+    let tracer = provider.tracer("rvc-remote-signer-client-test");
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let subscriber = Registry::default().with(capture).with(otel_layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+
+    let sk = SecretKey::generate();
+    let (mock, signer, data, ctx, _root) = mock_attestation_signer(&sk).await;
+
+    let parent = tracing::info_span!("duty.parent");
+    let _enter = parent.enter();
+    tracing::debug!("parent span live");
+    let result = TypedSigner::sign_attestation(&signer, &data, &ctx).await;
+    assert!(result.is_ok(), "sign must succeed while capturing traceparent; got {result:?}");
+    drop(_enter);
+
+    let requests = mock.received_requests().await.expect("wiremock recorder");
+    assert_eq!(requests.len(), 1, "expected one sign POST, got {}", requests.len());
+    let header = captured_traceparent(&requests)
+        .expect("outgoing request must carry traceparent while sign.remote is current");
+    let header_span = traceparent_span_id(&header)
+        .unwrap_or_else(|| panic!("traceparent must be a non-zero W3C value, got {header}"))
+        .to_string();
+
+    let recorded = ids.lock().expect("span ids").clone();
+    let child = recorded
+        .iter()
+        .find(|(name, _)| name == "sign.remote")
+        .unwrap_or_else(|| panic!("live sign.remote span id missing: {recorded:?}"))
+        .1
+        .clone();
+    let parent_id = recorded
+        .iter()
+        .find(|(name, _)| name == "duty.parent")
+        .unwrap_or_else(|| panic!("live duty.parent span id missing: {recorded:?}"))
+        .1
+        .clone();
+
+    assert_ne!(child, parent_id, "child and parent OTel span ids must differ");
+    assert_eq!(
+        header_span, child,
+        "traceparent span-id must be sign.remote ({child}), not duty.parent ({parent_id}); header={header}"
+    );
+    assert_ne!(
+        header_span, parent_id,
+        "traceparent must not carry the parent span-id ({parent_id})"
+    );
+
+    provider.shutdown().ok();
+}
+
+/// No OTel layer: inject is a no-op (header absent) and the sign request still succeeds.
+#[tokio::test(flavor = "current_thread")]
+async fn test_sign_remote_inject_without_otel_header_absent_request_succeeds() {
+    let sk = SecretKey::generate();
+    let (mock, signer, data, ctx, _root) = mock_attestation_signer(&sk).await;
+
+    let result = TypedSigner::sign_attestation(&signer, &data, &ctx).await;
+    assert!(result.is_ok(), "sign must succeed without an OTel layer; got {result:?}");
+
+    let requests = mock.received_requests().await.expect("wiremock recorder");
+    assert_eq!(requests.len(), 1, "expected one sign POST, got {}", requests.len());
+    let header = captured_traceparent(&requests);
+    assert!(header.is_none(), "no-OTel inject must not write traceparent, got {header:?}");
 }

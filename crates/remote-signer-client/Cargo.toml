@@ -19,12 +19,16 @@ observability.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+telemetry.workspace = true
 tracing.workspace = true
 web3signer-wire.workspace = true
 
 [dev-dependencies]
 eth-types = { workspace = true, features = ["test-fixtures"] }
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }
 tokio = { workspace = true, features = ["macros", "rt"] }
+tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 wiremock.workspace = true
