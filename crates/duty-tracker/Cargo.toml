@@ -13,6 +13,7 @@ workspace = true
 bn-manager.workspace = true
 eth-types.workspace = true
 metrics.workspace = true
+observability.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -24,5 +25,6 @@ bn-manager = { workspace = true, features = ["test-utils"] }
 beacon.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber.workspace = true
 wiremock.workspace = true
 tracing-test = { workspace = true, features = ["no-env-filter"] }

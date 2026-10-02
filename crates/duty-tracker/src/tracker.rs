@@ -255,7 +255,7 @@ impl DutyTracker {
         self.slot_duty_lookups.load(Ordering::Relaxed)
     }
 
-    #[tracing::instrument(name = "duty_tracker.fetch_attester_duties", level = "debug", skip_all, fields(epoch =epoch))]
+    #[tracing::instrument(name = "duty_tracker.fetch_attester_duties", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Attestation.as_str()))]
     pub async fn fetch_duties_for_epoch(
         &self,
         epoch: u64,
@@ -322,7 +322,7 @@ impl DutyTracker {
         Err(DutyTrackerError::DutyNotFound { slot, committee_index, validator_index })
     }
 
-    #[tracing::instrument(name = "duty_tracker.check_attester_reorg", level = "debug", skip_all, fields(epoch =epoch))]
+    #[tracing::instrument(name = "duty_tracker.check_attester_reorg", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Attestation.as_str()))]
     pub async fn check_and_refetch_if_root_changed(
         &self,
         epoch: u64,
@@ -471,7 +471,7 @@ impl DutyTracker {
         root_changed
     }
 
-    #[tracing::instrument(name = "duty_tracker.fetch_proposer_duties", level = "debug", skip_all, fields(epoch =epoch))]
+    #[tracing::instrument(name = "duty_tracker.fetch_proposer_duties", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Block.as_str()))]
     pub async fn fetch_proposer_duties(
         &self,
         epoch: u64,
@@ -510,7 +510,7 @@ impl DutyTracker {
         cache.get(&epoch).map(|c| c.dependent_root.clone())
     }
 
-    #[tracing::instrument(name = "duty_tracker.check_proposer_reorg", level = "debug", skip_all, fields(epoch =epoch))]
+    #[tracing::instrument(name = "duty_tracker.check_proposer_reorg", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::Block.as_str()))]
     pub async fn check_and_refetch_proposer_if_root_changed(
         &self,
         epoch: u64,
@@ -662,7 +662,7 @@ impl DutyTracker {
         cache.get(&epoch).is_some_and(|entry| entry.indices == indices)
     }
 
-    #[tracing::instrument(name = "duty_tracker.fetch_sync_committee_duties", level = "debug", skip_all, fields(epoch =epoch))]
+    #[tracing::instrument(name = "duty_tracker.fetch_sync_committee_duties", level = "debug", skip_all, fields(epoch =epoch, duty = %observability::logging::fields::Duty::SyncCommittee.as_str()))]
     pub async fn fetch_sync_committee_duties(
         &self,
         epoch: u64,
@@ -1001,8 +1001,8 @@ async fn changed_source_replaces_cached_duties_for_the_same_head() {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::Mutex;
+    use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
 
     use bn_manager::{
         AttesterDutiesResponse, AttesterDuty, BeaconError, BeaconNodeClient, MockBeaconNodeClient,
@@ -1010,6 +1010,7 @@ mod tests {
         SyncCommitteeDutiesResponse,
     };
     use eth_types::SyncCommitteeDuty;
+    use tracing_subscriber::prelude::*;
 
     use super::*;
 
@@ -1267,6 +1268,102 @@ mod tests {
             }
             Ok(())
         });
+    }
+
+    /// T14 (partial, TRC-4a / #427): exact field key-set of each duty-tracker epoch span at debug.
+    ///
+    /// Six epoch spans: five duty-bearing `{epoch, duty}` plus `evict_old_caches` `{epoch}` only.
+    /// PTC `fetch_ptc_duties` / `check_ptc_reorg` stay `{epoch}` (unchanged instrument sites).
+    /// `evict_old_caches` keeps `fields(epoch = current_epoch)` with no `duty` — a recorded decision.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_t14_epoch_span_exact_key_sets_at_debug() {
+        let attester = attester_response(vec![(320, 1, "1234")], "0xatt_root");
+        let proposer = proposer_response(vec![(320, "1234", "0xpubkey_1234")], "0xprop_root");
+        let ptc = ptc_response(vec![(320, "1234", "0xpubkey_1234")], "0xptc_root");
+        let sync = sync_response(vec![(1234, mock_sync_pubkey(), vec![0])]);
+        let mock = MockBeaconNodeClient::new()
+            .with_get_attester_duties({
+                let attester = attester.clone();
+                move |_epoch, _indices| Ok(attester.clone())
+            })
+            .with_get_proposer_duties({
+                let proposer = proposer.clone();
+                move |_epoch| Ok(proposer.clone())
+            })
+            .with_post_ptc_duties({
+                let ptc = ptc.clone();
+                move |_epoch, _indices| Ok(ptc.clone())
+            })
+            .with_post_sync_committee_duties({
+                let sync = sync.clone();
+                move |_epoch, _indices| Ok(sync.clone())
+            });
+        let indices = vec!["1234".to_string()];
+        let tracker = DutyTracker::new(Arc::new(mock), indices.clone());
+
+        let capture = EpochSpanCapture::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(capture.clone().with_filter(tracing_subscriber::filter::LevelFilter::DEBUG));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        tracker.fetch_duties_for_epoch(10).await.expect("attester fetch");
+        tracker.check_and_refetch_if_root_changed(10).await.expect("attester reorg");
+        tracker.fetch_proposer_duties(10).await.expect("proposer fetch");
+        tracker.check_and_refetch_proposer_if_root_changed(10).await.expect("proposer reorg");
+        tracker.fetch_sync_committee_duties(10).await.expect("sync fetch");
+        tracker.fetch_ptc_duties(10, &indices).await.expect("ptc fetch");
+        tracker.check_and_refetch_ptc_if_root_changed(10).await.expect("ptc reorg");
+        tracker.evict_old_caches(10).await;
+
+        let spans = capture.state.lock().expect("spans").spans.clone();
+        let names: BTreeSet<&str> = spans.iter().map(|s| s.name.as_str()).collect();
+        let expected_names: BTreeSet<&str> = [
+            "duty_tracker.fetch_attester_duties",
+            "duty_tracker.check_attester_reorg",
+            "duty_tracker.fetch_proposer_duties",
+            "duty_tracker.check_proposer_reorg",
+            "duty_tracker.fetch_sync_committee_duties",
+            "duty_tracker.evict_old_caches",
+            "duty_tracker.fetch_ptc_duties",
+            "duty_tracker.check_ptc_reorg",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(names, expected_names, "epoch span name set (8)");
+
+        let duty_bearing = [
+            ("duty_tracker.fetch_attester_duties", "attestation"),
+            ("duty_tracker.check_attester_reorg", "attestation"),
+            ("duty_tracker.fetch_proposer_duties", "block"),
+            ("duty_tracker.check_proposer_reorg", "block"),
+            ("duty_tracker.fetch_sync_committee_duties", "sync_committee"),
+        ];
+        let epoch_only = [
+            "duty_tracker.evict_old_caches",
+            "duty_tracker.fetch_ptc_duties",
+            "duty_tracker.check_ptc_reorg",
+        ];
+        let with_duty = key_set(&["duty", "epoch"]);
+        let epoch_keys = key_set(&["epoch"]);
+
+        for (name, duty) in duty_bearing {
+            let matched: Vec<_> = spans.iter().filter(|s| s.name == name).collect();
+            assert_eq!(matched.len(), 1, "expected one {name} span, got {matched:?}");
+            let span = matched[0];
+            assert_eq!(span.level, tracing::Level::DEBUG, "{name} must be debug");
+            assert_eq!(span.keys, with_duty, "{name} key-set");
+            assert_eq!(span.values.get("duty").map(String::as_str), Some(duty), "{name} duty");
+            assert_eq!(span.values.get("epoch").map(String::as_str), Some("10"), "{name} epoch");
+        }
+        for name in epoch_only {
+            let matched: Vec<_> = spans.iter().filter(|s| s.name == name).collect();
+            assert_eq!(matched.len(), 1, "expected one {name} span, got {matched:?}");
+            let span = matched[0];
+            assert_eq!(span.level, tracing::Level::DEBUG, "{name} must be debug");
+            assert_eq!(span.keys, epoch_keys, "{name} key-set must stay {{epoch}}");
+            assert!(!span.values.contains_key("duty"), "{name} must not carry duty");
+            assert_eq!(span.values.get("epoch").map(String::as_str), Some("10"), "{name} epoch");
+        }
     }
 
     #[tokio::test]
@@ -2317,5 +2414,76 @@ mod tests {
         assert!(tracker.is_ptc_epoch_cached(10).await);
         assert!(!tracker.get_sync_committee_duties(320).await.is_empty());
         assert!(!tracker.get_ptc_duties_for_slot(320).await.is_empty());
+    }
+
+    fn key_set(keys: &[&str]) -> BTreeSet<String> {
+        keys.iter().map(|k| (*k).to_string()).collect()
+    }
+
+    #[derive(Clone, Debug)]
+    struct CapturedSpan {
+        name: String,
+        level: tracing::Level,
+        keys: BTreeSet<String>,
+        values: BTreeMap<String, String>,
+    }
+
+    #[derive(Default, Clone)]
+    struct EpochSpanCapture {
+        state: Arc<Mutex<CaptureState>>,
+    }
+
+    #[derive(Default)]
+    struct CaptureState {
+        spans: Vec<CapturedSpan>,
+        index: HashMap<u64, usize>,
+    }
+
+    struct FieldVisitor<'a>(&'a mut CapturedSpan);
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let name = field.name().to_string();
+            let rendered = format!("{value:?}").trim_matches('"').to_string();
+            self.0.keys.insert(name.clone());
+            self.0.values.insert(name, rendered);
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for EpochSpanCapture
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            id: &tracing::span::Id,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut span = CapturedSpan {
+                name: attrs.metadata().name().to_string(),
+                level: *attrs.metadata().level(),
+                keys: BTreeSet::new(),
+                values: BTreeMap::new(),
+            };
+            attrs.record(&mut FieldVisitor(&mut span));
+            let mut state = self.state.lock().expect("span capture");
+            let idx = state.spans.len();
+            state.index.insert(id.into_u64(), idx);
+            state.spans.push(span);
+        }
+
+        fn on_record(
+            &self,
+            id: &tracing::span::Id,
+            values: &tracing::span::Record<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut state = self.state.lock().expect("span capture");
+            let Some(idx) = state.index.get(&id.into_u64()).copied() else {
+                return;
+            };
+            values.record(&mut FieldVisitor(&mut state.spans[idx]));
+        }
     }
 }
