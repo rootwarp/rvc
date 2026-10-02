@@ -15,6 +15,24 @@ impl Injector for HeaderInjector<'_> {
     }
 }
 
+/// Adapter that implements [`Injector`] for [`tonic::metadata::MetadataMap`].
+///
+/// Structurally the same as [`HeaderInjector`]: invalid keys and values are dropped
+/// rather than panicking, so a propagator cannot fail an RPC by writing metadata.
+#[cfg(feature = "grpc")]
+struct MetadataInjector<'a>(&'a mut tonic::metadata::MetadataMap);
+
+#[cfg(feature = "grpc")]
+impl Injector for MetadataInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        if let Ok(name) = tonic::metadata::MetadataKey::from_bytes(key.as_bytes()) {
+            if let Ok(val) = tonic::metadata::MetadataValue::try_from(value.as_str()) {
+                self.0.insert(name, val);
+            }
+        }
+    }
+}
+
 /// Inject the current trace context as W3C `traceparent` / `tracestate`
 /// headers into an HTTP header map.
 ///
@@ -26,6 +44,23 @@ pub fn inject_trace_context(headers: &mut reqwest::header::HeaderMap) {
     let context = tracing::Span::current().context();
     global::get_text_map_propagator(|propagator| {
         propagator.inject_context(&context, &mut HeaderInjector(headers));
+    });
+}
+
+/// Inject the current span's W3C trace context into outbound gRPC request metadata.
+///
+/// This is the [`MetadataMap`](tonic::metadata::MetadataMap) sibling of
+/// [`inject_trace_context`]. It writes `traceparent` / `tracestate` into outbound
+/// gRPC metadata so a duty trace continues across a tonic client call.
+///
+/// If no OTel layer is active, this is a no-op — no metadata entries are added.
+/// Uses the globally installed text-map propagator (`global::get_text_map_propagator`);
+/// it does not construct a second propagator.
+#[cfg(feature = "grpc")]
+pub fn inject_trace_context_metadata(metadata: &mut tonic::metadata::MetadataMap) {
+    let context = tracing::Span::current().context();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut MetadataInjector(metadata));
     });
 }
 
@@ -44,6 +79,31 @@ impl Extractor for HeaderExtractor<'_> {
 
     fn keys(&self) -> Vec<&str> {
         self.0.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+/// Adapter that implements [`Extractor`] for an inbound [`tonic::metadata::MetadataMap`].
+///
+/// Sibling of [`HeaderExtractor`]. ASCII metadata is exposed as `&str`; binary
+/// (`*-bin`) keys are listed but not readable via [`Extractor::get`] (trace context
+/// is ASCII `traceparent` / `tracestate`).
+#[cfg(feature = "grpc")]
+struct MetadataExtractor<'a>(&'a tonic::metadata::MetadataMap);
+
+#[cfg(feature = "grpc")]
+impl Extractor for MetadataExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|v| v.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0
+            .keys()
+            .map(|key| match key {
+                tonic::metadata::KeyRef::Ascii(k) => k.as_str(),
+                tonic::metadata::KeyRef::Binary(k) => k.as_str(),
+            })
+            .collect()
     }
 }
 
@@ -69,6 +129,38 @@ pub fn set_parent_from_headers(span: &tracing::Span, headers: &reqwest::header::
     // Graceful: a failure here (e.g. no active OTel layer — `SetParentError::LayerNotFound`)
     // leaves the span a root. Never panic; mirror inject_trace_context's no-op-without-layer
     // behavior, and surface the (non-secret) reason at trace for diagnosability.
+    if let Err(err) = span.set_parent(parent_cx) {
+        tracing::trace!(?err, "could not attach inbound OTel parent; span stays a root");
+    }
+}
+
+/// Set a span's OpenTelemetry parent from inbound W3C `traceparent` / `tracestate`
+/// gRPC metadata.
+///
+/// The exact inverse of [`inject_trace_context_metadata`]: it reads the inbound trace
+/// context from `metadata` and makes `span` a child of the caller's trace, so a duty
+/// trace continues across a tonic service boundary under the existing `ParentBased`
+/// sampler.
+///
+/// **Precondition — call before the span is entered/started.** `set_parent` attaches a
+/// parent only while the span is still being built; once the span has been entered
+/// (started), it returns `Err(AlreadyStarted)` and the parent is silently *not* attached
+/// (the span stays its own root). Wire this as the first action in the handler span, before
+/// any `.enter()`/`.in_scope()`.
+///
+/// Failure is graceful: an absent or malformed `traceparent` yields an empty context, so
+/// the span stays a root — no panic and no signing-behavior change, mirroring
+/// [`inject_trace_context_metadata`]'s no-op-without-context behavior.
+/// Uses the globally installed text-map propagator (`global::get_text_map_propagator`);
+/// it does not construct a second propagator.
+#[cfg(feature = "grpc")]
+pub fn set_parent_from_metadata(span: &tracing::Span, metadata: &tonic::metadata::MetadataMap) {
+    let parent_cx = global::get_text_map_propagator(|propagator| {
+        propagator.extract(&MetadataExtractor(metadata))
+    });
+    // Graceful: a failure here (e.g. no active OTel layer — `SetParentError::LayerNotFound`)
+    // leaves the span a root. Never panic; mirror inject_trace_context_metadata's
+    // no-op-without-layer behavior, and surface the (non-secret) reason at trace.
     if let Err(err) = span.set_parent(parent_cx) {
         tracing::trace!(?err, "could not attach inbound OTel parent; span stays a root");
     }
@@ -282,5 +374,104 @@ mod tests {
         assert_eq!(ex.get("traceparent"), Some("00-abc-def-01"));
         assert_eq!(ex.get("missing"), None);
         assert!(ex.keys().contains(&"traceparent"));
+    }
+
+    // --- MetadataMap inject/extract (feature = "grpc", T10/T11) ---
+
+    /// T10: a synthetic inbound `traceparent` makes the span a child of the caller's trace.
+    /// Re-injecting from the now-parented span yields the SAME trace id. MetadataMap mirror of
+    /// [`test_set_parent_continues_trace`].
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn test_set_parent_metadata_continues_trace() {
+        let (_default, guard) = setup_otel();
+
+        let trace_id = "0af7651916cd43dd8448eb211c80319c";
+        let mut inbound = tonic::metadata::MetadataMap::new();
+        inbound
+            .insert("traceparent", format!("00-{trace_id}-b7ad6b7169203331-01").parse().unwrap());
+
+        let span = tracing::info_span!("server_span");
+        set_parent_from_metadata(&span, &inbound);
+
+        let _enter = span.enter();
+        let mut outbound = tonic::metadata::MetadataMap::new();
+        inject_trace_context_metadata(&mut outbound);
+        let tp = outbound
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .expect("traceparent should be present");
+        assert!(tp.contains(trace_id), "trace must continue (got {tp})");
+        assert!(!tp.contains("00000000000000000000000000000000"));
+
+        guard.provider.shutdown().ok();
+    }
+
+    /// T11: no `traceparent` leaves the span a valid fresh root and does not panic.
+    /// MetadataMap mirror of [`test_set_parent_absent_header_is_root_no_panic`].
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn test_set_parent_metadata_absent_is_root_no_panic() {
+        let (_default, guard) = setup_otel();
+        let empty = tonic::metadata::MetadataMap::new();
+        let span = tracing::info_span!("server_span");
+        set_parent_from_metadata(&span, &empty); // must not panic
+        let _enter = span.enter();
+        let mut outbound = tonic::metadata::MetadataMap::new();
+        inject_trace_context_metadata(&mut outbound);
+        if let Some(tp) = outbound.get("traceparent").and_then(|v| v.to_str().ok()) {
+            assert!(!tp.contains("00000000000000000000000000000000"));
+        }
+        guard.provider.shutdown().ok();
+    }
+
+    /// A malformed `traceparent` yields a root span, no panic, and the ghost trace id must NOT
+    /// continue. Same contract as [`test_set_parent_garbled_header_is_root_no_panic`].
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn test_set_parent_metadata_garbled_is_root_no_panic() {
+        let (_default, guard) = setup_otel();
+        let ghost = "11111111111111111111111111111111";
+        let mut garbled = tonic::metadata::MetadataMap::new();
+        garbled.insert("traceparent", format!("00-{ghost}-2222222222222222-zz").parse().unwrap());
+        let span = tracing::info_span!("server_span");
+        set_parent_from_metadata(&span, &garbled); // must not panic on malformed input
+        let _enter = span.enter();
+        let mut outbound = tonic::metadata::MetadataMap::new();
+        inject_trace_context_metadata(&mut outbound);
+        let tp = outbound
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .expect("traceparent should be present");
+        assert!(!tp.contains(ghost), "garbled inbound trace id must NOT continue (got {tp})");
+        assert!(!tp.contains("00000000000000000000000000000000"), "fresh valid root");
+        guard.provider.shutdown().ok();
+    }
+
+    /// Without an active OTel layer, metadata inject adds no valid `traceparent`.
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn test_inject_metadata_without_otel_layer_is_noop() {
+        let mut metadata = tonic::metadata::MetadataMap::new();
+        inject_trace_context_metadata(&mut metadata);
+        let has_valid_trace = metadata
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| !v.contains("00000000000000000000000000000000"))
+            .unwrap_or(false);
+        assert!(!has_valid_trace);
+    }
+
+    /// With no OTel layer, `set_parent_from_metadata` returns `LayerNotFound` and must not panic.
+    #[cfg(feature = "grpc")]
+    #[test]
+    fn test_set_parent_metadata_without_layer_is_graceful() {
+        let mut inbound = tonic::metadata::MetadataMap::new();
+        inbound.insert(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01".parse().unwrap(),
+        );
+        let span = tracing::info_span!("server_span");
+        set_parent_from_metadata(&span, &inbound);
     }
 }
