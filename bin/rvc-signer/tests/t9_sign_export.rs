@@ -2,10 +2,11 @@
 //! and the exported resource `service.name` is `rvc-signer` unless
 //! `--tracing-service-name` overrides it.
 //!
-//! The collector is an in-test OTLP/HTTP endpoint. The signer binary is the
-//! production subscriber (`init_logging` → `telemetry::init_tracing` →
+//! T5 (TRC-2i) reuses this harness. The signer binary is the production
+//! subscriber (`init_logging` → `telemetry::init_tracing` →
 //! `BatchSpanProcessor`). Shutdown awaits `shutdown_tracing`, which flushes
-//! ended spans. An unclosed span is never exported.
+//! ended spans. An unclosed span is never exported. Console lines land on
+//! stdout; the first event inside a fresh span must already carry `trace_id`.
 
 // RF1-12: SIGTERM via libc::kill in the common harness.
 #![allow(unsafe_code)]
@@ -34,6 +35,8 @@ struct ExportedSpan {
     name: String,
     end_time_unix_nano: u64,
     service_name: Option<String>,
+    /// Lowercase hex of OTLP `Span.trace_id` (field 1), when the export carried it.
+    trace_id: Option<String>,
 }
 
 /// Loopback OTLP/HTTP collector. Records raw protobuf bodies from `POST /v1/traces`.
@@ -249,9 +252,12 @@ fn decode_scope_spans(scope: &[u8]) -> Vec<ExportedSpan> {
 fn decode_span(bytes: &[u8]) -> Option<ExportedSpan> {
     let mut name = None;
     let mut end_time_unix_nano = 0;
+    let mut trace_id = None;
     let mut reader = ProtoReader::new(bytes);
     while let Some((field, wire)) = reader.tag() {
         match (field, wire) {
+            // OTLP Span.trace_id (bytes, 16).
+            (1, 2) => trace_id = reader.len_bytes().map(hex::encode),
             (5, 2) => {
                 name = reader.len_bytes().and_then(|b| String::from_utf8(b.to_vec()).ok());
             }
@@ -263,7 +269,7 @@ fn decode_span(bytes: &[u8]) -> Option<ExportedSpan> {
             }
         }
     }
-    Some(ExportedSpan { name: name?, end_time_unix_nano, service_name: None })
+    Some(ExportedSpan { name: name?, end_time_unix_nano, service_name: None, trace_id })
 }
 
 struct ProtoReader<'a> {
@@ -353,6 +359,8 @@ fn randao_body() -> String {
 
 struct SignExport {
     stderr: String,
+    /// Console subscriber output (`console_fmt_layer` writes stdout).
+    stdout: String,
     spans: Vec<ExportedSpan>,
     http_status: u16,
 }
@@ -443,7 +451,12 @@ async fn drive_sign(tracing_args: &[&str], collector: Option<&OtlpCollector>) ->
     );
 
     let bodies = collector.map(|c| c.bodies()).unwrap_or_default();
-    SignExport { stderr: outcome.stderr_lossy(), spans: decode_exports(&bodies), http_status }
+    SignExport {
+        stderr: outcome.stderr_lossy(),
+        stdout: outcome.stdout_lossy(),
+        spans: decode_exports(&bodies),
+        http_status,
+    }
 }
 
 fn completed_sign_spans(spans: &[ExportedSpan]) -> Vec<&ExportedSpan> {
@@ -514,6 +527,70 @@ async fn test_t9_tracing_service_name_overrides_exported_resource() {
     }
 }
 
+/// JSON console events, in emission order. Non-JSON stdout (none expected) is skipped.
+fn json_log_events(stdout: &str) -> Vec<serde_json::Value> {
+    stdout.lines().filter_map(|line| serde_json::from_str(line).ok()).collect()
+}
+
+/// Current span name from a `console_fmt_layer(Json)` line (`with_current_span`).
+fn current_span_name(event: &serde_json::Value) -> Option<&str> {
+    event.get("span").and_then(|span| span.get("name")).and_then(|name| name.as_str())
+}
+
+/// T5 (signer): the first event inside a fresh span already carries `trace_id`
+/// on the production signer stack (`init_logging` in the `rvc-signer` binary).
+///
+/// Failure mode: layers composed after `console_layer`. `Layered::on_event`
+/// runs the inner subscriber before the outer layer, and `Vec::on_event`
+/// walks front to back, so `TraceIdLayer` must run before the console
+/// formatter. Composed after `console_layer`, only the first event in each
+/// span drops `trace_id`; every later event hits the cached `TraceIds` and
+/// still looks fine. Asserting "some" event, or the last one, cannot see the bug.
+#[tokio::test]
+async fn t5_first_event_inside_fresh_span_carries_trace_id_over_signer_stack() {
+    let collector = OtlpCollector::start();
+    let endpoint = format!("http://127.0.0.1:{}", collector.port);
+    let export = drive_sign(
+        &["--tracing-endpoint", &endpoint, "--tracing-sample-rate", "1.0", "--log-format", "json"],
+        Some(&collector),
+    )
+    .await;
+
+    let events = json_log_events(&export.stdout);
+    let in_span: Vec<&serde_json::Value> =
+        events.iter().filter(|event| current_span_name(event) == Some("sign")).collect();
+    assert!(
+        !in_span.is_empty(),
+        "T5: a fresh `sign` span must emit at least one event; stdout:\n{}\nstderr:\n{}",
+        export.stdout,
+        export.stderr
+    );
+    // Index 0 is the oracle. `in_span.last()` stays green when layers are
+    // composed after `console_layer`, because the cache is warm by then.
+    let first = in_span[0];
+    let tid = first.get(telemetry::TRACE_ID_KEY).and_then(|value| value.as_str());
+    let sid = first.get(telemetry::SPAN_ID_KEY).and_then(|value| value.as_str());
+    assert!(
+        tid.is_some(),
+        "T5: first event inside a fresh span must carry {}; got: {first}",
+        telemetry::TRACE_ID_KEY
+    );
+    assert!(
+        sid.is_some(),
+        "T5: first event inside a fresh span must carry {}; got: {first}",
+        telemetry::SPAN_ID_KEY
+    );
+    let rendered = tid.expect("trace_id");
+    let exported = completed_sign_spans(&export.spans)
+        .into_iter()
+        .find_map(|span| span.trace_id.as_deref())
+        .expect("exported sign span must carry a trace id");
+    assert_eq!(
+        rendered, exported,
+        "T5: rendered trace_id must equal the exported sign span (got {rendered}, exported={exported})"
+    );
+}
+
 /// T9 negative: no endpoint → no OTel layer and the in-test exporter stays empty
 /// even after a completed sign.
 #[tokio::test]
@@ -582,6 +659,7 @@ fn test_otlp_decoder_reads_completed_sign_span_service_name() {
             name: "sign".to_string(),
             end_time_unix_nano: 42,
             service_name: Some("rvc-signer".to_string()),
+            trace_id: None,
         }]
     );
 }
