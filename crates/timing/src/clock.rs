@@ -210,8 +210,8 @@ impl SlotClock for SystemSlotClock {
         let slot_duration_secs = self.slot_duration.as_secs();
         let slot = seconds_since_genesis / slot_duration_secs;
         let epoch = slot / self.slots_per_epoch;
-        let time_into_slot_ms = (seconds_since_genesis % slot_duration_secs) * 1000;
-        tracing::trace!(slot, epoch, time_into_slot_ms, "slot transition");
+        let time_into_slot = (seconds_since_genesis % slot_duration_secs) * 1000;
+        tracing::trace!(slot, epoch, time_into_slot, "slot transition");
         Ok(slot)
     }
 }
