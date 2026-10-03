@@ -419,6 +419,7 @@ EOF
     cat > "${workdir}/config.toml" <<EOF
 beacon_url = "http://127.0.0.1:${bn_port}"
 keystore_path = "${workdir}/keystores"
+grpc_signer.url = "http://127.0.0.1:${signer_port}"
 slashing_db_path = "${workdir}/slashing.db"
 validators_config = "${workdir}/validators.toml"
 password_file = "${workdir}/passwords.txt"
@@ -500,8 +501,11 @@ EOF
 
     rvc_log="${workdir}/rvc.log"
     : > "${rvc_log}"
+    # Loopback http is refused unless this is set. The signer process keeps
+    # its own --insecure / RVC_SIGNER_ALLOW_INSECURE pair.
     OTEL_TRACES_SAMPLER_ARG=1.0 \
         OTEL_EXPORTER_OTLP_ENDPOINT="${otlp_endpoint}" \
+        RVC_REMOTE_SIGNER_ALLOW_INSECURE=true \
         RUST_LOG=info \
         "${rvc_bin}" start \
             --config "${workdir}/config.toml" \
@@ -513,6 +517,22 @@ EOF
             --metrics-port "${rvc_metrics}" \
         >"${rvc_log}" 2>&1 &
     rvc_pid=$!
+
+    # A failed connect is non-fatal inside bin/rvc: it logs and keeps the
+    # local keystore. That still closes slot.process and then fails the
+    # continuity assert as missing-span. Name it here instead.
+    grpc_signer_connected() {
+        if ! kill -0 "${rvc_pid}" 2>/dev/null; then
+            fail rvc-exited "bin/rvc (pid ${rvc_pid}) exited before the gRPC signer connect settled"
+        fi
+        if grep -F -q 'Failed to connect to gRPC remote signer' "${rvc_log}"; then
+            fail grpc-connect \
+                "bin/rvc logged a failed gRPC connect and would keep signing on the local keystore"
+        fi
+        grep -F -q 'gRPC remote signer connected' "${rvc_log}"
+    }
+    wait_until grpc-connect 30 grpc_signer_connected
+    echo "trace-e2e: gRPC remote signer connected from bin/rvc"
 
     # slot.process stays open until the next slot boundary (post-duty window).
     # "Slot processing complete" is inside the span; the span drops after
