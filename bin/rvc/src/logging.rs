@@ -308,6 +308,7 @@ pub fn spawn_log_reload_handler(
         use rvc::bootstrap::ShutdownTier;
 
         let shutdown_token = executor.token();
+        // detached: SIGHUP log-reload handler; process-lifetime signal loop, no caller trace to inherit.
         executor.spawn("log_reload", ShutdownTier::Telemetry, async move {
             let mut sighup =
                 match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {

@@ -114,6 +114,7 @@ pub fn spawn_background_tasks(
 
     info!(addr = %metrics_address, port = metrics_port, "Starting metrics server");
     // P1-2: Telemetry tier; no cooperative token (abort-drain).
+    // detached: metrics server; serve loop is crates/metrics/src/server.rs:96 (serve_metrics_with_health), out of P1-1 scope.
     executor.spawn("metrics_server", ShutdownTier::Telemetry, async move {
         if let Err(e) =
             serve_metrics_with_health(metrics_address, metrics_port, health_status).await
@@ -202,9 +203,11 @@ pub fn spawn_sse_subscriber(
     info!("Starting beacon-node SSE subscriber");
     let sse_handle = bn_manager.start_sse(bridge.into_callback(), shutdown_rx);
     let sse_abort = sse_handle.abort_handle();
+    // detached: BN SSE subscriber; process-lifetime Infra handle, loop lives in bn-manager, out of P1-1 scope.
     executor.register(SSE_TASK_NAME, ShutdownTier::Background, sse_handle);
 
     let token = executor.token();
+    // detached: cancel-forwarder for bn.sse; not an iteration loop.
     executor.spawn(SSE_CANCEL_TASK_NAME, ShutdownTier::Background, async move {
         token.cancelled().await;
         let _ = shutdown_tx.send(true);
@@ -239,9 +242,11 @@ pub fn spawn_sync_monitor(
     info!("Starting beacon-node sync monitor");
     let sync_handle = bn_manager.start_sync_monitor(interval, shutdown_rx);
     let sync_abort = sync_handle.abort_handle();
+    // detached: BN sync monitor; process-lifetime Infra handle, loop lives in bn-manager, out of P1-1 scope.
     executor.register(SYNC_MONITOR_TASK_NAME, ShutdownTier::Background, sync_handle);
 
     let token = executor.token();
+    // detached: cancel-forwarder for bn.sync_monitor; not an iteration loop.
     executor.spawn(SYNC_MONITOR_CANCEL_TASK_NAME, ShutdownTier::Background, async move {
         token.cancelled().await;
         let _ = shutdown_tx.send(true);
