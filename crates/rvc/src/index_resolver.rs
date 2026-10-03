@@ -14,7 +14,7 @@ use doppelganger::MonotonicEpochClock;
 use eth_types::{SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, Instrument};
 
 use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 use crate::liveness_loop::merge_validator_indices;
@@ -109,25 +109,37 @@ impl IndexResolver {
         self.publish_gauge();
         let interval = epoch_tick_interval();
         let mut next_tick = tokio::time::Instant::now() + interval;
+        // detached: process-lifetime loop root; the tick is the exported span.
+        let loop_span = tracing::info_span!(parent: None, "index.resolve");
         loop {
-            let sleep_for = next_tick.saturating_duration_since(tokio::time::Instant::now());
-            tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => {
-                    info!("index resolver cancelled");
-                    break;
-                }
-                changed = self.key_gen_rx.changed() => {
-                    if changed.is_err() {
-                        info!("index resolver stopping: key_gen sender dropped");
-                        break;
+            let tick = tracing::info_span!(parent: None, "index.resolve.tick");
+            tick.follows_from(&loop_span);
+            let stop = async {
+                let sleep_for = next_tick.saturating_duration_since(tokio::time::Instant::now());
+                tokio::select! {
+                    biased;
+                    _ = self.cancel.cancelled() => {
+                        info!("index resolver cancelled");
+                        return true;
                     }
-                    self.finish_wake(self.epoch_clock.current_epoch()).await;
+                    changed = self.key_gen_rx.changed() => {
+                        if changed.is_err() {
+                            info!("index resolver stopping: key_gen sender dropped");
+                            return true;
+                        }
+                        self.finish_wake(self.epoch_clock.current_epoch()).await;
+                    }
+                    _ = tokio::time::sleep(sleep_for) => {
+                        next_tick = tokio::time::Instant::now() + interval;
+                        self.finish_wake(self.epoch_clock.current_epoch()).await;
+                    }
                 }
-                _ = tokio::time::sleep(sleep_for) => {
-                    next_tick = tokio::time::Instant::now() + interval;
-                    self.finish_wake(self.epoch_clock.current_epoch()).await;
-                }
+                false
+            }
+            .instrument(tick)
+            .await;
+            if stop {
+                break;
             }
         }
     }
@@ -643,6 +655,129 @@ mod tests {
         let _ =
             tokio::time::timeout(Duration::from_secs(2), executor.shutdown(TierBudget::default()))
                 .await;
+    }
+
+    /// Shape B on `IndexResolver::run`: each tick is a fresh root with exactly one
+    /// `follows_from` link, and N iterations close N tick spans.
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_shape_b_tick_has_one_link_and_each_iteration_closes() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::SpanProcessor;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        const N: usize = 3;
+        const TICK: &str = "index.resolve.tick";
+
+        #[derive(Debug)]
+        struct RecordingProcessor {
+            spans: Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
+        }
+
+        impl SpanProcessor for RecordingProcessor {
+            fn on_start(
+                &self,
+                _span: &mut opentelemetry_sdk::trace::Span,
+                _cx: &opentelemetry::Context,
+            ) {
+            }
+
+            fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+                self.spans.lock().expect("span log").push(span);
+            }
+
+            fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+                Ok(())
+            }
+
+            fn shutdown_with_timeout(
+                &self,
+                _timeout: Duration,
+            ) -> opentelemetry_sdk::error::OTelSdkResult {
+                Ok(())
+            }
+        }
+
+        let spans = Arc::new(Mutex::new(Vec::new()));
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
+            .with_span_processor(RecordingProcessor { spans: Arc::clone(&spans) })
+            .build();
+        let tracer = provider.tracer("rvc-shape-b");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let beacon = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_get_validators(|_| Ok(ValidatorsResponse { data: Vec::new() })),
+        );
+        let (pk, _, _) = fresh_key();
+        let (resolver, _registry, key_gen_tx, _key_gen_rx) = resolver_for(beacon, map_with(&pk));
+        let cancel = resolver.cancel.clone();
+        let task = tokio::spawn(resolver.run());
+
+        for i in 1..N {
+            key_gen_tx.send_modify(|gen| *gen += 1);
+            wait_for_completed_ticks(&spans, i).await;
+        }
+        cancel.cancel();
+        wait_for_completed_ticks(&spans, N).await;
+        task.await.expect("index resolver task");
+
+        let recorded = spans.lock().expect("span log");
+        let ticks: Vec<_> = recorded.iter().filter(|span| span.name == TICK).collect();
+        assert_eq!(
+            ticks.len(),
+            N,
+            "each iteration closes its span: {N} iterations must produce {N} completed \
+             index.resolve.tick spans, not one span for the process; saw {:?}",
+            recorded.iter().map(|span| span.name.as_ref()).collect::<Vec<_>>()
+        );
+        let parents: Vec<_> = recorded.iter().filter(|span| span.name == "index.resolve").collect();
+        assert_eq!(parents.len(), 1, "one process-lifetime loop span");
+        let parent_id = parents[0].span_context.span_id();
+        for tick in ticks {
+            assert_eq!(
+                tick.links.len(),
+                1,
+                "tick span must carry exactly one follows_from link, got {:?}",
+                tick.links.links
+            );
+            assert_eq!(
+                tick.links[0].span_context.span_id(),
+                parent_id,
+                "the single link must be follows_from the loop span"
+            );
+            assert_eq!(
+                tick.parent_span_id,
+                opentelemetry::trace::SpanId::INVALID,
+                "tick is a fresh root, not a child of the loop span"
+            );
+        }
+    }
+
+    async fn wait_for_completed_ticks(
+        spans: &Arc<Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
+        n: usize,
+    ) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let (count, names) = {
+                let guard = spans.lock().expect("span log");
+                let count = guard.iter().filter(|span| span.name == "index.resolve.tick").count();
+                let names: Vec<_> = guard.iter().map(|span| span.name.to_string()).collect();
+                (count, names)
+            };
+            if count >= n {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {n} completed index.resolve.tick spans (have {count}): \
+                 {names:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[test]
