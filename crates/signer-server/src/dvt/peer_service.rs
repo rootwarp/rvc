@@ -271,7 +271,9 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let peer_cn_for_log = peer_cn;
 
         // spawn_blocking is required because StagedBlock holds a !Send MutexGuard.
+        let span = tracing::Span::current();
         let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
+            let _enter = span.enter();
             let (staged, audit) = scoped
                 .stage_block(&pubkey_hex_str, slot, signing_root_hex)
                 .map_err(slashing_err)?;
@@ -376,7 +378,9 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let peer_cn_for_log = peer_cn;
 
         // spawn_blocking is required because StagedAttestation holds a !Send MutexGuard.
+        let span = tracing::Span::current();
         let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
+            let _enter = span.enter();
             let (staged, audit) = scoped
                 .stage_attestation(&pubkey_hex_str, source_epoch, target_epoch, signing_root_hex)
                 .map_err(slashing_err)?;
@@ -618,7 +622,9 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let scoped = PubkeyScopedDb::new(db_arc, peer_cn.clone(), gvr);
         let peer_cn_for_log = peer_cn;
 
+        let span = tracing::Span::current();
         let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
+            let _enter = span.enter();
             let (staged, audit) = scoped
                 .stage_block(&pubkey_hex_str, slot, signing_root_hex)
                 .map_err(slashing_err)?;
