@@ -1,22 +1,38 @@
 #!/usr/bin/env bash
-# trace-e2e.sh — part 1 (TRC-5a / #432).
+# trace-e2e.sh — part 1 (TRC-5a / #432) and part 2 (TRC-5b / #433).
 #
-# Stands up a MockBn-based fixture beacon node and runs bin/rvc until it
-# reaches at least one attestation duty. Evidence is a `slot.process` span
-# plus the duty-path log line "Found attestation duties".
+# Part 1 stands up a MockBn-based fixture beacon node and runs bin/rvc until
+# it reaches at least one attestation duty. Evidence is a `slot.process` span
+# in the fmt log plus the duty-path line "Found attestation duties". Part 1
+# does not start the signer or a collector. TRC-5c, TRC-5d, and TRC-5e are
+# not started.
 #
-# Part 1 exits when that evidence is present. TRC-5b (signer), TRC-5c, TRC-5d
-# (trace assert), and TRC-5e are not started.
+# Part 2 drives host bin/rvc and bin/rvc-signer against the Phase-1 compose
+# stack (docker-compose.yml, profile tracing / Jaeger v2). The beacon is the
+# part-1 fixture, on the host, so both binaries reach it and the published
+# OTLP sink. This script assigns OTEL_TRACES_SAMPLER_ARG=1.0 (do not rely on
+# the SDK default). It waits until one slot.process span has closed, waits a
+# bounded flush while both processes are still alive, then SIGTERM. SIGKILL
+# is not the success path. Jaeger traces are written for TRC-5c to:
+#   target/trace-e2e/spans.json
+# Override with TRACE_E2E_SPANS_FILE. This file is not the TRC-5c assert.
 #
-# Requires Docker and a repo checkout. A local `target/{debug,release}/rvc`
-# (or $RVC_BIN) is used when present; otherwise the script builds the `rvc`
-# image from the repo Dockerfile.
+# Requires Docker and a repo checkout for part 1's default runtime. A local
+# `target/{debug,release}/rvc` (or $RVC_BIN) is used when present; otherwise
+# part 1 builds the `rvc` image from the repo Dockerfile. Part 2 needs host
+# `rvc` and `rvc-signer` binaries (RVC_BIN / RVC_SIGNER_BIN or target/).
 #
-#   TRACE_E2E_RUNTIME=python   run the fixture server with host python3
-#                              (same program Docker runs; for hosts without a
-#                              daemon). Default is docker.
+#   TRACE_E2E_RUNTIME=python   part 1: run the fixture server with host python3
+#                              (same program Docker runs). Default is docker.
 #   TRACE_E2E_GENESIS_DELAY    seconds from now until genesis (default 20)
 #   TRACE_E2E_KEEP=1           keep the work directory after success
+#   TRACE_E2E_OTLP_ENDPOINT    part 2 OTLP sink (default http://127.0.0.1:4318)
+#   TRACE_E2E_FLUSH_WAIT       part 2 seconds both processes stay up after the
+#                              slot span closes (default 8)
+#   TRACE_E2E_SLOT_CLOSE_TIMEOUT
+#                              part 2 override for the slot-close wait, seconds.
+#                              Default is genesis delay + one epoch + 30s.
+#   TRACE_E2E_TEARDOWN=sigkill part 2 diagnostic only. Always exits non-zero.
 #
 # shellcheck disable=SC2317
 # fail() exits, and wait_until/trap invoke callbacks by name. Shellcheck
@@ -42,16 +58,23 @@ bn_alias="trace-e2e-bn"
 rvc_pid=""
 rvc_cid=""
 rvc_log=""
+signer_pid=""
+signer_log=""
+compose_started=0
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--part 1] [--up-only]
+Usage: $(basename "$0") [--part 1|2] [--up-only]
 
 Part 1 (default): start the fixture beacon node, run bin/rvc, and exit 0
 when a slot.process span and an attestation duty-path log are both present.
 
-  --part N     Only part 1 is implemented. Any other part exits 1.
-  --up-only    Start the fixture, wait until it is ready, then exit.
+Part 2: Jaeger from \`docker compose --profile tracing\`, host bin/rvc and
+bin/rvc-signer, one closed slot, bounded flush, SIGTERM. Writes
+target/trace-e2e/spans.json for TRC-5c.
+
+  --part N     Part 1 or 2. Any other part exits 1 (part-not-in-scope).
+  --up-only    Part 1 only: start the fixture, wait until ready, then exit.
   -h, --help   Show this help.
 
 Every wait has a timeout and a named failure (trace-e2e: FAIL <name>).
@@ -73,6 +96,10 @@ dump_debug() {
         echo "----- rvc log (tail) -----" >&2
         tail -n 160 "${rvc_log}" >&2 || true
     fi
+    if [[ -n "${signer_log}" && -f "${signer_log}" ]]; then
+        echo "----- rvc-signer log (tail) -----" >&2
+        tail -n 160 "${signer_log}" >&2 || true
+    fi
     if [[ -n "${bn_cid}" ]]; then
         echo "----- fixture container log -----" >&2
         docker logs "${bn_cid}" >&2 || true
@@ -82,8 +109,49 @@ dump_debug() {
     fi
 }
 
+# Bounded TERM, then KILL. Used only from the EXIT trap so a failed part-2
+# run cannot leak host processes. The success path is stop_pid_clean, which
+# never sends KILL.
+terminate_host() {
+    local pid="${1:-}"
+    local deadline st
+    if [[ -z "${pid}" ]]; then
+        return 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        wait "${pid}" >/dev/null 2>&1 || true
+        return 0
+    fi
+    kill -TERM "${pid}" >/dev/null 2>&1 || true
+    deadline=$((SECONDS + 5))
+    while kill -0 "${pid}" 2>/dev/null; do
+        st="$(ps -p "${pid}" -o stat= 2>/dev/null || true)"
+        st="${st//[[:space:]]/}"
+        case "${st}" in
+            Z*) break ;;
+        esac
+        if (( SECONDS >= deadline )); then
+            kill -KILL "${pid}" >/dev/null 2>&1 || true
+            break
+        fi
+        sleep 0.2
+    done
+    wait "${pid}" >/dev/null 2>&1 || true
+}
+
 cleanup() {
     dump_debug
+    if [[ "${compose_started}" -eq 1 ]]; then
+        terminate_host "${rvc_pid}"
+        terminate_host "${signer_pid}"
+        terminate_host "${bn_pid}"
+        rvc_pid=""
+        signer_pid=""
+        bn_pid=""
+        # Profile is required: Jaeger is not in the default service set.
+        timeout 60 docker compose --profile tracing down -v >/dev/null 2>&1 || true
+        compose_started=0
+    fi
     if [[ -n "${rvc_pid}" ]]; then
         kill "${rvc_pid}" >/dev/null 2>&1 || true
         wait "${rvc_pid}" >/dev/null 2>&1 || true
@@ -121,9 +189,21 @@ wait_until() {
     fail "${name}" "timed out after ${timeout_s}s"
 }
 
+# Optional args are ports already chosen but not yet bound. /dev/tcp only sees
+# listeners, so two calls in a row would otherwise return the same port.
 pick_port() {
-    local port
+    local port used skip
     for ((port = 19000; port <= 19250; port++)); do
+        skip=0
+        for used in "$@"; do
+            if [[ "${port}" == "${used}" ]]; then
+                skip=1
+                break
+            fi
+        done
+        if [[ "${skip}" -eq 1 ]]; then
+            continue
+        fi
         if ! (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1; then
             printf '%s\n' "${port}"
             return 0
@@ -160,9 +240,410 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "${part}" != "1" ]]; then
+# SIGTERM and wait. Still alive after the timeout is a failed run: this does
+# not SIGKILL (that would drop BatchSpanProcessor's queue and look like success).
+stop_pid_clean() {
+    local name="$1"
+    local pid="$2"
+    local timeout_s="$3"
+    local deadline st
+    if [[ -z "${pid}" ]]; then
+        return 0
+    fi
+    if ! kill -0 "${pid}" 2>/dev/null; then
+        wait "${pid}" >/dev/null 2>&1 || true
+        return 0
+    fi
+    kill -TERM "${pid}" >/dev/null 2>&1 || true
+    deadline=$((SECONDS + timeout_s))
+    while kill -0 "${pid}" 2>/dev/null; do
+        st="$(ps -p "${pid}" -o stat= 2>/dev/null || true)"
+        st="${st//[[:space:]]/}"
+        case "${st}" in
+            Z*)
+                wait "${pid}" >/dev/null 2>&1 || true
+                return 0
+                ;;
+        esac
+        if (( SECONDS >= deadline )); then
+            fail "${name}" \
+                "pid ${pid} still alive ${timeout_s}s after SIGTERM; refusing SIGKILL as success"
+        fi
+        sleep 0.2
+    done
+    wait "${pid}" >/dev/null 2>&1 || true
+}
+
+resolve_host_bin() {
+    local env_name="$1"
+    local bin_name="$2"
+    local override="${3:-}"
+    local candidate=""
+    if [[ -n "${override}" ]]; then
+        if [[ ! -x "${override}" ]]; then
+            fail "${bin_name}-bin" "${env_name} is not executable: ${override}"
+        fi
+        printf '%s\n' "${override}"
+        return 0
+    fi
+    if [[ -x "${ROOT}/target/debug/${bin_name}" ]]; then
+        candidate="${ROOT}/target/debug/${bin_name}"
+    elif [[ -x "${ROOT}/target/release/${bin_name}" ]]; then
+        candidate="${ROOT}/target/release/${bin_name}"
+    else
+        fail "${bin_name}-bin" \
+            "no ${bin_name} binary (build target/debug/${bin_name} or set ${env_name})"
+    fi
+    printf '%s\n' "${candidate}"
+}
+
+# Part 2. Exits. Does not return.
+run_part2() {
+    local spans_file otlp_endpoint flush_wait teardown spe delay now genesis_time
+    local bn_port signer_port signer_metrics rvc_metrics pubkey signer_pw
+    local evidence_timeout slot_close_margin shutdown_timeout
+
+    if [[ "${up_only}" -eq 1 ]]; then
+        fail usage "--up-only applies to part 1 only"
+    fi
+
+    teardown="${TRACE_E2E_TEARDOWN:-term}"
+    case "${teardown}" in
+        term|sigkill) ;;
+        *) fail usage "TRACE_E2E_TEARDOWN must be term or sigkill (got ${teardown})" ;;
+    esac
+
+    flush_wait="${TRACE_E2E_FLUSH_WAIT:-8}"
+    case "${flush_wait}" in
+        ''|*[!0-9]*) fail usage "TRACE_E2E_FLUSH_WAIT must be a non-negative integer" ;;
+    esac
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        fail python-missing "python3 is required for part 2 (fixture beacon node)"
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        fail curl-missing "curl is required for part 2"
+    fi
+    if ! command -v docker >/dev/null 2>&1; then
+        fail docker-missing "docker is required for part 2 (compose tracing profile)"
+    fi
+    if ! docker compose version >/dev/null 2>&1; then
+        fail docker-compose-missing "docker compose is required for part 2"
+    fi
+
+    shopt -s nullglob
+    fixture_files=("${FIXTURE_DIR}"/trace_e2e_bn__*.json)
+    shopt -u nullglob
+    if ((${#fixture_files[@]} == 0)); then
+        fail fixture-glob "no fixtures matched ${FIXTURE_DIR}/trace_e2e_bn__*.json"
+    fi
+    if [[ ! -f "${FIXTURE_DIR}/trace_e2e_validator_keystore.json" ]]; then
+        fail fixture-keystore "missing trace_e2e_validator_keystore.json"
+    fi
+    if [[ ! -f "${FIXTURE_DIR}/trace_e2e_validator_pubkey.txt" ]]; then
+        fail fixture-pubkey "missing trace_e2e_validator_pubkey.txt"
+    fi
+    if [[ ! -f "${FIXTURE_DIR}/trace_e2e_validator_password.txt" ]]; then
+        fail fixture-password "missing trace_e2e_validator_password.txt"
+    fi
+    pubkey="$(tr -d '[:space:]' < "${FIXTURE_DIR}/trace_e2e_validator_pubkey.txt")"
+    if [[ -z "${pubkey}" ]]; then
+        fail fixture-pubkey "pubkey file is empty"
+    fi
+    signer_pw="$(sed -n 's/^\*=//p' "${FIXTURE_DIR}/trace_e2e_validator_password.txt" | head -n 1 | tr -d '\r' || true)"
+    if [[ -z "${signer_pw}" ]]; then
+        fail fixture-password "password file has no *= entry for the signer"
+    fi
+
+    spe="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["data"]["SECONDS_PER_SLOT"])' \
+        "${FIXTURE_DIR}/trace_e2e_bn__spec.json")" || fail fixture-spec "cannot read SECONDS_PER_SLOT"
+    case "${spe}" in
+        ''|*[!0-9]*|0) fail fixture-spec "SECONDS_PER_SLOT must be a positive integer (got ${spe:-empty})" ;;
+    esac
+
+    delay="${TRACE_E2E_GENESIS_DELAY:-20}"
+    case "${delay}" in
+        ''|*[!0-9]*) fail usage "TRACE_E2E_GENESIS_DELAY must be a non-negative integer" ;;
+    esac
+    now="$(date +%s)"
+    genesis_time="$((now + delay))"
+    slot_close_margin=1
+    shutdown_timeout=20
+    evidence_timeout="$((delay + spe * 32 + 30))"
+    if [[ -n "${TRACE_E2E_SLOT_CLOSE_TIMEOUT:-}" ]]; then
+        evidence_timeout="${TRACE_E2E_SLOT_CLOSE_TIMEOUT}"
+        case "${evidence_timeout}" in
+            ''|*[!0-9]*|0)
+                fail usage "TRACE_E2E_SLOT_CLOSE_TIMEOUT must be a positive integer"
+                ;;
+        esac
+    fi
+
+    spans_file="${TRACE_E2E_SPANS_FILE:-${ROOT}/target/trace-e2e/spans.json}"
+    mkdir -p -- "$(dirname -- "${spans_file}")"
+
+    # Published by docker-compose.yml (jaeger, profile tracing): OTLP/HTTP 4318.
+    otlp_endpoint="${TRACE_E2E_OTLP_ENDPOINT:-http://127.0.0.1:4318}"
+    # Greppable assignment. ADR-005: the SDK default is 0.01; do not rely on it.
+    OTEL_TRACES_SAMPLER_ARG=1.0
+    export OTEL_TRACES_SAMPLER_ARG
+    export OTEL_EXPORTER_OTLP_ENDPOINT="${otlp_endpoint}"
+
+    export COMPOSE_FILE="${ROOT}/docker-compose.yml"
+    export COMPOSE_PROJECT_NAME="${TRACE_E2E_COMPOSE_PROJECT:-rvc-trace-e2e}"
+    case "${COMPOSE_PROJECT_NAME}" in
+        ''|*[!A-Za-z0-9_-]*)
+            fail usage "TRACE_E2E_COMPOSE_PROJECT must be a compose project name"
+            ;;
+    esac
+
+    rvc_bin="$(resolve_host_bin RVC_BIN rvc "${RVC_BIN:-}")"
+    signer_bin="$(resolve_host_bin RVC_SIGNER_BIN rvc-signer "${RVC_SIGNER_BIN:-}")"
+
+    bn_port="$(pick_port)" || fail port-bind "no free TCP port in 19000-19250 for the fixture"
+    signer_port="$(pick_port "${bn_port}")" || fail port-bind "no free TCP port for rvc-signer"
+    signer_metrics="$(pick_port "${bn_port}" "${signer_port}")" || fail port-bind "no free TCP port for signer metrics"
+    rvc_metrics="$(pick_port "${bn_port}" "${signer_port}" "${signer_metrics}")" || fail port-bind "no free TCP port for rvc metrics"
+
+    workdir="$(mktemp -d "${TMPDIR:-/tmp}/trace-e2e.XXXXXX")"
+    mkdir -p "${workdir}/keystores" "${workdir}/signer-data"
+    cp "${FIXTURE_DIR}/trace_e2e_validator_keystore.json" "${workdir}/keystores/keystore-0.json"
+    chmod 600 "${workdir}/keystores/keystore-0.json"
+    cp "${FIXTURE_DIR}/trace_e2e_validator_password.txt" "${workdir}/passwords.txt"
+    printf '%s\n' "${signer_pw}" > "${workdir}/signer-password.txt"
+    chmod 600 "${workdir}/signer-password.txt" "${workdir}/passwords.txt"
+    cat > "${workdir}/validators.toml" <<EOF
+[defaults]
+fee_recipient = "${FEE_RECIPIENT}"
+EOF
+    cat > "${workdir}/config.toml" <<EOF
+beacon_url = "http://127.0.0.1:${bn_port}"
+keystore_path = "${workdir}/keystores"
+slashing_db_path = "${workdir}/slashing.db"
+validators_config = "${workdir}/validators.toml"
+password_file = "${workdir}/passwords.txt"
+metrics_address = "127.0.0.1"
+metrics_port = ${rvc_metrics}
+network = "custom"
+genesis_time = ${genesis_time}
+genesis_validators_root = "${GVR}"
+log_level = "info"
+keymanager_enabled = false
+disable_keystore_locking = true
+allow_fresh_db = true
+doppelganger_detection = false
+EOF
+
+    # Set before `up` so a failed start still runs compose down from the trap.
+    compose_started=1
+    echo "trace-e2e: part 2 starting Phase-1 compose tracing profile (jaeger)"
+    if ! timeout 180 docker compose --profile tracing up -d jaeger; then
+        fail jaeger-start "docker compose --profile tracing up -d jaeger failed or timed out after 180s"
+    fi
+
+    jaeger_otlp_ready() {
+        local code
+        code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 -X POST \
+            "http://127.0.0.1:4318/v1/traces" \
+            -H 'Content-Type: application/json' -d '{}' 2>/dev/null || true)"
+        [[ "${code}" == "200" ]]
+    }
+    wait_until jaeger-otlp 90 jaeger_otlp_ready
+    echo "trace-e2e: jaeger OTLP sink ready at http://127.0.0.1:4318"
+
+    TRACE_E2E_GENESIS_TIME="${genesis_time}" \
+        TRACE_E2E_GENESIS_VALIDATORS_ROOT="${GVR}" \
+        TRACE_E2E_VALIDATOR_PUBKEY="${pubkey}" \
+        TRACE_E2E_VALIDATOR_INDEX="0" \
+        python3 "${FIXTURE_PY}" \
+            --fixtures "${FIXTURE_DIR}" \
+            --bind 127.0.0.1 \
+            --port "${bn_port}" \
+        >"${workdir}/fixture.log" 2>&1 &
+    bn_pid=$!
+
+    genesis_ok() {
+        curl -fsS --max-time 2 "http://127.0.0.1:${bn_port}/eth/v1/beacon/genesis" >/dev/null 2>&1
+    }
+    wait_until fixture-bn-ready 60 genesis_ok
+    echo "trace-e2e: fixture beacon node ready at http://127.0.0.1:${bn_port}"
+
+    signer_log="${workdir}/signer.log"
+    : > "${signer_log}"
+    # Same sampler and endpoint as bin/rvc. No --tracing-sample-rate flag:
+    # the explicit env assignment above is what the process resolves.
+    # Loopback fixture only. --insecure also requires this opt-in, and the
+    # signer gate still demands a loopback bind (predicate_ok).
+    OTEL_TRACES_SAMPLER_ARG=1.0 \
+        OTEL_EXPORTER_OTLP_ENDPOINT="${otlp_endpoint}" \
+        RVC_SIGNER_ALLOW_INSECURE=true \
+        RUST_LOG=info \
+        "${signer_bin}" serve \
+            --insecure \
+            --init-slashing-db \
+            --keystore-dir "${workdir}/keystores" \
+            --password-file "${workdir}/signer-password.txt" \
+            --data-dir "${workdir}/signer-data" \
+            --listen-address "127.0.0.1:${signer_port}" \
+            --metrics-address "127.0.0.1:${signer_metrics}" \
+        >"${signer_log}" 2>&1 &
+    signer_pid=$!
+
+    signer_ready() {
+        if ! kill -0 "${signer_pid}" 2>/dev/null; then
+            fail signer-exited "bin/rvc-signer (pid ${signer_pid}) exited before it was ready"
+        fi
+        curl -fsS --max-time 2 "http://127.0.0.1:${signer_metrics}/metrics" >/dev/null 2>&1
+    }
+    wait_until signer-ready 30 signer_ready
+    echo "trace-e2e: rvc-signer ready at 127.0.0.1:${signer_port}"
+
+    rvc_log="${workdir}/rvc.log"
+    : > "${rvc_log}"
+    OTEL_TRACES_SAMPLER_ARG=1.0 \
+        OTEL_EXPORTER_OTLP_ENDPOINT="${otlp_endpoint}" \
+        RUST_LOG=info \
+        "${rvc_bin}" start \
+            --config "${workdir}/config.toml" \
+            --init-slashing-db \
+            --no-doppelganger-detection \
+            --log-level info \
+            --log-format pretty \
+            --metrics-address 127.0.0.1 \
+            --metrics-port "${rvc_metrics}" \
+        >"${rvc_log}" 2>&1 &
+    rvc_pid=$!
+
+    # slot.process stays open until the next slot boundary (post-duty window).
+    # "Slot processing complete" is inside the span; the span drops after
+    # genesis + (slot+1)*SECONDS_PER_SLOT.
+    slot_span_closed() {
+        local line slot slot_end now
+        if ! kill -0 "${rvc_pid}" 2>/dev/null; then
+            fail rvc-exited "bin/rvc (pid ${rvc_pid}) exited before slot.process closed"
+        fi
+        if ! grep -F -q 'slot.process' "${rvc_log}"; then
+            return 1
+        fi
+        line="$(grep -E 'Slot processing complete slot=[0-9]+' "${rvc_log}" | head -n 1 || true)"
+        if [[ -z "${line}" ]]; then
+            return 1
+        fi
+        slot="${line##*slot=}"
+        slot="${slot%%[^0-9]*}"
+        case "${slot}" in
+            ''|*[!0-9]*) return 1 ;;
+        esac
+        slot_end=$((genesis_time + (slot + 1) * spe + slot_close_margin))
+        now="$(date +%s)"
+        (( now >= slot_end ))
+    }
+    wait_until slot-close "${evidence_timeout}" slot_span_closed
+    echo "trace-e2e: slot.process closed (full slot elapsed after Slot processing complete)"
+
+    if [[ "${teardown}" == "sigkill" ]]; then
+        # Diagnostic red: the span has ended but the batch worker has not been
+        # given the flush window, and SIGKILL skips shutdown. Always non-zero.
+        kill -KILL "${rvc_pid}" >/dev/null 2>&1 || true
+        kill -KILL "${signer_pid}" >/dev/null 2>&1 || true
+        wait "${rvc_pid}" >/dev/null 2>&1 || true
+        wait "${signer_pid}" >/dev/null 2>&1 || true
+        rvc_pid=""
+        signer_pid=""
+        fetch_jaeger_spans "${spans_file}"
+        if span_file_has_closed_slot "${spans_file}"; then
+            fail sigkill-exported \
+                "SIGKILL still left a closed slot.process in ${spans_file}; red path is invalid"
+        fi
+        fail sigkill-no-export \
+            "SIGKILL dropped the unflushed slot.process span (${spans_file})"
+    fi
+
+    # BatchSpanProcessor exports on its schedule while the process is alive.
+    # bin/rvc does not call shutdown_tracing on Drop, so this window is the flush.
+    span_flush_done() {
+        local elapsed
+        if ! kill -0 "${rvc_pid}" 2>/dev/null; then
+            fail rvc-exited "bin/rvc exited during span-flush"
+        fi
+        if ! kill -0 "${signer_pid}" 2>/dev/null; then
+            fail signer-exited "bin/rvc-signer exited during span-flush"
+        fi
+        elapsed=$((SECONDS - flush_mark))
+        (( elapsed >= flush_wait ))
+    }
+    flush_mark="${SECONDS}"
+    wait_until span-flush "$((flush_wait + 15))" span_flush_done
+    echo "trace-e2e: span-flush waited ${flush_wait}s with both processes alive"
+
+    stop_pid_clean rvc-shutdown "${rvc_pid}" "${shutdown_timeout}"
+    rvc_pid=""
+    stop_pid_clean signer-shutdown "${signer_pid}" "${shutdown_timeout}"
+    signer_pid=""
+    # Fixture is not a span exporter. TERM it so the trap does not have to.
+    stop_pid_clean fixture-shutdown "${bn_pid}" 10
+    bn_pid=""
+
+    fetch_jaeger_spans "${spans_file}"
+    if ! span_file_has_closed_slot "${spans_file}"; then
+        fail slot-span \
+            "no closed slot.process (startTime + duration) in ${spans_file}"
+    fi
+
+    echo "trace-e2e: part 2 ok — closed slot.process written to ${spans_file}"
+    ok=1
+    exit 0
+}
+
+fetch_jaeger_spans() {
+    local dest="$1"
+    local tmp
+    mkdir -p -- "$(dirname -- "${dest}")"
+    tmp="${dest}.partial"
+    if ! curl -fsS --max-time 10 \
+        "http://127.0.0.1:16686/api/traces?service=rvc&limit=50" \
+        -o "${tmp}"; then
+        rm -f -- "${tmp}"
+        fail jaeger-query "GET /api/traces?service=rvc timed out or failed (waited for Jaeger query)"
+    fi
+    mv -- "${tmp}" "${dest}"
+}
+
+span_file_has_closed_slot() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = json.load(fh)
+for trace in doc.get("data") or []:
+    for span in trace.get("spans") or []:
+        if span.get("operationName") != "slot.process":
+            continue
+        if "startTime" not in span or "duration" not in span:
+            continue
+        duration = span["duration"]
+        if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+            continue
+        if duration < 0:
+            continue
+        print(
+            "trace-e2e: closed slot.process"
+            f" duration={duration} startTime={span['startTime']}"
+        )
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+if [[ "${part}" != "1" && "${part}" != "2" ]]; then
     fail part-not-in-scope \
-        "TRC-5a implements part 1 only; part ${part} is a later ticket (5b–5e are not started)"
+        "only part 1 and part 2 are implemented; part ${part} is a later ticket (5c-5e are not started)"
+fi
+
+if [[ "${part}" == "2" ]]; then
+    run_part2
 fi
 
 # Shellcheck-friendly glob: nullglob + array, quoted directory prefix.
