@@ -41,6 +41,7 @@ crates/slashing/src/types.rs:generic-api-key:457
 crates/slashing/src/types.rs:generic-api-key:531
 crates/telemetry/src/format.rs:generic-api-key:450
 crates/telemetry/src/format.rs:generic-api-key:771
+docs/running-guide.md:generic-api-key:534
 docs/validators-config.md:generic-api-key:178
 docs/validators-config.md:generic-api-key:57
 plan/logging/OPERATOR_GUIDE.md:generic-api-key:365
