@@ -336,6 +336,7 @@ pub async fn run(
     info!("Starting duty orchestrator");
 
     // Spawn (not poll inline): in-flight publish survives the shutdown signal (M10).
+    // detached: already a per-slot root inside the task (slot.process, crates/rvc/src/orchestrator/coordinator/mod.rs:490); not shape B.
     executor.spawn("duty_orchestrator", ShutdownTier::Orchestrator, async move {
         match orchestrator.run().await {
             Ok(()) => info!("Orchestrator completed"),
@@ -472,6 +473,7 @@ fn spawn_secret_provider_refresh(
             std::time::Duration::from_secs(refresh_interval),
             executor.token(),
         );
+        // detached: secret_provider::RefreshService::run; loop body is crates/secret-provider/src/refresh.rs:179, out of scope.
         executor.spawn("secret_provider_refresh", ShutdownTier::Background, async move {
             refresh_service
                 .run(move |sk| {

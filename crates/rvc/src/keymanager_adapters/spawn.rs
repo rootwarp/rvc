@@ -269,6 +269,7 @@ pub fn spawn_keymanager_api(
     );
 
     let token = executor.token();
+    // detached: keymanager API server; serve loop is KeymanagerServer::run_with_shutdown in crates/keymanager-api/src/server.rs:175, out of scope.
     executor.spawn("keymanager_api", ShutdownTier::Ingress, async move {
         if let Err(e) = built.server.run_with_shutdown(token).await {
             error!("Keymanager API server error: {}", e);
