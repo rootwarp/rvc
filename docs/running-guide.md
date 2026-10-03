@@ -512,25 +512,58 @@ rvc start -c config.toml \
 #### Local Jaeger v2 (docker compose `tracing` profile)
 
 Bare `docker compose up` stays on `rvc` + `rvc-signer` only. Jaeger v2 is
-opt-in behind `profiles: ["tracing"]`. Compose already wires path-less
-`OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318` and
-`OTEL_TRACES_SAMPLER_ARG=1.0` on both services (signer remains inert until
-Phase 2B).
+opt-in behind `profiles: ["tracing"]`. Compose publishes host-local OTLP/HTTP
+`:4318` and the UI on `127.0.0.1:16686`. The operator recipe below does not
+start a second stack: `scripts/trace-e2e.sh --part 2` brings up that Jaeger,
+then host `bin/rvc` and `bin/rvc-signer` with `OTEL_TRACES_SAMPLER_ARG=1.0`.
 
-Four-step recipe:
+Four-step recipe (executed 2026-10-03 against part 2 on develop
+`8fab00400df79c4f111ec69e8e7cb4d633295710`, release binaries, `TRACE_E2E_KEEP=1`):
 
-1. Start the stack with the profile:
-   `docker compose --profile tracing up -d`
-2. Open the Jaeger UI at `http://127.0.0.1:16686` (loopback-bound).
-3. Confirm OTLP/HTTP accepts spans (Compose publishes host-local `:4318` only):
-   `curl -sS -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:4318/v1/traces -H 'Content-Type: application/json' -d '{}'`
-   — expect HTTP 200 when the collector is up; connection refused means the
-   profile is down.
-4. In the UI, open the **Service** dropdown, select `rvc` (or the name passed
-   via `--tracing-service-name`), and click **Find Traces**. With sample rate
-   `1.0` you should see spans from `bin/rvc`. To distinguish VC and signer
-   processes later, start each with a distinct `--tracing-service-name`
-   (e.g. `rvc` / `rvc-signer`).
+```bash
+TRACE_E2E_KEEP=1 ./scripts/trace-e2e.sh --part 2
+```
+
+The run printed `trace-e2e: part 2 ok` and wrote
+`target/trace-e2e/spans.json` (Jaeger `GET /api/traces?service=rvc&limit=50`)
+before tearing the stack down.
+
+1. **A warn line that carries a `trace_id`.** From the part-2 `rvc.log`:
+
+   ```text
+   trace_id=90bbcb5135671861a60ac8e363070de8 span_id=7b557055a7f8b910 2026-10-03T14:31:20.490491Z  WARN slot.process{slot=0 epoch=0}:slot.phase.aggregation{time_into_slot=8003}:aggregation.produce{slot=0 validator_index=0 pubkey=0x97f1d3a731...db22c6bb aggregation.fork="electra"}:sign.selection_proof{duty=aggregate}: rvc_signer: Signing failed pubkey=0x97f1d3a731...db22c6bb error=signing rejected locally (no remote contact): raw-root signing is not supported for gRPC remote signers; use TypedSigner::sign_block / sign_attestation / etc. signing_type="selection_proof"
+   ```
+
+2. **That id in Jaeger.** While the part-2 stack was still up:
+
+   ```text
+   GET http://127.0.0.1:16686/api/traces/90bbcb5135671861a60ac8e363070de8
+   ```
+
+   returned the trace (32853 bytes; `traceID` `90bbcb5135671861a60ac8e363070de8`).
+   After the script's flush, the same id is in `target/trace-e2e/spans.json`
+   (96 spans, process `serviceName` values `rvc` and `rvc-signer`).
+   `./scripts/assert-trace-continuity.sh target/trace-e2e/spans.json` exited 0.
+
+3. **Phase breakdown with `time_into_slot`.** Same trace in that Jaeger
+   document (tag on the span, duration in microseconds):
+
+   | Span | `service.name` | `time_into_slot` |
+   |---|---|---|
+   | `slot.phase.block` | `rvc` | 2 |
+   | `slot.phase.attestation` | `rvc` | 4003 |
+   | `slot.phase.aggregation` | `rvc` | 8003 |
+   | `slot.process` | `rvc` | (root span; duration 8009223) |
+
+   `slot.phase.payload_attestation` is present on `rvc` and has no
+   `time_into_slot` tag (pre-Gloas; the phase does not stamp).
+
+4. **Signer span under `rvc-signer`, distinct from `rvc`.** In the same
+   trace, `signer.v2.sign_attestation_data` has process `serviceName`
+   `rvc-signer` (spanID `83d1dab614c8e6ad`, duration 5562 µs). The VC side of
+   the hop is `sign.grpc_remote_typed` on `rvc`. Jaeger `GET /api/services`
+   during the run listed `jaeger`, `rvc`, and `rvc-signer`. The signer log
+   carried the same id on `grpc.sign` / `otel.name="signer.v2.sign_attestation_data"`.
 
 > **Warning:** Compose binds the Jaeger UI to `127.0.0.1:16686` only. Do not
 > republish `16686` on all interfaces. Remote access needs an SSH tunnel
