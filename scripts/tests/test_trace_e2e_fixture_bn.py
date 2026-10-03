@@ -1,7 +1,9 @@
-"""Contract tests for the TRC-5a fixture beacon node and trace-e2e.sh part 1.
+"""Contract tests for the TRC-5a fixture beacon node and trace-e2e.sh.
 
 No sockets (conftest disables them). The shell script is checked statically
-and via --help / --part 2, which exit before Docker.
+and via --help / --part 3, which exit before Docker. Part 2 (TRC-5b) is
+checked statically: sampler assignment, compose teardown, span path, and
+named waits. A live cluster is not started here.
 """
 
 from __future__ import annotations
@@ -131,7 +133,7 @@ def test_post_submit_accepts_empty_success_body():
     assert json.loads(raw) == {}
 
 
-def test_script_is_part1_only_and_shellcheck_friendly():
+def test_script_is_part1_fixture_and_shellcheck_friendly():
     text = SCRIPT.read_text(encoding="utf-8")
     assert text.startswith("#!/usr/bin/env bash\n")
     assert "set -euo pipefail" in text
@@ -148,16 +150,34 @@ def test_script_is_part1_only_and_shellcheck_friendly():
     assert '127.0.0.1:${bn_port}:5052' in text
 
 
-def test_part_other_than_1_exits_named_without_docker():
+def test_part_other_than_1_or_2_exits_named_without_docker():
     proc = subprocess.run(
-        [str(SCRIPT), "--part", "2"],
+        [str(SCRIPT), "--part", "3"],
         check=False,
         capture_output=True,
         text=True,
     )
     assert proc.returncode == 1
-    assert "FAIL part-not-in-scope" in proc.stderr
+    assert "trace-e2e: FAIL part-not-in-scope" in proc.stderr
     assert "part 1" in proc.stderr
+    assert "part 2" in proc.stderr
+
+
+def test_part2_sampler_teardown_and_spans_path_are_static():
+    text = SCRIPT.read_text(encoding="utf-8")
+    assert "OTEL_TRACES_SAMPLER_ARG=1.0" in text
+    assert "docker compose --profile tracing down -v" in text
+    assert "target/trace-e2e/spans.json" in text
+    assert "trap cleanup EXIT" in text
+    assert "wait_until jaeger-otlp" in text
+    assert "wait_until signer-ready" in text
+    assert "wait_until slot-close" in text
+    assert "wait_until span-flush" in text
+    assert "refusing SIGKILL as success" in text
+    # Do not reuse the devnet helper: its TERM→KILL path returns success.
+    assert "stop_rvc" not in text
+    assert "sigkill-no-export" in text
+    assert "part 2 ok" in text
 
 
 def test_help_exits_zero():
@@ -169,3 +189,4 @@ def test_help_exits_zero():
     )
     assert proc.returncode == 0
     assert "part 1" in proc.stdout.lower() or "Part 1" in proc.stdout
+    assert "Part 2" in proc.stdout or "part 2" in proc.stdout
