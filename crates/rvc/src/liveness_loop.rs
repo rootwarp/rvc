@@ -36,7 +36,7 @@ use doppelganger::{
 };
 use eth_types::{Epoch, SLOT_DURATION_MS};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 use crate::orchestrator::PubkeyMap;
@@ -180,74 +180,87 @@ impl LivenessObservationLoop {
         let mut observed_epochs: HashSet<Epoch> = HashSet::new();
         let mut has_pending = true;
 
+        // detached: process-lifetime loop root; the tick is the exported span.
+        let loop_span = tracing::debug_span!(parent: None, "liveness_loop");
         loop {
-            if self.cancel.is_cancelled() {
-                info!("SEC-2c: liveness observation loop cancelled");
-                break;
-            }
-
-            let current_epoch = self.epoch_clock.current_epoch();
-            let slot_in_epoch = self.epoch_clock.slot_in_epoch();
-
-            // Observe completed epochs that may still be needed by Pending keys.
-            if current_epoch > 0 {
-                let lookback_start = current_epoch.saturating_sub(LIVENESS_LOOKBACK_EPOCHS);
-                for epoch in lookback_start..current_epoch {
-                    // Finding 1: re-query while Pending remain; only skip when
-                    // nothing is Pending and this epoch already completed once.
-                    if !has_pending && observed_epochs.contains(&epoch) {
-                        continue;
-                    }
-                    match self.observe_epoch(epoch).await {
-                        Ok(true) => {
-                            observed_epochs.insert(epoch);
-                        }
-                        Ok(false) => {
-                            debug!(epoch, "liveness observation incomplete; will retry");
-                        }
-                        Err(e) => {
-                            warn!(
-                                epoch,
-                                error = %e,
-                                "liveness query failed; will retry next slot (fail-closed)"
-                            );
-                        }
-                    }
-                }
-            }
-
-            let statuses = self.machine.tick(current_epoch, slot_in_epoch);
-            has_pending = statuses.contains(&ForwardWindowStatus::Pending);
-            let detected = statuses.iter().filter(|s| **s == ForwardWindowStatus::Detected).count();
-            let pending = statuses.iter().filter(|s| **s == ForwardWindowStatus::Pending).count();
-            let safe = statuses.iter().filter(|s| **s == ForwardWindowStatus::Safe).count();
-            if detected > 0 {
-                error!(
-                    detected,
-                    pending,
-                    safe,
-                    current_epoch,
-                    slot_in_epoch,
-                    "doppelganger Detected: gate permanently closed for affected keys \
-                     (no signing for those validators)"
-                );
-            } else {
-                debug!(pending, safe, current_epoch, slot_in_epoch, "forward-window tick");
-            }
-
-            // Bound memory; keep more than lookback so re-queries after Pending
-            // drain still skip correctly.
-            if current_epoch > LIVENESS_LOOKBACK_EPOCHS + 4 {
-                let retain_from = current_epoch.saturating_sub(LIVENESS_LOOKBACK_EPOCHS + 4);
-                observed_epochs.retain(|e| *e >= retain_from);
-            }
-
-            tokio::select! {
-                _ = self.cancel.cancelled() => {
+            let tick = tracing::debug_span!(parent: None, "liveness_loop.tick");
+            tick.follows_from(&loop_span);
+            let stop = async {
+                if self.cancel.is_cancelled() {
                     info!("SEC-2c: liveness observation loop cancelled");
-                    break;
+                    return true;
                 }
-                _ = tokio::time::sleep(self.slot_duration) => {}
+
+                let current_epoch = self.epoch_clock.current_epoch();
+                let slot_in_epoch = self.epoch_clock.slot_in_epoch();
+
+                // Observe completed epochs that may still be needed by Pending keys.
+                if current_epoch > 0 {
+                    let lookback_start = current_epoch.saturating_sub(LIVENESS_LOOKBACK_EPOCHS);
+                    for epoch in lookback_start..current_epoch {
+                        // Finding 1: re-query while Pending remain; only skip when
+                        // nothing is Pending and this epoch already completed once.
+                        if !has_pending && observed_epochs.contains(&epoch) {
+                            continue;
+                        }
+                        match self.observe_epoch(epoch).await {
+                            Ok(true) => {
+                                observed_epochs.insert(epoch);
+                            }
+                            Ok(false) => {
+                                debug!(epoch, "liveness observation incomplete; will retry");
+                            }
+                            Err(e) => {
+                                warn!(
+                                    epoch,
+                                    error = %e,
+                                    "liveness query failed; will retry next slot (fail-closed)"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let statuses = self.machine.tick(current_epoch, slot_in_epoch);
+                has_pending = statuses.contains(&ForwardWindowStatus::Pending);
+                let detected =
+                    statuses.iter().filter(|s| **s == ForwardWindowStatus::Detected).count();
+                let pending =
+                    statuses.iter().filter(|s| **s == ForwardWindowStatus::Pending).count();
+                let safe = statuses.iter().filter(|s| **s == ForwardWindowStatus::Safe).count();
+                if detected > 0 {
+                    error!(
+                        detected,
+                        pending,
+                        safe,
+                        current_epoch,
+                        slot_in_epoch,
+                        "doppelganger Detected: gate permanently closed for affected keys \
+                         (no signing for those validators)"
+                    );
+                } else {
+                    debug!(pending, safe, current_epoch, slot_in_epoch, "forward-window tick");
+                }
+
+                // Bound memory; keep more than lookback so re-queries after Pending
+                // drain still skip correctly.
+                if current_epoch > LIVENESS_LOOKBACK_EPOCHS + 4 {
+                    let retain_from = current_epoch.saturating_sub(LIVENESS_LOOKBACK_EPOCHS + 4);
+                    observed_epochs.retain(|e| *e >= retain_from);
+                }
+
+                tokio::select! {
+                    _ = self.cancel.cancelled() => {
+                        info!("SEC-2c: liveness observation loop cancelled");
+                        true
+                    }
+                    _ = tokio::time::sleep(self.slot_duration) => false
+                }
+            }
+            .instrument(tick)
+            .await;
+            if stop {
+                break;
             }
         }
     }

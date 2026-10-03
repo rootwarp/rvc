@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 use validator_store::{DefaultUpdate, ValidatorStore};
 
 /// Literal pubkey key used for `default_config` entries (Prysm/Teku convention).
@@ -337,30 +337,42 @@ pub async fn start_proposer_config_refresh(
     // Skip the immediate first tick (we already did the initial fetch)
     interval.tick().await;
 
+    // detached: process-lifetime loop root; the tick is the exported span.
+    let loop_span = tracing::info_span!(parent: None, "proposer_config_refresh");
     loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                debug!("Proposer config refresh task shutting down");
-                return;
-            }
-            _ = interval.tick() => {
-                match fetch_proposer_config(
-                    &settings.url,
-                    settings.token.as_deref(),
-                    settings.insecure,
-                ).await {
-                    Ok((updates, default_update)) => {
-                        let count = updates.len();
-                        apply_fn(updates, default_update);
-                        debug!(count, "Proposer config refreshed from URL");
-                        crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL.inc();
+        let tick = tracing::info_span!(parent: None, "proposer_config_refresh.tick");
+        tick.follows_from(&loop_span);
+        let stop = async {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("Proposer config refresh task shutting down");
+                    true
+                }
+                _ = interval.tick() => {
+                    match fetch_proposer_config(
+                        &settings.url,
+                        settings.token.as_deref(),
+                        settings.insecure,
+                    ).await {
+                        Ok((updates, default_update)) => {
+                            let count = updates.len();
+                            apply_fn(updates, default_update);
+                            debug!(count, "Proposer config refreshed from URL");
+                            crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL.inc();
+                        }
+                        Err(e) => {
+                            warn!(error = %e, "Failed to refresh proposer config from URL, retaining existing config");
+                            crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL.inc();
+                        }
                     }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to refresh proposer config from URL, retaining existing config");
-                        crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL.inc();
-                    }
+                    false
                 }
             }
+        }
+        .instrument(tick)
+        .await;
+        if stop {
+            return;
         }
     }
 }
