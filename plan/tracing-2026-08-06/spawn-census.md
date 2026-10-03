@@ -77,7 +77,9 @@ The slashing-monitor `None` call is the old no-op detached site. It left the cen
 
 `crates/rvc/src/liveness_loop.rs` has method-level attributes at `:274` and `:342`. The column-0 module attribute is at `:400`. The production spawn is `:394`, above that module attribute.
 
-Truncating the file at the first `#[cfg(test)]` (the method-level attribute at `:274`) hides `:394` and drops a real production site. The command above keeps `:394` because it only treats a column-0 `#[cfg(test)]` as the end of the production region. This census does not change that rule and does not add a grep gate.
+Truncating the file at the first `#[cfg(test)]` (the method-level attribute at `:274`) hides `:394` and drops a real production site. The command above keeps `:394` because it only treats a column-0 `#[cfg(test)]` as the end of the production region.
+
+`crates/architecture-tests/tests/spawn_span_continuity.rs` pins this census at 14 under tracing ADR-009. The gate ends the production region at the first column-0 `#[cfg(test)]` followed by `mod` (not the first bare `#[cfg(test)]`), skips `///` and `//!` lines, and does not count `register_opt(..., None)`. A site passes only when the preceding non-empty line is a `// detached:` comment, or it is one of the five shape-B rows and the loop file in the table above contains `parent: None` and `follows_from` for that task. The allow-list is empty.
 
 ## A-12 pin
 
