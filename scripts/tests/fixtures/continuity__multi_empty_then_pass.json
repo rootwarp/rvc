@@ -1,0 +1,109 @@
+{
+  "data": [],
+  "total": 0,
+  "limit": 0,
+  "offset": 0,
+  "errors": null
+}
+{
+  "data": [
+    {
+      "traceID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "spans": [
+        {
+          "traceID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "spanID": "1111111111111111",
+          "operationName": "slot.process",
+          "references": [],
+          "startTime": 1710000000000000,
+          "duration": 12000,
+          "tags": [
+            {
+              "key": "service.name",
+              "type": "string",
+              "value": "rvc"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "spanID": "2222222222222222",
+          "operationName": "signer.v2.sign_block_header",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "spanID": "1111111111111111"
+            }
+          ],
+          "startTime": 1710000000001000,
+          "duration": 800,
+          "tags": [
+            {
+              "key": "service.name",
+              "type": "string",
+              "value": "rvc"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "rvc",
+          "tags": [
+            {
+              "key": "service.name",
+              "type": "string",
+              "value": "rvc"
+            }
+          ]
+        },
+        "p2": {
+          "serviceName": "rvc-signer",
+          "tags": [
+            {
+              "key": "service.name",
+              "type": "string",
+              "value": "rvc-signer"
+            }
+          ]
+        }
+      },
+      "warnings": null
+    },
+    {
+      "traceID": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "spans": [
+        {
+          "traceID": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "spanID": "3333333333333333",
+          "operationName": "slot.process",
+          "references": [],
+          "startTime": 1710000001000000,
+          "duration": 1000,
+          "tags": [],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "rvc",
+          "tags": []
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 0,
+  "limit": 0,
+  "offset": 0,
+  "errors": null
+}

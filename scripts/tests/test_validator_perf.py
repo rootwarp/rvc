@@ -5098,6 +5098,14 @@ _G5_SKIP = {
     "trace_e2e_bn__state_fork": "trace-e2e fixture BN; not a G5 overlay",
     "trace_e2e_bn__validators": "trace-e2e fixture BN; not a G5 overlay",
     "trace_e2e_validator_keystore": "trace-e2e fixture BN; not a G5 overlay",
+    "continuity__pass": "trace continuity Jaeger fixture; not a G5 overlay",
+    "continuity__missing_span": "trace continuity Jaeger fixture; not a G5 overlay",
+    "continuity__same_service": "trace continuity Jaeger fixture; not a G5 overlay",
+    "continuity__empty": "trace continuity Jaeger fixture; not a G5 overlay",
+    "continuity__malformed": "trace continuity Jaeger fixture; not a G5 overlay",
+    "continuity__missing_trace_id": "trace continuity Jaeger fixture; not a G5 overlay",
+    "continuity__multi_pass_then_empty": "trace continuity Jaeger fixture; not a G5 overlay",
+    "continuity__multi_empty_then_pass": "trace continuity Jaeger fixture; not a G5 overlay",
 }
 
 
