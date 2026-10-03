@@ -432,3 +432,61 @@ jobs:
 
       - name: Pytest (scripts)
         run: uv run --with pytest==9.1.1 --with pytest-socket==0.8.1 pytest scripts/tests/ -q
+
+  # TRC-5d / #435. First docker compose job on the PR lane. Not a required check.
+  # 30 minutes covers a cold debug build of bin/rvc and bin/rvc-signer plus the
+  # script's own slot waits. A hung fixture dies here, not at the runner default.
+  trace-e2e:
+    name: Trace continuity (end to end)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-trace-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-trace-e2e-
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Host bins. Part 2 resolves target/debug/rvc and target/debug/rvc-signer
+      # (or RVC_BIN / RVC_SIGNER_BIN). OTLP stays the script default, loopback.
+      - name: Build host bins
+        run: cargo build --locked -p rvc-bin -p rvc-signer-bin
+
+      - name: Trace e2e part 1 (fixture beacon node)
+        run: scripts/trace-e2e.sh --part 1
+
+      - name: Trace e2e part 2 (host bins, Jaeger, SIGTERM)
+        run: scripts/trace-e2e.sh --part 2
+
+      - name: Assert trace continuity
+        run: scripts/assert-trace-continuity.sh target/trace-e2e/spans.json
+
+      # Missing spans on an early fail must not fail this step.
+      - name: Upload spans
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-e2e-spans
+          path: target/trace-e2e/spans.json
+          if-no-files-found: ignore
+          retention-days: 7
