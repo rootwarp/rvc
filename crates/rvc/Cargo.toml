@@ -75,7 +75,10 @@ tokio-stream.workspace = true
 tonic.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
+tracing-opentelemetry.workspace = true
 tracing-test.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 # ARCH-7b: `start_paused` / `time::pause` for virtual multi-second duty stalls.
 tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true

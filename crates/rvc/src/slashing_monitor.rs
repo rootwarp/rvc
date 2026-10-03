@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use bn_manager::BeaconNodeClient;
 use metrics::definitions::RVC_VALIDATORS_SLASHED_TOTAL;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 use validator_store::ValidatorStore;
 
 use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
@@ -129,20 +129,33 @@ fn spawn_with_interval(
     let shutdown_token = executor.token();
     // P1-9: Background tier; cooperative cancel via process token.
     executor.spawn("slashing_monitor", ShutdownTier::Background, async move {
+        // detached: process-lifetime loop root; the tick is the exported span.
+        let loop_span = tracing::info_span!(parent: None, "slashing_monitor");
         loop {
-            tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
-                _ = shutdown_token.cancelled() => {
-                    debug!("Slashing monitor shutting down");
-                    break;
+            let tick = tracing::info_span!(parent: None, "slashing_monitor.tick");
+            tick.follows_from(&loop_span);
+            let stop = async {
+                tokio::select! {
+                    _ = tokio::time::sleep(interval) => {}
+                    _ = shutdown_token.cancelled() => {
+                        debug!("Slashing monitor shutting down");
+                        return true;
+                    }
                 }
+
+                let outcome =
+                    check_slashed_validators(beacon.as_ref(), store.as_ref(), action).await;
+
+                if outcome == SlashedOutcome::ShutdownRequested {
+                    info!("Slashing monitor requested process shutdown");
+                    shutdown_token.cancel();
+                    return true;
+                }
+                false
             }
-
-            let outcome = check_slashed_validators(beacon.as_ref(), store.as_ref(), action).await;
-
-            if outcome == SlashedOutcome::ShutdownRequested {
-                info!("Slashing monitor requested process shutdown");
-                shutdown_token.cancel();
+            .instrument(tick)
+            .await;
+            if stop {
                 break;
             }
         }

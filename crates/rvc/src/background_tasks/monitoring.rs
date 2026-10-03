@@ -3,7 +3,7 @@ use std::time::Duration;
 use beacon::RetryPolicy;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
 
 /// beaconcha.in monitoring API v1 payload for the validator process.
 #[derive(Debug, Clone, Serialize)]
@@ -156,17 +156,29 @@ pub async fn start_monitoring_push(
     // Skip the immediate first tick
     interval.tick().await;
 
+    // detached: process-lifetime loop root; the tick is the exported span.
+    let loop_span = tracing::info_span!(parent: None, "monitoring_push");
     loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                debug!("Monitoring push task shutting down");
-                return;
+        let tick = tracing::info_span!(parent: None, "monitoring_push.tick");
+        tick.follows_from(&loop_span);
+        let stop = async {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("Monitoring push task shutting down");
+                    true
+                }
+                _ = interval.tick() => {
+                    let (total, active) = validator_count_fn();
+                    let payload = collect_metrics(total, active);
+                    push_with_retry(&client, &config.endpoint, &payload).await;
+                    false
+                }
             }
-            _ = interval.tick() => {
-                let (total, active) = validator_count_fn();
-                let payload = collect_metrics(total, active);
-                push_with_retry(&client, &config.endpoint, &payload).await;
-            }
+        }
+        .instrument(tick)
+        .await;
+        if stop {
+            return;
         }
     }
 }
