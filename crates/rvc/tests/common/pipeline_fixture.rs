@@ -15,7 +15,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use beacon::{
     AttestationData as BeaconAttestationData, AttesterDuty, BeaconError,
-    Checkpoint as BeaconCheckpoint, DataResponse, SubmitAttestationResult, VersionedAttestation,
+    Checkpoint as BeaconCheckpoint, DataResponse, ExecutionOptimisticResponse,
+    SubmitAttestationResult, VersionedAggregateAttestation, VersionedAttestation,
 };
 use block_service::{
     BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse as BlockProdResp,
@@ -24,7 +25,10 @@ use bn_manager::{AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, P
 use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 use doppelganger::SigningEnablement;
 use duty_tracker::DutyTracker;
-use eth_types::{ForkSchedule, Slot};
+use eth_types::{
+    Attestation as EthAttestation, AttestationData as EthAttestationData,
+    Checkpoint as EthCheckpoint, ForkSchedule, Slot, SyncCommitteeDuty,
+};
 use rvc::orchestrator::{
     DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle, PubkeyMap,
 };
@@ -235,8 +239,10 @@ struct FixtureAttester {
 }
 
 /// Duty identity captured by the N-validator mock. Strings only — the signing
-/// key stays in the composite signer.
+/// key stays in the composite signer. `pubkey_bytes` is the sync-committee
+/// duty key (`SyncCommitteeDuty::pubkey`).
 struct BeaconAttester {
+    pubkey_bytes: [u8; 48],
     pubkey_hex_0x: String,
     validator_index: String,
     committee_position: usize,
@@ -253,6 +259,14 @@ pub struct PipelineBeacon {
     /// Empty for the single-validator fixture. Non-empty replaces the single
     /// `duty_pubkey` duty with one attester duty per identity per slot.
     attesters: Arc<Vec<BeaconAttester>>,
+    /// Compressed pubkey of the single-validator fixture. Unused once
+    /// `attesters` is non-empty.
+    single_pubkey: [u8; 48],
+    /// When set, `post_sync_committee_duties` returns one duty per validator.
+    sync_committee: bool,
+    /// When set, attester duties use a committee length that selects every
+    /// validator as an aggregator, and the aggregate fetch/submit hooks are on.
+    aggregators: bool,
 }
 
 impl PipelineBeacon {
@@ -266,11 +280,26 @@ impl PipelineBeacon {
             duty_slots: Arc::new(duty_slots),
             attestation_data_by_slot: Arc::new(Mutex::new(attestation_data_by_slot)),
             attesters: Arc::new(Vec::new()),
+            single_pubkey: [0u8; 48],
+            sync_committee: false,
+            aggregators: false,
         }
     }
 
     fn with_attesters(mut self, attesters: Vec<BeaconAttester>) -> Self {
         self.attesters = Arc::new(attesters);
+        self
+    }
+
+    fn with_duty_modes(
+        mut self,
+        single_pubkey: [u8; 48],
+        sync_committee: bool,
+        aggregators: bool,
+    ) -> Self {
+        self.single_pubkey = single_pubkey;
+        self.sync_committee = sync_committee;
+        self.aggregators = aggregators;
         self
     }
 
@@ -298,7 +327,7 @@ impl PipelineBeacon {
         let duty_slots = Arc::clone(&self.duty_slots);
         let att_map = Arc::clone(&self.attestation_data_by_slot);
         let head_slot = duty_slots.iter().copied().max().unwrap_or(0);
-        MockBeaconNodeClient::new()
+        let client = MockBeaconNodeClient::new()
             .with_slot_aware_block_root(head_slot, &[], |_queried| root_hex(0xbb))
             .with_get_attester_duties(move |epoch, _indices| {
                 let duty_pubkey = duty_pubkey.lock().unwrap().clone();
@@ -324,18 +353,24 @@ impl PipelineBeacon {
                 Ok(DataResponse { data })
             })
             .with_submit_sync_committee_messages(|_messages| Ok(()))
-            .with_submit_contribution_and_proofs(|_proofs| Ok(()))
+            .with_submit_contribution_and_proofs(|_proofs| Ok(()));
+        self.finish_client(client)
     }
 
     /// N attester duties per duty slot. Committee length is N and each
-    /// validator occupies a distinct in-range `validator_committee_index`.
+    /// validator occupies a distinct in-range `validator_committee_index`,
+    /// unless aggregators are on: then every validator is selected.
     fn build_n_client(&self) -> MockBeaconNodeClient {
         let attesters = Arc::clone(&self.attesters);
         let duty_slots = Arc::clone(&self.duty_slots);
         let att_map = Arc::clone(&self.attestation_data_by_slot);
         let head_slot = duty_slots.iter().copied().max().unwrap_or(0);
-        let committee_length = attesters.len();
-        MockBeaconNodeClient::new()
+        // `committee_length / 16 == 0` makes `is_aggregator` true for every
+        // selection proof. Length 1 also keeps `validator_committee_index` 0
+        // inside the bitlist. The default (aggregators off) keeps length N.
+        let force_aggregators = self.aggregators;
+        let committee_length = if force_aggregators { 1 } else { attesters.len() };
+        let client = MockBeaconNodeClient::new()
             .with_slot_aware_block_root(head_slot, &[], |_queried| root_hex(0xbb))
             .with_get_attester_duties(move |epoch, _indices| {
                 let mut data = Vec::new();
@@ -350,7 +385,11 @@ impl PipelineBeacon {
                             committee_index: COMMITTEE_INDEX.to_string(),
                             committee_length: committee_length.to_string(),
                             committees_at_slot: "1".to_string(),
-                            validator_committee_index: attester.committee_position.to_string(),
+                            validator_committee_index: if force_aggregators {
+                                "0".to_string()
+                            } else {
+                                attester.committee_position.to_string()
+                            },
                             slot: slot.to_string(),
                         });
                     }
@@ -371,7 +410,67 @@ impl PipelineBeacon {
                 Ok(DataResponse { data })
             })
             .with_submit_sync_committee_messages(|_messages| Ok(()))
-            .with_submit_contribution_and_proofs(|_proofs| Ok(()))
+            .with_submit_contribution_and_proofs(|_proofs| Ok(()));
+        self.finish_client(client)
+    }
+
+    /// Sync-committee duties and aggregator hooks. The sync *submit* handler
+    /// above stays a submit hook; duties come from `post_sync_committee_duties`.
+    fn finish_client(&self, mut client: MockBeaconNodeClient) -> MockBeaconNodeClient {
+        if self.sync_committee {
+            let duties = self.sync_committee_duties();
+            client = client.with_post_sync_committee_duties(move |_epoch, _indices| {
+                Ok(ExecutionOptimisticResponse {
+                    execution_optimistic: false,
+                    data: duties.clone(),
+                })
+            });
+        }
+        if self.aggregators {
+            client = client
+                .with_get_aggregate_attestation(|slot, _root, _committee_index, _fork| {
+                    Ok(VersionedAggregateAttestation::PreElectra(pre_electra_aggregate(slot)))
+                })
+                .with_submit_aggregate_and_proofs(|_proofs| Ok(()));
+        }
+        client
+    }
+
+    fn sync_committee_duties(&self) -> Vec<SyncCommitteeDuty> {
+        if self.attesters.is_empty() {
+            return vec![SyncCommitteeDuty {
+                pubkey: self.single_pubkey,
+                validator_index: VALIDATOR_INDEX.parse().expect("validator index"),
+                validator_sync_committee_indices: vec![0],
+            }];
+        }
+        self.attesters
+            .iter()
+            .map(|attester| SyncCommitteeDuty {
+                pubkey: attester.pubkey_bytes,
+                validator_index: attester.committee_position as u64,
+                validator_sync_committee_indices: vec![attester.committee_position as u64],
+            })
+            .collect()
+    }
+}
+
+/// Pre-Electra aggregate returned when aggregators are on.
+///
+/// The fixture fork schedule puts Electra at epoch 50. Slots 100 and 101 are
+/// epoch 3, so `AggregationService` expects this variant. The bitlist and
+/// signature match the aggregation unit-test body that tree-hashes.
+fn pre_electra_aggregate(slot: Slot) -> EthAttestation {
+    EthAttestation {
+        aggregation_bits: vec![0xff, 0x01],
+        data: EthAttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: [0x11; 32],
+            source: EthCheckpoint { epoch: 0, root: [0u8; 32] },
+            target: EthCheckpoint { epoch: 0, root: [0u8; 32] },
+        },
+        signature: vec![0xab; 96],
     }
 }
 
@@ -424,20 +523,23 @@ impl Default for PipelineFixtureOpts {
     }
 }
 
-/// [`PipelineFixtureOpts`] plus a validator count.
+/// [`PipelineFixtureOpts`] plus a validator count and optional duty modes.
 ///
 /// The count is not a field of [`PipelineFixtureOpts`]: two existing literals
 /// name every field, and a new field would stop those tests compiling.
 /// [`PipelineFixtureOpts::with_validators`] sets it; passing opts alone is
-/// one validator.
+/// one validator. Sync-committee and aggregator modes default to off and are
+/// set with [`Self::with_sync_committee`] and [`Self::with_aggregators`].
 pub struct PreparedPipelineFixture {
     opts: PipelineFixtureOpts,
     validator_count: usize,
+    sync_committee: bool,
+    aggregators: bool,
 }
 
 impl From<PipelineFixtureOpts> for PreparedPipelineFixture {
     fn from(opts: PipelineFixtureOpts) -> Self {
-        Self { opts, validator_count: 1 }
+        Self { opts, validator_count: 1, sync_committee: false, aggregators: false }
     }
 }
 
@@ -446,8 +548,34 @@ impl PipelineFixtureOpts {
     ///
     /// `with_validators(1)` matches a plain [`PipelineFixtureOpts`] build.
     /// `n > 1` is seeded: two builds at the same `n` share one pubkey set.
+    /// Sync-committee and aggregator modes stay off.
     pub fn with_validators(self, n: usize) -> PreparedPipelineFixture {
-        PreparedPipelineFixture { opts: self, validator_count: n }
+        PreparedPipelineFixture {
+            opts: self,
+            validator_count: n,
+            sync_committee: false,
+            aggregators: false,
+        }
+    }
+}
+
+impl PreparedPipelineFixture {
+    /// Put every validator in the sync committee when `enabled`.
+    ///
+    /// Default is off. This does not change the sync-message submit hook.
+    pub fn with_sync_committee(mut self, enabled: bool) -> Self {
+        self.sync_committee = enabled;
+        self
+    }
+
+    /// Make mock attester duties select every validator as an aggregator
+    /// when `enabled`.
+    ///
+    /// Default is off. Selection is the committee length (`is_aggregator`
+    /// modulo 1), not a second duty API.
+    pub fn with_aggregators(mut self, enabled: bool) -> Self {
+        self.aggregators = enabled;
+        self
     }
 }
 
@@ -471,6 +599,8 @@ pub struct PipelineFixture {
     pub pubkey_hex: String,
     /// `0x`-prefixed hex used in duty / pubkey_map keys.
     pub pubkey_hex_0x: String,
+    /// Concrete mock behind [`Self::beacon`]. Submit counters live here.
+    pub beacon_client: Arc<MockBeaconNodeClient>,
     /// Owns the on-disk slashing DB directory when more than one validator is
     /// requested and the caller did not pass [`PipelineFixtureOpts::slashing_db`].
     slashing_db_dir: Option<tempfile::TempDir>,
@@ -507,7 +637,8 @@ impl PipelineFixture {
 /// This is the RF1-02 / RF1-08 shared fixture contract — keep knobs on
 /// [`PipelineFixtureOpts`], not inlined inside individual tests.
 pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFixture {
-    let PreparedPipelineFixture { opts, validator_count } = opts.into();
+    let PreparedPipelineFixture { opts, validator_count, sync_committee, aggregators } =
+        opts.into();
     assert!(
         validator_count >= 1,
         "pipeline_fixture: validator_count must be >= 1, got {validator_count}"
@@ -531,7 +662,15 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
             key_manager.insert(secret_key);
             let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
-            finish_fixture(opts, composite, pubkey, pubkey_hex, pubkey_hex_0x, true, Vec::new())
+            finish_fixture(
+                FixtureBuild { opts, sync_committee, aggregators },
+                composite,
+                pubkey,
+                pubkey_hex,
+                pubkey_hex_0x,
+                true,
+                Vec::new(),
+            )
         } else {
             let seeded = seeded_attesters(validator_count);
             let first = &seeded[0];
@@ -544,7 +683,15 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
                 key_manager.insert(secret_key);
             }
             let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
-            finish_fixture(opts, composite, pubkey, pubkey_hex, pubkey_hex_0x, true, seeded)
+            finish_fixture(
+                FixtureBuild { opts, sync_committee, aggregators },
+                composite,
+                pubkey,
+                pubkey_hex,
+                pubkey_hex_0x,
+                true,
+                seeded,
+            )
         }
     } else {
         // RF1-08 path: empty signer/map; mock BN serves duties for the
@@ -561,12 +708,27 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
         let pubkey_hex_0x = format!("0x{pubkey_hex}");
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
 
-        finish_fixture(opts, composite, pubkey, pubkey_hex, pubkey_hex_0x, false, Vec::new())
+        finish_fixture(
+            FixtureBuild { opts, sync_committee, aggregators },
+            composite,
+            pubkey,
+            pubkey_hex,
+            pubkey_hex_0x,
+            false,
+            Vec::new(),
+        )
     }
 }
 
-fn finish_fixture(
+/// Opts plus the duty modes that must not be fields of [`PipelineFixtureOpts`].
+struct FixtureBuild {
     opts: PipelineFixtureOpts,
+    sync_committee: bool,
+    aggregators: bool,
+}
+
+fn finish_fixture(
+    build: FixtureBuild,
     composite: Arc<CompositeSigner>,
     pubkey: PublicKey,
     pubkey_hex: String,
@@ -574,6 +736,7 @@ fn finish_fixture(
     preload: bool,
     seeded: Vec<FixtureAttester>,
 ) -> PipelineFixture {
+    let FixtureBuild { opts, sync_committee, aggregators } = build;
     // An empty `seeded` vec is the single-validator constructor. N > 1 passes
     // one entry per validator, so the length is the count.
     let validator_count = if seeded.is_empty() { 1 } else { seeded.len() };
@@ -595,25 +758,28 @@ fn finish_fixture(
     let beacon_attesters: Vec<BeaconAttester> = seeded
         .iter()
         .map(|attester| BeaconAttester {
+            pubkey_bytes: attester.pubkey_bytes,
             pubkey_hex_0x: attester.pubkey_hex_0x.clone(),
             validator_index: attester.validator_index.clone(),
             committee_position: attester.committee_position,
         })
         .collect();
     let mut beacon =
-        PipelineBeacon::new(pubkey_hex_0x.clone(), opts.duty_slots, opts.attestation_data_by_slot);
+        PipelineBeacon::new(pubkey_hex_0x.clone(), opts.duty_slots, opts.attestation_data_by_slot)
+            .with_duty_modes(pubkey_bytes, sync_committee, aggregators);
     if validator_count > 1 {
         beacon = beacon.with_attesters(beacon_attesters);
     }
     let beacon = Arc::new(beacon);
-    let beacon_client: Arc<dyn BeaconNodeClient> = Arc::new(beacon.build_client());
+    let beacon_client = Arc::new(beacon.build_client());
+    let beacon_node: Arc<dyn BeaconNodeClient> = beacon_client.clone();
 
     let indices = if validator_count == 1 {
         vec![VALIDATOR_INDEX.to_string()]
     } else {
         seeded.iter().map(|attester| attester.validator_index.clone()).collect()
     };
-    let duty_tracker = Arc::new(DutyTracker::new(Arc::clone(&beacon_client), indices));
+    let duty_tracker = Arc::new(DutyTracker::new(Arc::clone(&beacon_node), indices));
 
     let submitter = Arc::new(RecordingSubmitter::new());
     let propagator = Arc::new(Propagator::new(Arc::clone(&submitter) as Arc<RecordingSubmitter>));
@@ -652,7 +818,7 @@ fn finish_fixture(
         Arc::clone(&duty_tracker),
         signer,
         propagator,
-        Arc::clone(&beacon_client),
+        beacon_node,
         Arc::new(NoopBlockBeacon),
         None,
         Arc::clone(&validator_store),
@@ -681,6 +847,7 @@ fn finish_fixture(
         pubkey,
         pubkey_hex,
         pubkey_hex_0x,
+        beacon_client,
         slashing_db_dir,
     }
 }
