@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -224,6 +224,24 @@ impl BeaconBlockClient for NoopBlockBeacon {
 
 // ── mock beacon with per-slot attestation data (shared mock, RF4-24) ─────────
 
+/// One seeded validator registered when [`PipelineFixtureOpts::with_validators`]
+/// requests more than one.
+struct FixtureAttester {
+    pubkey: PublicKey,
+    pubkey_bytes: [u8; 48],
+    pubkey_hex_0x: String,
+    validator_index: String,
+    committee_position: usize,
+}
+
+/// Duty identity captured by the N-validator mock. Strings only — the signing
+/// key stays in the composite signer.
+struct BeaconAttester {
+    pubkey_hex_0x: String,
+    validator_index: String,
+    committee_position: usize,
+}
+
 /// Control handle + shared state for the pipeline mock BN.
 ///
 /// Mutable knobs (`set_duty_pubkey`, `set_attestation_data`) update Arc state
@@ -232,6 +250,9 @@ pub struct PipelineBeacon {
     duty_pubkey: Arc<Mutex<String>>,
     duty_slots: Arc<Vec<Slot>>,
     attestation_data_by_slot: Arc<Mutex<HashMap<Slot, BeaconAttestationData>>>,
+    /// Empty for the single-validator fixture. Non-empty replaces the single
+    /// `duty_pubkey` duty with one attester duty per identity per slot.
+    attesters: Arc<Vec<BeaconAttester>>,
 }
 
 impl PipelineBeacon {
@@ -244,7 +265,13 @@ impl PipelineBeacon {
             duty_pubkey: Arc::new(Mutex::new(duty_pubkey)),
             duty_slots: Arc::new(duty_slots),
             attestation_data_by_slot: Arc::new(Mutex::new(attestation_data_by_slot)),
+            attesters: Arc::new(Vec::new()),
         }
+    }
+
+    fn with_attesters(mut self, attesters: Vec<BeaconAttester>) -> Self {
+        self.attesters = Arc::new(attesters);
+        self
     }
 
     /// Replace or insert attestation data for a slot (RF1-08 reuse knob).
@@ -264,6 +291,9 @@ impl PipelineBeacon {
 
     /// Build the shared configurable mock wired to this control state.
     pub fn build_client(&self) -> MockBeaconNodeClient {
+        if !self.attesters.is_empty() {
+            return self.build_n_client();
+        }
         let duty_pubkey = Arc::clone(&self.duty_pubkey);
         let duty_slots = Arc::clone(&self.duty_slots);
         let att_map = Arc::clone(&self.attestation_data_by_slot);
@@ -278,6 +308,53 @@ impl PipelineBeacon {
                     .filter(|s| s / SLOTS_PER_EPOCH == epoch)
                     .map(|s| make_attester_duty(&duty_pubkey, s))
                     .collect();
+                Ok(beacon::DependentRootResponse {
+                    dependent_root: root_hex(0xdd),
+                    execution_optimistic: false,
+                    data,
+                })
+            })
+            .with_get_attestation_data(move |slot, _committee_index| {
+                let map = att_map.lock().unwrap();
+                let data = map.get(&slot).cloned().ok_or_else(|| {
+                    BeaconError::HttpError(format!(
+                        "no attestation data configured for slot {slot}"
+                    ))
+                })?;
+                Ok(DataResponse { data })
+            })
+            .with_submit_sync_committee_messages(|_messages| Ok(()))
+            .with_submit_contribution_and_proofs(|_proofs| Ok(()))
+    }
+
+    /// N attester duties per duty slot. Committee length is N and each
+    /// validator occupies a distinct in-range `validator_committee_index`.
+    fn build_n_client(&self) -> MockBeaconNodeClient {
+        let attesters = Arc::clone(&self.attesters);
+        let duty_slots = Arc::clone(&self.duty_slots);
+        let att_map = Arc::clone(&self.attestation_data_by_slot);
+        let head_slot = duty_slots.iter().copied().max().unwrap_or(0);
+        let committee_length = attesters.len();
+        MockBeaconNodeClient::new()
+            .with_slot_aware_block_root(head_slot, &[], |_queried| root_hex(0xbb))
+            .with_get_attester_duties(move |epoch, _indices| {
+                let mut data = Vec::new();
+                for &slot in duty_slots.iter() {
+                    if slot / SLOTS_PER_EPOCH != epoch {
+                        continue;
+                    }
+                    for attester in attesters.iter() {
+                        data.push(AttesterDuty {
+                            pubkey: attester.pubkey_hex_0x.clone(),
+                            validator_index: attester.validator_index.clone(),
+                            committee_index: COMMITTEE_INDEX.to_string(),
+                            committee_length: committee_length.to_string(),
+                            committees_at_slot: "1".to_string(),
+                            validator_committee_index: attester.committee_position.to_string(),
+                            slot: slot.to_string(),
+                        });
+                    }
+                }
                 Ok(beacon::DependentRootResponse {
                     dependent_root: root_hex(0xdd),
                     execution_optimistic: false,
@@ -313,7 +390,9 @@ pub struct PipelineFixtureOpts {
     /// `ForwardWindowMachine` here.
     pub enablement: Arc<dyn SigningEnablement>,
     /// Optional pre-built slashing DB (e.g. a poisoned file-backed DB for the
-    /// fail-closed DB-error test). Defaults to a fresh in-memory DB.
+    /// fail-closed DB-error test). When `None`, the single-validator fixture
+    /// opens an in-memory DB. [`Self::with_validators`] with `n > 1` opens an
+    /// on-disk DB with production PRAGMAs instead.
     pub slashing_db: Option<Arc<SlashingDb>>,
     /// Initial mock-clock slot. Updated by callers via [`PipelineFixture::set_slot`].
     pub initial_slot: Slot,
@@ -345,6 +424,33 @@ impl Default for PipelineFixtureOpts {
     }
 }
 
+/// [`PipelineFixtureOpts`] plus a validator count.
+///
+/// The count is not a field of [`PipelineFixtureOpts`]: two existing literals
+/// name every field, and a new field would stop those tests compiling.
+/// [`PipelineFixtureOpts::with_validators`] sets it; passing opts alone is
+/// one validator.
+pub struct PreparedPipelineFixture {
+    opts: PipelineFixtureOpts,
+    validator_count: usize,
+}
+
+impl From<PipelineFixtureOpts> for PreparedPipelineFixture {
+    fn from(opts: PipelineFixtureOpts) -> Self {
+        Self { opts, validator_count: 1 }
+    }
+}
+
+impl PipelineFixtureOpts {
+    /// Register `n` local validators.
+    ///
+    /// `with_validators(1)` matches a plain [`PipelineFixtureOpts`] build.
+    /// `n > 1` is seeded: two builds at the same `n` share one pubkey set.
+    pub fn with_validators(self, n: usize) -> PreparedPipelineFixture {
+        PreparedPipelineFixture { opts: self, validator_count: n }
+    }
+}
+
 /// Fully wired pipeline under test.
 ///
 /// Holds the orchestrator plus the shared handles RF1-02/RF1-08 need to drive
@@ -365,9 +471,20 @@ pub struct PipelineFixture {
     pub pubkey_hex: String,
     /// `0x`-prefixed hex used in duty / pubkey_map keys.
     pub pubkey_hex_0x: String,
+    /// Owns the on-disk slashing DB directory when more than one validator is
+    /// requested and the caller did not pass [`PipelineFixtureOpts::slashing_db`].
+    slashing_db_dir: Option<tempfile::TempDir>,
 }
 
 impl PipelineFixture {
+    /// Path of the on-disk slashing database, when this fixture opened one.
+    ///
+    /// `None` for the single-validator in-memory database and when the caller
+    /// supplied [`PipelineFixtureOpts::slashing_db`].
+    pub fn slashing_db_path(&self) -> Option<std::path::PathBuf> {
+        self.slashing_db_dir.as_ref().map(|dir| dir.path().join("slashing.sqlite"))
+    }
+
     /// Advance the mock clock to `slot` (required before each `process_slot`).
     pub fn set_slot(&self, slot: Slot) {
         self.clock.set_slot(slot);
@@ -389,7 +506,12 @@ impl PipelineFixture {
 ///
 /// This is the RF1-02 / RF1-08 shared fixture contract — keep knobs on
 /// [`PipelineFixtureOpts`], not inlined inside individual tests.
-pub fn pipeline_fixture(opts: PipelineFixtureOpts) -> PipelineFixture {
+pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFixture {
+    let PreparedPipelineFixture { opts, validator_count } = opts.into();
+    assert!(
+        validator_count >= 1,
+        "pipeline_fixture: validator_count must be >= 1, got {validator_count}"
+    );
     if opts.preload_signing_key {
         // RF1-02 path: generate a local signing key and preload it into the
         // composite signer + pubkey_map + validator_store.
@@ -399,19 +521,38 @@ pub fn pipeline_fixture(opts: PipelineFixtureOpts) -> PipelineFixture {
              (PublicKey alone cannot load a signing key); use preload_signing_key=false \
              and import via KeystoreManagerAdapter"
         );
-        let secret_key = SecretKey::generate();
-        let pubkey = secret_key.public_key();
-        let pubkey_hex = hex::encode(pubkey.to_bytes());
-        let pubkey_hex_0x = format!("0x{pubkey_hex}");
+        if validator_count == 1 {
+            let secret_key = SecretKey::generate();
+            let pubkey = secret_key.public_key();
+            let pubkey_hex = hex::encode(pubkey.to_bytes());
+            let pubkey_hex_0x = format!("0x{pubkey_hex}");
 
-        let mut key_manager = KeyManager::new();
-        key_manager.insert(secret_key);
-        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+            let mut key_manager = KeyManager::new();
+            key_manager.insert(secret_key);
+            let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
-        finish_fixture(opts, composite, pubkey, pubkey_hex, pubkey_hex_0x, true)
+            finish_fixture(opts, composite, pubkey, pubkey_hex, pubkey_hex_0x, true, Vec::new())
+        } else {
+            let seeded = seeded_attesters(validator_count);
+            let first = &seeded[0];
+            let pubkey = first.pubkey.clone();
+            let pubkey_hex = hex::encode(first.pubkey_bytes);
+            let pubkey_hex_0x = first.pubkey_hex_0x.clone();
+            let mut key_manager = KeyManager::new();
+            for bytes in seeded_secret_key_bytes(validator_count).iter() {
+                let secret_key = SecretKey::from_bytes(bytes).expect("seeded BLS secret key");
+                key_manager.insert(secret_key);
+            }
+            let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+            finish_fixture(opts, composite, pubkey, pubkey_hex, pubkey_hex_0x, true, seeded)
+        }
     } else {
         // RF1-08 path: empty signer/map; mock BN serves duties for the
         // identity that the test will import.
+        assert!(
+            validator_count == 1,
+            "pipeline_fixture: validator_count > 1 requires preload_signing_key=true"
+        );
         let pubkey = opts
             .duty_identity
             .clone()
@@ -420,7 +561,7 @@ pub fn pipeline_fixture(opts: PipelineFixtureOpts) -> PipelineFixture {
         let pubkey_hex_0x = format!("0x{pubkey_hex}");
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
 
-        finish_fixture(opts, composite, pubkey, pubkey_hex, pubkey_hex_0x, false)
+        finish_fixture(opts, composite, pubkey, pubkey_hex, pubkey_hex_0x, false, Vec::new())
     }
 }
 
@@ -431,41 +572,71 @@ fn finish_fixture(
     pubkey_hex: String,
     pubkey_hex_0x: String,
     preload: bool,
+    seeded: Vec<FixtureAttester>,
 ) -> PipelineFixture {
+    // An empty `seeded` vec is the single-validator constructor. N > 1 passes
+    // one entry per validator, so the length is the count.
+    let validator_count = if seeded.is_empty() { 1 } else { seeded.len() };
     let pubkey_bytes = pubkey.to_bytes();
 
-    let slashing_db = opts.slashing_db.unwrap_or_else(|| {
-        Arc::new(SlashingDb::open_in_memory().expect("open in-memory slashing db"))
-    });
+    let (slashing_db, slashing_db_dir) = if let Some(db) = opts.slashing_db {
+        (db, None)
+    } else if validator_count > 1 {
+        let (db, dir) = open_production_slashing_db();
+        (db, Some(dir))
+    } else {
+        (Arc::new(SlashingDb::open_in_memory().expect("open in-memory slashing db")), None)
+    };
     let signer = Arc::new(
         SignerService::new(Arc::clone(&composite), Arc::clone(&slashing_db))
             .with_enablement(opts.enablement),
     );
 
-    let beacon = Arc::new(PipelineBeacon::new(
-        pubkey_hex_0x.clone(),
-        opts.duty_slots,
-        opts.attestation_data_by_slot,
-    ));
+    let beacon_attesters: Vec<BeaconAttester> = seeded
+        .iter()
+        .map(|attester| BeaconAttester {
+            pubkey_hex_0x: attester.pubkey_hex_0x.clone(),
+            validator_index: attester.validator_index.clone(),
+            committee_position: attester.committee_position,
+        })
+        .collect();
+    let mut beacon =
+        PipelineBeacon::new(pubkey_hex_0x.clone(), opts.duty_slots, opts.attestation_data_by_slot);
+    if validator_count > 1 {
+        beacon = beacon.with_attesters(beacon_attesters);
+    }
+    let beacon = Arc::new(beacon);
     let beacon_client: Arc<dyn BeaconNodeClient> = Arc::new(beacon.build_client());
 
-    let duty_tracker =
-        Arc::new(DutyTracker::new(Arc::clone(&beacon_client), vec![VALIDATOR_INDEX.to_string()]));
+    let indices = if validator_count == 1 {
+        vec![VALIDATOR_INDEX.to_string()]
+    } else {
+        seeded.iter().map(|attester| attester.validator_index.clone()).collect()
+    };
+    let duty_tracker = Arc::new(DutyTracker::new(Arc::clone(&beacon_client), indices));
 
     let submitter = Arc::new(RecordingSubmitter::new());
     let propagator = Arc::new(Propagator::new(Arc::clone(&submitter) as Arc<RecordingSubmitter>));
 
     let mut map = HashMap::new();
-    if preload {
+    if preload && validator_count == 1 {
         map.insert(pubkey_bytes, pubkey.clone());
+    } else if preload {
+        for attester in &seeded {
+            map.insert(attester.pubkey_bytes, attester.pubkey.clone());
+        }
     }
     let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(map));
 
     let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
     // D-3 fail-closed: register the validator as signing-enabled so duties
     // are not dropped by the post-import store gate (unless import path starts empty).
-    if preload {
+    if preload && validator_count == 1 {
         validator_store.add_validator(ValidatorConfig::new(pubkey_bytes)).unwrap();
+    } else if preload {
+        for attester in &seeded {
+            validator_store.add_validator(ValidatorConfig::new(attester.pubkey_bytes)).unwrap();
+        }
     }
 
     let clock =
@@ -510,7 +681,77 @@ fn finish_fixture(
         pubkey,
         pubkey_hex,
         pubkey_hex_0x,
+        slashing_db_dir,
     }
+}
+
+/// Domain tag mixed into the per-validator seed (`b"RVC0"`).
+const SEEDED_KEY_DOMAIN: &[u8; 4] = b"RVC0";
+
+/// 32-byte seed for validator `index` in an N-key set.
+///
+/// Bytes 0..4 are [`SEEDED_KEY_DOMAIN`], 4..12 are `n` little-endian, and
+/// 12..20 are `index` little-endian. The same `(n, index)` always yields the
+/// same seed, so two builds at one N share a pubkey set.
+fn seed_for_validator(n: usize, index: usize) -> [u8; 32] {
+    let mut seed = [0u8; 32];
+    seed[..4].copy_from_slice(SEEDED_KEY_DOMAIN);
+    seed[4..12].copy_from_slice(&(n as u64).to_le_bytes());
+    seed[12..20].copy_from_slice(&(index as u64).to_le_bytes());
+    seed
+}
+
+type SeededKeyBytes = Arc<Vec<[u8; 32]>>;
+type SeededKeyCache = HashMap<usize, SeededKeyBytes>;
+
+fn seeded_secret_key_bytes(n: usize) -> SeededKeyBytes {
+    static CACHE: OnceLock<Mutex<SeededKeyCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().expect("seeded key cache");
+    if let Some(hit) = guard.get(&n) {
+        return Arc::clone(hit);
+    }
+    let generated = Arc::new(generate_seeded_secret_bytes(n));
+    guard.insert(n, Arc::clone(&generated));
+    generated
+}
+
+#[allow(clippy::disallowed_methods)] // Gate 1: cache seeded fixture key bytes; never logged
+fn generate_seeded_secret_bytes(n: usize) -> Vec<[u8; 32]> {
+    (0..n)
+        .map(|index| {
+            let secret = crypto::eip2333::derive_master_sk(&seed_for_validator(n, index))
+                .expect("derive seeded BLS key");
+            secret.to_bytes()
+        })
+        .collect()
+}
+
+fn seeded_attesters(n: usize) -> Vec<FixtureAttester> {
+    seeded_secret_key_bytes(n)
+        .iter()
+        .enumerate()
+        .map(|(index, bytes)| {
+            let secret_key = SecretKey::from_bytes(bytes).expect("seeded BLS secret key");
+            let pubkey = secret_key.public_key();
+            let pubkey_bytes = pubkey.to_bytes();
+            let pubkey_hex_0x = format!("0x{}", hex::encode(pubkey_bytes));
+            FixtureAttester {
+                pubkey,
+                pubkey_bytes,
+                pubkey_hex_0x,
+                validator_index: index.to_string(),
+                committee_position: index,
+            }
+        })
+        .collect()
+}
+
+fn open_production_slashing_db() -> (Arc<SlashingDb>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("slashing db tempdir");
+    let path = dir.path().join("slashing.sqlite");
+    let db = Arc::new(SlashingDb::open(&path).expect("open on-disk slashing db"));
+    (db, dir)
 }
 
 /// Default double-vote attestation data: same target epoch, different roots.
