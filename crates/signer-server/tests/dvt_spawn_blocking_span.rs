@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use observability::logging::TruncatedPubkey;
 use tonic::Request;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::Layer;
@@ -196,8 +197,9 @@ fn sample_header(slot: u64) -> sv2::BeaconBlockHeader {
 /// carry the handler span's correlation fields. The success `tracing::info!`
 /// after `.await` is already on that span and is not the proof.
 ///
-/// TRC-6e has not landed, so the pubkey field is the full hex recorded by the
-/// handler prologue. This test does not assert truncation.
+/// TRC-6e records `TruncatedPubkey` on the handler span. The parent lookup
+/// matches that display (`0x` + first 10 hex + `...` + last 8). Slot and epoch
+/// correlation fields are unchanged.
 #[tokio::test]
 async fn test_spawn_blocking_audit_carries_parent_span_fields() {
     let events: Events = Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -275,7 +277,8 @@ async fn test_spawn_blocking_audit_carries_parent_span_fields() {
         .expect("partial_sign_attestation_data");
 
     let captured = events.lock().clone();
-    let assert_parent = |span_name: &str, pubkey: &str, extras: &[(&str, &str)]| {
+    let assert_parent = |span_name: &str, full_pubkey: &str, extras: &[(&str, &str)]| {
+        let pubkey = TruncatedPubkey::new(full_pubkey).to_string();
         let parents: Vec<&Vec<(String, String)>> = captured
             .iter()
             .filter(|event| event.message.contains("slashing audit"))
@@ -285,19 +288,19 @@ async fn test_spawn_blocking_audit_carries_parent_span_fields() {
             .collect();
         let fields = parents
             .iter()
-            .find(|fields| fields.iter().any(|(key, value)| key == "pubkey" && value == pubkey));
+            .find(|fields| fields.iter().any(|(key, value)| key == "pubkey" && value == &pubkey));
         assert!(
             fields.is_some(),
             "blocking-section slashing audit event is detached from {span_name} \
              (pubkey {pubkey} not on the event's parent span); parents={parents:?}"
         );
         let fields = fields.expect("parent span");
-        assert_eq!(
+        assert!(pubkey.contains("..."), "parent pubkey correlation field must be truncated");
+        assert_ne!(
             pubkey.len(),
-            2 + 96,
-            "parent pubkey correlation field must be the full hex, not a truncation"
+            full_pubkey.len(),
+            "parent pubkey correlation field must not be the full hex"
         );
-        assert!(!pubkey.contains("..."), "parent pubkey correlation field must not be truncated");
         for (key, value) in extras {
             assert!(
                 fields.iter().any(|(field, recorded)| field == key && recorded == value),
