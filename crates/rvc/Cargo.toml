@@ -13,6 +13,7 @@ workspace = true
 [features]
 default = []
 gcp-secret = ["secret-provider/gcp-secret"]
+test-utils = []
 
 [dependencies]
 async-trait.workspace = true
@@ -28,6 +29,7 @@ observability.workspace = true
 remote-signer-client.workspace = true
 duty-tracker.workspace = true
 fd-lock.workspace = true
+futures.workspace = true
 grpc-signer.workspace = true
 hex.workspace = true
 keymanager-api.workspace = true
@@ -84,6 +86,9 @@ tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 zeroize.workspace = true
 criterion.workspace = true
+# Feature-unify `test-utils` onto the crate-under-test so integration tests
+# can enable the feature. Production dependents do not get this line.
+rvc = { path = ".", features = ["test-utils"] }
 
 # Per-slot latency-sanity companion (issue 2.13). Run via `cargo bench`; NOT a
 # blocking gate and NOT run under nextest/CI.
@@ -96,3 +101,7 @@ harness = false
 [[bench]]
 name = "deadline_rebenchmark"
 harness = false
+
+[package.metadata.cargo-machete]
+# Used from RR2-03; remove in RR2-16
+ignored = ["futures"]
