@@ -576,6 +576,75 @@ Jaeger v1 env trap; v2 enables OTLP by default.
 Tear down with `docker compose --profile tracing down` (or plain
 `docker compose down` after stopping).
 
+#### Dev/demo tail sampling (`tracing-tailsample` profile)
+
+Head sampling decides keep or drop when the root span is created. The
+`"Missed attestation deadline"` warn
+(`crates/rvc/src/orchestrator/coordinator/mod.rs`, `warn_if_attestation_overrun`
+at line 977, `warn!` at line 981) fires seconds later. A head sampler cannot
+go back and keep a trace it already dropped. Collector-side tail sampling
+can: it holds the trace briefly, then decides.
+
+This is a **dev/demo topology, not a production recommendation**. A
+production sampler needs a load-balancing tier so every span of one trace
+lands on the same collector, plus durable storage. That topology is out of
+scope. In-process tail sampling is not added. ADR-005's
+`DEFAULT_TRACING_SAMPLE_RATE` stays **`0.01`**. The `tracing` profile's
+`OTEL_TRACES_SAMPLER_ARG=1.0` is unchanged. Volume context for a 1.0 head
+rate is `plan/tracing-2026-08-06/spans-per-slot.md` (TRC-1f); that
+measurement does not move the default.
+
+The profile uses the same pinned image as `jaeger`
+(`cr.jaegertracing.io/jaegertracing/jaeger:2.11.0`, digest
+`sha256:b585df1b6299bbbd16bf7c679da30389349736e4b6bc8f4f500142a75bf26ca8`).
+That image's `components` list includes the `tail_sampling` processor, so
+the stack does not add `otel-collector-contrib`. Config is
+`config/jaeger/tail-sampling.yaml`. `docker compose up` and
+`docker compose --profile tracing` do not start this service and do not
+change the other services.
+
+Do not combine `--profile tracing-tailsample` with `--profile tracing`.
+Both publish `127.0.0.1:16686` and `127.0.0.1:4318`. OTLP/gRPC `4317` stays
+unpublished. The service is DNS-aliased as `jaeger` on `rvc-net`, so the
+compose endpoint `http://jaeger:4318` reaches it when the `tracing` profile
+is off.
+
+Policy (any match keeps the trace):
+
+| Trace | Decision |
+|---|---|
+| Contains a span event named `Missed attestation deadline` | keep 100% |
+| Contains any span with status `ERROR` | keep 100% |
+| Anything else | keep 10% (`sampling_percentage: 10`) |
+
+The 10% figure is this collector's remainder rate. It is not the ADR-005
+head rate. `tracing-opentelemetry` records the warn as that span event
+only when a span is current; a warn with no current span is a log line
+only and this processor never sees it. `decision_wait` is 20s so spans
+that arrive later in the slot are present before the decision.
+
+```bash
+docker compose --profile tracing-tailsample up -d jaeger-tailsample
+```
+
+UI and query: `http://127.0.0.1:16686`. OTLP/HTTP: `http://127.0.0.1:4318`.
+Tear down with `docker compose --profile tracing-tailsample down`.
+
+Same-run check on 2026-10-04 against the pinned image (one OTLP/HTTP
+export, then `decision_wait`). Both trace ids sit in the 10% policy's
+drop bucket, so a keep is the event or status policy:
+
+| Trace | Id | Jaeger `GET /api/traces/{id}` |
+|---|---|---|
+| Span event `Missed attestation deadline` | `9e3779b97f4a7c15d1b54a32d192ed02` | 200, event present |
+| No warn event, status unset | `3c6ef372fe94f82ad1b54a32d192ed01` | 404, trace not found |
+
+The same export also sent an `ERROR`-status trace
+(`daa66d2c7ddf743fd1b54a32d192ed00`, kept) and one remainder-bucket trace
+with no warn and no error (`4e115049ec25924cd1b54a32d192ed1f`, kept). The
+collector counted 4 traces received, 3 sampled, 1 not sampled
+(`otelcol_processor_tail_sampling_global_count_traces_sampled_total`).
+
 ### With gRPC Remote Signer (rvc-signer)
 
 ```bash
