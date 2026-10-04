@@ -42,6 +42,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use observability::logging::{fields, record_display, TruncatedPubkey};
 use tonic::{Request, Response, Status};
 use tracing::{Instrument, Span};
 use tree_hash::TreeHash;
@@ -484,7 +485,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
             let block = decode_beacon_block(&r.block_ssz, r.fork_id)?;
@@ -545,7 +550,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
             let block = decode_blinded_beacon_block(&r.block_ssz, r.fork_id)?;
@@ -606,7 +615,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
             let epoch = r.epoch;
@@ -657,7 +670,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
             // EIP-7549 index-zeroing is the client's responsibility (H-2 / Phase 2).
@@ -712,7 +729,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
             let attestation = decode_attestation(&r.aggregate_ssz, r.fork_id)?;
@@ -785,7 +806,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
             let slot = r.slot;
@@ -845,7 +870,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
             let slot = r.slot;
@@ -911,7 +940,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
             let contribution = decode_sync_committee_contribution(&r.contribution_ssz, r.fork_id)?;
@@ -976,7 +1009,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let fee_recipient: [u8; 20] = r.fee_recipient.as_slice().try_into().map_err(|_| {
                 Status::invalid_argument(format!(
@@ -1040,7 +1077,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
             let epoch = r.epoch;
@@ -1100,7 +1141,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
 
             validate_transport_fork_id(r.fork_id)?;
             let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
@@ -1154,7 +1199,11 @@ impl SignerServiceV2 for SignerServiceImpl {
 
             let pubkey_bytes = validate_pubkey(&r.pubkey)?;
             let pubkey_hex_str = pubkey_hex(&pubkey_bytes);
-            Span::current().record("pubkey", pubkey_hex_str.as_str());
+            record_display(
+                &tracing::Span::current(),
+                fields::PUBKEY,
+                TruncatedPubkey::new(pubkey_hex_str.as_str()),
+            );
             Span::current().record("duty", r.duty);
 
             validate_transport_fork_id(r.fork_id)?;

@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use observability::logging::{fields, record_display, TruncatedPubkey};
 use tonic::{Request, Response, Status};
 use tracing::Span;
 use tree_hash::TreeHash;
@@ -240,7 +241,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 2. Validate fields.
         let pubkey = validate_pubkey(&r.pubkey)?;
         let pubkey_hex_str = pubkey_hex(&pubkey);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
 
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
@@ -353,7 +358,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 2. Validate.
         let pubkey = validate_pubkey(&r.pubkey)?;
         let pubkey_hex_str = pubkey_hex(&pubkey);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
 
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
@@ -459,7 +468,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 2. Validate.
         let pubkey = validate_pubkey(&r.pubkey)?;
         let pubkey_hex_str = pubkey_hex(&pubkey);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
 
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
@@ -533,7 +546,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // before the share map is consulted.
         let pubkey = validate_pubkey(&r.pubkey)?;
         let pubkey_hex_str = pubkey_hex(&pubkey);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
 
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
@@ -600,7 +617,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
         let pubkey = validate_pubkey(&r.pubkey)?;
         let pubkey_hex_str = pubkey_hex(&pubkey);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
 
         validate_transport_fork_id(r.fork_id)?;
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
@@ -698,7 +719,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
         let pubkey = validate_pubkey(&r.pubkey)?;
         let pubkey_hex_str = pubkey_hex(&pubkey);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
 
         validate_transport_fork_id(r.fork_id)?;
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
