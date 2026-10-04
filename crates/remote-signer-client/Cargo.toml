@@ -10,6 +10,9 @@ description = "Web3Signer HTTP remote signer client"
 [lints]
 workspace = true
 
+[features]
+test-utils = []
+
 [dependencies]
 async-trait.workspace = true
 crypto.workspace = true
