@@ -3,6 +3,9 @@
 # Usage:
 #   docker compose up                           # Start services (build from source)
 #   docker compose --profile tracing up -d      # Also start Jaeger v2 (UI/OTLP loopback)
+#   docker compose --profile tracing-tailsample up -d jaeger-tailsample
+#                                               # Dev/demo tail sampling (do not combine
+#                                               # with --profile tracing; same host ports)
 #   docker compose build                        # Build images only
 #   docker compose down                         # Stop and remove containers
 #
@@ -81,6 +84,33 @@ services:
       # 4317 (OTLP/gRPC) intentionally unpublished — HTTP-only by design.
     networks:
       - rvc-net
+    restart: unless-stopped
+
+  # Dev/demo tail sampling. Own profile so `docker compose up` and
+  # `--profile tracing` stay the same service set, image, and config.
+  #
+  # Same pinned Jaeger image as `jaeger`. Its `components` list includes
+  # the `tail_sampling` processor, so this profile does not add an
+  # otel-collector-contrib service. Config: config/jaeger/tail-sampling.yaml.
+  #
+  # Not a production topology. Do not enable together with `tracing`
+  # (both publish 127.0.0.1:16686 and 127.0.0.1:4318). The network alias
+  # `jaeger` lets the existing OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+  # setting reach this container when `tracing` is not also running.
+  jaeger-tailsample:
+    profiles: ["tracing-tailsample"]
+    image: cr.jaegertracing.io/jaegertracing/jaeger:2.11.0@sha256:b585df1b6299bbbd16bf7c679da30389349736e4b6bc8f4f500142a75bf26ca8
+    command: ["--config", "/tmp/tail-sampling.yaml"]
+    volumes:
+      - ./config/jaeger/tail-sampling.yaml:/tmp/tail-sampling.yaml:ro
+    ports:
+      - "127.0.0.1:16686:16686" # Jaeger UI (loopback only)
+      - "127.0.0.1:4318:4318"   # OTLP/HTTP (host-local only)
+      # 4317 (OTLP/gRPC) intentionally unpublished — HTTP-only by design.
+    networks:
+      rvc-net:
+        aliases:
+          - jaeger
     restart: unless-stopped
 
 volumes:

@@ -3,6 +3,16 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Tracing: dev/demo tail sampling profile (TRC-7c / #448)
+
+`docker compose --profile tracing-tailsample` starts the pinned Jaeger v2
+image with its built-in `tail_sampling` processor
+(`config/jaeger/tail-sampling.yaml`). Traces that contain a
+`"Missed attestation deadline"` span event, or any `ERROR` span, are kept.
+Other traces are kept at 10%. This is a local demonstration topology, not
+a production recommendation. `docker compose up` and `--profile tracing`
+are unchanged, and the in-process head sample rate stays `0.01`.
+
 ## DevNet: canonical green soak pins (DSR-3.1 / #386)
 
 Canonical fast-profile Docker soak+report archived after Phases 0–2:
