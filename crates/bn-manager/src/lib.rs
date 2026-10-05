@@ -16,7 +16,7 @@ pub mod types;
 pub use error::BnManagerError;
 pub use manager::{BnManager, ATTEMPT_TIMEOUT_FLOOR};
 #[cfg(any(test, feature = "test-utils"))]
-pub use mock::{MockBeaconNodeClient, MockMethod};
+pub use mock::{MockBeaconNodeClient, MockCallStamp, MockMethod};
 pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,

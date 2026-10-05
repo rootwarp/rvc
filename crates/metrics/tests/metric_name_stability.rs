@@ -40,6 +40,10 @@
 //! The sample is that wait on both success and timeout; a timeout is still an
 //! error. `Ok` from quiesce does not mean non-slashable duties are idle.
 //! It has no labels.
+//! RR0-07 adds `rvc_slashing_group_commit_batch_size` (family delta +1): one
+//! observation per non-empty group-commit drain. Mean batch size is
+//! `sample_sum / sample_count`. It has no labels. Dashboards that watch
+//! group-commit batching should bind this name.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -121,6 +125,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_signing_duration_seconds",
     "rvc_slashing_db_prune_total",
     "rvc_slashing_export_synthetic_records_total", // operator-facing: synthetic floors in an interchange export (RR-4.3)
+    "rvc_slashing_group_commit_batch_size", // operator-facing: reserves drained into one group-commit (RR0-07)
     "rvc_slashing_import_conflicts_total", // operator-facing: dropped interchange import rows (RR-4.2)
     "rvc_slashing_protection_checks_total",
     "rvc_slashing_prune_source_bound_raised_total", // operator-facing: prune raised an attestation source floor (RR-4.1)
@@ -236,8 +241,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        52,
-        "RR-5.1 adds rvc_keymanager_quiesce_wait_ms; count is the list length"
+        53,
+        "RR0-07 adds rvc_slashing_group_commit_batch_size; count is the list length"
     );
 }
 

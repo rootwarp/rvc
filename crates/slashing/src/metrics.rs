@@ -2,7 +2,10 @@
 
 use std::sync::LazyLock;
 
-use metrics::{define_int_counter, define_int_counter_vec, IntCounter, IntCounterVec};
+use metrics::{
+    define_int_counter, define_int_counter_vec, register_metric, Histogram, HistogramOpts,
+    IntCounter, IntCounterVec,
+};
 
 pub use metrics::definitions::{prune_type, reconcile_outcome, tx_hold_kind};
 
@@ -64,12 +67,31 @@ pub static RVC_SLASHING_EXPORT_SYNTHETIC_RECORDS_TOTAL: LazyLock<IntCounter> =
         )
     });
 
+/// Members drained by one group-commit batch.
+///
+/// `drain_batch` observes the drained length once per non-empty drain.
+/// Mean batch size is `sample_sum / sample_count`. Empty drains are not
+/// observed. This does not change reserve, commit, watermark, or PRAGMA
+/// behaviour.
+pub static RVC_SLASHING_GROUP_COMMIT_BATCH_SIZE: LazyLock<Histogram> = LazyLock::new(|| {
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "rvc_slashing_group_commit_batch_size",
+            "Number of reserves drained into one slashing group-commit batch",
+        )
+        .buckets(vec![1.0, 2.0, 4.0, 8.0, 16.0, 25.0, 32.0, 50.0, 64.0, 128.0]),
+    )
+    .unwrap_or_else(|e| panic!("Failed to create rvc_slashing_group_commit_batch_size: {e}"));
+    register_metric("rvc_slashing_group_commit_batch_size", histogram)
+});
+
 pub fn init() {
     LazyLock::force(&RVC_SLASHING_DB_PRUNE_TOTAL);
     LazyLock::force(&RVC_SLASHING_RECONCILE_TOTAL);
     LazyLock::force(&RVC_SLASHING_PRUNE_SOURCE_BOUND_RAISED_TOTAL);
     LazyLock::force(&RVC_SLASHING_IMPORT_CONFLICTS_TOTAL);
     LazyLock::force(&RVC_SLASHING_EXPORT_SYNTHETIC_RECORDS_TOTAL);
+    LazyLock::force(&RVC_SLASHING_GROUP_COMMIT_BATCH_SIZE);
 }
 
 #[cfg(test)]

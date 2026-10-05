@@ -443,7 +443,11 @@ impl SlashingDb {
             }
         }
         let n = q.len().min(batch_size);
-        q.drain(..n).collect()
+        let drained: Vec<QueuedReserve> = q.drain(..n).collect();
+        if !drained.is_empty() {
+            crate::metrics::RVC_SLASHING_GROUP_COMMIT_BATCH_SIZE.observe(drained.len() as f64);
+        }
+        drained
     }
 
     fn commit_batch(&self, batch: Vec<QueuedReserve>) {
