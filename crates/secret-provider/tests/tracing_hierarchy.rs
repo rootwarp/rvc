@@ -9,6 +9,7 @@ fn make_raw_key_entry(
     id: &str,
     sk: &SecretKey,
 ) -> (SecretKeyEntry, Result<KeyMaterial, rvc_secret_provider::SecretProviderError>) {
+    #[allow(clippy::disallowed_methods)] // test-only comparison of key material already in scope
     let bytes: [u8; 32] = sk.to_bytes();
     (
         SecretKeyEntry { id: id.to_string(), pubkey_hex: None },
@@ -16,8 +17,10 @@ fn make_raw_key_entry(
     )
 }
 
+type CapturedSpan = (String, Option<String>);
+
 struct HierarchyCapture {
-    spans: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    spans: Arc<Mutex<Vec<CapturedSpan>>>,
 }
 
 impl<S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>>
