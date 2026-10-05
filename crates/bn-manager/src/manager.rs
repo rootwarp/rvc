@@ -3843,7 +3843,20 @@ mod tests {
                 "with_op_timeout must not enclose query_first or query_first_prefer_some:\n{call}"
             );
         }
-        assert_eq!(production.matches("// no budget:").count(), 9);
+        let no_budget_sites: Vec<String> = production
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains("// no budget:"))
+            .map(|(index, _)| format!("manager.rs:{}", index + 1))
+            .collect();
+        let expected_no_budget_sites = 10;
+        let actual_no_budget_sites = no_budget_sites.len();
+        let sites = no_budget_sites.join(", ");
+        assert_eq!(
+            actual_no_budget_sites,
+            expected_no_budget_sites,
+            "expected {expected_no_budget_sites} `// no budget:` markers, found {actual_no_budget_sites}: {sites}"
+        );
         assert_eq!(
             production.matches("tokio::time::Instant::now() + budget").count(),
             12,
