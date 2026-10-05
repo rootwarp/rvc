@@ -362,12 +362,12 @@ flowchart TD
     A[Slot start, validator is proposer] --> B[Sign RANDAO reveal<br/>DOMAIN_RANDAO]
     B --> C[produce_block_v3<br/>graffiti, builder_boost_factor]
     C --> D{Blinded?}
-    D -->|Yes| E[SlashingDb<br/>stage_block]
+    D -->|Yes| E["SlashingDb reserve_block (commit, then release conn)"]
     D -->|No| E
     E -->|Slashable| X1[REJECT: DoubleProposal]
-    E -->|Safe| F[Sign block<br/>DOMAIN_BEACON_PROPOSER]
-    F --> G[commit staged block in SlashingDb]
-    G --> H{Blinded?}
+    E -->|Safe| F[Sign block<br/>DOMAIN_BEACON_PROPOSER<br/>per-pubkey lock held]
+    F -->|Signed| H{Blinded?}
+    F -->|Discard unsigned| G["reconcile reservation (per-pubkey lock held throughout)"]
     H -->|Yes| I[publish_blinded_block<br/>broadcast to all BNs]
     H -->|No| J[publish_block<br/>broadcast to all BNs]
 
@@ -375,6 +375,8 @@ flowchart TD
     style I fill:#51cf66,color:#fff
     style J fill:#51cf66,color:#fff
 ```
+
+`sign_block` reserves with `SlashingDb::reserve_block`, which commits the slashing row and releases the SQLite connection before the BLS sign. The per-pubkey `OwnedMutexGuard` is moved into `spawn_blocking` (`core.rs:1013` and `core.rs:1066` in `crates/signer/src/core.rs`) and stays held through reserve, the sign, and any reconcile. A signed block is published with that row already committed. An unsigned outcome under `DiscardStagedRow` (in-process) reconciles the reservation while the same lock is still held. `RetainStagedRow` (remote-capable) leaves the committed row.
 
 ## Signing Flow
 

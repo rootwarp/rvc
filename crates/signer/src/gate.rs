@@ -55,33 +55,35 @@
 //! implementation (e.g. `ForwardWindowMachine`) returns `false`, matching the
 //! fail-closed default `<bool as FailClosedDefault>::default_when_unknown()` = `false`.
 //!
-//! # Cancellation safety and the true double-sign authoritative lock
+//! # Cancellation safety and the sign-span lock
 //!
-//! The per-pubkey `OwnedMutexGuard` (tokio async lock) is held on the *async*
-//! task until `spawn_blocking(...).await` completes.  **If the caller drops the
-//! future mid-flight at that `.await` point, the tokio lock is released while
-//! the blocking task continues to run.**
+//! [`crate::core::sign_slashable`] acquires the per-pubkey `OwnedMutexGuard` and moves it into
+//! `tokio::task::spawn_blocking`.  The acquire-site comment is `core.rs:1013`; the closure that
+//! keeps the guard (`let _guard = guard`) starts at `core.rs:1066`.  That blocking task owns the
+//! guard for the whole reserve → sign → reconcile body.  Dropping the caller future while it
+//! waits on `spawn_blocking(...).await` leaves the guard on the blocking task until the body
+//! returns, so the same pubkey stays serialized for the in-flight sign.
 //!
-//! This is safe because the AUTHORITATIVE double-sign serializer is the
-//! `parking_lot::MutexGuard<Connection>` held inside the `StagedBlock` /
-//! `StagedAttestation` guard: it owns a `BEGIN IMMEDIATE` SQLite transaction that
-//! keeps all other writers out of the database until `commit()` or `discard()` is
-//! called.  The blocked task therefore still has exclusive DB access; it will
-//! complete (commit or rollback) atomically regardless of the caller's state.
-//! The per-pubkey tokio lock provides an *additional* latency benefit — it avoids
-//! queuing multiple blocking tasks for the same pubkey — but the no-double-sign
-//! invariant is upheld by SQLite even if that outer lock is lost to cancellation.
+//! `reserve_block` / `reserve_attestation` COMMIT the history row and release the SQLite
+//! connection mutex before the BLS call (`SlashingDb::reserve_block` in
+//! `crates/slashing/src/stage.rs`; production order is `SlashableSignSession::reserve_then_sign`
+//! in `core.rs` at lines 517-549).  From that COMMIT until the blocking body returns, the
+//! per-pubkey lock is the sign-span serializer.  A wedged signer blocks only that pubkey, inside
+//! `tokio::time::timeout`.
 //!
-//! # Signer timeout (BUG-003)
+//! # Signer timeout
 //!
-//! The staging guard holds the SQLite single-writer `parking_lot::MutexGuard`
-//! across the stage→sign→commit window.  A wedged signer would hold this write
-//! lock indefinitely, causing a signing blackout for ALL validators (they queue
-//! behind the same lock).  The gate therefore wraps the sign call in a
-//! `tokio::time::timeout`; on expiry with the gate's `DiscardStagedRow` policy
-//! the staged guard is discarded (ROLLBACK) and
-//! `Err(SigningFailed("signer timed out"))` is returned.  The default is 4 seconds
-//! (well under a 12-second Ethereum slot).  Configure with `with_sign_timeout`.
+//! The BLS call is bounded by `sign_timeout` (default [`DEFAULT_SIGN_TIMEOUT`], 4 seconds) inside
+//! `reserve_then_sign`.  Expiry returns `Err(SigningFailed("signer timed out"))`.  The reserved
+//! row is already committed, so the outcome follows [`TimeoutPolicy`]:
+//!
+//! - [`TimeoutPolicy::DiscardStagedRow`] — this gate, for in-process backends.  Reconcile the row
+//!   with `reconcile_unsigned`.  A failed delete retains the row.
+//! - [`TimeoutPolicy::RetainStagedRow`] — remote-capable backends (`SignerService` maps
+//!   `BackendKind::Remote` and `Unknown` here).  Leave the committed row in place.  This gate
+//!   always passes [`TimeoutPolicy::DiscardStagedRow`].
+//!
+//! Configure the bound with `with_sign_timeout`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -131,8 +133,9 @@ pub struct SigningGate {
     locks: Arc<ValidatorLockMap>,
     /// Maximum wall-clock duration allowed for a single BLS sign call.
     ///
-    /// Expiry is handled by the slashable core's [`TimeoutPolicy`] (gate uses
-    /// discard-on-timeout → ROLLBACK) and returns
+    /// Expiry is handled by the slashable core's [`TimeoutPolicy`].  This gate
+    /// passes [`TimeoutPolicy::DiscardStagedRow`], which reconciles the
+    /// already-committed reservation, and returns
     /// `Err(SigningFailed("signer timed out"))`.  Defaults to 4 seconds.
     sign_timeout: Duration,
 }
