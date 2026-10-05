@@ -38,3 +38,6 @@ serde_json = { workspace = true }
 wiremock = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }
+# RR0-05: `tokio::time::pause` / `start_paused` for the mock request-delay test.
+# `test-util` is not part of tokio's `full` feature.
+tokio = { workspace = true, features = ["test-util"] }
