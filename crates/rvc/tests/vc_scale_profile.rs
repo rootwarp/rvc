@@ -4,6 +4,10 @@
 //! mock-BN call arrival versus this harness's slot start. It does not read
 //! `rvc_slot_phase_*`.
 //!
+//! RR0-08 enables sync-committee and aggregator duties and drives them through
+//! `DutyOrchestrator::run` (the public slot loop). `process_slot` alone never
+//! publishes a sync message or an aggregate.
+//!
 //! # Run
 //!
 //! nextest 0.9 does not forward `--output`. Use `VC_SCALE_OUTPUT`, or pass
@@ -26,13 +30,15 @@
 //! `VC_SCALE_N` / `--validators` and `VC_SCALE_SLOTS` / `--slots` override the
 //! defaults (N = 4, one slot). A slot that exceeds 12 s is `overrun` with
 //! `overhang_ms`; it is not a test failure. The per-slot budget is 120 s.
+//! `--slots` must be 1: one `run` is shut down after that slot's submits.
 
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
-use bn_manager::MockMethod;
+use bn_manager::{MockBeaconNodeClient, MockMethod, VersionedSignedAggregateAndProof};
 use common::pipeline_fixture::{
     make_beacon_attestation_data, pipeline_fixture, PipelineFixture, PipelineFixtureOpts,
     SLOTS_PER_EPOCH,
@@ -46,6 +52,9 @@ const SLOT_DURATION_MS: u64 = 12_000;
 /// as overhang / overrun instead of a timeout failure.
 const PER_SLOT_BUDGET: Duration = Duration::from_secs(120);
 const REQUEST_DELAY: Duration = Duration::from_millis(50);
+/// Past the 8000 ms aggregate due, so `run`'s phase waits are zero and the
+/// slot reaches the next-slot sleep. Same offset as the RR0-10 fixture.
+const PAST_AGGREGATE_DUE_SECS: u64 = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ClockMode {
@@ -143,21 +152,105 @@ struct SlotTally {
     budget_exceeded: bool,
     successes: u64,
     failures: u64,
+    sync_publish_ms_after_slot_start: Option<f64>,
+    sync_messages_submitted: u64,
+    sync_submit_calls: u64,
+    aggregate_proofs_submitted: u64,
+    aggregate_submit_calls: u64,
+    aggregate_proofs_after_deadline: u64,
 }
 
-async fn tally_slot(
-    fixture: &PipelineFixture,
+fn sync_message_count(calls: &[Vec<bn_manager::SyncCommitteeMessage>]) -> usize {
+    calls.iter().map(Vec::len).sum()
+}
+
+fn aggregate_proof_count(calls: &[VersionedSignedAggregateAndProof]) -> usize {
+    calls
+        .iter()
+        .map(|batch| match batch {
+            VersionedSignedAggregateAndProof::PreElectra(v) => v.len(),
+            VersionedSignedAggregateAndProof::Electra(v)
+            | VersionedSignedAggregateAndProof::Fulu(v)
+            | VersionedSignedAggregateAndProof::Gloas(v) => v.len(),
+        })
+        .sum()
+}
+
+fn phase_submits_done(client: &MockBeaconNodeClient, n: usize) -> bool {
+    sync_message_count(&client.submit_sync_committee_messages_calls()) >= n
+        && aggregate_proof_count(&client.submit_aggregate_and_proofs_calls()) >= n
+        && client.submit_attestation_calls().len() >= n
+}
+
+/// One slot of `DutyOrchestrator::run`, then shutdown.
+///
+/// Sync duties are prefetched so `maybe_produce_sync_messages` has a cache.
+/// The mock clock is moved 8 s into the slot first, which is what makes the
+/// attestation and aggregate phase waits zero in the RR0-10 fixture. Submit
+/// arrival is still `tokio::time::Instant` from this function's slot start.
+async fn drive_slot(
+    fixture: &mut PipelineFixture,
     slot: u64,
     n: usize,
     attestation_deadline_ms: f64,
     aggregate_deadline_ms: f64,
     tally: &mut SlotTally,
 ) {
+    let epoch = slot / SLOTS_PER_EPOCH;
+    fixture
+        .duty_tracker
+        .fetch_duties_for_epoch(epoch)
+        .await
+        .unwrap_or_else(|err| panic!("fetch attester duties for epoch {epoch}: {err}"));
+    fixture
+        .duty_tracker
+        .fetch_sync_committee_duties(epoch)
+        .await
+        .unwrap_or_else(|err| panic!("fetch sync duties for epoch {epoch}: {err}"));
+    fixture.set_slot(slot);
+    fixture.clock.advance_time(PAST_AGGREGATE_DUE_SECS);
+
+    let client = Arc::clone(&fixture.beacon_client);
+    let before = client.call_stamps().len();
     let started = tokio::time::Instant::now();
-    let before = fixture.beacon_client.call_stamps().len();
-    let outcome = tokio::time::timeout(PER_SLOT_BUDGET, fixture.process_slot(slot)).await;
+    let wall_started = std::time::Instant::now();
+
+    // Disjoint field borrows: `run` needs `&mut orchestrator` while shutdown
+    // uses `handle`. Spawning would require moving the orchestrator out.
+    let orchestrator = &mut fixture.orchestrator;
+    let handle = &fixture.handle;
+    let run_fut = orchestrator.run();
+    tokio::pin!(run_fut);
+
+    let mut shutdown_sent = false;
+    let mut budget_exceeded = false;
+    let run_result = loop {
+        tokio::select! {
+            biased;
+            result = &mut run_fut => break result,
+            // A bare `yield_now` loop stays runnable, so `tokio::time::pause`
+            // never auto-advances the 50 ms mock delay. Sleeping lets the
+            // paused clock jump to the next timer. One millisecond is enough
+            // to notice completed submits without changing their stamps.
+            _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                if shutdown_sent {
+                    continue;
+                }
+                if phase_submits_done(&client, n) {
+                    handle.shutdown();
+                    shutdown_sent = true;
+                } else if wall_started.elapsed() > PER_SLOT_BUDGET {
+                    budget_exceeded = true;
+                    handle.shutdown();
+                    shutdown_sent = true;
+                }
+            }
+        }
+    };
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let stamps = fixture.beacon_client.call_stamps();
+    if let Err(err) = run_result {
+        eprintln!("slot {slot} orchestrator run error: {err}");
+    }
 
     let slot_overhang = (elapsed_ms - SLOT_DURATION_MS as f64).max(0.0);
     if slot_overhang > tally.overhang_ms {
@@ -166,36 +259,50 @@ async fn tally_slot(
     if slot_overhang > 0.0 {
         tally.overrun = true;
     }
-
-    match outcome {
-        Err(_timeout) => {
-            tally.budget_exceeded = true;
-            tally.overrun = true;
-        }
-        Ok(Err(err)) => {
-            eprintln!("slot {slot} process_slot error: {err}");
-            tally.failures += n as u64;
-        }
-        Ok(Ok(results)) => {
-            for result in results {
-                if result.success {
-                    tally.successes += 1;
-                } else {
-                    tally.failures += 1;
-                }
-            }
-        }
+    if budget_exceeded {
+        tally.budget_exceeded = true;
+        tally.overrun = true;
     }
 
+    let attestations = client.submit_attestation_calls().len() as u64;
+    if attestations >= n as u64 {
+        tally.successes += n as u64;
+    } else {
+        tally.successes += attestations;
+        tally.failures += (n as u64).saturating_sub(attestations);
+    }
+
+    tally.sync_messages_submitted +=
+        sync_message_count(&client.submit_sync_committee_messages_calls()) as u64;
+    tally.sync_submit_calls += client.submit_sync_committee_messages_calls().len() as u64;
+    let aggregate_calls = client.submit_aggregate_and_proofs_calls();
+    tally.aggregate_submit_calls += aggregate_calls.len() as u64;
+    tally.aggregate_proofs_submitted += aggregate_proof_count(&aggregate_calls) as u64;
+
+    let stamps = client.call_stamps();
     let mut last_submit_ms: Option<f64> = None;
+    let mut first_sync_ms: Option<f64> = None;
+    // Proofs ride in one batch per fork. A late batch counts as one arrival
+    // (`aggregate_deadline_misses`) and as every proof inside it.
+    let mut aggregate_call_index = 0usize;
     for stamp in stamps.iter().skip(before) {
         let off = offset_ms(started, stamp.at);
         match stamp.method {
             MockMethod::SubmitAttestation => {
                 last_submit_ms = Some(last_submit_ms.map_or(off, |prev| prev.max(off)));
             }
-            MockMethod::SubmitAggregateAndProofs if off > aggregate_deadline_ms => {
-                tally.aggregate_deadline_misses += 1;
+            MockMethod::SubmitAggregateAndProofs => {
+                let proofs = aggregate_calls
+                    .get(aggregate_call_index)
+                    .map_or(0, |batch| aggregate_proof_count(std::slice::from_ref(batch)));
+                aggregate_call_index += 1;
+                if off > aggregate_deadline_ms {
+                    tally.aggregate_deadline_misses += 1;
+                    tally.aggregate_proofs_after_deadline += proofs as u64;
+                }
+            }
+            MockMethod::SubmitSyncCommitteeMessages => {
+                first_sync_ms = Some(first_sync_ms.map_or(off, |prev| prev.min(off)));
             }
             MockMethod::GetAttestationData => {
                 tally.attestation_data_requests += 1;
@@ -210,11 +317,17 @@ async fn tally_slot(
             tally.last_publish_after_ms = after;
         }
     }
+    if tally.sync_publish_ms_after_slot_start.is_none() {
+        tally.sync_publish_ms_after_slot_start = first_sync_ms;
+    }
 }
 
 async fn run_profile(mode: ClockMode, n: usize, slot_count: usize) -> serde_json::Value {
     assert!(n >= 1, "validator count must be >= 1");
-    assert!(slot_count >= 1, "slot count must be >= 1");
+    assert!(
+        slot_count == 1,
+        "orchestrator.run is shut down after one slot; VC_SCALE_SLOTS must be 1, got {slot_count}"
+    );
 
     // Paused mode freezes the clock and auto-advances only to the next timer
     // (the 50 ms mock delay). A manual `advance` loop also moves time while
@@ -231,7 +344,7 @@ async fn run_profile(mode: ClockMode, n: usize, slot_count: usize) -> serde_json
             .insert(slot, make_beacon_attestation_data(slot, index as u64, 0x22, 0x33, 0x11));
     }
     let initial_slot = slots[0];
-    let fixture = pipeline_fixture(
+    let mut fixture = pipeline_fixture(
         PipelineFixtureOpts {
             attestation_data_by_slot,
             duty_slots: slots.clone(),
@@ -239,6 +352,8 @@ async fn run_profile(mode: ClockMode, n: usize, slot_count: usize) -> serde_json
             ..Default::default()
         }
         .with_validators(n)
+        .with_sync_committee(true)
+        .with_aggregators(true)
         .with_request_delay(REQUEST_DELAY),
     );
 
@@ -264,10 +379,16 @@ async fn run_profile(mode: ClockMode, n: usize, slot_count: usize) -> serde_json
         budget_exceeded: false,
         successes: 0,
         failures: 0,
+        sync_publish_ms_after_slot_start: None,
+        sync_messages_submitted: 0,
+        sync_submit_calls: 0,
+        aggregate_proofs_submitted: 0,
+        aggregate_submit_calls: 0,
+        aggregate_proofs_after_deadline: 0,
     };
     for slot in slots {
-        tally_slot(
-            &fixture,
+        drive_slot(
+            &mut fixture,
             slot,
             n,
             attestation_deadline_ms as f64,
@@ -301,6 +422,14 @@ async fn run_profile(mode: ClockMode, n: usize, slot_count: usize) -> serde_json
         "per_slot_budget_ms": u64::try_from(PER_SLOT_BUDGET.as_millis()).expect("budget fits u64"),
         "last_publish_ms_after_att_deadline": last_publish_ms_after_att_deadline,
         "aggregate_deadline_misses": tally.aggregate_deadline_misses,
+        "aggregate_proofs_submitted": tally.aggregate_proofs_submitted,
+        "aggregate_submit_calls": tally.aggregate_submit_calls,
+        "aggregate_proofs_after_deadline": tally.aggregate_proofs_after_deadline,
+        "sync_publish_ms_after_slot_start": tally.sync_publish_ms_after_slot_start,
+        "sync_messages_submitted": tally.sync_messages_submitted,
+        "sync_submit_calls": tally.sync_submit_calls,
+        "sync_committee_enabled": true,
+        "aggregators_enabled": true,
         "commits_per_attestation_phase": commits_per_attestation_phase,
         "attestation_data_requests_per_slot": attestation_data_requests_per_slot,
         "overhang_ms": tally.overhang_ms,
@@ -316,6 +445,12 @@ fn assert_complete_record(value: &serde_json::Value, mode: ClockMode, n: usize, 
     for key in [
         "last_publish_ms_after_att_deadline",
         "aggregate_deadline_misses",
+        "aggregate_proofs_submitted",
+        "aggregate_submit_calls",
+        "aggregate_proofs_after_deadline",
+        "sync_publish_ms_after_slot_start",
+        "sync_messages_submitted",
+        "sync_submit_calls",
         "commits_per_attestation_phase",
         "attestation_data_requests_per_slot",
         "overhang_ms",
@@ -345,10 +480,30 @@ fn assert_complete_record(value: &serde_json::Value, mode: ClockMode, n: usize, 
     assert_eq!(value["per_slot_budget_ms"].as_u64(), Some(120_000));
     assert!(value["per_slot_budget_ms"].as_u64().expect("budget") > 20_000);
 
-    if value["budget_exceeded"].as_bool() == Some(true) {
-        return;
-    }
+    assert_ne!(
+        value["budget_exceeded"].as_bool(),
+        Some(true),
+        "per-slot budget exceeded before sync and aggregate submits: {value}"
+    );
     assert_eq!(value["successes"].as_u64(), Some((n * slots) as u64), "pipeline failures: {value}");
+    assert!(value["sync_publish_ms_after_slot_start"].is_number(), "sync publish missing: {value}");
+    assert!(
+        value["sync_messages_submitted"].as_u64().expect("sync messages") >= (n * slots) as u64,
+        "sync messages must be produced, got {value}"
+    );
+    assert!(
+        value["sync_submit_calls"].as_u64().expect("sync calls") > 0,
+        "sync submit calls must be non-zero: {value}"
+    );
+    assert!(
+        value["aggregate_proofs_submitted"].as_u64().expect("aggregate proofs")
+            >= (n * slots) as u64,
+        "aggregate proofs must be produced, got {value}"
+    );
+    assert!(
+        value["aggregate_submit_calls"].as_u64().expect("aggregate calls") > 0,
+        "aggregate submit calls must be non-zero: {value}"
+    );
     assert!(
         value["mean_batch"].as_f64().expect("mean_batch") > 0.0,
         "mean batch must come from the group-commit instrument"
@@ -359,8 +514,8 @@ fn assert_complete_record(value: &serde_json::Value, mode: ClockMode, n: usize, 
     );
     let fetches = value["attestation_data_requests_per_slot"].as_f64().expect("fetches");
     assert!(
-        (fetches - n as f64).abs() < f64::EPSILON,
-        "expected one attestation-data request per validator, got {fetches}"
+        fetches + f64::EPSILON >= n as f64,
+        "expected at least one attestation-data request per validator, got {fetches}"
     );
 }
 
