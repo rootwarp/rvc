@@ -219,8 +219,20 @@ pub struct MockBeaconNodeClient {
     request_delay: Duration,
     /// Per-method override. A present key wins over `request_delay`, including zero.
     method_delays: HashMap<MockMethod, Duration>,
+    /// One stamp per role-trait entry, taken before [`Self::charge`] sleeps.
+    arrivals: Mutex<Vec<MockCallStamp>>,
     /// When this returns `Some`, `get_attestation_data` fails that call and skips the handler.
     get_attestation_data_error: Option<AttestationDataErrorInject>,
+}
+
+/// Arrival of one role-trait call, before the injected request delay.
+///
+/// [`tokio::time::Instant`] follows `pause` / `advance`, so a paused-clock
+/// harness and a wall-clock harness share this stamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MockCallStamp {
+    pub method: MockMethod,
+    pub at: tokio::time::Instant,
 }
 
 impl MockBeaconNodeClient {
@@ -249,7 +261,16 @@ impl MockBeaconNodeClient {
         self.method_delays.get(&method).copied().unwrap_or(self.request_delay)
     }
 
+    /// Stamps recorded since the client was built, in arrival order.
+    pub fn call_stamps(&self) -> Vec<MockCallStamp> {
+        self.arrivals.lock().expect("mock arrival log poisoned").clone()
+    }
+
     async fn charge(&self, method: MockMethod) {
+        self.arrivals
+            .lock()
+            .expect("mock arrival log poisoned")
+            .push(MockCallStamp { method, at: tokio::time::Instant::now() });
         let delay = self.effective_delay(method);
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;

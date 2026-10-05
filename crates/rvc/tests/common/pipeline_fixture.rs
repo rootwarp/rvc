@@ -21,7 +21,9 @@ use beacon::{
 use block_service::{
     BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse as BlockProdResp,
 };
-use bn_manager::{AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, Propagator};
+use bn_manager::{
+    AttestationApi, AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, Propagator,
+};
 use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
 use doppelganger::SigningEnablement;
 use duty_tracker::DutyTracker;
@@ -121,11 +123,28 @@ pub fn make_attester_duty(pubkey_hex: &str, slot: Slot) -> AttesterDuty {
 pub struct RecordingSubmitter {
     batch_count: AtomicUsize,
     signature_count: AtomicUsize,
+    /// When set, attestation publish is a mock-BN `submit_attestation` so
+    /// request delay and call-arrival stamps apply. `None` returns success
+    /// locally, which is the historical fixture path.
+    forward: Option<Arc<MockBeaconNodeClient>>,
 }
 
 impl RecordingSubmitter {
     pub fn new() -> Self {
-        Self { batch_count: AtomicUsize::new(0), signature_count: AtomicUsize::new(0) }
+        Self {
+            batch_count: AtomicUsize::new(0),
+            signature_count: AtomicUsize::new(0),
+            forward: None,
+        }
+    }
+
+    /// Count the publish, then send it through `client`.
+    fn forwarding(client: Arc<MockBeaconNodeClient>) -> Self {
+        Self {
+            batch_count: AtomicUsize::new(0),
+            signature_count: AtomicUsize::new(0),
+            forward: Some(client),
+        }
     }
 
     pub fn batch_count(&self) -> usize {
@@ -157,7 +176,14 @@ impl AttestationSubmitter for RecordingSubmitter {
         };
         self.batch_count.fetch_add(1, Ordering::SeqCst);
         self.signature_count.fetch_add(n, Ordering::SeqCst);
-        Box::pin(async { Ok(SubmitAttestationResult::Success) })
+        if let Some(client) = &self.forward {
+            let client = Arc::clone(client);
+            Box::pin(
+                async move { AttestationApi::submit_attestation(&*client, attestations).await },
+            )
+        } else {
+            Box::pin(async { Ok(SubmitAttestationResult::Success) })
+        }
     }
 }
 
@@ -530,16 +556,24 @@ impl Default for PipelineFixtureOpts {
 /// [`PipelineFixtureOpts::with_validators`] sets it; passing opts alone is
 /// one validator. Sync-committee and aggregator modes default to off and are
 /// set with [`Self::with_sync_committee`] and [`Self::with_aggregators`].
+/// [`Self::with_request_delay`] forwards to [`MockBeaconNodeClient::with_request_delay`].
 pub struct PreparedPipelineFixture {
     opts: PipelineFixtureOpts,
     validator_count: usize,
     sync_committee: bool,
     aggregators: bool,
+    request_delay: Duration,
 }
 
 impl From<PipelineFixtureOpts> for PreparedPipelineFixture {
     fn from(opts: PipelineFixtureOpts) -> Self {
-        Self { opts, validator_count: 1, sync_committee: false, aggregators: false }
+        Self {
+            opts,
+            validator_count: 1,
+            sync_committee: false,
+            aggregators: false,
+            request_delay: Duration::ZERO,
+        }
     }
 }
 
@@ -555,6 +589,7 @@ impl PipelineFixtureOpts {
             validator_count: n,
             sync_committee: false,
             aggregators: false,
+            request_delay: Duration::ZERO,
         }
     }
 }
@@ -575,6 +610,17 @@ impl PreparedPipelineFixture {
     /// modulo 1), not a second duty API.
     pub fn with_aggregators(mut self, enabled: bool) -> Self {
         self.aggregators = enabled;
+        self
+    }
+
+    /// Charge `delay` on every mock-BN role-trait call.
+    ///
+    /// A non-zero delay calls [`MockBeaconNodeClient::with_request_delay`] and
+    /// routes attestation publish through that mock, so submit arrival is a
+    /// mock-BN call under the same delay. Zero keeps the local success
+    /// submitter and does not change existing fixtures.
+    pub fn with_request_delay(mut self, delay: Duration) -> Self {
+        self.request_delay = delay;
         self
     }
 }
@@ -637,8 +683,13 @@ impl PipelineFixture {
 /// This is the RF1-02 / RF1-08 shared fixture contract — keep knobs on
 /// [`PipelineFixtureOpts`], not inlined inside individual tests.
 pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFixture {
-    let PreparedPipelineFixture { opts, validator_count, sync_committee, aggregators } =
-        opts.into();
+    let PreparedPipelineFixture {
+        opts,
+        validator_count,
+        sync_committee,
+        aggregators,
+        request_delay,
+    } = opts.into();
     assert!(
         validator_count >= 1,
         "pipeline_fixture: validator_count must be >= 1, got {validator_count}"
@@ -663,7 +714,7 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
             let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
             finish_fixture(
-                FixtureBuild { opts, sync_committee, aggregators },
+                FixtureBuild { opts, sync_committee, aggregators, request_delay },
                 composite,
                 pubkey,
                 pubkey_hex,
@@ -684,7 +735,7 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
             }
             let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
             finish_fixture(
-                FixtureBuild { opts, sync_committee, aggregators },
+                FixtureBuild { opts, sync_committee, aggregators, request_delay },
                 composite,
                 pubkey,
                 pubkey_hex,
@@ -709,7 +760,7 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
 
         finish_fixture(
-            FixtureBuild { opts, sync_committee, aggregators },
+            FixtureBuild { opts, sync_committee, aggregators, request_delay },
             composite,
             pubkey,
             pubkey_hex,
@@ -725,6 +776,7 @@ struct FixtureBuild {
     opts: PipelineFixtureOpts,
     sync_committee: bool,
     aggregators: bool,
+    request_delay: Duration,
 }
 
 fn finish_fixture(
@@ -736,7 +788,7 @@ fn finish_fixture(
     preload: bool,
     seeded: Vec<FixtureAttester>,
 ) -> PipelineFixture {
-    let FixtureBuild { opts, sync_committee, aggregators } = build;
+    let FixtureBuild { opts, sync_committee, aggregators, request_delay } = build;
     // An empty `seeded` vec is the single-validator constructor. N > 1 passes
     // one entry per validator, so the length is the count.
     let validator_count = if seeded.is_empty() { 1 } else { seeded.len() };
@@ -771,7 +823,13 @@ fn finish_fixture(
         beacon = beacon.with_attesters(beacon_attesters);
     }
     let beacon = Arc::new(beacon);
-    let beacon_client = Arc::new(beacon.build_client());
+    let mut raw_client = beacon.build_client();
+    if !request_delay.is_zero() {
+        raw_client = raw_client
+            .with_submit_attestation(|_| Ok(SubmitAttestationResult::Success))
+            .with_request_delay(request_delay);
+    }
+    let beacon_client = Arc::new(raw_client);
     let beacon_node: Arc<dyn BeaconNodeClient> = beacon_client.clone();
 
     let indices = if validator_count == 1 {
@@ -781,7 +839,11 @@ fn finish_fixture(
     };
     let duty_tracker = Arc::new(DutyTracker::new(Arc::clone(&beacon_node), indices));
 
-    let submitter = Arc::new(RecordingSubmitter::new());
+    let submitter = Arc::new(if request_delay.is_zero() {
+        RecordingSubmitter::new()
+    } else {
+        RecordingSubmitter::forwarding(Arc::clone(&beacon_client))
+    });
     let propagator = Arc::new(Propagator::new(Arc::clone(&submitter) as Arc<RecordingSubmitter>));
 
     let mut map = HashMap::new();
