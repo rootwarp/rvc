@@ -70,6 +70,9 @@ jobs:
       - name: Run clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+      - name: Run clippy (all features)
+        run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
+
       - name: Run clippy (dvt feature — Gate 1 secret-sink coverage)
         run: cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings
 
