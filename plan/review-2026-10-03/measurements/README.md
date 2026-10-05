@@ -19,7 +19,8 @@ comparable to a paused-clock GREEN, and the reverse is not comparable either.
 | Overhang (`overhang_ms`, and `overrun` when the slot ran past 12 s) | **wall** |
 | Attestation-data fetch count (`attestation_data_requests_per_slot`) | **paused** |
 | Mean group-commit batch (`mean_batch`) and commits per attestation phase (`commits_per_attestation_phase`) | **paused** |
-| Sync-start offset (first sync-committee mock-BN arrival versus the harness slot start, when a later run enables sync) | **paused** |
+| Sync-publish offset (`sync_publish_ms_after_slot_start`, first `SubmitSyncCommitteeMessages` stamp versus the harness slot start) | **paused** |
+| Sync messages submitted and aggregate proofs submitted | **paused** |
 
 Latency figures come from a wall-clock run. Counts and ordering come from a
 paused-clock run. Both modes write the same JSON keys; keep the cell that
@@ -27,13 +28,15 @@ this table names.
 
 Timing is mock-BN call arrival versus the harness slot start
 (`MockBeaconNodeClient` stamps, `tokio::time::Instant`). Do not read
-`rvc_slot_phase_*` — on `MockSlotClock` those samples are ~0.
+`rvc_slot_phase_*`. That histogram is `MockSlotClock` time. This harness
+advances that clock 8 s before `run`, so a sample is 8000 ms of mock time,
+not the wall overrun.
 
 ## Scenario
 
 | Knob | Value |
 |---|---|
-| Driver | `PipelineFixture::process_slot` |
+| Driver | `DutyOrchestrator::run` after prefetch of attester and sync duties, with `with_sync_committee(true)` and `with_aggregators(true)`. `VC_SCALE_SLOTS` must be 1 |
 | Validators | `VC_SCALE_N` / `--validators` (record default N = 4; scale runs use their own N) |
 | Slots | `VC_SCALE_SLOTS` / `--slots` (default 1). Each slot is the first slot of a new epoch so slashing protection accepts the vote |
 | Mock BN delay | `with_request_delay(50 ms)` on every role-trait call, including attestation publish |
@@ -42,20 +45,23 @@ Timing is mock-BN call arrival versus the harness slot start
 | Per-slot budget | **120_000 ms**. A slot of about 20 s (N = 200 at this delay) finishes inside the budget. Time past 12 s is `overhang_ms` and `overrun: true`. It is not a test failure. A slot that hits the 120 s budget sets `budget_exceeded` and is still recorded, not failed |
 
 `aggregate_deadline_misses` counts `SubmitAggregateAndProofs` arrivals whose
-offset from the harness slot start is greater than 8000 ms. This driver does
-not run the aggregation phase, so the count stays 0 until a later run produces
-aggregates. `last_publish_ms_after_att_deadline` is the worst slot's last
-`SubmitAttestation` arrival minus 3999 ms (negative means the publish landed
-before the attestation deadline).
+offset from the harness slot start is greater than 8000 ms. The harness enables
+`with_sync_committee(true)` and `with_aggregators(true)` and drives
+`DutyOrchestrator::run`, so a 0 is "no late aggregate submit", not "nothing
+aggregated". `aggregate_proofs_submitted` and `sync_messages_submitted` are the
+proof and message counts inside those submits. `last_publish_ms_after_att_deadline`
+is the worst slot's last `SubmitAttestation` arrival minus 3999 ms (negative
+means the publish landed before the attestation deadline).
 
 `commits_per_attestation_phase` and `mean_batch` are read from
 `rvc_slashing_group_commit_batch_size` (`sample_count` / slots, and
 `sample_sum / sample_count`). They are not inferred from validator count.
 
-Sync-start offset is not a key in this harness's JSON (sync committee is
-off). A later run that enables sync measures it on a **paused** clock as the
-milliseconds from the harness slot start to the first sync-committee mock-BN
-arrival, and still cites this protocol.
+`sync_publish_ms_after_slot_start` is the milliseconds from the harness slot
+start to the first `SubmitSyncCommitteeMessages` stamp. The protocol cell is
+the **paused** run. The mock clock is advanced 8 s before `run` so the
+attestation and aggregate phase waits are zero; submit offsets are still
+`tokio::time::Instant` from that slot start.
 
 ## How many runs
 
