@@ -4,7 +4,9 @@
 //! every method; override per method with the `with_*` builders. Call arguments
 //! are captured for assertions.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -47,8 +49,12 @@ impl<A, R> Default for MethodHook<A, R> {
 }
 
 impl<A: Clone, R> MethodHook<A, R> {
+    fn record(&self, args: A) {
+        self.calls.lock().expect("mock call log poisoned").push(args);
+    }
+
     fn invoke(&self, method: &'static str, args: A) -> Result<R, BeaconError> {
-        self.calls.lock().expect("mock call log poisoned").push(args.clone());
+        self.record(args.clone());
         match self.handler.lock().expect("mock handler poisoned").as_ref() {
             Some(h) => h(args),
             None => Err(BeaconError::HttpError(format!(
@@ -66,10 +72,101 @@ impl<A: Clone, R> MethodHook<A, R> {
     }
 }
 
+/// Role-trait methods on [`MockBeaconNodeClient`].
+///
+/// Keys the per-method request-delay override. A present entry wins over the
+/// global delay from [`MockBeaconNodeClient::with_request_delay`], including
+/// an explicit zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MockMethod {
+    GetGenesis,
+    GetGenesisMatchingValidatorsRoot,
+    GetConfigSpec,
+    GetForkSchedule,
+    GetFork,
+    GetValidators,
+    GetBlockRoot,
+    GetNodeSyncing,
+    GetNodeVersion,
+    GetAttesterDuties,
+    GetProposerDuties,
+    PostSyncCommitteeDuties,
+    PostPtcDuties,
+    ProduceBlockV3,
+    ProduceBlockV4,
+    PublishBlock,
+    PublishBlockContents,
+    PublishBlindedBlock,
+    PublishBlockSsz,
+    PublishExecutionPayloadEnvelope,
+    PrepareBeaconProposer,
+    RegisterValidators,
+    SubmitProposerPreferences,
+    SubmitBuilderPreferences,
+    GetAttestationData,
+    SubmitAttestation,
+    GetAggregateAttestation,
+    SubmitAggregateAndProofs,
+    SubmitBeaconCommitteeSubscriptions,
+    GetPayloadAttestationData,
+    SubmitPayloadAttestations,
+    SubmitSyncCommitteeMessages,
+    GetSyncCommitteeContribution,
+    SubmitContributionAndProofs,
+    PostValidatorLiveness,
+    PostValidatorLivenessMerged,
+}
+
+#[cfg(test)]
+impl MockMethod {
+    /// Every role-trait method, discriminants `0..ALL.len()` with no gaps.
+    const ALL: [Self; 36] = [
+        Self::GetGenesis,
+        Self::GetGenesisMatchingValidatorsRoot,
+        Self::GetConfigSpec,
+        Self::GetForkSchedule,
+        Self::GetFork,
+        Self::GetValidators,
+        Self::GetBlockRoot,
+        Self::GetNodeSyncing,
+        Self::GetNodeVersion,
+        Self::GetAttesterDuties,
+        Self::GetProposerDuties,
+        Self::PostSyncCommitteeDuties,
+        Self::PostPtcDuties,
+        Self::ProduceBlockV3,
+        Self::ProduceBlockV4,
+        Self::PublishBlock,
+        Self::PublishBlockContents,
+        Self::PublishBlindedBlock,
+        Self::PublishBlockSsz,
+        Self::PublishExecutionPayloadEnvelope,
+        Self::PrepareBeaconProposer,
+        Self::RegisterValidators,
+        Self::SubmitProposerPreferences,
+        Self::SubmitBuilderPreferences,
+        Self::GetAttestationData,
+        Self::SubmitAttestation,
+        Self::GetAggregateAttestation,
+        Self::SubmitAggregateAndProofs,
+        Self::SubmitBeaconCommitteeSubscriptions,
+        Self::GetPayloadAttestationData,
+        Self::SubmitPayloadAttestations,
+        Self::SubmitSyncCommitteeMessages,
+        Self::GetSyncCommitteeContribution,
+        Self::SubmitContributionAndProofs,
+        Self::PostValidatorLiveness,
+        Self::PostValidatorLivenessMerged,
+    ];
+}
+
+type AttestationDataErrorInject = Arc<dyn Fn(u64, u64) -> Option<BeaconError> + Send + Sync>;
+
 /// Erroring-by-default mock implementing all role traits and [`BeaconNodeClient`].
 ///
 /// Configure responses with `with_*` builders; inspect captured arguments with
-/// `*_calls` accessors.
+/// `*_calls` accessors. [`Self::with_request_delay`] sleeps before each async
+/// role-trait method; the default delay is zero.
 #[derive(Default)]
 pub struct MockBeaconNodeClient {
     // NodeStatusApi
@@ -118,11 +215,45 @@ pub struct MockBeaconNodeClient {
     submit_contribution_and_proofs: MethodHook<Vec<SignedContributionAndProof>, ()>,
     // LivenessApi
     post_validator_liveness: MethodHook<(u64, Vec<String>), ValidatorLivenessResponse>,
+    /// Global delay charged before every async role-trait method. Zero does not sleep.
+    request_delay: Duration,
+    /// Per-method override. A present key wins over `request_delay`, including zero.
+    method_delays: HashMap<MockMethod, Duration>,
+    /// When this returns `Some`, `get_attestation_data` fails that call and skips the handler.
+    get_attestation_data_error: Option<AttestationDataErrorInject>,
 }
 
 impl MockBeaconNodeClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Sleep `delay` before every async role-trait method.
+    ///
+    /// The default is [`Duration::ZERO`], which does not sleep, so existing
+    /// callers keep their timing. [`Self::with_method_delay`] wins for one
+    /// method, including an explicit zero. The wait is [`tokio::time::sleep`],
+    /// so `tokio::time::pause` / `start_paused` drives it with no wall clock.
+    pub fn with_request_delay(mut self, delay: Duration) -> Self {
+        self.request_delay = delay;
+        self
+    }
+
+    /// Override [`Self::with_request_delay`] for one role-trait method.
+    pub fn with_method_delay(mut self, method: MockMethod, delay: Duration) -> Self {
+        self.method_delays.insert(method, delay);
+        self
+    }
+
+    fn effective_delay(&self, method: MockMethod) -> Duration {
+        self.method_delays.get(&method).copied().unwrap_or(self.request_delay)
+    }
+
+    async fn charge(&self, method: MockMethod) {
+        let delay = self.effective_delay(method);
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
     }
 
     // -- NodeStatusApi builders --
@@ -404,6 +535,19 @@ impl MockBeaconNodeClient {
         self
     }
 
+    /// Fail selected `get_attestation_data` calls without replacing the success handler.
+    ///
+    /// Return `Some(err)` to fail that `(slot, committee_index)`; `None` falls
+    /// through to [`Self::with_get_attestation_data`]. The call is still recorded.
+    /// RR2-06 uses this so committee 3 can fail while other committees succeed.
+    pub fn with_get_attestation_data_error(
+        mut self,
+        f: impl Fn(u64, u64) -> Option<BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_attestation_data_error = Some(Arc::new(f));
+        self
+    }
+
     pub fn with_submit_attestation(
         self,
         f: impl Fn(VersionedAttestation) -> Result<SubmitAttestationResult, BeaconError>
@@ -611,6 +755,7 @@ impl MockBeaconNodeClient {
 #[async_trait]
 impl NodeStatusApi for MockBeaconNodeClient {
     async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError> {
+        self.charge(MockMethod::GetGenesis).await;
         self.get_genesis.invoke("get_genesis", ())
     }
 
@@ -618,34 +763,47 @@ impl NodeStatusApi for MockBeaconNodeClient {
         &self,
         expected_root_hex: &str,
     ) -> Result<GenesisResponse, BeaconError> {
-        beacon::ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
+        // One request: charge this method, then the genesis hook directly so
+        // the inner `get_genesis` delay is not added on top.
+        self.charge(MockMethod::GetGenesisMatchingValidatorsRoot).await;
+        beacon::ensure_genesis_validators_root(
+            self.get_genesis.invoke("get_genesis", ())?,
+            expected_root_hex,
+        )
     }
 
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
+        self.charge(MockMethod::GetConfigSpec).await;
         self.get_config_spec.invoke("get_config_spec", ())
     }
 
     async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError> {
+        self.charge(MockMethod::GetForkSchedule).await;
         self.get_fork_schedule.invoke("get_fork_schedule", ())
     }
 
     async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError> {
+        self.charge(MockMethod::GetFork).await;
         self.get_fork.invoke("get_fork", state_id.to_string())
     }
 
     async fn get_validators(&self, pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError> {
+        self.charge(MockMethod::GetValidators).await;
         self.get_validators.invoke("get_validators", pubkeys.to_vec())
     }
 
     async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
+        self.charge(MockMethod::GetBlockRoot).await;
         self.get_block_root.invoke("get_block_root", block_id.to_string())
     }
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
+        self.charge(MockMethod::GetNodeSyncing).await;
         self.get_node_syncing.invoke("get_node_syncing", ())
     }
 
     async fn get_node_version(&self) -> Result<String, BeaconError> {
+        self.charge(MockMethod::GetNodeVersion).await;
         self.get_node_version.invoke("get_node_version", ())
     }
 }
@@ -657,6 +815,7 @@ impl DutiesProvider for MockBeaconNodeClient {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<AttesterDutiesResponse, BeaconError> {
+        self.charge(MockMethod::GetAttesterDuties).await;
         self.get_attester_duties.invoke("get_attester_duties", (epoch, validator_indices.to_vec()))
     }
 
@@ -665,6 +824,7 @@ impl DutiesProvider for MockBeaconNodeClient {
         epoch: u64,
         _schedule: &ForkSchedule,
     ) -> Result<ProposerDutiesResponse, BeaconError> {
+        self.charge(MockMethod::GetProposerDuties).await;
         self.get_proposer_duties.invoke("get_proposer_duties", epoch)
     }
 
@@ -673,6 +833,7 @@ impl DutiesProvider for MockBeaconNodeClient {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
+        self.charge(MockMethod::PostSyncCommitteeDuties).await;
         self.post_sync_committee_duties
             .invoke("post_sync_committee_duties", (epoch, validator_indices.to_vec()))
     }
@@ -682,6 +843,7 @@ impl DutiesProvider for MockBeaconNodeClient {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<PtcDutiesResponse, BeaconError> {
+        self.charge(MockMethod::PostPtcDuties).await;
         self.post_ptc_duties.invoke("post_ptc_duties", (epoch, validator_indices.to_vec()))
     }
 }
@@ -695,6 +857,7 @@ impl BlockProducer for MockBeaconNodeClient {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BeaconError> {
+        self.charge(MockMethod::ProduceBlockV3).await;
         self.produce_block_v3.invoke(
             "produce_block_v3",
             (slot, randao_reveal.to_string(), graffiti.map(str::to_string), builder_boost_factor),
@@ -708,6 +871,7 @@ impl BlockProducer for MockBeaconNodeClient {
         graffiti: Option<&str>,
         builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BeaconError> {
+        self.charge(MockMethod::ProduceBlockV4).await;
         self.produce_block_v4.invoke(
             "produce_block_v4",
             (slot, randao_reveal.to_string(), graffiti.map(str::to_string), builder_config.clone()),
@@ -720,6 +884,7 @@ impl BlockProducer for MockBeaconNodeClient {
         consensus_version: &str,
         builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::PublishBlock).await;
         self.publish_block.invoke(
             "publish_block",
             (signed_block.clone(), consensus_version.to_string(), builder_url.map(str::to_string)),
@@ -732,6 +897,7 @@ impl BlockProducer for MockBeaconNodeClient {
         consensus_version: &str,
         builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::PublishBlockContents).await;
         self.publish_block_contents.invoke(
             "publish_block_contents",
             (contents.clone(), consensus_version.to_string(), builder_url.map(str::to_string)),
@@ -743,6 +909,7 @@ impl BlockProducer for MockBeaconNodeClient {
         signed_blinded_block: &SignedBlindedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::PublishBlindedBlock).await;
         self.publish_blinded_block.invoke(
             "publish_blinded_block",
             (signed_blinded_block.clone(), consensus_version.to_string()),
@@ -756,6 +923,7 @@ impl BlockProducer for MockBeaconNodeClient {
         is_blinded: bool,
         builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::PublishBlockSsz).await;
         self.publish_block_ssz.invoke(
             "publish_block_ssz",
             (
@@ -775,6 +943,7 @@ impl BlockProducer for MockBeaconNodeClient {
         consensus_version: &str,
         broadcast_validation: Option<&str>,
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::PublishExecutionPayloadEnvelope).await;
         self.publish_execution_payload_envelope.invoke(
             "publish_execution_payload_envelope",
             (
@@ -791,6 +960,7 @@ impl BlockProducer for MockBeaconNodeClient {
         &self,
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::PrepareBeaconProposer).await;
         self.prepare_beacon_proposer.invoke("prepare_beacon_proposer", preparations.to_vec())
     }
 
@@ -798,6 +968,7 @@ impl BlockProducer for MockBeaconNodeClient {
         &self,
         registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::RegisterValidators).await;
         self.register_validators.invoke("register_validators", registrations.to_vec())
     }
 
@@ -805,6 +976,7 @@ impl BlockProducer for MockBeaconNodeClient {
         &self,
         preferences: &[SignedProposerPreferences],
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::SubmitProposerPreferences).await;
         self.submit_proposer_preferences.invoke("submit_proposer_preferences", preferences.to_vec())
     }
 
@@ -812,6 +984,7 @@ impl BlockProducer for MockBeaconNodeClient {
         &self,
         entries: &[BuilderPreferencesEntry],
     ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        self.charge(MockMethod::SubmitBuilderPreferences).await;
         self.submit_builder_preferences.invoke("submit_builder_preferences", entries.to_vec())
     }
 }
@@ -823,6 +996,15 @@ impl AttestationApi for MockBeaconNodeClient {
         slot: u64,
         committee_index: u64,
     ) -> Result<AttestationDataResponse, BeaconError> {
+        self.charge(MockMethod::GetAttestationData).await;
+        if let Some(err) = self
+            .get_attestation_data_error
+            .as_ref()
+            .and_then(|inject| inject(slot, committee_index))
+        {
+            self.get_attestation_data.record((slot, committee_index));
+            return Err(err);
+        }
         self.get_attestation_data.invoke("get_attestation_data", (slot, committee_index))
     }
 
@@ -830,6 +1012,7 @@ impl AttestationApi for MockBeaconNodeClient {
         &self,
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
+        self.charge(MockMethod::SubmitAttestation).await;
         self.submit_attestation.invoke("submit_attestation", attestations.clone())
     }
 
@@ -840,6 +1023,7 @@ impl AttestationApi for MockBeaconNodeClient {
         committee_index: Option<u64>,
         fork: ForkName,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
+        self.charge(MockMethod::GetAggregateAttestation).await;
         self.get_aggregate_attestation.invoke(
             "get_aggregate_attestation",
             (slot, attestation_data_root.to_string(), committee_index, fork),
@@ -850,6 +1034,7 @@ impl AttestationApi for MockBeaconNodeClient {
         &self,
         proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::SubmitAggregateAndProofs).await;
         self.submit_aggregate_and_proofs.invoke("submit_aggregate_and_proofs", proofs.clone())
     }
 
@@ -857,6 +1042,7 @@ impl AttestationApi for MockBeaconNodeClient {
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::SubmitBeaconCommitteeSubscriptions).await;
         self.submit_beacon_committee_subscriptions
             .invoke("submit_beacon_committee_subscriptions", subscriptions.to_vec())
     }
@@ -868,6 +1054,7 @@ impl PayloadAttestationApi for MockBeaconNodeClient {
         &self,
         slot: u64,
     ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError> {
+        self.charge(MockMethod::GetPayloadAttestationData).await;
         self.get_payload_attestation_data.invoke("get_payload_attestation_data", slot)
     }
 
@@ -875,6 +1062,7 @@ impl PayloadAttestationApi for MockBeaconNodeClient {
         &self,
         messages: &[PayloadAttestationMessage],
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::SubmitPayloadAttestations).await;
         self.submit_payload_attestations.invoke("submit_payload_attestations", messages.to_vec())
     }
 }
@@ -885,6 +1073,7 @@ impl SyncCommitteeApi for MockBeaconNodeClient {
         &self,
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::SubmitSyncCommitteeMessages).await;
         self.submit_sync_committee_messages
             .invoke("submit_sync_committee_messages", messages.to_vec())
     }
@@ -895,6 +1084,7 @@ impl SyncCommitteeApi for MockBeaconNodeClient {
         subcommittee_index: u64,
         beacon_block_root: &str,
     ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
+        self.charge(MockMethod::GetSyncCommitteeContribution).await;
         self.get_sync_committee_contribution.invoke(
             "get_sync_committee_contribution",
             (slot, subcommittee_index, beacon_block_root.to_string()),
@@ -905,6 +1095,7 @@ impl SyncCommitteeApi for MockBeaconNodeClient {
         &self,
         proofs: &[SignedContributionAndProof],
     ) -> Result<(), BeaconError> {
+        self.charge(MockMethod::SubmitContributionAndProofs).await;
         self.submit_contribution_and_proofs
             .invoke("submit_contribution_and_proofs", proofs.to_vec())
     }
@@ -917,6 +1108,7 @@ impl LivenessApi for MockBeaconNodeClient {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        self.charge(MockMethod::PostValidatorLiveness).await;
         self.post_validator_liveness
             .invoke("post_validator_liveness", (epoch, validator_indices.to_vec()))
     }
@@ -927,8 +1119,11 @@ impl LivenessApi for MockBeaconNodeClient {
         validator_indices: &[String],
     ) -> Result<ValidatorLivenessResponse, BeaconError> {
         // Single-source mock: merge is a self-delegation so existing
-        // `with_post_validator_liveness` fixtures keep working.
-        self.post_validator_liveness(epoch, validator_indices).await
+        // `with_post_validator_liveness` fixtures keep working. Charge this
+        // method once, then the liveness hook directly (no second delay).
+        self.charge(MockMethod::PostValidatorLivenessMerged).await;
+        self.post_validator_liveness
+            .invoke("post_validator_liveness", (epoch, validator_indices.to_vec()))
     }
 }
 
@@ -1145,5 +1340,262 @@ mod tests {
         let head = mock.get_block_root("head").await.expect("head literal must resolve");
         let past = mock.get_block_root("99").await.expect("past slot must resolve");
         assert_ne!(head.data.root, past.data.root);
+    }
+
+    /// Two sequential requests each pay the configured delay on a paused clock.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mock_request_delay_is_charged_per_request() {
+        use std::time::Duration;
+
+        let mock = MockBeaconNodeClient::new().with_request_delay(Duration::from_millis(50));
+        let start = tokio::time::Instant::now();
+        let _ = mock.get_attestation_data(1, 0).await;
+        let _ = mock.get_attestation_data(1, 1).await;
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "two sequential get_attestation_data calls with with_request_delay(50ms) \
+             must advance virtual time by >= 100ms, got {elapsed:?}"
+        );
+        assert_eq!(
+            elapsed,
+            Duration::from_millis(100),
+            "paused clock must charge exactly 50ms per request, got {elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mock_method_delay_overrides_the_global_request_delay() {
+        use std::time::Duration;
+
+        let mock = MockBeaconNodeClient::new()
+            .with_request_delay(Duration::from_millis(50))
+            .with_method_delay(MockMethod::GetAttestationData, Duration::from_millis(10))
+            .with_method_delay(MockMethod::GetGenesis, Duration::ZERO);
+        let start = tokio::time::Instant::now();
+        let _ = mock.get_attestation_data(1, 0).await;
+        let _ = mock.get_attestation_data(1, 1).await;
+        assert_eq!(start.elapsed(), Duration::from_millis(20));
+        let _ = mock.get_genesis().await;
+        assert_eq!(start.elapsed(), Duration::from_millis(20));
+        let _ = mock.get_fork("head").await;
+        assert_eq!(start.elapsed(), Duration::from_millis(70));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mock_default_request_delay_does_not_advance_virtual_time() {
+        use std::time::Duration;
+
+        let mock = MockBeaconNodeClient::new();
+        let start = tokio::time::Instant::now();
+        let _ = mock.get_attestation_data(1, 0).await;
+        let _ = mock.get_genesis().await;
+        let _ = mock.submit_attestation(&VersionedAttestation::Electra(vec![])).await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    #[test]
+    fn mock_method_all_covers_every_discriminant() {
+        assert_eq!(
+            MockMethod::ALL.len(),
+            (MockMethod::PostValidatorLivenessMerged as usize) + 1,
+            "MockMethod::ALL must list every variant"
+        );
+        let mut seen = vec![false; MockMethod::ALL.len()];
+        for method in MockMethod::ALL {
+            let index = method as usize;
+            assert!(index < seen.len(), "{method:?} discriminant {index} is outside ALL");
+            assert!(!seen[index], "duplicate {method:?}");
+            seen[index] = true;
+        }
+        assert!(seen.iter().all(|hit| *hit));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn mock_request_delay_covers_every_role_trait_method() {
+        use std::time::Duration;
+
+        let delay = Duration::from_millis(50);
+        let mock = MockBeaconNodeClient::new().with_request_delay(delay);
+        let start = tokio::time::Instant::now();
+        for method in MockMethod::ALL {
+            invoke_role_method(&mock, method).await;
+        }
+        assert_eq!(start.elapsed(), delay * u32::try_from(MockMethod::ALL.len()).unwrap());
+    }
+
+    async fn invoke_role_method(mock: &MockBeaconNodeClient, method: MockMethod) {
+        let schedule = ForkSchedule::unscheduled_gloas();
+        let contents = sample_block_contents();
+        let block = SignedBeaconBlock {
+            message: eth_types::BeaconBlock {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: [1u8; 32],
+                state_root: [2u8; 32],
+                body: vec![0xde, 0xad],
+            },
+            signature: vec![0xaa; 96],
+        };
+        let blinded = SignedBlindedBeaconBlock {
+            message: eth_types::BlindedBeaconBlock {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: [1u8; 32],
+                state_root: [2u8; 32],
+                body: vec![0xbe, 0xef],
+            },
+            signature: vec![0xbb; 96],
+        };
+        let wire = WireBody::Ssz(Vec::new());
+        // Fork-name literals stay outside the match so the fork-hazard scanner
+        // does not treat this MockMethod dispatch as a string-literal fork match.
+        let deneb = "deneb";
+        let electra = "electra";
+        let gloas = "gloas";
+        match method {
+            MockMethod::GetGenesis => {
+                let _ = mock.get_genesis().await;
+            }
+            MockMethod::GetGenesisMatchingValidatorsRoot => {
+                let _ = mock.get_genesis_matching_validators_root("0x00").await;
+            }
+            MockMethod::GetConfigSpec => {
+                let _ = mock.get_config_spec().await;
+            }
+            MockMethod::GetForkSchedule => {
+                let _ = mock.get_fork_schedule().await;
+            }
+            MockMethod::GetFork => {
+                let _ = mock.get_fork("head").await;
+            }
+            MockMethod::GetValidators => {
+                let _ = mock.get_validators(&[]).await;
+            }
+            MockMethod::GetBlockRoot => {
+                let _ = mock.get_block_root("head").await;
+            }
+            MockMethod::GetNodeSyncing => {
+                let _ = mock.get_node_syncing().await;
+            }
+            MockMethod::GetNodeVersion => {
+                let _ = mock.get_node_version().await;
+            }
+            MockMethod::GetAttesterDuties => {
+                let _ = mock.get_attester_duties(0, &[]).await;
+            }
+            MockMethod::GetProposerDuties => {
+                let _ = mock.get_proposer_duties(0, &schedule).await;
+            }
+            MockMethod::PostSyncCommitteeDuties => {
+                let _ = mock.post_sync_committee_duties(0, &[]).await;
+            }
+            MockMethod::PostPtcDuties => {
+                let _ = mock.post_ptc_duties(0, &[]).await;
+            }
+            MockMethod::ProduceBlockV3 => {
+                let _ = mock.produce_block_v3(0, "0x", None, None).await;
+            }
+            MockMethod::ProduceBlockV4 => {
+                let _ = mock.produce_block_v4(0, "0x", None, &BuilderConfig::default()).await;
+            }
+            MockMethod::PublishBlock => {
+                let _ = mock.publish_block(&block, deneb, None).await;
+            }
+            MockMethod::PublishBlockContents => {
+                let _ = mock.publish_block_contents(&contents, electra, None).await;
+            }
+            MockMethod::PublishBlindedBlock => {
+                let _ = mock.publish_blinded_block(&blinded, deneb).await;
+            }
+            MockMethod::PublishBlockSsz => {
+                let _ = mock.publish_block_ssz(&[], deneb, false, None).await;
+            }
+            MockMethod::PublishExecutionPayloadEnvelope => {
+                let _ =
+                    mock.publish_execution_payload_envelope(&wire, &wire, &wire, gloas, None).await;
+            }
+            MockMethod::PrepareBeaconProposer => {
+                let _ = mock.prepare_beacon_proposer(&[]).await;
+            }
+            MockMethod::RegisterValidators => {
+                let _ = mock.register_validators(&[]).await;
+            }
+            MockMethod::SubmitProposerPreferences => {
+                let _ = mock.submit_proposer_preferences(&[]).await;
+            }
+            MockMethod::SubmitBuilderPreferences => {
+                let _ = mock.submit_builder_preferences(&[]).await;
+            }
+            MockMethod::GetAttestationData => {
+                let _ = mock.get_attestation_data(1, 0).await;
+            }
+            MockMethod::SubmitAttestation => {
+                let _ = mock.submit_attestation(&VersionedAttestation::Electra(vec![])).await;
+            }
+            MockMethod::GetAggregateAttestation => {
+                let _ = mock.get_aggregate_attestation(0, "0x00", None, ForkName::Phase0).await;
+            }
+            MockMethod::SubmitAggregateAndProofs => {
+                let _ = mock
+                    .submit_aggregate_and_proofs(&VersionedSignedAggregateAndProof::Electra(vec![]))
+                    .await;
+            }
+            MockMethod::SubmitBeaconCommitteeSubscriptions => {
+                let _ = mock.submit_beacon_committee_subscriptions(&[]).await;
+            }
+            MockMethod::GetPayloadAttestationData => {
+                let _ = mock.get_payload_attestation_data(0).await;
+            }
+            MockMethod::SubmitPayloadAttestations => {
+                let _ = mock.submit_payload_attestations(&[]).await;
+            }
+            MockMethod::SubmitSyncCommitteeMessages => {
+                let _ = mock.submit_sync_committee_messages(&[]).await;
+            }
+            MockMethod::GetSyncCommitteeContribution => {
+                let _ = mock.get_sync_committee_contribution(0, 0, "0x00").await;
+            }
+            MockMethod::SubmitContributionAndProofs => {
+                let _ = mock.submit_contribution_and_proofs(&[]).await;
+            }
+            MockMethod::PostValidatorLiveness => {
+                let _ = mock.post_validator_liveness(0, &[]).await;
+            }
+            MockMethod::PostValidatorLivenessMerged => {
+                let _ = mock.post_validator_liveness_merged(0, &[]).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn get_attestation_data_error_fails_only_the_selected_committee() {
+        let mock = MockBeaconNodeClient::new()
+            .with_get_attestation_data(|_slot, committee| {
+                Ok(AttestationDataResponse {
+                    data: beacon::AttestationData {
+                        slot: "1".to_string(),
+                        index: committee.to_string(),
+                        beacon_block_root: "0x00".to_string(),
+                        source: beacon::Checkpoint {
+                            epoch: "0".to_string(),
+                            root: "0x01".to_string(),
+                        },
+                        target: beacon::Checkpoint {
+                            epoch: "1".to_string(),
+                            root: "0x02".to_string(),
+                        },
+                    },
+                })
+            })
+            .with_get_attestation_data_error(|_slot, committee| {
+                (committee == 3).then(|| BeaconError::HttpError("committee 3".to_string()))
+            });
+
+        let err = mock.get_attestation_data(1, 3).await.unwrap_err();
+        assert!(matches!(err, BeaconError::HttpError(ref msg) if msg.contains("committee 3")));
+        let ok = mock.get_attestation_data(1, 1).await.expect("other committees succeed");
+        assert_eq!(ok.data.index, "1");
+        assert_eq!(mock.get_attestation_data_calls(), vec![(1, 3), (1, 1)]);
     }
 }
