@@ -17,8 +17,8 @@ use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, ForkSchedule, Root, Slot};
 use metrics::definitions::{
-    slot_phase_cache, slot_phase_late, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS,
-    RVC_SLOT_PHASE_LATE_TOTAL, RVC_SLOT_REPLAY_SKIPPED_TOTAL,
+    slot_phase_cache, slot_phase_late, slot_phase_offset, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS,
+    RVC_SLOT_PHASE_LATE_TOTAL, RVC_SLOT_PHASE_OFFSET_MS, RVC_SLOT_REPLAY_SKIPPED_TOTAL,
 };
 
 use crate::metrics::{
@@ -523,11 +523,8 @@ where
 
             let slot_span = info_span!("slot.process", slot = current_slot, epoch = current_epoch,);
             // One wall-clock read per slot, taken before the pre-proposal timeout.
-            // Phase deadlines are absolute offsets from this anchor. `slot_started`
-            // stays the wake instant for `record_time_into_slot` and
-            // `record_phase_block_start_offset` until RR1-05 re-anchors those stamps.
+            // Phase deadlines and offset stamps are absolute from this anchor.
             let anchor = SlotAnchor::capture(&*self.clock, current_slot);
-            let slot_started = tokio::time::Instant::now();
 
             // Check if keys changed (dynamic key import/delete via keymanager API).
             // has_changed() does NOT mark the value as seen — mark_unchanged() so
@@ -561,14 +558,15 @@ where
             };
             {
                 // M2: offset from slot start to entry of maybe_propose_block.
-                self.record_phase_block_start_offset(current_slot);
+                self.record_phase_block_start_offset(&anchor);
                 let phase_span = info_span!(
                     parent: &slot_span,
                     "slot.phase.block",
                     time_into_slot = field::Empty,
                 );
                 // Block fires at t=0: no bps wait, stamp at entry.
-                Self::record_time_into_slot(&phase_span, slot_started);
+                Self::record_time_into_slot(&phase_span, &anchor);
+                Self::record_phase_offset(slot_phase_offset::BLOCK, &anchor);
                 self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx).instrument(phase_span).await;
             }
 
@@ -604,7 +602,6 @@ where
                     deadlines,
                     att_phase_span,
                     &anchor,
-                    slot_started,
                 ),
                 self.run_aggregation_and_contribution_phases(
                     current_slot,
@@ -613,7 +610,6 @@ where
                     deadlines,
                     agg_phase_span,
                     &anchor,
-                    slot_started,
                 ),
                 self.run_payload_attestation_phase(
                     current_slot,
@@ -622,7 +618,6 @@ where
                     deadlines,
                     ptc_phase_span,
                     &anchor,
-                    slot_started,
                 ),
             );
             if matches!(att_outcome, WaitOutcome::Shutdown)
@@ -880,13 +875,12 @@ where
     }
 
     /// Records `rvc_slot_phase_block_start_offset_ms` immediately before
-    /// `maybe_propose_block` (M2 instrument). Uses the slot clock for both
-    /// `now` and nominal slot start; labels `cache=cold` for post-boot and
-    /// post-key_gen slots, then clears the cold flag for subsequent slots.
-    fn record_phase_block_start_offset(&mut self, slot: Slot) {
-        let slot_start_ms = self.clock.slot_start_time(slot).saturating_mul(1000);
-        let now_ms = self.clock.current_time_secs().saturating_mul(1000);
-        let offset_ms = now_ms.saturating_sub(slot_start_ms) as f64;
+    /// `maybe_propose_block` (M2 instrument). The sample is
+    /// [`SlotAnchor::elapsed_ms`], the true offset into the slot. Labels
+    /// `cache=cold` for post-boot and post-key_gen slots, then clears the
+    /// cold flag for subsequent slots.
+    fn record_phase_block_start_offset(&mut self, anchor: &SlotAnchor) {
+        let offset_ms = anchor.elapsed_ms() as f64;
         let cache = if self.phase_block_cache_cold {
             slot_phase_cache::COLD
         } else {
@@ -1075,15 +1069,16 @@ where
 
     /// Stamps `time_into_slot` when a phase fires.
     ///
-    /// One [`tokio::time::Instant::now`] per call, measured from the per-slot
-    /// anchor taken after `slot.process`. The slot clock is whole seconds and
-    /// cannot represent a sub-second bps offset such as 3999 ms.
-    fn record_time_into_slot(span: &tracing::Span, slot_started: tokio::time::Instant) {
-        let elapsed_ms = u64::try_from(
-            tokio::time::Instant::now().saturating_duration_since(slot_started).as_millis(),
-        )
-        .unwrap_or(u64::MAX);
-        span.record(observability::logging::fields::TIME_INTO_SLOT, elapsed_ms);
+    /// The value is [`SlotAnchor::elapsed_ms`]: milliseconds since the true
+    /// slot start, so a late wake is included. The slot clock is whole
+    /// seconds and cannot represent a sub-second bps offset such as 3999 ms.
+    fn record_time_into_slot(span: &tracing::Span, anchor: &SlotAnchor) {
+        span.record(observability::logging::fields::TIME_INTO_SLOT, anchor.elapsed_ms());
+    }
+
+    /// Records `rvc_slot_phase_offset_ms{phase}` at the moment a phase fires.
+    fn record_phase_offset(phase: &'static str, anchor: &SlotAnchor) {
+        RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).observe(anchor.elapsed_ms() as f64);
     }
 
     async fn run_attestation_phase(&self, current_slot: Slot, att_phase_span: &tracing::Span) {
@@ -1133,7 +1128,6 @@ where
 
     /// Attestations and sync messages share a wait while their bps match;
     /// otherwise each duty waits from slot start to its own offset.
-    #[allow(clippy::too_many_arguments)] // anchor is added beside the RR1-05 `slot_started` hand-off
     async fn run_attestation_and_sync_phases(
         &self,
         current_slot: Slot,
@@ -1142,7 +1136,6 @@ where
         deadlines: DeadlineBps,
         att_phase_span: tracing::Span,
         anchor: &SlotAnchor,
-        slot_started: tokio::time::Instant,
     ) -> WaitOutcome {
         if deadlines.attestation == deadlines.sync_message {
             if matches!(
@@ -1162,11 +1155,13 @@ where
             if self.check_shutdown() {
                 return WaitOutcome::Shutdown;
             }
-            Self::record_time_into_slot(&att_phase_span, slot_started);
+            Self::record_time_into_slot(&att_phase_span, anchor);
+            Self::record_phase_offset(slot_phase_offset::ATTESTATION, anchor);
             self.capture_head_if_needed(ctx).await;
             self.warn_if_attestation_overrun(anchor, deadlines.attestation);
             self.run_attestation_phase(current_slot, &att_phase_span).await;
             let snapshot = self.snapshot_ctx(ctx).await;
+            Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
             self.run_sync_messages_phase(current_slot, current_epoch, &snapshot)
                 .instrument(att_phase_span)
                 .await;
@@ -1189,7 +1184,8 @@ where
                 ) {
                     return WaitOutcome::Shutdown;
                 }
-                Self::record_time_into_slot(&att_phase_span, slot_started);
+                Self::record_time_into_slot(&att_phase_span, anchor);
+                Self::record_phase_offset(slot_phase_offset::ATTESTATION, anchor);
                 self.capture_head_if_needed(ctx).await;
                 self.warn_if_attestation_overrun(anchor, deadlines.attestation);
                 self.run_attestation_phase(current_slot, &att_phase_span).await;
@@ -1210,6 +1206,7 @@ where
                 ) {
                     return WaitOutcome::Shutdown;
                 }
+                Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
                 self.capture_head_if_needed(ctx).await;
                 let snapshot = self.snapshot_ctx(ctx).await;
                 self.run_sync_messages_phase(current_slot, current_epoch, &snapshot)
@@ -1229,7 +1226,6 @@ where
 
     /// Contributions share the aggregate wait while their bps match; otherwise
     /// each duty waits from slot start to its own offset.
-    #[allow(clippy::too_many_arguments)] // anchor is added beside the RR1-05 `slot_started` hand-off
     async fn run_aggregation_and_contribution_phases(
         &self,
         current_slot: Slot,
@@ -1238,7 +1234,6 @@ where
         deadlines: DeadlineBps,
         agg_phase_span: tracing::Span,
         anchor: &SlotAnchor,
-        slot_started: tokio::time::Instant,
     ) -> WaitOutcome {
         if deadlines.contribution == deadlines.aggregate {
             if matches!(
@@ -1258,11 +1253,13 @@ where
             if self.check_shutdown() {
                 return WaitOutcome::Shutdown;
             }
-            Self::record_time_into_slot(&agg_phase_span, slot_started);
+            Self::record_time_into_slot(&agg_phase_span, anchor);
+            Self::record_phase_offset(slot_phase_offset::CONTRIBUTION, anchor);
             let snapshot = self.snapshot_ctx(ctx).await;
             self.run_sync_contributions_phase(current_slot, current_epoch, &snapshot)
                 .instrument(agg_phase_span.clone())
                 .await;
+            Self::record_phase_offset(slot_phase_offset::AGGREGATE, anchor);
             self.run_aggregation_phase(current_slot, current_epoch, agg_phase_span).await;
             return WaitOutcome::Continue;
         }
@@ -1283,6 +1280,7 @@ where
                 ) {
                     return WaitOutcome::Shutdown;
                 }
+                Self::record_phase_offset(slot_phase_offset::CONTRIBUTION, anchor);
                 self.capture_head_if_needed(ctx).await;
                 let snapshot = self.snapshot_ctx(ctx).await;
                 self.run_sync_contributions_phase(current_slot, current_epoch, &snapshot)
@@ -1305,7 +1303,8 @@ where
                 ) {
                     return WaitOutcome::Shutdown;
                 }
-                Self::record_time_into_slot(&agg_phase_span, slot_started);
+                Self::record_time_into_slot(&agg_phase_span, anchor);
+                Self::record_phase_offset(slot_phase_offset::AGGREGATE, anchor);
                 self.run_aggregation_phase(current_slot, current_epoch, agg_phase_span.clone())
                     .await;
                 WaitOutcome::Continue
@@ -1359,7 +1358,6 @@ where
 
     /// Gloas+ payload-attestation phase. Waits to the 4.19-resolved
     /// `deadlines.payload_attestation` offset, then signs and submits.
-    #[allow(clippy::too_many_arguments)] // anchor is added beside the RR1-05 `slot_started` hand-off
     async fn run_payload_attestation_phase(
         &self,
         current_slot: Slot,
@@ -1368,7 +1366,6 @@ where
         deadlines: DeadlineBps,
         ptc_phase_span: tracing::Span,
         anchor: &SlotAnchor,
-        slot_started: tokio::time::Instant,
     ) -> WaitOutcome {
         if fork >= ForkName::Gloas {
             if matches!(
@@ -1388,7 +1385,8 @@ where
             if self.check_shutdown() {
                 return WaitOutcome::Shutdown;
             }
-            Self::record_time_into_slot(&ptc_phase_span, slot_started);
+            Self::record_time_into_slot(&ptc_phase_span, anchor);
+            Self::record_phase_offset(slot_phase_offset::PAYLOAD_ATTESTATION, anchor);
             self.payload_attestation_service
                 .maybe_produce_payload_attestations(current_slot, current_epoch)
                 .instrument(ptc_phase_span)

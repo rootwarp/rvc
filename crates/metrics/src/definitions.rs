@@ -12,6 +12,12 @@ use crate::{
     define_int_counter_with_const_labels, define_int_gauge, define_int_gauge_vec,
 };
 
+/// Buckets (ms) shared by the retained phase-0 histogram and `rvc_slot_phase_offset_ms`.
+const SLOT_PHASE_OFFSET_BUCKETS_MS: &[f64] = &[
+    5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 12000.0, 20000.0,
+    30000.0, 60000.0,
+];
+
 lazy_static! {
     /// Gauge for attestation enabled state (1=enabled, 0=disabled).
     pub static ref RVC_ATTESTING_ENABLED: Gauge = {
@@ -95,16 +101,30 @@ lazy_static! {
         )
     };
 
-    /// Histogram for slot phase-0 start offset in milliseconds (M2).
+    /// retained for dashboards
+    ///
+    /// Histogram for slot phase-0 start offset in milliseconds (M2 / AQ-7).
     pub static ref RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS: HistogramVec = {
         define_histogram_vec(
             "rvc_slot_phase_block_start_offset_ms",
             "Offset (ms) from slot start to entry of maybe_propose_block",
             &["cache"],
-            &[
-                5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0,
-                12000.0, 20000.0, 30000.0, 60000.0,
-            ],
+            SLOT_PHASE_OFFSET_BUCKETS_MS,
+            &[],
+        )
+    };
+
+    /// Offset (ms) from the true slot start when a slot phase fires.
+    ///
+    /// Label `phase` is one of {block, attestation, sync_message, aggregate,
+    /// contribution, payload_attestation}. Buckets match
+    /// [`RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS`].
+    pub static ref RVC_SLOT_PHASE_OFFSET_MS: HistogramVec = {
+        define_histogram_vec(
+            "rvc_slot_phase_offset_ms",
+            "Offset (ms) from the true slot start when a slot phase fires",
+            &["phase"],
+            SLOT_PHASE_OFFSET_BUCKETS_MS,
             &[],
         )
     };
@@ -179,6 +199,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_BN_HEALTH_TIER);
     lazy_static::initialize(&RVC_TX_HOLD_DURATION_MS);
     lazy_static::initialize(&RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS);
+    lazy_static::initialize(&RVC_SLOT_PHASE_OFFSET_MS);
     lazy_static::initialize(&RVC_SLOT_PHASE_LATE_TOTAL);
     lazy_static::initialize(&RVC_TASKS_RUNNING);
     lazy_static::initialize(&RVC_SSE_EVENTS_DROPPED_TOTAL);
@@ -239,6 +260,20 @@ pub mod slot_phase_late {
     pub const AGGREGATE: &str = "aggregate";
     pub const CONTRIBUTION: &str = "contribution";
     pub const PAYLOAD_ATTESTATION: &str = "payload_attestation";
+}
+
+/// `phase` label values for `rvc_slot_phase_offset_ms`.
+pub mod slot_phase_offset {
+    pub const BLOCK: &str = "block";
+    pub const ATTESTATION: &str = "attestation";
+    pub const SYNC_MESSAGE: &str = "sync_message";
+    pub const AGGREGATE: &str = "aggregate";
+    pub const CONTRIBUTION: &str = "contribution";
+    pub const PAYLOAD_ATTESTATION: &str = "payload_attestation";
+    /// Every label the histogram records. Registration and the coordinator
+    /// suite both walk this list.
+    pub const ALL: &[&str] =
+        &[BLOCK, ATTESTATION, SYNC_MESSAGE, AGGREGATE, CONTRIBUTION, PAYLOAD_ATTESTATION];
 }
 
 /// `outcome` label values for `rvc_task_exits_total`.
@@ -417,6 +452,42 @@ mod tests {
         RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
         let value = RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.get();
         assert!(value >= 1, "Circuit breaker trips counter should be at least 1 after increment");
+    }
+
+    #[test]
+    fn slot_phase_offset_ms_is_registered_at_init() {
+        init_metrics();
+        for phase in slot_phase_offset::ALL {
+            let _ = RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).get_sample_count();
+        }
+        let gathered = REGISTRY.gather();
+        let metric = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_slot_phase_offset_ms")
+            .expect("rvc_slot_phase_offset_ms must be registered at init");
+        let mut phases = std::collections::BTreeSet::new();
+        for sample in metric.get_metric() {
+            for label in sample.get_label() {
+                if label.name() == "phase" {
+                    phases.insert(label.value().to_string());
+                }
+            }
+            let bounds: Vec<f64> = sample
+                .get_histogram()
+                .get_bucket()
+                .iter()
+                .map(|bucket| bucket.upper_bound())
+                .filter(|bound| bound.is_finite())
+                .collect();
+            assert_eq!(
+                bounds.as_slice(),
+                SLOT_PHASE_OFFSET_BUCKETS_MS,
+                "phase offset buckets must match the retained block-start list"
+            );
+        }
+        let expected: std::collections::BTreeSet<String> =
+            slot_phase_offset::ALL.iter().map(|phase| (*phase).to_string()).collect();
+        assert_eq!(phases, expected, "all six phase labels must be recordable");
     }
 
     #[test]

@@ -849,3 +849,77 @@ async fn test_t15_ptc_time_into_slot_when_gloas_active() {
     assert_fire_stamp(phase_stamp(&recorded, PHASE_AGGREGATION), expected_agg);
     assert_fire_stamp(phase_stamp(&recorded, PHASE_PTC), expected_ptc);
 }
+
+/// A wake 600 ms after slot start is part of the attestation span's
+/// `time_into_slot`. Measuring from the wake instant drops that offset.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn attestation_span_time_into_slot_includes_a_late_wake() {
+    const OFFSET_MS: u64 = 600;
+    let slot_ms = 12_000u64;
+    let pre = DeadlineBps::default();
+    let expected_att = due_ms(pre.attestation, slot_ms);
+    assert_eq!(expected_att, 3999);
+
+    let slot = 31u64;
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot_with_offset_ms(slot, 0);
+    clock.advance_ms(OFFSET_MS);
+
+    let beacon = Arc::new(bn_manager::MockBeaconNodeClient::new());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
+    let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        t15_config(pre, DeadlineBps::default()),
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+    ));
+
+    let constructed = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::new(Mutex::new(Vec::new()));
+    let layer = FireTimeCapture {
+        origin: tokio::time::Instant::now(),
+        names: Arc::new(Mutex::new(SpanMap::new())),
+        constructed: constructed.clone(),
+        recorded: recorded.clone(),
+    };
+    let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    tokio::select! {
+        biased;
+        _ = orchestrator.run() => {}
+        () = async {
+            // Attestation is due at 3999 ms from the true start (3399 ms from the wake).
+            tokio::time::sleep(Duration::from_millis(4_000)).await;
+            handle.shutdown();
+            std::future::pending::<()>().await;
+        } => {}
+    }
+
+    let recorded = recorded.lock().clone();
+    let att = phase_stamp(&recorded, PHASE_ATTESTATION);
+    assert!(
+        (expected_att..=expected_att + 50).contains(&att.value),
+        "attestation time_into_slot must include the {OFFSET_MS} ms late wake \
+         (true offset ~{expected_att}), got {} (tokio elapsed at fire {})",
+        att.value,
+        att.at_ms
+    );
+    assert!(
+        att.value.abs_diff(att.at_ms + OFFSET_MS) <= 50,
+        "time_into_slot {} must be the wake-relative elapsed {} plus the {OFFSET_MS} ms late wake",
+        att.value,
+        att.at_ms
+    );
+}

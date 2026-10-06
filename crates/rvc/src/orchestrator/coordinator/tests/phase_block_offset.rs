@@ -1,7 +1,10 @@
 //! ARCH-7a / M2: `rvc_slot_phase_block_start_offset_ms` histogram.
 
 use super::*;
-use metrics::definitions::{slot_phase_cache, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS};
+use metrics::definitions::{
+    slot_phase_cache, slot_phase_offset, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS,
+    RVC_SLOT_PHASE_OFFSET_MS,
+};
 use timing::SystemSlotClock;
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -70,6 +73,14 @@ fn histogram_count(cache: &str) -> u64 {
 
 fn histogram_sum(cache: &str) -> f64 {
     RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS.with_label_values(&[cache]).get_sample_sum()
+}
+
+fn phase_offset_count(phase: &str) -> u64 {
+    RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).get_sample_count()
+}
+
+fn phase_offset_sum(phase: &str) -> f64 {
+    RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).get_sample_sum()
 }
 
 /// Drive one slot through `run()` and assert the M2 histogram records a sample.
@@ -301,4 +312,133 @@ async fn test_offset_labels_cold_after_key_gen_invalidation() {
         cold_added >= 2,
         "post-boot and post-key_gen slots must both be cold; cold_added={cold_added}"
     );
+}
+
+/// Anchor captured 600 ms into the slot. The histogram must observe that
+/// offset; a whole-second clock read records 0.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn phase_block_start_offset_reports_the_true_offset() {
+    let _guard = m2_metric_lock().await;
+
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    let slot = 65u64;
+    clock.set_slot_with_offset_ms(slot, 0);
+    clock.advance_ms(600);
+
+    let beacon = Arc::new(bn_manager::MockBeaconNodeClient::new());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
+
+    let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        create_test_config()
+            .with_timeouts(fast_timeouts())
+            .with_pre_proposal_deadline(Duration::ZERO)
+            .with_cold_proposer_fetch_deadline(Duration::ZERO),
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+    ));
+
+    let cold_count_before = histogram_count(slot_phase_cache::COLD);
+    let cold_sum_before = histogram_sum(slot_phase_cache::COLD);
+    let block_count_before = phase_offset_count(slot_phase_offset::BLOCK);
+    let block_sum_before = phase_offset_sum(slot_phase_offset::BLOCK);
+
+    tokio::select! {
+        biased;
+        _ = orchestrator.run() => {}
+        () = async {
+            // Phase 0 records before the bps waits. Shut down once that sample exists.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            handle.shutdown();
+            std::future::pending::<()>().await;
+        } => {}
+    }
+
+    let cold_added = histogram_count(slot_phase_cache::COLD) - cold_count_before;
+    let sum_delta = histogram_sum(slot_phase_cache::COLD) - cold_sum_before;
+    assert!(cold_added >= 1, "post-boot slot must record cache=cold, added {cold_added}");
+    let observed = sum_delta / cold_added as f64;
+    assert!(
+        (550.0..=650.0).contains(&observed),
+        "anchor at +600 ms must observe about 600, got {observed} \
+         (sum_delta={sum_delta}, cold_added={cold_added})"
+    );
+
+    let block_added = phase_offset_count(slot_phase_offset::BLOCK) - block_count_before;
+    let block_sum = phase_offset_sum(slot_phase_offset::BLOCK) - block_sum_before;
+    assert!(block_added >= 1, "phase=block must be recorded, added {block_added}");
+    let block_observed = block_sum / block_added as f64;
+    assert!(
+        (550.0..=650.0).contains(&block_observed),
+        "rvc_slot_phase_offset_ms{{phase=block}} must observe about 600, got {block_observed}"
+    );
+}
+
+/// Every `rvc_slot_phase_offset_ms` phase label is recorded when that phase fires.
+/// Gloas is required so payload attestation runs.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn slot_phase_offset_ms_records_every_phase_label() {
+    let _guard = m2_metric_lock().await;
+
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    // Epoch 70 is the test schedule's Gloas activation.
+    let slot = 70 * 32;
+    clock.set_slot_with_offset_ms(slot, 0);
+    clock.advance_ms(600);
+
+    let beacon = Arc::new(bn_manager::MockBeaconNodeClient::new());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
+
+    let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        create_test_config()
+            .with_timeouts(fast_timeouts())
+            .with_pre_proposal_deadline(Duration::ZERO)
+            .with_cold_proposer_fetch_deadline(Duration::ZERO),
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+    ));
+
+    let before: Vec<u64> =
+        slot_phase_offset::ALL.iter().map(|phase| phase_offset_count(phase)).collect();
+
+    tokio::select! {
+        biased;
+        _ = orchestrator.run() => {}
+        () = async {
+            // Payload attestation is due at 9000 ms from the true start
+            // (8400 ms after a 600 ms wake). Shut down after it fires and
+            // before the inter-slot wait.
+            tokio::time::sleep(Duration::from_millis(8_600)).await;
+            handle.shutdown();
+            std::future::pending::<()>().await;
+        } => {}
+    }
+
+    for (phase, before_count) in slot_phase_offset::ALL.iter().zip(before) {
+        let added = phase_offset_count(phase) - before_count;
+        assert!(added >= 1, "phase={phase} must be recorded when it fires, added {added}");
+    }
 }
