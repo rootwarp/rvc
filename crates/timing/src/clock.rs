@@ -228,7 +228,8 @@ pub struct MockSlotClock {
     genesis_time: u64,
     slot_duration: Duration,
     slots_per_epoch: u64,
-    current_time: std::sync::atomic::AtomicU64,
+    /// Unix time in milliseconds since the epoch.
+    current_time_ms: std::sync::atomic::AtomicU64,
     schedule: DeadlineSchedule,
 }
 
@@ -238,7 +239,7 @@ impl MockSlotClock {
             genesis_time,
             slot_duration,
             slots_per_epoch,
-            current_time: std::sync::atomic::AtomicU64::new(genesis_time),
+            current_time_ms: std::sync::atomic::AtomicU64::new(genesis_time * 1000),
             schedule: DeadlineSchedule::uniform(DeadlineBps::default()),
         }
     }
@@ -254,11 +255,22 @@ impl MockSlotClock {
     }
 
     pub fn set_current_time(&self, time: u64) {
-        self.current_time.store(time, std::sync::atomic::Ordering::SeqCst);
+        self.current_time_ms.store(time * 1000, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set unix time in milliseconds. `store` (not `fetch_max`) so a smaller
+    /// value steps the clock backwards.
+    pub fn set_current_time_ms(&self, time_ms: u64) {
+        self.current_time_ms.store(time_ms, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn advance_time(&self, seconds: u64) {
-        self.current_time.fetch_add(seconds, std::sync::atomic::Ordering::SeqCst);
+        self.current_time_ms.fetch_add(seconds * 1000, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Advance unix time by `millis`.
+    pub fn advance_ms(&self, millis: u64) {
+        self.current_time_ms.fetch_add(millis, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_slot(&self, slot: Slot) {
@@ -266,8 +278,14 @@ impl MockSlotClock {
         self.set_current_time(slot_start);
     }
 
+    /// Place the clock `offset_ms` after the start of `slot`.
+    pub fn set_slot_with_offset_ms(&self, slot: Slot, offset_ms: u64) {
+        self.set_current_time_ms(self.slot_start_ms(slot) + offset_ms);
+    }
+
+    /// Whole seconds. The sub-second remainder is visible through `now_since_epoch`.
     fn get_current_time(&self) -> u64 {
-        self.current_time.load(std::sync::atomic::Ordering::SeqCst)
+        self.current_time_ms.load(std::sync::atomic::Ordering::SeqCst) / 1000
     }
 }
 
@@ -293,7 +311,7 @@ impl SlotClock for MockSlotClock {
     }
 
     fn now_since_epoch(&self) -> Duration {
-        Duration::from_secs(self.get_current_time())
+        Duration::from_millis(self.current_time_ms.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn current_slot(&self) -> Result<Slot, TimingError> {
@@ -745,5 +763,41 @@ mod tests {
             now: Duration::from_secs(TEST_GENESIS_TIME) - Duration::from_millis(1),
         };
         assert_eq!(early.ms_into_slot(0), 0);
+    }
+
+    /// Genesis + 600 ms is 600 ms into slot 0, so the wait to slot 1 is one
+    /// slot duration minus that 600 ms.
+    #[test]
+    fn mock_clock_expresses_a_mid_second_start() {
+        let clock = create_mock_clock();
+        let genesis_ms = TEST_GENESIS_TIME * 1000;
+        let slot_duration = clock.slot_duration();
+        clock.set_current_time_ms(genesis_ms + 600);
+        assert_eq!(clock.ms_into_slot(0), 600);
+        assert_eq!(clock.time_until_slot(1).unwrap(), slot_duration - Duration::from_millis(600));
+    }
+
+    /// A smaller `set_current_time_ms` must replace the stored instant.
+    /// `fetch_max` would leave the clock at the later value.
+    #[test]
+    fn mock_clock_set_current_time_ms_steps_backwards() {
+        let clock = create_mock_clock();
+        let genesis_ms = TEST_GENESIS_TIME * 1000;
+        clock.set_current_time_ms(genesis_ms + 5_000);
+        clock.set_current_time_ms(genesis_ms + 600);
+        assert_eq!(clock.ms_into_slot(0), 600);
+        assert_eq!(clock.current_time_ms(), genesis_ms + 600);
+        assert_eq!(clock.now_since_epoch(), Duration::from_millis(genesis_ms + 600));
+    }
+
+    #[test]
+    fn mock_clock_set_slot_with_offset_ms_and_advance_ms() {
+        let clock = create_mock_clock();
+        clock.set_slot_with_offset_ms(2, 600);
+        assert_eq!(clock.current_slot().unwrap(), 2);
+        assert_eq!(clock.ms_into_slot(2), 600);
+        clock.advance_ms(400);
+        assert_eq!(clock.ms_into_slot(2), 1_000);
+        assert_eq!(clock.current_time_secs(), TEST_GENESIS_TIME + (2 * 12) + 1);
     }
 }
