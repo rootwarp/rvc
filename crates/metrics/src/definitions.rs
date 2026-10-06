@@ -109,6 +109,16 @@ lazy_static! {
         )
     };
 
+    /// Phases that fired immediately because their absolute deadline had already passed.
+    /// Label: phase
+    pub static ref RVC_SLOT_PHASE_LATE_TOTAL: IntCounterVec = {
+        define_int_counter_vec(
+            "rvc_slot_phase_late_total",
+            "Total number of slot phases that fired immediately because their absolute deadline had already passed",
+            &["phase"],
+        )
+    };
+
     /// Gauge for currently running registered tasks (TaskExecutor).
     pub static ref RVC_TASKS_RUNNING: prometheus::IntGaugeVec = {
         define_int_gauge_vec(
@@ -161,6 +171,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_BN_HEALTH_TIER);
     lazy_static::initialize(&RVC_TX_HOLD_DURATION_MS);
     lazy_static::initialize(&RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS);
+    lazy_static::initialize(&RVC_SLOT_PHASE_LATE_TOTAL);
     lazy_static::initialize(&RVC_TASKS_RUNNING);
     lazy_static::initialize(&RVC_SSE_EVENTS_DROPPED_TOTAL);
     lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
@@ -210,6 +221,15 @@ pub mod tx_hold_kind {
 pub mod slot_phase_cache {
     pub const WARM: &str = "warm";
     pub const COLD: &str = "cold";
+}
+
+/// `phase` label values for `rvc_slot_phase_late_total`.
+pub mod slot_phase_late {
+    pub const ATTESTATION: &str = "attestation";
+    pub const SYNC_MESSAGE: &str = "sync_message";
+    pub const AGGREGATE: &str = "aggregate";
+    pub const CONTRIBUTION: &str = "contribution";
+    pub const PAYLOAD_ATTESTATION: &str = "payload_attestation";
 }
 
 /// `outcome` label values for `rvc_task_exits_total`.
