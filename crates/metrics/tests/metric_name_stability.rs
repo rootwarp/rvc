@@ -44,6 +44,10 @@
 //! observation per non-empty group-commit drain. Mean batch size is
 //! `sample_sum / sample_count`. It has no labels. Dashboards that watch
 //! group-commit batching should bind this name.
+//! RR1-03 adds `rvc_slot_phase_late_total` (family delta +1): one increment
+//! when a slot phase's absolute deadline has already passed and the phase
+//! fires immediately. Label `phase` names that phase. Later phases are not
+//! shifted. Dashboards that alert on late slot phases should bind this name.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -133,6 +137,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_slashing_reserve_tx_hold_duration_ms",
     "rvc_slot_context_parent_fallback_total",
     "rvc_slot_phase_block_start_offset_ms",
+    "rvc_slot_phase_late_total", // operator-facing: phases that fired after their absolute deadline (RR1-03 / #506)
     "rvc_sse_events_dropped_total",
     "rvc_sync_committee_skipped_total",
     "rvc_task_exits_total",
@@ -241,8 +246,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        53,
-        "RR0-07 adds rvc_slashing_group_commit_batch_size; count is the list length"
+        54,
+        "RR1-03 adds rvc_slot_phase_late_total; count is the list length"
     );
 }
 

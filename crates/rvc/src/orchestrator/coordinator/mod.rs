@@ -16,7 +16,10 @@ use builder::{legacy_proposer_ops_retired, BuilderService, UpcomingProposal};
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{ForkName, ForkSchedule, Root, Slot};
-use metrics::definitions::{slot_phase_cache, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS};
+use metrics::definitions::{
+    slot_phase_cache, slot_phase_late, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS,
+    RVC_SLOT_PHASE_LATE_TOTAL,
+};
 
 use crate::metrics::{
     attestation_status, pre_proposal_cold_fetch, RVC_ATTESTATIONS_TOTAL, RVC_FORK_CURRENT_ID,
@@ -32,6 +35,7 @@ use super::duty_management::DutyManagementService;
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
+use super::slot_anchor::SlotAnchor;
 use super::slot_context::SlotContext;
 use super::sync_committee::SyncCommitteeService;
 use super::utils::{self, TimedOutcome};
@@ -488,9 +492,11 @@ where
             let deadlines = self.config.deadline_schedule.for_fork(fork);
 
             let slot_span = info_span!("slot.process", slot = current_slot, epoch = current_epoch,);
-            // One Instant per slot. Phase spans stamp `time_into_slot` from this
-            // anchor when they fire. A SlotClock read is whole seconds, so it
-            // cannot represent sub-second bps offsets.
+            // One wall-clock read per slot, taken before the pre-proposal timeout.
+            // Phase deadlines are absolute offsets from this anchor. `slot_started`
+            // stays the wake instant for `record_time_into_slot` and
+            // `record_phase_block_start_offset` until RR1-05 re-anchors those stamps.
+            let anchor = SlotAnchor::capture(&*self.clock, current_slot);
             let slot_started = tokio::time::Instant::now();
 
             // Check if keys changed (dynamic key import/delete via keymanager API).
@@ -567,6 +573,7 @@ where
                     &ctx,
                     deadlines,
                     att_phase_span,
+                    &anchor,
                     slot_started,
                 ),
                 self.run_aggregation_and_contribution_phases(
@@ -575,6 +582,7 @@ where
                     &ctx,
                     deadlines,
                     agg_phase_span,
+                    &anchor,
                     slot_started,
                 ),
                 self.run_payload_attestation_phase(
@@ -583,6 +591,7 @@ where
                     fork,
                     deadlines,
                     ptc_phase_span,
+                    &anchor,
                     slot_started,
                 ),
             );
@@ -599,6 +608,8 @@ where
             // pending after occupants so a warm-cache fetch cannot skip the
             // remainder of the slot.
             let next_slot = current_slot + 1;
+            // Inter-slot wait stays wall-based. Architecture §10.11: a backward slew
+            // on a monotonic next-slot wait would re-process slot S.
             let time_until_next_slot = self.clock.time_until_slot(next_slot)?;
             let should_register = current_slot % SLOTS_PER_EPOCH == 0;
             let post_duty_work = async {
@@ -862,10 +873,13 @@ where
         }
     }
 
-    /// Phase-2 wait: [`HeadEventGate::wait_for_head_or`] (timer-only today)
-    /// raced with shutdown. ARCH-3m implements the head-event arm in the gate.
-    async fn wait_for_attestation_or_head(&self, slot: Slot, timer: Duration) -> WaitOutcome {
-        if timer.is_zero() {
+    /// Phase-2 wait: [`HeadEventGate::wait_for_head_or_deadline`] raced with shutdown.
+    async fn wait_for_attestation_or_head(
+        &self,
+        slot: Slot,
+        deadline: tokio::time::Instant,
+    ) -> WaitOutcome {
+        if tokio::time::Instant::now() >= deadline {
             return if self.check_shutdown() {
                 WaitOutcome::Shutdown
             } else {
@@ -874,7 +888,7 @@ where
         }
         let mut rx = self.shutdown_rx.clone();
         tokio::select! {
-            _ = self.head_gate.wait_for_head_or(slot, timer) => {}
+            _ = self.head_gate.wait_for_head_or_deadline(slot, deadline) => {}
             _ = rx.changed() => {}
         }
         if self.check_shutdown() {
@@ -901,6 +915,21 @@ where
         }
     }
 
+    /// Absolute-deadline form of [`Self::wait_for_shared`]. `sleep_until` is
+    /// raced with shutdown the same way the duration wait is.
+    async fn wait_until_deadline(&self, deadline: tokio::time::Instant) -> WaitOutcome {
+        let mut rx = self.shutdown_rx.clone();
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {}
+            _ = rx.changed() => {}
+        }
+        if self.check_shutdown() {
+            WaitOutcome::Shutdown
+        } else {
+            WaitOutcome::Continue
+        }
+    }
+
     /// Race `work` against the next-slot wait. Work that is still pending when
     /// the slot arrives is abandoned; a ready occupant (or zero duration)
     /// returns without sleeping, matching the previous builder-registration
@@ -919,42 +948,51 @@ where
         }
     }
 
-    /// Phase deadline at `bps` basis points into `slot`.
+    /// Phase deadline at `bps` basis points into the anchored slot.
     ///
-    /// Single source for the bps-in-milliseconds arithmetic previously inlined
-    /// at the attestation missed-deadline check and the aggregation 2/3 wait
-    /// (report §4.3). Mainnet examples: 1/3 → 3999 ms, 2/3 → 8000 ms.
-    fn phase_deadline(&self, slot: Slot, bps: u64) -> PhaseDeadline {
-        let offset_ms = due_ms(bps, self.clock.slot_duration().as_millis() as u64);
-        let deadline_ms = self.clock.slot_start_time(slot) * 1000 + offset_ms;
-        let now_ms = self.clock.current_time_secs() * 1000;
-        if now_ms < deadline_ms {
+    /// Offset, remaining, and overrun come from `anchor` (zero slot-clock reads).
+    /// Mainnet examples: 1/3 → 3999 ms, 2/3 → 8000 ms.
+    fn phase_deadline(anchor: &SlotAnchor, bps: u64) -> PhaseDeadline {
+        let offset_ms = due_ms(bps, anchor.slot_duration_ms());
+        let deadline = anchor.deadline(bps);
+        let now = tokio::time::Instant::now();
+        if now < deadline {
             PhaseDeadline {
                 offset: Duration::from_millis(offset_ms),
-                remaining: Duration::from_millis(deadline_ms - now_ms),
+                remaining: deadline.saturating_duration_since(now),
                 overrun_ms: 0,
             }
         } else {
             PhaseDeadline {
                 offset: Duration::from_millis(offset_ms),
                 remaining: Duration::ZERO,
-                overrun_ms: now_ms - deadline_ms,
+                overrun_ms: u64::try_from(now.saturating_duration_since(deadline).as_millis())
+                    .unwrap_or(u64::MAX),
             }
         }
     }
 
-    /// Wait until `bps` into `slot`. Attestation waits use the head-event gate;
-    /// other duties use the timer.
+    /// Wait until `bps` into the anchored slot. Attestation waits use the head-event
+    /// gate; other duties use `sleep_until`. A deadline that has already passed
+    /// fires immediately.
     async fn wait_until_bps(
         &self,
-        slot: Slot,
+        anchor: &SlotAnchor,
         bps: u64,
+        phase: &'static str,
         use_head_gate: bool,
         span: &tracing::Span,
         wait_msg: &'static str,
     ) -> WaitOutcome {
-        let deadline = self.phase_deadline(slot, bps);
-        if deadline.remaining.is_zero() {
+        let phase_deadline = Self::phase_deadline(anchor, bps);
+        if phase_deadline.remaining.is_zero() {
+            warn!(
+                phase,
+                overrun_ms = phase_deadline.overrun_ms,
+                slot = anchor.slot(),
+                "slot phase deadline already passed; firing immediately"
+            );
+            RVC_SLOT_PHASE_LATE_TOTAL.with_label_values(&[phase]).inc();
             return if self.check_shutdown() {
                 WaitOutcome::Shutdown
             } else {
@@ -963,22 +1001,32 @@ where
         }
         {
             let _guard = span.enter();
-            debug!(slot, wait_ms = deadline.remaining.as_millis(), "{}", wait_msg);
+            debug!(
+                slot = anchor.slot(),
+                wait_ms = phase_deadline.remaining.as_millis(),
+                "{}",
+                wait_msg
+            );
         }
+        let deadline = anchor.deadline(bps);
         if use_head_gate {
-            self.wait_for_attestation_or_head(slot, deadline.remaining)
+            self.wait_for_attestation_or_head(anchor.slot(), deadline)
                 .instrument(span.clone())
                 .await
         } else {
-            self.wait_for_shared(deadline.remaining).instrument(span.clone()).await
+            self.wait_until_deadline(deadline).instrument(span.clone()).await
         }
     }
 
-    fn warn_if_attestation_overrun(&self, slot: Slot, attestation_due_bps: u64) {
-        let deadline = self.phase_deadline(slot, attestation_due_bps);
+    fn warn_if_attestation_overrun(&self, anchor: &SlotAnchor, attestation_due_bps: u64) {
+        let deadline = Self::phase_deadline(anchor, attestation_due_bps);
         let att_window_ms = deadline.offset.as_millis() as u64;
         if deadline.overrun_ms > att_window_ms {
-            warn!(slot, delay_ms = deadline.overrun_ms, "Missed attestation deadline");
+            warn!(
+                slot = anchor.slot(),
+                delay_ms = deadline.overrun_ms,
+                "Missed attestation deadline"
+            );
         }
     }
 
@@ -1053,6 +1101,7 @@ where
 
     /// Attestations and sync messages share a wait while their bps match;
     /// otherwise each duty waits from slot start to its own offset.
+    #[allow(clippy::too_many_arguments)] // anchor is added beside the RR1-05 `slot_started` hand-off
     async fn run_attestation_and_sync_phases(
         &self,
         current_slot: Slot,
@@ -1060,13 +1109,15 @@ where
         ctx: &tokio::sync::Mutex<SlotContext>,
         deadlines: DeadlineBps,
         att_phase_span: tracing::Span,
+        anchor: &SlotAnchor,
         slot_started: tokio::time::Instant,
     ) -> WaitOutcome {
         if deadlines.attestation == deadlines.sync_message {
             if matches!(
                 self.wait_until_bps(
-                    current_slot,
+                    anchor,
                     deadlines.attestation,
+                    slot_phase_late::ATTESTATION,
                     true,
                     &att_phase_span,
                     "Waiting for attestation time",
@@ -1081,7 +1132,7 @@ where
             }
             Self::record_time_into_slot(&att_phase_span, slot_started);
             self.capture_head_if_needed(ctx).await;
-            self.warn_if_attestation_overrun(current_slot, deadlines.attestation);
+            self.warn_if_attestation_overrun(anchor, deadlines.attestation);
             self.run_attestation_phase(current_slot, &att_phase_span).await;
             let snapshot = self.snapshot_ctx(ctx).await;
             self.run_sync_messages_phase(current_slot, current_epoch, &snapshot)
@@ -1094,8 +1145,9 @@ where
             async {
                 if matches!(
                     self.wait_until_bps(
-                        current_slot,
+                        anchor,
                         deadlines.attestation,
+                        slot_phase_late::ATTESTATION,
                         true,
                         &att_phase_span,
                         "Waiting for attestation time",
@@ -1107,15 +1159,16 @@ where
                 }
                 Self::record_time_into_slot(&att_phase_span, slot_started);
                 self.capture_head_if_needed(ctx).await;
-                self.warn_if_attestation_overrun(current_slot, deadlines.attestation);
+                self.warn_if_attestation_overrun(anchor, deadlines.attestation);
                 self.run_attestation_phase(current_slot, &att_phase_span).await;
                 WaitOutcome::Continue
             },
             async {
                 if matches!(
                     self.wait_until_bps(
-                        current_slot,
+                        anchor,
                         deadlines.sync_message,
+                        slot_phase_late::SYNC_MESSAGE,
                         false,
                         &att_phase_span,
                         "Waiting for sync message time",
@@ -1144,6 +1197,7 @@ where
 
     /// Contributions share the aggregate wait while their bps match; otherwise
     /// each duty waits from slot start to its own offset.
+    #[allow(clippy::too_many_arguments)] // anchor is added beside the RR1-05 `slot_started` hand-off
     async fn run_aggregation_and_contribution_phases(
         &self,
         current_slot: Slot,
@@ -1151,13 +1205,15 @@ where
         ctx: &tokio::sync::Mutex<SlotContext>,
         deadlines: DeadlineBps,
         agg_phase_span: tracing::Span,
+        anchor: &SlotAnchor,
         slot_started: tokio::time::Instant,
     ) -> WaitOutcome {
         if deadlines.contribution == deadlines.aggregate {
             if matches!(
                 self.wait_until_bps(
-                    current_slot,
+                    anchor,
                     deadlines.aggregate,
+                    slot_phase_late::AGGREGATE,
                     false,
                     &agg_phase_span,
                     "Waiting for 2/3 slot time",
@@ -1183,8 +1239,9 @@ where
             async {
                 if matches!(
                     self.wait_until_bps(
-                        current_slot,
+                        anchor,
                         deadlines.contribution,
+                        slot_phase_late::CONTRIBUTION,
                         false,
                         &agg_phase_span,
                         "Waiting for contribution time",
@@ -1204,8 +1261,9 @@ where
             async {
                 if matches!(
                     self.wait_until_bps(
-                        current_slot,
+                        anchor,
                         deadlines.aggregate,
+                        slot_phase_late::AGGREGATE,
                         false,
                         &agg_phase_span,
                         "Waiting for aggregate time",
@@ -1269,6 +1327,7 @@ where
 
     /// Gloas+ payload-attestation phase. Waits to the 4.19-resolved
     /// `deadlines.payload_attestation` offset, then signs and submits.
+    #[allow(clippy::too_many_arguments)] // anchor is added beside the RR1-05 `slot_started` hand-off
     async fn run_payload_attestation_phase(
         &self,
         current_slot: Slot,
@@ -1276,13 +1335,15 @@ where
         fork: ForkName,
         deadlines: DeadlineBps,
         ptc_phase_span: tracing::Span,
+        anchor: &SlotAnchor,
         slot_started: tokio::time::Instant,
     ) -> WaitOutcome {
         if fork >= ForkName::Gloas {
             if matches!(
                 self.wait_until_bps(
-                    current_slot,
+                    anchor,
                     deadlines.payload_attestation,
+                    slot_phase_late::PAYLOAD_ATTESTATION,
                     false,
                     &ptc_phase_span,
                     "Waiting for payload attestation time",

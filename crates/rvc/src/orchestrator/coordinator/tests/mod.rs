@@ -619,6 +619,7 @@ mod phase_block_offset;
 mod proposal;
 mod proposal_first;
 mod slashing_protection;
+mod slot_anchor;
 mod spans;
 mod sync_gating;
 mod timeouts;

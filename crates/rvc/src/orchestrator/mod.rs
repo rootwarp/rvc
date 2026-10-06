@@ -11,6 +11,7 @@ pub(crate) mod duty_management;
 mod error;
 pub mod head_events;
 pub(crate) mod payload_attestation;
+mod slot_anchor;
 pub(crate) mod slot_context;
 pub(crate) mod sync_committee;
 pub(crate) mod utils;

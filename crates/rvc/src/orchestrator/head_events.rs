@@ -71,8 +71,17 @@ impl HeadEventGate {
     /// receiver has already marked it seen. SSE head for slot N usually lands
     /// at t≈0, before this wait is armed; `changed()`-only would miss that.
     pub async fn wait_for_head_or(&self, slot: Slot, timer: Duration) -> TriggerReason {
+        self.wait_for_head_or_deadline(slot, tokio::time::Instant::now() + timer).await
+    }
+
+    /// [`Self::wait_for_head_or`] against an absolute tokio deadline.
+    pub(crate) async fn wait_for_head_or_deadline(
+        &self,
+        slot: Slot,
+        deadline: tokio::time::Instant,
+    ) -> TriggerReason {
         let mut rx = self.rx.clone();
-        let sleep = tokio::time::sleep(timer);
+        let sleep = tokio::time::sleep_until(deadline);
         tokio::pin!(sleep);
 
         let reason = tokio::select! {
