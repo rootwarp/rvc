@@ -620,6 +620,7 @@ mod proposal;
 mod proposal_first;
 mod slashing_protection;
 mod slot_anchor;
+mod slot_replay;
 mod spans;
 mod sync_gating;
 mod timeouts;

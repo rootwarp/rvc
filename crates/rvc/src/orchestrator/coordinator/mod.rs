@@ -18,7 +18,7 @@ use duty_tracker::DutyTracker;
 use eth_types::{ForkName, ForkSchedule, Root, Slot};
 use metrics::definitions::{
     slot_phase_cache, slot_phase_late, RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS,
-    RVC_SLOT_PHASE_LATE_TOTAL,
+    RVC_SLOT_PHASE_LATE_TOTAL, RVC_SLOT_REPLAY_SKIPPED_TOTAL,
 };
 
 use crate::metrics::{
@@ -469,6 +469,10 @@ where
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
         info!("Starting duty orchestrator");
 
+        // Defence-in-depth behind the wall-based inter-slot wait. A backward
+        // clock step must not re-run a slot whose phases already finished.
+        let mut last_processed_slot: Option<Slot> = None;
+
         loop {
             if *self.shutdown_rx.borrow() {
                 info!("Shutdown signal received, stopping orchestrator");
@@ -483,6 +487,32 @@ where
                     continue;
                 }
             };
+
+            if let Some(last) = last_processed_slot {
+                if current_slot <= last {
+                    warn!(
+                        current_slot,
+                        last_processed_slot = last,
+                        "skipping slot replay; clock is at or behind the last processed slot"
+                    );
+                    RVC_SLOT_REPLAY_SKIPPED_TOTAL.inc();
+                    // Re-enter the wall-based wait. A bare `continue` spins
+                    // while the clock stays behind.
+                    let next_slot = last + 1;
+                    let time_until_next_slot = self.clock.time_until_slot(next_slot)?;
+                    if matches!(
+                        self.run_post_duty_window(
+                            time_until_next_slot,
+                            std::future::pending::<()>(),
+                        )
+                        .await,
+                        WaitOutcome::Shutdown
+                    ) {
+                        return Ok(());
+                    }
+                    continue;
+                }
+            }
 
             let current_epoch = current_slot / SLOTS_PER_EPOCH;
             // One resolved fork per slot; wait sites consume `deadlines`, not
@@ -601,6 +631,8 @@ where
             {
                 return Ok(());
             }
+
+            last_processed_slot = Some(current_slot);
 
             // === Post-duty: host work in the next-slot wait ===
             // Occupants race the wait via `run_post_duty_window`. Incomplete
