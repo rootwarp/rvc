@@ -48,6 +48,10 @@
 //! when a slot phase's absolute deadline has already passed and the phase
 //! fires immediately. Label `phase` names that phase. Later phases are not
 //! shifted. Dashboards that alert on late slot phases should bind this name.
+//! RR1-04 adds `rvc_slot_replay_skipped_total` (family delta +1): one increment
+//! when the slot loop skips a slot the clock stepped back onto after that
+//! slot's phases already ran. It has no labels. Dashboards that alert on a
+//! backward clock step should bind this name.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -138,6 +142,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_slot_context_parent_fallback_total",
     "rvc_slot_phase_block_start_offset_ms",
     "rvc_slot_phase_late_total", // operator-facing: phases that fired after their absolute deadline (RR1-03 / #506)
+    "rvc_slot_replay_skipped_total", // operator-facing: slots skipped after a backward clock step (RR1-04 / #507)
     "rvc_sse_events_dropped_total",
     "rvc_sync_committee_skipped_total",
     "rvc_task_exits_total",
@@ -246,8 +251,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        54,
-        "RR1-03 adds rvc_slot_phase_late_total; count is the list length"
+        55,
+        "RR1-04 adds rvc_slot_replay_skipped_total; count is the list length"
     );
 }
 

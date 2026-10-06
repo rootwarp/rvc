@@ -154,6 +154,14 @@ lazy_static! {
             &["reason"],
         )
     };
+
+    /// Slots skipped because the clock stepped back onto an already-processed slot.
+    pub static ref RVC_SLOT_REPLAY_SKIPPED_TOTAL: IntCounter = {
+        define_int_counter(
+            "rvc_slot_replay_skipped_total",
+            "Total number of slots skipped because the clock stepped back onto an already-processed slot",
+        )
+    };
 }
 
 /// Pre-change path for `tx_hold_metric.rs` (byte-unmodified).
@@ -176,6 +184,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_SSE_EVENTS_DROPPED_TOTAL);
     lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
     lazy_static::initialize(&RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL);
+    lazy_static::initialize(&RVC_SLOT_REPLAY_SKIPPED_TOTAL);
     // DSR-2.4: force-register S5A zero children so scrapes see numeric samples.
     let _ = RVC_BN_HEALTH_TIER.with_label_values(&[bn_health_tier::UNCONFIGURED_ENDPOINT]);
     for task in task_exit_tasks::ALL {
@@ -408,6 +417,22 @@ mod tests {
         RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.inc();
         let value = RVC_BUILDER_CIRCUIT_BREAKER_TRIPS_TOTAL.get();
         assert!(value >= 1, "Circuit breaker trips counter should be at least 1 after increment");
+    }
+
+    #[test]
+    fn slot_replay_skipped_total_is_registered_at_init() {
+        init_metrics();
+        let gathered = REGISTRY.gather();
+        let metric = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_slot_replay_skipped_total")
+            .expect("rvc_slot_replay_skipped_total must be registered at init so a scrape sees it");
+        assert_eq!(metric.get_metric().len(), 1, "unlabelled counter exposes one sample");
+        assert_eq!(
+            metric.get_metric()[0].get_counter().get_value(),
+            0.0,
+            "a scrape at init must see zero"
+        );
     }
 
     #[test]
