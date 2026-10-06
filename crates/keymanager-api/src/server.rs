@@ -173,8 +173,24 @@ impl KeymanagerServer {
 
     /// Bind and serve until `token` is cancelled, then drain in-flight requests.
     pub async fn run_with_shutdown(self, token: CancellationToken) -> Result<(), std::io::Error> {
-        let router = self.router();
         let listener = tokio::net::TcpListener::bind(self.addr).await?;
+        self.serve_on(listener, token).await
+    }
+
+    /// Serve on a caller-supplied listener until `token` is cancelled, then
+    /// drain in-flight requests.
+    ///
+    /// Does not bind. [`Self::run_with_shutdown`] binds `self.addr` and then
+    /// calls this method.
+    ///
+    /// # Errors
+    /// Returns an error if the server stops serving.
+    pub async fn serve_on(
+        self,
+        listener: tokio::net::TcpListener,
+        token: CancellationToken,
+    ) -> Result<(), std::io::Error> {
+        let router = self.router();
         let bound = listener.local_addr().unwrap_or(self.addr);
         tracing::info!(addr = %bound, "Starting Keymanager API server");
         axum::serve(listener, router)
@@ -563,5 +579,35 @@ mod tests {
         // No external token: abort the task (pre-graceful behaviour for stop).
         join.abort();
         let _ = join.await;
+    }
+
+    /// Caller binds port 0 and hands the listener to `serve_on`.
+    /// The probe must hit that listener's address.
+    #[tokio::test]
+    async fn keymanager_serve_on_accepts_a_prebound_listener() {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind ephemeral listener");
+        let addr = listener.local_addr().expect("listener local_addr");
+        let bearer = "prebound-token";
+        let token = CancellationToken::new();
+        let settings =
+            KeymanagerSettings { token: bearer.to_string(), ..KeymanagerSettings::default() };
+        let server = KeymanagerServer::new(stub_deps(), settings);
+        let cancel = token.clone();
+        let join = tokio::spawn(async move { server.serve_on(listener, cancel).await });
+
+        wait_until_accepting(addr).await;
+        let status = get_keystores(addr, bearer).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "serve_on must answer GET /eth/v1/keystores on the pre-bound listener; got {status}"
+        );
+
+        token.cancel();
+        let finished = tokio::time::timeout(Duration::from_secs(2), join)
+            .await
+            .expect("serve_on must return within 2s after cancel");
+        finished.expect("server task must not panic").expect("server must exit cleanly");
     }
 }
