@@ -5,15 +5,17 @@
 //! drains registered tasks tier-by-tier on SIGTERM or task panic (ARCH-2h).
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 
 use bn_manager::{BeaconNodeClient, OperationTimeouts};
 use metrics::{new_health_status, SharedHealthStatus};
 use secret_provider::SecretProvider;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use super::executor::{ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
+use super::executor::{ShutdownOutcome, ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
 use super::tasks::{spawn_background_tasks, spawn_sse_subscriber, spawn_sync_monitor};
 use super::{
     build_services, connect_beacon, load_signing_keys, open_slashing_db, wire_signing_enablement,
@@ -24,6 +26,7 @@ use crate::deletion_denylist::DeletionDenylist;
 use crate::index_resolver::{spawn_index_resolver, IndexResolverDeps};
 use crate::key_admission::{AdmissionSource, KeyAdmissionService};
 use crate::keymanager_adapters::{spawn_keymanager_api, KeymanagerApiDeps};
+use crate::orchestrator::OrchestratorHandle;
 use crate::startup;
 
 /// Binary-owned flags that are not part of [`Config`].
@@ -48,14 +51,16 @@ pub struct RunOptions {
 ///
 /// # Errors
 ///
-/// Returns [`BootstrapError`] for phase failures. Named `EXIT_*` codes (10, 11,
-/// 13 unsupported-fork, 14 keystore-lock) are mapped by the synchronous binary
-/// `main` after the Tokio runtime is dropped (ARCH-2i / NFR-3).
+/// Returns [`BootstrapError`] for phase failures and for a panicking registered
+/// task ([`BootstrapError::CriticalTaskFailed`], exit 16). Named `EXIT_*` codes
+/// (10, 11, 13 unsupported-fork, 14 keystore-lock, 16 critical-task) are mapped
+/// by the synchronous binary `main` after the Tokio runtime is dropped
+/// (ARCH-2i / NFR-3). `run` itself never calls `process::exit`.
 pub async fn run(
     config: Config,
     options: RunOptions,
     executor: TaskExecutor,
-    mut shutdown_rx: mpsc::Receiver<ShutdownReason>,
+    shutdown_rx: mpsc::Receiver<ShutdownReason>,
 ) -> Result<(), BootstrapError> {
     let startup_time = std::time::Instant::now();
     let shutdown_token = executor.token();
@@ -346,38 +351,14 @@ pub async fn run(
 
     // Operator signal, panicking registered tasks, and internal token cancel
     // (e.g. slashing-monitor ShutdownRequested) converge on one drain path.
-    tokio::select! {
-        _ = shutdown_signal() => {
-            info!("Shutdown signal received");
-            startup::log_shutdown_initiated("signal received");
-        }
-        reason = shutdown_rx.recv() => {
-            match reason {
-                Some(ShutdownReason::Failure(task)) => {
-                    error!(task, "Registered task panicked; initiating process drain");
-                    startup::log_shutdown_initiated("task failure");
-                }
-                Some(ShutdownReason::Success(msg)) => {
-                    info!(reason = msg, "Shutdown reason received");
-                    startup::log_shutdown_initiated(msg);
-                }
-                None => {
-                    warn!("Shutdown reason channel closed");
-                    startup::log_shutdown_initiated("shutdown channel closed");
-                }
-            }
-        }
-        _ = shutdown_token.cancelled() => {
-            info!("Process cancellation token cancelled");
-            startup::log_shutdown_initiated("token cancelled");
-        }
-    }
-
-    // Cooperative stop for the duty loop (watch channel, not the cancel token).
-    orchestrator_handle.shutdown();
-    // Cancels the process token once, then joins each tier under TierBudget.
-    // No sleep-as-join: duty_orchestrator is in the registry and is joined here.
-    let outcome = executor.shutdown(TierBudget::default()).await;
+    let (outcome, res) = await_shutdown_and_drain(ShutdownInputs {
+        executor,
+        orchestrator_handle,
+        shutdown_rx,
+        shutdown_token,
+        budget: TierBudget::default(),
+    })
+    .await;
     info!(
         joined = ?outcome.joined,
         aborted = ?outcome.aborted,
@@ -385,7 +366,89 @@ pub async fn run(
     );
 
     info!(uptime_secs = startup_time.elapsed().as_secs(), "Validator client shut down complete");
+    res?;
     Ok(())
+}
+
+/// Pieces the composition root hands to [`await_shutdown_and_drain`].
+pub(crate) struct ShutdownInputs {
+    /// Registered tasks, consumed by the tier drain.
+    pub(crate) executor: TaskExecutor,
+    /// Cooperative stop for the duty loop (watch channel, not the cancel token).
+    pub(crate) orchestrator_handle: OrchestratorHandle,
+    /// Panic and intentional-stop reasons from [`TaskExecutor`].
+    pub(crate) shutdown_rx: mpsc::Receiver<ShutdownReason>,
+    /// Process cancellation token (internal shutdown, e.g. slashing monitor).
+    pub(crate) shutdown_token: CancellationToken,
+    /// Per-tier join budgets for the drain.
+    pub(crate) budget: TierBudget,
+}
+
+/// Wait until an operator signal, a [`ShutdownReason`], or token cancel, then
+/// stop the duty loop and drain every registered task.
+///
+/// The drain finishes before this returns, on every arm.
+/// [`ShutdownReason::Failure`] becomes [`BootstrapError::CriticalTaskFailed`]
+/// (exit 16). Signal, token, and [`ShutdownReason::Success`] return `Ok`.
+pub(crate) async fn await_shutdown_and_drain(
+    inputs: ShutdownInputs,
+) -> (ShutdownOutcome, Result<(), BootstrapError>) {
+    await_shutdown_and_drain_with_signal(inputs, shutdown_signal()).await
+}
+
+/// Same as [`await_shutdown_and_drain`], with the operator-signal arm replaced.
+///
+/// Production passes [`shutdown_signal`]. Tests pass a ready or pending future
+/// so the signal arm does not install a process-wide SIGINT handler.
+async fn await_shutdown_and_drain_with_signal(
+    inputs: ShutdownInputs,
+    signal: impl Future<Output = ()>,
+) -> (ShutdownOutcome, Result<(), BootstrapError>) {
+    let ShutdownInputs { executor, orchestrator_handle, mut shutdown_rx, shutdown_token, budget } =
+        inputs;
+
+    let failed_task = tokio::select! {
+        _ = signal => {
+            info!("Shutdown signal received");
+            startup::log_shutdown_initiated("signal received");
+            None
+        }
+        reason = shutdown_rx.recv() => {
+            match reason {
+                Some(ShutdownReason::Failure(task)) => {
+                    error!(task, "Registered task panicked; initiating process drain");
+                    startup::log_shutdown_initiated("task failure");
+                    Some(task)
+                }
+                Some(ShutdownReason::Success(msg)) => {
+                    info!(reason = msg, "Shutdown reason received");
+                    startup::log_shutdown_initiated(msg);
+                    None
+                }
+                None => {
+                    warn!("Shutdown reason channel closed");
+                    startup::log_shutdown_initiated("shutdown channel closed");
+                    None
+                }
+            }
+        }
+        _ = shutdown_token.cancelled() => {
+            info!("Process cancellation token cancelled");
+            startup::log_shutdown_initiated("token cancelled");
+            None
+        }
+    };
+
+    // Cooperative stop for the duty loop (watch channel, not the cancel token).
+    orchestrator_handle.shutdown();
+    // Cancels the process token once, then joins each tier under TierBudget.
+    // No sleep-as-join: duty_orchestrator is in the registry and is joined here.
+    let outcome = executor.shutdown(budget).await;
+    let res = match failed_task {
+        Some(task) => Err(BootstrapError::CriticalTaskFailed { task }),
+        None => Ok(()),
+    };
+    (outcome, res)
 }
 
 async fn shutdown_signal() {
@@ -493,12 +556,128 @@ fn spawn_secret_provider_refresh(
 mod tests {
     use super::*;
     use crate::startup::{
-        acquire_keystore_lock, EXIT_GENESIS_ROOT_MISMATCH, EXIT_INTEGRITY_CHECK_FAILED,
-        EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
+        acquire_keystore_lock, EXIT_CRITICAL_TASK_FAILED, EXIT_GENESIS_ROOT_MISMATCH,
+        EXIT_INTEGRITY_CHECK_FAILED, EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
     };
     use ::slashing::SlashingDb;
     use std::time::Duration;
     use tokio_util::sync::CancellationToken;
+
+    fn short_budget() -> TierBudget {
+        TierBudget::new([
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        ])
+    }
+
+    /// RR1-06: a panicking registered task must surface as exit 16 after the drain.
+    ///
+    /// No beacon node, slashing database, or keys — only a registered task and the
+    /// extracted shutdown tail.
+    #[tokio::test]
+    async fn await_shutdown_and_drain_returns_err_on_task_failure() {
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        executor.spawn("boom_task", ShutdownTier::Background, async {
+            panic!("registered task failed");
+        });
+
+        let (outcome, res) = await_shutdown_and_drain(ShutdownInputs {
+            executor,
+            orchestrator_handle: OrchestratorHandle::for_drain_test(),
+            shutdown_rx,
+            shutdown_token: token,
+            budget: short_budget(),
+        })
+        .await;
+
+        assert!(
+            matches!(res, Err(BootstrapError::CriticalTaskFailed { task: "boom_task" })),
+            "expected CriticalTaskFailed(boom_task) with exit {EXIT_CRITICAL_TASK_FAILED}, got {res:?}; joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted,
+        );
+        let err = res.expect_err("task failure must not return Ok");
+        assert_eq!(err.exit_code(), EXIT_CRITICAL_TASK_FAILED);
+        assert_eq!(err.exit_code(), 16);
+        assert!(
+            outcome.joined.contains(&"boom_task") || outcome.aborted.contains(&"boom_task"),
+            "drain must report boom_task in joined ({:?}) or aborted ({:?})",
+            outcome.joined,
+            outcome.aborted,
+        );
+    }
+
+    fn assert_ok_with_drain(outcome: &ShutdownOutcome, res: &Result<(), BootstrapError>) {
+        assert!(res.is_ok(), "non-failure shutdown must stay Ok, got {res:?}");
+        assert!(
+            outcome.joined.contains(&"drain_probe") || outcome.aborted.contains(&"drain_probe"),
+            "drain must report drain_probe in joined ({:?}) or aborted ({:?})",
+            outcome.joined,
+            outcome.aborted,
+        );
+    }
+
+    fn probe_inputs(
+        executor: TaskExecutor,
+        shutdown_rx: mpsc::Receiver<ShutdownReason>,
+        shutdown_token: CancellationToken,
+    ) -> ShutdownInputs {
+        ShutdownInputs {
+            executor,
+            orchestrator_handle: OrchestratorHandle::for_drain_test(),
+            shutdown_rx,
+            shutdown_token,
+            budget: short_budget(),
+        }
+    }
+
+    /// Signal shutdown still returns Ok, and the drain still runs.
+    #[tokio::test]
+    async fn await_shutdown_and_drain_returns_ok_on_signal() {
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        executor.spawn("drain_probe", ShutdownTier::Background, async {});
+        let (outcome, res) = await_shutdown_and_drain_with_signal(
+            probe_inputs(executor, shutdown_rx, token),
+            std::future::ready(()),
+        )
+        .await;
+        assert_ok_with_drain(&outcome, &res);
+    }
+
+    /// [`ShutdownReason::Success`] still returns Ok, and the drain still runs.
+    #[tokio::test]
+    async fn await_shutdown_and_drain_returns_ok_on_success_reason() {
+        let token = CancellationToken::new();
+        let (executor, _executor_rx) = TaskExecutor::new(token.clone());
+        executor.spawn("drain_probe", ShutdownTier::Background, async {});
+        let (tx, rx) = mpsc::channel(1);
+        tx.try_send(ShutdownReason::Success("operator stop")).expect("send success");
+        let (outcome, res) = await_shutdown_and_drain_with_signal(
+            probe_inputs(executor, rx, token),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert_ok_with_drain(&outcome, &res);
+    }
+
+    /// Token cancel still returns Ok, and the drain still runs.
+    #[tokio::test]
+    async fn await_shutdown_and_drain_returns_ok_on_token_cancel() {
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        executor.spawn("drain_probe", ShutdownTier::Background, async {});
+        token.cancel();
+        let (outcome, res) = await_shutdown_and_drain_with_signal(
+            probe_inputs(executor, shutdown_rx, token),
+            std::future::pending::<()>(),
+        )
+        .await;
+        assert_ok_with_drain(&outcome, &res);
+    }
 
     /// ARCH-2i / NFR-3: pin EXIT_* numeric values so a silent renumber fails CI.
     #[test]
@@ -507,8 +686,26 @@ mod tests {
         assert_eq!(EXIT_GENESIS_ROOT_MISMATCH, 11);
         assert_eq!(EXIT_UNSUPPORTED_FORK_VERSION, 13);
         assert_eq!(EXIT_KEYSTORE_LOCKED, 14);
+        assert_eq!(EXIT_CRITICAL_TASK_FAILED, 16);
         // Reserved historically (one-shot doppelganger); must not be reused.
+        assert_ne!(EXIT_INTEGRITY_CHECK_FAILED, 12);
+        assert_ne!(EXIT_GENESIS_ROOT_MISMATCH, 12);
+        assert_ne!(EXIT_UNSUPPORTED_FORK_VERSION, 12);
         assert_ne!(EXIT_KEYSTORE_LOCKED, 12);
+        assert_ne!(EXIT_CRITICAL_TASK_FAILED, 12);
+        let startup_src = include_str!("../startup.rs");
+        assert!(
+            startup_src
+                .contains("EXIT 12 reserved historically for one-shot doppelganger detection"),
+            "exit 12 must stay documented as reserved"
+        );
+        assert!(
+            !startup_src.lines().any(|line| {
+                let trimmed = line.trim();
+                trimmed.starts_with("pub const EXIT_") && trimmed.contains("= 12")
+            }),
+            "exit 12 must stay unused"
+        );
     }
 
     /// ARCH-2i: keystore-lock contention returns `Err` with EXIT_KEYSTORE_LOCKED
