@@ -10,6 +10,7 @@
 //! Shutdown drains tiers in order (Ingress → Orchestrator → Background → Telemetry)
 //! under per-tier budgets ([`TierBudget`]). Process metrics land in ARCH-2f.
 
+use std::fmt::Display;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +20,7 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
+use tracing::{error, warn};
 
 /// Drain order. Lower tiers drain first; each tier is fully drained (or its
 /// budget expires) before the next begins.
@@ -113,9 +114,12 @@ struct Registered {
 
 /// Composition-root task registry: named spawns, panic containment, joined shutdown.
 ///
-/// Two entry points:
-/// - [`spawn`](Self::spawn) — root owns the future (`tokio::spawn` inside).
+/// Entry points:
+/// - [`spawn`](Self::spawn) — root owns a `()` future (`tokio::spawn` inside).
 /// - [`register`](Self::register) — primitive; wrap an existing [`JoinHandle`].
+/// - [`spawn_result`](Self::spawn_result) / [`register_result`](Self::register_result) —
+///   `Result`-returning tasks. `Ok(Err(_))` records outcome `error` and requests
+///   failure shutdown. Criticality stays the call site's [`ShutdownTier`].
 ///
 /// `register` wraps Infra `JoinHandle`s at the composition root (DAG). ARCH-3l
 /// registers `BnManager::start_sse`'s handle as `"bn.sse"`; a separate
@@ -127,7 +131,7 @@ pub struct TaskExecutor {
     token: CancellationToken,
     shutdown_tx: mpsc::Sender<ShutdownReason>,
     registry: Arc<Mutex<Vec<Registered>>>,
-    /// Exit classifications (`ok` / `panic` / `cancelled`) in completion order.
+    /// Exit classifications (`ok` / `error` / `panic` / `cancelled`) in completion order.
     /// Written by every monitor; read by unit tests (ARCH-2f will also drive metrics).
     exits: Arc<Mutex<Vec<(&'static str, &'static str)>>>,
 }
@@ -224,6 +228,62 @@ impl TaskExecutor {
         if let Some(handle) = handle {
             self.register(name, tier, handle);
         }
+    }
+
+    /// Wrap a [`JoinHandle`] whose output is `Result<T, E>`.
+    ///
+    /// `Ok(Ok(_))` records [`task_exit_outcome::OK`]. `Ok(Err(e))` records
+    /// [`task_exit_outcome::ERROR`], logs `e`, and `try_send`s
+    /// [`ShutdownReason::Failure`]. A panic records [`task_exit_outcome::PANIC`]
+    /// and sends `Failure`. An abort records [`task_exit_outcome::CANCELLED`].
+    ///
+    /// [`register`](Self::register) is unchanged: a `JoinHandle<Result<_, _>>`
+    /// passed there still classifies every `Ok` as a clean exit.
+    pub fn register_result<T, E>(
+        &self,
+        name: &'static str,
+        tier: ShutdownTier,
+        handle: JoinHandle<Result<T, E>>,
+    ) where
+        T: Send + 'static,
+        E: Display + Send + 'static,
+    {
+        let work = handle.abort_handle();
+        let tx = self.shutdown_tx.clone();
+        let exits = Arc::clone(&self.exits);
+        RVC_TASKS_RUNNING.with_label_values(&[name]).inc();
+        let monitor = tokio::spawn(async move {
+            let outcome = match handle.await {
+                Ok(Ok(_)) => task_exit_outcome::OK,
+                Ok(Err(e)) => {
+                    let _ = tx.try_send(ShutdownReason::Failure(name));
+                    error!(task = name, error = %e, "registered task returned an error");
+                    task_exit_outcome::ERROR
+                }
+                Err(e) if e.is_panic() => {
+                    let _ = tx.try_send(ShutdownReason::Failure(name));
+                    task_exit_outcome::PANIC
+                }
+                Err(_) => task_exit_outcome::CANCELLED,
+            };
+            RVC_TASKS_RUNNING.with_label_values(&[name]).dec();
+            RVC_TASK_EXITS_TOTAL.with_label_values(&[name, outcome]).inc();
+            exits.lock().push((name, outcome));
+        });
+        self.registry.lock().push(Registered { name, tier, work, monitor });
+    }
+
+    /// [`spawn`](Self::spawn) for a `Result`-returning future.
+    ///
+    /// Defined as `register_result(name, tier, tokio::spawn(fut))`, so the
+    /// `tokio::spawn` stays inside this module.
+    pub fn spawn_result<F, T, E>(&self, name: &'static str, tier: ShutdownTier, fut: F)
+    where
+        F: Future<Output = Result<T, E>> + Send + 'static,
+        T: Send + 'static,
+        E: Display + Send + 'static,
+    {
+        self.register_result(name, tier, tokio::spawn(fut));
     }
 
     /// Cancel the process token once, then drain registered tasks tier by tier.
@@ -813,6 +873,132 @@ mod tests {
 
         assert_eq!(running_gauge("abort_label_task"), 0);
         assert_eq!(exit_count("abort_label_task", task_exit_outcome::CANCELLED), before + 1);
+    }
+
+    /// RR1-09: `spawn_result` returning `Ok(Err(e))` is outcome `error`, not `ok`.
+    ///
+    /// `Failure(name)` is sent so the composition root drains and exits 16.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn spawn_result_task_returning_err_records_error_outcome() {
+        let (exec, mut rx) = TaskExecutor::new(CancellationToken::new());
+        const NAME: &str = "err_outcome_task";
+        let before_ok = exit_count(NAME, task_exit_outcome::OK);
+
+        exec.spawn_result(NAME, ShutdownTier::Orchestrator, async {
+            Err::<(), _>("orchestrator blew up")
+        });
+
+        tokio::time::timeout(Duration::from_secs(2), exec.wait_exits(1))
+            .await
+            .expect("error task monitor must complete");
+
+        assert_eq!(
+            exit_count(NAME, task_exit_outcome::ERROR),
+            1,
+            "Ok(Err) must increment rvc_task_exits_total{{outcome=\"error\"}}"
+        );
+        assert_eq!(
+            exit_count(NAME, task_exit_outcome::OK),
+            before_ok,
+            "Ok(Err) must not be labelled ok"
+        );
+        assert_eq!(exec.recorded_outcomes(), vec![(NAME, task_exit_outcome::ERROR)]);
+
+        let reason = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for ShutdownReason")
+            .expect("channel closed without reason");
+        assert_eq!(reason, ShutdownReason::Failure(NAME));
+        assert_eq!(running_gauge(NAME), 0, "error path must dec rvc_tasks_running");
+        assert!(
+            logs_contain("orchestrator blew up"),
+            "error log must include the Display of the returned error"
+        );
+
+        let outcome = exec.shutdown(TierBudget::default()).await;
+        assert!(
+            outcome.joined.contains(&NAME) || outcome.aborted.contains(&NAME),
+            "Failure must be followed by a drain that accounts for {NAME}: joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted,
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_result_ok_records_ok_and_sends_no_failure() {
+        let (exec, mut rx) = TaskExecutor::new(CancellationToken::new());
+        const NAME: &str = "ok_result_task";
+
+        exec.spawn_result(NAME, ShutdownTier::Background, async { Ok::<(), String>(()) });
+
+        tokio::time::timeout(Duration::from_secs(2), exec.wait_exits(1))
+            .await
+            .expect("ok result task should finish");
+
+        assert_eq!(exit_count(NAME, task_exit_outcome::OK), 1);
+        assert_eq!(exit_count(NAME, task_exit_outcome::ERROR), 0);
+        assert_eq!(exec.recorded_outcomes(), vec![(NAME, task_exit_outcome::OK)]);
+
+        let leftover = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(leftover.is_err(), "Ok(Ok) must not push ShutdownReason, got {leftover:?}");
+        let _ = exec.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_result_panic_records_panic_and_failure() {
+        async fn boom() -> Result<(), String> {
+            panic!("spawn_result boom");
+        }
+
+        let (exec, mut rx) = TaskExecutor::new(CancellationToken::new());
+        const NAME: &str = "panic_result_task";
+
+        exec.spawn_result(NAME, ShutdownTier::Background, boom());
+
+        tokio::time::timeout(Duration::from_secs(2), exec.wait_exits(1))
+            .await
+            .expect("panic result monitor must complete");
+
+        assert_eq!(exit_count(NAME, task_exit_outcome::PANIC), 1);
+        assert_eq!(exit_count(NAME, task_exit_outcome::OK), 0);
+        assert_eq!(exit_count(NAME, task_exit_outcome::ERROR), 0);
+        assert_eq!(exec.recorded_outcomes(), vec![(NAME, task_exit_outcome::PANIC)]);
+
+        let reason = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("timeout waiting for ShutdownReason")
+            .expect("channel closed without reason");
+        assert_eq!(reason, ShutdownReason::Failure(NAME));
+        let _ = exec.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    async fn spawn_result_abort_records_cancelled() {
+        let (exec, mut rx) = TaskExecutor::new(CancellationToken::new());
+        const NAME: &str = "abort_result_task";
+        let before_ok = exit_count(NAME, task_exit_outcome::OK);
+        let before_error = exit_count(NAME, task_exit_outcome::ERROR);
+
+        exec.spawn_result(NAME, ShutdownTier::Background, async {
+            std::future::pending::<Result<(), String>>().await
+        });
+        tokio::task::yield_now().await;
+
+        let outcome = exec.shutdown(TierBudget::default()).await;
+
+        assert_eq!(exit_count(NAME, task_exit_outcome::CANCELLED), 1);
+        assert_eq!(exit_count(NAME, task_exit_outcome::OK), before_ok);
+        assert_eq!(exit_count(NAME, task_exit_outcome::ERROR), before_error);
+        assert!(
+            outcome.joined.contains(&NAME) || outcome.aborted.contains(&NAME),
+            "aborted result task must be drained: joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted,
+        );
+        // Drain drops the sender. A queued Failure would still be readable.
+        let queued = rx.try_recv();
+        assert!(queued.is_err(), "abort must not push ShutdownReason::Failure, got {queued:?}");
     }
 
     #[tokio::test]

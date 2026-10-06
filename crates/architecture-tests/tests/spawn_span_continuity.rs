@@ -7,7 +7,8 @@
 //! ```
 //!
 //! Paths containing `/tests/` are dropped. A site is `executor.spawn(`,
-//! `executor.register(`, or `executor.register_opt(` whose handle argument is
+//! `executor.spawn_result(`, `executor.register(`, `executor.register_result(`,
+//! or `executor.register_opt(` whose handle argument is
 //! `Some` (any non-`None` handle expression counts, so a future `Some(_)` cannot
 //! hide). `register_opt(..., None)` is not a site. `spawn_blocking` is not scanned.
 //!
@@ -317,7 +318,9 @@ fn parse_call(code: &str, at: usize) -> Option<CallHit> {
 fn method_kind(rest: &str) -> Option<(Kind, usize)> {
     const CANDIDATES: &[(&str, Kind)] = &[
         ("register_opt", Kind::RegisterOpt),
+        ("register_result", Kind::Register),
         ("register", Kind::Register),
+        ("spawn_result", Kind::Spawn),
         ("spawn", Kind::Spawn),
     ];
     for &(name, kind) in CANDIDATES {
@@ -795,6 +798,27 @@ fn register_opt_none_is_not_a_site_and_some_is() {
     assert!(sites.iter().all(|s| s.kind == Kind::RegisterOpt));
     assert_eq!(sites[0].line, 7, "single-line Some");
     assert_eq!(sites[1].line, 8, "multiline Some");
+}
+
+/// RR1-09: result-bearing entry points are the same sites as `spawn` / `register`.
+#[test]
+fn spawn_result_and_register_result_are_sites() {
+    let src = "\
+        // detached: result-bearing task.\n\
+        executor.spawn_result(\"duty_orchestrator\", ShutdownTier::Orchestrator, async move {});\n\
+        executor.register_result(\"metrics_like\", ShutdownTier::Telemetry, handle);\n\
+        executor.spawn_blocking(\"not-a-site\", || {});\n\
+";
+    let sites = find_production_sites("crates/rvc/src/bootstrap/run.rs", src);
+    assert_eq!(
+        sites.len(),
+        2,
+        "spawn_result and register_result count; spawn_blocking does not: {sites:?}"
+    );
+    assert_eq!(sites[0].kind, Kind::Spawn);
+    assert!(sites[0].detached, "preceding // detached: still classifies spawn_result");
+    assert_eq!(sites[1].kind, Kind::Register);
+    assert!(!sites[1].detached);
 }
 
 #[test]

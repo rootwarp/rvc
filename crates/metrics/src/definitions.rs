@@ -281,8 +281,9 @@ pub mod task_exit_outcome {
     pub const OK: &str = "ok";
     pub const PANIC: &str = "panic";
     pub const CANCELLED: &str = "cancelled";
+    pub const ERROR: &str = "error";
     /// Children force-registered at process init so scrapes see them at zero.
-    pub const ALL: &[&str] = &[OK, PANIC, CANCELLED];
+    pub const ALL: &[&str] = &[OK, PANIC, CANCELLED, ERROR];
 }
 
 /// Production TaskExecutor task names force-registered for

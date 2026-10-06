@@ -352,11 +352,8 @@ pub async fn run(
 
     // Spawn (not poll inline): in-flight publish survives the shutdown signal (M10).
     // detached: already a per-slot root inside the task (slot.process, crates/rvc/src/orchestrator/coordinator/mod.rs:490); not shape B.
-    executor.spawn("duty_orchestrator", ShutdownTier::Orchestrator, async move {
-        match orchestrator.run().await {
-            Ok(()) => info!("Orchestrator completed"),
-            Err(e) => error!("Orchestrator error: {}", e),
-        }
+    executor.spawn_result("duty_orchestrator", ShutdownTier::Orchestrator, async move {
+        orchestrator.run().await
     });
 
     // Operator signal, panicking registered tasks, and internal token cancel
@@ -621,6 +618,42 @@ mod tests {
         );
     }
 
+    /// RR1-09: `spawn_result` returning `Err` is exit 16 after the same drain.
+    #[tokio::test]
+    async fn await_shutdown_and_drain_returns_exit_16_on_spawn_result_error() {
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        executor.spawn_result("duty_orchestrator", ShutdownTier::Orchestrator, async {
+            Err::<(), _>("orchestrator failed")
+        });
+
+        let (outcome, res) = await_shutdown_and_drain(ShutdownInputs {
+            executor,
+            orchestrator_handle: OrchestratorHandle::for_drain_test(),
+            shutdown_rx,
+            shutdown_token: token,
+            budget: short_budget(),
+        })
+        .await;
+
+        assert!(
+            matches!(res, Err(BootstrapError::CriticalTaskFailed { task: "duty_orchestrator" })),
+            "expected CriticalTaskFailed(duty_orchestrator) with exit {EXIT_CRITICAL_TASK_FAILED}, got {res:?}; joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted,
+        );
+        let err = res.expect_err("Ok(Err) must not return Ok");
+        assert_eq!(err.exit_code(), EXIT_CRITICAL_TASK_FAILED);
+        assert_eq!(err.exit_code(), 16);
+        assert!(
+            outcome.joined.contains(&"duty_orchestrator")
+                || outcome.aborted.contains(&"duty_orchestrator"),
+            "drain must report duty_orchestrator in joined ({:?}) or aborted ({:?})",
+            outcome.joined,
+            outcome.aborted,
+        );
+    }
+
     fn assert_ok_with_drain(outcome: &ShutdownOutcome, res: &Result<(), BootstrapError>) {
         assert!(res.is_ok(), "non-failure shutdown must stay Ok, got {res:?}");
         assert!(
@@ -795,7 +828,7 @@ mod tests {
         let bind_at =
             run_fn.find("bind_required_listeners(").expect("bind_required_listeners call");
         let keys_at = run_fn.find("load_signing_keys(").expect("load_signing_keys call");
-        // Production spawn is `executor.spawn("duty_orchestrator"`.
+        // Production spawn is `executor.spawn_result("duty_orchestrator"`.
         let orch_at = run_fn.find("\"duty_orchestrator\"").expect("duty_orchestrator spawn");
 
         assert!(connect_at < bind_at, "bind_required_listeners must follow connect_beacon");
