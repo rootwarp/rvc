@@ -40,7 +40,7 @@ use ::slashing::SlashingDb;
 use crate::config::ConfigError;
 use crate::deletion_denylist::{DeletionDenylist, DeletionDenylistError};
 use crate::keymanager_adapters::SpawnKeymanagerApiError;
-use crate::startup::StartupError;
+use crate::startup::{StartupError, EXIT_CRITICAL_TASK_FAILED};
 
 /// Values produced by bootstrap phases and consumed by later ones.
 ///
@@ -106,6 +106,10 @@ pub enum BootstrapError {
     /// Invalid runtime configuration (e.g. slashed action string, gRPC address).
     #[error("{0}")]
     InvalidConfig(String),
+
+    /// A registered task panicked. The executor drain has already finished.
+    #[error("critical task '{task}' failed; process exiting")]
+    CriticalTaskFailed { task: &'static str },
 }
 
 impl BootstrapError {
@@ -113,6 +117,7 @@ impl BootstrapError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Startup(e) => e.exit_code(),
+            Self::CriticalTaskFailed { .. } => EXIT_CRITICAL_TASK_FAILED,
             _ => 1,
         }
     }
@@ -127,8 +132,8 @@ impl BootstrapError {
 mod tests {
     use super::*;
     use crate::startup::{
-        StartupError, EXIT_GENESIS_ROOT_MISMATCH, EXIT_INTEGRITY_CHECK_FAILED,
-        EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
+        StartupError, EXIT_CRITICAL_TASK_FAILED, EXIT_GENESIS_ROOT_MISMATCH,
+        EXIT_INTEGRITY_CHECK_FAILED, EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
     };
 
     /// ARCH-2i / NFR-3: BootstrapError maps each named startup failure to EXIT_*.
@@ -155,6 +160,10 @@ mod tests {
             (
                 BootstrapError::Startup(StartupError::KeystoreLocked("held".into())),
                 EXIT_KEYSTORE_LOCKED,
+            ),
+            (
+                BootstrapError::CriticalTaskFailed { task: "duty_orchestrator" },
+                EXIT_CRITICAL_TASK_FAILED,
             ),
         ];
         for (err, want) in cases {

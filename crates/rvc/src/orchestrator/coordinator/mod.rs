@@ -1453,3 +1453,16 @@ impl BuilderConfigProvider for BuilderConfigAdapter {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// Watch sender with no live slot loop.
+///
+/// Shutdown-drain tests call [`OrchestratorHandle::shutdown`] without a beacon
+/// node, slashing database, or keys. This impl sits after the fork-hazard sites
+/// so those line pins do not move.
+#[cfg(test)]
+impl OrchestratorHandle {
+    pub(crate) fn for_drain_test() -> Self {
+        let (shutdown_tx, _shutdown_rx) = watch::channel(false);
+        Self { shutdown_tx }
+    }
+}

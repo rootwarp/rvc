@@ -30,6 +30,9 @@ pub const EXIT_GENESIS_ROOT_MISMATCH: i32 = 11;
 // run_doppelganger_detection; production uses ForwardWindowMachine + Detected gate).
 pub const EXIT_UNSUPPORTED_FORK_VERSION: i32 = 13;
 pub const EXIT_KEYSTORE_LOCKED: i32 = 14;
+/// A registered task panicked. The drain has already finished; supervisors
+/// that restart on non-zero will restart the process.
+pub const EXIT_CRITICAL_TASK_FAILED: i32 = 16;
 
 /// Errors specific to the startup sequence.
 #[derive(Debug, thiserror::Error)]
