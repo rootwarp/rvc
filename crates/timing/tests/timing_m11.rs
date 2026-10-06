@@ -70,22 +70,9 @@ fn test_attestation_default_bps_5s_slot_is_1666ms() {
     assert_eq!(time_until, Duration::from_millis(1666), "5 s slot: 3333 * 5000 / 10000 = 1666 ms");
 }
 
-// -- Verify `attestation_time` (slot_start + offset in whole seconds) is consistent.
-// Seconds API floors (slot_start_ms + due_ms) / 1000; for a 12 s slot due_ms = 3999.
-// Intended 3334→3333 bps shift: genesis+4→genesis+3 and genesis+16→genesis+15
-// (NOT a regression; the legacy 4000 ms floored to +4, the spec 3999 ms floors to +3).
-#[test]
-fn test_attestation_time_offset_consistent_with_slot_start() {
-    let clock = MockSlotClock::new(TEST_GENESIS, Duration::from_secs(12), 32);
-    // Slot 0 starts at genesis; (0 + 3999) / 1000 = genesis + 3.
-    assert_eq!(clock.attestation_time(0), TEST_GENESIS + 3);
-    // Slot 1 starts at genesis + 12; (12000 + 3999) / 1000 = genesis + 15.
-    assert_eq!(clock.attestation_time(1), TEST_GENESIS + 15);
-}
-
 // -- After the attestation moment has passed, time_until_attestation returns zero.
 #[test]
-fn test_attestation_time_past_returns_zero() {
+fn test_time_until_attestation_past_returns_zero() {
     let clock = MockSlotClock::new(TEST_GENESIS, Duration::from_secs(6), 32);
     // Advance time well past the 2 s attestation window for slot 0.
     clock.set_current_time(TEST_GENESIS + 5);
