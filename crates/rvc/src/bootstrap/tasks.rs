@@ -4,12 +4,12 @@
 //! gate and task cancel/drain sequence can be unit-tested without the full
 //! startup chain.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bn_manager::BnManager;
-use metrics::{serve_metrics_with_health, SharedHealthStatus};
+use metrics::SharedHealthStatus;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 use validator_store::ValidatorStore;
@@ -89,8 +89,8 @@ fn live_monitoring_counts(pubkey_map: &PubkeyMap, validator_store: &ValidatorSto
     (total, active)
 }
 
-/// Spawn metrics server, optional monitoring push, and optional proposer-config
-/// refresh through the process [`TaskExecutor`] (ARCH-2g).
+/// Spawn metrics on `metrics_listener`, plus optional monitoring and proposer refresh
+/// through the process [`TaskExecutor`] (ARCH-2g).
 ///
 /// Cooperative tasks take `executor.token()` and exit on cancel. The metrics
 /// server has no token (abort-drain on Telemetry tier via `TaskExecutor::shutdown`).
@@ -99,6 +99,7 @@ fn live_monitoring_counts(pubkey_map: &PubkeyMap, validator_store: &ValidatorSto
 /// each interval reports live totals (not a boot-time constant).
 pub fn spawn_background_tasks(
     config: &Config,
+    metrics_listener: tokio::net::TcpListener,
     health_status: SharedHealthStatus,
     executor: &TaskExecutor,
     pubkey_map: PubkeyMap,
@@ -106,7 +107,6 @@ pub fn spawn_background_tasks(
 ) -> Result<(), BootstrapError> {
     let metrics_address = config.metrics_address;
     let metrics_port = config.metrics_port;
-
     check_metrics_bind_gate(metrics_address)?;
 
     // Force-register families (including PTC zero-children) before the scrape listener.
@@ -114,14 +114,14 @@ pub fn spawn_background_tasks(
 
     info!(addr = %metrics_address, port = metrics_port, "Starting metrics server");
     // P1-2: Telemetry tier; no cooperative token (abort-drain).
-    // detached: metrics server; serve loop is crates/metrics/src/server.rs:96 (serve_metrics_with_health), out of P1-1 scope.
+    // detached: metrics server; serve loop is serve_metrics_on (no bind), out of P1-1 scope.
     executor.spawn("metrics_server", ShutdownTier::Telemetry, async move {
-        if let Err(e) =
-            serve_metrics_with_health(metrics_address, metrics_port, health_status).await
-        {
+        if let Err(e) = metrics::server::serve_metrics_on(metrics_listener, health_status).await {
             error!(error = %e, "Metrics server exited with error");
         }
     });
+    // Listener was bound by bind_required_listeners after check_metrics_bind_gate.
+    // This spawn serves that socket and does not bind a second time.
 
     // P1-3: monitoring push (PB-B2) — Background tier.
     if let Some(ref monitoring_endpoint) = config.monitoring.endpoint {
@@ -254,6 +254,70 @@ pub fn spawn_sync_monitor(
     });
 }
 
+/// Listeners bound before keystore load so a port clash aborts startup.
+///
+/// `metrics` is always bound. `keymanager` is bound only when
+/// `config.keymanager.enabled` is set.
+#[derive(Debug)]
+pub struct RequiredListeners {
+    /// Metrics and health HTTP listener.
+    pub metrics: tokio::net::TcpListener,
+    /// Keymanager API listener. `None` when keymanager is disabled.
+    pub keymanager: Option<tokio::net::TcpListener>,
+}
+
+/// Bind the metrics listener, then the keymanager listener when it is enabled.
+///
+/// [`check_metrics_bind_gate`] runs first, so a non-loopback metrics address
+/// without `RVC_METRICS_ALLOW_NON_LOOPBACK=true` is [`BootstrapError::MetricsBind`]
+/// (exit 1) and nothing is bound. A port clash is [`BootstrapError::ListenerBind`]
+/// (exit 15) and names the listener and the address.
+///
+/// The keymanager address uses the loopback default `127.0.0.1:5062` when unset
+/// ([`crate::keymanager_adapters::keymanager_bind_addr`]). Disabled keymanager
+/// does not bind.
+pub async fn bind_required_listeners(config: &Config) -> Result<RequiredListeners, BootstrapError> {
+    check_metrics_bind_gate(config.metrics_address)?;
+
+    let metrics_addr = SocketAddr::from((config.metrics_address, config.metrics_port));
+    let metrics = match tokio::net::TcpListener::bind(metrics_addr).await {
+        Ok(listener) => listener,
+        Err(source) => {
+            error!(
+                listener = "metrics",
+                addr = %metrics_addr,
+                error = %source,
+                "failed to bind required listener"
+            );
+            return Err(BootstrapError::ListenerBind {
+                listener: "metrics",
+                addr: metrics_addr,
+                source,
+            });
+        }
+    };
+
+    let keymanager = if config.keymanager.enabled {
+        let addr = crate::keymanager_adapters::keymanager_bind_addr(config)?;
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => Some(listener),
+            Err(source) => {
+                error!(
+                    listener = "keymanager",
+                    addr = %addr,
+                    error = %source,
+                    "failed to bind required listener"
+                );
+                return Err(BootstrapError::ListenerBind { listener: "keymanager", addr, source });
+            }
+        }
+    } else {
+        None
+    };
+
+    Ok(RequiredListeners { metrics, keymanager })
+}
+
 #[cfg(test)]
 // RF5-10: env-var contract tests use set_var/remove_var under a lock.
 #[allow(unsafe_code)]
@@ -305,6 +369,12 @@ mod tests {
         Arc::new(ValidatorStore::new([0u8; 20], 30_000_000))
     }
 
+    async fn prebound_metrics(config: &Config) -> tokio::net::TcpListener {
+        tokio::net::TcpListener::bind((config.metrics_address, config.metrics_port))
+            .await
+            .expect("pre-bind metrics listener")
+    }
+
     fn encrypt_test_keystore(sk: &SecretKey) -> String {
         let keystore = crypto::Keystore::encrypt(
             sk,
@@ -314,6 +384,124 @@ mod tests {
         )
         .expect("encrypt");
         serde_json::to_string(&keystore).expect("serialize keystore")
+    }
+
+    /// RR1-08: an occupied metrics port aborts with `ListenerBind` naming the
+    /// listener and the address, and the process exit code is 15.
+    #[tokio::test]
+    async fn bind_required_listeners_fails_with_listener_and_addr() {
+        let held =
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("hold port");
+        let addr = held.local_addr().expect("held addr");
+        let config =
+            Config { metrics_address: addr.ip(), metrics_port: addr.port(), ..Config::default() };
+
+        let err =
+            bind_required_listeners(&config).await.expect_err("occupied metrics port must fail");
+        match &err {
+            BootstrapError::ListenerBind { listener, addr: got, .. } => {
+                assert_eq!(*listener, "metrics");
+                assert_eq!(*got, addr);
+            }
+            other => panic!("expected ListenerBind, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("metrics"), "message must name the listener, got: {msg}");
+        assert!(msg.contains(&addr.to_string()), "message must name the address, got: {msg}");
+        assert_eq!(err.exit_code(), 15);
+        assert_eq!(err.exit_code(), crate::startup::EXIT_LISTENER_BIND);
+        // Keep the port occupied until the assertion returns.
+        drop(held);
+    }
+
+    /// RR1-08: an occupied keymanager port is the same `ListenerBind` (exit 15)
+    /// when keymanager is enabled.
+    #[tokio::test]
+    async fn bind_required_listeners_keymanager_port_held_is_listener_bind() {
+        let held =
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("hold port");
+        let addr = held.local_addr().expect("held addr");
+        let config = Config {
+            metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            metrics_port: 0,
+            keymanager: crate::config::KeymanagerConfig {
+                enabled: true,
+                address: Some(addr.to_string()),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let err =
+            bind_required_listeners(&config).await.expect_err("occupied keymanager port must fail");
+        match &err {
+            BootstrapError::ListenerBind { listener, addr: got, .. } => {
+                assert_eq!(*listener, "keymanager");
+                assert_eq!(*got, addr);
+            }
+            other => panic!("expected ListenerBind, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("keymanager"), "message must name the listener, got: {msg}");
+        assert!(msg.contains(&addr.to_string()), "message must name the address, got: {msg}");
+        assert_eq!(err.exit_code(), crate::startup::EXIT_LISTENER_BIND);
+        drop(held);
+    }
+
+    /// RR1-08: keymanager disabled does not bind, even if its address is held.
+    #[tokio::test]
+    async fn bind_required_listeners_skips_keymanager_when_disabled() {
+        let held =
+            tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("hold port");
+        let addr = held.local_addr().expect("held addr");
+        let config = Config {
+            metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            metrics_port: 0,
+            keymanager: crate::config::KeymanagerConfig {
+                enabled: false,
+                address: Some(addr.to_string()),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+
+        let listeners = bind_required_listeners(&config)
+            .await
+            .expect("disabled keymanager must not bind the held address");
+        assert!(listeners.keymanager.is_none(), "disabled keymanager must not bind");
+        assert!(listeners.metrics.local_addr().expect("metrics addr").ip().is_loopback());
+        drop(held);
+    }
+
+    /// RR1-08: a non-loopback metrics address still fails the gate (exit 1) and
+    /// is not `ListenerBind` (exit 15).
+    #[test]
+    fn bind_required_listeners_non_loopback_metrics_is_metrics_bind_exit_1() {
+        with_env_var(None, || {
+            let config = Config {
+                metrics_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                metrics_port: 0,
+                ..Config::default()
+            };
+            let err = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime")
+                .block_on(bind_required_listeners(&config))
+                .expect_err("non-loopback metrics without opt-in must fail the gate");
+            assert!(
+                matches!(err, BootstrapError::MetricsBind(_)),
+                "gate refusal must stay MetricsBind, got {err:?}"
+            );
+            assert!(!matches!(err, BootstrapError::ListenerBind { .. }));
+            assert_eq!(err.exit_code(), 1);
+            assert_ne!(err.exit_code(), 15);
+            let msg = err.to_string();
+            assert!(
+                msg.contains(METRICS_ALLOW_NON_LOOPBACK_ENV),
+                "error must name the opt-in env var, got: {msg}"
+            );
+        });
     }
 
     #[test]
@@ -347,10 +535,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_metrics_server_answers_health_and_readyz() {
-        let port = {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
-            listener.local_addr().expect("local_addr").port()
-        };
         let health = metrics::new_health_status();
         {
             let mut status = health.write().await;
@@ -361,12 +545,15 @@ mod tests {
         }
         let config = Config {
             metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            metrics_port: port,
+            metrics_port: 0,
             ..Config::default()
         };
+        let listener = prebound_metrics(&config).await;
+        let port = listener.local_addr().expect("local_addr").port();
         let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
         spawn_background_tasks(
             &config,
+            listener,
             health,
             &executor,
             empty_pubkey_map(),
@@ -411,15 +598,17 @@ mod tests {
     async fn test_spawn_background_tasks_all_tasks_cancel_on_shutdown() {
         let config = Config {
             metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            metrics_port: 0, // OS-assigned; serve binds ephemeral
+            metrics_port: 0, // OS-assigned; caller pre-binds ephemeral
             // monitoring / proposer_config left at nested defaults (disabled)
             ..Config::default()
         };
         let health = metrics::new_health_status();
+        let listener = prebound_metrics(&config).await;
         let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
         spawn_background_tasks(
             &config,
+            listener,
             health,
             &executor,
             empty_pubkey_map(),
@@ -440,9 +629,11 @@ mod tests {
             ..Config::default()
         };
         let health = metrics::new_health_status();
+        let listener = prebound_metrics(&config).await;
         let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
         spawn_background_tasks(
             &config,
+            listener,
             health,
             &executor,
             empty_pubkey_map(),
@@ -481,9 +672,11 @@ mod tests {
             ..Config::default()
         };
         let health = metrics::new_health_status();
+        let listener = prebound_metrics(&config).await;
         let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
         spawn_background_tasks(
             &config,
+            listener,
             health,
             &executor,
             empty_pubkey_map(),

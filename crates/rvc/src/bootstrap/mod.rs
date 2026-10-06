@@ -27,9 +27,9 @@ pub use run::{run, RunOptions};
 pub use services::{build_services, ServiceHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
 pub use tasks::{
-    check_metrics_bind_gate, spawn_background_tasks, spawn_sse_subscriber, spawn_sync_monitor,
-    METRICS_ALLOW_NON_LOOPBACK_ENV, SSE_CANCEL_TASK_NAME, SSE_TASK_NAME,
-    SYNC_MONITOR_CANCEL_TASK_NAME, SYNC_MONITOR_TASK_NAME,
+    bind_required_listeners, check_metrics_bind_gate, spawn_background_tasks, spawn_sse_subscriber,
+    spawn_sync_monitor, RequiredListeners, METRICS_ALLOW_NON_LOOPBACK_ENV, SSE_CANCEL_TASK_NAME,
+    SSE_TASK_NAME, SYNC_MONITOR_CANCEL_TASK_NAME, SYNC_MONITOR_TASK_NAME,
 };
 
 use std::sync::Arc;
@@ -40,7 +40,7 @@ use ::slashing::SlashingDb;
 use crate::config::ConfigError;
 use crate::deletion_denylist::{DeletionDenylist, DeletionDenylistError};
 use crate::keymanager_adapters::SpawnKeymanagerApiError;
-use crate::startup::{StartupError, EXIT_CRITICAL_TASK_FAILED};
+use crate::startup::{StartupError, EXIT_CRITICAL_TASK_FAILED, EXIT_LISTENER_BIND};
 
 /// Values produced by bootstrap phases and consumed by later ones.
 ///
@@ -107,6 +107,13 @@ pub enum BootstrapError {
     #[error("{0}")]
     InvalidConfig(String),
 
+    /// A required listener failed to bind. Names the listener and address.
+    ///
+    /// Distinct from [`Self::MetricsBind`], which is the non-loopback metrics
+    /// config refusal and still exits 1.
+    #[error("failed to bind {listener} listener at {addr}: {source}")]
+    ListenerBind { listener: &'static str, addr: std::net::SocketAddr, source: std::io::Error },
+
     /// A registered task panicked. The executor drain has already finished.
     #[error("critical task '{task}' failed; process exiting")]
     CriticalTaskFailed { task: &'static str },
@@ -118,6 +125,7 @@ impl BootstrapError {
         match self {
             Self::Startup(e) => e.exit_code(),
             Self::CriticalTaskFailed { .. } => EXIT_CRITICAL_TASK_FAILED,
+            Self::ListenerBind { .. } => EXIT_LISTENER_BIND,
             _ => 1,
         }
     }
@@ -133,7 +141,8 @@ mod tests {
     use super::*;
     use crate::startup::{
         StartupError, EXIT_CRITICAL_TASK_FAILED, EXIT_GENESIS_ROOT_MISMATCH,
-        EXIT_INTEGRITY_CHECK_FAILED, EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
+        EXIT_INTEGRITY_CHECK_FAILED, EXIT_KEYSTORE_LOCKED, EXIT_LISTENER_BIND,
+        EXIT_UNSUPPORTED_FORK_VERSION,
     };
 
     /// ARCH-2i / NFR-3: BootstrapError maps each named startup failure to EXIT_*.
@@ -164,6 +173,14 @@ mod tests {
             (
                 BootstrapError::CriticalTaskFailed { task: "duty_orchestrator" },
                 EXIT_CRITICAL_TASK_FAILED,
+            ),
+            (
+                BootstrapError::ListenerBind {
+                    listener: "metrics",
+                    addr: "127.0.0.1:9".parse().expect("addr"),
+                    source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "in use"),
+                },
+                EXIT_LISTENER_BIND,
             ),
         ];
         for (err, want) in cases {

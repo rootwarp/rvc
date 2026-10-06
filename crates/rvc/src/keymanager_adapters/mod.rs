@@ -25,8 +25,8 @@ pub use notifier::KeyChangeNotifier;
 pub use remote_keys::RemoteKeyManagerAdapter;
 pub use slashing::SlashingProtectionAdapter;
 pub use spawn::{
-    build_keymanager_api, spawn_keymanager_api, BuiltKeymanagerApi, DoppelgangerMonitorKind,
-    KeymanagerApiDeps, SpawnKeymanagerApiError,
+    build_keymanager_api, keymanager_bind_addr, spawn_keymanager_api, BuiltKeymanagerApi,
+    DoppelgangerMonitorKind, KeymanagerApiDeps, SpawnKeymanagerApiError,
 };
 pub use validator::ValidatorManagerAdapter;
 pub use voluntary_exit::VoluntaryExitManagerAdapter;

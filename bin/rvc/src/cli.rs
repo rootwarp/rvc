@@ -263,8 +263,8 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             let _ = &logging_guards;
 
             // Named BootstrapError codes (unsupported-fork 13, keystore-lock 14,
-            // critical-task 16, …) map in synchronous main after the runtime
-            // drops (ARCH-2i); never hard-exit mid-async here.
+            // listener-bind 15, critical-task 16, …) map in synchronous main
+            // after the runtime drops (ARCH-2i); never hard-exit mid-async here.
             run_result?;
         }
         Commands::VoluntaryExit {
