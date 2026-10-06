@@ -57,7 +57,6 @@ impl SlotAnchor {
     }
 
     /// Milliseconds since the true slot start.
-    #[allow(dead_code)] // RR1-05 stamps offsets from `elapsed_ms`.
     pub(crate) fn elapsed_ms(&self) -> u64 {
         u64::try_from(tokio::time::Instant::now().saturating_duration_since(self.start).as_millis())
             .unwrap_or(u64::MAX)

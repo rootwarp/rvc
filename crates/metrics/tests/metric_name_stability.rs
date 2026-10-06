@@ -52,6 +52,11 @@
 //! when the slot loop skips a slot the clock stepped back onto after that
 //! slot's phases already ran. It has no labels. Dashboards that alert on a
 //! backward clock step should bind this name.
+//! RR1-05 adds `rvc_slot_phase_offset_ms` (family delta +1): one observation
+//! when a slot phase fires. Label `phase` is block, attestation, sync_message,
+//! aggregate, contribution, or payload_attestation. The sample is milliseconds
+//! from the true slot start, including a late wake. Buckets match
+//! `rvc_slot_phase_block_start_offset_ms`, which is retained for dashboards.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -142,6 +147,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_slot_context_parent_fallback_total",
     "rvc_slot_phase_block_start_offset_ms",
     "rvc_slot_phase_late_total", // operator-facing: phases that fired after their absolute deadline (RR1-03 / #506)
+    "rvc_slot_phase_offset_ms", // operator-facing: true offset into the slot when a phase fires (RR1-05 / #508)
     "rvc_slot_replay_skipped_total", // operator-facing: slots skipped after a backward clock step (RR1-04 / #507)
     "rvc_sse_events_dropped_total",
     "rvc_sync_committee_skipped_total",
@@ -251,8 +257,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        55,
-        "RR1-04 adds rvc_slot_replay_skipped_total; count is the list length"
+        56,
+        "RR1-05 adds rvc_slot_phase_offset_ms; count is the list length"
     );
 }
 
