@@ -117,6 +117,18 @@ fn select_and_rearm_doppelganger_monitor(
     (monitor, kind)
 }
 
+/// Keymanager listen address.
+///
+/// An unset address defaults to loopback `127.0.0.1:5062`. A missing setting
+/// does not widen the bind to an unspecified address.
+pub fn keymanager_bind_addr(
+    config: &Config,
+) -> Result<std::net::SocketAddr, SpawnKeymanagerApiError> {
+    config.keymanager.address.as_deref().unwrap_or("127.0.0.1:5062").parse().map_err(
+        |e: std::net::AddrParseError| SpawnKeymanagerApiError::InvalidAddress(e.to_string()),
+    )
+}
+
 /// Assemble Keymanager adapters, settings, and server without spawning the bind loop.
 ///
 /// Returns `Ok(None)` when `config.keymanager.enabled` is false — nothing is
@@ -142,10 +154,7 @@ pub fn build_keymanager_api(
         Err(e) => return Err(SpawnKeymanagerApiError::Token(e.to_string())),
     };
 
-    let km_addr: std::net::SocketAddr =
-        config.keymanager.address.as_deref().unwrap_or("127.0.0.1:5062").parse().map_err(
-            |e: std::net::AddrParseError| SpawnKeymanagerApiError::InvalidAddress(e.to_string()),
-        )?;
+    let km_addr = keymanager_bind_addr(config)?;
 
     if !km_addr.ip().is_loopback() {
         warn!(
@@ -251,15 +260,24 @@ pub fn build_keymanager_api(
 /// constructing adapters or touching the token file.
 ///
 /// When enabled, registers the server on `executor` at Ingress tier (ARCH-2g
-/// P1-6). Cancellation is driven by the executor token via
-/// [`keymanager_api::KeymanagerServer::run_with_shutdown`].
+/// P1-6). `listener` is the socket from
+/// [`crate::bootstrap::bind_required_listeners`]; this function does not bind.
+/// Cancellation is driven by the executor token via
+/// [`keymanager_api::KeymanagerServer::serve_on`].
 pub fn spawn_keymanager_api(
     config: &Config,
     deps: KeymanagerApiDeps,
+    listener: Option<tokio::net::TcpListener>,
     executor: &TaskExecutor,
 ) -> Result<bool, SpawnKeymanagerApiError> {
     let Some(built) = build_keymanager_api(config, deps)? else {
         return Ok(false);
+    };
+
+    let Some(listener) = listener else {
+        return Err(SpawnKeymanagerApiError::InvalidAddress(
+            "keymanager listener was not pre-bound".into(),
+        ));
     };
 
     info!(
@@ -269,9 +287,9 @@ pub fn spawn_keymanager_api(
     );
 
     let token = executor.token();
-    // detached: keymanager API server; serve loop is KeymanagerServer::run_with_shutdown in crates/keymanager-api/src/server.rs:175, out of scope.
+    // detached: keymanager API server; serve loop is KeymanagerServer::serve_on, out of scope.
     executor.spawn("keymanager_api", ShutdownTier::Ingress, async move {
-        if let Err(e) = built.server.run_with_shutdown(token).await {
+        if let Err(e) = built.server.serve_on(listener, token).await {
             error!("Keymanager API server error: {}", e);
         }
     });

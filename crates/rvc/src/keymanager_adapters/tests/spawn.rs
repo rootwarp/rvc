@@ -107,7 +107,7 @@ fn test_spawn_keymanager_api_disabled_constructs_nothing() {
     // spawn path is also a no-op
     let deps = spawn_test_deps(dir.path(), None);
     let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
-    let started = spawn_keymanager_api(&config, deps, &exec).expect("disabled spawn is Ok");
+    let started = spawn_keymanager_api(&config, deps, None, &exec).expect("disabled spawn is Ok");
     assert!(!started, "disabled spawn must not start a task");
     assert!(exec.registered_names().is_empty());
 }
@@ -267,6 +267,17 @@ fn test_spawn_keymanager_api_warns_on_non_loopback_bind() {
     assert!(logs_contain("non-loopback address"), "must warn when Keymanager binds non-loopback");
 }
 
+/// Loopback remains the default when the keymanager address is unset.
+#[test]
+fn keymanager_bind_addr_defaults_to_loopback() {
+    let dir = TempDir::new().unwrap();
+    let mut config = spawn_test_config(&dir, true, "0.0.0.0:1");
+    config.keymanager.address = None;
+    let addr = keymanager_bind_addr(&config).expect("default addr");
+    assert_eq!(addr, "127.0.0.1:5062".parse().unwrap());
+    assert!(addr.ip().is_loopback(), "unset keymanager address must stay on loopback");
+}
+
 /// Enabled spawn registers on the executor and drains after token cancel.
 #[tokio::test]
 async fn test_spawn_keymanager_api_returns_a_joinable_handle() {
@@ -275,22 +286,19 @@ async fn test_spawn_keymanager_api_returns_a_joinable_handle() {
     use crate::bootstrap::executor::{TaskExecutor, TierBudget};
 
     let dir = TempDir::new().unwrap();
-    let addr = {
-        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        l.local_addr().unwrap().to_string()
-    };
-    let config = spawn_test_config(&dir, true, &addr);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = spawn_test_config(&dir, true, &addr.to_string());
     let deps = spawn_test_deps(dir.path(), None);
     let token = CancellationToken::new();
     let (exec, _rx) = TaskExecutor::new(token.clone());
-    let started = spawn_keymanager_api(&config, deps, &exec).expect("spawn");
+    let started = spawn_keymanager_api(&config, deps, Some(listener), &exec).expect("spawn");
     assert!(started, "enabled must start keymanager_api");
     assert_eq!(exec.registered_names(), vec!["keymanager_api"]);
 
     // Wait until the listener accepts.
-    let sock: std::net::SocketAddr = addr.parse().unwrap();
     for _ in 0..100 {
-        if tokio::net::TcpStream::connect(sock).await.is_ok() {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;

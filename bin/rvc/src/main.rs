@@ -58,6 +58,22 @@ mod tests {
         assert_eq!(EXIT_CRITICAL_TASK_FAILED, 16);
     }
 
+    /// RR1-08: a listener bind failure exits 15 after the runtime drops.
+    #[test]
+    fn listener_bind_maps_to_exit_15() {
+        use std::net::SocketAddr;
+
+        use rvc::startup::EXIT_LISTENER_BIND;
+
+        let err = anyhow::Error::from(BootstrapError::ListenerBind {
+            listener: "metrics",
+            addr: "127.0.0.1:9".parse::<SocketAddr>().expect("addr"),
+            source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "in use"),
+        });
+        assert_eq!(named_process_exit_code(&err), Some(EXIT_LISTENER_BIND));
+        assert_eq!(EXIT_LISTENER_BIND, 15);
+    }
+
     /// Unnamed bootstrap failures stay on anyhow's default status.
     #[test]
     fn generic_bootstrap_error_is_not_a_named_exit() {

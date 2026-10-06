@@ -16,7 +16,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::executor::{ShutdownOutcome, ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
-use super::tasks::{spawn_background_tasks, spawn_sse_subscriber, spawn_sync_monitor};
+use super::tasks::{
+    bind_required_listeners, spawn_background_tasks, spawn_sse_subscriber, spawn_sync_monitor,
+};
 use super::{
     build_services, connect_beacon, load_signing_keys, open_slashing_db, wire_signing_enablement,
     BeaconHandles, BootstrapError, EnablementHandles, LoadedKeys, ServiceHandles,
@@ -53,9 +55,10 @@ pub struct RunOptions {
 ///
 /// Returns [`BootstrapError`] for phase failures and for a panicking registered
 /// task ([`BootstrapError::CriticalTaskFailed`], exit 16). Named `EXIT_*` codes
-/// (10, 11, 13 unsupported-fork, 14 keystore-lock, 16 critical-task) are mapped
-/// by the synchronous binary `main` after the Tokio runtime is dropped
-/// (ARCH-2i / NFR-3). `run` itself never calls `process::exit`.
+/// (10, 11, 13 unsupported-fork, 14 keystore-lock, 15 listener-bind,
+/// 16 critical-task) are mapped by the synchronous binary `main` after the
+/// Tokio runtime is dropped (ARCH-2i / NFR-3). `run` itself never calls
+/// `process::exit`.
 pub async fn run(
     config: Config,
     options: RunOptions,
@@ -122,6 +125,11 @@ pub async fn run(
                 return Err(e);
             }
         };
+
+    // RR1-08: bind metrics and, when enabled, keymanager before keystore
+    // decryption. A port clash is ListenerBind (exit 15) and returns here,
+    // before load_signing_keys and before the duty orchestrator is spawned.
+    let listeners = bind_required_listeners(&config).await?;
 
     // Keystore-dir + secret providers + CompositeSigner + optional gRPC remote.
     let loaded_keys = match load_signing_keys(&config, &deletion_denylist).await {
@@ -260,6 +268,7 @@ pub async fn run(
             admissions,
             quiesce_registry,
         },
+        listeners.keymanager,
         &executor,
     )?;
 
@@ -319,6 +328,7 @@ pub async fn run(
     // P1-2/P1-3/P1-4: metrics + monitoring + proposer-config on executor.
     spawn_background_tasks(
         &config,
+        listeners.metrics,
         health_status,
         &executor,
         pubkey_map.clone(),
@@ -557,7 +567,8 @@ mod tests {
     use super::*;
     use crate::startup::{
         acquire_keystore_lock, EXIT_CRITICAL_TASK_FAILED, EXIT_GENESIS_ROOT_MISMATCH,
-        EXIT_INTEGRITY_CHECK_FAILED, EXIT_KEYSTORE_LOCKED, EXIT_UNSUPPORTED_FORK_VERSION,
+        EXIT_INTEGRITY_CHECK_FAILED, EXIT_KEYSTORE_LOCKED, EXIT_LISTENER_BIND,
+        EXIT_UNSUPPORTED_FORK_VERSION,
     };
     use ::slashing::SlashingDb;
     use std::time::Duration;
@@ -686,12 +697,14 @@ mod tests {
         assert_eq!(EXIT_GENESIS_ROOT_MISMATCH, 11);
         assert_eq!(EXIT_UNSUPPORTED_FORK_VERSION, 13);
         assert_eq!(EXIT_KEYSTORE_LOCKED, 14);
+        assert_eq!(EXIT_LISTENER_BIND, 15);
         assert_eq!(EXIT_CRITICAL_TASK_FAILED, 16);
         // Reserved historically (one-shot doppelganger); must not be reused.
         assert_ne!(EXIT_INTEGRITY_CHECK_FAILED, 12);
         assert_ne!(EXIT_GENESIS_ROOT_MISMATCH, 12);
         assert_ne!(EXIT_UNSUPPORTED_FORK_VERSION, 12);
         assert_ne!(EXIT_KEYSTORE_LOCKED, 12);
+        assert_ne!(EXIT_LISTENER_BIND, 12);
         assert_ne!(EXIT_CRITICAL_TASK_FAILED, 12);
         let startup_src = include_str!("../startup.rs");
         assert!(
@@ -764,6 +777,30 @@ mod tests {
             !body.contains("serve_with_shutdown"),
             "bootstrap/run.rs must not call tonic serve_with_shutdown (ARCH-7d)"
         );
+    }
+
+    /// RR1-08: required listeners bind after beacon connect and before keystore
+    /// load, which is itself before the duty orchestrator spawn. A bind failure
+    /// therefore returns from `run` before any orchestrator task exists.
+    #[test]
+    fn bind_required_listeners_precedes_keystore_load_and_orchestrator_spawn() {
+        let src = include_str!("run.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production body before tests");
+        let start = prod.find("pub async fn run(").expect("fn run");
+        let rest = &prod[start..];
+        let end = rest.find("pub(crate) struct ShutdownInputs").expect("end of run");
+        let run_fn = &rest[..end];
+
+        let connect_at = run_fn.find("connect_beacon(").expect("connect_beacon call");
+        let bind_at =
+            run_fn.find("bind_required_listeners(").expect("bind_required_listeners call");
+        let keys_at = run_fn.find("load_signing_keys(").expect("load_signing_keys call");
+        // Production spawn is `executor.spawn("duty_orchestrator"`.
+        let orch_at = run_fn.find("\"duty_orchestrator\"").expect("duty_orchestrator spawn");
+
+        assert!(connect_at < bind_at, "bind_required_listeners must follow connect_beacon");
+        assert!(bind_at < keys_at, "bind_required_listeners must precede load_signing_keys");
+        assert!(keys_at < orch_at, "load_signing_keys must precede the duty_orchestrator spawn");
     }
 
     /// ARCH-2i: production body of run.rs must not hard-exit the process.

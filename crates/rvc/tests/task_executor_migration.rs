@@ -43,8 +43,11 @@ async fn test_every_background_task_is_registered_by_name() {
         ..Config::default()
     };
 
+    let metrics_listener =
+        tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("pre-bind metrics");
     spawn_background_tasks(
         &config,
+        metrics_listener,
         metrics::new_health_status(),
         &executor,
         empty_pubkey_map(),
