@@ -1,0 +1,1951 @@
+{
+  "issue": "RR1-10",
+  "protocol": "plan/review-2026-10-03/measurements/README.md",
+  "clock_mode_protocol_cell": "wall",
+  "clock_mode_note": "RR0-08 keeps latency on wall and counts on paused, and records both. Phase-fire offsets are a latency figure, so the protocol cell is wall. Paused runs are recorded beside it. The vc_scale_profile harness is not this measurement: it advances the mock clock 8s and does not read rvc_slot_phase_*.",
+  "sha_at_process_start": "7ea68c730dca060545d42164d15fde41c9e40f08",
+  "runtime_identical_to": "7ea68c730dca060545d42164d15fde41c9e40f08",
+  "host": {
+    "hostname": "cursor",
+    "os": "linux",
+    "arch": "x86_64",
+    "uname": "Linux cursor 6.12.94+ #1 SMP PREEMPT_DYNAMIC Fri Oct  2 18:10:29 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux",
+    "cpu_model_name": "Intel(R) Xeon(R) Processor",
+    "cpu_vendor": "GenuineIntel",
+    "cpu_family": 6,
+    "cpu_model": 207,
+    "cpu_stepping": 2,
+    "cores": 4,
+    "threads_per_core": 1,
+    "siblings": 4,
+    "harness_host_field": "cursor linux/x86_64"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "nextest": "cargo-nextest 0.9.146 (8af696ddc 2026-09-21)"
+  },
+  "scenario": {
+    "fixture": "single-duty",
+    "validators": 0,
+    "slots_per_scenario": 1,
+    "capture_offset_ms": 600,
+    "slot_duration_ms": 12000,
+    "driver": "DutyOrchestrator::run",
+    "clock": "MockSlotClock set_slot_with_offset_ms(slot, 0) then advance_ms(600)",
+    "runs_per_clock_mode": 3,
+    "aggregator": "median",
+    "m1_claimed_at_n200": false,
+    "measured_at_utc": [
+      "2026-10-06T09:40:52Z",
+      "2026-10-06T09:45:18Z"
+    ]
+  },
+  "lateness_definition": "lateness_ms = observed_elapsed_ms - deadline_ms, except block, whose deadline 0 has already passed at the 600 ms wake, so lateness_ms = observed_elapsed_ms - 600. The [0, +50] bound is this lateness. The offset metric is the observed elapsed itself (about 600 for block, where a whole-second RED read is 0).",
+  "summary": {
+    "wall": {
+      "pre_gloas": {
+        "fork": "Phase0",
+        "slot": 65,
+        "epoch": 2,
+        "deadlines_ms": {
+          "aggregate": 8000,
+          "attestation": 3999,
+          "block": 0,
+          "contribution": 8000,
+          "payload_attestation": 8000,
+          "sync_message": 3999
+        },
+        "deadlines_bps": {
+          "aggregate": 6667,
+          "attestation": 3333,
+          "contribution": 6667,
+          "payload": 6667,
+          "payload_attestation": 6667,
+          "sync_message": 3333
+        },
+        "phases": {
+          "block": {
+            "runs_ms": [
+              600.0,
+              600.0,
+              600.0
+            ],
+            "median_ms": 600.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 0,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "attestation": {
+            "runs_ms": [
+              4000.0,
+              4000.0,
+              3999.0
+            ],
+            "median_ms": 4000.0,
+            "lateness_ms": [
+              1.0,
+              1.0,
+              0.0
+            ],
+            "lateness_median_ms": 1.0,
+            "deadline_ms": 3999,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "sync_message": {
+            "runs_ms": [
+              4001.0,
+              4000.0,
+              4000.0
+            ],
+            "median_ms": 4000.0,
+            "lateness_ms": [
+              2.0,
+              1.0,
+              1.0
+            ],
+            "lateness_median_ms": 1.0,
+            "deadline_ms": 3999,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "aggregate": {
+            "runs_ms": [
+              8001.0,
+              8000.0,
+              8000.0
+            ],
+            "median_ms": 8000.0,
+            "lateness_ms": [
+              1.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 8000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "contribution": {
+            "runs_ms": [
+              8001.0,
+              8000.0,
+              8000.0
+            ],
+            "median_ms": 8000.0,
+            "lateness_ms": [
+              1.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 8000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "payload_attestation": {
+            "runs_ms": [
+              null,
+              null,
+              null
+            ],
+            "median_ms": null,
+            "lateness_ms": [
+              null,
+              null,
+              null
+            ],
+            "lateness_median_ms": null,
+            "deadline_ms": 8000,
+            "samples_added": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "block_start_offset_cold_ms": {
+          "runs": [
+            600.0,
+            600.0,
+            600.0
+          ],
+          "median": 600.0
+        },
+        "late_total_added": {
+          "attestation": [
+            0,
+            0,
+            0
+          ],
+          "sync_message": [
+            0,
+            0,
+            0
+          ],
+          "aggregate": [
+            0,
+            0,
+            0
+          ],
+          "contribution": [
+            0,
+            0,
+            0
+          ],
+          "payload_attestation": [
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "gloas": {
+        "fork": "Gloas",
+        "slot": 2240,
+        "epoch": 70,
+        "deadlines_ms": {
+          "aggregate": 6000,
+          "attestation": 3000,
+          "block": 0,
+          "contribution": 6000,
+          "payload_attestation": 9000,
+          "sync_message": 3000
+        },
+        "deadlines_bps": {
+          "aggregate": 5000,
+          "attestation": 2500,
+          "contribution": 5000,
+          "payload": 5000,
+          "payload_attestation": 7500,
+          "sync_message": 2500
+        },
+        "phases": {
+          "block": {
+            "runs_ms": [
+              600.0,
+              600.0,
+              600.0
+            ],
+            "median_ms": 600.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 0,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "attestation": {
+            "runs_ms": [
+              3001.0,
+              3001.0,
+              3000.0
+            ],
+            "median_ms": 3001.0,
+            "lateness_ms": [
+              1.0,
+              1.0,
+              0.0
+            ],
+            "lateness_median_ms": 1.0,
+            "deadline_ms": 3000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "sync_message": {
+            "runs_ms": [
+              3001.0,
+              3001.0,
+              3000.0
+            ],
+            "median_ms": 3001.0,
+            "lateness_ms": [
+              1.0,
+              1.0,
+              0.0
+            ],
+            "lateness_median_ms": 1.0,
+            "deadline_ms": 3000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "aggregate": {
+            "runs_ms": [
+              6000.0,
+              6000.0,
+              6001.0
+            ],
+            "median_ms": 6000.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              1.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 6000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "contribution": {
+            "runs_ms": [
+              6000.0,
+              6000.0,
+              6001.0
+            ],
+            "median_ms": 6000.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              1.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 6000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "payload_attestation": {
+            "runs_ms": [
+              9001.0,
+              9001.0,
+              9000.0
+            ],
+            "median_ms": 9001.0,
+            "lateness_ms": [
+              1.0,
+              1.0,
+              0.0
+            ],
+            "lateness_median_ms": 1.0,
+            "deadline_ms": 9000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          }
+        },
+        "block_start_offset_cold_ms": {
+          "runs": [
+            600.0,
+            600.0,
+            600.0
+          ],
+          "median": 600.0
+        },
+        "late_total_added": {
+          "attestation": [
+            0,
+            0,
+            0
+          ],
+          "sync_message": [
+            0,
+            0,
+            0
+          ],
+          "aggregate": [
+            0,
+            0,
+            0
+          ],
+          "contribution": [
+            0,
+            0,
+            0
+          ],
+          "payload_attestation": [
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    },
+    "paused": {
+      "pre_gloas": {
+        "fork": "Phase0",
+        "slot": 65,
+        "epoch": 2,
+        "deadlines_ms": {
+          "aggregate": 8000,
+          "attestation": 3999,
+          "block": 0,
+          "contribution": 8000,
+          "payload_attestation": 8000,
+          "sync_message": 3999
+        },
+        "deadlines_bps": {
+          "aggregate": 6667,
+          "attestation": 3333,
+          "contribution": 6667,
+          "payload": 6667,
+          "payload_attestation": 6667,
+          "sync_message": 3333
+        },
+        "phases": {
+          "block": {
+            "runs_ms": [
+              600.0,
+              600.0,
+              600.0
+            ],
+            "median_ms": 600.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 0,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "attestation": {
+            "runs_ms": [
+              3999.0,
+              3999.0,
+              3999.0
+            ],
+            "median_ms": 3999.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 3999,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "sync_message": {
+            "runs_ms": [
+              3999.0,
+              3999.0,
+              3999.0
+            ],
+            "median_ms": 3999.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 3999,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "aggregate": {
+            "runs_ms": [
+              8000.0,
+              8000.0,
+              8000.0
+            ],
+            "median_ms": 8000.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 8000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "contribution": {
+            "runs_ms": [
+              8000.0,
+              8000.0,
+              8000.0
+            ],
+            "median_ms": 8000.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 8000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "payload_attestation": {
+            "runs_ms": [
+              null,
+              null,
+              null
+            ],
+            "median_ms": null,
+            "lateness_ms": [
+              null,
+              null,
+              null
+            ],
+            "lateness_median_ms": null,
+            "deadline_ms": 8000,
+            "samples_added": [
+              0,
+              0,
+              0
+            ]
+          }
+        },
+        "block_start_offset_cold_ms": {
+          "runs": [
+            600.0,
+            600.0,
+            600.0
+          ],
+          "median": 600.0
+        },
+        "late_total_added": {
+          "attestation": [
+            0,
+            0,
+            0
+          ],
+          "sync_message": [
+            0,
+            0,
+            0
+          ],
+          "aggregate": [
+            0,
+            0,
+            0
+          ],
+          "contribution": [
+            0,
+            0,
+            0
+          ],
+          "payload_attestation": [
+            0,
+            0,
+            0
+          ]
+        }
+      },
+      "gloas": {
+        "fork": "Gloas",
+        "slot": 2240,
+        "epoch": 70,
+        "deadlines_ms": {
+          "aggregate": 6000,
+          "attestation": 3000,
+          "block": 0,
+          "contribution": 6000,
+          "payload_attestation": 9000,
+          "sync_message": 3000
+        },
+        "deadlines_bps": {
+          "aggregate": 5000,
+          "attestation": 2500,
+          "contribution": 5000,
+          "payload": 5000,
+          "payload_attestation": 7500,
+          "sync_message": 2500
+        },
+        "phases": {
+          "block": {
+            "runs_ms": [
+              600.0,
+              600.0,
+              600.0
+            ],
+            "median_ms": 600.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 0,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "attestation": {
+            "runs_ms": [
+              3000.0,
+              3000.0,
+              3000.0
+            ],
+            "median_ms": 3000.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 3000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "sync_message": {
+            "runs_ms": [
+              3000.0,
+              3000.0,
+              3000.0
+            ],
+            "median_ms": 3000.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 3000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "aggregate": {
+            "runs_ms": [
+              6000.0,
+              6000.0,
+              6000.0
+            ],
+            "median_ms": 6000.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 6000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "contribution": {
+            "runs_ms": [
+              6000.0,
+              6000.0,
+              6000.0
+            ],
+            "median_ms": 6000.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 6000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          },
+          "payload_attestation": {
+            "runs_ms": [
+              9000.0,
+              9000.0,
+              9000.0
+            ],
+            "median_ms": 9000.0,
+            "lateness_ms": [
+              0.0,
+              0.0,
+              0.0
+            ],
+            "lateness_median_ms": 0.0,
+            "deadline_ms": 9000,
+            "samples_added": [
+              1,
+              1,
+              1
+            ]
+          }
+        },
+        "block_start_offset_cold_ms": {
+          "runs": [
+            600.0,
+            600.0,
+            600.0
+          ],
+          "median": 600.0
+        },
+        "late_total_added": {
+          "attestation": [
+            0,
+            0,
+            0
+          ],
+          "sync_message": [
+            0,
+            0,
+            0
+          ],
+          "aggregate": [
+            0,
+            0,
+            0
+          ],
+          "contribution": [
+            0,
+            0,
+            0
+          ],
+          "payload_attestation": [
+            0,
+            0,
+            0
+          ]
+        }
+      }
+    }
+  },
+  "raw_runs": {
+    "wall": [
+      {
+        "clock_mode": "wall",
+        "host": {
+          "arch": "x86_64",
+          "hostname": "cursor",
+          "os": "linux"
+        },
+        "probe": "m1-smalln-single-duty",
+        "scenarios": {
+          "gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 5000,
+              "attestation": 2500,
+              "contribution": 5000,
+              "payload": 5000,
+              "payload_attestation": 7500,
+              "sync_message": 2500
+            },
+            "deadlines_ms": {
+              "aggregate": 6000,
+              "attestation": 3000,
+              "block": 0,
+              "contribution": 6000,
+              "payload_attestation": 9000,
+              "sync_message": 3000
+            },
+            "epoch": 70,
+            "fork": "Gloas",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3001.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3001.0
+              },
+              {
+                "mean_ms": 3001.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 3001.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 9001.0,
+                "phase": "payload_attestation",
+                "samples_added": 1,
+                "sum_added": 9001.0
+              }
+            ],
+            "slot": 2240,
+            "tokio_elapsed_ms": 8422.736541999999,
+            "validators": 0
+          },
+          "pre_gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 6667,
+              "attestation": 3333,
+              "contribution": 6667,
+              "payload": 6667,
+              "payload_attestation": 6667,
+              "sync_message": 3333
+            },
+            "deadlines_ms": {
+              "aggregate": 8000,
+              "attestation": 3999,
+              "block": 0,
+              "contribution": 8000,
+              "payload_attestation": 8000,
+              "sync_message": 3999
+            },
+            "epoch": 2,
+            "fork": "Phase0",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 4000.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 4000.0
+              },
+              {
+                "mean_ms": 4001.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 4001.0
+              },
+              {
+                "mean_ms": 8001.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 8001.0
+              },
+              {
+                "mean_ms": 8001.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 8001.0
+              },
+              {
+                "mean_ms": null,
+                "phase": "payload_attestation",
+                "samples_added": 0,
+                "sum_added": 0.0
+              }
+            ],
+            "slot": 65,
+            "tokio_elapsed_ms": 7429.55788,
+            "validators": 0
+          }
+        },
+        "sha": "7ea68c730dca060545d42164d15fde41c9e40f08",
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "clock_mode": "wall",
+        "host": {
+          "arch": "x86_64",
+          "hostname": "cursor",
+          "os": "linux"
+        },
+        "probe": "m1-smalln-single-duty",
+        "scenarios": {
+          "gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 5000,
+              "attestation": 2500,
+              "contribution": 5000,
+              "payload": 5000,
+              "payload_attestation": 7500,
+              "sync_message": 2500
+            },
+            "deadlines_ms": {
+              "aggregate": 6000,
+              "attestation": 3000,
+              "block": 0,
+              "contribution": 6000,
+              "payload_attestation": 9000,
+              "sync_message": 3000
+            },
+            "epoch": 70,
+            "fork": "Gloas",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3001.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3001.0
+              },
+              {
+                "mean_ms": 3001.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 3001.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 9001.0,
+                "phase": "payload_attestation",
+                "samples_added": 1,
+                "sum_added": 9001.0
+              }
+            ],
+            "slot": 2240,
+            "tokio_elapsed_ms": 8428.935429,
+            "validators": 0
+          },
+          "pre_gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 6667,
+              "attestation": 3333,
+              "contribution": 6667,
+              "payload": 6667,
+              "payload_attestation": 6667,
+              "sync_message": 3333
+            },
+            "deadlines_ms": {
+              "aggregate": 8000,
+              "attestation": 3999,
+              "block": 0,
+              "contribution": 8000,
+              "payload_attestation": 8000,
+              "sync_message": 3999
+            },
+            "epoch": 2,
+            "fork": "Phase0",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 4000.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 4000.0
+              },
+              {
+                "mean_ms": 4000.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 4000.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": null,
+                "phase": "payload_attestation",
+                "samples_added": 0,
+                "sum_added": 0.0
+              }
+            ],
+            "slot": 65,
+            "tokio_elapsed_ms": 7426.477643,
+            "validators": 0
+          }
+        },
+        "sha": "7ea68c730dca060545d42164d15fde41c9e40f08",
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "clock_mode": "wall",
+        "host": {
+          "arch": "x86_64",
+          "hostname": "cursor",
+          "os": "linux"
+        },
+        "probe": "m1-smalln-single-duty",
+        "scenarios": {
+          "gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 5000,
+              "attestation": 2500,
+              "contribution": 5000,
+              "payload": 5000,
+              "payload_attestation": 7500,
+              "sync_message": 2500
+            },
+            "deadlines_ms": {
+              "aggregate": 6000,
+              "attestation": 3000,
+              "block": 0,
+              "contribution": 6000,
+              "payload_attestation": 9000,
+              "sync_message": 3000
+            },
+            "epoch": 70,
+            "fork": "Gloas",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3000.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3000.0
+              },
+              {
+                "mean_ms": 3000.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 3000.0
+              },
+              {
+                "mean_ms": 6001.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 6001.0
+              },
+              {
+                "mean_ms": 6001.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 6001.0
+              },
+              {
+                "mean_ms": 9000.0,
+                "phase": "payload_attestation",
+                "samples_added": 1,
+                "sum_added": 9000.0
+              }
+            ],
+            "slot": 2240,
+            "tokio_elapsed_ms": 8430.820978,
+            "validators": 0
+          },
+          "pre_gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 6667,
+              "attestation": 3333,
+              "contribution": 6667,
+              "payload": 6667,
+              "payload_attestation": 6667,
+              "sync_message": 3333
+            },
+            "deadlines_ms": {
+              "aggregate": 8000,
+              "attestation": 3999,
+              "block": 0,
+              "contribution": 8000,
+              "payload_attestation": 8000,
+              "sync_message": 3999
+            },
+            "epoch": 2,
+            "fork": "Phase0",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3999.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3999.0
+              },
+              {
+                "mean_ms": 4000.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 4000.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": null,
+                "phase": "payload_attestation",
+                "samples_added": 0,
+                "sum_added": 0.0
+              }
+            ],
+            "slot": 65,
+            "tokio_elapsed_ms": 7430.278020000001,
+            "validators": 0
+          }
+        },
+        "sha": "7ea68c730dca060545d42164d15fde41c9e40f08",
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    ],
+    "paused": [
+      {
+        "clock_mode": "paused",
+        "host": {
+          "arch": "x86_64",
+          "hostname": "cursor",
+          "os": "linux"
+        },
+        "probe": "m1-smalln-single-duty",
+        "scenarios": {
+          "gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 5000,
+              "attestation": 2500,
+              "contribution": 5000,
+              "payload": 5000,
+              "payload_attestation": 7500,
+              "sync_message": 2500
+            },
+            "deadlines_ms": {
+              "aggregate": 6000,
+              "attestation": 3000,
+              "block": 0,
+              "contribution": 6000,
+              "payload_attestation": 9000,
+              "sync_message": 3000
+            },
+            "epoch": 70,
+            "fork": "Gloas",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3000.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3000.0
+              },
+              {
+                "mean_ms": 3000.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 3000.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 9000.0,
+                "phase": "payload_attestation",
+                "samples_added": 1,
+                "sum_added": 9000.0
+              }
+            ],
+            "slot": 2240,
+            "tokio_elapsed_ms": 8420.0,
+            "validators": 0
+          },
+          "pre_gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 6667,
+              "attestation": 3333,
+              "contribution": 6667,
+              "payload": 6667,
+              "payload_attestation": 6667,
+              "sync_message": 3333
+            },
+            "deadlines_ms": {
+              "aggregate": 8000,
+              "attestation": 3999,
+              "block": 0,
+              "contribution": 8000,
+              "payload_attestation": 8000,
+              "sync_message": 3999
+            },
+            "epoch": 2,
+            "fork": "Phase0",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3999.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3999.0
+              },
+              {
+                "mean_ms": 3999.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 3999.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": null,
+                "phase": "payload_attestation",
+                "samples_added": 0,
+                "sum_added": 0.0
+              }
+            ],
+            "slot": 65,
+            "tokio_elapsed_ms": 7420.0,
+            "validators": 0
+          }
+        },
+        "sha": "7ea68c730dca060545d42164d15fde41c9e40f08",
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "clock_mode": "paused",
+        "host": {
+          "arch": "x86_64",
+          "hostname": "cursor",
+          "os": "linux"
+        },
+        "probe": "m1-smalln-single-duty",
+        "scenarios": {
+          "gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 5000,
+              "attestation": 2500,
+              "contribution": 5000,
+              "payload": 5000,
+              "payload_attestation": 7500,
+              "sync_message": 2500
+            },
+            "deadlines_ms": {
+              "aggregate": 6000,
+              "attestation": 3000,
+              "block": 0,
+              "contribution": 6000,
+              "payload_attestation": 9000,
+              "sync_message": 3000
+            },
+            "epoch": 70,
+            "fork": "Gloas",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3000.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3000.0
+              },
+              {
+                "mean_ms": 3000.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 3000.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 9000.0,
+                "phase": "payload_attestation",
+                "samples_added": 1,
+                "sum_added": 9000.0
+              }
+            ],
+            "slot": 2240,
+            "tokio_elapsed_ms": 8420.0,
+            "validators": 0
+          },
+          "pre_gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 6667,
+              "attestation": 3333,
+              "contribution": 6667,
+              "payload": 6667,
+              "payload_attestation": 6667,
+              "sync_message": 3333
+            },
+            "deadlines_ms": {
+              "aggregate": 8000,
+              "attestation": 3999,
+              "block": 0,
+              "contribution": 8000,
+              "payload_attestation": 8000,
+              "sync_message": 3999
+            },
+            "epoch": 2,
+            "fork": "Phase0",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3999.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3999.0
+              },
+              {
+                "mean_ms": 3999.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 3999.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": null,
+                "phase": "payload_attestation",
+                "samples_added": 0,
+                "sum_added": 0.0
+              }
+            ],
+            "slot": 65,
+            "tokio_elapsed_ms": 7420.0,
+            "validators": 0
+          }
+        },
+        "sha": "7ea68c730dca060545d42164d15fde41c9e40f08",
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "clock_mode": "paused",
+        "host": {
+          "arch": "x86_64",
+          "hostname": "cursor",
+          "os": "linux"
+        },
+        "probe": "m1-smalln-single-duty",
+        "scenarios": {
+          "gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 5000,
+              "attestation": 2500,
+              "contribution": 5000,
+              "payload": 5000,
+              "payload_attestation": 7500,
+              "sync_message": 2500
+            },
+            "deadlines_ms": {
+              "aggregate": 6000,
+              "attestation": 3000,
+              "block": 0,
+              "contribution": 6000,
+              "payload_attestation": 9000,
+              "sync_message": 3000
+            },
+            "epoch": 70,
+            "fork": "Gloas",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3000.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3000.0
+              },
+              {
+                "mean_ms": 3000.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 3000.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 6000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 6000.0
+              },
+              {
+                "mean_ms": 9000.0,
+                "phase": "payload_attestation",
+                "samples_added": 1,
+                "sum_added": 9000.0
+              }
+            ],
+            "slot": 2240,
+            "tokio_elapsed_ms": 8420.0,
+            "validators": 0
+          },
+          "pre_gloas": {
+            "block_start_offset": {
+              "cold_mean_ms": 600.0,
+              "cold_samples_added": 1,
+              "cold_sum_added": 600.0,
+              "warm_mean_ms": null,
+              "warm_samples_added": 0,
+              "warm_sum_added": 0.0
+            },
+            "capture_offset_ms": 600,
+            "deadlines_bps": {
+              "aggregate": 6667,
+              "attestation": 3333,
+              "contribution": 6667,
+              "payload": 6667,
+              "payload_attestation": 6667,
+              "sync_message": 3333
+            },
+            "deadlines_ms": {
+              "aggregate": 8000,
+              "attestation": 3999,
+              "block": 0,
+              "contribution": 8000,
+              "payload_attestation": 8000,
+              "sync_message": 3999
+            },
+            "epoch": 2,
+            "fork": "Phase0",
+            "late_total_added": [
+              {
+                "added": 0,
+                "phase": "attestation"
+              },
+              {
+                "added": 0,
+                "phase": "sync_message"
+              },
+              {
+                "added": 0,
+                "phase": "aggregate"
+              },
+              {
+                "added": 0,
+                "phase": "contribution"
+              },
+              {
+                "added": 0,
+                "phase": "payload_attestation"
+              }
+            ],
+            "phase_offset_ms": [
+              {
+                "mean_ms": 600.0,
+                "phase": "block",
+                "samples_added": 1,
+                "sum_added": 600.0
+              },
+              {
+                "mean_ms": 3999.0,
+                "phase": "attestation",
+                "samples_added": 1,
+                "sum_added": 3999.0
+              },
+              {
+                "mean_ms": 3999.0,
+                "phase": "sync_message",
+                "samples_added": 1,
+                "sum_added": 3999.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "aggregate",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": 8000.0,
+                "phase": "contribution",
+                "samples_added": 1,
+                "sum_added": 8000.0
+              },
+              {
+                "mean_ms": null,
+                "phase": "payload_attestation",
+                "samples_added": 0,
+                "sum_added": 0.0
+              }
+            ],
+            "slot": 65,
+            "tokio_elapsed_ms": 7420.0,
+            "validators": 0
+          }
+        },
+        "sha": "7ea68c730dca060545d42164d15fde41c9e40f08",
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    ]
+  }
+}
