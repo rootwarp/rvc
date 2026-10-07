@@ -9,6 +9,7 @@
 mod beacon;
 mod builder;
 mod builder_limits;
+mod duties;
 mod fork_schedule;
 mod grpc_signer;
 mod keymanager;
@@ -27,6 +28,9 @@ mod tracing;
 pub use beacon::{BeaconArgs, BeaconConfig};
 pub use builder::BuilderSettings;
 pub use builder_limits::{BuilderLimits, BuilderLimitsArgs};
+pub use duties::{
+    DutiesArgs, DutiesConfig, DEFAULT_DUTY_DISPATCH_CONCURRENCY, DEFAULT_DUTY_PUBLISH_CONCURRENCY,
+};
 pub use fork_schedule::ForkScheduleConfig;
 pub use grpc_signer::{GrpcSignerArgs, GrpcSignerConfig};
 pub use keymanager::{KeymanagerArgs, KeymanagerConfig};

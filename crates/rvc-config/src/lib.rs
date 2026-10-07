@@ -13,13 +13,14 @@ pub mod sections;
 pub use error::{ConfigError, ConfigSource};
 pub use network::Network;
 pub use sections::{
-    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, BuilderSettings,
-    ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs, GrpcSignerConfig,
-    KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs, LogfileConfig,
-    MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig, ProposerConfigArgs,
-    ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs, SecretProviderConfig,
-    ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig, TimingConfig,
-    TracingArgs, TracingConfig, TracingExporter, DEFAULT_TRACING_SAMPLE_RATE,
+    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, BuilderSettings, DutiesArgs,
+    DutiesConfig, ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs,
+    GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs,
+    LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
+    ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs,
+    SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig,
+    TimingConfig, TracingArgs, TracingConfig, TracingExporter, DEFAULT_DUTY_DISPATCH_CONCURRENCY,
+    DEFAULT_DUTY_PUBLISH_CONCURRENCY, DEFAULT_TRACING_SAMPLE_RATE,
 };
 
 #[cfg(test)]
