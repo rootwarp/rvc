@@ -889,8 +889,8 @@ fn import_records_one_conn_hold_sample() {
 /// before the lock, so they record a duration sample and no hold sample.
 /// A successful import whose pre-lock work is paused records a hold sample
 /// much smaller than the whole call: the pause stands in for a payload that
-/// parses slowly and then commits quickly. Numeric field parsing stays inside
-/// the lock (the #526 baseline).
+/// parses slowly and then commits quickly. Numeric field parsing runs before
+/// the lock (RR2-13).
 #[test]
 fn import_conn_hold_covers_lock_to_commit_not_pre_lock_parse() {
     let _guard = IMPORT_TIMING_METRIC.lock().expect("import timing metric");
@@ -956,10 +956,11 @@ fn import_conn_hold_covers_lock_to_commit_not_pre_lock_parse() {
     );
 }
 
-/// RR2-12: a rollback after the lock is taken still records exactly one hold
-/// sample, and the partial inserts do not land (SC-02).
+/// RR2-13: the #525 fixture (a valid row, then a malformed epoch) no longer
+/// takes `conn`. `parse_interchange` rejects the file first, so there is no
+/// hold sample and the valid prefix does not land (SC-02).
 #[test]
-fn import_rollback_records_one_conn_hold_sample() {
+fn malformed_epoch_after_a_valid_row_does_not_take_conn() {
     let _guard = IMPORT_TIMING_METRIC.lock().expect("import timing metric");
     let db = SlashingDb::open_in_memory().expect("open");
     let gvr = chain_gvr();
@@ -984,17 +985,84 @@ fn import_rollback_records_one_conn_hold_sample() {
             },
         ],
     };
-    let err = db.import(&file, &gvr).expect_err("malformed epoch rolls the transaction back");
+    let err = db.import(&file, &gvr).expect_err("malformed epoch is rejected before the lock");
     assert!(matches!(err, SlashingError::InvalidInterchangeFormat(_)));
-    assert_eq!(hold_samples(), hold_before + 1, "rollback records exactly one hold sample");
-    assert_eq!(
-        duration_samples(),
-        duration_before + 1,
-        "rollback records exactly one duration sample"
-    );
+    assert_eq!(hold_samples(), hold_before, "a malformed numeric field must not take conn");
+    assert_eq!(duration_samples(), duration_before + 1, "the whole call is still timed");
     assert!(
         db.get_attestations(PUBKEY).expect("rows").is_empty(),
-        "rolled-back import must not keep the valid prefix"
+        "a malformed numeric field must not keep the valid prefix"
+    );
+    assert!(db.get_attestations(OTHER_PUBKEY).expect("rows").is_empty());
+}
+
+/// RR2-13: a malformed numeric field returns `Err` without taking `conn`.
+///
+/// Invalid JSON, a bad format version, and a genesis-validators-root mismatch
+/// are already rejected outside the mutex. This targets numeric fields only
+/// (`source_epoch`, `target_epoch`, `slot`). A valid prefix in the same file
+/// must not land.
+#[test]
+fn malformed_numeric_field_errors_without_taking_the_conn_mutex() {
+    let _guard = IMPORT_TIMING_METRIC.lock().expect("import timing metric");
+    let db = SlashingDb::open_in_memory().expect("open");
+    let gvr = chain_gvr();
+
+    let cases = [
+        ("source_epoch", interchange(vec![att("not_a_number", "2", None)], vec![])),
+        ("target_epoch", interchange(vec![att("1", "not_a_number", None)], vec![])),
+        (
+            "slot",
+            interchange(
+                vec![],
+                vec![InterchangeBlock { slot: "not_a_number".to_string(), signing_root: None }],
+            ),
+        ),
+    ];
+
+    for (field, file) in cases {
+        let hold_before = hold_samples();
+        let duration_before = duration_samples();
+        let err = db.import(&file, &gvr).unwrap_err();
+        assert!(
+            matches!(err, SlashingError::InvalidInterchangeFormat(ref msg) if msg.contains(field)),
+            "{field} must be InvalidInterchangeFormat naming the field, got {err:?}"
+        );
+        assert_eq!(
+            hold_samples(),
+            hold_before,
+            "{field} must not take the conn mutex (conn_hold_ms sample count unchanged)"
+        );
+        assert_eq!(duration_samples(), duration_before + 1, "{field} still times the whole call");
+        assert!(db.get_attestations(PUBKEY).expect("rows").is_empty());
+        assert!(db.get_blocks(PUBKEY).expect("blocks").is_empty());
+    }
+
+    let hold_before = hold_samples();
+    let prefixed = InterchangeFormat {
+        metadata: InterchangeMetadata {
+            interchange_format_version: "5".to_string(),
+            genesis_validators_root: CHAIN_GVR_HEX.to_string(),
+        },
+        data: vec![
+            ValidatorRecord {
+                pubkey: PUBKEY.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![att("1", "2", None)],
+            },
+            ValidatorRecord {
+                pubkey: OTHER_PUBKEY.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![att("3", "not_a_number", None)],
+            },
+        ],
+    };
+    let err = db.import(&prefixed, &gvr).expect_err("malformed target_epoch");
+    assert!(matches!(err, SlashingError::InvalidInterchangeFormat(_)));
+    assert_eq!(hold_samples(), hold_before, "prefixed malformed numeric field must not take conn");
+    assert!(
+        db.get_attestations(PUBKEY).expect("rows").is_empty(),
+        "a malformed numeric field must not keep the valid prefix"
     );
     assert!(db.get_attestations(OTHER_PUBKEY).expect("rows").is_empty());
 }
