@@ -159,6 +159,7 @@ pub const ALL: &[&str] = &[
     "slot.phase.attestation",
     "slot.phase.block",
     "slot.phase.payload_attestation",
+    "slot.phase.sync_message",
     "slot.process",
     "validator_store.list_enabled_pubkeys",
     "validator_store.load_from_config",
