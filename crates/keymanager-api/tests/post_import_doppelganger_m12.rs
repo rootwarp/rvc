@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::routing::get;
 use axum::Router;
 use common::PendingSetMonitor;
@@ -39,6 +40,7 @@ impl TrackingKeystoreManager {
     }
 }
 
+#[async_trait]
 impl KeystoreManager for TrackingKeystoreManager {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.keys.lock().unwrap().clone()
@@ -48,7 +50,7 @@ impl KeystoreManager for TrackingKeystoreManager {
         self.keys.lock().unwrap().contains(pubkey)
     }
 
-    fn import_keystore(
+    async fn import_keystore(
         &self,
         keystore_json: &str,
         _password: &str,
@@ -85,8 +87,9 @@ impl KeystoreManager for TrackingKeystoreManager {
 }
 
 struct NoopSlashingProtection;
+#[async_trait]
 impl SlashingProtection for NoopSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
     fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {

@@ -7,6 +7,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::routing::{get, post};
 use axum::Router;
 use http_body_util::BodyExt;
@@ -30,6 +31,7 @@ const VERBOSE_ERROR: &str =
 
 struct SimpleKeystoreManager;
 
+#[async_trait]
 impl KeystoreManager for SimpleKeystoreManager {
     fn list_keys(&self) -> Vec<Pubkey> {
         vec![]
@@ -37,7 +39,7 @@ impl KeystoreManager for SimpleKeystoreManager {
     fn has_key(&self, _: &Pubkey) -> bool {
         false
     }
-    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+    async fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
         Ok([1u8; 48])
     }
     fn delete_keystore(&self, _: &Pubkey) -> Result<bool, DeleteKeystoreError> {
@@ -48,6 +50,7 @@ impl KeystoreManager for SimpleKeystoreManager {
 /// Always returns a verbose I/O error from `import_keystore`.
 struct VerboseFailingKeystoreManager;
 
+#[async_trait]
 impl KeystoreManager for VerboseFailingKeystoreManager {
     fn list_keys(&self) -> Vec<Pubkey> {
         vec![]
@@ -55,7 +58,7 @@ impl KeystoreManager for VerboseFailingKeystoreManager {
     fn has_key(&self, _: &Pubkey) -> bool {
         false
     }
-    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+    async fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
         Err(ImportKeystoreError::Io(VERBOSE_ERROR.to_string()))
     }
     fn delete_keystore(&self, _: &Pubkey) -> Result<bool, DeleteKeystoreError> {
@@ -65,8 +68,9 @@ impl KeystoreManager for VerboseFailingKeystoreManager {
 
 struct SimpleSlashingProtection;
 
+#[async_trait]
 impl SlashingProtection for SimpleSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
     fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
@@ -77,8 +81,9 @@ impl SlashingProtection for SimpleSlashingProtection {
 /// Always returns a verbose error from `import_interchange`.
 struct VerboseFailingSlashingProtection;
 
+#[async_trait]
 impl SlashingProtection for VerboseFailingSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Err(SlashingProtectionError::Backend(VERBOSE_ERROR.to_string()))
     }
     fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {

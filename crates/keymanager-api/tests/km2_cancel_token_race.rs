@@ -11,6 +11,7 @@
 //!   (c) the window-elapsed branch prunes its OWN cancel-token entry;
 //!   (d) concurrent delete+re-import leaves no stale enable task (HTTP e2e).
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -116,6 +117,7 @@ struct GatedKeystoreManager {
     import_waits_for_delete: bool,
 }
 
+#[async_trait]
 impl KeystoreManager for GatedKeystoreManager {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.keys.lock().unwrap().clone()
@@ -125,7 +127,7 @@ impl KeystoreManager for GatedKeystoreManager {
         self.keys.lock().unwrap().contains(pubkey)
     }
 
-    fn import_keystore(
+    async fn import_keystore(
         &self,
         keystore_json: &str,
         _password: &str,
@@ -181,8 +183,9 @@ impl KeystoreManager for GatedKeystoreManager {
 }
 
 struct NoopSlashingProtection;
+#[async_trait]
 impl SlashingProtection for NoopSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
     fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {

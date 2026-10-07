@@ -136,6 +136,7 @@ impl MemoryKeys {
     }
 }
 
+#[async_trait]
 impl KeystoreManager for MemoryKeys {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.keys.lock().expect("keys").clone()
@@ -143,7 +144,7 @@ impl KeystoreManager for MemoryKeys {
     fn has_key(&self, pubkey: &Pubkey) -> bool {
         self.keys.lock().expect("keys").contains(pubkey)
     }
-    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+    async fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
         Err(ImportKeystoreError::InvalidKeystore("unused".into()))
     }
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {

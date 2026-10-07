@@ -35,6 +35,7 @@ struct Keys {
     fail: Option<Pubkey>,
 }
 
+#[async_trait]
 impl KeystoreManager for Keys {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.present.clone()
@@ -42,7 +43,7 @@ impl KeystoreManager for Keys {
     fn has_key(&self, pubkey: &Pubkey) -> bool {
         self.present.contains(pubkey)
     }
-    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+    async fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
         Err(ImportKeystoreError::InvalidKeystore("unused".into()))
     }
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {
@@ -105,8 +106,9 @@ struct OkSlash {
     exported: Mutex<Vec<Vec<Pubkey>>>,
 }
 
+#[async_trait]
 impl SlashingProtection for OkSlash {
-    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
     fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {
@@ -252,6 +254,7 @@ struct LiveKeys {
     deleted: Mutex<Vec<Pubkey>>,
 }
 
+#[async_trait]
 impl KeystoreManager for LiveKeys {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.present.lock().expect("present").clone()
@@ -259,7 +262,7 @@ impl KeystoreManager for LiveKeys {
     fn has_key(&self, pubkey: &Pubkey) -> bool {
         self.present.lock().expect("present").contains(pubkey)
     }
-    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+    async fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
         Err(ImportKeystoreError::InvalidKeystore("unused".into()))
     }
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {

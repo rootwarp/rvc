@@ -146,7 +146,7 @@ async fn test_imported_key_clears_duty_cache_without_restart() {
         key_gen_tx,
     );
 
-    adapter.import_keystore(&keystore_json, PASSWORD).expect("import keystore");
+    adapter.import_keystore(&keystore_json, PASSWORD).await.expect("import keystore");
 
     assert!(
         fixture.pubkey_map.read().contains_key(&pubkey_bytes),
@@ -262,7 +262,7 @@ async fn test_imported_key_produces_no_attestations_during_doppelganger_window()
         Arc::clone(&fixture.pubkey_map),
         key_gen_tx,
     );
-    let pk_bytes = adapter.import_keystore(&keystore_json, PASSWORD).expect("import");
+    let pk_bytes = adapter.import_keystore(&keystore_json, PASSWORD).await.expect("import");
     // Mirror production keymanager handler: register import with the machine.
     monitor.start_monitoring(pk_bytes);
 
@@ -339,7 +339,7 @@ async fn test_imported_key_signs_after_doppelganger_window_clears() {
         Arc::clone(&fixture.pubkey_map),
         key_gen_tx,
     );
-    let pk_bytes = adapter.import_keystore(&keystore_json, PASSWORD).expect("import");
+    let pk_bytes = adapter.import_keystore(&keystore_json, PASSWORD).await.expect("import");
     monitor.start_monitoring(pk_bytes);
     fixture.validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
 

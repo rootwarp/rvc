@@ -31,10 +31,11 @@ pub enum DeleteKeystoreError {
 }
 
 /// Manages BLS keystores: decryption, import, removal, and file operations.
+#[async_trait]
 pub trait KeystoreManager: Send + Sync {
     fn list_keys(&self) -> Vec<Pubkey>;
     fn has_key(&self, pubkey: &Pubkey) -> bool;
-    fn import_keystore(
+    async fn import_keystore(
         &self,
         keystore_json: &str,
         password: &str,
@@ -92,8 +93,12 @@ pub enum SlashingProtectionError {
 }
 
 /// Manages EIP-3076 slashing protection interchange data.
+#[async_trait]
 pub trait SlashingProtection: Send + Sync {
-    fn import_interchange(&self, interchange_json: &str) -> Result<(), SlashingProtectionError>;
+    async fn import_interchange(
+        &self,
+        interchange_json: &str,
+    ) -> Result<(), SlashingProtectionError>;
     fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError>;
 }
 

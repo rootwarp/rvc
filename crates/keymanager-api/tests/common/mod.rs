@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
 use axum::Router;
@@ -50,6 +51,7 @@ impl MockKeystoreManager {
     }
 }
 
+#[async_trait]
 impl KeystoreManager for MockKeystoreManager {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.keys.lock().clone()
@@ -59,7 +61,7 @@ impl KeystoreManager for MockKeystoreManager {
         self.keys.lock().contains(pubkey)
     }
 
-    fn import_keystore(
+    async fn import_keystore(
         &self,
         keystore_json: &str,
         _password: &str,
@@ -106,8 +108,9 @@ impl MockSlashingProtection {
     }
 }
 
+#[async_trait]
 impl SlashingProtection for MockSlashingProtection {
-    fn import_interchange(
+    async fn import_interchange(
         &self,
         interchange_json: &str,
     ) -> Result<(), rvc_keymanager_api::traits::SlashingProtectionError> {
@@ -379,8 +382,9 @@ impl ValidatorConfigManager for MockValidatorConfigManager {
 
 pub struct FailingSlashingProtection;
 
+#[async_trait]
 impl SlashingProtection for FailingSlashingProtection {
-    fn import_interchange(
+    async fn import_interchange(
         &self,
         _interchange_json: &str,
     ) -> Result<(), rvc_keymanager_api::traits::SlashingProtectionError> {
@@ -402,8 +406,9 @@ pub struct KeyAwareSlashingProtection {
     pub keystore_manager: Arc<MockKeystoreManager>,
 }
 
+#[async_trait]
 impl SlashingProtection for KeyAwareSlashingProtection {
-    fn import_interchange(
+    async fn import_interchange(
         &self,
         _interchange_json: &str,
     ) -> Result<(), rvc_keymanager_api::traits::SlashingProtectionError> {

@@ -171,8 +171,8 @@ async fn a_provider_refreshed_key_leaves_pending() {
 }
 
 /// Keystore import goes through the same admission service.
-#[test]
-fn keymanager_import_admits_through_the_service() {
+#[tokio::test]
+async fn keymanager_import_admits_through_the_service() {
     use crypto::EncryptionKdf;
     use rvc::keymanager_adapters::KeystoreManagerAdapter;
 
@@ -213,7 +213,7 @@ fn keymanager_import_admits_through_the_service() {
     let keystore_json = serde_json::to_string(&keystore).unwrap();
 
     key_gen_rx.borrow_and_update();
-    adapter.import_keystore(&keystore_json, "testpass").expect("import");
+    adapter.import_keystore(&keystore_json, "testpass").await.expect("import");
 
     assert!(pubkey_map.read().contains_key(&pk));
     assert!(validator_store.has_validator(&pk));

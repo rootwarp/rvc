@@ -712,7 +712,7 @@ mod tests {
 
         let sk = SecretKey::generate();
         let keystore_json = encrypt_test_keystore(&sk);
-        adapter.import_keystore(&keystore_json, "testpass").unwrap();
+        futures::executor::block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
 
         let (total, _active) = count();
         assert_eq!(total, 1, "keymanager import must bump live total loaded count");
@@ -737,7 +737,7 @@ mod tests {
         let sk = SecretKey::generate();
         let pk_bytes = sk.public_key().to_bytes();
         let keystore_json = encrypt_test_keystore(&sk);
-        adapter.import_keystore(&keystore_json, "testpass").unwrap();
+        futures::executor::block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
         assert_eq!(count().0, 1);
 
         assert!(adapter.delete_keystore(&pk_bytes).unwrap());

@@ -260,13 +260,13 @@ impl Harness {
     }
 
     /// Keymanager import: `import_keystore` then `DoppelgangerLifecycle::on_import`.
-    fn admit(&mut self, kind: AdmissionKind) -> AdmittedKey {
+    async fn admit(&mut self, kind: AdmissionKind) -> AdmittedKey {
         match kind {
-            AdmissionKind::Keymanager => self.admit_keymanager(),
+            AdmissionKind::Keymanager => self.admit_keymanager().await,
         }
     }
 
-    fn admit_keymanager(&mut self) -> AdmittedKey {
+    async fn admit_keymanager(&mut self) -> AdmittedKey {
         let secret = SecretKey::generate();
         let pubkey = secret.public_key();
         let bytes = pubkey.to_bytes();
@@ -278,7 +278,7 @@ impl Harness {
         )
         .expect("encrypt");
         let json = serde_json::to_string(&keystore).expect("keystore json");
-        self.keystores.import_keystore(&json, PASSWORD).expect("import keystore");
+        self.keystores.import_keystore(&json, PASSWORD).await.expect("import keystore");
         self.lifecycle.on_import(bytes, ImportKind::Local);
         self.bn_state
             .validators
@@ -739,7 +739,7 @@ async fn beacon_handles(config: &Config) -> BeaconHandles {
 
 async fn g6_once(doppelganger_enabled: bool) {
     let mut harness = Harness::boot(doppelganger_enabled).await;
-    let key = harness.admit(AdmissionKind::Keymanager);
+    let key = harness.admit(AdmissionKind::Keymanager).await;
     harness.resolve().await;
     harness.assert_index_in_next_requests(&key.index).await;
 }
@@ -761,7 +761,7 @@ async fn request_after_insert_is_not_served_from_the_pre_insert_cache() {
     assert!(tracker.is_sync_period_cached(DUTY_EPOCH).await, "pre-insert sync cache");
     assert!(tracker.is_ptc_epoch_cached(DUTY_EPOCH).await, "pre-insert ptc cache");
 
-    let key = harness.admit(AdmissionKind::Keymanager);
+    let key = harness.admit(AdmissionKind::Keymanager).await;
     harness.resolve().await;
     assert!(!tracker.is_epoch_cached(DUTY_EPOCH).await, "attester cache must miss after insert");
     assert!(!tracker.is_sync_period_cached(DUTY_EPOCH).await, "sync cache must miss after insert");
@@ -790,7 +790,7 @@ async fn request_after_insert_is_not_served_from_the_pre_insert_cache() {
 #[tokio::test]
 async fn c1_admitted_key_produces_no_signature_until_both_gates_open() {
     let mut harness = Harness::boot(true).await;
-    let key = harness.admit(AdmissionKind::Keymanager);
+    let key = harness.admit(AdmissionKind::Keymanager).await;
     harness.resolve().await;
     harness.assert_index_in_next_requests(&key.index).await;
 
@@ -834,7 +834,7 @@ async fn c1_admitted_key_produces_no_signature_until_both_gates_open() {
 #[tokio::test]
 async fn c1_with_doppelganger_disabled_only_the_validator_store_gate_blocks() {
     let mut harness = Harness::boot(false).await;
-    let key = harness.admit(AdmissionKind::Keymanager);
+    let key = harness.admit(AdmissionKind::Keymanager).await;
     // Zero window enables the key. Wait until that task has run, then apply
     // the validators-config `enabled` gate — the only one left.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -865,7 +865,7 @@ async fn c1_with_doppelganger_disabled_only_the_validator_store_gate_blocks() {
 #[tokio::test]
 async fn deleted_key_index_leaves_the_effective_set_via_the_intersection() {
     let mut harness = Harness::boot(false).await;
-    let key = harness.admit(AdmissionKind::Keymanager);
+    let key = harness.admit(AdmissionKind::Keymanager).await;
     harness.resolve().await;
     harness.assert_index_in_next_requests(&key.index).await;
 
