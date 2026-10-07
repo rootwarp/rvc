@@ -8,4 +8,5 @@
 
 #![allow(dead_code)]
 
+pub mod import_during_duties;
 pub mod pipeline_fixture;
