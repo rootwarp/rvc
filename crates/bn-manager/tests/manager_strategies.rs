@@ -24,7 +24,8 @@ use rvc_bn_manager::{
     AttestationApi, BeaconError, BeaconNodeClient, BlockProducer, BnManager, BnManagerConfig,
     BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, DutiesProvider, LivenessApi, NodeStatusApi,
     OperationTimeouts, PayloadAttestationApi, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SyncCommitteeApi, VersionedAttestation, VersionedSignedAggregateAndProof,
+    SubmitAttestationResult, SyncCommitteeApi, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
 
 // -- Helper --
@@ -3656,6 +3657,87 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.blocks = false;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.publish_blinded_block(&blinded, "deneb").await.is_ok());
+    }
+}
+
+/// First `Ok` wins, including a 400 partial failure. The sibling 200 is not merged in.
+#[tokio::test]
+async fn submit_attestation_attributed_names_first_ok_bn_without_merging() {
+    let bn1 = MockServer::start().await;
+    let bn2 = MockServer::start().await;
+    let partial = serde_json::json!({
+        "code": 400,
+        "message": "some failures",
+        "failures": [{ "index": 2, "message": "invalid signature" }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(partial))
+        .expect(1)
+        .mount(&bn1)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .expect(1)
+        .mount(&bn2)
+        .await;
+
+    let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+    config.broadcast_topics.attestations = true;
+    let manager = BnManager::new(config).unwrap();
+    let (reported_by, result) = manager
+        .submit_attestation_attributed(&VersionedAttestation::Electra(vec![]))
+        .await
+        .expect("attributed submit");
+
+    assert_eq!(reported_by, Some(bn1.uri()));
+    match result {
+        SubmitAttestationResult::PartialFailure { failures } => {
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].index, 2);
+            assert_eq!(failures[0].message, "invalid signature");
+        }
+        other => panic!("expected the first Ok partial failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn submit_attestation_attributed_names_the_query_first_bn() {
+    let bn1 = MockServer::start().await;
+    let bn2 = MockServer::start().await;
+    let partial = serde_json::json!({
+        "code": 400,
+        "message": "some failures",
+        "failures": [{ "index": 2, "message": "invalid signature" }]
+    });
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(partial))
+        .expect(1)
+        .mount(&bn1)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .expect(0)
+        .mount(&bn2)
+        .await;
+
+    let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
+    config.broadcast_topics.attestations = false;
+    let manager = BnManager::new(config).unwrap();
+    let (reported_by, result) = manager
+        .submit_attestation_attributed(&VersionedAttestation::Electra(vec![]))
+        .await
+        .expect("attributed query-first submit");
+
+    assert_eq!(reported_by, Some(bn1.uri()));
+    match result {
+        SubmitAttestationResult::PartialFailure { failures } => {
+            assert_eq!(failures[0].index, 2);
+        }
+        other => panic!("expected partial failure from the answering BN, got {other:?}"),
     }
 }
 

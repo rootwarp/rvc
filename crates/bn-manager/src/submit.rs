@@ -11,12 +11,20 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use beacon::{BeaconError, SubmitAttestationResult, VersionedAttestation};
+use beacon::{BeaconError, IndexedAttestationError, SubmitAttestationResult, VersionedAttestation};
 use metrics::definitions::attestation_status;
 
 use crate::metrics::RVC_ATTESTATIONS_TOTAL;
 
 use crate::traits::{AttestationApi, BeaconNodeClient};
+
+type AttributedSubmitFut<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<(Option<String>, SubmitAttestationResult), BeaconError>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Errors that can occur during attestation propagation.
 #[derive(Error, Debug)]
@@ -37,6 +45,17 @@ pub trait AttestationSubmitter: Send + Sync {
         &'a self,
         attestations: &'a VersionedAttestation,
     ) -> Pin<Box<dyn Future<Output = Result<SubmitAttestationResult, BeaconError>> + Send + 'a>>;
+
+    /// [`AttestationApi::submit_attestation_attributed`] for submitters that are
+    /// not a [`BeaconNodeClient`]. The default does not know an endpoint.
+    fn submit_attestation_attributed<'a>(
+        &'a self,
+        attestations: &'a VersionedAttestation,
+    ) -> AttributedSubmitFut<'a> {
+        Box::pin(
+            async move { self.submit_attestation(attestations).await.map(|result| (None, result)) },
+        )
+    }
 }
 
 impl<T: BeaconNodeClient + ?Sized> AttestationSubmitter for T {
@@ -47,6 +66,15 @@ impl<T: BeaconNodeClient + ?Sized> AttestationSubmitter for T {
     {
         Box::pin(async move { AttestationApi::submit_attestation(self, attestations).await })
     }
+
+    fn submit_attestation_attributed<'a>(
+        &'a self,
+        attestations: &'a VersionedAttestation,
+    ) -> AttributedSubmitFut<'a> {
+        Box::pin(
+            async move { AttestationApi::submit_attestation_attributed(self, attestations).await },
+        )
+    }
 }
 
 /// Result of a propagation operation.
@@ -55,6 +83,19 @@ pub struct PropagationResult {
     pub total: usize,
     pub success_count: usize,
     pub failure_count: usize,
+}
+
+/// Per-index result of [`Propagator::propagate_indexed`].
+///
+/// `reported_by` is the endpoint of the beacon node whose response was kept.
+/// It is `None` when the submitter cannot name one. `failures` is that node's
+/// list only — responses are not merged across beacon nodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropagationOutcome {
+    pub total: usize,
+    pub success_count: usize,
+    pub failures: Vec<IndexedAttestationError>,
+    pub reported_by: Option<String>,
 }
 
 impl PropagationResult {
@@ -98,11 +139,40 @@ impl<S: AttestationSubmitter> Propagator<S> {
     }
 
     /// Propagates attestations to the beacon node.
-    #[tracing::instrument(name = "propagator.propagate", skip_all, fields(count = tracing::field::Empty))]
+    ///
+    /// Thin wrapper over [`Self::propagate_indexed`]: counts and the historical
+    /// error variants are unchanged, and the per-index list is not returned.
     pub async fn propagate(
         &self,
         attestations: &VersionedAttestation,
     ) -> Result<PropagationResult, PropagatorError> {
+        let outcome = self.propagate_indexed(attestations).await?;
+        if outcome.failures.is_empty() {
+            return Ok(PropagationResult {
+                total: outcome.total,
+                success_count: outcome.success_count,
+                failure_count: 0,
+            });
+        }
+        if outcome.success_count == 0 {
+            return Err(PropagatorError::AllAttestationsFailed);
+        }
+        Err(PropagatorError::PartialFailure {
+            success_count: outcome.success_count,
+            failure_count: outcome.failures.len(),
+        })
+    }
+
+    /// Propagates attestations and keeps the per-index failures plus the reporting node.
+    ///
+    /// `reported_by` is `None` when the submitter cannot name an endpoint.
+    /// A partial failure is `Ok`. The list is the answering node's report:
+    /// nothing here merges across beacon nodes or retries a failed index.
+    #[tracing::instrument(name = "propagator.propagate", skip_all, fields(count = tracing::field::Empty))]
+    pub async fn propagate_indexed(
+        &self,
+        attestations: &VersionedAttestation,
+    ) -> Result<PropagationOutcome, PropagatorError> {
         let total = match attestations {
             VersionedAttestation::PreElectra(a) => a.len(),
             VersionedAttestation::Electra(a)
@@ -119,12 +189,18 @@ impl<S: AttestationSubmitter> Propagator<S> {
 
         if total == 0 {
             debug!("No attestations to propagate");
-            return Ok(PropagationResult { total: 0, success_count: 0, failure_count: 0 });
+            return Ok(PropagationOutcome {
+                total: 0,
+                success_count: 0,
+                failures: Vec::new(),
+                reported_by: None,
+            });
         }
 
         debug!(count = total, slot = %batch_slot, "Propagating attestations to beacon node");
 
-        let result = self.submitter.submit_attestation(attestations).await?;
+        let (reported_by, result) =
+            self.submitter.submit_attestation_attributed(attestations).await?;
 
         match result {
             SubmitAttestationResult::Success => {
@@ -138,7 +214,12 @@ impl<S: AttestationSubmitter> Propagator<S> {
                     .with_label_values(&[attestation_status::SUCCESS])
                     .inc_by(total as u64);
 
-                Ok(PropagationResult { total, success_count: total, failure_count: 0 })
+                Ok(PropagationOutcome {
+                    total,
+                    success_count: total,
+                    failures: Vec::new(),
+                    reported_by,
+                })
             }
             SubmitAttestationResult::PartialFailure { failures } => {
                 let failure_count = failures.len();
@@ -154,7 +235,12 @@ impl<S: AttestationSubmitter> Propagator<S> {
                     RVC_ATTESTATIONS_TOTAL
                         .with_label_values(&[attestation_status::SUCCESS])
                         .inc_by(total as u64);
-                    return Ok(PropagationResult { total, success_count: total, failure_count: 0 });
+                    return Ok(PropagationOutcome {
+                        total,
+                        success_count: total,
+                        failures,
+                        reported_by,
+                    });
                 }
 
                 for failure in &failures {
@@ -180,7 +266,6 @@ impl<S: AttestationSubmitter> Propagator<S> {
                         target_epoch = %batch_target_epoch,
                         "Attestation submission complete failure"
                     );
-                    Err(PropagatorError::AllAttestationsFailed)
                 } else {
                     warn!(
                         slot = %batch_slot,
@@ -189,8 +274,8 @@ impl<S: AttestationSubmitter> Propagator<S> {
                         target_epoch = %batch_target_epoch,
                         "Attestation submission partial failure"
                     );
-                    Err(PropagatorError::PartialFailure { success_count, failure_count })
                 }
+                Ok(PropagationOutcome { total, success_count, failures, reported_by })
             }
         }
     }
@@ -255,6 +340,7 @@ mod tests {
         call_count: AtomicUsize,
         should_error: tokio::sync::Mutex<Option<BeaconError>>,
         last_submitted: tokio::sync::Mutex<Option<VersionedAttestation>>,
+        reporting_bn: Option<String>,
     }
 
     impl MockSubmitter {
@@ -264,7 +350,14 @@ mod tests {
                 call_count: AtomicUsize::new(0),
                 should_error: tokio::sync::Mutex::new(None),
                 last_submitted: tokio::sync::Mutex::new(None),
+                reporting_bn: None,
             }
+        }
+
+        fn with_reporting_bn(endpoint: &str, result: SubmitAttestationResult) -> Self {
+            let mut submitter = Self::new(result);
+            submitter.reporting_bn = Some(endpoint.to_string());
+            submitter
         }
 
         fn with_error(error: BeaconError) -> Self {
@@ -273,6 +366,7 @@ mod tests {
                 call_count: AtomicUsize::new(0),
                 should_error: tokio::sync::Mutex::new(Some(error)),
                 last_submitted: tokio::sync::Mutex::new(None),
+                reporting_bn: None,
             }
         }
 
@@ -311,6 +405,16 @@ mod tests {
 
                 let result = self.result.lock().await;
                 Ok(result.clone())
+            })
+        }
+
+        fn submit_attestation_attributed<'a>(
+            &'a self,
+            attestations: &'a VersionedAttestation,
+        ) -> AttributedSubmitFut<'a> {
+            Box::pin(async move {
+                let result = self.submit_attestation(attestations).await?;
+                Ok((self.reporting_bn.clone(), result))
             })
         }
     }
@@ -709,5 +813,58 @@ mod tests {
         let beacon_err = BeaconError::HttpError("connection refused".to_string());
         let err: PropagatorError = beacon_err.into();
         assert!(matches!(err, PropagatorError::BeaconError(_)));
+    }
+
+    #[tokio::test]
+    async fn propagate_indexed_returns_per_index_failures_with_reporting_bn() {
+        let endpoint = "http://bn-report:5052";
+        let submitter = Arc::new(MockSubmitter::with_reporting_bn(
+            endpoint,
+            SubmitAttestationResult::PartialFailure {
+                failures: vec![IndexedAttestationError {
+                    index: 2,
+                    message: "invalid signature".to_string(),
+                }],
+            },
+        ));
+        let propagator = Propagator::new(submitter.clone());
+        let attestations = VersionedAttestation::PreElectra(vec![
+            create_test_legacy_attestation("1000", "0"),
+            create_test_legacy_attestation("1000", "1"),
+            create_test_legacy_attestation("1000", "2"),
+        ]);
+
+        let outcome = propagator.propagate_indexed(&attestations).await.expect("indexed outcome");
+
+        assert_eq!(outcome.total, 3);
+        assert_eq!(outcome.success_count, 2);
+        assert_eq!(
+            outcome.failures,
+            vec![IndexedAttestationError { index: 2, message: "invalid signature".to_string() }]
+        );
+        assert_eq!(outcome.reported_by, Some(endpoint.to_string()));
+        assert_eq!(submitter.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn propagate_indexed_reported_by_is_none_when_submitter_has_no_endpoint() {
+        let submitter = Arc::new(MockSubmitter::new(SubmitAttestationResult::PartialFailure {
+            failures: vec![IndexedAttestationError {
+                index: 0,
+                message: "invalid signature".to_string(),
+            }],
+        }));
+        let propagator = Propagator::new(submitter);
+        let attestations = VersionedAttestation::PreElectra(vec![
+            create_test_legacy_attestation("1000", "0"),
+            create_test_legacy_attestation("1000", "1"),
+        ]);
+
+        let outcome = propagator.propagate_indexed(&attestations).await.expect("indexed outcome");
+
+        assert!(outcome.reported_by.is_none());
+        assert_eq!(outcome.total, 2);
+        assert_eq!(outcome.success_count, 1);
+        assert_eq!(outcome.failures[0].index, 0);
     }
 }

@@ -732,6 +732,24 @@ impl BnManager {
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
+        self.query_first_attributed(op_name, role, min_tier, deadline, op)
+            .await
+            .map(|(_endpoint, value)| value)
+    }
+
+    /// [`Self::query_first`] plus the endpoint of the beacon node that answered.
+    async fn query_first_attributed<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
+        deadline: Option<tokio::time::Instant>,
+        op: F,
+    ) -> Result<(String, T), BeaconError>
+    where
+        T: Send,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
         let strategy_span = tracing::info_span!(
             "bn.strategy.first",
             strategy = "first",
@@ -754,7 +772,7 @@ impl BnManager {
         min_tier: HealthTier,
         deadline: Option<tokio::time::Instant>,
         op: &F,
-    ) -> Result<T, BeaconError>
+    ) -> Result<(String, T), BeaconError>
     where
         T: Send,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
@@ -798,7 +816,7 @@ impl BnManager {
                         "query succeeded"
                     );
                     tracing::Span::current().record("tried", tried);
-                    return Ok(result);
+                    return Ok((client.endpoint().to_string(), result));
                 }
                 Err(e) => {
                     self.record_outcomes(op_name, &[(i, error_outcome(op_name, &e))]).await;
@@ -1501,6 +1519,25 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
     {
+        self.broadcast_with_result_attributed(op_name, role, op)
+            .await
+            .map(|(_endpoint, value)| value)
+    }
+
+    /// [`Self::broadcast_with_result`] plus the endpoint of the first `Ok`.
+    ///
+    /// No cross-BN merge and no extra retry. A partial failure is `Ok`, so it
+    /// is the result even when a later node accepted the whole batch.
+    async fn broadcast_with_result_attributed<'s, T, F>(
+        &'s self,
+        op_name: &str,
+        role: BnRole,
+        op: F,
+    ) -> Result<(String, T), BeaconError>
+    where
+        T: Send + 'static,
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+    {
         let strategy_span = tracing::info_span!(
             "bn.strategy.broadcast",
             strategy = "broadcast",
@@ -1515,7 +1552,7 @@ impl BnManager {
                     role: role.to_string(),
                 });
             }
-            broadcast.into_result()
+            broadcast.into_result_attributed()
         }
         .instrument(strategy_span)
         .await
@@ -2094,20 +2131,30 @@ impl AttestationApi for BnManager {
         &self,
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError> {
+        self.submit_attestation_attributed(attestations).await.map(|(_endpoint, result)| result)
+    }
+
+    async fn submit_attestation_attributed(
+        &self,
+        attestations: &VersionedAttestation,
+    ) -> Result<(Option<String>, SubmitAttestationResult), BeaconError> {
         if self.broadcast_topics.attestations {
             self.with_op_timeout(
                 "submit_attestation",
                 self.op_timeout(|t| t.attestation_submit),
-                self.broadcast_with_result("submit_attestation", BnRole::Attestation, |c| {
-                    Box::pin(c.submit_attestation(attestations))
-                }),
+                self.broadcast_with_result_attributed(
+                    "submit_attestation",
+                    BnRole::Attestation,
+                    |c| Box::pin(c.submit_attestation(attestations)),
+                ),
             )
             .await
+            .map(|(endpoint, result)| (Some(endpoint), result))
         } else {
             let deadline = self
                 .op_timeout(|t| t.attestation_submit)
                 .map(|budget| tokio::time::Instant::now() + budget);
-            self.query_first(
+            self.query_first_attributed(
                 "submit_attestation",
                 BnRole::Submission,
                 HealthTier::LargeLag,
@@ -2115,6 +2162,7 @@ impl AttestationApi for BnManager {
                 |c| Box::pin(c.submit_attestation(attestations)),
             )
             .await
+            .map(|(endpoint, result)| (Some(endpoint), result))
         }
     }
 
