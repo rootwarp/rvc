@@ -326,3 +326,28 @@ fn test_committed_member_returns_while_later_batch_is_stalled() {
         h.join().expect("join").expect("all must finish");
     }
 }
+
+/// Reserves that arrive together must each get a commit result.
+///
+/// The waiter is armed before the item is queued. A leader that drains during
+/// enqueue must not drop a live member as "worker disconnected".
+#[test]
+fn concurrent_reserves_all_receive_a_commit_result() {
+    let db = batching_db(8);
+    let n = 64;
+    let barrier = Arc::new(Barrier::new(n));
+    let mut handles = Vec::with_capacity(n);
+    for i in 0..n {
+        let db = Arc::clone(&db);
+        let barrier = Arc::clone(&barrier);
+        handles.push(thread::spawn(move || {
+            barrier.wait();
+            let i = u8::try_from(i).expect("index");
+            db.reserve_block(&pk(i), u64::from(i) + 1, Some(root(i)), &GVR)
+        }));
+    }
+    for (i, handle) in handles.into_iter().enumerate() {
+        let result = handle.join().expect("join");
+        assert!(result.is_ok(), "reserve {i} must commit, got {result:?}");
+    }
+}
