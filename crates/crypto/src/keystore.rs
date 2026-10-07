@@ -43,6 +43,14 @@ const MAX_SCRYPT_R: u32 = 16;
 const MAX_SCRYPT_P: u32 = 16;
 const MAX_SCRYPT_DKLEN: u32 = 64;
 
+/// Largest scrypt working set `decrypt` will still attempt, in bytes.
+///
+/// Scrypt's buffer is `128 · r · N` (RFC 7914). This is that product at the
+/// largest `r` and `N` the decrypt-time gates accept, which is 8 GiB.
+/// [`kdf_working_set_bytes`] reports the uploaded cost even past this ceiling;
+/// parameter rejection stays inside `decrypt`.
+pub const MAX_KDF_WORKING_SET_BYTES: u64 = 128 * (MAX_SCRYPT_R as u64) * (MAX_SCRYPT_N as u64);
+
 #[derive(Debug, Clone, Copy)]
 pub enum EncryptionKdf {
     /// Production scrypt params (n = 2^18). EIP-2335 default.
@@ -144,6 +152,31 @@ pub struct CipherModule {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CipherParams {
     pub iv: String,
+}
+
+/// KDF memory working set of `keystore` as uploaded, in bytes.
+///
+/// Scrypt costs `128 · r · N` from the parameters in the keystore, including
+/// values [`Keystore::decrypt`] will later reject. PBKDF2 is not memory-hard
+/// and costs `0`. Overflow saturates at `u64::MAX` so a wrapped product cannot
+/// under-report the working set.
+///
+/// # Examples
+///
+/// ```
+/// use rvc_crypto::{kdf_working_set_bytes, Keystore};
+///
+/// let json = r#"{"crypto":{"kdf":{"function":"pbkdf2","params":{"dklen":32,"c":262144,"prf":"hmac-sha256","salt":"aa"},"message":""},"checksum":{"function":"sha256","params":{},"message":"aa"},"cipher":{"function":"aes-128-ctr","params":{"iv":"aa"},"message":"aa"}},"path":"m/12381/3600/0/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":4}"#;
+/// let keystore = Keystore::from_json(json).expect("keystore json");
+/// assert_eq!(kdf_working_set_bytes(&keystore), 0);
+/// ```
+pub fn kdf_working_set_bytes(keystore: &Keystore) -> u64 {
+    match (keystore.crypto.kdf.function.as_str(), &keystore.crypto.kdf.params) {
+        (KDF_SCRYPT, KdfParams::Scrypt(params)) => {
+            128u64.saturating_mul(u64::from(params.r)).saturating_mul(u64::from(params.n))
+        }
+        _ => 0,
+    }
 }
 
 impl Keystore {
@@ -1021,6 +1054,70 @@ mod tests {
         }
         let result = keystore.decrypt(EIP2335_PASSWORD);
         assert!(result.is_ok(), "EIP-2335 default params should work: {:?}", result.err());
+    }
+
+    fn keystore_with_kdf(function: &str, params: KdfParams) -> Keystore {
+        Keystore {
+            crypto: Crypto {
+                kdf: KdfModule { function: function.to_string(), params, message: String::new() },
+                checksum: ChecksumModule {
+                    function: CHECKSUM_SHA256.to_string(),
+                    params: ChecksumParams {},
+                    message: String::new(),
+                },
+                cipher: CipherModule {
+                    function: CIPHER_AES_128_CTR.to_string(),
+                    params: CipherParams { iv: String::new() },
+                    message: String::new(),
+                },
+            },
+            description: None,
+            pubkey: None,
+            path: "m/12381/3600/0/0/0".to_string(),
+            uuid: Uuid::nil(),
+            version: KEYSTORE_VERSION,
+        }
+    }
+
+    #[test]
+    fn kdf_working_set_bytes_matches_the_accepted_ceiling() {
+        assert_eq!(
+            MAX_KDF_WORKING_SET_BYTES,
+            128 * u64::from(MAX_SCRYPT_R) * u64::from(MAX_SCRYPT_N)
+        );
+        assert_eq!(MAX_KDF_WORKING_SET_BYTES, 8u64 * 1024 * 1024 * 1024);
+
+        let at_ceiling = keystore_with_kdf(
+            KDF_SCRYPT,
+            KdfParams::Scrypt(ScryptParams {
+                dklen: DEFAULT_SCRYPT_DKLEN,
+                n: MAX_SCRYPT_N,
+                p: 1,
+                r: MAX_SCRYPT_R,
+                salt: "aa".to_string(),
+            }),
+        );
+        assert_eq!(kdf_working_set_bytes(&at_ceiling), MAX_KDF_WORKING_SET_BYTES);
+
+        // Uploaded cost, not the clamped ceiling: the EIP-2335 vector is 128 · 8 · 2^18.
+        let uploaded = Keystore::from_json(EIP2335_SCRYPT_TEST_VECTOR).expect("should parse");
+        assert_eq!(kdf_working_set_bytes(&uploaded), 128u64 * 8 * 262_144);
+
+        let pbkdf2 = Keystore::from_json(EIP2335_PBKDF2_TEST_VECTOR).expect("should parse");
+        assert_eq!(kdf_working_set_bytes(&pbkdf2), 0);
+
+        // A product that does not fit in u64 saturates instead of wrapping small.
+        let saturated = keystore_with_kdf(
+            KDF_SCRYPT,
+            KdfParams::Scrypt(ScryptParams {
+                dklen: DEFAULT_SCRYPT_DKLEN,
+                n: u32::MAX,
+                p: 1,
+                r: u32::MAX,
+                salt: "aa".to_string(),
+            }),
+        );
+        assert_eq!(kdf_working_set_bytes(&saturated), u64::MAX);
     }
 
     // ========== from_file() tests ==========

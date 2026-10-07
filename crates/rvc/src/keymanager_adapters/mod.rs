@@ -5,6 +5,7 @@
 
 mod config;
 mod doppelganger;
+mod kdf_budget;
 mod keystore;
 mod notifier;
 mod remote_keys;
