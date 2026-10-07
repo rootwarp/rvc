@@ -480,7 +480,8 @@ where
 
     /// Runs the orchestrator main loop with four-phase slot processing:
     /// - t=0: bounded parent capture + block proposal
-    /// - attestation due: attestations + sync committee messages (HeadEventGate wait)
+    /// - attestation due: attestations and sync messages concurrently
+    ///   (HeadEventGate wait; sync has its own span)
     /// - aggregate due: sync committee contributions + aggregations
     /// - payload attestation due (Gloas+): payload attestations
     /// - post-duty: epoch duty fetches, epoch-boundary prep, builder registration
@@ -602,6 +603,11 @@ where
                 "slot.phase.attestation",
                 time_into_slot = field::Empty,
             );
+            let sync_phase_span = info_span!(
+                parent: &slot_span,
+                "slot.phase.sync_message",
+                time_into_slot = field::Empty,
+            );
             let agg_phase_span = info_span!(
                 parent: &slot_span,
                 "slot.phase.aggregation",
@@ -619,6 +625,7 @@ where
                     &ctx,
                     deadlines,
                     att_phase_span,
+                    sync_phase_span,
                     &anchor,
                 ),
                 self.run_aggregation_and_contribution_phases(
@@ -1153,8 +1160,13 @@ where
         }
     }
 
-    /// Attestations and sync messages share a wait while their bps match;
-    /// otherwise each duty waits from slot start to its own offset.
+    /// Attestations and sync messages share a wait while their bps match,
+    /// then run concurrently. Otherwise each duty waits from slot start to
+    /// its own offset.
+    ///
+    /// `sync_phase_span` is created beside the other phase spans in [`Self::run`].
+    /// `slot.process` is not in scope here.
+    #[allow(clippy::too_many_arguments)]
     async fn run_attestation_and_sync_phases(
         &self,
         current_slot: Slot,
@@ -1162,6 +1174,7 @@ where
         ctx: &tokio::sync::Mutex<SlotContext>,
         deadlines: DeadlineBps,
         att_phase_span: tracing::Span,
+        sync_phase_span: tracing::Span,
         anchor: &SlotAnchor,
     ) -> WaitOutcome {
         if deadlines.attestation == deadlines.sync_message {
@@ -1184,14 +1197,19 @@ where
             }
             Self::record_time_into_slot(&att_phase_span, anchor);
             Self::record_phase_offset(slot_phase_offset::ATTESTATION, anchor);
+            Self::record_time_into_slot(&sync_phase_span, anchor);
+            Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
             self.capture_head_if_needed(ctx).await;
             self.warn_if_attestation_overrun(anchor, deadlines.attestation);
-            self.run_attestation_phase(current_slot, &att_phase_span, anchor.slot_end()).await;
+            // Snapshot before the join. Inside it, sync would block on the
+            // ctx mutex while attestation holds it across capture_head.
             let snapshot = self.snapshot_ctx(ctx).await;
-            Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
-            self.run_sync_messages_phase(current_slot, current_epoch, &snapshot, anchor.slot_end())
-                .instrument(att_phase_span)
-                .await;
+            let slot_end = anchor.slot_end();
+            tokio::join!(
+                self.run_attestation_phase(current_slot, &att_phase_span, slot_end),
+                self.run_sync_messages_phase(current_slot, current_epoch, &snapshot, slot_end)
+                    .instrument(sync_phase_span),
+            );
             return WaitOutcome::Continue;
         }
 
@@ -1225,7 +1243,7 @@ where
                         deadlines.sync_message,
                         slot_phase_late::SYNC_MESSAGE,
                         false,
-                        &att_phase_span,
+                        &sync_phase_span,
                         "Waiting for sync message time",
                     )
                     .await,
@@ -1233,6 +1251,7 @@ where
                 ) {
                     return WaitOutcome::Shutdown;
                 }
+                Self::record_time_into_slot(&sync_phase_span, anchor);
                 Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
                 self.capture_head_if_needed(ctx).await;
                 let snapshot = self.snapshot_ctx(ctx).await;
@@ -1242,7 +1261,7 @@ where
                     &snapshot,
                     anchor.slot_end(),
                 )
-                .instrument(att_phase_span.clone())
+                .instrument(sync_phase_span.clone())
                 .await;
                 WaitOutcome::Continue
             },
