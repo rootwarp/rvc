@@ -94,6 +94,27 @@ The free window in [#530](https://github.com/rootwarp/rvc/issues/530) is
 **7301 ms**. The 10 MB hold median **658.322 ms** fits. PQ-2 does not apply.
 No payload cap. `NoFreeWindow` is not introduced. AQ-6 margins are unchanged.
 
+## Budget (RR2-14)
+
+The budget is the after median measured on this host and toolchain. Issue
+[#527](https://github.com/rootwarp/rvc/issues/527). Parent #491 stays open.
+`conn_hold_for_10mb_import_stays_within_budget` in
+`crates/slashing/tests/interchange.rs` is `#[ignore]`d and fails when a real
+10 MB import's `conn_hold_ms` exceeds this budget.
+
+| Field | Value |
+|---|---|
+| Budget | **658.322 ms** `conn_hold_ms` |
+| Host | hostname `cursor`, Linux 6.12.94+ x86_64, Intel(R) Xeon(R) Processor (family 6, model 207, stepping 2), 4 cores, 1 thread per core, MemTotal 16,398,384 kB, ext4 on `/dev/vdc` |
+| `uname -a` | `Linux cursor 6.12.94+ #1 SMP PREEMPT_DYNAMIC Tue Oct  6 05:59:35 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux` |
+| Toolchain | `rustc 1.99.0 (b940084d7 2026-09-28)`; `cargo 1.99.0 (5f94df478 2026-08-27)` |
+| Profile | `cargo nextest run --release`; `clock_mode` **wall** |
+| Payload | 10,026,526 bytes; 26,737 validators; 53,474 history rows |
+
+PQ-2 does not apply. **658.322 ms** fits the **7301 ms** window, so this note
+does not publish a maximum fitting payload. No payload cap. `NoFreeWindow`
+is not introduced.
+
 ## RR3-01 input
 
 Use the after median.

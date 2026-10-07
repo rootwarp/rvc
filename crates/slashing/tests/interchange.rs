@@ -1066,3 +1066,119 @@ fn malformed_numeric_field_errors_without_taking_the_conn_mutex() {
     );
     assert!(db.get_attestations(OTHER_PUBKEY).expect("rows").is_empty());
 }
+
+/// RR2-13 median `conn_hold_ms` for the 10 MB interchange on host `cursor`,
+/// rustc 1.99.0 (`cargo nextest run --release`, wall clock).
+///
+/// Source: `plan/review-2026-10-03/measurements/rv15-conn-hold-10mb.md`.
+const CONN_HOLD_10MB_BUDGET_MS: f64 = 658.322;
+
+const TEN_MB_JSON_BYTES: usize = 10_026_526;
+const TEN_MB_VALIDATORS: u64 = 26_737;
+const TEN_MB_HISTORY_ROWS: u64 = 53_474;
+
+struct TenMbInterchange {
+    file: InterchangeFormat,
+    json_bytes: usize,
+    validators: u64,
+}
+
+/// Same shape as the RR2-13 measurement: compact JSON at least 10_000_000
+/// bytes, one attestation and one block per validator, each with a 32-byte
+/// signing root. The first size that clears the floor is 10,026,526 bytes
+/// and 26,737 validators.
+fn ten_mb_interchange() -> TenMbInterchange {
+    const TARGET_BYTES: usize = 10_000_000;
+    const SIGNING_ROOT: &str = "0x4ff6f743a43f3b4f95350831aeaf0a122a1a392922c45d804280284a69eb850b";
+
+    let sample = ten_mb_validator(0, SIGNING_ROOT);
+    let sample_len = serde_json::to_vec(&sample).expect("sample json").len();
+    let empty = InterchangeFormat {
+        metadata: InterchangeMetadata {
+            interchange_format_version: "5".to_string(),
+            genesis_validators_root: CHAIN_GVR_HEX.to_string(),
+        },
+        data: vec![],
+    };
+    let empty_len = serde_json::to_vec(&empty).expect("empty json").len();
+    let estimated = TARGET_BYTES.saturating_sub(empty_len.saturating_sub(2)) / sample_len.max(1);
+    let mut n = u32::try_from(estimated).unwrap_or(u32::MAX).max(1);
+    loop {
+        let data: Vec<ValidatorRecord> =
+            (0..n).map(|index| ten_mb_validator(index, SIGNING_ROOT)).collect();
+        let file = InterchangeFormat {
+            metadata: InterchangeMetadata {
+                interchange_format_version: "5".to_string(),
+                genesis_validators_root: CHAIN_GVR_HEX.to_string(),
+            },
+            data,
+        };
+        let bytes = serde_json::to_vec(&file).expect("interchange json");
+        if bytes.len() >= TARGET_BYTES {
+            return TenMbInterchange { file, json_bytes: bytes.len(), validators: u64::from(n) };
+        }
+        n = n.checked_add(1).expect("10 MB interchange validator count fits in u32");
+    }
+}
+
+fn ten_mb_validator(index: u32, signing_root: &str) -> ValidatorRecord {
+    let mut raw = [0x11u8; 48];
+    raw[44..48].copy_from_slice(&index.to_be_bytes());
+    ValidatorRecord {
+        pubkey: format!("0x{}", hex::encode(raw)),
+        signed_blocks: vec![InterchangeBlock {
+            slot: "1".to_string(),
+            signing_root: Some(signing_root.to_string()),
+        }],
+        signed_attestations: vec![att("1", "2", Some(signing_root.to_string()))],
+    }
+}
+
+/// RR2-14: a real 10 MB import's `conn_hold_ms` stays within the recorded budget.
+///
+/// `#[ignore]`d so `cargo nextest run --workspace` does not run it. The check
+/// opens an on-disk database (`SlashingDb::open`: WAL, `synchronous=EXTRA`,
+/// mode `0o600`) and imports the RR2-13 payload. It fails when that hold
+/// exceeds [`CONN_HOLD_10MB_BUDGET_MS`].
+///
+/// ```text
+/// cargo nextest run --release -p rvc-slashing --test interchange \
+///   --run-ignored ignored-only --no-capture \
+///   -E 'test(conn_hold_for_10mb_import_stays_within_budget)'
+/// ```
+#[test]
+#[ignore]
+fn conn_hold_for_10mb_import_stays_within_budget() {
+    let _guard = IMPORT_TIMING_METRIC.lock().expect("import timing metric");
+    rvc_slashing::metrics::init();
+
+    let payload = ten_mb_interchange();
+    let history_rows = payload.validators * 2;
+    assert_eq!(
+        payload.json_bytes, TEN_MB_JSON_BYTES,
+        "10 MB payload byte size drifted from the RR2-13 measurement"
+    );
+    assert_eq!(payload.validators, TEN_MB_VALIDATORS, "validator count drifted");
+    assert_eq!(history_rows, TEN_MB_HISTORY_ROWS, "history-row count drifted");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("slashing.db");
+    let db = SlashingDb::open(&path).expect("open on-disk db");
+    let gvr = chain_gvr();
+
+    let hold_before = hold_sum_ms();
+    let hold_n_before = hold_samples();
+    db.import(&payload.file, &gvr).expect("10 MB import");
+    let hold_ms = hold_sum_ms() - hold_before;
+    eprintln!(
+        "RV15_BUDGET json_bytes={} validators={} history_rows={history_rows} hold_ms={hold_ms:.3} budget_ms={CONN_HOLD_10MB_BUDGET_MS:.3}",
+        payload.json_bytes, payload.validators,
+    );
+    assert_eq!(hold_samples(), hold_n_before + 1, "one 10 MB import records one conn-hold sample");
+    assert!(
+        hold_ms <= CONN_HOLD_10MB_BUDGET_MS,
+        "10 MB import conn_hold {hold_ms:.3} ms exceeds the recorded budget {CONN_HOLD_10MB_BUDGET_MS} ms \
+         (host cursor, rustc 1.99.0; payload {TEN_MB_JSON_BYTES} bytes / {TEN_MB_VALIDATORS} validators / \
+         {TEN_MB_HISTORY_ROWS} history rows)"
+    );
+}
