@@ -72,7 +72,8 @@ pub struct OrchestratorConfig {
     /// Pre-Gloas and Gloas deadline sets. Selected once per slot via
     /// [`ForkName::from_epoch`]; wait sites consume the resolved [`DeadlineBps`].
     pub deadline_schedule: DeadlineSchedule,
-    /// Sign-request and publish-wave concurrency for attestation and sync messages.
+    /// Sign-request and publish-wave concurrency for attestation, sync messages,
+    /// and aggregates.
     pub dispatch_limits: DispatchLimits,
 }
 
@@ -141,7 +142,7 @@ impl OrchestratorConfig {
         self
     }
 
-    /// Replace the attestation and sync-message sign/publish concurrency.
+    /// Replace the attestation, sync-message, and aggregate sign/publish concurrency.
     ///
     /// Callers pass [`DispatchLimits::validated`]. A zero is rejected there
     /// because `ready_chunks(0)` panics.
@@ -1131,15 +1132,20 @@ where
         }
     }
 
+    /// Aggregate duties for `slot` until `slot_end`.
+    ///
+    /// Intake stops at `slot_end`. A publish still running stops at `slot_end`
+    /// plus [`super::dispatch::SLOT_END_PUBLISH_OVERHANG`].
     async fn run_aggregation_phase(
         &self,
         current_slot: Slot,
         current_epoch: u64,
         agg_phase_span: tracing::Span,
+        slot_end: tokio::time::Instant,
     ) {
         if self.attesting_enabled.load(Ordering::Relaxed) {
             self.aggregation_service
-                .maybe_produce_aggregations(current_slot, current_epoch)
+                .maybe_produce_aggregations(current_slot, current_epoch, slot_end)
                 .instrument(agg_phase_span)
                 .await;
         } else {
@@ -1286,7 +1292,13 @@ where
                 .instrument(agg_phase_span.clone())
                 .await;
             Self::record_phase_offset(slot_phase_offset::AGGREGATE, anchor);
-            self.run_aggregation_phase(current_slot, current_epoch, agg_phase_span).await;
+            self.run_aggregation_phase(
+                current_slot,
+                current_epoch,
+                agg_phase_span,
+                anchor.slot_end(),
+            )
+            .await;
             return WaitOutcome::Continue;
         }
 
@@ -1331,8 +1343,13 @@ where
                 }
                 Self::record_time_into_slot(&agg_phase_span, anchor);
                 Self::record_phase_offset(slot_phase_offset::AGGREGATE, anchor);
-                self.run_aggregation_phase(current_slot, current_epoch, agg_phase_span.clone())
-                    .await;
+                self.run_aggregation_phase(
+                    current_slot,
+                    current_epoch,
+                    agg_phase_span.clone(),
+                    anchor.slot_end(),
+                )
+                .await;
                 WaitOutcome::Continue
             },
         );

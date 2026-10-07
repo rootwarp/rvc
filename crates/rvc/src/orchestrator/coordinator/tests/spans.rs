@@ -287,7 +287,10 @@ async fn test_aggregation_creates_produce_span() {
     let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 
     let span_names = captured.lock();
     assert!(
@@ -346,7 +349,10 @@ async fn test_aggregation_non_aggregator_creates_produce_span_without_submit() {
     let subscriber = tracing_subscriber::registry::Registry::default().with(layer);
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 
     let span_names = captured.lock();
     // produce span should still be created (it wraps the entire per-validator loop body)
