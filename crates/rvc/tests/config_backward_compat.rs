@@ -42,6 +42,7 @@ fn expected_production_config() -> Config {
             allow_insecure_remote_signer: false,
             cors_origins: vec!["https://ops.example".to_string()],
             body_limit: 10485760,
+            ..Default::default()
         },
         tracing: TracingConfig {
             endpoint: Some("http://otel-collector:4318".to_string()),

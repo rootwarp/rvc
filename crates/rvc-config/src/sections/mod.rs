@@ -33,7 +33,10 @@ pub use duties::{
 };
 pub use fork_schedule::ForkScheduleConfig;
 pub use grpc_signer::{GrpcSignerArgs, GrpcSignerConfig};
-pub use keymanager::{KeymanagerArgs, KeymanagerConfig};
+pub use keymanager::{
+    KeymanagerArgs, KeymanagerConfig, DEFAULT_IMPORT_KDF_CONCURRENCY,
+    DEFAULT_IMPORT_KDF_MAX_KEYSTORE_MIB, DEFAULT_IMPORT_KDF_TOTAL_MIB, MAX_IMPORT_KDF_CONCURRENCY,
+};
 pub use keys::{KeysArgs, KeysConfig};
 pub use logfile::{LogfileArgs, LogfileConfig};
 pub use monitoring::{MonitoringArgs, MonitoringConfig};
@@ -218,6 +221,9 @@ mod tests {
                 "--key-decrypt-threads",
                 "--disable-keystore-locking",
                 "--validators-config",
+                "--keymanager-import-kdf-concurrency",
+                "--keymanager-import-kdf-max-keystore-mib",
+                "--keymanager-import-kdf-total-mib",
             ]);
             v.extend_from_slice(PRE_MOVE_LONG_FLAGS_4H);
             v.sort();

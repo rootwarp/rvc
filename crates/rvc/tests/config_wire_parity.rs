@@ -4,7 +4,9 @@
 //! binding contract for later Stream-A issues. ARCH-4j extended the corpus with
 //! the four BN timeout knobs (65 → 69); ARCH-7e disposed the healthz bind knobs
 //! (69 → 67). RR2-02 adds the two `[duties]` concurrency knobs (70 → 72).
-//! Remaining snapshots stay byte-identical: default `[duties]` is omitted.
+//! RR2-10 adds the three `[keymanager]` import KDF knobs (72 → 75).
+//! Remaining snapshots stay byte-identical: default `[duties]` and default
+//! import-KDF fields are omitted.
 //!
 //! KAT-first: no test name here ends in `_root` / `tree_hash` / `signing_root`
 //! (the knob `genesis_validators_root` is in the corpus).
@@ -132,14 +134,15 @@ const REQUIRED_CORPUS: &[&str] = &[
     "beacon_timeouts.toml",
     "slashing_group_commit.toml",
     "duties.toml",
+    "keymanager_kdf.toml",
 ];
 
 #[test]
 fn every_knob_appears_in_the_parity_corpus() {
     let names = cli_override_field_names();
-    assert_eq!(names.len(), 72, "operator knob count is 72 after the [duties] knobs");
+    assert_eq!(names.len(), 75, "operator knob count is 75 after the [keymanager] KDF knobs");
     let unique: BTreeSet<_> = names.iter().copied().collect();
-    assert_eq!(unique.len(), 72, "operator knob names must be unique");
+    assert_eq!(unique.len(), 75, "operator knob names must be unique");
 
     for name in REQUIRED_CORPUS {
         let path = fixture_path(name);
@@ -353,6 +356,23 @@ fn duties_section_parses_from_corpus() {
     assert_eq!(defaults.duties.duty_dispatch_concurrency, 32);
     assert_eq!(defaults.duties.duty_publish_concurrency, 2);
     assert!(!config_snapshot_json(&defaults).contains("duty_dispatch_concurrency"));
+}
+
+#[test]
+fn keymanager_kdf_section_parses_from_corpus() {
+    let config = load_fixture("keymanager_kdf.toml");
+    assert_eq!(config.keymanager.keymanager_import_kdf_concurrency, 4);
+    assert_eq!(config.keymanager.keymanager_import_kdf_total_mib, 256);
+    assert_eq!(config.keymanager.keymanager_import_kdf_max_keystore_mib, 1024);
+    assert!(config.validate().is_ok());
+    let defaults = Config::default();
+    assert_eq!(defaults.keymanager.keymanager_import_kdf_concurrency, 2);
+    assert_eq!(defaults.keymanager.keymanager_import_kdf_total_mib, 512);
+    assert_eq!(defaults.keymanager.keymanager_import_kdf_max_keystore_mib, 8192);
+    let snapshot = config_snapshot_json(&defaults);
+    assert!(!snapshot.contains("keymanager_import_kdf_concurrency"));
+    assert!(!snapshot.contains("keymanager_import_kdf_total_mib"));
+    assert!(!snapshot.contains("keymanager_import_kdf_max_keystore_mib"));
 }
 
 #[test]

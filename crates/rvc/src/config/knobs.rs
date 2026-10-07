@@ -1,15 +1,17 @@
-//! Canonical 72 operator-knob names.
+//! Canonical 75 operator-knob names.
 //!
 //! These are the historical flat / `CliOverrides` names plus the four BN
-//! timeouts promoted in ARCH-4j and the two `[duties]` concurrency knobs
-//! from RR2-02. ARCH-4d's corpus and G-2 clause (iii) use this list after
-//! `CliOverrides` is deleted.
+//! timeouts promoted in ARCH-4j, the two `[duties]` concurrency knobs from
+//! RR2-02, and the three `[keymanager]` import KDF knobs from RR2-10.
+//! ARCH-4d's corpus and G-2 clause (iii) use this list after `CliOverrides`
+//! is deleted.
 
 /// Every remaining operator knob that had a `CliOverrides` field before
 /// ARCH-4i, plus the four BN timeouts promoted to `Config` in ARCH-4j,
-/// plus `duty_dispatch_concurrency` and `duty_publish_concurrency` (RR2-02).
+/// plus `duty_dispatch_concurrency` and `duty_publish_concurrency` (RR2-02),
+/// plus the three keymanager import KDF knobs (RR2-10).
 ///
-/// Count is **72**.
+/// Count is **75**.
 pub const OPERATOR_KNOB_NAMES: &[&str] = &[
     "beacon_url",
     "beacon_nodes",
@@ -48,6 +50,9 @@ pub const OPERATOR_KNOB_NAMES: &[&str] = &[
     "allow_insecure_remote_signer",
     "keymanager_cors_origins",
     "keymanager_body_limit",
+    "keymanager_import_kdf_concurrency",
+    "keymanager_import_kdf_total_mib",
+    "keymanager_import_kdf_max_keystore_mib",
     "grpc_signer_url",
     "grpc_signer_tls_cert",
     "grpc_signer_tls_key",

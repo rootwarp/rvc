@@ -988,6 +988,43 @@ impl Config {
             },
         )?;
 
+        // RR2-10: import-time KDF budget. The per-keystore cap is tighten-only
+        // against today's decrypt ceiling.
+        let keymanager_import_kdf_concurrency = self.keymanager.keymanager_import_kdf_concurrency;
+        if !(1..=rvc_config::MAX_IMPORT_KDF_CONCURRENCY)
+            .contains(&keymanager_import_kdf_concurrency)
+        {
+            return Err(ConfigError::Invalid {
+                field: "keymanager_import_kdf_concurrency",
+                message: format!(
+                    "must be 1..={}, got {keymanager_import_kdf_concurrency}",
+                    rvc_config::MAX_IMPORT_KDF_CONCURRENCY
+                ),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        let keymanager_import_kdf_total_mib = self.keymanager.keymanager_import_kdf_total_mib;
+        if keymanager_import_kdf_total_mib < 1 {
+            return Err(ConfigError::Invalid {
+                field: "keymanager_import_kdf_total_mib",
+                message: format!("must be >= 1, got {keymanager_import_kdf_total_mib}"),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        let keymanager_import_kdf_max_keystore_mib =
+            self.keymanager.keymanager_import_kdf_max_keystore_mib;
+        let kdf_ceiling_mib = crypto::MAX_KDF_WORKING_SET_BYTES / (1024 * 1024);
+        let max_keystore_mib = u64::from(keymanager_import_kdf_max_keystore_mib);
+        if max_keystore_mib < 1 || max_keystore_mib > kdf_ceiling_mib {
+            return Err(ConfigError::Invalid {
+                field: "keymanager_import_kdf_max_keystore_mib",
+                message: format!(
+                    "must be 1..={kdf_ceiling_mib} (tighten-only; cannot exceed the decrypt working-set ceiling), got {keymanager_import_kdf_max_keystore_mib}"
+                ),
+                source_layer: ConfigSource::Default,
+            });
+        }
+
         // Validate proposer node URLs
         for node_url in &self.proposer_nodes {
             if node_url.is_empty() {
@@ -1303,6 +1340,15 @@ impl Config {
         }
         if let Some(v) = keymanager.body_limit {
             self.keymanager.body_limit = v;
+        }
+        if let Some(v) = keymanager.keymanager_import_kdf_concurrency {
+            self.keymanager.keymanager_import_kdf_concurrency = v;
+        }
+        if let Some(v) = keymanager.keymanager_import_kdf_total_mib {
+            self.keymanager.keymanager_import_kdf_total_mib = v;
+        }
+        if let Some(v) = keymanager.keymanager_import_kdf_max_keystore_mib {
+            self.keymanager.keymanager_import_kdf_max_keystore_mib = v;
         }
 
         if let Some(v) = &grpc_signer.url {
@@ -1645,6 +1691,163 @@ allow_fresh_db = true
         assert_eq!(loaded.duties.duty_dispatch_concurrency, 64);
         assert_eq!(loaded.duties.duty_publish_concurrency, 4);
         assert!(loaded.validate().is_ok());
+    }
+
+    #[test]
+    fn kdf_max_keystore_mib_is_tighten_only() {
+        let ceiling = crypto::MAX_KDF_WORKING_SET_BYTES / (1024 * 1024);
+        assert_eq!(ceiling, 8192, "today's decrypt ceiling is 8192 MiB");
+
+        let above: Config = toml::from_str(&format!(
+            "[keymanager]\nkeymanager_import_kdf_max_keystore_mib = {}\n",
+            ceiling + 1
+        ))
+        .expect("value above the ceiling parses");
+        let err = above.validate().expect_err("above the decrypt ceiling");
+        match &err {
+            ConfigError::Invalid { field, message, .. } => {
+                assert_eq!(*field, "keymanager_import_kdf_max_keystore_mib");
+                assert!(message.contains(&(ceiling + 1).to_string()), "{message}");
+            }
+            other => panic!("expected a named Invalid error, got {other:?}"),
+        }
+        let rendered = err.to_string();
+        assert!(rendered.contains("keymanager_import_kdf_max_keystore_mib"), "{rendered}");
+
+        let smaller: Config = toml::from_str(&format!(
+            "[keymanager]\nkeymanager_import_kdf_max_keystore_mib = {}\n",
+            ceiling - 1
+        ))
+        .expect("smaller cap parses");
+        assert!(smaller.validate().is_ok(), "a cap below the ceiling is accepted");
+        assert_eq!(
+            u64::from(smaller.keymanager.keymanager_import_kdf_max_keystore_mib),
+            ceiling - 1
+        );
+
+        let at_ceiling: Config = toml::from_str(&format!(
+            "[keymanager]\nkeymanager_import_kdf_max_keystore_mib = {ceiling}\n"
+        ))
+        .expect("ceiling parses");
+        assert!(at_ceiling.validate().is_ok(), "the current ceiling stays accepted");
+
+        let zero: Config =
+            toml::from_str("[keymanager]\nkeymanager_import_kdf_max_keystore_mib = 0\n")
+                .expect("0 parses");
+        let err = zero.validate().expect_err("0 is below 1");
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid { field: "keymanager_import_kdf_max_keystore_mib", .. }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn import_kdf_defaults_match_kdf_budget_config() {
+        let budget = crate::keymanager_adapters::KdfBudgetConfig::default();
+        let defaults = Config::default();
+        assert_eq!(defaults.keymanager.keymanager_import_kdf_concurrency, budget.concurrency);
+        assert_eq!(
+            u64::from(defaults.keymanager.keymanager_import_kdf_total_mib) * 1024 * 1024,
+            budget.total_bytes
+        );
+        assert_eq!(
+            u64::from(defaults.keymanager.keymanager_import_kdf_max_keystore_mib) * 1024 * 1024,
+            budget.max_keystore_bytes
+        );
+        assert!(defaults.validate().is_ok());
+
+        let absent = StartArgs::default();
+        assert!(absent.keymanager.keymanager_import_kdf_concurrency.is_none());
+        assert!(absent.keymanager.keymanager_import_kdf_total_mib.is_none());
+        assert!(absent.keymanager.keymanager_import_kdf_max_keystore_mib.is_none());
+        let loaded = Config::load(None, absent).expect("defaults");
+        assert_eq!(loaded.keymanager.keymanager_import_kdf_concurrency, budget.concurrency);
+        assert_eq!(
+            loaded.keymanager.keymanager_import_kdf_total_mib,
+            u32::try_from(budget.total_bytes / (1024 * 1024)).unwrap()
+        );
+        assert_eq!(
+            loaded.keymanager.keymanager_import_kdf_max_keystore_mib,
+            u32::try_from(budget.max_keystore_bytes / (1024 * 1024)).unwrap()
+        );
+    }
+
+    #[test]
+    fn config_rejects_zero_import_kdf_concurrency() {
+        let config: Config =
+            toml::from_str("[keymanager]\nkeymanager_import_kdf_concurrency = 0\n")
+                .expect("0 is a u32; reject at validate");
+        let err = config.validate().expect_err("zero import KDF concurrency must fail validate");
+        match err {
+            ConfigError::Invalid { field, message, .. } => {
+                assert_eq!(field, "keymanager_import_kdf_concurrency");
+                assert!(message.contains('0'), "{message}");
+            }
+            other => panic!("expected a named Invalid error, got {other:?}"),
+        }
+
+        let over: Config = toml::from_str("[keymanager]\nkeymanager_import_kdf_concurrency = 33\n")
+            .expect("33 parses");
+        let err = over.validate().expect_err("33 is above 32");
+        assert!(
+            matches!(err, ConfigError::Invalid { field: "keymanager_import_kdf_concurrency", .. }),
+            "{err}"
+        );
+
+        let at_max: Config =
+            toml::from_str("[keymanager]\nkeymanager_import_kdf_concurrency = 32\n")
+                .expect("32 parses");
+        assert!(at_max.validate().is_ok());
+
+        let zero_total: Config =
+            toml::from_str("[keymanager]\nkeymanager_import_kdf_total_mib = 0\n")
+                .expect("0 parses");
+        let err = zero_total.validate().expect_err("zero total MiB");
+        assert!(
+            matches!(err, ConfigError::Invalid { field: "keymanager_import_kdf_total_mib", .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keymanager_import_kdf_toml_and_cli() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[keymanager]\n\
+             keymanager_import_kdf_concurrency = 8\n\
+             keymanager_import_kdf_total_mib = 128\n\
+             keymanager_import_kdf_max_keystore_mib = 1024\n"
+        )
+        .unwrap();
+        let from_file = Config::load(Some(file.path()), StartArgs::default()).expect("file");
+        assert_eq!(from_file.keymanager.keymanager_import_kdf_concurrency, 8);
+        assert_eq!(from_file.keymanager.keymanager_import_kdf_total_mib, 128);
+        assert_eq!(from_file.keymanager.keymanager_import_kdf_max_keystore_mib, 1024);
+        assert!(from_file.validate().is_ok());
+
+        let loaded = overlay(|cli| {
+            cli.keymanager.keymanager_import_kdf_concurrency = Some(4);
+            cli.keymanager.keymanager_import_kdf_total_mib = Some(256);
+            cli.keymanager.keymanager_import_kdf_max_keystore_mib = Some(2048);
+        });
+        assert_eq!(loaded.keymanager.keymanager_import_kdf_concurrency, 4);
+        assert_eq!(loaded.keymanager.keymanager_import_kdf_total_mib, 256);
+        assert_eq!(loaded.keymanager.keymanager_import_kdf_max_keystore_mib, 2048);
+        assert!(loaded.validate().is_ok());
+
+        let mut cli = StartArgs::default();
+        cli.keymanager.keymanager_import_kdf_concurrency = Some(16);
+        cli.keymanager.keymanager_import_kdf_total_mib = Some(64);
+        cli.keymanager.keymanager_import_kdf_max_keystore_mib = Some(32);
+        let overlaid = Config::load(Some(file.path()), cli).expect("file+cli");
+        assert_eq!(overlaid.keymanager.keymanager_import_kdf_concurrency, 16);
+        assert_eq!(overlaid.keymanager.keymanager_import_kdf_total_mib, 64);
+        assert_eq!(overlaid.keymanager.keymanager_import_kdf_max_keystore_mib, 32);
+        assert!(overlaid.validate().is_ok());
     }
 
     #[test]

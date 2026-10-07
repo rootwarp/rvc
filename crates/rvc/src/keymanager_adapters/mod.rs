@@ -31,3 +31,6 @@ pub use spawn::{
 };
 pub use validator::ValidatorManagerAdapter;
 pub use voluntary_exit::VoluntaryExitManagerAdapter;
+
+#[cfg(test)]
+pub(crate) use kdf_budget::KdfBudgetConfig;

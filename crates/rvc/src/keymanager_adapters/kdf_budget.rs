@@ -45,6 +45,16 @@ impl Default for KdfBudgetConfig {
     }
 }
 
+/// `rvc-config` cannot name this type. The `[keymanager]` import-KDF defaults
+/// repeat these numbers and must stay equal.
+const _: () = {
+    assert!(DEFAULT_CONCURRENCY == rvc_config::DEFAULT_IMPORT_KDF_CONCURRENCY);
+    assert!(DEFAULT_TOTAL_BYTES == (rvc_config::DEFAULT_IMPORT_KDF_TOTAL_MIB as u64) * MIB);
+    assert!(
+        MAX_KDF_WORKING_SET_BYTES / MIB == rvc_config::DEFAULT_IMPORT_KDF_MAX_KEYSTORE_MIB as u64
+    );
+};
+
 /// Shared admission gate over a slot semaphore and a byte semaphore.
 ///
 /// Byte permits are 1 MiB each. [`Self::admit`] waits asynchronously.

@@ -411,6 +411,9 @@ mod tests {
         "--allow-insecure-remote-signer",
         "--keymanager-cors-origins",
         "--keymanager-body-limit",
+        "--keymanager-import-kdf-concurrency",
+        "--keymanager-import-kdf-total-mib",
+        "--keymanager-import-kdf-max-keystore-mib",
         "--grpc-signer-url",
         "--grpc-signer-tls-cert",
         "--grpc-signer-tls-key",
@@ -521,6 +524,12 @@ mod tests {
             "https://a,https://b",
             "--keymanager-body-limit",
             "2048",
+            "--keymanager-import-kdf-concurrency",
+            "4",
+            "--keymanager-import-kdf-total-mib",
+            "256",
+            "--keymanager-import-kdf-max-keystore-mib",
+            "1024",
             "--grpc-signer-url",
             "https://gs:50051",
             "--grpc-signer-tls-cert",
@@ -628,6 +637,9 @@ mod tests {
             vec!["https://a".to_string(), "https://b".to_string()]
         );
         assert_eq!(cfg.keymanager.body_limit, 2048);
+        assert_eq!(cfg.keymanager.keymanager_import_kdf_concurrency, 4);
+        assert_eq!(cfg.keymanager.keymanager_import_kdf_total_mib, 256);
+        assert_eq!(cfg.keymanager.keymanager_import_kdf_max_keystore_mib, 1024);
         assert_eq!(cfg.grpc_signer.url.as_deref(), Some("https://gs:50051"));
         assert_eq!(cfg.grpc_signer.tls_cert, Some(PathBuf::from("/c.pem")));
         assert_eq!(cfg.grpc_signer.tls_key, Some(PathBuf::from("/k.pem")));
@@ -691,6 +703,18 @@ mod tests {
         assert_eq!(cfg.log_level, defaults.log_level);
         assert_eq!(cfg.tracing.exporter, defaults.tracing.exporter);
         assert_eq!(cfg.keymanager.body_limit, defaults.keymanager.body_limit);
+        assert_eq!(
+            cfg.keymanager.keymanager_import_kdf_concurrency,
+            defaults.keymanager.keymanager_import_kdf_concurrency
+        );
+        assert_eq!(
+            cfg.keymanager.keymanager_import_kdf_total_mib,
+            defaults.keymanager.keymanager_import_kdf_total_mib
+        );
+        assert_eq!(
+            cfg.keymanager.keymanager_import_kdf_max_keystore_mib,
+            defaults.keymanager.keymanager_import_kdf_max_keystore_mib
+        );
         assert_eq!(cfg.slashed_validators_action, defaults.slashed_validators_action);
         assert_eq!(cfg.beacon_max_body_bytes, defaults.beacon_max_body_bytes);
         assert_eq!(cfg.duties, defaults.duties);
