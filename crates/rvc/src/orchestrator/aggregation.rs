@@ -1,5 +1,7 @@
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::stream::{self, StreamExt};
 use tracing::{debug, info, info_span, warn, Instrument, Span};
 
 use crate::metrics::{attestation_status, RVC_AGGREGATIONS_TOTAL};
@@ -18,6 +20,7 @@ use tree_hash::TreeHash;
 use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
+use super::dispatch::{SlotEndDropCounter, SLOT_END_PUBLISH_OVERHANG};
 use super::utils::{self, TimedOutcome};
 
 pub(crate) struct AggregationService {
@@ -30,6 +33,8 @@ pub(crate) struct AggregationService {
     /// present in attestation.rs so that aggregation and selection proofs
     /// are also suppressed during the post-import doppelganger window.
     validator_store: Arc<ValidatorStore>,
+    /// Aggregator duties not pulled onto the sign pipeline before slot end.
+    slot_end_drops: SlotEndDropCounter,
 }
 
 /// Signed aggregate produced for one aggregator duty (fork-discriminated).
@@ -66,11 +71,38 @@ impl AggregationService {
         config: OrchestratorConfig,
         validator_store: Arc<ValidatorStore>,
     ) -> Self {
-        Self { signer, beacon, duty_tracker, pubkey_map, config, validator_store }
+        Self {
+            signer,
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            config,
+            validator_store,
+            slot_end_drops: SlotEndDropCounter::default(),
+        }
     }
 
+    /// Duties dropped because slot end arrived before they were dispatched.
+    #[cfg(test)]
+    pub(crate) fn slot_end_drops(&self) -> u64 {
+        self.slot_end_drops.get()
+    }
+
+    /// Produce aggregate-and-proofs for `slot`.
+    ///
+    /// `take_until(slot_end)` stops pulling new duties. Signs already inside
+    /// `buffer_unordered` drain. Each ready chunk is one submit. A publish is
+    /// admitted only until `slot_end` plus [`SLOT_END_PUBLISH_OVERHANG`].
+    /// Aggregates are non-slashable: this path does not touch SQLite.
+    /// `source_validators` is sorted before recording because wave completion
+    /// order is not the duty order.
     #[tracing::instrument(name = "orchestrator.produce_aggregations", level = "debug", skip_all, fields(slot = slot, epoch = epoch))]
-    pub(crate) async fn maybe_produce_aggregations(&self, slot: Slot, epoch: u64) {
+    pub(crate) async fn maybe_produce_aggregations(
+        &self,
+        slot: Slot,
+        epoch: u64,
+        slot_end: tokio::time::Instant,
+    ) {
         let duties =
             match utils::get_duties_for_slot(&self.pubkey_map, &self.duty_tracker, slot).await {
                 Ok(d) => d,
@@ -83,12 +115,7 @@ impl AggregationService {
 
         let fork_name = ForkName::from_epoch(epoch, &self.config.fork_schedule);
         let uses_electra_wire = utils::uses_electra_attestation_wire(fork_name);
-
-        let mut pre_electra_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
-        let mut electra_aggregates: Vec<SignedElectraAggregateAndProof> = Vec::new();
-        let mut source_validators: Vec<String> = Vec::new();
-
-        let fork_label = if fork_name == ForkName::Gloas {
+        let fork_label: &'static str = if fork_name == ForkName::Gloas {
             "gloas"
         } else if fork_name == ForkName::Fulu {
             "fulu"
@@ -98,61 +125,43 @@ impl AggregationService {
             "pre_electra"
         };
 
-        for duty in &duties {
-            let agg_span = info_span!(
-                "aggregation.produce",
-                slot = slot,
-                validator_index = %duty.validator_index,
-                pubkey = %TruncatedPubkey::new(&duty.pubkey),
-                aggregation.fork = fork_label,
-            );
-
-            let Some(outcome) = self.produce_one_aggregate(duty, slot, fork_name, agg_span).await
-            else {
-                continue;
-            };
-
-            source_validators.push(outcome.validator_index);
-            match outcome.proof {
-                Some(ProducedAggregate::PreElectra(p)) => pre_electra_aggregates.push(p),
-                Some(ProducedAggregate::Electra(p) | ProducedAggregate::Gloas(p)) => {
-                    electra_aggregates.push(p)
-                }
-                None => {}
-            }
+        // Same shape as attestation and sync dispatch. Aggregates stay
+        // non-slashable: no slashing DB access on this path.
+        let duty_count = duties.len();
+        let concurrency = self.config.dispatch_limits.concurrency as usize;
+        let publish_concurrency = self.config.dispatch_limits.publish_concurrency as usize;
+        let waves = stream::iter(duties)
+            .take_until(tokio::time::sleep_until(slot_end))
+            .map(|duty| {
+                let agg_span = info_span!(
+                    "aggregation.produce",
+                    slot = slot,
+                    validator_index = %duty.validator_index,
+                    pubkey = %TruncatedPubkey::new(&duty.pubkey),
+                    aggregation.fork = fork_label,
+                );
+                self.produce_one_aggregate(duty, slot, fork_name, agg_span)
+            })
+            .buffer_unordered(concurrency)
+            .ready_chunks(concurrency)
+            .map(|wave| self.publish_aggregate_wave(slot, slot_end, fork_name, wave))
+            .buffer_unordered(publish_concurrency);
+        let mut waves = std::pin::pin!(waves);
+        let mut dispatched = 0usize;
+        while let Some(attempted) = waves.next().await {
+            dispatched += attempted;
         }
 
-        if !pre_electra_aggregates.is_empty() {
-            let versioned = VersionedSignedAggregateAndProof::PreElectra(pre_electra_aggregates);
-            self.submit_versioned(
+        let dropped = duty_count.saturating_sub(dispatched);
+        if dropped > 0 {
+            self.slot_end_drops.record(dropped as u64);
+            warn!(
                 slot,
-                versioned,
-                &source_validators,
-                AggregateSubmitLabel::PreElectra,
-            )
-            .await;
-        }
-
-        if !electra_aggregates.is_empty() {
-            // Exact fork, not `>= Fulu`: Gloas must submit Eth-Consensus-Version: gloas.
-            // Fulu keeps the Electra submit-label so its log literals stay byte-identical.
-            let (versioned, label) = if fork_name == ForkName::Gloas {
-                (
-                    VersionedSignedAggregateAndProof::Gloas(electra_aggregates),
-                    AggregateSubmitLabel::Gloas,
-                )
-            } else if fork_name == ForkName::Fulu {
-                (
-                    VersionedSignedAggregateAndProof::Fulu(electra_aggregates),
-                    AggregateSubmitLabel::Electra,
-                )
-            } else {
-                (
-                    VersionedSignedAggregateAndProof::Electra(electra_aggregates),
-                    AggregateSubmitLabel::Electra,
-                )
-            };
-            self.submit_versioned(slot, versioned, &source_validators, label).await;
+                dropped,
+                duty_count,
+                total_dropped = self.slot_end_drops.get(),
+                "undispatched aggregation duties dropped at slot end"
+            );
         }
     }
 
@@ -161,7 +170,7 @@ impl AggregationService {
     /// before selection; `Some` once selected (proof may still be `None`).
     async fn produce_one_aggregate(
         &self,
-        duty: &AttesterDuty,
+        duty: AttesterDuty,
         slot: Slot,
         fork_name: ForkName,
         agg_span: Span,
@@ -227,7 +236,7 @@ impl AggregationService {
         let validator_index = duty.validator_index.clone();
         let proof = self
             .fetch_sign_aggregate(
-                duty,
+                &duty,
                 slot,
                 fork_name,
                 &pubkey,
@@ -550,12 +559,85 @@ impl AggregationService {
         Some(SignedElectraAggregateAndProof { message, signature: signature.to_bytes().to_vec() })
     }
 
+    /// One batch POST for a wave of signed aggregates.
+    ///
+    /// `source_validators` is sorted before the submit span records it (H-25).
+    /// The POST's deadline is the earlier of the `aggregate_submit` timeout and
+    /// `slot_end` plus 500 ms. Signs already running are not cancelled; a wave
+    /// that becomes ready after that instant is not sent. Returns how many
+    /// duties this wave attempted, including skips and sign failures.
+    async fn publish_aggregate_wave(
+        &self,
+        slot: Slot,
+        slot_end: tokio::time::Instant,
+        fork_name: ForkName,
+        wave: Vec<Option<AggregateDutyOutcome>>,
+    ) -> usize {
+        let attempted = wave.len();
+        let outcomes: Vec<AggregateDutyOutcome> = wave.into_iter().flatten().collect();
+        if outcomes.is_empty() {
+            return attempted;
+        }
+
+        let mut source_validators: Vec<String> =
+            outcomes.iter().map(|outcome| outcome.validator_index.clone()).collect();
+        sort_source_validators(&mut source_validators);
+
+        let mut pre_electra_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
+        let mut electra_aggregates: Vec<SignedElectraAggregateAndProof> = Vec::new();
+        for outcome in outcomes {
+            match outcome.proof {
+                Some(ProducedAggregate::PreElectra(proof)) => pre_electra_aggregates.push(proof),
+                Some(ProducedAggregate::Electra(proof) | ProducedAggregate::Gloas(proof)) => {
+                    electra_aggregates.push(proof)
+                }
+                None => {}
+            }
+        }
+
+        if !pre_electra_aggregates.is_empty() {
+            let versioned = VersionedSignedAggregateAndProof::PreElectra(pre_electra_aggregates);
+            self.submit_versioned(
+                slot,
+                slot_end,
+                versioned,
+                &source_validators,
+                AggregateSubmitLabel::PreElectra,
+            )
+            .await;
+        }
+
+        if !electra_aggregates.is_empty() {
+            // Exact fork, not `>= Fulu`: Gloas must submit Eth-Consensus-Version: gloas.
+            // Fulu keeps the Electra submit-label so its log literals stay byte-identical.
+            let (versioned, label) = if fork_name == ForkName::Gloas {
+                (
+                    VersionedSignedAggregateAndProof::Gloas(electra_aggregates),
+                    AggregateSubmitLabel::Gloas,
+                )
+            } else if fork_name == ForkName::Fulu {
+                (
+                    VersionedSignedAggregateAndProof::Fulu(electra_aggregates),
+                    AggregateSubmitLabel::Electra,
+                )
+            } else {
+                (
+                    VersionedSignedAggregateAndProof::Electra(electra_aggregates),
+                    AggregateSubmitLabel::Electra,
+                )
+            };
+            self.submit_versioned(slot, slot_end, versioned, &source_validators, label).await;
+        }
+        attempted
+    }
+
     /// Submit a versioned batch of signed aggregates; shared by pre-Electra and
     /// Electra/Fulu/Gloas. Log messages stay as static literals (byte-identical
     /// to the pre-refactor paths) via [`AggregateSubmitLabel`].
     async fn submit_versioned(
         &self,
         slot: Slot,
+        slot_end: tokio::time::Instant,
         versioned: VersionedSignedAggregateAndProof,
         source_validators: &[String],
         label: AggregateSubmitLabel,
@@ -567,6 +649,11 @@ impl AggregationService {
             | VersionedSignedAggregateAndProof::Gloas(v) => v.len(),
         };
         let source_validators_str = source_validators.join(",");
+        // The span field below is this string. Tests read the thread-local
+        // because a parallel `set_default` rebuilds callsite interest and can
+        // drop the `info` span after the value was already chosen.
+        #[cfg(test)]
+        record_source_validators_for_test(&source_validators_str);
 
         let submit_span = info_span!(
             "aggregation.submit",
@@ -575,15 +662,33 @@ impl AggregationService {
             aggregation.source_validators = %source_validators_str,
         );
 
-        match utils::timed(
-            "aggregate_submit",
-            self.config.timeouts.aggregate_submit,
-            self.beacon.submit_aggregate_and_proofs(&versioned),
-        )
-        .instrument(submit_span)
-        .await
-        {
-            TimedOutcome::Ok(()) => {
+        let now = tokio::time::Instant::now();
+        let overhang_at = slot_end + SLOT_END_PUBLISH_OVERHANG;
+        let submit_at =
+            now.checked_add(self.config.timeouts.aggregate_submit).unwrap_or(overhang_at);
+        let deadline = overhang_at.min(submit_at);
+        let bounded_by_overhang = deadline == overhang_at;
+        if now >= deadline {
+            drop(submit_span);
+            warn_aggregate_publish_stopped(
+                slot,
+                label,
+                bounded_by_overhang,
+                self.config.timeouts.aggregate_submit,
+            );
+            RVC_AGGREGATIONS_TOTAL
+                .with_label_values(&[attestation_status::FAILED])
+                .inc_by(count as u64);
+            return;
+        }
+
+        let submit_result =
+            tokio::time::timeout_at(deadline, self.beacon.submit_aggregate_and_proofs(&versioned))
+                .instrument(submit_span)
+                .await;
+
+        match submit_result {
+            Ok(Ok(())) => {
                 match label {
                     AggregateSubmitLabel::PreElectra => {
                         info!(slot, count, "Submitted aggregate and proofs");
@@ -599,7 +704,7 @@ impl AggregationService {
                     .with_label_values(&[attestation_status::SUCCESS])
                     .inc_by(count as u64);
             }
-            TimedOutcome::Err(e) => {
+            Ok(Err(e)) => {
                 match label {
                     AggregateSubmitLabel::PreElectra => {
                         warn!(slot, error = %e, "Failed to submit aggregate and proofs");
@@ -615,33 +720,83 @@ impl AggregationService {
                     .with_label_values(&[attestation_status::FAILED])
                     .inc_by(count as u64);
             }
-            TimedOutcome::Timeout => {
-                match label {
-                    AggregateSubmitLabel::PreElectra => {
-                        warn!(
-                            slot,
-                            "Aggregate and proofs submit timed out after {}s",
-                            self.config.timeouts.aggregate_submit.as_secs()
-                        );
-                    }
-                    AggregateSubmitLabel::Electra => {
-                        warn!(
-                            slot,
-                            "Electra aggregate and proofs submit timed out after {}s",
-                            self.config.timeouts.aggregate_submit.as_secs()
-                        );
-                    }
-                    AggregateSubmitLabel::Gloas => {
-                        warn!(
-                            slot,
-                            "Gloas aggregate and proofs submit timed out after {}s",
-                            self.config.timeouts.aggregate_submit.as_secs()
-                        );
-                    }
-                }
+            Err(_) => {
+                warn_aggregate_publish_stopped(
+                    slot,
+                    label,
+                    bounded_by_overhang,
+                    self.config.timeouts.aggregate_submit,
+                );
                 RVC_AGGREGATIONS_TOTAL
                     .with_label_values(&[attestation_status::FAILED])
                     .inc_by(count as u64);
+            }
+        }
+    }
+}
+
+/// Decimal validator indices, so `2` stays before `10`.
+///
+/// Wave completion order is not this order. H-25 records the sorted list.
+fn sort_source_validators(indices: &mut [String]) {
+    indices.sort_by(|left, right| {
+        left.parse::<u64>().ok().cmp(&right.parse::<u64>().ok()).then_with(|| left.cmp(right))
+    });
+}
+
+fn warn_aggregate_publish_stopped(
+    slot: Slot,
+    label: AggregateSubmitLabel,
+    bounded_by_overhang: bool,
+    submit_timeout: Duration,
+) {
+    if bounded_by_overhang {
+        let overhang_ms = SLOT_END_PUBLISH_OVERHANG.as_millis();
+        match label {
+            AggregateSubmitLabel::PreElectra => {
+                warn!(
+                    slot,
+                    "Aggregate and proofs publish exceeded the {} ms slot-end overhang",
+                    overhang_ms
+                );
+            }
+            AggregateSubmitLabel::Electra => {
+                warn!(
+                    slot,
+                    "Electra aggregate and proofs publish exceeded the {} ms slot-end overhang",
+                    overhang_ms
+                );
+            }
+            AggregateSubmitLabel::Gloas => {
+                warn!(
+                    slot,
+                    "Gloas aggregate and proofs publish exceeded the {} ms slot-end overhang",
+                    overhang_ms
+                );
+            }
+        }
+    } else {
+        match label {
+            AggregateSubmitLabel::PreElectra => {
+                warn!(
+                    slot,
+                    "Aggregate and proofs submit timed out after {}s",
+                    submit_timeout.as_secs()
+                );
+            }
+            AggregateSubmitLabel::Electra => {
+                warn!(
+                    slot,
+                    "Electra aggregate and proofs submit timed out after {}s",
+                    submit_timeout.as_secs()
+                );
+            }
+            AggregateSubmitLabel::Gloas => {
+                warn!(
+                    slot,
+                    "Gloas aggregate and proofs submit timed out after {}s",
+                    submit_timeout.as_secs()
+                );
             }
         }
     }
@@ -681,6 +836,33 @@ fn encode_electra_aggregate_and_proof(
         rvc_gloas::GloasError::InvalidBody { reason: format!("aggregation_bits: {e:?}") }
     })?;
     Ok(Encode::as_ssz_bytes(message))
+}
+
+/// Slot end far enough that tests which do not exercise the bound still drain.
+#[cfg(test)]
+pub(crate) fn ample_slot_end() -> tokio::time::Instant {
+    tokio::time::Instant::now() + Duration::from_secs(3_600)
+}
+
+// Values passed to `aggregation.source_validators`, in submit order.
+// Libtest reuses threads, so callers clear this before a run.
+#[cfg(test)]
+thread_local! {
+    static RECORDED_SOURCE_VALIDATORS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+fn record_source_validators_for_test(value: &str) {
+    RECORDED_SOURCE_VALIDATORS.with(|slot| slot.borrow_mut().push(value.to_string()));
+}
+
+#[cfg(test)]
+fn take_recorded_source_validators() -> Vec<String> {
+    RECORDED_SOURCE_VALIDATORS.with(|slot| {
+        let mut values = slot.borrow_mut();
+        std::mem::take(&mut *values)
+    })
 }
 
 #[cfg(test)]
@@ -1005,7 +1187,7 @@ mod tests {
         .await;
 
         // Epoch 0 / slot 0 — the duty tracker has the duty for slot 0.
-        service.maybe_produce_aggregations(0, 0).await;
+        service.maybe_produce_aggregations(0, 0, super::ample_slot_end()).await;
 
         // No aggregation must be submitted for a disabled validator.
         assert_eq!(
@@ -1210,7 +1392,7 @@ mod tests {
         )
         .await;
 
-        service.maybe_produce_aggregations(slot, gloas_epoch).await;
+        service.maybe_produce_aggregations(slot, gloas_epoch, super::ample_slot_end()).await;
 
         let calls = rec.calls();
         assert!(
@@ -1247,7 +1429,7 @@ mod tests {
         )
         .await;
 
-        service.maybe_produce_aggregations(slot, fulu_epoch).await;
+        service.maybe_produce_aggregations(slot, fulu_epoch, super::ample_slot_end()).await;
 
         let calls = rec.calls();
         assert!(
@@ -1290,7 +1472,7 @@ mod tests {
         )
         .await;
 
-        service.maybe_produce_aggregations(slot, gloas_epoch).await;
+        service.maybe_produce_aggregations(slot, gloas_epoch, super::ample_slot_end()).await;
 
         let calls = rec.calls();
         assert!(
@@ -1345,7 +1527,7 @@ mod tests {
             )
             .await;
 
-            service.maybe_produce_aggregations(slot, gloas_epoch).await;
+            service.maybe_produce_aggregations(slot, gloas_epoch, super::ample_slot_end()).await;
 
             let calls = rec.calls();
             assert!(
@@ -1399,7 +1581,7 @@ mod tests {
             config,
             enabled_store(pk_bytes),
         );
-        service.maybe_produce_aggregations(slot, epoch).await;
+        service.maybe_produce_aggregations(slot, epoch, super::ample_slot_end()).await;
         let forks = fetched.lock().unwrap().clone();
         let proofs = submitted.lock().unwrap().clone();
         (forks, proofs)
@@ -1459,5 +1641,267 @@ mod tests {
             vec![ForkName::Gloas],
             "Gloas slot must not keep the previous Fulu fork"
         );
+    }
+
+    /// H-25: one wave can contain indices in duty order `10,2,1,3`.
+    ///
+    /// `ready_chunks` flushes when the sign stream is pending, so staggered
+    /// sleeps would publish one index at a time. A shared delay makes the four
+    /// selection proofs ready in one poll; the recorded attribute is still the
+    /// numeric order, and a second run records the same string.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn source_validators_is_sorted_before_recording() {
+        use std::time::Duration;
+
+        use crate::orchestrator::dispatch::DispatchLimits;
+
+        let indices = ["10", "2", "1", "3"];
+        let mut keys = Vec::new();
+        let mut delays = HashMap::new();
+        let mut duties = Vec::new();
+        for index in indices {
+            let secret = SecretKey::generate();
+            let pubkey = secret.public_key();
+            let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+            delays.insert(pubkey.to_bytes(), Duration::from_millis(5));
+            duties.push(beacon::AttesterDuty {
+                pubkey: pubkey_hex,
+                validator_index: index.to_string(),
+                committee_index: "0".to_string(),
+                committee_length: "8".to_string(),
+                committees_at_slot: "1".to_string(),
+                validator_committee_index: "0".to_string(),
+                slot: "0".to_string(),
+            });
+            keys.push(pubkey);
+        }
+
+        let duty_rows = duties.clone();
+        let beacon = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_get_attester_duties(move |_epoch, _indices| {
+                    Ok(DependentRootResponse {
+                        dependent_root: "0xaabb".to_string(),
+                        execution_optimistic: false,
+                        data: duty_rows.clone(),
+                    })
+                })
+                .with_get_attestation_data(|slot, _committee_index| {
+                    Ok(DataResponse {
+                        data: beacon::AttestationData {
+                            slot: slot.to_string(),
+                            index: "0".to_string(),
+                            beacon_block_root:
+                                "0x1111111111111111111111111111111111111111111111111111111111111111"
+                                    .to_string(),
+                            source: beacon::Checkpoint {
+                                epoch: "0".to_string(),
+                                root: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                                    .to_string(),
+                            },
+                            target: beacon::Checkpoint {
+                                epoch: "0".to_string(),
+                                root: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                                    .to_string(),
+                            },
+                        },
+                    })
+                })
+                .with_get_aggregate_attestation(move |slot, _root, _idx, _fork| {
+                    Ok(VersionedAggregateAttestation::PreElectra(pre_electra_attestation(slot)))
+                })
+                .with_submit_aggregate_and_proofs(|_| Ok(())),
+        );
+
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        let mut map = HashMap::new();
+        for pubkey in &keys {
+            let bytes = pubkey.to_bytes();
+            store.add_validator(ValidatorConfig::new(bytes)).unwrap();
+            map.insert(bytes, pubkey.clone());
+        }
+        let tracked: Vec<String> = indices.iter().map(|index| (*index).to_string()).collect();
+        let duty_tracker = Arc::new(DutyTracker::new(
+            beacon.clone() as Arc<dyn bn_manager::BeaconNodeClient>,
+            tracked,
+        ));
+        duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
+
+        let signer = Arc::new(DelayingSigner { inner: StubValidatorSigner::new(), delays });
+        let config = create_test_config().with_dispatch_limits(
+            DispatchLimits::validated(4, 1).expect("concurrency is non-zero"),
+        );
+        let service = AggregationService::new(
+            signer,
+            beacon.clone() as Arc<dyn bn_manager::BeaconNodeClient>,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            config,
+            store,
+        );
+
+        super::take_recorded_source_validators();
+        let slot_end = super::ample_slot_end();
+        service.maybe_produce_aggregations(0, 0, slot_end).await;
+        service.maybe_produce_aggregations(0, 0, slot_end).await;
+
+        let recorded = super::take_recorded_source_validators();
+        assert_eq!(
+            beacon.submit_aggregate_and_proofs_calls().len(),
+            2,
+            "one aggregate submit per run"
+        );
+        assert_eq!(recorded.len(), 2, "one source_validators value per run, got {recorded:?}");
+        assert_eq!(recorded[0], recorded[1], "source_validators must be stable across runs");
+        assert_eq!(
+            recorded[0], "1,2,3,10",
+            "validator indices are sorted numerically before recording, got {}",
+            recorded[0]
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn undispatched_aggregation_duties_are_dropped_at_slot_end() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let submit_calls = Arc::new(AtomicUsize::new(0));
+        let service = setup_agg_service(
+            pk_hex,
+            pk.clone(),
+            local_signer_service(sk),
+            enabled_store(pk.to_bytes()),
+            submit_calls.clone(),
+            AggEnv {
+                config: create_test_config(),
+                slot: 0,
+                aggregate: VersionedAggregateAttestation::PreElectra(pre_electra_attestation(0)),
+            },
+        )
+        .await;
+        let slot_end = tokio::time::Instant::now();
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        service.maybe_produce_aggregations(0, 0, slot_end).await;
+        assert_eq!(submit_calls.load(Ordering::SeqCst), 0, "nothing is published after slot end");
+        assert_eq!(service.slot_end_drops(), 1);
+    }
+
+    /// A publish started near `slot_end` is cut at `slot_end + 500 ms`.
+    /// The `aggregate_submit` timeout alone (2 s) would finish well into S+1.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn delayed_aggregate_publish_stops_at_slot_end_overhang() {
+        use std::time::Duration;
+
+        use bn_manager::MockMethod;
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let submit_calls = Arc::new(AtomicUsize::new(0));
+        let beacon = Arc::new(
+            tracking_beacon(
+                pk_hex.clone(),
+                Arc::clone(&submit_calls),
+                0,
+                VersionedAggregateAttestation::PreElectra(pre_electra_attestation(0)),
+            )
+            .with_method_delay(MockMethod::SubmitAggregateAndProofs, Duration::from_secs(2)),
+        );
+        let duty_tracker = Arc::new(DutyTracker::new(
+            beacon.clone() as Arc<dyn bn_manager::BeaconNodeClient>,
+            vec!["1".to_string()],
+        ));
+        duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
+        let mut map = HashMap::new();
+        map.insert(pk.to_bytes(), pk.clone());
+        let config = create_test_config().with_timeouts(bn_manager::OperationTimeouts {
+            aggregate_submit: Duration::from_secs(2),
+            ..bn_manager::OperationTimeouts::default()
+        });
+        let service = AggregationService::new(
+            local_signer_service(sk),
+            beacon.clone(),
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            config,
+            enabled_store(pk.to_bytes()),
+        );
+
+        let started = tokio::time::Instant::now();
+        let slot_end = started + Duration::from_millis(50);
+        service.maybe_produce_aggregations(0, 0, slot_end).await;
+        let finished = tokio::time::Instant::now();
+        let overhang_at = slot_end + Duration::from_millis(500);
+        assert!(
+            finished <= overhang_at,
+            "drain ran until {finished:?}, past overhang {overhang_at:?}"
+        );
+        assert!(
+            finished.saturating_duration_since(started) < Duration::from_secs(2),
+            "the 2 s aggregate_submit timeout must not extend the phase, elapsed {:?}",
+            finished.saturating_duration_since(started)
+        );
+        let submits: Vec<_> = beacon
+            .call_stamps()
+            .into_iter()
+            .filter(|stamp| stamp.method == MockMethod::SubmitAggregateAndProofs)
+            .collect();
+        assert!(!submits.is_empty(), "the publish starts, then the overhang budget stops it");
+        assert!(
+            submits.iter().all(|stamp| stamp.at <= overhang_at),
+            "a publish must not be admitted after the overhang: {submits:?}"
+        );
+        assert_eq!(submit_calls.load(Ordering::SeqCst), 0, "the 2 s POST must be cancelled");
+        assert!(
+            beacon.submit_aggregate_and_proofs_completions().is_empty(),
+            "a POST cancelled during the delay must not record a completion"
+        );
+        assert_eq!(service.slot_end_drops(), 0, "the in-flight duty is dispatched");
+    }
+
+    struct DelayingSigner {
+        inner: StubValidatorSigner,
+        delays: HashMap<[u8; 48], std::time::Duration>,
+    }
+
+    macro_rules! delay_fwd {
+        ($($name:ident($($arg:ident: $ty:ty),* $(,)?));* $(;)?) => {
+            #[async_trait]
+            impl ValidatorSigner for DelayingSigner {
+                $(
+                    async fn $name(
+                        &self,
+                        $($arg: $ty),*
+                    ) -> Result<Signature, SignerError> {
+                        delay_fwd!(@maybe_delay $name, self, $($arg),*);
+                        self.inner.$name($($arg),*).await
+                    }
+                )*
+            }
+        };
+        (@maybe_delay sign_selection_proof, $self:ident, $slot:ident, $pubkey:ident, $($rest:ident),*) => {
+            if let Some(delay) = $self.delays.get(&$pubkey.to_bytes()) {
+                tokio::time::sleep(*delay).await;
+            }
+        };
+        (@maybe_delay $name:ident, $self:ident, $($arg:ident),*) => {};
+    }
+
+    delay_fwd! {
+        sign_attestation(data: &AttestationData, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_block(block_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_block_header(header: &signer::BeaconBlockHeaderFields, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_randao_reveal(epoch: Epoch, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_sync_committee_message(beacon_block_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_selection_proof(slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_aggregate_and_proof(aggregate_and_proof: &eth_types::AggregateAndProof, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_electra_aggregate_and_proof(aggregate_and_proof: &ElectraAggregateAndProof, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_voluntary_exit(voluntary_exit: &eth_types::VoluntaryExit, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_builder_registration(registration: &eth_types::ValidatorRegistrationV1, pubkey: &PublicKey, fork_version: [u8; 4]);
+        sign_sync_committee_selection_proof(slot: Slot, subcommittee_index: u64, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_contribution_and_proof(contribution_and_proof: &eth_types::ContributionAndProof, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_payload_attestation(data: &eth_types::PayloadAttestationData, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_execution_payload_envelope_root(object_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+        sign_aggregate_and_proof_root(object_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
     }
 }

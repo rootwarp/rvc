@@ -758,7 +758,10 @@ async fn test_electra_aggregation_passes_committee_index() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 
     // wiremock expect(1) on aggregate_attestation with committee_index=3
     // confirms Electra path passes the committee_index query parameter
@@ -814,7 +817,10 @@ async fn test_pre_electra_aggregation_no_committee_index() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 
     // Verify pre-Electra requests do NOT contain committee_index query param
     let requests = mock_server.received_requests().await.unwrap();
@@ -1447,7 +1453,14 @@ async fn test_aggregation_still_zeroes_index_at_electra_and_fulu() {
             .await;
 
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator
+            .aggregation_service
+            .maybe_produce_aggregations(
+                slot,
+                epoch,
+                crate::orchestrator::aggregation::ample_slot_end(),
+            )
+            .await;
     }
 }
 
@@ -1772,7 +1785,14 @@ async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
             }
         }
 
-        orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+        orchestrator
+            .aggregation_service
+            .maybe_produce_aggregations(
+                slot,
+                epoch,
+                crate::orchestrator::aggregation::ample_slot_end(),
+            )
+            .await;
 
         let requests = mock_server.received_requests().await.unwrap();
         let aggregate_requests: Vec<_> = requests
@@ -2008,7 +2028,14 @@ async fn test_boundary_attestation_and_aggregate_continuity() {
             "Fulu slot 2208 attestation should succeed: {:?}",
             fulu_results[0].error
         );
-        orchestrator.aggregation_service.maybe_produce_aggregations(fulu_slot, fulu_epoch).await;
+        orchestrator
+            .aggregation_service
+            .maybe_produce_aggregations(
+                fulu_slot,
+                fulu_epoch,
+                crate::orchestrator::aggregation::ample_slot_end(),
+            )
+            .await;
 
         orchestrator.clock.set_slot(gloas_slot);
         orchestrator.duty_tracker.fetch_duties_for_epoch(gloas_epoch).await.unwrap();
@@ -2019,7 +2046,14 @@ async fn test_boundary_attestation_and_aggregate_continuity() {
             "Gloas slot 2240 attestation should succeed: {:?}",
             gloas_results[0].error
         );
-        orchestrator.aggregation_service.maybe_produce_aggregations(gloas_slot, gloas_epoch).await;
+        orchestrator
+            .aggregation_service
+            .maybe_produce_aggregations(
+                gloas_slot,
+                gloas_epoch,
+                crate::orchestrator::aggregation::ample_slot_end(),
+            )
+            .await;
 
         let captured = capturing.captured();
         assert_eq!(

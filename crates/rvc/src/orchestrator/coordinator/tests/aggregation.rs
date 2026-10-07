@@ -42,7 +42,10 @@ async fn test_aggregation_no_duties_does_nothing() {
         .mount(&mock_server)
         .await;
 
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -137,7 +140,10 @@ async fn test_aggregation_full_flow_with_mock_beacon() {
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
     // Run the aggregation dispatch
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 
     // The mock server's expect(1) on submit verifies the request was made
 }
@@ -190,7 +196,10 @@ async fn test_aggregation_non_aggregator_skips() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -245,7 +254,10 @@ async fn test_aggregation_beacon_failure_handled_gracefully() {
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
     // Should not panic; gracefully handle error
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 // -- Fork-aware attestation construction tests (G-1-05) --
@@ -454,7 +466,10 @@ async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -552,7 +567,10 @@ async fn test_aggregation_pre_electra_unchanged() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -660,7 +678,10 @@ async fn test_aggregation_fulu_dispatches_as_fulu() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -767,7 +788,10 @@ async fn test_aggregation_gloas_dispatches_as_gloas() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -850,5 +874,8 @@ async fn test_aggregation_mismatched_response_logs_warning() {
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
     // Should not panic — gracefully handles failure
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }

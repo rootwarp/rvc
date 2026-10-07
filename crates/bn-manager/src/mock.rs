@@ -224,6 +224,9 @@ pub struct MockBeaconNodeClient {
     /// `submit_sync_committee_messages` futures that returned, after the delay
     /// and the handler. A call dropped during [`Self::charge`] is absent.
     sync_message_completions: Mutex<Vec<tokio::time::Instant>>,
+    /// `submit_aggregate_and_proofs` futures that returned, after the delay
+    /// and the handler. A call dropped during [`Self::charge`] is absent.
+    aggregate_completions: Mutex<Vec<tokio::time::Instant>>,
     /// When this returns `Some`, `get_attestation_data` fails that call and skips the handler.
     get_attestation_data_error: Option<AttestationDataErrorInject>,
 }
@@ -268,6 +271,8 @@ impl MockBeaconNodeClient {
     ///
     /// Each stamp is taken before the request delay. Completed sync-message
     /// publishes are [`Self::submit_sync_committee_messages_completions`].
+    /// Completed aggregate publishes are
+    /// [`Self::submit_aggregate_and_proofs_completions`].
     pub fn call_stamps(&self) -> Vec<MockCallStamp> {
         self.arrivals.lock().expect("mock arrival log poisoned").clone()
     }
@@ -280,8 +285,23 @@ impl MockBeaconNodeClient {
         self.sync_message_completions.lock().expect("mock completion log poisoned").clone()
     }
 
+    /// Paused-clock instants when `submit_aggregate_and_proofs` returned.
+    ///
+    /// Recorded after [`Self::charge`] and the handler, so this is when the
+    /// publish future finishes. [`Self::call_stamps`] is the pre-delay arrival.
+    pub fn submit_aggregate_and_proofs_completions(&self) -> Vec<tokio::time::Instant> {
+        self.aggregate_completions.lock().expect("mock completion log poisoned").clone()
+    }
+
     fn stamp_sync_message_completion(&self) {
         self.sync_message_completions
+            .lock()
+            .expect("mock completion log poisoned")
+            .push(tokio::time::Instant::now());
+    }
+
+    fn stamp_aggregate_completion(&self) {
+        self.aggregate_completions
             .lock()
             .expect("mock completion log poisoned")
             .push(tokio::time::Instant::now());
@@ -1077,7 +1097,10 @@ impl AttestationApi for MockBeaconNodeClient {
         proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
         self.charge(MockMethod::SubmitAggregateAndProofs).await;
-        self.submit_aggregate_and_proofs.invoke("submit_aggregate_and_proofs", proofs.clone())
+        let result =
+            self.submit_aggregate_and_proofs.invoke("submit_aggregate_and_proofs", proofs.clone());
+        self.stamp_aggregate_completion();
+        result
     }
 
     async fn submit_beacon_committee_subscriptions(
@@ -1403,6 +1426,27 @@ mod tests {
         assert_eq!(arrivals[0].method, MockMethod::SubmitSyncCommitteeMessages);
         assert_eq!(arrivals[0].at.saturating_duration_since(start), Duration::ZERO);
         assert_eq!(mock.submit_sync_committee_messages_completions(), vec![start + delay]);
+        assert_eq!(start.elapsed(), delay);
+    }
+
+    /// Arrival is before the delay; completion is when the aggregate submit returns.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn submit_aggregate_completion_is_after_the_request_delay() {
+        use std::time::Duration;
+
+        let delay = Duration::from_millis(50);
+        let mock = MockBeaconNodeClient::new()
+            .with_request_delay(delay)
+            .with_submit_aggregate_and_proofs(|_| Ok(()));
+        let start = tokio::time::Instant::now();
+        mock.submit_aggregate_and_proofs(&VersionedSignedAggregateAndProof::Electra(vec![]))
+            .await
+            .expect("submit");
+        let arrivals = mock.call_stamps();
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(arrivals[0].method, MockMethod::SubmitAggregateAndProofs);
+        assert_eq!(arrivals[0].at.saturating_duration_since(start), Duration::ZERO);
+        assert_eq!(mock.submit_aggregate_and_proofs_completions(), vec![start + delay]);
         assert_eq!(start.elapsed(), delay);
     }
 

@@ -261,7 +261,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/aggregation.rs",
-        369,
+        378,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -270,7 +270,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/mod.rs",
-        1415,
+        1432,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -352,7 +352,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        954,
+        960,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -361,7 +361,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1079,
+        1085,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -370,7 +370,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1108,
+        1114,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -379,7 +379,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1116,
+        1122,
         Class::IndexZero,
         false,
         ".index = \"0\"",
@@ -561,7 +561,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        2345,
+        2379,
         Class::StringDispatch,
         false,
         "match &envelopes[0]",
