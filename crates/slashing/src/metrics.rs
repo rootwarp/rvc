@@ -85,6 +85,43 @@ pub static RVC_SLASHING_GROUP_COMMIT_BATCH_SIZE: LazyLock<Histogram> = LazyLock:
     register_metric("rvc_slashing_group_commit_batch_size", histogram)
 });
 
+/// Buckets for interchange-import timing, in milliseconds.
+const IMPORT_TIMING_BUCKETS_MS: [f64; 10] =
+    [10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0];
+
+/// Whole `SlashingDb::import` call, in milliseconds.
+///
+/// One sample per call, including a rejection before the connection is taken.
+/// The format-version check and the genesis-validators-root check are included.
+pub static RVC_SLASHING_IMPORT_DURATION_MS: LazyLock<Histogram> = LazyLock::new(|| {
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "rvc_slashing_import_duration_ms",
+            "Milliseconds spent in one slashing interchange import call",
+        )
+        .buckets(IMPORT_TIMING_BUCKETS_MS.to_vec()),
+    )
+    .unwrap_or_else(|e| panic!("Failed to create rvc_slashing_import_duration_ms: {e}"));
+    register_metric("rvc_slashing_import_duration_ms", histogram)
+});
+
+/// `conn.lock()` through `COMMIT` inside `SlashingDb::import`, in milliseconds.
+///
+/// The format-version check and the genesis-validators-root check are not
+/// included. A rollback after the lock is taken still records one sample.
+/// An import rejected before the lock records nothing here.
+pub static RVC_SLASHING_IMPORT_CONN_HOLD_MS: LazyLock<Histogram> = LazyLock::new(|| {
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "rvc_slashing_import_conn_hold_ms",
+            "Milliseconds from taking the slashing DB connection through COMMIT during an interchange import",
+        )
+        .buckets(IMPORT_TIMING_BUCKETS_MS.to_vec()),
+    )
+    .unwrap_or_else(|e| panic!("Failed to create rvc_slashing_import_conn_hold_ms: {e}"));
+    register_metric("rvc_slashing_import_conn_hold_ms", histogram)
+});
+
 pub fn init() {
     LazyLock::force(&RVC_SLASHING_DB_PRUNE_TOTAL);
     LazyLock::force(&RVC_SLASHING_RECONCILE_TOTAL);
@@ -92,6 +129,8 @@ pub fn init() {
     LazyLock::force(&RVC_SLASHING_IMPORT_CONFLICTS_TOTAL);
     LazyLock::force(&RVC_SLASHING_EXPORT_SYNTHETIC_RECORDS_TOTAL);
     LazyLock::force(&RVC_SLASHING_GROUP_COMMIT_BATCH_SIZE);
+    LazyLock::force(&RVC_SLASHING_IMPORT_DURATION_MS);
+    LazyLock::force(&RVC_SLASHING_IMPORT_CONN_HOLD_MS);
 }
 
 #[cfg(test)]

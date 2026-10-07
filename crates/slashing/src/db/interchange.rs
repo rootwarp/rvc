@@ -31,6 +31,46 @@ fn wire_block(block: SignedBlock) -> InterchangeBlock {
     }
 }
 
+/// Records elapsed milliseconds into `histogram` on drop, unless disarmed.
+///
+/// `observe_now` samples immediately so a later drop does not sample twice.
+struct ImportElapsedMs {
+    start: std::time::Instant,
+    histogram: &'static ::metrics::Histogram,
+    armed: bool,
+}
+
+impl ImportElapsedMs {
+    fn start(histogram: &'static ::metrics::Histogram) -> Self {
+        Self { start: std::time::Instant::now(), histogram, armed: true }
+    }
+
+    fn observe_now(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        let ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        self.histogram.observe(ms);
+    }
+}
+
+impl Drop for ImportElapsedMs {
+    fn drop(&mut self) {
+        self.observe_now();
+    }
+}
+
+// Test-only pause after the GVR check and before `import` takes `conn`.
+// A successful genesis-validators-root check cannot be made slow: the wire
+// value is 32 bytes. The pause stands in for that pre-lock work so a test
+// can show the hold sample excludes it. Production builds omit it.
+#[cfg(any(test, feature = "test-utils"))]
+thread_local! {
+    static IMPORT_PRE_LOCK_PAUSE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Fixed point `(S*, T*)`. `Err` is that pair when `S* > T*`.
 fn attestation_synthetic_bounds(
     rows: &[(Epoch, Epoch)],
@@ -286,11 +326,19 @@ impl SlashingDb {
     /// A `WHERE NOT EXISTS` conflict drops the row and still raises the watermark
     /// from the parsed maxima. An audit table for those drops was rejected: no
     /// schema migration; the drop is a `warn` plus `rvc_slashing_import_conflicts_total`.
+    ///
+    /// # Metrics
+    ///
+    /// `rvc_slashing_import_duration_ms` is the whole call.
+    /// `rvc_slashing_import_conn_hold_ms` is `conn.lock()` through `COMMIT`
+    /// (one sample on rollback after the lock is taken; none if the call
+    /// returns before the lock). Numeric parsing stays inside that hold.
     pub fn import(
         &self,
         interchange: &InterchangeFormat,
         expected_genesis_validators_root: &Root,
     ) -> Result<(), SlashingError> {
+        let _duration = ImportElapsedMs::start(&metrics::RVC_SLASHING_IMPORT_DURATION_MS);
         if interchange.metadata.interchange_format_version != "5" {
             return Err(SlashingError::InvalidInterchangeFormat(format!(
                 "unsupported interchange_format_version: expected \"5\", got \"{}\"",
@@ -327,6 +375,12 @@ impl SlashingDb {
         // as DISTINCT, so a NULL gvr would bypass the index silently.
         let gvr_hex = expected_hex;
 
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(pause) = IMPORT_PRE_LOCK_PAUSE.with(std::cell::Cell::get) {
+            std::thread::sleep(pause);
+        }
+
+        let mut hold = ImportElapsedMs::start(&metrics::RVC_SLASHING_IMPORT_CONN_HOLD_MS);
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
@@ -428,6 +482,7 @@ impl SlashingDb {
         }
 
         tx.commit()?;
+        hold.observe_now();
         let record_count = interchange.data.len();
         tracing::info!(
             record_count,
@@ -435,6 +490,17 @@ impl SlashingDb {
             "slashing DB import completed"
         );
         Ok(())
+    }
+
+    /// Pause after the GVR check and before `import` takes `conn`, on this thread.
+    ///
+    /// # Test-only
+    ///
+    /// Production builds omit the pause. Pass `None` to clear it. `import` is
+    /// synchronous, so the pause applies to imports on the calling thread.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_import_pre_lock_pause_for_test(pause: Option<std::time::Duration>) {
+        IMPORT_PRE_LOCK_PAUSE.with(|cell| cell.set(pause));
     }
 
     /// Read the stored genesis validators root from the metadata table.
