@@ -19,17 +19,11 @@ use timing::{SlotClock, SLOTS_PER_EPOCH};
 use validator_store::ValidatorStore;
 
 use super::coordinator::{AttestationResult, OrchestratorConfig, PubkeyMap};
-use super::dispatch::{SlotEndDropCounter, WaveAttribution, WaveEntry};
+use super::dispatch::{SlotEndDropCounter, WaveAttribution, WaveEntry, SLOT_END_PUBLISH_OVERHANG};
 use super::error::OrchestratorError;
 use super::slot_anchor::SlotAnchor;
 use super::utils;
 use super::validation::attestation_data::validate_attestation_data;
-
-/// How far past `slot_end` (the start of slot S+1) an attestation publish may run.
-///
-/// Accept #5 on #516. A fresh `attestation_submit` timeout (default 2s) is not
-/// this bound: a wave admitted near slot end must still stop by this instant.
-const SLOT_END_PUBLISH_OVERHANG: Duration = Duration::from_millis(500);
 
 /// Decide whether an attestation duty may proceed past the doppelganger gate.
 ///

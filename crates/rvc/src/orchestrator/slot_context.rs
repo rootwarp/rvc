@@ -416,7 +416,14 @@ mod tests {
             store,
         );
 
-        service.maybe_produce_sync_messages(slot, epoch, &ctx).await;
+        service
+            .maybe_produce_sync_messages(
+                slot,
+                epoch,
+                &ctx,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(60),
+            )
+            .await;
         assert!(
             submitted.lock().unwrap().is_empty(),
             "ARCH-3a defect: capture 404 → head_root=None → zero sync committee messages"

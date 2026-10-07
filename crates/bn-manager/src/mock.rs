@@ -221,6 +221,9 @@ pub struct MockBeaconNodeClient {
     method_delays: HashMap<MockMethod, Duration>,
     /// One stamp per role-trait entry, taken before [`Self::charge`] sleeps.
     arrivals: Mutex<Vec<MockCallStamp>>,
+    /// `submit_sync_committee_messages` futures that returned, after the delay
+    /// and the handler. A call dropped during [`Self::charge`] is absent.
+    sync_message_completions: Mutex<Vec<tokio::time::Instant>>,
     /// When this returns `Some`, `get_attestation_data` fails that call and skips the handler.
     get_attestation_data_error: Option<AttestationDataErrorInject>,
 }
@@ -262,8 +265,26 @@ impl MockBeaconNodeClient {
     }
 
     /// Stamps recorded since the client was built, in arrival order.
+    ///
+    /// Each stamp is taken before the request delay. Completed sync-message
+    /// publishes are [`Self::submit_sync_committee_messages_completions`].
     pub fn call_stamps(&self) -> Vec<MockCallStamp> {
         self.arrivals.lock().expect("mock arrival log poisoned").clone()
+    }
+
+    /// Paused-clock instants when `submit_sync_committee_messages` returned.
+    ///
+    /// Recorded after [`Self::charge`] and the handler, so this is when the
+    /// publish future finishes. [`Self::call_stamps`] is the pre-delay arrival.
+    pub fn submit_sync_committee_messages_completions(&self) -> Vec<tokio::time::Instant> {
+        self.sync_message_completions.lock().expect("mock completion log poisoned").clone()
+    }
+
+    fn stamp_sync_message_completion(&self) {
+        self.sync_message_completions
+            .lock()
+            .expect("mock completion log poisoned")
+            .push(tokio::time::Instant::now());
     }
 
     async fn charge(&self, method: MockMethod) {
@@ -1095,8 +1116,11 @@ impl SyncCommitteeApi for MockBeaconNodeClient {
         messages: &[SyncCommitteeMessage],
     ) -> Result<(), BeaconError> {
         self.charge(MockMethod::SubmitSyncCommitteeMessages).await;
-        self.submit_sync_committee_messages
-            .invoke("submit_sync_committee_messages", messages.to_vec())
+        let result = self
+            .submit_sync_committee_messages
+            .invoke("submit_sync_committee_messages", messages.to_vec());
+        self.stamp_sync_message_completion();
+        result
     }
 
     async fn get_sync_committee_contribution(
@@ -1361,6 +1385,25 @@ mod tests {
         let head = mock.get_block_root("head").await.expect("head literal must resolve");
         let past = mock.get_block_root("99").await.expect("past slot must resolve");
         assert_ne!(head.data.root, past.data.root);
+    }
+
+    /// Arrival is before the delay; completion is when the submit future returns.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn submit_sync_message_completion_is_after_the_request_delay() {
+        use std::time::Duration;
+
+        let delay = Duration::from_millis(50);
+        let mock = MockBeaconNodeClient::new()
+            .with_request_delay(delay)
+            .with_submit_sync_committee_messages(|_| Ok(()));
+        let start = tokio::time::Instant::now();
+        mock.submit_sync_committee_messages(&[]).await.expect("submit");
+        let arrivals = mock.call_stamps();
+        assert_eq!(arrivals.len(), 1);
+        assert_eq!(arrivals[0].method, MockMethod::SubmitSyncCommitteeMessages);
+        assert_eq!(arrivals[0].at.saturating_duration_since(start), Duration::ZERO);
+        assert_eq!(mock.submit_sync_committee_messages_completions(), vec![start + delay]);
+        assert_eq!(start.elapsed(), delay);
     }
 
     /// Two sequential requests each pay the configured delay on a paused clock.
