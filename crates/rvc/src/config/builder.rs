@@ -9,6 +9,7 @@ use tracing::{error, info, warn};
 
 use observability::logging::RedactedUrl;
 
+use crate::orchestrator::dispatch::DispatchLimits;
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use crate::quiesce::{QuiesceRegistry, QuiescingEnablement};
 use beacon::{parse_slot_duration_ms, BeaconClient, BeaconClientConfig};
@@ -739,9 +740,15 @@ impl ServiceBuilder {
         genesis_validators_root: Root,
         fork_schedule: Arc<ForkSchedule>,
     ) -> OrchestratorConfig {
+        let limits = DispatchLimits::validated(
+            self.config.duties.duty_dispatch_concurrency,
+            self.config.duties.duty_publish_concurrency,
+        )
+        .expect("Config::validate rejects zero duty concurrency");
         OrchestratorConfig::new(genesis_validators_root, fork_schedule)
             .with_shutdown_timeout(Duration::from_secs(30))
             .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing))
+            .with_dispatch_limits(limits)
     }
 }
 
@@ -774,6 +781,7 @@ fn deadline_schedule_from_timing(timing: &TimingConfig) -> DeadlineSchedule {
 mod tests {
     use super::*;
     use crate::config::TimingConfig;
+    use crate::orchestrator::dispatch::DispatchLimits;
     use crypto::{LocalSigner, Signer as _};
     use eth_types::{ForkName, NetworkPreset, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
     use tempfile::TempDir;
@@ -1160,6 +1168,11 @@ mod tests {
         assert_eq!(orch_config.deadline_schedule.gloas.contribution, 5000);
         assert_eq!(orch_config.deadline_schedule.gloas.payload, 5000);
         assert_eq!(orch_config.deadline_schedule.gloas.payload_attestation, 7500);
+        assert_eq!(orch_config.dispatch_limits.concurrency, DispatchLimits::DEFAULT_CONCURRENCY);
+        assert_eq!(
+            orch_config.dispatch_limits.publish_concurrency,
+            DispatchLimits::DEFAULT_PUBLISH_CONCURRENCY
+        );
     }
 
     #[test]

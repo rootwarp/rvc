@@ -270,7 +270,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/mod.rs",
-        1370,
+        1400,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -343,7 +343,7 @@ const INVENTORY: &[Inv] = &[
     // Class 2
     inv(
         "crates/rvc/src/orchestrator/attestation.rs",
-        417,
+        622,
         Class::IndexZero,
         false,
         ".index = \"0\"",

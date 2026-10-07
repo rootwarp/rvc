@@ -101,7 +101,3 @@ harness = false
 [[bench]]
 name = "deadline_rebenchmark"
 harness = false
-
-[package.metadata.cargo-machete]
-# Used from RR2-03; remove in RR2-16
-ignored = ["futures"]
