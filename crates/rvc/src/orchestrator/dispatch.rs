@@ -1,9 +1,13 @@
-//! Concurrent duty-dispatch limits (RR2-02).
+//! Concurrent duty-dispatch limits (RR2-02) and one attestation wave (RR2-03).
 //!
 //! `StreamExt::ready_chunks(0)` panics, so [`DispatchLimits::validated`] rejects
 //! a zero in either field. [`crate::config::Config::validate`] repeats that
 //! check and also enforces the operator ranges (`1..=512` / `1..=16`).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use beacon::VersionedAttestation;
+use eth_types::Slot;
 use thiserror::Error;
 
 /// In-flight sign requests and publish waves for one attestation slot.
@@ -47,6 +51,52 @@ const _: () = {
         DispatchLimits::DEFAULT_PUBLISH_CONCURRENCY == rvc_config::DEFAULT_DUTY_PUBLISH_CONCURRENCY
     );
 };
+
+/// Identity of one signed attestation inside a publish wave.
+///
+/// `IndexedAttestationError.index` is the position of this entry in the
+/// merged array POST, not a beacon validator index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaveAttribution {
+    /// Beacon validator index carried on the duty (decimal string).
+    pub validator_index: String,
+    /// Duty pubkey (`0x` hex) for the per-index failure log.
+    pub pubkey: String,
+    /// Duty slot copied onto the attestation result.
+    pub slot: Slot,
+}
+
+/// One signed attestation waiting for its wave's array POST.
+#[derive(Debug, Clone)]
+pub struct WaveEntry {
+    /// Join key for a beacon partial-failure index.
+    pub attribution: WaveAttribution,
+    /// A single-item [`VersionedAttestation`]. A wave must be one variant.
+    pub attestation: VersionedAttestation,
+}
+
+/// Duties not pulled onto the sign pipeline before slot end.
+///
+/// Cumulative for the life of the attestation service. One slot records only
+/// the duties that `take_until(slot_end)` did not yield.
+#[derive(Debug, Default)]
+pub struct SlotEndDropCounter {
+    dropped: AtomicU64,
+}
+
+impl SlotEndDropCounter {
+    /// Add `n` duties dropped because slot end arrived first.
+    pub fn record(&self, n: u64) {
+        if n > 0 {
+            self.dropped.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Duties recorded so far.
+    pub fn get(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
 
 /// Zero concurrency, which would panic inside `ready_chunks`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

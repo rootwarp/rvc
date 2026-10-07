@@ -51,7 +51,6 @@ impl SlotAnchor {
     }
 
     /// Absolute tokio instant of the end of this slot.
-    #[allow(dead_code)] // RR1-05 / slot-end budget read this; RR1-03 keeps the anchor API whole.
     pub(crate) fn slot_end(&self) -> tokio::time::Instant {
         self.start + Duration::from_millis(self.slot_duration_ms)
     }

@@ -38,7 +38,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bn_manager::{MockBeaconNodeClient, MockMethod, VersionedSignedAggregateAndProof};
+use bn_manager::{
+    MockBeaconNodeClient, MockMethod, VersionedAttestation, VersionedSignedAggregateAndProof,
+};
 use common::pipeline_fixture::{
     make_beacon_attestation_data, pipeline_fixture, PipelineFixture, PipelineFixtureOpts,
     SLOTS_PER_EPOCH,
@@ -176,10 +178,22 @@ fn aggregate_proof_count(calls: &[VersionedSignedAggregateAndProof]) -> usize {
         .sum()
 }
 
+fn attestation_item_count(calls: &[VersionedAttestation]) -> usize {
+    calls
+        .iter()
+        .map(|batch| match batch {
+            VersionedAttestation::PreElectra(v) => v.len(),
+            VersionedAttestation::Electra(v)
+            | VersionedAttestation::Fulu(v)
+            | VersionedAttestation::Gloas(v) => v.len(),
+        })
+        .sum()
+}
+
 fn phase_submits_done(client: &MockBeaconNodeClient, n: usize) -> bool {
     sync_message_count(&client.submit_sync_committee_messages_calls()) >= n
         && aggregate_proof_count(&client.submit_aggregate_and_proofs_calls()) >= n
-        && client.submit_attestation_calls().len() >= n
+        && attestation_item_count(&client.submit_attestation_calls()) >= n
 }
 
 /// One slot of `DutyOrchestrator::run`, then shutdown.
@@ -264,7 +278,7 @@ async fn drive_slot(
         tally.overrun = true;
     }
 
-    let attestations = client.submit_attestation_calls().len() as u64;
+    let attestations = attestation_item_count(&client.submit_attestation_calls()) as u64;
     if attestations >= n as u64 {
         tally.successes += n as u64;
     } else {

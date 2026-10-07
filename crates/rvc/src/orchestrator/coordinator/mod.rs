@@ -31,6 +31,7 @@ use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
+use super::dispatch::DispatchLimits;
 use super::duty_management::DutyManagementService;
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
@@ -71,6 +72,8 @@ pub struct OrchestratorConfig {
     /// Pre-Gloas and Gloas deadline sets. Selected once per slot via
     /// [`ForkName::from_epoch`]; wait sites consume the resolved [`DeadlineBps`].
     pub deadline_schedule: DeadlineSchedule,
+    /// Sign-request and publish-wave concurrency for one attestation slot.
+    pub dispatch_limits: DispatchLimits,
 }
 
 impl OrchestratorConfig {
@@ -95,6 +98,11 @@ impl OrchestratorConfig {
                     payload_attestation: 7500,
                 },
             },
+            dispatch_limits: DispatchLimits::validated(
+                DispatchLimits::DEFAULT_CONCURRENCY,
+                DispatchLimits::DEFAULT_PUBLISH_CONCURRENCY,
+            )
+            .expect("default dispatch limits are non-zero"),
         }
     }
 
@@ -130,6 +138,15 @@ impl OrchestratorConfig {
 
     pub fn with_deadline_schedule(mut self, schedule: DeadlineSchedule) -> Self {
         self.deadline_schedule = schedule;
+        self
+    }
+
+    /// Replace the attestation sign/publish concurrency.
+    ///
+    /// Callers pass [`DispatchLimits::validated`]. A zero is rejected there
+    /// because `ready_chunks(0)` panics.
+    pub fn with_dispatch_limits(mut self, limits: DispatchLimits) -> Self {
+        self.dispatch_limits = limits;
         self
     }
 
@@ -1081,11 +1098,15 @@ where
         RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).observe(anchor.elapsed_ms() as f64);
     }
 
-    async fn run_attestation_phase(&self, current_slot: Slot, att_phase_span: &tracing::Span) {
+    async fn run_attestation_phase(
+        &self,
+        current_slot: Slot,
+        att_phase_span: &tracing::Span,
+        slot_end: tokio::time::Instant,
+    ) {
         if self.attesting_enabled.load(Ordering::Relaxed) {
             if let Err(e) = self
-                .attestation_service
-                .process_slot(current_slot)
+                .process_slot_until(current_slot, slot_end)
                 .instrument(att_phase_span.clone())
                 .await
             {
@@ -1159,7 +1180,7 @@ where
             Self::record_phase_offset(slot_phase_offset::ATTESTATION, anchor);
             self.capture_head_if_needed(ctx).await;
             self.warn_if_attestation_overrun(anchor, deadlines.attestation);
-            self.run_attestation_phase(current_slot, &att_phase_span).await;
+            self.run_attestation_phase(current_slot, &att_phase_span, anchor.slot_end()).await;
             let snapshot = self.snapshot_ctx(ctx).await;
             Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
             self.run_sync_messages_phase(current_slot, current_epoch, &snapshot)
@@ -1188,7 +1209,7 @@ where
                 Self::record_phase_offset(slot_phase_offset::ATTESTATION, anchor);
                 self.capture_head_if_needed(ctx).await;
                 self.warn_if_attestation_overrun(anchor, deadlines.attestation);
-                self.run_attestation_phase(current_slot, &att_phase_span).await;
+                self.run_attestation_phase(current_slot, &att_phase_span, anchor.slot_end()).await;
                 WaitOutcome::Continue
             },
             async {
@@ -1324,6 +1345,15 @@ where
         slot: Slot,
     ) -> Result<Vec<AttestationResult>, OrchestratorError> {
         self.attestation_service.process_slot(slot).await
+    }
+
+    /// Attestation duties for `slot` until `slot_end` (coordinator slot anchor).
+    pub(crate) async fn process_slot_until(
+        &self,
+        slot: Slot,
+        slot_end: tokio::time::Instant,
+    ) -> Result<Vec<AttestationResult>, OrchestratorError> {
+        self.attestation_service.process_slot_until(slot, slot_end).await
     }
 
     /// Sets the sync-committee duty participation flag.
