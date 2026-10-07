@@ -27,10 +27,19 @@ impl<T> BroadcastResult<T> {
     }
 
     pub fn into_result(self) -> Result<T, BeaconError> {
+        self.into_result_attributed().map(|(_endpoint, value)| value)
+    }
+
+    /// First `Ok` outcome, paired with that beacon node's endpoint.
+    ///
+    /// Walks outcomes in broadcast order. A partial failure is `Ok`, so a
+    /// later node's success does not replace it and failures are not merged.
+    /// An empty outcome list is [`BeaconError::NoEligibleBn`].
+    pub fn into_result_attributed(self) -> Result<(String, T), BeaconError> {
         let mut last_err = None;
         for outcome in self.outcomes {
             match outcome.result {
-                Ok(val) => return Ok(val),
+                Ok(val) => return Ok((outcome.endpoint, val)),
                 Err(e) => last_err = Some(e),
             }
         }
@@ -154,5 +163,59 @@ mod tests {
             ],
         };
         assert_eq!(br.into_result().unwrap(), 42u64);
+    }
+
+    #[test]
+    fn test_into_result_attributed_returns_first_ok_endpoint() {
+        let br =
+            BroadcastResult { outcomes: vec![err_outcome("http://bn1"), ok_outcome("http://bn2")] };
+        let (endpoint, ()) = br.into_result_attributed().unwrap();
+        assert_eq!(endpoint, "http://bn2");
+    }
+
+    #[test]
+    fn test_into_result_attributed_keeps_first_ok_without_merging() {
+        use beacon::{IndexedAttestationError, SubmitAttestationResult};
+
+        let br = BroadcastResult {
+            outcomes: vec![
+                BnOutcome {
+                    endpoint: "http://bn1".to_string(),
+                    result: Ok(SubmitAttestationResult::PartialFailure {
+                        failures: vec![IndexedAttestationError {
+                            index: 2,
+                            message: "invalid signature".to_string(),
+                        }],
+                    }),
+                    latency: Duration::from_millis(10),
+                },
+                BnOutcome {
+                    endpoint: "http://bn2".to_string(),
+                    result: Ok(SubmitAttestationResult::Success),
+                    latency: Duration::from_millis(20),
+                },
+            ],
+        };
+        let (endpoint, result) = br.into_result_attributed().unwrap();
+        assert_eq!(endpoint, "http://bn1");
+        match result {
+            SubmitAttestationResult::PartialFailure { failures } => {
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].index, 2);
+            }
+            other => panic!("expected the first Ok partial failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_into_result_attributed_empty_is_typed_error() {
+        let br: BroadcastResult<()> = BroadcastResult { outcomes: vec![] };
+        match br.into_result_attributed() {
+            Err(BeaconError::NoEligibleBn { operation, role }) => {
+                assert_eq!(operation, "broadcast");
+                assert_eq!(role, "none");
+            }
+            other => panic!("expected NoEligibleBn, got {other:?}"),
+        }
     }
 }

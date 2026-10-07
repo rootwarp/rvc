@@ -21,7 +21,9 @@ pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,
 };
-pub use submit::{AttestationSubmitter, PropagationResult, Propagator, PropagatorError};
+pub use submit::{
+    AttestationSubmitter, PropagationOutcome, PropagationResult, Propagator, PropagatorError,
+};
 pub use sync_status::{BnSyncDetail, BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,

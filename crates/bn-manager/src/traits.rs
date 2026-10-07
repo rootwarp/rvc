@@ -176,6 +176,19 @@ pub trait AttestationApi: Send + Sync {
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError>;
 
+    /// Submit attestations and name the beacon node that produced the result.
+    ///
+    /// The default delegates to [`Self::submit_attestation`] and returns
+    /// `None`: this implementation does not know an endpoint. `BnManager`
+    /// overrides it with the first successful broadcast (or query) endpoint.
+    /// Partial failure stays `Ok`; nothing here merges across nodes or retries.
+    async fn submit_attestation_attributed(
+        &self,
+        attestations: &VersionedAttestation,
+    ) -> Result<(Option<String>, SubmitAttestationResult), BeaconError> {
+        self.submit_attestation(attestations).await.map(|result| (None, result))
+    }
+
     /// Fetch an aggregate attestation.
     ///
     /// The caller supplies the resolved fork for the slot, not the configured
