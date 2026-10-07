@@ -370,7 +370,8 @@ Import conflicts are logged and counted (`rvc_slashing_import_conflicts_total`).
 Interchange import records `rvc_slashing_import_duration_ms` for the whole call
 and `rvc_slashing_import_conn_hold_ms` for `conn.lock()` through `COMMIT`.
 A rollback after the lock is taken still records one hold sample. A rejection
-before the lock (format version or genesis validators root) is duration only.
+before the lock (format version, genesis validators root, or a malformed
+numeric field) is duration only. Import prepares each SQL statement once.
 Buckets are 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, and 10000 milliseconds.
 
 ## Breaking (wire): Deneb/Electra/Fulu blocks are published as full SignedBlockContents with sidecars

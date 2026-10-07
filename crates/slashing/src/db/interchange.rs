@@ -5,8 +5,9 @@
 use rusqlite::{OptionalExtension, TransactionBehavior};
 
 use observability::logging::TruncatedPubkey;
+use observability::pubkey::CanonicalPubkey;
 
-use super::watermarks::{raise_watermark_max, read_watermark, WatermarkKind};
+use super::watermarks::{read_watermark, WatermarkKind};
 use super::{normalize_pubkey, SlashingDb};
 use crate::error::SlashingError;
 use crate::metrics;
@@ -171,6 +172,108 @@ fn export_validator(
     Ok((ValidatorRecord { pubkey, signed_blocks, signed_attestations }, synthetics))
 }
 
+/// One attestation row parsed before the connection is taken.
+struct ParsedAttestation<'a> {
+    source_epoch: Epoch,
+    target_epoch: Epoch,
+    signing_root: &'a Option<String>,
+}
+
+/// One block row parsed before the connection is taken.
+struct ParsedBlock<'a> {
+    slot: Slot,
+    signing_root: &'a Option<String>,
+}
+
+/// One interchange validator, parsed before `conn.lock()`.
+///
+/// Carries the normalised pubkey, the per-row attestations and blocks, and the
+/// `max_source` / `max_target` / `max_slot` maxima used for raise-only watermarks.
+struct ParsedValidator<'a> {
+    pubkey: CanonicalPubkey,
+    attestations: Vec<ParsedAttestation<'a>>,
+    blocks: Vec<ParsedBlock<'a>>,
+    max_source: Option<Epoch>,
+    max_target: Option<Epoch>,
+    max_slot: Option<Slot>,
+}
+
+const INSERT_ATTESTATION_SQL: &str = "\
+INSERT INTO attestations \
+(client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root) \
+SELECT 'local-vc', ?1, ?2, ?3, ?4, ?5 \
+WHERE NOT EXISTS ( \
+SELECT 1 FROM attestations WHERE pubkey = ?1 AND target_epoch = ?3 \
+)";
+
+const INSERT_BLOCK_SQL: &str = "\
+INSERT INTO blocks \
+(client_cn, pubkey, slot, signing_root, genesis_validators_root) \
+SELECT 'local-vc', ?1, ?2, ?3, ?4 \
+WHERE NOT EXISTS ( \
+SELECT 1 FROM blocks WHERE pubkey = ?1 AND slot = ?2 \
+)";
+
+/// Parse pubkeys and numeric fields before `import` takes `conn`.
+///
+/// A malformed `source_epoch`, `target_epoch`, or `slot` returns `Err` here.
+/// The caller does not lock the database for that file. The format-version
+/// check and the genesis-validators-root check stay in `import`, ahead of this
+/// function.
+fn parse_interchange(
+    interchange: &InterchangeFormat,
+) -> Result<Vec<ParsedValidator<'_>>, SlashingError> {
+    let mut parsed = Vec::with_capacity(interchange.data.len());
+    for validator in &interchange.data {
+        let pubkey = normalize_pubkey(&validator.pubkey)?;
+        let mut attestations = Vec::with_capacity(validator.signed_attestations.len());
+        let mut blocks = Vec::with_capacity(validator.signed_blocks.len());
+        let mut max_source: Option<Epoch> = None;
+        let mut max_target: Option<Epoch> = None;
+        let mut max_slot: Option<Slot> = None;
+
+        for attestation in &validator.signed_attestations {
+            let source_epoch: Epoch = attestation.source_epoch.parse().map_err(|_| {
+                SlashingError::InvalidInterchangeFormat(format!(
+                    "invalid source_epoch: {}",
+                    attestation.source_epoch
+                ))
+            })?;
+            let target_epoch: Epoch = attestation.target_epoch.parse().map_err(|_| {
+                SlashingError::InvalidInterchangeFormat(format!(
+                    "invalid target_epoch: {}",
+                    attestation.target_epoch
+                ))
+            })?;
+            max_source = Some(max_source.map_or(source_epoch, |current| current.max(source_epoch)));
+            max_target = Some(max_target.map_or(target_epoch, |current| current.max(target_epoch)));
+            attestations.push(ParsedAttestation {
+                source_epoch,
+                target_epoch,
+                signing_root: &attestation.signing_root,
+            });
+        }
+
+        for block in &validator.signed_blocks {
+            let slot: Slot = block.slot.parse().map_err(|_| {
+                SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
+            })?;
+            max_slot = Some(max_slot.map_or(slot, |current| current.max(slot)));
+            blocks.push(ParsedBlock { slot, signing_root: &block.signing_root });
+        }
+
+        parsed.push(ParsedValidator {
+            pubkey,
+            attestations,
+            blocks,
+            max_source,
+            max_target,
+            max_slot,
+        });
+    }
+    Ok(parsed)
+}
+
 impl SlashingDb {
     /// Parse a hex string (with or without `0x` prefix) into a `Root`.
     ///
@@ -332,7 +435,8 @@ impl SlashingDb {
     /// `rvc_slashing_import_duration_ms` is the whole call.
     /// `rvc_slashing_import_conn_hold_ms` is `conn.lock()` through `COMMIT`
     /// (one sample on rollback after the lock is taken; none if the call
-    /// returns before the lock). Numeric parsing stays inside that hold.
+    /// returns before the lock). Numeric fields are parsed by
+    /// [`parse_interchange`] before the lock.
     pub fn import(
         &self,
         interchange: &InterchangeFormat,
@@ -374,6 +478,7 @@ impl SlashingDb {
         // inserts that also go through root_to_hex (RF3-18).  SQLite treats NULL
         // as DISTINCT, so a NULL gvr would bypass the index silently.
         let gvr_hex = expected_hex;
+        let parsed = parse_interchange(interchange)?;
 
         #[cfg(any(test, feature = "test-utils"))]
         if let Some(pause) = IMPORT_PRE_LOCK_PAUSE.with(std::cell::Cell::get) {
@@ -384,100 +489,74 @@ impl SlashingDb {
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
 
-        for validator in &interchange.data {
-            let pubkey = normalize_pubkey(&validator.pubkey)?;
-            let mut max_slot: Option<Slot> = None;
-            let mut max_source: Option<Epoch> = None;
-            let mut max_target: Option<Epoch> = None;
+        {
+            let mut insert_attestation = tx.prepare_cached(INSERT_ATTESTATION_SQL)?;
+            let mut insert_block = tx.prepare_cached(INSERT_BLOCK_SQL)?;
+            let mut raise_watermark =
+                tx.prepare_cached(super::watermarks::RAISE_WATERMARK_MAX_SQL)?;
 
-            for attestation in &validator.signed_attestations {
-                let source_epoch: Epoch = attestation.source_epoch.parse().map_err(|_| {
-                    SlashingError::InvalidInterchangeFormat(format!(
-                        "invalid source_epoch: {}",
-                        attestation.source_epoch
-                    ))
-                })?;
-
-                let target_epoch: Epoch = attestation.target_epoch.parse().map_err(|_| {
-                    SlashingError::InvalidInterchangeFormat(format!(
-                        "invalid target_epoch: {}",
-                        attestation.target_epoch
-                    ))
-                })?;
-
-                max_source = Some(max_source.map_or(source_epoch, |m| m.max(source_epoch)));
-                max_target = Some(max_target.map_or(target_epoch, |m| m.max(target_epoch)));
-
-                let inserted = tx.execute(
-                    "INSERT INTO attestations \
-                     (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
-                     SELECT 'local-vc', ?1, ?2, ?3, ?4, ?5
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM attestations WHERE pubkey = ?1 AND target_epoch = ?3
-                     )",
-                    (
-                        pubkey.as_ref(),
-                        source_epoch as i64,
-                        target_epoch as i64,
-                        &attestation.signing_root,
+            for validator in &parsed {
+                let pubkey = validator.pubkey.as_ref();
+                for attestation in &validator.attestations {
+                    let inserted = insert_attestation.execute((
+                        pubkey,
+                        attestation.source_epoch as i64,
+                        attestation.target_epoch as i64,
+                        attestation.signing_root,
                         &gvr_hex,
-                    ),
-                )?;
-                if inserted == 0 {
-                    tracing::warn!(
-                        pubkey = %TruncatedPubkey::new(pubkey.as_ref()),
-                        source_epoch,
-                        target_epoch,
-                        "dropped conflicting interchange attestation (source, target)=({source_epoch}, {target_epoch}); watermark still raised"
-                    );
-                    metrics::RVC_SLASHING_IMPORT_CONFLICTS_TOTAL.inc();
+                    ))?;
+                    if inserted == 0 {
+                        tracing::warn!(
+                            pubkey = %TruncatedPubkey::new(pubkey),
+                            source_epoch = attestation.source_epoch,
+                            target_epoch = attestation.target_epoch,
+                            "dropped conflicting interchange attestation (source, target)=({}, {}); watermark still raised",
+                            attestation.source_epoch,
+                            attestation.target_epoch
+                        );
+                        metrics::RVC_SLASHING_IMPORT_CONFLICTS_TOTAL.inc();
+                    }
                 }
-            }
 
-            for block in &validator.signed_blocks {
-                let slot: u64 = block.slot.parse().map_err(|_| {
-                    SlashingError::InvalidInterchangeFormat(format!("invalid slot: {}", block.slot))
-                })?;
-
-                max_slot = Some(max_slot.map_or(slot, |m| m.max(slot)));
-
-                let inserted = tx.execute(
-                    "INSERT INTO blocks \
-                     (client_cn, pubkey, slot, signing_root, genesis_validators_root)
-                     SELECT 'local-vc', ?1, ?2, ?3, ?4
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM blocks WHERE pubkey = ?1 AND slot = ?2
-                     )",
-                    (pubkey.as_ref(), slot as i64, &block.signing_root, &gvr_hex),
-                )?;
-                if inserted == 0 {
-                    tracing::warn!(
-                        pubkey = %TruncatedPubkey::new(pubkey.as_ref()),
-                        slot,
-                        "dropped conflicting interchange block slot={slot}"
-                    );
-                    metrics::RVC_SLASHING_IMPORT_CONFLICTS_TOTAL.inc();
+                for block in &validator.blocks {
+                    let inserted = insert_block.execute((
+                        pubkey,
+                        block.slot as i64,
+                        block.signing_root,
+                        &gvr_hex,
+                    ))?;
+                    if inserted == 0 {
+                        tracing::warn!(
+                            pubkey = %TruncatedPubkey::new(pubkey),
+                            slot = block.slot,
+                            "dropped conflicting interchange block slot={}",
+                            block.slot
+                        );
+                        metrics::RVC_SLASHING_IMPORT_CONFLICTS_TOTAL.inc();
+                    }
                 }
-            }
 
-            // Raise watermarks from this interchange's maxima (same transaction).
-            // Raise-only SQL: re-import of older maxima is a silent no-op.
-            if let Some(slot) = max_slot {
-                raise_watermark_max(&tx, pubkey.as_ref(), WatermarkKind::Block, slot)?;
-            }
-            if let (Some(source), Some(target)) = (max_source, max_target) {
-                raise_watermark_max(
-                    &tx,
-                    pubkey.as_ref(),
-                    WatermarkKind::AttestationSource,
-                    source,
-                )?;
-                raise_watermark_max(
-                    &tx,
-                    pubkey.as_ref(),
-                    WatermarkKind::AttestationTarget,
-                    target,
-                )?;
+                // Raise watermarks from this interchange's maxima (same transaction).
+                // Raise-only SQL: re-import of older maxima is a silent no-op.
+                if let Some(slot) = validator.max_slot {
+                    raise_watermark.execute((
+                        pubkey,
+                        WatermarkKind::Block.as_sql_str(),
+                        slot as i64,
+                    ))?;
+                }
+                if let (Some(source), Some(target)) = (validator.max_source, validator.max_target) {
+                    raise_watermark.execute((
+                        pubkey,
+                        WatermarkKind::AttestationSource.as_sql_str(),
+                        source as i64,
+                    ))?;
+                    raise_watermark.execute((
+                        pubkey,
+                        WatermarkKind::AttestationTarget.as_sql_str(),
+                        target as i64,
+                    ))?;
+                }
             }
         }
 
@@ -1667,7 +1746,8 @@ mod tests {
         let result = db.import(&interchange, &genesis_root_bytes);
         assert!(result.is_err());
 
-        // All 5 valid validators should have zero records due to rollback
+        // The malformed epoch is rejected before BEGIN IMMEDIATE, so the valid
+        // prefix never lands.
         for i in 0..5 {
             let pubkey = format!("0x{:04x}", i);
             let attestations = db.get_attestations(&pubkey).expect("query failed");

@@ -104,23 +104,28 @@ pub fn raise_watermark(
     Ok(())
 }
 
+/// Raise-only watermark upsert.
+///
+/// Interchange import prepares this once per transaction. [`raise_watermark_max`]
+/// uses the same text so the two paths cannot drift.
+pub(crate) const RAISE_WATERMARK_MAX_SQL: &str =
+    "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)
+     ON CONFLICT(pubkey, watermark_type) DO UPDATE
+     SET value = MAX(watermarks.value, excluded.value)";
+
 /// Raise a watermark with `MAX(existing, new)` semantics (silent no-op when lower).
 ///
-/// Used by interchange import so re-importing older maxima never fails and never
-/// lowers floors. Prefer [`raise_watermark`] for explicit set APIs that must
-/// surface [`SlashingError::WatermarkLowered`].
+/// Prune uses this so a lower candidate never fails and never lowers the floor.
+/// Interchange import prepares [`RAISE_WATERMARK_MAX_SQL`] once per transaction
+/// instead of calling this per row. Prefer [`raise_watermark`] for explicit set
+/// APIs that must surface [`SlashingError::WatermarkLowered`].
 pub(crate) fn raise_watermark_max(
     conn: &Connection,
     pubkey: &str,
     kind: WatermarkKind,
     value: u64,
 ) -> Result<(), SlashingError> {
-    conn.execute(
-        "INSERT INTO watermarks (pubkey, watermark_type, value) VALUES (?1, ?2, ?3)
-         ON CONFLICT(pubkey, watermark_type) DO UPDATE
-         SET value = MAX(watermarks.value, excluded.value)",
-        (pubkey, kind.as_sql_str(), value as i64),
-    )?;
+    conn.execute(RAISE_WATERMARK_MAX_SQL, (pubkey, kind.as_sql_str(), value as i64))?;
     Ok(())
 }
 

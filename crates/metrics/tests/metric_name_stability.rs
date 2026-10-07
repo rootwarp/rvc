@@ -61,7 +61,8 @@
 //! `rvc_slashing_import_conn_hold_ms` (family delta +2). Duration is one sample
 //! per interchange import call. Conn-hold is `conn.lock()` through `COMMIT`;
 //! a rollback after the lock is taken still records one hold sample, and a
-//! rejection before the lock records none. Buckets are 10, 25, 50, 100, 250,
+//! rejection before the lock (format version, genesis validators root, or a
+//! malformed numeric field) records none. Buckets are 10, 25, 50, 100, 250,
 //! 500, 1000, 2500, 5000, and 10000 milliseconds. Neither family has labels.
 //! Dashboards that watch import latency or connection occupancy should bind
 //! these names (RR4-05 / #541).

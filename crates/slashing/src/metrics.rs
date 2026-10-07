@@ -107,9 +107,9 @@ pub static RVC_SLASHING_IMPORT_DURATION_MS: LazyLock<Histogram> = LazyLock::new(
 
 /// `conn.lock()` through `COMMIT` inside `SlashingDb::import`, in milliseconds.
 ///
-/// The format-version check and the genesis-validators-root check are not
-/// included. A rollback after the lock is taken still records one sample.
-/// An import rejected before the lock records nothing here.
+/// The format-version check, the genesis-validators-root check, and numeric
+/// field parsing are not included. A rollback after the lock is taken still
+/// records one sample. An import rejected before the lock records nothing here.
 pub static RVC_SLASHING_IMPORT_CONN_HOLD_MS: LazyLock<Histogram> = LazyLock::new(|| {
     let histogram = Histogram::with_opts(
         HistogramOpts::new(
