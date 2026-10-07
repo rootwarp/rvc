@@ -1,7 +1,9 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
-use tracing::{debug, info, warn};
+use futures::stream::{self, StreamExt};
+use tracing::{debug, info, info_span, warn, Instrument};
 
 use crate::metrics::{
     sync_committee_skip_phase, sync_committee_skip_reason, RVC_SYNC_COMMITTEE_SKIPPED_TOTAL,
@@ -18,6 +20,7 @@ use signer::{SignerService, ValidatorSigner};
 use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
+use super::dispatch::{SlotEndDropCounter, SLOT_END_PUBLISH_OVERHANG};
 use super::slot_context::SlotContext;
 use super::utils;
 
@@ -31,6 +34,8 @@ pub(crate) struct SyncCommitteeService {
     /// present in attestation.rs so that sync messages and contributions
     /// are also suppressed during the post-import doppelganger window.
     validator_store: Arc<ValidatorStore>,
+    /// Sync duties not pulled onto the sign pipeline before slot end.
+    slot_end_drops: SlotEndDropCounter,
 }
 
 impl SyncCommitteeService {
@@ -42,7 +47,21 @@ impl SyncCommitteeService {
         config: OrchestratorConfig,
         validator_store: Arc<ValidatorStore>,
     ) -> Self {
-        Self { signer, beacon, duty_tracker, pubkey_map, config, validator_store }
+        Self {
+            signer,
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            config,
+            validator_store,
+            slot_end_drops: SlotEndDropCounter::default(),
+        }
+    }
+
+    /// Duties dropped because slot end arrived before they were dispatched.
+    #[cfg(test)]
+    pub(crate) fn slot_end_drops(&self) -> u64 {
+        self.slot_end_drops.get()
     }
 
     #[tracing::instrument(name = "orchestrator.produce_sync_messages", level = "debug", skip_all, fields(slot = slot))]
@@ -51,6 +70,7 @@ impl SyncCommitteeService {
         slot: Slot,
         _epoch: u64,
         ctx: &SlotContext,
+        slot_end: tokio::time::Instant,
     ) {
         let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
         if duties.is_empty() {
@@ -82,56 +102,125 @@ impl SyncCommitteeService {
             }
         };
 
-        let mut messages = Vec::new();
-
-        for (duty, pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
-            match self
-                .signer
-                .sign_sync_committee_message(
-                    &head_root,
-                    slot,
-                    pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                )
-                .await
-            {
-                Ok(sig) => {
-                    messages.push(beacon::SyncCommitteeMessage {
-                        slot,
-                        beacon_block_root: head_root,
-                        validator_index: duty.validator_index,
-                        signature: sig.to_bytes().to_vec(),
-                    });
-                }
-                Err(e) => {
-                    warn!(
-                        slot,
-                        validator_index = duty.validator_index,
-                        error = %e,
-                        "Failed to sign sync committee message"
-                    );
-                }
-            }
+        // Same shape as attestation dispatch: `take_until` stops pulling new
+        // duties at slot end, signs already in `buffer_unordered` drain, and
+        // each ready chunk is one `submit_sync_committee_messages` call.
+        // Sync messages are non-slashable, so this path does not touch SQLite.
+        let pairs: Vec<_> = matching_duties.into_iter().zip(matching_pubkeys).collect();
+        let duty_count = pairs.len();
+        let concurrency = self.config.dispatch_limits.concurrency as usize;
+        let publish_concurrency = self.config.dispatch_limits.publish_concurrency as usize;
+        let waves = stream::iter(pairs)
+            .take_until(tokio::time::sleep_until(slot_end))
+            .map(|(duty, pubkey)| self.sign_sync_message(slot, head_root, duty, pubkey))
+            .buffer_unordered(concurrency)
+            .ready_chunks(concurrency)
+            .map(|wave| self.publish_sync_wave(slot, slot_end, wave))
+            .buffer_unordered(publish_concurrency);
+        let mut waves = std::pin::pin!(waves);
+        let mut dispatched = 0usize;
+        while let Some(attempted) = waves.next().await {
+            dispatched += attempted;
         }
 
-        if !messages.is_empty() {
-            let count = messages.len();
-            match tokio::time::timeout(
-                self.config.timeouts.sync_message,
-                self.beacon.submit_sync_committee_messages(&messages),
+        let dropped = duty_count.saturating_sub(dispatched);
+        if dropped > 0 {
+            self.slot_end_drops.record(dropped as u64);
+            warn!(
+                slot,
+                dropped,
+                duty_count,
+                total_dropped = self.slot_end_drops.get(),
+                "undispatched sync committee duties dropped at slot end"
+            );
+        }
+    }
+
+    /// Sign one sync-committee message. Publish is a later wave, not this future.
+    async fn sign_sync_message(
+        &self,
+        slot: Slot,
+        head_root: eth_types::Root,
+        duty: SyncCommitteeDuty,
+        pubkey: PublicKey,
+    ) -> Result<beacon::SyncCommitteeMessage, ()> {
+        match self
+            .signer
+            .sign_sync_committee_message(
+                &head_root,
+                slot,
+                &pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
             )
             .await
-            {
-                Ok(Ok(_)) => info!(slot, count, "Submitted sync committee messages"),
-                Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit sync committee messages"),
-                Err(_) => warn!(
+        {
+            Ok(sig) => Ok(beacon::SyncCommitteeMessage {
+                slot,
+                beacon_block_root: head_root,
+                validator_index: duty.validator_index,
+                signature: sig.to_bytes().to_vec(),
+            }),
+            Err(e) => {
+                warn!(
                     slot,
-                    "Sync committee message submit timed out after {}s",
-                    self.config.timeouts.sync_message.as_secs()
-                ),
+                    validator_index = duty.validator_index,
+                    error = %e,
+                    "Failed to sign sync committee message"
+                );
+                Err(())
             }
         }
+    }
+
+    /// One batch POST for a wave of signed sync messages.
+    ///
+    /// The POST's deadline is the earlier of the `sync_message` timeout and
+    /// `slot_end` plus 500 ms. Signs already running are not cancelled; a
+    /// wave that becomes ready after that instant is not sent. Returns how
+    /// many duties this wave attempted, including sign failures.
+    async fn publish_sync_wave(
+        &self,
+        slot: Slot,
+        slot_end: tokio::time::Instant,
+        wave: Vec<Result<beacon::SyncCommitteeMessage, ()>>,
+    ) -> usize {
+        let attempted = wave.len();
+        let messages: Vec<_> = wave.into_iter().flatten().collect();
+        if messages.is_empty() {
+            return attempted;
+        }
+
+        let now = tokio::time::Instant::now();
+        let overhang_at = slot_end + SLOT_END_PUBLISH_OVERHANG;
+        let submit_at = now.checked_add(self.config.timeouts.sync_message).unwrap_or(overhang_at);
+        let deadline = overhang_at.min(submit_at);
+        let bounded_by_overhang = deadline == overhang_at;
+        if now >= deadline {
+            warn_sync_publish_stopped(slot, bounded_by_overhang, self.config.timeouts.sync_message);
+            return attempted;
+        }
+
+        let count = messages.len();
+        let submit_result = tokio::time::timeout_at(
+            deadline,
+            self.beacon.submit_sync_committee_messages(&messages),
+        )
+        .instrument(info_span!("beacon.submit_sync_committee_messages", slot, count))
+        .await;
+
+        match submit_result {
+            Ok(Ok(_)) => info!(slot, count, "Submitted sync committee messages"),
+            Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit sync committee messages"),
+            Err(_) => {
+                warn_sync_publish_stopped(
+                    slot,
+                    bounded_by_overhang,
+                    self.config.timeouts.sync_message,
+                );
+            }
+        }
+        attempted
     }
 
     #[tracing::instrument(name = "orchestrator.produce_sync_contributions", level = "debug", skip_all, fields(slot = slot))]
@@ -339,6 +428,18 @@ impl SyncCommitteeService {
     }
 }
 
+fn warn_sync_publish_stopped(slot: Slot, bounded_by_overhang: bool, submit_timeout: Duration) {
+    if bounded_by_overhang {
+        warn!(
+            slot,
+            "Sync committee message publish exceeded the {} ms slot-end overhang",
+            SLOT_END_PUBLISH_OVERHANG.as_millis()
+        );
+    } else {
+        warn!(slot, "Sync committee message submit timed out after {}s", submit_timeout.as_secs());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,7 +455,7 @@ mod tests {
         sync_committee_skip_phase, sync_committee_skip_reason, RVC_SYNC_COMMITTEE_SKIPPED_TOTAL,
     };
     use beacon::{DataResponse, ExecutionOptimisticResponse};
-    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
+    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient, MockMethod};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
     use duty_tracker::DutyTracker;
     use eth_types::{ForkSchedule, Root, SyncCommitteeDuty};
@@ -388,6 +489,11 @@ mod tests {
 
     fn create_test_config() -> OrchestratorConfig {
         OrchestratorConfig::new([0u8; 32], create_test_fork_schedule())
+    }
+
+    /// Far enough ahead that `take_until(slot_end)` does not drop duties.
+    fn ample_slot_end() -> tokio::time::Instant {
+        tokio::time::Instant::now() + Duration::from_secs(60)
     }
 
     // -----------------------------------------------------------------------
@@ -604,7 +710,7 @@ mod tests {
         let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
 
         // Run both sync-committee phases with the same context.
-        service.maybe_produce_sync_messages(0, 0, &ctx).await;
+        service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
         service.maybe_produce_sync_contributions(0, 0, &ctx).await;
 
         // Neither phase must call get_block_root: head_root is sourced from SlotContext.
@@ -661,7 +767,7 @@ mod tests {
         let before_messages = skip_count(sync_committee_skip_phase::MESSAGES);
         let before_contributions = skip_count(sync_committee_skip_phase::CONTRIBUTIONS);
 
-        service.maybe_produce_sync_messages(0, 0, &ctx).await;
+        service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
         service.maybe_produce_sync_contributions(0, 0, &ctx).await;
 
         assert_eq!(
@@ -709,7 +815,7 @@ mod tests {
         // head_root = None simulates a BN failure during SlotContext::capture_head.
         let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: None };
 
-        service.maybe_produce_sync_messages(0, 0, &ctx).await;
+        service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
 
         assert_eq!(
             get_block_root_call_count.load(Ordering::SeqCst),
@@ -784,7 +890,7 @@ mod tests {
         let service = setup_service_with_store(beacon, pk_hex, pk, sk, store).await;
 
         let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
-        service.maybe_produce_sync_messages(0, 0, &ctx).await;
+        service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
 
         // No messages must be submitted for a disabled validator.
         assert!(
@@ -996,7 +1102,7 @@ mod tests {
 
         let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
         // Must complete without panic / hang — isolation property.
-        service.maybe_produce_sync_messages(0, 0, &ctx).await;
+        service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
 
         let mut indices = submitted_message_indices.lock().unwrap().clone();
         indices.sort_unstable();
@@ -1166,7 +1272,7 @@ mod tests {
             "phase-2 capture_head must supply a head even when the current slot 404s"
         );
 
-        service.maybe_produce_sync_messages(slot, epoch, &ctx).await;
+        service.maybe_produce_sync_messages(slot, epoch, &ctx, ample_slot_end()).await;
         let roots = submitted.lock().unwrap();
         assert!(
             !roots.is_empty(),
@@ -1178,5 +1284,185 @@ mod tests {
                 "messages must sign the captured head (parent when slot N has no block)"
             );
         }
+    }
+
+    /// `slot_end` already passed: nothing is signed or published, and the drop
+    /// counter matches the duty count.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn undispatched_sync_duties_are_dropped_at_slot_end() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let submitted = Arc::new(Mutex::new(0usize));
+        let submitted_for_hook = Arc::clone(&submitted);
+        let duty_pk = pk.to_bytes();
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties(move |_epoch, _indices| {
+                    Ok(ExecutionOptimisticResponse {
+                        execution_optimistic: false,
+                        data: vec![SyncCommitteeDuty {
+                            pubkey: duty_pk,
+                            validator_index: 1,
+                            validator_sync_committee_indices: vec![0],
+                        }],
+                    })
+                })
+                .with_submit_sync_committee_messages(move |messages| {
+                    *submitted_for_hook.lock().unwrap() += messages.len();
+                    Ok(())
+                }),
+        );
+        let service = setup_service(beacon, pk_hex, pk, sk).await;
+        let slot_end = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
+        service.maybe_produce_sync_messages(0, 0, &ctx, slot_end).await;
+        assert_eq!(*submitted.lock().unwrap(), 0, "no sync message is published after slot end");
+        assert_eq!(service.slot_end_drops(), 1);
+    }
+
+    /// A publish started near `slot_end` is cut at `slot_end + 500 ms`.
+    /// The `sync_message` timeout alone (2 s) would finish well into S+1.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn delayed_sync_publish_stops_at_slot_end_overhang() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let duty_pk = pk.to_bytes();
+        let beacon = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties(move |_epoch, _indices| {
+                    Ok(ExecutionOptimisticResponse {
+                        execution_optimistic: false,
+                        data: vec![SyncCommitteeDuty {
+                            pubkey: duty_pk,
+                            validator_index: 1,
+                            validator_sync_committee_indices: vec![0],
+                        }],
+                    })
+                })
+                .with_submit_sync_committee_messages(|_| Ok(()))
+                .with_method_delay(MockMethod::SubmitSyncCommitteeMessages, Duration::from_secs(2)),
+        );
+        let service =
+            setup_service(Arc::clone(&beacon) as Arc<dyn BeaconNodeClient>, pk_hex, pk, sk).await;
+        let started = tokio::time::Instant::now();
+        let slot_end = started + Duration::from_millis(50);
+        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
+        service.maybe_produce_sync_messages(0, 0, &ctx, slot_end).await;
+        let finished = tokio::time::Instant::now();
+        let overhang_at = slot_end + Duration::from_millis(500);
+        assert!(
+            finished <= overhang_at,
+            "drain ran until {finished:?}, past overhang {overhang_at:?}"
+        );
+        assert!(
+            finished.saturating_duration_since(started) < Duration::from_secs(2),
+            "the 2 s sync_message timeout must not extend the phase, elapsed {:?}",
+            finished.saturating_duration_since(started)
+        );
+        let submits: Vec<_> = beacon
+            .call_stamps()
+            .into_iter()
+            .filter(|stamp| stamp.method == MockMethod::SubmitSyncCommitteeMessages)
+            .collect();
+        assert!(!submits.is_empty(), "the publish starts, then the overhang budget stops it");
+        assert!(
+            submits.iter().all(|stamp| stamp.at <= overhang_at),
+            "a publish must not be admitted after the overhang: {submits:?}"
+        );
+        assert!(
+            beacon.submit_sync_committee_messages_calls().is_empty(),
+            "the 2 s POST must be cancelled before it completes"
+        );
+        assert!(
+            beacon.submit_sync_committee_messages_completions().is_empty(),
+            "a POST cancelled during the delay must not record a completion"
+        );
+    }
+
+    /// Sync messages are non-slashable. Holding the slashing connection must
+    /// not stop the phase from publishing.
+    #[test]
+    fn sync_messages_publish_while_slashing_db_conn_is_held() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let (service, submitted, db) = rt.block_on(async {
+            let sk = SecretKey::generate();
+            let pk = sk.public_key();
+            let submitted = Arc::new(Mutex::new(0usize));
+            let submitted_for_hook = Arc::clone(&submitted);
+            let duty_pk = pk.to_bytes();
+            let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_sync_committee_duties(move |_epoch, _indices| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    })
+                    .with_submit_sync_committee_messages(move |messages| {
+                        *submitted_for_hook.lock().unwrap() += messages.len();
+                        Ok(())
+                    }),
+            );
+            let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+            let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+            store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
+            let mut key_manager = KeyManager::new();
+            key_manager.insert(sk);
+            let signer = Arc::new(
+                SignerService::new(
+                    Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+                    Arc::clone(&db),
+                )
+                .with_enablement(always_enabled()),
+            );
+            let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+            duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+            let mut map = HashMap::new();
+            map.insert(pk.to_bytes(), pk);
+            let service = SyncCommitteeService::new(
+                signer,
+                beacon,
+                duty_tracker,
+                Arc::new(parking_lot::RwLock::new(map)),
+                create_test_config(),
+                store,
+            );
+            (service, submitted, db)
+        });
+
+        let held = db
+            .stage_block("0xdeadbeef01", 1, Some("0xhold".into()), &[0u8; 32])
+            .expect("stage_block holds the slashing connection");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let published = rt.block_on(async move {
+                let ctx = SlotContext {
+                    slot: 0,
+                    epoch: 0,
+                    parent_root: None,
+                    head_root: Some([0xAA; 32]),
+                };
+                let slot_end = tokio::time::Instant::now() + Duration::from_secs(30);
+                service.maybe_produce_sync_messages(0, 0, &ctx, slot_end).await;
+                *submitted.lock().unwrap()
+            });
+            tx.send(published).expect("publish result");
+        });
+
+        let published = rx.recv_timeout(Duration::from_secs(15)).unwrap_or_else(|_| {
+            panic!("sync phase blocked while the slashing connection was held")
+        });
+        assert!(published > 0, "sync phase must publish while the slashing connection is held");
+        worker.join().expect("sync worker");
+        drop(held);
     }
 }

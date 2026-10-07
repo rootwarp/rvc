@@ -177,7 +177,9 @@ async fn test_sync_runs_with_attesting_disabled() {
     let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
 
     // Exercise the guarded sync-messages phase directly.
-    orchestrator.run_sync_messages_phase(0, 0, &ctx).await;
+    orchestrator
+        .run_sync_messages_phase(0, 0, &ctx, tokio::time::Instant::now() + Duration::from_secs(60))
+        .await;
 
     let roots = submitted_roots.lock().unwrap();
     assert!(
@@ -217,7 +219,9 @@ async fn test_sync_messages_skipped_when_sync_disabled() {
 
     let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
 
-    orchestrator.run_sync_messages_phase(0, 0, &ctx).await;
+    orchestrator
+        .run_sync_messages_phase(0, 0, &ctx, tokio::time::Instant::now() + Duration::from_secs(60))
+        .await;
 
     assert!(
         submitted_roots.lock().unwrap().is_empty(),

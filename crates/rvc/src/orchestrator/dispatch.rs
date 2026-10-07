@@ -1,16 +1,26 @@
-//! Concurrent duty-dispatch limits (RR2-02) and one attestation wave (RR2-03).
+//! Concurrent duty-dispatch limits (RR2-02), one attestation wave (RR2-03),
+//! and the sync-message publish budget (RR2-04).
 //!
 //! `StreamExt::ready_chunks(0)` panics, so [`DispatchLimits::validated`] rejects
 //! a zero in either field. [`crate::config::Config::validate`] repeats that
 //! check and also enforces the operator ranges (`1..=512` / `1..=16`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use beacon::VersionedAttestation;
 use eth_types::Slot;
 use thiserror::Error;
 
-/// In-flight sign requests and publish waves for one attestation slot.
+/// How far past `slot_end` (the start of slot S+1) a duty publish may run.
+///
+/// Shared by attestation submit and sync-message submit. A fresh operation
+/// timeout (default 2 s) is not this bound: a wave admitted near slot end
+/// must still stop by this instant.
+pub(crate) const SLOT_END_PUBLISH_OVERHANG: Duration = Duration::from_millis(500);
+
+/// In-flight sign requests and publish waves for one attestation slot
+/// and one sync-message slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchLimits {
     /// Sign requests issued together (`buffer_unordered` / `ready_chunks`).

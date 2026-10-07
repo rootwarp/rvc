@@ -72,7 +72,7 @@ pub struct OrchestratorConfig {
     /// Pre-Gloas and Gloas deadline sets. Selected once per slot via
     /// [`ForkName::from_epoch`]; wait sites consume the resolved [`DeadlineBps`].
     pub deadline_schedule: DeadlineSchedule,
-    /// Sign-request and publish-wave concurrency for one attestation slot.
+    /// Sign-request and publish-wave concurrency for attestation and sync messages.
     pub dispatch_limits: DispatchLimits,
 }
 
@@ -141,7 +141,7 @@ impl OrchestratorConfig {
         self
     }
 
-    /// Replace the attestation sign/publish concurrency.
+    /// Replace the attestation and sync-message sign/publish concurrency.
     ///
     /// Callers pass [`DispatchLimits::validated`]. A zero is rejected there
     /// because `ready_chunks(0)` panics.
@@ -1183,7 +1183,7 @@ where
             self.run_attestation_phase(current_slot, &att_phase_span, anchor.slot_end()).await;
             let snapshot = self.snapshot_ctx(ctx).await;
             Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
-            self.run_sync_messages_phase(current_slot, current_epoch, &snapshot)
+            self.run_sync_messages_phase(current_slot, current_epoch, &snapshot, anchor.slot_end())
                 .instrument(att_phase_span)
                 .await;
             return WaitOutcome::Continue;
@@ -1230,9 +1230,14 @@ where
                 Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
                 self.capture_head_if_needed(ctx).await;
                 let snapshot = self.snapshot_ctx(ctx).await;
-                self.run_sync_messages_phase(current_slot, current_epoch, &snapshot)
-                    .instrument(att_phase_span.clone())
-                    .await;
+                self.run_sync_messages_phase(
+                    current_slot,
+                    current_epoch,
+                    &snapshot,
+                    anchor.slot_end(),
+                )
+                .instrument(att_phase_span.clone())
+                .await;
                 WaitOutcome::Continue
             },
         );
@@ -1372,10 +1377,20 @@ where
     /// Runs the sync-committee messages phase, gated by `sync_enabled`.
     ///
     /// Extracted so both the run loop and tests can invoke the guarded phase
-    /// in isolation.
-    async fn run_sync_messages_phase(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
+    /// in isolation. `slot_end` bounds intake the same way as attestation
+    /// dispatch: duties not yet pulled are dropped, and a publish still
+    /// running stops at `slot_end` plus [`super::dispatch::SLOT_END_PUBLISH_OVERHANG`].
+    async fn run_sync_messages_phase(
+        &self,
+        slot: Slot,
+        epoch: u64,
+        ctx: &SlotContext,
+        slot_end: tokio::time::Instant,
+    ) {
         if self.sync_enabled.load(Ordering::Acquire) {
-            self.sync_committee_service.maybe_produce_sync_messages(slot, epoch, ctx).await;
+            self.sync_committee_service
+                .maybe_produce_sync_messages(slot, epoch, ctx, slot_end)
+                .await;
         }
     }
 
