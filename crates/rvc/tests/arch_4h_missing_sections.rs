@@ -253,7 +253,7 @@ fn absent_timing_section_uses_pre_gloas_defaults() {
 // M4: exactly one clap/section declaration per knob across rvc-config (+ leftover cli groups)
 // ---------------------------------------------------------------------------
 
-const KNOBS_70: &[&str] = &[
+const KNOBS_72: &[&str] = &[
     "beacon_url",
     "beacon_nodes",
     "keystore_path",
@@ -324,6 +324,8 @@ const KNOBS_70: &[&str] = &[
     "attestation_timeout",
     "aggregate_timeout",
     "duty_fetch_timeout",
+    "duty_dispatch_concurrency",
+    "duty_publish_concurrency",
 ];
 
 const NOT_A_KNOB: &[&str] = &[
@@ -428,10 +430,10 @@ fn leaf_declarations(src: &str, struct_name: &str) -> Vec<(String, String)> {
 }
 
 #[test]
-fn every_one_of_the_70_knobs_has_exactly_one_declaration() {
-    assert_eq!(KNOBS_70.len(), 70);
-    let unique: BTreeSet<_> = KNOBS_70.iter().copied().collect();
-    assert_eq!(unique.len(), 70);
+fn every_one_of_the_72_knobs_has_exactly_one_declaration() {
+    assert_eq!(KNOBS_72.len(), 72);
+    let unique: BTreeSet<_> = KNOBS_72.iter().copied().collect();
+    assert_eq!(unique.len(), 72);
 
     let root = workspace_root();
     let section_dir = root.join("crates/rvc-config/src/sections");
@@ -466,10 +468,11 @@ fn every_one_of_the_70_knobs_has_exactly_one_declaration() {
         "LoggingArgs",
         "BuilderArgs",
         "ProposerArgs",
+        "DutiesArgs",
     ];
 
     let mut counts: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for k in KNOBS_70 {
+    for k in KNOBS_72 {
         counts.insert(*k, Vec::new());
     }
     let mut extras = Vec::new();
@@ -493,7 +496,7 @@ fn every_one_of_the_70_knobs_has_exactly_one_declaration() {
         counts.iter().filter(|(_, v)| v.len() > 1).map(|(k, v)| (*k, v)).collect();
     assert!(
         extras.is_empty(),
-        "scanner found clap fields that are not in the 70 knobs or NOT_A_KNOB: {extras:?}"
+        "scanner found clap fields that are not in the 72 knobs or NOT_A_KNOB: {extras:?}"
     );
     assert!(missing.is_empty(), "knobs with zero clap/section declarations: {missing:?}");
     assert!(dupes.is_empty(), "knobs with more than one declaration: {dupes:?}");

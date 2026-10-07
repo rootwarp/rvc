@@ -1,13 +1,15 @@
-//! Canonical 70 operator-knob names.
+//! Canonical 72 operator-knob names.
 //!
 //! These are the historical flat / `CliOverrides` names plus the four BN
-//! timeouts promoted in ARCH-4j. ARCH-4d's corpus and G-2 clause (iii) use
-//! this list after `CliOverrides` is deleted.
+//! timeouts promoted in ARCH-4j and the two `[duties]` concurrency knobs
+//! from RR2-02. ARCH-4d's corpus and G-2 clause (iii) use this list after
+//! `CliOverrides` is deleted.
 
 /// Every remaining operator knob that had a `CliOverrides` field before
-/// ARCH-4i, plus the four BN timeouts promoted to `Config` in ARCH-4j.
+/// ARCH-4i, plus the four BN timeouts promoted to `Config` in ARCH-4j,
+/// plus `duty_dispatch_concurrency` and `duty_publish_concurrency` (RR2-02).
 ///
-/// Count is **70**.
+/// Count is **72**.
 pub const OPERATOR_KNOB_NAMES: &[&str] = &[
     "beacon_url",
     "beacon_nodes",
@@ -79,4 +81,6 @@ pub const OPERATOR_KNOB_NAMES: &[&str] = &[
     "attestation_timeout",
     "aggregate_timeout",
     "duty_fetch_timeout",
+    "duty_dispatch_concurrency",
+    "duty_publish_concurrency",
 ];

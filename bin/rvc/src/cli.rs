@@ -370,6 +370,8 @@ mod tests {
         "--attestation-timeout",
         "--aggregate-timeout",
         "--duty-fetch-timeout",
+        "--duty-dispatch-concurrency",
+        "--duty-publish-concurrency",
         "--keystore-path",
         "--password-file",
         "--key-decrypt-threads",
@@ -570,6 +572,10 @@ mod tests {
             "/validators.toml",
             "--beacon-max-body-bytes",
             "1024",
+            "--duty-dispatch-concurrency",
+            "64",
+            "--duty-publish-concurrency",
+            "4",
         ])
         .expect("argv should parse");
 
@@ -650,6 +656,8 @@ mod tests {
         assert_eq!(cfg.validator_registration_batch_delay, 20);
         assert_eq!(cfg.validators_config, Some(PathBuf::from("/validators.toml")));
         assert_eq!(cfg.beacon_max_body_bytes, 1024);
+        assert_eq!(cfg.duties.duty_dispatch_concurrency, 64);
+        assert_eq!(cfg.duties.duty_publish_concurrency, 4);
     }
 
     #[test]
@@ -685,6 +693,7 @@ mod tests {
         assert_eq!(cfg.keymanager.body_limit, defaults.keymanager.body_limit);
         assert_eq!(cfg.slashed_validators_action, defaults.slashed_validators_action);
         assert_eq!(cfg.beacon_max_body_bytes, defaults.beacon_max_body_bytes);
+        assert_eq!(cfg.duties, defaults.duties);
     }
 
     #[test]

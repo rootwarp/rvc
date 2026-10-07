@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use super::{
-    BeaconArgs, BlockSelectionMode, BroadcastTopic, BuilderLimitsArgs, GrpcSignerArgs,
+    BeaconArgs, BlockSelectionMode, BroadcastTopic, BuilderLimitsArgs, DutiesArgs, GrpcSignerArgs,
     KeymanagerArgs, KeysArgs, LogfileArgs, MonitoringArgs, NetworkArgs, ProposerConfigArgs,
     SafetyArgs, ServerArgs, SlashingArgs, TracingArgs,
 };
@@ -60,6 +60,9 @@ pub struct StartArgs {
 
     #[command(flatten)]
     pub slashing: SlashingArgs,
+
+    #[command(flatten)]
+    pub duties: DutiesArgs,
 }
 
 /// Console logging plus flattened `[logfile]` knobs (ARCH-4g / A-4.4).

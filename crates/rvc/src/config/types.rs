@@ -20,17 +20,18 @@ use beacon::ResponseCaps;
 use super::error::ConfigError;
 use super::network::Network;
 use super::start::StartArgs;
+use crate::orchestrator::dispatch::DispatchLimits;
 use rvc_config::ConfigSource;
 use slashing::GroupCommitConfig;
 
 pub use rvc_config::{
-    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, BuilderSettings,
-    ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs, GrpcSignerConfig,
-    KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs, LogfileConfig,
-    MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig, ProposerConfigArgs,
-    ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs, SecretProviderConfig,
-    ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig, TimingConfig,
-    TracingArgs, TracingConfig, TracingExporter, DEFAULT_TRACING_SAMPLE_RATE,
+    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, BuilderSettings, DutiesArgs,
+    DutiesConfig, ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs,
+    GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs,
+    LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
+    ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs,
+    SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig,
+    TimingConfig, TracingArgs, TracingConfig, TracingExporter, DEFAULT_TRACING_SAMPLE_RATE,
 };
 
 /// Message types that may be broadcast to all beacon nodes.
@@ -78,7 +79,7 @@ impl FromStr for BroadcastTopic {
 ///
 /// Related knobs are grouped into nested sub-structs (`logfile`, `tracing`,
 /// `keymanager`, `grpc_signer`, `proposer_config`, `monitoring`,
-/// `builder_limits`, `timing`, `fork_schedule`). ARCH-4h invents `[beacon]` / `[server]` /
+/// `builder_limits`, `timing`, `duties`, `fork_schedule`). ARCH-4h invents `[beacon]` / `[server]` /
 /// `[network]` / `[safety]` / `[slashing]` / `[keys]` on the wire; `Config`'s
 /// public / serialize shape stays flat so ARCH-4d snapshots stay byte-identical.
 /// Existing operator TOML may still use the **flat** keys; both spellings are
@@ -186,6 +187,10 @@ pub struct Config {
 
     #[serde(default)]
     pub timing: TimingConfig,
+
+    /// Concurrent duty dispatch (`[duties]`). Omitted from snapshots at the defaults.
+    #[serde(default, skip_serializing_if = "DutiesConfig::is_default")]
+    pub duties: DutiesConfig,
 
     /// Local Gloas schedule; reconciled against the BN spec at startup.
     #[serde(default)]
@@ -302,6 +307,7 @@ impl Default for Config {
             builder_limits: BuilderLimits::default(),
             builder: BuilderSettings::default(),
             timing: TimingConfig::default(),
+            duties: DutiesConfig::default(),
             fork_schedule: ForkScheduleConfig::default(),
             proposer_nodes: Vec::new(),
             broadcast: Vec::new(),
@@ -430,6 +436,8 @@ struct ConfigWire {
     builder: BuilderSettings,
     #[serde(default)]
     timing: TimingConfig,
+    #[serde(default)]
+    duties: DutiesConfig,
     #[serde(default)]
     fork_schedule: ForkScheduleConfig,
 
@@ -672,6 +680,7 @@ impl Config {
             builder_limits,
             builder: w.builder,
             timing: w.timing,
+            duties: w.duties,
             fork_schedule: w.fork_schedule,
             proposer_nodes: w.proposer_nodes,
             broadcast: w.broadcast,
@@ -953,6 +962,32 @@ impl Config {
 
         self.builder.validate()?;
 
+        // RR2-02: both gates. Range is the operator bound; `DispatchLimits::validated`
+        // rejects 0 because `ready_chunks(0)` panics (architecture §2.8).
+        let duty_dispatch_concurrency = self.duties.duty_dispatch_concurrency;
+        if !(1..=512).contains(&duty_dispatch_concurrency) {
+            return Err(ConfigError::Invalid {
+                field: "duties.duty_dispatch_concurrency",
+                message: format!("must be 1..=512, got {duty_dispatch_concurrency}"),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        let duty_publish_concurrency = self.duties.duty_publish_concurrency;
+        if !(1..=16).contains(&duty_publish_concurrency) {
+            return Err(ConfigError::Invalid {
+                field: "duties.duty_publish_concurrency",
+                message: format!("must be 1..=16, got {duty_publish_concurrency}"),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        DispatchLimits::validated(duty_dispatch_concurrency, duty_publish_concurrency).map_err(
+            |err| ConfigError::Invalid {
+                field: "duties",
+                message: err.to_string(),
+                source_layer: ConfigSource::Default,
+            },
+        )?;
+
         // Validate proposer node URLs
         for node_url in &self.proposer_nodes {
             if node_url.is_empty() {
@@ -1123,6 +1158,7 @@ impl Config {
             proposer,
             monitoring,
             slashing,
+            duties,
         } = cli;
 
         if let Some(v) = &beacon.url {
@@ -1355,6 +1391,13 @@ impl Config {
         if let Some(v) = slashing.group_commit_wait_to_fill_ms {
             self.group_commit_wait_to_fill_ms = Some(v);
         }
+
+        if let Some(v) = duties.duty_dispatch_concurrency {
+            self.duties.duty_dispatch_concurrency = v;
+        }
+        if let Some(v) = duties.duty_publish_concurrency {
+            self.duties.duty_publish_concurrency = v;
+        }
     }
 }
 
@@ -1530,6 +1573,78 @@ allow_fresh_db = true
     fn test_validate_valid_config() {
         let config = Config::default();
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_rejects_zero_duty_concurrency() {
+        for (body, needle) in [
+            ("duty_dispatch_concurrency = 0\n", "duty_dispatch_concurrency"),
+            ("duty_publish_concurrency = 0\n", "duty_publish_concurrency"),
+        ] {
+            let config: Config = toml::from_str(&format!("[duties]\n{body}"))
+                .expect("0 is a u32; reject at validate");
+            let err = config.validate().expect_err("zero duty concurrency must fail validate");
+            let msg = err.to_string();
+            assert!(msg.contains(needle), "{msg}");
+        }
+    }
+
+    #[test]
+    fn config_rejects_duty_concurrency_above_range() {
+        let over_dispatch: Config =
+            toml::from_str("[duties]\nduty_dispatch_concurrency = 513\n").expect("513 parses");
+        let err = over_dispatch.validate().expect_err("513 is above 512");
+        let msg = err.to_string();
+        assert!(msg.contains("duty_dispatch_concurrency"), "{msg}");
+        assert!(msg.contains("513"), "{msg}");
+
+        let over_publish: Config =
+            toml::from_str("[duties]\nduty_publish_concurrency = 17\n").expect("17 parses");
+        let err = over_publish.validate().expect_err("17 is above 16");
+        let msg = err.to_string();
+        assert!(msg.contains("duty_publish_concurrency"), "{msg}");
+        assert!(msg.contains("17"), "{msg}");
+    }
+
+    #[test]
+    fn duty_concurrency_bounds_and_defaults_match_dispatch_limits() {
+        let defaults = Config::default();
+        assert_eq!(defaults.duties.duty_dispatch_concurrency, DispatchLimits::DEFAULT_CONCURRENCY);
+        assert_eq!(
+            defaults.duties.duty_publish_concurrency,
+            DispatchLimits::DEFAULT_PUBLISH_CONCURRENCY
+        );
+        assert_eq!(DispatchLimits::DEFAULT_CONCURRENCY, 32);
+        assert_eq!(DispatchLimits::DEFAULT_PUBLISH_CONCURRENCY, 2);
+        assert!(defaults.validate().is_ok());
+
+        let at_max: Config = toml::from_str(
+            "[duties]\nduty_dispatch_concurrency = 512\nduty_publish_concurrency = 16\n",
+        )
+        .expect("bounds parse");
+        assert!(at_max.validate().is_ok());
+
+        let absent = DutiesArgs::default().resolved();
+        assert_eq!(absent.duty_dispatch_concurrency, defaults.duties.duty_dispatch_concurrency);
+        assert_eq!(absent.duty_publish_concurrency, defaults.duties.duty_publish_concurrency);
+    }
+
+    #[test]
+    fn cli_duty_concurrency_overrides_toml() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[duties]\nduty_dispatch_concurrency = 8\nduty_publish_concurrency = 3\n")
+            .unwrap();
+        let from_file = Config::load(Some(file.path()), StartArgs::default()).expect("file");
+        assert_eq!(from_file.duties.duty_dispatch_concurrency, 8);
+        assert_eq!(from_file.duties.duty_publish_concurrency, 3);
+
+        let mut cli = StartArgs::default();
+        cli.duties.duty_dispatch_concurrency = Some(64);
+        cli.duties.duty_publish_concurrency = Some(4);
+        let loaded = Config::load(Some(file.path()), cli).expect("file+cli");
+        assert_eq!(loaded.duties.duty_dispatch_concurrency, 64);
+        assert_eq!(loaded.duties.duty_publish_concurrency, 4);
+        assert!(loaded.validate().is_ok());
     }
 
     #[test]
@@ -3337,6 +3452,7 @@ builders = ["not a url"]
             "pub builder_limits: BuilderLimits",
             "pub builder: BuilderSettings",
             "pub timing: TimingConfig",
+            "pub duties: DutiesConfig",
             "pub fork_schedule: ForkScheduleConfig",
         ] {
             assert!(config_struct.contains(nested), "nested group missing from Config: {nested}");

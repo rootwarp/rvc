@@ -128,6 +128,8 @@ fn start_help_exits_zero_and_lists_flags() {
         "--attestation-timeout",
         "--aggregate-timeout",
         "--duty-fetch-timeout",
+        "--duty-dispatch-concurrency",
+        "--duty-publish-concurrency",
         "--key-decrypt-threads",
         "--tracing-endpoint",
         "--tracing-exporter",
