@@ -55,6 +55,7 @@ tracing.workspace = true
 tree_hash.workspace = true
 url.workspace = true
 validator-store.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
@@ -84,7 +85,6 @@ opentelemetry_sdk.workspace = true
 # ARCH-7b: `start_paused` / `time::pause` for virtual multi-second duty stalls.
 tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
-zeroize.workspace = true
 criterion.workspace = true
 # Feature-unify `test-utils` onto the crate-under-test so integration tests
 # can enable the feature. Production dependents do not get this line.

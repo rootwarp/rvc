@@ -2,12 +2,8 @@
 //!
 //! Scrypt's memory cost is `128 · r · N`. [`KdfBudget`] limits how many of those
 //! derivations run at once and how much of that memory they may hold together.
-//! The permit is owned and `'static` so a later import path can move it into
-//! `spawn_blocking` and keep it until decrypt returns.
-//!
-//! Keystore import calls [`KdfBudget::admit`] in a follow-up. Until that call
-//! site lands, this module's public items have no production caller.
-#![allow(dead_code, reason = "keystore import calls KdfBudget::admit in a follow-up")]
+//! Keystore import awaits [`KdfBudget::admit`] on the async side, then moves the
+//! owned permit into `spawn_blocking` and keeps it until that body returns.
 
 use std::sync::Arc;
 
@@ -33,6 +29,17 @@ pub struct KdfBudgetConfig {
     pub total_bytes: u64,
     /// Per-keystore working-set cap, in bytes. Above this, admission fails.
     pub max_keystore_bytes: u64,
+}
+
+impl KdfBudgetConfig {
+    /// Budget described by the `[keymanager]` import-KDF knobs (RR2-10).
+    pub(crate) fn from_keymanager(km: &crate::config::KeymanagerConfig) -> Self {
+        Self {
+            concurrency: km.keymanager_import_kdf_concurrency,
+            total_bytes: u64::from(km.keymanager_import_kdf_total_mib) * MIB,
+            max_keystore_bytes: u64::from(km.keymanager_import_kdf_max_keystore_mib) * MIB,
+        }
+    }
 }
 
 impl Default for KdfBudgetConfig {
@@ -187,6 +194,20 @@ mod tests {
         assert_eq!(cfg.total_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.max_keystore_bytes, MAX_KDF_WORKING_SET_BYTES);
         assert_eq!(cfg.max_keystore_bytes, 8u64 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn kdf_budget_config_from_keymanager_knobs() {
+        let mut km = crate::config::KeymanagerConfig::default();
+        assert_eq!(KdfBudgetConfig::from_keymanager(&km), KdfBudgetConfig::default());
+
+        km.keymanager_import_kdf_concurrency = 4;
+        km.keymanager_import_kdf_total_mib = 256;
+        km.keymanager_import_kdf_max_keystore_mib = 1024;
+        let cfg = KdfBudgetConfig::from_keymanager(&km);
+        assert_eq!(cfg.concurrency, 4);
+        assert_eq!(cfg.total_bytes, 256 * MIB);
+        assert_eq!(cfg.max_keystore_bytes, 1024 * MIB);
     }
 
     #[tokio::test]
