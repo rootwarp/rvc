@@ -108,6 +108,7 @@ impl MemoryKeys {
     }
 }
 
+#[async_trait]
 impl KeystoreManager for MemoryKeys {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.keys.lock().expect("keys").clone()
@@ -117,7 +118,7 @@ impl KeystoreManager for MemoryKeys {
         self.has(pubkey)
     }
 
-    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+    async fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
         Err(ImportKeystoreError::InvalidKeystore("unused".into()))
     }
 
@@ -138,9 +139,10 @@ struct ExportSpy {
     calls: Arc<AtomicU32>,
 }
 
+#[async_trait]
 impl SlashingProtection for ExportSpy {
-    fn import_interchange(&self, json: &str) -> Result<(), SlashingProtectionError> {
-        self.inner.import_interchange(json)
+    async fn import_interchange(&self, json: &str) -> Result<(), SlashingProtectionError> {
+        self.inner.import_interchange(json).await
     }
 
     fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {

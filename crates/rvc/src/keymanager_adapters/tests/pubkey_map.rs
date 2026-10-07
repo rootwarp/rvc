@@ -26,7 +26,7 @@ fn test_import_updates_shared_pubkey_map_and_notifies() {
     rx.borrow_and_update();
     assert!(!rx.has_changed().unwrap());
 
-    adapter.import_keystore(&keystore_json, "testpass").unwrap();
+    futures::executor::block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
 
     assert!(pubkey_map.read().contains_key(&pk_bytes), "import must update the shared PubkeyMap");
     assert!(rx.has_changed().unwrap(), "import must notify via key_gen_tx");
@@ -53,7 +53,7 @@ fn test_delete_removes_from_shared_pubkey_map_and_notifies() {
     let pk_bytes = sk.public_key().to_bytes();
     let _pubkey_hex = pubkey_hex(pk_bytes);
 
-    adapter.import_keystore(&keystore_json, "testpass").unwrap();
+    futures::executor::block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
     assert!(pubkey_map.read().contains_key(&pk_bytes));
     rx.borrow_and_update();
     assert!(!rx.has_changed().unwrap());
@@ -285,7 +285,9 @@ fn test_concurrent_import_same_key() {
     for _ in 0..n {
         let adapter = adapter.clone();
         let json = keystore_json.clone();
-        handles.push(thread::spawn(move || adapter.import_keystore(&json, "testpass")));
+        handles.push(thread::spawn(move || {
+            futures::executor::block_on(adapter.import_keystore(&json, "testpass"))
+        }));
     }
 
     let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
@@ -322,7 +324,7 @@ fn test_concurrent_import_delete_same_key() {
     let keystore_json = serde_json::to_string(&keystore).unwrap();
 
     // Import the key first
-    adapter.import_keystore(&keystore_json, "testpass").unwrap();
+    futures::executor::block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
     assert!(adapter.has_key(&pk_bytes));
 
     // Now race: half delete, half try to re-import
@@ -338,7 +340,7 @@ fn test_concurrent_import_delete_same_key() {
             if i % 2 == 0 {
                 let _ = adapter.delete_keystore(&pk_bytes);
             } else {
-                let _ = adapter.import_keystore(&json, "testpass");
+                let _ = futures::executor::block_on(adapter.import_keystore(&json, "testpass"));
             }
         }));
     }

@@ -49,7 +49,7 @@ fn test_keystore_manager_adapter_import_invalid_json() {
     let dir = TempDir::new().unwrap();
     let (adapter, _, _) =
         test_keystore_adapter(dir.path().to_path_buf(), create_empty_composite_signer());
-    let result = adapter.import_keystore("not valid json", "password");
+    let result = futures::executor::block_on(adapter.import_keystore("not valid json", "password"));
     assert!(matches!(result, Err(ImportKeystoreError::InvalidKeystore(_))));
 }
 

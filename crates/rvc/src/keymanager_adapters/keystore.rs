@@ -8,6 +8,7 @@ use doppelganger::MonotonicEpochClock;
 use parking_lot::Mutex;
 use validator_store::ValidatorStore;
 
+use async_trait::async_trait;
 use crypto::{CompositeSigner, Keystore};
 use keymanager_api::traits::{DeleteKeystoreError, ImportKeystoreError, KeystoreManager, Pubkey};
 use observability::logging::TruncatedPubkey;
@@ -278,6 +279,7 @@ fn remove_matching_keystore_files(
 
     Ok(())
 }
+#[async_trait]
 impl KeystoreManager for KeystoreManagerAdapter {
     /// Local keys the VC can sign with (`CompositeSigner::local_public_keys`).
     fn list_keys(&self) -> Vec<Pubkey> {
@@ -329,7 +331,7 @@ impl KeystoreManager for KeystoreManagerAdapter {
         }
     }
 
-    fn import_keystore(
+    async fn import_keystore(
         &self,
         keystore_json: &str,
         password: &str,

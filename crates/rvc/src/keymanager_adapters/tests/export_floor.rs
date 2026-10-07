@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::extract::{Json, State};
 use keymanager_api::error::ApiError;
 use keymanager_api::handlers::{delete_keystores, AppState};
@@ -46,6 +47,7 @@ impl CountingKeys {
     }
 }
 
+#[async_trait]
 impl KeystoreManager for CountingKeys {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.keys.lock().expect("keys").clone()
@@ -55,7 +57,7 @@ impl KeystoreManager for CountingKeys {
         self.keys.lock().expect("keys").contains(pubkey)
     }
 
-    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+    async fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
         Err(ImportKeystoreError::Io("unused".into()))
     }
 

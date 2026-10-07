@@ -109,75 +109,81 @@ pub async fn import_keystores(
         "keymanager.import_keystores",
         keymanager.count = request.keystores.len(),
     );
-    let _guard = span.enter();
+    // `Instrument` enters the span per poll. A `Span::enter` guard must not
+    // be held across the import awaits (axum requires the handler future to be Send).
+    async move {
+        // ISSUE-4.7 / L-7: per-API-token rate limit on the decrypt path.
+        // Refused calls return 429 with Retry-After and never reach the
+        // CPU-bound keystore decryption loop.
+        check_import_keystores_rate(&state, &headers)?;
 
-    // ISSUE-4.7 / L-7: per-API-token rate limit on the decrypt path.
-    // Refused calls return 429 with Retry-After and never reach the
-    // CPU-bound keystore decryption loop.
-    check_import_keystores_rate(&state, &headers)?;
+        info!(count = request.keystores.len(), "Importing keystores");
 
-    info!(count = request.keystores.len(), "Importing keystores");
-
-    if request.keystores.len() != request.passwords.len() {
-        return Err(ApiError::BadRequest(
-            "keystores and passwords arrays must have the same length".into(),
-        ));
-    }
-
-    // Import slashing protection FIRST — before any keystores are activated.
-    // This prevents a window where signing keys exist without slashing records.
-    if let Some(ref slashing_json) = request.slashing_protection {
-        if let Err(e) = state.slashing_protection.import_interchange(slashing_json) {
-            return Err(map_slashing_protection_error(e, "slashing protection import failed"));
+        if request.keystores.len() != request.passwords.len() {
+            return Err(ApiError::BadRequest(
+                "keystores and passwords arrays must have the same length".into(),
+            ));
         }
-    }
 
-    let mut results = Vec::with_capacity(request.keystores.len());
-
-    for (keystore_json, password) in request.keystores.iter().zip(request.passwords.iter()) {
-        match state.keystore_manager.import_keystore(keystore_json, password) {
-            Ok(pubkey) => {
-                let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-                info!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    status = "imported",
-                    "Keystore import result"
-                );
-                // M-12 + KM-2: register disabled validator, start monitoring,
-                // displace any prior enable task, and spawn the window task.
-                // Owned by [`DoppelgangerLifecycle`] so local and remote imports
-                // share one path (ImportKind::Local).
-                state.doppelganger.on_import(pubkey, ImportKind::Local);
-
-                results.push(ImportKeystoreResult {
-                    status: ImportStatus::Imported,
-                    message: String::new(),
-                });
-            }
-            Err(ImportKeystoreError::Duplicate) => {
-                info!(status = "duplicate", "Keystore import result");
-                results.push(ImportKeystoreResult {
-                    status: ImportStatus::Duplicate,
-                    message: "key already exists".into(),
-                });
-            }
-            Err(ImportKeystoreError::DeleteInProgress) => {
-                info!(status = "error", "Keystore import result");
-                results.push(ImportKeystoreResult {
-                    status: ImportStatus::Error,
-                    message: map_import_keystore_item_error(ImportKeystoreError::DeleteInProgress),
-                });
-            }
-            Err(e) => {
-                results.push(ImportKeystoreResult {
-                    status: ImportStatus::Error,
-                    message: map_import_keystore_item_error(e),
-                });
+        // Import slashing protection FIRST — before any keystores are activated.
+        // This prevents a window where signing keys exist without slashing records.
+        if let Some(ref slashing_json) = request.slashing_protection {
+            if let Err(e) = state.slashing_protection.import_interchange(slashing_json).await {
+                return Err(map_slashing_protection_error(e, "slashing protection import failed"));
             }
         }
-    }
 
-    Ok(Json(ImportKeystoresResponse { data: results }))
+        let mut results = Vec::with_capacity(request.keystores.len());
+
+        for (keystore_json, password) in request.keystores.iter().zip(request.passwords.iter()) {
+            match state.keystore_manager.import_keystore(keystore_json, password).await {
+                Ok(pubkey) => {
+                    let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+                    info!(
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                        status = "imported",
+                        "Keystore import result"
+                    );
+                    // M-12 + KM-2: register disabled validator, start monitoring,
+                    // displace any prior enable task, and spawn the window task.
+                    // Owned by [`DoppelgangerLifecycle`] so local and remote imports
+                    // share one path (ImportKind::Local).
+                    state.doppelganger.on_import(pubkey, ImportKind::Local);
+
+                    results.push(ImportKeystoreResult {
+                        status: ImportStatus::Imported,
+                        message: String::new(),
+                    });
+                }
+                Err(ImportKeystoreError::Duplicate) => {
+                    info!(status = "duplicate", "Keystore import result");
+                    results.push(ImportKeystoreResult {
+                        status: ImportStatus::Duplicate,
+                        message: "key already exists".into(),
+                    });
+                }
+                Err(ImportKeystoreError::DeleteInProgress) => {
+                    info!(status = "error", "Keystore import result");
+                    results.push(ImportKeystoreResult {
+                        status: ImportStatus::Error,
+                        message: map_import_keystore_item_error(
+                            ImportKeystoreError::DeleteInProgress,
+                        ),
+                    });
+                }
+                Err(e) => {
+                    results.push(ImportKeystoreResult {
+                        status: ImportStatus::Error,
+                        message: map_import_keystore_item_error(e),
+                    });
+                }
+            }
+        }
+
+        Ok(Json(ImportKeystoresResponse { data: results }))
+    }
+    .instrument(span)
+    .await
 }
 
 /// Drops the in-flight count taken by [`KeystoreManager::membership_for_delete`]

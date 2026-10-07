@@ -6,7 +6,7 @@ use super::*;
 fn test_slashing_adapter_import_invalid_json() {
     let db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let adapter = SlashingProtectionAdapter::new(db, [0u8; 32]);
-    let result = adapter.import_interchange("not valid json");
+    let result = futures::executor::block_on(adapter.import_interchange("not valid json"));
     assert!(result.is_err());
 }
 
@@ -21,7 +21,7 @@ fn test_slashing_adapter_import_valid() {
         },
         "data": []
     });
-    let result = adapter.import_interchange(&interchange.to_string());
+    let result = futures::executor::block_on(adapter.import_interchange(&interchange.to_string()));
     assert!(result.is_ok());
 }
 

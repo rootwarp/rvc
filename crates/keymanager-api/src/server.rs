@@ -209,6 +209,7 @@ mod tests {
         DeleteKeystoreError, DeleteRemoteKeyError, ImportKeystoreError, ImportRemoteKeyError,
         Pubkey,
     };
+    use async_trait::async_trait;
     use axum::http::StatusCode;
     use tower::ServiceExt;
 
@@ -264,6 +265,7 @@ mod tests {
     }
 
     struct StubKeystore;
+    #[async_trait]
     impl KeystoreManager for StubKeystore {
         fn list_keys(&self) -> Vec<Pubkey> {
             vec![]
@@ -271,7 +273,7 @@ mod tests {
         fn has_key(&self, _pubkey: &Pubkey) -> bool {
             false
         }
-        fn import_keystore(
+        async fn import_keystore(
             &self,
             _keystore_json: &str,
             _password: &str,
@@ -284,8 +286,9 @@ mod tests {
     }
 
     struct StubSlashing;
+    #[async_trait]
     impl SlashingProtection for StubSlashing {
-        fn import_interchange(
+        async fn import_interchange(
             &self,
             _interchange_json: &str,
         ) -> Result<(), crate::traits::SlashingProtectionError> {
@@ -506,6 +509,7 @@ mod tests {
 
     /// Slow `list_keys` so an in-flight GET holds the connection across cancel.
     struct SlowKeystore;
+    #[async_trait]
     impl KeystoreManager for SlowKeystore {
         fn list_keys(&self) -> Vec<Pubkey> {
             std::thread::sleep(Duration::from_millis(500));
@@ -514,7 +518,7 @@ mod tests {
         fn has_key(&self, _pubkey: &Pubkey) -> bool {
             false
         }
-        fn import_keystore(
+        async fn import_keystore(
             &self,
             _keystore_json: &str,
             _password: &str,

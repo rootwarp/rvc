@@ -197,9 +197,10 @@ impl SecondExportStall {
     }
 }
 
+#[async_trait]
 impl SlashingProtection for SecondExportStall {
-    fn import_interchange(&self, json: &str) -> Result<(), SlashingProtectionError> {
-        self.inner.import_interchange(json)
+    async fn import_interchange(&self, json: &str) -> Result<(), SlashingProtectionError> {
+        self.inner.import_interchange(json).await
     }
 
     fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError> {

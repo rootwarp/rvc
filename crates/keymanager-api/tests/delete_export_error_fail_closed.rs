@@ -20,6 +20,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use axum::extract::{Json, State};
 use rvc_keymanager_api::error::ApiError;
 use rvc_keymanager_api::handlers::{delete_keystores, AppState};
@@ -72,8 +73,12 @@ fn make_state(
 /// returns `Err`.  Used to simulate a corrupt or unavailable slashing DB.
 struct FailingExport;
 
+#[async_trait]
 impl SlashingProtection for FailingExport {
-    fn import_interchange(&self, _interchange_json: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(
+        &self,
+        _interchange_json: &str,
+    ) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
 
@@ -89,8 +94,9 @@ impl SlashingProtection for FailingExport {
 /// exercise the completeness / empty-record path in the adapter).
 struct RecordingExport;
 
+#[async_trait]
 impl SlashingProtection for RecordingExport {
-    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
 
@@ -145,6 +151,7 @@ impl CountingKeystoreManager {
     }
 }
 
+#[async_trait]
 impl KeystoreManager for CountingKeystoreManager {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.keys.clone()
@@ -154,7 +161,7 @@ impl KeystoreManager for CountingKeystoreManager {
         self.keys.contains(pubkey)
     }
 
-    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+    async fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
         unimplemented!("not exercised in this test")
     }
 

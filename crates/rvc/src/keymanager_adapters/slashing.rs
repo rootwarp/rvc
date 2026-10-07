@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use keymanager_api::traits::{Pubkey, SlashingProtection, SlashingProtectionError};
 use slashing::SlashingDb;
 
@@ -44,8 +45,12 @@ fn map_slashing_db_error(e: slashing::SlashingError) -> SlashingProtectionError 
     }
 }
 
+#[async_trait]
 impl SlashingProtection for SlashingProtectionAdapter {
-    fn import_interchange(&self, interchange_json: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(
+        &self,
+        interchange_json: &str,
+    ) -> Result<(), SlashingProtectionError> {
         let interchange: slashing::InterchangeFormat = serde_json::from_str(interchange_json)
             .map_err(|e| {
                 SlashingProtectionError::InvalidInterchange(format!("invalid JSON: {e}"))

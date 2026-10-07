@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::routing::post;
 use axum::Router;
 use http_body_util::BodyExt;
@@ -25,6 +26,7 @@ use rvc_keymanager_api::traits::{
 // ── Minimal mock implementations ──────────────────────────────────────────
 
 struct NoopKeystoreManager;
+#[async_trait]
 impl KeystoreManager for NoopKeystoreManager {
     fn list_keys(&self) -> Vec<Pubkey> {
         vec![]
@@ -32,7 +34,7 @@ impl KeystoreManager for NoopKeystoreManager {
     fn has_key(&self, _: &Pubkey) -> bool {
         false
     }
-    fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
+    async fn import_keystore(&self, _: &str, _: &str) -> Result<Pubkey, ImportKeystoreError> {
         Ok([0u8; 48])
     }
     fn delete_keystore(&self, _: &Pubkey) -> Result<bool, DeleteKeystoreError> {
@@ -41,8 +43,9 @@ impl KeystoreManager for NoopKeystoreManager {
 }
 
 struct NoopSlashingProtection;
+#[async_trait]
 impl SlashingProtection for NoopSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
     fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
