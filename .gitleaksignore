@@ -7,8 +7,8 @@ crates/crypto/examples/log_sample.rs:generic-api-key:27
 crates/crypto/src/key_manager.rs:generic-api-key:452
 crates/crypto/src/key_manager.rs:generic-api-key:704
 crates/crypto/src/key_manager.rs:generic-api-key:994
-crates/crypto/src/keystore.rs:generic-api-key:512
-crates/crypto/src/keystore.rs:generic-api-key:546
+crates/crypto/src/keystore.rs:generic-api-key:545
+crates/crypto/src/keystore.rs:generic-api-key:579
 # Same private-key stub as the 2026-09-29 baseline; the line moved 1356 → 1392.
 crates/grpc-signer/src/client.rs:private-key:1392
 crates/keymanager-api/src/auth.rs:generic-api-key:339
