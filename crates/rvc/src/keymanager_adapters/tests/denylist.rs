@@ -25,7 +25,7 @@ fn test_import_keystore_writes_import_meta_sidecar() {
     let before =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
-    futures::executor::block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
+    block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
 
     let after =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -62,7 +62,7 @@ fn test_delete_keystore_removes_import_meta_sidecar() {
     )
     .expect("encrypt");
     let keystore_json = serde_json::to_string(&keystore).unwrap();
-    futures::executor::block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
+    block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
 
     let meta_path = import_meta_path(dir.path(), &pk_bytes);
     assert!(meta_path.exists(), "sidecar should exist after import");
@@ -402,12 +402,12 @@ fn test_reimport_clears_denylist_and_allows_key_again() {
     .expect("encrypt");
     let keystore_json = serde_json::to_string(&keystore).unwrap();
 
-    futures::executor::block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
+    block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
     assert!(adapter.delete_keystore(&pk).unwrap());
     assert!(denylist.contains(&pk), "delete must denylist");
 
     // Intentional re-import clears denylist so the key is allowed again
-    futures::executor::block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
+    block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
     assert!(!denylist.contains(&pk), "re-import must clear denylist entry");
     assert!(adapter.has_key(&pk));
     assert!(composite.has_local_key(&pk));
@@ -465,7 +465,7 @@ fn test_failed_reimport_leaves_denylist_intact() {
     assert!(denylist.contains(&pk));
 
     // Invalid keystore JSON fails before any denylist mutation.
-    let err = futures::executor::block_on(adapter.import_keystore("not-valid-json", "password"));
+    let err = block_on(adapter.import_keystore("not-valid-json", "password"));
     assert!(matches!(err, Err(ImportKeystoreError::InvalidKeystore(_))));
 
     assert!(denylist.contains(&pk), "failed import must not clear denylist");
@@ -498,7 +498,7 @@ fn test_keymanager_import_iv_corrupted_keystore_returns_item_error() {
     keystore.crypto.cipher.params.iv = hex::encode([0u8; 8]);
     let json = keystore.to_json().expect("serialize");
 
-    let err = futures::executor::block_on(adapter.import_keystore(&json, password));
+    let err = block_on(adapter.import_keystore(&json, password));
     match err {
         Err(ImportKeystoreError::DecryptionFailed(msg)) => {
             assert!(

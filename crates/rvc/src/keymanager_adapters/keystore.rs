@@ -20,6 +20,7 @@ use crate::key_admission::{AdmissionOutcome, AdmissionSource, KeyAdmissionServic
 use crate::orchestrator::PubkeyMap;
 use crate::quiesce::{QuiesceRegistry, TrackedKeys};
 
+use super::kdf_budget::{KdfBudget, KdfBudgetConfig};
 use super::notifier::{pubkey_hex, KeyChangeNotifier};
 
 /// Adapts `CompositeSigner` local keys to the Keymanager `KeystoreManager` trait.
@@ -50,18 +51,24 @@ pub struct KeystoreManagerAdapter {
     /// Cleared by [`QuiesceRegistry::readmit`] after a successful import.
     quiesce: Option<Arc<QuiesceRegistry>>,
     #[cfg(test)]
-    after_admit: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    after_admit: TestHookSlot,
     #[cfg(test)]
-    after_readmit: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    after_readmit: TestHookSlot,
     #[cfg(test)]
-    after_delete_unlock: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    after_delete_unlock: TestHookSlot,
+    /// Runs inside the import `spawn_blocking` body, after the permit is moved
+    /// in and before `decrypt`.
+    #[cfg(test)]
+    during_blocking: TestHookSlot,
+    /// Import KDF admission (RR2-09/10). Decrypt runs only after [`KdfBudget::admit`].
+    kdf_budget: Arc<KdfBudget>,
     /// In-flight DELETE counts. Touched only while `tracked_keys` is held.
     ///
     /// `requests` is how many [`KeystoreManager::membership_for_delete`]
     /// snapshots have not yet been ended. `per_key` counts the pubkeys in
     /// those snapshots. [`KeystoreManager::end_delete_export`] decrements
     /// only the pubkeys that snapshot returned.
-    delete_inflight: Mutex<DeleteInflight>,
+    delete_inflight: Arc<Mutex<DeleteInflight>>,
     /// Shared pubkey map + generation notifier for the orchestrator (RF1-06 / RF1-07).
     /// Used for DELETE (`remove_and_notify`); import goes through [`KeyAdmissionService`].
     notifier: KeyChangeNotifier,
@@ -110,17 +117,20 @@ impl KeystoreManagerAdapter {
             keystore_dir,
             composite_signer,
             tracked_keys: Arc::new(TrackedKeys::new()),
-            delete_inflight: Mutex::new(DeleteInflight::default()),
+            kdf_budget: Arc::new(KdfBudget::new(KdfBudgetConfig::default())),
+            delete_inflight: Arc::new(Mutex::new(DeleteInflight::default())),
             notifier: KeyChangeNotifier::new(pubkey_map, key_gen_tx),
             denylist: None,
             admissions,
             quiesce: None,
             #[cfg(test)]
-            after_admit: Mutex::new(None),
+            after_admit: Arc::new(Mutex::new(None)),
             #[cfg(test)]
-            after_readmit: Mutex::new(None),
+            after_readmit: Arc::new(Mutex::new(None)),
             #[cfg(test)]
-            after_delete_unlock: Mutex::new(None),
+            after_delete_unlock: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            during_blocking: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -145,19 +155,31 @@ impl KeystoreManagerAdapter {
         self
     }
 
+    /// Replace the default import KDF budget. Production passes the RR2-10 knobs.
+    #[must_use]
+    pub fn with_kdf_budget(mut self, kdf_budget: Arc<KdfBudget>) -> Self {
+        self.kdf_budget = kdf_budget;
+        self
+    }
+
     #[cfg(test)]
-    pub(crate) fn set_after_admit_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+    pub(crate) fn set_after_admit_hook(&self, hook: TestHook) {
         *self.after_admit.lock() = Some(hook);
     }
 
     #[cfg(test)]
-    pub(crate) fn set_after_readmit_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+    pub(crate) fn set_after_readmit_hook(&self, hook: TestHook) {
         *self.after_readmit.lock() = Some(hook);
     }
 
     #[cfg(test)]
-    pub(crate) fn set_after_delete_unlock_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+    pub(crate) fn set_after_delete_unlock_hook(&self, hook: TestHook) {
         *self.after_delete_unlock.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_during_blocking_hook(&self, hook: TestHook) {
+        *self.during_blocking.lock() = Some(hook);
     }
 }
 
@@ -169,7 +191,13 @@ struct DeleteInflight {
 }
 
 #[cfg(test)]
-fn run_hook(slot: &Mutex<Option<Arc<dyn Fn() + Send + Sync>>>) {
+type TestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+type TestHookSlot = Arc<Mutex<Option<TestHook>>>;
+
+#[cfg(test)]
+fn run_hook(slot: &Mutex<Option<TestHook>>) {
     let hook = slot.lock().clone();
     if let Some(hook) = hook {
         hook();
@@ -279,6 +307,189 @@ fn remove_matching_keystore_files(
 
     Ok(())
 }
+/// Owned inputs for one import. The closure is `'static`, so every field is
+/// owned or an `Arc` clone. The KDF permit is *not* stored here: the
+/// `spawn_blocking` closure binds it so it cannot be dropped early.
+struct ImportJob {
+    keystore: Keystore,
+    keystore_json: String,
+    password: zeroize::Zeroizing<String>,
+    keystore_dir: PathBuf,
+    composite_signer: Arc<CompositeSigner>,
+    tracked_keys: Arc<TrackedKeys>,
+    delete_inflight: Arc<Mutex<DeleteInflight>>,
+    denylist: Option<Arc<DeletionDenylist>>,
+    admissions: Arc<KeyAdmissionService>,
+    quiesce: Option<Arc<QuiesceRegistry>>,
+    #[cfg(test)]
+    after_admit: TestHookSlot,
+    #[cfg(test)]
+    after_readmit: TestHookSlot,
+    #[cfg(test)]
+    during_blocking: TestHookSlot,
+}
+
+/// Decrypt, then the same check-and-admit the async method used to run inline.
+///
+/// `tracked_keys` / `delete_inflight` ordering is unchanged. Callers hold the
+/// KDF admission for the whole call.
+fn import_keystore_blocking(job: ImportJob) -> Result<Pubkey, ImportKeystoreError> {
+    let ImportJob {
+        keystore,
+        keystore_json,
+        password,
+        keystore_dir,
+        composite_signer,
+        tracked_keys,
+        delete_inflight,
+        denylist,
+        admissions,
+        quiesce,
+        #[cfg(test)]
+        after_admit,
+        #[cfg(test)]
+        after_readmit,
+        #[cfg(test)]
+        during_blocking,
+    } = job;
+
+    #[cfg(test)]
+    run_hook(&during_blocking);
+
+    let secret_key = keystore
+        .decrypt(password.as_bytes())
+        .map_err(|e| ImportKeystoreError::DecryptionFailed(e.to_string()))?;
+
+    let pubkey_bytes = secret_key.public_key().to_bytes();
+
+    // Hold lock for the entire check-and-insert to prevent TOCTOU race.
+    // Duplicate check uses the real local registry (not only API-tracked keys).
+    let mut keys = tracked_keys.lock();
+    if composite_signer.has_local_key(&pubkey_bytes) {
+        return Err(ImportKeystoreError::Duplicate);
+    }
+    // Absent, but a DELETE that snapshotted this key has not finished.
+    // Admitting here would `readmit` during that request's export.
+    if delete_inflight.lock().per_key.get(&pubkey_bytes).copied().unwrap_or(0) > 0 {
+        return Err(ImportKeystoreError::DeleteInProgress);
+    }
+
+    // Save keystore file to disk with restricted permissions (0o600)
+    let filename = format!("{}.json", pubkey_hex(pubkey_bytes));
+    let file_path = keystore_dir.join(&filename);
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&file_path)
+            .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+        file.write_all(keystore_json.as_bytes())
+            .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&file_path, keystore_json)
+            .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+    }
+
+    // M-12 (Critical #2): persist the import timestamp so that after a
+    // restart the doppelganger gate can detect keys whose window is still
+    // active and re-arm monitoring rather than treating them as safe.
+    let meta_path = import_meta_path(&keystore_dir, &pubkey_bytes);
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let meta_json = format!("{{\"imported_unix_seconds\":{}}}", now_unix);
+
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if let Ok(mut f) =
+            OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&meta_path)
+        {
+            let _ = f.write_all(meta_json.as_bytes());
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::write(&meta_path, meta_json.as_bytes());
+    }
+
+    // Multi-store admission (ARCH-2c): composite signer, PubkeyMap,
+    // ValidatorStore, doppelganger, key_gen bump — single choke point.
+    let outcome = admissions
+        .admit(secret_key, AdmissionSource::Keystore { keystore_path: file_path.clone() })
+        .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
+
+    match outcome {
+        AdmissionOutcome::Admitted { .. } => {}
+        AdmissionOutcome::AlreadyPresent { .. } => {
+            return Err(ImportKeystoreError::Duplicate);
+        }
+        AdmissionOutcome::SkippedDenylisted { .. } => {
+            // Keystore source does not enforce denylist inside admit;
+            // this branch is defensive.
+            return Err(ImportKeystoreError::Io(
+                "admission skipped denylisted key unexpectedly".into(),
+            ));
+        }
+    }
+
+    #[cfg(test)]
+    run_hook(&after_admit);
+
+    // Track the key (lock still held)
+    keys.push(pubkey_bytes);
+
+    // SEC-1b: clear denylist only *after* successful persistence + registry
+    // add so a mid-import IO failure cannot un-delete a previously deleted
+    // key (restart would otherwise re-load it from secret-provider).
+    if let Some(ref denylist) = denylist {
+        if let Err(e) = denylist.remove(&pubkey_bytes) {
+            // Key is already loaded and signable; surface IO so operators
+            // can repair the denylist file. Do not roll back the import.
+            // Do not readmit: a failed clear leaves the key quiesced.
+            return Err(ImportKeystoreError::Io(e.to_string()));
+        }
+    }
+
+    let delete_still_in_flight =
+        delete_inflight.lock().per_key.get(&pubkey_bytes).copied().unwrap_or(0) > 0;
+    if let Some(registry) = &quiesce {
+        if !delete_still_in_flight {
+            // admit's register_for_import leaves a deleted key Pending.
+            // Unmonitored (post-cancel, before that register) is closed too.
+            registry.readmit(&pubkey_bytes);
+        }
+    }
+
+    #[cfg(test)]
+    run_hook(&after_readmit);
+    // Hold `tracked_keys` through readmit. Releasing earlier would let a
+    // DELETE insert a quiescence that this readmit then erases.
+    drop(keys);
+
+    info!(
+        pubkey = %TruncatedPubkey::new(&hex::encode(pubkey_bytes)),
+        "Imported keystore"
+    );
+    Ok(pubkey_bytes)
+}
+
 #[async_trait]
 impl KeystoreManager for KeystoreManagerAdapter {
     /// Local keys the VC can sign with (`CompositeSigner::local_public_keys`).
@@ -336,146 +547,47 @@ impl KeystoreManager for KeystoreManagerAdapter {
         keystore_json: &str,
         password: &str,
     ) -> Result<Pubkey, ImportKeystoreError> {
+        // Parse on the async side (~1 KB) so admission can read r/N without
+        // occupying a blocking thread.
         let keystore: Keystore = serde_json::from_str(keystore_json)
             .map_err(|e| ImportKeystoreError::InvalidKeystore(e.to_string()))?;
 
-        let secret_key = keystore
-            .decrypt(password.as_bytes())
-            .map_err(|e| ImportKeystoreError::DecryptionFailed(e.to_string()))?;
+        // Async wait. A queued import holds no blocking thread.
+        let admit = self
+            .kdf_budget
+            .admit(crypto::kdf_working_set_bytes(&keystore))
+            .await
+            .map_err(|e| ImportKeystoreError::InvalidKeystore(e.to_string()))?;
 
-        let pubkey_bytes = secret_key.public_key().to_bytes();
+        let job = ImportJob {
+            keystore,
+            keystore_json: keystore_json.to_owned(),
+            password: zeroize::Zeroizing::new(password.to_owned()),
+            keystore_dir: self.keystore_dir.clone(),
+            composite_signer: Arc::clone(&self.composite_signer),
+            tracked_keys: Arc::clone(&self.tracked_keys),
+            delete_inflight: Arc::clone(&self.delete_inflight),
+            denylist: self.denylist.clone(),
+            admissions: Arc::clone(&self.admissions),
+            quiesce: self.quiesce.clone(),
+            #[cfg(test)]
+            after_admit: Arc::clone(&self.after_admit),
+            #[cfg(test)]
+            after_readmit: Arc::clone(&self.after_readmit),
+            #[cfg(test)]
+            during_blocking: Arc::clone(&self.during_blocking),
+        };
 
-        // Hold lock for the entire check-and-insert to prevent TOCTOU race.
-        // Duplicate check uses the real local registry (not only API-tracked keys).
-        let mut keys = self.tracked_keys.lock();
-        if self.composite_signer.has_local_key(&pubkey_bytes) {
-            return Err(ImportKeystoreError::Duplicate);
-        }
-        // Absent, but a DELETE that snapshotted this key has not finished.
-        // Admitting here would `readmit` during that request's export.
-        if self.delete_inflight.lock().per_key.get(&pubkey_bytes).copied().unwrap_or(0) > 0 {
-            return Err(ImportKeystoreError::DeleteInProgress);
-        }
-
-        // Save keystore file to disk with restricted permissions (0o600)
-        let filename = format!("{}.json", pubkey_hex(pubkey_bytes));
-        let file_path = self.keystore_dir.join(&filename);
-
-        #[cfg(unix)]
-        {
-            use std::fs::OpenOptions;
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&file_path)
-                .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
-            file.write_all(keystore_json.as_bytes())
-                .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
-        }
-
-        #[cfg(not(unix))]
-        {
-            std::fs::write(&file_path, keystore_json)
-                .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
-        }
-
-        // M-12 (Critical #2): persist the import timestamp so that after a
-        // restart the doppelganger gate can detect keys whose window is still
-        // active and re-arm monitoring rather than treating them as safe.
-        let meta_path = import_meta_path(&self.keystore_dir, &pubkey_bytes);
-        let now_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let meta_json = format!("{{\"imported_unix_seconds\":{}}}", now_unix);
-
-        #[cfg(unix)]
-        {
-            use std::fs::OpenOptions;
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-
-            if let Ok(mut f) = OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&meta_path)
-            {
-                let _ = f.write_all(meta_json.as_bytes());
-            }
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = std::fs::write(&meta_path, meta_json.as_bytes());
-        }
-
-        // Multi-store admission (ARCH-2c): composite signer, PubkeyMap,
-        // ValidatorStore, doppelganger, key_gen bump — single choke point.
-        let outcome = self
-            .admissions
-            .admit(secret_key, AdmissionSource::Keystore { keystore_path: file_path.clone() })
-            .map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
-
-        match outcome {
-            AdmissionOutcome::Admitted { .. } => {}
-            AdmissionOutcome::AlreadyPresent { .. } => {
-                return Err(ImportKeystoreError::Duplicate);
-            }
-            AdmissionOutcome::SkippedDenylisted { .. } => {
-                // Keystore source does not enforce denylist inside admit;
-                // this branch is defensive.
-                return Err(ImportKeystoreError::Io(
-                    "admission skipped denylisted key unexpectedly".into(),
-                ));
-            }
-        }
-
-        #[cfg(test)]
-        run_hook(&self.after_admit);
-
-        // Track the key (lock still held)
-        keys.push(pubkey_bytes);
-
-        // SEC-1b: clear denylist only *after* successful persistence + registry
-        // add so a mid-import IO failure cannot un-delete a previously deleted
-        // key (restart would otherwise re-load it from secret-provider).
-        if let Some(ref denylist) = self.denylist {
-            if let Err(e) = denylist.remove(&pubkey_bytes) {
-                // Key is already loaded and signable; surface IO so operators
-                // can repair the denylist file. Do not roll back the import.
-                // Do not readmit: a failed clear leaves the key quiesced.
-                return Err(ImportKeystoreError::Io(e.to_string()));
-            }
-        }
-
-        let delete_still_in_flight =
-            self.delete_inflight.lock().per_key.get(&pubkey_bytes).copied().unwrap_or(0) > 0;
-        if let Some(registry) = &self.quiesce {
-            if !delete_still_in_flight {
-                // admit's register_for_import leaves a deleted key Pending.
-                // Unmonitored (post-cancel, before that register) is closed too.
-                registry.readmit(&pubkey_bytes);
-            }
-        }
-
-        #[cfg(test)]
-        run_hook(&self.after_readmit);
-        // Hold `tracked_keys` through readmit. Releasing earlier would let a
-        // DELETE insert a quiescence that this readmit then erases.
-        drop(keys);
-
-        info!(
-            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey_bytes)),
-            "Imported keystore"
-        );
-        Ok(pubkey_bytes)
+        // The permit moves into the closure. A permit held on this future would
+        // drop when axum drops the handler on client disconnect, while decrypt
+        // kept running. `spawn_blocking` is outside the G-4 ban.
+        let joined = tokio::task::spawn_blocking(move || {
+            let _admit = admit;
+            import_keystore_blocking(job)
+        })
+        .await
+        .map_err(|e| ImportKeystoreError::Io(format!("keystore import task failed: {e}")))?;
+        joined
     }
 
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError> {

@@ -66,11 +66,21 @@ fn test_remote_adapter(
     (adapter, pubkey_map, rx)
 }
 
+/// Drive a future that needs a Tokio runtime (`KdfBudget::admit`, `spawn_blocking`).
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(fut)
+}
+
 mod config;
 mod delete_quiesce;
 mod denylist;
 mod exit;
 mod export_floor;
+mod import_budget;
 mod keystore;
 mod misc_adapters;
 mod pubkey_map;

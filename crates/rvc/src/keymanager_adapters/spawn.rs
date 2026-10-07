@@ -25,6 +25,7 @@ use crate::quiesce::{QuiesceRegistry, SigningQuiesceAdapter};
 
 use super::config::ValidatorConfigManagerAdapter;
 use super::doppelganger::{scan_and_rearm_gate, DoppelgangerDisabledMonitor, ForwardWindowMonitor};
+use super::kdf_budget::{KdfBudget, KdfBudgetConfig};
 use super::keystore::KeystoreManagerAdapter;
 use super::remote_keys::RemoteKeyManagerAdapter;
 use super::slashing::SlashingProtectionAdapter;
@@ -164,6 +165,7 @@ pub fn build_keymanager_api(
     }
 
     let km_composite = deps.composite_signer;
+    let kdf_budget = Arc::new(KdfBudget::new(KdfBudgetConfig::from_keymanager(&config.keymanager)));
     let keystore_mgr = Arc::new(
         KeystoreManagerAdapter::new(
             config.keystore_path.clone(),
@@ -173,7 +175,8 @@ pub fn build_keymanager_api(
         )
         .with_denylist(Arc::clone(&deps.deletion_denylist))
         .with_admission_service(deps.admissions)
-        .with_quiesce_registry(Arc::clone(&deps.quiesce_registry)),
+        .with_quiesce_registry(Arc::clone(&deps.quiesce_registry))
+        .with_kdf_budget(kdf_budget),
     );
     let tracked_keys = Arc::clone(&keystore_mgr.tracked_keys);
     let membership = Arc::clone(&km_composite);
