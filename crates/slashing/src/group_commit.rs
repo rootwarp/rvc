@@ -397,9 +397,12 @@ impl SlashingDb {
     fn enqueue_and_wait(&self, spec: ReserveSpec) -> Result<CommittedReservation, SlashingError> {
         let (tx, rx) = mpsc::sync_channel(1);
         let cancelled = Arc::new(AtomicBool::new(true));
-        let become_leader =
-            self.push_pending(QueuedReserve { spec, tx, cancelled: Arc::clone(&cancelled) }, true);
-        let wait = ReserveWait::arm(rx, cancelled);
+        // Arm before the item is queued. A leader can drain between push and
+        // arm; a still-cancelled member is skipped and its sender dropped, so
+        // the waiter sees "worker disconnected" even though it is about to wait.
+        // That window shows up when many attestation reserves arrive together.
+        let wait = ReserveWait::arm(rx, Arc::clone(&cancelled));
+        let become_leader = self.push_pending(QueuedReserve { spec, tx, cancelled }, true);
         if become_leader {
             self.lead_flush();
         }

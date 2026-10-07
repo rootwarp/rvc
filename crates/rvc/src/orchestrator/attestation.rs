@@ -9,10 +9,13 @@ use crate::metrics::{
     orchestrator_result, RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS, RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL,
     RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
 };
-use beacon::{AttesterDuty, LegacyAttestation, SingleAttestation, VersionedAttestation};
+use beacon::{
+    AttestationData as BeaconAttestationData, AttesterDuty, LegacyAttestation, SingleAttestation,
+    VersionedAttestation,
+};
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, Propagator};
 use duty_tracker::DutyTracker;
-use eth_types::{ForkName, Slot};
+use eth_types::{ForkName, ForkSchedule, Slot};
 use observability::logging::TruncatedPubkey;
 use signer::{SignerService, ValidatorSigner};
 use timing::{SlotClock, SLOTS_PER_EPOCH};
@@ -91,6 +94,83 @@ where
     validator_store: Arc<ValidatorStore>,
     /// Duties not pulled onto the sign pipeline before slot end.
     slot_end_drops: SlotEndDropCounter,
+}
+
+/// Attestation data for one `process_slot` call.
+///
+/// Not stored on the service: the next slot builds a new memo. `fork` is the
+/// duty slot's fork (`slot / SLOTS_PER_EPOCH`), which is known before the
+/// beacon response. `None` keys are post-Electra (one fetch for the slot);
+/// `Some(committee)` keys are pre-Electra.
+struct AttestationDataMemo {
+    slot: Slot,
+    fork: ForkName,
+    /// The shared post-Electra response was for a different fork, so `entries`
+    /// were refetched per committee.
+    degraded: bool,
+    entries: HashMap<Option<u64>, Result<Arc<BeaconAttestationData>, String>>,
+}
+
+#[derive(Clone, Copy)]
+struct MemoQuery {
+    key: Option<u64>,
+    /// Beacon API `committee_index`. Post-Electra this is 0, not the duty's committee.
+    committee_index: u64,
+}
+
+/// `None` once attestation data is shared across committees (Electra and later).
+fn memo_key(fork: ForkName, committee_index: u64) -> Option<u64> {
+    if utils::uses_electra_attestation_wire(fork) {
+        None
+    } else {
+        Some(committee_index)
+    }
+}
+
+fn distinct_committee_indexes(duties: &[AttesterDuty]) -> Vec<u64> {
+    let mut indexes = Vec::new();
+    for duty in duties {
+        if let Ok(index) = duty.committee_index.parse() {
+            indexes.push(index);
+        }
+    }
+    indexes.sort_unstable();
+    indexes.dedup();
+    indexes
+}
+
+fn memo_queries(fork: ForkName, committees: &[u64]) -> Vec<MemoQuery> {
+    if utils::uses_electra_attestation_wire(fork) {
+        // Beacon API: after Electra, `committee_index` must be 0. The duty
+        // committee is not part of the cache key.
+        vec![MemoQuery { key: None, committee_index: 0 }]
+    } else {
+        committees
+            .iter()
+            .copied()
+            .map(|committee_index| MemoQuery { key: Some(committee_index), committee_index })
+            .collect()
+    }
+}
+
+fn response_fork(data: &BeaconAttestationData, schedule: &ForkSchedule) -> Option<ForkName> {
+    let epoch = data.target.epoch.parse().ok()?;
+    Some(ForkName::from_epoch(epoch, schedule))
+}
+
+impl AttestationDataMemo {
+    fn get(&self, committee_index: u64) -> Result<Arc<BeaconAttestationData>, String> {
+        let key = if self.degraded {
+            Some(committee_index)
+        } else {
+            memo_key(self.fork, committee_index)
+        };
+        match self.entries.get(&key) {
+            Some(Ok(data)) => Ok(Arc::clone(data)),
+            Some(Err(error)) => Err(error.clone()),
+            None => Err("Attestation data was not fetched for this duty".to_string()),
+        }
+    }
 }
 
 impl<C, S> AttestationService<C, S>
@@ -193,12 +273,14 @@ where
         info!(slot = slot, duty_count = duties.len(), "Found attestation duties");
         RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS.set(duties.len() as f64);
 
+        let memo = self.load_attestation_data_memo(slot, &duties, slot_end).await;
+
         let duty_count = duties.len();
         let concurrency = self.config.dispatch_limits.concurrency as usize;
         let publish_concurrency = self.config.dispatch_limits.publish_concurrency as usize;
         let waves = stream::iter(duties)
             .take_until(tokio::time::sleep_until(slot_end))
-            .map(|duty| self.sign_one(duty))
+            .map(|duty| self.sign_one(duty, &memo))
             .buffer_unordered(concurrency)
             .ready_chunks(concurrency)
             .map(|wave| self.publish_wave(slot, slot_end, wave))
@@ -251,15 +333,154 @@ where
         Ok(results)
     }
 
+    /// Fill the per-slot memo before signing.
+    ///
+    /// Distinct keys run under `dispatch_limits.concurrency`, so k pre-Electra
+    /// committees cost `ceil(k / concurrency)` round trips. A key that fails
+    /// is stored as `Err` and fails only the duties that share that key.
+    /// Each key gets at most one retry, and both attempts share
+    /// `timeouts.attestation_fetch` — a second budget is not started.
+    ///
+    /// When the duty-slot fork says the data is shared but the response's
+    /// target epoch resolves to a different fork, the shared entry is dropped
+    /// and each committee is fetched on its own. Per-duty normalization still
+    /// uses that response fork.
+    async fn load_attestation_data_memo(
+        &self,
+        slot: Slot,
+        duties: &[AttesterDuty],
+        slot_end: tokio::time::Instant,
+    ) -> AttestationDataMemo {
+        let fork = ForkName::from_epoch(slot / SLOTS_PER_EPOCH, &self.config.fork_schedule);
+        let committees = distinct_committee_indexes(duties);
+        if tokio::time::Instant::now() >= slot_end || committees.is_empty() {
+            return AttestationDataMemo { slot, fork, degraded: false, entries: HashMap::new() };
+        }
+
+        let queries = memo_queries(fork, &committees);
+        let mut entries = self.fetch_memo_entries(slot, &queries).await;
+        let mut degraded = false;
+        if utils::uses_electra_attestation_wire(fork) {
+            let disagrees =
+                entries.get(&None).and_then(|result| result.as_ref().ok()).is_some_and(|data| {
+                    response_fork(data, &self.config.fork_schedule)
+                        .is_some_and(|response| response != fork)
+                });
+            if disagrees {
+                degraded = true;
+                let per_committee: Vec<MemoQuery> = committees
+                    .iter()
+                    .copied()
+                    .map(|committee_index| MemoQuery {
+                        key: Some(committee_index),
+                        committee_index,
+                    })
+                    .collect();
+                entries = self.fetch_memo_entries(slot, &per_committee).await;
+                debug!(
+                    slot,
+                    memo_fork = ?fork,
+                    committees = committees.len(),
+                    "attestation data fork disagreed with the duty slot; fetched per committee"
+                );
+            }
+        }
+
+        debug!(
+            slot,
+            fork = ?fork,
+            keys = entries.len(),
+            degraded,
+            "attestation data memo ready"
+        );
+        AttestationDataMemo { slot, fork, degraded, entries }
+    }
+
+    async fn fetch_memo_entries(
+        &self,
+        slot: Slot,
+        queries: &[MemoQuery],
+    ) -> HashMap<Option<u64>, Result<Arc<BeaconAttestationData>, String>> {
+        if queries.is_empty() {
+            return HashMap::new();
+        }
+        let concurrency = self.config.dispatch_limits.concurrency as usize;
+        let fetched: Vec<_> = stream::iter(queries.iter().copied())
+            .map(|query| self.fetch_memo_query(slot, query))
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+        fetched.into_iter().collect()
+    }
+
+    async fn fetch_memo_query(
+        &self,
+        slot: Slot,
+        query: MemoQuery,
+    ) -> (Option<u64>, Result<Arc<BeaconAttestationData>, String>) {
+        let result = self.fetch_attestation_data_with_retry(slot, query.committee_index).await;
+        (query.key, result)
+    }
+
+    /// One attempt, and a second only when the first failed before the deadline.
+    async fn fetch_attestation_data_with_retry(
+        &self,
+        slot: Slot,
+        committee_index: u64,
+    ) -> Result<Arc<BeaconAttestationData>, String> {
+        let deadline = tokio::time::Instant::now() + self.config.timeouts.attestation_fetch;
+        match self.fetch_attestation_data_attempt(slot, committee_index, deadline).await {
+            Ok(data) => Ok(data),
+            Err(first) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(first);
+                }
+                debug!(
+                    slot,
+                    committee_index,
+                    error = %first,
+                    "retrying attestation data fetch inside attestation_fetch"
+                );
+                self.fetch_attestation_data_attempt(slot, committee_index, deadline).await
+            }
+        }
+    }
+
+    async fn fetch_attestation_data_attempt(
+        &self,
+        slot: Slot,
+        committee_index: u64,
+        deadline: tokio::time::Instant,
+    ) -> Result<Arc<BeaconAttestationData>, String> {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("Timeout getting attestation data from beacon node".to_string());
+        }
+        let result = tokio::time::timeout_at(
+            deadline,
+            self.beacon.get_attestation_data(slot, committee_index),
+        )
+        .instrument(info_span!("beacon.get_attestation_data", slot, committee_index))
+        .await;
+        match result {
+            Ok(Ok(response)) => Ok(Arc::new(response.data)),
+            Ok(Err(error)) => Err(format!("Failed to get attestation data: {error}")),
+            Err(_elapsed) => Err("Timeout getting attestation data from beacon node".to_string()),
+        }
+    }
+
     /// Produce and sign one duty. Publish is a later wave, not this future.
-    async fn sign_one(&self, duty: AttesterDuty) -> Result<WaveEntry, AttestationResult> {
+    async fn sign_one(
+        &self,
+        duty: AttesterDuty,
+        memo: &AttestationDataMemo,
+    ) -> Result<WaveEntry, AttestationResult> {
         let validator_index = duty.validator_index.clone();
         let pubkey = duty.pubkey.clone();
         // Updated as soon as the duty slot parses successfully; stays 0 on
         // that first failure so the outer result still has a defined slot.
         let mut slot: Slot = 0;
 
-        match self.attest(&duty, &validator_index, &mut slot).await {
+        match self.attest(&duty, &validator_index, &mut slot, memo).await {
             Ok(attestation) => Ok(WaveEntry {
                 attribution: WaveAttribution { validator_index, pubkey, slot },
                 attestation,
@@ -448,8 +669,10 @@ where
         duty: &AttesterDuty,
         validator_index: &str,
         slot: &mut Slot,
+        memo: &AttestationDataMemo,
     ) -> Result<VersionedAttestation, String> {
         *slot = duty.slot.parse().map_err(|_| format!("Invalid slot in duty: {}", duty.slot))?;
+        debug_assert_eq!(memo.slot, *slot);
 
         let committee_index: u64 = duty
             .committee_index
@@ -476,25 +699,9 @@ where
         let pubkey = utils::find_pubkey(&self.pubkey_map, &duty.pubkey)
             .ok_or_else(|| format!("Public key not found: {}", duty.pubkey))?;
 
-        // Apply timeout to beacon client call to prevent blocking
-        let attestation_data_result = tokio::time::timeout(
-            self.config.timeouts.attestation_fetch,
-            self.beacon.get_attestation_data(*slot, committee_index),
-        )
-        .instrument(info_span!(parent: &att_span, "beacon.get_attestation_data"))
-        .await;
-
-        let attestation_data_response = match attestation_data_result {
-            Ok(Ok(response)) => response,
-            Ok(Err(e)) => {
-                return Err(format!("Failed to get attestation data: {}", e));
-            }
-            Err(_) => {
-                return Err("Timeout getting attestation data from beacon node".to_string());
-            }
-        };
-
-        let beacon_attestation_data = attestation_data_response.data;
+        // Fetched once per memo key before this sign stream. Normalization below
+        // still uses the response's target epoch, not `memo.fork`.
+        let beacon_attestation_data = (*memo.get(committee_index)?).clone();
 
         debug!(
             validator_index = %validator_index,
@@ -1088,6 +1295,15 @@ mod dispatch_pipeline {
         Fixture { service, beacon, signer, _db_dir: db_dir }
     }
 
+    struct SleepBarrier(Duration);
+
+    #[async_trait]
+    impl PreReserveBarrier for SleepBarrier {
+        async fn wait(&self) {
+            tokio::time::sleep(self.0).await;
+        }
+    }
+
     struct OverlapBarrier {
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
@@ -1179,8 +1395,8 @@ mod dispatch_pipeline {
         (count, window)
     }
 
-    /// N = 64 duties, 50 ms mock RTT, paused clock. Every sign request is issued
-    /// inside one RTT. The sequential loop spaces them 64 RTTs apart.
+    /// N = 64 Electra duties, 50 ms mock RTT, paused clock. The slot shares one
+    /// attestation-data fetch (committee index 0), issued inside that RTT.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn attestation_dispatch_issues_all_sign_requests_within_one_rtt() {
         const N: usize = 64;
@@ -1200,10 +1416,11 @@ mod dispatch_pipeline {
             "every duty should publish: {results:?}"
         );
         let (count, window) = sign_request_window(&fixture.beacon);
-        assert_eq!(count, N, "one get_attestation_data per duty");
+        assert_eq!(count, 1, "Electra slot shares one get_attestation_data");
+        assert_eq!(fixture.beacon.get_attestation_data_calls(), vec![(SLOT, 0)]);
         assert!(
             window <= Duration::from_millis(50),
-            "all 64 sign requests must be issued within one 50 ms RTT, spread was {window:?}"
+            "the shared fetch must be issued within one 50 ms RTT, spread was {window:?}"
         );
     }
 
@@ -1226,24 +1443,23 @@ mod dispatch_pipeline {
     }
 
     /// Signs already inside `buffer_unordered` finish after `take_until` stops
-    /// pulling new duties.
+    /// pulling new duties. Attestation data is fetched before that stream, so
+    /// the hold is the pre-reserve barrier rather than the beacon fetch.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn in_flight_signs_complete_when_slot_end_stops_new_dispatch() {
         const N: usize = 8;
         let fixture = open_fixture(
             N,
-            FixtureOpts {
-                only_delay: Some((MockMethod::GetAttestationData, Duration::from_millis(50))),
-                concurrency: 4,
-                publish_concurrency: 2,
-                ..FixtureOpts::default()
-            },
+            FixtureOpts { concurrency: 4, publish_concurrency: 2, ..FixtureOpts::default() },
         );
+        fixture
+            .signer
+            .set_pre_reserve_barrier(Some(Arc::new(SleepBarrier(Duration::from_millis(50)))));
         let slot_end = tokio::time::Instant::now() + Duration::from_millis(25);
         let results = fixture.service.process_slot_until(SLOT, slot_end).await.expect("drain");
         assert_eq!(results.len(), 4, "the in-flight wave completes");
         assert!(results.iter().all(|result| result.success), "{results:?}");
-        assert_eq!(fixture.beacon.get_attestation_data_calls().len(), 4);
+        assert_eq!(fixture.beacon.get_attestation_data_calls(), vec![(SLOT, 0)]);
         assert_eq!(fixture.service.slot_end_drops(), 4);
     }
 
@@ -1277,7 +1493,7 @@ mod dispatch_pipeline {
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|result| result.success), "{results:?}");
         assert!(results.iter().all(|result| result.validator_index != "1001"));
-        assert_eq!(fixture.beacon.get_attestation_data_calls().len(), 3);
+        assert_eq!(fixture.beacon.get_attestation_data_calls(), vec![(SLOT, 0)]);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
