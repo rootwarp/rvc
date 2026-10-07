@@ -57,6 +57,14 @@
 //! aggregate, contribution, or payload_attestation. The sample is milliseconds
 //! from the true slot start, including a late wake. Buckets match
 //! `rvc_slot_phase_block_start_offset_ms`, which is retained for dashboards.
+//! RR2-12 adds `rvc_slashing_import_duration_ms` and
+//! `rvc_slashing_import_conn_hold_ms` (family delta +2). Duration is one sample
+//! per interchange import call. Conn-hold is `conn.lock()` through `COMMIT`;
+//! a rollback after the lock is taken still records one hold sample, and a
+//! rejection before the lock records none. Buckets are 10, 25, 50, 100, 250,
+//! 500, 1000, 2500, 5000, and 10000 milliseconds. Neither family has labels.
+//! Dashboards that watch import latency or connection occupancy should bind
+//! these names (RR4-05 / #541).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -140,6 +148,8 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_slashing_export_synthetic_records_total", // operator-facing: synthetic floors in an interchange export (RR-4.3)
     "rvc_slashing_group_commit_batch_size", // operator-facing: reserves drained into one group-commit (RR0-07)
     "rvc_slashing_import_conflicts_total", // operator-facing: dropped interchange import rows (RR-4.2)
+    "rvc_slashing_import_conn_hold_ms", // operator-facing: interchange import conn.lock through COMMIT (RR2-12 / #525)
+    "rvc_slashing_import_duration_ms", // operator-facing: whole interchange import call (RR2-12 / #525)
     "rvc_slashing_protection_checks_total",
     "rvc_slashing_prune_source_bound_raised_total", // operator-facing: prune raised an attestation source floor (RR-4.1)
     "rvc_slashing_reconcile_total",
@@ -257,8 +267,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        56,
-        "RR1-05 adds rvc_slot_phase_offset_ms; count is the list length"
+        58,
+        "RR2-12 adds import duration and conn-hold histograms; count is the list length"
     );
 }
 

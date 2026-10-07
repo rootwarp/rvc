@@ -4,10 +4,12 @@
 mod support;
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use proptest::prelude::*;
 use rvc_slashing::metrics::{
     RVC_SLASHING_EXPORT_SYNTHETIC_RECORDS_TOTAL, RVC_SLASHING_IMPORT_CONFLICTS_TOTAL,
+    RVC_SLASHING_IMPORT_CONN_HOLD_MS, RVC_SLASHING_IMPORT_DURATION_MS,
 };
 use rvc_slashing::{
     AttestationSlashingViolation, BlockSlashingViolation, InterchangeAttestation, InterchangeBlock,
@@ -22,6 +24,13 @@ static CONFLICT_METRIC: Mutex<()> = Mutex::new(());
 /// Same for synthetic-export increments. Proptest and the fixture tests share
 /// the process counter.
 static EXPORT_METRIC: Mutex<()> = Mutex::new(());
+
+/// Import timing histograms are process-global. Hold this across a delta so
+/// another import in this process cannot land between the snapshots.
+static IMPORT_TIMING_METRIC: Mutex<()> = Mutex::new(());
+
+const IMPORT_MS_BUCKETS: [f64; 10] =
+    [10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0];
 
 const OTHER_PUBKEY: &str = "0xaaaa";
 /// Row and watermark domain for the export proptest, and the candidate grid.
@@ -67,6 +76,22 @@ fn interchange(
 
 fn conflicts() -> u64 {
     RVC_SLASHING_IMPORT_CONFLICTS_TOTAL.get()
+}
+
+fn hold_samples() -> u64 {
+    RVC_SLASHING_IMPORT_CONN_HOLD_MS.get_sample_count()
+}
+
+fn duration_samples() -> u64 {
+    RVC_SLASHING_IMPORT_DURATION_MS.get_sample_count()
+}
+
+fn hold_sum_ms() -> f64 {
+    RVC_SLASHING_IMPORT_CONN_HOLD_MS.get_sample_sum()
+}
+
+fn duration_sum_ms() -> f64 {
+    RVC_SLASHING_IMPORT_DURATION_MS.get_sample_sum()
 }
 
 #[tracing_test::traced_test]
@@ -817,4 +842,159 @@ fn export_import_export_is_non_weakening_and_bounded_by_the_surviving_maxima() {
     let block = Candidate::Block { slot: 5, signing_root: Some("0xfresh-slot".into()) };
     assert!(!refuses(&first, PUBKEY, &block), "first file allows slot 5");
     assert!(refuses(&second, PUBKEY, &block), "second file refuses slot 5");
+}
+
+/// RR2-12: both import histograms exist at init, with the stated buckets, and
+/// a scrape before any import sees zero samples.
+#[test]
+fn import_histograms_are_registered_at_init_with_stated_buckets() {
+    rvc_slashing::metrics::init();
+    let gathered = metrics::REGISTRY.gather();
+    for name in ["rvc_slashing_import_duration_ms", "rvc_slashing_import_conn_hold_ms"] {
+        let family = gathered.iter().find(|metric| metric.name() == name).unwrap_or_else(|| {
+            panic!("{name} must be registered at init");
+        });
+        assert_eq!(family.get_metric().len(), 1, "{name} has no labels");
+        let histogram = family.get_metric()[0].get_histogram();
+        assert_eq!(histogram.get_sample_count(), 0, "{name} scrape sees zero before any import");
+        let bounds: Vec<f64> = histogram
+            .get_bucket()
+            .iter()
+            .map(|bucket| bucket.upper_bound())
+            .filter(|bound| bound.is_finite())
+            .collect();
+        assert_eq!(bounds, IMPORT_MS_BUCKETS, "{name} buckets");
+    }
+}
+
+/// RR2-12: one small valid import records exactly one hold sample and one
+/// duration sample.
+#[test]
+fn import_records_one_conn_hold_sample() {
+    let _guard = IMPORT_TIMING_METRIC.lock().expect("import timing metric");
+    let db = SlashingDb::open_in_memory().expect("open");
+    let gvr = chain_gvr();
+    let hold_before = hold_samples();
+    let duration_before = duration_samples();
+
+    db.import(&interchange(vec![att("1", "2", None)], vec![]), &gvr).expect("small import");
+
+    assert_eq!(hold_samples(), hold_before + 1, "one import records one conn-hold sample");
+    assert_eq!(duration_samples(), duration_before + 1, "one import records one duration sample");
+}
+
+/// RR2-12: `conn_hold_ms` is `conn.lock()` → `COMMIT` only.
+///
+/// A format-version rejection and a genesis-validators-root rejection happen
+/// before the lock, so they record a duration sample and no hold sample.
+/// A successful import whose pre-lock work is paused records a hold sample
+/// much smaller than the whole call: the pause stands in for a payload that
+/// parses slowly and then commits quickly. Numeric field parsing stays inside
+/// the lock (the #526 baseline).
+#[test]
+fn import_conn_hold_covers_lock_to_commit_not_pre_lock_parse() {
+    let _guard = IMPORT_TIMING_METRIC.lock().expect("import timing metric");
+    let db = SlashingDb::open_in_memory().expect("open");
+    let gvr = chain_gvr();
+
+    let hold_before = hold_samples();
+    let duration_before = duration_samples();
+    let bad_version = InterchangeFormat {
+        metadata: InterchangeMetadata {
+            interchange_format_version: "4".to_string(),
+            genesis_validators_root: CHAIN_GVR_HEX.to_string(),
+        },
+        data: vec![],
+    };
+    let err = db.import(&bad_version, &gvr).expect_err("unsupported version");
+    assert!(matches!(err, SlashingError::InvalidInterchangeFormat(_)));
+    assert_eq!(hold_samples(), hold_before, "format-version check must not take conn");
+    assert_eq!(duration_samples(), duration_before + 1, "the whole call is still timed");
+
+    let hold_before = hold_samples();
+    let duration_before = duration_samples();
+    let bad_gvr = InterchangeFormat {
+        metadata: InterchangeMetadata {
+            interchange_format_version: "5".to_string(),
+            genesis_validators_root: "0xnot-a-root".to_string(),
+        },
+        data: vec![],
+    };
+    let err = db.import(&bad_gvr, &gvr).expect_err("gvr mismatch");
+    assert!(matches!(err, SlashingError::GenesisValidatorsRootMismatch { .. }));
+    assert_eq!(hold_samples(), hold_before, "GVR check must not take conn");
+    assert_eq!(duration_samples(), duration_before + 1);
+
+    let pause = Duration::from_millis(80);
+    SlashingDb::set_import_pre_lock_pause_for_test(Some(pause));
+    struct ClearPause;
+    impl Drop for ClearPause {
+        fn drop(&mut self) {
+            SlashingDb::set_import_pre_lock_pause_for_test(None);
+        }
+    }
+    let _clear = ClearPause;
+
+    let hold_before = hold_samples();
+    let duration_before = duration_samples();
+    let hold_sum_before = hold_sum_ms();
+    let duration_sum_before = duration_sum_ms();
+    db.import(&interchange(vec![att("3", "4", None)], vec![]), &gvr)
+        .expect("slow parse, quick commit");
+    assert_eq!(hold_samples(), hold_before + 1);
+    assert_eq!(duration_samples(), duration_before + 1);
+    let hold_ms = hold_sum_ms() - hold_sum_before;
+    let duration_ms = duration_sum_ms() - duration_sum_before;
+    let pause_ms = pause.as_secs_f64() * 1000.0;
+    assert!(
+        duration_ms + 5.0 >= pause_ms,
+        "duration {duration_ms} ms must include the {pause_ms} ms pre-lock pause"
+    );
+    assert!(
+        hold_ms < duration_ms - pause_ms / 2.0,
+        "conn_hold {hold_ms} ms is lock→COMMIT; duration {duration_ms} ms includes the pre-lock pause"
+    );
+}
+
+/// RR2-12: a rollback after the lock is taken still records exactly one hold
+/// sample, and the partial inserts do not land (SC-02).
+#[test]
+fn import_rollback_records_one_conn_hold_sample() {
+    let _guard = IMPORT_TIMING_METRIC.lock().expect("import timing metric");
+    let db = SlashingDb::open_in_memory().expect("open");
+    let gvr = chain_gvr();
+    let hold_before = hold_samples();
+    let duration_before = duration_samples();
+
+    let file = InterchangeFormat {
+        metadata: InterchangeMetadata {
+            interchange_format_version: "5".to_string(),
+            genesis_validators_root: CHAIN_GVR_HEX.to_string(),
+        },
+        data: vec![
+            ValidatorRecord {
+                pubkey: PUBKEY.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![att("1", "2", None)],
+            },
+            ValidatorRecord {
+                pubkey: OTHER_PUBKEY.to_string(),
+                signed_blocks: vec![],
+                signed_attestations: vec![att("not_a_number", "3", None)],
+            },
+        ],
+    };
+    let err = db.import(&file, &gvr).expect_err("malformed epoch rolls the transaction back");
+    assert!(matches!(err, SlashingError::InvalidInterchangeFormat(_)));
+    assert_eq!(hold_samples(), hold_before + 1, "rollback records exactly one hold sample");
+    assert_eq!(
+        duration_samples(),
+        duration_before + 1,
+        "rollback records exactly one duration sample"
+    );
+    assert!(
+        db.get_attestations(PUBKEY).expect("rows").is_empty(),
+        "rolled-back import must not keep the valid prefix"
+    );
+    assert!(db.get_attestations(OTHER_PUBKEY).expect("rows").is_empty());
 }
