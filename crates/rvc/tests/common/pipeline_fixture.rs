@@ -15,8 +15,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use beacon::{
     AttestationData as BeaconAttestationData, AttesterDuty, BeaconError,
-    Checkpoint as BeaconCheckpoint, DataResponse, ExecutionOptimisticResponse,
-    SubmitAttestationResult, VersionedAggregateAttestation, VersionedAttestation,
+    Checkpoint as BeaconCheckpoint, DataResponse, DependentRootResponse,
+    ExecutionOptimisticResponse, ProposerDuty, SubmitAttestationResult,
+    VersionedAggregateAttestation, VersionedAttestation,
 };
 use block_service::{
     BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse as BlockProdResp,
@@ -39,7 +40,7 @@ use signer::{always_enabled, SignerService};
 use slashing::SlashingDb;
 use timing::MockSlotClock;
 use tokio::sync::watch;
-use validator_store::{ValidatorConfig, ValidatorStore};
+use validator_store::{BlockSelectionMode, ValidatorConfig, ValidatorStore};
 
 // ── constants ────────────────────────────────────────────────────────────────
 
@@ -47,6 +48,14 @@ pub const TEST_GENESIS_TIME: u64 = 1_606_824_023;
 pub const SLOTS_PER_EPOCH: u64 = 32;
 pub const VALIDATOR_INDEX: &str = "1";
 pub const COMMITTEE_INDEX: &str = "0";
+
+/// Parent byte of `eth_types::external_vector_deneb_block`.
+///
+/// H-4 compares the produced block's `parent_root` with the slot-context
+/// walk-back. The Deneb production path serves this byte from `get_block_root`.
+const DENEB_PARENT_BYTE: u8 = 0x11;
+/// Block root the attester-only fixture has always returned.
+const DEFAULT_BLOCK_ROOT_BYTE: u8 = 0xbb;
 
 /// Slot pair in the same epoch used for the double-vote / import scenarios.
 pub const SLOT_A: Slot = 100; // epoch 3
@@ -252,6 +261,176 @@ impl BeaconBlockClient for NoopBlockBeacon {
     }
 }
 
+/// How [`pipeline_fixture`] answers `produce_block_v3` / `produce_block_v4`.
+///
+/// [`Self::Noop`] is the historical [`NoopBlockBeacon`] (`Err`). It stays the
+/// default so existing fixture consumers keep that beacon. [`Self::Deneb`]
+/// returns `eth_types::external_vector_deneb_block` with the duty slot and
+/// proposer index written over the vector header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum FixtureBlockProduction {
+    /// `produce_block_v3` and `produce_block_v4` return `Err("noop")`.
+    #[default]
+    Noop,
+    /// Succeeding Deneb body from `eth-types`'s `test-fixtures` feature.
+    Deneb,
+}
+
+enum FixtureBlockMode {
+    Noop,
+    Deneb { validator_index: u64 },
+}
+
+/// Block beacon wired into the pipeline fixture.
+///
+/// [`Self::noop`] delegates to [`NoopBlockBeacon`]. [`Self::deneb`] produces a
+/// valid Deneb block. Publish methods on the Deneb path accept the signed block.
+pub struct FixtureBlockBeacon {
+    mode: FixtureBlockMode,
+}
+
+impl FixtureBlockBeacon {
+    /// Historical `Err`-returning beacon.
+    pub fn noop() -> Self {
+        Self { mode: FixtureBlockMode::Noop }
+    }
+
+    /// Succeeding production of the external Deneb block vector.
+    pub fn deneb(validator_index: u64) -> Self {
+        Self { mode: FixtureBlockMode::Deneb { validator_index } }
+    }
+}
+
+/// Deneb `ProduceBlockResponse` from the eth-types test vector.
+///
+/// Slot and proposer index are the duty's. `parent_root` stays the vector's
+/// `[0x11; 32]` so it matches [`DENEB_PARENT_BYTE`].
+fn deneb_block_response(
+    slot: Slot,
+    validator_index: u64,
+) -> Result<BlockProdResp, BlockServiceError> {
+    let mut block = eth_types::external_vector_deneb_block();
+    block.slot = slot;
+    block.proposer_index = validator_index;
+    block.parent_root = [DENEB_PARENT_BYTE; 32];
+    Ok(BlockProdResp {
+        data: serde_json::to_value(&block).map_err(|e| BlockServiceError::Parse(e.to_string()))?,
+        is_blinded: false,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some("0".to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+    })
+}
+
+#[async_trait]
+impl BeaconBlockClient for FixtureBlockBeacon {
+    async fn produce_block_v3(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+    ) -> Result<BlockProdResp, BlockServiceError> {
+        match self.mode {
+            FixtureBlockMode::Noop => {
+                NoopBlockBeacon
+                    .produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor)
+                    .await
+            }
+            FixtureBlockMode::Deneb { validator_index } => {
+                deneb_block_response(slot, validator_index)
+            }
+        }
+    }
+
+    async fn produce_block_v4(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<BlockProdResp, BlockServiceError> {
+        match self.mode {
+            FixtureBlockMode::Noop => {
+                NoopBlockBeacon
+                    .produce_block_v4(slot, randao_reveal, graffiti, builder_config)
+                    .await
+            }
+            FixtureBlockMode::Deneb { validator_index } => {
+                deneb_block_response(slot, validator_index)
+            }
+        }
+    }
+
+    async fn publish_block(
+        &self,
+        signed_block: &eth_types::SignedBeaconBlock,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        NoopBlockBeacon.publish_block(signed_block, consensus_version, builder_url).await
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        signed_block: &eth_types::SignedBlindedBeaconBlock,
+        consensus_version: &str,
+    ) -> Result<(), BlockServiceError> {
+        NoopBlockBeacon.publish_blinded_block(signed_block, consensus_version).await
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+        builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        NoopBlockBeacon
+            .publish_block_ssz(ssz_bytes, consensus_version, is_blinded, builder_url)
+            .await
+    }
+
+    async fn publish_block_contents(
+        &self,
+        contents: &eth_types::SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        match self.mode {
+            FixtureBlockMode::Noop => {
+                NoopBlockBeacon
+                    .publish_block_contents(contents, consensus_version, builder_url)
+                    .await
+            }
+            FixtureBlockMode::Deneb { .. } => Ok(()),
+        }
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &block_service::WireBody,
+        blobs: &block_service::WireBody,
+        kzg_proofs: &block_service::WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        NoopBlockBeacon
+            .publish_execution_payload_envelope(
+                signed_envelope,
+                blobs,
+                kzg_proofs,
+                consensus_version,
+                broadcast_validation,
+            )
+            .await
+    }
+}
+
 // ── mock beacon with per-slot attestation data (shared mock, RF4-24) ─────────
 
 /// One seeded validator registered when [`PipelineFixtureOpts::with_validators`]
@@ -293,6 +472,14 @@ pub struct PipelineBeacon {
     /// When set, attester duties use a committee length that selects every
     /// validator as an aggregator, and the aggregate fetch/submit hooks are on.
     aggregators: bool,
+    /// When set, `get_proposer_duties` returns one duty per [`Self::duty_slots`]
+    /// entry for [`Self::proposer_validator_index`].
+    proposer: bool,
+    /// Beacon `validator_index` string on those proposer duties.
+    proposer_validator_index: String,
+    /// Byte repeated into the slot-aware block root (`0xbb` historically,
+    /// [`DENEB_PARENT_BYTE`] when Deneb production is selected).
+    block_root_byte: u8,
 }
 
 impl PipelineBeacon {
@@ -309,6 +496,9 @@ impl PipelineBeacon {
             single_pubkey: [0u8; 48],
             sync_committee: false,
             aggregators: false,
+            proposer: false,
+            proposer_validator_index: VALIDATOR_INDEX.to_string(),
+            block_root_byte: DEFAULT_BLOCK_ROOT_BYTE,
         }
     }
 
@@ -326,6 +516,13 @@ impl PipelineBeacon {
         self.single_pubkey = single_pubkey;
         self.sync_committee = sync_committee;
         self.aggregators = aggregators;
+        self
+    }
+
+    fn with_proposal(mut self, proposer: bool, validator_index: u64, block_root_byte: u8) -> Self {
+        self.proposer = proposer;
+        self.proposer_validator_index = validator_index.to_string();
+        self.block_root_byte = block_root_byte;
         self
     }
 
@@ -353,8 +550,9 @@ impl PipelineBeacon {
         let duty_slots = Arc::clone(&self.duty_slots);
         let att_map = Arc::clone(&self.attestation_data_by_slot);
         let head_slot = duty_slots.iter().copied().max().unwrap_or(0);
+        let block_root_byte = self.block_root_byte;
         let client = MockBeaconNodeClient::new()
-            .with_slot_aware_block_root(head_slot, &[], |_queried| root_hex(0xbb))
+            .with_slot_aware_block_root(head_slot, &[], move |_queried| root_hex(block_root_byte))
             .with_get_attester_duties(move |epoch, _indices| {
                 let duty_pubkey = duty_pubkey.lock().unwrap().clone();
                 let data: Vec<AttesterDuty> = duty_slots
@@ -396,8 +594,9 @@ impl PipelineBeacon {
         // inside the bitlist. The default (aggregators off) keeps length N.
         let force_aggregators = self.aggregators;
         let committee_length = if force_aggregators { 1 } else { attesters.len() };
+        let block_root_byte = self.block_root_byte;
         let client = MockBeaconNodeClient::new()
-            .with_slot_aware_block_root(head_slot, &[], |_queried| root_hex(0xbb))
+            .with_slot_aware_block_root(head_slot, &[], move |_queried| root_hex(block_root_byte))
             .with_get_attester_duties(move |epoch, _indices| {
                 let mut data = Vec::new();
                 for &slot in duty_slots.iter() {
@@ -459,6 +658,13 @@ impl PipelineBeacon {
                 })
                 .with_submit_aggregate_and_proofs(|_proofs| Ok(()));
         }
+        if self.proposer {
+            client = client.with_get_proposer_duties(proposer_duties_for(
+                Arc::clone(&self.duty_slots),
+                self.duty_pubkey.lock().expect("duty pubkey").clone(),
+                self.proposer_validator_index.clone(),
+            ));
+        }
         client
     }
 
@@ -478,6 +684,31 @@ impl PipelineBeacon {
                 validator_sync_committee_indices: vec![attester.committee_position as u64],
             })
             .collect()
+    }
+}
+
+/// Proposer duties for `slots` that fall in the requested epoch.
+fn proposer_duties_for(
+    slots: Arc<Vec<Slot>>,
+    pubkey: String,
+    validator_index: String,
+) -> impl Fn(u64) -> Result<beacon::ProposerDutiesResponse, BeaconError> + Send + Sync + 'static {
+    move |epoch| {
+        let data = slots
+            .iter()
+            .copied()
+            .filter(|slot| slot / SLOTS_PER_EPOCH == epoch)
+            .map(|slot| ProposerDuty {
+                pubkey: pubkey.clone(),
+                validator_index: validator_index.clone(),
+                slot: slot.to_string(),
+            })
+            .collect();
+        Ok(DependentRootResponse {
+            dependent_root: root_hex(0xdd),
+            execution_optimistic: false,
+            data,
+        })
     }
 }
 
@@ -557,12 +788,17 @@ impl Default for PipelineFixtureOpts {
 /// one validator. Sync-committee and aggregator modes default to off and are
 /// set with [`Self::with_sync_committee`] and [`Self::with_aggregators`].
 /// [`Self::with_request_delay`] forwards to [`MockBeaconNodeClient::with_request_delay`].
+/// [`Self::with_proposer`] serves a proposer duty. [`Self::with_block_production`]
+/// selects [`NoopBlockBeacon`] ([`FixtureBlockProduction::Noop`], the default)
+/// or a succeeding Deneb block.
 pub struct PreparedPipelineFixture {
     opts: PipelineFixtureOpts,
     validator_count: usize,
     sync_committee: bool,
     aggregators: bool,
     request_delay: Duration,
+    proposer: bool,
+    block_production: FixtureBlockProduction,
 }
 
 impl From<PipelineFixtureOpts> for PreparedPipelineFixture {
@@ -573,6 +809,8 @@ impl From<PipelineFixtureOpts> for PreparedPipelineFixture {
             sync_committee: false,
             aggregators: false,
             request_delay: Duration::ZERO,
+            proposer: false,
+            block_production: FixtureBlockProduction::Noop,
         }
     }
 }
@@ -590,6 +828,8 @@ impl PipelineFixtureOpts {
             sync_committee: false,
             aggregators: false,
             request_delay: Duration::ZERO,
+            proposer: false,
+            block_production: FixtureBlockProduction::Noop,
         }
     }
 }
@@ -623,6 +863,26 @@ impl PreparedPipelineFixture {
         self.request_delay = delay;
         self
     }
+
+    /// Serve a proposer duty for every [`PipelineFixtureOpts::duty_slots`] entry.
+    ///
+    /// Default is off, so existing fixtures never see a proposer duty. The
+    /// block beacon stays [`FixtureBlockProduction::Noop`] until
+    /// [`Self::with_block_production`] selects [`FixtureBlockProduction::Deneb`].
+    pub fn with_proposer(mut self, enabled: bool) -> Self {
+        self.proposer = enabled;
+        self
+    }
+
+    /// Select block production.
+    ///
+    /// [`FixtureBlockProduction::Noop`] is [`NoopBlockBeacon`]: `produce_block_v3`
+    /// and `produce_block_v4` return `Err`. That is the default.
+    /// [`FixtureBlockProduction::Deneb`] returns the eth-types Deneb test vector.
+    pub fn with_block_production(mut self, mode: FixtureBlockProduction) -> Self {
+        self.block_production = mode;
+        self
+    }
 }
 
 /// Fully wired pipeline under test.
@@ -630,7 +890,10 @@ impl PreparedPipelineFixture {
 /// Holds the orchestrator plus the shared handles RF1-02/RF1-08 need to drive
 /// slots and assert signatures / DB rows / duty-cache invalidation.
 pub struct PipelineFixture {
-    pub orchestrator: DutyOrchestrator<MockSlotClock, RecordingSubmitter, NoopBlockBeacon>,
+    pub orchestrator: DutyOrchestrator<MockSlotClock, RecordingSubmitter, FixtureBlockBeacon>,
+    /// Block beacon inside [`Self::orchestrator`]. [`FixtureBlockBeacon::noop`]
+    /// unless [`PreparedPipelineFixture::with_block_production`] selected Deneb.
+    pub block_beacon: Arc<FixtureBlockBeacon>,
     pub handle: OrchestratorHandle,
     pub clock: Arc<MockSlotClock>,
     pub slashing_db: Arc<SlashingDb>,
@@ -689,6 +952,8 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
         sync_committee,
         aggregators,
         request_delay,
+        proposer,
+        block_production,
     } = opts.into();
     assert!(
         validator_count >= 1,
@@ -714,7 +979,14 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
             let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
 
             finish_fixture(
-                FixtureBuild { opts, sync_committee, aggregators, request_delay },
+                FixtureBuild {
+                    opts,
+                    sync_committee,
+                    aggregators,
+                    request_delay,
+                    proposer,
+                    block_production,
+                },
                 composite,
                 pubkey,
                 pubkey_hex,
@@ -735,7 +1007,14 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
             }
             let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
             finish_fixture(
-                FixtureBuild { opts, sync_committee, aggregators, request_delay },
+                FixtureBuild {
+                    opts,
+                    sync_committee,
+                    aggregators,
+                    request_delay,
+                    proposer,
+                    block_production,
+                },
                 composite,
                 pubkey,
                 pubkey_hex,
@@ -760,7 +1039,14 @@ pub fn pipeline_fixture(opts: impl Into<PreparedPipelineFixture>) -> PipelineFix
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
 
         finish_fixture(
-            FixtureBuild { opts, sync_committee, aggregators, request_delay },
+            FixtureBuild {
+                opts,
+                sync_committee,
+                aggregators,
+                request_delay,
+                proposer,
+                block_production,
+            },
             composite,
             pubkey,
             pubkey_hex,
@@ -777,6 +1063,8 @@ struct FixtureBuild {
     sync_committee: bool,
     aggregators: bool,
     request_delay: Duration,
+    proposer: bool,
+    block_production: FixtureBlockProduction,
 }
 
 fn finish_fixture(
@@ -788,7 +1076,14 @@ fn finish_fixture(
     preload: bool,
     seeded: Vec<FixtureAttester>,
 ) -> PipelineFixture {
-    let FixtureBuild { opts, sync_committee, aggregators, request_delay } = build;
+    let FixtureBuild {
+        opts,
+        sync_committee,
+        aggregators,
+        request_delay,
+        proposer,
+        block_production,
+    } = build;
     // An empty `seeded` vec is the single-validator constructor. N > 1 passes
     // one entry per validator, so the length is the count.
     let validator_count = if seeded.is_empty() { 1 } else { seeded.len() };
@@ -816,9 +1111,19 @@ fn finish_fixture(
             committee_position: attester.committee_position,
         })
         .collect();
+    let proposer_index = if validator_count == 1 {
+        VALIDATOR_INDEX.parse::<u64>().expect("validator index")
+    } else {
+        0
+    };
+    let block_root_byte = match block_production {
+        FixtureBlockProduction::Deneb => DENEB_PARENT_BYTE,
+        FixtureBlockProduction::Noop => DEFAULT_BLOCK_ROOT_BYTE,
+    };
     let mut beacon =
         PipelineBeacon::new(pubkey_hex_0x.clone(), opts.duty_slots, opts.attestation_data_by_slot)
-            .with_duty_modes(pubkey_bytes, sync_committee, aggregators);
+            .with_duty_modes(pubkey_bytes, sync_committee, aggregators)
+            .with_proposal(proposer, proposer_index, block_root_byte);
     if validator_count > 1 {
         beacon = beacon.with_attesters(beacon_attesters);
     }
@@ -866,6 +1171,10 @@ fn finish_fixture(
             validator_store.add_validator(ValidatorConfig::new(attester.pubkey_bytes)).unwrap();
         }
     }
+    // Local Deneb production (boost 0). Default fixtures keep MaxProfit.
+    if block_production == FixtureBlockProduction::Deneb {
+        validator_store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
+    }
 
     let clock =
         Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), SLOTS_PER_EPOCH));
@@ -875,13 +1184,17 @@ fn finish_fixture(
     let circuit_breaker = Arc::new(CircuitBreakerState::new(0, 0));
     let attesting_enabled = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
+    let block_beacon = Arc::new(match block_production {
+        FixtureBlockProduction::Noop => FixtureBlockBeacon::noop(),
+        FixtureBlockProduction::Deneb => FixtureBlockBeacon::deneb(proposer_index),
+    });
     let mut deps = OrchestratorDeps::for_test(
         Arc::clone(&clock),
         Arc::clone(&duty_tracker),
         signer,
         propagator,
         beacon_node,
-        Arc::new(NoopBlockBeacon),
+        Arc::clone(&block_beacon),
         None,
         Arc::clone(&validator_store),
         config,
@@ -897,6 +1210,7 @@ fn finish_fixture(
 
     PipelineFixture {
         orchestrator,
+        block_beacon,
         handle,
         clock,
         slashing_db,
