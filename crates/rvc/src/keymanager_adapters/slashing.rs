@@ -58,6 +58,22 @@ impl SlashingProtectionAdapter {
         Self::new(slashing_db, genesis_validators_root, gate)
     }
 
+    /// Adapter whose gate follows `clock`.
+    ///
+    /// RR3-07 passes the pipeline fixture's clock so the import waits on that
+    /// slot's free window. Each call builds a private gate, same as
+    /// [`Self::new_in_free_window`]. Production still passes the single gate
+    /// from [`super::spawn::build_keymanager_api`].
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn new_on_clock(
+        slashing_db: Arc<SlashingDb>,
+        genesis_validators_root: eth_types::Root,
+        clock: Arc<dyn SlotClock>,
+    ) -> Self {
+        let gate = Arc::new(ImportWindowGate::new(clock));
+        Self::new(slashing_db, genesis_validators_root, gate)
+    }
+
     #[cfg(test)]
     pub(crate) fn set_during_import(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
         *self.during_import.lock().expect("during_import") = hook;

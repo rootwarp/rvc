@@ -21,23 +21,33 @@
 //! RR3-02's free-window gate and then imports. The fixture, the payload, the
 //! miss count, and the `rvc_slashing_import_conn_hold_ms` read stay here.
 //!
-//! The fixture block beacon stays [`NoopBlockBeacon`](super::pipeline_fixture::NoopBlockBeacon)
-//! until RR3-06. `block_phase_overlapped` is the phase-span overlap PQ-7 can
-//! read today; it is not yet a block-reserve interval.
+//! [`ImportDuringDutiesOpts::n200_unscheduled_attestation`] leaves the block
+//! beacon as [`NoopBlockBeacon`](super::pipeline_fixture::NoopBlockBeacon).
+//! [`ImportDuringDutiesOpts::n200_scheduled_attestation`] turns on RR3-06's
+//! proposer duty and Deneb production so a block reserve is observable.
+//! `block_phase_overlapped` is phase-span overlap. `late_block_reserves`
+//! counts block-reserve waits whose interval meets the import conn-hold (PQ-7).
+//!
+//! Those waits are the `(start, end)` instants around `reserve()` in
+//! `SlashableSignSession::reserve_then_sign` (block kind only). The conn-hold
+//! end is the `slashing DB import completed` event, which fires on the import
+//! thread immediately after the hold histogram is sampled. The start is that
+//! instant minus the sample. Neither interval is reconstructed from a poll.
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bn_manager::{MockBeaconNodeClient, MockMethod, VersionedAttestation};
 use keymanager_api::traits::SlashingProtection;
-use slashing::metrics::RVC_SLASHING_IMPORT_CONN_HOLD_MS;
+use slashing::metrics::{RVC_SLASHING_IMPORT_CONN_HOLD_MS, RVC_SLASHING_IMPORT_DEFERRED_MS};
 use slashing::{
     InterchangeAttestation, InterchangeBlock, InterchangeFormat, InterchangeMetadata, SlashingDb,
     ValidatorRecord,
 };
 use timing::{due_ms, DeadlineBps};
+use timing::{MockSlotClock, SlotClock};
 use tokio::sync::oneshot;
 use tracing::field::{Field, Visit};
 use tracing::span::{Attributes, Id};
@@ -46,8 +56,8 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::Layer;
 
 use super::pipeline_fixture::{
-    create_test_config, make_beacon_attestation_data, pipeline_fixture, PipelineFixtureOpts,
-    SLOTS_PER_EPOCH,
+    create_test_config, make_beacon_attestation_data, pipeline_fixture, FixtureBlockProduction,
+    PipelineFixtureOpts, SLOTS_PER_EPOCH,
 };
 use rvc::keymanager_adapters::SlashingProtectionAdapter;
 
@@ -127,6 +137,33 @@ pub struct ImportDuringDutiesOpts {
     pub aggregators: bool,
     /// Duty slot. Use the first slot of an epoch so the vote's target epoch is new.
     pub slot: u64,
+    /// Serve a proposer duty and produce a Deneb block (RR3-06).
+    ///
+    /// RR2-15 leaves this false, so the block beacon stays the `Err` path.
+    pub proposer: bool,
+    /// Advance the fixture clock with wall time after the block phase so the
+    /// import gate sees the same offset as the slot anchor.
+    ///
+    /// The orchestrator captures the anchor once and then waits on tokio time.
+    /// [`MockSlotClock`] does not move on its own. Without this, a gate on the
+    /// fixture clock still reads t=0 at attestation entry. RR2-15 leaves it
+    /// false: [`UnscheduledImport`] uses its own clock.
+    pub sync_slot_clock: bool,
+    /// Wait this many milliseconds after the slot anchor before `admit`.
+    ///
+    /// `None` admits at [`Self::fire_at`] entry. The boundary cell sets this
+    /// so the import starts late in slot N.
+    pub fire_after_ms: Option<u64>,
+    /// When true, clock sync may pass the slot end and `current_slot()` rolls.
+    ///
+    /// `false` clamps the offset at one millisecond before the slot end, which
+    /// keeps `current_slot()` on `slot` and so never reaches a later reserve.
+    pub roll_slot_clock: bool,
+    /// Slots after [`Self::slot`] that also get a duty and attestation data.
+    ///
+    /// `0` is the one-slot scenario. `1` lets the orchestrator propose slot
+    /// N+1 while an import started in slot N is still in flight.
+    pub following_slots: u64,
 }
 
 impl ImportDuringDutiesOpts {
@@ -142,6 +179,59 @@ impl ImportDuringDutiesOpts {
             sync_committee: true,
             aggregators: true,
             slot: SLOTS_PER_EPOCH,
+            proposer: false,
+            sync_slot_clock: false,
+            fire_after_ms: None,
+            roll_slot_clock: false,
+            following_slots: 0,
+        }
+    }
+
+    /// N=200 scheduled path. Same duty mix as [`Self::n200_unscheduled_attestation`].
+    ///
+    /// The slot is the first slot of the Deneb epoch (epoch 40). Slot 32 is
+    /// epoch 1, and a Deneb body there fails the consensus-version check
+    /// before `reserve_block`. Epoch 40 is Deneb and still pre-Electra
+    /// (Electra is epoch 50), so the attestation target epoch is new and
+    /// RR3-06's block production can record a reserve.
+    pub fn n200_scheduled_attestation() -> Self {
+        Self {
+            validators: 200,
+            request_delay: Duration::from_millis(50),
+            fire_at: OverlapPhase::Attestation,
+            sync_committee: true,
+            aggregators: true,
+            slot: 40 * SLOTS_PER_EPOCH,
+            proposer: true,
+            sync_slot_clock: true,
+            fire_after_ms: None,
+            roll_slot_clock: false,
+            following_slots: 0,
+        }
+    }
+
+    /// N=200 boundary cell. Import fires late in slot N and the clock may roll
+    /// into slot N+1, which also has a proposer duty.
+    ///
+    /// `fire_after_ms` is 11_600. The free window closes at 11_800, so a
+    /// scheduled admission cannot finish a ~700 ms hold in the remainder and
+    /// defers to slot N+1's open at 4,499 ms. An unscheduled admission starts
+    /// at 11_600 ms and can still be holding `conn` when slot N+1's t=0 block
+    /// reserve begins. Slot 1280 is the first slot of Deneb epoch 40, so slot
+    /// 1281 stays on that fork and in that epoch.
+    pub fn n200_boundary_attestation() -> Self {
+        Self {
+            validators: 200,
+            request_delay: Duration::from_millis(50),
+            fire_at: OverlapPhase::Attestation,
+            sync_committee: true,
+            aggregators: true,
+            slot: 40 * SLOTS_PER_EPOCH,
+            proposer: true,
+            sync_slot_clock: true,
+            fire_after_ms: Some(11_600),
+            roll_slot_clock: true,
+            following_slots: 1,
         }
     }
 }
@@ -155,6 +245,9 @@ pub struct ImportRequest<'a> {
     pub history_rows: u64,
     pub slashing_db: &'a Arc<SlashingDb>,
     pub genesis_validators_root: eth_types::Root,
+    /// Fixture clock. [`ScheduledImport`] builds its gate on this.
+    /// [`UnscheduledImport`] does not read it.
+    pub slot_clock: &'a Arc<MockSlotClock>,
 }
 
 /// Failure from [`ImportAdmission::admit`].
@@ -210,6 +303,31 @@ impl ImportAdmission for UnscheduledImport {
     }
 }
 
+/// Wait on the fixture clock's free window, then import.
+///
+/// [`SlashingProtectionAdapter::new_on_clock`] builds one import-window gate
+/// for this call. `import_interchange` is what calls `admit`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ScheduledImport;
+
+impl ImportAdmission for ScheduledImport {
+    fn label(&self) -> &'static str {
+        "scheduled"
+    }
+
+    async fn admit(&mut self, request: ImportRequest<'_>) -> Result<(), AdmissionError> {
+        let slashing = SlashingProtectionAdapter::new_on_clock(
+            Arc::clone(request.slashing_db),
+            request.genesis_validators_root,
+            Arc::clone(request.slot_clock) as Arc<dyn SlotClock>,
+        );
+        slashing
+            .import_interchange(request.interchange_json)
+            .await
+            .map_err(|err| AdmissionError { message: err.to_string() })
+    }
+}
+
 /// One measured run. Misses are recorded; they are not a pass/fail gate.
 #[derive(Clone, Debug)]
 pub struct ImportDuringDutiesRecord {
@@ -227,6 +345,12 @@ pub struct ImportDuringDutiesRecord {
     pub history_rows: u64,
     pub on_disk: bool,
     pub fire_at: &'static str,
+    /// Milliseconds after the slot anchor before `admit`. `None` is phase entry.
+    pub fire_after_ms: Option<u64>,
+    /// Clock sync was allowed to roll `current_slot()` past [`Self::slot`].
+    pub roll_slot_clock: bool,
+    /// Extra duty slots after [`Self::slot`].
+    pub following_slots: u64,
     pub attestation_deadline_ms: u64,
     pub attestation_publish_budget_ms: u64,
     /// Attestation items whose estimated publish completion is later than
@@ -245,9 +369,29 @@ pub struct ImportDuringDutiesRecord {
     pub conn_hold_end_ms: f64,
     /// Phases whose open interval intersected the conn-hold window, in slot order.
     pub overlapping_phase: String,
-    /// `true` when the hold intersected the block phase. PQ-7 input.
+    /// `true` when the hold intersected the block phase. Phase-span overlap.
     pub block_phase_overlapped: bool,
+    /// RR3-06 proposer duty was served.
+    pub proposer: bool,
+    /// Delta of `rvc_slashing_import_deferred_ms` for this import.
+    pub import_deferred_ms: f64,
+    pub import_deferred_samples: u64,
+    /// Block-reserve waits observed on `rvc_slashing_reserve_tx_hold_duration_ms{kind="block"}`.
+    pub block_reserves: u64,
+    /// How many of those waits meet the import conn-hold interval (PQ-7).
+    pub late_block_reserves: u64,
+    pub block_reserve_intervals: Vec<BlockReserveWait>,
     pub phase_fires: Vec<PhaseFireRecord>,
+}
+
+/// One block reserve's wait: mutex acquire through COMMIT, placed on the slot clock.
+#[derive(Clone, Debug)]
+pub struct BlockReserveWait {
+    /// Offset from the slot anchor, milliseconds.
+    pub start_ms: f64,
+    /// Offset from the slot anchor, milliseconds.
+    pub end_ms: f64,
+    pub duration_ms: f64,
 }
 
 fn round_ms(value: f64) -> f64 {
@@ -271,7 +415,7 @@ impl ImportDuringDutiesRecord {
             .map(|fire| serde_json::json!({ "phase": fire.phase, "offset_ms": fire.offset_ms }))
             .collect();
         let value = serde_json::json!({
-            "issue": "RR2-15",
+            "issue": if self.admission == "scheduled" { "RR3-07" } else { "RR2-15" },
             "admission": self.admission,
             "sha": self.sha,
             "host": self.host,
@@ -286,6 +430,9 @@ impl ImportDuringDutiesRecord {
             "history_rows": self.history_rows,
             "on_disk": self.on_disk,
             "fire_at": self.fire_at,
+            "fire_after_ms": self.fire_after_ms,
+            "roll_slot_clock": self.roll_slot_clock,
+            "following_slots": self.following_slots,
             "attestation_deadline_ms": self.attestation_deadline_ms,
             "attestation_publish_budget_ms": self.attestation_publish_budget_ms,
             "attestation_deadline_misses": self.attestation_deadline_misses,
@@ -297,6 +444,18 @@ impl ImportDuringDutiesRecord {
             "conn_hold_end_ms": round_ms(self.conn_hold_end_ms),
             "overlapping_phase": self.overlapping_phase,
             "block_phase_overlapped": self.block_phase_overlapped,
+            "proposer": self.proposer,
+            "import_deferred_ms": round_ms(self.import_deferred_ms),
+            "import_deferred_samples": self.import_deferred_samples,
+            "block_reserves": self.block_reserves,
+            "late_block_reserves": self.late_block_reserves,
+            "block_reserve_intervals": self.block_reserve_intervals.iter().map(|wait| {
+                serde_json::json!({
+                    "start_ms": round_ms(wait.start_ms),
+                    "end_ms": round_ms(wait.end_ms),
+                    "duration_ms": round_ms(wait.duration_ms),
+                })
+            }).collect::<Vec<_>>(),
             "phase_fires": fires,
         });
         format!("{}\n", serde_json::to_string_pretty(&value).expect("record json"))
@@ -399,6 +558,13 @@ struct PhaseFire {
 struct PhaseState {
     spans: HashMap<Id, &'static str>,
     slot_started: Option<tokio::time::Instant>,
+    /// Same origin as `slot_started`, on `std::time::Instant`.
+    ///
+    /// Reserve instants and the import-completed event use that clock.
+    /// Tokio's clock is only the phase spans.
+    slot_started_std: Option<Instant>,
+    /// `slashing DB import completed`, on the import thread.
+    import_completed_at: Option<Instant>,
     fires: Vec<PhaseFire>,
 }
 
@@ -430,9 +596,12 @@ where
             return;
         };
         let now = tokio::time::Instant::now();
+        let now_std = Instant::now();
         if phase == "block" && state.slot_started.is_none() {
             state.slot_started =
                 Some(now.checked_sub(Duration::from_millis(offset_ms)).unwrap_or(now));
+            state.slot_started_std =
+                Some(now_std.checked_sub(Duration::from_millis(offset_ms)).unwrap_or(now_std));
         }
         let span_key = id.into_u64();
         state.fires.push(PhaseFire { phase, span_key, at: now, offset_ms, closed_at: None });
@@ -456,6 +625,41 @@ where
             }
         }
         state.spans.remove(&id);
+    }
+
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+        // `metadata().name()` is the callsite (`event path:line`), not the
+        // message. The message is a field on the event.
+        let mut visitor = ImportCompletedVisitor { matched: false };
+        event.record(&mut visitor);
+        if !visitor.matched {
+            return;
+        }
+        let mut state = self.state.lock().expect("phase log");
+        if state.import_completed_at.is_none() {
+            state.import_completed_at = Some(Instant::now());
+        }
+    }
+}
+
+/// Sees the static message on `tracing::info!(..., "slashing DB import completed")`.
+struct ImportCompletedVisitor {
+    matched: bool,
+}
+
+impl Visit for ImportCompletedVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message"
+            && format!("{value:?}").contains("slashing DB import completed")
+        {
+            self.matched = true;
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" && value == "slashing DB import completed" {
+            self.matched = true;
+        }
     }
 }
 
@@ -531,6 +735,8 @@ fn tally_publishes(
     request_delay: Duration,
     deadline_ms: f64,
     miss_after_ms: f64,
+    // Publishes later than this offset are a following slot, not slot N misses.
+    count_through_ms: Option<f64>,
 ) -> PublishTally {
     let calls = client.submit_attestation_calls();
     let mut call_index = 0usize;
@@ -545,6 +751,9 @@ fn tally_publishes(
         call_index += 1;
         let completion = stamp.at + request_delay;
         let offset = offset_ms(slot_started, completion);
+        if count_through_ms.is_some_and(|limit| offset > limit) {
+            continue;
+        }
         items += batch_items;
         last_completion_ms = Some(last_completion_ms.map_or(offset, |prev| prev.max(offset)));
         if offset > miss_after_ms {
@@ -579,6 +788,51 @@ fn overlapping_phases(
     names
 }
 
+fn sync_slot_clock(state: &Mutex<PhaseState>, clock: &MockSlotClock, slot: u64, roll: bool) {
+    let phase_state = state.lock().expect("phase log");
+    let Some(block) = phase_state.fires.iter().find(|fire| fire.phase == "block") else {
+        return;
+    };
+    let elapsed_ms = u64::try_from(block.at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let mut into_slot = block.offset_ms.saturating_add(elapsed_ms);
+    if !roll {
+        into_slot = into_slot.min(SLOT_DURATION_MS - 1);
+    }
+    drop(phase_state);
+    clock.set_slot_with_offset_ms(slot, into_slot);
+}
+
+fn std_offset_ms(origin: Instant, at: Instant) -> f64 {
+    at.saturating_duration_since(origin).as_secs_f64() * 1000.0
+}
+
+/// Closed intervals. An endpoint touch counts as overlap.
+pub fn intervals_overlap(a_start: f64, a_end: f64, b_start: f64, b_end: f64) -> bool {
+    a_start <= b_end && b_start <= a_end
+}
+
+/// How many reserve intervals `[start, end]` meet the hold.
+///
+/// The harness passes the instants recorded at reserve start/return and at
+/// the import-completed event. It does not shift them by a poll lag.
+pub fn late_reserve_count(hold_start: f64, hold_end: f64, reserves: &[(f64, f64)]) -> u64 {
+    u64::try_from(
+        reserves
+            .iter()
+            .filter(|(start, end)| intervals_overlap(hold_start, hold_end, *start, *end))
+            .count(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+/// Interval the old 10 ms poll detector stored for one histogram sample.
+///
+/// `poll_at_ms` is the poll instant. The start is that instant minus the
+/// sample, so a late poll slides the whole wait forward by the lag.
+pub fn poll_reconstructed_interval(poll_at_ms: f64, duration_ms: f64) -> (f64, f64) {
+    (poll_at_ms - duration_ms, poll_at_ms)
+}
+
 /// Drive `opts` against `admission` and return the measurement record.
 ///
 /// Wall clock, not paused. The import is not a pass/fail latency gate.
@@ -597,7 +851,28 @@ pub async fn run_import_during_duties(
         ));
     }
 
+    let (fire_tx, fire_rx) = oneshot::channel();
+    let state = Arc::new(Mutex::new(PhaseState {
+        spans: HashMap::new(),
+        slot_started: None,
+        slot_started_std: None,
+        import_completed_at: None,
+        fires: Vec::new(),
+    }));
+    let layer = PhaseLayer {
+        state: Arc::clone(&state),
+        fire_tx: Mutex::new(Some(fire_tx)),
+        target_span: opts.fire_at.span_name(),
+    };
+    // Install before the fixture. `spawn_blocking` threads cache the global
+    // dispatcher on their first event, and the import completion is one of
+    // those events. A subscriber installed after the pool has already logged
+    // is invisible to it.
+    let subscriber = tracing_subscriber::registry().with(layer);
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|err| format!("installing the import-during-duties subscriber failed: {err}"))?;
     slashing::metrics::init();
+
     let payload = ten_mb_payload()?;
     let attestation_deadline_ms = due_ms(DeadlineBps::default().attestation, SLOT_DURATION_MS);
     if attestation_deadline_ms != 3999 {
@@ -607,21 +882,31 @@ pub async fn run_import_during_duties(
     }
     let miss_after_ms = attestation_deadline_ms as f64 + ATTESTATION_PUBLISH_BUDGET_MS as f64;
 
+    let mut duty_slots = vec![opts.slot];
     let mut attestation_data_by_slot = std::collections::HashMap::new();
     attestation_data_by_slot
         .insert(opts.slot, make_beacon_attestation_data(opts.slot, 0, 0x22, 0x33, 0x11));
-    let mut fixture = pipeline_fixture(
-        PipelineFixtureOpts {
-            attestation_data_by_slot,
-            duty_slots: vec![opts.slot],
-            initial_slot: opts.slot,
-            ..Default::default()
-        }
-        .with_validators(opts.validators)
-        .with_sync_committee(opts.sync_committee)
-        .with_aggregators(opts.aggregators)
-        .with_request_delay(opts.request_delay),
-    );
+    for extra in 1..=opts.following_slots {
+        let slot = opts.slot + extra;
+        duty_slots.push(slot);
+        attestation_data_by_slot
+            .insert(slot, make_beacon_attestation_data(slot, 0, 0x22, 0x33, 0x11));
+    }
+    let mut prepared = PipelineFixtureOpts {
+        attestation_data_by_slot,
+        duty_slots,
+        initial_slot: opts.slot,
+        ..Default::default()
+    }
+    .with_validators(opts.validators)
+    .with_sync_committee(opts.sync_committee)
+    .with_aggregators(opts.aggregators)
+    .with_request_delay(opts.request_delay);
+    if opts.proposer {
+        prepared =
+            prepared.with_proposer(true).with_block_production(FixtureBlockProduction::Deneb);
+    }
+    let mut fixture = pipeline_fixture(prepared);
     let db_path = fixture
         .slashing_db_path()
         .ok_or_else(|| "N-key pipeline_fixture did not open an on-disk SlashingDb".to_string())?;
@@ -629,55 +914,70 @@ pub async fn run_import_during_duties(
         return Err(format!("slashing db path is not a file: {}", db_path.display()));
     }
 
-    let epoch = opts.slot / SLOTS_PER_EPOCH;
-    fixture
-        .duty_tracker
-        .fetch_duties_for_epoch(epoch)
-        .await
-        .map_err(|err| format!("fetch attester duties: {err}"))?;
-    if opts.sync_committee {
+    let mut epochs = vec![opts.slot / SLOTS_PER_EPOCH];
+    for extra in 1..=opts.following_slots {
+        let epoch = (opts.slot + extra) / SLOTS_PER_EPOCH;
+        if !epochs.contains(&epoch) {
+            epochs.push(epoch);
+        }
+    }
+    for epoch in epochs {
         fixture
             .duty_tracker
-            .fetch_sync_committee_duties(epoch)
+            .fetch_duties_for_epoch(epoch)
             .await
-            .map_err(|err| format!("fetch sync duties: {err}"))?;
+            .map_err(|err| format!("fetch attester duties: {err}"))?;
+        if opts.sync_committee {
+            fixture
+                .duty_tracker
+                .fetch_sync_committee_duties(epoch)
+                .await
+                .map_err(|err| format!("fetch sync duties: {err}"))?;
+        }
     }
     fixture.set_slot(opts.slot);
 
     let db = Arc::clone(&fixture.slashing_db);
     let client = Arc::clone(&fixture.beacon_client);
-    let (fire_tx, fire_rx) = oneshot::channel();
-    let state = Arc::new(Mutex::new(PhaseState {
-        spans: HashMap::new(),
-        slot_started: None,
-        fires: Vec::new(),
-    }));
-    let layer = PhaseLayer {
-        state: Arc::clone(&state),
-        fire_tx: Mutex::new(Some(fire_tx)),
-        target_span: opts.fire_at.span_name(),
-    };
-    let subscriber = tracing_subscriber::registry().with(layer);
-    let _guard = tracing::subscriber::set_default(subscriber);
 
     let hold_sum_before = RVC_SLASHING_IMPORT_CONN_HOLD_MS.get_sample_sum();
     let hold_n_before = RVC_SLASHING_IMPORT_CONN_HOLD_MS.get_sample_count();
+    let deferred_sum_before = RVC_SLASHING_IMPORT_DEFERRED_MS.get_sample_sum();
+    let deferred_n_before = RVC_SLASHING_IMPORT_DEFERRED_MS.get_sample_count();
     let admission_label = admission.label();
     let history_rows = payload.history_rows;
     let gvr = payload.gvr;
     let json = payload.json;
+    let slot_clock = Arc::clone(&fixture.clock);
+    signer::clear_block_reserve_intervals();
+    let fire_after_ms = opts.fire_after_ms;
+    let roll_slot_clock = opts.roll_slot_clock;
+    let sync_clock = opts.sync_slot_clock;
+    let clock_slot = opts.slot;
 
     let import_fut = async {
         let _ = fire_rx.await;
-        let result = admission
+        if let Some(after_ms) = fire_after_ms {
+            let slot_started = loop {
+                if let Some(started) = state.lock().expect("phase log").slot_started {
+                    break started;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            };
+            tokio::time::sleep_until(slot_started + Duration::from_millis(after_ms)).await;
+            if sync_clock {
+                sync_slot_clock(&state, &slot_clock, clock_slot, roll_slot_clock);
+            }
+        }
+        admission
             .admit(ImportRequest {
                 interchange_json: &json,
                 history_rows,
                 slashing_db: &db,
                 genesis_validators_root: gvr,
+                slot_clock: &slot_clock,
             })
-            .await;
-        (result, tokio::time::Instant::now())
+            .await
     };
     tokio::pin!(import_fut);
 
@@ -687,7 +987,9 @@ pub async fn run_import_during_duties(
     let wall_started = std::time::Instant::now();
     let mut shutdown_sent = false;
     let mut budget_exceeded = false;
-    let mut import_done: Option<(Result<(), AdmissionError>, tokio::time::Instant)> = None;
+    let mut import_done: Option<Result<(), AdmissionError>> = None;
+    // Slot N's t=0 reserve, plus one t=0 reserve per following proposer slot.
+    let needed_reserves = if opts.proposer { 1 + opts.following_slots } else { 0 };
 
     loop {
         tokio::select! {
@@ -702,6 +1004,9 @@ pub async fn run_import_during_duties(
                 import_done = Some(outcome);
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                if opts.sync_slot_clock {
+                    sync_slot_clock(&state, &slot_clock, opts.slot, opts.roll_slot_clock);
+                }
                 if shutdown_sent {
                     continue;
                 }
@@ -711,7 +1016,16 @@ pub async fn run_import_during_duties(
                     .map(attestation_items)
                     .sum::<usize>();
                 let import_finished = import_done.is_some();
-                if import_finished && published >= opts.validators {
+                let reserves_done = signer::block_reserve_interval_count() >= needed_reserves as usize;
+                // The one-slot path stops once slot N has published. The
+                // boundary path must stay up through the later block reserve;
+                // slot N's publishes finish before that reserve starts.
+                let scenario_done = if opts.following_slots == 0 {
+                    import_finished && published >= opts.validators
+                } else {
+                    import_finished && reserves_done
+                };
+                if scenario_done {
                     handle.shutdown();
                     shutdown_sent = true;
                 } else if wall_started.elapsed() > SLOT_WALL_BUDGET {
@@ -729,13 +1043,15 @@ pub async fn run_import_during_duties(
             opts.validators,
         ));
     }
-    let (import_result, import_finished_at) =
-        import_done.ok_or("orchestrator stopped before the import finished")?;
+    let import_result = import_done.ok_or("orchestrator stopped before the import finished")?;
     import_result.map_err(|err| format!("import_interchange: {err}"))?;
 
     let conn_hold_ms = RVC_SLASHING_IMPORT_CONN_HOLD_MS.get_sample_sum() - hold_sum_before;
     let conn_hold_samples =
         RVC_SLASHING_IMPORT_CONN_HOLD_MS.get_sample_count().saturating_sub(hold_n_before);
+    let import_deferred_ms = RVC_SLASHING_IMPORT_DEFERRED_MS.get_sample_sum() - deferred_sum_before;
+    let import_deferred_samples =
+        RVC_SLASHING_IMPORT_DEFERRED_MS.get_sample_count().saturating_sub(deferred_n_before);
     if conn_hold_samples != 1 {
         return Err(format!(
             "expected one rvc_slashing_import_conn_hold_ms sample, got {conn_hold_samples}"
@@ -745,10 +1061,16 @@ pub async fn run_import_during_duties(
     let phase_state = state.lock().expect("phase log");
     let slot_started =
         phase_state.slot_started.ok_or("block phase did not record time_into_slot")?;
-    let hold_end = import_finished_at;
-    let hold_start = hold_end
+    let slot_started_std =
+        phase_state.slot_started_std.ok_or("block phase did not record a std slot origin")?;
+    let hold_end_std = phase_state
+        .import_completed_at
+        .ok_or("slashing DB import completed was not observed; the conn-hold end is that event")?;
+    let hold_start_std = hold_end_std
         .checked_sub(Duration::from_secs_f64((conn_hold_ms / 1000.0).max(0.0)))
-        .unwrap_or(hold_end);
+        .unwrap_or(hold_end_std);
+    let hold_start = slot_started + hold_start_std.saturating_duration_since(slot_started_std);
+    let hold_end = slot_started + hold_end_std.saturating_duration_since(slot_started_std);
     let phases = overlapping_phases(&phase_state.fires, hold_start, hold_end);
     // Recorded, not gated. A deferred admission may return after `fire_at` has
     // closed; the unscheduled test asserts attestation overlap itself.
@@ -761,19 +1083,44 @@ pub async fn run_import_during_duties(
         .collect();
     drop(phase_state);
 
+    let count_through_ms =
+        if opts.following_slots == 0 { None } else { Some(SLOT_DURATION_MS as f64) };
     let tally = tally_publishes(
         &client,
         slot_started,
         opts.request_delay,
         attestation_deadline_ms as f64,
         miss_after_ms,
+        count_through_ms,
     );
-    if tally.items != opts.validators as u64 {
+    if opts.following_slots == 0 && tally.items != opts.validators as u64 {
         return Err(format!("expected {} attestation items, got {}", opts.validators, tally.items));
+    }
+    if opts.following_slots > 0 && tally.items < opts.validators as u64 {
+        return Err(format!(
+            "expected at least {} slot-{} attestation items, got {}",
+            opts.validators, opts.slot, tally.items
+        ));
     }
 
     let request_delay_ms =
         u64::try_from(opts.request_delay.as_millis()).map_err(|_| "request delay exceeds u64")?;
+
+    let conn_hold_start_ms = std_offset_ms(slot_started_std, hold_start_std);
+    let conn_hold_end_ms = std_offset_ms(slot_started_std, hold_end_std);
+    let block_reserve_intervals: Vec<BlockReserveWait> = signer::take_block_reserve_intervals()
+        .into_iter()
+        .map(|(start, end)| BlockReserveWait {
+            start_ms: std_offset_ms(slot_started_std, start),
+            end_ms: std_offset_ms(slot_started_std, end),
+            duration_ms: end.saturating_duration_since(start).as_secs_f64() * 1000.0,
+        })
+        .collect();
+    let reserve_pairs: Vec<(f64, f64)> =
+        block_reserve_intervals.iter().map(|wait| (wait.start_ms, wait.end_ms)).collect();
+    let late_block_reserves =
+        late_reserve_count(conn_hold_start_ms, conn_hold_end_ms, &reserve_pairs);
+    let block_reserves = u64::try_from(block_reserve_intervals.len()).unwrap_or(u64::MAX);
 
     Ok(ImportDuringDutiesRecord {
         admission: admission_label,
@@ -790,6 +1137,9 @@ pub async fn run_import_during_duties(
         history_rows: payload.history_rows,
         on_disk: true,
         fire_at: opts.fire_at.as_str(),
+        fire_after_ms: opts.fire_after_ms,
+        roll_slot_clock: opts.roll_slot_clock,
+        following_slots: opts.following_slots,
         attestation_deadline_ms,
         attestation_publish_budget_ms: ATTESTATION_PUBLISH_BUDGET_MS,
         attestation_deadline_misses: tally.misses,
@@ -797,10 +1147,16 @@ pub async fn run_import_during_duties(
         attestation_items: tally.items,
         conn_hold_ms,
         conn_hold_samples,
-        conn_hold_start_ms: offset_ms(slot_started, hold_start),
-        conn_hold_end_ms: offset_ms(slot_started, hold_end),
+        conn_hold_start_ms,
+        conn_hold_end_ms,
         overlapping_phase,
         block_phase_overlapped,
+        proposer: opts.proposer,
+        import_deferred_ms,
+        import_deferred_samples,
+        block_reserves,
+        late_block_reserves,
+        block_reserve_intervals,
         phase_fires,
     })
 }

@@ -28,6 +28,10 @@ pub use eth_types::is_aggregator;
 pub use core::PreReserveBarrier;
 #[allow(deprecated)]
 pub use core::StagedRow;
+#[cfg(any(test, feature = "test-utils"))]
+pub use core::{
+    block_reserve_interval_count, clear_block_reserve_intervals, take_block_reserve_intervals,
+};
 pub use core::{
     sign_nonslashable_core, sign_slashable, NonSlashableFailure, NoopSignHooks, SignHooks,
     SignSlashableRequest, SlashableKind, SlashableSignSession, StandardSlashableHooks,
