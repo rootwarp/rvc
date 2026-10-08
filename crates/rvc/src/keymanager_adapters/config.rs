@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use keymanager_api::error::ApiError;
 use keymanager_api::traits::{Pubkey, ValidatorConfigManager};
-use validator_store::{ValidatorConfigUpdate, ValidatorStore};
+use validator_store::{ValidatorConfigUpdate, ValidatorStore, ValidatorStoreError};
 
 use super::notifier::pubkey_hex;
 
@@ -30,9 +30,17 @@ impl ValidatorConfigManagerAdapter {
         update: ValidatorConfigUpdate,
     ) -> Result<(), ApiError> {
         self.validator_store
-            .update_config(pubkey, update)
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        self.validator_store.save_config().map_err(|e| ApiError::Internal(e.to_string()))
+            .update_config_durable(pubkey, update)
+            .map_err(|e| map_durable_update_error(pubkey, e))
+    }
+}
+
+pub(super) fn map_durable_update_error(pubkey: &Pubkey, err: ValidatorStoreError) -> ApiError {
+    match err {
+        ValidatorStoreError::NotFound => {
+            ApiError::NotFound(format!("validator {} not found", pubkey_hex(pubkey)))
+        }
+        other => ApiError::Internal(other.to_string()),
     }
 }
 

@@ -40,6 +40,24 @@ fn test_config_adapter_unknown_pubkey_returns_not_found() {
 }
 
 #[test]
+fn test_durable_not_found_maps_to_http_404() {
+    use axum::response::IntoResponse;
+
+    let pk = test_pubkey(1);
+    let mapped = crate::keymanager_adapters::config::map_durable_update_error(
+        &pk,
+        validator_store::ValidatorStoreError::NotFound,
+    );
+    assert!(matches!(mapped, ApiError::NotFound(_)));
+    assert_eq!(mapped.into_response().status(), axum::http::StatusCode::NOT_FOUND);
+
+    let (adapter, _store) = create_config_adapter_with_store();
+    let err = adapter.set_fee_recipient(&pk, [0x11; 20]).unwrap_err();
+    assert!(matches!(err, ApiError::NotFound(_)));
+    assert_eq!(err.into_response().status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+#[test]
 fn test_config_adapter_get_fee_recipient_returns_default() {
     let (adapter, store) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);

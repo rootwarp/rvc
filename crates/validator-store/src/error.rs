@@ -6,4 +6,7 @@ pub enum ValidatorStoreError {
     TomlParse(#[from] toml::de::Error),
     #[error("config error: {0}")]
     Config(String),
+    /// The durable update's target pubkey was not in the cloned store.
+    #[error("validator not found")]
+    NotFound,
 }
