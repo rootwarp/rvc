@@ -5,14 +5,33 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, trace, warn};
 
-use crate::metrics::{RVC_DUTIES_FETCHED_TOTAL, RVC_PTC_DUTIES_FETCHED_TOTAL};
+use crate::metrics::{
+    RVC_DUTIES_FETCHED_TOTAL, RVC_DUTY_REJECTED_TOTAL, RVC_PTC_DUTIES_FETCHED_TOTAL,
+};
 use bn_manager::{AttesterDuty, BeaconNodeClient, ProposerDuty, PtcDuty};
 use eth_types::{ForkSchedule, SyncCommitteeDuty, SLOTS_PER_EPOCH};
 
+use crate::duty::{DutyParseError, TypedAttesterDuty, TypedProposerDuty, TypedPtcDuty};
 use crate::error::DutyTrackerError;
 
 /// Epochs per sync committee period (256 epochs ~ 27 hours).
 const EPOCHS_PER_SYNC_COMMITTEE_PERIOD: u64 = 256;
+
+fn record_rejection(err: DutyParseError, rejected: &mut Vec<DutyParseError>) {
+    RVC_DUTY_REJECTED_TOTAL.with_label_values(&[err.field]).inc();
+    match err.validator_index {
+        Some(validator_index) => {
+            warn!(
+                validator_index,
+                "rejecting duty: malformed numeric field {} raw {}", err.field, err.raw
+            );
+        }
+        None => {
+            warn!("rejecting duty: malformed numeric field {} raw {}", err.field, err.raw);
+        }
+    }
+    rejected.push(err);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct DutyCacheKey {
@@ -23,7 +42,7 @@ pub struct DutyCacheKey {
 
 #[derive(Debug)]
 struct EpochDutyCache {
-    duties: HashMap<DutyCacheKey, AttesterDuty>,
+    duties: HashMap<DutyCacheKey, TypedAttesterDuty>,
     dependent_root: String,
     /// Index list posted to produce `duties`. `dependent_root` does not cover it.
     indices: Vec<String>,
@@ -36,52 +55,51 @@ impl EpochDutyCache {
 
     /// Parse attester duties from a BN response into a keyed epoch cache.
     ///
-    /// Duties with unparseable slot / committee_index / validator_index are
-    /// skipped (with a warn log). Per-duty cache inserts are traced.
-    fn from_response(dependent_root: String, duties: &[AttesterDuty], epoch: u64) -> Self {
+    /// All five numeric fields are parsed per duty. A malformed field is a
+    /// [`DutyParseError`] (counted and warned); that duty is skipped and the
+    /// rest of the response is cached. Per-duty cache inserts are traced.
+    fn from_response(
+        dependent_root: String,
+        duties: &[AttesterDuty],
+        epoch: u64,
+    ) -> (Self, Vec<DutyParseError>) {
         let mut epoch_cache = Self::new(dependent_root);
+        let mut rejected = Vec::new();
         for duty in duties {
-            let slot: u64 = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(raw_slot = %duty.slot, "Skipping duty with unparseable slot");
-                    continue;
+            match TypedAttesterDuty::try_from(duty) {
+                Ok(typed) => {
+                    let key = DutyCacheKey {
+                        slot: typed.slot,
+                        committee_index: typed.committee_index,
+                        validator_index: typed.validator_index,
+                    };
+                    trace!(
+                        slot = key.slot,
+                        epoch,
+                        validator_index = key.validator_index,
+                        committee_index = key.committee_index,
+                        "cached attester duty"
+                    );
+                    epoch_cache.insert(key, typed);
                 }
-            };
-            let committee_index: u64 = match duty.committee_index.parse() {
-                Ok(c) => c,
-                Err(_) => {
-                    warn!(raw_committee_index = %duty.committee_index, "Skipping duty with unparseable committee_index");
-                    continue;
-                }
-            };
-            let validator_index: u64 = match duty.validator_index.parse() {
-                Ok(v) => v,
-                Err(_) => {
-                    warn!(raw_validator_index = %duty.validator_index, "Skipping duty with unparseable validator_index");
-                    continue;
-                }
-            };
-
-            let key = DutyCacheKey { slot, committee_index, validator_index };
-            trace!(slot, epoch, validator_index, committee_index, "cached attester duty");
-            epoch_cache.insert(key, duty.clone());
+                Err(err) => record_rejection(err, &mut rejected),
+            }
         }
-        epoch_cache
+        (epoch_cache, rejected)
     }
 
-    fn insert(&mut self, key: DutyCacheKey, duty: AttesterDuty) {
+    fn insert(&mut self, key: DutyCacheKey, duty: TypedAttesterDuty) {
         self.duties.insert(key, duty);
     }
 
-    fn get(&self, key: &DutyCacheKey) -> Option<&AttesterDuty> {
+    fn get(&self, key: &DutyCacheKey) -> Option<&TypedAttesterDuty> {
         self.duties.get(key)
     }
 }
 
 #[derive(Debug)]
 struct ProposerEpochDutyCache {
-    duties: HashMap<u64, ProposerDuty>,
+    duties: HashMap<u64, TypedProposerDuty>,
     dependent_root: String,
 }
 
@@ -92,27 +110,29 @@ impl ProposerEpochDutyCache {
 
     /// Parse proposer duties from a BN response into a slot-keyed epoch cache.
     ///
-    /// Duties with an unparseable slot are skipped (with a warn log).
-    fn from_response(dependent_root: String, duties: &[ProposerDuty]) -> Self {
+    /// `slot` and `validator_index` are parsed per duty. A malformed field is a
+    /// [`DutyParseError`] (counted and warned); that duty is skipped and the
+    /// rest of the response is cached.
+    fn from_response(
+        dependent_root: String,
+        duties: &[ProposerDuty],
+    ) -> (Self, Vec<DutyParseError>) {
         let mut epoch_cache = Self::new(dependent_root);
+        let mut rejected = Vec::new();
         for duty in duties {
-            let slot: u64 = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(raw_slot = %duty.slot, "Skipping proposer duty with unparseable slot");
-                    continue;
-                }
-            };
-            epoch_cache.insert(slot, duty.clone());
+            match TypedProposerDuty::try_from(duty) {
+                Ok(typed) => epoch_cache.insert(typed.slot, typed),
+                Err(err) => record_rejection(err, &mut rejected),
+            }
         }
-        epoch_cache
+        (epoch_cache, rejected)
     }
 
-    fn insert(&mut self, slot: u64, duty: ProposerDuty) {
+    fn insert(&mut self, slot: u64, duty: TypedProposerDuty) {
         self.duties.insert(slot, duty);
     }
 
-    fn get(&self, slot: &u64) -> Option<&ProposerDuty> {
+    fn get(&self, slot: &u64) -> Option<&TypedProposerDuty> {
         self.duties.get(slot)
     }
 }
@@ -120,7 +140,7 @@ impl ProposerEpochDutyCache {
 /// PTC duties for one epoch, keyed by slot (multiple validators per slot).
 #[derive(Debug)]
 struct PtcEpochDutyCache {
-    duties: HashMap<u64, Vec<PtcDuty>>,
+    duties: HashMap<u64, Vec<TypedPtcDuty>>,
     dependent_root: String,
     /// Index list posted to produce `duties`. `dependent_root` does not cover it.
     indices: Vec<String>,
@@ -133,27 +153,26 @@ impl PtcEpochDutyCache {
 
     /// Parse PTC duties from a BN response into a slot-keyed epoch cache.
     ///
-    /// Duties with an unparseable slot are skipped (with a warn log).
-    fn from_response(dependent_root: String, duties: &[PtcDuty]) -> Self {
+    /// `slot` and `validator_index` are parsed per duty. A malformed field is a
+    /// [`DutyParseError`] (counted and warned); that duty is skipped and the
+    /// rest of the response is cached.
+    fn from_response(dependent_root: String, duties: &[PtcDuty]) -> (Self, Vec<DutyParseError>) {
         let mut epoch_cache = Self::new(dependent_root);
+        let mut rejected = Vec::new();
         for duty in duties {
-            let slot: u64 = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(raw_slot = %duty.slot, "Skipping PTC duty with unparseable slot");
-                    continue;
-                }
-            };
-            epoch_cache.insert(slot, duty.clone());
+            match TypedPtcDuty::try_from(duty) {
+                Ok(typed) => epoch_cache.insert(typed.slot, typed),
+                Err(err) => record_rejection(err, &mut rejected),
+            }
         }
-        epoch_cache
+        (epoch_cache, rejected)
     }
 
-    fn insert(&mut self, slot: u64, duty: PtcDuty) {
+    fn insert(&mut self, slot: u64, duty: TypedPtcDuty) {
         self.duties.entry(slot).or_default().push(duty);
     }
 
-    fn get(&self, slot: &u64) -> Option<&[PtcDuty]> {
+    fn get(&self, slot: &u64) -> Option<&[TypedPtcDuty]> {
         self.duties.get(slot).map(Vec::as_slice)
     }
 
@@ -284,7 +303,7 @@ impl DutyTracker {
             }
         }
 
-        let mut epoch_cache =
+        let (mut epoch_cache, _rejected) =
             EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
         epoch_cache.indices = indices;
 
@@ -325,7 +344,7 @@ impl DutyTracker {
         if let Some(epoch_cache) = cache.get(&epoch) {
             if let Some(duty) = epoch_cache.get(&key) {
                 debug!(slot, epoch, cache_type = "attester", "Cache hit");
-                return Ok(duty.clone());
+                return Ok(duty.raw.clone());
             }
         }
 
@@ -368,7 +387,7 @@ impl DutyTracker {
             debug!(epoch, "Index snapshot changed, replacing cached attester duties");
         }
 
-        let mut epoch_cache =
+        let (mut epoch_cache, _rejected) =
             EpochDutyCache::from_response(response.dependent_root.clone(), &response.data, epoch);
         epoch_cache.indices = indices;
 
@@ -440,7 +459,7 @@ impl DutyTracker {
             .duties
             .iter()
             .filter(|(key, _)| key.slot == slot)
-            .map(|(_, duty)| duty.clone())
+            .map(|(_, duty)| duty.raw.clone())
             .collect();
 
         debug!(slot, epoch, cache_type = "attester", count = duties.len(), "Cache hit for slot");
@@ -484,7 +503,9 @@ impl DutyTracker {
     ) -> bool {
         let mut cache = self.proposer_cache.write().await;
         let root_changed = cache.get(&epoch).is_some_and(|c| c.dependent_root != dependent_root);
-        cache.insert(epoch, ProposerEpochDutyCache::from_response(dependent_root, duties));
+        let (epoch_cache, _rejected) =
+            ProposerEpochDutyCache::from_response(dependent_root, duties);
+        cache.insert(epoch, epoch_cache);
         root_changed
     }
 
@@ -519,7 +540,7 @@ impl DutyTracker {
     pub async fn get_proposer_duty(&self, slot: u64) -> Option<ProposerDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.proposer_cache.read().await;
-        let result = cache.get(&epoch).and_then(|c| c.get(&slot)).cloned();
+        let result = cache.get(&epoch).and_then(|c| c.get(&slot)).map(|duty| duty.raw.clone());
         if result.is_some() {
             debug!(slot, epoch, cache_type = "proposer", "Cache hit");
         } else {
@@ -591,7 +612,7 @@ impl DutyTracker {
 
         RVC_PTC_DUTIES_FETCHED_TOTAL.with_label_values(&[] as &[&str]).inc();
 
-        let mut epoch_cache =
+        let (mut epoch_cache, _rejected) =
             PtcEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
         epoch_cache.indices = validator_indices.to_vec();
 
@@ -618,7 +639,7 @@ impl DutyTracker {
         match cache.get(&epoch).and_then(|c| c.get(&slot)) {
             Some(duties) => {
                 debug!(slot, epoch, cache_type = "ptc", count = duties.len(), "Cache hit");
-                duties.to_vec()
+                duties.iter().map(|duty| duty.raw.clone()).collect()
             }
             None => {
                 debug!(slot, epoch, cache_type = "ptc", "Cache miss");
@@ -670,7 +691,7 @@ impl DutyTracker {
             debug!(epoch, "Index snapshot changed, replacing cached PTC duties");
         }
 
-        let mut epoch_cache =
+        let (mut epoch_cache, _rejected) =
             PtcEpochDutyCache::from_response(response.dependent_root.clone(), &response.data);
         epoch_cache.indices = indices;
 
@@ -2423,6 +2444,254 @@ mod tests {
         );
     }
 
+    fn rejection_count(field: &str) -> u64 {
+        crate::metrics::RVC_DUTY_REJECTED_TOTAL.with_label_values(&[field]).get()
+    }
+
+    macro_rules! assert_rejection_warned {
+        ($field:expr, $raw:expr) => {
+            logs_assert(|lines| {
+                let field = $field;
+                let raw = $raw;
+                if lines.iter().any(|line| {
+                    line.contains("WARN")
+                        && line.contains("malformed numeric field")
+                        && line.contains(field)
+                        && line.contains(raw)
+                }) {
+                    Ok(())
+                } else {
+                    Err(format!("no warn naming {field} raw {raw}; lines={lines:?}"))
+                }
+            });
+        };
+    }
+
+    /// One malformed numeric field is a named per-duty rejection. The epoch's
+    /// other duties stay in the cache.
+    #[test]
+    #[tracing_test::traced_test]
+    fn malformed_committee_length_is_rejected_at_the_cache_with_a_named_error() {
+        let mut bad = attester_duty(322, 3, "300");
+        bad.committee_length = "not-a-length".to_string();
+        let duties = vec![attester_duty(320, 1, "100"), attester_duty(321, 2, "200"), bad];
+
+        let before = rejection_count("committee_length");
+        let (cache, errors) = EpochDutyCache::from_response("0xroot".into(), &duties, 10);
+
+        assert_eq!(
+            errors,
+            vec![DutyParseError {
+                field: "committee_length",
+                raw: "not-a-length".to_string(),
+                validator_index: Some(300),
+            }]
+        );
+        assert!(
+            rejection_count("committee_length") > before,
+            "rvc_duty_rejected_total{{field=committee_length}} must increment"
+        );
+        assert_rejection_warned!("committee_length", "not-a-length");
+
+        assert_eq!(cache.duties.len(), 2, "the rest of the epoch stays cached");
+        let kept = cache
+            .get(&DutyCacheKey { slot: 320, committee_index: 1, validator_index: 100 })
+            .expect("sibling duty");
+        assert_eq!(kept.slot, 320);
+        assert_eq!(kept.committee_index, 1);
+        assert_eq!(kept.validator_index, 100);
+        assert_eq!(kept.committee_length, 128);
+        assert_eq!(kept.validator_committee_index, 25);
+        assert_eq!(kept.committees_at_slot, "64");
+        assert_eq!(kept.raw.committee_length, "128");
+        assert_eq!(kept.raw.validator_index, "100");
+        assert!(cache
+            .get(&DutyCacheKey { slot: 322, committee_index: 3, validator_index: 300 })
+            .is_none());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn malformed_validator_committee_index_is_rejected_at_the_cache_with_a_named_error() {
+        assert_one_attester_field_rejected(
+            "validator_committee_index",
+            "not-a-position",
+            |duty| duty.validator_committee_index = "not-a-position".to_string(),
+            Some(300),
+        );
+        assert_rejection_warned!("validator_committee_index", "not-a-position");
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn malformed_slot_is_rejected_at_the_cache_with_a_named_error() {
+        assert_one_attester_field_rejected(
+            "slot",
+            "not-a-slot",
+            |duty| duty.slot = "not-a-slot".to_string(),
+            Some(300),
+        );
+        assert_rejection_warned!("slot", "not-a-slot");
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn malformed_committee_index_is_rejected_at_the_cache_with_a_named_error() {
+        assert_one_attester_field_rejected(
+            "committee_index",
+            "not-a-committee",
+            |duty| duty.committee_index = "not-a-committee".to_string(),
+            Some(300),
+        );
+        assert_rejection_warned!("committee_index", "not-a-committee");
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn malformed_validator_index_is_rejected_at_the_cache_with_a_named_error() {
+        assert_one_attester_field_rejected(
+            "validator_index",
+            "not-an-index",
+            |duty| duty.validator_index = "not-an-index".to_string(),
+            None,
+        );
+        assert_rejection_warned!("validator_index", "not-an-index");
+    }
+
+    fn assert_one_attester_field_rejected(
+        field: &'static str,
+        raw: &'static str,
+        corrupt: impl FnOnce(&mut AttesterDuty),
+        validator_index: Option<u64>,
+    ) {
+        let mut bad = attester_duty(322, 3, "300");
+        corrupt(&mut bad);
+        let duties = vec![attester_duty(320, 1, "100"), attester_duty(321, 2, "200"), bad];
+
+        let before = rejection_count(field);
+        let (cache, errors) = EpochDutyCache::from_response("0xroot".into(), &duties, 10);
+
+        assert_eq!(errors, vec![DutyParseError { field, raw: raw.to_string(), validator_index }]);
+        assert!(
+            rejection_count(field) > before,
+            "rvc_duty_rejected_total{{field={field}}} must increment"
+        );
+        assert_eq!(cache.duties.len(), 2, "the rest of the epoch stays cached");
+        assert!(cache
+            .get(&DutyCacheKey { slot: 320, committee_index: 1, validator_index: 100 })
+            .is_some());
+        assert!(cache
+            .get(&DutyCacheKey { slot: 321, committee_index: 2, validator_index: 200 })
+            .is_some());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn proposer_cache_rejects_malformed_validator_index() {
+        let duties = vec![
+            proposer_duty(320, "100", "0xpk100"),
+            proposer_duty(321, "not-an-index", "0xpk-bad"),
+            proposer_duty(322, "200", "0xpk200"),
+        ];
+        let before = rejection_count("validator_index");
+        let (cache, errors) = ProposerEpochDutyCache::from_response("0xproot".into(), &duties);
+        assert_eq!(
+            errors,
+            vec![DutyParseError {
+                field: "validator_index",
+                raw: "not-an-index".to_string(),
+                validator_index: None,
+            }]
+        );
+        assert!(rejection_count("validator_index") > before);
+        assert_rejection_warned!("validator_index", "not-an-index");
+        assert_eq!(cache.duties.len(), 2);
+        assert!(cache.get(&320).is_some());
+        assert!(cache.get(&322).is_some());
+        assert!(cache.get(&321).is_none());
+        assert_eq!(cache.get(&320).unwrap().raw.validator_index, "100");
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn proposer_cache_rejects_malformed_slot() {
+        let duties = vec![
+            proposer_duty(320, "100", "0xpk100"),
+            ProposerDuty {
+                pubkey: "0xpk-bad".into(),
+                validator_index: "300".into(),
+                slot: "not-a-slot".into(),
+            },
+        ];
+        let before = rejection_count("slot");
+        let (cache, errors) = ProposerEpochDutyCache::from_response("0xproot".into(), &duties);
+        assert_eq!(
+            errors,
+            vec![DutyParseError {
+                field: "slot",
+                raw: "not-a-slot".to_string(),
+                validator_index: Some(300),
+            }]
+        );
+        assert!(rejection_count("slot") > before);
+        assert_rejection_warned!("slot", "not-a-slot");
+        assert_eq!(cache.duties.len(), 1);
+        assert!(cache.get(&320).is_some());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn ptc_cache_rejects_malformed_validator_index() {
+        let duties = vec![
+            ptc_duty(320, "100", "0xpk100"),
+            ptc_duty(320, "not-an-index", "0xpk-bad"),
+            ptc_duty(321, "200", "0xpk200"),
+        ];
+        let before = rejection_count("validator_index");
+        let (cache, errors) = PtcEpochDutyCache::from_response("0xtroot".into(), &duties);
+        assert_eq!(
+            errors,
+            vec![DutyParseError {
+                field: "validator_index",
+                raw: "not-an-index".to_string(),
+                validator_index: None,
+            }]
+        );
+        assert!(rejection_count("validator_index") > before);
+        assert_rejection_warned!("validator_index", "not-an-index");
+        assert_eq!(cache.duty_count(), 2);
+        assert_eq!(cache.get(&320).map(|d| d.len()), Some(1));
+        assert_eq!(cache.get(&321).map(|d| d.len()), Some(1));
+        assert_eq!(cache.get(&320).unwrap()[0].raw.validator_index, "100");
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn ptc_cache_rejects_malformed_slot() {
+        let duties = vec![
+            ptc_duty(320, "100", "0xpk100"),
+            PtcDuty {
+                pubkey: "0xpk-bad".into(),
+                validator_index: "300".into(),
+                slot: "not-a-slot".into(),
+            },
+        ];
+        let before = rejection_count("slot");
+        let (cache, errors) = PtcEpochDutyCache::from_response("0xtroot".into(), &duties);
+        assert_eq!(
+            errors,
+            vec![DutyParseError {
+                field: "slot",
+                raw: "not-a-slot".to_string(),
+                validator_index: Some(300),
+            }]
+        );
+        assert!(rejection_count("slot") > before);
+        assert_rejection_warned!("slot", "not-a-slot");
+        assert_eq!(cache.duty_count(), 1);
+        assert_eq!(cache.get(&320).map(|d| d.len()), Some(1));
+    }
+
     /// RF4-29: `from_response` constructors produce the same cache contents
     /// as the previous inline parse loops (keyed by parsed fields, skip bad rows).
     #[test]
@@ -2466,7 +2735,8 @@ mod tests {
             },
         ];
 
-        let attester_cache = EpochDutyCache::from_response("0xroot".into(), &attester_duties, 10);
+        let (attester_cache, _) =
+            EpochDutyCache::from_response("0xroot".into(), &attester_duties, 10);
         assert_eq!(attester_cache.dependent_root, "0xroot");
         assert_eq!(attester_cache.duties.len(), 1);
         let key = DutyCacheKey { slot: 320, committee_index: 2, validator_index: 10 };
@@ -2489,7 +2759,7 @@ mod tests {
                 slot: "325".into(),
             },
         ];
-        let proposer_cache =
+        let (proposer_cache, _) =
             ProposerEpochDutyCache::from_response("0xproot".into(), &proposer_duties);
         assert_eq!(proposer_cache.dependent_root, "0xproot");
         assert_eq!(proposer_cache.duties.len(), 2);
@@ -2506,7 +2776,7 @@ mod tests {
             },
             PtcDuty { pubkey: "0xpk3".into(), validator_index: "12".into(), slot: "320".into() },
         ];
-        let ptc_cache = PtcEpochDutyCache::from_response("0xtroot".into(), &ptc_duties);
+        let (ptc_cache, _) = PtcEpochDutyCache::from_response("0xtroot".into(), &ptc_duties);
         assert_eq!(ptc_cache.dependent_root, "0xtroot");
         assert_eq!(ptc_cache.duty_count(), 2);
         assert_eq!(ptc_cache.get(&320).map(|d| d.len()), Some(2));
