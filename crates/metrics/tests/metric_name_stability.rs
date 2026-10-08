@@ -66,6 +66,12 @@
 //! 500, 1000, 2500, 5000, and 10000 milliseconds. Neither family has labels.
 //! Dashboards that watch import latency or connection occupancy should bind
 //! these names (RR4-05 / #541).
+//! RR3-04 adds `rvc_duty_rejected_total` (family delta +1): one increment when
+//! the duty cache rejects one attester, proposer, or PTC duty because a numeric
+//! field did not parse as a `u64`. Label `field` is that wire name (`slot`,
+//! `committee_index`, `validator_index`, `committee_length`,
+//! `validator_committee_index`). The rest of the epoch stays cached. Dashboards
+//! that alert on malformed beacon duties should bind this name (RR3-04 / #533).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -119,6 +125,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_builder_epoch_misses",
     "rvc_duties_fetched_total",
     "rvc_duty_index_set_size", // operator-facing: pubkey-index registry size (RR-2.2)
+    "rvc_duty_rejected_total", // operator-facing: per-duty malformed numeric field (RR3-04 / #533)
     "rvc_duty_reorg_detected_total",
     "rvc_dvt_peer_ready", // operator-facing: 0 until the first successful DVT peer RPC (RR-1.6)
     "rvc_fork_current_id", // operator-facing: resolved current fork id (issue 8.1)
@@ -268,8 +275,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        58,
-        "RR2-12 adds import duration and conn-hold histograms; count is the list length"
+        59,
+        "RR3-04 adds rvc_duty_rejected_total; count is the list length"
     );
 }
 

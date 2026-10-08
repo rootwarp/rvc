@@ -18,9 +18,23 @@ pub static RVC_PTC_DUTIES_FETCHED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new
     )
 });
 
+/// Duties dropped at the cache because a numeric field did not parse.
+///
+/// Label `field` is the wire name (`slot`, `committee_index`, `validator_index`,
+/// `committee_length`, `validator_committee_index`). One increment is one duty.
+/// The rest of that epoch stays cached.
+pub static RVC_DUTY_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_duty_rejected_total",
+        "Duties rejected at the cache because a numeric field did not parse",
+        &["field"],
+    )
+});
+
 pub fn init() {
     LazyLock::force(&RVC_DUTIES_FETCHED_TOTAL);
     LazyLock::force(&RVC_PTC_DUTIES_FETCHED_TOTAL);
+    LazyLock::force(&RVC_DUTY_REJECTED_TOTAL);
 }
 
 #[cfg(test)]

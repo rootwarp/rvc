@@ -3,6 +3,16 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Behaviour: malformed duty fields are named per-duty rejections (RR3-04 / #533)
+
+A numeric field on an attester, proposer, or PTC duty that does not parse as
+an integer is now a named per-duty rejection. That duty is left out of the
+epoch cache. The epoch's other duties are still cached. The rejection is
+counted on `rvc_duty_rejected_total{field}` (`field` is `slot`,
+`committee_index`, `validator_index`, `committee_length`, or
+`validator_committee_index`) and logged at `warn`. One bad duty does not
+discard the rest of the epoch.
+
 ## Tracing: dev/demo tail sampling profile (TRC-7c / #448)
 
 `docker compose --profile tracing-tailsample` starts the pinned Jaeger v2
