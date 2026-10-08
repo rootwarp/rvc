@@ -149,6 +149,10 @@ pub struct ValidatorDefaults {
 /// `save_config`) and so `reload_config` can apply a full update under one
 /// write guard — concurrent readers observe either the pre- or post-reload
 /// state, never a mix of old defaults with new validators (or vice versa).
+///
+/// `Clone` exists so `update_config_durable` can persist a candidate and
+/// publish only after that write succeeds.
+#[derive(Clone)]
 struct StoreState {
     validators: HashMap<[u8; 48], ValidatorConfig>,
     defaults: ValidatorDefaults,
@@ -156,16 +160,41 @@ struct StoreState {
     global_builders: Option<Vec<String>>,
     global_min_bid: Option<u64>,
     global_builder_boost_factor: Option<u64>,
+    /// Identity of each pubkey. Bumped on insert, cleared on remove. Not
+    /// persisted. `set_enabled` and `update_config` leave it alone, so a
+    /// durable update can tell a field edit from a delete/re-import.
+    validator_gen: HashMap<[u8; 48], u64>,
+    next_validator_gen: u64,
+}
+
+impl StoreState {
+    fn insert_validator(&mut self, config: ValidatorConfig) {
+        let pubkey = config.pubkey;
+        self.validators.insert(pubkey, config);
+        let gen = self.next_validator_gen;
+        self.next_validator_gen = self.next_validator_gen.wrapping_add(1);
+        self.validator_gen.insert(pubkey, gen);
+    }
+
+    fn take_validator(&mut self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
+        self.validator_gen.remove(pubkey);
+        self.validators.remove(pubkey)
+    }
 }
 
 pub struct ValidatorStore {
     state: RwLock<StoreState>,
     config_path: Option<PathBuf>,
-    // Serializes `save_config` so that snapshot → tempfile write → atomic
-    // rename happens as a single critical section. Without this, a thread
-    // holding a stale snapshot can `persist` AFTER a thread with newer data,
-    // silently clobbering committed updates. Intentionally separate from
-    // `state`: it guards file I/O ordering, not in-memory fields.
+    // Serializes durable mutation (`update_config_durable`, `save_config`,
+    // `reload_config`). Snapshot → tempfile write → atomic rename, and the
+    // in-memory publish that follows a successful write, run as one critical
+    // section. Without this, a thread holding a stale snapshot can `persist`
+    // AFTER a thread with newer data and silently clobber committed updates.
+    // Lock order is always `save_lock` then `state`, never the reverse.
+    // Intentionally separate from `state`: `set_enabled`, `add_validator`,
+    // `remove_validator`, and the proposer-URL refresher mutate memory without
+    // taking it, so a durable update re-applies its delta and must not replace
+    // the map.
     save_lock: Mutex<()>,
 }
 
@@ -183,6 +212,8 @@ impl ValidatorStore {
                 global_builders: None,
                 global_min_bid: None,
                 global_builder_boost_factor: None,
+                validator_gen: HashMap::new(),
+                next_validator_gen: 1,
             }),
             config_path: None,
             save_lock: Mutex::new(()),
@@ -203,6 +234,12 @@ impl ValidatorStore {
 
         let validators: HashMap<_, _> =
             parsed_validators.into_iter().map(|c| (c.pubkey, c)).collect();
+        let mut validator_gen = HashMap::with_capacity(validators.len());
+        let mut next_validator_gen = 1u64;
+        for pubkey in validators.keys() {
+            validator_gen.insert(*pubkey, next_validator_gen);
+            next_validator_gen = next_validator_gen.wrapping_add(1);
+        }
 
         info!(
             validator_count = validators.len(),
@@ -218,6 +255,8 @@ impl ValidatorStore {
                 global_builders: None,
                 global_min_bid: None,
                 global_builder_boost_factor: None,
+                validator_gen,
+                next_validator_gen,
             }),
             config_path: Some(path.to_path_buf()),
             save_lock: Mutex::new(()),
@@ -366,12 +405,12 @@ impl ValidatorStore {
         if let Some(urls) = config.builders.as_deref() {
             validate_builder_urls(urls)?;
         }
-        self.state.write().validators.insert(config.pubkey, config);
+        self.state.write().insert_validator(config);
         Ok(())
     }
 
     pub fn remove_validator(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
-        self.state.write().validators.remove(pubkey)
+        self.state.write().take_validator(pubkey)
     }
 
     pub fn set_enabled(&self, pubkey: &[u8; 48], enabled: bool) {
@@ -394,66 +433,82 @@ impl ValidatorStore {
         if let Some(ref builders) = update.builders {
             validate_builder_urls(builders)?;
         }
-        let mut changed_fields = Vec::new();
-        if update.fee_recipient.is_some() {
-            changed_fields.push("fee_recipient");
-        }
-        if update.gas_limit.is_some() {
-            changed_fields.push("gas_limit");
-        }
-        if update.graffiti.is_some() {
-            changed_fields.push("graffiti");
-        }
-        if update.builder_proposals.is_some() {
-            changed_fields.push("builder_proposals");
-        }
-        if update.builder_boost_factor.is_some() {
-            changed_fields.push("builder_boost_factor");
-        }
-        if update.block_selection_mode.is_some() {
-            changed_fields.push("block_selection_mode");
-        }
-        if update.builders.is_some() {
-            changed_fields.push("builders");
-        }
-        if update.min_bid.is_some() {
-            changed_fields.push("min_bid");
-        }
-
-        if let Some(config) = self.state.write().validators.get_mut(pubkey) {
-            if let Some(fr) = update.fee_recipient {
-                config.fee_recipient = fr;
-            }
-            if let Some(gl) = update.gas_limit {
-                config.gas_limit = gl;
-            }
-            if let Some(g) = update.graffiti {
-                config.graffiti = g;
-            }
-            if let Some(bp) = update.builder_proposals {
-                config.builder_proposals = bp;
-            }
-            if let Some(bbf) = update.builder_boost_factor {
-                config.builder_boost_factor = Some(bbf);
-            }
-            if let Some(bsm) = update.block_selection_mode {
-                config.block_selection_mode = bsm;
-            }
-            if let Some(builders) = update.builders {
-                config.builders = Some(builders);
-            }
-            if let Some(min_bid) = update.min_bid {
-                config.min_bid = Some(min_bid);
-            }
-
-            let pk_hex = hex::encode(pubkey);
-            info!(
-                pubkey = %TruncatedPubkey::new(&pk_hex),
-                changed_fields = changed_fields.join(","),
-                "validator config updated"
-            );
-        }
+        let changed_fields = apply_update_locked(&mut self.state.write(), pubkey, &update);
+        log_validator_config_updated(pubkey, &changed_fields);
         Ok(())
+    }
+
+    /// Persist `update` for `pubkey`, then publish it to the live store.
+    ///
+    /// Builder URLs are validated before `save_lock` is taken. If `pubkey` is
+    /// absent from the cloned state this returns [`ValidatorStoreError::NotFound`]
+    /// and does not write or publish. A write error also publishes nothing.
+    /// On success the same delta is applied to the live map — the map is not
+    /// replaced — so `set_enabled` and the proposer-URL refresher survive.
+    /// `add_validator` and `remove_validator` do not take `save_lock` (keymanager
+    /// delete and `KeyAdmission::admit`). If that pubkey's identity changes
+    /// during the write, the stale delta is not published and the file is
+    /// rewritten so the key matches the live store.
+    #[tracing::instrument(name = "validator_store.update_config_durable", skip_all)]
+    pub fn update_config_durable(
+        &self,
+        pubkey: &[u8; 48],
+        update: ValidatorConfigUpdate,
+    ) -> Result<(), ValidatorStoreError> {
+        if let Some(ref builders) = update.builders {
+            validate_builder_urls(builders)?;
+        }
+
+        let config_path = self.config_path.as_ref().ok_or_else(|| {
+            ValidatorStoreError::Config("no config path set for save".to_string())
+        })?;
+
+        // Lock order: `save_lock` then `state`. The state guard is dropped
+        // before I/O.
+        let _save_guard = self.save_lock.lock();
+
+        let mut candidate = self.state.read().clone();
+        // Absent at clone: the following write would omit this pubkey, and a
+        // re-import before publish would then apply a delta the file never had.
+        if !candidate.validators.contains_key(pubkey) {
+            return Err(ValidatorStoreError::NotFound);
+        }
+        let identity = candidate.validator_gen.get(pubkey).copied();
+        apply_update_locked(&mut candidate, pubkey, &update);
+
+        write_toml_atomic(config_path, &snapshot_toml(&candidate))?;
+
+        // `save_lock` does not cover `add_validator` / `remove_validator`
+        // (`ValidatorManagerAdapter::remove_validator`, `KeyAdmission::admit`).
+        // Those bump `validator_gen`. `set_enabled` and the proposer-URL
+        // refresher do not, so the same identity still takes the delta.
+        // A changed identity means the file currently describes a validator
+        // that is gone or was replaced. Copy the live entry (or drop the key)
+        // back over the snapshot and do not publish the stale delta.
+        let live_cfg = {
+            let mut state = self.state.write();
+            let same = state.validators.contains_key(pubkey)
+                && state.validator_gen.get(pubkey).copied() == identity;
+            if same {
+                let changed_fields = apply_update_locked(&mut state, pubkey, &update);
+                drop(state);
+                log_validator_config_updated(pubkey, &changed_fields);
+                return Ok(());
+            }
+            state.validators.get(pubkey).cloned()
+        };
+
+        let mut repaired = candidate;
+        match live_cfg {
+            Some(cfg) => {
+                repaired.validators.insert(*pubkey, cfg);
+            }
+            None => {
+                repaired.validators.remove(pubkey);
+            }
+        }
+        write_toml_atomic(config_path, &snapshot_toml(&repaired))?;
+        Err(ValidatorStoreError::NotFound)
     }
 
     /// Apply a partial update to the store-wide defaults under one write guard.
@@ -501,54 +556,16 @@ impl ValidatorStore {
 
         // Serialize the entire snapshot → write → rename sequence so a
         // concurrent saver with a stale snapshot cannot persist after a
-        // saver with newer data and clobber it.
+        // saver with newer data and clobber it. Lock order: `save_lock`
+        // then `state`.
         let _save_guard = self.save_lock.lock();
 
         // Single state read: defaults + validators under one guard (no
-        // multi-lock ordering with `effective_config`).
-        let (toml_defaults, toml_validators) = {
-            let state = self.state.read();
-            let toml_defaults = TomlDefaults {
-                fee_recipient: Some(format!("0x{}", hex::encode(state.defaults.fee_recipient))),
-                gas_limit: Some(state.defaults.gas_limit),
-                graffiti: state.defaults.graffiti.map(|g| graffiti_to_string(&g)),
-            };
-            let toml_validators: Vec<TomlValidator> = state
-                .validators
-                .values()
-                .map(|v| TomlValidator {
-                    pubkey: format!("0x{}", hex::encode(v.pubkey)),
-                    fee_recipient: v.fee_recipient.map(|fr| format!("0x{}", hex::encode(fr))),
-                    gas_limit: v.gas_limit,
-                    builder_proposals: Some(v.builder_proposals),
-                    builder_boost_factor: v.builder_boost_factor,
-                    graffiti: v.graffiti.map(|g| graffiti_to_string(&g)),
-                    enabled: Some(v.enabled),
-                    block_selection_mode: v.block_selection_mode,
-                    builders: v.builders.clone(),
-                    min_bid: v.min_bid,
-                })
-                .collect();
-            (toml_defaults, toml_validators)
-        };
-        // State read guard dropped before I/O.
+        // multi-lock ordering with `effective_config`). The guard drops
+        // before I/O.
+        let toml_config = snapshot_toml(&self.state.read());
 
-        let toml_config = TomlConfig { defaults: Some(toml_defaults), validators: toml_validators };
-
-        let toml_string = toml::to_string(&toml_config)
-            .map_err(|e| ValidatorStoreError::Config(e.to_string()))?;
-
-        let parent = config_path.parent().ok_or_else(|| {
-            ValidatorStoreError::Config("config path has no parent directory".to_string())
-        })?;
-
-        let tmp = tempfile::NamedTempFile::new_in(parent)?;
-        std::io::Write::write_all(&mut &tmp, toml_string.as_bytes())?;
-        tmp.as_file().sync_all()?;
-        tmp.persist(config_path).map_err(|e| ValidatorStoreError::Io(e.error))?;
-
-        info!(path = %config_path.display(), "config saved");
-        Ok(())
+        write_toml_atomic(config_path, &toml_config)
     }
 
     #[tracing::instrument(name = "validator_store.reload_config", skip_all)]
@@ -556,6 +573,11 @@ impl ValidatorStore {
         let path = self.config_path.as_ref().ok_or_else(|| {
             ValidatorStoreError::Config("no config path set for reload".to_string())
         })?;
+
+        // Lock order is `save_lock` then `state`. Hold `save_lock` across the
+        // read and the apply so a durable update cannot commit a newer file
+        // that this reload then overwrites from a stale read.
+        let _save_guard = self.save_lock.lock();
 
         let content = std::fs::read_to_string(path).map_err(|e| {
             warn!(path = %path.display(), error = %e, "config parse error");
@@ -575,7 +597,7 @@ impl ValidatorStore {
         state.defaults = new_defaults;
         let existing_count = state.validators.len();
         for config in parsed_validators {
-            state.validators.insert(config.pubkey, config);
+            state.insert_validator(config);
         }
         let added_count = state.validators.len().saturating_sub(existing_count);
         let total_count = state.validators.len();
@@ -627,6 +649,137 @@ fn graffiti_to_string(graffiti: &[u8; 32]) -> String {
     let end = graffiti.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     String::from_utf8_lossy(&graffiti[..end]).into_owned()
 }
+
+/// TOML document for `state`. Field set and order match the historical
+/// `save_config` body, including `enabled: Some(v.enabled)`.
+fn snapshot_toml(state: &StoreState) -> TomlConfig {
+    let toml_defaults = TomlDefaults {
+        fee_recipient: Some(format!("0x{}", hex::encode(state.defaults.fee_recipient))),
+        gas_limit: Some(state.defaults.gas_limit),
+        graffiti: state.defaults.graffiti.map(|g| graffiti_to_string(&g)),
+    };
+    let toml_validators: Vec<TomlValidator> = state
+        .validators
+        .values()
+        .map(|v| TomlValidator {
+            pubkey: format!("0x{}", hex::encode(v.pubkey)),
+            fee_recipient: v.fee_recipient.map(|fr| format!("0x{}", hex::encode(fr))),
+            gas_limit: v.gas_limit,
+            builder_proposals: Some(v.builder_proposals),
+            builder_boost_factor: v.builder_boost_factor,
+            graffiti: v.graffiti.map(|g| graffiti_to_string(&g)),
+            enabled: Some(v.enabled),
+            block_selection_mode: v.block_selection_mode,
+            builders: v.builders.clone(),
+            min_bid: v.min_bid,
+        })
+        .collect();
+    TomlConfig { defaults: Some(toml_defaults), validators: toml_validators }
+}
+
+/// Write `toml_config` to `config_path` via tempfile + `sync_all` + rename.
+fn write_toml_atomic(
+    config_path: &Path,
+    toml_config: &TomlConfig,
+) -> Result<(), ValidatorStoreError> {
+    let toml_string =
+        toml::to_string(toml_config).map_err(|e| ValidatorStoreError::Config(e.to_string()))?;
+
+    let parent = config_path.parent().ok_or_else(|| {
+        ValidatorStoreError::Config("config path has no parent directory".to_string())
+    })?;
+
+    let tmp = tempfile::NamedTempFile::new_in(parent)?;
+    std::io::Write::write_all(&mut &tmp, toml_string.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(config_path).map_err(|e| ValidatorStoreError::Io(e.error))?;
+
+    info!(path = %config_path.display(), "config saved");
+    // After the snapshot is durable and before the caller publishes. A test
+    // installs this so `set_enabled` can land in the window a map replacement
+    // would clobber. Production builds have an empty hook.
+    invoke_durable_write_hook();
+    Ok(())
+}
+
+/// Apply `update` to `pubkey` under the caller's state guard.
+///
+/// Returns the changed field names when that validator is present, or an empty
+/// vec when it is not (unknown pubkeys stay a no-op).
+fn apply_update_locked(
+    state: &mut StoreState,
+    pubkey: &[u8; 48],
+    update: &ValidatorConfigUpdate,
+) -> Vec<&'static str> {
+    let Some(config) = state.validators.get_mut(pubkey) else {
+        return Vec::new();
+    };
+
+    let mut changed_fields = Vec::new();
+    if let Some(fr) = update.fee_recipient {
+        config.fee_recipient = fr;
+        changed_fields.push("fee_recipient");
+    }
+    if let Some(gl) = update.gas_limit {
+        config.gas_limit = gl;
+        changed_fields.push("gas_limit");
+    }
+    if let Some(g) = update.graffiti {
+        config.graffiti = g;
+        changed_fields.push("graffiti");
+    }
+    if let Some(bp) = update.builder_proposals {
+        config.builder_proposals = bp;
+        changed_fields.push("builder_proposals");
+    }
+    if let Some(bbf) = update.builder_boost_factor {
+        config.builder_boost_factor = Some(bbf);
+        changed_fields.push("builder_boost_factor");
+    }
+    if let Some(bsm) = update.block_selection_mode {
+        config.block_selection_mode = bsm;
+        changed_fields.push("block_selection_mode");
+    }
+    if let Some(builders) = update.builders.clone() {
+        config.builders = Some(builders);
+        changed_fields.push("builders");
+    }
+    if let Some(min_bid) = update.min_bid {
+        config.min_bid = Some(min_bid);
+        changed_fields.push("min_bid");
+    }
+    changed_fields
+}
+
+fn log_validator_config_updated(pubkey: &[u8; 48], changed_fields: &[&str]) {
+    if changed_fields.is_empty() {
+        return;
+    }
+    let pk_hex = hex::encode(pubkey);
+    info!(
+        pubkey = %TruncatedPubkey::new(&pk_hex),
+        changed_fields = changed_fields.join(","),
+        "validator config updated"
+    );
+}
+
+#[cfg(test)]
+thread_local! {
+    static DURABLE_WRITE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn invoke_durable_write_hook() {
+    DURABLE_WRITE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
+
+#[cfg(not(test))]
+fn invoke_durable_write_hook() {}
 
 #[cfg(test)]
 mod tests {
@@ -2563,7 +2716,7 @@ builder_boost_factor = 175
     }
 
     /// Structural pin: exactly one `RwLock` protects store state; `save_lock`
-    /// remains a separate `Mutex` for file-I/O serialization only.
+    /// remains a separate `Mutex`. Lock order is `save_lock` then `state`.
     #[test]
     fn test_all_accessors_use_single_state_lock() {
         // Compile-time shape of ValidatorStore: one RwLock + one Mutex.
@@ -2603,5 +2756,482 @@ builder_boost_factor = 175
         assert_eq!(store.builder_boost_factor(&pk), 100);
         assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::MaxProfit);
         assert_eq!(store.list_enabled_pubkeys(), vec![pk]);
+    }
+
+    #[test]
+    fn set_fee_recipient_with_missing_parent_dir_does_not_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("missing").join("validators.toml");
+        assert!(!config_path.parent().unwrap().exists(), "parent directory must not exist");
+
+        let pk = test_pubkey(1);
+        let old_fee = test_fee_recipient(1);
+        let old_gas = 31_000_000u64;
+        let old_graffiti = parse_graffiti("keep-me");
+
+        let mut store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(old_fee);
+        cfg.gas_limit = Some(old_gas);
+        cfg.graffiti = Some(old_graffiti);
+        store.add_validator(cfg).unwrap();
+        store.config_path = Some(config_path);
+
+        let err = store.update_config_durable(
+            &pk,
+            ValidatorConfigUpdate {
+                fee_recipient: Some(Some(test_fee_recipient(2))),
+                gas_limit: Some(Some(42_000_000)),
+                graffiti: Some(Some(parse_graffiti("nope"))),
+                ..Default::default()
+            },
+        );
+
+        assert!(err.is_err(), "durable update must fail when the parent directory is missing");
+        assert_eq!(store.effective_fee_recipient(&pk), old_fee);
+        assert_eq!(store.effective_gas_limit(&pk), old_gas);
+        assert_eq!(store.effective_graffiti(&pk), Some(old_graffiti));
+    }
+
+    /// Distinct-field writers all land, and a multi-field update is never
+    /// observed half-applied. `save_lock` plus delta re-apply is what keeps
+    /// both properties.
+    #[test]
+    fn test_concurrent_durable_writers_lose_no_update_and_apply_none_partially() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let store = Arc::new(store);
+
+        let barrier = Arc::new(Barrier::new(3));
+        let fee = test_fee_recipient(7);
+        let gas = 45_000_000u64;
+        let graffiti = parse_graffiti("kept");
+
+        let mut handles = Vec::new();
+        {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                store
+                    .update_config_durable(
+                        &pk,
+                        ValidatorConfigUpdate {
+                            fee_recipient: Some(Some(fee)),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }));
+        }
+        {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                store
+                    .update_config_durable(
+                        &pk,
+                        ValidatorConfigUpdate { gas_limit: Some(Some(gas)), ..Default::default() },
+                    )
+                    .unwrap();
+            }));
+        }
+        {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                barrier.wait();
+                store
+                    .update_config_durable(
+                        &pk,
+                        ValidatorConfigUpdate {
+                            graffiti: Some(Some(graffiti)),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(store.effective_fee_recipient(&pk), fee);
+        assert_eq!(store.effective_gas_limit(&pk), gas);
+        assert_eq!(store.effective_graffiti(&pk), Some(graffiti));
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert_eq!(disk.effective_fee_recipient(&pk), fee);
+        assert_eq!(disk.effective_gas_limit(&pk), gas);
+        assert_eq!(disk.effective_graffiti(&pk), Some(graffiti));
+
+        // Seed a correlated triple so readers have a consistent baseline
+        // before the racing writers start.
+        let seed_fee = [0u8; 20];
+        let seed_graffiti = [0u8; 32];
+        store
+            .update_config_durable(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(seed_fee)),
+                    gas_limit: Some(Some(40_000_000)),
+                    graffiti: Some(Some(seed_graffiti)),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            readers.push(thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let cfg = store.effective_config(&pk);
+                    let fee_id = cfg.fee_recipient[0];
+                    let gas_id = cfg
+                        .gas_limit
+                        .checked_sub(40_000_000)
+                        .and_then(|delta| u8::try_from(delta).ok())
+                        .unwrap_or(255);
+                    let graf_id = cfg.graffiti.map(|g| g[0]).unwrap_or(255);
+                    assert_eq!(fee_id, gas_id, "fee recipient applied without gas limit");
+                    assert_eq!(fee_id, graf_id, "fee recipient applied without graffiti");
+                }
+            }));
+        }
+
+        let mut writers = Vec::new();
+        for id in 1u8..=4 {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            writers.push(thread::spawn(move || {
+                let mut fee = [0u8; 20];
+                fee[0] = id;
+                let mut graf = [0u8; 32];
+                graf[0] = id;
+                while !stop.load(Ordering::Relaxed) {
+                    store
+                        .update_config_durable(
+                            &pk,
+                            ValidatorConfigUpdate {
+                                fee_recipient: Some(Some(fee)),
+                                gas_limit: Some(Some(40_000_000 + u64::from(id))),
+                                graffiti: Some(Some(graf)),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                }
+            }));
+        }
+
+        thread::sleep(Duration::from_millis(80));
+        stop.store(true, Ordering::Relaxed);
+        for handle in writers {
+            handle.join().unwrap();
+        }
+        for handle in readers {
+            handle.join().unwrap();
+        }
+
+        let cfg = store.effective_config(&pk);
+        let fee_id = cfg.fee_recipient[0];
+        assert_eq!(cfg.gas_limit, 40_000_000 + u64::from(fee_id));
+        assert_eq!(cfg.graffiti.unwrap()[0], fee_id);
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert_eq!(disk.effective_fee_recipient(&pk), cfg.fee_recipient);
+        assert_eq!(disk.effective_gas_limit(&pk), cfg.gas_limit);
+        assert_eq!(disk.effective_graffiti(&pk), cfg.graffiti);
+    }
+
+    /// `set_enabled(false)` on another thread, joined while `save_lock` is
+    /// still held and before the delta is published, must survive. Replacing
+    /// the live map with the pre-write candidate would restore `enabled`.
+    #[test]
+    fn test_concurrent_set_enabled_survives_durable_update() {
+        let pk = test_pubkey(1);
+        let old_fee = test_fee_recipient(1);
+        let new_fee = test_fee_recipient(4);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+
+        let mut store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(old_fee);
+        cfg.enabled = true;
+        store.add_validator(cfg).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                super::DURABLE_WRITE_HOOK.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _clear_hook = ClearHook;
+
+        let hooked = std::sync::Arc::clone(&store);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let hooked = std::sync::Arc::clone(&hooked);
+                std::thread::spawn(move || hooked.set_enabled(&pk, false))
+                    .join()
+                    .expect("set_enabled thread");
+            }));
+        });
+
+        store
+            .update_config_durable(
+                &pk,
+                ValidatorConfigUpdate { fee_recipient: Some(Some(new_fee)), ..Default::default() },
+            )
+            .unwrap();
+
+        assert_eq!(store.effective_fee_recipient(&pk), new_fee);
+        assert!(
+            !store.is_signing_enabled(&pk),
+            "set_enabled(false) must survive the durable publish"
+        );
+        let on_disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            on_disk.contains("enabled = true"),
+            "the persisted snapshot was taken before set_enabled"
+        );
+    }
+
+    #[test]
+    fn test_reload_config_racing_durable_update_file_and_store_agree() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(test_fee_recipient(1));
+        cfg.gas_limit = Some(31_000_000);
+        cfg.graffiti = Some(parse_graffiti("stable"));
+        store.add_validator(cfg).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let store = Arc::new(store);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let rounds = 40u8;
+
+        let writer_store = Arc::clone(&store);
+        let writer_barrier = Arc::clone(&barrier);
+        let writer = thread::spawn(move || {
+            writer_barrier.wait();
+            for i in 0..rounds {
+                let mut fee = [0x10u8; 20];
+                fee[0] = i;
+                writer_store
+                    .update_config_durable(
+                        &pk,
+                        ValidatorConfigUpdate {
+                            fee_recipient: Some(Some(fee)),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+            }
+        });
+
+        let reloader_store = Arc::clone(&store);
+        let reloader_barrier = Arc::clone(&barrier);
+        let reloader = thread::spawn(move || {
+            reloader_barrier.wait();
+            for _ in 0..rounds {
+                reloader_store.reload_config().unwrap();
+            }
+        });
+
+        writer.join().unwrap();
+        reloader.join().unwrap();
+
+        let mem = store.get_config(&pk).unwrap();
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        let from_file = disk.get_config(&pk).unwrap();
+        assert_eq!(mem.fee_recipient, from_file.fee_recipient);
+        assert_eq!(mem.gas_limit, from_file.gas_limit);
+        assert_eq!(mem.graffiti, from_file.graffiti);
+        assert_eq!(mem.enabled, from_file.enabled);
+        assert_eq!(mem.builder_proposals, from_file.builder_proposals);
+        assert_eq!(store.default_fee_recipient(), disk.default_fee_recipient());
+        assert_eq!(store.default_gas_limit(), disk.default_gas_limit());
+        assert_eq!(store.effective_graffiti(&pk), disk.effective_graffiti(&pk));
+    }
+
+    #[test]
+    fn test_save_config_persisted_bytes_match_golden_file() {
+        let golden = include_str!("../testdata/save_config_golden.toml");
+        let pk = test_pubkey(1);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(test_fee_recipient(2));
+        cfg.gas_limit = Some(35_000_000);
+        cfg.builder_proposals = true;
+        cfg.builder_boost_factor = Some(200);
+        cfg.graffiti = Some(parse_graffiti("my graffiti"));
+        cfg.enabled = false;
+        cfg.block_selection_mode = Some(BlockSelectionMode::BuilderOnly);
+        cfg.builders = Some(vec!["https://builder.example/api".to_string()]);
+        cfg.min_bid = Some(1_500_000);
+
+        let mut store = ValidatorStore::new(test_fee_recipient(3), 25_000_000);
+        store.set_default_graffiti(parse_graffiti("default graffiti"));
+        store.add_validator(cfg).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+
+        let bytes = std::fs::read_to_string(&config_path).unwrap();
+        assert_eq!(bytes, golden);
+        assert!(golden.contains("enabled = false"), "enabled: Some(v.enabled) must be persisted");
+    }
+
+    /// The target is absent when the candidate is cloned, so the write must
+    /// not happen. The hook re-adds it after a write and before publish — the
+    /// pre-fix path took that unpersisted fee. A fix returns `NotFound` before
+    /// the write, so the hook does not run and the file is unchanged.
+    #[test]
+    fn test_absent_target_readded_before_publish_returns_not_found() {
+        let pk = test_pubkey(1);
+        let other = test_pubkey(2);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        store.add_validator(ValidatorConfig::new(other)).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let before = std::fs::read(&config_path).unwrap();
+        let store = std::sync::Arc::new(store);
+
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                super::DURABLE_WRITE_HOOK.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _clear_hook = ClearHook;
+        let hooked = std::sync::Arc::clone(&store);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let hooked = std::sync::Arc::clone(&hooked);
+                std::thread::spawn(move || {
+                    hooked.add_validator(ValidatorConfig::new(pk)).unwrap();
+                })
+                .join()
+                .expect("add_validator thread");
+            }));
+        });
+
+        let new_fee = test_fee_recipient(4);
+        let res = store.update_config_durable(
+            &pk,
+            ValidatorConfigUpdate { fee_recipient: Some(Some(new_fee)), ..Default::default() },
+        );
+        let on_disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        let persisted = on_disk.get_config(&pk).and_then(|c| c.fee_recipient);
+        let live = store.get_config(&pk).and_then(|c| c.fee_recipient);
+        assert!(
+            matches!(res, Err(ValidatorStoreError::NotFound)),
+            "expected NotFound, got {res:?}; live={live:?} persisted={persisted:?}"
+        );
+        let after = std::fs::read(&config_path).unwrap();
+        assert_eq!(after, before, "absent target must not rewrite the file");
+        assert_ne!(live, Some(new_fee), "unpersisted fee must not be published");
+    }
+
+    /// Clone sees the validator, then a delete plus re-import lands before
+    /// publish. `save_lock` does not cover those paths. The file must match
+    /// the live key, and the in-flight delta must not stick to the new import.
+    #[test]
+    fn test_remove_and_readd_during_durable_update_file_matches_live() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let pk = test_pubkey(1);
+        let old_fee = test_fee_recipient(1);
+        let new_fee = test_fee_recipient(4);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(old_fee);
+        cfg.gas_limit = Some(35_000_000);
+        cfg.graffiti = Some(parse_graffiti("old"));
+        cfg.enabled = false;
+        store.add_validator(cfg).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let store = Arc::new(store);
+
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                super::DURABLE_WRITE_HOOK.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _clear_hook = ClearHook;
+        let once = Arc::new(AtomicBool::new(false));
+        let hooked = Arc::clone(&store);
+        let once_hook = Arc::clone(&once);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                if once_hook.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let hooked = Arc::clone(&hooked);
+                std::thread::spawn(move || {
+                    hooked.remove_validator(&pk);
+                    hooked.add_validator(ValidatorConfig::new(pk)).unwrap();
+                })
+                .join()
+                .expect("reimport thread");
+            }));
+        });
+
+        let res = store.update_config_durable(
+            &pk,
+            ValidatorConfigUpdate { fee_recipient: Some(Some(new_fee)), ..Default::default() },
+        );
+        assert!(
+            matches!(res, Err(ValidatorStoreError::NotFound)),
+            "replaced identity must not report success, got {res:?}"
+        );
+
+        let live = store.get_config(&pk).expect("reimport stays in the live store");
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        let from_file = disk.get_config(&pk).expect("file keeps the live key");
+        assert_eq!(live.fee_recipient, from_file.fee_recipient);
+        assert_eq!(live.gas_limit, from_file.gas_limit);
+        assert_eq!(live.graffiti, from_file.graffiti);
+        assert_eq!(live.enabled, from_file.enabled);
+        assert_eq!(live.builder_proposals, from_file.builder_proposals);
+        assert_eq!(live.builder_boost_factor, from_file.builder_boost_factor);
+        assert_eq!(live.block_selection_mode, from_file.block_selection_mode);
+        assert_eq!(live.builders, from_file.builders);
+        assert_eq!(live.min_bid, from_file.min_bid);
+        assert_eq!(live.fee_recipient, None, "stale fee delta must not land on the reimport");
+        assert!(live.enabled);
+        assert_eq!(live.gas_limit, None);
     }
 }
