@@ -243,7 +243,7 @@ fn rig(extra: &[Pubkey]) -> Rig {
     let keys = MemoryKeys::with(known);
     let exports = Arc::new(AtomicU32::new(0));
     let slashing = Arc::new(ExportSpy {
-        inner: SlashingProtectionAdapter::new(Arc::clone(&db), GVR),
+        inner: SlashingProtectionAdapter::new_in_free_window(Arc::clone(&db), GVR),
         calls: Arc::clone(&exports),
     });
     let quiesce = Arc::new(SigningQuiesceAdapter::new(Arc::clone(&registry), Arc::clone(&signer)));

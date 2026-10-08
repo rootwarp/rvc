@@ -184,11 +184,12 @@ pub trait ImportAdmission: Send {
     ) -> impl Future<Output = Result<(), AdmissionError>> + Send;
 }
 
-/// No RV-15b window. `import_interchange` starts at phase entry.
+/// No orchestrator-slot window. The adapter's gate clock is already inside a
+/// free window, so `import_interchange` starts at phase entry.
 ///
-/// The call runs on Tokio's blocking pool so the slot loop keeps polling
-/// while SQLite holds `conn`. The production adapter is still synchronous;
-/// the pool only keeps this current-thread runtime from stalling inside the lock.
+/// The adapter moves the SQLite transaction onto Tokio's blocking pool and
+/// keeps the admission guard there. This harness awaits that future on the
+/// runtime; nesting `block_on` inside another `spawn_blocking` would stall it.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnscheduledImport;
 
@@ -198,23 +199,15 @@ impl ImportAdmission for UnscheduledImport {
     }
 
     async fn admit(&mut self, request: ImportRequest<'_>) -> Result<(), AdmissionError> {
-        let json = request.interchange_json.to_owned();
-        let db = Arc::clone(request.slashing_db);
-        let gvr = request.genesis_validators_root;
-        tokio::task::spawn_blocking(move || import_interchange_blocking(db, gvr, &json))
+        let slashing = SlashingProtectionAdapter::new_in_free_window(
+            Arc::clone(request.slashing_db),
+            request.genesis_validators_root,
+        );
+        slashing
+            .import_interchange(request.interchange_json)
             .await
-            .map_err(|err| AdmissionError { message: format!("import task join: {err}") })?
+            .map_err(|err| AdmissionError { message: err.to_string() })
     }
-}
-
-fn import_interchange_blocking(
-    db: Arc<SlashingDb>,
-    gvr: eth_types::Root,
-    json: &str,
-) -> Result<(), AdmissionError> {
-    let slashing = SlashingProtectionAdapter::new(db, gvr);
-    futures::executor::block_on(slashing.import_interchange(json))
-        .map_err(|err| AdmissionError { message: err.to_string() })
 }
 
 /// One measured run. Misses are recorded; they are not a pass/fail gate.

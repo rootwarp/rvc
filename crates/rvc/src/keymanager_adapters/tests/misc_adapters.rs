@@ -5,15 +5,15 @@ use super::*;
 #[test]
 fn test_slashing_adapter_import_invalid_json() {
     let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-    let adapter = SlashingProtectionAdapter::new(db, [0u8; 32]);
-    let result = futures::executor::block_on(adapter.import_interchange("not valid json"));
+    let adapter = SlashingProtectionAdapter::new_in_free_window(db, [0u8; 32]);
+    let result = block_on(adapter.import_interchange("not valid json"));
     assert!(result.is_err());
 }
 
 #[test]
 fn test_slashing_adapter_import_valid() {
     let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-    let adapter = SlashingProtectionAdapter::new(db, [0u8; 32]);
+    let adapter = SlashingProtectionAdapter::new_in_free_window(db, [0u8; 32]);
     let interchange = serde_json::json!({
         "metadata": {
             "interchange_format_version": "5",
@@ -21,14 +21,14 @@ fn test_slashing_adapter_import_valid() {
         },
         "data": []
     });
-    let result = futures::executor::block_on(adapter.import_interchange(&interchange.to_string()));
+    let result = block_on(adapter.import_interchange(&interchange.to_string()));
     assert!(result.is_ok());
 }
 
 #[test]
 fn test_slashing_adapter_export_empty() {
     let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-    let adapter = SlashingProtectionAdapter::new(db, [0u8; 32]);
+    let adapter = SlashingProtectionAdapter::new_in_free_window(db, [0u8; 32]);
     let result = adapter.export_interchange(&[]);
     assert!(result.is_ok());
     let export: serde_json::Value = serde_json::from_str(&result.unwrap()).unwrap();

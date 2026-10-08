@@ -178,7 +178,7 @@ fn a_pruned_key_delete_exports_a_floor_not_an_empty_record() {
     db.prune_below_watermarks().expect("prune");
     assert_eq!(db.get_attestation_watermark(&pruned_hex).expect("wm"), Some((5, 11)));
 
-    let adapter = SlashingProtectionAdapter::new(db, gvr);
+    let adapter = SlashingProtectionAdapter::new_in_free_window(db, gvr);
     let export = adapter.export_interchange(&[pruned, unknown]).expect("DELETE export");
     let json: serde_json::Value = serde_json::from_str(&export).expect("json");
     let data = json["data"].as_array().expect("data");
@@ -213,7 +213,7 @@ async fn export_fails_closed_delete_aborts_and_key_stays_disabled() {
     db.seed_attestation(&good_hex, 1, 2, Some("0xok".into()), &gvr).expect("other");
     db.set_attestation_watermark(&good_hex, 1, 3).expect("other watermark");
 
-    let adapter = Arc::new(SlashingProtectionAdapter::new(Arc::clone(&db), gvr));
+    let adapter = Arc::new(SlashingProtectionAdapter::new_in_free_window(Arc::clone(&db), gvr));
     assert!(adapter.export_interchange(&[bad]).is_err(), "no file for the unrepresentable key");
     assert!(
         adapter.export_interchange(&[good]).is_err(),

@@ -125,7 +125,7 @@ fn app_state(adapter: Arc<KeystoreManagerAdapter>) -> Arc<AppState> {
     let (remote, _, _) = test_remote_adapter(create_empty_composite_signer(), None);
     Arc::new(AppState {
         keystore_manager: adapter,
-        slashing_protection: Arc::new(SlashingProtectionAdapter::new(
+        slashing_protection: Arc::new(SlashingProtectionAdapter::new_in_free_window(
             Arc::new(SlashingDb::open_in_memory().expect("db")),
             [0x11; 32],
         )),

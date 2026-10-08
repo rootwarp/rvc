@@ -19,6 +19,13 @@ pub enum ApiError {
     Internal(String),
     #[error("Rate limited: retry after {retry_after_secs}s")]
     RateLimited { retry_after_secs: u64 },
+    /// Admission refused the interchange import. HTTP 503.
+    ///
+    /// `retry_after_secs` is set when the same payload can succeed later
+    /// (the import queue). It is absent when the payload itself does not fit
+    /// a free window.
+    #[error("{message}")]
+    Unavailable { message: String, retry_after_secs: Option<u64> },
 }
 
 impl IntoResponse for ApiError {
@@ -49,6 +56,19 @@ impl IntoResponse for ApiError {
                 axum::Json(serde_json::json!({ "message": msg })),
             )
                 .into_response(),
+            ApiError::Unavailable { message, retry_after_secs } => {
+                let mut response = (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    axum::Json(serde_json::json!({ "message": message })),
+                )
+                    .into_response();
+                if let Some(secs) = retry_after_secs {
+                    if let Ok(val) = secs.to_string().parse() {
+                        response.headers_mut().insert("Retry-After", val);
+                    }
+                }
+                response
+            }
         }
     }
 }
@@ -94,6 +114,8 @@ fn map_backend_to_item_message(detail: &str, ctx: &str) -> String {
 ///
 /// * `NotFound` → 404
 /// * `InvalidInterchange` → 400 with a client-safe message
+/// * `NoFreeWindow` → 503 with the named message
+/// * `ImportQueueFull` → 503 with `Retry-After`
 /// * `Backend` → 500 generic message; detail logged only
 pub fn map_slashing_protection_error(err: SlashingProtectionError, ctx: &str) -> ApiError {
     match err {
@@ -103,6 +125,15 @@ pub fn map_slashing_protection_error(err: SlashingProtectionError, ctx: &str) ->
         SlashingProtectionError::InvalidInterchange(msg) => {
             ApiError::BadRequest(format!("invalid interchange: {msg}"))
         }
+        SlashingProtectionError::NoFreeWindow(msg) => {
+            ApiError::Unavailable { message: msg, retry_after_secs: None }
+        }
+        SlashingProtectionError::ImportQueueFull { retry_after_secs } => ApiError::Unavailable {
+            message: format!(
+                "interchange import queue exceeded the wait bound; retry after {retry_after_secs}s"
+            ),
+            retry_after_secs: Some(retry_after_secs),
+        },
         SlashingProtectionError::Backend(detail) => map_backend_to_api_error(&detail, ctx),
     }
 }
@@ -120,6 +151,15 @@ pub fn map_slashing_export_error(err: SlashingProtectionError) -> ApiError {
         SlashingProtectionError::InvalidInterchange(msg) => {
             ApiError::BadRequest(format!("invalid interchange: {msg}"))
         }
+        SlashingProtectionError::NoFreeWindow(msg) => {
+            ApiError::Unavailable { message: msg, retry_after_secs: None }
+        }
+        SlashingProtectionError::ImportQueueFull { retry_after_secs } => ApiError::Unavailable {
+            message: format!(
+                "interchange import queue exceeded the wait bound; retry after {retry_after_secs}s"
+            ),
+            retry_after_secs: Some(retry_after_secs),
+        },
         SlashingProtectionError::Backend(detail) => {
             let req_id = Uuid::new_v4();
             let safe = escape_log_control_chars(&detail);
@@ -291,6 +331,17 @@ mod tests {
             (SlashingProtectionError::NotFound, StatusCode::NOT_FOUND),
             (SlashingProtectionError::InvalidInterchange("x".into()), StatusCode::BAD_REQUEST),
             (SlashingProtectionError::Backend("db".into()), StatusCode::INTERNAL_SERVER_ERROR),
+            (
+                SlashingProtectionError::NoFreeWindow(
+                    "NoFreeWindow: estimated hold 1 ms does not fit a free window of 0 ms; split the payload"
+                        .into(),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                SlashingProtectionError::ImportQueueFull { retry_after_secs: 24 },
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
         ];
         for (err, expected) in cases {
             let response = map_slashing_protection_error(err, "table").into_response();
@@ -299,6 +350,40 @@ mod tests {
             let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
             assert!(json.get("message").and_then(|v| v.as_str()).is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn test_no_free_window_is_named_in_the_503_body() {
+        let api = map_slashing_protection_error(
+            SlashingProtectionError::NoFreeWindow(
+                "NoFreeWindow: estimated hold 800 ms does not fit a free window of 100 ms; split the payload"
+                    .into(),
+            ),
+            "slashing protection import failed",
+        );
+        let response = api.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.headers().get("Retry-After").is_none());
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let msg = json["message"].as_str().unwrap_or("");
+        assert!(msg.contains("NoFreeWindow"), "msg={msg}");
+        assert!(msg.contains("split the payload"), "msg={msg}");
+    }
+
+    #[tokio::test]
+    async fn test_import_queue_full_is_retryable_503() {
+        let api = map_slashing_protection_error(
+            SlashingProtectionError::ImportQueueFull { retry_after_secs: 24 },
+            "slashing protection import failed",
+        );
+        let response = api.into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.headers().get("Retry-After").and_then(|v| v.to_str().ok()), Some("24"));
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let msg = json["message"].as_str().unwrap_or("");
+        assert!(msg.contains("retry"), "msg={msg}");
     }
 
     #[tokio::test]

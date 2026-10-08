@@ -322,7 +322,7 @@ fn build(opts: Build) -> Harness {
     let vm = Arc::new(ValidatorManagerAdapter::new(Arc::clone(&store)));
     let vm_dyn: Arc<dyn ValidatorManager> = vm;
     let window = if opts.doppelganger { Duration::from_secs(3_600) } else { Duration::ZERO };
-    let slashing = SlashingProtectionAdapter::new(Arc::clone(&db), GVR);
+    let slashing = SlashingProtectionAdapter::new_in_free_window(Arc::clone(&db), GVR);
     let export_stall;
     let export_entered;
     let export_release;

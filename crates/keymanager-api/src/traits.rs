@@ -90,6 +90,21 @@ pub enum SlashingProtectionError {
     /// Internal/backend failure. Detail is never echoed to HTTP clients.
     #[error("{0}")]
     Backend(String),
+    /// The estimated interchange hold fits no free slot window.
+    ///
+    /// The string is the gate's named `NoFreeWindow` message. It is safe to
+    /// surface. Retrying the same payload does not succeed; split it.
+    ///
+    /// Additive: architecture §3 did not list this variant. No existing
+    /// variant changed.
+    #[error("{0}")]
+    NoFreeWindow(String),
+    /// The single-flight import queue exceeded its slot bound.
+    ///
+    /// Retryable. `retry_after_secs` is that bound. Additive, same as
+    /// [`Self::NoFreeWindow`].
+    #[error("interchange import queue exceeded the wait bound; retry after {retry_after_secs}s")]
+    ImportQueueFull { retry_after_secs: u64 },
 }
 
 /// Manages EIP-3076 slashing protection interchange data.

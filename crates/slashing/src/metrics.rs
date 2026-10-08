@@ -105,6 +105,26 @@ pub static RVC_SLASHING_IMPORT_DURATION_MS: LazyLock<Histogram> = LazyLock::new(
     register_metric("rvc_slashing_import_duration_ms", histogram)
 });
 
+/// Time an interchange import waited before it was admitted, in milliseconds.
+///
+/// One sample per deferred import. The sample is the single-flight mutex queue
+/// plus the sleep until the free window, and it is not the connection hold.
+/// An import that is admitted without waiting records nothing here.
+pub static RVC_SLASHING_IMPORT_DEFERRED_MS: LazyLock<Histogram> = LazyLock::new(|| {
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "rvc_slashing_import_deferred_ms",
+            "Milliseconds an interchange import waited for the single-flight mutex and a free slot window",
+        )
+        .buckets(vec![
+            10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 12000.0,
+            24000.0,
+        ]),
+    )
+    .unwrap_or_else(|e| panic!("Failed to create rvc_slashing_import_deferred_ms: {e}"));
+    register_metric("rvc_slashing_import_deferred_ms", histogram)
+});
+
 /// `conn.lock()` through `COMMIT` inside `SlashingDb::import`, in milliseconds.
 ///
 /// The format-version check, the genesis-validators-root check, and numeric
@@ -131,6 +151,7 @@ pub fn init() {
     LazyLock::force(&RVC_SLASHING_GROUP_COMMIT_BATCH_SIZE);
     LazyLock::force(&RVC_SLASHING_IMPORT_DURATION_MS);
     LazyLock::force(&RVC_SLASHING_IMPORT_CONN_HOLD_MS);
+    LazyLock::force(&RVC_SLASHING_IMPORT_DEFERRED_MS);
 }
 
 #[cfg(test)]

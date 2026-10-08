@@ -23,8 +23,11 @@ use crate::key_admission::KeyAdmissionService;
 use crate::orchestrator::PubkeyMap;
 use crate::quiesce::{QuiesceRegistry, SigningQuiesceAdapter};
 
+use timing::SlotClock;
+
 use super::config::ValidatorConfigManagerAdapter;
 use super::doppelganger::{scan_and_rearm_gate, DoppelgangerDisabledMonitor, ForwardWindowMonitor};
+use super::import_window::ImportWindowGate;
 use super::kdf_budget::{KdfBudget, KdfBudgetConfig};
 use super::keystore::KeystoreManagerAdapter;
 use super::remote_keys::RemoteKeyManagerAdapter;
@@ -55,6 +58,10 @@ pub struct KeymanagerApiDeps {
     /// Registry the signer's [`crate::quiesce::QuiescingEnablement`] reads.
     /// DELETE inserts here before draining `signer`.
     pub quiesce_registry: Arc<QuiesceRegistry>,
+    /// Process slot clock. [`build_keymanager_api`] builds one
+    /// [`ImportWindowGate`] from it for the single slashing adapter.
+    /// A second gate would not share the import mutex.
+    pub slot_clock: Arc<dyn SlotClock>,
 }
 
 /// Which doppelganger monitor was selected when assembling the keymanager API.
@@ -180,8 +187,14 @@ pub fn build_keymanager_api(
     );
     let tracked_keys = Arc::clone(&keystore_mgr.tracked_keys);
     let membership = Arc::clone(&km_composite);
-    let slashing_prot =
-        Arc::new(SlashingProtectionAdapter::new(deps.slashing_db, deps.genesis_validators_root));
+    // One gate per `SlashingDb`, built here at bootstrap and stored in the
+    // only adapter that imports interchange.
+    let import_gate = Arc::new(ImportWindowGate::new(deps.slot_clock));
+    let slashing_prot = Arc::new(SlashingProtectionAdapter::new(
+        deps.slashing_db,
+        deps.genesis_validators_root,
+        import_gate,
+    ));
     let validator_mgr = Arc::new(ValidatorManagerAdapter::new(deps.validator_store.clone()));
 
     // M-12: time-based window for the delayed set_enabled task. When
