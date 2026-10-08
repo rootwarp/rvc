@@ -521,10 +521,20 @@ impl SlashableSignSession {
         let tx_start = Instant::now();
         let reservation = match reserve() {
             Ok(r) => {
-                let reserve_ms = tx_start.elapsed().as_secs_f64() * 1000.0;
+                // End is the instant `reserve()` returned, before the histogram
+                // write. Test builds keep this pair so a harness can place the
+                // wait without polling the histogram.
+                let reserve_end = Instant::now();
+                let reserve_ms =
+                    reserve_end.saturating_duration_since(tx_start).as_secs_f64() * 1000.0;
+                let kind_label = reservation_metric_kind(r.kind);
                 RVC_SLASHING_RESERVE_TX_HOLD_DURATION_MS
-                    .with_label_values(&[reservation_metric_kind(r.kind)])
+                    .with_label_values(&[kind_label])
                     .observe(reserve_ms);
+                #[cfg(any(test, feature = "test-utils"))]
+                if kind_label == tx_hold_kind::BLOCK {
+                    record_block_reserve_interval(tx_start, reserve_end);
+                }
                 self.hooks.on_stage_safe();
                 r
             }
@@ -961,6 +971,45 @@ fn emit_stage_trace(kind: SlashableKind) {
             tracing::trace!("reserving block slashing-protection record on blocking thread");
         }
     }
+}
+
+/// Block-reserve `[start, end]` pairs from [`SlashableSignSession::reserve_then_sign`].
+///
+/// `start` is the instant before `reserve()`. `end` is the instant it returns.
+/// Attestation reserves are not stored. Production builds omit the log.
+#[cfg(any(test, feature = "test-utils"))]
+static BLOCK_RESERVE_INTERVALS: parking_lot::Mutex<Vec<(Instant, Instant)>> =
+    parking_lot::Mutex::new(Vec::new());
+
+#[cfg(any(test, feature = "test-utils"))]
+fn record_block_reserve_interval(start: Instant, end: Instant) {
+    BLOCK_RESERVE_INTERVALS.lock().push((start, end));
+}
+
+/// How many block-reserve intervals are stored.
+///
+/// Test-only. See [`clear_block_reserve_intervals`].
+#[cfg(any(test, feature = "test-utils"))]
+#[must_use]
+pub fn block_reserve_interval_count() -> usize {
+    BLOCK_RESERVE_INTERVALS.lock().len()
+}
+
+/// Take the stored block-reserve intervals and leave the log empty.
+///
+/// Test-only. Each pair is `(reserve start, reserve return)`.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn take_block_reserve_intervals() -> Vec<(Instant, Instant)> {
+    std::mem::take(&mut *BLOCK_RESERVE_INTERVALS.lock())
+}
+
+/// Drop stored block-reserve intervals.
+///
+/// Test-only. A harness calls this before the slot loop so an earlier test
+/// in the same process cannot contribute a wait.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn clear_block_reserve_intervals() {
+    BLOCK_RESERVE_INTERVALS.lock().clear();
 }
 
 fn reservation_metric_kind(kind: ReservationKind) -> &'static str {

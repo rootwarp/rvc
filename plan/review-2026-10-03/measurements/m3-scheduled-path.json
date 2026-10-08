@@ -1,0 +1,698 @@
+{
+  "issue": "RR3-07",
+  "protocol": "plan/review-2026-10-03/measurements/README.md",
+  "harness": "crates/rvc/tests/common/import_during_duties.rs",
+  "helper_signature_unchanged": true,
+  "harness_sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+  "harness_sha_note": "git rev-parse HEAD at process start. Working tree was dirty (the boundary harness and signer interval log were uncommitted). The commit that contains these notes has a different SHA.",
+  "profile": "release",
+  "clock_mode": "wall",
+  "pq7": {
+    "meaning": "A late block reserve is a block-reserve [start, end] recorded around reserve() that meets the import conn-hold on a closed interval.",
+    "boundary_unscheduled_late_median": 1,
+    "boundary_scheduled_late_median": 0
+  },
+  "unscheduled_baseline_cited": {
+    "path": "plan/review-2026-10-03/measurements/rv15-import-during-duties-unscheduled.md",
+    "table_lines": "99-104",
+    "record_lines": "114-119",
+    "pq7_lines": "133-140",
+    "sha": "1483670fd52f2225d1a8681dc0a4861412571db1",
+    "not_rerun": true
+  },
+  "same_slot_scheduled": {
+    "when_utc": [
+      "2026-10-08T14:57:53Z/2026-10-08T14:57:59Z",
+      "2026-10-08T14:57:59Z/2026-10-08T14:58:05Z",
+      "2026-10-08T14:58:05Z/2026-10-08T14:58:11Z"
+    ],
+    "runs": [
+      {
+        "admission": "scheduled",
+        "attestation_deadline_misses": 0,
+        "attestation_deadline_ms": 3999,
+        "attestation_items": 200,
+        "attestation_publish_budget_ms": 1000,
+        "block_phase_overlapped": false,
+        "block_reserve_intervals": [
+          {
+            "duration_ms": 5.75,
+            "end_ms": 108.689,
+            "start_ms": 102.94
+          }
+        ],
+        "block_reserves": 1,
+        "clock_mode": "wall",
+        "conn_hold_end_ms": 5277.204,
+        "conn_hold_ms": 745.365,
+        "conn_hold_samples": 1,
+        "conn_hold_start_ms": 4531.839,
+        "fire_after_ms": null,
+        "fire_at": "attestation",
+        "following_slots": 0,
+        "history_rows": 53474,
+        "host": "cursor linux/x86_64",
+        "import_deferred_ms": 505.0,
+        "import_deferred_samples": 1,
+        "issue": "RR3-07",
+        "last_publish_ms_after_att_deadline": 425.752,
+        "late_block_reserves": 0,
+        "n": 200,
+        "on_disk": true,
+        "overlapping_phase": "",
+        "payload_bytes": 10026526,
+        "payload_validators": 26737,
+        "phase_fires": [
+          {
+            "offset_ms": 102,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "sync_message"
+          }
+        ],
+        "proposer": true,
+        "request_delay_ms": 50,
+        "roll_slot_clock": false,
+        "sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+        "slot": 1280,
+        "slot_duration_ms": 12000,
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "admission": "scheduled",
+        "attestation_deadline_misses": 0,
+        "attestation_deadline_ms": 3999,
+        "attestation_items": 200,
+        "attestation_publish_budget_ms": 1000,
+        "block_phase_overlapped": false,
+        "block_reserve_intervals": [
+          {
+            "duration_ms": 5.608,
+            "end_ms": 107.548,
+            "start_ms": 101.94
+          }
+        ],
+        "block_reserves": 1,
+        "clock_mode": "wall",
+        "conn_hold_end_ms": 5294.221,
+        "conn_hold_ms": 767.944,
+        "conn_hold_samples": 1,
+        "conn_hold_start_ms": 4526.277,
+        "fire_after_ms": null,
+        "fire_at": "attestation",
+        "following_slots": 0,
+        "history_rows": 53474,
+        "host": "cursor linux/x86_64",
+        "import_deferred_ms": 501.0,
+        "import_deferred_samples": 1,
+        "issue": "RR3-07",
+        "last_publish_ms_after_att_deadline": 392.725,
+        "late_block_reserves": 0,
+        "n": 200,
+        "on_disk": true,
+        "overlapping_phase": "",
+        "payload_bytes": 10026526,
+        "payload_validators": 26737,
+        "phase_fires": [
+          {
+            "offset_ms": 101,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "sync_message"
+          }
+        ],
+        "proposer": true,
+        "request_delay_ms": 50,
+        "roll_slot_clock": false,
+        "sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+        "slot": 1280,
+        "slot_duration_ms": 12000,
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "admission": "scheduled",
+        "attestation_deadline_misses": 0,
+        "attestation_deadline_ms": 3999,
+        "attestation_items": 200,
+        "attestation_publish_budget_ms": 1000,
+        "block_phase_overlapped": false,
+        "block_reserve_intervals": [
+          {
+            "duration_ms": 4.585,
+            "end_ms": 107.553,
+            "start_ms": 102.968
+          }
+        ],
+        "block_reserves": 1,
+        "clock_mode": "wall",
+        "conn_hold_end_ms": 5264.554,
+        "conn_hold_ms": 735.628,
+        "conn_hold_samples": 1,
+        "conn_hold_start_ms": 4528.926,
+        "fire_after_ms": null,
+        "fire_at": "attestation",
+        "following_slots": 0,
+        "history_rows": 53474,
+        "host": "cursor linux/x86_64",
+        "import_deferred_ms": 504.0,
+        "import_deferred_samples": 1,
+        "issue": "RR3-07",
+        "last_publish_ms_after_att_deadline": 395.582,
+        "late_block_reserves": 0,
+        "n": 200,
+        "on_disk": true,
+        "overlapping_phase": "",
+        "payload_bytes": 10026526,
+        "payload_validators": 26737,
+        "phase_fires": [
+          {
+            "offset_ms": 102,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "sync_message"
+          }
+        ],
+        "proposer": true,
+        "request_delay_ms": 50,
+        "roll_slot_clock": false,
+        "sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+        "slot": 1280,
+        "slot_duration_ms": 12000,
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    ],
+    "median": {
+      "late_block_reserves": 0,
+      "conn_hold_ms": 745.365,
+      "last_publish_ms_after_att_deadline": 395.582,
+      "import_deferred_ms": 504.0,
+      "attestation_deadline_misses": 0,
+      "conn_hold_start_ms": 4528.926,
+      "conn_hold_end_ms": 5277.204,
+      "block_reserves": 1,
+      "attestation_items": 200
+    }
+  },
+  "boundary_unscheduled": {
+    "when_utc": [
+      "2026-10-08T14:56:10Z/2026-10-08T14:56:32Z",
+      "2026-10-08T14:56:32Z/2026-10-08T14:56:45Z",
+      "2026-10-08T14:56:45Z/2026-10-08T14:56:59Z"
+    ],
+    "runs": [
+      {
+        "admission": "unscheduled",
+        "attestation_deadline_misses": 0,
+        "attestation_deadline_ms": 3999,
+        "attestation_items": 200,
+        "attestation_publish_budget_ms": 1000,
+        "block_phase_overlapped": true,
+        "block_reserve_intervals": [
+          {
+            "duration_ms": 3.039,
+            "end_ms": 105.869,
+            "start_ms": 102.83
+          },
+          {
+            "duration_ms": 410.906,
+            "end_ms": 12467.824,
+            "start_ms": 12056.919
+          }
+        ],
+        "block_reserves": 2,
+        "clock_mode": "wall",
+        "conn_hold_end_ms": 12463.036,
+        "conn_hold_ms": 823.799,
+        "conn_hold_samples": 1,
+        "conn_hold_start_ms": 11639.237,
+        "fire_after_ms": 11600,
+        "fire_at": "attestation",
+        "following_slots": 1,
+        "history_rows": 53474,
+        "host": "cursor linux/x86_64",
+        "import_deferred_ms": 0.0,
+        "import_deferred_samples": 0,
+        "issue": "RR2-15",
+        "last_publish_ms_after_att_deadline": 393.665,
+        "late_block_reserves": 1,
+        "n": 200,
+        "on_disk": true,
+        "overlapping_phase": "block",
+        "payload_bytes": 10026526,
+        "payload_validators": 26737,
+        "phase_fires": [
+          {
+            "offset_ms": 102,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "sync_message"
+          },
+          {
+            "offset_ms": 8001,
+            "phase": "aggregate"
+          },
+          {
+            "offset_ms": 50,
+            "phase": "block"
+          }
+        ],
+        "proposer": true,
+        "request_delay_ms": 50,
+        "roll_slot_clock": true,
+        "sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+        "slot": 1280,
+        "slot_duration_ms": 12000,
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "admission": "unscheduled",
+        "attestation_deadline_misses": 0,
+        "attestation_deadline_ms": 3999,
+        "attestation_items": 200,
+        "attestation_publish_budget_ms": 1000,
+        "block_phase_overlapped": true,
+        "block_reserve_intervals": [
+          {
+            "duration_ms": 4.201,
+            "end_ms": 107.14,
+            "start_ms": 102.939
+          },
+          {
+            "duration_ms": 324.632,
+            "end_ms": 12383.021,
+            "start_ms": 12058.389
+          }
+        ],
+        "block_reserves": 2,
+        "clock_mode": "wall",
+        "conn_hold_end_ms": 12379.911,
+        "conn_hold_ms": 752.647,
+        "conn_hold_samples": 1,
+        "conn_hold_start_ms": 11627.263,
+        "fire_after_ms": 11600,
+        "fire_at": "attestation",
+        "following_slots": 1,
+        "history_rows": 53474,
+        "host": "cursor linux/x86_64",
+        "import_deferred_ms": 0.0,
+        "import_deferred_samples": 0,
+        "issue": "RR2-15",
+        "last_publish_ms_after_att_deadline": 428.884,
+        "late_block_reserves": 1,
+        "n": 200,
+        "on_disk": true,
+        "overlapping_phase": "block",
+        "payload_bytes": 10026526,
+        "payload_validators": 26737,
+        "phase_fires": [
+          {
+            "offset_ms": 102,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "sync_message"
+          },
+          {
+            "offset_ms": 8000,
+            "phase": "aggregate"
+          },
+          {
+            "offset_ms": 51,
+            "phase": "block"
+          }
+        ],
+        "proposer": true,
+        "request_delay_ms": 50,
+        "roll_slot_clock": true,
+        "sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+        "slot": 1280,
+        "slot_duration_ms": 12000,
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "admission": "unscheduled",
+        "attestation_deadline_misses": 0,
+        "attestation_deadline_ms": 3999,
+        "attestation_items": 200,
+        "attestation_publish_budget_ms": 1000,
+        "block_phase_overlapped": true,
+        "block_reserve_intervals": [
+          {
+            "duration_ms": 7.436,
+            "end_ms": 111.337,
+            "start_ms": 103.901
+          },
+          {
+            "duration_ms": 389.645,
+            "end_ms": 12455.134,
+            "start_ms": 12065.488
+          }
+        ],
+        "block_reserves": 2,
+        "clock_mode": "wall",
+        "conn_hold_end_ms": 12448.898,
+        "conn_hold_ms": 805.73,
+        "conn_hold_samples": 1,
+        "conn_hold_start_ms": 11643.168,
+        "fire_after_ms": 11600,
+        "fire_at": "attestation",
+        "following_slots": 1,
+        "history_rows": 53474,
+        "host": "cursor linux/x86_64",
+        "import_deferred_ms": 0.0,
+        "import_deferred_samples": 0,
+        "issue": "RR2-15",
+        "last_publish_ms_after_att_deadline": 390.412,
+        "late_block_reserves": 1,
+        "n": 200,
+        "on_disk": true,
+        "overlapping_phase": "block",
+        "payload_bytes": 10026526,
+        "payload_validators": 26737,
+        "phase_fires": [
+          {
+            "offset_ms": 103,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "sync_message"
+          },
+          {
+            "offset_ms": 8001,
+            "phase": "aggregate"
+          },
+          {
+            "offset_ms": 52,
+            "phase": "block"
+          }
+        ],
+        "proposer": true,
+        "request_delay_ms": 50,
+        "roll_slot_clock": true,
+        "sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+        "slot": 1280,
+        "slot_duration_ms": 12000,
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    ],
+    "median": {
+      "late_block_reserves": 1,
+      "conn_hold_ms": 805.73,
+      "last_publish_ms_after_att_deadline": 393.665,
+      "import_deferred_ms": 0.0,
+      "attestation_deadline_misses": 0,
+      "conn_hold_start_ms": 11639.237,
+      "conn_hold_end_ms": 12448.898,
+      "block_reserves": 2,
+      "attestation_items": 200
+    }
+  },
+  "boundary_scheduled": {
+    "when_utc": [
+      "2026-10-08T14:56:59Z/2026-10-08T14:57:17Z",
+      "2026-10-08T14:57:17Z/2026-10-08T14:57:35Z",
+      "2026-10-08T14:57:35Z/2026-10-08T14:57:53Z"
+    ],
+    "runs": [
+      {
+        "admission": "scheduled",
+        "attestation_deadline_misses": 0,
+        "attestation_deadline_ms": 3999,
+        "attestation_items": 200,
+        "attestation_publish_budget_ms": 1000,
+        "block_phase_overlapped": false,
+        "block_reserve_intervals": [
+          {
+            "duration_ms": 4.554,
+            "end_ms": 107.518,
+            "start_ms": 102.964
+          },
+          {
+            "duration_ms": 4.892,
+            "end_ms": 12063.582,
+            "start_ms": 12058.69
+          }
+        ],
+        "block_reserves": 2,
+        "clock_mode": "wall",
+        "conn_hold_end_ms": 17340.259,
+        "conn_hold_ms": 809.942,
+        "conn_hold_samples": 1,
+        "conn_hold_start_ms": 16530.317,
+        "fire_after_ms": 11600,
+        "fire_at": "attestation",
+        "following_slots": 1,
+        "history_rows": 53474,
+        "host": "cursor linux/x86_64",
+        "import_deferred_ms": 4899.0,
+        "import_deferred_samples": 1,
+        "issue": "RR3-07",
+        "last_publish_ms_after_att_deadline": 375.189,
+        "late_block_reserves": 0,
+        "n": 200,
+        "on_disk": true,
+        "overlapping_phase": "",
+        "payload_bytes": 10026526,
+        "payload_validators": 26737,
+        "phase_fires": [
+          {
+            "offset_ms": 102,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "sync_message"
+          },
+          {
+            "offset_ms": 8001,
+            "phase": "aggregate"
+          },
+          {
+            "offset_ms": 53,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "sync_message"
+          }
+        ],
+        "proposer": true,
+        "request_delay_ms": 50,
+        "roll_slot_clock": true,
+        "sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+        "slot": 1280,
+        "slot_duration_ms": 12000,
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "admission": "scheduled",
+        "attestation_deadline_misses": 0,
+        "attestation_deadline_ms": 3999,
+        "attestation_items": 200,
+        "attestation_publish_budget_ms": 1000,
+        "block_phase_overlapped": false,
+        "block_reserve_intervals": [
+          {
+            "duration_ms": 4.596,
+            "end_ms": 106.553,
+            "start_ms": 101.958
+          },
+          {
+            "duration_ms": 3.523,
+            "end_ms": 12059.136,
+            "start_ms": 12055.612
+          }
+        ],
+        "block_reserves": 2,
+        "clock_mode": "wall",
+        "conn_hold_end_ms": 17288.658,
+        "conn_hold_ms": 762.694,
+        "conn_hold_samples": 1,
+        "conn_hold_start_ms": 16525.965,
+        "fire_after_ms": 11600,
+        "fire_at": "attestation",
+        "following_slots": 1,
+        "history_rows": 53474,
+        "host": "cursor linux/x86_64",
+        "import_deferred_ms": 4899.0,
+        "import_deferred_samples": 1,
+        "issue": "RR3-07",
+        "last_publish_ms_after_att_deadline": 426.162,
+        "late_block_reserves": 0,
+        "n": 200,
+        "on_disk": true,
+        "overlapping_phase": "",
+        "payload_bytes": 10026526,
+        "payload_validators": 26737,
+        "phase_fires": [
+          {
+            "offset_ms": 101,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "sync_message"
+          },
+          {
+            "offset_ms": 8001,
+            "phase": "aggregate"
+          },
+          {
+            "offset_ms": 52,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 4000,
+            "phase": "sync_message"
+          }
+        ],
+        "proposer": true,
+        "request_delay_ms": 50,
+        "roll_slot_clock": true,
+        "sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+        "slot": 1280,
+        "slot_duration_ms": 12000,
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      },
+      {
+        "admission": "scheduled",
+        "attestation_deadline_misses": 0,
+        "attestation_deadline_ms": 3999,
+        "attestation_items": 200,
+        "attestation_publish_budget_ms": 1000,
+        "block_phase_overlapped": false,
+        "block_reserve_intervals": [
+          {
+            "duration_ms": 5.008,
+            "end_ms": 107.943,
+            "start_ms": 102.935
+          },
+          {
+            "duration_ms": 6.747,
+            "end_ms": 12070.955,
+            "start_ms": 12064.209
+          }
+        ],
+        "block_reserves": 2,
+        "clock_mode": "wall",
+        "conn_hold_end_ms": 17280.784,
+        "conn_hold_ms": 749.278,
+        "conn_hold_samples": 1,
+        "conn_hold_start_ms": 16531.506,
+        "fire_after_ms": 11600,
+        "fire_at": "attestation",
+        "following_slots": 1,
+        "history_rows": 53474,
+        "host": "cursor linux/x86_64",
+        "import_deferred_ms": 4898.0,
+        "import_deferred_samples": 1,
+        "issue": "RR3-07",
+        "last_publish_ms_after_att_deadline": 433.894,
+        "late_block_reserves": 0,
+        "n": 200,
+        "on_disk": true,
+        "overlapping_phase": "",
+        "payload_bytes": 10026526,
+        "payload_validators": 26737,
+        "phase_fires": [
+          {
+            "offset_ms": 102,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "sync_message"
+          },
+          {
+            "offset_ms": 8000,
+            "phase": "aggregate"
+          },
+          {
+            "offset_ms": 55,
+            "phase": "block"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "attestation"
+          },
+          {
+            "offset_ms": 3999,
+            "phase": "sync_message"
+          }
+        ],
+        "proposer": true,
+        "request_delay_ms": 50,
+        "roll_slot_clock": true,
+        "sha": "0a74cc6435b6e96559c4104a785d08fe2bd0eabb",
+        "slot": 1280,
+        "slot_duration_ms": 12000,
+        "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+      }
+    ],
+    "median": {
+      "late_block_reserves": 0,
+      "conn_hold_ms": 762.694,
+      "last_publish_ms_after_att_deadline": 426.162,
+      "import_deferred_ms": 4899.0,
+      "attestation_deadline_misses": 0,
+      "conn_hold_start_ms": 16530.317,
+      "conn_hold_end_ms": 17288.658,
+      "block_reserves": 2,
+      "attestation_items": 200
+    }
+  }
+}
