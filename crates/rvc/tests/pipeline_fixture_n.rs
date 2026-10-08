@@ -60,12 +60,12 @@ async fn fixture_builds_n_keys_and_n_duties() {
     let mut positions = HashSet::new();
     let mut duty_keys = HashSet::new();
     for duty in &duties {
-        assert_eq!(duty.slot, SLOT_A.to_string());
-        assert_eq!(duty.committee_index, "0");
+        assert_eq!(duty.raw.slot, SLOT_A.to_string());
+        assert_eq!(duty.raw.committee_index, "0");
         assert_eq!(duty.committees_at_slot, "1");
-        let committee_length: usize = duty.committee_length.parse().expect("committee_length");
+        let committee_length: usize = duty.raw.committee_length.parse().expect("committee_length");
         let position: usize =
-            duty.validator_committee_index.parse().expect("validator_committee_index");
+            duty.raw.validator_committee_index.parse().expect("validator_committee_index");
         assert_eq!(committee_length, N);
         assert!(
             position < committee_length,

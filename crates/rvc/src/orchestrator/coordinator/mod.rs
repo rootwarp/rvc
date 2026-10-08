@@ -815,20 +815,8 @@ where
             if !self.validator_store.is_signing_enabled(&pubkey) {
                 continue;
             }
-            let validator_index = match duty.validator_index.parse() {
-                Ok(i) => i,
-                Err(_) => {
-                    warn!(slot, "Skipping proposer duty with unparseable validator_index");
-                    continue;
-                }
-            };
-            let proposal_slot = match duty.slot.parse() {
-                Ok(s) => s,
-                Err(_) => {
-                    warn!(slot, "Skipping proposer duty with unparseable slot");
-                    continue;
-                }
-            };
+            let validator_index = duty.validator_index;
+            let proposal_slot = duty.slot;
             out.push(UpcomingProposal { pubkey, validator_index, proposal_slot, dependent_root });
         }
         out

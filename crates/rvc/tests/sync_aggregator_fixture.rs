@@ -84,7 +84,7 @@ async fn drive_one_slot() -> SlotSubmits {
     assert_eq!(duties.len(), N, "one attester duty per validator");
     let mut selections = 0usize;
     for duty in &duties {
-        let committee_length: u64 = duty.committee_length.parse().expect("committee_length");
+        let committee_length: u64 = duty.raw.committee_length.parse().expect("committee_length");
         // The mock selection is the committee length: modulo 1 selects every proof.
         assert!(
             is_aggregator(committee_length, &[0x00; 96]),

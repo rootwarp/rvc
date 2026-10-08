@@ -459,17 +459,8 @@ impl DutyManagementService {
                     continue;
                 }
 
-                let committee_length: u64 = match duty.committee_length.parse() {
-                    Ok(cl) => cl,
-                    Err(_) => {
-                        warn!(
-                            validator_index = %duty.validator_index,
-                            "Invalid committee_length in duty: {}",
-                            duty.committee_length
-                        );
-                        continue;
-                    }
-                };
+                let committee_length = duty.committee_length;
+                let wire = &duty.raw;
 
                 // Compute selection proof and determine if aggregator
                 let selection_proof = match self
@@ -497,10 +488,10 @@ impl DutyManagementService {
                 let is_agg = is_aggregator(committee_length, &selection_proof.to_bytes());
 
                 subscriptions.push(BeaconCommitteeSubscription {
-                    validator_index: duty.validator_index.clone(),
-                    committee_index: duty.committee_index.clone(),
-                    committees_at_slot: duty.committees_at_slot.clone(),
-                    slot: duty.slot.clone(),
+                    validator_index: wire.validator_index.clone(),
+                    committee_index: wire.committee_index.clone(),
+                    committees_at_slot: wire.committees_at_slot.clone(),
+                    slot: wire.slot.clone(),
                     is_aggregator: is_agg,
                 });
             }

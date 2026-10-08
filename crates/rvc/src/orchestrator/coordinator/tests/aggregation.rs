@@ -262,6 +262,10 @@ async fn test_aggregation_beacon_failure_handled_gracefully() {
 
 // -- Fork-aware attestation construction tests (G-1-05) --
 
+fn typed_attester_duty(duty: &AttesterDuty) -> duty_tracker::TypedAttesterDuty {
+    duty_tracker::TypedAttesterDuty::try_from(duty).expect("numeric fixture")
+}
+
 #[test]
 fn test_make_aggregation_bits_first_position() {
     let duty = AttesterDuty {
@@ -273,7 +277,7 @@ fn test_make_aggregation_bits_first_position() {
         validator_committee_index: "0".to_string(),
         slot: "100".to_string(),
     };
-    let bits = utils::make_aggregation_bits(&duty).unwrap();
+    let bits = utils::make_aggregation_bits(&typed_attester_duty(&duty)).unwrap();
     // committee_length=4, validator_committee_index=0
     // Byte 0: bit 0 set (validator) = 0x01
     // Length bit at position 4 → byte 0, bit 4 = 0x10
@@ -292,7 +296,7 @@ fn test_make_aggregation_bits_middle_position() {
         validator_committee_index: "3".to_string(),
         slot: "100".to_string(),
     };
-    let bits = utils::make_aggregation_bits(&duty).unwrap();
+    let bits = utils::make_aggregation_bits(&typed_attester_duty(&duty)).unwrap();
     // committee_length=8, validator_committee_index=3
     // Byte 0: bit 3 set = 0x08
     // Length bit at position 8 → byte 1, bit 0 = 0x01
@@ -311,7 +315,7 @@ fn test_make_aggregation_bits_last_position() {
         validator_committee_index: "3".to_string(),
         slot: "100".to_string(),
     };
-    let bits = utils::make_aggregation_bits(&duty).unwrap();
+    let bits = utils::make_aggregation_bits(&typed_attester_duty(&duty)).unwrap();
     // committee_length=4, validator_committee_index=3
     // Byte 0: bit 3 set = 0x08, length bit at position 4 = 0x10
     // Combined: 0x18
@@ -329,7 +333,7 @@ fn test_make_aggregation_bits_zero_committee_length() {
         validator_committee_index: "0".to_string(),
         slot: "100".to_string(),
     };
-    assert!(utils::make_aggregation_bits(&duty).is_none());
+    assert!(utils::make_aggregation_bits(&typed_attester_duty(&duty)).is_none());
 }
 
 #[test]
@@ -343,7 +347,7 @@ fn test_make_aggregation_bits_invalid_committee_length() {
         validator_committee_index: "0".to_string(),
         slot: "100".to_string(),
     };
-    assert!(utils::make_aggregation_bits(&duty).is_none());
+    assert!(duty_tracker::TypedAttesterDuty::try_from(&duty).is_err());
 }
 
 #[test]
@@ -357,7 +361,7 @@ fn test_make_aggregation_bits_invalid_validator_committee_index() {
         validator_committee_index: "garbage".to_string(),
         slot: "100".to_string(),
     };
-    assert!(utils::make_aggregation_bits(&duty).is_none());
+    assert!(duty_tracker::TypedAttesterDuty::try_from(&duty).is_err());
 }
 
 // ── Aggregation fork-format tests (Electra/Fulu proofs) ──

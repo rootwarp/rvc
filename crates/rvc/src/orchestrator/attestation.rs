@@ -10,11 +10,11 @@ use crate::metrics::{
     RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL, RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS,
 };
 use beacon::{
-    AttestationData as BeaconAttestationData, AttesterDuty, LegacyAttestation, SingleAttestation,
+    AttestationData as BeaconAttestationData, LegacyAttestation, SingleAttestation,
     VersionedAttestation,
 };
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, Propagator};
-use duty_tracker::DutyTracker;
+use duty_tracker::{DutyTracker, TypedAttesterDuty};
 use eth_types::{ForkName, ForkSchedule, Slot};
 use observability::logging::TruncatedPubkey;
 use signer::{SignerService, ValidatorSigner};
@@ -45,7 +45,7 @@ use super::validation::attestation_data::validate_attestation_data;
 /// and removes the previous fail-OPEN fall-through where a non-`0x`-lowercase
 /// or non-decoding pubkey string skipped the gate entirely.
 pub(crate) fn attestation_duty_enabled(
-    duty: &AttesterDuty,
+    duty: &TypedAttesterDuty,
     pubkey_map: &PubkeyMap,
     validator_store: &ValidatorStore,
     slot: Slot,
@@ -127,12 +127,10 @@ fn memo_key(fork: ForkName, committee_index: u64) -> Option<u64> {
     }
 }
 
-fn distinct_committee_indexes(duties: &[AttesterDuty]) -> Vec<u64> {
+fn distinct_committee_indexes(duties: &[TypedAttesterDuty]) -> Vec<u64> {
     let mut indexes = Vec::new();
     for duty in duties {
-        if let Ok(index) = duty.committee_index.parse() {
-            indexes.push(index);
-        }
+        indexes.push(duty.committee_index);
     }
     indexes.sort_unstable();
     indexes.dedup();
@@ -255,7 +253,7 @@ where
         // startup (`ServiceBuilder::register_loaded_validators`), so they
         // resolve and remain enabled; an unresolved or disabled pubkey is
         // skipped rather than passed through.  See `attestation_duty_enabled`.
-        let duties: Vec<AttesterDuty> = raw_duties
+        let duties: Vec<TypedAttesterDuty> = raw_duties
             .into_iter()
             .filter(|duty| {
                 attestation_duty_enabled(duty, &self.pubkey_map, &self.validator_store, slot)
@@ -348,7 +346,7 @@ where
     async fn load_attestation_data_memo(
         &self,
         slot: Slot,
-        duties: &[AttesterDuty],
+        duties: &[TypedAttesterDuty],
         slot_end: tokio::time::Instant,
     ) -> AttestationDataMemo {
         let fork = ForkName::from_epoch(slot / SLOTS_PER_EPOCH, &self.config.fork_schedule);
@@ -471,13 +469,13 @@ where
     /// Produce and sign one duty. Publish is a later wave, not this future.
     async fn sign_one(
         &self,
-        duty: AttesterDuty,
+        duty: TypedAttesterDuty,
         memo: &AttestationDataMemo,
     ) -> Result<WaveEntry, AttestationResult> {
-        let validator_index = duty.validator_index.clone();
+        let validator_index = duty.raw.validator_index.clone();
         let pubkey = duty.pubkey.clone();
-        // Updated as soon as the duty slot parses successfully; stays 0 on
-        // that first failure so the outer result still has a defined slot.
+        // Written from the typed duty slot before any fallible step. Stays 0
+        // only when `attest` has not yet copied it.
         let mut slot: Slot = 0;
 
         match self.attest(&duty, &validator_index, &mut slot, memo).await {
@@ -662,22 +660,18 @@ where
     /// Returns the signed [`VersionedAttestation`] (one item). On failure
     /// returns a user-visible error string. Publish is [`Self::publish_wave`].
     ///
-    /// `slot` is written once the duty's slot field parses; callers leave it
-    /// at `0` when that parse is the failing step.
+    /// `slot` is written from the typed duty before any fallible step.
     async fn attest(
         &self,
-        duty: &AttesterDuty,
+        duty: &TypedAttesterDuty,
         validator_index: &str,
         slot: &mut Slot,
         memo: &AttestationDataMemo,
     ) -> Result<VersionedAttestation, String> {
-        *slot = duty.slot.parse().map_err(|_| format!("Invalid slot in duty: {}", duty.slot))?;
+        *slot = duty.slot;
         debug_assert_eq!(memo.slot, *slot);
 
-        let committee_index: u64 = duty
-            .committee_index
-            .parse()
-            .map_err(|_| format!("Invalid committee_index in duty: {}", duty.committee_index))?;
+        let committee_index = duty.committee_index;
 
         let att_span = info_span!(
             "attestation.produce",
@@ -809,9 +803,7 @@ where
             }
         };
 
-        let attester_index: u64 = validator_index
-            .parse()
-            .map_err(|_| format!("Invalid validator_index in duty: {}", validator_index))?;
+        let attester_index = duty.validator_index;
 
         let sig_hex = format!("0x{}", hex::encode(signature.to_bytes()));
 
@@ -947,6 +939,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use beacon::AttesterDuty;
     use crypto::{PublicKey, SecretKey};
     use parking_lot::RwLock;
     use validator_store::{ValidatorConfig, ValidatorStore};
@@ -997,7 +990,7 @@ mod tests {
         // Duty carries the uppercase `0X` prefix — `find_pubkey` resolves it,
         // but the old lowercase-only `strip_prefix("0x")` + decode does not.
         let duty_pubkey = format!("0X{}", hex::encode(pubkey.to_bytes()).to_uppercase());
-        let duty = duty_with_pubkey(&duty_pubkey);
+        let duty = TypedAttesterDuty::try_from(&duty_with_pubkey(&duty_pubkey)).expect("fixture");
 
         let pubkey_map = pubkey_map_with(&pubkey);
         let store = disabled_store(&pubkey);
@@ -1020,7 +1013,8 @@ mod tests {
     #[test]
     fn test_unresolved_nondecoding_pubkey_is_skipped_fail_closed() {
         // Not valid hex (contains 'z') and not present in the map.
-        let duty = duty_with_pubkey("0xzzzznotvalidhex");
+        let duty =
+            TypedAttesterDuty::try_from(&duty_with_pubkey("0xzzzznotvalidhex")).expect("fixture");
 
         let other = SecretKey::generate().public_key();
         let pubkey_map = pubkey_map_with(&other);
@@ -1041,7 +1035,7 @@ mod tests {
         let pubkey = sk.public_key();
 
         let duty_pubkey = format!("0X{}", hex::encode(pubkey.to_bytes()).to_uppercase());
-        let duty = duty_with_pubkey(&duty_pubkey);
+        let duty = TypedAttesterDuty::try_from(&duty_with_pubkey(&duty_pubkey)).expect("fixture");
 
         let pubkey_map = pubkey_map_with(&pubkey);
         let store = ValidatorStore::new([0u8; 20], 30_000_000);
@@ -1065,8 +1059,9 @@ mod dispatch_pipeline {
 
     use async_trait::async_trait;
     use beacon::{
-        AttestationData, AttestationDataResponse, AttesterDutiesResponse, BeaconError, Checkpoint,
-        IndexedAttestationError, SubmitAttestationResult, VersionedAttestation,
+        AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
+        BeaconError, Checkpoint, IndexedAttestationError, SubmitAttestationResult,
+        VersionedAttestation,
     };
     use bn_manager::{
         AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, MockMethod, Propagator,
@@ -1081,7 +1076,6 @@ mod dispatch_pipeline {
 
     use super::super::dispatch::DispatchLimits;
     use super::AttestationService;
-    use super::AttesterDuty;
     use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 
     const SLOT: u64 = 1_600;

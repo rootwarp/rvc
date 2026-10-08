@@ -6,9 +6,9 @@ use crate::metrics::{
     attestation_status, payload_attestation_skip_reason, ptc_duty_outcome,
     RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL, RVC_PTC_ATTESTATIONS_TOTAL, RVC_PTC_DUTIES_TOTAL,
 };
-use bn_manager::{BeaconNodeClient, PtcDuty};
+use bn_manager::BeaconNodeClient;
 use crypto::PublicKey;
-use duty_tracker::DutyTracker;
+use duty_tracker::{DutyTracker, TypedPtcDuty};
 use eth_types::{PayloadAttestationMessage, Slot};
 use observability::logging::TruncatedPubkey;
 use signer::{SignerService, ValidatorSigner};
@@ -100,19 +100,7 @@ impl PayloadAttestationService {
 
         let mut messages = Vec::new();
         for (duty, pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
-            let validator_index = match duty.validator_index.parse::<u64>() {
-                Ok(i) => i,
-                Err(e) => {
-                    warn!(
-                        slot,
-                        validator_index = %duty.validator_index,
-                        error = %e,
-                        "Failed to parse PTC validator_index"
-                    );
-                    inc_ptc_duty(ptc_duty_outcome::DROPPED);
-                    continue;
-                }
-            };
+            let validator_index = duty.validator_index;
             match self
                 .signer
                 .sign_payload_attestation(
@@ -172,7 +160,7 @@ impl PayloadAttestationService {
         }
     }
 
-    fn filter_ptc_duties(&self, duties: &[PtcDuty]) -> (Vec<PtcDuty>, Vec<PublicKey>) {
+    fn filter_ptc_duties(&self, duties: &[TypedPtcDuty]) -> (Vec<TypedPtcDuty>, Vec<PublicKey>) {
         let mut matching_duties = Vec::new();
         let mut matching_pubkeys = Vec::new();
 

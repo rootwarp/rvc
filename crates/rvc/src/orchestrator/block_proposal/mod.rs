@@ -127,15 +127,8 @@ where
             }
         }
 
-        // H-4: parse validator_index for proposer_index validation (returned as String by the BN type)
-        let expected_proposer_index: u64 = match proposer_duty.validator_index.parse() {
-            Ok(v) => v,
-            Err(_) => {
-                error!(slot, raw = %proposer_duty.validator_index,
-                    "Cannot parse proposer duty validator_index as u64 — dropping duty");
-                return;
-            }
-        };
+        // H-4: validator_index was parsed when the proposer duty entered the cache.
+        let expected_proposer_index = proposer_duty.validator_index;
 
         info!(slot, validator_index = %proposer_duty.validator_index, "Proposing block");
 

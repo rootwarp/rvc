@@ -261,7 +261,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/aggregation.rs",
-        378,
+        384,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -270,7 +270,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/mod.rs",
-        1451,
+        1439,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -279,7 +279,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/utils.rs",
-        144,
+        127,
         Class::GeForkName,
         false,
         ">= ForkName::Electra",
@@ -343,7 +343,7 @@ const INVENTORY: &[Inv] = &[
     // Class 2
     inv(
         "crates/rvc/src/orchestrator/attestation.rs",
-        823,
+        815,
         Class::IndexZero,
         false,
         ".index = \"0\"",
@@ -388,7 +388,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/utils.rs",
-        163,
+        146,
         Class::IndexZero,
         false,
         ".index = 0",

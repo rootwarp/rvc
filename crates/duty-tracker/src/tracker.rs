@@ -335,7 +335,7 @@ impl DutyTracker {
         slot: u64,
         committee_index: u64,
         validator_index: u64,
-    ) -> Result<AttesterDuty, DutyTrackerError> {
+    ) -> Result<TypedAttesterDuty, DutyTrackerError> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.cache.read().await;
 
@@ -344,7 +344,7 @@ impl DutyTracker {
         if let Some(epoch_cache) = cache.get(&epoch) {
             if let Some(duty) = epoch_cache.get(&key) {
                 debug!(slot, epoch, cache_type = "attester", "Cache hit");
-                return Ok(duty.raw.clone());
+                return Ok(duty.clone());
             }
         }
 
@@ -445,7 +445,7 @@ impl DutyTracker {
         skip_all,
         fields(slot = slot, epoch = slot / SLOTS_PER_EPOCH)
     )]
-    pub async fn get_duties_for_slot(&self, slot: u64) -> Vec<AttesterDuty> {
+    pub async fn get_duties_for_slot(&self, slot: u64) -> Vec<TypedAttesterDuty> {
         self.slot_duty_lookups.fetch_add(1, Ordering::Relaxed);
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.cache.read().await;
@@ -455,11 +455,11 @@ impl DutyTracker {
             return Vec::new();
         };
 
-        let duties: Vec<AttesterDuty> = epoch_cache
+        let duties: Vec<TypedAttesterDuty> = epoch_cache
             .duties
             .iter()
             .filter(|(key, _)| key.slot == slot)
-            .map(|(_, duty)| duty.raw.clone())
+            .map(|(_, duty)| duty.clone())
             .collect();
 
         debug!(slot, epoch, cache_type = "attester", count = duties.len(), "Cache hit for slot");
@@ -537,10 +537,10 @@ impl DutyTracker {
         skip_all,
         fields(slot = slot, epoch = slot / SLOTS_PER_EPOCH)
     )]
-    pub async fn get_proposer_duty(&self, slot: u64) -> Option<ProposerDuty> {
+    pub async fn get_proposer_duty(&self, slot: u64) -> Option<TypedProposerDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.proposer_cache.read().await;
-        let result = cache.get(&epoch).and_then(|c| c.get(&slot)).map(|duty| duty.raw.clone());
+        let result = cache.get(&epoch).and_then(|c| c.get(&slot)).cloned();
         if result.is_some() {
             debug!(slot, epoch, cache_type = "proposer", "Cache hit");
         } else {
@@ -633,13 +633,13 @@ impl DutyTracker {
         self.fetch_ptc_duties(epoch, &indices).await
     }
 
-    pub async fn get_ptc_duties_for_slot(&self, slot: u64) -> Vec<PtcDuty> {
+    pub async fn get_ptc_duties_for_slot(&self, slot: u64) -> Vec<TypedPtcDuty> {
         let epoch = slot / SLOTS_PER_EPOCH;
         let cache = self.ptc_cache.read().await;
         match cache.get(&epoch).and_then(|c| c.get(&slot)) {
             Some(duties) => {
                 debug!(slot, epoch, cache_type = "ptc", count = duties.len(), "Cache hit");
-                duties.iter().map(|duty| duty.raw.clone()).collect()
+                duties.to_vec()
             }
             None => {
                 debug!(slot, epoch, cache_type = "ptc", "Cache miss");
@@ -1022,8 +1022,8 @@ async fn changed_source_replaces_cached_duties_for_the_same_head() {
     assert!(tracker.is_epoch_cached(10).await);
     assert!(tracker.is_ptc_epoch_cached(10).await);
     assert!(tracker.is_sync_period_cached(10).await);
-    assert_eq!(tracker.get_duties_for_slot(320).await[0].validator_index, "111");
-    assert_eq!(tracker.get_ptc_duties_for_slot(320).await[0].validator_index, "111");
+    assert_eq!(tracker.get_duties_for_slot(320).await[0].validator_index, 111);
+    assert_eq!(tracker.get_ptc_duties_for_slot(320).await[0].validator_index, 111);
     assert_eq!(tracker.get_sync_committee_duties(320).await[0].validator_index, 111);
 
     *source.0.lock().expect("indices") = vec!["222".to_string()];
@@ -1040,10 +1040,10 @@ async fn changed_source_replaces_cached_duties_for_the_same_head() {
 
     let attester = tracker.get_duties_for_slot(320).await;
     assert_eq!(attester.len(), 1);
-    assert_eq!(attester[0].validator_index, "222");
+    assert_eq!(attester[0].validator_index, 222);
     let ptc = tracker.get_ptc_duties_for_slot(320).await;
     assert_eq!(ptc.len(), 1);
-    assert_eq!(ptc[0].validator_index, "222");
+    assert_eq!(ptc[0].validator_index, 222);
     let sync = tracker.get_sync_committee_duties(320).await;
     assert_eq!(sync.len(), 1);
     assert_eq!(sync[0].validator_index, 222);
@@ -1276,9 +1276,9 @@ mod tests {
         tracker.fetch_duties_for_epoch(10).await.unwrap();
 
         let duty = tracker.get_duty(320, 1, 1234).await.unwrap();
-        assert_eq!(duty.slot, "320");
-        assert_eq!(duty.committee_index, "1");
-        assert_eq!(duty.validator_index, "1234");
+        assert_eq!(duty.slot, 320);
+        assert_eq!(duty.committee_index, 1);
+        assert_eq!(duty.validator_index, 1234);
     }
 
     /// Issue 2.8: the per-duty fetch-loop detail is `trace` with canonical
@@ -1650,10 +1650,10 @@ mod tests {
         assert_eq!(duties.len(), 2);
 
         let duty1 = tracker.get_duty(320, 1, 1234).await.unwrap();
-        assert_eq!(duty1.validator_index, "1234");
+        assert_eq!(duty1.validator_index, 1234);
 
         let duty2 = tracker.get_duty(321, 2, 5678).await.unwrap();
-        assert_eq!(duty2.validator_index, "5678");
+        assert_eq!(duty2.validator_index, 5678);
 
         let calls = mock.get_attester_duties_calls();
         assert_eq!(calls.len(), 1);
@@ -1691,10 +1691,10 @@ mod tests {
         assert!(tracker.is_epoch_cached(11).await);
 
         let duty10 = tracker.get_duty(320, 1, 1234).await.unwrap();
-        assert_eq!(duty10.slot, "320");
+        assert_eq!(duty10.slot, 320);
 
         let duty11 = tracker.get_duty(352, 2, 1234).await.unwrap();
-        assert_eq!(duty11.slot, "352");
+        assert_eq!(duty11.slot, 352);
     }
 
     #[tokio::test]
@@ -1744,7 +1744,7 @@ mod tests {
 
         let duty = tracker.get_proposer_duty(320).await;
         assert!(duty.is_some());
-        assert_eq!(duty.unwrap().validator_index, "1234");
+        assert_eq!(duty.unwrap().validator_index, 1234);
     }
 
     #[tokio::test]
@@ -1886,7 +1886,7 @@ mod tests {
             tracker.get_cached_proposer_dependent_root(10).await.as_deref(),
             Some("0xroot_b")
         );
-        assert_eq!(tracker.get_proposer_duty(320).await.unwrap().validator_index, "1234");
+        assert_eq!(tracker.get_proposer_duty(320).await.unwrap().validator_index, 1234);
     }
 
     // --- PTC duty tests ---
@@ -2351,10 +2351,10 @@ mod tests {
         tracker.fetch_duties_for_epoch(10).await.unwrap();
 
         let duty = tracker.get_duty(320, 1, 100).await.unwrap();
-        assert_eq!(duty.validator_index, "100");
+        assert_eq!(duty.validator_index, 100);
 
         let duty = tracker.get_duty(320, 1, 200).await.unwrap();
-        assert_eq!(duty.validator_index, "200");
+        assert_eq!(duty.validator_index, 200);
 
         let result = tracker.get_duty(320, 1, 999).await;
         assert!(matches!(result, Err(DutyTrackerError::DutyNotFound { .. })));
