@@ -66,6 +66,13 @@
 //! 500, 1000, 2500, 5000, and 10000 milliseconds. Neither family has labels.
 //! Dashboards that watch import latency or connection occupancy should bind
 //! these names (RR4-05 / #541).
+//! RR3-02 adds `rvc_slashing_import_deferred_ms` (family delta +1): one sample
+//! per deferred interchange import. The sample is the single-flight mutex
+//! queue plus the sleep until a free slot window. An import admitted without
+//! waiting records nothing. Buckets match the import timing set and add
+//! 12000 and 24000 milliseconds so a one-slot and a two-slot wait are not
+//! only the +Inf bucket. It has no labels. Dashboards that watch import
+//! deferral should bind this name (RR4-05 / #541).
 //! RR3-04 adds `rvc_duty_rejected_total` (family delta +1): one increment when
 //! the duty cache rejects one attester, proposer, or PTC duty because a numeric
 //! field did not parse as a `u64`. Label `field` is that wire name (`slot`,
@@ -157,6 +164,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_slashing_group_commit_batch_size", // operator-facing: reserves drained into one group-commit (RR0-07)
     "rvc_slashing_import_conflicts_total", // operator-facing: dropped interchange import rows (RR-4.2)
     "rvc_slashing_import_conn_hold_ms", // operator-facing: interchange import conn.lock through COMMIT (RR2-12 / #525)
+    "rvc_slashing_import_deferred_ms", // operator-facing: mutex queue plus free-window wait (RR3-02 / #531)
     "rvc_slashing_import_duration_ms", // operator-facing: whole interchange import call (RR2-12 / #525)
     "rvc_slashing_protection_checks_total",
     "rvc_slashing_prune_source_bound_raised_total", // operator-facing: prune raised an attestation source floor (RR-4.1)
@@ -275,8 +283,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        59,
-        "RR3-04 adds rvc_duty_rejected_total; count is the list length"
+        60,
+        "RR3-02 adds rvc_slashing_import_deferred_ms; count is the list length"
     );
 }
 

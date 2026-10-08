@@ -71,6 +71,15 @@ fn spawn_test_deps(
         key_gen_tx,
         admissions,
         quiesce_registry: Arc::new(crate::quiesce::QuiesceRegistry::new()),
+        slot_clock: {
+            let clock = Arc::new(timing::MockSlotClock::new(
+                1_606_824_023,
+                std::time::Duration::from_secs(12),
+                32,
+            ));
+            clock.set_slot_with_offset_ms(0, 8_000);
+            clock
+        },
     }
 }
 

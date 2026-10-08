@@ -201,7 +201,7 @@ fn test_delete_returns_real_eip3076_interchange_for_key_with_history() {
     db.seed_attestation(&pk_hex, 10, 11, None, &gvr_root).expect("seed history");
     db.seed_block(&pk_hex, 42, None, &gvr_root).expect("seed block history");
 
-    let slashing = SlashingProtectionAdapter::new(db, gvr_root);
+    let slashing = SlashingProtectionAdapter::new_in_free_window(db, gvr_root);
 
     assert!(
         adapter.has_key(&pk),

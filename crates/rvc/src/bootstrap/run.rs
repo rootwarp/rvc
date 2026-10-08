@@ -267,6 +267,7 @@ pub async fn run(
             key_gen_tx,
             admissions,
             quiesce_registry,
+            slot_clock: Arc::clone(&slot_clock) as Arc<dyn timing::SlotClock>,
         },
         listeners.keymanager,
         &executor,

@@ -410,6 +410,47 @@ impl SlashingDb {
         Ok(result)
     }
 
+    /// Version and genesis-validators-root checks, with no connection lock.
+    ///
+    /// [`Self::import`] calls this before it parses rows or takes `conn`.
+    /// Callers that admit an import into a slot window run it first so a
+    /// rejected file does not wait for that window.
+    pub fn validate_interchange_metadata(
+        interchange: &InterchangeFormat,
+        expected_genesis_validators_root: &Root,
+    ) -> Result<(), SlashingError> {
+        if interchange.metadata.interchange_format_version != "5" {
+            return Err(SlashingError::InvalidInterchangeFormat(format!(
+                "unsupported interchange_format_version: expected \"5\", got \"{}\"",
+                interchange.metadata.interchange_format_version
+            )));
+        }
+
+        // RF3-18: byte-based metadata compare — bare hex, 0x-prefixed, and mixed-case
+        // encodings of the same 32-byte root must not spuriously reject a valid import.
+        // Use eth-types parse (no all-zeros policy) so interchange wire forms stay open;
+        // row storage always uses the caller's typed Root in canonical form.
+        let expected_hex = Self::root_to_hex(expected_genesis_validators_root);
+        let actual_root = match eth_types::canonical::gvr_hex::parse_gvr_hex(
+            &interchange.metadata.genesis_validators_root,
+        ) {
+            Ok(root) => root,
+            Err(_) => {
+                return Err(SlashingError::GenesisValidatorsRootMismatch {
+                    expected: expected_hex,
+                    actual: interchange.metadata.genesis_validators_root.clone(),
+                });
+            }
+        };
+        if actual_root != *expected_genesis_validators_root {
+            return Err(SlashingError::GenesisValidatorsRootMismatch {
+                expected: expected_hex,
+                actual: interchange.metadata.genesis_validators_root.clone(),
+            });
+        }
+        Ok(())
+    }
+
     #[tracing::instrument(name = "slashing.db.import", skip_all)]
     /// Import an EIP-3076 interchange into the history tables and raise per-pubkey
     /// watermarks to the interchange maxima.
@@ -443,41 +484,13 @@ impl SlashingDb {
         expected_genesis_validators_root: &Root,
     ) -> Result<(), SlashingError> {
         let _duration = ImportElapsedMs::start(&metrics::RVC_SLASHING_IMPORT_DURATION_MS);
-        if interchange.metadata.interchange_format_version != "5" {
-            return Err(SlashingError::InvalidInterchangeFormat(format!(
-                "unsupported interchange_format_version: expected \"5\", got \"{}\"",
-                interchange.metadata.interchange_format_version
-            )));
-        }
-
-        // RF3-18: byte-based metadata compare — bare hex, 0x-prefixed, and mixed-case
-        // encodings of the same 32-byte root must not spuriously reject a valid import.
-        // Use eth-types parse (no all-zeros policy) so interchange wire forms stay open;
-        // row storage always uses the caller's typed Root in canonical form.
-        let expected_hex = Self::root_to_hex(expected_genesis_validators_root);
-        let actual_root = match eth_types::canonical::gvr_hex::parse_gvr_hex(
-            &interchange.metadata.genesis_validators_root,
-        ) {
-            Ok(root) => root,
-            Err(_) => {
-                return Err(SlashingError::GenesisValidatorsRootMismatch {
-                    expected: expected_hex,
-                    actual: interchange.metadata.genesis_validators_root.clone(),
-                });
-            }
-        };
-        if actual_root != *expected_genesis_validators_root {
-            return Err(SlashingError::GenesisValidatorsRootMismatch {
-                expected: expected_hex,
-                actual: interchange.metadata.genesis_validators_root.clone(),
-            });
-        }
+        Self::validate_interchange_metadata(interchange, expected_genesis_validators_root)?;
 
         // Canonical 0x+lowercase for every imported row so the v3 unique index
         // (pubkey, genesis_validators_root, slot/target_epoch) matches runtime
         // inserts that also go through root_to_hex (RF3-18).  SQLite treats NULL
         // as DISTINCT, so a NULL gvr would bypass the index silently.
-        let gvr_hex = expected_hex;
+        let gvr_hex = Self::root_to_hex(expected_genesis_validators_root);
         let parsed = parse_interchange(interchange)?;
 
         #[cfg(any(test, feature = "test-utils"))]

@@ -81,6 +81,7 @@ mod denylist;
 mod exit;
 mod export_floor;
 mod import_budget;
+mod import_window;
 mod keystore;
 mod misc_adapters;
 mod pubkey_map;

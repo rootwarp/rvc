@@ -237,7 +237,7 @@ fn world() -> World {
         store,
         vm,
         keys: Arc::new(MemoryKeys { keys: Mutex::new(vec![pk]) }),
-        slashing: Arc::new(SlashingProtectionAdapter::new(db, GVR)),
+        slashing: Arc::new(SlashingProtectionAdapter::new_in_free_window(db, GVR)),
         fork: ForkSchedule::unscheduled_gloas(),
         raced: Arc::new(AtomicUsize::new(0)),
     }
