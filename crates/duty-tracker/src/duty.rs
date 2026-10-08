@@ -51,8 +51,8 @@ pub struct TypedAttesterDuty {
     pub committee_length: u64,
     pub validator_committee_index: u64,
     pub committees_at_slot: String,
-    /// Beacon wire body. Downstream code that still takes `&AttesterDuty`
-    /// uses this until it switches to the typed fields.
+    /// Beacon wire body. Callers that need the beacon DTO (committee
+    /// subscription strings, wire validator-index labels) use this.
     pub raw: AttesterDuty,
 }
 

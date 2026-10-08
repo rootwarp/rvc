@@ -72,7 +72,8 @@ async fn attester_duties_http_roundtrip() {
     assert_eq!(tracker.get_cached_dependent_root(10).await, Some("0xdeproot_http".to_string()));
 
     let duty = tracker.get_duty(320, 1, 1234).await.unwrap();
-    assert_eq!(duty.committee_index, "1");
+    assert_eq!(duty.committee_index, 1);
+    assert_eq!(duty.raw.committee_index, "1");
 }
 
 /// Proposer + sync-committee duties: GET/POST paths and typed sync pubkey decode.
@@ -120,7 +121,8 @@ async fn proposer_and_sync_duties_http_roundtrip() {
     assert_eq!(proposers.len(), 1);
     assert!(tracker.is_proposer_epoch_cached(10).await);
     let duty = tracker.get_proposer_duty(320).await.unwrap();
-    assert_eq!(duty.validator_index, "1234");
+    assert_eq!(duty.validator_index, 1234);
+    assert_eq!(duty.raw.validator_index, "1234");
 
     let sync_duties = tracker.fetch_sync_committee_duties(10).await.unwrap();
     assert_eq!(sync_duties.len(), 1);

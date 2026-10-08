@@ -1,9 +1,8 @@
 use std::future::Future;
 use std::time::Duration;
 
-use beacon::AttesterDuty;
 use crypto::PublicKey;
-use duty_tracker::DutyTracker;
+use duty_tracker::{DutyTracker, TypedAttesterDuty};
 use eth_types::{ForkName, Root, Slot};
 use timing::SLOTS_PER_EPOCH;
 use tracing::warn;
@@ -45,54 +44,38 @@ where
 
 /// Constructs a hex-encoded SSZ bitlist where only the validator's position
 /// in the committee is set (pre-Electra aggregation_bits format).
-pub(crate) fn make_aggregation_bits(duty: &AttesterDuty) -> Option<String> {
-    let committee_length: usize = match duty.committee_length.parse() {
-        Ok(0) => {
-            warn!(
-                validator_index = %duty.validator_index,
-                "committee_length is 0, cannot produce aggregation bits"
-            );
-            return None;
-        }
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                validator_index = %duty.validator_index,
-                raw_value = %duty.committee_length,
-                error = %e,
-                "failed to parse committee_length, skipping duty"
-            );
-            return None;
-        }
-    };
+///
+/// `committee_length` and `validator_committee_index` are the typed duty
+/// fields. `duty.raw.validator_index` is the wire label on the existing warns.
+pub(crate) fn make_aggregation_bits(duty: &TypedAttesterDuty) -> Option<String> {
+    let committee_length_u64 = duty.committee_length;
+    if committee_length_u64 == 0 {
+        warn!(
+            validator_index = %duty.raw.validator_index,
+            "committee_length is 0, cannot produce aggregation bits"
+        );
+        return None;
+    }
 
-    let validator_committee_index: usize = match duty.validator_committee_index.parse() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                validator_index = %duty.validator_index,
-                raw_value = %duty.validator_committee_index,
-                error = %e,
-                "failed to parse validator_committee_index, skipping duty"
-            );
-            return None;
-        }
-    };
+    let validator_committee_index_u64 = duty.validator_committee_index;
 
     // ISSUE-4.4 / L-4: out-of-bounds validator_committee_index returns None.
     // Previously this fell through to a bitlist with only the sentinel bit
     // set (validator position not bound), which the BN would silently
     // accept as a zero-participation attestation.  The caller's `None`
     // branch already drops the duty.
-    if validator_committee_index >= committee_length {
+    if validator_committee_index_u64 >= committee_length_u64 {
         warn!(
-            validator_index = %duty.validator_index,
-            committee_length = committee_length,
-            validator_committee_index = validator_committee_index,
+            validator_index = %duty.raw.validator_index,
+            committee_length = committee_length_u64,
+            validator_committee_index = validator_committee_index_u64,
             "validator_committee_index is out of range, skipping duty (ISSUE-4.4 / L-4)"
         );
         return None;
     }
+
+    let committee_length = committee_length_u64 as usize;
+    let validator_committee_index = validator_committee_index_u64 as usize;
 
     // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
     // The "+1" is for the length bit at position committee_length
@@ -227,7 +210,7 @@ pub(crate) async fn get_duties_for_slot(
     pubkey_map: &PubkeyMap,
     duty_tracker: &DutyTracker,
     slot: Slot,
-) -> Result<Vec<AttesterDuty>, OrchestratorError> {
+) -> Result<Vec<TypedAttesterDuty>, OrchestratorError> {
     // Borrow keys only — no full map clone / PublicKey clone on the hot path.
     let our_keys: std::collections::HashSet<[u8; 48]> = {
         let map = pubkey_map.read();
@@ -244,7 +227,7 @@ pub(crate) async fn get_duties_for_slot(
     }
 
     let all_duties = duty_tracker.get_duties_for_slot(slot).await;
-    let duties: Vec<AttesterDuty> = all_duties
+    let duties: Vec<TypedAttesterDuty> = all_duties
         .into_iter()
         .filter(|duty| {
             parse_pubkey_bytes(&duty.pubkey).is_some_and(|bytes| our_keys.contains(&bytes))
@@ -257,6 +240,8 @@ pub(crate) async fn get_duties_for_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use beacon::AttesterDuty;
 
     #[test]
     fn test_parse_hex_root_with_prefix() {
@@ -319,8 +304,8 @@ mod tests {
     fn make_duty_with_committee(
         committee_length: &str,
         validator_committee_index: &str,
-    ) -> AttesterDuty {
-        AttesterDuty {
+    ) -> TypedAttesterDuty {
+        let raw = AttesterDuty {
             pubkey: "0xaabb".to_string(),
             validator_index: "1".to_string(),
             committee_index: "0".to_string(),
@@ -328,7 +313,8 @@ mod tests {
             committees_at_slot: "1".to_string(),
             validator_committee_index: validator_committee_index.to_string(),
             slot: "100".to_string(),
-        }
+        };
+        TypedAttesterDuty::try_from(&raw).expect("numeric committee fixture")
     }
 
     /// ISSUE-4.4 / L-4: validator_committee_index == committee_length must

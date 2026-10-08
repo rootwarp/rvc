@@ -5,10 +5,10 @@ use futures::stream::{self, StreamExt};
 use tracing::{debug, info, info_span, warn, Instrument, Span};
 
 use crate::metrics::{attestation_status, RVC_AGGREGATIONS_TOTAL};
-use beacon::{AttesterDuty, VersionedAggregateAttestation, VersionedSignedAggregateAndProof};
+use beacon::{VersionedAggregateAttestation, VersionedSignedAggregateAndProof};
 use bn_manager::BeaconNodeClient;
 use crypto::PublicKey;
-use duty_tracker::DutyTracker;
+use duty_tracker::{DutyTracker, TypedAttesterDuty};
 use eth_types::{
     AggregateAndProof, ElectraAggregateAndProof, ForkName, SignedAggregateAndProof,
     SignedElectraAggregateAndProof, Slot, MAX_COMMITTEES_PER_SLOT,
@@ -53,12 +53,15 @@ enum AggregateSubmitLabel {
 
 /// Result of attempting aggregation for a single attester duty.
 ///
-/// `None` means the duty was skipped before selection (parse / disabled / not
+/// `None` means the duty was skipped before selection (disabled / not
 /// selected). `Some` means the validator was selected as aggregator; `proof`
 /// is `None` when a later step failed after selection (source_validators still
 /// records the validator_index — matches pre-refactor behaviour).
 struct AggregateDutyOutcome {
-    validator_index: String,
+    /// Parsed at the duty cache. Primary key for `source_validators`.
+    validator_index: u64,
+    /// Wire decimal recorded on the submit span. Tie-break for the sort.
+    raw_validator_index: String,
     proof: Option<ProducedAggregate>,
 }
 
@@ -170,12 +173,12 @@ impl AggregationService {
     /// before selection; `Some` once selected (proof may still be `None`).
     async fn produce_one_aggregate(
         &self,
-        duty: AttesterDuty,
+        duty: TypedAttesterDuty,
         slot: Slot,
         fork_name: ForkName,
         agg_span: Span,
     ) -> Option<AggregateDutyOutcome> {
-        let committee_length: u64 = duty.committee_length.parse().ok()?;
+        let committee_length = duty.committee_length;
 
         let pubkey = utils::find_pubkey(&self.pubkey_map, &duty.pubkey)?;
 
@@ -233,7 +236,6 @@ impl AggregationService {
             "Selected as attestation aggregator"
         );
 
-        let validator_index = duty.validator_index.clone();
         let proof = self
             .fetch_sign_aggregate(
                 &duty,
@@ -245,13 +247,17 @@ impl AggregationService {
             )
             .await;
 
-        Some(AggregateDutyOutcome { validator_index, proof })
+        Some(AggregateDutyOutcome {
+            validator_index: duty.validator_index,
+            raw_validator_index: duty.raw.validator_index.clone(),
+            proof,
+        })
     }
 
     /// Fetch attestation data + aggregate, then sign_and_wrap for the fork.
     async fn fetch_sign_aggregate(
         &self,
-        duty: &AttesterDuty,
+        duty: &TypedAttesterDuty,
         slot: Slot,
         fork_name: ForkName,
         pubkey: &PublicKey,
@@ -259,7 +265,7 @@ impl AggregationService {
         agg_span: Span,
     ) -> Option<ProducedAggregate> {
         let uses_electra_wire = utils::uses_electra_attestation_wire(fork_name);
-        let committee_index: u64 = duty.committee_index.parse().ok()?;
+        let committee_index = duty.committee_index;
 
         let attestation_data_response = match utils::timed(
             "aggregate_attestation_data",
@@ -352,7 +358,7 @@ impl AggregationService {
             }
         };
 
-        let aggregator_index: u64 = duty.validator_index.parse().ok()?;
+        let aggregator_index = duty.validator_index;
 
         if uses_electra_wire {
             let electra_agg = match aggregate {
@@ -377,12 +383,24 @@ impl AggregationService {
             // Inherit-intentionally: Gloas and later use the island root, not tree_hash 0.9.
             if fork_name >= ForkName::Gloas {
                 let signed = self
-                    .sign_and_wrap_gloas(slot, &duty.validator_index, pubkey, message, agg_span)
+                    .sign_and_wrap_gloas(
+                        slot,
+                        duty.raw.validator_index.as_str(),
+                        pubkey,
+                        message,
+                        agg_span,
+                    )
                     .await?;
                 Some(ProducedAggregate::Gloas(signed))
             } else {
                 let signed = self
-                    .sign_and_wrap_electra(slot, &duty.validator_index, pubkey, message, agg_span)
+                    .sign_and_wrap_electra(
+                        slot,
+                        duty.raw.validator_index.as_str(),
+                        pubkey,
+                        message,
+                        agg_span,
+                    )
                     .await?;
                 Some(ProducedAggregate::Electra(signed))
             }
@@ -404,7 +422,13 @@ impl AggregationService {
             let message =
                 AggregateAndProof { aggregator_index, aggregate: pre_electra_agg, selection_proof };
             let signed = self
-                .sign_and_wrap_pre_electra(slot, &duty.validator_index, pubkey, message, agg_span)
+                .sign_and_wrap_pre_electra(
+                    slot,
+                    duty.raw.validator_index.as_str(),
+                    pubkey,
+                    message,
+                    agg_span,
+                )
                 .await?;
             Some(ProducedAggregate::PreElectra(signed))
         }
@@ -579,9 +603,13 @@ impl AggregationService {
             return attempted;
         }
 
-        let mut source_validators: Vec<String> =
-            outcomes.iter().map(|outcome| outcome.validator_index.clone()).collect();
+        let mut source_validators: Vec<(u64, String)> = outcomes
+            .iter()
+            .map(|outcome| (outcome.validator_index, outcome.raw_validator_index.clone()))
+            .collect();
         sort_source_validators(&mut source_validators);
+        let source_validators: Vec<String> =
+            source_validators.into_iter().map(|(_, raw)| raw).collect();
 
         let mut pre_electra_aggregates: Vec<SignedAggregateAndProof> = Vec::new();
         let mut electra_aggregates: Vec<SignedElectraAggregateAndProof> = Vec::new();
@@ -737,11 +765,11 @@ impl AggregationService {
 
 /// Decimal validator indices, so `2` stays before `10`.
 ///
-/// Wave completion order is not this order. H-25 records the sorted list.
-fn sort_source_validators(indices: &mut [String]) {
-    indices.sort_by(|left, right| {
-        left.parse::<u64>().ok().cmp(&right.parse::<u64>().ok()).then_with(|| left.cmp(right))
-    });
+/// The typed index is the primary key. The wire string breaks ties, matching
+/// the order a successful parse of that string used to produce. Wave
+/// completion order is not this order. H-25 records the sorted list.
+fn sort_source_validators(indices: &mut [(u64, String)]) {
+    indices.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 }
 
 fn warn_aggregate_publish_stopped(

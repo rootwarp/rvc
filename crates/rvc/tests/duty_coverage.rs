@@ -453,7 +453,7 @@ impl Harness {
         self.handles.duty_tracker.fetch_duties_for_epoch(epoch).await.expect("cache duty");
         let cached = self.handles.duty_tracker.get_duties_for_slot(slot).await;
         assert!(
-            cached.iter().any(|d| d.validator_index == key.index),
+            cached.iter().any(|d| d.raw.validator_index == key.index),
             "precondition: attester duty for {INDEX} is cached, got {cached:?}"
         );
         assert!(
@@ -492,7 +492,7 @@ impl Harness {
         self.handles.duty_tracker.fetch_duties_for_epoch(epoch).await.expect("cache duty");
         let cached = self.handles.duty_tracker.get_duties_for_slot(slot).await;
         assert!(
-            cached.iter().any(|d| d.validator_index == key.index),
+            cached.iter().any(|d| d.raw.validator_index == key.index),
             "precondition: subscription loop must see the cached duty"
         );
         assert!(!self.handles.validator_store.is_signing_enabled(&key.bytes));
