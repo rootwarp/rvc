@@ -5,6 +5,7 @@
 
 mod config;
 mod doppelganger;
+mod import_window;
 mod kdf_budget;
 mod keystore;
 mod notifier;

@@ -29,7 +29,7 @@ impl SlotAnchor {
     /// The offset is clamped to two slot durations, and `checked_sub` falls
     /// back to `Instant::now()` when that rewind cannot be represented. An NTP
     /// jump or a stalled loop must not panic.
-    pub(crate) fn capture(clock: &impl SlotClock, slot: Slot) -> Self {
+    pub(crate) fn capture(clock: &dyn SlotClock, slot: Slot) -> Self {
         let slot_duration_ms =
             u64::try_from(clock.slot_duration().as_millis()).unwrap_or(u64::MAX / 2);
         let into = clock.ms_into_slot(slot).min(2 * slot_duration_ms);
