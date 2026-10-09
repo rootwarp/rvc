@@ -1,7 +1,7 @@
 //! SEC-2c: per-slot forward-window liveness observation loop.
 //!
 //! Drives [`ForwardWindowMachine`] with real network liveness via the bn-manager
-//! (`BeaconNodeClient::post_validator_liveness_merged`, multi-BN OR-merge).
+//! (`LivenessApi::post_validator_liveness_merged`, multi-BN OR-merge).
 //!
 //! Each cycle (once per slot):
 //! 1. Query liveness for recently completed epochs that still need observation
@@ -18,7 +18,7 @@
 //! # Multi-BN OR-merge (ARCH-P1-13)
 //!
 //! Liveness fans out to every configured BN via
-//! [`BeaconNodeClient::post_validator_liveness_merged`]. Per validator index,
+//! [`LivenessApi::post_validator_liveness_merged`]. Per validator index,
 //! `is_live` is OR-merged — any BN reporting live wins (fail-safe: a lagging
 //! primary that answers all-not-live cannot suppress a secondary that saw
 //! activity). Errors and non-responses contribute nothing (they are not treated
@@ -29,7 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bn_manager::BeaconNodeClient;
+use bn_manager::{LivenessApi, NodeStatusApi};
 use doppelganger::{
     ForwardWindowMachine, ForwardWindowStatus, MonotonicEpochClock, ValidatorLivenessData,
     DEFAULT_MONITORING_EPOCHS,
@@ -71,7 +71,7 @@ pub struct LivenessLoopSpawn {
 /// Background task that ticks the forward-window machine once per slot.
 pub struct LivenessObservationLoop {
     machine: Arc<ForwardWindowMachine>,
-    beacon: Arc<dyn BeaconNodeClient>,
+    beacon: Arc<dyn LivenessApi>,
     /// Shared pubkey ↔ index registry (liveness uses the reverse index→bare-hex view).
     pubkey_index: SharedPubkeyIndexRegistry,
     /// Live keystore/keymanager pubkey set for periodic BN index re-resolve.
@@ -85,7 +85,7 @@ pub struct LivenessObservationLoop {
 /// Body of the retained liveness index refresh. Expanded only from the test helper
 /// (and, under `cfg(test)`, from `refresh_indices_from_pubkey_map`).
 macro_rules! refresh_indices_from_pubkey_map_impl {
-    ($self:ident) => {{
+    ($self:ident, $validators:expr) => {{
         let Some(ref pm) = $self.pubkey_map else {
             return;
         };
@@ -97,7 +97,7 @@ macro_rules! refresh_indices_from_pubkey_map_impl {
             map.keys().map(pubkey_bytes_to_0x).collect()
         };
 
-        match $self.beacon.get_validators(&pubkeys).await {
+        match $validators.get_validators(&pubkeys).await {
             Ok(resp) => {
                 let mut w = $self.pubkey_index.write();
                 let before = w.len();
@@ -130,7 +130,7 @@ macro_rules! refresh_indices_from_pubkey_map_impl {
 impl LivenessObservationLoop {
     pub fn new(
         machine: Arc<ForwardWindowMachine>,
-        beacon: Arc<dyn BeaconNodeClient>,
+        beacon: Arc<dyn LivenessApi>,
         pubkey_index: SharedPubkeyIndexRegistry,
         epoch_clock: Arc<MonotonicEpochClock>,
         cancel: CancellationToken,
@@ -272,8 +272,8 @@ impl LivenessObservationLoop {
     /// tests build this crate without `cfg(test)`, so the helper inlines the same
     /// body.
     #[cfg(test)]
-    async fn refresh_indices_from_pubkey_map(&self) {
-        refresh_indices_from_pubkey_map_impl!(self);
+    async fn refresh_indices_from_pubkey_map(&self, validators: &dyn NodeStatusApi) {
+        refresh_indices_from_pubkey_map_impl!(self, validators);
     }
 
     /// Query BN liveness for `epoch`, translate indices, feed the machine.
@@ -337,15 +337,17 @@ impl LivenessObservationLoop {
 
     /// Test helper: run one index refresh from the attached pubkey map.
     ///
-    /// Not a production writer. [`Self::run`] must not call this.
-    pub async fn refresh_indices_for_test(&self) {
+    /// `validators` is the index lookup. The loop client is only [`LivenessApi`],
+    /// which has no `get_validators`. Not a production writer. [`Self::run`]
+    /// must not call this.
+    pub async fn refresh_indices_for_test(&self, validators: &dyn NodeStatusApi) {
         #[cfg(test)]
         {
-            self.refresh_indices_from_pubkey_map().await;
+            self.refresh_indices_from_pubkey_map(validators).await;
         }
         #[cfg(not(test))]
         {
-            refresh_indices_from_pubkey_map_impl!(self);
+            refresh_indices_from_pubkey_map_impl!(self, validators);
         }
     }
 }
@@ -361,7 +363,7 @@ impl LivenessObservationLoop {
 /// The loop is registered on `executor` at Orchestrator tier (ARCH-2g P1-7).
 pub fn spawn_liveness_loop(
     machine: Option<Arc<ForwardWindowMachine>>,
-    beacon: Arc<dyn BeaconNodeClient>,
+    beacon: Arc<dyn LivenessApi>,
     pubkey_index: SharedPubkeyIndexRegistry,
     pubkey_map: Option<PubkeyMap>,
     epoch_clock: Arc<MonotonicEpochClock>,
@@ -401,7 +403,7 @@ pub fn spawn_liveness_loop(
 mod tests {
     use super::*;
     use crate::pubkey_index::PubkeyIndexRegistry;
-    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
+    use bn_manager::MockBeaconNodeClient;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use beacon::{
@@ -568,7 +570,7 @@ mod tests {
 
     fn loop_with(
         machine: Arc<ForwardWindowMachine>,
-        beacon: Arc<dyn BeaconNodeClient>,
+        beacon: Arc<dyn LivenessApi>,
         numeric_index: &str,
         pubkey: &crypto::PublicKey,
     ) -> LivenessObservationLoop {
@@ -641,8 +643,8 @@ mod tests {
         // Failover sequence preserved: one call path that succeeds after primary would fail
         // (shared mock returns secondary-style success; primary permanent-down is modeled
         // by always returning the secondary result — loop sees a single Ok, same as before).
-        let failover: Arc<dyn BeaconNodeClient> = Arc::new(build_failover_liveness_mock(&["99"]));
-        let loop_ = loop_with(Arc::clone(&m), Arc::clone(&failover), "99", &pk);
+        let failover = Arc::new(build_failover_liveness_mock(&["99"]));
+        let loop_ = loop_with(Arc::clone(&m), failover.clone(), "99", &pk);
 
         let ok = loop_.drive_once_for_test(Some(start), start, 0).await;
         assert!(ok.is_ok(), "failover must succeed via secondary: {ok:?}");
@@ -673,7 +675,7 @@ mod tests {
 
         let reg = PubkeyIndexRegistry::shared();
         reg.write().insert(pk.to_bytes(), "1".to_string());
-        let bn: Arc<dyn BeaconNodeClient> = Arc::new(all_not_live(&["1"]).0);
+        let bn = Arc::new(all_not_live(&["1"]).0);
         let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
         let handle = spawn_liveness_loop(
             Some(Arc::clone(&m)),
@@ -736,7 +738,7 @@ mod tests {
 
         let loop_ = LivenessObservationLoop::new(
             Arc::clone(&m),
-            bn as Arc<dyn BeaconNodeClient>,
+            bn.clone(),
             Arc::clone(&pubkey_index),
             Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
             CancellationToken::new(),
@@ -750,7 +752,7 @@ mod tests {
         assert!(pubkey_index.read().is_empty());
 
         // Refresh pulls index 77 from BN for the pubkey_map key.
-        loop_.refresh_indices_for_test().await;
+        loop_.refresh_indices_for_test(bn.as_ref()).await;
         assert_eq!(pubkey_index.read().bare_hex_of_index("77"), Some(bare.as_str()));
 
         // Now observation succeeds for the imported key.

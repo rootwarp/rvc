@@ -6,7 +6,7 @@ use tracing::{debug, info, info_span, warn, Instrument, Span};
 
 use crate::metrics::{attestation_status, RVC_AGGREGATIONS_TOTAL};
 use beacon::{VersionedAggregateAttestation, VersionedSignedAggregateAndProof};
-use bn_manager::BeaconNodeClient;
+use bn_manager::AttestationApi;
 use crypto::PublicKey;
 use duty_tracker::{DutyTracker, TypedAttesterDuty};
 use eth_types::{
@@ -25,7 +25,7 @@ use super::utils::{self, TimedOutcome};
 
 pub(crate) struct AggregationService {
     signer: Arc<dyn ValidatorSigner>,
-    beacon: Arc<dyn BeaconNodeClient>,
+    beacon: Arc<dyn AttestationApi>,
     duty_tracker: Arc<DutyTracker>,
     pubkey_map: PubkeyMap,
     config: OrchestratorConfig,
@@ -68,7 +68,7 @@ struct AggregateDutyOutcome {
 impl AggregationService {
     pub(crate) fn new(
         signer: Arc<dyn ValidatorSigner>,
-        beacon: Arc<dyn BeaconNodeClient>,
+        beacon: Arc<dyn AttestationApi>,
         duty_tracker: Arc<DutyTracker>,
         pubkey_map: PubkeyMap,
         config: OrchestratorConfig,
@@ -1749,10 +1749,7 @@ mod tests {
             map.insert(bytes, pubkey.clone());
         }
         let tracked: Vec<String> = indices.iter().map(|index| (*index).to_string()).collect();
-        let duty_tracker = Arc::new(DutyTracker::new(
-            beacon.clone() as Arc<dyn bn_manager::BeaconNodeClient>,
-            tracked,
-        ));
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), tracked));
         duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
 
         let signer = Arc::new(DelayingSigner { inner: StubValidatorSigner::new(), delays });
@@ -1761,7 +1758,7 @@ mod tests {
         );
         let service = AggregationService::new(
             signer,
-            beacon.clone() as Arc<dyn bn_manager::BeaconNodeClient>,
+            beacon.clone(),
             duty_tracker,
             Arc::new(parking_lot::RwLock::new(map)),
             config,
@@ -1835,10 +1832,7 @@ mod tests {
             )
             .with_method_delay(MockMethod::SubmitAggregateAndProofs, Duration::from_secs(2)),
         );
-        let duty_tracker = Arc::new(DutyTracker::new(
-            beacon.clone() as Arc<dyn bn_manager::BeaconNodeClient>,
-            vec!["1".to_string()],
-        ));
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
         let mut map = HashMap::new();
         map.insert(pk.to_bytes(), pk.clone());

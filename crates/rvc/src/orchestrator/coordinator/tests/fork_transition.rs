@@ -99,6 +99,7 @@ async fn build_fork_transition_orchestrator_with(
     let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
 
     let duty_tracker = {
+        // Upcast: wide object only.
         let tracker = DutyTracker::new(beacon.clone(), vec![pubkey_hex.clone()]);
         // Production pins the reconciled schedule (v1 pre-Gloas, v2 at Gloas).
         Arc::new(if attach_builder {

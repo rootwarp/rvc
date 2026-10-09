@@ -8,7 +8,7 @@ use tracing::{debug, info, trace, warn};
 use crate::metrics::{
     RVC_DUTIES_FETCHED_TOTAL, RVC_DUTY_REJECTED_TOTAL, RVC_PTC_DUTIES_FETCHED_TOTAL,
 };
-use bn_manager::{AttesterDuty, BeaconNodeClient, ProposerDuty, PtcDuty};
+use bn_manager::{AttesterDuty, DutiesProvider, ProposerDuty, PtcDuty};
 use eth_types::{ForkSchedule, SyncCommitteeDuty, SLOTS_PER_EPOCH};
 
 use crate::duty::{DutyParseError, TypedAttesterDuty, TypedProposerDuty, TypedPtcDuty};
@@ -218,7 +218,7 @@ impl ValidatorIndexSource for StaticIndexSource {
 }
 
 pub struct DutyTracker {
-    beacon: Arc<dyn BeaconNodeClient>,
+    beacon: Arc<dyn DutiesProvider>,
     index_source: Arc<dyn ValidatorIndexSource>,
     cache: RwLock<HashMap<u64, EpochDutyCache>>,
     /// Proposer duties keyed by epoch -> ProposerEpochDutyCache.
@@ -238,7 +238,7 @@ impl DutyTracker {
     ///
     /// Convenience wrapper around [`Self::new_with_source`]: the set does not
     /// change between fetches.
-    pub fn new(beacon: Arc<dyn BeaconNodeClient>, validator_indices: Vec<String>) -> Self {
+    pub fn new(beacon: Arc<dyn DutiesProvider>, validator_indices: Vec<String>) -> Self {
         Self::new_with_source(beacon, Arc::new(StaticIndexSource(validator_indices)))
     }
 
@@ -248,7 +248,7 @@ impl DutyTracker {
     /// snapshot for every beacon request the call makes. [`Self::new`] wraps a
     /// static set.
     pub fn new_with_source(
-        beacon: Arc<dyn BeaconNodeClient>,
+        beacon: Arc<dyn DutiesProvider>,
         index_source: Arc<dyn ValidatorIndexSource>,
     ) -> Self {
         Self {
@@ -1055,7 +1055,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use bn_manager::{
-        AttesterDutiesResponse, AttesterDuty, BeaconError, BeaconNodeClient, MockBeaconNodeClient,
+        AttesterDutiesResponse, AttesterDuty, BeaconError, DutiesProvider, MockBeaconNodeClient,
         ProposerDutiesResponse, ProposerDuty, PtcDutiesResponse, PtcDuty,
         SyncCommitteeDutiesResponse,
     };
@@ -1064,7 +1064,7 @@ mod tests {
 
     use super::*;
 
-    fn empty_beacon() -> Arc<dyn BeaconNodeClient> {
+    fn empty_beacon() -> Arc<dyn DutiesProvider> {
         Arc::new(MockBeaconNodeClient::new())
     }
 
@@ -1230,7 +1230,7 @@ mod tests {
             .with_post_sync_committee_duties(move |_epoch, _indices| Ok(resp.clone()))
     }
 
-    fn as_beacon(mock: MockBeaconNodeClient) -> Arc<dyn BeaconNodeClient> {
+    fn as_beacon(mock: MockBeaconNodeClient) -> Arc<dyn DutiesProvider> {
         Arc::new(mock)
     }
 

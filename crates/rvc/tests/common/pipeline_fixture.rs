@@ -1142,7 +1142,7 @@ fn finish_fixture(
     } else {
         seeded.iter().map(|attester| attester.validator_index.clone()).collect()
     };
-    let duty_tracker = Arc::new(DutyTracker::new(Arc::clone(&beacon_node), indices));
+    let duty_tracker = Arc::new(DutyTracker::new(beacon_client.clone(), indices));
 
     let submitter = Arc::new(if request_delay.is_zero() {
         RecordingSubmitter::new()

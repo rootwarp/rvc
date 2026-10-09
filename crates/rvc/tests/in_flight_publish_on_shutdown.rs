@@ -279,10 +279,8 @@ async fn build_harness(pk: PublicKey, sk: SecretKey) -> Harness {
     let pubkey_hex = format!("0x{}", hex::encode(pk.to_bytes()));
     let beacon = Arc::new(build_proposer_beacon(pubkey_hex, PROPOSAL_SLOT));
 
-    let duty_tracker = Arc::new(DutyTracker::new(
-        beacon.clone() as Arc<dyn BeaconNodeClient>,
-        vec![VALIDATOR_INDEX.to_string()],
-    ));
+    let duty_tracker =
+        Arc::new(DutyTracker::new(beacon.clone(), vec![VALIDATOR_INDEX.to_string()]));
     // Warm duty cache so the slot loop does not stall on BN fetches.
     let epoch = PROPOSAL_SLOT / SLOTS_PER_EPOCH;
     duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();

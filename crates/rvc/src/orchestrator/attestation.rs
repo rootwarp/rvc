@@ -1067,9 +1067,7 @@ mod dispatch_pipeline {
         BeaconError, Checkpoint, IndexedAttestationError, SubmitAttestationResult,
         VersionedAttestation,
     };
-    use bn_manager::{
-        AttestationSubmitter, BeaconNodeClient, MockBeaconNodeClient, MockMethod, Propagator,
-    };
+    use bn_manager::{AttestationSubmitter, MockBeaconNodeClient, MockMethod, Propagator};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
     use duty_tracker::DutyTracker;
     use eth_types::ForkSchedule;
@@ -1265,8 +1263,7 @@ mod dispatch_pipeline {
             }
         }
         let indices: Vec<String> = keys.iter().map(|key| key.index.clone()).collect();
-        let duty_tracker =
-            Arc::new(DutyTracker::new(Arc::clone(&beacon) as Arc<dyn BeaconNodeClient>, indices));
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices));
         let clock = Arc::new(MockSlotClock::new(GENESIS, Duration::from_secs(12), 32));
         clock.set_slot(SLOT);
         let limits = DispatchLimits::validated(opts.concurrency, opts.publish_concurrency)

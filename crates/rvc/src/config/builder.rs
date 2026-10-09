@@ -13,7 +13,9 @@ use crate::orchestrator::dispatch::DispatchLimits;
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use crate::quiesce::{QuiesceRegistry, QuiescingEnablement};
 use beacon::{parse_slot_duration_ms, BeaconClient, BeaconClientConfig};
-use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, Propagator};
+use bn_manager::{
+    AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, DutiesProvider, Propagator,
+};
 use builder::BuilderService;
 use crypto::{CompositeSigner, KeyManager};
 use doppelganger::{
@@ -485,7 +487,7 @@ impl ServiceBuilder {
 
     pub fn build_duty_tracker(
         &self,
-        beacon: Arc<dyn BeaconNodeClient>,
+        beacon: Arc<dyn DutiesProvider>,
         validator_indices: Vec<String>,
         fork_schedule: ForkSchedule,
     ) -> Arc<DutyTracker> {

@@ -226,8 +226,7 @@ async fn test_ptc_duty_round_trip() {
         SignerService::new(composite, Arc::clone(&slashing_db)).with_enablement(always_enabled()),
     );
 
-    let duty_tracker =
-        Arc::new(DutyTracker::new(beacon.clone(), vec![VALIDATOR_INDEX.to_string()]));
+    let duty_tracker = Arc::new(DutyTracker::new(mock.clone(), vec![VALIDATOR_INDEX.to_string()]));
 
     let mut map = HashMap::new();
     map.insert(pubkey.to_bytes(), pubkey.clone());

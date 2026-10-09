@@ -220,6 +220,7 @@ async fn build_integration_orchestrator(
     let signer =
         Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
+    // Upcast: wide object only.
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
     // Pre-seed the sync-committee duty cache so the orchestrator doesn't need
     // to reach the BN for it inside run().

@@ -445,7 +445,7 @@ where
         let aggregation_signer: Arc<dyn ValidatorSigner> = signer.clone();
         let aggregation_service = AggregationService::new(
             aggregation_signer,
-            beacon.clone(),
+            beacon.clone() as Arc<dyn bn_manager::AttestationApi>, // Upcast: wide object only.
             duty_tracker.clone(),
             pubkey_map.clone(),
             config.clone(),

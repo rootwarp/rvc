@@ -367,7 +367,7 @@ async fn test_pre_gloas_epoch_does_not_call_ptc_endpoint() {
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let signer =
         Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
-    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+    let duty_tracker = Arc::new(DutyTracker::new(mock.clone(), vec!["1".to_string()]));
     duty_tracker.fetch_ptc_duties(0, &["1".to_string()]).await.unwrap();
     let mut map = HashMap::new();
     map.insert(pk.to_bytes(), pk.clone());
