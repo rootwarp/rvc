@@ -19,8 +19,8 @@ pub(crate) mod utils;
 pub mod validation;
 
 pub use coordinator::{
-    AttestationResult, DutyOrchestrator, OrchestratorConfig, OrchestratorDeps, OrchestratorHandle,
-    PubkeyMap, COLD_PROPOSER_FETCH_DEADLINE, DEFAULT_PRE_PROPOSAL_DEADLINE,
+    AttestationOutcome, AttestationResult, DutyOrchestrator, OrchestratorConfig, OrchestratorDeps,
+    OrchestratorHandle, PubkeyMap, COLD_PROPOSER_FETCH_DEADLINE, DEFAULT_PRE_PROPOSAL_DEADLINE,
 };
 pub use error::OrchestratorError;
 pub use head_events::{HeadEventGate, TriggerReason};

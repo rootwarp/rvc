@@ -113,7 +113,7 @@ async fn test_slot_processing_profile_reports_p99() {
     for slot in duty_slots {
         let results = fixture.process_slot(slot).await.expect("process_slot Ok");
         assert_eq!(results.len(), 1, "empty-duty sample at slot {slot}; discard the run");
-        if results[0].success {
+        if results[0].outcome.is_published() {
             successes += 1;
         } else {
             failures += 1;

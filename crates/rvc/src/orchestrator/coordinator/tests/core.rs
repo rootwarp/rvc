@@ -471,11 +471,16 @@ fn test_attestation_result_success() {
     let result = AttestationResult {
         validator_index: "1234".to_string(),
         slot: 100,
-        success: true,
-        error: None,
+        outcome: AttestationOutcome::Published,
     };
-    assert!(result.success);
-    assert!(result.error.is_none());
+    assert!(result.outcome.is_published());
+    match result.outcome {
+        AttestationOutcome::Published => {}
+        AttestationOutcome::Failed(message) => panic!("published is not an error: {message}"),
+        AttestationOutcome::RejectedByBeaconNode { message, bn: _bn } => {
+            panic!("published is not an error: {message}")
+        }
+    }
 }
 
 #[test]
@@ -483,11 +488,70 @@ fn test_attestation_result_failure() {
     let result = AttestationResult {
         validator_index: "1234".to_string(),
         slot: 100,
-        success: false,
-        error: Some("Test error".to_string()),
+        outcome: AttestationOutcome::Failed("Test error".to_string()),
     };
-    assert!(!result.success);
-    assert_eq!(result.error.as_deref(), Some("Test error"));
+    assert!(!result.outcome.is_published());
+    match result.outcome {
+        AttestationOutcome::Failed(message) => assert_eq!(message, "Test error"),
+        AttestationOutcome::Published => panic!("expected Failed"),
+        AttestationOutcome::RejectedByBeaconNode { message, bn: _bn } => {
+            panic!("expected Failed, got beacon rejection: {message}")
+        }
+    }
+}
+
+#[test]
+fn attestation_outcome_is_exhaustive_and_published_is_not_an_error() {
+    let published = AttestationResult {
+        validator_index: "1234".to_string(),
+        slot: 100,
+        outcome: AttestationOutcome::Published,
+    };
+    let failed = AttestationResult {
+        validator_index: "1234".to_string(),
+        slot: 100,
+        outcome: AttestationOutcome::Failed("sign failed".to_string()),
+    };
+    let rejected = AttestationResult {
+        validator_index: "1234".to_string(),
+        slot: 100,
+        outcome: AttestationOutcome::RejectedByBeaconNode {
+            bn: Some("http://bn.example:5052".to_string()),
+            message: "invalid signature".to_string(),
+        },
+    };
+    let rejected_without_bn = AttestationResult {
+        validator_index: "1234".to_string(),
+        slot: 100,
+        outcome: AttestationOutcome::RejectedByBeaconNode {
+            bn: None,
+            message: "rejected".to_string(),
+        },
+    };
+
+    assert!(published.outcome.is_published());
+    assert!(!failed.outcome.is_published());
+    assert!(!rejected.outcome.is_published());
+    assert!(!rejected_without_bn.outcome.is_published());
+
+    for result in [&published, &failed, &rejected, &rejected_without_bn] {
+        match &result.outcome {
+            AttestationOutcome::Published => {
+                assert!(result.outcome.is_published());
+            }
+            AttestationOutcome::Failed(message) => {
+                assert!(!result.outcome.is_published());
+                assert!(!message.is_empty());
+            }
+            AttestationOutcome::RejectedByBeaconNode { bn, message } => {
+                assert!(!result.outcome.is_published());
+                assert!(!message.is_empty());
+                if let Some(endpoint) = bn {
+                    assert!(!endpoint.is_empty(), "a bn-less rejection is None");
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

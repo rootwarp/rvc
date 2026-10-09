@@ -270,7 +270,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/mod.rs",
-        1439,
+        1480,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -343,7 +343,7 @@ const INVENTORY: &[Inv] = &[
     // Class 2
     inv(
         "crates/rvc/src/orchestrator/attestation.rs",
-        815,
+        819,
         Class::IndexZero,
         false,
         ".index = \"0\"",
@@ -352,7 +352,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        960,
+        976,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -361,7 +361,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1085,
+        1105,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -370,7 +370,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1114,
+        1134,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -379,7 +379,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1122,
+        1142,
         Class::IndexZero,
         false,
         ".index = \"0\"",
@@ -397,7 +397,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/tests/gloas_data_index_round_trip.rs",
-        358,
+        362,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -406,7 +406,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/tests/gloas_data_index_round_trip.rs",
-        385,
+        389,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -561,7 +561,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        2379,
+        2419,
         Class::StringDispatch,
         false,
         "match &envelopes[0]",

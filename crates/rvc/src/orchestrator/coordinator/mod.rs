@@ -183,12 +183,53 @@ impl OrchestratorHandle {
 }
 
 /// Result of processing a single attestation duty.
+///
+/// [`AttestationOutcome`] is the only status. A published attestation cannot
+/// also carry a failure message: the old `success` / `error` pair is gone.
 #[derive(Debug)]
 pub struct AttestationResult {
+    /// Validator index from the attester duty.
     pub validator_index: String,
+    /// Slot the duty was processed for.
     pub slot: Slot,
-    pub success: bool,
-    pub error: Option<String>,
+    /// How the duty finished.
+    pub outcome: AttestationOutcome,
+}
+
+/// How one attestation duty finished.
+#[derive(Debug)]
+pub enum AttestationOutcome {
+    /// The signed attestation was accepted by the beacon node.
+    Published,
+    /// The duty failed before a beacon-node rejection report.
+    ///
+    /// The string is the operator-visible reason (sign, fetch, timeout, or
+    /// propagate).
+    Failed(String),
+    /// A beacon node rejected this index in a submit response.
+    ///
+    /// `bn` is the reporting endpoint from `PropagationOutcome::reported_by`.
+    /// It is `None` when that outcome names no endpoint. An empty string is
+    /// not stored.
+    RejectedByBeaconNode {
+        /// Reporting beacon-node endpoint, when the propagator named one.
+        bn: Option<String>,
+        /// Rejection message from that beacon node.
+        message: String,
+    },
+}
+
+impl AttestationOutcome {
+    /// Whether this duty was published.
+    ///
+    /// [`Self::Failed`] and [`Self::RejectedByBeaconNode`] are not published.
+    pub fn is_published(&self) -> bool {
+        match self {
+            Self::Published => true,
+            Self::Failed(_message) => false,
+            Self::RejectedByBeaconNode { bn: _bn, message: _message } => false,
+        }
+    }
 }
 
 /// Timeout for builder registration API calls.

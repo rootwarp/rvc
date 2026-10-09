@@ -21,7 +21,7 @@ use signer::{SignerService, ValidatorSigner};
 use timing::{SlotClock, SLOTS_PER_EPOCH};
 use validator_store::ValidatorStore;
 
-use super::coordinator::{AttestationResult, OrchestratorConfig, PubkeyMap};
+use super::coordinator::{AttestationOutcome, AttestationResult, OrchestratorConfig, PubkeyMap};
 use super::dispatch::{SlotEndDropCounter, WaveAttribution, WaveEntry, SLOT_END_PUBLISH_OVERHANG};
 use super::error::OrchestratorError;
 use super::slot_anchor::SlotAnchor;
@@ -303,7 +303,7 @@ where
             );
         }
 
-        let success_count = results.iter().filter(|r| r.success).count();
+        let success_count = results.iter().filter(|r| r.outcome.is_published()).count();
         let failure_count = results.len() - success_count;
 
         if failure_count > 0 || dropped > 0 {
@@ -484,15 +484,17 @@ where
                 attestation,
             }),
             Err(error) => {
-                let result =
-                    AttestationResult { validator_index, slot, success: false, error: Some(error) };
                 warn!(
-                    validator_index = %result.validator_index,
-                    slot = result.slot,
-                    error = ?result.error,
+                    validator_index = %validator_index,
+                    slot = slot,
+                    error = %error,
                     "Attestation failed"
                 );
-                Err(result)
+                Err(AttestationResult {
+                    validator_index,
+                    slot,
+                    outcome: AttestationOutcome::Failed(error),
+                })
             }
         }
     }
@@ -559,7 +561,10 @@ where
 
         match submit_result {
             Ok(Ok(outcome)) => {
-                let bn = outcome.reported_by.unwrap_or_default();
+                // The log keeps the historical empty-string fallback. The
+                // outcome stores `None` for a bn-less (or empty) report.
+                let bn_log = outcome.reported_by.clone().unwrap_or_default();
+                let bn = outcome.reported_by.filter(|endpoint| !endpoint.is_empty());
                 let mut rejected = HashMap::<u32, String>::new();
                 for failure in outcome.failures {
                     let positioned =
@@ -569,7 +574,7 @@ where
                             warn!(
                                 validator_index = %entry.attribution.validator_index,
                                 pubkey = %TruncatedPubkey::new(&entry.attribution.pubkey),
-                                bn = %bn,
+                                bn = %bn_log,
                                 message = %failure.message,
                                 "Attestation submission failed"
                             );
@@ -579,7 +584,7 @@ where
                             warn!(
                                 slot,
                                 index = failure.index,
-                                bn = %bn,
+                                bn = %bn_log,
                                 message = %failure.message,
                                 "Attestation submission failed for an unknown wave index"
                             );
@@ -592,8 +597,10 @@ where
                         results.push(AttestationResult {
                             validator_index: entry.attribution.validator_index,
                             slot: entry.attribution.slot,
-                            success: false,
-                            error: Some(message),
+                            outcome: AttestationOutcome::RejectedByBeaconNode {
+                                bn: bn.clone(),
+                                message,
+                            },
                         });
                     } else {
                         results.push(self.successful_publish(entry));
@@ -625,8 +632,7 @@ where
         let result = AttestationResult {
             validator_index: entry.attribution.validator_index,
             slot: entry.attribution.slot,
-            success: true,
-            error: None,
+            outcome: AttestationOutcome::Published,
         };
         // Per-validator completion is developer detail (scales with validator
         // count); the per-slot "Batch attestation summary" is the operator
@@ -640,19 +646,17 @@ where
     }
 
     fn failed_publish(&self, entry: WaveEntry, error: String) -> AttestationResult {
-        let result = AttestationResult {
-            validator_index: entry.attribution.validator_index,
-            slot: entry.attribution.slot,
-            success: false,
-            error: Some(error),
-        };
         warn!(
-            validator_index = %result.validator_index,
-            slot = result.slot,
-            error = ?result.error,
+            validator_index = %entry.attribution.validator_index,
+            slot = entry.attribution.slot,
+            error = %error,
             "Attestation failed"
         );
-        result
+        AttestationResult {
+            validator_index: entry.attribution.validator_index,
+            slot: entry.attribution.slot,
+            outcome: AttestationOutcome::Failed(error),
+        }
     }
 
     /// Produce and sign a single attestation duty.
@@ -1076,7 +1080,7 @@ mod dispatch_pipeline {
 
     use super::super::dispatch::DispatchLimits;
     use super::AttestationService;
-    use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
+    use crate::orchestrator::{AttestationOutcome, OrchestratorConfig, PubkeyMap};
 
     const SLOT: u64 = 1_600;
     const GENESIS: u64 = 1_606_824_023;
@@ -1406,7 +1410,7 @@ mod dispatch_pipeline {
         let results = fixture.service.process_slot(SLOT).await.expect("process_slot");
         assert_eq!(results.len(), N);
         assert!(
-            results.iter().all(|result| result.success),
+            results.iter().all(|result| result.outcome.is_published()),
             "every duty should publish: {results:?}"
         );
         let (count, window) = sign_request_window(&fixture.beacon);
@@ -1452,7 +1456,7 @@ mod dispatch_pipeline {
         let slot_end = tokio::time::Instant::now() + Duration::from_millis(25);
         let results = fixture.service.process_slot_until(SLOT, slot_end).await.expect("drain");
         assert_eq!(results.len(), 4, "the in-flight wave completes");
-        assert!(results.iter().all(|result| result.success), "{results:?}");
+        assert!(results.iter().all(|result| result.outcome.is_published()), "{results:?}");
         assert_eq!(fixture.beacon.get_attestation_data_calls(), vec![(SLOT, 0)]);
         assert_eq!(fixture.service.slot_end_drops(), 4);
     }
@@ -1485,7 +1489,7 @@ mod dispatch_pipeline {
         );
         let results = fixture.service.process_slot(SLOT).await.expect("process_slot");
         assert_eq!(results.len(), 3);
-        assert!(results.iter().all(|result| result.success), "{results:?}");
+        assert!(results.iter().all(|result| result.outcome.is_published()), "{results:?}");
         assert!(results.iter().all(|result| result.validator_index != "1001"));
         assert_eq!(fixture.beacon.get_attestation_data_calls(), vec![(SLOT, 0)]);
     }
@@ -1521,16 +1525,21 @@ mod dispatch_pipeline {
         assert_eq!(posted.len(), 3, "every duty is in exactly one POST");
         assert_eq!(unique.len(), 3, "a rejected attestation is not posted again");
 
-        let failed: Vec<_> = results.iter().filter(|result| !result.success).collect();
+        let failed: Vec<_> =
+            results.iter().filter(|result| !result.outcome.is_published()).collect();
         assert_eq!(failed.len(), failed_indices.len());
         for index in &failed_indices {
             assert!(
                 failed.iter().any(|result| {
                     result.validator_index == *index
-                        && result
-                            .error
-                            .as_deref()
-                            .is_some_and(|message| message.contains("invalid signature"))
+                        && match &result.outcome {
+                            AttestationOutcome::RejectedByBeaconNode { bn, message } => {
+                                bn.as_deref() == Some("http://bn-partial.example:5052")
+                                    && message.contains("invalid signature")
+                            }
+                            AttestationOutcome::Published => false,
+                            AttestationOutcome::Failed(_message) => false,
+                        }
                 }),
                 "index {index} missing from {failed:?}"
             );
@@ -1540,7 +1549,7 @@ mod dispatch_pipeline {
         assert!(logs_contain("invalid signature"));
         assert_eq!(results.len(), 3);
         assert_eq!(
-            results.iter().filter(|result| result.success).count(),
+            results.iter().filter(|result| result.outcome.is_published()).count(),
             3 - failed_indices.len()
         );
     }
@@ -1567,12 +1576,10 @@ mod dispatch_pipeline {
         let overhang_at = slot_end + Duration::from_millis(500);
         assert_eq!(results.len(), N, "in-flight signs still produce a result");
         assert!(
-            results.iter().all(|result| {
-                !result.success
-                    && result
-                        .error
-                        .as_deref()
-                        .is_some_and(|message| message.contains("slot-end overhang"))
+            results.iter().all(|result| match &result.outcome {
+                AttestationOutcome::Failed(message) => message.contains("slot-end overhang"),
+                AttestationOutcome::Published => false,
+                AttestationOutcome::RejectedByBeaconNode { bn: _bn, message: _message } => false,
             }),
             "{results:?}"
         );

@@ -289,7 +289,7 @@ async fn post_electra_fetches_attestation_data_once_per_slot() {
     });
     let results = harness.run().await;
     assert_eq!(results.len(), N);
-    assert!(results.iter().all(|result| result.success), "{results:?}");
+    assert!(results.iter().all(|result| result.outcome.is_published()), "{results:?}");
     assert_eq!(
         harness.mock.get_attestation_data_calls(),
         vec![(POST_ELECTRA_SLOT, 0)],
@@ -319,7 +319,7 @@ async fn pre_electra_fetches_once_per_distinct_committee_index() {
     });
     let results = harness.run().await;
     assert_eq!(results.len(), 6);
-    assert!(results.iter().all(|result| result.success), "{results:?}");
+    assert!(results.iter().all(|result| result.outcome.is_published()), "{results:?}");
     let mut calls = harness.mock.get_attestation_data_calls();
     calls.sort();
     assert_eq!(calls, vec![(PRE_ELECTRA_SLOT, 2), (PRE_ELECTRA_SLOT, 5), (PRE_ELECTRA_SLOT, 8)]);
@@ -343,19 +343,19 @@ async fn failing_fetch_for_committee_3_fails_only_committee_3() {
 
     let mut failed: Vec<String> = results
         .iter()
-        .filter(|result| !result.success)
+        .filter(|result| !result.outcome.is_published())
         .map(|result| result.validator_index.clone())
         .collect();
     failed.sort();
     assert_eq!(failed, vec!["2".to_string(), "3".to_string()]);
-    for result in results.iter().filter(|result| !result.success) {
-        let error = result.error.as_deref().unwrap_or("");
+    for result in results.iter().filter(|result| !result.outcome.is_published()) {
+        let error = common::failed_attestation_message(result);
         assert!(
             error.contains("committee 3"),
             "committee 3 failure must name that fetch, got {error}"
         );
     }
-    let succeeded: Vec<_> = results.iter().filter(|result| result.success).collect();
+    let succeeded: Vec<_> = results.iter().filter(|result| result.outcome.is_published()).collect();
     assert_eq!(succeeded.len(), 3);
 
     let mut calls = harness.mock.get_attestation_data_calls();
@@ -384,7 +384,7 @@ async fn pre_electra_duty_uses_its_own_committee_data() {
         ..Spec::default()
     });
     let results = harness.run().await;
-    assert!(results.iter().all(|result| result.success), "{results:?}");
+    assert!(results.iter().all(|result| result.outcome.is_published()), "{results:?}");
     let mut calls = harness.mock.get_attestation_data_calls();
     calls.sort();
     assert_eq!(
@@ -429,7 +429,7 @@ async fn attestation_data_fetch_retries_once_inside_the_fetch_budget() {
     let results = harness.run().await;
     let elapsed = tokio::time::Instant::now().saturating_duration_since(started);
     assert_eq!(results.len(), 1);
-    assert!(results[0].success, "{results:?}");
+    assert!(results[0].outcome.is_published(), "{results:?}");
     assert_eq!(
         harness.mock.get_attestation_data_calls(),
         vec![(PRE_ELECTRA_SLOT, 4), (PRE_ELECTRA_SLOT, 4)]
@@ -452,8 +452,8 @@ async fn attestation_data_fetch_does_not_retry_when_the_budget_is_spent() {
     let results = harness.run().await;
     let elapsed = tokio::time::Instant::now().saturating_duration_since(started);
     assert_eq!(results.len(), 1);
-    assert!(!results[0].success, "{results:?}");
-    let error = results[0].error.as_deref().unwrap_or("");
+    assert!(!results[0].outcome.is_published(), "{results:?}");
+    let error = common::failed_attestation_message(&results[0]);
     assert!(
         error.contains("Timeout getting attestation data"),
         "budget exhaustion must surface as the fetch timeout, got {error}"
@@ -485,9 +485,9 @@ async fn boundary_slot_fork_disagreement_fetches_per_committee() {
     });
     let results = harness.run().await;
     assert_eq!(results.len(), 2);
-    assert!(results.iter().all(|result| !result.success), "{results:?}");
+    assert!(results.iter().all(|result| !result.outcome.is_published()), "{results:?}");
     for result in &results {
-        let error = result.error.as_deref().unwrap_or("");
+        let error = common::failed_attestation_message(result);
         assert!(
             error.contains("target epoch"),
             "mismatched target epoch must fail the duty, got {error}"
