@@ -3,15 +3,347 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
-## Behaviour: malformed duty fields are named per-duty rejections (RR3-04 / #533)
+## Exit codes: listener bind is 15 and a critical task is 16
+
+Two new process exit codes sit beside the existing startup codes. `12` stays
+unused (reserved for the retired one-shot doppelganger check).
+
+| Code | Constant | When |
+|---|---|---|
+| 15 | `EXIT_LISTENER_BIND` | `BootstrapError::ListenerBind`. The metrics listener, or the keymanager listener when keymanager is enabled, failed to bind. |
+| 16 | `EXIT_CRITICAL_TASK_FAILED` | `BootstrapError::CriticalTaskFailed`. A registered task panicked, or a task started with `spawn_result` / `register_result` returned `Err`. |
+
+The bind error is `failed to bind {listener} listener at {addr}: {source}`.
+`listener` is `metrics` or `keymanager`, and `addr` is the socket that failed.
+A non-loopback metrics address without `RVC_METRICS_ALLOW_NON_LOOPBACK=true`
+is `BootstrapError::MetricsBind` and still exits **1**.
+
+Exit 16 is returned after the task drain finishes. The drain log line is
+`Registered task panicked; initiating process drain` for both a panic and an
+`Err`. The series `rvc_task_exits_total` separates them: `outcome="panic"` or
+`outcome="error"`. The process error is `critical task '{task}' failed; process exiting`.
+A `JoinHandle<Result<_, _>>` passed to `register` (not `register_result`) still
+counts every `Ok` as a clean exit. A supervisor that restarts on any non-zero
+status restarts the process after exit 15 or 16.
+
+## Startup: listeners bind before keystore load
+
+`bind_required_listeners` runs after the beacon connection and before
+`load_signing_keys`. The metrics listener is always bound. The keymanager
+listener is bound only when keymanager is enabled. An unset keymanager address
+uses `127.0.0.1:5062`.
+
+A port clash returns `ListenerBind` (exit 15) before keystore decryption and
+before the duty orchestrator is spawned. The error names the listener and the
+address.
+
+## Config: new [duties] section
+
+Attestation, sync-message, and aggregation dispatch read a `[duties]` table.
+`0` is rejected. A value above the range is rejected. A present CLI flag
+overrides the file.
+
+| Knob | CLI | Default | Accepted |
+|---|---|---|---|
+| `duty_dispatch_concurrency` | `--duty-dispatch-concurrency` | 32 | `1..=512` |
+| `duty_publish_concurrency` | `--duty-publish-concurrency` | 2 | `1..=16` |
+
+```toml
+[duties]
+duty_dispatch_concurrency = 32
+duty_publish_concurrency = 2
+```
+
+`duty_dispatch_concurrency` is the number of in-flight sign requests in one
+wave. `duty_publish_concurrency` is the number of publish waves in flight.
+
+## Config: KDF budget
+
+Keymanager keystore import has its own KDF budget under `[keymanager]`. These
+three knobs are not `--key-decrypt-threads` / `key_decrypt_threads` (startup
+keystore load). A present CLI flag overrides the file.
+
+| Knob | CLI | Default | Accepted |
+|---|---|---|---|
+| `keymanager_import_kdf_concurrency` | `--keymanager-import-kdf-concurrency` | 2 | `1..=32` |
+| `keymanager_import_kdf_total_mib` | `--keymanager-import-kdf-total-mib` | 512 | `>= 1` (MiB) |
+| `keymanager_import_kdf_max_keystore_mib` | `--keymanager-import-kdf-max-keystore-mib` | 8192 | `1..=8192` (MiB), tighten-only |
+
+`keymanager_import_kdf_max_keystore_mib` cannot exceed the decrypt working-set
+ceiling (`MAX_KDF_WORKING_SET_BYTES`, 8 GiB, which is 8192 MiB). A larger
+value is rejected. The default is that ceiling.
+
+```toml
+[keymanager]
+keymanager_import_kdf_concurrency = 2
+keymanager_import_kdf_total_mib = 512
+keymanager_import_kdf_max_keystore_mib = 8192
+```
+
+## Config: knob inventory is 75
+
+The live operator-knob inventory is **75**. That is the length of
+`OPERATOR_KNOB_NAMES` in `crates/rvc/src/config/knobs.rs`, and the same count
+`crates/architecture-tests/tests/config_drift.rs` asserts.
+
+The five names added since the 70-name list are the two `[duties]` knobs and
+the three `[keymanager]` import KDF knobs:
+
+- `duty_dispatch_concurrency`
+- `duty_publish_concurrency`
+- `keymanager_import_kdf_concurrency`
+- `keymanager_import_kdf_total_mib`
+- `keymanager_import_kdf_max_keystore_mib`
+
+`grpc_port` and `grpc_address` stay removed. The sentence further down that
+used to say the inventory was 69 now says 75.
+
+## Keymanager: imports may defer and can finish after disconnect
+
+Keystore import runs on the blocking pool (`spawn_blocking`). The KDF
+permit moves into that task. `import_keystore_blocking` decrypts the
+keystore, writes the keystore file, and then admits the key. Decrypt runs
+before that write. If the HTTP client drops and the handler is cancelled,
+that blocking task still finishes: the file can be written and the key can
+be admitted. Do not activate the key in any other client while the import
+may still be running. An in-flight import can be absent from both
+`GET /eth/v1/keystores` and the keystore directory (`keystore_path`) during
+decrypt. A key missing from that list also does not prove the import
+stopped after decrypt: the file is written before `admit`.
+
+An interchange import takes a single-flight lock, then waits until its
+estimated hold fits inside one free window of the current slot. After the
+lock is acquired, that wait is at most one slot. Imports serialize on the
+same lock, so a second import can wait longer while the first holds it. The
+queue wait is capped at two slot durations (`QUEUE_WAIT_SLOTS`). Past that
+cap the import is refused as `ImportQueueFull` with `retry_after_secs`
+(HTTP 503 and `Retry-After`).
+
+If `admit` cannot place the estimated hold in a free window it can reach
+within one slot, or the blocking import starts after `latest_start`, the
+import is refused as `NoFreeWindow` (HTTP 503, no `Retry-After`). Both paths
+use the same message. It starts with the prefix `NoFreeWindow: ` and then
+the gate text:
+
+`NoFreeWindow: estimated hold {estimated_hold_ms} ms does not fit a free window of {window_ms} ms; split the payload`
+
+`admit` returns that error when the estimate is longer than one free window,
+or when no fitting start falls inside one slot of acquiring the mutex. An
+estimate longer than the window still does not fit on a retry; split the
+payload. `ImportAdmission::ensure_still_fits` returns the same error when
+`tokio::time::Instant::now()` is after `latest_start`. `admit` had already
+accepted that payload. A later request of the same payload can succeed when
+its blocking start is still at or before the new `latest_start`. Before
+genesis the import is admitted immediately.
+
+A wait of at least 1 ms is recorded on `rvc_slashing_import_deferred_ms`.
+The sample is the mutex queue plus the sleep until the window. It is not the
+connection hold (`rvc_slashing_import_conn_hold_ms`). An import that is
+admitted without waiting records nothing on the deferred histogram.
+
+## Keymanager: fee recipient, gas limit, and graffiti persist before publish
+
+`set_fee_recipient`, `set_gas_limit`, `set_graffiti`, and the matching
+deletes call `ValidatorStore::update_config_durable`. That method writes the
+validators file first, then applies the same change to the live store.
+
+A failed save returns an error and leaves the previous live value in place.
+A pubkey that is absent returns `NotFound` and does not rewrite the file.
+If that pubkey is removed or replaced while the write is in progress, the
+in-flight change is not published, the file is rewritten to match the live
+key, and the call returns `NotFound`.
+
+`map_durable_update_error` is the HTTP mapping:
+
+| Outcome | Store result | HTTP |
+|---|---|---|
+| Pubkey absent when the candidate is cloned | `ValidatorStoreError::NotFound` | 404 |
+| Pubkey removed or replaced during the write | `ValidatorStoreError::NotFound` | 404 |
+| Save or repair failure (`write_toml_atomic`, or no config path) | any other `ValidatorStoreError` | 500 |
+
+The remove-or-replace race is 404 because it returns `NotFound`. Before
+RR3-03 the adapter mapped every store error to `ApiError::Internal`, which
+is HTTP 500. `ApiError::NotFound` is HTTP 404.
+
+## Behaviour: slot boundary drops undispatched duties
+
+When the slot ends, attestation, sync-committee, and aggregation duties that
+have not yet been pulled onto the sign pipeline are dropped. Each drop is
+logged at `warn` and added to `SlotEndDropCounter`. The warn fields are
+`dropped` (this slot) and `total_dropped` (process lifetime). The messages
+are:
+
+- `undispatched attestation duties dropped at slot end`
+- `undispatched sync committee duties dropped at slot end`
+- `undispatched aggregation duties dropped at slot end`
+
+Signs already in flight drain. A publish is admitted only until `slot_end`
+plus `SLOT_END_PUBLISH_OVERHANG` (500 ms). A submit still running at that
+instant is cancelled. `SlotEndDropCounter` is in-process. It is not a
+Prometheus series.
+
+## Behaviour: duty validation rejects a malformed numeric field
 
 A numeric field on an attester, proposer, or PTC duty that does not parse as
-an integer is now a named per-duty rejection. That duty is left out of the
-epoch cache. The epoch's other duties are still cached. The rejection is
-counted on `rvc_duty_rejected_total{field}` (`field` is `slot`,
-`committee_index`, `validator_index`, `committee_length`, or
-`validator_committee_index`) and logged at `warn`. One bad duty does not
+an integer is a named per-duty rejection (`DutyParseError`). That duty is
+left out of the epoch cache. The epoch's other duties are still cached. The
+rejection is counted on `rvc_duty_rejected_total{field}` and logged at
+`warn` (`rejecting duty: malformed numeric field`). One bad duty does not
 discard the rest of the epoch.
+
+`field` is the wire name. Attester duties parse all five. Proposer and PTC
+duties parse `slot` and `validator_index`.
+
+| `field` | Attester | Proposer | PTC |
+|---|---|---|---|
+| `slot` | yes | yes | yes |
+| `committee_index` | yes | | |
+| `validator_index` | yes | yes | yes |
+| `committee_length` | yes | | |
+| `validator_committee_index` | yes | | |
+
+## New metrics: slot phase, replay, import, and duty rejection
+
+| Series | Labels | What one sample is |
+|---|---|---|
+| `rvc_slot_phase_offset_ms` | `phase` = `block`, `attestation`, `sync_message`, `aggregate`, `contribution`, `payload_attestation` | Milliseconds from the true slot start when that phase fires (`SlotAnchor::elapsed_ms`). |
+| `rvc_slot_phase_late_total` | `phase` = `attestation`, `sync_message`, `aggregate`, `contribution`, `payload_attestation` | One increment inside `wait_until_bps` when that labelled deadline has already passed. There is no `phase="block"` child. |
+| `rvc_slot_replay_skipped_total` | none | One increment when the clock steps back onto an already-processed slot. |
+| `rvc_slashing_import_duration_ms` | none | One sample per `SlashingDb::import` call. Keymanager refusals before that call record nothing. See below. |
+| `rvc_slashing_import_conn_hold_ms` | none | `conn.lock()` through `COMMIT`. A rejection before the lock records nothing here. |
+| `rvc_slashing_import_deferred_ms` | none | Mutex-queue plus window sleep, when that wait is at least 1 ms. |
+| `rvc_duty_rejected_total` | `field` (table above) | One increment per duty dropped at the cache for a malformed numeric field. |
+| `rvc_task_exits_total` | `task`, `outcome` | Existing family. New label value `outcome="error"` for `spawn_result` / `register_result` returning `Err`. |
+| `rvc_slashing_group_commit_batch_size` | none | Members drained by one non-empty `drain_batch`. Empty drains are not observed. |
+
+`rvc_slot_phase_late_total` increments only for the label passed to
+`wait_until_bps`. The process clock is `ServiceBuilder::build_slot_clock`:
+`SystemSlotClock::new` then `with_deadline_schedule(deadline_schedule_from_timing)`.
+`SystemSlotClock::new` first stores `DeadlineSchedule::uniform(DeadlineBps::default())`.
+Production replaces that schedule before the clock is used.
+`deadline_schedule_from_timing` sets pre-Gloas `sync_message` to
+`attestation_due_bps` and `contribution` to `aggregate_due_bps`.
+`TimingConfig::default` is 3333 and 6667 for those two. The Gloas defaults
+are attestation 2500 with `sync_message_due_bps_gloas` 2500, and aggregate
+5000 with `contribution_due_bps_gloas` 5000. On that installed schedule the
+pairs are equal, so the coordinator takes one shared wait and labels it
+`attestation` or `aggregate`. `sync_message` and `contribution` are not
+passed to `wait_until_bps`, so those two children do not increment. They
+increment only when the paired deadlines differ and each phase waits on its
+own offset. `payload_attestation` always has its own wait, labelled
+`payload_attestation`, and only when the slot's fork is Gloas or later.
+That child can increment on the default schedule once that phase runs.
+There is still no `phase="block"` child.
+
+On the keymanager path, `import_interchange` returns before
+`SlashingDb::import` for bad JSON, a format-version or genesis-validators-root
+failure (`validate_interchange_metadata`), `ImportQueueFull`, `NoFreeWindow`
+(from `admit` or from `ensure_still_fits`), and a slot-clock refusal
+(`ImportDeferralError::Clock`, mapped to `SlashingProtectionError::Backend`).
+None of those record `rvc_slashing_import_duration_ms`. The duration timer starts at the
+top of `SlashingDb::import`. A call that gets that far records one sample
+for the whole call, including a metadata re-check and `parse_interchange`.
+A malformed `source_epoch`, `target_epoch`, or `slot` fails in
+`parse_interchange` before `conn.lock()`: that is a duration sample and not
+a connection-hold sample. `rvc_slashing_import_conn_hold_ms` starts at
+`conn.lock()` and runs through `COMMIT`. A rollback after the lock still
+records one hold sample.
+
+`rvc_slashing_group_commit_batch_size` has no labels. `drain_batch` observes
+the drained length once per non-empty drain. Buckets are 1, 2, 4, 8, 16,
+25, 32, 50, 64, and 128. Mean batch size is `sample_sum / sample_count`.
+Empty drains are not observed. This histogram does not change reserve,
+commit, watermark, or PRAGMA behaviour.
+
+`rvc_task_exits_total` force-registers `ok`, `panic`, `cancelled`, and
+`error` at process init. `rvc_slashing_import_deferred_ms` uses the import
+timing buckets plus `12000` and `24000` milliseconds. Duration and connection
+hold keep the buckets listed under Observability below.
+
+## Changed metric values: block-start offset is the true elapsed time
+
+`rvc_slot_phase_block_start_offset_ms` is unchanged in name and in its
+`cache` label (`cold` or `warm`). The sample is now `SlotAnchor::elapsed_ms`,
+milliseconds since the true slot start, taken immediately before
+`maybe_propose_block`. `cache=cold` is the post-boot slot and the slot that
+sees a key-set change. Later slots are `cache=warm`.
+
+A whole-second read of a sub-second offset records 0. This histogram records
+the millisecond offset. `rvc_slot_phase_offset_ms` is a separate family and
+is kept. Nothing was renamed.
+
+`rvc_slashing_reserve_tx_hold_duration_ms` (`kind` is `attestation` or
+`block`) starts in `SlashableSignSession::reserve_then_sign` before
+`reserve()` and is observed only when `reserve()` returns `Ok`. The sample
+includes the group-commit queue wait inside that call. Group commit is on
+by default: `GroupCommitConfig::default` is batch size 50 and wait-to-fill
+1 ms, and `ServiceBuilder::build_slashing_db` calls `set_group_commit` with
+`GroupCommitConfig::try_from_knobs`. Unset knobs use those defaults. A
+failed `reserve()` does not record this histogram.
+
+`rvc_signer_slashing_tx_hold_duration_ms` uses the same start. It is
+observed when the sign call returns, when the signer times out
+(`finish_reserve_timeout`), and when `reserve()` returns `Err`. It is not a
+stage-to-commit window. `kind` is `attestation` or `block`.
+
+The p99 of `rvc_slashing_reserve_tx_hold_duration_ms{kind="block"}` can rise
+after this release. The sample includes the default group-commit queue wait,
+and an interchange import can hold the same connection from `conn.lock()`
+through `COMMIT`. Do not page on that rise alone. Re-baseline after
+upgrading. Investigate a sustained rise beyond the new baseline: the sample
+cannot separate that contention from a slashing-DB stall. Page on
+`rvc_slot_phase_late_total` and on the `Missed attestation deadline` warn.
+That warn is logged once, at attestation-phase start, when the phase begins
+more than one attestation-deadline offset past the deadline (about 8 s into
+a 12 s slot on default `[timing]`). It does not cover a publish that lands
+late after an on-time start. There is no Prometheus series for it.
+`rvc_slot_phase_late_total` increments when `wait_until_bps` finds that
+phase's deadline already passed, so it covers a late phase start, including
+one that is past the deadline but not yet more than one offset past it.
+Neither that counter nor the warn catches an attestation that starts on time
+and publishes late.
+
+Wall-clock last publish in the RR2-16 N=200 record
+(`plan/review-2026-10-03/measurements/m2-n200.md`) falls against the RED
+record in that note. Wall `last_publish_ms_after_att_deadline` RED median
+**17739.82913**, M2 median **-3527.843577** (wall runs -3527.843577,
+-3500.726064, -3568.643065). That field is a harness record. No Prometheus
+series is named `last_publish`.
+
+## Library consumers: operator-invisible API changes
+
+Process flags, metrics, and the keymanager HTTP API are unchanged by the
+items below. Library and embedding callers are.
+
+- `SlotClock` requires `now_since_epoch`. The trait has no `attestation_time`
+  method. `current_time_secs` and `current_time_ms` are default methods on
+  `now_since_epoch`.
+- `KeystoreManager::import_keystore` and `SlashingProtection::import_interchange`
+  are `async`.
+- `AttestationResult` is `{ validator_index, slot, outcome }`.
+  `AttestationOutcome` is `Published`, `Failed(String)`, or
+  `RejectedByBeaconNode { bn: Option<String>, message: String }`.
+  `bn` is `PropagationOutcome::reported_by` and is `None` when that outcome
+  names no endpoint. The old `success` / `error` fields are gone.
+  Both types stay re-exported from `rvc::orchestrator`.
+  `is_published` is true only for `Published`.
+- `RemoteSigner::new_for_tests` and its `pub(crate)` alias `new_unchecked`
+  compile only under `cfg(test)` or the `test-utils` feature.
+  `OrchestratorDeps::for_test` has the same gate. Production code calls
+  `RemoteSigner::new` and constructs `OrchestratorDeps` explicitly.
+- `signer_server::server::run` joins its reloader, metrics, and HTTP tasks
+  before it returns, including when the gRPC transport fails. The `Children`
+  type is private. `rvc-signer` still exits when `run` returns. The join
+  matters for an embedder that calls `run` again in-process.
+- `DutyTracker::new` and `DutyTracker::new_with_source` take
+  `Arc<dyn DutiesProvider>`. `LivenessObservationLoop::new` takes
+  `Arc<dyn LivenessApi>`. `AggregationService::new` takes
+  `Arc<dyn AttestationApi>` (that constructor is `pub(crate)`).
+  `BeaconNodeClient` is the composition of the role traits. Its supertraits
+  are `DutiesProvider`, `BlockProducer`, `AttestationApi`,
+  `PayloadAttestationApi`, `SyncCommitteeApi`, `LivenessApi`, and
+  `NodeStatusApi`. No new method was added to a beacon-node role trait.
+
 
 ## Tracing: dev/demo tail sampling profile (TRC-7c / #448)
 
@@ -45,7 +377,7 @@ Process init force-registers numeric zero samples (same pattern as PTC /
 `envelope_late`) for rare-event / presence families that blake-manual S5A missed:
 
 - `rvc_orchestrator_missed_slots_total`
-- `rvc_task_exits_total{task,outcome}` (known tasks × `ok`/`panic`/`cancelled`)
+- `rvc_task_exits_total{task,outcome}` (known tasks × `ok`/`panic`/`cancelled`/`error`)
 - `rvc_bn_health_tier{endpoint="unknown"}` (real BN endpoints still come from the
   sync poller)
 - `rvc_slashing_protection_checks_total{result="blocked"}`
@@ -320,8 +652,10 @@ disposed later in this file.
 ## Config: leftover healthz bind knobs fail startup
 
 See the breaking section at the top of this file. The live operator-knob
-inventory is **69** after disposing `grpc_port` / `grpc_address` and adding
-the two slashing group-commit knobs.
+inventory is **75** (`OPERATOR_KNOB_NAMES` in
+`crates/rvc/src/config/knobs.rs`). `grpc_port` and `grpc_address` stay
+removed. The five names added since the 70-name list are the two `[duties]`
+knobs and the three `[keymanager]` import KDF knobs.
 
 ---
 
@@ -350,16 +684,24 @@ The same four keys also parse as top-level flat keys (`block_production_timeout`
 
 ---
 
-## Slashing: ADR-005 does not deliver G6 on the VC path
+## Slashing: VC attestation signs concurrently
 
 ARCH-P1-5 (`reserve_then_sign`) shortens the slashing-DB critical section on
-the **signer-server** path. It does **not** make slashable signing scale to
-the target validator count on the validator-client path. Attestation in
-`crates/rvc/src/orchestrator/attestation.rs` is still a sequential
-`for duty in duties { … .await }` loop; 200 keys × 200 ms remote-sign
-latency is **40 s (ten mainnet slots) with a free slashing DB**. VC-path
-attestation concurrency is a separate, unscheduled requirement. Do not read
-this cycle as delivering G6.
+the **signer-server** path. `AttestationService::process_slot_until` in
+`crates/rvc/src/orchestrator/attestation.rs` stops pulling new duties at
+`slot_end`, signs with `buffer_unordered(dispatch_limits.concurrency)`, and
+publishes each ready chunk with
+`buffer_unordered(dispatch_limits.publish_concurrency)`. Sync-committee
+messages and aggregation use the same limits. Those limits are the
+`[duties]` knobs above (`duty_dispatch_concurrency` default 32,
+`duty_publish_concurrency` default 2). The attestation-data memo fetches
+one query per distinct committee, under `buffer_unordered(concurrency)`,
+only before Electra. `memo_queries` returns that list when
+`uses_electra_attestation_wire` is false. Electra and later start with one
+query at `committee_index` 0. If the response fork disagrees,
+`load_attestation_data_memo` drops the shared entry and refetches per
+committee. A fetch error, or a target epoch that does not parse, does not
+trigger that refetch.
 
 ---
 
@@ -377,12 +719,22 @@ fatal. Startup logs those peers as configured and not yet dialled; `rvc_dvt_peer
 
 Import conflicts are logged and counted (`rvc_slashing_import_conflicts_total`).
 
-Interchange import records `rvc_slashing_import_duration_ms` for the whole call
-and `rvc_slashing_import_conn_hold_ms` for `conn.lock()` through `COMMIT`.
-A rollback after the lock is taken still records one hold sample. A rejection
-before the lock (format version, genesis validators root, or a malformed
-numeric field) is duration only. Import prepares each SQL statement once.
-Buckets are 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, and 10000 milliseconds.
+On the keymanager path, `import_interchange` returns before `SlashingDb::import`
+for bad JSON, a format-version or genesis-validators-root failure
+(`validate_interchange_metadata`), `ImportQueueFull`, `NoFreeWindow`
+(from `admit` or from `ensure_still_fits`), and a slot-clock refusal
+(`ImportDeferralError::Clock`). Those refusals record no
+`rvc_slashing_import_duration_ms` sample and no
+`rvc_slashing_import_conn_hold_ms` sample.
+
+`SlashingDb::import` records `rvc_slashing_import_duration_ms` for the whole
+call, starting before its own metadata re-check and before `parse_interchange`.
+A malformed `source_epoch`, `target_epoch`, or `slot` fails in that parse,
+before `conn.lock()`: duration only. `rvc_slashing_import_conn_hold_ms` is
+`conn.lock()` through `COMMIT`. A rollback after the lock is taken still
+records one hold sample. Import prepares each SQL statement once.
+Buckets for both histograms are 10, 25, 50, 100, 250, 500, 1000, 2500, 5000,
+and 10000 milliseconds.
 
 ## Breaking (wire): Deneb/Electra/Fulu blocks are published as full SignedBlockContents with sidecars
 
