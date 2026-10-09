@@ -31,12 +31,67 @@ use tracing::info;
 use crate::error::ServerError;
 use crate::{config, http_api, metrics, reload, service};
 
+/// Child tasks spawned by [`run_inner`].
+///
+/// [`Self::shutdown`] cancels cooperative tokens, aborts the metrics task (it
+/// has no stop token), then joins every handle. Dropping a `JoinHandle`
+/// would detach the task.
+#[derive(Default)]
+struct Children {
+    reloader: Option<tokio::task::JoinHandle<()>>,
+    metrics: Option<tokio::task::JoinHandle<()>>,
+    http: Option<tokio::task::JoinHandle<()>>,
+    reloader_cancel: Option<tokio_util::sync::CancellationToken>,
+    http_shutdown: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl Children {
+    /// Cancel, then join. Metrics is aborted before the join.
+    async fn shutdown(self) {
+        #[cfg(test)]
+        tests::note_shutdown();
+
+        if let Some(token) = self.reloader_cancel {
+            token.cancel();
+        }
+        if let Some(token) = self.http_shutdown {
+            token.cancel();
+        }
+        if let Some(handle) = self.metrics.as_ref() {
+            handle.abort();
+        }
+        if let Some(handle) = self.reloader {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.metrics {
+            let _ = handle.await;
+        }
+        if let Some(handle) = self.http {
+            let _ = handle.await;
+        }
+    }
+}
+
 /// Run the signer server until `shutdown` is cancelled.
 ///
 /// Composition root: crypto-provider install → password → TLS material →
 /// [`build_backend`] → hot-reload / metrics → [`open_slashing_db`] → one shared
 /// gate → [`spawn_http_api`] + [`build_grpc_router`] → serve until `shutdown`.
+///
+/// The keystore reloader, metrics server, and HTTP listener are joined before
+/// this returns, including when startup or the gRPC transport fails.
 pub async fn run(
+    resolved: crate::config::ResolvedConfig,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<(), ServerError> {
+    let mut children = Children::default();
+    let result = run_inner(&mut children, resolved, shutdown).await;
+    children.shutdown().await;
+    result
+}
+
+async fn run_inner(
+    children: &mut Children,
     resolved: crate::config::ResolvedConfig,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<(), ServerError> {
@@ -124,11 +179,17 @@ pub async fn run(
                 Arc::clone(basic_signer),
             );
 
-            let cancel = tokio_util::sync::CancellationToken::new();
-            let cancel_clone = cancel.clone();
-            tokio::spawn(async move {
-                reloader.run(cancel_clone).await;
+            // Parent cancel propagates through `child_token`. Shutdown cancels
+            // the same token so a startup or transport error stops the reloader too.
+            let reloader_cancel = shutdown.child_token();
+            let cancel_for_task = reloader_cancel.clone();
+            let reloader_handle = tokio::spawn(async move {
+                reloader.run(cancel_for_task).await;
             });
+            #[cfg(test)]
+            tests::note_reloader(&reloader_handle, &reloader_cancel);
+            children.reloader = Some(reloader_handle);
+            children.reloader_cancel = Some(reloader_cancel);
 
             info!(
                 interval_secs = resolved.reload_interval_secs,
@@ -154,10 +215,13 @@ pub async fn run(
         .metrics_address
         .parse()
         .map_err(|e| ServerError::bind(format!("invalid metrics address: {e}")))?;
-    let (_metrics_handle, metrics_bound_addr) =
+    let (metrics_handle, metrics_bound_addr) =
         metrics::serve_metrics(metrics_addr, Arc::clone(&signer_metrics))
             .await
             .map_err(|e| ServerError::bind(e.to_string()))?;
+    #[cfg(test)]
+    tests::note_metrics(&metrics_handle, metrics_bound_addr);
+    children.metrics = Some(metrics_handle);
     info!(address = %metrics_bound_addr, "Prometheus metrics server listening");
 
     let slashing_db_opt = open_slashing_db(&resolved)?;
@@ -216,7 +280,7 @@ pub async fn run(
     // unified across both transports. A panic in an HTTP connection task is
     // isolated and never touches the gRPC accept loop (Issue 3.3).
     let http_shutdown = tokio_util::sync::CancellationToken::new();
-    let http_handle = spawn_http_api(
+    let spawned_http = spawn_http_api(
         http::HttpApiDeps {
             resolved: &resolved,
             shared_gate,
@@ -227,22 +291,28 @@ pub async fn run(
         http_shutdown.clone(),
     )
     .await?;
+    if let Some(spawned) = spawned_http {
+        info!(
+            address = %spawned.bound,
+            tls_mode = ?resolved.http_tls_mode,
+            "Web3Signer HTTP API listening"
+        );
+        #[cfg(test)]
+        tests::note_http(&spawned.handle, spawned.bound);
+        children.http = Some(spawned.handle);
+        children.http_shutdown = Some(http_shutdown);
+    }
 
     info!(address = %built_grpc.listen_addr, "gRPC server listening");
 
+    // HTTP / reloader / metrics are joined by `Children::shutdown` after this
+    // returns, including when `serve_with_shutdown` fails. Log-reload SIGHUP
+    // stays owned by `main` (`init_logging`).
     built_grpc
         .router
         .serve_with_shutdown(built_grpc.listen_addr, async move { shutdown.cancelled().await })
         .await
         .map_err(|e| ServerError::bind(e.to_string()))?;
-
-    // gRPC has shut down (shutdown token cancelled). Stop the HTTP listener
-    // accepting new connections and drain any in-flight `/sign` (bounded inside
-    // serve_https). Log-reload SIGHUP task is owned by `main` (init_logging).
-    http_shutdown.cancel();
-    if let Some(handle) = http_handle {
-        let _ = handle.await;
-    }
 
     Ok(())
 }
@@ -256,9 +326,140 @@ mod tests {
     use super::*;
     use crate::config::{Backend, HttpTlsMode, ResolvedConfig};
     use crate::error::ServerError;
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
+
+    /// Test-only view of child-task handles owned by `run`.
+    ///
+    /// Shutdown consumes each `JoinHandle`. These abort handles name the same
+    /// tasks, so tests can call `is_finished` after `run` returns.
+    #[derive(Clone, Default)]
+    struct ChildProbe {
+        reloader: Option<tokio::task::AbortHandle>,
+        metrics: Option<tokio::task::AbortHandle>,
+        http: Option<tokio::task::AbortHandle>,
+        reloader_cancel: Option<CancellationToken>,
+        http_addr: Option<std::net::SocketAddr>,
+        metrics_addr: Option<std::net::SocketAddr>,
+        shutdown_ran: bool,
+    }
+
+    tokio::task_local! {
+        static CHILD_PROBE: Arc<Mutex<ChildProbe>>;
+    }
+
+    fn probe_snapshot(probe: &Arc<Mutex<ChildProbe>>) -> ChildProbe {
+        probe.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(super) fn note_shutdown() {
+        let _ = CHILD_PROBE.try_with(|probe| {
+            probe.lock().unwrap_or_else(|e| e.into_inner()).shutdown_ran = true;
+        });
+    }
+
+    pub(super) fn note_metrics(handle: &tokio::task::JoinHandle<()>, addr: std::net::SocketAddr) {
+        let _ = CHILD_PROBE.try_with(|probe| {
+            let mut slot = probe.lock().unwrap_or_else(|e| e.into_inner());
+            slot.metrics = Some(handle.abort_handle());
+            slot.metrics_addr = Some(addr);
+        });
+    }
+
+    pub(super) fn note_http(handle: &tokio::task::JoinHandle<()>, addr: std::net::SocketAddr) {
+        let _ = CHILD_PROBE.try_with(|probe| {
+            let mut slot = probe.lock().unwrap_or_else(|e| e.into_inner());
+            slot.http = Some(handle.abort_handle());
+            slot.http_addr = Some(addr);
+        });
+    }
+
+    pub(super) fn note_reloader(handle: &tokio::task::JoinHandle<()>, cancel: &CancellationToken) {
+        let _ = CHILD_PROBE.try_with(|probe| {
+            let mut slot = probe.lock().unwrap_or_else(|e| e.into_inner());
+            slot.reloader = Some(handle.abort_handle());
+            slot.reloader_cancel = Some(cancel.clone());
+        });
+    }
+
+    fn assert_finished(handle: &Option<tokio::task::AbortHandle>, name: &str) {
+        assert!(
+            handle.as_ref().is_some_and(|h| h.is_finished()),
+            "{name} child handle must be finished when run returns (present={}, finished={})",
+            handle.is_some(),
+            handle.as_ref().is_some_and(|h| h.is_finished()),
+        );
+    }
+
+    fn assert_rebindable(addr: std::net::SocketAddr) {
+        std::net::TcpListener::bind(addr).unwrap_or_else(|e| {
+            panic!("listener {addr} must be rebindable after run returns: {e}")
+        });
+    }
+
+    struct InsecureEnv {
+        prev_signer: Option<String>,
+        prev_allow: Option<String>,
+    }
+
+    impl InsecureEnv {
+        fn enable() -> Self {
+            let prev_signer = std::env::var("RVC_SIGNER_ALLOW_INSECURE").ok();
+            let prev_allow = std::env::var("RVC_ALLOW_INSECURE").ok();
+            unsafe {
+                std::env::set_var("RVC_SIGNER_ALLOW_INSECURE", "true");
+                std::env::set_var("RVC_ALLOW_INSECURE", "true");
+            }
+            Self { prev_signer, prev_allow }
+        }
+    }
+
+    impl Drop for InsecureEnv {
+        fn drop(&mut self) {
+            restore_env("RVC_SIGNER_ALLOW_INSECURE", self.prev_signer.as_deref());
+            restore_env("RVC_ALLOW_INSECURE", self.prev_allow.as_deref());
+        }
+    }
+
+    fn restore_env(key: &str, prev: Option<&str>) {
+        match prev {
+            Some(v) => unsafe { std::env::set_var(key, v) },
+            None => unsafe { std::env::remove_var(key) },
+        }
+    }
+
+    fn use_ephemeral_listeners(resolved: &mut ResolvedConfig) {
+        resolved.metrics_address = "127.0.0.1:0".to_string();
+        resolved.http_listen_address = "127.0.0.1:0".to_string();
+    }
+
+    fn enable_http(resolved: &mut ResolvedConfig, tmp: &TempDir) {
+        let pki = rvc_test_support::TestPki::generate(rvc_test_support::TestPkiParams {
+            ca_name: "rvc-signer-ca".to_string(),
+            server_sans: vec!["localhost".to_string()],
+            client_name: "rvc-client".to_string(),
+        });
+        let paths = pki.write_server_pem(tmp.path());
+        resolved.http_enabled = true;
+        resolved.http_tls_mode = HttpTlsMode::Mtls;
+        resolved.http_tls_cert = Some(paths.cert);
+        resolved.http_tls_key = Some(paths.key);
+        resolved.http_tls_ca_cert = Some(paths.ca_cert);
+        resolved.init_slashing_db = true;
+        resolved.disable_slashing_protection = false;
+    }
+
+    /// Slashing off, metrics and gRPC on port 0, HTTP left disabled.
+    fn live_resolved(tmp: &TempDir) -> ResolvedConfig {
+        let mut resolved = base_resolved(tmp);
+        resolved.listen_address = "127.0.0.1:0".to_string();
+        resolved.metrics_address = "127.0.0.1:0".to_string();
+        resolved.disable_slashing_protection = true;
+        resolved.init_slashing_db = false;
+        resolved
+    }
 
     fn free_port() -> u16 {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral");
@@ -485,5 +686,199 @@ mod tests {
         // dry_run returns before TLS/slashing gates; insecure still fine.
         let shutdown = CancellationToken::new();
         run(resolved, shutdown).await.expect("dry_run should succeed");
+    }
+
+    /// gRPC transport error after both listeners are up: HTTP port is rebindable
+    /// and both child handles are finished. Awaited on this test's runtime.
+    #[tokio::test]
+    async fn run_joins_both_children_on_the_grpc_error_path() {
+        let _g = env_lock();
+        let _env = InsecureEnv::enable();
+        let tmp = TempDir::new().unwrap();
+        let mut resolved = base_resolved(&tmp);
+        use_ephemeral_listeners(&mut resolved);
+        enable_http(&mut resolved, &tmp);
+        // Invalid transport: the address parses, but the port is already bound,
+        // so `serve_with_shutdown` fails after metrics and HTTP are spawned.
+        let grpc_in_use = std::net::TcpListener::bind("127.0.0.1:0").expect("occupy grpc port");
+        let grpc_port = grpc_in_use.local_addr().expect("grpc local_addr").port();
+        resolved.listen_address = format!("127.0.0.1:{grpc_port}");
+
+        let probe = Arc::new(Mutex::new(ChildProbe::default()));
+        let shutdown = CancellationToken::new();
+        let outcome = CHILD_PROBE
+            .scope(Arc::clone(&probe), async move {
+                tokio::time::timeout(Duration::from_secs(10), run(resolved, shutdown)).await
+            })
+            .await;
+
+        let result = outcome.expect("run must return on the gRPC transport error path");
+        let err = result.expect_err("gRPC transport bind must fail");
+        assert!(matches!(err, ServerError::Bind(_)), "expected Bind, got {err:?}");
+
+        let snap = probe_snapshot(&probe);
+        assert!(snap.shutdown_ran, "children.shutdown must run on the gRPC error path");
+        assert_finished(&snap.metrics, "metrics");
+        assert_finished(&snap.http, "http");
+        let http_addr = snap.http_addr.expect("HTTP listener address");
+        assert_rebindable(http_addr);
+        drop(grpc_in_use);
+    }
+
+    /// Success path: cancel the parent, `run` returns `Ok`, shutdown joined metrics.
+    #[tokio::test]
+    async fn run_shutdown_joins_children_on_the_success_path() {
+        let _g = env_lock();
+        let _env = InsecureEnv::enable();
+        let tmp = TempDir::new().unwrap();
+        let resolved = live_resolved(&tmp);
+
+        let probe = Arc::new(Mutex::new(ChildProbe::default()));
+        let probe_for_wait = Arc::clone(&probe);
+        let outcome = CHILD_PROBE
+            .scope(Arc::clone(&probe), async move {
+                let shutdown = CancellationToken::new();
+                let run_fut = run(resolved, shutdown.clone());
+                tokio::pin!(run_fut);
+                let started = Instant::now();
+                loop {
+                    tokio::select! {
+                        result = &mut run_fut => {
+                            panic!("run returned before the metrics child was observed: {result:?}");
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                            if probe_snapshot(&probe_for_wait).metrics.is_some() {
+                                break;
+                            }
+                            if started.elapsed() >= Duration::from_secs(10) {
+                                panic!("timed out waiting for the metrics child to be owned");
+                            }
+                        }
+                    }
+                }
+                shutdown.cancel();
+                tokio::time::timeout(Duration::from_secs(10), run_fut).await
+            })
+            .await;
+
+        let result = outcome.expect("run must return after parent cancel");
+        assert!(result.is_ok(), "success path should shut down cleanly: {result:?}");
+        let snap = probe_snapshot(&probe);
+        assert!(snap.shutdown_ran, "children.shutdown must run on the success path");
+        assert_finished(&snap.metrics, "metrics");
+        assert_rebindable(snap.metrics_addr.expect("metrics listener address"));
+    }
+
+    /// A `?` inside `run_inner` (missing slashing DB, after metrics is spawned)
+    /// still runs shutdown and joins that child.
+    #[tokio::test]
+    async fn run_shutdown_joins_children_on_run_inner_error_path() {
+        let _g = env_lock();
+        let _env = InsecureEnv::enable();
+        let tmp = TempDir::new().unwrap();
+        let mut resolved = base_resolved(&tmp);
+        resolved.metrics_address = "127.0.0.1:0".to_string();
+        resolved.disable_slashing_protection = false;
+        resolved.init_slashing_db = false;
+        assert!(!resolved.data_dir.as_ref().unwrap().join("signer-slashing.db").exists());
+
+        let probe = Arc::new(Mutex::new(ChildProbe::default()));
+        let shutdown = CancellationToken::new();
+        let outcome = CHILD_PROBE
+            .scope(Arc::clone(&probe), async move {
+                tokio::time::timeout(Duration::from_secs(10), run(resolved, shutdown)).await
+            })
+            .await;
+
+        let result = outcome.expect("run must return when run_inner hits ?");
+        let err = result.expect_err("missing slashing DB");
+        assert!(matches!(err, ServerError::SlashingDb(_)), "expected SlashingDb, got {err:?}");
+
+        let snap = probe_snapshot(&probe);
+        assert!(snap.shutdown_ran, "children.shutdown must run on a ? inside run_inner");
+        assert_finished(&snap.metrics, "metrics");
+        assert_rebindable(snap.metrics_addr.expect("metrics listener address"));
+    }
+
+    /// `reloader_cancel` is a `child_token()` of `shutdown`: cancelling the
+    /// parent stops the reloader before `Children::shutdown` runs.
+    #[tokio::test]
+    async fn cancelling_the_parent_shutdown_token_stops_the_reloader() {
+        let _g = env_lock();
+        let _env = InsecureEnv::enable();
+        let tmp = TempDir::new().unwrap();
+        let mut resolved = live_resolved(&tmp);
+        resolved.enable_hot_reload = true;
+        // Longer than this test's wait, so the reloader sits in `select` until cancelled.
+        resolved.reload_interval_secs = 30;
+
+        let probe = Arc::new(Mutex::new(ChildProbe::default()));
+        let probe_for_wait = Arc::clone(&probe);
+        let outcome = CHILD_PROBE
+            .scope(Arc::clone(&probe), async move {
+                let shutdown = CancellationToken::new();
+                let run_fut = run(resolved, shutdown.clone());
+                tokio::pin!(run_fut);
+                let started = Instant::now();
+                let token = loop {
+                    tokio::select! {
+                        result = &mut run_fut => {
+                            panic!("run returned before the reloader token was observed: {result:?}");
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(20)) => {
+                            if let Some(token) = probe_snapshot(&probe_for_wait).reloader_cancel.clone()
+                            {
+                                break token;
+                            }
+                            if started.elapsed() >= Duration::from_secs(10) {
+                                panic!("timed out waiting for the reloader cancellation token");
+                            }
+                        }
+                    }
+                };
+                assert!(!token.is_cancelled(), "reloader must still be running");
+                // No await between cancel and the assert: shutdown has not run yet,
+                // so only a child token of `shutdown` is cancelled here.
+                shutdown.cancel();
+                assert!(
+                    token.is_cancelled(),
+                    "cancelling the parent shutdown token must stop the reloader"
+                );
+                tokio::time::timeout(Duration::from_secs(10), run_fut).await
+            })
+            .await;
+
+        let result = outcome.expect("run must return after the reloader is cancelled");
+        assert!(result.is_ok(), "parent cancel should yield Ok: {result:?}");
+        let snap = probe_snapshot(&probe);
+        assert!(snap.shutdown_ran, "children.shutdown must run after the reloader stops");
+        assert_finished(&snap.reloader, "reloader");
+    }
+
+    /// Metrics has no cooperative stop. Abort bounds the join so `run` returns
+    /// while that child is wedged in `accept`.
+    #[tokio::test]
+    async fn wedged_metrics_child_is_bounded_by_abort() {
+        let _g = env_lock();
+        let _env = InsecureEnv::enable();
+        let tmp = TempDir::new().unwrap();
+        let resolved = live_resolved(&tmp);
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+
+        let probe = Arc::new(Mutex::new(ChildProbe::default()));
+        let outcome = CHILD_PROBE
+            .scope(Arc::clone(&probe), async move {
+                tokio::time::timeout(Duration::from_secs(10), run(resolved, shutdown)).await
+            })
+            .await;
+
+        let result = outcome
+            .expect("wedged metrics child must not hang run; abort then join bounds shutdown");
+        assert!(result.is_ok(), "aborting the wedged metrics task still returns Ok: {result:?}");
+        let snap = probe_snapshot(&probe);
+        assert!(snap.shutdown_ran, "children.shutdown must abort the wedged metrics child");
+        assert_finished(&snap.metrics, "metrics");
+        assert_rebindable(snap.metrics_addr.expect("metrics listener address"));
     }
 }

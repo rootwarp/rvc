@@ -6,8 +6,6 @@
 
 use std::sync::Arc;
 
-use tracing::info;
-
 use crate::config::ResolvedConfig;
 use crate::error::ServerError;
 use crate::http_api::{self, Web3SignerState};
@@ -63,15 +61,24 @@ pub(crate) fn build_http_state(deps: &HttpApiDeps<'_>) -> Result<Web3SignerState
     })
 }
 
+/// HTTPS listener task and the address it bound.
+///
+/// Port 0 in the configured listen address is resolved to an ephemeral port on
+/// `bound`, so the composition root can release that exact socket on shutdown.
+pub(crate) struct SpawnedHttpApi {
+    pub handle: tokio::task::JoinHandle<()>,
+    pub bound: std::net::SocketAddr,
+}
+
 /// Spawn the opt-in Web3Signer HTTPS listener, or return `Ok(None)` when disabled.
 ///
 /// When enabled, requires the shared gate, HTTP TLS material, and binds the
-/// configured listen address. Shutdown is driven by `shutdown` (the composition
-/// root cancels after gRPC exit and awaits the returned handle).
+/// configured listen address. The composition root keeps [`SpawnedHttpApi::handle`]
+/// and cancels `shutdown` on every return path (success and error).
 pub(crate) async fn spawn_http_api(
     deps: HttpApiDeps<'_>,
     shutdown: tokio_util::sync::CancellationToken,
-) -> Result<Option<tokio::task::JoinHandle<()>>, ServerError> {
+) -> Result<Option<SpawnedHttpApi>, ServerError> {
     if !deps.resolved.http_enabled {
         return Ok(None);
     }
@@ -102,12 +109,7 @@ pub(crate) async fn spawn_http_api(
     .await
     .map_err(|e| ServerError::bind(e.to_string()))?;
 
-    info!(
-        address = %bound,
-        tls_mode = ?deps.resolved.http_tls_mode,
-        "Web3Signer HTTP API listening"
-    );
-    Ok(Some(handle))
+    Ok(Some(SpawnedHttpApi { handle, bound }))
 }
 
 #[cfg(test)]
