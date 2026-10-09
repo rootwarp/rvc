@@ -162,7 +162,11 @@ async fn test_double_vote_rejected_through_full_pipeline() {
     // --- Slot 1: First attestation should succeed ---
     let results_1 = orchestrator.process_slot(slot_1).await.unwrap();
     assert_eq!(results_1.len(), 1, "Expected one attestation result for slot 1");
-    assert!(results_1[0].success, "First attestation should succeed: {:?}", results_1[0].error);
+    assert!(
+        results_1[0].outcome.is_published(),
+        "First attestation should succeed: {:?}",
+        results_1[0].outcome
+    );
     assert_eq!(
         capturing.captured().len(),
         1,
@@ -173,10 +177,19 @@ async fn test_double_vote_rejected_through_full_pipeline() {
     clock.set_slot(slot_2);
     let results_2 = orchestrator.process_slot(slot_2).await.unwrap();
     assert_eq!(results_2.len(), 1, "Expected one attestation result for slot 2");
-    assert!(!results_2[0].success, "Second attestation (double vote) must be rejected");
+    assert!(
+        !results_2[0].outcome.is_published(),
+        "Second attestation (double vote) must be rejected"
+    );
 
-    // Verify the rejection is specifically from slashing protection, not a generic error
-    let error_msg = results_2[0].error.as_deref().expect("rejected attestation must have error");
+    // Verify the rejection is specifically from slashing protection, not a generic error.
+    let error_msg = match &results_2[0].outcome {
+        AttestationOutcome::Failed(message) => message.as_str(),
+        AttestationOutcome::Published => panic!("double vote must not publish"),
+        AttestationOutcome::RejectedByBeaconNode { bn, message } => {
+            panic!("double vote is a sign failure, not a beacon rejection bn={bn:?}: {message}")
+        }
+    };
     assert!(
         error_msg.contains("slashing protection") || error_msg.contains("SlashingBlocked"),
         "Error must indicate slashing protection blocked signing, got: {error_msg}"

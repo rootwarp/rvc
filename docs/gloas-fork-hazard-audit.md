@@ -65,7 +65,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/grpc-signer/src/client.rs` 273 | 1 | — | inherit-intentionally | `uses_gloas_rpc`: open-ended `>= Gloas` so later forks keep the Gloas-safe header/root RPCs rather than silently falling back to decoder-bound legacy RPCs. | 4.20c |
 | `crates/rvc/benches/deadline_rebenchmark.rs` 75 | 1 | — | test-only | Bench asserts the slot resolved `>= Gloas`. Not a production guard. | — |
 | `crates/rvc/src/orchestrator/aggregation.rs` 384 | 1 | — | inherit-intentionally | Aggregate wrap: open-ended `>= Gloas` uses the island root so a later fork does not fall back to tree_hash 0.9. | — |
-| `crates/rvc/src/orchestrator/coordinator/mod.rs` 1439 | 1 | — | inherit-intentionally | PTC phase (4.13): open-ended `>= Gloas` so later forks keep the payload-attestation duty rather than silently dropping it. Threaded once-per-slot `ForkName`; not gated on decode failure. | 4.13 |
+| `crates/rvc/src/orchestrator/coordinator/mod.rs` 1480 | 1 | — | inherit-intentionally | PTC phase (4.13): open-ended `>= Gloas` so later forks keep the payload-attestation duty rather than silently dropping it. Threaded once-per-slot `ForkName`; not gated on decode failure. | 4.13 |
 | `crates/rvc/src/orchestrator/utils.rs` 127 | 1 | — | inherit-intentionally | `uses_electra_attestation_wire`: open-ended `>= Electra` so Gloas (and later forks) keep the Electra+ wire. Index zeroing is the separate `zeroes_committee_index` (`Electra..Gloas`). | 2.8 |
 | `crates/rvc/tests/l5_sentinel_epoch_byte_identity.rs` 134 | 1 | — | test-only | Assertion string mentions `>= ForkName::Gloas`. Not a production guard. | — |
 | `crates/signer-server/src/dvt/peer_client.rs` 207 | 1 | — | inherit-intentionally | DVT peer `uses_gloas_rpc`: same open-ended `>= Gloas` as the gRPC client so later forks keep Gloas-safe RPCs. | 4.20c |
@@ -73,14 +73,14 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/signer/src/lib.rs` 1360 | 1 | — | inherit-intentionally | Pre-Electra aggregate signing fails closed at `>= Gloas` rather than using the legacy decoder RPC. | — |
 | `crates/signer/src/lib.rs` 1435 | 1 | — | inherit-intentionally | Electra aggregate path: open-ended `>= Gloas` fails closed instead of the pre-Electra `SignAggregateAndProof` decoder. | 4.20c |
 | `crates/timing/src/clock.rs` 30 | 1 | — | inherit-intentionally | `DeadlineSchedule::for_fork`: open-ended `>= Gloas` selects the Gloas deadline set so later forks keep those offsets rather than silently reverting to pre-Gloas 3333/6667. | 4.19 |
-| `crates/rvc/src/orchestrator/attestation.rs` 815 | 2 | — | must-bound | Submission-path `SingleAttestation.data.index = "0"` inside `zeroes_committee_index`, not the Electra+ wrapper branch, so Gloas preserves the BN value. | 2.8 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 960 | 2 | — | test-only | Test applies `index = 0` when local `is_electra`. Follows 2.3 helper. | 2.3 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1085 | 2 | — | test-only | Pre-Electra path does not assign; the `if is_electra` still contains the assignment. 2.3. | 2.3 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1114 | 2 | — | test-only | Signing-root fixture zeros index by hand. Not a production guard. | 2.3 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1122 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 815. | 2.8 |
+| `crates/rvc/src/orchestrator/attestation.rs` 819 | 2 | — | must-bound | Submission-path `SingleAttestation.data.index = "0"` inside `zeroes_committee_index`, not the Electra+ wrapper branch, so Gloas preserves the BN value. | 2.8 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 976 | 2 | — | test-only | Test applies `index = 0` when local `is_electra`. Follows 2.3 helper. | 2.3 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1105 | 2 | — | test-only | Pre-Electra path does not assign; the `if is_electra` still contains the assignment. 2.3. | 2.3 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1134 | 2 | — | test-only | Signing-root fixture zeros index by hand. Not a production guard. | 2.3 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1142 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 819. | 2.8 |
 | `crates/rvc/src/orchestrator/utils.rs` 146 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the half-open `Electra..Gloas` predicate (2.3 / 2.8). | 2.3 |
-| `crates/rvc/tests/gloas_data_index_round_trip.rs` 358 | 2 | — | test-only | Gloas round-trip builds a zeroed index to prove the signing path did not zero it. | — |
-| `crates/rvc/tests/gloas_data_index_round_trip.rs` 385 | 2 | — | test-only | Electra/Fulu round-trip expects the submitted index to be zeroed. | — |
+| `crates/rvc/tests/gloas_data_index_round_trip.rs` 362 | 2 | — | test-only | Gloas round-trip builds a zeroed index to prove the signing path did not zero it. | — |
+| `crates/rvc/tests/gloas_data_index_round_trip.rs` 389 | 2 | — | test-only | Electra/Fulu round-trip expects the submitted index to be zeroed. | — |
 | `bin/rvc/tests/common/mock_bn.rs` 267 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
 | `crates/beacon/src/client.rs` 1222 | 3 | exhaustive | inherit-intentionally | Aggregate fetch v2 request table. Exhaustive `match fork` so a new variant is a compile error, not a silent v1 or v2 inherit. | RR-3.2 |
 | `crates/beacon/src/client.rs` 2059 | 3 | exhaustive | inherit-intentionally | v2 200 is accepted only when the response header, body `version`, and the requested fork agree. Pre-Electra is not decoded on this path. | RR-3.2 |
@@ -97,7 +97,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/block-service/src/service/tests/v4.rs` 138 | 4 | exhaustive | test-only | Fulu slot with a gloas JSON version must fail closed. | — |
 | `crates/block-service/src/service/tests/v4.rs` 170 | 4 | exhaustive | test-only | Fulu slot with a gloas SSZ version must fail closed. | — |
 | `crates/block-service/src/service/tests/v4.rs` 203 | 4 | exhaustive | test-only | Gloas slot with a fulu version must fail closed. | — |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 2379 | 4 | exhaustive | test-only | Envelope publish assert names consensus version `gloas`. Not a production dispatch. | — |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 2419 | 4 | exhaustive | test-only | Envelope publish assert names consensus version `gloas`. Not a production dispatch. | — |
 | `crates/crypto/src/typed_signer.rs` 61 | 5 | — | must-bound | `SignContext::resolve` first-matches `fork_info.current_version` over `entries()`. Two `[0xFF;4]` rows (unscheduled Fulu+Gloas after 2.6) resolve Fulu, so `Gloas.fork_version()` does not round-trip. 2.6 pins the collision; 2.10 confines it to both-unscheduled. | 2.6 |
 | `crates/eth-types/src/fork.rs` 118 | 5 | — | inherit-intentionally | `next_activation` scans `entries()` and skips `u64::MAX`. A new row participates by construction. | — |
 | `crates/eth-types/src/fork.rs` 222 | 5 | — | inherit-intentionally | `from_epoch` reverse-scans `entries()`; a new row is picked up automatically. Equal activation epochs pick the latest fork. | 2.5b |

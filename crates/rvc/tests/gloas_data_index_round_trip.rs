@@ -258,7 +258,11 @@ async fn run_round_trip(fork: ForkName, bn_index: &str) -> RoundTrip {
 
     let results = orchestrator.process_slot(slot).await.expect("process_slot");
     assert_eq!(results.len(), 1);
-    assert!(results[0].success, "attestation must succeed: {:?}", results[0].error);
+    assert!(
+        results[0].outcome.is_published(),
+        "attestation must succeed: {:?}",
+        results[0].outcome
+    );
 
     let requests = mock_server.received_requests().await.expect("wiremock requests");
     let submit = requests

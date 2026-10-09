@@ -593,7 +593,11 @@ async fn test_pre_electra_attestation_produces_legacy_format() {
     // Process the slot
     let results = orchestrator.process_slot(slot).await.unwrap();
     assert_eq!(results.len(), 1);
-    assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+    assert!(
+        results[0].outcome.is_published(),
+        "Attestation should succeed: {:?}",
+        results[0].outcome
+    );
 
     // Verify the captured attestation is PreElectra
     let captured = capturing.captured();
@@ -634,7 +638,11 @@ async fn test_electra_attestation_produces_single_attestation_format() {
 
     let results = orchestrator.process_slot(slot).await.unwrap();
     assert_eq!(results.len(), 1);
-    assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+    assert!(
+        results[0].outcome.is_published(),
+        "Attestation should succeed: {:?}",
+        results[0].outcome
+    );
 
     let captured = capturing.captured();
     assert_eq!(captured.len(), 1);
@@ -679,7 +687,11 @@ async fn test_fork_boundary_last_pre_electra_slot() {
 
     let results = orchestrator.process_slot(slot).await.unwrap();
     assert_eq!(results.len(), 1);
-    assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+    assert!(
+        results[0].outcome.is_published(),
+        "Attestation should succeed: {:?}",
+        results[0].outcome
+    );
 
     let captured = capturing.captured();
     assert_eq!(captured.len(), 1);
@@ -899,7 +911,11 @@ async fn test_electra_attestation_data_index_zero_before_signing() {
 
     let results = orchestrator.process_slot(slot).await.unwrap();
     assert_eq!(results.len(), 1);
-    assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+    assert!(
+        results[0].outcome.is_published(),
+        "Attestation should succeed: {:?}",
+        results[0].outcome
+    );
 
     let captured = capturing.captured();
     assert_eq!(captured.len(), 1);
@@ -1024,7 +1040,11 @@ async fn test_electra_submitted_single_attestation_data_index_zero() {
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
     let results = orchestrator.process_slot(slot).await.unwrap();
     assert_eq!(results.len(), 1);
-    assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+    assert!(
+        results[0].outcome.is_published(),
+        "Attestation should succeed: {:?}",
+        results[0].outcome
+    );
 
     let captured = capturing.captured();
     assert_eq!(captured.len(), 1);
@@ -1183,7 +1203,11 @@ async fn test_fulu_attestation_versioning() {
 
     let results = orchestrator.process_slot(slot).await.unwrap();
     assert_eq!(results.len(), 1);
-    assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+    assert!(
+        results[0].outcome.is_published(),
+        "Attestation should succeed: {:?}",
+        results[0].outcome
+    );
 
     let captured = capturing.captured();
     assert_eq!(captured.len(), 1);
@@ -1214,7 +1238,7 @@ async fn test_fulu_eip7549_index_zeroing() {
     mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
 
     let results = orchestrator.process_slot(slot).await.unwrap();
-    assert!(results[0].success);
+    assert!(results[0].outcome.is_published());
 
     let captured = capturing.captured();
     match &captured[0] {
@@ -1242,7 +1266,11 @@ async fn test_electra_attestation_unchanged() {
     mount_attestation_mocks(&mock_server, slot, &pubkey_hex).await;
 
     let results = orchestrator.process_slot(slot).await.unwrap();
-    assert!(results[0].success, "Attestation should succeed: {:?}", results[0].error);
+    assert!(
+        results[0].outcome.is_published(),
+        "Attestation should succeed: {:?}",
+        results[0].outcome
+    );
 
     let captured = capturing.captured();
     assert_eq!(captured.len(), 1);
@@ -1323,7 +1351,11 @@ async fn test_attestation_still_zeroes_index_at_electra_and_fulu() {
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
         let results = orchestrator.process_slot(slot).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].success, "{label} attestation should succeed: {:?}", results[0].error);
+        assert!(
+            results[0].outcome.is_published(),
+            "{label} attestation should succeed: {:?}",
+            results[0].outcome
+        );
 
         let captured = capturing.captured();
         assert_eq!(captured.len(), 1, "{label}: one submission");
@@ -1559,7 +1591,11 @@ async fn test_submission_preserves_index_at_gloas_zeroes_at_electra_and_fulu() {
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
         let results = orchestrator.process_slot(slot).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].success, "{label} attestation should succeed: {:?}", results[0].error);
+        assert!(
+            results[0].outcome.is_published(),
+            "{label} attestation should succeed: {:?}",
+            results[0].outcome
+        );
 
         let captured = capturing.captured();
         assert_eq!(captured.len(), 1, "{label}: one submission");
@@ -1755,7 +1791,11 @@ async fn test_electra_attestation_wire_taken_at_gloas_electra_fulu_not_deneb() {
         orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
         let results = orchestrator.process_slot(slot).await.unwrap();
         assert_eq!(results.len(), 1);
-        assert!(results[0].success, "{label} attestation should succeed: {:?}", results[0].error);
+        assert!(
+            results[0].outcome.is_published(),
+            "{label} attestation should succeed: {:?}",
+            results[0].outcome
+        );
 
         let captured = capturing.captured();
         assert_eq!(captured.len(), 1, "{label}: one attestation submission");
@@ -2024,9 +2064,9 @@ async fn test_boundary_attestation_and_aggregate_continuity() {
         let fulu_results = orchestrator.process_slot(fulu_slot).await.unwrap();
         assert_eq!(fulu_results.len(), 1);
         assert!(
-            fulu_results[0].success,
+            fulu_results[0].outcome.is_published(),
             "Fulu slot 2208 attestation should succeed: {:?}",
-            fulu_results[0].error
+            fulu_results[0].outcome
         );
         orchestrator
             .aggregation_service
@@ -2042,9 +2082,9 @@ async fn test_boundary_attestation_and_aggregate_continuity() {
         let gloas_results = orchestrator.process_slot(gloas_slot).await.unwrap();
         assert_eq!(gloas_results.len(), 1);
         assert!(
-            gloas_results[0].success,
+            gloas_results[0].outcome.is_published(),
             "Gloas slot 2240 attestation should succeed: {:?}",
-            gloas_results[0].error
+            gloas_results[0].outcome
         );
         orchestrator
             .aggregation_service
