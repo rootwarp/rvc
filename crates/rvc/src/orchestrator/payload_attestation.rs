@@ -357,6 +357,7 @@ mod tests {
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
+        // Upcast: wide object only.
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices.clone()));
         duty_tracker.fetch_ptc_duties(0, &indices).await.unwrap();
 

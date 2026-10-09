@@ -641,6 +641,7 @@ mod tests {
             .with_max_retries(1);
         let beacon =
             Arc::new(BeaconClient::new(beacon_config).unwrap()) as Arc<dyn BeaconNodeClient>;
+        // Upcast: wide object only.
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![]));
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
@@ -745,6 +746,7 @@ mod tests {
             .with_max_retries(0);
         let beacon_client =
             Arc::new(BeaconClient::new(beacon_config).unwrap()) as Arc<dyn BeaconNodeClient>;
+        // Upcast: wide object only.
         let duty_tracker = Arc::new(DutyTracker::new(beacon_client.clone(), vec!["1".to_string()]));
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
@@ -990,6 +992,7 @@ mod tests {
         ) as Arc<dyn BeaconNodeClient>;
 
         let indices = vec!["1".to_string(), "2".to_string()];
+        // Upcast: wide object only.
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), indices));
         duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
         duty_tracker.fetch_proposer_duties(epoch).await.unwrap();

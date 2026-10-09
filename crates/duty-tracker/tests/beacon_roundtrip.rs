@@ -9,18 +9,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beacon::{BeaconClient, BeaconClientConfig};
-use bn_manager::BeaconNodeClient;
+use bn_manager::DutiesProvider;
 use rvc_duty_tracker::DutyTracker;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn setup_http_beacon() -> (MockServer, Arc<dyn BeaconNodeClient>) {
+async fn setup_http_beacon() -> (MockServer, Arc<dyn DutiesProvider>) {
     let mock_server = MockServer::start().await;
     let config = BeaconClientConfig::new(mock_server.uri())
         .with_timeout(Duration::from_secs(5))
         .with_max_retries(1);
     let client = BeaconClient::new(config).unwrap();
-    (mock_server, Arc::new(client) as Arc<dyn BeaconNodeClient>)
+    (mock_server, Arc::new(client) as Arc<dyn DutiesProvider>)
 }
 
 /// Attester duties: POST path, request body indices, dependent_root caching.

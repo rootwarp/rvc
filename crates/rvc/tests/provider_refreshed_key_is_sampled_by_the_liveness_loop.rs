@@ -119,7 +119,7 @@ async fn a_provider_refreshed_key_leaves_pending() {
 
     let loop_ = LivenessObservationLoop::new(
         Arc::clone(&machine),
-        bn as Arc<dyn bn_manager::BeaconNodeClient>,
+        bn.clone(),
         Arc::clone(&pubkey_index),
         Arc::clone(&epoch_clock),
         CancellationToken::new(),
@@ -128,7 +128,7 @@ async fn a_provider_refreshed_key_leaves_pending() {
     .with_slot_duration(Duration::from_millis(1));
 
     // Without map membership this refresh would find nothing — that was the starvation bug.
-    loop_.refresh_indices_for_test().await;
+    loop_.refresh_indices_for_test(bn.as_ref()).await;
     assert!(
         !pubkey_index.read().is_empty(),
         "liveness index map must resolve the admitted key from PubkeyMap"

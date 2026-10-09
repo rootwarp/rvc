@@ -206,7 +206,7 @@ fn wire(spec: Spec) -> Harness {
     );
     let indices: Vec<String> = validators.iter().map(|val| val.index.clone()).collect();
     let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
-    let duty_tracker = Arc::new(DutyTracker::new(Arc::clone(&beacon), indices));
+    let duty_tracker = Arc::new(DutyTracker::new(mock.clone(), indices));
     let clock = Arc::new(MockSlotClock::new(GENESIS, Duration::from_secs(12), SLOTS_PER_EPOCH));
     clock.set_slot(slot);
     let mut config = OrchestratorConfig::new([0xaa; 32], fork_schedule());

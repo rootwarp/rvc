@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use bn_manager::BeaconNodeClient;
+use bn_manager::{BeaconNodeClient, LivenessApi};
 use doppelganger::{ForwardWindowMachine, MonotonicEpochClock, SigningEnablement};
 use slashing::SlashingDb;
 use tracing::{error, info, warn};
@@ -140,7 +140,7 @@ pub async fn wire_signing_enablement(
     let liveness_task = if doppelganger_enabled {
         spawn_liveness_loop(
             forward_window_machine.clone(),
-            Arc::clone(&beacon.bn_manager) as Arc<dyn BeaconNodeClient>,
+            Arc::clone(&beacon.bn_manager) as Arc<dyn LivenessApi>,
             Arc::clone(&pubkey_index),
             Some(Arc::clone(&keys.pubkey_map)),
             Arc::clone(&epoch_clock),

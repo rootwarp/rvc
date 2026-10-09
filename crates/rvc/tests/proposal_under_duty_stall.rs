@@ -697,10 +697,7 @@ async fn build_harness(
     let beacon =
         Arc::new(build_duty_stall_beacon(duty_stall, pubkey_hex.clone(), proposal_slots.to_vec()));
 
-    let duty_tracker = Arc::new(DutyTracker::new(
-        beacon.clone() as Arc<dyn BeaconNodeClient>,
-        vec!["1".to_string()],
-    ));
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
 
     if warm_cache {
         // Duty-cache warm: pre-seed attester/proposer/sync so the slot loop's

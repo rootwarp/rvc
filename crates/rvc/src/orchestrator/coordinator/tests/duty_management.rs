@@ -972,7 +972,7 @@ async fn drive_prepare_and_register(
     )));
 
     let duty_tracker = Arc::new(
-        DutyTracker::new(beacon.clone(), vec!["42".to_string(), "43".to_string()])
+        DutyTracker::new(mock.clone(), vec!["42".to_string(), "43".to_string()])
             .with_fork_schedule((*schedule).clone()),
     );
 
@@ -1183,7 +1183,7 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
         schedule.clone(),
     )));
     let duty_tracker = Arc::new(
-        DutyTracker::new(beacon.clone(), vec!["42".to_string()])
+        DutyTracker::new(mock.clone(), vec!["42".to_string()])
             .with_fork_schedule((*schedule).clone()),
     );
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));

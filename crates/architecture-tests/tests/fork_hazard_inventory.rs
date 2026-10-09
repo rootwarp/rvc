@@ -352,7 +352,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        976,
+        977,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -361,7 +361,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1105,
+        1106,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -370,7 +370,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1134,
+        1135,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -379,7 +379,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1142,
+        1143,
         Class::IndexZero,
         false,
         ".index = \"0\"",
@@ -397,7 +397,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/tests/gloas_data_index_round_trip.rs",
-        362,
+        363,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -406,7 +406,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/tests/gloas_data_index_round_trip.rs",
-        389,
+        390,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -561,7 +561,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        2419,
+        2420,
         Class::StringDispatch,
         false,
         "match &envelopes[0]",

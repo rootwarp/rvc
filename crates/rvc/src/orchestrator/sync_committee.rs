@@ -652,6 +652,7 @@ mod tests {
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
+        // Upcast: wide object only.
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         // Pre-populate sync committee duties for period 0 (epoch 0 / 256 = 0)
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
@@ -981,6 +982,7 @@ mod tests {
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
+        // Upcast: wide object only.
         let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
 
@@ -1081,6 +1083,7 @@ mod tests {
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
+        // Upcast: wide object only.
         let duty_tracker =
             Arc::new(DutyTracker::new(beacon.clone(), vec!["10".into(), "11".into(), "12".into()]));
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
@@ -1174,6 +1177,7 @@ mod tests {
         let signer =
             Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
+        // Upcast: wide object only.
         let duty_tracker =
             Arc::new(DutyTracker::new(beacon.clone(), vec!["10".into(), "11".into(), "12".into()]));
         duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
@@ -1422,6 +1426,7 @@ mod tests {
                 )
                 .with_enablement(always_enabled()),
             );
+            // Upcast: wide object only.
             let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
             duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
             let mut map = HashMap::new();

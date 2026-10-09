@@ -228,6 +228,7 @@ async fn run_round_trip(fork: ForkName, bn_index: &str) -> RoundTrip {
             .with_sign_backend(recording.clone()),
     );
 
+    // Upcast: wide object only.
     let duty_tracker =
         Arc::new(DutyTracker::new(beacon.clone(), vec![VALIDATOR_INDEX.to_string()]));
 

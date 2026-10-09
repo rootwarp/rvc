@@ -8,7 +8,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use bn_manager::{BeaconNodeClient, BnManager, OperationTimeouts, Propagator};
+use bn_manager::{BeaconNodeClient, BnManager, DutiesProvider, OperationTimeouts, Propagator};
 use builder::BuilderService;
 use duty_tracker::DutyTracker;
 use signer::SignerService;
@@ -172,8 +172,11 @@ pub async fn build_services(
         pubkey_map: Arc::clone(&keys.pubkey_map),
     });
     let duty_tracker = Arc::new(
-        DutyTracker::new_with_source(main_beacon.clone(), index_source)
-            .with_fork_schedule(fork_schedule.as_ref().clone()),
+        DutyTracker::new_with_source(
+            Arc::clone(&beacon.bn_manager) as Arc<dyn DutiesProvider>,
+            index_source,
+        )
+        .with_fork_schedule(fork_schedule.as_ref().clone()),
     );
 
     // SEC-9 / M-15: fork mismatch is fatal by default (mirrors the GVR chain-swap

@@ -659,10 +659,7 @@ async fn build_harness(opts: BuildOpts<'_>) -> HarnessParts {
         opts.proposal_slots.to_vec(),
     ));
 
-    let duty_tracker = Arc::new(DutyTracker::new(
-        beacon.clone() as Arc<dyn BeaconNodeClient>,
-        vec!["1".to_string()],
-    ));
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
 
     if opts.warm_cache {
         let mut epochs: Vec<u64> =
