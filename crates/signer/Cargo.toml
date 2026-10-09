@@ -36,7 +36,8 @@ crypto = { workspace = true, features = ["test-utils"] }
 eth-types = { workspace = true, features = ["test-fixtures"] }
 grpc-signer.workspace = true
 prost.workspace = true
-remote-signer-client.workspace = true
+# test-utils: `RemoteSigner::new_for_tests` for typed-facade and unit tests (RR4-03).
+remote-signer-client = { workspace = true, features = ["test-utils"] }
 signer-server.workspace = true
 tonic.workspace = true
 tokio-stream.workspace = true

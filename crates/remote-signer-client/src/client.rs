@@ -92,6 +92,10 @@ impl RemoteSigner {
     /// policy resolution without dialing Web3Signer). Production callers must
     /// use [`Self::new`], which enforces the `InsecureMode::Refuse` gate
     /// (ISSUE-3.13 / NFR-10).
+    ///
+    /// Compiled only for this crate's tests (`cfg(test)`) or when the
+    /// `test-utils` feature is enabled.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn new_for_tests(
         config: RemoteSignerConfig,
         pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,
@@ -103,7 +107,13 @@ impl RemoteSigner {
     }
 
     /// Alias kept for in-crate tests that predate [`Self::new_for_tests`].
-    #[cfg(test)]
+    ///
+    /// Same compiler gate as [`Self::new_for_tests`]. `pub(crate)`, so enabling
+    /// `test-utils` does not expose the alias outside this crate. Unit tests in
+    /// `client_tests.rs` are the only callers; `dead_code` is allowed because a
+    /// `test-utils` library build (no `cfg(test)`) still compiles the alias.
+    #[allow(dead_code)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn new_unchecked(
         config: RemoteSignerConfig,
         pubkeys: Vec<[u8; PUBLIC_KEY_BYTES_LEN]>,

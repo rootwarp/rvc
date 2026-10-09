@@ -309,7 +309,12 @@ where
     /// `key_gen_rx`, a shared circuit breaker, or a custom attesting flag.
     /// Production code must construct [`OrchestratorDeps`] explicitly with the
     /// real receiver from the channel shared with keymanager adapters.
+    ///
+    /// Compiled only for this crate's tests or when the `test-utils` feature
+    /// is enabled. Integration tests see it through the self dev-dependency
+    /// that turns `test-utils` on for the library under test.
     #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn for_test(
         clock: Arc<C>,
         duty_tracker: Arc<DutyTracker>,
@@ -400,8 +405,8 @@ where
     /// Creates a new DutyOrchestrator from the given dependencies.
     ///
     /// The sole constructor. Callers must supply a real `key_gen_rx` (production)
-    /// or use [`OrchestratorDeps::for_test`] (unit tests that do not exercise
-    /// key-import notifications).
+    /// or use `OrchestratorDeps::for_test` (unit tests that do not exercise
+    /// key-import notifications; compiled with `cfg(test)` or `test-utils`).
     pub fn new(deps: OrchestratorDeps<C, S, B>) -> (Self, OrchestratorHandle) {
         let OrchestratorDeps {
             clock,
