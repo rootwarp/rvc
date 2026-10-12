@@ -398,10 +398,25 @@ items below. Library and embedding callers are.
 - `AttestationResult` is `{ validator_index, slot, outcome }`.
   `AttestationOutcome` is `Published`, `Failed(String)`, or
   `RejectedByBeaconNode { bn: Option<String>, message: String }`.
-  `bn` is `PropagationOutcome::reported_by` and is `None` when that outcome
-  names no endpoint. The old `success` / `error` fields are gone.
-  Both types stay re-exported from `rvc::orchestrator`.
-  `is_published` is true only for `Published`.
+  `bn` is a host-only label (`scheme://host:port`) from
+  `PropagationOutcome::reported_by` via `bn_manager::metrics::endpoint_label`,
+  and is `None` when that outcome names no endpoint (including empty string).
+  The old `success` / `error` fields are gone. Both types stay re-exported
+  from `rvc::orchestrator`. Production status reads use `is_published()`
+  (true only for `Published`). Out-of-range BN failure indices count as
+  `Failed`, not `Published`. The `Attestation failed` warn fields use Debug
+  (`?error`) so BN-supplied CR/LF cannot forge text-format log lines.
+  Red-check with `--exact` needs the fully-qualified test name:
+  `orchestrator::coordinator::tests::core::attestation_outcome_is_exhaustive_and_published_is_not_an_error`.
+
+## Metrics: `rvc_attestations_total{failed}` scope
+
+`rvc_attestations_total{status="failed"}` from the beacon-node propagator
+counts submit-response failures only (indexed rejections and complete submit
+failures). Sign, attestation-data fetch, submit-timeout, and propagate
+transport failures show up in slot accounting / `AttestationOutcome::Failed`
+but do not increment that series in bn-manager. The signer may also increment
+the same Prometheus name when an attestation sign is slashing-blocked.
 - `RemoteSigner::new_for_tests` and its `pub(crate)` alias `new_unchecked`
   compile only under `cfg(test)` or the `test-utils` feature.
   `OrchestratorDeps::for_test` has the same gate. Production code calls

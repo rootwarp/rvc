@@ -353,7 +353,7 @@ pub async fn run(
     info!("Starting duty orchestrator");
 
     // Spawn (not poll inline): in-flight publish survives the shutdown signal (M10).
-    // detached: already a per-slot root inside the task (slot.process, crates/rvc/src/orchestrator/coordinator/mod.rs:490); not shape B.
+    // detached: already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B.
     executor.spawn_result("duty_orchestrator", ShutdownTier::Orchestrator, async move {
         orchestrator.run().await
     });

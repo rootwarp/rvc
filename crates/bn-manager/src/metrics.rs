@@ -11,8 +11,9 @@ use url::Url;
 /// `scheme://host:port` with userinfo and path stripped — dashboards key on host,
 /// not credentials or request path (issue 8.3 label hygiene).
 ///
-/// Shared by `rvc_bn_capability_state` and `rvc_bn_health_tier`.
-pub(crate) fn endpoint_label(endpoint: &str) -> String {
+/// Shared by `rvc_bn_capability_state`, `rvc_bn_health_tier`, and
+/// `RejectedByBeaconNode.bn` (issue #598).
+pub fn endpoint_label(endpoint: &str) -> String {
     match Url::parse(endpoint) {
         Ok(mut parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {
             let _ = parsed.set_username("");
@@ -28,12 +29,24 @@ pub(crate) fn endpoint_label(endpoint: &str) -> String {
     }
 }
 
-/// Counter for attestation operations.
-/// Labels: status (success, failed, skipped)
+/// Counter for attestation submit outcomes in the beacon-node propagator.
+///
+/// Labels: `status` (`success`, `failed`, `skipped`).
+///
+/// **Scope of `{status="failed"}`:** increments from this crate cover beacon-node
+/// submit responses only (per-index entries in a partial-failure list, or a
+/// complete submit failure). Orchestrator-side terminal failures that never
+/// reach a submit response — sign errors, attestation-data fetch errors,
+/// submit timeouts, and propagate transport errors — appear in slot accounting
+/// (`AttestationOutcome::Failed`, slot summary logs) but do **not** increment
+/// this series here. The signer crate may also increment the same Prometheus
+/// name for slashing-blocked attestation signs; that path is separate from
+/// submit accounting (issue #598 / Security S4).
 pub static RVC_ATTESTATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     define_int_counter_vec(
         "rvc_attestations_total",
-        "Total number of attestation operations",
+        "Attestation submit outcomes (success/failed cover BN submit responses; \
+         orchestrator sign/fetch/timeout failures are not counted here)",
         &["status"],
     )
 });
