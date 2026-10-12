@@ -420,16 +420,18 @@ async fn test_run_at_gloas_hits_payload_attestation_endpoints() {
     );
 }
 
-/// PTC phase is skipped at epoch 69 (no data GET / pool POST) even though
-/// ungated post-duty fetch POSTs duties/ptc/69. At Gloas, PTC waits for the
-/// configured bps deadline then submits one pool message per validator
-/// without writing a slashing row.
+/// PTC phase is skipped at epoch 69 (no data GET / pool POST). Post-duty
+/// fetch is also Gloas-gated, so duties/ptc/69 is not requested; the first
+/// Gloas epoch (70) is still prefetched via `current_epoch + 1`. At Gloas,
+/// PTC waits for the configured bps deadline then submits one pool message
+/// per validator without writing a slashing row.
 #[tokio::test]
 async fn test_ptc_duties_absent_before_gloas_fire_at_configured_bps() {
     use timing::{due_ms, SlotClock};
 
     // Park at the pre-Gloas aggregate offset so att/agg remaining are zero and
-    // post-duty `fetch_epoch_duties` runs. Fetch is ungated; the phase is not.
+    // post-duty `fetch_epoch_duties` runs. Both the PTC phase and the PTC
+    // duty fetch are gated on Gloas.
     let pre_slot = 2208u64;
     let pre_epoch = pre_slot / SLOTS_PER_EPOCH;
     assert_eq!(pre_epoch, 69, "Slot 2208 should be epoch 69");
@@ -438,7 +440,10 @@ async fn test_ptc_duties_absent_before_gloas_fire_at_configured_bps() {
     let (mut pre_orch, pre_handle, pre_pubkey, _capturing) =
         build_fork_transition_orchestrator(&pre_server.uri(), pre_slot).await;
     mount_attestation_mocks(&pre_server, pre_slot, &pre_pubkey).await;
-    mount_gloas_mocks(&pre_server, pre_slot, &pre_pubkey).await;
+    // Prefetch targets the first Gloas epoch (pre_epoch + 1), not the current
+    // pre-Gloas epoch — mount duties/ptc for that epoch.
+    let first_gloas_slot = (pre_epoch + 1) * SLOTS_PER_EPOCH;
+    mount_gloas_mocks(&pre_server, first_gloas_slot, &pre_pubkey).await;
 
     let pre_fork = ForkName::from_epoch(pre_epoch, &pre_orch.config.fork_schedule);
     assert_eq!(pre_fork, ForkName::Fulu);
@@ -449,9 +454,15 @@ async fn test_ptc_duties_absent_before_gloas_fire_at_configured_bps() {
 
     let pre_requests = pre_server.received_requests().await.unwrap();
     let pre_paths = request_paths(&pre_requests);
+    assert_eq!(
+        ptc_duty_request_count(&pre_requests, pre_epoch),
+        0,
+        "pre-Gloas fetch_epoch_duties must not POST /eth/v1/validator/duties/ptc/{pre_epoch}, got {pre_paths:?}"
+    );
     assert!(
-        ptc_duty_request_count(&pre_requests, pre_epoch) >= 1,
-        "ungated fetch_epoch_duties must POST /eth/v1/validator/duties/ptc/{pre_epoch}, got {pre_paths:?}"
+        ptc_duty_request_count(&pre_requests, pre_epoch + 1) >= 1,
+        "boundary prefetch must POST /eth/v1/validator/duties/ptc/{} (first Gloas epoch), got {pre_paths:?}",
+        pre_epoch + 1
     );
     assert!(
         !hit_payload_attestation_data(&pre_requests),

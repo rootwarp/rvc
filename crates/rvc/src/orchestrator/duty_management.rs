@@ -105,8 +105,12 @@ impl DutyManagementService {
             }
         }
 
-        // PTC duties
-        if !self.duty_tracker.is_ptc_epoch_cached(epoch).await {
+        // PTC duties — Gloas+ only. Pre-Gloas BNs reject duties/ptc (often HTTP
+        // 500); skipping avoids retry-exhaustion ERROR spam. The coordinator
+        // already fetches `current_epoch + 1`, so the first Gloas epoch is
+        // prefetched during the last pre-Gloas epoch.
+        let ptc_active = ForkName::from_epoch(epoch, &self.config.fork_schedule) >= ForkName::Gloas;
+        if ptc_active && !self.duty_tracker.is_ptc_epoch_cached(epoch).await {
             debug!(epoch, "Fetching PTC duties for epoch");
             match utils::timed(
                 "ptc_duty_fetch",
@@ -330,38 +334,42 @@ impl DutyManagementService {
                 }
             }
 
-            let ptc_cached = self.duty_tracker.is_ptc_epoch_cached(epoch).await;
-            let old_ptc_root = self.duty_tracker.get_cached_ptc_dependent_root(epoch).await;
-            match utils::timed(
-                "ptc_reorg_check",
-                self.config.timeouts.duty_fetch,
-                self.duty_tracker.check_and_refetch_ptc_if_root_changed(epoch),
-            )
-            .await
-            {
-                TimedOutcome::Ok(true) if ptc_cached => {
-                    let new_root = self.duty_tracker.get_cached_ptc_dependent_root(epoch).await;
-                    warn!(
-                        epoch,
-                        old_head = ?old_ptc_root,
-                        new_head = ?new_root,
-                        "Reorg detected: PTC duties refetched"
-                    );
-                    RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["ptc"]).inc();
-                }
-                TimedOutcome::Ok(true) => {
-                    debug!(epoch, "PTC duties fetched (was uncached)");
-                }
-                TimedOutcome::Ok(false) => {}
-                TimedOutcome::Err(e) => {
-                    warn!(epoch, error = %e, "Failed to check PTC dependent root");
-                }
-                TimedOutcome::Timeout => {
-                    warn!(
-                        epoch,
-                        "PTC reorg check timed out after {}s",
-                        self.config.timeouts.duty_fetch.as_secs()
-                    );
+            // Same Gloas gate as fetch_epoch_duties: uncached pre-Gloas would
+            // otherwise POST duties/ptc and surface BN 500s as ERROR.
+            if ForkName::from_epoch(epoch, &self.config.fork_schedule) >= ForkName::Gloas {
+                let ptc_cached = self.duty_tracker.is_ptc_epoch_cached(epoch).await;
+                let old_ptc_root = self.duty_tracker.get_cached_ptc_dependent_root(epoch).await;
+                match utils::timed(
+                    "ptc_reorg_check",
+                    self.config.timeouts.duty_fetch,
+                    self.duty_tracker.check_and_refetch_ptc_if_root_changed(epoch),
+                )
+                .await
+                {
+                    TimedOutcome::Ok(true) if ptc_cached => {
+                        let new_root = self.duty_tracker.get_cached_ptc_dependent_root(epoch).await;
+                        warn!(
+                            epoch,
+                            old_head = ?old_ptc_root,
+                            new_head = ?new_root,
+                            "Reorg detected: PTC duties refetched"
+                        );
+                        RVC_DUTY_REORG_DETECTED_TOTAL.with_label_values(&["ptc"]).inc();
+                    }
+                    TimedOutcome::Ok(true) => {
+                        debug!(epoch, "PTC duties fetched (was uncached)");
+                    }
+                    TimedOutcome::Ok(false) => {}
+                    TimedOutcome::Err(e) => {
+                        warn!(epoch, error = %e, "Failed to check PTC dependent root");
+                    }
+                    TimedOutcome::Timeout => {
+                        warn!(
+                            epoch,
+                            "PTC reorg check timed out after {}s",
+                            self.config.timeouts.duty_fetch.as_secs()
+                        );
+                    }
                 }
             }
         }
@@ -1034,5 +1042,200 @@ mod tests {
 
         assert_eq!(single_pass, (dual_attester, dual_proposer, dual_sync));
         assert_eq!(single_pass, (3, 2, 1), "known fixture counts");
+    }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // #622: gate PTC duty fetch on Gloas fork epoch
+    // ──────────────────────────────────────────────────────────────────────────
+
+    fn empty_dependent_root_response<T>() -> beacon::DependentRootResponse<Vec<T>> {
+        beacon::DependentRootResponse {
+            dependent_root: "0xdeproot".into(),
+            execution_optimistic: false,
+            data: Vec::new(),
+        }
+    }
+
+    fn gloas_gated_ptc_mock() -> Arc<bn_manager::MockBeaconNodeClient> {
+        Arc::new(
+            bn_manager::MockBeaconNodeClient::new()
+                .with_get_attester_duties(|_e, _i| Ok(empty_dependent_root_response()))
+                .with_get_proposer_duties(|_e| Ok(empty_dependent_root_response()))
+                .with_post_ptc_duties(|_e, _i| Ok(empty_dependent_root_response()))
+                .with_post_sync_committee_duties(|_e, _i| {
+                    Ok(beacon::ExecutionOptimisticResponse {
+                        execution_optimistic: false,
+                        data: Vec::new(),
+                    })
+                }),
+        )
+    }
+
+    fn make_config_with_gloas(gloas_epoch: u64) -> OrchestratorConfig {
+        let mut schedule = (*make_fork_schedule()).clone();
+        schedule.fulu_fork_epoch = 0;
+        schedule.gloas_fork_epoch = gloas_epoch;
+        OrchestratorConfig::new([0xaa; 32], Arc::new(schedule))
+    }
+
+    fn build_service_with_mock(
+        mock: Arc<bn_manager::MockBeaconNodeClient>,
+        config: OrchestratorConfig,
+    ) -> DutyManagementService {
+        let beacon = mock.clone() as Arc<dyn BeaconNodeClient>;
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let signer =
+            Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+        DutyManagementService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            validator_store,
+            pubkey_map,
+            crate::pubkey_index::PubkeyIndexRegistry::shared(),
+            config,
+        )
+    }
+
+    /// Pre-Gloas epochs must not POST duties/ptc (avoids BN 500 → ERROR spam).
+    #[tokio::test]
+    async fn test_fetch_epoch_duties_skips_ptc_before_gloas() {
+        let gloas_epoch = 100u64;
+        let mock = gloas_gated_ptc_mock();
+        let service = build_service_with_mock(mock.clone(), make_config_with_gloas(gloas_epoch));
+
+        for epoch in [gloas_epoch - 3, gloas_epoch - 2, gloas_epoch - 1] {
+            assert!(
+                ForkName::from_epoch(epoch, &service.config.fork_schedule) < ForkName::Gloas,
+                "fixture epoch {epoch} must be pre-Gloas"
+            );
+            service.fetch_epoch_duties(epoch).await;
+        }
+
+        assert!(
+            mock.post_ptc_duties_calls().is_empty(),
+            "pre-Gloas fetch_epoch_duties must issue zero post_ptc_duties calls, got {:?}",
+            mock.post_ptc_duties_calls()
+        );
+        // Attester/proposer/sync still fetched for each pre-Gloas epoch.
+        assert_eq!(mock.get_attester_duties_calls().len(), 3);
+        assert_eq!(mock.get_proposer_duties_calls().len(), 3);
+    }
+
+    /// Once Gloas is active, PTC duties are fetched as before.
+    #[tokio::test]
+    async fn test_fetch_epoch_duties_fetches_ptc_at_and_after_gloas() {
+        let gloas_epoch = 100u64;
+        let mock = gloas_gated_ptc_mock();
+        let service = build_service_with_mock(mock.clone(), make_config_with_gloas(gloas_epoch));
+
+        service.fetch_epoch_duties(gloas_epoch).await;
+        service.fetch_epoch_duties(gloas_epoch + 1).await;
+
+        let ptc_epochs: Vec<u64> =
+            mock.post_ptc_duties_calls().into_iter().map(|(epoch, _)| epoch).collect();
+        assert_eq!(
+            ptc_epochs,
+            vec![gloas_epoch, gloas_epoch + 1],
+            "Gloas+ epochs must POST duties/ptc"
+        );
+    }
+
+    /// Coordinator prefetches `current_epoch + 1`; the first Gloas epoch must
+    /// still be requested during the last pre-Gloas epoch.
+    #[tokio::test]
+    async fn test_fetch_epoch_duties_prefetches_first_gloas_epoch() {
+        let gloas_epoch = 100u64;
+        let mock = gloas_gated_ptc_mock();
+        let service = build_service_with_mock(mock.clone(), make_config_with_gloas(gloas_epoch));
+
+        // Mirror coordinator post-duty: fetch current and next.
+        let current = gloas_epoch - 1;
+        service.fetch_epoch_duties(current).await;
+        service.fetch_epoch_duties(current + 1).await;
+
+        let ptc_epochs: Vec<u64> =
+            mock.post_ptc_duties_calls().into_iter().map(|(epoch, _)| epoch).collect();
+        assert_eq!(
+            ptc_epochs,
+            vec![gloas_epoch],
+            "boundary prefetch must request only the first Gloas epoch, got {ptc_epochs:?}"
+        );
+    }
+
+    /// Reorg checks must not POST duties/ptc for pre-Gloas epochs either.
+    #[tokio::test]
+    async fn test_check_reorg_skips_ptc_before_gloas() {
+        let gloas_epoch = 100u64;
+        let mock = gloas_gated_ptc_mock();
+        let service = build_service_with_mock(mock.clone(), make_config_with_gloas(gloas_epoch));
+
+        // Epoch boundary at gloas-2 checks epochs gloas-2 and gloas-1 (both pre-Gloas).
+        service.check_reorg_at_epoch_boundary(gloas_epoch - 2).await;
+
+        assert!(
+            mock.post_ptc_duties_calls().is_empty(),
+            "pre-Gloas reorg check must issue zero post_ptc_duties calls, got {:?}",
+            mock.post_ptc_duties_calls()
+        );
+
+        // Boundary into Gloas: current pre-Gloas skipped, next (Gloas) fetched.
+        service.check_reorg_at_epoch_boundary(gloas_epoch - 1).await;
+        let ptc_epochs: Vec<u64> =
+            mock.post_ptc_duties_calls().into_iter().map(|(epoch, _)| epoch).collect();
+        assert_eq!(
+            ptc_epochs,
+            vec![gloas_epoch],
+            "reorg boundary must prefetch first Gloas epoch only, got {ptc_epochs:?}"
+        );
+    }
+
+    /// Unscheduled Gloas (`u64::MAX`, `ForkSchedule::unscheduled_gloas` / fork.rs:86)
+    /// must never POST duties/ptc on the fetch path for ordinary epochs.
+    #[tokio::test]
+    async fn test_fetch_epoch_duties_skips_ptc_when_gloas_unscheduled() {
+        let mock = gloas_gated_ptc_mock();
+        let service = build_service_with_mock(mock.clone(), make_config_with_gloas(u64::MAX));
+        assert_eq!(
+            service.config.fork_schedule.gloas_fork_epoch,
+            u64::MAX,
+            "fixture must use the unset/default Gloas sentinel"
+        );
+
+        // Ordinary epochs only: epoch×SLOTS_PER_EPOCH overflows near u64::MAX.
+        for epoch in [0u64, 10, 100, 1_000_000] {
+            assert!(
+                ForkName::from_epoch(epoch, &service.config.fork_schedule) < ForkName::Gloas,
+                "epoch {epoch} must stay pre-Gloas when gloas_fork_epoch is u64::MAX"
+            );
+            service.fetch_epoch_duties(epoch).await;
+        }
+
+        assert!(
+            mock.post_ptc_duties_calls().is_empty(),
+            "unscheduled Gloas must issue zero post_ptc_duties calls, got {:?}",
+            mock.post_ptc_duties_calls()
+        );
+    }
+
+    /// Unscheduled Gloas must also skip PTC on the reorg-check path.
+    #[tokio::test]
+    async fn test_check_reorg_skips_ptc_when_gloas_unscheduled() {
+        let mock = gloas_gated_ptc_mock();
+        let service = build_service_with_mock(mock.clone(), make_config_with_gloas(u64::MAX));
+        assert_eq!(service.config.fork_schedule.gloas_fork_epoch, u64::MAX);
+
+        service.check_reorg_at_epoch_boundary(10).await;
+        service.check_reorg_at_epoch_boundary(1_000_000).await;
+
+        assert!(
+            mock.post_ptc_duties_calls().is_empty(),
+            "unscheduled Gloas reorg check must issue zero post_ptc_duties calls, got {:?}",
+            mock.post_ptc_duties_calls()
+        );
     }
 }

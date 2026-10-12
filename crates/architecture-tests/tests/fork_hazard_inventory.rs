@@ -114,7 +114,7 @@ const fn inv(
 
 /// Exact per-class counts. Update together with [`INVENTORY`] and the audit doc.
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
-    (Class::GeForkName, 24),
+    (Class::GeForkName, 26),
     (Class::IndexZero, 8),
     (Class::MatchForkName, 8),
     (Class::StringDispatch, 9),
@@ -278,6 +278,24 @@ const INVENTORY: &[Inv] = &[
         "4.13",
     ),
     inv(
+        "crates/rvc/src/orchestrator/duty_management.rs",
+        112,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "—",
+    ),
+    inv(
+        "crates/rvc/src/orchestrator/duty_management.rs",
+        339,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "—",
+    ),
+    inv(
         "crates/rvc/src/orchestrator/utils.rs",
         127,
         Class::GeForkName,
@@ -352,7 +370,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        977,
+        988,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -361,7 +379,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1106,
+        1117,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -370,7 +388,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1135,
+        1146,
         Class::IndexZero,
         false,
         ".index = 0",
@@ -379,7 +397,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        1143,
+        1154,
         Class::IndexZero,
         false,
         ".index = \"0\"",
@@ -561,7 +579,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        2420,
+        2431,
         Class::StringDispatch,
         false,
         "match &envelopes[0]",
