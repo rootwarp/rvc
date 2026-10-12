@@ -3,6 +3,16 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Duties: no PTC fetch before Gloas
+
+The orchestrator no longer POSTs `/eth/v1/validator/duties/ptc/{epoch}` for
+epochs before the Gloas fork epoch from the fork schedule. Pre-Gloas beacon
+nodes often answer that endpoint with HTTP 500; each failed poll previously
+exhausted retries and logged ERROR, drowning real faults in a long DevNet
+run. The first Gloas epoch is still prefetched during the last pre-Gloas
+epoch (`current_epoch + 1`). Attester, proposer, and sync duty fetching are
+unchanged. Post-Gloas PTC failures still surface as warnings.
+
 ## Decrypt: scrypt keystores above the new caps are rejected
 
 Decrypt rejects a scrypt keystore before it runs scrypt when any parameter is

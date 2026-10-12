@@ -588,13 +588,94 @@ async fn test_check_reorg_at_epoch_boundary_uncached_fetches() {
     // No caches populated — should fetch and not panic
     orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
 
-    // Caches should now be populated
+    // Attester/proposer caches populated; PTC skipped (epochs 10/11 are pre-Gloas).
     assert!(duty_tracker.is_epoch_cached(10).await);
     assert!(duty_tracker.is_epoch_cached(11).await);
     assert!(duty_tracker.is_proposer_epoch_cached(10).await);
     assert!(duty_tracker.is_proposer_epoch_cached(11).await);
-    assert!(duty_tracker.is_ptc_epoch_cached(10).await);
-    assert!(duty_tracker.is_ptc_epoch_cached(11).await);
+    assert!(!duty_tracker.is_ptc_epoch_cached(10).await);
+    assert!(!duty_tracker.is_ptc_epoch_cached(11).await);
+}
+
+#[tokio::test]
+async fn test_check_reorg_at_epoch_boundary_uncached_fetches_ptc_when_gloas_active() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let attester_response = serde_json::json!({
+        "data": [],
+        "dependent_root": "0xnew_root",
+        "execution_optimistic": false
+    });
+
+    let proposer_response = serde_json::json!({
+        "data": [],
+        "dependent_root": "0xnew_root",
+        "execution_optimistic": false
+    });
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&attester_response))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&proposer_response))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/eth/v1/validator/duties/ptc/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&attester_response))
+        .mount(&mock_server)
+        .await;
+
+    let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
+        .with_timeout(Duration::from_secs(5))
+        .with_max_retries(1);
+    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+    // create_test_config schedules Gloas at epoch 70.
+    let gloas_epoch = 70u64;
+    let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(slot);
+
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let submitter = Arc::new(MockSubmitter::new());
+    let propagator = Arc::new(Propagator::new(submitter));
+    let config = create_test_config();
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker.clone(),
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        config,
+        pubkey_map,
+    ));
+
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(gloas_epoch).await;
+
+    assert!(duty_tracker.is_epoch_cached(gloas_epoch).await);
+    assert!(duty_tracker.is_epoch_cached(gloas_epoch + 1).await);
+    assert!(duty_tracker.is_proposer_epoch_cached(gloas_epoch).await);
+    assert!(duty_tracker.is_proposer_epoch_cached(gloas_epoch + 1).await);
+    assert!(duty_tracker.is_ptc_epoch_cached(gloas_epoch).await);
+    assert!(duty_tracker.is_ptc_epoch_cached(gloas_epoch + 1).await);
 }
 
 #[tokio::test]
@@ -669,14 +750,106 @@ async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon() {
     orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
     let elapsed = start.elapsed();
 
-    // 4 calls each bounded by duty_fetch timeout (200ms).
-    // Without timeout wrapping this would take 4 * 700ms ≈ 2.8s.
-    // With timeouts: 4 * 200ms = 800ms + margin.
+    // Pre-Gloas: 4 calls (attester+proposer × current/next), each bounded by
+    // duty_fetch (200ms). PTC is gated out. Without timeout wrapping this would
+    // take 4 * 700ms ≈ 2.8s. With timeouts: 4 * 200ms = 800ms + margin.
     assert!(
         elapsed < timeouts.duty_fetch * 5,
         "Reorg check took {:?}, expected < {:?} (4 timeouts + margin)",
         elapsed,
         timeouts.duty_fetch * 5
+    );
+}
+
+#[tokio::test]
+async fn test_check_reorg_at_epoch_boundary_timeout_bounds_slow_beacon_when_gloas_active() {
+    use wiremock::matchers::{method, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+
+    let slow_response = serde_json::json!({
+        "data": [],
+        "dependent_root": "0xslow_root",
+        "execution_optimistic": false
+    });
+
+    let timeouts = fast_timeouts();
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&slow_response)
+                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path_regex(r"/eth/v1/validator/duties/proposer/.*"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&slow_response)
+                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/eth/v1/validator/duties/ptc/.*"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&slow_response)
+                .set_delay(timeouts.duty_fetch + Duration::from_millis(500)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri())
+        .with_timeout(Duration::from_secs(30))
+        .with_max_retries(0);
+    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+    let gloas_epoch = 70u64;
+    let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(slot);
+
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let submitter = Arc::new(MockSubmitter::new());
+    let propagator = Arc::new(Propagator::new(submitter));
+    let config = create_test_config().with_timeouts(timeouts.clone());
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        config,
+        pubkey_map,
+    ));
+
+    let start = std::time::Instant::now();
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(gloas_epoch).await;
+    let elapsed = start.elapsed();
+
+    // Gloas+: 6 calls (attester+proposer+ptc × current/next), each bounded by
+    // duty_fetch (200ms). With timeouts: 6 * 200ms = 1.2s + margin.
+    assert!(
+        elapsed < timeouts.duty_fetch * 7,
+        "Gloas reorg check took {:?}, expected < {:?} (6 timeouts + margin)",
+        elapsed,
+        timeouts.duty_fetch * 7
     );
 }
 
@@ -714,8 +887,47 @@ async fn test_check_reorg_at_epoch_boundary_survives_error() {
         pubkey_map,
     ));
 
-    // Should not panic even with broken beacon
+    // Should not panic even with broken beacon (pre-Gloas: PTC path not entered)
     orchestrator.duty_management.check_reorg_at_epoch_boundary(10).await;
+}
+
+#[tokio::test]
+async fn test_check_reorg_at_epoch_boundary_survives_error_when_gloas_active() {
+    // Broken beacon must not panic once the PTC reorg arm is entered at Gloas+.
+    let beacon_config = beacon::BeaconClientConfig::new("http://127.0.0.1:1")
+        .with_timeout(Duration::from_millis(100))
+        .with_max_retries(0);
+    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+    let gloas_epoch = 70u64;
+    let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(slot);
+
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let submitter = Arc::new(MockSubmitter::new());
+    let propagator = Arc::new(Propagator::new(submitter));
+    let config = create_test_config();
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        config,
+        pubkey_map,
+    ));
+
+    orchestrator.duty_management.check_reorg_at_epoch_boundary(gloas_epoch).await;
 }
 
 // --- RF6-31: prepare_proposers complexity (count-based, not wall-clock) ---
