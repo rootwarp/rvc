@@ -189,6 +189,9 @@ pub fn spawn_background_tasks(
 /// the process token onto `start_sse`'s `watch<bool>` and then aborts the
 /// Infra handle so drain does not wait on `sse.rs`'s uninterruptible reconnect
 /// sleep. A panic in that handle is `ShutdownReason::Failure("bn.sse")`.
+/// Framing failures are not panics: a leading BOM, an oversize line or
+/// `data`/`event`/`id` field, or invalid UTF-8 closes the BN connection and
+/// the subscriber reconnects or fails over. Timer-based duties keep running.
 pub fn spawn_sse_subscriber(
     bn_manager: Option<Arc<BnManager>>,
     executor: &TaskExecutor,
@@ -879,6 +882,80 @@ mod tests {
             .expect("channel closed without reason");
         assert_eq!(reason, ShutdownReason::Failure(SSE_TASK_NAME));
         let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    /// A leading BOM used to panic inside `eventsource-stream` (`&str[1..]` on
+    /// U+FEFF). That panic is `ShutdownReason::Failure("bn.sse")` and drains
+    /// the process, which stops timer-driven duties. Framing errors must stay
+    /// inside the subscriber.
+    #[tokio::test]
+    async fn test_malformed_sse_stream_does_not_fail_the_process() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    // U+FEFF (EF BB BF) then invalid UTF-8. The old parser panics
+                    // on the BOM before it can report the bad bytes.
+                    let body = b"\xEF\xBB\xBF\xFF\xFEnot-an-event\n";
+                    let headers = "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/event-stream\r\n\
+                         Transfer-Encoding: chunked\r\n\
+                         \r\n";
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let chunk = format!("{:x}\r\n", body.len());
+                    let _ = stream.write_all(chunk.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.write_all(b"\r\n").await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        let bn = Arc::new(
+            BnManager::new(bn_manager::BnManagerConfig::new(vec![format!(
+                "http://127.0.0.1:{port}"
+            )]))
+            .expect("test BnManager"),
+        );
+        let (executor, mut rx) = TaskExecutor::new(CancellationToken::new());
+        let _gate = spawn_sse_subscriber(Some(bn), &executor);
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_task = Arc::clone(&ticks);
+        executor.spawn("slot.timer", ShutdownTier::Orchestrator, async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
+            loop {
+                interval.tick().await;
+                ticks_task.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let reason = rx.try_recv();
+        assert!(
+            matches!(reason, Err(TryRecvError::Empty)),
+            "malformed SSE must not end in ShutdownReason::Failure(\"bn.sse\"), got {reason:?}"
+        );
+        assert!(
+            ticks.load(Ordering::Relaxed) >= 5,
+            "timer-based duties must keep running while SSE is down, ticks={}",
+            ticks.load(Ordering::Relaxed)
+        );
+
+        let _ = executor.shutdown(TierBudget::default()).await;
+        server.abort();
     }
 
     #[test]
