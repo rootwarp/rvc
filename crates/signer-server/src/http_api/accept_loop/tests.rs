@@ -111,19 +111,28 @@ fn serve_test_router() -> Router {
         .route("/cn", get(cn_handler))
         .route("/ok", get(|| async { "ok" }))
         .route("/panic", get(panic_handler))
+        // Stand-in for Web3Signer `/sign`: keep-alive shutdown must refuse this.
+        .route(
+            "/api/v1/eth2/sign/:identifier",
+            axum::routing::post(|| async { (axum::http::StatusCode::OK, "signed") }),
+        )
 }
 
 /// Spawn `serve_https` on an ephemeral loopback port; return its address.
 async fn start_server(mode: HttpTlsMode, pki: &Pki) -> std::net::SocketAddr {
+    start_server_with_shutdown(mode, pki, CancellationToken::new()).await
+}
+
+/// Like [`start_server`], but returns the shutdown token so tests can cancel it.
+async fn start_server_with_shutdown(
+    mode: HttpTlsMode,
+    pki: &Pki,
+    shutdown: CancellationToken,
+) -> std::net::SocketAddr {
     install_crypto_provider();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve_https(
-        listener,
-        server_cfg(pki, mode),
-        serve_test_router(),
-        CancellationToken::new(),
-    ));
+    tokio::spawn(serve_https(listener, server_cfg(pki, mode), serve_test_router(), shutdown));
     addr
 }
 
@@ -275,6 +284,61 @@ async fn spawn_https_listener_serves_upcheck_over_tls() {
     assert_eq!(body, "OK", "the full 3.1–3.4 path serves /upcheck over TLS");
 }
 
+/// An already-open keep-alive connection must not accept a new `/sign` after
+/// shutdown begins: the connection is closed or the request is refused.
+#[tokio::test]
+async fn keep_alive_sign_after_shutdown_is_refused_or_closed() {
+    install_crypto_provider();
+    let pki = test_pki();
+    let shutdown = CancellationToken::new();
+    let addr = start_server_with_shutdown(HttpTlsMode::ServerTlsOnly, &pki, shutdown.clone()).await;
+
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    let connector = TlsConnector::from(client_cfg(&pki, None));
+    let tls = connector.connect(ServerName::try_from("localhost").unwrap(), tcp).await.unwrap();
+    let (mut sender, conn) =
+        hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.unwrap();
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Establish keep-alive with a successful request on this connection.
+    let warm = Request::builder()
+        .uri("/ok")
+        .header("host", "localhost")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let warm_resp = sender.send_request(warm).await.expect("warm-up request");
+    assert_eq!(warm_resp.status(), axum::http::StatusCode::OK);
+    let _ = axum::body::to_bytes(axum::body::Body::new(warm_resp.into_body()), usize::MAX)
+        .await
+        .expect("warm-up body");
+
+    shutdown.cancel();
+    // Give the accept loop and per-connection graceful_shutdown a moment.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let sign = Request::builder()
+        .method("POST")
+        .uri("/api/v1/eth2/sign/0xabc")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    match sender.send_request(sign).await {
+        Ok(resp) => {
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                "keep-alive /sign after shutdown must be refused with 503"
+            );
+        }
+        Err(_) => {
+            // Connection closed by per-connection graceful_shutdown — also success.
+        }
+    }
+}
+
 #[tokio::test]
 async fn serve_https_exits_promptly_on_shutdown() {
     install_crypto_provider();
@@ -404,7 +468,14 @@ async fn test_handshake_timeout_closes_connection() {
     let router = serve_test_router();
     let server = tokio::spawn(async move {
         let (tcp, _) = listener.accept().await.unwrap();
-        serve_one_with_timeout(acceptor, tcp, router, Duration::from_millis(200)).await;
+        serve_one_with_timeout(
+            acceptor,
+            tcp,
+            router,
+            Duration::from_millis(200),
+            CancellationToken::new(),
+        )
+        .await;
     });
 
     // Open TCP but do not speak TLS.
