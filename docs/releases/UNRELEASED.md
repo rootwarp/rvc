@@ -3,6 +3,30 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Duties: payload attestations sign concurrently
+
+Payload-attestation (PTC) signing now uses the same `[duties]` limits as
+attestation, sync-committee messages, and aggregation
+(`duty_dispatch_concurrency`, default 32; `duty_publish_concurrency`, default
+2). After the single `payload_attestation_data` fetch, signs run together up
+to that concurrency. Duty fetch, payload-data fetch, and the sign/publish
+drain each stop at the earlier of slot end plus 500 ms and
+`attestation_submit` (default 2 s). The phase may therefore overhang into the
+next slot by up to 500 ms; a stalled BN or signer cannot hold the slot loop
+beyond that. `rvc_ptc_duties_total{outcome="scheduled"}` means the duty was
+signed. `outcome="dropped"` is recorded at most once per duty and can follow
+a successful sign when publish fails or is cut off (slot-end / submit
+deadline, payload `data.slot` mismatch, sign failure, or publish failure —
+the PTC dropped alert includes those paths). A cold duty-fetch failure or
+timeout records no per-duty drop — the epoch cache is still empty, so there
+is no duty list to attribute. Duplicate BN rows for the same parsed pubkey
+bytes and slot are deduped before dispatch. Each ready chunk of successful
+signatures is one `pool/payload_attestations` submission, fanned out to the
+configured BNs. A validator whose signer fails is left out of that
+submission; the others are still sent. PTC remains non-slashable: this path
+does not write slashing protection rows. The pre-Gloas skip of `duties/ptc`
+is unchanged.
+
 ## Duties: no PTC fetch before Gloas
 
 The orchestrator no longer POSTs `/eth/v1/validator/duties/ptc/{epoch}` for

@@ -72,8 +72,8 @@ pub struct OrchestratorConfig {
     /// Pre-Gloas and Gloas deadline sets. Selected once per slot via
     /// [`ForkName::from_epoch`]; wait sites consume the resolved [`DeadlineBps`].
     pub deadline_schedule: DeadlineSchedule,
-    /// Sign-request and publish-wave concurrency for attestation, sync messages,
-    /// and aggregates.
+    /// Sign and publish concurrency for attestation, sync messages, aggregates,
+    /// and payload attestations (`[duties]`).
     pub dispatch_limits: DispatchLimits,
 }
 
@@ -142,7 +142,7 @@ impl OrchestratorConfig {
         self
     }
 
-    /// Replace the attestation, sync-message, and aggregate sign/publish concurrency.
+    /// Replace sign/publish concurrency for attestation, sync, aggregate, and PTC.
     ///
     /// Callers pass [`DispatchLimits::validated`]. A zero is rejected there
     /// because `ready_chunks(0)` panics.
@@ -1473,7 +1473,7 @@ where
     }
 
     /// Gloas+ payload-attestation phase. Waits to the 4.19-resolved
-    /// `deadlines.payload_attestation` offset, then signs and submits.
+    /// `deadlines.payload_attestation` offset, then signs until slot end.
     async fn run_payload_attestation_phase(
         &self,
         current_slot: Slot,
@@ -1504,7 +1504,7 @@ where
             Self::record_time_into_slot(&ptc_phase_span, anchor);
             Self::record_phase_offset(slot_phase_offset::PAYLOAD_ATTESTATION, anchor);
             self.payload_attestation_service
-                .maybe_produce_payload_attestations(current_slot, current_epoch)
+                .maybe_produce_payload_attestations(current_slot, current_epoch, anchor.slot_end())
                 .instrument(ptc_phase_span)
                 .await;
         }

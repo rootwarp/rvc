@@ -56,7 +56,7 @@ sample is observed. The per-family notes below say which is which.
 |--------|-------|------|--------|--------------|
 | `rvc_fork_current_id` | 8.1 · `crates/rvc/src/metrics.rs` | gauge | none | `ForkName::id()` (phase0=0 … gloas=7) on every slot after the orchestrator loop starts. `init()` creates the series at `0` before the first slot. |
 | `rvc_fork_next_activation_epoch` | 8.1 · `crates/rvc/src/metrics.rs` | gauge | `fork` (lowercase `ForkName`) | Next non-sentinel activation from `ForkSchedule::next_activation` (`crates/eth-types/src/fork.rs`). **Omitted** when the remainder is the far-future sentinel (`u64::MAX`); the child is removed, never set to `0` or `u64::MAX`. |
-| `rvc_ptc_duties_total` | 7.6 / 8.2 · `crates/rvc/src/metrics.rs` | counter | `outcome` = `scheduled` / `skipped_no_data` / `dropped` | PTC duty path. Children are pre-created at `0` in `init()`. |
+| `rvc_ptc_duties_total` | 7.6 / 8.2 · `crates/rvc/src/metrics.rs` | counter | `outcome` = `scheduled` / `skipped_no_data` / `dropped` | PTC duty path. `scheduled` = signed; `dropped` at most once per duty (can follow a signed duty that fails to publish). Children are pre-created at `0` in `init()`. |
 | `rvc_ptc_attestations_total` | 7.6 / 8.2 · `crates/rvc/src/metrics.rs` | counter | `status` = `success` / `failed` | Pool POST of signed payload attestations. Children pre-created at `0`. A 204 skip never increments this family. |
 | `rvc_bn_capability_state` | 6.7 / 8.3 · `crates/bn-manager/src/metrics.rs` | gauge | `endpoint` (`scheme://host:port`, no userinfo/path), `capability` = `fork_recognised` / `produce_block_v4` | `BnManager::new` (`crates/bn-manager/src/manager.rs`) publishes **1** for both capabilities **before any probe** (optimistic). A later `record_outcomes` probe writes `1` (v4 success) or `0` (incapable). **`1` is not evidence that v4 was probed.** `0` is a real post-probe incapable sample. Configured endpoints are present from `new()`, not omitted. |
 | `rvc_signer_rejections_total` | 8.4 · `crates/signer/src/metrics.rs` (VC) and `crates/signer-server/src/metrics.rs` (`rvc-signer`) | counter | `reason`, `sign_type`, `version` | Fail-closed type/version rejections. Children omitted until the first rejection. `reason` is `unsupported_type` / `unsupported_version`; `version` is a lowercase fork name or `unknown`. |
@@ -163,13 +163,15 @@ sum(increase(rvc_ptc_duties_total{outcome="dropped"}[1h])) > 0
 
 **Fires when:** at least one duty was `scheduled` (signed) in the hour and the
 fraction that then POSTed `success` is below 0.99; or at least one duty was
-`dropped` (fetch/sign failure) before it could be scheduled. The `scheduled > 0`
+`dropped` (fetch / sign / publish / deadline cut-off). The `scheduled > 0`
 guard keeps a pre-Gloas rest-`0` process from looking like a 0 % rate.
 
 `skipped_no_data` (HTTP 204) is never a failure: 7.6b returns `1.0` when
 `scheduled = 0` and skipped > 0. The alert does the same operationally (does
-not fire). Dropped duties never become `scheduled`, so they are invisible to
-the ratio — that is why the companion `dropped` rule exists.
+not fire). `scheduled` means signed; a duty that signs and then fails to
+publish is counted as both `scheduled` and (once) `dropped`. Duties that
+drop before signing never become `scheduled` and are invisible to the ratio —
+that is why the companion `dropped` rule exists.
 
 Do **not** substitute `success / (success + failed)` on
 `rvc_ptc_attestations_total` alone. That denominator is pool POSTs, not 7.6b's
@@ -270,7 +272,7 @@ slash counter is not mistaken for a "healthy zero" of a missing series.
 |-------|-------|----------------|
 | Current fork | `rvc_fork_current_id` | Stat. Map 0–7 → phase0 … gloas. Ignore `0` until a `Fork boundary` log has fired. |
 | Next activation | `rvc_fork_next_activation_epoch` | Stat by `fork`. **No data = unscheduled** (omit-not-zero), never display `0`. |
-| PTC duties | `increase(rvc_ptc_duties_total[1h])` | Stacked time series by `outcome`. `skipped_no_data` is 204; `dropped` is a failed duty. |
+| PTC duties | `increase(rvc_ptc_duties_total[1h])` | Stacked time series by `outcome`. `skipped_no_data` is 204; `scheduled` is signed; `dropped` is at most once per duty (including after a failed/cut-off publish). |
 | PTC submissions | 7.6b `success / scheduled` over 1 h | Gauge, floor 0.99. Empty/NaN when `scheduled` did not move — not a 0 % miss. 204-only windows are 7.6b `1.0`, not a miss. |
 | BN capability | `rvc_bn_capability_state` | Table by `endpoint`, `capability`. `0` = post-probe incapable (page). `1` = boot optimistic **or** a later successful probe — **not** "v4 was probed". Missing row after startup is scrape-down, not "not yet probed". |
 | Signer rejections | `increase(rvc_signer_rejections_total[5m])` | Time series by `reason`, `sign_type`, `version`. No series = no rejection yet. |
@@ -393,8 +395,8 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: PTC duties dropped before pool POST.
-          action: Check signer rejections and BN payload-attestation fetch.
+          summary: PTC duties dropped at most once; may follow a successful sign when publish fails or is cut off.
+          action: Check signer rejections, payload-attestation fetch, and publish failures or cut-offs.
 
       - alert: RvcBnCapabilityIncapable
         expr: rvc_bn_capability_state == 0
