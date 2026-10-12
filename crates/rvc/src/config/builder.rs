@@ -593,16 +593,25 @@ impl ServiceBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::ZeroFeeRecipient`] if the effective default fee
-    /// recipient is the zero address.  Operators must set a non-zero address in
-    /// the validators config file passed via `--validators-config`.
+    /// Returns [`ConfigError::EmptyValidatorsConfig`] when the file exists and
+    /// is empty or whitespace. Returns [`ConfigError::ZeroFeeRecipient`] if the
+    /// effective default fee recipient is the zero address. Operators must set
+    /// a non-zero address in the validators config file passed via
+    /// `--validators-config`.
     pub fn build_validator_store(
         &self,
         validators_config: Option<&std::path::Path>,
     ) -> Result<Arc<ValidatorStore>, ConfigError> {
         let store = match validators_config {
-            Some(path) => ValidatorStore::load_from_config(path)
-                .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?,
+            Some(path) => {
+                let raw = std::fs::read_to_string(path)
+                    .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?;
+                if raw.trim().is_empty() {
+                    return Err(ConfigError::EmptyValidatorsConfig);
+                }
+                ValidatorStore::load_from_config(path)
+                    .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?
+            }
             None => ValidatorStore::new([0u8; 20], 30_000_000),
         };
 
@@ -1586,6 +1595,57 @@ mod tests {
         assert!(
             matches!(result, Err(ConfigError::ZeroFeeRecipient)),
             "expected ZeroFeeRecipient, got: {:?}",
+            result.err()
+        );
+    }
+
+    /// The empty-file error points at the rejected-file recovery steps.
+    #[test]
+    fn test_empty_validators_config_points_at_rejected_recovery() {
+        let msg = ConfigError::EmptyValidatorsConfig.to_string();
+        assert!(
+            !msg.to_ascii_lowercase().contains("fee recipient"),
+            "empty validators config must point at the rejected-file recovery, got {msg}"
+        );
+        assert!(msg.contains("validators.toml.rejected"), "{msg}");
+        assert!(msg.contains("doppelganger_hold_until"), "{msg}");
+    }
+
+    /// Omitting the validators file fails closed with the zero fee recipient.
+    #[test]
+    fn test_docs_say_omitting_validators_config_is_zero_fee_recipient() {
+        let validators = include_str!("../../../../docs/validators-config.md");
+        let notes = include_str!("../../../../docs/releases/UNRELEASED.md");
+        for text in [validators, notes] {
+            assert!(
+                !text.contains("registers every loaded key as enabled"),
+                "dropping --validators-config fails with ZeroFeeRecipient"
+            );
+        }
+    }
+
+    /// An empty validators file is a boot error, distinct from a zero fee recipient.
+    #[test]
+    fn test_empty_validators_config_is_an_explicit_boot_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_validator_store(Some(&config_path));
+        assert!(
+            matches!(result, Err(ConfigError::EmptyValidatorsConfig)),
+            "an empty validators file must be an explicit boot error, got {:?}",
+            result.err()
+        );
+
+        std::fs::write(&config_path, " \n\t").unwrap();
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_validator_store(Some(&config_path));
+        assert!(
+            matches!(result, Err(ConfigError::EmptyValidatorsConfig)),
+            "a whitespace validators file must be an explicit boot error, got {:?}",
             result.err()
         );
     }

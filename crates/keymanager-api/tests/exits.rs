@@ -267,6 +267,29 @@ async fn test_set_gas_limit_non_numeric_400() {
 }
 
 #[tokio::test]
+async fn test_set_gas_limit_above_i64_max_400() {
+    let pk = test_pubkey(1);
+    let mock = MockValidatorConfigManager::with_validator(pk);
+    let router = TestApp::with_config_manager(mock).router();
+    let uri = format!("/eth/v1/validator/0x{}/gas_limit", test_pubkey_hex(1));
+    let above = (i64::MAX as u64).saturating_add(1).to_string();
+    let body = serde_json::json!({"gas_limit": above});
+    let response = router
+        .oneshot(
+            axum::http::Request::builder()
+                .method("POST")
+                .uri(&uri)
+                .header("Authorization", format!("Bearer {}", common::DEFAULT_TEST_TOKEN))
+                .header("Content-Type", "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_delete_gas_limit_204() {
     let pk = test_pubkey(1);
     let mock = MockValidatorConfigManager::with_validator(pk);

@@ -10,6 +10,12 @@ pub struct ValidatorConfig {
     pub builder_boost_factor: Option<u64>,
     pub graffiti: Option<[u8; 32]>,
     pub enabled: bool,
+    /// Unix-second deadline while a doppelganger import holds this key.
+    ///
+    /// `None` means the row is not a doppelganger hold. An operator or
+    /// slashing `enabled = false` leaves this unset, so boot will not
+    /// re-enable it.
+    pub doppelganger_hold_until: Option<u64>,
     pub block_selection_mode: Option<BlockSelectionMode>,
     /// Per-validator builder URLs. `None` falls through to the store global, then `[]`.
     pub builders: Option<Vec<String>>,
@@ -27,6 +33,7 @@ impl ValidatorConfig {
             builder_boost_factor: None,
             graffiti: None,
             enabled: true,
+            doppelganger_hold_until: None,
             block_selection_mode: None,
             builders: None,
             min_bid: None,

@@ -51,7 +51,6 @@ impl ValidatorConfigManager for ValidatorConfigManagerAdapter {
     }
 
     fn set_fee_recipient(&self, pubkey: &Pubkey, address: [u8; 20]) -> Result<(), ApiError> {
-        self.ensure_validator_exists(pubkey)?;
         self.update_and_save(
             pubkey,
             ValidatorConfigUpdate { fee_recipient: Some(Some(address)), ..Default::default() },
@@ -59,7 +58,6 @@ impl ValidatorConfigManager for ValidatorConfigManagerAdapter {
     }
 
     fn delete_fee_recipient(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
-        self.ensure_validator_exists(pubkey)?;
         self.update_and_save(
             pubkey,
             ValidatorConfigUpdate { fee_recipient: Some(None), ..Default::default() },
@@ -72,7 +70,11 @@ impl ValidatorConfigManager for ValidatorConfigManagerAdapter {
     }
 
     fn set_gas_limit(&self, pubkey: &Pubkey, limit: u64) -> Result<(), ApiError> {
-        self.ensure_validator_exists(pubkey)?;
+        if limit > i64::MAX as u64 {
+            return Err(ApiError::BadRequest(
+                "invalid gas_limit: must be <= i64::MAX so the validators file can store it".into(),
+            ));
+        }
         self.update_and_save(
             pubkey,
             ValidatorConfigUpdate { gas_limit: Some(Some(limit)), ..Default::default() },
@@ -80,7 +82,6 @@ impl ValidatorConfigManager for ValidatorConfigManagerAdapter {
     }
 
     fn delete_gas_limit(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
-        self.ensure_validator_exists(pubkey)?;
         self.update_and_save(
             pubkey,
             ValidatorConfigUpdate { gas_limit: Some(None), ..Default::default() },
@@ -100,7 +101,6 @@ impl ValidatorConfigManager for ValidatorConfigManagerAdapter {
     }
 
     fn set_graffiti(&self, pubkey: &Pubkey, graffiti: &str) -> Result<(), ApiError> {
-        self.ensure_validator_exists(pubkey)?;
         let mut bytes = [0u8; 32];
         let src = graffiti.as_bytes();
         let len = src.len().min(32);
@@ -112,7 +112,6 @@ impl ValidatorConfigManager for ValidatorConfigManagerAdapter {
     }
 
     fn delete_graffiti(&self, pubkey: &Pubkey) -> Result<(), ApiError> {
-        self.ensure_validator_exists(pubkey)?;
         self.update_and_save(
             pubkey,
             ValidatorConfigUpdate { graffiti: Some(None), ..Default::default() },

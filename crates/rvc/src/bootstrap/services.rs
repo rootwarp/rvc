@@ -122,6 +122,15 @@ pub async fn build_services(
     // Without this, the common no-validators_config deployment would have every
     // loaded validator silently blocked from signing.
     builder.register_loaded_validators(&validator_store, &keys.pubkey_map);
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Elapsed doppelganger holds are re-enabled here. A still-open hold stays
+    // disabled. When the keymanager is running, the wall-clock enable task is
+    // started again for the time left. A restart does not replay doppelganger
+    // observations.
+    let _open = validator_store.reconcile_doppelganger_holds_at_boot(now_unix);
 
     // Attestation submit path uses the main-pool BnManager (failover-aware).
     // `build_beacon`'s client is still constructed and is not the keymanager

@@ -19,6 +19,7 @@ use doppelganger::{
     ValidatorLivenessData, DEFAULT_MONITORING_EPOCHS,
 };
 use eth_types::{AttestationData, Checkpoint, Root, SLOTS_PER_EPOCH};
+use keymanager_api::lifecycle::{ConfigRemoval, ConfigTouch};
 use keymanager_api::traits::{DoppelgangerMonitor, KeystoreManager, ValidatorManager};
 use keymanager_api::{DoppelgangerLifecycle, ImportKind};
 use rvc::bootstrap::{
@@ -279,7 +280,7 @@ impl Harness {
         .expect("encrypt");
         let json = serde_json::to_string(&keystore).expect("keystore json");
         self.keystores.import_keystore(&json, PASSWORD).await.expect("import keystore");
-        self.lifecycle.on_import(bytes, ImportKind::Local);
+        self.lifecycle.on_import(bytes, ImportKind::Local).expect("import");
         self.bn_state
             .validators
             .lock()
@@ -870,13 +871,17 @@ async fn deleted_key_index_leaves_the_effective_set_via_the_intersection() {
     harness.assert_index_in_next_requests(&key.index).await;
 
     let lifecycle = Arc::clone(&harness.lifecycle);
-    let deleted = lifecycle.on_delete(&key.bytes, ImportKind::Local, || {
+    let (config, deleted) = lifecycle.on_delete(&key.bytes, ImportKind::Local, || {
         match harness.keystores.delete_keystore(&key.bytes) {
-            Ok(removed) => (removed, Ok(removed)),
-            Err(e) => (false, Err(e)),
+            Ok(present) => (ConfigTouch::Apply { keystore_present: present }, Ok(present)),
+            Err(e) => (ConfigTouch::Skip, Err(e)),
         }
     });
     assert!(matches!(deleted, Ok(true)), "keymanager delete must remove the key, got {deleted:?}");
+    assert!(
+        matches!(config, ConfigRemoval::Removed | ConfigRemoval::Absent),
+        "config removal must not fail, got {config:?}"
+    );
 
     assert_eq!(
         harness.registry.read().index_of(&key.bytes),

@@ -219,10 +219,14 @@ pub fn apply_builder_settings(
         .set_global_builders(settings.builders.clone())
         .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?;
     if let Some(min_bid) = settings.min_bid {
-        store.set_global_min_bid(min_bid);
+        store
+            .set_global_min_bid(min_bid)
+            .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?;
     }
     if let Some(factor) = settings.builder_boost_factor {
-        store.set_global_builder_boost_factor(factor);
+        store
+            .set_global_builder_boost_factor(factor)
+            .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?;
     }
     Ok(())
 }

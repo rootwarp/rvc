@@ -1,10 +1,11 @@
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use observability::logging::TruncatedPubkey;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::block_selection::BlockSelectionMode;
 use crate::config::{DefaultUpdate, ValidatorConfig, ValidatorConfigUpdate};
@@ -40,6 +41,9 @@ struct TomlValidator {
     graffiti: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     enabled: Option<bool>,
+    /// Absent on operator and slashing disables. Present only for a doppelganger hold.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doppelganger_hold_until: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     block_selection_mode: Option<BlockSelectionMode>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -65,6 +69,31 @@ const FALLBACK_BUILDER_BOOST_FACTOR: u64 = 100;
 
 /// Built-in `min_bid` when neither per-validator nor global is set.
 const FALLBACK_MIN_BID: u64 = 0;
+
+/// How many times a slashed disable retries the validators-file write.
+const SLASHED_PERSIST_ATTEMPTS: u32 = 3;
+
+/// Repair attempts after a durable update sees `validator_gen` change.
+const IDENTITY_REPAIR_ATTEMPTS: u32 = 8;
+
+/// Reject `value` when TOML cannot serialize it (`u64` above `i64::MAX`).
+///
+/// A value that passes this check can round-trip through `toml::to_string`.
+/// A larger value would make every later save fail.
+pub fn ensure_toml_u64(field: &str, value: u64) -> Result<(), ValidatorStoreError> {
+    if value > i64::MAX as u64 {
+        return Err(ValidatorStoreError::Config(format!(
+            "{field} {value} exceeds i64::MAX; TOML cannot store it"
+        )));
+    }
+    Ok(())
+}
+
+fn missing_validators_config() -> ValidatorStoreError {
+    ValidatorStoreError::Config(
+        "no validators_config path set; the change is not persisted".to_string(),
+    )
+}
 
 /// SSZ `MAX_BUILDER_URL_SIZE`; keep in lock-step with `rvc-config` `[builder]`
 /// and `beacon::v4_wire::MAX_BUILDER_URL_SIZE`.
@@ -119,6 +148,7 @@ fn parse_config(
             fee_recipient = parse_hex_bytes(fr)?;
         }
         if let Some(gl) = defaults.gas_limit {
+            ensure_toml_u64("defaults.gas_limit", gl)?;
             gas_limit = gl;
         }
         if let Some(ref g) = defaults.graffiti {
@@ -186,16 +216,25 @@ pub struct ValidatorStore {
     state: RwLock<StoreState>,
     config_path: Option<PathBuf>,
     // Serializes durable mutation (`update_config_durable`, `save_config`,
-    // `reload_config`). Snapshot → tempfile write → atomic rename, and the
-    // in-memory publish that follows a successful write, run as one critical
-    // section. Without this, a thread holding a stale snapshot can `persist`
-    // AFTER a thread with newer data and silently clobber committed updates.
+    // `reload_config`, import, delete, and signing-safety disables).
+    // Snapshot → tempfile write → atomic rename, and the matching in-memory
+    // publish, run as one critical section. A safer disable publishes before
+    // the write; a less-safe change publishes only after it. Without this, a
+    // thread holding a stale snapshot can `persist` AFTER a thread with newer
+    // data and silently clobber committed updates.
     // Lock order is always `save_lock` then `state`, never the reverse.
-    // Intentionally separate from `state`: `set_enabled`, `add_validator`,
-    // `remove_validator`, and the proposer-URL refresher mutate memory without
-    // taking it, so a durable update re-applies its delta and must not replace
-    // the map.
+    // Intentionally separate from `state`: `set_enabled` and the proposer-URL
+    // refresher mutate memory without taking it, so a durable update re-applies
+    // its delta and must not replace the map. Keymanager import and delete go
+    // through `add_validator_durable` / `remove_validator_durable`, which take
+    // this lock and persist. `add_validator` / `remove_validator` stay
+    // memory-only for startup registration and tests.
     save_lock: Mutex<()>,
+    /// Fired after `save_lock` is dropped when a disable has been published.
+    /// Callers cancel a doppelganger enable task. Must not run while
+    /// `save_lock` is held: the hook takes the lifecycle `state_lock`.
+    #[allow(clippy::type_complexity)]
+    disable_listener: Mutex<Option<Arc<dyn Fn(&[u8; 48]) + Send + Sync>>>,
 }
 
 impl ValidatorStore {
@@ -217,6 +256,22 @@ impl ValidatorStore {
             }),
             config_path: None,
             save_lock: Mutex::new(()),
+            disable_listener: Mutex::new(None),
+        }
+    }
+
+    /// Register the hook invoked after a signing disable is published.
+    ///
+    /// The hook runs only after `save_lock` is released.
+    #[allow(clippy::type_complexity)]
+    pub fn set_disable_listener(&self, listener: Arc<dyn Fn(&[u8; 48]) + Send + Sync>) {
+        *self.disable_listener.lock() = Some(listener);
+    }
+
+    fn notify_signing_disabled(&self, pubkey: &[u8; 48]) {
+        let listener = self.disable_listener.lock().clone();
+        if let Some(listener) = listener {
+            listener(pubkey);
         }
     }
 
@@ -260,6 +315,7 @@ impl ValidatorStore {
             }),
             config_path: Some(path.to_path_buf()),
             save_lock: Mutex::new(()),
+            disable_listener: Mutex::new(None),
         })
     }
 
@@ -368,12 +424,16 @@ impl ValidatorStore {
         Ok(())
     }
 
-    pub fn set_global_min_bid(&self, min_bid: u64) {
+    pub fn set_global_min_bid(&self, min_bid: u64) -> Result<(), ValidatorStoreError> {
+        ensure_toml_u64("min_bid", min_bid)?;
         self.state.write().global_min_bid = Some(min_bid);
+        Ok(())
     }
 
-    pub fn set_global_builder_boost_factor(&self, factor: u64) {
+    pub fn set_global_builder_boost_factor(&self, factor: u64) -> Result<(), ValidatorStoreError> {
+        ensure_toml_u64("builder_boost_factor", factor)?;
         self.state.write().global_builder_boost_factor = Some(factor);
+        Ok(())
     }
 
     /// Write the defaults-tier graffiti. Same field as [`Self::apply_default_update`].
@@ -402,27 +462,367 @@ impl ValidatorStore {
     }
 
     pub fn add_validator(&self, config: ValidatorConfig) -> Result<(), ValidatorStoreError> {
-        if let Some(urls) = config.builders.as_deref() {
-            validate_builder_urls(urls)?;
-        }
+        validate_validator_ingress(&config)?;
         self.state.write().insert_validator(config);
         Ok(())
+    }
+
+    /// Insert `config` under `save_lock` when `config.pubkey` is absent.
+    ///
+    /// Returns `Ok(false)` without writing when the row already exists, so a
+    /// slashed `enabled = false` cannot be replaced. The check and the insert
+    /// share `save_lock`. Import makes signing possible, so a new row is
+    /// published only after the validators file write succeeds. No config path
+    /// inserts in memory only. A failed write leaves memory unchanged. A
+    /// parent-directory `fsync` failure restores the previous file, or moves
+    /// the validators file off the boot path when that restore cannot rename.
+    pub fn add_validator_durable(
+        &self,
+        config: ValidatorConfig,
+    ) -> Result<bool, ValidatorStoreError> {
+        validate_validator_ingress(&config)?;
+        let _save_guard = self.save_lock.lock();
+        // Check and insert share this critical section. An existing row,
+        // including a slashed `enabled = false`, is left unchanged.
+        if self.state.read().validators.contains_key(&config.pubkey) {
+            return Ok(false);
+        }
+        let Some(path) = self.config_path.clone() else {
+            self.state.write().insert_validator(config);
+            return Ok(true);
+        };
+        let live = self.state.read().clone();
+        let previous = snapshot_toml(&live);
+        let mut candidate = live;
+        candidate.insert_validator(config.clone());
+        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        self.state.write().insert_validator(config);
+        Ok(true)
     }
 
     pub fn remove_validator(&self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
         self.state.write().take_validator(pubkey)
     }
 
+    /// Remove `pubkey` under `save_lock`, persisting a candidate before publish.
+    ///
+    /// The live validator stays until the write succeeds, so readers do not act
+    /// on an unpersisted delete. A parent-directory `fsync` failure restores
+    /// the previous file. `Ok(None)` is an unknown pubkey (nothing was written).
+    pub fn remove_validator_durable(
+        &self,
+        pubkey: &[u8; 48],
+    ) -> Result<Option<ValidatorConfig>, ValidatorStoreError> {
+        let _save_guard = self.save_lock.lock();
+        let live = self.state.read().clone();
+        if !live.validators.contains_key(pubkey) {
+            return Ok(None);
+        }
+        let Some(path) = self.config_path.clone() else {
+            return Ok(self.state.write().take_validator(pubkey));
+        };
+        let previous = snapshot_toml(&live);
+        let mut candidate = live;
+        candidate.take_validator(pubkey);
+        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        Ok(self.state.write().take_validator(pubkey))
+    }
+
     pub fn set_enabled(&self, pubkey: &[u8; 48], enabled: bool) {
-        if let Some(config) = self.state.write().validators.get_mut(pubkey) {
-            config.enabled = enabled;
-            let pk_hex = hex::encode(pubkey);
-            if enabled {
-                info!(pubkey = %TruncatedPubkey::new(&pk_hex), "validator enabled");
+        publish_enabled(&mut self.state.write(), pubkey, enabled);
+    }
+
+    /// Flip `enabled` under `save_lock`, following the signing-safety direction.
+    ///
+    /// `enabled = false` is published immediately, then persisted. A failed
+    /// write leaves the validator disabled and returns `Err`. When that row
+    /// had a doppelganger hold, the validators file is moved off the boot path
+    /// so a restart cannot reload the hold and re-enable the key. `enabled = true`
+    /// is persisted first and published only after that write succeeds. An
+    /// unknown pubkey is `Ok(())` and does not create a row. A published disable
+    /// notifies the disable hook only after `save_lock` is dropped.
+    pub fn set_enabled_durable(
+        &self,
+        pubkey: &[u8; 48],
+        enabled: bool,
+    ) -> Result<(), ValidatorStoreError> {
+        if enabled {
+            return self.persist_signing_enable(pubkey);
+        }
+        let (result, fire) = self.persist_signing_disable(pubkey);
+        if fire {
+            self.notify_signing_disabled(pubkey);
+        }
+        result
+    }
+
+    /// Persist `enabled = true` before publishing it. An unknown pubkey is `Ok(())`.
+    fn persist_signing_enable(&self, pubkey: &[u8; 48]) -> Result<(), ValidatorStoreError> {
+        let _save_guard = self.save_lock.lock();
+        if !self.state.read().validators.contains_key(pubkey) {
+            return Ok(());
+        }
+        let Some(path) = self.config_path.clone() else {
+            publish_enabled(&mut self.state.write(), pubkey, true);
+            return Ok(());
+        };
+        let live = self.state.read().clone();
+        let previous = snapshot_toml(&live);
+        let mut candidate = live;
+        if let Some(cfg) = candidate.validators.get_mut(pubkey) {
+            cfg.enabled = true;
+            cfg.doppelganger_hold_until = None;
+        }
+        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        publish_enabled(&mut self.state.write(), pubkey, true);
+        Ok(())
+    }
+
+    /// Persist `enabled = false` and do not run the disable listener.
+    ///
+    /// The bool is whether the listener still has to run. It is false when
+    /// `pubkey` is absent. A caller that holds `tracked_keys` must not call
+    /// [`Self::run_disable_listener`] until that lock is released: the listener
+    /// takes the doppelganger `state_lock`, and DELETE takes `state_lock` before
+    /// `tracked_keys`.
+    pub fn persist_signing_disable(
+        &self,
+        pubkey: &[u8; 48],
+    ) -> (Result<(), ValidatorStoreError>, bool) {
+        let disable_result = {
+            let _save_guard = self.save_lock.lock();
+            if !self.state.read().validators.contains_key(pubkey) {
+                return (Ok(()), false);
+            }
+            let had_hold = self
+                .state
+                .read()
+                .validators
+                .get(pubkey)
+                .and_then(|cfg| cfg.doppelganger_hold_until)
+                .is_some();
+            publish_enabled(&mut self.state.write(), pubkey, false);
+            if self.config_path.is_none() {
+                Ok(())
             } else {
-                warn!(pubkey = %TruncatedPubkey::new(&pk_hex), "validator disabled");
+                match persist_disabled_snapshot(self, pubkey) {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        if had_hold {
+                            quarantine_held_validators_file(self);
+                        }
+                        Err(e)
+                    }
+                }
+            }
+        };
+        (disable_result, true)
+    }
+
+    /// Run the disable listener. Do not call this while holding `tracked_keys`.
+    pub fn run_disable_listener(&self, pubkey: &[u8; 48]) {
+        self.notify_signing_disabled(pubkey);
+    }
+
+    /// Persist a doppelganger hold separately from an operator or slashing disable.
+    ///
+    /// Returns `Ok(false)` when the row is already disabled and is not a hold:
+    /// the deadline is not written and the caller must not arm a timer.
+    /// `Ok(true)` means a hold is in place (already stored, or just written)
+    /// and the timer should run. An existing enabled row is published
+    /// `enabled = false` with the deadline, then written. If that write fails,
+    /// the previous enabled document is moved off the boot path. A new row is
+    /// persisted before it is published. A row that already carries a hold
+    /// keeps the later of the two deadlines.
+    pub fn begin_doppelganger_hold(
+        &self,
+        pubkey: &[u8; 48],
+        until_unix: u64,
+    ) -> Result<bool, ValidatorStoreError> {
+        let _save_guard = self.save_lock.lock();
+        // Drop the read guard before the body takes `state.write()`.
+        let existing = self.state.read().validators.get(pubkey).cloned();
+        if let Some(existing) = existing {
+            if !existing.enabled && existing.doppelganger_hold_until.is_none() {
+                return Ok(false);
+            }
+            if let Some(old) = existing.doppelganger_hold_until.filter(|_| !existing.enabled) {
+                let until = old.max(until_unix);
+                if until == old {
+                    return Ok(true);
+                }
+                publish_doppelganger_hold(&mut self.state.write(), pubkey, until);
+                if self.config_path.is_none() {
+                    return Ok(true);
+                }
+                if let Err(e) = persist_disabled_snapshot(self, pubkey) {
+                    quarantine_held_validators_file(self);
+                    return Err(e);
+                }
+                return Ok(true);
+            }
+            publish_doppelganger_hold(&mut self.state.write(), pubkey, until_unix);
+            if self.config_path.is_none() {
+                return Ok(true);
+            }
+            if let Err(e) = persist_disabled_snapshot(self, pubkey) {
+                quarantine_held_validators_file(self);
+                return Err(e);
+            }
+            return Ok(true);
+        }
+        let mut config = ValidatorConfig::new(*pubkey);
+        config.enabled = false;
+        config.doppelganger_hold_until = Some(until_unix);
+        let Some(path) = self.config_path.clone() else {
+            self.state.write().insert_validator(config);
+            return Ok(true);
+        };
+        let live = self.state.read().clone();
+        let previous = snapshot_toml(&live);
+        let mut candidate = live;
+        candidate.insert_validator(config.clone());
+        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        self.state.write().insert_validator(config);
+        Ok(true)
+    }
+
+    /// Enable `pubkey` only while it still has a doppelganger hold.
+    ///
+    /// The check and the write share `save_lock`, so a disable that already
+    /// cleared the hold is not overwritten with `enabled = true`. `Ok(false)`
+    /// means the row is not a hold, or the deadline has not been reached, and
+    /// the row was left unchanged.
+    pub fn release_doppelganger_hold(
+        &self,
+        pubkey: &[u8; 48],
+    ) -> Result<bool, ValidatorStoreError> {
+        let _save_guard = self.save_lock.lock();
+        let until =
+            self.state.read().validators.get(pubkey).and_then(|cfg| cfg.doppelganger_hold_until);
+        let Some(until) = until else {
+            return Ok(false);
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        if now < until {
+            return Ok(false);
+        }
+        let Some(path) = self.config_path.clone() else {
+            publish_enabled(&mut self.state.write(), pubkey, true);
+            return Ok(true);
+        };
+        let live = self.state.read().clone();
+        let previous = snapshot_toml(&live);
+        let mut candidate = live;
+        if let Some(cfg) = candidate.validators.get_mut(pubkey) {
+            cfg.enabled = true;
+            cfg.doppelganger_hold_until = None;
+        }
+        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        publish_enabled(&mut self.state.write(), pubkey, true);
+        Ok(true)
+    }
+
+    /// Re-enable holds whose deadline has passed. Still-open holds are returned
+    /// as `(pubkey, residual_secs)` so the caller can re-arm the enable task.
+    /// A failed re-enable is retried, then returned with a zero residual.
+    pub fn reconcile_doppelganger_holds_at_boot(&self, now_unix: u64) -> Vec<([u8; 48], u64)> {
+        let holds: Vec<([u8; 48], u64)> = self
+            .state
+            .read()
+            .validators
+            .values()
+            .filter_map(|v| v.doppelganger_hold_until.map(|until| (v.pubkey, until)))
+            .collect();
+        let mut open = Vec::new();
+        for (pk, until) in holds {
+            if now_unix >= until {
+                let mut released = false;
+                for _ in 0..3 {
+                    if self.set_enabled_durable(&pk, true).is_ok() {
+                        released = true;
+                        break;
+                    }
+                }
+                if !released {
+                    warn!(
+                        pubkey = %TruncatedPubkey::new(&hex::encode(pk)),
+                        "elapsed doppelganger hold could not be re-enabled; it will be retried"
+                    );
+                    open.push((pk, 0));
+                }
+            } else {
+                open.push((pk, until - now_unix));
             }
         }
+        open
+    }
+
+    /// Publish `enabled = false` for a slashed validator, then persist it.
+    ///
+    /// Holds `save_lock` across the publish and the write. The write hook
+    /// (tests) runs while the live flag is already `false`. If every persist
+    /// attempt fails, the validator stays disabled in memory and this returns
+    /// `Err`. The previous file is not restored: a post-rename failure already
+    /// has the safer bytes on disk. When the row had a doppelganger hold, that
+    /// failure also moves the validators file off the boot path. An unknown
+    /// pubkey is `Ok(())`.
+    #[tracing::instrument(name = "validator_store.disable_slashed", skip_all)]
+    pub fn disable_slashed(&self, pubkey: &[u8; 48]) -> Result<(), ValidatorStoreError> {
+        let result = {
+            let _save_guard = self.save_lock.lock();
+            if !self.state.read().validators.contains_key(pubkey) {
+                return Ok(());
+            }
+            let had_hold = self
+                .state
+                .read()
+                .validators
+                .get(pubkey)
+                .and_then(|cfg| cfg.doppelganger_hold_until)
+                .is_some();
+            publish_enabled(&mut self.state.write(), pubkey, false);
+            if self.config_path.is_none() {
+                persist_disabled_snapshot(self, pubkey)
+            } else {
+                let mut last_err = None;
+                let mut persisted = false;
+                for attempt in 1..=SLASHED_PERSIST_ATTEMPTS {
+                    match persist_disabled_snapshot(self, pubkey) {
+                        Ok(()) => {
+                            persisted = true;
+                            break;
+                        }
+                        Err(e) => {
+                            error!(
+                                attempt,
+                                error = %e,
+                                pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                                "failed to persist slashed validator disable; retrying"
+                            );
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                if persisted {
+                    Ok(())
+                } else {
+                    if had_hold {
+                        quarantine_held_validators_file(self);
+                    }
+                    error!(
+                        pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                        "slashed validator stays disabled in memory after persist retries failed"
+                    );
+                    Err(last_err.unwrap_or_else(missing_validators_config))
+                }
+            }
+        };
+        self.notify_signing_disabled(pubkey);
+        result
     }
 
     pub fn update_config(
@@ -430,9 +830,7 @@ impl ValidatorStore {
         pubkey: &[u8; 48],
         update: ValidatorConfigUpdate,
     ) -> Result<(), ValidatorStoreError> {
-        if let Some(ref builders) = update.builders {
-            validate_builder_urls(builders)?;
-        }
+        validate_update_ingress(&update)?;
         let changed_fields = apply_update_locked(&mut self.state.write(), pubkey, &update);
         log_validator_config_updated(pubkey, &changed_fields);
         Ok(())
@@ -440,28 +838,29 @@ impl ValidatorStore {
 
     /// Persist `update` for `pubkey`, then publish it to the live store.
     ///
-    /// Builder URLs are validated before `save_lock` is taken. If `pubkey` is
-    /// absent from the cloned state this returns [`ValidatorStoreError::NotFound`]
-    /// and does not write or publish. A write error also publishes nothing.
-    /// On success the same delta is applied to the live map — the map is not
-    /// replaced — so `set_enabled` and the proposer-URL refresher survive.
-    /// `add_validator` and `remove_validator` do not take `save_lock` (keymanager
-    /// delete and `KeyAdmission::admit`). If that pubkey's identity changes
-    /// during the write, the stale delta is not published and the file is
-    /// rewritten so the key matches the live store.
+    /// Builder URLs and TOML integer bounds are validated before `save_lock`
+    /// is taken. If `pubkey` is absent from the cloned state this returns
+    /// [`ValidatorStoreError::NotFound`] and does not write or publish. A write
+    /// error also publishes nothing. On success the same delta is applied to
+    /// the live map — the map is not replaced — so `set_enabled` and the
+    /// proposer-URL refresher survive.
+    ///
+    /// Keymanager import and delete take `save_lock` and persist, so they
+    /// cannot land between this snapshot and its publish. If that pubkey's
+    /// identity still changes during the write, the stale delta is not
+    /// published. The repair re-snapshots the whole live store and retries
+    /// until `validator_gen` is stable, logging each attempt at `warn` with a
+    /// truncated pubkey. [`ValidatorStoreError::NotFound`] covers both the
+    /// missing-at-clone case and a replaced identity.
     #[tracing::instrument(name = "validator_store.update_config_durable", skip_all)]
     pub fn update_config_durable(
         &self,
         pubkey: &[u8; 48],
         update: ValidatorConfigUpdate,
     ) -> Result<(), ValidatorStoreError> {
-        if let Some(ref builders) = update.builders {
-            validate_builder_urls(builders)?;
-        }
+        validate_update_ingress(&update)?;
 
-        let config_path = self.config_path.as_ref().ok_or_else(|| {
-            ValidatorStoreError::Config("no config path set for save".to_string())
-        })?;
+        let config_path = self.config_path.as_ref().ok_or_else(missing_validators_config)?;
 
         // Lock order: `save_lock` then `state`. The state guard is dropped
         // before I/O.
@@ -474,40 +873,46 @@ impl ValidatorStore {
             return Err(ValidatorStoreError::NotFound);
         }
         let identity = candidate.validator_gen.get(pubkey).copied();
+        let previous = snapshot_toml(&candidate);
         apply_update_locked(&mut candidate, pubkey, &update);
 
-        write_toml_atomic(config_path, &snapshot_toml(&candidate))?;
+        commit_less_safe(config_path, &snapshot_toml(&candidate), &previous)?;
 
-        // `save_lock` does not cover `add_validator` / `remove_validator`
-        // (`ValidatorManagerAdapter::remove_validator`, `KeyAdmission::admit`).
-        // Those bump `validator_gen`. `set_enabled` and the proposer-URL
-        // refresher do not, so the same identity still takes the delta.
-        // A changed identity means the file currently describes a validator
-        // that is gone or was replaced. Copy the live entry (or drop the key)
-        // back over the snapshot and do not publish the stale delta.
-        let live_cfg = {
-            let mut state = self.state.write();
-            let same = state.validators.contains_key(pubkey)
-                && state.validator_gen.get(pubkey).copied() == identity;
-            if same {
-                let changed_fields = apply_update_locked(&mut state, pubkey, &update);
-                drop(state);
-                log_validator_config_updated(pubkey, &changed_fields);
-                return Ok(());
-            }
-            state.validators.get(pubkey).cloned()
-        };
-
-        let mut repaired = candidate;
-        match live_cfg {
-            Some(cfg) => {
-                repaired.validators.insert(*pubkey, cfg);
-            }
-            None => {
-                repaired.validators.remove(pubkey);
+        // `set_enabled` and the proposer-URL refresher do not bump
+        // `validator_gen`, so the same identity still takes the delta.
+        // Import and delete take `save_lock` and cannot run here. A caller
+        // that still mutates identity without the lock leaves a file that
+        // describes a validator that is gone or was replaced. Re-snapshot the
+        // whole live store and retry until `validator_gen` is stable. Do not
+        // publish the stale delta.
+        for attempt in 1..=IDENTITY_REPAIR_ATTEMPTS {
+            let live = {
+                let mut state = self.state.write();
+                let same = state.validators.contains_key(pubkey)
+                    && state.validator_gen.get(pubkey).copied() == identity;
+                if same {
+                    let changed_fields = apply_update_locked(&mut state, pubkey, &update);
+                    drop(state);
+                    log_validator_config_updated(pubkey, &changed_fields);
+                    return Ok(());
+                }
+                state.clone()
+            };
+            warn!(
+                attempt,
+                pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+                "validator identity changed during durable update; rewriting the file from the live store"
+            );
+            let gen = live.validator_gen.clone();
+            commit_snapshot(config_path, &snapshot_toml(&live))?;
+            if self.state.read().validator_gen == gen {
+                return Err(ValidatorStoreError::NotFound);
             }
         }
-        write_toml_atomic(config_path, &snapshot_toml(&repaired))?;
+        error!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            "validator identity kept changing during durable update; in-flight delta was not published"
+        );
         Err(ValidatorStoreError::NotFound)
     }
 
@@ -516,7 +921,11 @@ impl ValidatorStore {
     /// Only fields set to `Some(...)` change; `None` leaves the current value.
     /// Concurrent readers observe either the pre-update or post-update defaults
     /// as a unit (never a mix of new fee recipient with old gas limit).
-    pub fn apply_default_update(&self, update: DefaultUpdate) {
+    /// `gas_limit` above `i64::MAX` is rejected and nothing is published.
+    pub fn apply_default_update(&self, update: DefaultUpdate) -> Result<(), ValidatorStoreError> {
+        if let Some(gl) = update.gas_limit {
+            ensure_toml_u64("gas_limit", gl)?;
+        }
         let mut changed_fields = Vec::new();
         if update.fee_recipient.is_some() {
             changed_fields.push("fee_recipient");
@@ -542,6 +951,7 @@ impl ValidatorStore {
         if !changed_fields.is_empty() {
             info!(changed_fields = changed_fields.join(","), "validator defaults updated");
         }
+        Ok(())
     }
 
     pub fn has_validator(&self, pubkey: &[u8; 48]) -> bool {
@@ -550,9 +960,7 @@ impl ValidatorStore {
 
     #[tracing::instrument(name = "validator_store.save_config", skip_all)]
     pub fn save_config(&self) -> Result<(), ValidatorStoreError> {
-        let config_path = self.config_path.as_ref().ok_or_else(|| {
-            ValidatorStoreError::Config("no config path set for save".to_string())
-        })?;
+        let config_path = self.config_path.as_ref().ok_or_else(missing_validators_config)?;
 
         // Serialize the entire snapshot → write → rename sequence so a
         // concurrent saver with a stale snapshot cannot persist after a
@@ -565,7 +973,7 @@ impl ValidatorStore {
         // before I/O.
         let toml_config = snapshot_toml(&self.state.read());
 
-        write_toml_atomic(config_path, &toml_config)
+        commit_snapshot(config_path, &toml_config)
     }
 
     #[tracing::instrument(name = "validator_store.reload_config", skip_all)]
@@ -588,6 +996,11 @@ impl ValidatorStore {
             warn!(path = %path.display(), error = %e, "config parse error");
             e
         })?;
+
+        // Still holding `save_lock`. A test asserts `try_lock` fails here so
+        // removing the guard makes that test fail.
+        #[cfg(test)]
+        invoke_reload_after_parse_hook();
 
         // Apply-second under one write guard: defaults + validator merges are
         // visible to concurrent readers as a single atomic transition. Merge
@@ -626,6 +1039,7 @@ fn parse_validator(v: &TomlValidator) -> Result<ValidatorConfig, ValidatorStoreE
         builder_boost_factor: v.builder_boost_factor,
         graffiti,
         enabled: v.enabled.unwrap_or(true),
+        doppelganger_hold_until: v.doppelganger_hold_until,
         block_selection_mode: v.block_selection_mode,
         builders: v.builders.clone(),
         min_bid: v.min_bid,
@@ -633,6 +1047,7 @@ fn parse_validator(v: &TomlValidator) -> Result<ValidatorConfig, ValidatorStoreE
     if let Some(urls) = config.builders.as_deref() {
         validate_builder_urls(urls)?;
     }
+    ensure_config_toml_bounds(&config)?;
     Ok(config)
 }
 
@@ -669,6 +1084,7 @@ fn snapshot_toml(state: &StoreState) -> TomlConfig {
             builder_boost_factor: v.builder_boost_factor,
             graffiti: v.graffiti.map(|g| graffiti_to_string(&g)),
             enabled: Some(v.enabled),
+            doppelganger_hold_until: v.doppelganger_hold_until,
             block_selection_mode: v.block_selection_mode,
             builders: v.builders.clone(),
             min_bid: v.min_bid,
@@ -677,28 +1093,138 @@ fn snapshot_toml(state: &StoreState) -> TomlConfig {
     TomlConfig { defaults: Some(toml_defaults), validators: toml_validators }
 }
 
-/// Write `toml_config` to `config_path` via tempfile + `sync_all` + rename.
-fn write_toml_atomic(
+/// A validators-file write failed before or after the rename.
+enum AtomicWriteError {
+    /// Temp file, `fsync`, or rename failed. The previous file is intact.
+    PreCommit(ValidatorStoreError),
+    /// Rename succeeded and the parent-directory `fsync` failed.
+    PostRename(ValidatorStoreError),
+}
+
+impl AtomicWriteError {
+    fn into_store(self) -> ValidatorStoreError {
+        match self {
+            Self::PreCommit(e) | Self::PostRename(e) => e,
+        }
+    }
+}
+
+/// Write `toml_config` without restoring a previous document.
+fn commit_snapshot(
     config_path: &Path,
     toml_config: &TomlConfig,
 ) -> Result<(), ValidatorStoreError> {
-    let toml_string =
-        toml::to_string(toml_config).map_err(|e| ValidatorStoreError::Config(e.to_string()))?;
+    write_toml_atomic(config_path, toml_config).map_err(AtomicWriteError::into_store)
+}
+
+/// Write `new_doc`, and put `previous` back if the failure is after rename.
+///
+/// Used when publishing would make signing less safe. A directory `fsync`
+/// failure must not leave the new document on disk while memory stays old.
+fn commit_less_safe(
+    config_path: &Path,
+    new_doc: &TomlConfig,
+    previous: &TomlConfig,
+) -> Result<(), ValidatorStoreError> {
+    match write_toml_atomic(config_path, new_doc) {
+        Ok(()) => Ok(()),
+        Err(AtomicWriteError::PreCommit(e)) => Err(e),
+        Err(AtomicWriteError::PostRename(e)) => match write_toml_atomic(config_path, previous) {
+            Ok(()) => Err(e),
+            Err(AtomicWriteError::PostRename(restore)) => {
+                warn!(
+                    error = %restore,
+                    "directory sync failed while restoring the validators file; the previous document is in place"
+                );
+                Err(e)
+            }
+            Err(AtomicWriteError::PreCommit(restore)) => {
+                warn!(
+                    error = %restore,
+                    "failed to restore the validators file before rename; removing it from the boot path"
+                );
+                if let Err(quarantine_err) = quarantine_validators_file(config_path) {
+                    error!(
+                        error = %quarantine_err,
+                        "failed to move the unrestorable validators file off the boot path"
+                    );
+                }
+                Err(e)
+            }
+        },
+    }
+}
+
+/// Persist the live snapshot. The caller has already published `enabled = false`.
+///
+/// A post-rename failure is not restored: the file already holds the safer
+/// bytes, and putting the previous document back would re-enable the key.
+fn persist_disabled_snapshot(
+    store: &ValidatorStore,
+    pubkey: &[u8; 48],
+) -> Result<(), ValidatorStoreError> {
+    let Some(path) = store.config_path.clone() else {
+        let err = missing_validators_config();
+        error!(
+            error = %err,
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            "validator disabled in memory; validators_config path is unset"
+        );
+        return Err(err);
+    };
+    let snapshot = snapshot_toml(&store.state.read());
+    commit_snapshot(&path, &snapshot)
+}
+
+/// Write `toml_config` to `config_path` via tempfile + `sync_all` + rename + dir fsync.
+fn write_toml_atomic(config_path: &Path, toml_config: &TomlConfig) -> Result<(), AtomicWriteError> {
+    #[cfg(test)]
+    take_write_fault(TomlWriteFault::Serialize).map_err(AtomicWriteError::PreCommit)?;
+    let toml_string = toml::to_string(toml_config)
+        .map_err(|e| AtomicWriteError::PreCommit(ValidatorStoreError::Config(e.to_string())))?;
 
     let parent = config_path.parent().ok_or_else(|| {
-        ValidatorStoreError::Config("config path has no parent directory".to_string())
+        AtomicWriteError::PreCommit(ValidatorStoreError::Config(
+            "config path has no parent directory".to_string(),
+        ))
     })?;
 
-    let tmp = tempfile::NamedTempFile::new_in(parent)?;
-    std::io::Write::write_all(&mut &tmp, toml_string.as_bytes())?;
-    tmp.as_file().sync_all()?;
-    tmp.persist(config_path).map_err(|e| ValidatorStoreError::Io(e.error))?;
+    #[cfg(test)]
+    take_write_fault(TomlWriteFault::CreateTemp).map_err(AtomicWriteError::PreCommit)?;
+    let tmp = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|e| AtomicWriteError::PreCommit(ValidatorStoreError::Io(e)))?;
+    #[cfg(test)]
+    take_write_fault(TomlWriteFault::Write).map_err(AtomicWriteError::PreCommit)?;
+    std::io::Write::write_all(&mut &tmp, toml_string.as_bytes())
+        .map_err(|e| AtomicWriteError::PreCommit(ValidatorStoreError::Io(e)))?;
+    #[cfg(test)]
+    take_write_fault(TomlWriteFault::SyncFile).map_err(AtomicWriteError::PreCommit)?;
+    tmp.as_file()
+        .sync_all()
+        .map_err(|e| AtomicWriteError::PreCommit(ValidatorStoreError::Io(e)))?;
+    #[cfg(test)]
+    take_write_fault(TomlWriteFault::Rename).map_err(AtomicWriteError::PreCommit)?;
+    tmp.persist(config_path)
+        .map_err(|e| AtomicWriteError::PreCommit(ValidatorStoreError::Io(e.error)))?;
+    #[cfg(test)]
+    take_write_fault(TomlWriteFault::SyncDir).map_err(AtomicWriteError::PostRename)?;
+    sync_parent_dir(parent).map_err(AtomicWriteError::PostRename)?;
 
     info!(path = %config_path.display(), "config saved");
-    // After the snapshot is durable and before the caller publishes. A test
-    // installs this so `set_enabled` can land in the window a map replacement
-    // would clobber. Production builds have an empty hook.
+    // After the snapshot is durable (file and parent directory) and before the
+    // caller publishes. Test-only: production builds do not call a hook.
+    #[cfg(test)]
     invoke_durable_write_hook();
+    Ok(())
+}
+
+/// `fsync` the directory that holds `config_path` so the rename survives power loss.
+fn sync_parent_dir(parent: &Path) -> Result<(), ValidatorStoreError> {
+    #[cfg(test)]
+    PARENT_DIR_SYNCS.with(|cell| cell.set(cell.get().saturating_add(1)));
+    let dir_path: &Path = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+    let dir = std::fs::File::open(dir_path)?;
+    dir.sync_all()?;
     Ok(())
 }
 
@@ -751,6 +1277,124 @@ fn apply_update_locked(
     changed_fields
 }
 
+fn quarantine_held_validators_file(store: &ValidatorStore) {
+    let Some(path) = store.config_path.clone() else {
+        return;
+    };
+    if let Err(err) = quarantine_validators_file(&path) {
+        error!(
+            error = %err,
+            "failed to move the validators file off the boot path after a failed hold write"
+        );
+    }
+}
+
+fn publish_doppelganger_hold(state: &mut StoreState, pubkey: &[u8; 48], until_unix: u64) {
+    if let Some(config) = state.validators.get_mut(pubkey) {
+        config.enabled = false;
+        config.doppelganger_hold_until = Some(until_unix);
+        warn!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            until_unix,
+            "validator held for doppelganger"
+        );
+    }
+}
+
+/// Move `config_path` off the boot path. If the rename fails, truncate the
+/// file so the next boot cannot parse the rejected document.
+fn quarantine_validators_file(config_path: &Path) -> Result<(), ValidatorStoreError> {
+    let name = config_path.file_name().and_then(|n| n.to_str()).unwrap_or("validators.toml");
+    let rejected = config_path.with_file_name(format!("{name}.rejected"));
+    if let Err(err) = std::fs::rename(config_path, &rejected) {
+        let file = std::fs::OpenOptions::new().write(true).truncate(true).open(config_path)?;
+        file.sync_all()?;
+        if let Some(parent) = config_path.parent() {
+            let _ = sync_parent_dir(parent);
+        }
+        return Err(ValidatorStoreError::Io(err));
+    }
+    log_moved_validators_file(&rejected);
+    if let Some(parent) = config_path.parent() {
+        sync_parent_dir(parent)?;
+    }
+    Ok(())
+}
+
+/// The moved document is off the boot path. Name every pubkey in full.
+fn log_moved_validators_file(rejected: &Path) {
+    let pubkeys = std::fs::read_to_string(rejected).ok().and_then(|text| {
+        toml::from_str::<TomlConfig>(&text).ok().map(|doc| {
+            doc.validators.into_iter().map(|validator| validator.pubkey).collect::<Vec<_>>()
+        })
+    });
+    match pubkeys {
+        Some(keys) if !keys.is_empty() => {
+            for pubkey in keys {
+                warn!(
+                    pubkey = %pubkey,
+                    rejected = %rejected.display(),
+                    "moved validators file off the boot path"
+                );
+            }
+        }
+        _ => {
+            warn!(rejected = %rejected.display(), "moved validators file off the boot path");
+        }
+    }
+}
+
+fn publish_enabled(state: &mut StoreState, pubkey: &[u8; 48], enabled: bool) {
+    if let Some(config) = state.validators.get_mut(pubkey) {
+        config.enabled = enabled;
+        // An operator, slashing, or delete disable is not a doppelganger hold.
+        // Enabling clears the hold as well.
+        config.doppelganger_hold_until = None;
+        let pk_hex = hex::encode(pubkey);
+        if enabled {
+            info!(pubkey = %TruncatedPubkey::new(&pk_hex), "validator enabled");
+        } else {
+            warn!(pubkey = %TruncatedPubkey::new(&pk_hex), "validator disabled");
+        }
+    }
+}
+
+fn validate_validator_ingress(config: &ValidatorConfig) -> Result<(), ValidatorStoreError> {
+    if let Some(urls) = config.builders.as_deref() {
+        validate_builder_urls(urls)?;
+    }
+    ensure_config_toml_bounds(config)
+}
+
+fn validate_update_ingress(update: &ValidatorConfigUpdate) -> Result<(), ValidatorStoreError> {
+    if let Some(ref builders) = update.builders {
+        validate_builder_urls(builders)?;
+    }
+    if let Some(Some(gl)) = update.gas_limit {
+        ensure_toml_u64("gas_limit", gl)?;
+    }
+    if let Some(factor) = update.builder_boost_factor {
+        ensure_toml_u64("builder_boost_factor", factor)?;
+    }
+    if let Some(min_bid) = update.min_bid {
+        ensure_toml_u64("min_bid", min_bid)?;
+    }
+    Ok(())
+}
+
+fn ensure_config_toml_bounds(config: &ValidatorConfig) -> Result<(), ValidatorStoreError> {
+    if let Some(gl) = config.gas_limit {
+        ensure_toml_u64("gas_limit", gl)?;
+    }
+    if let Some(factor) = config.builder_boost_factor {
+        ensure_toml_u64("builder_boost_factor", factor)?;
+    }
+    if let Some(min_bid) = config.min_bid {
+        ensure_toml_u64("min_bid", min_bid)?;
+    }
+    Ok(())
+}
+
 fn log_validator_config_updated(pubkey: &[u8; 48], changed_fields: &[&str]) {
     if changed_fields.is_empty() {
         return;
@@ -778,8 +1422,69 @@ fn invoke_durable_write_hook() {
     });
 }
 
-#[cfg(not(test))]
-fn invoke_durable_write_hook() {}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TomlWriteFault {
+    Serialize,
+    CreateTemp,
+    Write,
+    SyncFile,
+    Rename,
+    SyncDir,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+struct FaultPlan {
+    skip: u32,
+    step: TomlWriteFault,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOML_WRITE_FAULT: std::cell::Cell<Option<FaultPlan>> = const { std::cell::Cell::new(None) };
+    /// Installed when the current fault fires, so a restore write can fail too.
+    static NEXT_TOML_WRITE_FAULT: std::cell::Cell<Option<FaultPlan>> = const { std::cell::Cell::new(None) };
+    /// Re-arm the same plan after it fires when no follow-up plan is installed.
+    static KEEP_TOML_WRITE_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PARENT_DIR_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_write_fault(step: TomlWriteFault) -> Result<(), ValidatorStoreError> {
+    TOML_WRITE_FAULT.with(|cell| {
+        let Some(mut plan) = cell.get() else {
+            return Ok(());
+        };
+        if plan.step != step {
+            return Ok(());
+        }
+        if plan.skip > 0 {
+            plan.skip -= 1;
+            cell.set(Some(plan));
+            return Ok(());
+        }
+        let follow = NEXT_TOML_WRITE_FAULT.with(|next| next.replace(None));
+        let sticky = follow.is_none() && KEEP_TOML_WRITE_FAULT.with(|keep| keep.get());
+        cell.set(if sticky { Some(plan) } else { follow });
+        Err(ValidatorStoreError::Config(format!("injected write fault at {step:?}")))
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static RELOAD_AFTER_PARSE_HOOK: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn invoke_reload_after_parse_hook() {
+    RELOAD_AFTER_PARSE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook();
+        }
+    });
+}
 
 #[cfg(test)]
 mod tests {
@@ -1168,7 +1873,7 @@ builders = ["file:///tmp/builder"]
     #[test]
     fn test_min_bid_global_default() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        store.set_global_min_bid(10_000_000);
+        store.set_global_min_bid(10_000_000).unwrap();
         let pk = test_pubkey(1);
         store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
@@ -1179,7 +1884,7 @@ builders = ["file:///tmp/builder"]
     #[test]
     fn test_min_bid_per_validator_override() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        store.set_global_min_bid(10_000_000);
+        store.set_global_min_bid(10_000_000).unwrap();
         let pk = test_pubkey(1);
         let mut config = ValidatorConfig::new(pk);
         config.min_bid = Some(1);
@@ -1192,7 +1897,7 @@ builders = ["file:///tmp/builder"]
     #[test]
     fn test_builder_boost_factor_global_default() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        store.set_global_builder_boost_factor(50);
+        store.set_global_builder_boost_factor(50).unwrap();
         let pk = test_pubkey(1);
         store.add_validator(ValidatorConfig::new(pk)).unwrap();
 
@@ -1203,7 +1908,7 @@ builders = ["file:///tmp/builder"]
     #[test]
     fn test_builder_boost_factor_override_beats_global() {
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
-        store.set_global_builder_boost_factor(50);
+        store.set_global_builder_boost_factor(50).unwrap();
         let pk = test_pubkey(1);
         let mut config = ValidatorConfig::new(pk);
         config.builder_boost_factor = Some(200);
@@ -1320,11 +2025,13 @@ builders = ["file:///tmp/builder"]
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let new_fr = test_fee_recipient(9);
 
-        store.apply_default_update(DefaultUpdate {
-            fee_recipient: Some(new_fr),
-            gas_limit: Some(40_000_000),
-            graffiti: Some(Some([0xab; 32])),
-        });
+        store
+            .apply_default_update(DefaultUpdate {
+                fee_recipient: Some(new_fr),
+                gas_limit: Some(40_000_000),
+                graffiti: Some(Some([0xab; 32])),
+            })
+            .unwrap();
 
         assert_eq!(store.default_fee_recipient(), new_fr);
         assert_eq!(store.default_gas_limit(), 40_000_000);
@@ -1336,11 +2043,13 @@ builders = ["file:///tmp/builder"]
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         store.state.write().defaults.graffiti = Some([0x11; 32]);
 
-        store.apply_default_update(DefaultUpdate {
-            fee_recipient: Some(test_fee_recipient(2)),
-            gas_limit: None,
-            graffiti: None,
-        });
+        store
+            .apply_default_update(DefaultUpdate {
+                fee_recipient: Some(test_fee_recipient(2)),
+                gas_limit: None,
+                graffiti: None,
+            })
+            .unwrap();
 
         assert_eq!(store.default_fee_recipient(), test_fee_recipient(2));
         assert_eq!(store.default_gas_limit(), 30_000_000);
@@ -1352,11 +2061,13 @@ builders = ["file:///tmp/builder"]
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         store.state.write().defaults.graffiti = Some([0x11; 32]);
 
-        store.apply_default_update(DefaultUpdate {
-            fee_recipient: None,
-            gas_limit: None,
-            graffiti: Some(None),
-        });
+        store
+            .apply_default_update(DefaultUpdate {
+                fee_recipient: None,
+                gas_limit: None,
+                graffiti: Some(None),
+            })
+            .unwrap();
 
         assert!(store.state.read().defaults.graffiti.is_none());
         assert_eq!(store.default_fee_recipient(), test_fee_recipient(1));
@@ -1399,16 +2110,20 @@ builders = ["file:///tmp/builder"]
             .collect();
 
         for _ in 0..200 {
-            store.apply_default_update(DefaultUpdate {
-                fee_recipient: Some(new_fr),
-                gas_limit: Some(new_gl),
-                graffiti: None,
-            });
-            store.apply_default_update(DefaultUpdate {
-                fee_recipient: Some(old_fr),
-                gas_limit: Some(old_gl),
-                graffiti: None,
-            });
+            store
+                .apply_default_update(DefaultUpdate {
+                    fee_recipient: Some(new_fr),
+                    gas_limit: Some(new_gl),
+                    graffiti: None,
+                })
+                .unwrap();
+            store
+                .apply_default_update(DefaultUpdate {
+                    fee_recipient: Some(old_fr),
+                    gas_limit: Some(old_gl),
+                    graffiti: None,
+                })
+                .unwrap();
         }
 
         stop.store(true, Ordering::Relaxed);
@@ -1642,6 +2357,7 @@ pubkey = "not-valid-hex"
             builder_boost_factor: None,
             graffiti: None,
             enabled: None,
+            doppelganger_hold_until: None,
             block_selection_mode: None,
             builders: None,
             min_bid: None,
@@ -2170,6 +2886,7 @@ builder_proposals = true
                 builder_proposals: false,
                 builder_boost_factor: None,
                 enabled: true,
+                doppelganger_hold_until: None,
                 block_selection_mode: None,
                 builders: None,
                 min_bid: None,
@@ -2212,6 +2929,7 @@ builder_proposals = true
                 builder_proposals: false,
                 builder_boost_factor: None,
                 enabled: true,
+                doppelganger_hold_until: None,
                 block_selection_mode: None,
                 builders: None,
                 min_bid: None,
@@ -3160,9 +3878,11 @@ builder_boost_factor = 175
         assert_ne!(live, Some(new_fee), "unpersisted fee must not be published");
     }
 
-    /// Clone sees the validator, then a delete plus re-import lands before
-    /// publish. `save_lock` does not cover those paths. The file must match
-    /// the live key, and the in-flight delta must not stick to the new import.
+    /// Clone sees the validator, then an unlocked delete plus re-import lands
+    /// before publish. Production import/delete take `save_lock` and cannot
+    /// interleave; this drives the unlocked methods the repair path still
+    /// covers. The file must match the live key, and the in-flight delta must
+    /// not stick to the new import.
     #[test]
     fn test_remove_and_readd_during_durable_update_file_matches_live() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -3233,5 +3953,1075 @@ builder_boost_factor = 175
         assert_eq!(live.fee_recipient, None, "stale fee delta must not land on the reimport");
         assert!(live.enabled);
         assert_eq!(live.gas_limit, None);
+    }
+
+    /// Publish `enabled = false` before persisting it. The write hook runs
+    /// after the file is durable, and signing is already disabled there. A
+    /// failed write still leaves the validator disabled.
+    #[test]
+    fn test_disable_slashed_publishes_before_persist_and_fails_closed() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                super::DURABLE_WRITE_HOOK.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        let _clear_hook = ClearHook;
+        let hooked = std::sync::Arc::clone(&store);
+        let saw_disabled_at_write = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&saw_disabled_at_write);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                flag.store(!hooked.is_signing_enabled(&pk), std::sync::atomic::Ordering::SeqCst);
+            }));
+        });
+
+        store.disable_slashed(&pk).unwrap();
+        assert!(
+            saw_disabled_at_write.load(std::sync::atomic::Ordering::SeqCst),
+            "the validator is already disabled while the file is written"
+        );
+        assert!(!store.is_signing_enabled(&pk));
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(!disk.is_signing_enabled(&pk));
+
+        let missing = dir.path().join("missing").join("validators.toml");
+        let mut failed = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        failed.add_validator(ValidatorConfig::new(pk)).unwrap();
+        failed.config_path = Some(missing);
+        assert!(failed.disable_slashed(&pk).is_err());
+        assert!(
+            !failed.is_signing_enabled(&pk),
+            "a failed persist must still disable the slashed validator"
+        );
+    }
+
+    fn clear_test_hooks() {
+        super::DURABLE_WRITE_HOOK.with(|slot| *slot.borrow_mut() = None);
+        super::RELOAD_AFTER_PARSE_HOOK.with(|slot| *slot.borrow_mut() = None);
+        super::TOML_WRITE_FAULT.with(|cell| cell.set(None));
+        super::NEXT_TOML_WRITE_FAULT.with(|cell| cell.set(None));
+        super::KEEP_TOML_WRITE_FAULT.with(|cell| cell.set(false));
+        super::PARENT_DIR_SYNCS.with(|cell| cell.set(0));
+    }
+
+    struct ClearHooks;
+    impl Drop for ClearHooks {
+        fn drop(&mut self) {
+            clear_test_hooks();
+        }
+    }
+
+    /// Removing the `save_lock` guard in `reload_config` makes `try_lock`
+    /// succeed and this test fail.
+    #[test]
+    fn test_reload_holds_save_lock_across_parse_and_apply() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path);
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+        let _clear = ClearHooks;
+        let hooked = std::sync::Arc::clone(&store);
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&held);
+        super::RELOAD_AFTER_PARSE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                flag.store(
+                    hooked.save_lock.try_lock().is_none(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }));
+        });
+        store.reload_config().unwrap();
+        assert!(held.load(std::sync::atomic::Ordering::SeqCst), "reload must hold save_lock");
+    }
+
+    #[test]
+    fn test_durable_write_holds_save_lock() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path);
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+        let _clear = ClearHooks;
+        let hooked = std::sync::Arc::clone(&store);
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&held);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                flag.store(
+                    hooked.save_lock.try_lock().is_none(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }));
+        });
+        store
+            .update_config_durable(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(test_fee_recipient(4))),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(held.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_write_fault_at_each_step_does_not_publish() {
+        let steps = [
+            super::TomlWriteFault::Serialize,
+            super::TomlWriteFault::CreateTemp,
+            super::TomlWriteFault::Write,
+            super::TomlWriteFault::SyncFile,
+            super::TomlWriteFault::Rename,
+            super::TomlWriteFault::SyncDir,
+        ];
+        for step in steps {
+            let pk = test_pubkey(1);
+            let old_fee = test_fee_recipient(1);
+            let new_fee = test_fee_recipient(4);
+            let dir = tempfile::tempdir().unwrap();
+            let config_path = dir.path().join("validators.toml");
+            let mut store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+            let mut cfg = ValidatorConfig::new(pk);
+            cfg.fee_recipient = Some(old_fee);
+            store.add_validator(cfg).unwrap();
+            store.config_path = Some(config_path.clone());
+            store.save_config().unwrap();
+            let _clear = ClearHooks;
+            super::TOML_WRITE_FAULT.with(|cell| {
+                cell.set(Some(super::FaultPlan { skip: 0, step }));
+            });
+            let err = store.update_config_durable(
+                &pk,
+                ValidatorConfigUpdate { fee_recipient: Some(Some(new_fee)), ..Default::default() },
+            );
+            assert!(err.is_err(), "{step:?} must fail the durable update");
+            assert_eq!(store.effective_fee_recipient(&pk), old_fee, "{step:?} must not publish");
+        }
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_failed_repair_write_does_not_publish_stale_delta() {
+        let pk = test_pubkey(1);
+        let old_fee = test_fee_recipient(1);
+        let new_fee = test_fee_recipient(4);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(old_fee);
+        store.add_validator(cfg).unwrap();
+        store.config_path = Some(config_path);
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+        let _clear = ClearHooks;
+        let once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hooked = std::sync::Arc::clone(&store);
+        let once_hook = std::sync::Arc::clone(&once);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                if once_hook.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
+                let hooked = std::sync::Arc::clone(&hooked);
+                std::thread::spawn(move || {
+                    hooked.remove_validator(&pk);
+                    hooked.add_validator(ValidatorConfig::new(pk)).unwrap();
+                })
+                .join()
+                .unwrap();
+            }));
+        });
+        // First write succeeds. The repair write hits the fault.
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 1, step: super::TomlWriteFault::SyncFile }));
+        });
+        let res = store.update_config_durable(
+            &pk,
+            ValidatorConfigUpdate { fee_recipient: Some(Some(new_fee)), ..Default::default() },
+        );
+        assert!(res.is_err(), "repair write failure must surface, got {res:?}");
+        let live = store.get_config(&pk).expect("reimport stays");
+        assert_ne!(live.fee_recipient, Some(new_fee), "stale fee must not publish");
+        assert!(logs_contain("validator identity changed during durable update"));
+    }
+
+    #[test]
+    fn test_remove_only_during_durable_update_drops_the_key() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+        let _clear = ClearHooks;
+        let hooked = std::sync::Arc::clone(&store);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                let hooked = std::sync::Arc::clone(&hooked);
+                std::thread::spawn(move || {
+                    hooked.remove_validator(&pk);
+                })
+                .join()
+                .unwrap();
+            }));
+        });
+        let res = store.update_config_durable(
+            &pk,
+            ValidatorConfigUpdate {
+                fee_recipient: Some(Some(test_fee_recipient(4))),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(res, Err(ValidatorStoreError::NotFound)));
+        assert!(store.get_config(&pk).is_none());
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(disk.get_config(&pk).is_none());
+    }
+
+    #[test]
+    fn test_add_validator_over_existing_key_replaces_config() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        let mut first = ValidatorConfig::new(pk);
+        first.fee_recipient = Some(test_fee_recipient(1));
+        store.add_validator(first).unwrap();
+        let gen = store.state.read().validator_gen[&pk];
+        let mut second = ValidatorConfig::new(pk);
+        second.fee_recipient = Some(test_fee_recipient(2));
+        second.enabled = false;
+        store.add_validator(second).unwrap();
+        assert_eq!(store.effective_fee_recipient(&pk), test_fee_recipient(2));
+        assert!(!store.is_signing_enabled(&pk));
+        assert_ne!(store.state.read().validator_gen[&pk], gen);
+    }
+
+    #[test]
+    fn test_add_and_remove_validator_durable_persist_and_roll_back() {
+        let pk = test_pubkey(1);
+        let extra = test_pubkey(2);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+
+        let mut replacement = ValidatorConfig::new(pk);
+        replacement.fee_recipient = Some(test_fee_recipient(7));
+        assert!(
+            !store.add_validator_durable(replacement).unwrap(),
+            "an existing row is not replaced"
+        );
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert_eq!(disk.effective_fee_recipient(&pk), test_fee_recipient(1));
+
+        store.add_validator_durable(ValidatorConfig::new(extra)).unwrap();
+        assert!(ValidatorStore::load_from_config(&config_path).unwrap().has_validator(&extra));
+
+        let _clear = ClearHooks;
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::SyncDir }));
+        });
+        let boom = test_pubkey(3);
+        assert!(store.add_validator_durable(ValidatorConfig::new(boom)).is_err());
+        assert!(!store.has_validator(&boom));
+
+        clear_test_hooks();
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }));
+        });
+        assert!(store.remove_validator_durable(&extra).is_err());
+        assert!(store.has_validator(&extra));
+        assert!(ValidatorStore::load_from_config(&config_path).unwrap().has_validator(&extra));
+
+        clear_test_hooks();
+        assert!(store.remove_validator_durable(&extra).unwrap().is_some());
+        assert!(!ValidatorStore::load_from_config(&config_path).unwrap().has_validator(&extra));
+        assert!(store.remove_validator_durable(&test_pubkey(99)).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_ingress_rejects_u64_above_i64_max() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let pk = test_pubkey(1);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        let huge = (i64::MAX as u64).saturating_add(1);
+        let err = store
+            .update_config(
+                &pk,
+                ValidatorConfigUpdate { gas_limit: Some(Some(huge)), ..Default::default() },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("i64::MAX"), "{err}");
+        assert_eq!(store.effective_gas_limit(&pk), 30_000_000);
+        assert!(
+            store
+                .update_config(
+                    &pk,
+                    ValidatorConfigUpdate { min_bid: Some(huge), ..Default::default() },
+                )
+                .is_err()
+        );
+        assert!(store
+            .update_config(
+                &pk,
+                ValidatorConfigUpdate { builder_boost_factor: Some(huge), ..Default::default() },
+            )
+            .is_err());
+        assert!(store.min_bid(&pk) <= i64::MAX as u64);
+        assert!(store
+            .apply_default_update(DefaultUpdate {
+                fee_recipient: None,
+                gas_limit: Some(huge),
+                graffiti: None,
+            })
+            .is_err());
+        assert_eq!(store.default_gas_limit(), 30_000_000);
+        assert!(store.set_global_min_bid(huge).is_err());
+        assert!(store.set_global_builder_boost_factor(huge).is_err());
+        let mut cfg = ValidatorConfig::new(test_pubkey(2));
+        cfg.gas_limit = Some(huge);
+        assert!(store.add_validator(cfg).is_err());
+        assert!(!store.has_validator(&test_pubkey(2)));
+
+        let err = store
+            .update_config_durable(
+                &pk,
+                ValidatorConfigUpdate {
+                    builders: Some(vec!["file://evil".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("file://evil"), "{err}");
+    }
+
+    /// Import must not be visible to readers until the validators file write
+    /// has succeeded. The hook runs after the file write and before publish.
+    #[test]
+    fn test_add_validator_durable_is_invisible_until_the_write_succeeds() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path);
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+        let _clear = ClearHooks;
+        let hooked = std::sync::Arc::clone(&store);
+        let visible = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&visible);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                flag.store(hooked.has_validator(&pk), std::sync::atomic::Ordering::SeqCst);
+            }));
+        });
+        store.add_validator_durable(ValidatorConfig::new(pk)).unwrap();
+        assert!(
+            !visible.load(std::sync::atomic::Ordering::SeqCst),
+            "a new validator must stay unpublished until the write succeeds"
+        );
+        assert!(store.has_validator(&pk));
+    }
+
+    /// Delete must keep the validator visible until the file write succeeds.
+    #[test]
+    fn test_remove_validator_durable_stays_live_until_the_write_succeeds() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path);
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+        let _clear = ClearHooks;
+        let hooked = std::sync::Arc::clone(&store);
+        let still_live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&still_live);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                flag.store(hooked.has_validator(&pk), std::sync::atomic::Ordering::SeqCst);
+            }));
+        });
+        assert!(store.remove_validator_durable(&pk).unwrap().is_some());
+        assert!(
+            still_live.load(std::sync::atomic::Ordering::SeqCst),
+            "remove must not drop the live validator before the write succeeds"
+        );
+        assert!(!store.has_validator(&pk));
+    }
+
+    /// A directory fsync failure happens after rename. Disk must be put back
+    /// so it does not move ahead of memory.
+    #[test]
+    fn test_syncdir_fault_reconciles_the_file_with_memory() {
+        let pk = test_pubkey(1);
+        let boom = test_pubkey(2);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let _clear = ClearHooks;
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::SyncDir }))
+        });
+        assert!(store.add_validator_durable(ValidatorConfig::new(boom)).is_err());
+        assert!(!store.has_validator(&boom));
+        assert!(
+            !ValidatorStore::load_from_config(&config_path).unwrap().has_validator(&boom),
+            "a failed add must not leave the new validator on disk"
+        );
+
+        // The restore write fails before rename, so the rejected document is
+        // still the file boot would load.
+        clear_test_hooks();
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::SyncDir }))
+        });
+        super::NEXT_TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }))
+        });
+        let stuck = test_pubkey(3);
+        assert!(store.add_validator_durable(ValidatorConfig::new(stuck)).is_err());
+        assert!(!store.has_validator(&stuck));
+        let rejected = config_path.with_file_name("validators.toml.rejected");
+        assert!(
+            !config_path.exists() || rejected.exists(),
+            "a failed restore must move the validators file off the boot path"
+        );
+        if config_path.exists() {
+            assert!(
+                !ValidatorStore::load_from_config(&config_path).unwrap().has_validator(&stuck),
+                "a failed restore must not leave the rejected validator loadable"
+            );
+        }
+
+        clear_test_hooks();
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::SyncDir }))
+        });
+        assert!(store.remove_validator_durable(&pk).is_err());
+        assert!(store.has_validator(&pk));
+        assert!(
+            ValidatorStore::load_from_config(&config_path).unwrap().has_validator(&pk),
+            "a failed remove must not drop the validator from disk"
+        );
+    }
+
+    /// A second durable add must not turn a disabled row back on.
+    #[test]
+    fn test_add_validator_durable_does_not_replace_an_existing_row() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let mut disabled = ValidatorConfig::new(pk);
+        disabled.enabled = false;
+        disabled.fee_recipient = Some(test_fee_recipient(4));
+        store.add_validator(disabled).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+
+        store.add_validator_durable(ValidatorConfig::new(pk)).unwrap();
+        assert!(
+            !store.is_signing_enabled(&pk),
+            "insert-if-absent must not overwrite enabled=false"
+        );
+        assert_eq!(store.effective_fee_recipient(&pk), test_fee_recipient(4));
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(!disk.is_signing_enabled(&pk));
+        assert_eq!(disk.effective_fee_recipient(&pk), test_fee_recipient(4));
+    }
+
+    /// An elapsed doppelganger hold is re-enabled at boot. An operator disable is not.
+    #[test]
+    fn test_elapsed_doppelganger_hold_reenables_at_boot_operator_disable_does_not() {
+        let held = test_pubkey(1);
+        let operator = test_pubkey(2);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+
+        store.begin_doppelganger_hold(&held, 1_700_000_000).unwrap();
+        let mut op = ValidatorConfig::new(operator);
+        op.enabled = false;
+        store.add_validator_durable(op).unwrap();
+        store.set_enabled_durable(&operator, false).unwrap();
+
+        let held_cfg = store.get_config(&held).unwrap();
+        assert_eq!(
+            held_cfg.doppelganger_hold_until,
+            Some(1_700_000_000),
+            "the hold must be stored separately from enabled=false"
+        );
+        assert!(!held_cfg.enabled);
+
+        let _open = store.reconcile_doppelganger_holds_at_boot(1_700_000_100);
+        assert!(
+            store.is_signing_enabled(&held),
+            "an elapsed doppelganger hold must be re-enabled at boot"
+        );
+        assert!(store.get_config(&held).unwrap().doppelganger_hold_until.is_none());
+        assert!(
+            !store.is_signing_enabled(&operator),
+            "an operator disable must stay disabled across boot"
+        );
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(disk.is_signing_enabled(&held));
+        assert!(!disk.is_signing_enabled(&operator));
+        assert!(disk.get_config(&operator).unwrap().doppelganger_hold_until.is_none());
+    }
+
+    /// A disabled row with no hold is a tombstone. Boot must not re-enable it.
+    #[test]
+    fn test_tombstone_without_a_hold_stays_disabled_at_boot() {
+        let pk = test_pubkey(7);
+        let pk_hex = format!("0x{}", hex::encode(pk));
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\ngas_limit = 30000000\n\n[[validators]]\npubkey = \"{pk_hex}\"\nenabled = false\n"
+            ),
+        )
+        .unwrap();
+
+        let store = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(!store.is_signing_enabled(&pk), "a tombstone loads disabled");
+        assert!(
+            store.get_config(&pk).unwrap().doppelganger_hold_until.is_none(),
+            "a tombstone has no doppelganger hold"
+        );
+        let open = store.reconcile_doppelganger_holds_at_boot(u64::MAX / 2);
+        assert!(open.is_empty(), "a tombstone has no hold for boot to re-arm");
+        assert!(!store.is_signing_enabled(&pk), "a tombstone stays disabled across boot");
+        assert!(store.get_config(&pk).unwrap().doppelganger_hold_until.is_none());
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(!disk.is_signing_enabled(&pk));
+        assert!(disk.get_config(&pk).unwrap().doppelganger_hold_until.is_none());
+    }
+
+    /// A restart inside the window reloads the hold and does not enable the key.
+    /// After the deadline, boot releases it. An operator disable has no deadline.
+    #[test]
+    fn test_open_doppelganger_hold_survives_restart_and_releases_at_the_deadline() {
+        let held = test_pubkey(4);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        store.begin_doppelganger_hold(&held, 1_700_000_100).unwrap();
+
+        let restarted = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(
+            !restarted.is_signing_enabled(&held),
+            "a restart inside the doppelganger window must leave the key disabled"
+        );
+        assert_eq!(
+            restarted.get_config(&held).unwrap().doppelganger_hold_until,
+            Some(1_700_000_100),
+            "the hold deadline must be reloaded from the validators file"
+        );
+        let open = restarted.reconcile_doppelganger_holds_at_boot(1_700_000_050);
+        assert_eq!(
+            open,
+            vec![(held, 50)],
+            "an open hold must be returned so boot can re-arm the enable task"
+        );
+        assert!(!restarted.is_signing_enabled(&held));
+
+        let still_open = restarted.reconcile_doppelganger_holds_at_boot(1_700_000_100);
+        assert!(
+            still_open.is_empty(),
+            "an elapsed hold is released at boot, not left for a later re-arm"
+        );
+        assert!(
+            restarted.is_signing_enabled(&held),
+            "a restart after the window must re-enable the held key"
+        );
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(disk.is_signing_enabled(&held));
+        assert!(disk.get_config(&held).unwrap().doppelganger_hold_until.is_none());
+    }
+
+    /// Boot retries a failed re-enable of an elapsed hold instead of dropping it.
+    #[test]
+    fn test_elapsed_hold_reenable_is_retried_at_boot() {
+        let held = test_pubkey(5);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        store.begin_doppelganger_hold(&held, 1_700_000_000).unwrap();
+
+        let _clear = ClearHooks;
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::SyncDir }))
+        });
+        let open = store.reconcile_doppelganger_holds_at_boot(1_700_000_100);
+        assert!(open.is_empty(), "a failed re-enable must be retried at boot");
+        assert!(store.is_signing_enabled(&held));
+        assert!(store.get_config(&held).unwrap().doppelganger_hold_until.is_none());
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(disk.is_signing_enabled(&held));
+    }
+
+    /// A remove whose restore also fails must not boot a file that dropped the key.
+    #[test]
+    fn test_failed_remove_restore_does_not_boot_without_the_validator() {
+        let pk = test_pubkey(6);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+
+        let _clear = ClearHooks;
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::SyncDir }))
+        });
+        super::NEXT_TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }))
+        });
+        assert!(store.remove_validator_durable(&pk).is_err());
+        assert!(store.has_validator(&pk), "memory keeps the validator when restore fails");
+        let rejected = config_path.with_file_name("validators.toml.rejected");
+        assert!(
+            !config_path.exists() || rejected.exists(),
+            "a failed restore must move the validators file off the boot path"
+        );
+        if config_path.exists() {
+            assert!(
+                ValidatorStore::load_from_config(&config_path).unwrap().has_validator(&pk),
+                "a failed remove restore must not boot without the live validator"
+            );
+        }
+    }
+
+    /// The import row is `enabled = true` today, then the hold write fails.
+    /// Disk must not keep that enabled row.
+    #[test]
+    fn test_failed_hold_write_does_not_leave_the_key_enabled_on_disk() {
+        let pk = test_pubkey(7);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+
+        assert!(store.add_validator_durable(ValidatorConfig::new(pk)).unwrap());
+        assert!(store.is_signing_enabled(&pk));
+
+        let _clear = ClearHooks;
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }))
+        });
+        assert!(store.begin_doppelganger_hold(&pk, 1_700_000_400).is_err());
+        assert!(!store.is_signing_enabled(&pk), "memory stays disabled when the hold write fails");
+
+        let rejected = config_path.with_file_name("validators.toml.rejected");
+        assert!(
+            !config_path.exists() || rejected.exists(),
+            "a failed hold write must take an enabled document off the boot path"
+        );
+        if config_path.exists() {
+            let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+            assert!(
+                !disk.is_signing_enabled(&pk),
+                "a failed hold write must not leave the key enabled on disk"
+            );
+        }
+    }
+
+    /// Importing over a slashing or operator disable must not arm a hold.
+    #[test]
+    fn test_preexisting_disable_is_not_turned_into_a_doppelganger_hold() {
+        let pk = test_pubkey(8);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let mut disabled = ValidatorConfig::new(pk);
+        disabled.enabled = false;
+        disabled.fee_recipient = Some(test_fee_recipient(4));
+        store.add_validator(disabled).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+
+        assert!(
+            !store.add_validator_durable(ValidatorConfig::new(pk)).unwrap(),
+            "the disabled row is already present"
+        );
+        store.begin_doppelganger_hold(&pk, 1_700_000_100).unwrap();
+        assert!(
+            store.get_config(&pk).unwrap().doppelganger_hold_until.is_none(),
+            "a pre-existing disable must not gain a doppelganger hold"
+        );
+        assert!(!store.is_signing_enabled(&pk));
+        assert_eq!(store.effective_fee_recipient(&pk), test_fee_recipient(4));
+
+        let open = store.reconcile_doppelganger_holds_at_boot(1_700_000_200);
+        assert!(open.is_empty(), "boot must not re-arm a disable that was never a hold");
+        assert!(
+            !store.is_signing_enabled(&pk),
+            "reconciling past a deadline must not re-enable a slashing or operator disable"
+        );
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(!disk.is_signing_enabled(&pk));
+        assert!(disk.get_config(&pk).unwrap().doppelganger_hold_until.is_none());
+    }
+
+    /// A failed DELETE disable must not leave a hold that boot will re-enable.
+    #[test]
+    fn test_failed_delete_disable_does_not_leave_a_reenableable_hold() {
+        let pk = test_pubkey(9);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        store.begin_doppelganger_hold(&pk, 1_700_000_500).unwrap();
+        assert!(store.get_config(&pk).unwrap().doppelganger_hold_until.is_some());
+
+        let _clear = ClearHooks;
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }))
+        });
+        assert!(store.set_enabled_durable(&pk, false).is_err(), "the delete write fails");
+        assert!(!store.is_signing_enabled(&pk));
+        assert!(
+            store.get_config(&pk).unwrap().doppelganger_hold_until.is_none(),
+            "memory must drop the hold even when the write fails"
+        );
+
+        let rejected = config_path.with_file_name("validators.toml.rejected");
+        assert!(
+            !config_path.exists() || rejected.exists(),
+            "a failed delete must take the old hold off the boot path"
+        );
+        if config_path.exists() {
+            let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+            let hold = disk.get_config(&pk).and_then(|c| c.doppelganger_hold_until);
+            assert!(hold.is_none(), "boot must not reload a hold after a failed delete");
+            if disk.has_validator(&pk) {
+                let _open = disk.reconcile_doppelganger_holds_at_boot(1_700_000_900);
+                assert!(
+                    !disk.is_signing_enabled(&pk),
+                    "a failed delete must not be undone by boot reconcile"
+                );
+            }
+        }
+    }
+
+    /// A failed slashing disable of a held key must not leave a boot-loadable hold.
+    #[test]
+    fn test_failed_slashing_disable_of_a_held_key_is_not_reenabled_at_boot() {
+        let pk = test_pubkey(10);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        store.begin_doppelganger_hold(&pk, 1_700_000_600).unwrap();
+        assert!(store.get_config(&pk).unwrap().doppelganger_hold_until.is_some());
+
+        let _clear = ClearHooks;
+        super::KEEP_TOML_WRITE_FAULT.with(|cell| cell.set(true));
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }))
+        });
+        assert!(store.disable_slashed(&pk).is_err(), "all three persist attempts fail");
+        assert!(!store.is_signing_enabled(&pk));
+        assert!(
+            store.get_config(&pk).unwrap().doppelganger_hold_until.is_none(),
+            "memory drops the hold when slashing disable is published"
+        );
+
+        let rejected = config_path.with_file_name("validators.toml.rejected");
+        assert!(
+            !config_path.exists() || rejected.exists(),
+            "a failed slashing disable of a held key must leave the boot path"
+        );
+        if config_path.exists() {
+            let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+            let _open = disk.reconcile_doppelganger_holds_at_boot(1_700_000_900);
+            assert!(
+                !disk.is_signing_enabled(&pk),
+                "boot must not re-enable a held key whose slashing disable failed to persist"
+            );
+        }
+    }
+
+    /// A re-import must not shorten a hold that already lasts longer.
+    #[test]
+    fn test_reimport_stores_the_later_hold_deadline() {
+        let pk = test_pubkey(12);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        store.begin_doppelganger_hold(&pk, 1_700_000_500).unwrap();
+        store.begin_doppelganger_hold(&pk, 1_700_000_100).unwrap();
+        assert_eq!(
+            store.get_config(&pk).unwrap().doppelganger_hold_until,
+            Some(1_700_000_500),
+            "a re-import must not shorten the persisted hold"
+        );
+        store.begin_doppelganger_hold(&pk, 1_700_000_900).unwrap();
+        assert_eq!(
+            store.get_config(&pk).unwrap().doppelganger_hold_until,
+            Some(1_700_000_900),
+            "a re-import must store the later hold deadline"
+        );
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert_eq!(disk.get_config(&pk).unwrap().doppelganger_hold_until, Some(1_700_000_900));
+    }
+
+    /// Release before the stored deadline must leave the hold in place.
+    #[test]
+    fn test_release_before_the_deadline_stays_disabled() {
+        let pk = test_pubkey(13);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        store.begin_doppelganger_hold(&pk, now.saturating_add(3_600)).unwrap();
+        assert!(!store.release_doppelganger_hold(&pk).unwrap());
+        assert!(!store.is_signing_enabled(&pk), "an early release must not enable the key");
+        assert!(store.get_config(&pk).unwrap().doppelganger_hold_until.is_some());
+        let disk = ValidatorStore::load_from_config(&config_path).unwrap();
+        assert!(!disk.is_signing_enabled(&pk));
+    }
+
+    /// Moving the validators file aside names the full pubkey and the rejected path.
+    #[tracing_test::traced_test]
+    #[test]
+    fn test_quarantine_logs_the_full_pubkey_and_rejected_path() {
+        let pk = test_pubkey(14);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        store.add_validator_durable(ValidatorConfig::new(pk)).unwrap();
+        let _clear = ClearHooks;
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }))
+        });
+        assert!(store.begin_doppelganger_hold(&pk, 1_700_000_400).is_err());
+        let full = format!("0x{}", hex::encode(pk));
+        let rejected = config_path.with_file_name("validators.toml.rejected");
+        assert!(
+            logs_contain(&full) && logs_contain(&rejected.display().to_string()),
+            "a moved validators file must log the full pubkey and the .rejected path"
+        );
+    }
+
+    /// Slashing clears the hold, so a later release must not turn the key back on.
+    #[test]
+    fn test_release_after_slashing_disable_stays_disabled() {
+        let pk = test_pubkey(11);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path);
+        store.save_config().unwrap();
+        store.begin_doppelganger_hold(&pk, 1_700_000_700).unwrap();
+        store.disable_slashed(&pk).unwrap();
+        assert!(!store.release_doppelganger_hold(&pk).unwrap());
+        assert!(!store.is_signing_enabled(&pk));
+    }
+
+    /// A disable that makes signing safer is live before the write. A failed
+    /// write leaves it disabled.
+    #[test]
+    fn test_safety_disable_publishes_before_persist_and_stays_disabled() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path.clone());
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+        let _clear = ClearHooks;
+        let hooked = std::sync::Arc::clone(&store);
+        let disabled_at_write = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&disabled_at_write);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                flag.store(!hooked.is_signing_enabled(&pk), std::sync::atomic::Ordering::SeqCst);
+            }));
+        });
+        store.disable_slashed(&pk).unwrap();
+        assert!(
+            disabled_at_write.load(std::sync::atomic::Ordering::SeqCst),
+            "a slashed validator must already be disabled while the file is written"
+        );
+
+        let mut failed = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        failed.add_validator(ValidatorConfig::new(pk)).unwrap();
+        failed.config_path = Some(config_path);
+        failed.save_config().unwrap();
+        clear_test_hooks();
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }));
+        });
+        // One-shot fault: the first attempt fails, retries succeed. Force every
+        // attempt to fail by pointing at a missing directory instead.
+        clear_test_hooks();
+        let missing = dir.path().join("gone").join("validators.toml");
+        let mut stuck = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        stuck.add_validator(ValidatorConfig::new(pk)).unwrap();
+        stuck.config_path = Some(missing);
+        assert!(stuck.disable_slashed(&pk).is_err());
+        assert!(!stuck.is_signing_enabled(&pk), "failed persist must stay disabled");
+    }
+
+    /// Replacing an enabled validator with `enabled = false` must not roll
+    /// back to enabled when the write fails. That is the doppelganger disable.
+    #[test]
+    fn test_failed_enabled_false_replace_stays_disabled() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path);
+        store.save_config().unwrap();
+        let _clear = ClearHooks;
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }))
+        });
+        assert!(store.set_enabled_durable(&pk, false).is_err());
+        assert!(
+            !store.is_signing_enabled(&pk),
+            "a failed doppelganger disable must not leave the key enabled"
+        );
+    }
+
+    /// Removing `save_lock` from these paths makes `try_lock` succeed.
+    #[test]
+    fn test_safety_and_import_writes_hold_save_lock() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path);
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+        let _clear = ClearHooks;
+
+        let hooked = std::sync::Arc::clone(&store);
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&held);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                flag.store(
+                    hooked.save_lock.try_lock().is_none(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }));
+        });
+        store.disable_slashed(&pk).unwrap();
+        assert!(
+            held.load(std::sync::atomic::Ordering::SeqCst),
+            "disable_slashed must hold save_lock across the write"
+        );
+
+        clear_test_hooks();
+        let hooked = std::sync::Arc::clone(&store);
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&held);
+        super::DURABLE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move || {
+                flag.store(
+                    hooked.save_lock.try_lock().is_none(),
+                    std::sync::atomic::Ordering::SeqCst,
+                );
+            }));
+        });
+        store.add_validator_durable(ValidatorConfig::new(test_pubkey(2))).unwrap();
+        assert!(
+            held.load(std::sync::atomic::Ordering::SeqCst),
+            "add_validator_durable must hold save_lock across the write"
+        );
+    }
+
+    /// The parent-directory fsync is a real call, not only a fault label.
+    #[test]
+    fn test_sync_parent_dir_increments_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.config_path = Some(config_path);
+        let _clear = ClearHooks;
+        store.save_config().unwrap();
+        let syncs = super::PARENT_DIR_SYNCS.with(|cell| cell.get());
+        assert!(syncs >= 1, "save_config must fsync the parent directory, count={syncs}");
+    }
+
+    /// `i64::MAX` is a legal TOML integer. One past it is not.
+    #[test]
+    fn test_i64_max_boundary_is_accepted() {
+        let limit = i64::MAX as u64;
+        assert!(super::ensure_toml_u64("gas_limit", limit).is_ok());
+        assert!(super::ensure_toml_u64("gas_limit", limit.saturating_add(1)).is_err());
+        let pk = test_pubkey(1);
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store
+            .update_config(
+                &pk,
+                ValidatorConfigUpdate { gas_limit: Some(Some(limit)), ..Default::default() },
+            )
+            .unwrap();
+        assert_eq!(store.effective_gas_limit(&pk), limit);
+        assert!(store
+            .update_config(
+                &pk,
+                ValidatorConfigUpdate {
+                    gas_limit: Some(Some(limit.saturating_add(1))),
+                    ..Default::default()
+                },
+            )
+            .is_err());
     }
 }

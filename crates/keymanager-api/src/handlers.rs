@@ -7,14 +7,14 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use observability::logging::{RedactedUrl, TruncatedPubkey};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn, Instrument};
+use tracing::{error, info, warn, Instrument};
 
 use crate::error::{
     map_delete_keystore_item_error, map_delete_remote_key_item_error,
     map_import_keystore_item_error, map_import_remote_key_item_error, map_slashing_export_error,
     map_slashing_protection_error, map_url_validation_error, ApiError,
 };
-use crate::lifecycle::{DoppelgangerLifecycle, ImportKind};
+use crate::lifecycle::{ConfigRemoval, ConfigTouch, DoppelgangerLifecycle, ImportKind};
 use crate::traits::{
     ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, QuiesceError,
     RemoteKeyManager, SlashingProtection, ValidatorConfigManager, ValidatorManager,
@@ -148,7 +148,18 @@ pub async fn import_keystores(
                     // displace any prior enable task, and spawn the window task.
                     // Owned by [`DoppelgangerLifecycle`] so local and remote imports
                     // share one path (ImportKind::Local).
-                    state.doppelganger.on_import(pubkey, ImportKind::Local);
+                    if let Err(e) = state.doppelganger.on_import(pubkey, ImportKind::Local) {
+                        error!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                            error = %e,
+                            "imported key stays disabled; validators file update failed and a retry is a duplicate"
+                        );
+                        results.push(ImportKeystoreResult {
+                            status: ImportStatus::Error,
+                            message: "imported key stays disabled; validators file update failed and a retry is a duplicate".into(),
+                        });
+                        continue;
+                    }
 
                     results.push(ImportKeystoreResult {
                         status: ImportStatus::Imported,
@@ -241,7 +252,12 @@ async fn delete_keystores_inner(
     // drain timeout aborts before export: nothing is migrated and nothing is
     // deleted.
     for pubkey in &existing_keys {
-        state.doppelganger.disable_for_delete(pubkey);
+        if let Err(e) = state.doppelganger.disable_for_delete(pubkey) {
+            error!(error = %e, "failed to persist validator disable before delete");
+            return Err(ApiError::Internal(
+                "validator disable was not persisted; no keystores deleted".into(),
+            ));
+        }
     }
     let mut timed_out: Vec<Pubkey> = Vec::new();
     for pubkey in &existing_keys {
@@ -301,37 +317,65 @@ async fn delete_keystores_inner(
                 // KM-2 (b)+(Finding 3): keystore removal + token cancel (+
                 // remove_validator / cancel_monitoring on success) are one
                 // critical section inside DoppelgangerLifecycle::on_delete.
-                let delete_result = state.doppelganger.on_delete(pubkey, ImportKind::Local, || {
-                    match state.keystore_manager.delete_keystore(pubkey) {
-                        Ok(true) => (true, Ok(true)),
-                        Ok(false) => (false, Ok(false)),
-                        Err(e) => (false, Err(e)),
-                    }
-                });
+                let (config, delete_result) =
+                    state.doppelganger.on_delete(pubkey, ImportKind::Local, || {
+                        match state.keystore_manager.delete_keystore(pubkey) {
+                            // Absent keystore still drops a leftover config row.
+                            Ok(present) => {
+                                (ConfigTouch::Apply { keystore_present: present }, Ok(present))
+                            }
+                            Err(e) => (ConfigTouch::Skip, Err(e)),
+                        }
+                    });
 
                 match delete_result {
-                    Ok(true) => {
-                        warn!(
-                            pubkey = %TruncatedPubkey::new(pubkey_hex),
-                            status = "deleted",
-                            "Keystore delete result"
-                        );
-                        results.push(DeleteKeystoreResult {
-                            status: DeleteStatus::Deleted,
-                            message: String::new(),
-                        });
-                    }
-                    Ok(false) => {
-                        warn!(
-                            pubkey = %TruncatedPubkey::new(pubkey_hex),
-                            status = "not_found",
-                            "Keystore delete result"
-                        );
-                        results.push(DeleteKeystoreResult {
-                            status: DeleteStatus::NotFound,
-                            message: String::new(),
-                        });
-                    }
+                    Ok(present) => match config {
+                        ConfigRemoval::Failed(detail) => {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(pubkey_hex),
+                                error = %detail,
+                                "validator config removal failed after keystore delete"
+                            );
+                            results.push(DeleteKeystoreResult {
+                                status: DeleteStatus::Error,
+                                message: "validator config update failed".into(),
+                            });
+                        }
+                        ConfigRemoval::Removed => {
+                            warn!(
+                                pubkey = %TruncatedPubkey::new(pubkey_hex),
+                                status = "deleted",
+                                "Keystore delete result"
+                            );
+                            results.push(DeleteKeystoreResult {
+                                status: DeleteStatus::Deleted,
+                                message: String::new(),
+                            });
+                        }
+                        ConfigRemoval::Absent | ConfigRemoval::NotAttempted => {
+                            if present {
+                                warn!(
+                                    pubkey = %TruncatedPubkey::new(pubkey_hex),
+                                    status = "deleted",
+                                    "Keystore delete result"
+                                );
+                                results.push(DeleteKeystoreResult {
+                                    status: DeleteStatus::Deleted,
+                                    message: String::new(),
+                                });
+                            } else {
+                                warn!(
+                                    pubkey = %TruncatedPubkey::new(pubkey_hex),
+                                    status = "not_found",
+                                    "Keystore delete result"
+                                );
+                                results.push(DeleteKeystoreResult {
+                                    status: DeleteStatus::NotFound,
+                                    message: String::new(),
+                                });
+                            }
+                        }
+                    },
                     Err(e) => {
                         // M-8: central mapper sanitizes Backend-class payloads.
                         let message = map_delete_keystore_item_error(&e);
@@ -421,7 +465,14 @@ pub async fn import_remote_keys(
                         // SEC-2b: same enablement gate as local imports via
                         // DoppelgangerLifecycle (ImportKind::Remote skips VM
                         // registration; still starts monitoring + enable task).
-                        state.doppelganger.on_import(pubkey, ImportKind::Remote);
+                        if let Err(e) = state.doppelganger.on_import(pubkey, ImportKind::Remote) {
+                            error!(error = %e, "remote import lifecycle failed");
+                            results.push(ImportRemoteKeyResult {
+                                status: ImportRemoteKeyStatus::Error,
+                                message: "remote import was not completed".into(),
+                            });
+                            continue;
+                        }
                         info!(
                             pubkey = %TruncatedPubkey::new(&key_import.pubkey),
                             url = %RedactedUrl(&key_import.url),
@@ -487,12 +538,12 @@ pub async fn delete_remote_keys(
     for pubkey_str in &request.pubkeys {
         match parse_pubkey(pubkey_str) {
             Ok(pubkey) => {
-                let delete_result =
+                let (_config, delete_result) =
                     state.doppelganger.on_delete(&pubkey, ImportKind::Remote, || {
                         match state.remote_key_manager.delete_remote_key(&pubkey) {
-                            Ok(true) => (true, Ok(true)),
-                            Ok(false) => (false, Ok(false)),
-                            Err(e) => (false, Err(e)),
+                            Ok(true) => (ConfigTouch::Apply { keystore_present: true }, Ok(true)),
+                            Ok(false) => (ConfigTouch::Skip, Ok(false)),
+                            Err(e) => (ConfigTouch::Skip, Err(e)),
                         }
                     });
                 match delete_result {
@@ -608,6 +659,11 @@ pub async fn set_gas_limit(
         .gas_limit
         .parse::<u64>()
         .map_err(|_| ApiError::BadRequest("invalid gas_limit: must be a numeric string".into()))?;
+    if limit > i64::MAX as u64 {
+        return Err(ApiError::BadRequest(
+            "invalid gas_limit: must be <= i64::MAX so the validators file can store it".into(),
+        ));
+    }
     state.config_manager.set_gas_limit(&pubkey, limit)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -1003,5 +1059,154 @@ mod tests {
         assert!(parse_pubkey(&format!("0X0x{bare}")).is_err());
         assert!(parse_pubkey(&format!("0x{}", "ab".repeat(47))).is_err());
         assert!(parse_pubkey(&format!("0x{}", "zz".repeat(48))).is_err());
+    }
+
+    /// A remote import whose lifecycle persist fails must not report imported.
+    #[tokio::test]
+    async fn test_remote_import_surfaces_lifecycle_error() {
+        use std::time::Duration;
+
+        use crate::lifecycle::arm_import_failure;
+        use crate::traits::{
+            DeleteRemoteKeyError, DoppelgangerMonitor, ImportRemoteKeyError, RemoteKeyManager,
+            SlashingProtection, SlashingProtectionError, ValidatorConfigManager,
+        };
+        use crate::types::RemoteKeyImport;
+
+        struct EmptyKeys;
+        #[async_trait::async_trait]
+        impl KeystoreManager for EmptyKeys {
+            fn list_keys(&self) -> Vec<Pubkey> {
+                Vec::new()
+            }
+            fn has_key(&self, _: &Pubkey) -> bool {
+                false
+            }
+            async fn import_keystore(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Pubkey, crate::traits::ImportKeystoreError> {
+                Ok([0u8; 48])
+            }
+            fn delete_keystore(
+                &self,
+                _: &Pubkey,
+            ) -> Result<bool, crate::traits::DeleteKeystoreError> {
+                Ok(false)
+            }
+        }
+        struct EmptySlash;
+        #[async_trait::async_trait]
+        impl SlashingProtection for EmptySlash {
+            async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+                Ok(())
+            }
+            fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+                Ok("{}".into())
+            }
+        }
+        struct OkRemote;
+        impl RemoteKeyManager for OkRemote {
+            fn list_remote_keys(&self) -> Vec<(Pubkey, String)> {
+                Vec::new()
+            }
+            fn has_remote_key(&self, _: &Pubkey) -> bool {
+                false
+            }
+            fn import_remote_key(&self, _: Pubkey, _: String) -> Result<(), ImportRemoteKeyError> {
+                Ok(())
+            }
+            fn delete_remote_key(&self, _: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
+                Ok(false)
+            }
+        }
+        struct NoConfig;
+        impl ValidatorConfigManager for NoConfig {
+            fn get_fee_recipient(&self, _: &Pubkey) -> Result<[u8; 20], ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn set_fee_recipient(&self, _: &Pubkey, _: [u8; 20]) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn delete_fee_recipient(&self, _: &Pubkey) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn get_gas_limit(&self, _: &Pubkey) -> Result<u64, ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn set_gas_limit(&self, _: &Pubkey, _: u64) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn delete_gas_limit(&self, _: &Pubkey) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn get_graffiti(&self, _: &Pubkey) -> Result<String, ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn set_graffiti(&self, _: &Pubkey, _: &str) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn delete_graffiti(&self, _: &Pubkey) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+        }
+        struct NoVm;
+        impl ValidatorManager for NoVm {
+            fn add_validator(&self, _: Pubkey, _: bool) -> Result<(), String> {
+                Ok(())
+            }
+            fn remove_validator(&self, _: &Pubkey) -> Result<bool, String> {
+                Ok(false)
+            }
+            fn set_validator_enabled(&self, _: &Pubkey, _: bool) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        struct NoMonitor;
+        impl DoppelgangerMonitor for NoMonitor {
+            fn start_monitoring(&self, _: Pubkey) {}
+            fn stop_monitoring(&self, _: &Pubkey) {}
+            fn is_doppelganger_safe(&self, _: &Pubkey) -> bool {
+                true
+            }
+        }
+        let vm: Arc<dyn ValidatorManager> = Arc::new(NoVm);
+        let state = Arc::new(AppState {
+            keystore_manager: Arc::new(EmptyKeys),
+            slashing_protection: Arc::new(EmptySlash),
+            validator_manager: Arc::clone(&vm),
+            doppelganger: Arc::new(DoppelgangerLifecycle::new(
+                Duration::ZERO,
+                Arc::new(NoMonitor),
+                vm,
+            )),
+            remote_key_manager: Arc::new(OkRemote),
+            config_manager: Arc::new(NoConfig),
+            exit_manager: None,
+            allow_insecure_remote_signer: false,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: Mutex::new(None),
+            import_keystores_rate: Mutex::new(HashMap::new()),
+        });
+        arm_import_failure();
+        let mut pubkey = [0u8; 48];
+        pubkey[0] = 1;
+        let Json(resp) = import_remote_keys(
+            State(state),
+            Json(ImportRemoteKeysRequest {
+                remote_keys: vec![RemoteKeyImport {
+                    pubkey: format!("0x{}", hex::encode(pubkey)),
+                    url: "https://8.8.8.8:9000".into(),
+                }],
+            }),
+        )
+        .await;
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(
+            resp.data[0].status,
+            ImportRemoteKeyStatus::Error,
+            "a failed remote import must not be reported as imported"
+        );
     }
 }

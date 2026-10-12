@@ -132,6 +132,19 @@ pub enum ConfigError {
     )]
     ZeroFeeRecipient,
 
+    /// The validators config file exists and has no content.
+    ///
+    /// Boot refuses it. Recover from `validators.toml.rejected` by editing
+    /// that document, not by treating the empty file as a missing fee recipient.
+    #[error(
+        "validators config file is empty; boot refuses it. \
+         Recover from validators.toml.rejected by copying it aside, \
+         setting the affected key to enabled = false, deleting doppelganger_hold_until, \
+         and replacing validators.toml with that edited file. \
+         Do not restore validators.toml.rejected unchanged."
+    )]
+    EmptyValidatorsConfig,
+
     /// Wraps a `ValidatorStoreError` that occurs during validator store construction.
     #[error("validator store error: {0}")]
     ValidatorStoreError(String),

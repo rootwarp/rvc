@@ -195,6 +195,11 @@ pub fn build_keymanager_api(
         deps.genesis_validators_root,
         import_gate,
     ));
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let open_holds = deps.validator_store.reconcile_doppelganger_holds_at_boot(now_unix);
     let validator_mgr = Arc::new(ValidatorManagerAdapter::new(deps.validator_store.clone()));
 
     // M-12: time-based window for the delayed set_enabled task. When
@@ -205,6 +210,7 @@ pub fn build_keymanager_api(
     } else {
         Duration::ZERO
     };
+    keystore_mgr.set_doppelganger_window(doppelganger_window);
 
     // SEC-2b: when a ForwardWindowMachine is wired, keymanager imports
     // register with it (signing gate). Same monotonic epoch_clock as boot.
@@ -223,7 +229,8 @@ pub fn build_keymanager_api(
         deps.key_gen_tx,
     ));
 
-    let config_mgr = Arc::new(ValidatorConfigManagerAdapter::new(deps.validator_store));
+    let config_mgr =
+        Arc::new(ValidatorConfigManagerAdapter::new(Arc::clone(&deps.validator_store)));
 
     let exit_mgr: Option<Arc<dyn VoluntaryExitManager>> =
         Some(Arc::new(VoluntaryExitManagerAdapter::new(
@@ -259,6 +266,13 @@ pub fn build_keymanager_api(
             doppelganger_window,
         },
     );
+    let lifecycle = Arc::downgrade(&server.doppelganger_lifecycle());
+    deps.validator_store.set_disable_listener(Arc::new(move |pubkey| {
+        if let Some(life) = lifecycle.upgrade() {
+            life.cancel_enable_on_disable(pubkey);
+        }
+    }));
+    server.rearm_persisted_doppelganger_holds(open_holds);
 
     Ok(Some(BuiltKeymanagerApi {
         server,

@@ -41,17 +41,86 @@ fn test_slashing_adapter_export_empty() {
 fn test_validator_manager_adapter_add_remove() {
     let store = Arc::new(ValidatorStore::new([0u8; 20], 100));
     let adapter = ValidatorManagerAdapter::new(store.clone());
-    adapter.add_validator(test_pubkey(1), true);
+    adapter.add_validator(test_pubkey(1), true).unwrap();
 
     // Verify the validator was actually added to the store
     assert!(store.get_config(&test_pubkey(1)).is_some());
 
     // Remove and verify
-    assert!(adapter.remove_validator(&test_pubkey(1)));
+    assert!(adapter.remove_validator(&test_pubkey(1)).unwrap());
     assert!(store.get_config(&test_pubkey(1)).is_none());
 
     // Removing non-existent returns false
-    assert!(!adapter.remove_validator(&test_pubkey(99)));
+    assert!(!adapter.remove_validator(&test_pubkey(99)).unwrap());
+}
+
+#[test]
+fn test_validator_manager_remove_persists_under_save_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("validators.toml");
+    std::fs::write(
+        &path,
+        "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\ngas_limit = 30000000\n",
+    )
+    .unwrap();
+    let store = Arc::new(ValidatorStore::load_from_config(&path).unwrap());
+    let adapter = ValidatorManagerAdapter::new(store.clone());
+    let pk = test_pubkey(1);
+    adapter.add_validator(pk, true).unwrap();
+    assert!(ValidatorStore::load_from_config(&path).unwrap().has_validator(&pk));
+    assert!(adapter.remove_validator(&pk).unwrap());
+    assert!(!store.has_validator(&pk));
+    assert!(!ValidatorStore::load_from_config(&path).unwrap().has_validator(&pk));
+}
+
+/// The doppelganger window re-enable must reach the validators file.
+/// A restart otherwise reloads `enabled = false` and the key stays offline.
+#[test]
+fn test_reenable_persists_before_it_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("validators.toml");
+    std::fs::write(
+        &path,
+        "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\ngas_limit = 30000000\n",
+    )
+    .unwrap();
+    let store = Arc::new(ValidatorStore::load_from_config(&path).unwrap());
+    let pk = test_pubkey(1);
+    let mut disabled = validator_store::ValidatorConfig::new(pk);
+    disabled.enabled = false;
+    store.add_validator(disabled).unwrap();
+    let adapter = ValidatorManagerAdapter::new(store.clone());
+    adapter.set_validator_enabled(&pk, true).unwrap();
+    assert!(store.is_signing_enabled(&pk));
+    let disk = ValidatorStore::load_from_config(&path).unwrap();
+    assert!(
+        disk.is_signing_enabled(&pk),
+        "re-enable must be durable; a restart would otherwise stay disabled"
+    );
+}
+
+/// A failed validators-file write must not look like "validator not found".
+#[test]
+fn test_remove_validator_surfaces_a_persist_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("gone");
+    std::fs::create_dir(&parent).unwrap();
+    let path = parent.join("validators.toml");
+    std::fs::write(
+        &path,
+        "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\ngas_limit = 30000000\n",
+    )
+    .unwrap();
+    let store = Arc::new(ValidatorStore::load_from_config(&path).unwrap());
+    let adapter = ValidatorManagerAdapter::new(Arc::clone(&store));
+    let pk = test_pubkey(7);
+    adapter.add_validator(pk, true).expect("import persists");
+    std::fs::remove_dir_all(&parent).unwrap();
+    let err = adapter
+        .remove_validator(&pk)
+        .expect_err("a failed config removal is an error, not not-found");
+    assert!(!err.is_empty());
+    assert!(store.has_validator(&pk), "failed remove must keep the live validator");
 }
 
 // --- DoppelgangerDisabledMonitor tests ---

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use bn_manager::{BeaconNodeClient, OperationTimeouts};
 use metrics::{new_health_status, SharedHealthStatus};
+use observability::logging::TruncatedPubkey;
 use secret_provider::SecretProvider;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -549,7 +550,19 @@ fn spawn_secret_provider_refresh(
             refresh_service
                 .run(move |sk| {
                     // Denylist DELETE-races-refresh guard is inside admit.
-                    let _ = admissions.admit(sk, AdmissionSource::RawSecret);
+                    // A rejected key is forgotten so the next refresh retries it.
+                    let pubkey = sk.public_key().to_bytes();
+                    match admissions.admit(sk, AdmissionSource::RawSecret) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            warn!(
+                                pubkey = %TruncatedPubkey::new(&format!("0x{}", hex::encode(pubkey))),
+                                error = %e,
+                                "secret-provider key was not admitted; it will be retried"
+                            );
+                            false
+                        }
+                    }
                 })
                 .await;
         });

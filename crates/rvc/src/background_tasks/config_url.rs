@@ -92,6 +92,10 @@ impl ValidatorConfigUpdate {
             return Err(ParseError::IsDefaultPubkey);
         }
         let pubkey = parse_pubkey_hex(&self.pubkey)?;
+        if let Some(gl) = self.gas_limit {
+            validator_store::ensure_toml_u64("gas_limit", gl)
+                .map_err(|e| ParseError::InvalidGasLimit(e.to_string()))?;
+        }
         let fee_recipient = match &self.fee_recipient {
             None => None,
             Some(s) => Some(Some(parse_fee_recipient_hex(s)?)),
@@ -123,6 +127,10 @@ impl ValidatorConfigUpdate {
     pub fn to_default_update(&self) -> Result<DefaultUpdate, ParseError> {
         if !self.is_default_entry() {
             return Err(ParseError::NotDefaultPubkey);
+        }
+        if let Some(gl) = self.gas_limit {
+            validator_store::ensure_toml_u64("gas_limit", gl)
+                .map_err(|e| ParseError::InvalidGasLimit(e.to_string()))?;
         }
         let fee_recipient = match &self.fee_recipient {
             None => None,
@@ -252,7 +260,11 @@ fn entry_to_update(
             let gas_limit = match b.gas_limit.as_deref() {
                 None => None,
                 Some(g) => {
-                    Some(g.parse::<u64>().map_err(|e| ParseError::InvalidGasLimit(e.to_string()))?)
+                    let parsed =
+                        g.parse::<u64>().map_err(|e| ParseError::InvalidGasLimit(e.to_string()))?;
+                    validator_store::ensure_toml_u64("gas_limit", parsed)
+                        .map_err(|e| ParseError::InvalidGasLimit(e.to_string()))?;
+                    Some(parsed)
                 }
             };
             (b.enabled, gas_limit)
@@ -281,7 +293,11 @@ pub fn apply_proposer_config_updates(
 ) {
     if let Some(d) = default_update {
         match d.to_default_update() {
-            Ok(u) => store.apply_default_update(u),
+            Ok(u) => {
+                if let Err(e) = store.apply_default_update(u) {
+                    warn!(error = %e, "proposer config default entry ignored");
+                }
+            }
             Err(e) => {
                 warn!(error = %e, "proposer config default entry ignored");
             }
@@ -895,5 +911,36 @@ mod tests {
 
         assert_eq!(store.effective_fee_recipient(&pk), [0xaau8; 20]);
         assert!(logs_contain("proposer config entry ignored"));
+    }
+
+    /// A refresher `gas_limit` above `i64::MAX` must not go live. TOML cannot
+    /// serialize it, so a published value makes every later save fail.
+    #[test]
+    fn apply_proposer_config_updates_rejects_gas_limit_above_i64_max() {
+        use validator_store::ValidatorConfig;
+
+        let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
+        let pk = [0x11u8; 48];
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        let huge = (i64::MAX as u64).saturating_add(1);
+
+        apply_proposer_config_updates(
+            &store,
+            vec![ValidatorConfigUpdate {
+                pubkey: valid_pubkey_hex(),
+                fee_recipient: None,
+                builder_enabled: None,
+                gas_limit: Some(huge),
+            }],
+            Some(ValidatorConfigUpdate {
+                pubkey: DEFAULT_PUBKEY.to_string(),
+                fee_recipient: None,
+                builder_enabled: None,
+                gas_limit: Some(huge),
+            }),
+        );
+
+        assert_eq!(store.effective_gas_limit(&pk), 30_000_000);
+        assert_eq!(store.default_gas_limit(), 30_000_000);
     }
 }

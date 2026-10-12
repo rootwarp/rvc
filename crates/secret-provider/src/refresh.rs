@@ -176,16 +176,21 @@ impl RefreshService {
         new_keys
     }
 
-    pub async fn run<F>(mut self, on_new_key: F)
+    /// `on_new_key` returns `true` when the key was kept. `false` drops it from
+    /// `known_pubkeys` so the next refresh offers it again.
+    pub async fn run<F>(mut self, mut on_new_key: F)
     where
-        F: Fn(SecretKey),
+        F: FnMut(SecretKey) -> bool,
     {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(self.interval) => {
                     let new_keys = self.refresh().await;
                     for sk in new_keys {
-                        on_new_key(sk);
+                        let pubkey = sk.public_key().to_bytes();
+                        if !on_new_key(sk) {
+                            self.known_pubkeys.remove(&pubkey);
+                        }
                     }
                 }
                 _ = self.cancel_token.cancelled() => break,
@@ -357,6 +362,7 @@ mod tests {
             service
                 .run(move |_| {
                     *call_count_clone.lock() += 1;
+                    true
                 })
                 .await;
         });
@@ -437,6 +443,7 @@ mod tests {
             service
                 .run(move |sk| {
                     captured_clone.lock().push(sk.public_key().to_bytes());
+                    true
                 })
                 .await;
         });
@@ -450,6 +457,44 @@ mod tests {
         let keys = captured_keys.lock();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0], expected_pubkey);
+    }
+
+    /// A callback that rejects the key must not keep it in `known_pubkeys`.
+    #[tokio::test]
+    async fn test_rejected_callback_is_offered_again() {
+        let sk = SecretKey::generate();
+        let provider = MockSecretProvider {
+            name: "test-provider".to_string(),
+            keys: vec![make_raw_key_entry_with_pubkey("key-1", &sk)],
+            list_error: None,
+        };
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let service = RefreshService::new(
+            vec![Arc::new(provider)],
+            HashSet::new(),
+            Duration::from_millis(20),
+            cancel,
+        );
+        let seen = Arc::new(Mutex::new(0u32));
+        let seen_clone = Arc::clone(&seen);
+        let handle = tokio::spawn(async move {
+            service
+                .run(move |_sk| -> bool {
+                    let mut n = seen_clone.lock();
+                    *n += 1;
+                    false
+                })
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        cancel_clone.cancel();
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert!(
+            *seen.lock() >= 2,
+            "a callback that returns false must see the key on a later refresh, saw {}",
+            *seen.lock()
+        );
     }
 
     #[tokio::test]

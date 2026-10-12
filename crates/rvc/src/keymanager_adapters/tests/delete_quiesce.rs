@@ -233,9 +233,9 @@ fn rig(extra: &[Pubkey]) -> Rig {
 
     let store = Arc::new(ValidatorStore::new([1u8; 20], 30_000_000));
     let vm = Arc::new(ValidatorManagerAdapter::new(Arc::clone(&store)));
-    vm.add_validator(pk, true);
+    vm.add_validator(pk, true).unwrap();
     for extra_pk in extra {
-        vm.add_validator(*extra_pk, true);
+        vm.add_validator(*extra_pk, true).unwrap();
     }
 
     let mut known = vec![pk];

@@ -156,10 +156,12 @@ fn keymanager_runtime_default_beats_the_top_level_knob() {
     let pk = [0x33u8; 48];
     let (_dir, store) = build_store(Some("cli-graf"), &fee_recipient_toml(""));
     assert_eq!(store.effective_graffiti(&pk), Some(parse_graffiti("cli-graf")));
-    store.apply_default_update(DefaultUpdate {
-        graffiti: Some(Some(parse_graffiti("km-graf"))),
-        ..DefaultUpdate::default()
-    });
+    store
+        .apply_default_update(DefaultUpdate {
+            graffiti: Some(Some(parse_graffiti("km-graf"))),
+            ..DefaultUpdate::default()
+        })
+        .unwrap();
     assert_eq!(store.effective_graffiti(&pk), Some(parse_graffiti("km-graf")));
 }
 

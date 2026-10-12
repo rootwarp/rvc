@@ -41,6 +41,8 @@ fn test_config_adapter_unknown_pubkey_returns_not_found() {
 
 #[test]
 fn test_durable_not_found_maps_to_http_404() {
+    // Setters do not pre-check. A missing pubkey reaches
+    // `update_config_durable`, which returns `NotFound` before any write.
     use axum::response::IntoResponse;
 
     let pk = test_pubkey(1);
@@ -318,4 +320,39 @@ fn test_config_persistence_concurrent_writes() {
         let gl = reloaded.effective_gas_limit(&pk);
         assert_eq!(gl, 30_000_000 + i as u64 * 1_000_000);
     }
+}
+
+#[test]
+fn test_config_adapter_durable_write_failure_does_not_publish() {
+    use axum::response::IntoResponse;
+
+    let pk = test_pubkey(1);
+    let dir = TempDir::new().unwrap();
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let nested_file = nested.join("validators.toml");
+    std::fs::write(
+        &nested_file,
+        "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\ngas_limit = 30000000\n",
+    )
+    .unwrap();
+    let store = Arc::new(ValidatorStore::load_from_config(&nested_file).unwrap());
+    store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
+    let old = store.effective_fee_recipient(&pk);
+    std::fs::remove_dir_all(&nested).unwrap();
+    let adapter = ValidatorConfigManagerAdapter::new(store.clone());
+    let err = adapter.set_fee_recipient(&pk, [0xab; 20]).unwrap_err();
+    assert_eq!(err.into_response().status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(store.effective_fee_recipient(&pk), old);
+}
+
+#[test]
+fn test_config_adapter_rejects_gas_limit_above_i64_max() {
+    use axum::response::IntoResponse;
+
+    let (adapter, store) = create_config_adapter_with_store();
+    let pk = add_test_validator(&store, 1);
+    let err = adapter.set_gas_limit(&pk, (i64::MAX as u64).saturating_add(1)).unwrap_err();
+    assert_eq!(err.into_response().status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(store.effective_gas_limit(&pk), 30_000_000);
 }
