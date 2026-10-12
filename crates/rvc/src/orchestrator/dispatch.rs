@@ -1,5 +1,6 @@
 //! Concurrent duty-dispatch limits (RR2-02), one attestation wave (RR2-03),
-//! the sync-message publish budget (RR2-04), and aggregation waves (RR2-05).
+//! the sync-message publish budget (RR2-04), aggregation waves (RR2-05), and
+//! payload-attestation waves (issue #608).
 //!
 //! `StreamExt::ready_chunks(0)` panics, so [`DispatchLimits::validated`] rejects
 //! a zero in either field. [`crate::config::Config::validate`] repeats that
@@ -20,7 +21,7 @@ use thiserror::Error;
 pub(crate) const SLOT_END_PUBLISH_OVERHANG: Duration = Duration::from_millis(500);
 
 /// In-flight sign requests and publish waves for one attestation slot,
-/// one sync-message slot, and one aggregation slot.
+/// one sync-message slot, one aggregation slot, and one payload-attestation slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchLimits {
     /// Sign requests issued together (`buffer_unordered` / `ready_chunks`).
