@@ -53,11 +53,12 @@ fn gate_at(offset_ms: u64, slot: Duration) -> (Arc<MockSlotClock>, Arc<ImportWin
 
 /// Published zero-row estimate, truncated to the millisecond the log stores.
 ///
-/// `min_hold` is one row (12_311 ns). `post_admit` is the same-host spread
-/// 31.116 ms, one group-commit batch 6.018 ms, and the 1 ms fill wait.
+/// Includes the 0.440 ms pre-lock spread, the scaled-margin floor, the
+/// loaded-run and statement-shape terms on `min_hold`, one group-commit
+/// batch, the fill wait, and the 1 ms slot-anchor allowance. Reading the
+/// gate's own estimate keeps a truncated millisecond from hiding a missing term.
 fn published_zero_row_hold_ms() -> u64 {
-    let total_ns = 12_311u64 + 31_116_000 + 6_018_000 + 1_000_000;
-    u64::try_from(Duration::from_nanos(total_ns).as_millis()).unwrap()
+    super::super::import_window::truncated_estimated_hold_ms(0)
 }
 
 #[derive(Default)]

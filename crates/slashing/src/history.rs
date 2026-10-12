@@ -46,6 +46,16 @@ impl<'a> TargetedSqlAttestationHistory<'a> {
     }
 }
 
+/// Production SQL for [`AttestationHistory::surrounding_exists`].
+///
+/// Shared with the work-bound unit test so counters measure this statement, not
+/// a private copy. Do **not** add `ORDER BY` — that materializes the match set
+/// into a TEMP B-TREE and defeats early `LIMIT 1` exit.
+pub(crate) const SURROUNDING_EXISTS_SQL: &str = "SELECT source_epoch, target_epoch \
+     FROM attestations \
+     WHERE pubkey = ?1 AND source_epoch > ?2 AND target_epoch < ?3 \
+     LIMIT 1";
+
 impl AttestationHistory for TargetedSqlAttestationHistory<'_> {
     fn conflicting_at_target(&self, target: Epoch) -> Result<Option<ExistingAtt>, SlashingError> {
         // At most one row per (pubkey, gvr, target) under the v3 unique index.
@@ -79,18 +89,11 @@ impl AttestationHistory for TargetedSqlAttestationHistory<'_> {
         // ⇔ existing.source > source && existing.target < target.
         //
         // EXISTS-style: any matching witness is enough for the violation payload.
-        // Do **not** `ORDER BY id` — that materializes the full match set into a
-        // TEMP B-TREE (O(N log N) on wide surrounds) and defeats early LIMIT 1 exit.
         let row = self
             .conn
-            .query_row(
-                "SELECT source_epoch, target_epoch \
-                 FROM attestations \
-                 WHERE pubkey = ?1 AND source_epoch > ?2 AND target_epoch < ?3 \
-                 LIMIT 1",
-                (self.pubkey, source as i64, target as i64),
-                |row| Ok((row.get::<_, i64>(0)? as Epoch, row.get::<_, i64>(1)? as Epoch)),
-            )
+            .query_row(SURROUNDING_EXISTS_SQL, (self.pubkey, source as i64, target as i64), |row| {
+                Ok((row.get::<_, i64>(0)? as Epoch, row.get::<_, i64>(1)? as Epoch))
+            })
             .optional()?;
         Ok(row)
     }
@@ -186,7 +189,7 @@ mod tests {
     };
     use crate::SlashingDb;
     use proptest::prelude::*;
-    use std::time::Instant;
+    use rusqlite::StatementStatus;
 
     const PK: &str = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     /// Noise validators: overlapping epochs/slots must not bleed into subject checks.
@@ -628,9 +631,7 @@ mod tests {
         // Without ORDER BY the plan must still use the index and not TEMP B-TREE.
         let surround_plan = explain_plan(
             &conn,
-            "SELECT source_epoch, target_epoch FROM attestations \
-             WHERE pubkey = ?1 AND source_epoch > ?2 AND target_epoch < ?3 \
-             LIMIT 1",
+            SURROUNDING_EXISTS_SQL,
             &[&PK as &dyn rusqlite::types::ToSql, &1i64, &100i64],
         );
         assert_no_table_scan(&surround_plan, "surrounding_exists");
@@ -667,64 +668,115 @@ mod tests {
         assert_no_table_scan(&min_slot_plan, "min_slot");
     }
 
-    /// Per-sign work stays bounded as history grows — including a **wide-surround**
-    /// candidate that matches many rows (the path that used to force TEMP B-TREE).
+    /// Production [`SURROUNDING_EXISTS_SQL`] stays an index `LIMIT 1` lookup:
+    /// no sort, no full scan, and VM/filter work does not grow with history size.
+    ///
+    /// The sole matching row is inserted after a long non-matching prefix so a
+    /// table scan from the start would pay O(N). Wall-clock ratios flake under
+    /// llvm-cov; these statement counters are deterministic.
     #[test]
-    fn test_per_sign_work_bounded_as_history_grows() {
-        /// Sequential history (i, i+1). Wide candidate (0, n+10) surrounds ~all rows.
-        fn median_check_ns(n_rows: usize, samples: usize) -> u128 {
+    fn test_surrounding_exists_sql_is_index_limit_without_sort_or_fullscan() {
+        #[derive(Debug, Clone, Copy)]
+        struct SurroundWork {
+            surrounding_vm: i32,
+            surrounding_filter: i32,
+            sort: i32,
+            fullscan: i32,
+            query_runs: i32,
+        }
+
+        /// `non_matching` rows with `source = 0` (not a surround witness for
+        /// candidate `source = 0`), then one late match (`source = 1`).
+        fn surround_work(non_matching: usize) -> SurroundWork {
             let db = SlashingDb::open_in_memory().unwrap();
             {
                 let conn = db.conn.lock();
-                for i in 0..n_rows {
-                    let source = i as u64;
-                    let target = source + 1;
-                    seed_attestation(&conn, PK, source, target, Some("0x01"));
+                for i in 0..non_matching {
+                    // source == 0 ⇒ not `(source > 0 AND target < cand_target)`.
+                    seed_attestation(&conn, PK, 0, (i as u64) + 1, Some("0x01"));
                 }
+                let match_target = (non_matching as u64) + 1;
+                seed_attestation(&conn, PK, 1, match_target, Some("0x02"));
             }
 
-            let mut times = Vec::with_capacity(samples);
-            for s in 0..samples {
-                let conn = db.conn.lock();
-                let history = TargetedSqlAttestationHistory::new(&conn, PK);
-                let n = n_rows as u64;
-                // Alternate: (a) wide surround that matches many rows, (b) above-all accept.
-                // Wide path is the TEMP B-TREE regression case.
-                let candidate = if s % 2 == 0 {
-                    AttestationCandidate {
-                        source_epoch: 0,
-                        target_epoch: n + 10 + (s as u64 % 5),
-                        signing_root: Some(format!("0x{:02x}", (s % 200) as u8)),
-                    }
-                } else {
-                    AttestationCandidate {
-                        source_epoch: n,
-                        target_epoch: n + 1 + (s as u64 % 10),
-                        signing_root: Some(format!("0x{:02x}", (s % 200) as u8)),
-                    }
-                };
-                let wm = AttestationWatermarks::default();
-                let start = Instant::now();
-                let _ = check_attestation(PK, &history, &wm, &candidate, false);
-                times.push(start.elapsed().as_nanos());
+            let conn = db.conn.lock();
+            let cand_source = 0i64;
+            let cand_target = (non_matching as i64) + 10;
+            let mut surrounding = conn.prepare(SURROUNDING_EXISTS_SQL).unwrap();
+            let hit = surrounding
+                .query_row((PK, cand_source, cand_target), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+                })
+                .optional()
+                .unwrap();
+            assert_eq!(hit, Some((1, (non_matching as i64) + 1)), "late witness must be found");
+
+            let surrounding_vm = surrounding.get_status(StatementStatus::VmStep);
+            let surrounding_filter = surrounding.get_status(StatementStatus::FilterHit)
+                + surrounding.get_status(StatementStatus::FilterMiss);
+            let sort = surrounding.get_status(StatementStatus::Sort);
+            let fullscan = surrounding.get_status(StatementStatus::FullscanStep);
+            let surrounding_runs = surrounding.get_status(StatementStatus::Run);
+
+            let history = TargetedSqlAttestationHistory::new(&conn, PK);
+            let candidate = AttestationCandidate {
+                source_epoch: 0,
+                target_epoch: (non_matching as u64) + 10,
+                signing_root: Some("0xaa".into()),
+            };
+            let outcome = check_attestation(
+                PK,
+                &history,
+                &AttestationWatermarks::default(),
+                &candidate,
+                false,
+            );
+            assert!(
+                matches!(
+                    outcome,
+                    Err(SlashingError::SlashableAttestation(
+                        AttestationSlashingViolation::SurroundingVote { .. }
+                    ))
+                ),
+                "candidate must be a surrounding vote via production history, got {outcome:?}"
+            );
+
+            SurroundWork {
+                surrounding_vm,
+                surrounding_filter,
+                sort,
+                fullscan,
+                query_runs: surrounding_runs,
             }
-            times.sort_unstable();
-            times[times.len() / 2]
         }
 
-        // Warm once so first-open costs don't skew the small-N sample.
-        let _ = median_check_ns(10, 5);
+        let small = surround_work(10);
+        let large = surround_work(10_000);
 
-        let t_small = median_check_ns(10, 60);
-        let t_large = median_check_ns(10_000, 60);
+        assert_eq!(small.sort, 0, "production SQL must not SORT (small={small:?})");
+        assert_eq!(large.sort, 0, "production SQL must not SORT (large={large:?})");
+        assert_eq!(small.fullscan, 0, "production SQL must not FULLSCAN (small={small:?})");
+        assert_eq!(large.fullscan, 0, "production SQL must not FULLSCAN (large={large:?})");
 
-        // Bound: large history should not be more than ~50× the small one.
-        // O(N) full-scan / O(N log N) TEMP B-TREE would be ~1000×; LIMIT 1 is near-constant.
-        let factor = t_large.checked_div(t_small.max(1)).unwrap_or(0);
+        assert_eq!(
+            small.query_runs, large.query_runs,
+            "surrounding_exists is one statement run; runs must not grow with N \
+             (small={small:?}, large={large:?})"
+        );
+        assert_eq!(small.query_runs, 1, "exactly one LIMIT 1 run per surround question");
+
+        // O(N) full-scan / TEMP B-TREE materialization would grow roughly with N
+        // (~1000× from 10 → 10k). LIMIT 1 + index keeps VM/filter work near-constant.
+        let vm_factor = (large.surrounding_vm.max(1) as u64)
+            .checked_div(small.surrounding_vm.max(1) as u64)
+            .unwrap_or(0);
+        let filter_factor = (large.surrounding_filter.max(1) as u64)
+            .checked_div(small.surrounding_filter.max(1) as u64)
+            .unwrap_or(0);
         assert!(
-            factor < 50,
-            "per-sign work not bounded (incl. wide-surround): 10 rows median={t_small}ns, \
-             10k rows median={t_large}ns (factor={factor})"
+            vm_factor < 50 && filter_factor < 50,
+            "production surrounding_exists work not bounded: small={small:?}, large={large:?} \
+             (vm_factor={vm_factor}, filter_factor={filter_factor})"
         );
     }
 }

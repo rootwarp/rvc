@@ -84,6 +84,12 @@ pub struct BuiltKeymanagerApi {
     pub doppelganger_window: Duration,
     pub addr: std::net::SocketAddr,
     pub token_path: PathBuf,
+    /// The single import gate wired into [`SlashingProtectionAdapter`].
+    ///
+    /// Test-only: pins that [`build_keymanager_api`] forwards the DB's
+    /// [`slashing::GroupCommitConfig`] into the gate.
+    #[cfg(test)]
+    pub(crate) import_window_gate: Arc<ImportWindowGate>,
 }
 
 /// Errors from assembling or spawning the Keymanager API.
@@ -188,12 +194,16 @@ pub fn build_keymanager_api(
     let tracked_keys = Arc::clone(&keystore_mgr.tracked_keys);
     let membership = Arc::clone(&km_composite);
     // One gate per `SlashingDb`, built here at bootstrap and stored in the
-    // only adapter that imports interchange.
-    let import_gate = Arc::new(ImportWindowGate::new(deps.slot_clock));
+    // only adapter that imports interchange. The gate must see the DB's
+    // effective group-commit knobs (not `GroupCommitConfig::default`).
+    let import_gate = Arc::new(
+        ImportWindowGate::new(deps.slot_clock)
+            .with_group_commit(deps.slashing_db.group_commit_config()),
+    );
     let slashing_prot = Arc::new(SlashingProtectionAdapter::new(
         deps.slashing_db,
         deps.genesis_validators_root,
-        import_gate,
+        Arc::clone(&import_gate),
     ));
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -281,6 +291,8 @@ pub fn build_keymanager_api(
         doppelganger_window,
         addr: km_addr,
         token_path,
+        #[cfg(test)]
+        import_window_gate: import_gate,
     }))
 }
 

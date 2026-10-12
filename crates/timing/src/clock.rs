@@ -70,8 +70,26 @@ pub trait SlotClock: Send + Sync {
         self.genesis_time() + (slot * self.slot_duration().as_secs())
     }
 
+    /// Unix milliseconds at the start of `slot`.
+    ///
+    /// Uses saturating multiply so oversized genesis/slot values do not wrap
+    /// to a small timestamp. Prefer [`Self::slot_start_ms_checked`] on paths
+    /// that must fail closed (e.g. pre-genesis import).
     fn slot_start_ms(&self, slot: Slot) -> u64 {
-        self.slot_start_time(slot) * 1000
+        self.slot_start_time(slot).saturating_mul(1000)
+    }
+
+    /// Checked unix milliseconds at the start of `slot`.
+    ///
+    /// Fails with [`TimingError::TimeOverflow`] when `genesis_time`, the slot
+    /// offset, or the seconds-to-milliseconds conversion would overflow `u64`.
+    /// Pre-genesis import uses this via [`Self::time_until_slot`]`(0)`.
+    fn slot_start_ms_checked(&self, slot: Slot) -> Result<u64, TimingError> {
+        let slot_secs =
+            slot.checked_mul(self.slot_duration().as_secs()).ok_or(TimingError::TimeOverflow)?;
+        let start_secs =
+            self.genesis_time().checked_add(slot_secs).ok_or(TimingError::TimeOverflow)?;
+        start_secs.checked_mul(1000).ok_or(TimingError::TimeOverflow)
     }
 
     fn ms_into_slot(&self, slot: Slot) -> u64 {
@@ -84,7 +102,7 @@ pub trait SlotClock: Send + Sync {
 
     fn time_until_slot(&self, slot: Slot) -> Result<Duration, TimingError> {
         let current_time_ms = self.current_time_ms();
-        let slot_start_ms = self.slot_start_ms(slot);
+        let slot_start_ms = self.slot_start_ms_checked(slot)?;
 
         if current_time_ms >= slot_start_ms {
             return Ok(Duration::ZERO);
@@ -100,9 +118,11 @@ pub trait SlotClock: Send + Sync {
         // integer-second division — firing up to ~333 ms early). Mainnet is
         // 3333 * 12000 / 10000 = 3999 ms (report §4.3).
         let current_time_ms = self.current_time_ms();
-        let slot_start_ms = self.slot_start_ms(slot);
+        let slot_start_ms = self.slot_start_ms_checked(slot)?;
         let slot_duration_ms = self.slot_duration().as_millis() as u64;
-        let due_time_ms = slot_start_ms + due_ms(bps, slot_duration_ms);
+        let due_time_ms = slot_start_ms
+            .checked_add(due_ms(bps, slot_duration_ms))
+            .ok_or(TimingError::TimeOverflow)?;
 
         if current_time_ms >= due_time_ms {
             return Ok(Duration::ZERO);
@@ -239,7 +259,9 @@ impl MockSlotClock {
             genesis_time,
             slot_duration,
             slots_per_epoch,
-            current_time_ms: std::sync::atomic::AtomicU64::new(genesis_time * 1000),
+            // Saturating so oversized genesis values remain constructible for
+            // overflow tests; [`SlotClock::time_until_slot`] still fails closed.
+            current_time_ms: std::sync::atomic::AtomicU64::new(genesis_time.saturating_mul(1000)),
             schedule: DeadlineSchedule::uniform(DeadlineBps::default()),
         }
     }
@@ -255,7 +277,7 @@ impl MockSlotClock {
     }
 
     pub fn set_current_time(&self, time: u64) {
-        self.current_time_ms.store(time * 1000, std::sync::atomic::Ordering::SeqCst);
+        self.current_time_ms.store(time.saturating_mul(1000), std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Set unix time in milliseconds. `store` (not `fetch_max`) so a smaller
@@ -414,6 +436,22 @@ mod tests {
         clock.set_current_time(TEST_GENESIS_TIME + 100);
         let time_until = clock.time_until_slot(5).unwrap();
         assert_eq!(time_until, Duration::ZERO);
+    }
+
+    /// Pre-genesis admission calls `time_until_slot(0)`, which is `genesis*1000`.
+    /// Wrapping that multiply would admit with a bogus duration; fail closed.
+    #[test]
+    fn time_until_slot_zero_fails_closed_when_genesis_ms_overflows() {
+        let genesis = (u64::MAX / 1000) + 1;
+        assert!(genesis.checked_mul(1000).is_none(), "fixture must overflow");
+        let clock = MockSlotClock::new(genesis, Duration::from_secs(12), 32);
+        clock.set_current_time_ms(0);
+        let err = clock.time_until_slot(0).expect_err("overflow must refuse");
+        assert!(matches!(err, TimingError::TimeOverflow), "expected TimeOverflow, got {err:?}");
+        assert!(
+            matches!(clock.slot_start_ms_checked(0), Err(TimingError::TimeOverflow)),
+            "slot_start_ms_checked must refuse the same overflow"
+        );
     }
 
     #[test]
