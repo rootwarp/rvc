@@ -3,6 +3,30 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Beacon node SSE: oversize frames drop the connection
+
+The beacon-node event stream (`bn.sse`) limits how much of an SSE frame it
+buffers. The cap is 64 KiB (`DEFAULT_MAX_SSE_EVENT_BYTES`). It applies to the
+current line and to the `data`, `event`, and `id` fields while the frame is
+still being read.
+
+A frame that would grow past the cap closes that connection. The subscriber
+counts the close as a failure and reconnects. After three consecutive
+failures on one endpoint it fails over to the next beacon node, or waits on
+the polling fallback when only one endpoint is configured. The same close
+happens when a line is not valid UTF-8.
+
+A stream that starts with a UTF-8 BOM (`U+FEFF`) is accepted. These cases
+stay inside the subscriber. They do not stop the process, and timer-based
+duties keep running.
+
+Events at or under the cap are unchanged.
+
+The HTTP client no longer uses `reqwest-eventsource` / `eventsource-stream`
+0.2.3. That release is the latest on crates.io. It buffered frames without a
+cap and panicked on a leading BOM. Framing lives in `bn-manager`
+(`sse::frame`).
+
 ## Exit codes: listener bind is 15 and a critical task is 16
 
 Two new process exit codes sit beside the existing startup codes. `12` stays

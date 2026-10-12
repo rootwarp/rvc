@@ -67,7 +67,11 @@ clap = { version = "4", features = ["derive"] }
 tonic = "0.12"
 prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-reqwest-eventsource = "0.6"
+# Beacon-node SSE is framed in `crates/bn-manager/src/sse/frame.rs`.
+# `reqwest-eventsource` 0.6.0 depends on `eventsource-stream` 0.2.3 (latest
+# crates.io release). That parser grows its line and `data` buffers without a
+# cap, and strips a leading U+FEFF with `&str[1..]`, which panics. Do not
+# reintroduce either crate. See `docs/releases/UNRELEASED.md`.
 futures = "0.3"
 hyper = "1"
 http-body-util = "0.1"
