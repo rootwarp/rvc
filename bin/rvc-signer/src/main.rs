@@ -563,7 +563,8 @@ fn classify_exit_code(err: &ServerError) -> i32 {
         | ServerError::Tls(_)
         | ServerError::Bind(_)
         | ServerError::Config(_)
-        | ServerError::Io(_) => 1,
+        | ServerError::Io(_)
+        | ServerError::Runtime(_) => 1,
     }
 }
 

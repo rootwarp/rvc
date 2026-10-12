@@ -53,7 +53,8 @@ pub(crate) const MAX_CONCURRENT_CONNECTIONS: usize = 1024;
 /// the task and bounds the spin (3.3 review).
 pub(crate) const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 /// Upper bound on draining in-flight connections at shutdown, so SIGTERM cannot
-/// hang on an idle keep-alive client.
+/// hang on an idle keep-alive client that ignores per-connection graceful
+/// shutdown.
 pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Serve the Web3Signer HTTP API over TLS on `listener` (ADR-005, R7).
@@ -72,8 +73,11 @@ pub(crate) const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 ///   spawning unbounded tasks;
 /// - an `accept()` error backs off [`ACCEPT_ERROR_BACKOFF`] so EMFILE/ENFILE
 ///   cannot busy-spin the loop;
-/// - on `shutdown`, the loop stops accepting and drains in-flight connections
-///   (bounded by [`DRAIN_TIMEOUT`]) so an in-progress `/sign` completes.
+/// - on `shutdown`, the loop stops accepting and each open connection's hyper
+///   [`Connection::graceful_shutdown`](http1::Connection::graceful_shutdown) is
+///   wired to the same token, so an idle keep-alive client cannot keep serving
+///   new `/sign` requests during the drain; an in-progress request still finishes,
+///   then the connection closes (bounded by [`DRAIN_TIMEOUT`]).
 ///
 /// `router` is taken as an opaque [`axum::Router`]; this module stays ignorant
 /// of `/sign` and the gate (extraction-readiness). Unlike `serve_metrics` (which
@@ -134,8 +138,9 @@ async fn serve_https_inner(
 
         let acceptor = acceptor.clone();
         let router = router.clone();
+        let conn_shutdown = shutdown.clone();
         conns.spawn(async move {
-            serve_one(acceptor, tcp, router).await;
+            serve_one(acceptor, tcp, router, conn_shutdown).await;
             drop(permit); // release the serving slot when the connection ends
         });
 
@@ -143,8 +148,10 @@ async fn serve_https_inner(
         while conns.try_join_next().is_some() {}
     }
 
-    // Graceful shutdown: stop accepting (listener dropped) and drain in-flight
-    // connections, bounded so an idle keep-alive client cannot hang exit.
+    // Accept loop stopped: listener is dropped below. Open connections already
+    // observe `shutdown` via per-connection graceful_shutdown; drain them here
+    // so an in-progress request can finish, bounded by `drain_timeout`.
+    tracing::info!("HTTP listener stopped accepting");
     drop(listener);
     let _ =
         tokio::time::timeout(drain_timeout, async { while conns.join_next().await.is_some() {} })
@@ -176,8 +183,17 @@ pub async fn spawn_https_listener(
 }
 
 /// Handshake one connection, inject [`PeerCert`], and serve `router` over it.
-async fn serve_one(acceptor: TlsAcceptor, tcp: TcpStream, router: Router) {
-    serve_one_with_timeout(acceptor, tcp, router, HANDSHAKE_TIMEOUT).await
+///
+/// `shutdown` drives hyper [`Connection::graceful_shutdown`]: after the token
+/// fires, the current request (if any) finishes and keep-alive is disabled so
+/// no further `/sign` (or other) requests are accepted on this connection.
+async fn serve_one(
+    acceptor: TlsAcceptor,
+    tcp: TcpStream,
+    router: Router,
+    shutdown: CancellationToken,
+) {
+    serve_one_with_timeout(acceptor, tcp, router, HANDSHAKE_TIMEOUT, shutdown).await
 }
 
 /// [`serve_one`] with an injectable handshake timeout for unit tests.
@@ -186,6 +202,7 @@ async fn serve_one_with_timeout(
     tcp: TcpStream,
     router: Router,
     handshake_timeout: Duration,
+    shutdown: CancellationToken,
 ) {
     let tls_stream = match tokio::time::timeout(handshake_timeout, acceptor.accept(tcp)).await {
         Ok(Ok(stream)) => stream,
@@ -220,8 +237,30 @@ async fn serve_one_with_timeout(
 
     let mut builder = http1::Builder::new();
     builder.timer(TokioTimer::new()).header_read_timeout(HEADER_READ_TIMEOUT);
-    if let Err(e) = builder.serve_connection(TokioIo::new(tls_stream), service).await {
-        tracing::debug!(error = %e, "HTTP connection closed with error");
+    let conn = builder.serve_connection(TokioIo::new(tls_stream), service);
+    tokio::pin!(conn);
+
+    // Already shutting down (e.g. accepted just as the token fired): disable
+    // keep-alive before the first request on this connection.
+    if shutdown.is_cancelled() {
+        conn.as_mut().graceful_shutdown();
+    }
+
+    tokio::select! {
+        biased;
+        result = conn.as_mut() => {
+            if let Err(e) = result {
+                tracing::debug!(error = %e, "HTTP connection closed with error");
+            }
+        }
+        _ = shutdown.cancelled() => {
+            // Finish the in-flight request (if any), then close — do not accept
+            // further keep-alive requests such as a late `/sign`.
+            conn.as_mut().graceful_shutdown();
+            if let Err(e) = conn.as_mut().await {
+                tracing::debug!(error = %e, "HTTP connection closed with error");
+            }
+        }
     }
 }
 

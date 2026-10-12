@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use tracing::info;
+
 use crate::config::ResolvedConfig;
 use crate::error::ServerError;
 use crate::http_api::{self, Web3SignerState};
@@ -63,8 +65,9 @@ pub(crate) fn build_http_state(deps: &HttpApiDeps<'_>) -> Result<Web3SignerState
 
 /// HTTPS listener task and the address it bound.
 ///
-/// Port 0 in the configured listen address is resolved to an ephemeral port on
-/// `bound`, so the composition root can release that exact socket on shutdown.
+/// `bound` is the address the listener actually bound. Port 0 in the configured
+/// listen address is resolved here. The composition root logs this address and
+/// tests probe it. Shutdown releases the socket by stopping the listener task.
 pub(crate) struct SpawnedHttpApi {
     pub handle: tokio::task::JoinHandle<()>,
     pub bound: std::net::SocketAddr,
@@ -72,9 +75,14 @@ pub(crate) struct SpawnedHttpApi {
 
 /// Spawn the opt-in Web3Signer HTTPS listener, or return `Ok(None)` when disabled.
 ///
-/// When enabled, requires the shared gate, HTTP TLS material, and binds the
-/// configured listen address. The composition root keeps [`SpawnedHttpApi::handle`]
-/// and cancels `shutdown` on every return path (success and error).
+/// When enabled, requires the shared gate and HTTP TLS material, then binds the
+/// configured listen address. The composition root then logs
+/// `Web3Signer HTTP API listening` via [`log_http_listening`] on the
+/// `signer_server::server::http` target (`address`, `tls_mode`).
+///
+/// The composition root stops new HTTP accepts before the gRPC drain starts,
+/// then joins [`SpawnedHttpApi::handle`]. If `server::run` is dropped or panics,
+/// its drop guard cancels `shutdown` and aborts the task.
 pub(crate) async fn spawn_http_api(
     deps: HttpApiDeps<'_>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -110,6 +118,23 @@ pub(crate) async fn spawn_http_api(
     .map_err(|e| ServerError::bind(e.to_string()))?;
 
     Ok(Some(SpawnedHttpApi { handle, bound }))
+}
+
+/// Log that the HTTP API is listening.
+///
+/// Emitted on the `signer_server::server::http` target so operators filtering
+/// that module path still see `Web3Signer HTTP API listening` with `address`
+/// and `tls_mode`. The composition root calls this with [`SpawnedHttpApi::bound`]
+/// after a successful spawn.
+pub(crate) fn log_http_listening(
+    bound: std::net::SocketAddr,
+    tls_mode: crate::config::HttpTlsMode,
+) {
+    info!(
+        address = %bound,
+        tls_mode = ?tls_mode,
+        "Web3Signer HTTP API listening"
+    );
 }
 
 #[cfg(test)]
@@ -316,5 +341,61 @@ mod tests {
         let handle =
             spawn_http_api(deps, CancellationToken::new()).await.expect("disabled HTTP is ok");
         assert!(handle.is_none());
+    }
+
+    /// The listening line stays on `signer_server::server::http`, the target from
+    /// before the composition root moved the call site. `run` logs through this
+    /// function so the target does not follow the caller.
+    #[test]
+    fn http_listening_log_uses_the_http_module_target() {
+        use std::sync::Mutex;
+        use tracing::field::Visit;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Capture(Arc<Mutex<Vec<(String, String)>>>);
+
+        struct MessageVisitor<'a>(&'a mut String);
+
+        impl Visit for MessageVisitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    *self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for Capture
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut message = String::new();
+                event.record(&mut MessageVisitor(&mut message));
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((event.metadata().target().to_string(), message));
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&events)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+        log_http_listening(addr, HttpTlsMode::Mtls);
+        drop(_guard);
+
+        let events = events.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            events.iter().any(|(target, message)| {
+                target == "signer_server::server::http"
+                    && message.contains("Web3Signer HTTP API listening")
+            }),
+            "listening log target/message: {events:?}"
+        );
     }
 }
