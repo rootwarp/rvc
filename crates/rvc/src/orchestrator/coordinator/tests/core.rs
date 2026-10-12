@@ -500,6 +500,15 @@ fn test_attestation_result_failure() {
     }
 }
 
+/// Red-check (issue #598 / Formal S-3): `--exact` needs the fully-qualified name.
+///
+/// ```text
+/// CARGO_TERM_COLOR=never cargo test -p rvc --lib \
+///   orchestrator::coordinator::tests::core::attestation_outcome_is_exhaustive_and_published_is_not_an_error \
+///   --locked -- --exact
+/// ```
+///
+/// An unqualified name with `--exact` filters out every test on tip.
 #[test]
 fn attestation_outcome_is_exhaustive_and_published_is_not_an_error() {
     let published = AttestationResult {

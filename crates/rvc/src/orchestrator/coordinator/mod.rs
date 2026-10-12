@@ -201,18 +201,19 @@ pub struct AttestationResult {
 pub enum AttestationOutcome {
     /// The signed attestation was accepted by the beacon node.
     Published,
-    /// The duty failed before a beacon-node rejection report.
+    /// The duty failed for any reason other than a per-index BN rejection.
     ///
-    /// The string is the operator-visible reason (sign, fetch, timeout, or
-    /// propagate).
+    /// The string is the operator-visible reason (sign, fetch, timeout,
+    /// propagate, or an unattributable BN failure index).
     Failed(String),
     /// A beacon node rejected this index in a submit response.
     ///
-    /// `bn` is the reporting endpoint from `PropagationOutcome::reported_by`.
+    /// `bn` is a host-only label (`scheme://host:port`) derived from
+    /// `PropagationOutcome::reported_by` via `bn_manager::metrics::endpoint_label`.
     /// It is `None` when that outcome names no endpoint. An empty string is
     /// not stored.
     RejectedByBeaconNode {
-        /// Reporting beacon-node endpoint, when the propagator named one.
+        /// Host-only reporting beacon-node label, when the propagator named one.
         bn: Option<String>,
         /// Rejection message from that beacon node.
         message: String,

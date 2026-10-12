@@ -487,7 +487,7 @@ where
                 warn!(
                     validator_index = %validator_index,
                     slot = slot,
-                    error = %error,
+                    error = ?error,
                     "Attestation failed"
                 );
                 Err(AttestationResult {
@@ -561,11 +561,15 @@ where
 
         match submit_result {
             Ok(Ok(outcome)) => {
-                // The log keeps the historical empty-string fallback. The
-                // outcome stores `None` for a bn-less (or empty) report.
-                let bn_log = outcome.reported_by.clone().unwrap_or_default();
-                let bn = outcome.reported_by.filter(|endpoint| !endpoint.is_empty());
+                // Host-only label for storage and logs (issue #598 / Security S2).
+                // `None` for a bn-less or empty report.
+                let bn = outcome
+                    .reported_by
+                    .filter(|endpoint| !endpoint.is_empty())
+                    .map(|endpoint| bn_manager::metrics::endpoint_label(&endpoint));
+                let bn_log = bn.clone().unwrap_or_default();
                 let mut rejected = HashMap::<u32, String>::new();
+                let mut unattributable = false;
                 for failure in outcome.failures {
                     let positioned =
                         usize::try_from(failure.index).ok().and_then(|i| signed.get(i));
@@ -581,6 +585,8 @@ where
                             rejected.insert(failure.index, failure.message);
                         }
                         None => {
+                            // Out-of-range indices are not Published (issue #598 / S3).
+                            unattributable = true;
                             warn!(
                                 slot,
                                 index = failure.index,
@@ -602,6 +608,14 @@ where
                                 message,
                             },
                         });
+                    } else if unattributable {
+                        results.push(
+                            self.failed_publish(
+                                entry,
+                                "beacon node reported an unattributable attestation failure"
+                                    .to_string(),
+                            ),
+                        );
                     } else {
                         results.push(self.successful_publish(entry));
                     }
@@ -649,7 +663,7 @@ where
         warn!(
             validator_index = %entry.attribution.validator_index,
             slot = entry.attribution.slot,
-            error = %error,
+            error = ?error,
             "Attestation failed"
         );
         AttestationResult {
@@ -1337,6 +1351,12 @@ mod dispatch_pipeline {
         }
     }
 
+    /// Raw configured endpoint with userinfo and path — must not be stored in
+    /// `RejectedByBeaconNode.bn` (issue #598 / Security S2).
+    const PARTIAL_BN_RAW: &str =
+        "http://user:secret@bn-partial.example:5052/eth/v1/beacon/pool/attestations";
+    const PARTIAL_BN_HOST: &str = "http://bn-partial.example:5052";
+
     impl AttestationSubmitter for PartialSubmitter {
         fn submit_attestation<'a>(
             &'a self,
@@ -1363,11 +1383,86 @@ mod dispatch_pipeline {
             // miss a one-item wave.
             Box::pin(async {
                 Ok((
-                    Some("http://bn-partial.example:5052".to_string()),
+                    Some(PARTIAL_BN_RAW.to_string()),
                     SubmitAttestationResult::PartialFailure {
                         failures: vec![IndexedAttestationError {
                             index: 0,
                             message: "invalid signature".to_string(),
+                        }],
+                    },
+                ))
+            })
+        }
+    }
+
+    /// Submitter that returns a fixed `reported_by` and rejects wave index 0.
+    struct ReportedBySubmitter {
+        reported_by: Option<String>,
+    }
+
+    impl AttestationSubmitter for ReportedBySubmitter {
+        fn submit_attestation<'a>(
+            &'a self,
+            _attestations: &'a VersionedAttestation,
+        ) -> Pin<Box<dyn Future<Output = Result<SubmitAttestationResult, BeaconError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(SubmitAttestationResult::Success) })
+        }
+
+        fn submit_attestation_attributed<'a>(
+            &'a self,
+            _attestations: &'a VersionedAttestation,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(Option<String>, SubmitAttestationResult), BeaconError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let reported_by = self.reported_by.clone();
+            Box::pin(async move {
+                Ok((
+                    reported_by,
+                    SubmitAttestationResult::PartialFailure {
+                        failures: vec![IndexedAttestationError {
+                            index: 0,
+                            message: "rejected".to_string(),
+                        }],
+                    },
+                ))
+            })
+        }
+    }
+
+    /// Submitter that returns an out-of-range failure index.
+    struct OutOfRangeSubmitter;
+
+    impl AttestationSubmitter for OutOfRangeSubmitter {
+        fn submit_attestation<'a>(
+            &'a self,
+            _attestations: &'a VersionedAttestation,
+        ) -> Pin<Box<dyn Future<Output = Result<SubmitAttestationResult, BeaconError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(SubmitAttestationResult::Success) })
+        }
+
+        fn submit_attestation_attributed<'a>(
+            &'a self,
+            _attestations: &'a VersionedAttestation,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(Option<String>, SubmitAttestationResult), BeaconError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async {
+                Ok((
+                    Some("http://bn-oor.example:5052".to_string()),
+                    SubmitAttestationResult::PartialFailure {
+                        failures: vec![IndexedAttestationError {
+                            index: 999,
+                            message: "ghost index".to_string(),
                         }],
                     },
                 ))
@@ -1531,7 +1626,7 @@ mod dispatch_pipeline {
                     result.validator_index == *index
                         && match &result.outcome {
                             AttestationOutcome::RejectedByBeaconNode { bn, message } => {
-                                bn.as_deref() == Some("http://bn-partial.example:5052")
+                                bn.as_deref() == Some(PARTIAL_BN_HOST)
                                     && message.contains("invalid signature")
                             }
                             AttestationOutcome::Published => false,
@@ -1542,12 +1637,101 @@ mod dispatch_pipeline {
             );
             assert!(logs_contain(index), "log must name validator {index}");
         }
-        assert!(logs_contain("http://bn-partial.example:5052"));
+        assert!(logs_contain(PARTIAL_BN_HOST));
+        assert!(
+            !logs_contain("user:secret"),
+            "raw credentials must not appear in the bn log field"
+        );
         assert!(logs_contain("invalid signature"));
         assert_eq!(results.len(), 3);
         assert_eq!(
             results.iter().filter(|result| result.outcome.is_published()).count(),
             3 - failed_indices.len()
+        );
+    }
+
+    /// Issue #598 / Formal S-4: empty or missing `reported_by` stores `bn: None`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn empty_or_missing_reported_by_maps_bn_to_none() {
+        for reported_by in [None, Some(String::new())] {
+            let case = format!("{reported_by:?}");
+            let submitter = Arc::new(ReportedBySubmitter { reported_by });
+            let fixture = open_fixture_with_submitter(
+                1,
+                FixtureOpts { concurrency: 1, publish_concurrency: 1, ..FixtureOpts::default() },
+                submitter,
+            );
+            let results = fixture.service.process_slot(SLOT).await.expect("process_slot");
+            assert_eq!(results.len(), 1, "reported_by={case}");
+            match &results[0].outcome {
+                AttestationOutcome::RejectedByBeaconNode { bn, message } => {
+                    assert!(
+                        bn.is_none(),
+                        "empty/missing reported_by must store bn: None, got {bn:?} (case {case})"
+                    );
+                    assert!(message.contains("rejected"));
+                }
+                other => panic!("expected RejectedByBeaconNode for {case}, got {other:?}"),
+            }
+        }
+    }
+
+    /// Issue #598 / Security S3: out-of-range BN failure indices are not Published.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[traced_test]
+    async fn out_of_range_bn_failure_indices_are_not_published() {
+        let submitter = Arc::new(OutOfRangeSubmitter);
+        let fixture = open_fixture_with_submitter(
+            2,
+            FixtureOpts { concurrency: 2, publish_concurrency: 1, ..FixtureOpts::default() },
+            submitter,
+        );
+        let results = fixture.service.process_slot(SLOT).await.expect("process_slot");
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|result| !result.outcome.is_published()),
+            "out-of-range failure indices must not leave duties as Published: {results:?}"
+        );
+        assert!(
+            results.iter().all(|result| matches!(
+                &result.outcome,
+                AttestationOutcome::Failed(message)
+                    if message.contains("unattributable")
+            )),
+            "out-of-range indices count as Failed, got {results:?}"
+        );
+        assert!(logs_contain("unknown wave index"));
+        assert!(logs_contain("999"));
+    }
+
+    /// Issue #598 / Security S1: BN-supplied CR/LF must not forge text-format log lines.
+    ///
+    /// The `Attestation failed` warns use Debug (`?`) for the error field. Debug
+    /// escapes control characters, so a newline in BN text cannot inject a new
+    /// log line in the text formatter.
+    #[test]
+    fn attestation_failed_warn_escapes_newlines_via_debug() {
+        let injected = "Failed to get attestation data: bad\nINFO forged line from bn";
+        let rendered = format!("{injected:?}");
+        assert!(
+            !rendered.contains('\n') && !rendered.contains('\r'),
+            "Debug must escape CR/LF for text logs: {rendered}"
+        );
+        assert!(rendered.contains("\\n"), "expected escaped newline in {rendered}");
+
+        let src =
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/orchestrator/attestation.rs"));
+        // Production only: stop before this test module's sibling `dispatch_pipeline`.
+        let production = src.split("mod dispatch_pipeline").next().expect("production source");
+        let debug_sites = production.matches("error = ?error").count();
+        let display_sites = production.matches("error = %error").count();
+        assert_eq!(
+            display_sites, 0,
+            "Attestation failed warns must not use Display (%error); BN CR/LF can forge text logs"
+        );
+        assert!(
+            debug_sites >= 2,
+            "Attestation failed warns must use Debug (?error); found {debug_sites}"
         );
     }
 
