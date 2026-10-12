@@ -245,9 +245,9 @@ fn world() -> World {
 
 async fn one_iteration(world: &World, n: u64) {
     if world.store.get_config(&world.pk).is_none() {
-        world.vm.add_validator(world.pk, true);
+        world.vm.add_validator(world.pk, true).unwrap();
     } else {
-        world.vm.set_validator_enabled(&world.pk, true);
+        world.vm.set_validator_enabled(&world.pk, true).unwrap();
     }
     world.keys.ensure(world.pk);
 

@@ -154,25 +154,27 @@ impl MockValidatorManager {
 }
 
 impl ValidatorManager for MockValidatorManager {
-    fn add_validator(&self, pubkey: Pubkey, enabled: bool) {
+    fn add_validator(&self, pubkey: Pubkey, enabled: bool) -> Result<(), String> {
         self.validators.lock().push((pubkey, enabled));
+        Ok(())
     }
 
-    fn remove_validator(&self, pubkey: &Pubkey) -> bool {
+    fn remove_validator(&self, pubkey: &Pubkey) -> Result<bool, String> {
         let mut validators = self.validators.lock();
         if let Some(pos) = validators.iter().position(|(pk, _)| pk == pubkey) {
             validators.remove(pos);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
-    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) {
+    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) -> Result<(), String> {
         let mut validators = self.validators.lock();
         if let Some((_, e)) = validators.iter_mut().find(|(pk, _)| pk == pubkey) {
             *e = enabled;
         }
+        Ok(())
     }
 }
 

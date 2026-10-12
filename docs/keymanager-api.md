@@ -322,9 +322,9 @@ Set a per-validator gas limit override. The change is persisted.
 **Response:** `202 Accepted` (no body)
 
 **Validation:**
-- `gas_limit` must be a string-encoded decimal integer
+- `gas_limit` must be a string-encoded decimal integer `<= i64::MAX` (TOML cannot store a larger value)
 
-**Errors:** `400` (non-numeric value), `404` (unknown validator)
+**Errors:** `400` (non-numeric value, or above `i64::MAX`), `404` (unknown validator)
 
 ---
 

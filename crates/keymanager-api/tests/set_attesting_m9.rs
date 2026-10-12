@@ -55,11 +55,15 @@ impl SlashingProtection for NoopSlashingProtection {
 
 struct NoopValidatorManager;
 impl ValidatorManager for NoopValidatorManager {
-    fn add_validator(&self, _: Pubkey, _: bool) {}
-    fn remove_validator(&self, _: &Pubkey) -> bool {
-        false
+    fn add_validator(&self, _: Pubkey, _: bool) -> Result<(), String> {
+        Ok(())
     }
-    fn set_validator_enabled(&self, _: &Pubkey, _: bool) {}
+    fn remove_validator(&self, _: &Pubkey) -> Result<bool, String> {
+        Ok(false)
+    }
+    fn set_validator_enabled(&self, _: &Pubkey, _: bool) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 struct NoopDoppelgangerMonitor;

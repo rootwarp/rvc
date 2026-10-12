@@ -222,7 +222,7 @@ async fn export_fails_closed_delete_aborts_and_key_stays_disabled() {
 
     let store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
     let manager = ValidatorManagerAdapter::new(Arc::clone(&store));
-    manager.add_validator(bad, false);
+    manager.add_validator(bad, false).unwrap();
     assert!(!store.is_signing_enabled(&bad));
     let validator_manager: Arc<dyn ValidatorManager> = Arc::new(manager);
 

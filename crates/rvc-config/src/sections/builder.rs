@@ -39,8 +39,25 @@ impl BuilderSettings {
         for raw in &self.builders {
             validate_builder_url(raw)?;
         }
+        if let Some(min_bid) = self.min_bid {
+            reject_above_toml_i64("builder.min_bid", min_bid)?;
+        }
+        if let Some(factor) = self.builder_boost_factor {
+            reject_above_toml_i64("builder.builder_boost_factor", factor)?;
+        }
         Ok(())
     }
+}
+
+fn reject_above_toml_i64(field: &'static str, value: u64) -> Result<(), ConfigError> {
+    if value > i64::MAX as u64 {
+        return Err(ConfigError::Invalid {
+            field,
+            message: format!("{value} exceeds i64::MAX; TOML cannot store it"),
+            source_layer: ConfigSource::Default,
+        });
+    }
+    Ok(())
 }
 
 fn validate_builder_url(raw: &str) -> Result<(), ConfigError> {
@@ -102,6 +119,16 @@ builder_boost_factor = 80
         assert_eq!(cfg.min_bid, Some(10_000_000));
         assert_eq!(cfg.builder_boost_factor, Some(80));
         cfg.validate().expect("well-formed URLs");
+    }
+
+    #[test]
+    fn min_bid_and_boost_above_i64_max_are_rejected() {
+        let above = (i64::MAX as u64).saturating_add(1);
+        let min_bid = BuilderSettings { min_bid: Some(above), ..BuilderSettings::default() };
+        assert!(min_bid.validate().is_err(), "min_bid above i64::MAX must be rejected");
+        let boost =
+            BuilderSettings { builder_boost_factor: Some(above), ..BuilderSettings::default() };
+        assert!(boost.validate().is_err(), "builder_boost_factor above i64::MAX must be rejected");
     }
 
     #[test]

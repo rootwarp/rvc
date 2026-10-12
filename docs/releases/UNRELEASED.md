@@ -165,6 +165,57 @@ The remove-or-replace race is 404 because it returns `NotFound`. Before
 RR3-03 the adapter mapped every store error to `ApiError::Internal`, which
 is HTTP 500. `ApiError::NotFound` is HTTP 404.
 
+## Config durability: slashing disable, import, and integer bounds
+
+A change that makes signing safer publishes first. A slashed validator on
+the `disable-only` action, and a doppelganger disable, set `enabled = false`
+in memory and then persist that flag under `save_lock`. If the write fails,
+the validator stays disabled and the error is surfaced. A directory `fsync`
+failure on that path does not restore the previous file.
+
+Import, delete, enable, and doppelganger re-enable persist a candidate
+first and publish only after the write. A directory `fsync` failure restores
+the previous file and leaves memory unchanged. If that restore fails before
+rename, the validators file is moved off the boot path. The `.rejected` file
+holds that rejected document. To recover, copy it aside, set the affected key
+to `enabled = false`, delete `doppelganger_hold_until`, and replace
+`validators.toml` with that edited file. Restoring `.rejected` unchanged puts
+the hold back on the boot path. Dropping `--validators-config` builds a zero
+fee recipient and boot fails with `ZeroFeeRecipient`.
+A doppelganger hold is `doppelganger_hold_until` plus `enabled = false`, not
+a plain disable. Importing over a plain disable does not arm a hold. Boot
+re-enables an elapsed hold. A hold that is still open stays disabled; when
+the keymanager is running, the wall-clock enable task is started again for
+the time left. A restart does not replay doppelganger observations. A failed
+re-enable is retried. The re-enable task checks the hold deadline under
+`state_lock`; it does not read `key_gen`. Any disable cancels the task.
+DELETE cancels it before the disable write returns. A failed delete of a
+held key moves the validators file off the boot path so restart cannot
+re-enable it. A failed slashing disable of a held key does the same. A re-import stores
+the later hold deadline. The live enable task waits until that deadline and
+no longer than the configured window. A wake before the deadline leaves the
+hold in place. A windowed keystore import writes the disabled hold before
+the signer is published, and keeps the keystore as `.json.partial` until
+that hold is durable. Importing over an existing enabled row writes that
+hold before the signer as well. A duplicate import leaves no live keystore json. A
+failed import revokes the in-memory key before deleting those files and
+bumps `key_gen` so duty caches drop the key. That bump is not a hold check.
+Only a validators row that admission inserted is removed. A remote import
+that fails its lifecycle write is an error status. A failed import does not
+leave a boot-loadable keystore. A failed delete or import is an error to
+the caller, not a success status. A secret-provider key whose admit fails
+is offered again on the next refresh. Admit does not replace an existing
+`enabled = false` row.
+
+`gas_limit`, `min_bid`, and `builder_boost_factor` above `i64::MAX` are
+rejected. `gas_limit` is also rejected at the keymanager API (HTTP 400) and
+by the proposer-config refresher. `i64::MAX` itself is accepted. TOML cannot
+store a larger integer.
+
+With no `validators_config` path, fee-recipient, gas-limit, and graffiti
+setters return HTTP 500 and publish nothing. The error body is
+`no validators_config path set; the change is not persisted`.
+
 ## Behaviour: slot boundary drops undispatched duties
 
 When the slot ends, attestation, sync-committee, and aggregation duties that

@@ -177,6 +177,21 @@ impl KeymanagerServer {
         self.serve_on(listener, token).await
     }
 
+    /// Lifecycle that arms and cancels doppelganger enable tasks.
+    pub fn doppelganger_lifecycle(&self) -> Arc<DoppelgangerLifecycle> {
+        Arc::clone(&self.state.doppelganger)
+    }
+
+    /// Spawn enable tasks for doppelganger holds that are still inside their window.
+    pub fn rearm_persisted_doppelganger_holds(&self, holds: Vec<(crate::traits::Pubkey, u64)>) {
+        for (pk, residual_secs) in holds {
+            let life = Arc::clone(&self.state.doppelganger);
+            if let Err(e) = life.rearm_persisted_hold(pk, Duration::from_secs(residual_secs)) {
+                tracing::warn!(error = %e, "failed to re-arm a persisted doppelganger hold");
+            }
+        }
+    }
+
     /// Serve on a caller-supplied listener until `token` is cancelled, then
     /// drain in-flight requests.
     ///
@@ -304,11 +319,15 @@ mod tests {
 
     struct StubValidator;
     impl ValidatorManager for StubValidator {
-        fn add_validator(&self, _pubkey: Pubkey, _enabled: bool) {}
-        fn remove_validator(&self, _pubkey: &Pubkey) -> bool {
-            false
+        fn add_validator(&self, _pubkey: Pubkey, _enabled: bool) -> Result<(), String> {
+            Ok(())
         }
-        fn set_validator_enabled(&self, _pubkey: &Pubkey, _enabled: bool) {}
+        fn remove_validator(&self, _pubkey: &Pubkey) -> Result<bool, String> {
+            Ok(false)
+        }
+        fn set_validator_enabled(&self, _pubkey: &Pubkey, _enabled: bool) -> Result<(), String> {
+            Ok(())
+        }
     }
 
     struct StubDoppelganger;

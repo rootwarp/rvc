@@ -113,18 +113,20 @@ impl SpyValidatorManager {
 }
 
 impl ValidatorManager for SpyValidatorManager {
-    fn add_validator(&self, pubkey: Pubkey, enabled: bool) {
+    fn add_validator(&self, pubkey: Pubkey, enabled: bool) -> Result<(), String> {
         self.state.lock().unwrap().insert(pubkey, enabled);
+        Ok(())
     }
 
-    fn remove_validator(&self, pubkey: &Pubkey) -> bool {
-        self.state.lock().unwrap().remove(pubkey).is_some()
+    fn remove_validator(&self, pubkey: &Pubkey) -> Result<bool, String> {
+        Ok(self.state.lock().unwrap().remove(pubkey).is_some())
     }
 
-    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) {
+    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) -> Result<(), String> {
         if let Some(v) = self.state.lock().unwrap().get_mut(pubkey) {
             *v = enabled;
         }
+        Ok(())
     }
 }
 

@@ -55,6 +55,11 @@ const DEFAULT_IS_SAFE: &[(&str, &str, &str)] = &[
     ),
     ("crates/keymanager-api/src/server.rs", "StubDoppelganger", "test double"),
     (
+        "crates/keymanager-api/src/handlers.rs",
+        "NoMonitor",
+        "test double; no-op monitor, cancel defaults to stop",
+    ),
+    (
         "crates/keymanager-api/tests/common/mod.rs",
         "MockDoppelgangerMonitor",
         "test double; in-memory pending list, cancel defaults to stop",

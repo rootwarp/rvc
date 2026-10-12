@@ -161,10 +161,12 @@ pub const ALL: &[&str] = &[
     "slot.phase.payload_attestation",
     "slot.phase.sync_message",
     "slot.process",
+    "validator_store.disable_slashed",
     "validator_store.list_enabled_pubkeys",
     "validator_store.load_from_config",
     "validator_store.reload_config",
     "validator_store.save_config",
+    "validator_store.update_config_durable",
 ];
 
 /// Returns whether `name` is in the span-name registry.

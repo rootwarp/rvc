@@ -70,17 +70,19 @@ impl SpyVm {
 }
 
 impl ValidatorManager for SpyVm {
-    fn add_validator(&self, pubkey: Pubkey, enabled: bool) {
+    fn add_validator(&self, pubkey: Pubkey, enabled: bool) -> Result<(), String> {
         self.enabled.lock().expect("vm").insert(pubkey, enabled);
+        Ok(())
     }
-    fn remove_validator(&self, pubkey: &Pubkey) -> bool {
-        self.enabled.lock().expect("vm").remove(pubkey).is_some()
+    fn remove_validator(&self, pubkey: &Pubkey) -> Result<bool, String> {
+        Ok(self.enabled.lock().expect("vm").remove(pubkey).is_some())
     }
-    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) {
+    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) -> Result<(), String> {
         self.sets.lock().expect("sets").push((*pubkey, enabled));
         if let Some(slot) = self.enabled.lock().expect("vm").get_mut(pubkey) {
             *slot = enabled;
         }
+        Ok(())
     }
 }
 
@@ -197,7 +199,7 @@ fn state_for(
 async fn a_failed_delete_leaves_the_key_disabled_and_quiesced() {
     let key = pk(7);
     let vm = Arc::new(SpyVm::new());
-    vm.add_validator(key, true);
+    vm.add_validator(key, true).unwrap();
     let quiesce = Arc::new(SpyQuiesce::new());
     let keys = Arc::new(Keys { present: vec![key], fail: Some(key) });
     let slash = Arc::new(OkSlash { exported: Mutex::new(Vec::new()) });
@@ -226,7 +228,7 @@ async fn delete_quiesces_only_the_keys_that_exist() {
     let existing = pk(3);
     let unknown = pk(9);
     let vm = Arc::new(SpyVm::new());
-    vm.add_validator(existing, true);
+    vm.add_validator(existing, true).unwrap();
     let quiesce = Arc::new(SpyQuiesce::new());
     let keys = Arc::new(Keys { present: vec![existing], fail: None });
     let slash = Arc::new(OkSlash { exported: Mutex::new(Vec::new()) });
@@ -305,7 +307,7 @@ async fn a_key_admitted_during_drain_is_not_deleted_or_exported() {
     let quiesce =
         Arc::new(AdmitDuringDrain { keys: Arc::clone(&keys), late, calls: Mutex::new(Vec::new()) });
     let vm = Arc::new(SpyVm::new());
-    vm.add_validator(existing, true);
+    vm.add_validator(existing, true).unwrap();
     let slash = Arc::new(OkSlash { exported: Mutex::new(Vec::new()) });
     let vm_owned = Arc::clone(&vm);
     let vm_dyn: Arc<dyn ValidatorManager> = vm_owned;

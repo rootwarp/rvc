@@ -77,9 +77,14 @@ pub async fn check_slashed_validators(
                         v.validator.pubkey.strip_prefix("0x").unwrap_or(&v.validator.pubkey);
                     if let Ok(pk_bytes) = hex::decode(pk_hex) {
                         if let Ok(pk) = <[u8; 48]>::try_from(pk_bytes.as_slice()) {
-                            validator_store.set_enabled(&pk, false);
-                            if let Err(e) = validator_store.save_config() {
-                                error!(error = %e, "Failed to persist disabled state for slashed validator");
+                            // Persist under `save_lock`, then publish. A failed
+                            // write still leaves the validator disabled.
+                            if let Err(e) = validator_store.disable_slashed(&pk) {
+                                error!(
+                                    error = %e,
+                                    pubkey = %v.validator.pubkey,
+                                    "failed to persist slashed validator disable; validator remains disabled in memory"
+                                );
                             }
                         }
                     }
