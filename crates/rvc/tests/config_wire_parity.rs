@@ -368,7 +368,7 @@ fn keymanager_kdf_section_parses_from_corpus() {
     let defaults = Config::default();
     assert_eq!(defaults.keymanager.keymanager_import_kdf_concurrency, 2);
     assert_eq!(defaults.keymanager.keymanager_import_kdf_total_mib, 512);
-    assert_eq!(defaults.keymanager.keymanager_import_kdf_max_keystore_mib, 8192);
+    assert_eq!(defaults.keymanager.keymanager_import_kdf_max_keystore_mib, 1024);
     let snapshot = config_snapshot_json(&defaults);
     assert!(!snapshot.contains("keymanager_import_kdf_concurrency"));
     assert!(!snapshot.contains("keymanager_import_kdf_total_mib"));

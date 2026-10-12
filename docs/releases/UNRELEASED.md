@@ -3,6 +3,53 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Decrypt: scrypt keystores above the new caps are rejected
+
+Decrypt rejects a scrypt keystore before it runs scrypt when any parameter is
+above the new ceiling. The error is `InvalidScryptParams` (`n (…) exceeds
+maximum (…)`, and the same shape for `r`, `p`, and `dklen`). Startup keystore
+load and keymanager import both use this path.
+
+| Parameter | Previous cap | New cap |
+|---|---|---|
+| `n` | 2^22 | 2^20 (1 048 576) |
+| `r` | 16 | 8 |
+| `p` | 16 | 8 |
+| `dklen` | 64 | 32 |
+
+The largest working set decrypt will attempt is `128 · r · N` at those caps,
+which is 1 GiB (`MAX_KDF_WORKING_SET_BYTES`). It was 8 GiB. A keystore past
+the ceiling still reports its uploaded cost through `kdf_working_set_bytes`;
+the import knobs (`keymanager_import_kdf_concurrency`,
+`keymanager_import_kdf_total_mib`, `keymanager_import_kdf_max_keystore_mib`)
+still bound admission. The per-keystore knob's default is now 1024 MiB, and
+a value above 1024 is rejected.
+
+Keystores at the EIP-2335 defaults still decrypt: `n = 262144` (2^18), `r = 8`,
+`p = 1`, `dklen = 32`. That is the ERC-2335 scrypt test vector and what
+staking-deposit-cli, ethdo's scrypt encryptor, Lighthouse `eth2_keystore`,
+Teku's `SCryptParam`, Nimbus, Lodestar's `defaultScryptModule`, and the
+Web3Signer copy of that constructor write. Prysm's validator import defaults
+to pbkdf2 at cost `c = 262144`. Teku's `EncryptedKeystoreWriter` writes
+pbkdf2 with `c = 1`, which rvc already rejects (`InvalidPbkdf2Params`;
+minimum `c` is 10_000). Other pbkdf2 keystores with `c` in range are
+unchanged.
+
+A keystore is rejected when `n` is above 2^20, `r` is above 8, `p` is above 8,
+or `dklen` is above 32. Re-encrypt keystores over the new caps (for example
+with ethdo) at standard EIP-2335 parameters (`n = 2^18`, `r = 8`, `p = 1`,
+`dklen = 32`), or with pbkdf2 (`dklen = 32`, `c = 262144`,
+`prf = hmac-sha256`). Never pass passphrases as command-line arguments
+(including `--passphrase="$VAR"`), and never store them in persistent or
+shared files such as `~/.ethdo.yml`. Follow the tool's interactive or
+secure-input method and its own docs. Passphrases with leading or trailing
+spaces, or with YAML-special characters, may be altered by config parsing.
+On keymanager import the API returns a generic key error (`request_id=…`).
+Internally, over-cap parameters are `DecryptionFailed` /
+`InvalidScryptParams`, and oversized keystores are rejected earlier as
+`TooLarge` / `InvalidKeystore` by the budget check — which is where most
+old high-cost keystores fail.
+
 ## Beacon node SSE: oversize frames drop the connection
 
 The beacon-node event stream (`bn.sse`) limits how much of an SSE frame it
@@ -91,17 +138,17 @@ keystore load). A present CLI flag overrides the file.
 |---|---|---|---|
 | `keymanager_import_kdf_concurrency` | `--keymanager-import-kdf-concurrency` | 2 | `1..=32` |
 | `keymanager_import_kdf_total_mib` | `--keymanager-import-kdf-total-mib` | 512 | `>= 1` (MiB) |
-| `keymanager_import_kdf_max_keystore_mib` | `--keymanager-import-kdf-max-keystore-mib` | 8192 | `1..=8192` (MiB), tighten-only |
+| `keymanager_import_kdf_max_keystore_mib` | `--keymanager-import-kdf-max-keystore-mib` | 1024 | `1..=1024` (MiB), tighten-only |
 
 `keymanager_import_kdf_max_keystore_mib` cannot exceed the decrypt working-set
-ceiling (`MAX_KDF_WORKING_SET_BYTES`, 8 GiB, which is 8192 MiB). A larger
+ceiling (`MAX_KDF_WORKING_SET_BYTES`, 1 GiB, which is 1024 MiB). A larger
 value is rejected. The default is that ceiling.
 
 ```toml
 [keymanager]
 keymanager_import_kdf_concurrency = 2
 keymanager_import_kdf_total_mib = 512
-keymanager_import_kdf_max_keystore_mib = 8192
+keymanager_import_kdf_max_keystore_mib = 1024
 ```
 
 ## Config: knob inventory is 75

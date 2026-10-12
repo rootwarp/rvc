@@ -29,9 +29,9 @@ pub const DEFAULT_IMPORT_KDF_TOTAL_MIB: u32 = 512;
 
 /// Per-keystore import KDF cap, in MiB, when the knob is unset.
 ///
-/// Lock-step with `MAX_KDF_WORKING_SET_BYTES / 1 MiB` (8192). The operator
+/// Lock-step with `MAX_KDF_WORKING_SET_BYTES / 1 MiB` (1024). The operator
 /// knob is tighten-only: `Config::validate` rejects any larger value.
-pub const DEFAULT_IMPORT_KDF_MAX_KEYSTORE_MIB: u32 = 8192;
+pub const DEFAULT_IMPORT_KDF_MAX_KEYSTORE_MIB: u32 = 1024;
 
 /// Inclusive upper bound for [`KeymanagerArgs::keymanager_import_kdf_concurrency`].
 pub const MAX_IMPORT_KDF_CONCURRENCY: u32 = 32;
@@ -137,7 +137,7 @@ pub struct KeymanagerArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keymanager_import_kdf_total_mib: Option<u32>,
 
-    /// Per-keystore KDF working-set cap, in MiB (default when unset: 8192).
+    /// Per-keystore KDF working-set cap, in MiB (default when unset: 1024).
     ///
     /// Tighten-only: a value above the decrypt working-set ceiling is rejected.
     /// Not `--key-decrypt-threads`.
@@ -266,7 +266,7 @@ mod tests {
         );
         assert_eq!(DEFAULT_IMPORT_KDF_CONCURRENCY, 2);
         assert_eq!(DEFAULT_IMPORT_KDF_TOTAL_MIB, 512);
-        assert_eq!(DEFAULT_IMPORT_KDF_MAX_KEYSTORE_MIB, 8192);
+        assert_eq!(DEFAULT_IMPORT_KDF_MAX_KEYSTORE_MIB, 1024);
         assert_eq!(MAX_IMPORT_KDF_CONCURRENCY, 32);
     }
 
