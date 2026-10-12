@@ -1696,7 +1696,7 @@ allow_fresh_db = true
     #[test]
     fn kdf_max_keystore_mib_is_tighten_only() {
         let ceiling = crypto::MAX_KDF_WORKING_SET_BYTES / (1024 * 1024);
-        assert_eq!(ceiling, 8192, "today's decrypt ceiling is 8192 MiB");
+        assert_eq!(ceiling, 1024, "today's decrypt ceiling is 1024 MiB");
 
         let above: Config = toml::from_str(&format!(
             "[keymanager]\nkeymanager_import_kdf_max_keystore_mib = {}\n",
@@ -1832,11 +1832,11 @@ allow_fresh_db = true
         let loaded = overlay(|cli| {
             cli.keymanager.keymanager_import_kdf_concurrency = Some(4);
             cli.keymanager.keymanager_import_kdf_total_mib = Some(256);
-            cli.keymanager.keymanager_import_kdf_max_keystore_mib = Some(2048);
+            cli.keymanager.keymanager_import_kdf_max_keystore_mib = Some(512);
         });
         assert_eq!(loaded.keymanager.keymanager_import_kdf_concurrency, 4);
         assert_eq!(loaded.keymanager.keymanager_import_kdf_total_mib, 256);
-        assert_eq!(loaded.keymanager.keymanager_import_kdf_max_keystore_mib, 2048);
+        assert_eq!(loaded.keymanager.keymanager_import_kdf_max_keystore_mib, 512);
         assert!(loaded.validate().is_ok());
 
         let mut cli = StartArgs::default();

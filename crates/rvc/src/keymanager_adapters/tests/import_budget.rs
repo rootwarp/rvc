@@ -348,8 +348,9 @@ async fn keystore_above_max_scrypt_is_rejected_at_the_decrypt_gate() {
     let dir = TempDir::new().unwrap();
     let (adapter, _, _) =
         test_keystore_adapter(dir.path().to_path_buf(), create_empty_composite_signer());
-    // n = 2^23, r = 1 is above MAX_SCRYPT_N and still under the 8 GiB byte cap,
-    // so admission succeeds and decrypt's existing parameter gate rejects it.
+    // n = 2^23, r = 1 is above MAX_SCRYPT_N. Its working set is 1 GiB, equal to
+    // the decrypt ceiling, so admission still succeeds and decrypt's parameter
+    // gate rejects it.
     let json = scrypt_params_json(1 << 23, 1, 1);
     let err = adapter.import_keystore(&json, PASSWORD).await.expect_err("above MAX_SCRYPT_N");
     match err {

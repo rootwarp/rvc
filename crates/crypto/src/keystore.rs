@@ -38,15 +38,52 @@ const DEFAULT_PBKDF2_PRF: &str = "hmac-sha256";
 const MIN_PBKDF2_C: u32 = 10_000;
 const MAX_PBKDF2_C: u32 = 10_000_000;
 
-const MAX_SCRYPT_N: u32 = 1 << 22;
-const MAX_SCRYPT_R: u32 = 16;
-const MAX_SCRYPT_P: u32 = 16;
-const MAX_SCRYPT_DKLEN: u32 = 64;
+/// Decrypt-time scrypt ceilings (RQ-4, issue #609).
+///
+/// Survey of EIP-2335 scrypt writers and decryptors, October 2026. Every
+/// production writer that emits scrypt uses `dklen = 32`, `n = 2^18`, `r = 8`,
+/// `p = 1`. Several tools default to pbkdf2 and still decrypt that scrypt tuple.
+///
+/// - ERC-2335 scrypt test vector (`ethereum/ERCs` `ERCS/erc-2335.md`):
+///   dklen 32, n 262144, r 8, p 1.
+/// - `ethereum/staking-deposit-cli` `ScryptKeystore` and
+///   `ethstaker/ethstaker-deposit-cli` `ScryptKeystore`: `n = 2**18`, r 8,
+///   p 1, dklen 32. `ethstaker/staking-deposit-cli` is not on GitHub; these
+///   two trees are the launchpad CLI and the current ethstaker CLI.
+/// - ethdo `go-eth2-wallet-encryptor-keystorev4`: the default cipher is
+///   pbkdf2 (`c = 2^18`, dklen 32). Scrypt encrypt writes `n = 1<<18`, r 8,
+///   p 1, dklen 32. Decrypt forwards n, r, p, and dklen with no ceiling. The
+///   passing `SCrypt` decrypt test is n 16, r 1, p 8, dklen 32.
+/// - Lighthouse `eth2_keystore::Scrypt::default_scrypt` (stable): n 262144,
+///   r 8, p 1, `DKLEN = 32`. Decrypt requires `dklen == 32` and `128·n·p·r`
+///   to fit in a `u32` (about 4 GiB).
+/// - Teku `SCryptParam(dklen, salt)` and the Web3Signer copy: n 262144, p 1,
+///   r 8. Decrypt requires `dklen >= 32` and does not cap it. Teku's
+///   `EncryptedKeystoreWriter` writes pbkdf2.
+/// - Nimbus `scryptParams` (stable): dklen 32, `n = 2^18`, p 1, r 8, and
+///   decrypt accepts only that exact tuple.
+/// - Lodestar `@chainsafe/bls-keystore` `defaultScryptModule`: dklen 32,
+///   n 262144, r 8, p 1. `create()` defaults to pbkdf2. Node scrypt sets
+///   `maxmem = n · r · 256`.
+/// - Prysm validator import uses `keystorev4.New()` (pbkdf2, cost `1<<18`).
+///   Its scrypt branch is the ethdo encryptor above.
+///
+/// `N` allows up to `2^20`, four times the emitted `2^18`, at `r = 8` (the
+/// RFC 7914 block size every writer uses). Raising `r` would multiply the
+/// working-set ceiling, so `r` stays 8; ethdo's r 1 fixture is under that.
+/// `p` allows up to 8 so that same ethdo fixture is accepted. Production
+/// writers use `p = 1`, and `p` does not change `128 · r · N`. `dklen` is 32:
+/// ERC-2335's checksum reads bytes 16..32, Lighthouse and Nimbus reject any
+/// other length, and nothing in the survey writes a longer derived key.
+const MAX_SCRYPT_N: u32 = 1 << 20;
+const MAX_SCRYPT_R: u32 = 8;
+const MAX_SCRYPT_P: u32 = 8;
+const MAX_SCRYPT_DKLEN: u32 = 32;
 
 /// Largest scrypt working set `decrypt` will still attempt, in bytes.
 ///
 /// Scrypt's buffer is `128 · r · N` (RFC 7914). This is that product at the
-/// largest `r` and `N` the decrypt-time gates accept, which is 8 GiB.
+/// largest `r` and `N` the decrypt-time gates accept, which is 1 GiB.
 /// [`kdf_working_set_bytes`] reports the uploaded cost even past this ceiling;
 /// parameter rejection stays inside `decrypt`.
 pub const MAX_KDF_WORKING_SET_BYTES: u64 = 128 * (MAX_SCRYPT_R as u64) * (MAX_SCRYPT_N as u64);
@@ -1056,6 +1093,126 @@ mod tests {
         assert!(result.is_ok(), "EIP-2335 default params should work: {:?}", result.err());
     }
 
+    /// Scrypt JSON with an invalid salt. Hex decoding runs after the parameter
+    /// gate and before `scrypt`, so a cap accept is `InvalidHex` and a cap
+    /// reject is `InvalidScryptParams` without allocating the working set.
+    fn scrypt_gate_keystore(n: u32, r: u32, p: u32, dklen: u32) -> Keystore {
+        let json = format!(
+            r#"{{"crypto":{{"kdf":{{"function":"scrypt","params":{{"dklen":{dklen},"n":{n},"p":{p},"r":{r},"salt":"zz"}},"message":""}},"checksum":{{"function":"sha256","params":{{}},"message":"aa"}},"cipher":{{"function":"aes-128-ctr","params":{{"iv":"aa"}},"message":"aa"}}}},"path":"m/12381/3600/0/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":4}}"#
+        );
+        Keystore::from_json(&json).expect("scrypt keystore json")
+    }
+
+    fn assert_scrypt_cap_accepted(n: u32, r: u32, p: u32, dklen: u32) {
+        let err = scrypt_gate_keystore(n, r, p, dklen).decrypt(b"test").expect_err("invalid salt");
+        assert!(
+            matches!(err, KeystoreError::InvalidHex(_)),
+            "n={n} r={r} p={p} dklen={dklen} must pass the parameter gate before scrypt: {err:?}"
+        );
+    }
+
+    fn assert_scrypt_cap_rejected(field: &str, n: u32, r: u32, p: u32, dklen: u32) {
+        let err = scrypt_gate_keystore(n, r, p, dklen).decrypt(b"test").expect_err("over cap");
+        match err {
+            KeystoreError::InvalidScryptParams(msg) => {
+                assert!(msg.contains("exceeds maximum"), "{field}: {msg}");
+                assert!(msg.contains(field), "{field}: {msg}");
+            }
+            other => panic!("{field}: expected InvalidScryptParams before scrypt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_scrypt_n_accepts_cap_and_rejects_one_past() {
+        assert_scrypt_cap_accepted(1 << 20, 8, 1, 32);
+        assert_scrypt_cap_rejected("n (", (1 << 20) + 1, 8, 1, 32);
+    }
+
+    #[test]
+    fn test_scrypt_r_accepts_cap_and_rejects_one_past() {
+        assert_scrypt_cap_accepted(2, 8, 1, 32);
+        assert_scrypt_cap_rejected("r (", 2, 9, 1, 32);
+    }
+
+    #[test]
+    fn test_scrypt_p_accepts_cap_and_rejects_one_past() {
+        assert_scrypt_cap_accepted(2, 1, 8, 32);
+        assert_scrypt_cap_rejected("p (", 2, 1, 9, 32);
+    }
+
+    #[test]
+    fn test_scrypt_dklen_accepts_cap_and_rejects_one_past() {
+        assert_scrypt_cap_accepted(2, 1, 1, 32);
+        assert_scrypt_cap_rejected("dklen (", 2, 1, 1, 33);
+    }
+
+    #[test]
+    fn test_scrypt_working_set_accepts_cap_and_rejects_past_it() {
+        assert_eq!(MAX_SCRYPT_N, 1 << 20);
+        assert_eq!(MAX_SCRYPT_R, 8);
+        assert_eq!(MAX_KDF_WORKING_SET_BYTES, 128 * 8 * (1u64 << 20));
+        assert_eq!(MAX_KDF_WORKING_SET_BYTES, 1024 * 1024 * 1024);
+
+        let at_cap = keystore_with_kdf(
+            KDF_SCRYPT,
+            KdfParams::Scrypt(ScryptParams {
+                dklen: 32,
+                n: 1 << 20,
+                p: 1,
+                r: 8,
+                salt: "zz".to_string(),
+            }),
+        );
+        assert_eq!(kdf_working_set_bytes(&at_cap), MAX_KDF_WORKING_SET_BYTES);
+        assert_scrypt_cap_accepted(1 << 20, 8, 1, 32);
+
+        // Next power of two at r = 8 is twice the 1 GiB ceiling and above MAX_SCRYPT_N.
+        let past = keystore_with_kdf(
+            KDF_SCRYPT,
+            KdfParams::Scrypt(ScryptParams {
+                dklen: 32,
+                n: 1 << 21,
+                p: 1,
+                r: 8,
+                salt: "zz".to_string(),
+            }),
+        );
+        assert_eq!(kdf_working_set_bytes(&past), 2 * MAX_KDF_WORKING_SET_BYTES);
+        assert_scrypt_cap_rejected("n (", 1 << 21, 8, 1, 32);
+    }
+
+    #[test]
+    fn test_scrypt_old_ceiling_rejected_without_running_scrypt() {
+        // Previous decrypt caps: N = 2^22, r = 16, p = 16, dklen = 64 (8 GiB).
+        let old_n = 1u32 << 22;
+        let old_r = 16u32;
+        let keystore = scrypt_gate_keystore(old_n, old_r, 16, 64);
+        assert_eq!(kdf_working_set_bytes(&keystore), 128u64 * u64::from(old_r) * u64::from(old_n));
+        assert_eq!(kdf_working_set_bytes(&keystore), 8 * 1024 * 1024 * 1024);
+        assert_scrypt_cap_rejected("n (", old_n, old_r, 16, 64);
+    }
+
+    #[test]
+    fn test_eip2335_scrypt_vector_decrypts_inside_tightened_caps() {
+        let keystore = Keystore::from_json(EIP2335_SCRYPT_TEST_VECTOR).expect("should parse");
+        match &keystore.crypto.kdf.params {
+            KdfParams::Scrypt(params) => {
+                assert_eq!(params.n, 1 << 18);
+                assert_eq!(params.r, 8);
+                assert_eq!(params.p, 1);
+                assert_eq!(params.dklen, 32);
+                assert!(params.n <= MAX_SCRYPT_N);
+                assert!(params.r <= MAX_SCRYPT_R);
+                assert!(params.p <= MAX_SCRYPT_P);
+                assert!(params.dklen <= MAX_SCRYPT_DKLEN);
+            }
+            _ => panic!("expected scrypt params"),
+        }
+        let secret_key = keystore.decrypt(EIP2335_PASSWORD).expect("EIP-2335 scrypt vector");
+        let expected_secret = hex::decode(EIP2335_SECRET_HEX).expect("valid hex");
+        assert_eq!(secret_key.to_bytes().to_vec(), expected_secret);
+    }
+
     fn keystore_with_kdf(function: &str, params: KdfParams) -> Keystore {
         Keystore {
             crypto: Crypto {
@@ -1085,7 +1242,7 @@ mod tests {
             MAX_KDF_WORKING_SET_BYTES,
             128 * u64::from(MAX_SCRYPT_R) * u64::from(MAX_SCRYPT_N)
         );
-        assert_eq!(MAX_KDF_WORKING_SET_BYTES, 8u64 * 1024 * 1024 * 1024);
+        assert_eq!(MAX_KDF_WORKING_SET_BYTES, 1024 * 1024 * 1024);
 
         let at_ceiling = keystore_with_kdf(
             KDF_SCRYPT,

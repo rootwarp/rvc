@@ -193,7 +193,7 @@ mod tests {
         assert_eq!(cfg.concurrency, 2);
         assert_eq!(cfg.total_bytes, 512 * 1024 * 1024);
         assert_eq!(cfg.max_keystore_bytes, MAX_KDF_WORKING_SET_BYTES);
-        assert_eq!(cfg.max_keystore_bytes, 8u64 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.max_keystore_bytes, 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -203,11 +203,11 @@ mod tests {
 
         km.keymanager_import_kdf_concurrency = 4;
         km.keymanager_import_kdf_total_mib = 256;
-        km.keymanager_import_kdf_max_keystore_mib = 1024;
+        km.keymanager_import_kdf_max_keystore_mib = 128;
         let cfg = KdfBudgetConfig::from_keymanager(&km);
         assert_eq!(cfg.concurrency, 4);
         assert_eq!(cfg.total_bytes, 256 * MIB);
-        assert_eq!(cfg.max_keystore_bytes, 1024 * MIB);
+        assert_eq!(cfg.max_keystore_bytes, 128 * MIB);
     }
 
     #[tokio::test]
