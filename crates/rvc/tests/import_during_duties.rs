@@ -165,6 +165,11 @@ async fn boundary_unscheduled_import_meets_next_slot_block_reserve() {
         record.conn_hold_start_ms,
         record.conn_hold_end_ms
     );
+    assert_eq!(record.attestation_deadline_ms, 3999);
+    assert_eq!(
+        record.attestation_deadline_misses, 0,
+        "firing at 11_600 ms is after slot N's attestation deadline"
+    );
 }
 
 /// Scheduled import late in slot N misses slot N+1's t=0 block reserve.
@@ -205,6 +210,16 @@ async fn boundary_scheduled_import_misses_next_slot_block_reserve() {
         record.import_deferred_ms > 0.0,
         "the gate must defer the late import, got {} ms",
         record.import_deferred_ms
+    );
+    assert!(
+        record.conn_hold_start_ms >= 16_499.0,
+        "scheduled hold must start at or after slot N+1's free window (16_499 ms), got {}",
+        record.conn_hold_start_ms
+    );
+    assert_eq!(record.attestation_deadline_ms, 3999);
+    assert_eq!(
+        record.attestation_deadline_misses, 0,
+        "scheduled boundary import must miss no slot-N attestation deadline"
     );
 }
 

@@ -287,6 +287,72 @@ fn keymanager_bind_addr_defaults_to_loopback() {
     assert!(addr.ip().is_loopback(), "unset keymanager address must stay on loopback");
 }
 
+/// `build_keymanager_api` must forward the DB's `GroupCommitConfig` into the
+/// import gate. Reverting `spawn.rs` to `ImportWindowGate::new(clock)` (default
+/// knobs) fails both independent variations below.
+#[test]
+fn build_keymanager_api_wires_group_commit_config_into_import_gate() {
+    use crate::keymanager_adapters::import_window::ImportWindowGate;
+    use slashing::GroupCommitConfig;
+    use std::time::Duration;
+    use timing::{MockSlotClock, SlotClock};
+
+    let default_post = ImportWindowGate::new(Arc::new(MockSlotClock::new(
+        1_606_824_023,
+        Duration::from_secs(12),
+        32,
+    )) as Arc<dyn SlotClock>)
+    .post_admit();
+
+    // Vary batch_size with the default wait-to-fill.
+    {
+        let dir = TempDir::new().unwrap();
+        let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+        let deps = spawn_test_deps(dir.path(), None);
+        let cfg = GroupCommitConfig {
+            batch_size: GroupCommitConfig::DEFAULT_BATCH_SIZE * 2,
+            wait_to_fill: GroupCommitConfig::DEFAULT_WAIT_TO_FILL,
+        };
+        deps.slashing_db.set_group_commit(cfg);
+        let expected = ImportWindowGate::new(Arc::clone(&deps.slot_clock)).with_group_commit(cfg);
+        let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+        assert_ne!(
+            expected.post_admit(),
+            default_post,
+            "fixture batch_size must change post_admit vs default"
+        );
+        assert_eq!(
+            built.import_window_gate.post_admit(),
+            expected.post_admit(),
+            "spawn must wire batch_size from the DB into the gate"
+        );
+    }
+
+    // Vary wait_to_fill_ms with the default batch_size.
+    {
+        let dir = TempDir::new().unwrap();
+        let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+        let deps = spawn_test_deps(dir.path(), None);
+        let cfg = GroupCommitConfig {
+            batch_size: GroupCommitConfig::DEFAULT_BATCH_SIZE,
+            wait_to_fill: Duration::from_millis(50),
+        };
+        deps.slashing_db.set_group_commit(cfg);
+        let expected = ImportWindowGate::new(Arc::clone(&deps.slot_clock)).with_group_commit(cfg);
+        let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+        assert_ne!(
+            expected.post_admit(),
+            default_post,
+            "fixture wait_to_fill must change post_admit vs default"
+        );
+        assert_eq!(
+            built.import_window_gate.post_admit(),
+            expected.post_admit(),
+            "spawn must wire wait_to_fill from the DB into the gate"
+        );
+    }
+}
+
 /// Enabled spawn registers on the executor and drains after token cancel.
 #[tokio::test]
 async fn test_spawn_keymanager_api_returns_a_joinable_handle() {

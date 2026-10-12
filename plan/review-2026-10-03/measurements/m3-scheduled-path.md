@@ -107,48 +107,50 @@ database is the on-disk `SlashingDb` that `pipeline_fixture` opens for N>1.
 | cargo | `cargo 1.99.0 (5f94df478 2026-08-27)` |
 | nextest | `cargo-nextest 0.9.146 (8af696ddc 2026-09-21)` |
 | protoc | `libprotoc 3.21.12` |
-| Profile | `CARGO_BUILD_JOBS=2 cargo nextest run --release -p rvc --test import_during_duties --locked --run-ignored ignored-only --no-capture` |
+| Profile | release binary from `CARGO_BUILD_JOBS=2 cargo test --release -p rvc --test import_during_duties --no-run`, then that binary with `--ignored --exact --nocapture`, one cell per process |
 | `clock_mode` | `wall` |
 | Harness `host` | `cursor linux/x86_64` |
 | Harness `toolchain` | `rustc 1.99.0 (b940084d7 2026-09-28)` |
 
 `git rev-parse HEAD` at process start, every run:
-`0a74cc6435b6e96559c4104a785d08fe2bd0eabb`. `git status` at that moment
-reported 4 dirty paths: `crates/signer/src/core.rs`, `crates/signer/src/lib.rs`,
-`crates/rvc/tests/common/import_during_duties.rs`, and
-`crates/rvc/tests/import_during_duties.rs`. These notes were written after
-the runs, from those logs. The commit SHA is not the harness `sha`.
+`2696cd85be22bc96ee2b331087a6e6fd675c4057`. `git status --porcelain` was
+empty. The release binary was already built; these nine processes did not
+rebuild. These notes were written after the runs, from those logs, and
+amended into that commit. The tip SHA therefore differs from the harness
+`sha` by this note, the load-margin comment, and the unit test that lists
+these holds. The estimate constants the processes ran are unchanged. The
+load term stays sized to the 2026-10-08 maximum of 823.799 ms, which covers
+this re-record's maximum of 787.345 ms.
 
 ## PQ-7 boundary cell
 
 All six processes exited 0. One conn-hold sample each. 200 slot-N attestation
 items each. Zero slot-N deadline misses each. Two block reserves each: slot
-N near 103–111 ms, slot N+1 near 12,056–12,070 ms.
+N near 102–109 ms, slot N+1 near 12,056–12,065 ms.
 
 | Run | When (UTC) | Admission | Late | Hold window (ms into slot N) | `conn_hold_ms` | Slot N+1 reserve (ms) | Deferred ms |
 |---|---|---|---:|---|---:|---|---:|
-| 1 | 2026-10-08T14:56:10Z – 14:56:32Z | unscheduled | 1 | 11639.237–12463.036 | 823.799 | 12056.919–12467.824 (410.906) | 0.0 |
-| 2 | 2026-10-08T14:56:32Z – 14:56:45Z | unscheduled | 1 | 11627.263–12379.911 | 752.647 | 12058.389–12383.021 (324.632) | 0.0 |
-| 3 | 2026-10-08T14:56:45Z – 14:56:59Z | unscheduled | 1 | 11643.168–12448.898 | 805.73 | 12065.488–12455.134 (389.645) | 0.0 |
-| **Median** | | unscheduled | **1** | | **805.73** | | **0.0** |
-| 1 | 2026-10-08T14:56:59Z – 14:57:17Z | scheduled | 0 | 16530.317–17340.259 | 809.942 | 12058.690–12063.582 (4.892) | 4899.0 |
-| 2 | 2026-10-08T14:57:17Z – 14:57:35Z | scheduled | 0 | 16525.965–17288.658 | 762.694 | 12055.612–12059.136 (3.523) | 4899.0 |
-| 3 | 2026-10-08T14:57:35Z – 14:57:53Z | scheduled | 0 | 16531.506–17280.784 | 749.278 | 12064.209–12070.955 (6.747) | 4898.0 |
-| **Median** | | scheduled | **0** | | **762.694** | | **4899.0** |
+| 1 | 2026-10-12T15:24:40Z – 15:24:52Z | unscheduled | 1 | 11627.675–12415.02 | 787.345 | 12063.173–12420.113 (356.94) | 0.0 |
+| 2 | 2026-10-12T15:24:52Z – 15:25:05Z | unscheduled | 1 | 11631.5–12400.513 | 769.013 | 12055.727–12404.083 (348.356) | 0.0 |
+| 3 | 2026-10-12T15:25:05Z – 15:25:18Z | unscheduled | 1 | 11627.024–12370.47 | 743.446 | 12063.109–12376.876 (313.767) | 0.0 |
+| **Median** | | unscheduled | **1** | | **769.013** | | **0.0** |
+| 1 | 2026-10-12T15:25:18Z – 15:25:35Z | scheduled | 0 | 16527.953–17253.482 | 725.529 | 12065.098–12069.957 (4.859) | 4900.0 |
+| 2 | 2026-10-12T15:25:35Z – 15:25:53Z | scheduled | 0 | 16527.814–17240.99 | 713.176 | 12063.993–12068.388 (4.395) | 4900.0 |
+| 3 | 2026-10-12T15:25:53Z – 15:26:10Z | scheduled | 0 | 16527.279–17240.878 | 713.599 | 12064.775–12068.814 (4.039) | 4900.0 |
+| **Median** | | scheduled | **0** | | **713.599** | | **4900.0** |
 
-Unscheduled run 1's 22 s includes the release rebuild. The later runs are the
-test only.
+The release binary was already built. Every run is the test only.
 
 The unscheduled hold opens just after 11,600 ms and is still open when slot
-N+1's block reserve starts (~12,057–12,065 ms). That reserve's wait is
+N+1's block reserve starts (~12,056–12,063 ms). That reserve's wait is
 hundreds of milliseconds because `reserve()` blocks on `conn` until the
 import commits. `late_block_reserves` is 1 on every unscheduled run.
 `overlapping_phase` is `block` and `block_phase_overlapped` is true, from
 slot N+1's block span.
 
-The scheduled gate, seeing ~11,600 ms, defers **4,898–4,899 ms**. The hold
-opens at 16,526–16,532 ms, which is slot N+1's free window (open at 16,499 ms).
-Slot N+1's block reserve has already finished (ends 12,059–12,071 ms).
+The scheduled gate, seeing ~11,600 ms, defers **4,900 ms**. The hold
+opens at 16,527.279–16,527.953 ms, which is slot N+1's free window (open at 16,499 ms).
+Slot N+1's block reserve has already finished (ends 12,068–12,070 ms).
 `late_block_reserves` is 0 on every scheduled run. `overlapping_phase` is
 empty and `block_phase_overlapped` is false.
 
@@ -165,12 +167,12 @@ at attestation entry, so that reserve cannot meet the hold.
 
 | Run | When (UTC) | Misses | `conn_hold_ms` | Last publish after 3,999 ms | Hold window (ms) | Deferred ms | Block reserve (ms) |
 |---|---|---:|---:|---:|---|---:|---|
-| 1 | 2026-10-08T14:57:53Z – 14:57:59Z | 0 | 745.365 | 425.752 | 4531.839–5277.204 | 505.0 | 102.940–108.689 (5.750) |
-| 2 | 2026-10-08T14:57:59Z – 14:58:05Z | 0 | 767.944 | 392.725 | 4526.277–5294.221 | 501.0 | 101.940–107.548 (5.608) |
-| 3 | 2026-10-08T14:58:05Z – 14:58:11Z | 0 | 735.628 | 395.582 | 4528.926–5264.554 | 504.0 | 102.968–107.553 (4.585) |
-| **Median** | | **0** | **745.365** | **395.582** | | **504.0** | |
+| 1 | 2026-10-12T15:26:10Z – 15:26:16Z | 0 | 679.854 | 389.137 | 4535.33–5215.185 | 508.0 | 102.768–108.505 (5.737) |
+| 2 | 2026-10-12T15:26:16Z – 15:26:21Z | 0 | 727.203 | 374.463 | 4534.141–5261.344 | 509.0 | 101.638–106.375 (4.737) |
+| 3 | 2026-10-12T15:26:21Z – 15:26:27Z | 0 | 712.291 | 425.837 | 4528.311–5240.602 | 503.0 | 102.682–108.187 (5.505) |
+| **Median** | | **0** | **712.291** | **389.137** | | **508.0** | |
 
-Every hold opens at or after 4,499 ms (4,526.277, 4,528.926, 4,531.839).
+Every hold opens at or after 4,499 ms (4,528.311, 4,534.141, 4,535.33).
 `block_phase_overlapped` is false. `overlapping_phase` is empty. One block
 reserve each. `late_block_reserves` is 0, and that 0 is the t≈0 reserve
 finishing before the hold, not a later reserve.
@@ -183,9 +185,9 @@ columns are the new cell.
 | Figure | Cited unscheduled (lines 114–119) | Boundary unscheduled | Boundary scheduled |
 |---|---|---|---|
 | Attestation-deadline misses, median | **0** (105, 0, 0) | **0** (0, 0, 0) | **0** (0, 0, 0) |
-| `conn_hold_ms`, median | **726.726** | **805.73** (823.799, 752.647, 805.73) | **762.694** (809.942, 762.694, 749.278) |
+| `conn_hold_ms`, median | **726.726** | **769.013** (787.345, 769.013, 743.446) | **713.599** (725.529, 713.176, 713.599) |
 | Late block reserves, median | not a later reserve on that tree (lines 133–140) | **1** (1, 1, 1) | **0** (0, 0, 0) |
-| Hold opens (ms) | 4074.563, 4037.190, 4039.730 | 11639.237, 11627.263, 11643.168 | 16530.317, 16525.965, 16531.506 |
+| Hold opens (ms) | 4074.563, 4037.190, 4039.730 | 11627.675, 11631.5, 11627.024 | 16527.953, 16527.814, 16527.279 |
 
 ## Detector
 
@@ -250,8 +252,11 @@ are informational. They are not an N=500 gate and they are not extrapolated.
 
 ## Formal flags
 
-1. The harness `sha` is `0a74cc6435b6e96559c4104a785d08fe2bd0eabb`. The runs
-   were on a dirty tree (the four source paths above). The commit SHA differs.
+1. The harness `sha` is `2696cd85be22bc96ee2b331087a6e6fd675c4057`. The runs
+   were on a clean tree. The amended tip differs from that sha by this note,
+   the load-margin comment, and the unit-test sample list. The estimate
+   constants are the ones the processes ran. The load term is still the
+   2026-10-08 maximum, 823.799 ms, which covers this re-record's 787.345 ms.
 2. The cited unscheduled numbers are from
    `rv15-import-during-duties-unscheduled.md` lines 99–119. They were not
    re-measured. The boundary unscheduled column is a new cell (fire at
@@ -274,8 +279,11 @@ are informational. They are not an N=500 gate and they are not extrapolated.
 
 ## Gate
 
-Tree at the measurement runs: `0a74cc6435b6e96559c4104a785d08fe2bd0eabb`, dirty
-as noted above. Gates below are that tree plus the fork-hazard line renumber
+The tables above are the 2026-10-12 clean re-record. The gate commands below
+are the 2026-10-08 verification of the previous recording. They were not
+repeated on 2026-10-12. Tree at those earlier runs:
+`0a74cc6435b6e96559c4104a785d08fe2bd0eabb`, dirty as that recording noted.
+Gates below are that tree plus the fork-hazard line renumber
 (signer `lib.rs` gained 4 export lines; inventory and
 `docs/gloas-fork-hazard-audit.md` moved 1029/1356/1431 to 1033/1360/1435).
 Host `cursor`, Linux 6.12.94+ x86_64. rustc `1.99.0 (b940084d7 2026-09-28)`.

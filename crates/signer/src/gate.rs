@@ -58,16 +58,17 @@
 //! # Cancellation safety and the sign-span lock
 //!
 //! [`crate::core::sign_slashable`] acquires the per-pubkey `OwnedMutexGuard` and moves it into
-//! `tokio::task::spawn_blocking`.  The acquire-site comment is `core.rs:1013`; the closure that
-//! keeps the guard (`let _guard = guard`) starts at `core.rs:1066`.  That blocking task owns the
+//! `tokio::task::spawn_blocking`.  The acquire is `core.rs:1067` (`req.locks.lock`); the closure
+//! that keeps the guard (`let _guard = guard`) is `core.rs:1116`.  That blocking task owns the
 //! guard for the whole reserve → sign → reconcile body.  Dropping the caller future while it
 //! waits on `spawn_blocking(...).await` leaves the guard on the blocking task until the body
 //! returns, so the same pubkey stays serialized for the in-flight sign.
 //!
 //! `reserve_block` / `reserve_attestation` COMMIT the history row and release the SQLite
 //! connection mutex before the BLS call (`SlashingDb::reserve_block` in
-//! `crates/slashing/src/stage.rs`; production order is `SlashableSignSession::reserve_then_sign`
-//! in `core.rs` at lines 517-549).  From that COMMIT until the blocking body returns, the
+//! `crates/slashing/src/stage.rs`; production order is
+//! [`crate::SlashableSignSession::reserve_then_sign`]: `reserve()`, then the BLS
+//! `signer.sign` call).  From that COMMIT until the blocking body returns, the
 //! per-pubkey lock is the sign-span serializer.  A wedged signer blocks only that pubkey, inside
 //! `tokio::time::timeout`.
 //!
