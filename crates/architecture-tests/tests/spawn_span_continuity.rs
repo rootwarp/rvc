@@ -279,9 +279,7 @@ fn find_calls(code: &str) -> Vec<CallHit> {
         if code[i..].starts_with("executor.") {
             if let Some(hit) = parse_call(code, i) {
                 let next = hit.close_paren + 1;
-                if hit.is_site {
-                    hits.push(hit);
-                }
+                hits.push(hit);
                 i = next;
                 continue;
             }
@@ -475,6 +473,9 @@ fn find_production_sites(path: &str, src: &str) -> Vec<Site> {
     let code = production_code(src);
     let mut sites = Vec::new();
     for hit in find_calls(&code) {
+        if !hit.is_site {
+            continue;
+        }
         let text = lines.get(hit.line - 1).map(|l| l.trim().to_string()).unwrap_or_default();
         let detached = preceding_nonempty(&lines, hit.line).is_some_and(is_detached_comment);
         sites.push(Site { path: path.to_string(), line: hit.line, kind: hit.kind, detached, text });
@@ -927,4 +928,205 @@ fn shape_b_spawn_must_not_carry_a_detached_comment() {
     let site = find_production_sites(&row.spawn_path, src).pop().unwrap();
     assert!(site.detached);
     assert_eq!(classify(&site, &[row], |_| true), Class::ShapeBWithDetached);
+}
+
+// ---------------------------------------------------------------------------
+// Census line pins (first table, shape-B loop lines, liveness prose)
+// ---------------------------------------------------------------------------
+
+fn section_body(census: &str, heading_contains: &str) -> String {
+    let mut collecting = false;
+    let mut found = false;
+    let mut out = String::new();
+    for line in census.lines() {
+        if line.starts_with("## ") {
+            if collecting {
+                break;
+            }
+            if line.contains(heading_contains) {
+                collecting = true;
+                found = true;
+            }
+            continue;
+        }
+        if collecting {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    assert!(found, "census section containing {heading_contains:?} not found");
+    out
+}
+
+fn markdown_table(section: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for line in section.lines() {
+        if !line.starts_with('|') || line.contains("---") {
+            continue;
+        }
+        let cells: Vec<String> = line
+            .trim()
+            .trim_matches('|')
+            .split('|')
+            .map(|c| c.trim().trim_matches('`').to_string())
+            .collect();
+        if cells.iter().any(|c| c == "File" || c == "Task") || cells.iter().all(|c| c.is_empty()) {
+            continue;
+        }
+        rows.push(cells);
+    }
+    rows
+}
+
+fn cite_after(section: &str, phrase: &str) -> usize {
+    let idx = section.find(phrase).unwrap_or_else(|| panic!("census prose missing {phrase:?}"));
+    let rest = section[idx + phrase.len()..].trim_start_matches('`');
+    assert!(rest.starts_with(':'), "expected :LINE after {phrase:?}, rest starts {rest:?}");
+    let digits: String = rest[1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().unwrap_or_else(|_| panic!("line number after {phrase:?}"))
+}
+
+fn line_is_loop(line: &str) -> bool {
+    let code = code_portion(line).trim();
+    code == "loop" || code.starts_with("loop ") || code.starts_with("loop{")
+}
+
+fn next_code_line<'a>(lines: &[&'a str], after_1based: usize) -> &'a str {
+    for line in lines.iter().skip(after_1based) {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") || t.starts_with("#[") || t.starts_with("///") {
+            continue;
+        }
+        return t;
+    }
+    ""
+}
+
+fn register_opt_none_sites(root: &std::path::Path) -> Vec<(String, usize)> {
+    let mut out = Vec::new();
+    for rel in tracked_rs_files(root) {
+        let src = std::fs::read_to_string(root.join(&rel)).unwrap_or_default();
+        let code = production_code(&src);
+        for hit in find_calls(&code) {
+            if hit.kind == Kind::RegisterOpt && !hit.is_site {
+                out.push((rel.clone(), hit.line));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The census's first table, shape-B loop lines, not-site rows, and the
+/// `liveness_loop.rs` prose pins must match the sources. Reverting a table
+/// line while leaving the shape-B spawn row alone used to stay green.
+#[test]
+fn census_line_pins_match_sources() {
+    let root = workspace_root();
+    let census = std::fs::read_to_string(root.join(CENSUS)).unwrap_or_default();
+    assert!(
+        census.contains(&format!("## Production sites ({PIN})")),
+        "production-sites heading must name the pin {PIN}"
+    );
+
+    let (sites, _) = scan_workspace(&root);
+    let mut scanned: Vec<(String, usize, String)> =
+        sites.iter().map(|s| (s.path.clone(), s.line, s.kind.as_str().to_string())).collect();
+    scanned.sort();
+    let mut table: Vec<(String, usize, String)> =
+        markdown_table(&section_body(&census, "Production sites"))
+            .into_iter()
+            .map(|cells| {
+                assert!(cells.len() >= 4, "production row {cells:?}");
+                let line: usize =
+                    cells[1].parse().unwrap_or_else(|_| panic!("line {:?}", cells[1]));
+                (cells[0].clone(), line, cells[3].clone())
+            })
+            .collect();
+    table.sort();
+    assert_eq!(
+        table,
+        scanned,
+        "production-sites table (file, line, call) must match scanned executor sites.\n\
+         table:\n  {}\nscanned:\n  {}",
+        table.iter().map(|r| format!("{}:{} {}", r.0, r.1, r.2)).collect::<Vec<_>>().join("\n  "),
+        scanned.iter().map(|r| format!("{}:{} {}", r.0, r.1, r.2)).collect::<Vec<_>>().join("\n  ")
+    );
+
+    for cells in markdown_table(&section_body(&census, "Shape B loop sites")) {
+        assert!(cells.len() >= 3, "shape-B row {cells:?}");
+        let (path, line) =
+            split_path_line(&cells[2]).unwrap_or_else(|| panic!("loop spec {:?}", cells[2]));
+        let src = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+        let text = src.lines().nth(line - 1).unwrap_or("");
+        assert!(
+            line_is_loop(text),
+            "{path}:{line} is not a `loop` (shape-B loop column): {text:?}"
+        );
+    }
+
+    let mut not_sites: Vec<(String, usize)> = markdown_table(&section_body(&census, "Not sites"))
+        .into_iter()
+        .map(|cells| {
+            assert!(cells.len() >= 2, "not-site row {cells:?}");
+            let line: usize = cells[1].parse().unwrap_or_else(|_| panic!("line {:?}", cells[1]));
+            (cells[0].clone(), line)
+        })
+        .collect();
+    not_sites.sort();
+    let scanned_none = register_opt_none_sites(&root);
+    assert_eq!(
+        not_sites, scanned_none,
+        "not-site table must match production register_opt(..., None) calls.\n\
+         table: {not_sites:?}\nscanned: {scanned_none:?}"
+    );
+
+    let prose = section_body(&census, "liveness_loop.rs");
+    let method_line = cite_after(&prose, "method-level `#[cfg(test)]` at ");
+    let inner_line = cite_after(&prose, "inner `#[cfg(test)]` at ");
+    let module_line = cite_after(&prose, "column-0 module attribute is at ");
+    let spawn_line = cite_after(&prose, "production spawn is ");
+    assert_eq!(
+        cite_after(&prose, "method-level attribute at "),
+        method_line,
+        "truncate sentence must cite the same method-level attribute"
+    );
+    assert_eq!(
+        cite_after(&prose, "hides "),
+        spawn_line,
+        "truncate sentence must cite the production spawn"
+    );
+
+    let src = std::fs::read_to_string(root.join("crates/rvc/src/liveness_loop.rs")).unwrap();
+    let lines: Vec<&str> = src.lines().collect();
+    assert_eq!(lines[method_line - 1].trim(), "#[cfg(test)]", "method-level pin");
+    assert!(!is_column0_cfg_test(lines[method_line - 1]), "method-level attribute is indented");
+    let method_next = next_code_line(&lines, method_line);
+    assert!(
+        method_next.contains("fn "),
+        "method-level #[cfg(test)] at {method_line} must sit on a function, next is {method_next:?}"
+    );
+    assert_eq!(lines[inner_line - 1].trim(), "#[cfg(test)]", "inner pin");
+    assert!(!is_column0_cfg_test(lines[inner_line - 1]), "inner attribute is indented");
+    let inner_next = next_code_line(&lines, inner_line);
+    assert!(
+        !inner_next.contains("fn "),
+        "inner #[cfg(test)] at {inner_line} is not a method attribute, next is {inner_next:?}"
+    );
+    assert!(is_column0_cfg_test(lines[module_line - 1]), "column-0 module attribute");
+    assert!(
+        cfg_test_followed_by_mod(&lines, module_line - 1),
+        "column-0 attribute must be followed by mod"
+    );
+    assert!(
+        code_portion(lines[spawn_line - 1]).contains("executor.spawn"),
+        "production spawn line {spawn_line}: {:?}",
+        lines[spawn_line - 1]
+    );
+    assert!(method_line < spawn_line && inner_line < spawn_line && spawn_line < module_line);
+    assert_eq!(
+        first_bare_cfg_test_line(&lines),
+        Some(method_line),
+        "the first bare #[cfg(test)] is the method-level pin"
+    );
 }

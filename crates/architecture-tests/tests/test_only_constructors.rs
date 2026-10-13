@@ -5,15 +5,17 @@
 //! a default library build. `new_unchecked` is the `pub(crate)` alias of
 //! `new_for_tests`. Before the gate it was already `#[cfg(test)]` (this crate's
 //! unit tests only); it did not compile into a default build. The named check
-//! still requires the same attribute on all three, and requires the alias to
+//! still requires the same attribute on all four, and requires the alias to
 //! stay `pub(crate)`:
 //!
 //! - `RemoteSigner::new_for_tests` in `crates/remote-signer-client/src/client.rs`
 //!   (skips the insecure-URL gate)
 //! - its alias `new_unchecked` immediately below (delegates to `new_for_tests`)
 //! - `OrchestratorDeps::for_test` in `crates/rvc/src/orchestrator/coordinator/mod.rs`
+//! - `LivenessObservationLoop::refresh_indices_for_test` in
+//!   `crates/rvc/src/liveness_loop.rs` (writes the shared pubkey↔index registry)
 //!
-//! `#[cfg(test)]` alone is not enough for those three. Integration tests are a
+//! `#[cfg(test)]` alone is not enough for those four. Integration tests are a
 //! separate crate, so `cfg(test)` is false on the library they link. The
 //! attribute is exactly `#[cfg(any(test, feature = "test-utils"))]`. Downstream
 //! integration tests see the items through the self dev-dependency feature
@@ -41,7 +43,8 @@
 //!
 //! ## Every `pub` `*for_test*` item
 //!
-//! The named check covers three items. A second scan walks `crates/*/src` and
+//! The named check covers those items plus `refresh_indices_for_test`. A second
+//! scan walks `crates/*/src` and
 //! `bin/*/src` for every `pub` / `pub(...)` function whose name contains
 //! `for_test` (including generic signatures such as `fn name<T>(`, generics
 //! containing `->`, and multi-line generics). The contiguous attribute block
@@ -60,6 +63,8 @@ const GATE: &str = "#[cfg(any(test, feature = \"test-utils\"))]";
 
 const CLIENT_REL: &str = "crates/remote-signer-client/src/client.rs";
 const COORD_REL: &str = "crates/rvc/src/orchestrator/coordinator/mod.rs";
+const LIVENESS_REL: &str = "crates/rvc/src/liveness_loop.rs";
+const BUILDER_REL: &str = "crates/rvc/src/config/builder.rs";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
@@ -87,8 +92,15 @@ fn find_decl(lines: &[String], pred: impl Fn(&str) -> bool, what: &str) -> Resul
 
 fn is_fn_item(trim: &str, name: &str) -> bool {
     let sig = format!("fn {name}(");
-    (trim.starts_with("pub fn ") || trim.starts_with("pub(crate) fn ") || trim.starts_with("fn "))
-        && trim.contains(&sig)
+    if !trim.contains(&sig) {
+        return false;
+    }
+    trim.starts_with("pub fn ")
+        || trim.starts_with("pub(crate) fn ")
+        || trim.starts_with("pub async fn ")
+        || trim.starts_with("pub(crate) async fn ")
+        || trim.starts_with("fn ")
+        || trim.starts_with("async fn ")
 }
 
 /// Walk described in the module docs.
@@ -197,6 +209,13 @@ fn test_only_constructors_are_feature_gated() {
     let coord = read_lines(COORD_REL);
     let for_test = find_decl(&coord, |t| is_fn_item(t, "for_test"), "OrchestratorDeps::for_test")
         .unwrap_or_else(|e| panic!("{e}"));
+    let liveness = read_lines(LIVENESS_REL);
+    let refresh_indices = find_decl(
+        &liveness,
+        |t| is_fn_item(t, "refresh_indices_for_test"),
+        "LivenessObservationLoop::refresh_indices_for_test",
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     let mut impl_ok = false;
     for line in coord[..=for_test].iter().rev() {
         let t = line.trim();
@@ -217,6 +236,7 @@ fn test_only_constructors_are_feature_gated() {
         (client.as_slice(), new_for_tests, format!("{CLIENT_REL} new_for_tests")),
         (client.as_slice(), new_unchecked, format!("{CLIENT_REL} new_unchecked")),
         (coord.as_slice(), for_test, format!("{COORD_REL} OrchestratorDeps::for_test")),
+        (liveness.as_slice(), refresh_indices, format!("{LIVENESS_REL} refresh_indices_for_test")),
     ] {
         if let Err(e) = predecessor_gate(lines, idx) {
             failures.push(format!("{what}: {e}"));
@@ -484,5 +504,49 @@ fn pub_for_test_helpers_are_cfg_gated() {
         found.is_empty(),
         "pub *for_test* items need #[cfg(any(test, feature = \"test-utils\"))] or #[cfg(test)]:\n  {}",
         rendered.join("\n  ")
+    );
+}
+
+/// `ServiceBuilder::build_duty_tracker` has no production caller.
+///
+/// An ungated `DutiesProvider` parameter can be wired to a single-endpoint
+/// client and skip `BnManager` failover. Removed, `#[cfg(test)]` /
+/// `#[cfg(any(test, feature = "test-utils"))]`, or a `BnManager` parameter
+/// are the admissible fixes.
+#[test]
+fn build_duty_tracker_cannot_bypass_bn_failover() {
+    let lines = read_lines(BUILDER_REL);
+    let hits: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| is_fn_item(line.trim(), "build_duty_tracker"))
+        .map(|(i, _)| i)
+        .collect();
+    let [idx] = hits.as_slice() else {
+        assert!(
+            hits.is_empty(),
+            "{BUILDER_REL}: expected 0 or 1 build_duty_tracker, found {} at {:?}",
+            hits.len(),
+            hits.iter().map(|i| i + 1).collect::<Vec<_>>()
+        );
+        return;
+    };
+    if block_is_gated(&attribute_block(&lines, *idx)) {
+        return;
+    }
+    let mut sig = String::new();
+    for line in lines.iter().skip(*idx).take(16) {
+        sig.push_str(line.trim());
+        sig.push(' ');
+        if line.contains('{') {
+            break;
+        }
+    }
+    let failover_safe = sig.contains("BnManager") && !sig.contains("DutiesProvider");
+    assert!(
+        failover_safe,
+        "{BUILDER_REL}:{} build_duty_tracker must be removed, cfg-gated, or take BnManager \
+         (ungated DutiesProvider skips failover).\n  signature: {sig}",
+        idx + 1
     );
 }

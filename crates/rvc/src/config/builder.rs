@@ -13,15 +13,16 @@ use crate::orchestrator::dispatch::DispatchLimits;
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use crate::quiesce::{QuiesceRegistry, QuiescingEnablement, TrackedKeys};
 use beacon::{parse_slot_duration_ms, BeaconClient, BeaconClientConfig};
-use bn_manager::{
-    AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, DutiesProvider, Propagator,
-};
+#[cfg(test)]
+use bn_manager::DutiesProvider;
+use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, Propagator};
 use builder::BuilderService;
 use crypto::{CompositeSigner, KeyManager};
 use doppelganger::{
     DoppelgangerDisabledByOperator, ForwardWindowMachine, SigningEnablement,
     DEFAULT_MONITORING_EPOCHS,
 };
+#[cfg(test)]
 use duty_tracker::DutyTracker;
 use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use rvc_config::TimingConfig;
@@ -859,6 +860,13 @@ impl ServiceBuilder {
         Arc::new(propagator)
     }
 
+    /// Test-only duty tracker.
+    ///
+    /// The beacon argument is whatever the test passes. A production caller
+    /// could hand this a single-endpoint client and skip `BnManager` failover.
+    /// Production wiring is `DutyTracker::new_with_source` on `beacon.bn_manager`
+    /// in `bootstrap/services.rs`. This helper is not in a library build.
+    #[cfg(test)]
     pub fn build_duty_tracker(
         &self,
         beacon: Arc<dyn DutiesProvider>,

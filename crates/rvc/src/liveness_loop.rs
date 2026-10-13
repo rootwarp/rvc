@@ -995,4 +995,43 @@ mod tests {
         );
         assert!(src.contains("fn refresh_indices_for_test"));
     }
+
+    /// Beacon stand-in that implements [`LivenessApi`] and nothing else.
+    ///
+    /// Construction is the proof: a `BeaconNodeClient` constructor cannot name
+    /// this type.
+    struct LivenessOnlyMock;
+
+    #[async_trait::async_trait]
+    impl LivenessApi for LivenessOnlyMock {
+        async fn post_validator_liveness(
+            &self,
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError> {
+            Ok(ValidatorLivenessResponse { data: vec![] })
+        }
+
+        async fn post_validator_liveness_merged(
+            &self,
+            epoch: u64,
+            validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError> {
+            self.post_validator_liveness(epoch, validator_indices).await
+        }
+    }
+
+    /// A liveness-only client must construct [`LivenessObservationLoop`].
+    #[tokio::test]
+    async fn liveness_only_mock_satisfies_observation_loop() {
+        let loop_ = LivenessObservationLoop::new(
+            machine(),
+            Arc::new(LivenessOnlyMock),
+            PubkeyIndexRegistry::shared(),
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
+            CancellationToken::new(),
+        );
+        let statuses = loop_.drive_once_for_test(None, 0, 0).await.expect("tick");
+        assert!(statuses.is_empty());
+    }
 }
