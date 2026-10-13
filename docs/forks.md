@@ -105,8 +105,8 @@ or to `Electra..Gloas`.
 | Keygen EIP-7044 schedule | `bin/rvc-keygen/src/network.rs` | 22–39 | `exit_fork_schedule`: Capella at epoch 0, post-Capella (including Gloas) at `u64::MAX`. Production keygen signs via `sign_voluntary_exit` → `signing_root_for`. |
 | Keygen exit cap (test only) | `bin/rvc-keygen/src/exit.rs` | 106–107 | Re-implements the Capella cap inside `#[cfg(test)]` `test_exit_round_trip_encrypt_decrypt_sign`. Not the production definition. Same open-ended `>= Capella`. |
 | `SignContext` | `crates/crypto/src/typed_signer.rs` | 36–42, 55–78 | Carries resolved `ForkName`. `resolve` matches `fork_info.current_version` against `entries()`; **no silent Deneb default**. |
-| gRPC `fork_id` | `crates/grpc-signer/src/client.rs` | 268–270 | `ctx.fork_name.id()`. |
-| gRPC Gloas RPC | `crates/grpc-signer/src/client.rs` | 272–274 | `uses_gloas_rpc`: open-ended `>= Gloas` keeps header/root RPCs. |
+| gRPC `fork_id` | `crates/grpc-signer/src/client.rs` | 272–274 | `ctx.fork_name.id()`. |
+| gRPC Gloas RPC | `crates/grpc-signer/src/client.rs` | 276–278 | `uses_gloas_rpc`: open-ended `>= Gloas` keeps header/root RPCs. |
 | `validate_fork_id` | `crates/eth-types/src/ssz_helpers.rs` | 304–321 | **Not** `ForkName::try_from`. Allowlist `DECODER_SUPPORTED_FORK_IDS = 0..=6` (Phase0…Fulu). Gloas id 7 is `Ok` on `ForkName::try_from` and **rejected here** so Gloas SSZ never reaches these pre-Electra layouts. Encoders ignore `fork_id`. |
 | `decode_attestation_ssz` | `crates/eth-types/src/ssz_helpers.rs` | 179–218 | Always pre-Electra three-field layout. Electra-shaped buffers → `ElectraLayoutUnsupported` (81, 204, 217), never a wrong `Attestation`. |
 
@@ -124,7 +124,7 @@ inventory in [gloas-fork-hazard-audit.md](gloas-fork-hazard-audit.md)):
 | Signer header RPC | `crates/signer/src/lib.rs` | 953 | `>= Gloas` uses `SignBlockHeader` (no Gloas body SSZ into a legacy decoder). |
 | Signer aggregate RPC | `crates/signer/src/lib.rs` | 1229, 1283 | `>= Gloas` rejects legacy `sign_aggregate_and_proof` / `sign_electra_aggregate_and_proof` (`UnsupportedDuty`); Gloas signs via the root RPC (`sign_aggregate_and_proof_root` 1248). |
 | Typed-signer aggregate reject | `crates/crypto/src/typed_signer.rs` | 342, 361 | Same `>= Gloas` `UnsupportedDuty` on the local typed path. |
-| DVT peer Gloas RPC | `crates/signer-server/src/dvt/peer_client.rs` | 204 | Same open-ended `>= Gloas` as the gRPC client. |
+| DVT peer Gloas RPC | `crates/signer-server/src/dvt/peer_client.rs` | 210–212 | Same open-ended `>= Gloas` as the gRPC client. |
 
 ### 1.4 SEC-9 fail-closed startup gate
 

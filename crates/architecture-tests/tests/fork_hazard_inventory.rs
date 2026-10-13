@@ -243,7 +243,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/grpc-signer/src/client.rs",
-        273,
+        277,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -315,7 +315,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer-server/src/dvt/peer_client.rs",
-        207,
+        211,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",

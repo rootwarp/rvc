@@ -144,6 +144,10 @@ fn build_endpoint(
         .map_err(|e| SigningError::RemoteSignerError(format!("invalid endpoint URL: {e}")))?;
 
     if let Some((cert, key, ca_cert)) = tls {
+        // Both rustls providers are compiled in under `--all-features`
+        // (`ring` here, `aws_lc_rs` via gcp-secret). Install `ring` before
+        // tonic resolves a provider, or `tls_config` panics.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let tls_config = tonic::transport::ClientTlsConfig::new()
             .identity(tonic::transport::Identity::from_pem(cert, &*key))
             .ca_certificate(tonic::transport::Certificate::from_pem(ca_cert));

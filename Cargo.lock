@@ -4497,6 +4497,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry_sdk",
  "prost 0.13.5",
+ "rustls",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-observability",
@@ -4836,6 +4837,7 @@ name = "rvc-test-support"
 version = "0.7.0"
 dependencies = [
  "rcgen",
+ "rustls",
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",

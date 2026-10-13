@@ -68,7 +68,7 @@ const DOMAIN_EDGE_ALLOWLIST: &[(&str, &str)] = rvc_architecture_tests::DOMAIN_ED
 /// - `rvc-observability`: logging/hex/pubkey leaf sink (RF3-01); zero workspace out-edges so
 ///   dependents can take the light path without pulling BLS/KDF/HTTP via crypto.
 /// - `rvc-test-support`: dev-only rcgen PKI + mTLS harness (RF6-14); external deps only
-///   (rcgen/tonic/tokio), never a production edge into the workspace graph.
+///   (rcgen/tonic/tokio/rustls), never a production edge into the workspace graph.
 /// - `rvc-spec-vectors`: integration-only spec vectors + KAT codegen; external deps only
 ///   (none yet), never a production edge into the workspace graph.
 const ZERO_OUT_EDGE_IF_PRESENT: &[&str] = &[
