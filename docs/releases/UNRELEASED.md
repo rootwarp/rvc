@@ -200,8 +200,7 @@ the three `[keymanager]` import KDF knobs:
 - `keymanager_import_kdf_total_mib`
 - `keymanager_import_kdf_max_keystore_mib`
 
-`grpc_port` and `grpc_address` stay removed. The sentence further down that
-used to say the inventory was 69 now says 75.
+`grpc_port` and `grpc_address` stay removed.
 
 ## Keymanager: imports may defer and can finish after disconnect
 
@@ -216,8 +215,17 @@ may still be running. An in-flight import can be absent from both
 decrypt. A key missing from that list also does not prove the import
 stopped after decrypt: the file is written before `admit`.
 
+`doppelganger.on_import` runs only if the handler is still alive after
+`import_keystore` returns. A disconnect skips it. The blocking import still
+calls `admit`: the key starts Pending and refuses signing while Pending.
+Liveness can move it to Safe without `on_import`. After that, automatic
+duties stay withheld by the store hold, but voluntary exit is gated only by
+the forward window, and the API may report `doppelganger_safe = true` while
+the row stays disabled until restart. With doppelganger disabled there is no
+hold. A restart only re-arms the timed store hold. See #626.
+
 An interchange import takes a single-flight lock, then waits until its
-estimated hold fits inside one free window of the current slot. After the
+estimated hold fits inside one free window of this slot or the next. After the
 lock is acquired, that wait is at most one slot. Imports serialize on the
 same lock, so a second import can wait longer while the first holds it. The
 queue wait is capped at two slot durations (`QUEUE_WAIT_SLOTS`). Past that
@@ -239,12 +247,18 @@ payload. `ImportAdmission::ensure_still_fits` returns the same error when
 `tokio::time::Instant::now()` is after `latest_start`. `admit` had already
 accepted that payload. A later request of the same payload can succeed when
 its blocking start is still at or before the new `latest_start`. Before
-genesis the import is admitted immediately.
+genesis the same single-flight lock is already held. The import returns
+without a further sleep only when the estimate finishes at or before genesis.
+Otherwise it waits, still holding that lock, for a free window in the first
+two post-genesis slots (slot 0, then slot 1).
 
 A wait of at least 1 ms is recorded on `rvc_slashing_import_deferred_ms`.
 The sample is the mutex queue plus the sleep until the window. It is not the
 connection hold (`rvc_slashing_import_conn_hold_ms`). An import that is
 admitted without waiting records nothing on the deferred histogram.
+
+A deferred import logs `interchange import deferred` at info with `wait_ms`,
+`window_ms`, and `estimated_hold_ms`.
 
 ## Keymanager: fee recipient, gas limit, and graffiti persist before publish
 
@@ -254,17 +268,22 @@ validators file first, then applies the same change to the live store.
 
 A failed save returns an error and leaves the previous live value in place.
 A pubkey that is absent returns `NotFound` and does not rewrite the file.
-If that pubkey is removed or replaced while the write is in progress, the
-in-flight change is not published, the file is rewritten to match the live
-key, and the call returns `NotFound`.
+With no config path, `update_config_durable` fails at entry (`store.rs`)
+before any rewrite and is HTTP 500. If that pubkey is removed or replaced
+while the write is in progress, the in-flight change is not published. The
+repair rewrites the file from the live store up to 8 times
+(`IDENTITY_REPAIR_ATTEMPTS`). A rewrite that fails (`write_toml_atomic`) is
+HTTP 500 and publishes nothing. When a rewrite finishes and the identity is
+stable, or the identity keeps changing after those 8 attempts, the call
+returns `NotFound` (HTTP 404).
 
 `map_durable_update_error` is the HTTP mapping:
 
 | Outcome | Store result | HTTP |
 |---|---|---|
 | Pubkey absent when the candidate is cloned | `ValidatorStoreError::NotFound` | 404 |
-| Pubkey removed or replaced during the write | `ValidatorStoreError::NotFound` | 404 |
-| Save or repair failure (`write_toml_atomic`, or no config path) | any other `ValidatorStoreError` | 500 |
+| Pubkey removed or replaced during the write, and the repair write finishes (or 8 repair attempts exhausted) | `ValidatorStoreError::NotFound` | 404 |
+| Missing config path at entry, or save/repair failure (`write_toml_atomic`) | any other `ValidatorStoreError` | 500 |
 
 The remove-or-replace race is 404 because it returns `NotFound`. Before
 RR3-03 the adapter mapped every store error to `ApiError::Internal`, which
@@ -326,8 +345,10 @@ setters return HTTP 500 and publish nothing. The error body is
 When the slot ends, attestation, sync-committee, and aggregation duties that
 have not yet been pulled onto the sign pipeline are dropped. Each drop is
 logged at `warn` and added to `SlotEndDropCounter`. The warn fields are
-`dropped` (this slot) and `total_dropped` (process lifetime). The messages
-are:
+`slot`, `dropped` (this slot), `duty_count`, and `total_dropped` (that
+service instance). Attestation, sync-committee, and aggregation each keep
+their own counter. The counter lasts for the service instance, not for the
+process. The messages are:
 
 - `undispatched attestation duties dropped at slot end`
 - `undispatched sync committee duties dropped at slot end`
@@ -344,7 +365,9 @@ A numeric field on an attester, proposer, or PTC duty that does not parse as
 an integer is a named per-duty rejection (`DutyParseError`). That duty is
 left out of the epoch cache. The epoch's other duties are still cached. The
 rejection is counted on `rvc_duty_rejected_total{field}` and logged at
-`warn` (`rejecting duty: malformed numeric field`). One bad duty does not
+`warn` (`rejecting duty: malformed numeric field {field} raw {raw}`).
+When the duty had a validator index, that index is a structured field on the
+same line. One bad duty does not
 discard the rest of the epoch.
 
 `field` is the wire name. Attester duties parse all five. Proposer and PTC
@@ -373,10 +396,21 @@ duties parse `slot` and `validator_index`.
 | `rvc_slashing_group_commit_batch_size` | none | Members drained by one non-empty `drain_batch`. Empty drains are not observed. |
 
 `rvc_slot_phase_late_total` increments only for the label passed to
-`wait_until_bps`. The process clock is `ServiceBuilder::build_slot_clock`:
-`SystemSlotClock::new` then `with_deadline_schedule(deadline_schedule_from_timing)`.
-`SystemSlotClock::new` first stores `DeadlineSchedule::uniform(DeadlineBps::default())`.
-Production replaces that schedule before the clock is used.
+`wait_until_bps`. The late-fire warn is
+`slot phase deadline already passed; firing immediately` with `phase`,
+`overrun_ms`, and `slot`. A skipped replay logs
+`skipping slot replay; clock is at or behind the last processed slot` with
+`current_slot` and `last_processed_slot`.
+
+The shared-wait decision reads `OrchestratorConfig.deadline_schedule`, set by
+`ServiceBuilder::build_orchestrator_config` via
+`with_deadline_schedule(deadline_schedule_from_timing)` (default `[timing]`).
+`ServiceBuilder::build_slot_clock` calls
+`SystemSlotClock::new` and then the same `with_deadline_schedule`.
+`SystemSlotClock::new` first stores
+`DeadlineSchedule::uniform(DeadlineBps::default())`; production replaces that
+schedule before the clock is used. The late counter follows the orchestrator
+schedule, not that constructor.
 `deadline_schedule_from_timing` sets pre-Gloas `sync_message` to
 `attestation_due_bps` and `contribution` to `aggregate_due_bps`.
 `TimingConfig::default` is 3333 and 6667 for those two. The Gloas defaults
@@ -451,13 +485,14 @@ cannot separate that contention from a slashing-DB stall. Page on
 `rvc_slot_phase_late_total` and on the `Missed attestation deadline` warn.
 That warn is logged once, at attestation-phase start, when the phase begins
 more than one attestation-deadline offset past the deadline (about 8 s into
-a 12 s slot on default `[timing]`). It does not cover a publish that lands
+a 12 s slot before Gloas, or about 6 s once the Gloas default of 2500 bps
+is the active schedule). It does not cover a publish that lands
 late after an on-time start. There is no Prometheus series for it.
-`rvc_slot_phase_late_total` increments when `wait_until_bps` finds that
-phase's deadline already passed, so it covers a late phase start, including
-one that is past the deadline but not yet more than one offset past it.
-Neither that counter nor the warn catches an attestation that starts on time
-and publishes late.
+`rvc_slot_phase_late_total` records a deadline that is already due when
+`wait_until_bps` is entered, including lateness below the warn threshold.
+A late wake-up or a slow head capture after that wait can delay the phase
+without incrementing the counter. Neither the counter nor the warn catches
+an attestation that starts on time and publishes late.
 
 Wall-clock last publish in the RR2-16 N=200 record
 (`plan/review-2026-10-03/measurements/m2-n200.md`) falls against the RED
@@ -487,6 +522,12 @@ items below. Library and embedding callers are.
   (true only for `Published`). Out-of-range BN failure indices count as
   `Failed`, not `Published`. The `Attestation failed` warn fields use Debug
   (`?error`) so BN-supplied CR/LF cannot forge text-format log lines.
+  A beacon rejection of one attestation in a publish wave logs
+  `Attestation submission failed` at warn with `validator_index`, a truncated
+  `pubkey` (`0x` + first 10 hex digits + `...` + last 8), `bn` (host-only
+  label; empty when the outcome names no endpoint), and `message`.
+  A complete submit failure for the wave logs the same message at error with
+  `slot` and `error` instead.
   Red-check with `--exact` needs the fully-qualified test name:
   `orchestrator::coordinator::tests::core::attestation_outcome_is_exhaustive_and_published_is_not_an_error`.
 
@@ -513,8 +554,25 @@ the same Prometheus name when an attestation sign is slashing-blocked.
   `BeaconNodeClient` is the composition of the role traits. Its supertraits
   are `DutiesProvider`, `BlockProducer`, `AttestationApi`,
   `PayloadAttestationApi`, `SyncCommitteeApi`, `LivenessApi`, and
-  `NodeStatusApi`. No new method was added to a beacon-node role trait.
+  `NodeStatusApi`. RR4-04 (#603) added no method on those traits.
+  `AttestationApi::submit_attestation_attributed` was added earlier (#514).
 
+## Source issues
+
+| Section | Issues |
+|---|---|
+| Exit codes | #509, #511, #512 |
+| Startup | #510, #511 |
+| Config: new `[duties]` | #515 |
+| Config: KDF budget | #522, #523 |
+| Config: knob inventory is 75 | #515, #523 |
+| Keymanager: imports | #524, #530, #531 |
+| Keymanager: fee recipient, gas limit, and graffiti | #532 |
+| Behaviour: slot boundary | #516, #517, #518 |
+| Behaviour: duty validation | #533, #534 |
+| New metrics | #500, #506, #507, #508, #512, #525, #531, #533 |
+| Changed metric values | #508 |
+| Library consumers | #504, #521, #537, #538, #539, #540, #603 |
 
 ## Tracing: dev/demo tail sampling profile (TRC-7c / #448)
 
@@ -525,6 +583,25 @@ image with its built-in `tail_sampling` processor
 Other traces are kept at 10%. This is a local demonstration topology, not
 a production recommendation. `docker compose up` and `--profile tracing`
 are unchanged, and the in-process head sample rate stays `0.01`.
+
+## Tracing: loop ticks, DVT re-entry, and truncated signer pubkeys
+
+Five loops each hold a process-lifetime span with `parent: None`, and each
+tick is a fresh root that `follows_from` that span: `liveness_loop`
+(`debug`), and `index.resolve`, `slashing_monitor`,
+`proposer_config_refresh`, and `monitoring_push` (`info`) (TRC-6b, #439).
+The duty orchestrator stays a detached per-slot root (`slot.process`) and is
+not one of those five.
+
+DVT `spawn_blocking` work re-enters the handler span, so the blocking
+closure stays on the request trace (TRC-6d, #441).
+
+Signer span `pubkey` attributes are truncated to `0x` plus the first 10 hex
+digits, `...`, and the last 8 (TRC-6e, #442). The field name stays `pubkey`.
+
+`tracing_service_name` (flat) and `[tracing].service_name` set the
+OpenTelemetry resource `service.name` and the tracer name to the same string.
+Unset uses `rvc`.
 
 ## DevNet: canonical green soak pins (DSR-3.1 / #386)
 
@@ -760,6 +837,7 @@ tracing_exporter = "gcp"
 tracing_sample_rate = 0.37
 tracing_max_queue_size = 3333
 tracing_max_export_batch_size = 444
+tracing_service_name = "rvc-wire"
 ```
 
 **After** — the same knobs as a section table (corpus fixture
@@ -772,6 +850,7 @@ exporter = "gcp"
 sample_rate = 0.37
 max_queue_size = 3333
 max_export_batch_size = 444
+service_name = "rvc-wire"
 ```
 
 Those two fixtures parse to the same `Config`
@@ -873,6 +952,15 @@ query at `committee_index` 0. If the response fork disagrees,
 `load_attestation_data_memo` drops the shared entry and refetches per
 committee. A fetch error, or a target epoch that does not parse, does not
 trigger that refetch.
+
+When the memo load succeeds, duties look up that shared memo (RR2-06, #519)
+rather than fetching during sign. Pre-Electra queries once per distinct
+committee up front; Electra and later use one shared query unless a fork
+disagreement refetches per committee as above. A missing or failed memo
+entry fails that duty; there is no per-duty beacon fallback. When the
+attestation and sync-message deadlines match, those two phases run
+concurrently after one shared wait (RR2-07, #520). Neither change adds a
+flag, a metric, or a status code.
 
 ---
 

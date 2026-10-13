@@ -5,6 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use keymanager_api::traits::{Pubkey, SlashingProtection, SlashingProtectionError};
 use slashing::SlashingDb;
+#[cfg(any(test, feature = "test-utils"))]
 use timing::SlotClock;
 
 use super::import_window::{ImportDeferralError, ImportWindowGate};
