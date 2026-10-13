@@ -2,7 +2,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,17 +39,40 @@ pub fn known_pubkey_bytes() -> [u8; 48] {
 pub static KNOWN_PUBKEY_BYTES: std::sync::LazyLock<[u8; 48]> =
     std::sync::LazyLock::new(known_pubkey_bytes);
 
+/// On-disk slashing DB path. Dropping this removes the parent directory.
+///
+/// Bind it for the whole test (`db_path` or `_db_path`). A bare `_` drops the
+/// directory before the test body runs.
+pub struct TempDbPath {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl AsRef<Path> for TempDbPath {
+    fn as_ref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl std::ops::Deref for TempDbPath {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// Build a `SignerServiceImpl` backed by an in-memory key manager and an
-/// on-disk slashing DB (tempfile, caller gets the path to re-open for assertions).
-pub fn make_service_with_db() -> (SignerServiceImpl, PathBuf) {
+/// on-disk slashing DB. The returned [`TempDbPath`] keeps the directory alive.
+pub fn make_service_with_db() -> (SignerServiceImpl, TempDbPath) {
     make_service_with_genesis(eth_types::NetworkPreset::MAINNET.genesis_fork_version)
 }
 
 /// Like [`make_service_with_db`] but with an explicit network genesis fork version
 /// (builder-registration domain source).
-pub fn make_service_with_genesis(genesis_fork_version: [u8; 4]) -> (SignerServiceImpl, PathBuf) {
+pub fn make_service_with_genesis(genesis_fork_version: [u8; 4]) -> (SignerServiceImpl, TempDbPath) {
     let sk = known_secret_key();
-    let db_path = make_temp_db_path();
+    let (dir, db_path) = make_temp_db_path();
 
     let mut km = KeyManager::new();
     km.insert(sk);
@@ -59,29 +82,29 @@ pub fn make_service_with_genesis(genesis_fork_version: [u8; 4]) -> (SignerServic
 
     let svc = SignerServiceImpl::new_v2(backend as Arc<dyn SigningBackend>, "test".to_string(), db)
         .with_genesis_fork_version(genesis_fork_version);
-    (svc, db_path)
+    (svc, TempDbPath { _dir: dir, path: db_path })
 }
 
 /// Same as `make_service_with_db` but the backend has no keys loaded.
 /// Calls to `backend.sign()` will return `KeyNotFound`.
-pub fn make_service_with_db_unknown_key() -> (SignerServiceImpl, PathBuf) {
-    let db_path = make_temp_db_path();
+pub fn make_service_with_db_unknown_key() -> (SignerServiceImpl, TempDbPath) {
+    let (dir, db_path) = make_temp_db_path();
     let backend = Arc::new(TestBackend { km: Arc::new(KeyManager::new()) });
     let db = Arc::new(SlashingDb::open(&db_path).expect("open test DB"));
     let svc = SignerServiceImpl::new_v2(backend as Arc<dyn SigningBackend>, "test".to_string(), db);
-    (svc, db_path)
+    (svc, TempDbPath { _dir: dir, path: db_path })
 }
 
 /// Create a temporary path for a slashing DB that does **not** yet exist.
 ///
 /// SEC-3 rejects pre-existing 0-byte files as corrupt; `SlashingDb::open` still
 /// creates a fresh DB when the path is missing (library/test convenience).
-/// Leak the parent `TempDir` so the path stays valid for the test lifetime.
-fn make_temp_db_path() -> PathBuf {
+/// The caller keeps the [`tempfile::TempDir`] so the path stays valid until the
+/// test drops it.
+fn make_temp_db_path() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().join("slashing.db");
-    std::mem::forget(dir);
-    path
+    (dir, path)
 }
 
 // ── TestBackend ───────────────────────────────────────────────────────────────
@@ -191,6 +214,8 @@ pub struct LoadFixture {
     pub slow: Arc<SlowSigner>,
     pub injected_latency: Duration,
     pub key_count: usize,
+    /// Dropped after `service`, so the slashing DB directory outlives the connection.
+    _dir: tempfile::TempDir,
 }
 
 /// 200-key / 200 ms load fixture (A-9 defaults).
@@ -217,7 +242,7 @@ pub fn make_load_fixture_with(key_count: usize, injected_latency: Duration) -> L
     }
 
     let slow = Arc::new(SlowSigner::new(LocalSigner::new(km_local), injected_latency));
-    let db_path = make_temp_db_path();
+    let (dir, db_path) = make_temp_db_path();
     let db = Arc::new(SlashingDb::open(&db_path).expect("open load-profile slashing db"));
     let gate = SigningGate::new_with_raw_signer(
         Arc::clone(&db),
@@ -234,7 +259,7 @@ pub fn make_load_fixture_with(key_count: usize, injected_latency: Duration) -> L
         "load-harness".to_string(),
         Arc::new(gate),
     );
-    LoadFixture { service, db_path, pubkeys, slow, injected_latency, key_count }
+    LoadFixture { service, db_path, pubkeys, slow, injected_latency, key_count, _dir: dir }
 }
 
 // ── SSZ helpers ───────────────────────────────────────────────────────────────
