@@ -357,6 +357,28 @@ fn path_token_extractor_accepts_plan_and_docs_prefixes() {
     );
 }
 
+/// `allow_unsupported_fork` is the opt-out in `apply_fork_compatibility_result`.
+///
+/// A line range in `docs/forks.md` drifted (RR4-04 S3). The checklist names the
+/// function. `173–176` / `173-176` must not come back.
+#[test]
+fn forks_md_names_allow_unsupported_fork_opt_out() {
+    let text = std::fs::read_to_string(workspace_root().join("docs/forks.md"))
+        .expect("read docs/forks.md");
+    assert!(
+        text.contains("`apply_fork_compatibility_result`"),
+        "docs/forks.md must name apply_fork_compatibility_result"
+    );
+    assert!(
+        text.contains("crates/rvc/src/bootstrap/services.rs"),
+        "the opt-out still lives in bootstrap/services.rs"
+    );
+    assert!(
+        !text.contains("173–176") && !text.contains("173-176"),
+        "stale services.rs line range must not return"
+    );
+}
+
 #[test]
 fn dead_path_helper_skips_exempt_docs() {
     let root = workspace_root();

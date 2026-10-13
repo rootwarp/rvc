@@ -903,10 +903,11 @@ mod tests {
 
     use async_trait::async_trait;
     use beacon::{
-        DataResponse, DependentRootResponse, VersionedAggregateAttestation,
-        VersionedSignedAggregateAndProof,
+        AttestationDataResponse, BeaconCommitteeSubscription, BeaconError, DataResponse,
+        DependentRootResponse, SubmitAttestationResult, VersionedAggregateAttestation,
+        VersionedAttestation, VersionedSignedAggregateAndProof,
     };
-    use bn_manager::MockBeaconNodeClient;
+    use bn_manager::{AttestationApi, MockBeaconNodeClient};
     use crypto::{
         signing_root_for, CompositeSigner, DutyRef, KeyManager, LocalSigner, PublicKey, SecretKey,
         Signature, SigningCtx,
@@ -1879,6 +1880,73 @@ mod tests {
             "a POST cancelled during the delay must not record a completion"
         );
         assert_eq!(service.slot_end_drops(), 0, "the in-flight duty is dispatched");
+    }
+
+    /// Beacon stand-in that implements [`AttestationApi`] and nothing else.
+    ///
+    /// Construction is the proof: a `BeaconNodeClient` constructor cannot name
+    /// this type.
+    struct AttestationOnlyMock;
+
+    #[async_trait]
+    impl AttestationApi for AttestationOnlyMock {
+        async fn get_attestation_data(
+            &self,
+            _slot: u64,
+            _committee_index: u64,
+        ) -> Result<AttestationDataResponse, BeaconError> {
+            Err(BeaconError::HttpError("attestation-only mock".into()))
+        }
+
+        async fn submit_attestation(
+            &self,
+            _attestations: &VersionedAttestation,
+        ) -> Result<SubmitAttestationResult, BeaconError> {
+            Err(BeaconError::HttpError("attestation-only mock".into()))
+        }
+
+        async fn get_aggregate_attestation(
+            &self,
+            _slot: u64,
+            _attestation_data_root: &str,
+            _committee_index: Option<u64>,
+            _fork: ForkName,
+        ) -> Result<VersionedAggregateAttestation, BeaconError> {
+            Err(BeaconError::HttpError("attestation-only mock".into()))
+        }
+
+        async fn submit_aggregate_and_proofs(
+            &self,
+            _proofs: &VersionedSignedAggregateAndProof,
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("attestation-only mock".into()))
+        }
+
+        async fn submit_beacon_committee_subscriptions(
+            &self,
+            _subscriptions: &[BeaconCommitteeSubscription],
+        ) -> Result<(), BeaconError> {
+            Err(BeaconError::HttpError("attestation-only mock".into()))
+        }
+    }
+
+    /// An attestation-only client must construct [`AggregationService`].
+    #[test]
+    fn attestation_only_mock_satisfies_aggregation_service() {
+        let beacon = Arc::new(AttestationOnlyMock);
+        let duty_tracker =
+            Arc::new(DutyTracker::new(Arc::new(MockBeaconNodeClient::new()), Vec::new()));
+        let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        let service = AggregationService::new(
+            Arc::new(StubValidatorSigner::new()),
+            beacon,
+            duty_tracker,
+            pubkey_map,
+            create_test_config(),
+            store,
+        );
+        assert_eq!(service.slot_end_drops(), 0);
     }
 
     struct DelayingSigner {

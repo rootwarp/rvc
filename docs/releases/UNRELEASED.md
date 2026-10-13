@@ -621,7 +621,9 @@ the same Prometheus name when an attestation sign is slashing-blocked.
   `SlashingDb::open_with_conn_for_testing`,
   `LivenessObservationLoop::drive_once_for_test`,
   `LivenessObservationLoop::refresh_indices_for_test`, and
-  `IndexResolver::drive_once_for_test`. An architecture test fails if
+  `IndexResolver::drive_once_for_test`. The architecture scan names
+  `refresh_indices_for_test` and fails if any public `*for_test*` helper
+  drops the gate. An architecture test fails if
   `test-utils` is reachable from `rvc-bin` (default, `gcp-trace`,
   `gcp-secret`, or both), `rvc-signer-bin` (default or `dvt`), `rvc-keygen`,
   or — under a unified workspace `default-members` resolve — enabled on any
@@ -641,6 +643,14 @@ the same Prometheus name when an attestation sign is slashing-blocked.
   `PayloadAttestationApi`, `SyncCommitteeApi`, `LivenessApi`, and
   `NodeStatusApi`. RR4-04 (#603) added no method on those traits.
   `AttestationApi::submit_attestation_attributed` was added earlier (#514).
+  `AggregationService::new` and `LivenessObservationLoop::new` have the same
+  compile-time guard as `DutyTracker::new`: a mock that implements only the
+  narrow trait still constructs the consumer.
+- `ServiceBuilder::build_duty_tracker` compiles only under `cfg(test)`.
+  It has no production caller. A default library build cannot pass a
+  single-endpoint client through it and skip `BnManager` failover.
+  Production duty tracking is `DutyTracker::new_with_source` on
+  `beacon.bn_manager` in `bootstrap/services.rs`.
 
 ## Source issues
 
@@ -657,7 +667,7 @@ the same Prometheus name when an attestation sign is slashing-blocked.
 | Behaviour: duty validation | #533, #534 |
 | New metrics | #500, #506, #507, #508, #512, #525, #531, #533 |
 | Changed metric values | #508 |
-| Library consumers | #504, #521, #537, #538, #539, #540, #602, #603 |
+| Library consumers | #504, #521, #537, #538, #539, #540, #602, #603, #604 |
 
 ## Tracing: dev/demo tail sampling profile (TRC-7c / #448)
 

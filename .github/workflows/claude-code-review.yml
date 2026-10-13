@@ -12,11 +12,9 @@ on:
 
 jobs:
   claude-review:
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+    # Bot actors are refused by the action ("initiated by non-human actor")
+    # and that refusal fails the check. Skip them; human PRs still run.
+    if: github.event.sender.type != 'Bot'
 
     runs-on: ubuntu-latest
     permissions:
