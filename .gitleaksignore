@@ -7,8 +7,10 @@ crates/crypto/examples/log_sample.rs:generic-api-key:27
 crates/crypto/src/key_manager.rs:generic-api-key:452
 crates/crypto/src/key_manager.rs:generic-api-key:704
 crates/crypto/src/key_manager.rs:generic-api-key:994
-crates/crypto/src/keystore.rs:generic-api-key:582
-crates/crypto/src/keystore.rs:generic-api-key:616
+# Same EIP-2335 test-vector pubkeys. Lines moved +8 when the cheap-KDF
+# helpers gained the test-utils cfg (#602).
+crates/crypto/src/keystore.rs:generic-api-key:590
+crates/crypto/src/keystore.rs:generic-api-key:624
 # Same private-key stub as the 2026-09-29 baseline; the line moved 1356 → 1392.
 crates/grpc-signer/src/client.rs:private-key:1392
 crates/keymanager-api/src/auth.rs:generic-api-key:339
@@ -36,7 +38,9 @@ crates/slashing/src/db/interchange.rs:generic-api-key:957
 crates/slashing/src/db/interchange.rs:generic-api-key:1009
 crates/slashing/src/db/interchange.rs:generic-api-key:1084
 crates/slashing/src/db/interchange.rs:generic-api-key:1143
-crates/slashing/src/db/open.rs:generic-api-key:487
+# Same test pubkey stub. Line moved +5 when open_with_conn_for_testing
+# gained the test-utils cfg (#602).
+crates/slashing/src/db/open.rs:generic-api-key:492
 crates/slashing/src/types.rs:generic-api-key:378
 crates/slashing/src/types.rs:generic-api-key:415
 crates/slashing/src/types.rs:generic-api-key:457

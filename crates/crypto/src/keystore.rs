@@ -106,6 +106,11 @@ pub enum EncryptionKdf {
 impl EncryptionKdf {
     /// Cheap scrypt params for unit tests only (n = 2). Provides essentially
     /// no key stretching — never use this in production code paths.
+    ///
+    /// Compiled only for this crate's tests or when the `test-utils` feature
+    /// is enabled. Other crates' tests see it through a dev-dependency on
+    /// `crypto` with that feature.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn scrypt_cheap_for_tests() -> Self {
         Self::ScryptWith { n: 2, r: 1, p: 1, dklen: DEFAULT_SCRYPT_DKLEN }
     }
@@ -114,6 +119,9 @@ impl EncryptionKdf {
     /// the floor the decrypt validator enforces). Prefer
     /// `scrypt_cheap_for_tests()` when the test does not specifically
     /// exercise the PBKDF2 path — scrypt-cheap is ~10× faster.
+    ///
+    /// Same compiler gate as [`Self::scrypt_cheap_for_tests`].
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn pbkdf2_cheap_for_tests() -> Self {
         Self::Pbkdf2With { c: MIN_PBKDF2_C, dklen: DEFAULT_PBKDF2_DKLEN }
     }

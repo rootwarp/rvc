@@ -41,7 +41,7 @@ pub struct IndexResolverDeps {
     pub epoch_clock: Arc<MonotonicEpochClock>,
 }
 
-/// Outcome of one [`IndexResolver::drive_once_for_test`] pass.
+/// Outcome of one `IndexResolver::drive_once_for_test` pass.
 ///
 /// `key_gen_after_write` is sampled after the registry merge and before any
 /// re-send, so a growth bump has a strictly greater ordinal.
@@ -148,6 +148,10 @@ impl IndexResolver {
     ///
     /// Tests call this instead of sleeping for an epoch. Production [`Self::run`]
     /// calls [`Self::finish_wake`] on each `key_gen` wake and on the per-epoch tick.
+    ///
+    /// Compiled only for this crate's tests or when the `test-utils` feature
+    /// is enabled. Integration tests see it through the self dev-dependency.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn drive_once_for_test(&mut self, epoch: u64) -> ResolvePass {
         self.resolve_at(epoch).await
     }
