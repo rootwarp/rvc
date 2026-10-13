@@ -161,9 +161,16 @@ pub async fn import_keystores(
                     // without `on_import`; after that, automatic duties stay
                     // withheld by the store hold, but voluntary exit is gated only
                     // by the forward window, and the API may report
-                    // `doppelganger_safe = true` while the row stays disabled until
-                    // restart. With doppelganger disabled there is no hold. A
-                    // restart only re-arms the timed store hold (see #626).
+                    // `doppelganger_safe = true` while the row stays disabled.
+                    // A disconnect skips `on_import`, so nothing in this process
+                    // releases that hold. A restart reconciles an elapsed hold,
+                    // or an operator recovers the row explicitly. With
+                    // doppelganger disabled there is no hold. A later restart
+                    // with that hold still open, or with an import sidecar still
+                    // on disk, registers the key through `register_for_import`
+                    // again, so epoch 0 and slashing history cannot skip the
+                    // window. The sidecar is removed only after this process
+                    // observes the forward window to Safe.
                     if let Err(e) = state.doppelganger.on_import(pubkey, ImportKind::Local) {
                         error!(
                             pubkey = %TruncatedPubkey::new(&pubkey_hex),

@@ -3,6 +3,71 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Doppelganger: an import sidecar stays unfinished until this process observes the window
+
+On startup, a loaded key is registered with `register_for_import` when any of
+the following is true:
+
+- the validators file has `doppelganger_hold_until` still in the future
+- `keystore_path` still has `0x<pubkey>.import_meta.json`. Age does not
+  finish the import. The 768 second store hold (2 epochs at a 12 second
+  slot) is a separate gate. This process removes the sidecar only after the
+  forward-window machine reaches Safe, while holding the same import/delete
+  lock, then fsyncs the keystore directory
+- that sidecar cannot be read or parsed
+- a leftover `0x<pubkey>.import_meta.json.removing.<n>` set-aside from an
+  older cleanup is still present (boot fails closed; Safe cleanup and DELETE
+  remove it under the same lock)
+- `0x<pubkey>.import_meta.json.partial` is still present. The same Safe
+  transition removes a leftover partial. DELETE removes the final sidecar,
+  a leftover partial, and any `.removing.*` set-aside. A partial for a key
+  that never loads stays on disk, and that key stays Pending on every later
+  boot that loads it
+- `keystore_path` is not a readable directory (a missing directory has no
+  sidecars), or the validators file cannot be read (every loaded key stays
+  Pending for that start)
+
+That key starts Pending. Signing stays off, including voluntary exit, until
+the forward-window machine reaches Safe. Removing the sidecar is not what
+opens signing; it only records that this process observed the window, so a
+later boot is not forced Pending by the unfinished marker. An open hold
+without a sidecar still blocks Safe-skip only until its deadline. A recent
+attestation in the slashing-protection database and a start at epoch 0 do
+not open signing while the sidecar or an open hold remains. A restart about
+900 seconds after import, with slashing history at import epoch `e` and boot
+at `e+2`, stays Pending.
+
+Keys imported before this release still have a sidecar, because nothing
+removed it except DELETE. The first start after upgrade registers those keys
+Pending until this process observes the window and removes the file. A later
+restart, with the sidecar gone and the hold elapsed, can mark the key Safe
+from recent local slashing history. A start at epoch 0 can still mark a key
+with no sidecar and no open hold Safe.
+
+A key with none of those markers still uses boot `register`. An operator
+`enabled = false` row with no `doppelganger_hold_until` is not an unfinished
+import.
+
+These cases are still open:
+
+- **No import marker.** Secret-provider refresh, a keystore copied in by
+  hand, and a gRPC remote key write no sidecar and set no hold. A restart
+  before liveness finishes can still mark that key Safe at epoch 0 or from
+  imported history.
+- **Later interchange.** After the sidecar is removed, a later
+  interchange-only import can move the latest attestation target forward.
+  This release does not tell imported history apart from history this VC
+  signed, so a following restart can still safe-skip from that history.
+- **Disconnected import.** A disconnect still skips `on_import`, so no
+  enable task is armed. The validators row stays disabled until a restart
+  reconciles an elapsed hold, or until an explicit recovery. Nothing in the
+  running process releases that hold. A retry of that import can still
+  return duplicate. After liveness marks the key Safe,
+  `GET /eth/v1/keystores` can still report `doppelganger_safe = true` while
+  the row stays disabled.
+- **Zero keys at start.** Starting with zero keys still does not spawn the
+  liveness loop, so a later import can stay Pending.
+
 ## Duties: payload attestations sign concurrently
 
 Payload-attestation (PTC) signing now uses the same `[duties]` limits as
@@ -221,8 +286,13 @@ calls `admit`: the key starts Pending and refuses signing while Pending.
 Liveness can move it to Safe without `on_import`. After that, automatic
 duties stay withheld by the store hold, but voluntary exit is gated only by
 the forward window, and the API may report `doppelganger_safe = true` while
-the row stays disabled until restart. With doppelganger disabled there is no
-hold. A restart only re-arms the timed store hold. See #626.
+the row stays disabled. A disconnect skips `on_import`, so nothing in that
+process releases the hold. A restart reconciles an elapsed hold, or an
+operator recovers the row explicitly. With doppelganger disabled there is
+no hold. A later restart with that hold still open, or with an import
+sidecar still on disk, registers the key Pending again. Epoch 0 and
+slashing history do not skip that window. The sidecar is removed only after
+this process observes the forward window to Safe.
 
 An interchange import takes a single-flight lock, then waits until its
 estimated hold fits inside one free window of this slot or the next. After the
@@ -310,7 +380,10 @@ A doppelganger hold is `doppelganger_hold_until` plus `enabled = false`, not
 a plain disable. Importing over a plain disable does not arm a hold. Boot
 re-enables an elapsed hold. A hold that is still open stays disabled; when
 the keymanager is running, the wall-clock enable task is started again for
-the time left. A restart does not replay doppelganger observations. A failed
+the time left. A restart does not replay doppelganger observations. An
+open hold also registers the key Pending on the forward window, so voluntary
+exit stays blocked until that liveness window completes. Epoch 0 and a
+recent attestation do not skip it. A failed
 re-enable is retried. The re-enable task checks the hold deadline under
 `state_lock`; it does not read `key_gen`. Any disable cancels the task.
 DELETE cancels it before the disable write returns. A failed delete of a

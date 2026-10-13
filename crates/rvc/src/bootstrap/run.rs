@@ -191,6 +191,7 @@ pub async fn run(
         pubkey_map: _,
         liveness_task: _,
         pubkey_index,
+        tracked_keys,
     } = enablement;
 
     let ServiceHandles {
@@ -269,6 +270,7 @@ pub async fn run(
             admissions,
             quiesce_registry,
             slot_clock: Arc::clone(&slot_clock) as Arc<dyn timing::SlotClock>,
+            tracked_keys,
         },
         listeners.keymanager,
         &executor,

@@ -9,6 +9,10 @@ mod types;
 
 pub use bn_manager::BnRole;
 pub use builder::ServiceBuilder;
+pub(crate) use builder::{
+    clear_completed_import_sidecars, doppelganger_import_window, import_sidecar_pubkey,
+    ImportSidecarKind,
+};
 pub use error::ConfigError;
 pub use knobs::OPERATOR_KNOB_NAMES;
 pub use network::Network;

@@ -66,9 +66,16 @@ fn test_delete_keystore_removes_import_meta_sidecar() {
 
     let meta_path = import_meta_path(dir.path(), &pk_bytes);
     assert!(meta_path.exists(), "sidecar should exist after import");
+    let partial = dir.path().join(format!("0x{}.import_meta.json.partial", hex::encode(pk_bytes)));
+    std::fs::write(&partial, "{\"imported_unix_seconds\":1}").unwrap();
+    let removing =
+        dir.path().join(format!("0x{}.import_meta.json.removing.1", hex::encode(pk_bytes)));
+    std::fs::write(&removing, "{\"imported_unix_seconds\":1}").unwrap();
 
     adapter.delete_keystore(&pk_bytes).unwrap();
     assert!(!meta_path.exists(), "sidecar must be removed after delete");
+    assert!(!partial.exists(), "a leftover staged sidecar must be removed after delete");
+    assert!(!removing.exists(), "a leftover .removing.* set-aside must be removed after delete");
 }
 
 /// `scan_and_rearm_gate` must call `start_monitoring` for any key whose
@@ -96,6 +103,23 @@ fn test_scan_and_rearm_gate_rearms_recent_keys() {
 
     assert!(logs_contain("re-arming"), "recent import must be re-armed");
     assert!(monitor.is_doppelganger_safe(&pk), "Disabled monitor stays safe after re-arm");
+}
+
+/// Leftover `.removing.*` set-asides must re-arm like a final sidecar.
+#[test]
+#[tracing_test::traced_test]
+fn test_scan_and_rearm_gate_rearms_leftover_removing_sidecar() {
+    let dir = TempDir::new().unwrap();
+    let pk: Pubkey = [0xAEu8; 48];
+    let now_unix =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let removing =
+        dir.path().join(format!("0x{}.import_meta.json.removing.{now_unix}", hex::encode(pk)));
+    std::fs::write(&removing, format!("{{\"imported_unix_seconds\":{now_unix}}}")).unwrap();
+
+    let monitor = DoppelgangerDisabledMonitor::new();
+    scan_and_rearm_gate(dir.path(), &monitor, 768);
+    assert!(logs_contain("re-arming"), "leftover .removing.* must re-arm within the window");
 }
 
 /// `scan_and_rearm_gate` must NOT re-arm keys whose window has already elapsed.

@@ -177,6 +177,15 @@ impl KeystoreManagerAdapter {
         self
     }
 
+    /// Share the process-wide import/delete/sidecar-cleanup lock.
+    ///
+    /// Production passes the same [`TrackedKeys`] the liveness loop holds
+    /// across Safe re-check and unlink.
+    pub fn with_tracked_keys(mut self, tracked_keys: Arc<TrackedKeys>) -> Self {
+        self.tracked_keys = tracked_keys;
+        self
+    }
+
     /// Replace the default import KDF budget. Production passes the RR2-10 knobs.
     #[must_use]
     pub fn with_kdf_budget(mut self, kdf_budget: Arc<KdfBudget>) -> Self {
@@ -269,6 +278,32 @@ fn staged_keystore_path(keystore_dir: &Path, pubkey: &Pubkey) -> PathBuf {
 
 fn staged_meta_path(keystore_dir: &Path, pubkey: &Pubkey) -> PathBuf {
     keystore_dir.join(format!("{}.import_meta.json.partial", pubkey_hex(pubkey)))
+}
+
+/// Drop leftover `0x<pubkey>.import_meta.json.removing.<n>` files.
+///
+/// Older cleanups renamed the final sidecar aside before unlink. A crash left
+/// those set-asides on disk; boot still treats them as unfinished. DELETE and
+/// Safe cleanup remove them under `tracked_keys`.
+fn remove_leftover_removing_sidecars(keystore_dir: &Path, pubkey: &Pubkey) {
+    let prefix = format!("{}.import_meta.json.removing.", pubkey_hex(pubkey));
+    let entries = match std::fs::read_dir(keystore_dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let after = &name[prefix.len()..];
+        if after.is_empty() || !after.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let _ = std::fs::remove_file(entry.path());
+    }
 }
 
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ImportKeystoreError> {
@@ -1024,9 +1059,13 @@ impl KeystoreManager for KeystoreManagerAdapter {
         remove_matching_keystore_files(&self.keystore_dir, pubkey)?;
 
         // M-12 (Critical #2): remove the import-time sidecar so a
-        // subsequent re-import starts with a clean timestamp.
+        // subsequent re-import starts with a clean timestamp. A leftover
+        // staged partial or `.removing.*` set-aside is the same unfinished
+        // marker (older cleanups used rename-aside; boot still fails closed).
         let meta_path = import_meta_path(&self.keystore_dir, pubkey);
         let _ = std::fs::remove_file(&meta_path);
+        let _ = std::fs::remove_file(staged_meta_path(&self.keystore_dir, pubkey));
+        remove_leftover_removing_sidecars(&self.keystore_dir, pubkey);
 
         // SEC-1b: persist deletion *before* registry removal so durability
         // failure leaves the key still present for DELETE retry.

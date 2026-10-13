@@ -41,6 +41,7 @@ use tracing::{debug, error, info, warn, Instrument};
 use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 use crate::orchestrator::PubkeyMap;
 use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x, SharedPubkeyIndexRegistry};
+use crate::quiesce::TrackedKeys;
 
 /// Lookback for completed-epoch liveness queries.
 ///
@@ -80,6 +81,10 @@ pub struct LivenessObservationLoop {
     /// Slot duration used for the sleep interval (defaults to mainnet 12s).
     slot_duration: Duration,
     cancel: CancellationToken,
+    /// Keystore directory whose import sidecars are removed once a key is Safe.
+    import_sidecar_dir: Option<std::path::PathBuf>,
+    /// Same lock DELETE/import hold; cleanup takes it across Safe re-check + unlink.
+    tracked_keys: Option<Arc<TrackedKeys>>,
 }
 
 /// Body of the retained liveness index refresh. Expanded only from the test helper
@@ -143,6 +148,8 @@ impl LivenessObservationLoop {
             epoch_clock,
             slot_duration: Duration::from_millis(SLOT_DURATION_MS),
             cancel,
+            import_sidecar_dir: None,
+            tracked_keys: None,
         }
     }
 
@@ -158,6 +165,22 @@ impl LivenessObservationLoop {
     /// Override the slot sleep interval (tests).
     pub fn with_slot_duration(mut self, slot_duration: Duration) -> Self {
         self.slot_duration = slot_duration;
+        self
+    }
+
+    /// Directory scanned after each tick. A Safe key's import sidecar is removed.
+    ///
+    /// That removal is the durable record that this process observed the
+    /// forward window. Pending and Detected keys keep their sidecars.
+    /// `tracked_keys` must be the same lock the keystore adapter uses for
+    /// DELETE/import so cleanup cannot race a concurrent re-import.
+    pub fn with_import_sidecar_dir(
+        mut self,
+        dir: std::path::PathBuf,
+        tracked_keys: Arc<TrackedKeys>,
+    ) -> Self {
+        self.import_sidecar_dir = Some(dir);
+        self.tracked_keys = Some(tracked_keys);
         self
     }
 
@@ -222,6 +245,7 @@ impl LivenessObservationLoop {
                 }
 
                 let statuses = self.machine.tick(current_epoch, slot_in_epoch);
+                self.record_completed_imports();
                 has_pending = statuses.contains(&ForwardWindowStatus::Pending);
                 let detected =
                     statuses.iter().filter(|s| **s == ForwardWindowStatus::Detected).count();
@@ -332,7 +356,29 @@ impl LivenessObservationLoop {
         if let Some(epoch) = observe_epoch {
             let _ = self.observe_epoch(epoch).await?;
         }
-        Ok(self.machine.tick(tick_epoch, slot_in_epoch))
+        let statuses = self.machine.tick(tick_epoch, slot_in_epoch);
+        self.record_completed_imports();
+        Ok(statuses)
+    }
+
+    /// Drop import sidecars for loaded keys that are Safe.
+    ///
+    /// Called after every tick. A failed delete leaves the sidecar, so the
+    /// next boot stays Pending. Keys that are not Safe are left alone.
+    fn record_completed_imports(&self) {
+        let (Some(dir), Some(map), Some(tracked)) =
+            (&self.import_sidecar_dir, &self.pubkey_map, &self.tracked_keys)
+        else {
+            return;
+        };
+        let map = Arc::clone(map);
+        let machine = Arc::clone(&self.machine);
+        crate::config::clear_completed_import_sidecars(dir, tracked.as_ref(), move |pk| {
+            let Some(public) = map.read().get(pk).cloned() else {
+                return false;
+            };
+            machine.status(&public) == ForwardWindowStatus::Safe
+        });
     }
 
     /// Test helper: run one index refresh from the attached pubkey map.
@@ -368,6 +414,8 @@ pub fn spawn_liveness_loop(
     pubkey_map: Option<PubkeyMap>,
     epoch_clock: Arc<MonotonicEpochClock>,
     executor: &TaskExecutor,
+    // Keystore dir + shared DELETE/import lock for Safe sidecar cleanup.
+    import_sidecar: Option<(std::path::PathBuf, Arc<TrackedKeys>)>,
 ) -> Option<LivenessLoopSpawn> {
     let machine = machine?;
     let has_pubkeys = pubkey_map.as_ref().is_some_and(|m| !m.read().is_empty());
@@ -392,6 +440,9 @@ pub fn spawn_liveness_loop(
         LivenessObservationLoop::new(machine, beacon, pubkey_index, epoch_clock, cancel);
     if let Some(pm) = pubkey_map {
         loop_task = loop_task.with_pubkey_map(pm);
+    }
+    if let Some((dir, tracked)) = import_sidecar {
+        loop_task = loop_task.with_import_sidecar_dir(dir, tracked);
     }
     executor.spawn("liveness_loop", ShutdownTier::Orchestrator, async move {
         loop_task.run().await;
@@ -633,6 +684,71 @@ mod tests {
         assert_eq!(m.status(&pk), ForwardWindowStatus::Safe);
     }
 
+    /// A completed forward window removes the import sidecar. Pending and
+    /// Detected keys keep theirs.
+    #[tokio::test]
+    async fn test_observed_safe_removes_import_sidecar_pending_and_detected_keep_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let m = machine();
+        let safe_pk = new_pk();
+        let pending_pk = new_pk();
+        let detected_pk = new_pk();
+        let start = 20u64;
+        m.register_for_import(&safe_pk, start);
+        m.register_for_import(&pending_pk, start + 50);
+        m.register_for_import(&detected_pk, start);
+
+        let write = |pk: &crypto::PublicKey| {
+            let path =
+                dir.path().join(format!("0x{}.import_meta.json", hex::encode(pk.to_bytes())));
+            std::fs::write(&path, "{\"imported_unix_seconds\":1}").unwrap();
+            path
+        };
+        let safe_path = write(&safe_pk);
+        let pending_path = write(&pending_pk);
+        let detected_path = write(&detected_pk);
+
+        let mut pm = HashMap::new();
+        pm.insert(safe_pk.to_bytes(), safe_pk.clone());
+        pm.insert(pending_pk.to_bytes(), pending_pk.clone());
+        pm.insert(detected_pk.to_bytes(), detected_pk.clone());
+        let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(pm));
+
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(safe_pk.to_bytes(), "7".to_string());
+        reg.write().insert(detected_pk.to_bytes(), "8".to_string());
+        let bn = Arc::new(with_live(&[("7", false), ("8", true)]).0);
+        let loop_ = LivenessObservationLoop::new(
+            Arc::clone(&m),
+            bn,
+            reg,
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
+            CancellationToken::new(),
+        )
+        .with_slot_duration(Duration::from_millis(1))
+        .with_pubkey_map(pubkey_map)
+        .with_import_sidecar_dir(
+            dir.path().to_path_buf(),
+            Arc::new(crate::quiesce::TrackedKeys::new()),
+        );
+
+        // Detected on the first observation. The safe key is still Pending.
+        loop_.drive_once_for_test(Some(start), start, 0).await.unwrap();
+        assert_eq!(m.status(&detected_pk), ForwardWindowStatus::Detected);
+        assert!(detected_path.exists(), "Detected must keep the unfinished marker");
+        assert!(safe_path.exists(), "Pending must keep the unfinished marker");
+
+        let end = start + DEFAULT_MONITORING_EPOCHS;
+        for epoch in (start + 1)..=end {
+            loop_.drive_once_for_test(Some(epoch), epoch, 0).await.unwrap();
+        }
+        loop_.drive_once_for_test(None, end, SLOTS_PER_EPOCH - 1).await.unwrap();
+        assert_eq!(m.status(&safe_pk), ForwardWindowStatus::Safe);
+        assert!(!safe_path.exists(), "Safe observation must remove the import sidecar");
+        assert!(pending_path.exists(), "a key still inside its window keeps its sidecar");
+        assert!(detected_path.exists(), "Detected must keep the unfinished marker");
+    }
+
     #[tokio::test]
     async fn test_liveness_loop_routes_through_bn_manager_failover() {
         let m = machine();
@@ -684,6 +800,7 @@ mod tests {
             None,
             Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 1_000_000)),
             &exec,
+            None,
         );
         assert!(handle.is_some(), "production loop must spawn with indices");
         let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
@@ -697,6 +814,7 @@ mod tests {
             None,
             Arc::new(MonotonicEpochClock::new(0)),
             &exec2,
+            None,
         );
         assert!(no_handle.is_none());
 
@@ -708,6 +826,7 @@ mod tests {
             None,
             Arc::new(MonotonicEpochClock::new(0)),
             &exec3,
+            None,
         );
         assert!(no_machine.is_none());
     }
@@ -826,6 +945,7 @@ mod tests {
             Some(pubkey_map),
             Arc::new(MonotonicEpochClock::new(0)),
             &exec,
+            None,
         );
         assert!(
             spawn.is_some(),
