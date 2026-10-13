@@ -17,6 +17,10 @@ eth-types.workspace = true
 hex.workspace = true
 signer-proto = { workspace = true, features = ["server", "client"] }
 telemetry = { workspace = true, features = ["grpc"] }
+# Same `ring`-only rustls as the rest of the workspace. `build_endpoint`
+# installs it so tonic does not panic when `--all-features` also unifies
+# `aws_lc_rs` (google-cloud via `gcp-secret`).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tonic = { workspace = true, features = ["transport", "tls"] }
 tracing.workspace = true
 tree_hash.workspace = true

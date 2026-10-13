@@ -182,6 +182,10 @@ impl GrpcPeerRequester {
                 }
                 debug!(addr = %peer.addr, sni = %peer.sni_cn, "SNI pinned for DVT peer");
                 let pinned_tls = tls.clone().domain_name(&peer.sni_cn);
+                // DVT tests dial without `run_inner`, which is the other
+                // caller of this install. Required once `--all-features`
+                // unifies rustls `aws_lc_rs` with `ring`.
+                crate::http_api::tls_config::install_crypto_provider();
                 endpoint = endpoint
                     .tls_config(pinned_tls)
                     .map_err(|e| PeerClientError::Connect { addr: peer.addr.clone(), source: e })?;

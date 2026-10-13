@@ -62,7 +62,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/crypto/src/signing_root.rs` 350 | 1 | — | inherit-intentionally | Test mirror of 301 (`legacy_voluntary_exit_root`). Same Capella-cap inherit. | — |
 | `crates/crypto/src/typed_signer.rs` 342 | 1 | — | inherit-intentionally | Pre-Electra aggregate signing fails closed at `>= Gloas` so a later fork does not sign `AggregateAndProof`. | — |
 | `crates/crypto/src/typed_signer.rs` 361 | 1 | — | inherit-intentionally | Electra aggregate signing fails closed at `>= Gloas` so a later fork does not sign `ElectraAggregateAndProof`. | — |
-| `crates/grpc-signer/src/client.rs` 273 | 1 | — | inherit-intentionally | `uses_gloas_rpc`: open-ended `>= Gloas` so later forks keep the Gloas-safe header/root RPCs rather than silently falling back to decoder-bound legacy RPCs. | 4.20c |
+| `crates/grpc-signer/src/client.rs` 277 | 1 | — | inherit-intentionally | `uses_gloas_rpc`: open-ended `>= Gloas` so later forks keep the Gloas-safe header/root RPCs rather than silently falling back to decoder-bound legacy RPCs. | 4.20c |
 | `crates/rvc/benches/deadline_rebenchmark.rs` 75 | 1 | — | test-only | Bench asserts the slot resolved `>= Gloas`. Not a production guard. | — |
 | `crates/rvc/src/orchestrator/aggregation.rs` 384 | 1 | — | inherit-intentionally | Aggregate wrap: open-ended `>= Gloas` uses the island root so a later fork does not fall back to tree_hash 0.9. | — |
 | `crates/rvc/src/orchestrator/coordinator/mod.rs` 1486 | 1 | — | inherit-intentionally | PTC phase (4.13): open-ended `>= Gloas` so later forks keep the payload-attestation duty rather than silently dropping it. Threaded once-per-slot `ForkName`; not gated on decode failure. | 4.13 |
@@ -70,7 +70,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/rvc/src/orchestrator/duty_management.rs` 339 | 1 | — | inherit-intentionally | PTC reorg-check gate: same open-ended `>= Gloas` as the fetch path so uncached pre-Gloas epochs do not POST `duties/ptc`. | — |
 | `crates/rvc/src/orchestrator/utils.rs` 127 | 1 | — | inherit-intentionally | `uses_electra_attestation_wire`: open-ended `>= Electra` so Gloas (and later forks) keep the Electra+ wire. Index zeroing is the separate `zeroes_committee_index` (`Electra..Gloas`). | 2.8 |
 | `crates/rvc/tests/l5_sentinel_epoch_byte_identity.rs` 134 | 1 | — | test-only | Assertion string mentions `>= ForkName::Gloas`. Not a production guard. | — |
-| `crates/signer-server/src/dvt/peer_client.rs` 207 | 1 | — | inherit-intentionally | DVT peer `uses_gloas_rpc`: same open-ended `>= Gloas` as the gRPC client so later forks keep Gloas-safe RPCs. | 4.20c |
+| `crates/signer-server/src/dvt/peer_client.rs` 211 | 1 | — | inherit-intentionally | DVT peer `uses_gloas_rpc`: same open-ended `>= Gloas` as the gRPC client so later forks keep Gloas-safe RPCs. | 4.20c |
 | `crates/signer/src/lib.rs` 1033 | 1 | — | inherit-intentionally | `sign_block_header` gRPC factory: open-ended `>= Gloas` always uses `SignBlockHeader` so a later fork never ships Gloas-shaped body SSZ into a legacy decoder RPC. | 4.20c |
 | `crates/signer/src/lib.rs` 1360 | 1 | — | inherit-intentionally | Pre-Electra aggregate signing fails closed at `>= Gloas` rather than using the legacy decoder RPC. | — |
 | `crates/signer/src/lib.rs` 1435 | 1 | — | inherit-intentionally | Electra aggregate path: open-ended `>= Gloas` fails closed instead of the pre-Electra `SignAggregateAndProof` decoder. | 4.20c |
