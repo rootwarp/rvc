@@ -2,13 +2,30 @@ use super::*;
 
 // --- Full lifecycle: adapters wired into KeymanagerServer ---
 
-fn build_test_server() -> keymanager_api::KeymanagerServer {
+/// Keymanager server plus the keystore directory it reads.
+///
+/// `server` is dropped first, then `_dir`, so the directory outlives the server.
+struct BuiltTestServer {
+    server: keymanager_api::KeymanagerServer,
+    _dir: TempDir,
+}
+
+impl std::ops::Deref for BuiltTestServer {
+    type Target = keymanager_api::KeymanagerServer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.server
+    }
+}
+
+fn build_test_server() -> BuiltTestServer {
     let composite = create_empty_composite_signer();
     let dir = TempDir::new().unwrap();
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
 
-    let keystore_mgr = Arc::new(test_keystore_adapter(dir.keep(), composite.clone()).0);
+    let keystore_mgr =
+        Arc::new(test_keystore_adapter(dir.path().to_path_buf(), composite.clone()).0);
     let slashing_prot =
         Arc::new(SlashingProtectionAdapter::new_in_free_window(slashing_db, [0u8; 32]));
     let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
@@ -19,7 +36,7 @@ fn build_test_server() -> keymanager_api::KeymanagerServer {
     let token = "deadbeef".repeat(8);
     let addr = "127.0.0.1:0".parse().unwrap();
 
-    keymanager_api::KeymanagerServer::new(
+    let server = keymanager_api::KeymanagerServer::new(
         keymanager_api::KeymanagerDeps {
             keystore_manager: keystore_mgr,
             slashing_protection: slashing_prot,
@@ -39,7 +56,8 @@ fn build_test_server() -> keymanager_api::KeymanagerServer {
             attesting_enabled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             doppelganger_window: std::time::Duration::ZERO,
         },
-    )
+    );
+    BuiltTestServer { server, _dir: dir }
 }
 
 #[test]
@@ -126,7 +144,8 @@ async fn test_keymanager_server_import_remote_key_lifecycle() {
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
 
-    let keystore_mgr = Arc::new(test_keystore_adapter(dir.keep(), composite.clone()).0);
+    let keystore_mgr =
+        Arc::new(test_keystore_adapter(dir.path().to_path_buf(), composite.clone()).0);
     let slashing_prot =
         Arc::new(SlashingProtectionAdapter::new_in_free_window(slashing_db, [0u8; 32]));
     let validator_mgr = Arc::new(ValidatorManagerAdapter::new(validator_store.clone()));
