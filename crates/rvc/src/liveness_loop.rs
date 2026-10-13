@@ -29,7 +29,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bn_manager::{LivenessApi, NodeStatusApi};
+use bn_manager::LivenessApi;
+#[cfg(any(test, feature = "test-utils"))]
+use bn_manager::NodeStatusApi;
 use doppelganger::{
     ForwardWindowMachine, ForwardWindowStatus, MonotonicEpochClock, ValidatorLivenessData,
     DEFAULT_MONITORING_EPOCHS,
@@ -40,7 +42,9 @@ use tracing::{debug, error, info, warn, Instrument};
 
 use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 use crate::orchestrator::PubkeyMap;
-use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x, SharedPubkeyIndexRegistry};
+use crate::pubkey_index::SharedPubkeyIndexRegistry;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x};
 use crate::quiesce::TrackedKeys;
 
 /// Lookback for completed-epoch liveness queries.
@@ -89,6 +93,7 @@ pub struct LivenessObservationLoop {
 
 /// Body of the retained liveness index refresh. Expanded only from the test helper
 /// (and, under `cfg(test)`, from `refresh_indices_from_pubkey_map`).
+#[cfg(any(test, feature = "test-utils"))]
 macro_rules! refresh_indices_from_pubkey_map_impl {
     ($self:ident, $validators:expr) => {{
         let Some(ref pm) = $self.pubkey_map else {
@@ -153,7 +158,7 @@ impl LivenessObservationLoop {
         }
     }
 
-    /// Attach the pubkey map used by [`Self::refresh_indices_for_test`].
+    /// Attach the pubkey map used by `refresh_indices_for_test`.
     ///
     /// Production index writes belong to [`crate::index_resolver::IndexResolver`]
     /// (ADR-R05), not this loop.
@@ -347,6 +352,10 @@ impl LivenessObservationLoop {
     /// Single-cycle driver for tests (no sleep / cancel).
     ///
     /// Observes `observe_epoch` if given, then ticks at `(tick_epoch, slot_in_epoch)`.
+    ///
+    /// Compiled only for this crate's tests or when the `test-utils` feature
+    /// is enabled. Integration tests see it through the self dev-dependency.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn drive_once_for_test(
         &self,
         observe_epoch: Option<Epoch>,
@@ -386,6 +395,11 @@ impl LivenessObservationLoop {
     /// `validators` is the index lookup. The loop client is only [`LivenessApi`],
     /// which has no `get_validators`. Not a production writer. [`Self::run`]
     /// must not call this.
+    ///
+    /// Compiled only for this crate's tests or when the `test-utils` feature
+    /// is enabled. Integration tests build this crate without `cfg(test)`, so
+    /// the `test-utils` arm inlines the refresh body.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn refresh_indices_for_test(&self, validators: &dyn NodeStatusApi) {
         #[cfg(test)]
         {
@@ -404,7 +418,7 @@ impl LivenessObservationLoop {
 /// `pubkey_index` is the workspace-shared registry (same handle used by
 /// `prepare_proposers` / duty tracking). Production index refresh is
 /// [`crate::index_resolver::IndexResolver`]; `pubkey_map` stays attached for
-/// [`LivenessObservationLoop::refresh_indices_for_test`].
+/// `LivenessObservationLoop::refresh_indices_for_test`.
 ///
 /// The loop is registered on `executor` at Orchestrator tier (ARCH-2g P1-7).
 pub fn spawn_liveness_loop(

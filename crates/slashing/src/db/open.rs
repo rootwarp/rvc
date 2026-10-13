@@ -251,7 +251,12 @@ impl SlashingDb {
     /// # Note
     /// This is a test helper. Do not use it in production paths; prefer `open` or
     /// `open_in_memory` instead.
+    ///
+    /// Compiled only for this crate's tests or when the `test-utils` feature
+    /// is enabled. This crate's integration tests see it through the self
+    /// dev-dependency that turns `test-utils` on.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn open_with_conn_for_testing(conn: Connection) -> Result<Self, SlashingError> {
         Self::configure_pragmas(&conn)?;
         let db = Self::from_connection(conn, None);

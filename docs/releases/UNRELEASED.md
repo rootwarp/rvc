@@ -616,6 +616,18 @@ the same Prometheus name when an attestation sign is slashing-blocked.
   compile only under `cfg(test)` or the `test-utils` feature.
   `OrchestratorDeps::for_test` has the same gate. Production code calls
   `RemoteSigner::new` and constructs `OrchestratorDeps` explicitly.
+- The same gate now covers `EncryptionKdf::scrypt_cheap_for_tests`,
+  `EncryptionKdf::pbkdf2_cheap_for_tests`,
+  `SlashingDb::open_with_conn_for_testing`,
+  `LivenessObservationLoop::drive_once_for_test`,
+  `LivenessObservationLoop::refresh_indices_for_test`, and
+  `IndexResolver::drive_once_for_test`. An architecture test fails if
+  `test-utils` is reachable from `rvc-bin` (default, `gcp-trace`,
+  `gcp-secret`, or both), `rvc-signer-bin` (default or `dvt`), `rvc-keygen`,
+  or — under a unified workspace `default-members` resolve — enabled on any
+  crate a release binary in that build links (using the joint resolve's
+  activated edges and features, not each crate's defaults alone). The image
+  build accepts only `gcp-trace`, `gcp-secret`, and `dvt`.
 - `signer_server::server::run` joins its reloader, metrics, and HTTP tasks
   before it returns, including when the gRPC transport fails. The `Children`
   type is private. `rvc-signer` still exits when `run` returns. The join
@@ -645,7 +657,7 @@ the same Prometheus name when an attestation sign is slashing-blocked.
 | Behaviour: duty validation | #533, #534 |
 | New metrics | #500, #506, #507, #508, #512, #525, #531, #533 |
 | Changed metric values | #508 |
-| Library consumers | #504, #521, #537, #538, #539, #540, #603 |
+| Library consumers | #504, #521, #537, #538, #539, #540, #602, #603 |
 
 ## Tracing: dev/demo tail sampling profile (TRC-7c / #448)
 

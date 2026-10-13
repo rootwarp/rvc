@@ -7,8 +7,10 @@
 //! cannot simulate WAL failure by pre-poisoning a file. Instead we use SQLite's
 //! in-memory mode: an in-memory connection returns "memory" (not "wal") when WAL is
 //! requested, which triggers the hard-fail code path. We inject the connection via
-//! `SlashingDb::open_with_conn_for_testing` (a `#[cfg(test)]`-only constructor that
-//! runs `configure_pragmas` and the schema migration but skips file-permission checks).
+//! `SlashingDb::open_with_conn_for_testing` (compiled under `cfg(test)` or the
+//! `test-utils` feature; this binary sees it via the crate's dev-dependency).
+//! It runs `configure_pragmas` and the schema migration but skips file-permission
+//! checks.
 //!
 //! This matches the research/04 guidance: "Opens a database on a tmpfs with WAL
 //! disabled (e.g. via a `:memory:` DB with `journal_mode=memory`) and asserts the
