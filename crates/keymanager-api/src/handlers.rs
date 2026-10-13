@@ -148,6 +148,22 @@ pub async fn import_keystores(
                     // displace any prior enable task, and spawn the window task.
                     // Owned by [`DoppelgangerLifecycle`] so local and remote imports
                     // share one path (ImportKind::Local).
+                    //
+                    // A client disconnect drops this handler during `import_keystore`
+                    // and never reaches `on_import`. That skip is intentional.
+                    // The blocking import calls `admit`, which registers the key with
+                    // `ForwardWindowMachine::register_for_import` (Pending;
+                    // Unmonitored cannot sign either) and, when the doppelganger
+                    // window is non-zero, persists `enabled = false` before the
+                    // signer is published. `on_import` repeats that registration and
+                    // starts the wall-clock enable task. The key starts Pending and
+                    // refuses signing while Pending. Liveness can move it to Safe
+                    // without `on_import`; after that, automatic duties stay
+                    // withheld by the store hold, but voluntary exit is gated only
+                    // by the forward window, and the API may report
+                    // `doppelganger_safe = true` while the row stays disabled until
+                    // restart. With doppelganger disabled there is no hold. A
+                    // restart only re-arms the timed store hold (see #626).
                     if let Err(e) = state.doppelganger.on_import(pubkey, ImportKind::Local) {
                         error!(
                             pubkey = %TruncatedPubkey::new(&pubkey_hex),
