@@ -129,7 +129,10 @@ pub async fn build_services(
     // Elapsed doppelganger holds are re-enabled here. A still-open hold stays
     // disabled. When the keymanager is running, the wall-clock enable task is
     // started again for the time left. A restart does not replay doppelganger
-    // observations.
+    // observations. Boot registration already routed an unfinished import
+    // (open hold, any or unreadable sidecar, or staged sidecar)
+    // through register_for_import, so the signer gate stays Pending until
+    // this process observes the forward window and removes the sidecar.
     let _open = validator_store.reconcile_doppelganger_holds_at_boot(now_unix);
 
     // Attestation submit path uses the main-pool BnManager (failover-aware).
@@ -326,6 +329,7 @@ mod tests {
             pubkey_map,
             liveness_task: None,
             pubkey_index: crate::pubkey_index::PubkeyIndexRegistry::shared(),
+            tracked_keys: Arc::new(crate::quiesce::TrackedKeys::new()),
         }
     }
 

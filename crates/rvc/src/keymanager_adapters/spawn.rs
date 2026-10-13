@@ -8,7 +8,7 @@ use std::time::Duration;
 use bn_manager::BeaconNodeClient;
 use crypto::CompositeSigner;
 use doppelganger::{ForwardWindowMachine, MonotonicEpochClock};
-use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+use eth_types::{Epoch, ForkSchedule, Root};
 use keymanager_api::traits::{DoppelgangerMonitor, SigningQuiesce, VoluntaryExitManager};
 use signer::SignerService;
 use slashing::SlashingDb;
@@ -62,6 +62,8 @@ pub struct KeymanagerApiDeps {
     /// [`ImportWindowGate`] from it for the single slashing adapter.
     /// A second gate would not share the import mutex.
     pub slot_clock: Arc<dyn SlotClock>,
+    /// Same lock the liveness loop uses for Safe sidecar cleanup.
+    pub tracked_keys: Arc<crate::quiesce::TrackedKeys>,
 }
 
 /// Which doppelganger monitor was selected when assembling the keymanager API.
@@ -186,6 +188,7 @@ pub fn build_keymanager_api(
             deps.pubkey_map.clone(),
             deps.key_gen_tx.clone(),
         )
+        .with_tracked_keys(Arc::clone(&deps.tracked_keys))
         .with_denylist(Arc::clone(&deps.deletion_denylist))
         .with_admission_service(deps.admissions)
         .with_quiesce_registry(Arc::clone(&deps.quiesce_registry))
@@ -216,7 +219,7 @@ pub fn build_keymanager_api(
     // doppelganger is disabled the window is Duration::ZERO so keys are
     // immediately enabled. When on: 2 epochs × 32 slots × 12_000 ms = 768 s.
     let doppelganger_window = if config.doppelganger_detection {
-        Duration::from_millis(2 * SLOTS_PER_EPOCH * SLOT_DURATION_MS)
+        crate::config::doppelganger_import_window()
     } else {
         Duration::ZERO
     };

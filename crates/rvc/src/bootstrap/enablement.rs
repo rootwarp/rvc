@@ -23,6 +23,7 @@ use crate::orchestrator::PubkeyMap;
 use crate::pubkey_index::{
     parse_pubkey_bytes, pubkey_bytes_to_0x, PubkeyIndexRegistry, SharedPubkeyIndexRegistry,
 };
+use crate::quiesce::TrackedKeys;
 
 /// Handles produced by [`wire_signing_enablement`].
 ///
@@ -45,6 +46,8 @@ pub struct EnablementHandles {
     /// Shared pubkey ↔ validator-index registry for duty tracking, proposer
     /// preparation, and liveness. Empty when unresolved / no keys.
     pub pubkey_index: SharedPubkeyIndexRegistry,
+    /// Import/delete/sidecar-cleanup lock shared with the keystore adapter.
+    pub tracked_keys: Arc<TrackedKeys>,
 }
 
 /// Construct SEC-2b enablement and spawn the SEC-2c liveness loop.
@@ -53,9 +56,17 @@ pub struct EnablementHandles {
 ///
 /// - Fail-closed machine when doppelganger is on; unregistered keys cannot sign.
 /// - Operator opt-out yields [`doppelganger::DoppelgangerDisabledByOperator`].
-/// - Epoch-0 boot register marks keys Safe (pre-genesis bypass).
-/// - Restart-aware safe-skip on **boot** `register` only (local slashing history
-///   under this GVR). Do **not** copy a live slashing DB to a second VC.
+/// - Epoch-0 boot register marks normally registered keys Safe (pre-genesis bypass).
+/// - Restart-aware safe-skip on **boot** `register` only, and only for keys
+///   with no open import hold and no remaining import sidecar (local slashing
+///   history under this GVR). Do **not** copy a live slashing DB to a second VC.
+/// - An open hold, any import sidecar (any age) or an unreadable one, a leftover
+///   `*.import_meta.json.removing.*` set-aside, a staged
+///   `*.import_meta.json.partial`, or an unreadable keystore directory or
+///   validators file uses `register_for_import` (Pending). An unreadable
+///   directory or file applies that to every loaded key. The liveness loop
+///   removes a sidecar only after that key reaches Safe, while holding the
+///   same `tracked_keys` lock as DELETE/import.
 /// - Dynamically added keys use `register_for_import` (always Pending).
 /// - Liveness goes through `bn_manager` (multi-BN failover) and re-resolves
 ///   indices from `pubkey_map` after import.
@@ -112,7 +123,9 @@ pub async fn wire_signing_enablement(
     if enablement_epoch == 0 && doppelganger_enabled {
         info!(
             "Doppelganger detection: pre-genesis (epoch 0) startup — \
-             validators will be marked Safe without a monitoring window (boot register)"
+             normally registered validators are marked Safe without a monitoring window. \
+             An unfinished import (open hold, any or unreadable sidecar, or \
+             staged sidecar) stays Pending"
         );
     } else if !doppelganger_enabled {
         warn!("Doppelganger detection is disabled");
@@ -121,17 +134,24 @@ pub async fn wire_signing_enablement(
     // SEC-2b: construct enablement (ForwardWindowMachine or operator opt-out)
     // and hand it to the production SignerService.
     //
-    // Restart-aware safe-skip (boot register only): if local slashing history
-    // shows a recent attestation under this GVR, the key is marked Safe without
-    // network observation. Do NOT copy a live slashing DB to a second VC — that
-    // would open a dual-instance fail-open. API import uses register_for_import
-    // (always Pending).
+    // Restart-aware safe-skip (boot register, normal keys only): if local
+    // slashing history shows a recent attestation under this GVR, the key is
+    // marked Safe without network observation. Do NOT copy a live slashing DB
+    // to a second VC — that would open a dual-instance fail-open. An unfinished
+    // import (open hold, any or unreadable sidecar, staged sidecar, or
+    // an unreadable keystore directory or validators file) uses
+    // register_for_import (always Pending), including at epoch 0. The sidecar
+    // stays until the liveness loop observes Safe and removes it. API import
+    // uses the same path.
     let (signing_enablement, forward_window_machine) = builder.build_signing_enablement(
         Arc::clone(&slashing_db),
         beacon.genesis_validators_root,
         enablement_epoch,
         &keys.pubkey_map,
     );
+
+    // Shared with keymanager DELETE/import and forward-window sidecar cleanup.
+    let tracked_keys = Arc::new(TrackedKeys::new());
 
     // SEC-2c: spawn the per-slot liveness observation loop when doppelganger is on.
     // bn_manager is Arc; clone for the loop and keep the original for later duties.
@@ -145,6 +165,7 @@ pub async fn wire_signing_enablement(
             Some(Arc::clone(&keys.pubkey_map)),
             Arc::clone(&epoch_clock),
             executor,
+            Some((config.keystore_path.clone(), Arc::clone(&tracked_keys))),
         )
     } else {
         None
@@ -157,6 +178,7 @@ pub async fn wire_signing_enablement(
         pubkey_map: Arc::clone(&keys.pubkey_map),
         liveness_task,
         pubkey_index,
+        tracked_keys,
     })
 }
 

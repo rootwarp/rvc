@@ -168,6 +168,7 @@ impl Harness {
             pubkey_map: Arc::clone(&pubkey_map),
             liveness_task: None,
             pubkey_index: Arc::clone(&registry),
+            tracked_keys: Arc::new(rvc::quiesce::TrackedKeys::new()),
         };
 
         let config = Config {

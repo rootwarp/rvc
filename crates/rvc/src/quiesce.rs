@@ -19,11 +19,13 @@ use signer::SignerService;
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
 
-/// Import/delete lock shared with the keystore adapter.
+/// Import/delete/sidecar-cleanup lock shared with the keystore adapter.
 ///
 /// DELETE's presence check and quiesce insert take it and drop it before the
 /// drain. [`QuiesceRegistry::readmit`] runs under the same mutex inside import.
-pub(crate) struct TrackedKeys {
+/// Forward-window sidecar cleanup holds it across the Safe re-check and unlink
+/// so a concurrent DELETE + re-import cannot lose a newer marker.
+pub struct TrackedKeys {
     keys: Mutex<Vec<Pubkey>>,
     #[cfg(test)]
     contended: AtomicU64,
@@ -32,7 +34,8 @@ pub(crate) struct TrackedKeys {
 }
 
 impl TrackedKeys {
-    pub(crate) fn new() -> Self {
+    #[must_use]
+    pub fn new() -> Self {
         Self {
             keys: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -78,6 +81,12 @@ impl TrackedKeys {
     #[cfg(test)]
     pub(crate) fn set_stall_ms(&self, ms: u64) {
         self.stall_ms.store(ms, Ordering::Relaxed);
+    }
+}
+
+impl Default for TrackedKeys {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

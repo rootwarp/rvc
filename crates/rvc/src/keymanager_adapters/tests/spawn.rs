@@ -80,6 +80,7 @@ fn spawn_test_deps(
             clock.set_slot_with_offset_ms(0, 8_000);
             clock
         },
+        tracked_keys: Arc::new(crate::quiesce::TrackedKeys::new()),
     }
 }
 
