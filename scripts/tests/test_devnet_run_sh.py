@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 from pathlib import Path
 
@@ -62,6 +63,7 @@ _ISOLATE_KEYS = (
     "DEVNET_FAIL_STAGE",
     "DEVNET_FAIL_CODE",
     "DEVNET_DOWN_CODE",
+    "DEVNET_LOG_DUMP_TIMEOUT_S",
 )
 
 _MNEMONIC = "test test test test test test test test test test junk"
@@ -796,4 +798,334 @@ def test_run_json_safe_records_offset_and_fail_under(tmp_path: Path):
     assert "--fail-under participation_rate=0.95" in report_cmd
     assert "--fail-under target_rate=0.95" in report_cmd
     assert_no_secret(proc)
+
+
+_CONTAINERS = (
+    "eth-devnet-geth",
+    "eth-devnet-beacon",
+    "eth-devnet-validator",
+)
+
+
+def _blocking_docker(tmp_path: Path) -> Path:
+    log = tmp_path / "docker.log"
+    stub = tmp_path / "docker"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {shlex.quote(str(log))}\n"
+        "if [ \"$1\" = logs ]; then\n"
+        "  sleep 300\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def _removing_docker(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """docker stub whose rm -f drops containers; logs fail after removal."""
+    log = tmp_path / "docker.log"
+    live = tmp_path / "docker-live"
+    live.mkdir()
+    for name in _CONTAINERS:
+        (live / name).write_text("up\n", encoding="utf-8")
+    stub = tmp_path / "docker"
+    stub.write_text(
+        "#!/bin/sh\n"
+        f"log={shlex.quote(str(log))}\n"
+        f"live={shlex.quote(str(live))}\n"
+        "printf '%s\\n' \"$*\" >> \"$log\"\n"
+        "cmd=$1\n"
+        "shift\n"
+        "case \"$cmd\" in\n"
+        "  logs)\n"
+        "    while [ $# -gt 0 ] && [ \"$1\" = -- ]; do shift; done\n"
+        "    name=$1\n"
+        "    if [ ! -f \"$live/$name\" ]; then\n"
+        "      printf 'Error: No such container: %s\\n' \"$name\" >&2\n"
+        "      exit 1\n"
+        "    fi\n"
+        "    printf 'CAPTURED %s\\n' \"$name\"\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "  rm)\n"
+        "    while [ $# -gt 0 ]; do\n"
+        "      case \"$1\" in\n"
+        "        -f|--force|-- ) shift ;;\n"
+        "        *)\n"
+        "          rm -f -- \"$live/$1\"\n"
+        "          shift\n"
+        "          ;;\n"
+        "      esac\n"
+        "    done\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub, log, live
+
+
+def _kill_pgroups_matching(marker: str) -> None:
+    """SIGKILL process groups whose cmdline contains marker (capture stubs)."""
+    try:
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid=,pgid=,args="], text=True, timeout=5
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return
+    seen: set[int] = set()
+    for line in out.splitlines():
+        if marker not in line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            pgid = int(parts[1])
+        except ValueError:
+            continue
+        if pgid <= 1 or pgid in seen:
+            continue
+        seen.add(pgid)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def _run_session(
+    tmp_path: Path,
+    args: list[str],
+    env: dict[str, str],
+    *,
+    timeout: float,
+    docker: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    proc = subprocess.Popen(
+        ["bash", str(RUN), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    finally:
+        # Main session plus any capture process groups left by set -m.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if docker is not None:
+            _kill_pgroups_matching(str(docker))
+        if proc.poll() is None:
+            proc.wait(timeout=5)
+    out, err = proc.communicate(timeout=5)
+    if timed_out:
+        raise AssertionError(
+            f"run.sh still running after {timeout}s "
+            f"(teardown did not finish)\nstderr:\n{err}\nstdout:\n{out}"
+        )
+    return subprocess.CompletedProcess(
+        ["bash", str(RUN), *args], proc.returncode, out, err
+    )
+
+
+def test_run_sh_report_failure_tears_down_while_log_dump_blocks(tmp_path: Path):
+    """Bounded capture still finishes, then teardown runs on report failure."""
+    plant_data(tmp_path)
+    docker = _blocking_docker(tmp_path)
+    rvc = write_rvc_stub(tmp_path)
+    stage_dir, slog = write_stage_stubs(tmp_path)
+    full = run_env(
+        tmp_path,
+        {
+            "DEVNET_FAIL_STAGE": "report.sh",
+            "DEVNET_FAIL_CODE": "4",
+            "DEVNET_LOG_DUMP_TIMEOUT_S": "1",
+        },
+        docker=docker,
+        stage_dir=stage_dir,
+        rvc=rvc,
+    )
+    proc = _run_session(
+        tmp_path,
+        ["--profile", "fast", "--run-id", "rep-fail"],
+        full,
+        timeout=25,
+        docker=docker,
+    )
+    assert proc.returncode == 4, proc.stderr
+    assert proc.stdout == ""
+    names = stage_names(slog)
+    assert "report.sh" in names
+    assert "down.sh" in names
+    assert names.index("report.sh") < names.index("down.sh")
+    assert "tearing down" in proc.stderr
+    assert "exceeded" in proc.stderr
+    assert_no_secret(proc)
+
+
+def test_run_sh_keep_bounds_log_dump_when_report_fails(tmp_path: Path):
+    """--keep skips teardown, but log capture still has a bounded timeout."""
+    plant_data(tmp_path)
+    docker = _blocking_docker(tmp_path)
+    rvc = write_rvc_stub(tmp_path)
+    stage_dir, slog = write_stage_stubs(tmp_path)
+    full = run_env(
+        tmp_path,
+        {
+            "DEVNET_FAIL_STAGE": "report.sh",
+            "DEVNET_FAIL_CODE": "2",
+            "DEVNET_LOG_DUMP_TIMEOUT_S": "1",
+        },
+        docker=docker,
+        stage_dir=stage_dir,
+        rvc=rvc,
+    )
+    proc = _run_session(
+        tmp_path,
+        ["--profile", "fast", "--run-id", "rep-keep", "--keep"],
+        full,
+        timeout=25,
+        docker=docker,
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    names = stage_names(slog)
+    assert "report.sh" in names
+    assert "down.sh" not in names
+    assert "exceeded" in proc.stderr
+    assert (tmp_path / "data").is_dir()
+    assert_no_secret(proc)
+
+
+def test_run_sh_captures_logs_before_teardown_on_report_failure(tmp_path: Path):
+    """down.sh docker rm must not run before log capture.
+
+    A fake docker whose rm -f really drops containers proves capture sees
+    live containers; a pre-planted 03-chain log must not be overwritten when
+    a late logs call would fail.
+    """
+    plant_data(tmp_path)
+    docker, dlog, live = _removing_docker(tmp_path)
+    rvc = write_rvc_stub(tmp_path)
+    stage_dir, slog = write_stage_stubs(tmp_path)
+    # Real down.sh path: remove containers via DOCKER, then purge data.
+    down = stage_dir / "down.sh"
+    header = _stub_common(slog)
+    down.write_text(
+        header
+        + "for c in eth-devnet-geth eth-devnet-beacon eth-devnet-validator; do\n"
+        + "  \"$DOCKER\" rm -f -- \"$c\" || true\n"
+        + "done\n"
+        + "data_dir=${DATA_DIR:-}\n"
+        + "if [ -n \"$data_dir\" ] && [ \"$data_dir\" != / ] "
+        + "&& [ -d \"$data_dir\" ]; then\n"
+        + "  rm -rf -- \"$data_dir\"\n"
+        + "fi\n"
+        + "exit 0\n",
+        encoding="utf-8",
+    )
+    down.chmod(0o755)
+
+    run_dir = tmp_path / "runs" / "cap-order"
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True)
+    chain_blob = "GOOD_CHAIN_CAPTURE\n"
+    for name in _CONTAINERS:
+        (logs_dir / f"{name}.log").write_text(chain_blob, encoding="utf-8")
+
+    full = run_env(
+        tmp_path,
+        {
+            "DEVNET_FAIL_STAGE": "report.sh",
+            "DEVNET_FAIL_CODE": "4",
+            "DEVNET_LOG_DUMP_TIMEOUT_S": "5",
+        },
+        docker=docker,
+        stage_dir=stage_dir,
+        rvc=rvc,
+    )
+    proc = _run_session(
+        tmp_path,
+        ["--profile", "fast", "--run-id", "cap-order"],
+        full,
+        timeout=25,
+        docker=docker,
+    )
+    assert proc.returncode == 4, proc.stderr
+    names = stage_names(slog)
+    assert names.index("report.sh") < names.index("down.sh")
+    assert "tearing down" in proc.stderr
+
+    docker_lines = dlog.read_text(encoding="utf-8").splitlines()
+    log_idxs = [
+        i for i, line in enumerate(docker_lines) if line.startswith("logs ")
+    ]
+    rm_idxs = [
+        i for i, line in enumerate(docker_lines) if line.startswith("rm ")
+    ]
+    assert log_idxs, docker_lines
+    assert rm_idxs, docker_lines
+    assert max(log_idxs) < min(rm_idxs), docker_lines
+
+    for name in _CONTAINERS:
+        text = (logs_dir / f"{name}.log").read_text(encoding="utf-8")
+        assert "No such container" not in text
+        assert "CAPTURED" in text or chain_blob.strip() in text
+        assert not (live / name).exists()
+    assert_no_secret(proc)
+
+
+def _timeout_s_via_run_sh(raw: str) -> subprocess.CompletedProcess[str]:
+    env = os.environ.copy()
+    for key in _ISOLATE_KEYS:
+        env.pop(key, None)
+    env["DOCKER"] = "/bin/echo"
+    env["CURL"] = "/bin/echo"
+    env["DEVNET_LOG_DUMP_TIMEOUT_S"] = raw
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"source {shlex.quote(str(RUN))}; _log_dump_timeout_s; printf '\\n'",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+@pytest.mark.parametrize(
+    ("raw", "expect"),
+    [
+        ("08", 8),
+        ("032", 32),
+    ],
+)
+def test_run_sh_log_dump_timeout_leading_zeros_are_decimal(
+    raw: str, expect: int
+):
+    """DEVNET_LOG_DUMP_TIMEOUT_S with leading zeros is base-10, not octal."""
+    proc = _timeout_s_via_run_sh(raw)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == str(expect)
+
+
+def test_run_sh_log_dump_timeout_00_falls_back_to_default():
+    proc = _timeout_s_via_run_sh("00")
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "30"
 

@@ -41,6 +41,8 @@ _ISOLATE_KEYS = (
     "VALIDATOR_PERF",
     "DEVNET_REPORT",
     "STRICT",
+    "DEVNET_HEAD_EPOCH",
+    "SLOTS_PER_EPOCH",
 )
 
 _MNEMONIC = "test test test test test test test test test test test junk"
@@ -122,6 +124,8 @@ def report_env(
     full["VALIDATOR_PERF"] = str(stub or (tmp_path / "validator_perf"))
     full["VP_BODY"] = str(_fixture_json("ok"))
     full["VP_EXIT"] = "0"
+    # High enough that profile epochs (4 / 7 / 8) stay inside head-2.
+    full["DEVNET_HEAD_EPOCH"] = "200"
     if extra is None or "DEVNET_REPORT" not in extra:
         dr_stub, _ = write_devnet_report_wrapper(tmp_path)
         full["DEVNET_REPORT"] = str(dr_stub)
@@ -1001,6 +1005,271 @@ def test_report_sh_reads_fail_under_from_run_json(tmp_path: Path):
         "participation_rate=0.95",
         "target_rate=0.95",
     ]
+    assert_no_secret(proc)
+
+
+def _unfixed_epoch_window(requested: int, head_epoch: int) -> tuple[int, int]:
+    """validator_perf.resolve_window with --epochs and --allow-unfinalized.
+
+    to = head-2, from = to-requested+1. No clamp.
+    """
+    to_epoch = head_epoch - 2
+    from_epoch = to_epoch - requested + 1
+    return from_epoch, to_epoch
+
+
+def _bash_clamp(requested: int, head_epoch: int) -> subprocess.CompletedProcess[str]:
+    snippet = (
+        f"_clamp_epoch_window {int(requested)} {int(head_epoch)}\n"
+        'printf "%s %s %s\\n" '
+        '"$_WINDOW_FROM" "$_WINDOW_TO" "$_WINDOW_CLAMPED"\n'
+    )
+    env = os.environ.copy()
+    env["DOCKER"] = "/bin/echo"
+    env["CURL"] = "/bin/echo"
+    return subprocess.run(
+        ["bash", "-c", f"source {shlex.quote(str(REPORT))}; {snippet}"],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=15,
+        stdin=subprocess.DEVNULL,
+    )
+
+
+def test_epochs_28_unfixed_window_math_is_negative():
+    """--epochs 28 at head_epoch 28 is the Lane devnet failure: from=-1."""
+    from_epoch, to_epoch = _unfixed_epoch_window(28, 28)
+    assert (from_epoch, to_epoch) == (-1, 26)
+    wider_from, wider_to = _unfixed_epoch_window(28, 10)
+    assert wider_from < 0
+    assert wider_to == 8
+
+
+def test_clamp_epoch_window_epochs_28_at_head_28():
+    proc = _bash_clamp(28, 28)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0 26 1"
+    assert "-1" not in proc.stderr
+    assert "negative" not in proc.stderr.lower()
+    assert_no_secret(proc)
+
+
+def test_clamp_epoch_window_shrinks_to_elapsed_safe_epochs():
+    proc = _bash_clamp(28, 10)
+    assert proc.returncode == 0, proc.stderr
+    # head 10 → safe through 8; requested 28 collapses to 0–8.
+    assert proc.stdout.strip() == "0 8 1"
+    assert_no_secret(proc)
+
+
+def test_clamp_epoch_window_keeps_a_window_that_fits():
+    # head 29 → safe through 27; 28 epochs is exactly 0–27, not negative.
+    proc = _bash_clamp(28, 29)
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout.strip() == "0 27 0"
+    assert_no_secret(proc)
+
+
+@pytest.mark.parametrize("head", [0, 1])
+def test_clamp_epoch_window_unsatisfiable_head_is_usage_error(head: int):
+    proc = _bash_clamp(28, head)
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    err = proc.stderr.lower()
+    assert "cannot be satisfied" in err
+    assert "negative" not in err
+    assert "-1" not in proc.stderr
+    assert_no_secret(proc)
+
+
+def test_report_sh_epochs_28_passes_clamped_window(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path, epochs=28)
+    proc, argv_log = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        env={"DEVNET_HEAD_EPOCH": "28"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    argv = argv_list(argv_log)
+    pairs = argv_pairs(argv)
+    assert "--epochs" not in pairs
+    assert pairs["--from-epoch"] == ["0"]
+    assert pairs["--to-epoch"] == ["26"]
+    assert "-1" not in proc.stderr
+    assert "negative" not in proc.stderr.lower()
+    assert_no_secret(proc)
+
+
+def test_report_sh_epochs_28_that_fit_keep_epochs_flag(tmp_path: Path):
+    run_dir = plant_run_dir(tmp_path, epochs=28)
+    proc, argv_log = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        env={"DEVNET_HEAD_EPOCH": "29"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    pairs = argv_pairs(argv_list(argv_log))
+    assert pairs["--epochs"] == ["28"]
+    assert "--from-epoch" not in pairs
+    assert "--to-epoch" not in pairs
+    assert_no_secret(proc)
+
+
+@pytest.mark.parametrize("head", ["0", "1"])
+def test_report_sh_unsatisfiable_epoch_window_exits_2(tmp_path: Path, head: str):
+    run_dir = plant_run_dir(tmp_path, epochs=28)
+    proc, argv_log = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        env={"DEVNET_HEAD_EPOCH": head},
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    assert argv_list(argv_log) == []
+    err = proc.stderr.lower()
+    assert "cannot be satisfied" in err
+    assert "negative" not in err
+    assert "-1" not in proc.stderr
+    assert not (run_dir / "chain.json").exists()
+    assert_no_secret(proc)
+
+
+def test_report_sh_epochs_28_clamps_from_bn_head_slot(tmp_path: Path):
+    """Head slot 896 / SLOTS_PER_EPOCH 32 = epoch 28, same negative window."""
+    curl = tmp_path / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        "for a in \"$@\"; do\n"
+        "  case \"$a\" in\n"
+        "    */eth/v1/beacon/headers/head)\n"
+        "      printf '%s\\n' "
+        "'{\"data\":{\"header\":{\"message\":{\"slot\":\"896\"}}}}'\n"
+        "      exit 0\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        "printf '%s\\n' \"unexpected curl $*\" >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    run_dir = plant_run_dir(tmp_path, epochs=28)
+    proc, argv_log = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        env={
+            "DEVNET_HEAD_EPOCH": "",
+            "CURL": str(curl),
+            "SLOTS_PER_EPOCH": "32",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    pairs = argv_pairs(argv_list(argv_log))
+    assert pairs["--from-epoch"] == ["0"]
+    assert pairs["--to-epoch"] == ["26"]
+    assert "--epochs" not in pairs
+    assert_no_secret(proc)
+
+
+def test_report_sh_slots_per_epoch_032_is_decimal_not_octal(tmp_path: Path):
+    """Leading-zero SLOTS_PER_EPOCH must not be parsed as octal (032 → 26)."""
+    curl = tmp_path / "curl"
+    # slot 896 / 32 = 28; if 032 were octal 26, head epoch would be 34.
+    curl.write_text(
+        "#!/bin/sh\n"
+        "for a in \"$@\"; do\n"
+        "  case \"$a\" in\n"
+        "    */eth/v1/beacon/headers/head)\n"
+        "      printf '%s\\n' "
+        "'{\"data\":{\"header\":{\"message\":{\"slot\":\"896\"}}}}'\n"
+        "      exit 0\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    run_dir = plant_run_dir(tmp_path, epochs=28)
+    proc, argv_log = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        env={
+            "DEVNET_HEAD_EPOCH": "",
+            "CURL": str(curl),
+            "SLOTS_PER_EPOCH": "032",
+        },
+    )
+    assert proc.returncode == 0, proc.stderr
+    pairs = argv_pairs(argv_list(argv_log))
+    assert pairs["--from-epoch"] == ["0"]
+    assert pairs["--to-epoch"] == ["26"]
+    assert_no_secret(proc)
+
+
+def test_report_sh_head_epoch_08_is_decimal(tmp_path: Path):
+    """DEVNET_HEAD_EPOCH=08 is decimal 8, not an octal parse error."""
+    run_dir = plant_run_dir(tmp_path, epochs=4)
+    proc, argv_log = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        env={"DEVNET_HEAD_EPOCH": "08"},
+    )
+    assert proc.returncode == 0, proc.stderr
+    pairs = argv_pairs(argv_list(argv_log))
+    # head 8 → safe through 6; 4 epochs fit as --epochs 4.
+    assert pairs["--epochs"] == ["4"]
+    assert_no_secret(proc)
+
+
+@pytest.mark.parametrize("raw", ["00", "0"])
+def test_report_sh_slots_per_epoch_zero_rejected(tmp_path: Path, raw: str):
+    curl = tmp_path / "curl"
+    curl.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' "
+        "'{\"data\":{\"header\":{\"message\":{\"slot\":\"96\"}}}}'\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    curl.chmod(0o755)
+    run_dir = plant_run_dir(tmp_path, epochs=2)
+    proc, argv_log = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        env={
+            "DEVNET_HEAD_EPOCH": "",
+            "CURL": str(curl),
+            "SLOTS_PER_EPOCH": raw,
+        },
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert proc.stdout == ""
+    assert argv_list(argv_log) == []
+    assert "SLOTS_PER_EPOCH" in proc.stderr
+    assert_no_secret(proc)
+
+
+@pytest.mark.parametrize("raw", ["00", "0"])
+def test_report_sh_epochs_zero_rejected(tmp_path: Path, raw: str):
+    run_dir = plant_run_dir(tmp_path, epochs=4)
+    doc = json.loads((run_dir / "run.json").read_text(encoding="utf-8"))
+    doc["epochs"] = int(raw) if raw == "0" else 0
+    # Force a leading-zero / zero string through the file for "00".
+    text = json.dumps(doc, sort_keys=True)
+    if raw == "00":
+        text = text.replace('"epochs": 0', '"epochs": "00"')
+    else:
+        text = text.replace('"epochs": 0', '"epochs": 0')
+    (run_dir / "run.json").write_text(text + "\n", encoding="utf-8")
+    proc, argv_log = run_report(
+        tmp_path,
+        ["--run-dir", str(run_dir)],
+        env={"DEVNET_HEAD_EPOCH": "10"},
+    )
+    assert proc.returncode == 2, proc.stderr
+    assert argv_list(argv_log) == []
     assert_no_secret(proc)
 
 
