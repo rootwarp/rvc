@@ -12,7 +12,7 @@ use crate::{
     define_int_counter_with_const_labels, define_int_gauge, define_int_gauge_vec,
 };
 
-/// Buckets (ms) shared by the retained phase-0 histogram and `rvc_slot_phase_offset_ms`.
+/// Buckets (ms) shared by the deprecated phase-0 histogram and `rvc_slot_phase_offset_ms`.
 const SLOT_PHASE_OFFSET_BUCKETS_MS: &[f64] = &[
     5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 4000.0, 8000.0, 12000.0, 20000.0,
     30000.0, 60000.0,
@@ -101,13 +101,17 @@ lazy_static! {
         )
     };
 
-    /// retained for dashboards
+    /// Deprecated: use [`RVC_SLOT_PHASE_OFFSET_MS`] with `phase="block"`.
     ///
-    /// Histogram for slot phase-0 start offset in milliseconds (M2 / AQ-7).
+    /// Soft-deprecated (AQ-7 / #611). Still emitted so existing dashboards that
+    /// bind `rvc_slot_phase_block_start_offset_ms{cache}` keep working. Prefer
+    /// `rvc_slot_phase_offset_ms{phase="block"}` for new queries.
+    ///
+    /// Histogram for slot phase-0 start offset in milliseconds (M2).
     pub static ref RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS: HistogramVec = {
         define_histogram_vec(
             "rvc_slot_phase_block_start_offset_ms",
-            "Offset (ms) from slot start to entry of maybe_propose_block",
+            "Deprecated: use rvc_slot_phase_offset_ms{phase=\"block\"}. Offset (ms) from slot start to entry of maybe_propose_block",
             &["cache"],
             SLOT_PHASE_OFFSET_BUCKETS_MS,
             &[],
@@ -247,7 +251,9 @@ pub mod tx_hold_kind {
     pub const BLOCK: &str = "block";
 }
 
-/// `cache` label values for `rvc_slot_phase_block_start_offset_ms`.
+/// `cache` label values for deprecated `rvc_slot_phase_block_start_offset_ms`.
+///
+/// Prefer `rvc_slot_phase_offset_ms{phase="block"}` (AQ-7 / #611).
 pub mod slot_phase_cache {
     pub const WARM: &str = "warm";
     pub const COLD: &str = "cold";
@@ -483,12 +489,34 @@ mod tests {
             assert_eq!(
                 bounds.as_slice(),
                 SLOT_PHASE_OFFSET_BUCKETS_MS,
-                "phase offset buckets must match the retained block-start list"
+                "phase offset buckets must match the deprecated block-start list"
             );
         }
         let expected: std::collections::BTreeSet<String> =
             slot_phase_offset::ALL.iter().map(|phase| (*phase).to_string()).collect();
         assert_eq!(phases, expected, "all six phase labels must be recordable");
+    }
+
+    #[test]
+    fn slot_phase_block_start_offset_ms_help_marks_deprecation() {
+        init_metrics();
+        let _ = RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS
+            .with_label_values(&[slot_phase_cache::COLD])
+            .get_sample_count();
+        let gathered = REGISTRY.gather();
+        let metric = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_slot_phase_block_start_offset_ms")
+            .expect("deprecated block-start family must still be registered");
+        let help = metric.help();
+        assert!(
+            help.to_ascii_lowercase().contains("deprecated"),
+            "HELP must mark the family deprecated, got {help:?}"
+        );
+        assert!(
+            help.contains("rvc_slot_phase_offset_ms") && help.contains("phase"),
+            "HELP must name the replacement family, got {help:?}"
+        );
     }
 
     #[test]

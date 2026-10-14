@@ -535,6 +535,30 @@ A whole-second read of a sub-second offset records 0. This histogram records
 the millisecond offset. `rvc_slot_phase_offset_ms` is a separate family and
 is kept. Nothing was renamed.
 
+## Deprecations: `rvc_slot_phase_block_start_offset_ms` (AQ-7 / #611)
+
+`rvc_slot_phase_block_start_offset_ms` is **soft-deprecated**. It is still
+emitted every block phase so existing dashboards that bind the old name keep
+working. Prefer the labelled family for new queries and panels.
+
+**Migration (PromQL):**
+
+```promql
+# before
+rvc_slot_phase_block_start_offset_ms_bucket
+rvc_slot_phase_block_start_offset_ms_sum
+rvc_slot_phase_block_start_offset_ms_count
+
+# after
+rvc_slot_phase_offset_ms_bucket{phase="block"}
+rvc_slot_phase_offset_ms_sum{phase="block"}
+rvc_slot_phase_offset_ms_count{phase="block"}
+```
+
+The old series still has the `cache` label (`cold` / `warm`). The replacement
+has `phase` only. Removal of the old name is deferred; this release starts the
+deprecation window only.
+
 `rvc_slashing_reserve_tx_hold_duration_ms` (`kind` is `attestation` or
 `block`) starts in `SlashableSignSession::reserve_then_sign` before
 `reserve()` and is observed only when `reserve()` returns `Ok`. The sample
@@ -667,6 +691,7 @@ the same Prometheus name when an attestation sign is slashing-blocked.
 | Behaviour: duty validation | #533, #534 |
 | New metrics | #500, #506, #507, #508, #512, #525, #531, #533 |
 | Changed metric values | #508 |
+| Deprecations: block-start offset | #611 |
 | Library consumers | #504, #521, #537, #538, #539, #540, #602, #603, #604 |
 
 ## Tracing: dev/demo tail sampling profile (TRC-7c / #448)

@@ -65,6 +65,26 @@ sample is observed. The per-family notes below say which is which.
 one of the six. It is the paging-immediately slashing gate and is listed with
 the rules so it is not wired as `== 0`.
 
+### Deprecated: `rvc_slot_phase_block_start_offset_ms` (AQ-7 / #611)
+
+Soft-deprecated. Still emitted on every block phase so existing dashboards keep
+working. Prefer the labelled replacement for new panels:
+
+```promql
+# before
+rvc_slot_phase_block_start_offset_ms_bucket
+rvc_slot_phase_block_start_offset_ms_sum
+rvc_slot_phase_block_start_offset_ms_count
+
+# after
+rvc_slot_phase_offset_ms_bucket{phase="block"}
+rvc_slot_phase_offset_ms_sum{phase="block"}
+rvc_slot_phase_offset_ms_count{phase="block"}
+```
+
+The old series keeps its `cache` label (`cold` / `warm`). The replacement has
+`phase` only. See [UNRELEASED.md](releases/UNRELEASED.md#deprecations-rvc_slot_phase_block_start_offset_ms-aq-7--611).
+
 ---
 
 ## Alert rules
