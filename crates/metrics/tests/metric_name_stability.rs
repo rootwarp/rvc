@@ -56,7 +56,9 @@
 //! when a slot phase fires. Label `phase` is block, attestation, sync_message,
 //! aggregate, contribution, or payload_attestation. The sample is milliseconds
 //! from the true slot start, including a late wake. Buckets match
-//! `rvc_slot_phase_block_start_offset_ms`, which is retained for dashboards.
+//! `rvc_slot_phase_block_start_offset_ms`, which is soft-deprecated in favour
+//! of `rvc_slot_phase_offset_ms{phase="block"}` but still retained for
+//! dashboards (AQ-7 / #611).
 //! RR2-12 adds `rvc_slashing_import_duration_ms` and
 //! `rvc_slashing_import_conn_hold_ms` (family delta +2). Duration is one sample
 //! per interchange import call. Conn-hold is `conn.lock()` through `COMMIT`;
@@ -171,7 +173,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_slashing_reconcile_total",
     "rvc_slashing_reserve_tx_hold_duration_ms",
     "rvc_slot_context_parent_fallback_total",
-    "rvc_slot_phase_block_start_offset_ms",
+    "rvc_slot_phase_block_start_offset_ms", // deprecated: use rvc_slot_phase_offset_ms{phase="block"}; retained for dashboards (AQ-7 / #611)
     "rvc_slot_phase_late_total", // operator-facing: phases that fired after their absolute deadline (RR1-03 / #506)
     "rvc_slot_phase_offset_ms", // operator-facing: true offset into the slot when a phase fires (RR1-05 / #508)
     "rvc_slot_replay_skipped_total", // operator-facing: slots skipped after a backward clock step (RR1-04 / #507)

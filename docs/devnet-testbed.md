@@ -420,7 +420,7 @@ K families (S5a presence is **family**-level; S5b non-zero required only where n
 | K7 | `rvc_signing_duration_seconds` | yes |
 | K8 | `rvc_slashing_protection_checks_total` | `blocked` must be 0 (S7; absent child on a valid scrape counts as 0) |
 | K9 | `rvc_slashing_reserve_tx_hold_duration_ms` | no |
-| K10 | `rvc_slot_phase_block_start_offset_ms` | no |
+| K10 | `rvc_slot_phase_block_start_offset_ms` (deprecated; prefer `rvc_slot_phase_offset_ms{phase="block"}`) | no |
 | K11 | `rvc_duties_fetched_total` / `rvc_duty_reorg_detected_total` | fetched yes; reorgs no |
 | K12 | `rvc_bn_health_tier` / `rvc_proposer_bn_latency_ms` | `rvc_bn_health_tier` yes |
 | K13 | `rvc_tasks_running` / `rvc_task_exits_total` / `rvc_sse_events_dropped_total` | exits no |

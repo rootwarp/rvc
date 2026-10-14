@@ -385,6 +385,68 @@ async fn phase_block_start_offset_reports_the_true_offset() {
     );
 }
 
+/// Soft deprecation (AQ-7 / #611): both the deprecated block-start family and
+/// `rvc_slot_phase_offset_ms{phase="block"}` must still record on a block phase.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn block_phase_still_records_deprecated_and_labelled_offset_families() {
+    let _guard = m2_metric_lock().await;
+
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    let slot = 65u64;
+    clock.set_slot_with_offset_ms(slot, 0);
+    clock.advance_ms(600);
+
+    let beacon = Arc::new(bn_manager::MockBeaconNodeClient::new());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
+
+    let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        create_test_config()
+            .with_timeouts(fast_timeouts())
+            .with_pre_proposal_deadline(Duration::ZERO)
+            .with_cold_proposer_fetch_deadline(Duration::ZERO),
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+    ));
+
+    let cold_before = histogram_count(slot_phase_cache::COLD);
+    let warm_before = histogram_count(slot_phase_cache::WARM);
+    let block_before = phase_offset_count(slot_phase_offset::BLOCK);
+
+    tokio::select! {
+        biased;
+        _ = orchestrator.run() => {}
+        () = async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            handle.shutdown();
+            std::future::pending::<()>().await;
+        } => {}
+    }
+
+    let deprecated_added = (histogram_count(slot_phase_cache::COLD) - cold_before)
+        + (histogram_count(slot_phase_cache::WARM) - warm_before);
+    let labelled_added = phase_offset_count(slot_phase_offset::BLOCK) - block_before;
+    assert!(
+        deprecated_added >= 1,
+        "deprecated rvc_slot_phase_block_start_offset_ms must still record, added {deprecated_added}"
+    );
+    assert!(
+        labelled_added >= 1,
+        "rvc_slot_phase_offset_ms{{phase=block}} must record, added {labelled_added}"
+    );
+}
+
 /// Every `rvc_slot_phase_offset_ms` phase label is recorded when that phase fires.
 /// Gloas is required so payload attestation runs.
 #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -118,8 +118,8 @@ inventory in [gloas-fork-hazard-audit.md](gloas-fork-hazard-audit.md)):
 | Proposer-duties v1/v2 | `crates/beacon/src/client.rs` | 482–490 | `>= Gloas` → `/eth/v2/validator/duties/proposer/{epoch}`. No silent v1 fallback. |
 | produceBlockV4 / v3 | `crates/block-service/src/service/mod.rs` | 307–320 | `>= Gloas` → `produce_block_v4` (`POST /eth/v4/validator/blocks/{slot}`); else `produce_block_v3` (`GET /eth/v3/validator/blocks/{slot}`). HTTP in `crates/beacon/src/client.rs` 526 / 643; path prefix `crates/beacon/src/v4_wire.rs` 13. |
 | Deadline set | `crates/timing/src/clock.rs` | 29–35 | `DeadlineSchedule::for_fork`: `>= Gloas` selects the six Gloas `*_DUE_BPS*` offsets. |
-| Coordinator attestation offset | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 131–142, 479–480 | `from_epoch` then `for_fork`; one resolved fork per slot. |
-| PTC phase | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 1219–1250 | `run_payload_attestation_phase`: open-ended `>= Gloas` waits then calls `crates/rvc/src/orchestrator/payload_attestation.rs`. |
+| Coordinator attestation offset | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 162–165, 586–588 | `from_epoch` then `for_fork`; one resolved fork per slot. |
+| PTC phase | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 1478–1513 | `run_payload_attestation_phase`: open-ended `>= Gloas` waits then calls `crates/rvc/src/orchestrator/payload_attestation.rs`. |
 | Legacy proposer ops | `crates/builder/src/service.rs` | 26–28 | `legacy_proposer_ops_retired`: `>= Gloas` retires `prepare_beacon_proposer` / `register_validator`. |
 | Signer header RPC | `crates/signer/src/lib.rs` | 953 | `>= Gloas` uses `SignBlockHeader` (no Gloas body SSZ into a legacy decoder). |
 | Signer aggregate RPC | `crates/signer/src/lib.rs` | 1229, 1283 | `>= Gloas` rejects legacy `sign_aggregate_and_proof` / `sign_electra_aggregate_and_proof` (`UnsupportedDuty`); Gloas signs via the root RPC (`sign_aggregate_and_proof_root` 1248). |

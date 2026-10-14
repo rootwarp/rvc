@@ -934,8 +934,9 @@ where
         }
     }
 
-    /// Records `rvc_slot_phase_block_start_offset_ms` immediately before
-    /// `maybe_propose_block` (M2 instrument). The sample is
+    /// Records deprecated `rvc_slot_phase_block_start_offset_ms` immediately
+    /// before `maybe_propose_block` (M2 instrument; soft-deprecated AQ-7 /
+    /// #611 — prefer `rvc_slot_phase_offset_ms{phase="block"}`). The sample is
     /// [`SlotAnchor::elapsed_ms`], the true offset into the slot. Labels
     /// `cache=cold` for post-boot and post-key_gen slots, then clears the
     /// cold flag for subsequent slots.
