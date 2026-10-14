@@ -132,19 +132,82 @@ _apply_fail_under_from_run_json() {
     _split_fail_under "$raw"
 }
 
+# Decimal-normalize a digit string via $((10#…)) so leading zeros are not
+# octal (08 / 032). Reject empty/non-digits; optional min/max bounds.
+_parse_uint() {
+    local name="$1"
+    local raw="${2:-}"
+    local min="${3:-}"
+    local max="${4:-}"
+    local n
+    case "$raw" in
+        '' | *[!0-9]*)
+            die_usage "${name} must be a non-negative integer (got ${raw:-<empty>})"
+            ;;
+    esac
+    n=$((10#$raw))
+    if [[ -n "$min" ]] && ((n < min)); then
+        die_usage "${name} must be >= ${min} (got ${raw})"
+    fi
+    if [[ -n "$max" ]] && ((n > max)); then
+        die_usage "${name} must be <= ${max} (got ${raw})"
+    fi
+    printf '%s' "$n"
+}
+
+# Soft ceilings: keep arithmetic and BN math in a sane range.
+_MAX_SLOTS_PER_EPOCH=65536
+_MAX_EPOCHS=1000000
+_MAX_SLOT=1000000000
+_MAX_HEAD_EPOCH=1000000000
+
 _epochs_from_run_json() {
     local path="${RUN_DIR}/run.json"
     local epochs
     epochs="$(jq -r '.epochs // empty' "$path" 2>/dev/null || true)"
-    case "$epochs" in
-        '' | *[!0-9]*)
-            die_usage "run.json missing epochs (produced by run.sh)"
-            ;;
-    esac
-    if [[ "$epochs" -le 0 ]]; then
-        die_usage "run.json missing epochs (produced by run.sh)"
+    _parse_uint "run.json epochs" "$epochs" 1 "$_MAX_EPOCHS"
+}
+
+# Head epoch for the report window. DEVNET_HEAD_EPOCH skips the BN (tests).
+_load_head_epoch() {
+    local override="${DEVNET_HEAD_EPOCH:-}"
+    local raw spe
+    if [[ -n "$override" ]]; then
+        _HEAD_EPOCH="$(_parse_uint "DEVNET_HEAD_EPOCH" "$override" 0 "$_MAX_HEAD_EPOCH")"
+        return 0
     fi
-    printf '%s\n' "$epochs"
+    raw="$(
+        bn_get /eth/v1/beacon/headers/head \
+            | jq -r '.data.header.message.slot // empty' \
+            | tr -d '[:space:]'
+    )" || die_infra "failed to read BN head slot"
+    raw="$(_parse_uint "BN head slot" "$raw" 0 "$_MAX_SLOT")"
+    spe="${SLOTS_PER_EPOCH:-32}"
+    spe="$(_parse_uint "SLOTS_PER_EPOCH" "$spe" 1 "$_MAX_SLOTS_PER_EPOCH")"
+    _HEAD_EPOCH=$((raw / spe))
+}
+
+# validator_perf --epochs N --allow-unfinalized uses to=head-2 and
+# from=to-N+1. --epochs 28 at head_epoch 28 is from=-1. Clamp into the
+# elapsed safe range 0..head-2. Head < 2 cannot be satisfied.
+_clamp_epoch_window() {
+    local requested head_epoch max_safe from_epoch
+    requested="$(_parse_uint "epoch window count" "${1:-}" 1 "$_MAX_EPOCHS")"
+    head_epoch="$(_parse_uint "head epoch" "${2:-}" 0 "$_MAX_HEAD_EPOCH")"
+    if ((head_epoch < 2)); then
+        die_usage "epoch window cannot be satisfied: requested ${requested} epochs but head_epoch=${head_epoch} has no safe epoch (head_epoch must be at least 2)"
+    fi
+    max_safe=$((head_epoch - 2))
+    from_epoch=$((max_safe - requested + 1))
+    _WINDOW_TO="$max_safe"
+    if ((from_epoch < 0)); then
+        log_warn "requested ${requested} epochs exceeds elapsed safe epochs 0-${max_safe} (head_epoch=${head_epoch}); clamping start to 0"
+        _WINDOW_FROM=0
+        _WINDOW_CLAMPED=1
+    else
+        _WINDOW_FROM="$from_epoch"
+        _WINDOW_CLAMPED=0
+    fi
 }
 
 # stdin → DEST. O_NOFOLLOW + O_EXCL random tmp; empty allowed. 2 = symlink.
@@ -315,14 +378,19 @@ run_chain_report() {
     local -a cmd _pipe
 
     epochs="$(_epochs_from_run_json)"
+    _load_head_epoch
+    _clamp_epoch_window "$epochs" "$_HEAD_EPOCH"
     cmd=(
         "$VALIDATOR_PERF"
         --beacon-url "$(bn_url)"
         --pubkeys-file "${RUN_DIR}/rvc-pubkeys.txt"
-        --epochs "$epochs"
-        --allow-unfinalized
-        --json
     )
+    if [[ "$_WINDOW_CLAMPED" -eq 1 ]]; then
+        cmd+=(--from-epoch "$_WINDOW_FROM" --to-epoch "$_WINDOW_TO")
+    else
+        cmd+=(--epochs "$epochs")
+    fi
+    cmd+=(--allow-unfinalized --json)
     # DSR-0.2: prefer soak-persisted duties over live BN (pruned LH 404).
     if [[ -d "$duties_dir" && ! -L "$duties_dir" ]]; then
         cmd+=(--proposer-duties-dir "$duties_dir")

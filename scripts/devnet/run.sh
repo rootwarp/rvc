@@ -316,13 +316,80 @@ record_stage() {
     )"
 }
 
+_teardown_after_failure() {
+    local name="$1"
+    if [[ "$KEEP" == "1" || "$name" == "down" || "$name" == "soak" ]]; then
+        return 1
+    fi
+    if [[ "${_DID_DOWN}" -eq 1 ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# Positive decimal seconds for the log-dump deadline. Leading zeros are
+# base-10 ($((10#…))), not octal. 0 / non-numeric → default 30; cap at 600.
+_log_dump_timeout_s() {
+    local raw="${DEVNET_LOG_DUMP_TIMEOUT_S:-30}"
+    local limit
+    case "$raw" in
+        '' | *[!0-9]*)
+            printf '%s' "30"
+            return 0
+            ;;
+    esac
+    limit=$((10#$raw))
+    if ((limit < 1)); then
+        limit=30
+    elif ((limit > 600)); then
+        limit=600
+    fi
+    printf '%s' "$limit"
+}
+
+# docker logs has no deadline. Bound it so a stuck daemon cannot wedge the
+# process after a stage failure. Capture runs before teardown so containers
+# still exist; --keep skips teardown and this wait is the only remaining work.
+# Monitor mode gives the capture its own process group so the timeout can
+# signal docker's grandchildren (a log follower's sleep, the pipe reader).
+# SIGTERM first, short grace, then SIGKILL so stubs cannot linger.
+_CAPTURE_KILL_GRACE_S=1
+_capture_logs_bounded() {
+    local name="$1"
+    local limit pid start grace_start
+    limit="$(_log_dump_timeout_s)"
+    set -m
+    capture_container_logs "$name" &
+    pid=$!
+    set +m
+    start="$SECONDS"
+    while kill -0 "$pid" 2>/dev/null; do
+        if [[ $((SECONDS - start)) -ge "$limit" ]]; then
+            log_warn "log capture for ${name} exceeded ${limit}s; continuing"
+            kill -TERM -- "-${pid}" 2>/dev/null || true
+            grace_start="$SECONDS"
+            while kill -0 "$pid" 2>/dev/null; do
+                if [[ $((SECONDS - grace_start)) -ge "${_CAPTURE_KILL_GRACE_S}" ]]; then
+                    break
+                fi
+                sleep 0.05
+            done
+            kill -KILL -- "-${pid}" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 0
+        fi
+        sleep 0.1
+    done
+    wait "$pid" 2>/dev/null || true
+}
+
 dump_stage_logs() {
     if [[ -z "${RUN_DIR:-}" ]]; then
         return 0
     fi
-    capture_container_logs "$GETH_CONTAINER" || true
-    capture_container_logs "$BEACON_CONTAINER" || true
-    capture_container_logs "$VALIDATOR_CONTAINER" || true
+    _capture_logs_bounded "$GETH_CONTAINER" || true
+    _capture_logs_bounded "$BEACON_CONTAINER" || true
+    _capture_logs_bounded "$VALIDATOR_CONTAINER" || true
 }
 
 want_stage() {
@@ -428,9 +495,16 @@ run_verb() {
         _DID_DOWN=1
     fi
     if [[ "$rc" -ne 0 ]]; then
-        dump_stage_logs || true
         if [[ "$name" != "soak" ]]; then
             _STOP=1
+        fi
+        # Capture while containers still exist (bounded), then tear down.
+        # Teardown-first made `docker logs` fail and overwrite good
+        # 03-chain.sh captures with "No such container" text.
+        dump_stage_logs || true
+        if _teardown_after_failure "$name"; then
+            log_info "stage ${script} failed; tearing down devnet"
+            _run_down || true
         fi
     fi
     return 0

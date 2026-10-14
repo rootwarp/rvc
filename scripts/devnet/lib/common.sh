@@ -1073,11 +1073,28 @@ capture_container_logs() {
         return 0
     fi
 
+    # Capture to a sibling temp first. On docker failure (container already
+    # removed), leave any existing log alone — never overwrite a good
+    # 03-chain.sh capture with "No such container" text.
+    local tmp rc=0 write_rc=0
+    tmp="${dest}.cap.${RANDOM}.$$"
+    if [[ -e "$tmp" || -L "$tmp" ]]; then
+        return 0
+    fi
     set +e
-    "$DOCKER" logs -- "$name" 2>&1 | _atomic_replace_stdin "$dest"
-    _pipe=("${PIPESTATUS[@]}" 1)
+    "$DOCKER" logs -- "$name" >"$tmp" 2>&1
+    rc=$?
     set -e
-    if [[ "${_pipe[1]}" -eq 2 ]]; then
+    if [[ "$rc" -ne 0 ]]; then
+        rm -f -- "$tmp" || true
+        return 0
+    fi
+    set +e
+    _atomic_replace_stdin "$dest" <"$tmp"
+    write_rc=$?
+    set -e
+    rm -f -- "$tmp" || true
+    if [[ "$write_rc" -eq 2 ]]; then
         return 0
     fi
     return 0

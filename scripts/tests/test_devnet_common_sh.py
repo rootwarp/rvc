@@ -648,6 +648,32 @@ def test_capture_container_logs_skips_file_run_dir(tmp_path: Path):
     assert not Path("/logs/eth-devnet-geth.log").exists()
 
 
+def test_capture_container_logs_preserves_existing_on_docker_failure(
+    tmp_path: Path,
+):
+    """docker logs failure must not overwrite a good 03-chain.sh capture."""
+    run_dir = tmp_path / "run"
+    logs = run_dir / "logs"
+    logs.mkdir(parents=True)
+    dest = logs / "eth-devnet-geth.log"
+    dest.write_text("GOOD_CHAIN_CAPTURE\n", encoding="utf-8")
+    stub = tmp_path / "docker"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "printf 'Error: No such container: %s\\n' \"$2\" >&2\n"
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    proc = run_common(
+        "parse_common_flags --run-dir \"$RUN_DIR\"; "
+        "capture_container_logs eth-devnet-geth",
+        env={"DOCKER": str(stub), "RUN_DIR": str(run_dir)},
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert dest.read_text(encoding="utf-8") == "GOOD_CHAIN_CAPTURE\n"
+
+
 def test_parse_genesis_fields_from_fixture():
     raw = (FIXTURES / "bn_genesis.json").read_text(encoding="utf-8")
     data = json.loads(raw)["data"]
