@@ -12,6 +12,10 @@ serde_json.workspace = true
 
 [dev-dependencies]
 observability.workspace = true
+# DAG-neutral: build_edge_map / architecture_no_cycles filter production edges only
+# (`kind` null — architecture_no_cycles.rs:132). Dev-deps do not add production
+# out-edges to zero-out-edge leaves rvc-telemetry / rvc-observability (:74-82/:326-342).
+telemetry.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["registry"] }
 

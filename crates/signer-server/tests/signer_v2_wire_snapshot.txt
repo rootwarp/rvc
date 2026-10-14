@@ -1,0 +1,140 @@
+# Frozen signer.v2.proto surface: develop including 4.11a
+# PartialSignPayloadAttestation and 4.11b
+# PartialSignPayloadAttestationRequest.object_root = 6.
+# Rows are RPC signatures (`rpc Service.Method (In) returns (Out)`),
+# `message Name` (including empty messages),
+# `message.field : type = number`, and `enum Name.VARIANT = number`.
+# Adding rows is allowed; changing or deleting a row fails
+# (D18/B5: no rename/renumber/retype).
+rpc SignerService.SignBeaconBlock (SignBeaconBlockRequest) returns (SignResponse)
+rpc SignerService.SignBlindedBeaconBlock (SignBlindedBeaconBlockRequest) returns (SignResponse)
+rpc SignerService.SignAttestationData (SignAttestationDataRequest) returns (SignResponse)
+rpc SignerService.SignAggregateAndProof (SignAggregateAndProofRequest) returns (SignResponse)
+rpc SignerService.SignSyncCommitteeMessage (SignSyncCommitteeMessageRequest) returns (SignResponse)
+rpc SignerService.SignSyncAggregatorSelectionData (SignSyncAggregatorSelectionDataRequest) returns (SignResponse)
+rpc SignerService.SignContributionAndProof (SignContributionAndProofRequest) returns (SignResponse)
+rpc SignerService.SignBuilderRegistration (SignBuilderRegistrationRequest) returns (SignResponse)
+rpc SignerService.SignRandaoReveal (SignRandaoRevealRequest) returns (SignResponse)
+rpc SignerService.SignVoluntaryExit (SignVoluntaryExitRequest) returns (SignResponse)
+rpc SignerService.ListPublicKeys (ListPublicKeysRequest) returns (ListPublicKeysResponse)
+rpc SignerService.GetStatus (GetStatusRequest) returns (GetStatusResponse)
+rpc PeerSignerService.PartialSignBeaconBlock (PartialSignBeaconBlockRequest) returns (PartialSignResponse)
+rpc PeerSignerService.PartialSignAttestationData (PartialSignAttestationDataRequest) returns (PartialSignResponse)
+rpc PeerSignerService.PartialSignSyncCommittee (PartialSignSyncCommitteeRequest) returns (PartialSignResponse)
+rpc PeerSignerService.PartialSignPayloadAttestation (PartialSignPayloadAttestationRequest) returns (PartialSignResponse)
+message ForkInfo
+ForkInfo.previous_version : bytes = 1
+ForkInfo.current_version : bytes = 2
+ForkInfo.epoch : uint64 = 3
+ForkInfo.genesis_validators_root : bytes = 4
+message SignResponse
+SignResponse.signature : bytes = 1
+message SignBeaconBlockRequest
+SignBeaconBlockRequest.pubkey : bytes = 1
+SignBeaconBlockRequest.fork_info : ForkInfo = 2
+SignBeaconBlockRequest.block_ssz : bytes = 3
+SignBeaconBlockRequest.fork_id : uint32 = 4
+message SignBlindedBeaconBlockRequest
+SignBlindedBeaconBlockRequest.pubkey : bytes = 1
+SignBlindedBeaconBlockRequest.fork_info : ForkInfo = 2
+SignBlindedBeaconBlockRequest.block_ssz : bytes = 3
+SignBlindedBeaconBlockRequest.fork_id : uint32 = 4
+message Checkpoint
+Checkpoint.epoch : uint64 = 1
+Checkpoint.root : bytes = 2
+message AttestationData
+AttestationData.slot : uint64 = 1
+AttestationData.index : uint64 = 2
+AttestationData.beacon_block_root : bytes = 3
+AttestationData.source : Checkpoint = 4
+AttestationData.target : Checkpoint = 5
+message SignAttestationDataRequest
+SignAttestationDataRequest.pubkey : bytes = 1
+SignAttestationDataRequest.fork_info : ForkInfo = 2
+SignAttestationDataRequest.data : AttestationData = 3
+SignAttestationDataRequest.fork_id : uint32 = 4
+message SignAggregateAndProofRequest
+SignAggregateAndProofRequest.pubkey : bytes = 1
+SignAggregateAndProofRequest.fork_info : ForkInfo = 2
+SignAggregateAndProofRequest.aggregator_index : uint64 = 3
+SignAggregateAndProofRequest.aggregate_ssz : bytes = 4
+SignAggregateAndProofRequest.selection_proof : bytes = 5
+SignAggregateAndProofRequest.fork_id : uint32 = 6
+message SignSyncCommitteeMessageRequest
+SignSyncCommitteeMessageRequest.pubkey : bytes = 1
+SignSyncCommitteeMessageRequest.fork_info : ForkInfo = 2
+SignSyncCommitteeMessageRequest.slot : uint64 = 3
+SignSyncCommitteeMessageRequest.beacon_block_root : bytes = 4
+SignSyncCommitteeMessageRequest.fork_id : uint32 = 5
+message SignSyncAggregatorSelectionDataRequest
+SignSyncAggregatorSelectionDataRequest.pubkey : bytes = 1
+SignSyncAggregatorSelectionDataRequest.fork_info : ForkInfo = 2
+SignSyncAggregatorSelectionDataRequest.slot : uint64 = 3
+SignSyncAggregatorSelectionDataRequest.subcommittee_index : uint64 = 4
+SignSyncAggregatorSelectionDataRequest.fork_id : uint32 = 5
+message SignContributionAndProofRequest
+SignContributionAndProofRequest.pubkey : bytes = 1
+SignContributionAndProofRequest.fork_info : ForkInfo = 2
+SignContributionAndProofRequest.aggregator_index : uint64 = 3
+SignContributionAndProofRequest.contribution_ssz : bytes = 4
+SignContributionAndProofRequest.selection_proof : bytes = 5
+SignContributionAndProofRequest.fork_id : uint32 = 6
+message SignBuilderRegistrationRequest
+SignBuilderRegistrationRequest.pubkey : bytes = 1
+SignBuilderRegistrationRequest.fee_recipient : bytes = 2
+SignBuilderRegistrationRequest.gas_limit : uint64 = 3
+SignBuilderRegistrationRequest.timestamp : uint64 = 4
+SignBuilderRegistrationRequest.genesis_fork_version : bytes = 5
+message SignRandaoRevealRequest
+SignRandaoRevealRequest.pubkey : bytes = 1
+SignRandaoRevealRequest.fork_info : ForkInfo = 2
+SignRandaoRevealRequest.epoch : uint64 = 3
+SignRandaoRevealRequest.fork_id : uint32 = 4
+message SignVoluntaryExitRequest
+SignVoluntaryExitRequest.pubkey : bytes = 1
+SignVoluntaryExitRequest.fork_info : ForkInfo = 2
+SignVoluntaryExitRequest.epoch : uint64 = 3
+SignVoluntaryExitRequest.validator_index : uint64 = 4
+SignVoluntaryExitRequest.fork_id : uint32 = 5
+message ListPublicKeysRequest
+message ListPublicKeysResponse
+ListPublicKeysResponse.pubkeys : repeated bytes = 1
+message GetStatusRequest
+message GetStatusResponse
+GetStatusResponse.ready : bool = 1
+GetStatusResponse.backend : string = 2
+GetStatusResponse.key_count : uint32 = 3
+message PartialSignBeaconBlockRequest
+PartialSignBeaconBlockRequest.requester_index : uint64 = 1
+PartialSignBeaconBlockRequest.pubkey : bytes = 2
+PartialSignBeaconBlockRequest.fork_info : ForkInfo = 3
+PartialSignBeaconBlockRequest.block_ssz : bytes = 4
+PartialSignBeaconBlockRequest.fork_id : uint32 = 5
+message PartialSignAttestationDataRequest
+PartialSignAttestationDataRequest.requester_index : uint64 = 1
+PartialSignAttestationDataRequest.pubkey : bytes = 2
+PartialSignAttestationDataRequest.fork_info : ForkInfo = 3
+PartialSignAttestationDataRequest.data : AttestationData = 4
+PartialSignAttestationDataRequest.fork_id : uint32 = 5
+message PartialSignSyncCommitteeRequest
+PartialSignSyncCommitteeRequest.requester_index : uint64 = 1
+PartialSignSyncCommitteeRequest.pubkey : bytes = 2
+PartialSignSyncCommitteeRequest.fork_info : ForkInfo = 3
+PartialSignSyncCommitteeRequest.slot : uint64 = 4
+PartialSignSyncCommitteeRequest.beacon_block_root : bytes = 5
+PartialSignSyncCommitteeRequest.fork_id : uint32 = 6
+message PartialSignResponse
+PartialSignResponse.partial_signature : bytes = 1
+PartialSignResponse.share_index : uint64 = 2
+message PayloadAttestationData
+PayloadAttestationData.beacon_block_root : bytes = 1
+PayloadAttestationData.slot : uint64 = 2
+PayloadAttestationData.payload_present : bool = 3
+PayloadAttestationData.blob_data_available : bool = 4
+message PartialSignPayloadAttestationRequest
+PartialSignPayloadAttestationRequest.requester_index : uint64 = 1
+PartialSignPayloadAttestationRequest.pubkey : bytes = 2
+PartialSignPayloadAttestationRequest.fork_info : ForkInfo = 3
+PartialSignPayloadAttestationRequest.data : PayloadAttestationData = 4
+PartialSignPayloadAttestationRequest.fork_id : uint32 = 5
+PartialSignPayloadAttestationRequest.object_root : bytes = 6

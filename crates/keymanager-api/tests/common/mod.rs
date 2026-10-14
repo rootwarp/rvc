@@ -12,6 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request};
 use axum::Router;
@@ -50,6 +51,7 @@ impl MockKeystoreManager {
     }
 }
 
+#[async_trait]
 impl KeystoreManager for MockKeystoreManager {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.keys.lock().clone()
@@ -59,7 +61,7 @@ impl KeystoreManager for MockKeystoreManager {
         self.keys.lock().contains(pubkey)
     }
 
-    fn import_keystore(
+    async fn import_keystore(
         &self,
         keystore_json: &str,
         _password: &str,
@@ -106,8 +108,9 @@ impl MockSlashingProtection {
     }
 }
 
+#[async_trait]
 impl SlashingProtection for MockSlashingProtection {
-    fn import_interchange(
+    async fn import_interchange(
         &self,
         interchange_json: &str,
     ) -> Result<(), rvc_keymanager_api::traits::SlashingProtectionError> {
@@ -151,25 +154,27 @@ impl MockValidatorManager {
 }
 
 impl ValidatorManager for MockValidatorManager {
-    fn add_validator(&self, pubkey: Pubkey, enabled: bool) {
+    fn add_validator(&self, pubkey: Pubkey, enabled: bool) -> Result<(), String> {
         self.validators.lock().push((pubkey, enabled));
+        Ok(())
     }
 
-    fn remove_validator(&self, pubkey: &Pubkey) -> bool {
+    fn remove_validator(&self, pubkey: &Pubkey) -> Result<bool, String> {
         let mut validators = self.validators.lock();
         if let Some(pos) = validators.iter().position(|(pk, _)| pk == pubkey) {
             validators.remove(pos);
-            true
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
-    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) {
+    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) -> Result<(), String> {
         let mut validators = self.validators.lock();
         if let Some((_, e)) = validators.iter_mut().find(|(pk, _)| pk == pubkey) {
             *e = enabled;
         }
+        Ok(())
     }
 }
 
@@ -197,6 +202,37 @@ impl DoppelgangerMonitor for MockDoppelgangerMonitor {
 
     fn is_doppelganger_safe(&self, _pubkey: &Pubkey) -> bool {
         true
+    }
+}
+
+/// Test double: unsafe while `start_monitoring` is outstanding.
+///
+/// Replaces the retired time-based gate in M-12 / KM-2 tests. `cancel_monitoring`
+/// inherits the prune-pending default.
+pub struct PendingSetMonitor {
+    pending: Mutex<Vec<Pubkey>>,
+}
+
+impl PendingSetMonitor {
+    pub fn new() -> Self {
+        Self { pending: Mutex::new(Vec::new()) }
+    }
+}
+
+impl DoppelgangerMonitor for PendingSetMonitor {
+    fn start_monitoring(&self, pubkey: Pubkey) {
+        self.pending.lock().push(pubkey);
+    }
+
+    fn stop_monitoring(&self, pubkey: &Pubkey) {
+        let mut pending = self.pending.lock();
+        if let Some(pos) = pending.iter().position(|pk| pk == pubkey) {
+            pending.remove(pos);
+        }
+    }
+
+    fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool {
+        !self.pending.lock().contains(pubkey)
     }
 }
 
@@ -348,8 +384,9 @@ impl ValidatorConfigManager for MockValidatorConfigManager {
 
 pub struct FailingSlashingProtection;
 
+#[async_trait]
 impl SlashingProtection for FailingSlashingProtection {
-    fn import_interchange(
+    async fn import_interchange(
         &self,
         _interchange_json: &str,
     ) -> Result<(), rvc_keymanager_api::traits::SlashingProtectionError> {
@@ -371,8 +408,9 @@ pub struct KeyAwareSlashingProtection {
     pub keystore_manager: Arc<MockKeystoreManager>,
 }
 
+#[async_trait]
 impl SlashingProtection for KeyAwareSlashingProtection {
-    fn import_interchange(
+    async fn import_interchange(
         &self,
         _interchange_json: &str,
     ) -> Result<(), rvc_keymanager_api::traits::SlashingProtectionError> {
@@ -571,6 +609,7 @@ impl TestApp {
             remote_key_manager: self.remote_key_manager.clone(),
             config_manager: self.config_manager.clone(),
             exit_manager: self.exit_manager.clone(),
+            signing_quiesce: None,
         }
     }
 

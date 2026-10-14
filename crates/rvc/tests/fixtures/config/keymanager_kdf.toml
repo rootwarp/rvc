@@ -1,0 +1,6 @@
+# RR2-10: [keymanager] import KDF knobs (parity corpus).
+
+[keymanager]
+keymanager_import_kdf_concurrency = 4
+keymanager_import_kdf_total_mib = 256
+keymanager_import_kdf_max_keystore_mib = 1024

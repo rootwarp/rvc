@@ -34,9 +34,9 @@ async fn test_pipeline_rejects_double_vote_across_two_process_slot_calls() {
     let results_a = fixture.process_slot(SLOT_A).await.expect("slot A process_slot");
     assert_eq!(results_a.len(), 1, "exactly one duty at slot A");
     assert!(
-        results_a[0].success,
+        results_a[0].outcome.is_published(),
         "first attestation must sign successfully; error={:?}",
-        results_a[0].error
+        results_a[0].outcome
     );
     assert_eq!(
         fixture.submitter.signature_count(),
@@ -47,11 +47,11 @@ async fn test_pipeline_rejects_double_vote_across_two_process_slot_calls() {
     let results_b = fixture.process_slot(SLOT_B).await.expect("slot B process_slot");
     assert_eq!(results_b.len(), 1, "exactly one duty at slot B");
     assert!(
-        !results_b[0].success,
+        !results_b[0].outcome.is_published(),
         "conflicting second attestation must be rejected; got success with error={:?}",
-        results_b[0].error
+        results_b[0].outcome
     );
-    let err = results_b[0].error.as_deref().unwrap_or("");
+    let err = common::failed_attestation_message(&results_b[0]);
     assert!(
         err.to_lowercase().contains("sign") || err.to_lowercase().contains("slash"),
         "rejection must surface as a signing/slashing failure, got: {err}"
@@ -78,10 +78,10 @@ async fn test_pipeline_double_vote_leaves_single_db_row() {
     });
 
     let results_a = fixture.process_slot(SLOT_A).await.expect("slot A");
-    assert!(results_a[0].success, "first must succeed: {:?}", results_a[0].error);
+    assert!(results_a[0].outcome.is_published(), "first must succeed: {:?}", results_a[0].outcome);
 
     let results_b = fixture.process_slot(SLOT_B).await.expect("slot B");
-    assert!(!results_b[0].success, "second must fail: {:?}", results_b[0].error);
+    assert!(!results_b[0].outcome.is_published(), "second must fail: {:?}", results_b[0].outcome);
 
     let rows = fixture.slashing_db.get_attestations(&fixture.pubkey_hex).expect("get_attestations");
     assert_eq!(
@@ -113,11 +113,11 @@ async fn test_pipeline_slashing_db_error_is_fail_closed() {
     let results = fixture.process_slot(SLOT_A).await.expect("process_slot returns results");
     assert_eq!(results.len(), 1);
     assert!(
-        !results[0].success,
+        !results[0].outcome.is_published(),
         "DB error must fail closed (no successful attestation); error={:?}",
-        results[0].error
+        results[0].outcome
     );
-    let err = results[0].error.as_deref().unwrap_or("");
+    let err = common::failed_attestation_message(&results[0]);
     assert!(
         err.to_lowercase().contains("sign")
             || err.to_lowercase().contains("slash")

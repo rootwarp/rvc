@@ -1,0 +1,29 @@
+[package]
+name = "rvc-gloas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Gloas progressive SSZ"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Spec KAT hex for consumers (block-service tests). Absent from default builds.
+test-fixtures = []
+
+[dependencies]
+eth-types.workspace = true
+libssz.workspace = true
+libssz-derive.workspace = true
+libssz-merkle.workspace = true
+libssz-types.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+ssz08.workspace = true
+tree_hash.workspace = true

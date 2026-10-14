@@ -33,6 +33,11 @@ proptest.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
+metrics.workspace = true
+# Feature-unify `test-utils` onto the crate-under-test so integration tests
+# (`tests/reserve.rs`) can arm `fail_next_commits`. Production dependents
+# do not get this line.
+rvc-slashing = { path = ".", features = ["test-utils"] }
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

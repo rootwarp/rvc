@@ -14,6 +14,7 @@ fn make_raw_key_entry(
     id: &str,
     sk: &SecretKey,
 ) -> (SecretKeyEntry, Result<KeyMaterial, SecretProviderError>) {
+    #[allow(clippy::disallowed_methods)] // test-only comparison of key material already in scope
     let bytes: [u8; 32] = sk.to_bytes();
     (
         SecretKeyEntry { id: id.to_string(), pubkey_hex: None },

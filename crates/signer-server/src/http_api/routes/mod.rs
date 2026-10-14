@@ -195,8 +195,12 @@ async fn sign_traced(
 /// proposer/block duty); the Web3Signer `type` stays distinct in the audit line.
 fn payload_duty(payload: &SignPayload) -> Duty {
     match payload {
-        SignPayload::Attestation { .. } => Duty::Attestation,
-        SignPayload::BlockV2 { .. } | SignPayload::RandaoReveal { .. } => Duty::Block,
+        SignPayload::Attestation { .. } | SignPayload::PayloadAttestation { .. } => {
+            Duty::Attestation
+        }
+        SignPayload::BlockV2 { .. }
+        | SignPayload::RandaoReveal { .. }
+        | SignPayload::ProposerPreferences { .. } => Duty::Block,
         SignPayload::AggregationSlot { .. }
         | SignPayload::AggregateAndProof { .. }
         | SignPayload::AggregateAndProofV2 { .. } => Duty::Aggregate,
@@ -204,6 +208,7 @@ fn payload_duty(payload: &SignPayload) -> Duty {
         SignPayload::SyncCommitteeContributionAndProof { .. }
         | SignPayload::SyncCommitteeSelectionProof { .. } => Duty::SyncContribution,
         SignPayload::ValidatorRegistration { .. } => Duty::ValidatorRegistration,
+        SignPayload::BuilderRequestAuth { .. } => Duty::BuilderRequestAuth,
         SignPayload::VoluntaryExit { .. } => Duty::VoluntaryExit,
     }
 }
@@ -220,7 +225,7 @@ fn payload_slot(payload: &SignPayload) -> Option<u64> {
             Some(aggregate_and_proof.aggregate.data.slot)
         }
         SignPayload::AggregateAndProofV2 { aggregate_and_proof } => {
-            Some(aggregate_and_proof.aggregate.data.slot)
+            Some(aggregate_and_proof.data.aggregate.data.slot)
         }
         SignPayload::SyncCommitteeMessage { sync_committee_message } => {
             Some(sync_committee_message.slot)
@@ -230,6 +235,15 @@ fn payload_slot(payload: &SignPayload) -> Option<u64> {
         }
         SignPayload::SyncCommitteeSelectionProof { sync_aggregator_selection_data } => {
             Some(sync_aggregator_selection_data.slot)
+        }
+        SignPayload::PayloadAttestation { payload_attestation } => {
+            Some(payload_attestation.data.slot)
+        }
+        SignPayload::ProposerPreferences { proposer_preferences } => {
+            Some(proposer_preferences.data.proposal_slot)
+        }
+        SignPayload::BuilderRequestAuth { builder_request_auth } => {
+            Some(builder_request_auth.data.slot())
         }
         SignPayload::RandaoReveal { .. }
         | SignPayload::ValidatorRegistration { .. }
@@ -264,8 +278,25 @@ async fn sign_inner(
     // 2. Decode the body. A serde decode failure maps to a FIXED 400 — the
     //    decoder message can echo request bytes / field text and is NEVER
     //    surfaced to the client (SEC-INFO-01).
-    let req: SignRequest = serde_json::from_slice(body)
-        .map_err(|_| HttpSignError::BadRequest("invalid sign request body".to_string()))?;
+    let req: SignRequest = serde_json::from_slice(body).map_err(|e| {
+        // Named unknown-version identifiers only. Empty / invalid tokens and
+        // every other decoder failure stay the fixed SEC-INFO-01 body.
+        match web3signer_wire::WireVersionError::from_serde_display(&e.to_string()) {
+            Some(web3signer_wire::WireVersionError::Unknown(value)) => {
+                // 8.4: fail-closed unknown version. Increment the `:9101`
+                // SignerMetrics registry this process serves — not the VC
+                // global REGISTRY. Version label is bounded "unknown", never
+                // the request token (`NOT_A_FORK`, …).
+                state.metrics.record_rejection(
+                    signer::metrics::rejection_reason::UNSUPPORTED_VERSION,
+                    peek_http_sign_type(body),
+                    signer::metrics::rejection_reason::UNKNOWN,
+                );
+                HttpSignError::BadRequest(format!("unknown version: {value}"))
+            }
+            _ => HttpSignError::BadRequest("invalid sign request body".to_string()),
+        }
+    })?;
     // Record the type for the audit entry now that the payload is known, so a
     // later slashing/gate rejection still audits the correct `type` (Issue 4.4).
     *rpc_type = Some(req.payload.type_name());
@@ -306,6 +337,23 @@ async fn sign_inner(
     Ok(sign_response(accept, &sig))
 }
 
+/// Bounded `sign_type` from a decode-failed body. Unknown `type` tokens map to
+/// [`signer::metrics::rejection_sign_type::UNKNOWN`], never the raw string.
+fn peek_http_sign_type(body: &[u8]) -> &'static str {
+    #[derive(serde::Deserialize)]
+    struct TypeOnly {
+        #[serde(rename = "type")]
+        type_name: Option<String>,
+    }
+    let Ok(partial) = serde_json::from_slice::<TypeOnly>(body) else {
+        return signer::metrics::rejection_sign_type::UNKNOWN;
+    };
+    match partial.type_name.as_deref() {
+        Some(name) => signer::metrics::sign_type_from_web3signer_type(name),
+        None => signer::metrics::rejection_sign_type::UNKNOWN,
+    }
+}
+
 /// Map Web3Signer payload types onto the bounded A7 `sign_*` type labels so HTTP
 /// and gRPC populate the same series with the same vocabulary.
 fn http_a7_sign_type(payload: &SignPayload) -> &'static str {
@@ -326,6 +374,9 @@ fn http_a7_sign_type(payload: &SignPayload) -> &'static str {
         }
         SignPayload::ValidatorRegistration { .. } => grpc_sign_type::BUILDER_REGISTRATION,
         SignPayload::VoluntaryExit { .. } => grpc_sign_type::VOLUNTARY_EXIT,
+        SignPayload::PayloadAttestation { .. } => grpc_sign_type::PAYLOAD_ATTESTATION,
+        SignPayload::ProposerPreferences { .. } => grpc_sign_type::PROPOSER_PREFERENCES,
+        SignPayload::BuilderRequestAuth { .. } => grpc_sign_type::BUILDER_REQUEST_AUTH,
     }
 }
 

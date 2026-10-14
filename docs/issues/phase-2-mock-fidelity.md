@@ -16,13 +16,13 @@ fidelity; the refactoring phase only reconciles status after layout changes.
 |-------|--------|----------|
 | **2.1** | **Done** | Landed as `0a1d50b` (`test(block-service): add CapturedCall structs…`). Survives RF6-10 mock merge. |
 | **2.2** | **Done** | Landed as `dfb529f` (`test(block-service): add assertion helpers…`). Content helpers + RED tests for #2/#3/#4 still present. |
-| **2.3** | **Superseded** | Target was `crates/sync-service` twin mocks (`SyncService` / `SyncSigner` / `SyncBeaconClient`). **RF2-01 / B1** (`c56ecfc`) deleted that stack; crate is residual `SyncServiceError` only. No mocks remain to extend. |
+| **2.3** | **Superseded** | Target was the former sync-service crate twin mocks (`SyncService` / `SyncSigner` / `SyncBeaconClient`). **RF2-01 / B1** (`c56ecfc`) deleted that stack; **ARCH-3** removed the residual shell entirely. No mocks remain to extend. |
 | **2.4** | **Superseded** | Same as 2.3 — assertion helpers would have attached to deleted mocks. Do not re-implement on the dead twin. Production path is `SyncCommitteeService` under `crates/rvc/src/orchestrator/sync_committee.rs` (own tests / `MockBeaconNodeClient`). |
 | 2.5–2.7 | Unchanged by this reconciliation | Signer-side; out of H4 mock-fidelity scope. |
 
 ### Post-RF6-10 home for block-service mocks
 
-Plan text still mentions `crates/block-service/src/service.rs`. After RF6-10 the capturing surface lives at:
+Plan text still mentions crates/block-service/src/service.rs (pre-RF6-10 layout; path no longer exists). After RF6-10 the capturing surface lives at:
 
 - `crates/block-service/src/service/tests/mocks.rs` — `CapturedProduceCall`, `CapturedPublishCall`, `CapturedSignBlockCall`, `MockBeaconClient`, `MockSigner`, assertion helpers
 - Exactly **one** `impl BeaconBlockClient for` in the crate (merged capture mock)
@@ -176,14 +176,14 @@ Add assertion helper methods to `MockBeaconClient` and `MockSigner`. Update exis
 Define `CapturedSyncSignCall`, `CapturedSelectionProofCall`, `CapturedContributionSignCall`, and `CapturedSubmittedMessages` structs in the sync-service test module. Extend `MockSigner` to capture full arguments in all sign methods. Extend `MockBeacon` to capture submitted messages and contribution proofs. Keep existing `AtomicUsize` counters for backward compatibility.
 
 **Why superseded:**
-`crates/sync-service` no longer hosts a `SyncService` / `SyncSigner` / `SyncBeaconClient` twin (RF2-01,
-commit `c56ecfc`). The crate exports residual `SyncServiceError` only. Capturing structs and mock
-extensions would target deleted code (~900 lines of twin + isolation tests removed). Findings #5/#6
-as originally filed against those mocks are **no longer applicable**. Any future fidelity work belongs
-on production `SyncCommitteeService` tests, not a resurrected twin.
+the former sync-service crate no longer hosts a `SyncService` / `SyncSigner` / `SyncBeaconClient` twin (RF2-01,
+commit `c56ecfc`); ARCH-3 deleted the residual shell. Capturing structs and mock extensions would target
+deleted code (~900 lines of twin + isolation tests removed). Findings #5/#6 as originally filed against
+those mocks are **no longer applicable**. Any future fidelity work belongs on production
+`SyncCommitteeService` tests, not a resurrected twin.
 
 **Implementation Notes (historical — do not execute):**
-- File: `crates/sync-service/src/lib.rs` — modify `#[cfg(test)]` module
+- File: the former sync-service lib (deleted with ARCH-3) — modify `#[cfg(test)]` module
 - Add structs (per architecture doc Section 1.4):
   ```
   CapturedSyncSignCall { beacon_block_root, slot, pubkey, fork_schedule, genesis_validators_root }
@@ -196,14 +196,14 @@ on production `SyncCommitteeService` tests, not a resurrected twin.
 - MUST use `tokio::sync::Mutex` (sync-service traits are async)
 - Keep existing `AtomicUsize` counters alongside capture vectors
 - All new capture fields initialized empty — zero breakage
-- Files NOT to modify: anything outside `crates/sync-service/src/lib.rs`
+- Files NOT to modify: anything outside the former sync-service lib (deleted with ARCH-3)
 
 **Acceptance Criteria:**
 - [x] **Closed as superseded** — twin mocks deleted by RF2-01; no capture structs required
-- [x] Confirmed: `rg "SyncService\b"` only hits `SyncServiceError`; no `SyncSigner` / `SyncBeaconClient`
+- [x] Confirmed: no `SyncService` / `SyncSigner` / `SyncBeaconClient` production surface remains
 
 **Testing Notes:**
-- Run `cargo test -p rvc-sync-service` (residual surface only)
+- N/A — package removed (ARCH-3)
 
 ---
 
@@ -226,7 +226,7 @@ Phase 3 Stream B (3.5–3.7) should treat the "uses upgraded sync-service mocks"
 retargeted rather than waiting on 2.4.
 
 **Implementation Notes (historical — do not execute):**
-- File: `crates/sync-service/src/lib.rs` — modify `#[cfg(test)]` module
+- File: the former sync-service lib (deleted with ARCH-3) — modify `#[cfg(test)]` module
 - Add helpers (per architecture doc Section 1.5):
   - `MockSigner::assert_last_sync_sign_args(expected_slot, expected_root)`
   - `MockBeacon::assert_last_submitted_messages(expected_count) -> Vec<SyncCommitteeMessage>`
@@ -234,7 +234,7 @@ retargeted rather than waiting on 2.4.
 - Key validation (#5): test must fail if any field (`beacon_block_root`, `validator_index`, `slot`, `signature`) in submitted message is incorrect
 - Key validation (#6): test must fail if production code passes wrong `slot`, `pubkey`, or `subcommittee_index` to signer
 - Async assertion helpers (use `.await`)
-- Files NOT to modify: anything outside `crates/sync-service/src/lib.rs`
+- Files NOT to modify: anything outside the former sync-service lib (deleted with ARCH-3)
 
 **Acceptance Criteria:**
 - [x] **Closed as superseded** — no twin assertion helpers to add

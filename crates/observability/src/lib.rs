@@ -7,3 +7,4 @@
 pub mod hex;
 pub mod logging;
 pub mod pubkey;
+pub mod span_names;

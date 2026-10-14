@@ -5,10 +5,11 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
-use crypto::{CompositeSigner, PublicKey, RemoteSigner, RemoteSignerConfig};
+use crypto::{CompositeSigner, PublicKey};
 use keymanager_api::traits::{
     DeleteRemoteKeyError, ImportRemoteKeyError, Pubkey, RemoteKeyManager,
 };
+use remote_signer_client::{RemoteSigner, RemoteSignerConfig};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -85,7 +86,7 @@ impl RemoteKeyManager for RemoteKeyManagerAdapter {
         let remote_signer = RemoteSigner::new(config, vec![pubkey])
             .map_err(|e| ImportRemoteKeyError::Backend(e.to_string()))?;
 
-        self.composite_signer.add_remote_key(pubkey, remote_signer);
+        self.composite_signer.add_remote_key(pubkey, Arc::new(remote_signer));
         keys.push((pubkey, url));
 
         // Update shared pubkey_map and notify under `tracked_keys` (same lock

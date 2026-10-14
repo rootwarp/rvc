@@ -6,7 +6,7 @@ use crate::BlockServiceError;
 ///
 /// Checks:
 /// - `proposer_index` matches the expected duty validator index (H-4).
-/// - `parent_root` matches the expected head root when provided (H-4).
+/// - `parent_root` matches the expected previous-slot parent when provided (H-4).
 ///
 /// Both `validate_full` (unblinded) and `validate_blinded` paths apply the same
 /// logic so the builder and non-builder code paths are symmetric.
@@ -127,6 +127,30 @@ mod tests {
             result,
             Err(BlockServiceError::ProposerIndexMismatch { expected: 42, got: 43 })
         ));
+    }
+
+    /// ARCH-3e: expected parent is the previous-slot root, not a current-slot head.
+    #[test]
+    fn test_wrong_ancestor_parent_rejected() {
+        let previous_slot_parent: Root = [0x11; 32];
+        let wrong_ancestor: Root = [0x22; 32];
+        let v = validator(42, Some(previous_slot_parent));
+        let block = full_block(42, wrong_ancestor);
+        let result = v.validate_full(&block);
+        assert!(matches!(
+            result,
+            Err(BlockServiceError::ParentRootMismatch { expected, got })
+            if expected == previous_slot_parent && got == wrong_ancestor
+        ));
+    }
+
+    /// ARCH-3e: previous-slot parent is accepted (naive head-as-parent would reject).
+    #[test]
+    fn test_previous_slot_parent_accepted() {
+        let previous_slot_parent: Root = [0x11; 32];
+        let v = validator(42, Some(previous_slot_parent));
+        let block = full_block(42, previous_slot_parent);
+        assert!(v.validate_full(&block).is_ok());
     }
 
     /// Reachability: ParentRootMismatch — full block with wrong parent_root.

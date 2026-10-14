@@ -1,5 +1,9 @@
 use serde::Deserialize;
 
+mod frame;
+
+use frame::{SseFramer, SseMessage};
+
 /// Data from a `head` SSE event.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct HeadEvent {
@@ -108,9 +112,10 @@ pub struct SseConfig {
     pub endpoint: String,
     /// Topics to subscribe to.
     pub topics: Vec<String>,
-    /// Maximum bytes allowed in a single SSE event `data` field (H-11).
+    /// Maximum bytes retained for one SSE frame (H-11).
     ///
-    /// Events that exceed this threshold are dropped with a `warn!` log.
+    /// The pending line and the `data`, `event`, and `id` fields each stop at
+    /// this size. A frame that would grow past it closes the connection.
     /// Default: 64 KiB.
     pub max_event_bytes: usize,
 }
@@ -134,11 +139,95 @@ pub enum SseConnectionState {
     Disconnected,
 }
 
+/// `true` keeps the connection. `false` counts a failure and reconnects.
+///
+/// A `data` payload past the cap is the second guard behind the framer.
+fn forward_sse_message(
+    endpoint: &str,
+    msg: &SseMessage,
+    max_event_bytes: usize,
+    tx: &tokio::sync::mpsc::Sender<SseEvent>,
+    consecutive_failures: &mut u32,
+    events_since_reconnect: &mut u64,
+) -> bool {
+    use observability::logging::RedactedUrl;
+    use tokio::sync::mpsc::error::TrySendError;
+    use tracing::{debug, trace, warn};
+
+    if msg.data.len() > max_event_bytes {
+        warn!(
+            size = msg.data.len(),
+            cap = max_event_bytes,
+            "SSE event size {} exceeds cap {}; closing connection",
+            msg.data.len(),
+            max_event_bytes
+        );
+        return false;
+    }
+
+    match parse_sse_event(&msg.event, &msg.data) {
+        Ok(sse_event) => {
+            *events_since_reconnect += 1;
+            if *events_since_reconnect == 1 && *consecutive_failures > 0 {
+                debug!(
+                    previous_failures = *consecutive_failures,
+                    "BN recovered, resetting failure counter"
+                );
+                *consecutive_failures = 0;
+            }
+            let slot = match &sse_event {
+                SseEvent::Head(h) => h.slot.as_str(),
+                SseEvent::Block(b) => b.slot.as_str(),
+                SseEvent::ChainReorg(r) => r.slot.as_str(),
+                SseEvent::FinalizedCheckpoint(_) => "",
+            };
+            trace!(event_type = %msg.event, slot = slot, "SSE event received");
+            match tx.try_send(sse_event) {
+                Ok(()) => true,
+                Err(TrySendError::Full(_)) => {
+                    warn!("SSE callback channel full; dropping event");
+                    true
+                }
+                Err(TrySendError::Closed(_)) => {
+                    warn!(
+                        bn_url = %RedactedUrl(endpoint),
+                        "SSE callback consumer exited; reconnecting"
+                    );
+                    false
+                }
+            }
+        }
+        Err(SseError::UnknownEvent(evt)) => {
+            debug!(event_type = %evt, "ignoring unknown SSE event type");
+            true
+        }
+        Err(e) => {
+            warn!(error = %e, "failed to parse SSE event");
+            true
+        }
+    }
+}
+
+fn content_type_is_event_stream(value: &reqwest::header::HeaderValue) -> bool {
+    let Ok(text) = value.to_str() else {
+        return false;
+    };
+    match text.split(';').next() {
+        Some(essence) => essence.trim().eq_ignore_ascii_case("text/event-stream"),
+        None => false,
+    }
+}
+
 /// Subscribes to beacon node SSE events. Calls `callback` for each parsed event.
 ///
 /// H-11 hardening applied:
-/// - Per-event size cap: events whose `data` field exceeds `config.max_event_bytes` (default
-///   64 KiB) are dropped with a `warn!` log; the connection continues.
+/// - Frame cap: the pending line and the `data`, `event`, and `id` fields each
+///   stop at `config.max_event_bytes` (default 64 KiB) before further bytes are
+///   buffered. A frame past the cap, or definite invalid UTF-8 (checked as
+///   bytes arrive, not only at EOL), closes the connection and counts as a
+///   failure (reconnect, then failover).
+/// - Leading U+FEFF is stripped as a character. A BOM-prefixed stream does not
+///   panic the `bn.sse` task.
 /// - Content-Type validation: if the server does not respond with `text/event-stream`, the
 ///   connection is dropped with a `warn!` log and reconnect is attempted.
 /// - Bounded dispatch: callbacks are dispatched via a bounded
@@ -159,9 +248,8 @@ pub async fn subscribe_events<F>(
     F: Fn(SseEvent) + Send + Sync + 'static,
 {
     use observability::logging::RedactedUrl;
-    use reqwest_eventsource::{Error as EsError, Event, EventSource};
-    use tokio::sync::mpsc::error::TrySendError;
-    use tracing::{debug, info, trace, warn};
+    use reqwest::header::{ACCEPT, CONTENT_TYPE};
+    use tracing::{debug, info, warn};
 
     if configs.is_empty() {
         warn!("No SSE endpoints configured");
@@ -176,6 +264,16 @@ pub async fn subscribe_events<F>(
             callback(event);
         }
     });
+
+    // One client for the life of the subscriber. Idle pooling is off so a
+    // frame we abandon is not reused as the next request's socket.
+    let client = match reqwest::Client::builder().pool_max_idle_per_host(0).build() {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(error = %err, "failed to build SSE HTTP client");
+            return;
+        }
+    };
 
     let mut current_idx = 0;
     let mut consecutive_failures: u32 = 0;
@@ -231,128 +329,155 @@ pub async fn subscribe_events<F>(
             "Connecting to SSE stream"
         );
 
-        let mut es = EventSource::get(&url);
         events_since_reconnect = 0;
+        let endpoint = config.endpoint.as_str();
 
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => {
-                    info!("SSE subscriber shutting down");
-                    es.close();
-                    return;
-                }
-                event = futures::StreamExt::next(&mut es) => {
-                    match event {
-                        Some(Ok(Event::Open)) => {
-                            debug!(
-                                bn_url = %RedactedUrl(&config.endpoint),
-                                event_types = %topics,
-                                "SSE connection established"
-                            );
-                            // Don't reset consecutive_failures on Open alone;
-                            // wait for at least one valid event to confirm BN health
-                        }
-                        Some(Ok(Event::Message(msg))) => {
-                            // H-11: per-event size cap — drop oversize events without
-                            // closing the connection.
-                            let event_size = msg.data.len();
-                            if event_size > max_event_bytes {
-                                warn!(
-                                    size = event_size,
-                                    cap = max_event_bytes,
-                                    "SSE event size {} exceeds cap {}; dropping",
-                                    event_size,
-                                    max_event_bytes
-                                );
-                                continue;
-                            }
-
-                            match parse_sse_event(&msg.event, &msg.data) {
-                                Ok(sse_event) => {
-                                    events_since_reconnect += 1;
-                                    if events_since_reconnect == 1 && consecutive_failures > 0 {
-                                        debug!(
-                                            previous_failures = consecutive_failures,
-                                            "BN recovered, resetting failure counter"
-                                        );
-                                        consecutive_failures = 0;
-                                    }
-                                    let slot = match &sse_event {
-                                        SseEvent::Head(h) => h.slot.as_str(),
-                                        SseEvent::Block(b) => b.slot.as_str(),
-                                        SseEvent::ChainReorg(r) => r.slot.as_str(),
-                                        SseEvent::FinalizedCheckpoint(_) => "",
-                                    };
-                                    trace!(
-                                        event_type = %msg.event,
-                                        slot = slot,
-                                        "SSE event received"
-                                    );
-                                    // H-11: non-blocking dispatch — drop on full channel.
-                                    match tx.try_send(sse_event) {
-                                        Ok(()) => {}
-                                        Err(TrySendError::Full(_)) => {
-                                            warn!("SSE callback channel full; dropping event");
-                                        }
-                                        Err(TrySendError::Closed(_)) => {
-                                            // Consumer task exited — reconnect to re-create
-                                            // the tx/rx pair so events are not silently dropped.
-                                            warn!(
-                                                bn_url = %RedactedUrl(&config.endpoint),
-                                                "SSE callback consumer exited; reconnecting"
-                                            );
-                                            consecutive_failures += 1;
-                                            es.close();
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(SseError::UnknownEvent(evt)) => {
-                                    debug!(event_type = %evt, "ignoring unknown SSE event type");
-                                }
-                                Err(e) => {
-                                    warn!(error = %e, "failed to parse SSE event");
-                                }
-                            }
-                        }
-                        Some(Err(EsError::InvalidContentType(ct, _))) => {
-                            // H-11: Content-Type must be text/event-stream.
-                            warn!(
-                                content_type = ?ct,
-                                bn_url = %RedactedUrl(&config.endpoint),
-                                "SSE response Content-Type is not text/event-stream; dropping connection"
-                            );
-                            consecutive_failures += 1;
-                            es.close();
-                            break;
-                        }
-                        Some(Err(err)) => {
-                            warn!(
-                                bn_url = %RedactedUrl(&config.endpoint),
-                                reason = %err,
-                                "SSE disconnection"
-                            );
-                            consecutive_failures += 1;
-                            es.close();
-                            break;
-                        }
-                        None => {
-                            warn!(
-                                bn_url = %RedactedUrl(&config.endpoint),
-                                reason = "stream ended",
-                                "SSE disconnection"
-                            );
-                            consecutive_failures += 1;
-                            break;
-                        }
-                    }
-                }
+        let request = client.get(&url).header(ACCEPT, "text/event-stream").send();
+        let response = tokio::select! {
+            _ = shutdown.changed() => {
+                info!("SSE subscriber shutting down");
+                return;
             }
+            response = request => response,
+        };
+
+        let mut resp = match response {
+            Ok(resp) => resp,
+            Err(err) => {
+                warn!(
+                    bn_url = %RedactedUrl(endpoint),
+                    reason = %err,
+                    "SSE disconnection"
+                );
+                consecutive_failures += 1;
+                info!(
+                    bn_url = %RedactedUrl(endpoint),
+                    attempt = consecutive_failures,
+                    "SSE reconnecting"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        if resp.status() != reqwest::StatusCode::OK {
+            warn!(
+                bn_url = %RedactedUrl(endpoint),
+                status = %resp.status(),
+                "SSE response status is not 200; dropping connection"
+            );
+            consecutive_failures += 1;
+            drop(resp);
+            info!(
+                bn_url = %RedactedUrl(endpoint),
+                attempt = consecutive_failures,
+                "SSE reconnecting"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
         }
 
-        // Brief delay before reconnecting
+        let content_type = resp.headers().get(CONTENT_TYPE).cloned();
+        if !content_type.as_ref().is_some_and(content_type_is_event_stream) {
+            warn!(
+                content_type = ?content_type,
+                bn_url = %RedactedUrl(endpoint),
+                "SSE response Content-Type is not text/event-stream; dropping connection"
+            );
+            consecutive_failures += 1;
+            drop(resp);
+            info!(
+                bn_url = %RedactedUrl(endpoint),
+                attempt = consecutive_failures,
+                "SSE reconnecting"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+
+        debug!(
+            bn_url = %RedactedUrl(endpoint),
+            event_types = %topics,
+            "SSE connection established"
+        );
+
+        let mut framer = SseFramer::new(max_event_bytes);
+        loop {
+            let chunk = tokio::select! {
+                _ = shutdown.changed() => {
+                    info!("SSE subscriber shutting down");
+                    return;
+                }
+                chunk = resp.chunk() => chunk,
+            };
+            let reconnect = match chunk {
+                Ok(Some(bytes)) => match framer.push(&bytes, |msg| {
+                    forward_sse_message(
+                        endpoint,
+                        &msg,
+                        max_event_bytes,
+                        &tx,
+                        &mut consecutive_failures,
+                        &mut events_since_reconnect,
+                    )
+                }) {
+                    Ok(keep_going) => !keep_going,
+                    Err(err) => {
+                        warn!(
+                            bn_url = %RedactedUrl(endpoint),
+                            error = %err,
+                            cap = max_event_bytes,
+                            "SSE frame rejected; closing connection"
+                        );
+                        true
+                    }
+                },
+                Ok(None) => {
+                    // Flush a line that ended with a lone `\r` at EOF before
+                    // treating the stream as closed.
+                    if let Err(err) = framer.finish(|msg| {
+                        forward_sse_message(
+                            endpoint,
+                            &msg,
+                            max_event_bytes,
+                            &tx,
+                            &mut consecutive_failures,
+                            &mut events_since_reconnect,
+                        )
+                    }) {
+                        warn!(
+                            bn_url = %RedactedUrl(endpoint),
+                            error = %err,
+                            cap = max_event_bytes,
+                            "SSE frame rejected; closing connection"
+                        );
+                    }
+                    warn!(
+                        bn_url = %RedactedUrl(endpoint),
+                        reason = "stream ended",
+                        "SSE disconnection"
+                    );
+                    true
+                }
+                Err(err) => {
+                    warn!(
+                        bn_url = %RedactedUrl(endpoint),
+                        reason = %err,
+                        "SSE disconnection"
+                    );
+                    true
+                }
+            };
+            if reconnect {
+                consecutive_failures += 1;
+                break;
+            }
+        }
+        // Drop the response before the backoff so the BN sees the close.
+        drop(resp);
+
         info!(
-            bn_url = %RedactedUrl(&config.endpoint),
+            bn_url = %RedactedUrl(endpoint),
             attempt = consecutive_failures,
             "SSE reconnecting"
         );
@@ -988,5 +1113,378 @@ mod tests {
             SseEvent::Head(h) => assert_eq!(h.slot, "42"),
             other => panic!("expected Head event, got: {:?}", other),
         }
+    }
+
+    fn head_json(slot: &str) -> String {
+        format!(
+            "{{\"slot\":\"{slot}\",\"block\":\"0xabc\",\"state\":\"0xdef\",\
+             \"epoch_transition\":false,\"previous_duty_dependent_root\":\"0x111\",\
+             \"current_duty_dependent_root\":\"0x222\",\"execution_optimistic\":false}}"
+        )
+    }
+
+    /// Send `body` once and leave the socket open. No terminating chunk, so a
+    /// client that keeps the stream after the bytes have arrived does not see
+    /// end-of-stream.
+    async fn start_holding_sse_server(body: Vec<u8>) -> (u16, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let headers = "HTTP/1.1 200 OK\r\n\
+                         Content-Type: text/event-stream\r\n\
+                         Cache-Control: no-cache\r\n\
+                         Transfer-Encoding: chunked\r\n\
+                         \r\n";
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let chunk = format!("{:x}\r\n", body.len());
+                    let _ = stream.write_all(chunk.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.write_all(b"\r\n").await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+        (port, handle)
+    }
+
+    /// Drip `payload` in small HTTP chunks. Stop when the client closes or the
+    /// payload is exhausted. Returns bytes of payload written on this connection.
+    async fn drip_sse_payload(stream: &mut tokio::net::TcpStream, payload: &[u8]) -> usize {
+        use tokio::io::AsyncWriteExt;
+
+        let headers = "HTTP/1.1 200 OK\r\n\
+             Content-Type: text/event-stream\r\n\
+             Cache-Control: no-cache\r\n\
+             Transfer-Encoding: chunked\r\n\
+             \r\n";
+        if stream.write_all(headers.as_bytes()).await.is_err() {
+            return 0;
+        }
+        let mut written = 0usize;
+        while written < payload.len() {
+            let end = (written + 1024).min(payload.len());
+            let piece = &payload[written..end];
+            let header = format!("{:x}\r\n", piece.len());
+            let write = async {
+                stream.write_all(header.as_bytes()).await?;
+                stream.write_all(piece).await?;
+                stream.write_all(b"\r\n").await?;
+                stream.flush().await?;
+                Ok::<(), std::io::Error>(())
+            };
+            match tokio::time::timeout(std::time::Duration::from_millis(150), write).await {
+                Ok(Ok(())) => written = end,
+                _ => break,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        written
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_events_leading_bom_is_parsed_without_panic() {
+        use std::sync::{Arc, Mutex};
+
+        let sse_body = format!("\u{feff}event: head\ndata: {}\n\n", head_json("7"));
+
+        let (port, server_handle) = start_sse_server(&sse_body).await;
+
+        let events: Arc<Mutex<Vec<SseEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let config = SseConfig::new(format!("http://127.0.0.1:{port}"));
+
+        let handle = tokio::spawn(async move {
+            subscribe_events(
+                vec![config],
+                move |event| {
+                    events_clone.lock().unwrap().push(event);
+                },
+                rx,
+            )
+            .await;
+        });
+
+        for _ in 0..30 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !events.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+
+        let _ = tx.send(true);
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+        server_handle.abort();
+
+        let joined = joined.expect("subscriber timed out");
+        assert!(joined.is_ok(), "leading U+FEFF must not panic the subscriber: {joined:?}");
+
+        let received = events.lock().unwrap();
+        assert!(!received.is_empty(), "BOM-prefixed head event must be parsed");
+        match &received[0] {
+            SseEvent::Head(h) => assert_eq!(h.slot, "7"),
+            other => panic!("expected Head event, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oversize_incomplete_line_closes_before_buffering_the_rest() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        use tokio::net::TcpListener;
+
+        const CAP: usize = 4 * 1024;
+        const OFFERED: usize = 256 * 1024;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connects = Arc::new(AtomicUsize::new(0));
+        let first_written = Arc::new(AtomicUsize::new(0));
+        let connects_srv = connects.clone();
+        let first_srv = first_written.clone();
+
+        let server_handle = tokio::spawn(async move {
+            let payload = vec![b'x'; OFFERED];
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                let n = connects_srv.fetch_add(1, Ordering::SeqCst);
+                let payload = payload.clone();
+                let first_srv = first_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let written = drip_sse_payload(&mut stream, &payload).await;
+                    if n == 0 {
+                        first_srv.store(written, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut config = SseConfig::new(format!("http://127.0.0.1:{port}"));
+        config.max_event_bytes = CAP;
+
+        let handle = tokio::spawn(async move {
+            subscribe_events(vec![config], |_event: SseEvent| {}, rx).await;
+        });
+
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if connects.load(Ordering::SeqCst) >= 2 && first_written.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+
+        tx.send(true).unwrap();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+        server_handle.abort();
+
+        assert!(joined.is_ok(), "oversize line must not hang or panic the subscriber");
+        let joined = joined.unwrap();
+        assert!(joined.is_ok(), "oversize line must not panic the subscriber: {joined:?}");
+
+        let connects = connects.load(Ordering::SeqCst);
+        let written = first_written.load(Ordering::SeqCst);
+        assert!(
+            connects >= 2,
+            "oversize incomplete line must close and reconnect, connects={connects} written={written}"
+        );
+        assert!(
+            written < OFFERED,
+            "incomplete line was buffered to the end ({written} of {OFFERED})"
+        );
+        // Socket and HTTP read-ahead sit above the framer cap. The framer unit
+        // test pins retained bytes to the cap; this bound is the connection.
+        assert!(
+            written <= CAP * 8,
+            "incomplete line was not cut off near {CAP} bytes (wrote {written})"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversize_multi_data_event_fails_over() {
+        use std::sync::{Arc, Mutex};
+
+        const CAP: usize = 2048;
+        // Many small `data:` lines and no blank line. The accumulated field
+        // crosses the cap before a complete event exists.
+        let line = b"data: 0123456789abcdef\n";
+        let mut payload = Vec::new();
+        while payload.len() < CAP * 8 {
+            payload.extend_from_slice(line);
+        }
+
+        let (primary_port, primary_handle) = start_holding_sse_server(payload).await;
+        let secondary_body = format!("event: head\ndata: {}\n\n", head_json("42"));
+        let (secondary_port, secondary_handle) = start_sse_server(&secondary_body).await;
+
+        let events: Arc<Mutex<Vec<SseEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        let mut primary = SseConfig::new(format!("http://127.0.0.1:{primary_port}"));
+        primary.max_event_bytes = CAP;
+        let mut secondary = SseConfig::new(format!("http://127.0.0.1:{secondary_port}"));
+        secondary.max_event_bytes = CAP;
+
+        let handle = tokio::spawn(async move {
+            subscribe_events(
+                vec![primary, secondary],
+                move |event| {
+                    events_clone.lock().unwrap().push(event);
+                },
+                rx,
+            )
+            .await;
+        });
+
+        for _ in 0..80 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !events.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+
+        tx.send(true).unwrap();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+        primary_handle.abort();
+        secondary_handle.abort();
+
+        let joined = joined.expect("subscriber timed out");
+        assert!(joined.is_ok(), "oversize data field must not panic: {joined:?}");
+        let received = events.lock().unwrap();
+        assert!(
+            !received.is_empty(),
+            "oversize multi-data event must count as a failure and fail over"
+        );
+        match &received[0] {
+            SseEvent::Head(h) => assert_eq!(h.slot, "42"),
+            other => panic!("expected Head event from the secondary BN, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_invalid_utf8_without_newline_fails_over() {
+        use std::sync::{Arc, Mutex};
+
+        // Invalid byte mid-line, then idle — no EOL. from_utf8_lossy at EOL
+        // would never fire; the connection must close and fail over now.
+        let payload = b"data: hi\xff".to_vec();
+        let (primary_port, primary_handle) = start_holding_sse_server(payload).await;
+        let secondary_body = format!("event: head\ndata: {}\n\n", head_json("99"));
+        let (secondary_port, secondary_handle) = start_sse_server(&secondary_body).await;
+
+        let events: Arc<Mutex<Vec<SseEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        let primary = SseConfig::new(format!("http://127.0.0.1:{primary_port}"));
+        let secondary = SseConfig::new(format!("http://127.0.0.1:{secondary_port}"));
+
+        let handle = tokio::spawn(async move {
+            subscribe_events(
+                vec![primary, secondary],
+                move |event| {
+                    events_clone.lock().unwrap().push(event);
+                },
+                rx,
+            )
+            .await;
+        });
+
+        for _ in 0..80 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if !events.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+
+        tx.send(true).unwrap();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+        primary_handle.abort();
+        secondary_handle.abort();
+
+        let joined = joined.expect("subscriber timed out");
+        assert!(joined.is_ok(), "invalid UTF-8 must not panic: {joined:?}");
+        let received = events.lock().unwrap();
+        assert!(
+            !received.is_empty(),
+            "invalid UTF-8 mid-line must close and fail over without waiting for EOL"
+        );
+        match &received[0] {
+            SseEvent::Head(h) => assert_eq!(h.slot, "99"),
+            other => panic!("expected Head event from the secondary BN, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_oversize_id_field_closes_and_reconnects() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        const CAP: usize = 1024;
+        let mut body = b"id: ".to_vec();
+        body.extend(std::iter::repeat_n(b'i', CAP * 8));
+
+        let connects = Arc::new(AtomicUsize::new(0));
+        let connects_srv = connects.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else { break };
+                connects_srv.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    use tokio::io::AsyncWriteExt;
+                    let mut buf = [0u8; 4096];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let chunk = format!("{:x}\r\n", body.len());
+                    let _ = stream.write_all(chunk.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    let _ = stream.write_all(b"\r\n").await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                });
+            }
+        });
+
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let mut config = SseConfig::new(format!("http://127.0.0.1:{port}"));
+        config.max_event_bytes = CAP;
+        let handle = tokio::spawn(async move {
+            subscribe_events(vec![config], |_event: SseEvent| {}, rx).await;
+        });
+
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if connects.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+        }
+
+        tx.send(true).unwrap();
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+        server_handle.abort();
+        assert!(joined.unwrap().is_ok(), "oversize id field must not panic");
+        let connects = connects.load(Ordering::SeqCst);
+        assert!(connects >= 2, "oversize id field must close and reconnect, connects={connects}");
     }
 }

@@ -17,8 +17,15 @@ server = []
 client = []
 
 [dependencies]
+# Used by tonic::include_proto! generated code (OUT_DIR); machete cannot see it.
 prost.workspace = true
 tonic = { workspace = true }
 
+[dev-dependencies]
+eth-types.workspace = true
+
 [build-dependencies]
 tonic-build.workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["prost"]

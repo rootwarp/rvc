@@ -3,7 +3,7 @@ use std::time::Duration;
 use beacon::RetryPolicy;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::{debug, warn, Instrument};
 
 /// beaconcha.in monitoring API v1 payload for the validator process.
 #[derive(Debug, Clone, Serialize)]
@@ -25,7 +25,8 @@ pub struct MonitoringPayload {
 /// Collects current process metrics into a `MonitoringPayload`.
 ///
 /// `validator_total` and `validator_active` are provided by the caller
-/// (from the validator store). CPU and memory are read from the current process.
+/// (typically live `PubkeyMap` size and enabled `ValidatorStore` count).
+/// CPU and memory are read from the current process.
 pub fn collect_metrics(validator_total: u32, validator_active: u32) -> MonitoringPayload {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -85,7 +86,7 @@ fn read_process_metrics_linux() -> (u64, u64) {
     let utime: u64 = fields[13].parse().unwrap_or(0);
     let stime: u64 = fields[14].parse().unwrap_or(0);
     let ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as u64;
-    let cpu_seconds = if ticks_per_sec > 0 { (utime + stime) / ticks_per_sec } else { 0 };
+    let cpu_seconds = (utime + stime).checked_div(ticks_per_sec).unwrap_or(0);
 
     // Field 23 = rss (pages)
     let rss_pages: u64 = fields[23].parse().unwrap_or(0);
@@ -155,17 +156,29 @@ pub async fn start_monitoring_push(
     // Skip the immediate first tick
     interval.tick().await;
 
+    // detached: process-lifetime loop root; the tick is the exported span.
+    let loop_span = tracing::info_span!(parent: None, "monitoring_push");
     loop {
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                debug!("Monitoring push task shutting down");
-                return;
+        let tick = tracing::info_span!(parent: None, "monitoring_push.tick");
+        tick.follows_from(&loop_span);
+        let stop = async {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    debug!("Monitoring push task shutting down");
+                    true
+                }
+                _ = interval.tick() => {
+                    let (total, active) = validator_count_fn();
+                    let payload = collect_metrics(total, active);
+                    push_with_retry(&client, &config.endpoint, &payload).await;
+                    false
+                }
             }
-            _ = interval.tick() => {
-                let (total, active) = validator_count_fn();
-                let payload = collect_metrics(total, active);
-                push_with_retry(&client, &config.endpoint, &payload).await;
-            }
+        }
+        .instrument(tick)
+        .await;
+        if stop {
+            return;
         }
     }
 }

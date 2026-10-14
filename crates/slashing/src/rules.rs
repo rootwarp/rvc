@@ -4,8 +4,9 @@
 //! [`stage_block`](crate::SlashingDb::stage_block) /
 //! [`stage_attestation`](crate::SlashingDb::stage_attestation) build a
 //! targeted SQL history impl (see `history` module) and translate the verdict.
-//! The Vec-backed full-scan history types remain under `cfg(test)` as the
-//! old-vs-new equivalence oracle.
+//! The Vec-backed full-scan history types remain under
+//! `cfg(any(test, feature = "test-utils"))` as the old-vs-new equivalence
+//! oracle.
 
 use eth_types::{Epoch, Slot};
 use observability::logging::TruncatedPubkey;
@@ -107,24 +108,25 @@ pub(crate) enum AttestationVerdict {
 
 // ── Full-scan history (Vec-backed oracle; production uses TargetedSql in history.rs) ─
 //
-// Kept under `cfg(test)` for one release as the RF4-18 old-vs-new equivalence
-// oracle. Production stage paths never construct these.
+// Kept under `cfg(any(test, feature = "test-utils"))` as the RF4-18 old-vs-new
+// equivalence oracle and the ARCH-5h history-validity oracle. Production
+// stage/reserve paths never construct these.
 
-/// Full-history attestation scan — equivalence oracle for RF4-18.
-#[cfg(test)]
+/// Full-history attestation scan — equivalence oracle for RF4-18 / ARCH-5h.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Clone)]
 pub(crate) struct FullScanAttestationHistory {
     rows: Vec<ExistingAtt>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl FullScanAttestationHistory {
     pub(crate) fn new(rows: Vec<ExistingAtt>) -> Self {
         Self { rows }
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl AttestationHistory for FullScanAttestationHistory {
     fn conflicting_at_target(&self, target: Epoch) -> Result<Option<ExistingAtt>, SlashingError> {
         Ok(self.rows.iter().find(|r| r.target_epoch == target).cloned())
@@ -161,15 +163,15 @@ impl AttestationHistory for FullScanAttestationHistory {
     }
 }
 
-/// Full-history block scan — equivalence oracle for RF4-18.
-#[cfg(test)]
+/// Full-history block scan — equivalence oracle for RF4-18 / ARCH-5h.
+#[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug, Clone)]
 pub(crate) struct FullScanBlockHistory {
     /// `(slot, signing_root)` rows for one pubkey.
     rows: Vec<(Slot, Option<String>)>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl FullScanBlockHistory {
     /// Construct from an arbitrary row list (unit tests and full-table loads).
     pub(crate) fn new(rows: Vec<(Slot, Option<String>)>) -> Self {
@@ -177,7 +179,7 @@ impl FullScanBlockHistory {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 impl BlockHistory for FullScanBlockHistory {
     fn signing_root_at_slot(&self, slot: Slot) -> Result<Option<Option<String>>, SlashingError> {
         Ok(self.rows.iter().find(|(s, _)| *s == slot).map(|(_, r)| r.clone()))
@@ -364,6 +366,138 @@ pub(crate) fn check_attestation(
     } else {
         Ok(AttestationVerdict::Stage)
     }
+}
+
+// ── ARCH-5h test-utils oracle ─────────────────────────────────────────────────
+
+/// First EIP-3076 slashing pair in a committed history, via production
+/// [`check_block`] / [`check_attestation`].
+///
+/// Min-slot / min-target / watermark floors are **not** violations here —
+/// those are liveness constraints (a valid history may contain an older row
+/// next to a newer one). The slashing pairs are: two distinct signing roots
+/// at the same `(pubkey, slot)` or `(pubkey, target)`; a surrounding or
+/// surrounded attestation pair.
+///
+/// Gated to tests / `test-utils` so integration tests (ARCH-5h) can use the
+/// production rule engine as the oracle without a second checker that can
+/// drift.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn first_eip3076_history_violation(
+    pubkey: &str,
+    blocks: &[crate::types::SignedBlock],
+    attestations: &[crate::types::SignedAttestation],
+) -> Option<String> {
+    use crate::error::{AttestationSlashingViolation, BlockSlashingViolation};
+
+    for (i, block) in blocks.iter().enumerate() {
+        let others: Vec<(Slot, Option<String>)> = blocks
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, b)| (b.slot, b.signing_root.as_ref().map(|r| r.as_hex().to_string())))
+            .collect();
+        let history = FullScanBlockHistory::new(others);
+        let candidate = BlockCandidate {
+            slot: block.slot,
+            signing_root: block.signing_root.as_ref().map(|r| r.as_hex().to_string()),
+        };
+        match check_block(pubkey, &history, &BlockWatermarks::default(), &candidate, false) {
+            Err(SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal {
+                slot,
+            })) => {
+                return Some(format!(
+                    "double block proposal at slot {slot} (pubkey={pubkey}, root={:?})",
+                    block.signing_root
+                ));
+            }
+            Err(SlashingError::SlashableBlock(BlockSlashingViolation::SlotBelowMinimum {
+                ..
+            })) => {}
+            Err(other) => return Some(format!("unexpected block check error: {other}")),
+            Ok(_) => {}
+        }
+    }
+
+    for (i, att) in attestations.iter().enumerate() {
+        let others: Vec<ExistingAtt> = attestations
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, a)| ExistingAtt {
+                source_epoch: a.source_epoch,
+                target_epoch: a.target_epoch,
+                signing_root: a.signing_root.as_ref().map(|r| r.as_hex().to_string()),
+            })
+            .collect();
+        let history = FullScanAttestationHistory::new(others);
+        let candidate = AttestationCandidate {
+            source_epoch: att.source_epoch,
+            target_epoch: att.target_epoch,
+            signing_root: att.signing_root.as_ref().map(|r| r.as_hex().to_string()),
+        };
+        match check_attestation(
+            pubkey,
+            &history,
+            &AttestationWatermarks::default(),
+            &candidate,
+            false,
+        ) {
+            Err(SlashingError::SlashableAttestation(
+                AttestationSlashingViolation::TargetEpochBelowMinimum { .. },
+            )) => {}
+            Err(SlashingError::SlashableAttestation(v)) => {
+                return Some(format!("attestation violation: {v} (pubkey={pubkey})"));
+            }
+            Err(other) => return Some(format!("unexpected attestation check error: {other}")),
+            Ok(_) => {}
+        }
+    }
+
+    None
+}
+
+/// Whether production [`check_block`] would accept `slot`/`signing_root`
+/// against `history` (no watermarks). `true` for Stage or Resign.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn eip3076_allows_block(
+    pubkey: &str,
+    history: &[crate::types::SignedBlock],
+    slot: Slot,
+    signing_root: Option<String>,
+    strict: bool,
+) -> bool {
+    let rows: Vec<(Slot, Option<String>)> = history
+        .iter()
+        .map(|b| (b.slot, b.signing_root.as_ref().map(|r| r.as_hex().to_string())))
+        .collect();
+    let hist = FullScanBlockHistory::new(rows);
+    let candidate = BlockCandidate { slot, signing_root };
+    check_block(pubkey, &hist, &BlockWatermarks::default(), &candidate, strict).is_ok()
+}
+
+/// Whether production [`check_attestation`] would accept the candidate
+/// against `history` (no watermarks). `true` for Stage or Duplicate.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn eip3076_allows_attestation(
+    pubkey: &str,
+    history: &[crate::types::SignedAttestation],
+    source_epoch: Epoch,
+    target_epoch: Epoch,
+    signing_root: Option<String>,
+    strict: bool,
+) -> bool {
+    let rows: Vec<ExistingAtt> = history
+        .iter()
+        .map(|a| ExistingAtt {
+            source_epoch: a.source_epoch,
+            target_epoch: a.target_epoch,
+            signing_root: a.signing_root.as_ref().map(|r| r.as_hex().to_string()),
+        })
+        .collect();
+    let hist = FullScanAttestationHistory::new(rows);
+    let candidate = AttestationCandidate { source_epoch, target_epoch, signing_root };
+    check_attestation(pubkey, &hist, &AttestationWatermarks::default(), &candidate, strict).is_ok()
 }
 
 // ── Unit tests (pure; no SQLite) ──────────────────────────────────────────────

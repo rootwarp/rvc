@@ -391,7 +391,7 @@ fn test_no_restart_skip_when_no_prior_attestation() {
 }
 
 /// Pre-genesis-skew guard: current_epoch <= monitoring_epochs must NOT safe-skip.
-/// (Same guard as DoppelgangerService M-7 fix.)
+/// (Same guard as the M-7 clock fix.)
 #[test]
 fn test_restart_safe_skip_blocked_at_low_epoch() {
     let monitoring_epochs: u64 = 2;

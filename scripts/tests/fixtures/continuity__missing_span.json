@@ -1,0 +1,56 @@
+{
+  "data": [
+    {
+      "traceID": "dddddddddddddddddddddddddddddddd",
+      "spans": [
+        {
+          "traceID": "dddddddddddddddddddddddddddddddd",
+          "spanID": "4444444444444444",
+          "operationName": "slot.process",
+          "references": [],
+          "startTime": 1710000002000000,
+          "duration": 9000,
+          "tags": [],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "rvc",
+          "tags": []
+        }
+      },
+      "warnings": null
+    },
+    {
+      "traceID": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "spans": [
+        {
+          "traceID": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "spanID": "5555555555555555",
+          "operationName": "signer.v2.sign_attestation_data",
+          "references": [],
+          "startTime": 1710000003000000,
+          "duration": 400,
+          "tags": [],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "rvc-signer",
+          "tags": []
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 0,
+  "limit": 0,
+  "offset": 0,
+  "errors": null
+}

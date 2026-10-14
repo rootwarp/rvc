@@ -42,7 +42,10 @@ async fn test_aggregation_no_duties_does_nothing() {
         .mount(&mock_server)
         .await;
 
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -137,7 +140,10 @@ async fn test_aggregation_full_flow_with_mock_beacon() {
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
     // Run the aggregation dispatch
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 
     // The mock server's expect(1) on submit verifies the request was made
 }
@@ -190,7 +196,10 @@ async fn test_aggregation_non_aggregator_skips() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -245,10 +254,17 @@ async fn test_aggregation_beacon_failure_handled_gracefully() {
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
     // Should not panic; gracefully handle error
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 // -- Fork-aware attestation construction tests (G-1-05) --
+
+fn typed_attester_duty(duty: &AttesterDuty) -> duty_tracker::TypedAttesterDuty {
+    duty_tracker::TypedAttesterDuty::try_from(duty).expect("numeric fixture")
+}
 
 #[test]
 fn test_make_aggregation_bits_first_position() {
@@ -261,7 +277,7 @@ fn test_make_aggregation_bits_first_position() {
         validator_committee_index: "0".to_string(),
         slot: "100".to_string(),
     };
-    let bits = utils::make_aggregation_bits(&duty).unwrap();
+    let bits = utils::make_aggregation_bits(&typed_attester_duty(&duty)).unwrap();
     // committee_length=4, validator_committee_index=0
     // Byte 0: bit 0 set (validator) = 0x01
     // Length bit at position 4 → byte 0, bit 4 = 0x10
@@ -280,7 +296,7 @@ fn test_make_aggregation_bits_middle_position() {
         validator_committee_index: "3".to_string(),
         slot: "100".to_string(),
     };
-    let bits = utils::make_aggregation_bits(&duty).unwrap();
+    let bits = utils::make_aggregation_bits(&typed_attester_duty(&duty)).unwrap();
     // committee_length=8, validator_committee_index=3
     // Byte 0: bit 3 set = 0x08
     // Length bit at position 8 → byte 1, bit 0 = 0x01
@@ -299,7 +315,7 @@ fn test_make_aggregation_bits_last_position() {
         validator_committee_index: "3".to_string(),
         slot: "100".to_string(),
     };
-    let bits = utils::make_aggregation_bits(&duty).unwrap();
+    let bits = utils::make_aggregation_bits(&typed_attester_duty(&duty)).unwrap();
     // committee_length=4, validator_committee_index=3
     // Byte 0: bit 3 set = 0x08, length bit at position 4 = 0x10
     // Combined: 0x18
@@ -317,7 +333,7 @@ fn test_make_aggregation_bits_zero_committee_length() {
         validator_committee_index: "0".to_string(),
         slot: "100".to_string(),
     };
-    assert!(utils::make_aggregation_bits(&duty).is_none());
+    assert!(utils::make_aggregation_bits(&typed_attester_duty(&duty)).is_none());
 }
 
 #[test]
@@ -331,7 +347,7 @@ fn test_make_aggregation_bits_invalid_committee_length() {
         validator_committee_index: "0".to_string(),
         slot: "100".to_string(),
     };
-    assert!(utils::make_aggregation_bits(&duty).is_none());
+    assert!(duty_tracker::TypedAttesterDuty::try_from(&duty).is_err());
 }
 
 #[test]
@@ -345,14 +361,14 @@ fn test_make_aggregation_bits_invalid_validator_committee_index() {
         validator_committee_index: "garbage".to_string(),
         slot: "100".to_string(),
     };
-    assert!(utils::make_aggregation_bits(&duty).is_none());
+    assert!(duty_tracker::TypedAttesterDuty::try_from(&duty).is_err());
 }
 
 // ── Aggregation fork-format tests (Electra/Fulu proofs) ──
 
 #[tokio::test]
 async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
-    use wiremock::matchers::{method, path, path_regex, query_param};
+    use wiremock::matchers::{header, method, path, path_regex, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let mock_server = MockServer::start().await;
@@ -403,12 +419,17 @@ async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
         .mount(&mock_server)
         .await;
 
-    // Electra aggregate response (has committee_bits field)
+    // Electra aggregate fetch is /eth/v2 with Eth-Consensus-Version.
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(header("Eth-Consensus-Version", "electra"))
         .and(query_param("slot", slot.to_string()))
         .and(query_param("committee_index", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "electra")
+                .set_body_json(serde_json::json!({
+            "version": "electra",
             "data": {
                 "aggregation_bits": "0xffffffff",
                 "data": {
@@ -427,7 +448,8 @@ async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
                 "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "committee_bits": "0x0200000000000000"
             }
-        })))
+        })),
+        )
         .mount(&mock_server)
         .await;
 
@@ -448,7 +470,10 @@ async fn test_aggregation_electra_builds_electra_aggregate_and_proof() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -546,7 +571,10 @@ async fn test_aggregation_pre_electra_unchanged() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -602,12 +630,17 @@ async fn test_aggregation_fulu_dispatches_as_fulu() {
         .mount(&mock_server)
         .await;
 
-    // Fulu aggregate (same structure as Electra)
+    // Fulu aggregate fetch is /eth/v2 with Eth-Consensus-Version.
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(header("Eth-Consensus-Version", "fulu"))
         .and(query_param("slot", slot.to_string()))
         .and(query_param("committee_index", "1"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "fulu")
+                .set_body_json(serde_json::json!({
+            "version": "fulu",
             "data": {
                 "aggregation_bits": "0xffffffff",
                 "data": {
@@ -626,7 +659,8 @@ async fn test_aggregation_fulu_dispatches_as_fulu() {
                 "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "committee_bits": "0x0200000000000000"
             }
-        })))
+        })),
+        )
         .mount(&mock_server)
         .await;
 
@@ -648,7 +682,120 @@ async fn test_aggregation_fulu_dispatches_as_fulu() {
         .await;
 
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
+}
+
+#[tokio::test]
+async fn test_aggregation_gloas_dispatches_as_gloas() {
+    use wiremock::matchers::{header, method, path, path_regex, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock_server = MockServer::start().await;
+    let mut schedule = (*create_test_fork_schedule()).clone();
+    schedule.gloas_fork_epoch = 70;
+    let (orchestrator, _handle, _, pubkey_hex) =
+        build_aggregation_orchestrator_with_schedule(&mock_server.uri(), Arc::new(schedule)).await;
+
+    // Gloas epoch = 70, slot = 70 * 32 = 2240
+    let slot = 2240u64;
+    let epoch = slot / SLOTS_PER_EPOCH;
+    orchestrator.clock.set_slot(slot);
+
+    Mock::given(method("POST"))
+        .and(path_regex(r"/eth/v1/validator/duties/attester/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "execution_optimistic": false,
+            "data": [{
+                "pubkey": pubkey_hex,
+                "validator_index": "42",
+                "committee_index": "1",
+                "committee_length": "8",
+                "committees_at_slot": "4",
+                "validator_committee_index": "0",
+                "slot": slot.to_string()
+            }]
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/attestation_data"))
+        .and(query_param("slot", slot.to_string()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "slot": slot.to_string(),
+                "index": "1",
+                "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                "source": {
+                    "epoch": (epoch - 1).to_string(),
+                    "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                },
+                "target": {
+                    "epoch": epoch.to_string(),
+                    "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                }
+            }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(header("Eth-Consensus-Version", "gloas"))
+        .and(query_param("slot", slot.to_string()))
+        .and(query_param("committee_index", "1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "gloas")
+                .set_body_json(serde_json::json!({
+            "version": "gloas",
+            "data": {
+                "aggregation_bits": "0xffffffff",
+                "data": {
+                    "slot": slot.to_string(),
+                    "index": "1",
+                    "beacon_block_root": "0x1111111111111111111111111111111111111111111111111111111111111111",
+                    "source": {
+                        "epoch": (epoch - 1).to_string(),
+                        "root": "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    },
+                    "target": {
+                        "epoch": epoch.to_string(),
+                        "root": "0x3333333333333333333333333333333333333333333333333333333333333333"
+                    }
+                },
+                "signature": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "committee_bits": "0x0200000000000000"
+            }
+        })),
+        )
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/validator/aggregate_and_proofs"))
+        .and(header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/aggregate_and_proofs"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }
 
 #[tokio::test]
@@ -704,21 +851,10 @@ async fn test_aggregation_mismatched_response_logs_warning() {
         .mount(&mock_server)
         .await;
 
-    // Return a pre-Electra aggregate (no committee_index param in mock)
-    // but the orchestrator expects Electra because is_electra=true.
-    // The BeaconClient uses committee_index presence to determine response type;
-    // since is_electra=true, committee_index is Some(...), so the client will request
-    // with committee_index and deserialize as ElectraAttestation.
-    // To simulate a mismatch, we need to force the beacon to return PreElectra.
-    // This is tricky with real HTTP mocks since the client decides the type based on
-    // committee_index param. Instead, we test the reverse: pre-Electra slot gets
-    // an Electra response. But that won't happen either because the client controls it.
-    //
-    // The mismatch scenario is guarded by the match arms in the orchestrator.
-    // We can verify the code compiles and handles the branch by checking that
-    // no submit endpoints are called when the aggregate fetch fails (returns 500).
+    // Electra slot fetches /eth/v2. A 500 is retried, not fallen back to v1,
+    // and nothing is submitted.
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
         .and(query_param("slot", slot.to_string()))
         .respond_with(ResponseTemplate::new(500))
         .mount(&mock_server)
@@ -742,5 +878,8 @@ async fn test_aggregation_mismatched_response_logs_warning() {
     orchestrator.duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
 
     // Should not panic — gracefully handles failure
-    orchestrator.aggregation_service.maybe_produce_aggregations(slot, epoch).await;
+    orchestrator
+        .aggregation_service
+        .maybe_produce_aggregations(slot, epoch, crate::orchestrator::aggregation::ample_slot_end())
+        .await;
 }

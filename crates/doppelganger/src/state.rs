@@ -33,8 +33,7 @@ pub enum ValidatorState {
 /// [`ForwardWindowMachine::status`].
 ///
 /// Named `ForwardWindowStatus` (not `DoppelgangerStatus`) to avoid confusion
-/// with the 3-variant [`crate::DoppelgangerStatus`] used by
-/// [`crate::DoppelgangerService`].
+/// with the 3-variant crate-level [`crate::DoppelgangerStatus`].
 ///
 /// `Copy` so callers can cheaply pass it around without cloning.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

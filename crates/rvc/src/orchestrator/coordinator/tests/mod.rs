@@ -3,7 +3,6 @@
 //! Split by topic (RF6-09 / F5). Shared mock scaffolding lives here;
 //! topic suites are sibling modules.
 
-#![allow(clippy::arc_with_non_send_sync)]
 #![allow(unused_imports)] // re-exports for topic submodules
 
 // Re-exports for topic submodules (`use super::*`) and sibling modules
@@ -14,7 +13,9 @@ pub(crate) use crate::orchestrator::utils;
 pub(crate) use ::async_trait::async_trait;
 pub(crate) use ::beacon::{AttesterDuty, BeaconClient, BeaconClientConfig, VersionedAttestation};
 pub(crate) use ::block_service::BeaconBlockClient;
+pub(crate) use ::block_service::BuilderConfig;
 pub(crate) use ::block_service::ProduceBlockResponse;
+pub(crate) use ::block_service::WireBody;
 pub(crate) use ::bn_manager::{
     AttestationSubmitter, BeaconNodeClient, OperationTimeouts, Propagator,
 };
@@ -31,8 +32,16 @@ pub(crate) use std::collections::HashMap;
 pub(crate) use std::future::Future;
 pub(crate) use std::pin::Pin;
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-pub(crate) use std::sync::Arc;
+pub(crate) use std::sync::{Arc, OnceLock};
 pub(crate) use std::time::Duration;
+pub(crate) use tokio::sync::{Mutex, MutexGuard};
+
+/// Process-wide M2 / slot-loop histogram counters; serialize tests that
+/// wait on or delta those samples (ARCH-7a + ARCH-3j C6).
+pub(super) async fn m2_metric_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().await
+}
 
 // ── Shared helpers / mocks ─────────────────────────────────────────────
 
@@ -68,6 +77,8 @@ pub(crate) fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         electra_fork_version: [0, 0, 0, 6],
         fulu_fork_epoch: 60,
         fulu_fork_version: [0, 0, 0, 7],
+        gloas_fork_epoch: 70,
+        gloas_fork_version: [0, 0, 0, 8],
     })
 }
 
@@ -122,33 +133,173 @@ impl AttestationSubmitter for MockSubmitter {
     }
 }
 
-pub(crate) struct MockBlockBeacon;
+/// Recorded `BeaconBlockClient` call. Dispatch tests assert on this seam,
+/// not on wiremock — production never reaches `MockServer` for block produce.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // SSZ / blinded fields are recorded for dispatch assertions.
+pub(crate) enum BlockBeaconCall {
+    ProduceV3 {
+        slot: Slot,
+    },
+    ProduceV4 {
+        slot: Slot,
+        builder_config: BuilderConfig,
+    },
+    PublishBlock {
+        slot: Slot,
+        builder_url: Option<String>,
+        signature_bytes: Vec<u8>,
+    },
+    PublishBlindedBlock {
+        slot: Slot,
+    },
+    PublishBlockSsz {
+        is_blinded: bool,
+        builder_url: Option<String>,
+    },
+    PublishExecutionPayloadEnvelope {
+        signed_envelope: WireBody,
+        blobs: WireBody,
+        kzg_proofs: WireBody,
+        consensus_version: String,
+    },
+}
 
-#[async_trait(?Send)]
+/// Call-recording `BeaconBlockClient`.
+///
+/// Default produce still returns `Err("mock")` so existing tests keep their
+/// assertions. `with_response` supplies a canned `ProduceBlockResponse`.
+pub(crate) struct MockBlockBeacon {
+    calls: std::sync::Mutex<Vec<BlockBeaconCall>>,
+    produce_response: std::sync::Mutex<Option<ProduceBlockResponse>>,
+}
+
+impl MockBlockBeacon {
+    pub(crate) fn new() -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            produce_response: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(crate) fn with_response(response: ProduceBlockResponse) -> Self {
+        Self {
+            calls: std::sync::Mutex::new(Vec::new()),
+            produce_response: std::sync::Mutex::new(Some(response)),
+        }
+    }
+
+    pub(crate) fn set_response(&self, response: ProduceBlockResponse) {
+        *self.produce_response.lock().unwrap() = Some(response);
+    }
+
+    fn record(&self, call: BlockBeaconCall) {
+        self.calls.lock().unwrap().push(call);
+    }
+
+    fn produce_answer(&self) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        self.produce_response
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| block_service::BlockServiceError::Beacon("mock".to_string()))
+    }
+
+    pub(crate) fn recorded_calls(&self) -> Vec<BlockBeaconCall> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn produce_v3_slots(&self) -> Vec<Slot> {
+        self.recorded_calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                BlockBeaconCall::ProduceV3 { slot } => Some(slot),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn produce_v4_calls(&self) -> Vec<(Slot, BuilderConfig)> {
+        self.recorded_calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                BlockBeaconCall::ProduceV4 { slot, builder_config } => Some((slot, builder_config)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn publish_block_calls(&self) -> Vec<(Slot, Option<String>, Vec<u8>)> {
+        self.recorded_calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                BlockBeaconCall::PublishBlock { slot, builder_url, signature_bytes } => {
+                    Some((slot, builder_url, signature_bytes))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub(crate) fn publish_blinded_count(&self) -> usize {
+        self.recorded_calls()
+            .iter()
+            .filter(|call| matches!(call, BlockBeaconCall::PublishBlindedBlock { .. }))
+            .count()
+    }
+
+    pub(crate) fn envelope_publish_calls(&self) -> Vec<BlockBeaconCall> {
+        self.recorded_calls()
+            .into_iter()
+            .filter(|call| matches!(call, BlockBeaconCall::PublishExecutionPayloadEnvelope { .. }))
+            .collect()
+    }
+}
+
+#[async_trait]
 impl BeaconBlockClient for MockBlockBeacon {
     async fn produce_block_v3(
         &self,
-        _slot: Slot,
+        slot: Slot,
         _randao_reveal: &str,
         _graffiti: Option<&str>,
         _builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
-        Err(block_service::BlockServiceError::Beacon("mock".to_string()))
+        self.record(BlockBeaconCall::ProduceV3 { slot });
+        self.produce_answer()
+    }
+
+    async fn produce_block_v4(
+        &self,
+        slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        self.record(BlockBeaconCall::ProduceV4 { slot, builder_config: builder_config.clone() });
+        self.produce_answer()
     }
 
     async fn publish_block(
         &self,
-        _signed_block: &eth_types::SignedBeaconBlock,
+        signed_block: &eth_types::SignedBeaconBlock,
         _consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), block_service::BlockServiceError> {
+        self.record(BlockBeaconCall::PublishBlock {
+            slot: signed_block.message.slot,
+            builder_url: builder_url.map(str::to_string),
+            signature_bytes: signed_block.signature.clone(),
+        });
         Ok(())
     }
 
     async fn publish_blinded_block(
         &self,
-        _signed_block: &eth_types::SignedBlindedBeaconBlock,
+        signed_block: &eth_types::SignedBlindedBeaconBlock,
         _consensus_version: &str,
     ) -> Result<(), block_service::BlockServiceError> {
+        self.record(BlockBeaconCall::PublishBlindedBlock { slot: signed_block.message.slot });
         Ok(())
     }
 
@@ -156,14 +307,36 @@ impl BeaconBlockClient for MockBlockBeacon {
         &self,
         _ssz_bytes: &[u8],
         _consensus_version: &str,
-        _is_blinded: bool,
+        is_blinded: bool,
+        builder_url: Option<&str>,
     ) -> Result<(), block_service::BlockServiceError> {
+        self.record(BlockBeaconCall::PublishBlockSsz {
+            is_blinded,
+            builder_url: builder_url.map(str::to_string),
+        });
+        Ok(())
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.record(BlockBeaconCall::PublishExecutionPayloadEnvelope {
+            signed_envelope: signed_envelope.clone(),
+            blobs: blobs.clone(),
+            kzg_proofs: kzg_proofs.clone(),
+            consensus_version: consensus_version.to_string(),
+        });
         Ok(())
     }
 }
 
 pub(crate) fn create_mock_block_beacon() -> Arc<MockBlockBeacon> {
-    Arc::new(MockBlockBeacon)
+    Arc::new(MockBlockBeacon::new())
 }
 
 /// Block beacon that returns a block with a configurable `proposer_index`
@@ -177,7 +350,7 @@ pub(crate) struct BadProposerBlockBeacon {
     pub(crate) publish_called: Arc<AtomicBool>,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl BeaconBlockClient for BadProposerBlockBeacon {
     async fn produce_block_v3(
         &self,
@@ -199,13 +372,27 @@ impl BeaconBlockClient for BadProposerBlockBeacon {
             execution_payload_value: None,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         })
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
     }
 
     async fn publish_block(
         &self,
         _signed_block: &eth_types::SignedBeaconBlock,
         _consensus_version: &str,
+        _builder_url: Option<&str>,
     ) -> Result<(), block_service::BlockServiceError> {
         self.publish_called.store(true, Ordering::SeqCst);
         Ok(())
@@ -225,8 +412,20 @@ impl BeaconBlockClient for BadProposerBlockBeacon {
         _ssz_bytes: &[u8],
         _consensus_version: &str,
         _is_blinded: bool,
+        _builder_url: Option<&str>,
     ) -> Result<(), block_service::BlockServiceError> {
         self.publish_called.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &block_service::WireBody,
+        _blobs: &block_service::WireBody,
+        _kzg_proofs: &block_service::WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
         Ok(())
     }
 }
@@ -247,16 +446,11 @@ pub(super) fn sync_guard_beacon(
     duty_pubkey: [u8; 48],
     submitted_roots: Arc<std::sync::Mutex<Vec<Root>>>,
 ) -> bn_manager::MockBeaconNodeClient {
-    use beacon::{BlockRootData, DataResponse, ExecutionOptimisticResponse};
+    use beacon::ExecutionOptimisticResponse;
     use eth_types::SyncCommitteeDuty;
     bn_manager::MockBeaconNodeClient::new()
-        .with_get_block_root(|_block_id| {
-            Ok(DataResponse {
-                data: BlockRootData {
-                    root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string(),
-                },
-            })
+        .with_slot_aware_block_root(0, &[], |_queried| {
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string()
         })
         .with_post_sync_committee_duties(move |_epoch, _indices| {
             Ok(ExecutionOptimisticResponse {
@@ -287,6 +481,18 @@ pub(super) async fn build_aggregation_orchestrator(
     PublicKey,
     String,
 ) {
+    build_aggregation_orchestrator_with_schedule(mock_server_uri, create_test_fork_schedule()).await
+}
+
+pub(super) async fn build_aggregation_orchestrator_with_schedule(
+    mock_server_uri: &str,
+    schedule: Arc<ForkSchedule>,
+) -> (
+    DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>,
+    OrchestratorHandle,
+    PublicKey,
+    String,
+) {
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(100);
 
@@ -309,7 +515,7 @@ pub(super) async fn build_aggregation_orchestrator(
     let submitter = Arc::new(MockSubmitter::new());
     let propagator = Arc::new(Propagator::new(submitter));
 
-    let config = create_test_config();
+    let config = OrchestratorConfig::new([0xaa; 32], schedule);
     let mut pubkey_map_inner = HashMap::new();
     pubkey_map_inner.insert(pubkey.to_bytes(), pubkey.clone());
     let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
@@ -317,7 +523,9 @@ pub(super) async fn build_aggregation_orchestrator(
     // D-3 fail-closed: register the loaded validator so the per-validator
     // signing gate permits its duties (mirrors startup registration).
     let validator_store = create_mock_validator_store();
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()));
+    validator_store
+        .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
+        .unwrap();
 
     let (orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
         clock,
@@ -402,11 +610,18 @@ pub(super) async fn setup_proposer_duty(
 
 mod aggregation;
 mod circuit_breaker;
+mod cold_cache;
 mod core;
 mod duty_management;
+mod fork_resolution;
 mod fork_transition;
+mod phase_block_offset;
 mod proposal;
+mod proposal_first;
 mod slashing_protection;
+mod slot_anchor;
+mod slot_replay;
 mod spans;
 mod sync_gating;
 mod timeouts;
+mod wait_window;

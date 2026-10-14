@@ -1,5 +1,7 @@
 .PHONY: build build-release check fmt clippy test test-fast coverage clean \
-       docker-rvc docker-signer docker-keygen docker-all architecture-doc
+       docker-rvc docker-signer docker-keygen docker-all architecture-doc \
+       spec-vectors spec-vectors-verify spec-vectors-regen spec-kat \
+       test-fork-transition
 
 # Build
 build:
@@ -41,6 +43,23 @@ test:
 test-verbose:
 	cargo test -- --nocapture
 
+# Named Gloas boundary gate (issue 7.5). Whole packages: a bare
+# `test(fork_transition)` filter would drop the rvc-bin Gloas-head smoke.
+test-fork-transition:
+	@count=$$(CARGO_TERM_COLOR=never cargo nextest list -p rvc -E 'test(fork_transition)' | grep -c fork_transition || true); \
+	if [ "$$count" -eq 0 ]; then \
+		echo "error: cargo nextest list -p rvc -E 'test(fork_transition)' matched 0 tests" >&2; \
+		exit 1; \
+	fi; \
+	echo "fork_transition tests: $$count"; \
+	smoke=$$(CARGO_TERM_COLOR=never cargo nextest list -p rvc-bin -E 'test(test_startup_reaches_ready_against_gloas_mock_bn)' | grep -c test_startup_reaches_ready_against_gloas_mock_bn || true); \
+	if [ "$$smoke" -eq 0 ]; then \
+		echo "error: cargo nextest list -p rvc-bin -E 'test(test_startup_reaches_ready_against_gloas_mock_bn)' matched 0 tests" >&2; \
+		exit 1; \
+	fi; \
+	echo "gloas smoke tests: $$smoke"; \
+	cargo nextest run -p rvc -p rvc-bin --final-status-level pass
+
 # Fast tests via cargo-nextest (install once: cargo install cargo-nextest --locked).
 # Falls back to plain cargo test if nextest is missing.
 test-fast:
@@ -67,6 +86,38 @@ clean:
 # CI enforces doc == generated via crates/architecture-tests.
 architecture-doc:
 	cargo run -p rvc-architecture-tests --bin generate-architecture-md
+
+# Fetched consensus-specs / ssz-specs vector cache (gitignored).
+# Export rather than splicing PRESET into the recipe (values with quotes/spaces).
+PRESET ?= minimal
+export PRESET
+
+spec-vectors:
+	./scripts/fetch_spec_vectors.sh
+
+# Digest-check tracked pyspec artifacts ([[generated]] in vectors.lock). No Python.
+spec-vectors-verify:
+	./scripts/fetch_spec_vectors.sh verify
+
+# Re-run the pinned pyspec recipe. Nightly only; PR jobs verify the digest.
+spec-vectors-regen:
+	./scripts/fetch_spec_vectors.sh regen
+
+# Codegen SPEC_PROGRESSIVE_* / SPEC_GLOAS_* / KAT_GLOAS_* from artifacts + the
+# 3.3a fixture tree (no network). --vectors is the fixture tree so P3/4.0
+# regeneration stays hermetic; L1 roots come from
+# vectors-generated/progressive/roots.yaml (pyspec pre-images), never JSON
+# mix_in_length. Gloas signing roots are copied from
+# vectors-generated/signing-roots/signing_roots.yaml (D28). Island L3
+# signing roots are copied into src/gloas_signing_kat.rs (sibling of --out)
+# from vectors-generated/gloas-signing-roots/signing_roots.yaml.
+# --gloas-out emits crates/rvc-gloas/src/spec_kat.rs from both preset archives
+# under crates/rvc-spec-vectors/vectors/<SPEC_TAG>.
+spec-kat:
+	cargo run -p rvc-spec-vectors --bin gen-spec-kat -- \
+		--vectors crates/rvc-spec-vectors/tests/fixtures \
+		--out crates/rvc-spec-vectors/src/spec_kat.rs \
+		--gloas-out crates/rvc-gloas/src/spec_kat.rs
 
 # All checks (CI)
 ci: fmt-check clippy test

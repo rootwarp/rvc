@@ -6,13 +6,13 @@
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use eth_types::{Epoch, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use eth_types::{Epoch, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 
 /// Epoch provider immune to post-start NTP steps.
 ///
 /// ```text
 /// now_unix       = start_unix_time + start_instant.elapsed()
-/// current_epoch  = (now_unix - genesis_time) / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
+/// current_epoch  = (now_unix - genesis_time) * 1000 / SLOT_DURATION_MS / SLOTS_PER_EPOCH
 /// ```
 ///
 /// If `genesis_time` is far in the future relative to process start, epoch
@@ -31,7 +31,10 @@ impl MonotonicEpochClock {
     pub fn new(genesis_time: u64) -> Self {
         let start_unix_time =
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        if genesis_time > start_unix_time.saturating_add(SECONDS_PER_SLOT * SLOTS_PER_EPOCH) {
+        if genesis_time
+            > start_unix_time
+                .saturating_add(SLOT_DURATION_MS.saturating_mul(SLOTS_PER_EPOCH) / 1000)
+        {
             // Genesis more than one epoch in the future → every call yields 0
             // until wall time catches up. Import path must use register_for_import.
             tracing::warn!(
@@ -46,8 +49,7 @@ impl MonotonicEpochClock {
 
     /// Test/helper constructor with explicit anchors.
     ///
-    /// Production paths use [`Self::new`]; tests and
-    /// [`crate::DoppelgangerService::with_start_time`] use this to drive
+    /// Production paths use [`Self::new`]; tests use this to drive
     /// deterministic epoch values.
     pub fn with_start_time(
         genesis_time: u64,
@@ -67,7 +69,7 @@ impl MonotonicEpochClock {
         let elapsed_secs = self.start_instant.elapsed().as_secs();
         let now_unix = self.start_unix_time.saturating_add(elapsed_secs);
         let secs_since_genesis = now_unix.saturating_sub(self.genesis_time);
-        secs_since_genesis / SECONDS_PER_SLOT
+        secs_since_genesis.saturating_mul(1000) / SLOT_DURATION_MS
     }
 
     /// Slot index within the current epoch (`0..SLOTS_PER_EPOCH`).

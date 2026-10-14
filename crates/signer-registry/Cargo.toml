@@ -9,3 +9,8 @@ publish = false
 
 [lints]
 workspace = true
+
+[features]
+default = []
+# Registers the DVT PeerSignerService partial-sign surface (ARCH-7i).
+dvt = []

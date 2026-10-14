@@ -1,7 +1,7 @@
 # === Tier 1: Dependency Preparation ===
 
 # Stage 1: chef — base image with cargo-chef
-ARG RUST_VERSION=1.92
+ARG RUST_VERSION=1.97
 FROM lukemathwalker/cargo-chef:latest-rust-${RUST_VERSION}-bookworm AS chef
 WORKDIR /app
 
@@ -34,16 +34,19 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Stage 4: builder — compile all binaries
 FROM cook AS builder
 COPY . .
-# Features are package-specific:
+# Features are package-specific and allow-listed by
+# scripts/docker-cargo-features.sh. A build-arg cannot enable test-utils.
 #   rvc-bin: gcp-trace, gcp-secret
 #   rvc-signer-bin: dvt
 #   rvc-keygen: (none)
 ARG RVC_FEATURES=""
 ARG SIGNER_FEATURES=""
-RUN cargo build --release -p rvc-bin --bin rvc \
-        ${RVC_FEATURES:+--features "$RVC_FEATURES"} && \
+RUN rvc_feats="$(sh scripts/docker-cargo-features.sh rvc "$RVC_FEATURES")" && \
+    signer_feats="$(sh scripts/docker-cargo-features.sh signer "$SIGNER_FEATURES")" && \
+    cargo build --release -p rvc-bin --bin rvc \
+        ${rvc_feats:+--features "$rvc_feats"} && \
     cargo build --release -p rvc-signer-bin --bin rvc-signer \
-        ${SIGNER_FEATURES:+--features "$SIGNER_FEATURES"} && \
+        ${signer_feats:+--features "$signer_feats"} && \
     cargo build --release -p rvc-keygen --bin rvc-keygen
 
 # === Tier 3: Runtime Images ===

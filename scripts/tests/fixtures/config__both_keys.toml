@@ -1,0 +1,4 @@
+# Both keys present; beacon_nodes takes precedence over beacon_url (P0-2).
+
+beacon_url = "http://primary.example:5052"
+beacon_nodes = ["http://alpha.example:5052", "http://beta.example:5052"]

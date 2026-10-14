@@ -4,21 +4,24 @@ use async_trait::async_trait;
 
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    BlockRootResponse, ConfigSpecResponse, GenesisResponse, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerPreparation, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    BlockRootResponse, BuilderConfig, BuilderPreferencesEntry, ConfigSpecResponse, GenesisResponse,
+    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
+    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
+    SubmitAttestationResult, SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse,
+    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
-    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+    ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration,
 };
 
 // ---------------------------------------------------------------------------
 // Role traits (domain splits of the former monolithic BeaconNodeClient)
 // ---------------------------------------------------------------------------
 
-/// Duty discovery: attester, proposer, and sync-committee duty endpoints.
+/// Duty discovery: attester, proposer, sync-committee, and PTC duty endpoints.
 #[async_trait]
 pub trait DutiesProvider: Send + Sync {
     async fn get_attester_duties(
@@ -27,13 +30,27 @@ pub trait DutiesProvider: Send + Sync {
         validator_indices: &[String],
     ) -> Result<AttesterDutiesResponse, BeaconError>;
 
-    async fn get_proposer_duties(&self, epoch: u64) -> Result<ProposerDutiesResponse, BeaconError>;
+    async fn get_proposer_duties(
+        &self,
+        epoch: u64,
+        schedule: &ForkSchedule,
+    ) -> Result<ProposerDutiesResponse, BeaconError>;
 
     async fn post_sync_committee_duties(
         &self,
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError>;
+
+    /// Fetch PTC duties for the given epoch (`POST /eth/v1/validator/duties/ptc/{epoch}`).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn post_ptc_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<PtcDutiesResponse, BeaconError>;
 }
 
 /// Block production, publication, proposer preparation, and builder registration.
@@ -47,10 +64,40 @@ pub trait BlockProducer: Send + Sync {
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BeaconError>;
 
+    /// Produce a block via `POST /eth/v4/validator/blocks/{slot}`.
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn produce_block_v4(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BeaconError>;
+
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError>;
+
+    /// Publish `{signed_block, kzg_proofs, blobs}` as JSON.
+    ///
+    /// Same policy as [`Self::publish_block`]: `Submission` role, `LargeLag`
+    /// tier, the `block_publication` timeout, and the blocks broadcast topic.
+    /// Broadcast when that topic is enabled; `query_first` failover otherwise,
+    /// with an absolute deadline on the failover arm.
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError>;
 
     async fn publish_blinded_block(
@@ -63,11 +110,26 @@ pub trait BlockProducer: Send + Sync {
     ///
     /// No default body: an unimplemented method is a compile error, not a
     /// silent runtime failure (same policy as [`LivenessApi::post_validator_liveness`]).
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block_ssz(
         &self,
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError>;
+
+    /// Publish a signed execution payload envelope with blobs and proofs.
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
     ) -> Result<(), BeaconError>;
 
     async fn prepare_beacon_proposer(
@@ -79,6 +141,25 @@ pub trait BlockProducer: Send + Sync {
         &self,
         registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError>;
+
+    /// Submit signed proposer preferences
+    /// (`POST /eth/v1/validator/proposer_preferences`).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn submit_proposer_preferences(
+        &self,
+        preferences: &[SignedProposerPreferences],
+    ) -> Result<(), BeaconError>;
+
+    /// Submit builder preferences (`POST /eth/v1/validator/builder_preferences`).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError>;
 }
 
 /// Attestation data, submission, aggregation, and committee subscriptions.
@@ -95,11 +176,29 @@ pub trait AttestationApi: Send + Sync {
         attestations: &VersionedAttestation,
     ) -> Result<SubmitAttestationResult, BeaconError>;
 
+    /// Submit attestations and name the beacon node that produced the result.
+    ///
+    /// The default delegates to [`Self::submit_attestation`] and returns
+    /// `None`: this implementation does not know an endpoint. `BnManager`
+    /// overrides it with the first successful broadcast (or query) endpoint.
+    /// Partial failure stays `Ok`; nothing here merges across nodes or retries.
+    async fn submit_attestation_attributed(
+        &self,
+        attestations: &VersionedAttestation,
+    ) -> Result<(Option<String>, SubmitAttestationResult), BeaconError> {
+        self.submit_attestation(attestations).await.map(|result| (None, result))
+    }
+
+    /// Fetch an aggregate attestation.
+    ///
+    /// The caller supplies the resolved fork for the slot, not the configured
+    /// head fork.
     async fn get_aggregate_attestation(
         &self,
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
+        fork: ForkName,
     ) -> Result<VersionedAggregateAttestation, BeaconError>;
 
     async fn submit_aggregate_and_proofs(
@@ -110,6 +209,32 @@ pub trait AttestationApi: Send + Sync {
     async fn submit_beacon_committee_subscriptions(
         &self,
         subscriptions: &[BeaconCommitteeSubscription],
+    ) -> Result<(), BeaconError>;
+}
+
+/// Payload attestation data fetch and pool submission.
+#[async_trait]
+pub trait PayloadAttestationApi: Send + Sync {
+    /// Fetch payload attestation data for `slot`
+    /// (`GET /eth/v1/validator/payload_attestation_data?slot=`).
+    ///
+    /// HTTP 204 from the BN is `Ok(None)` (skip the duty).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn get_payload_attestation_data(
+        &self,
+        slot: u64,
+    ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError>;
+
+    /// Submit payload attestation messages
+    /// (`POST /eth/v1/beacon/pool/payload_attestations`).
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure.
+    async fn submit_payload_attestations(
+        &self,
+        messages: &[PayloadAttestationMessage],
     ) -> Result<(), BeaconError>;
 }
 
@@ -147,12 +272,34 @@ pub trait LivenessApi: Send + Sync {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<ValidatorLivenessResponse, BeaconError>;
+
+    /// Query liveness on every configured BN and OR-merge `is_live` per index.
+    ///
+    /// Any BN reporting live wins (fail-safe). Errors and non-responses
+    /// contribute nothing — they are not treated as "not live". Returns `Err`
+    /// only when every BN fails, so callers can stay fail-closed.
+    ///
+    /// No default body: an unimplemented method is a compile error, not a
+    /// silent runtime failure. Single-BN clients (`BeaconClient`) self-delegate
+    /// to [`Self::post_validator_liveness`].
+    async fn post_validator_liveness_merged(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError>;
 }
 
 /// Chain state, config, block roots, and node health/version.
 #[async_trait]
 pub trait NodeStatusApi: Send + Sync {
     async fn get_genesis(&self) -> Result<GenesisResponse, BeaconError>;
+
+    /// [`Self::get_genesis`], but a body whose `genesis_validators_root` is not
+    /// `expected_root_hex` is not success. Pooled clients try the next node.
+    async fn get_genesis_matching_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<GenesisResponse, BeaconError>;
 
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError>;
 
@@ -169,16 +316,17 @@ pub trait NodeStatusApi: Send + Sync {
     async fn get_node_version(&self) -> Result<String, BeaconError>;
 }
 
-/// Full beacon-node surface: composition of the six role traits.
+/// Full beacon-node surface: composition of the seven role traits.
 ///
 /// Supertrait composition (not a blanket impl) keeps `dyn BeaconNodeClient`
 /// object-safe and lets callers that only need one role depend on that role
-/// alone. Implementors provide the six role traits, then an empty
+/// alone. Implementors provide the seven role traits, then an empty
 /// `impl BeaconNodeClient for T {}`.
 pub trait BeaconNodeClient:
     DutiesProvider
     + BlockProducer
     + AttestationApi
+    + PayloadAttestationApi
     + SyncCommitteeApi
     + LivenessApi
     + NodeStatusApi
@@ -219,11 +367,14 @@ impl Default for OperationTimeouts {
     }
 }
 
-/// Controls which message types are broadcast to all BNs vs sent to the first healthy BN.
+/// Controls which message types are broadcast to role-matching BNs vs sent to the first healthy BN.
 ///
-/// When a topic is `true`, the corresponding submission is broadcast to all BNs.
-/// When `false`, only the first healthy BN receives the message (query_first strategy).
-/// Default: all topics enabled (current behavior preserved).
+/// When a topic is `true`, the corresponding submission is broadcast to BNs whose
+/// `BnRole` matches the message (plus the `All`-role fallback). Health tier and
+/// health-score are **not** applied. An empty role+All set is
+/// [`crate::BeaconError::NoEligibleBn`] — never off-role fan-out. When `false`,
+/// only the first healthy BN receives the message (query_first strategy).
+/// Default: all topics enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BroadcastTopics {
     pub attestations: bool,
@@ -242,16 +393,19 @@ impl Default for BroadcastTopics {
 ///
 /// BN selection is not configurable: strategy is fixed per operation on
 /// [`crate::BnManager`] (query-first for reads, broadcast for submissions,
-/// best-of for block production). See that type's docs.
+/// best-of for `produce_block_v3`, sequential failover for `produce_block_v4`).
+/// See that type's docs.
 #[derive(Debug, Clone)]
 pub struct BnManagerConfig {
     /// Beacon node endpoint URLs.
     pub endpoints: Vec<String>,
     /// Per-BN request timeout.
     pub timeout: Duration,
-    /// Which submission types are broadcast to all BNs.
+    /// Which submission types are broadcast to role-matching BNs
+    /// (fail-closed if none).
     pub broadcast_topics: BroadcastTopics,
-    /// Per-BN role assignments (parallel to endpoints). Default: {All} for each.
+    /// Per-BN role assignments (parallel to endpoints). Honoured by query and
+    /// broadcast selection. Default: {All} for each.
     pub roles: Vec<std::collections::HashSet<crate::types::BnRole>>,
     /// Health tier thresholds for sync distance classification.
     pub tier_thresholds: crate::types::TierThresholds,
@@ -333,6 +487,7 @@ mod tests {
         fn _assert_role_duties(_: &dyn DutiesProvider) {}
         fn _assert_role_block(_: &dyn BlockProducer) {}
         fn _assert_role_attestation(_: &dyn AttestationApi) {}
+        fn _assert_role_payload_attestation(_: &dyn PayloadAttestationApi) {}
         fn _assert_role_sync(_: &dyn SyncCommitteeApi) {}
         fn _assert_role_liveness(_: &dyn LivenessApi) {}
         fn _assert_role_status(_: &dyn NodeStatusApi) {}
@@ -365,6 +520,7 @@ mod tests {
         async fn get_proposer_duties(
             &self,
             _epoch: u64,
+            _schedule: &ForkSchedule,
         ) -> Result<ProposerDutiesResponse, BeaconError> {
             Ok(ProposerDutiesResponse {
                 dependent_root: "0x00".into(),
@@ -380,6 +536,18 @@ mod tests {
         ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
             Ok(SyncCommitteeDutiesResponse { execution_optimistic: false, data: vec![] })
         }
+
+        async fn post_ptc_duties(
+            &self,
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<PtcDutiesResponse, BeaconError> {
+            Ok(PtcDutiesResponse {
+                dependent_root: "0x00".into(),
+                execution_optimistic: false,
+                data: vec![],
+            })
+        }
     }
 
     #[tokio::test]
@@ -387,10 +555,13 @@ mod tests {
         let only = OnlyDuties;
         let attester = only.get_attester_duties(1, &["0".into()]).await.unwrap();
         assert!(attester.data.is_empty());
-        let proposer = only.get_proposer_duties(1).await.unwrap();
+        let proposer =
+            only.get_proposer_duties(1, &ForkSchedule::unscheduled_gloas()).await.unwrap();
         assert!(proposer.data.is_empty());
         let sync = only.post_sync_committee_duties(1, &["0".into()]).await.unwrap();
         assert!(sync.data.is_empty());
+        let ptc = only.post_ptc_duties(1, &["0".into()]).await.unwrap();
+        assert!(ptc.data.is_empty());
         // OnlyDuties is *not* a BeaconNodeClient — that is the point of role traits.
         fn _takes_duties(_: &dyn DutiesProvider) {}
         _takes_duties(&only);

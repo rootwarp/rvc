@@ -1,12 +1,41 @@
 use std::collections::HashMap;
 
 use eth_types::{
-    BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, SyncCommitteeContribution,
-    SyncCommitteeDuty, Version,
+    BeaconBlock, BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, PayloadAttestationData,
+    SyncCommitteeContribution, SyncCommitteeDuty, Version,
 };
 use serde::{Deserialize, Serialize};
 
+use crate::ssz_deser;
+use crate::v4_wire::{
+    FIELD_BLOBS, FIELD_BLOCK, FIELD_EXECUTION_PAYLOAD_ENVELOPE, FIELD_KZG_PROOFS,
+};
 use crate::BeaconError;
+
+/// JSON object or raw SSZ bytes for a V4 envelope/blob/proof field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WireBody {
+    Json(serde_json::Value),
+    Ssz(Vec<u8>),
+}
+
+/// Gloas produce-block V4 body when `payload_included` is true.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GloasBlockContents {
+    pub block: BeaconBlock,
+    pub execution_payload_envelope: WireBody,
+    pub kzg_proofs: WireBody,
+    pub blobs: WireBody,
+    /// Bounded inner `BeaconBlock` SSZ for `[offset][sig][block]` framing.
+    pub block_ssz: Option<Vec<u8>>,
+}
+
+/// V4 produce-block `data`: bare `BeaconBlock` or payload-inclusive `BlockContents`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProduceBlockV4Body {
+    BeaconBlock { block: BeaconBlock, block_ssz: Option<Vec<u8>> },
+    BlockContents(GloasBlockContents),
+}
 
 /// A checkpoint in the beacon chain consisting of an epoch and block root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,7 +57,10 @@ pub struct AttestationData {
 /// A single attestation in the Electra (v2) `SingleAttestation` format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SingleAttestation {
+    // `quoted_u64` still accepts a bare integer; Beacon-API Uint64 does not.
+    #[serde(with = "serde_utils::quoted_u64::require_quotes")]
     pub committee_index: u64,
+    #[serde(with = "serde_utils::quoted_u64::require_quotes")]
     pub attester_index: u64,
     pub data: AttestationData,
     pub signature: String,
@@ -48,6 +80,7 @@ pub enum VersionedAttestation {
     PreElectra(Vec<LegacyAttestation>),
     Electra(Vec<SingleAttestation>),
     Fulu(Vec<SingleAttestation>),
+    Gloas(Vec<SingleAttestation>),
 }
 
 /// Fork-versioned aggregate attestation for fetch responses.
@@ -56,6 +89,7 @@ pub enum VersionedAggregateAttestation {
     PreElectra(eth_types::Attestation),
     Electra(eth_types::ElectraAttestation),
     Fulu(eth_types::ElectraAttestation),
+    Gloas(eth_types::ElectraAttestation),
 }
 
 /// Fork-versioned signed aggregate and proof for submission.
@@ -64,6 +98,7 @@ pub enum VersionedSignedAggregateAndProof {
     PreElectra(Vec<eth_types::SignedAggregateAndProof>),
     Electra(Vec<eth_types::SignedElectraAggregateAndProof>),
     Fulu(Vec<eth_types::SignedElectraAggregateAndProof>),
+    Gloas(Vec<eth_types::SignedElectraAggregateAndProof>),
 }
 
 /// Header of a beacon block.
@@ -123,7 +158,21 @@ pub struct ProposerDuty {
 /// Response type for proposer duties endpoint.
 pub type ProposerDutiesResponse = DependentRootResponse<Vec<ProposerDuty>>;
 
-/// Response from the produce block v3 endpoint, including header metadata.
+/// PTC duty information for a validator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtcDuty {
+    pub pubkey: String,
+    pub validator_index: String,
+    pub slot: String,
+}
+
+/// Response type for the PTC duties endpoint.
+pub type PtcDutiesResponse = DependentRootResponse<Vec<PtcDuty>>;
+
+/// Response type for the payload attestation data endpoint.
+pub type PayloadAttestationDataResponse = DataResponse<PayloadAttestationData>;
+
+/// Response from the produce block v3/v4 endpoint, including header metadata.
 ///
 /// Supports both JSON and SSZ content types. When the BN responds with SSZ,
 /// `is_ssz` is `true` and `ssz_bytes` contains the raw SSZ-encoded block.
@@ -138,13 +187,25 @@ pub struct ProduceBlockResponse {
     pub is_ssz: bool,
     /// Raw SSZ bytes when the BN responded with SSZ content type.
     pub ssz_bytes: Option<Vec<u8>>,
+    /// Required on V4 (fail closed); V3 defaults false.
+    pub payload_included: bool,
+    pub builder_url: Option<String>,
+    /// Unparsed header; no arithmetic.
+    pub consensus_block_value: Option<String>,
 }
 
 impl ProduceBlockResponse {
-    /// Parses the raw `data` field into a full block with blob sidecars.
+    /// Parses `data` into block contents, keeping [`eth_types::BeaconBlock::body`] as SSZ bytes.
+    ///
+    /// A JSON object body is decoded with [`eth_types::body_fork_layout`] of
+    /// `consensus_version` through [`eth_types::block_body_json::decode`]. Hex
+    /// bodies are unchanged. Gloas and pre-Deneb object bodies fail closed.
+    /// `BeaconBlock`'s `hex_vec` serde is not used on the object itself.
     pub fn parse_full_block(&self) -> Result<BlockContents, BeaconError> {
-        serde_json::from_value(self.data.clone())
-            .map_err(|e| BeaconError::ParseError(format!("invalid block contents: {}", e)))
+        let mut data = self.data.clone();
+        replace_json_body_with_ssz(&mut data, &self.consensus_version)?;
+        serde_json::from_value(data)
+            .map_err(|e| BeaconError::ParseError(format!("invalid block contents: {e}")))
     }
 
     /// Parses the raw `data` field into a blinded block.
@@ -152,6 +213,193 @@ impl ProduceBlockResponse {
         serde_json::from_value(self.data.clone())
             .map_err(|e| BeaconError::ParseError(format!("invalid blinded block: {}", e)))
     }
+
+    /// Decode a V4 produce body and require `payload_included` to match the shape.
+    pub fn decode_v4_body(&self) -> Result<ProduceBlockV4Body, BeaconError> {
+        if self.is_ssz {
+            self.decode_v4_ssz()
+        } else {
+            self.decode_v4_json()
+        }
+    }
+
+    fn decode_v4_json(&self) -> Result<ProduceBlockV4Body, BeaconError> {
+        let is_contents = json_is_gloas_block_contents(&self.data);
+        match (self.payload_included, is_contents) {
+            (true, true) => {
+                Ok(ProduceBlockV4Body::BlockContents(parse_gloas_block_contents_json(&self.data)?))
+            }
+            (false, false) => {
+                let block = parse_json_beacon_block(&self.data)?;
+                Ok(ProduceBlockV4Body::BeaconBlock { block, block_ssz: None })
+            }
+            (true, false) => Err(BeaconError::ParseError(
+                "payload_included is true but decoded shape is BeaconBlock, not BlockContents"
+                    .to_string(),
+            )),
+            (false, true) => Err(BeaconError::ParseError(
+                "payload_included is false but decoded shape is BlockContents, not BeaconBlock"
+                    .to_string(),
+            )),
+        }
+    }
+
+    fn decode_v4_ssz(&self) -> Result<ProduceBlockV4Body, BeaconError> {
+        let bytes = self.ssz_bytes.as_deref().ok_or_else(|| {
+            BeaconError::ParseError("SSZ produce response missing ssz_bytes".to_string())
+        })?;
+        if bytes.is_empty() {
+            return Err(BeaconError::ParseError("received empty SSZ body from beacon node".into()));
+        }
+        let is_contents = ssz_deser::looks_like_gloas_block_contents(bytes);
+        match (self.payload_included, is_contents) {
+            (true, true) => {
+                let parsed = ssz_deser::deserialize_gloas_block_contents(bytes)?;
+                Ok(ProduceBlockV4Body::BlockContents(GloasBlockContents {
+                    block: parsed.block,
+                    execution_payload_envelope: WireBody::Ssz(parsed.envelope_ssz),
+                    kzg_proofs: WireBody::Ssz(parsed.kzg_proofs),
+                    blobs: WireBody::Ssz(parsed.blobs),
+                    block_ssz: Some(parsed.block_ssz),
+                }))
+            }
+            (false, false) => {
+                let (block, offset) = ssz_deser::deserialize_beacon_block_from_ssz(
+                    bytes,
+                    ssz_deser::SszBlockFormat::BeaconBlock,
+                )?;
+                Ok(ProduceBlockV4Body::BeaconBlock {
+                    block,
+                    block_ssz: Some(bytes[offset..].to_vec()),
+                })
+            }
+            (true, false) => Err(BeaconError::ParseError(
+                "payload_included is true but SSZ shape is BeaconBlock, not BlockContents"
+                    .to_string(),
+            )),
+            (false, true) => Err(BeaconError::ParseError(
+                "payload_included is false but SSZ shape is BlockContents, not BeaconBlock"
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+/// Swap a Beacon-API object body for canonical SSZ hex so `BeaconBlock` serde stays `hex_vec`.
+///
+/// String bodies (pre-Deneb, and any already-SSZ payload) are left in place.
+fn replace_json_body_with_ssz(
+    data: &mut serde_json::Value,
+    consensus_version: &str,
+) -> Result<(), BeaconError> {
+    let Some(body) = json_body_field(data) else {
+        return Ok(());
+    };
+    if !body.is_object() {
+        return Ok(());
+    }
+    let layout = eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
+        BeaconError::ParseError(format!(
+            "JSON block body is unsupported for consensus version {consensus_version}"
+        ))
+    })?;
+    let ssz = eth_types::block_body_json::decode(body, layout)
+        .map_err(|err| BeaconError::ParseError(format!("invalid JSON block body: {err}")))?;
+    *body = serde_json::Value::String(format!("0x{}", hex::encode(ssz)));
+    Ok(())
+}
+
+fn json_body_field(data: &mut serde_json::Value) -> Option<&mut serde_json::Value> {
+    if data.get("block").is_some() {
+        data.get_mut("block")?.get_mut("body")
+    } else {
+        data.get_mut("body")
+    }
+}
+
+fn json_is_gloas_block_contents(data: &serde_json::Value) -> bool {
+    data.get(FIELD_BLOCK).is_some()
+        && data.get(FIELD_EXECUTION_PAYLOAD_ENVELOPE).is_some()
+        && data.get(FIELD_KZG_PROOFS).is_some()
+        && data.get(FIELD_BLOBS).is_some()
+}
+
+fn parse_gloas_block_contents_json(
+    data: &serde_json::Value,
+) -> Result<GloasBlockContents, BeaconError> {
+    let block = parse_json_beacon_block(data.get(FIELD_BLOCK).ok_or_else(|| {
+        BeaconError::ParseError(format!("BlockContents missing '{FIELD_BLOCK}'"))
+    })?)?;
+    let execution_payload_envelope =
+        data.get(FIELD_EXECUTION_PAYLOAD_ENVELOPE).cloned().ok_or_else(|| {
+            BeaconError::ParseError(format!(
+                "BlockContents missing '{FIELD_EXECUTION_PAYLOAD_ENVELOPE}'"
+            ))
+        })?;
+    let kzg_proofs = data.get(FIELD_KZG_PROOFS).cloned().ok_or_else(|| {
+        BeaconError::ParseError(format!("BlockContents missing '{FIELD_KZG_PROOFS}'"))
+    })?;
+    let blobs = data
+        .get(FIELD_BLOBS)
+        .cloned()
+        .ok_or_else(|| BeaconError::ParseError(format!("BlockContents missing '{FIELD_BLOBS}'")))?;
+    Ok(GloasBlockContents {
+        block,
+        execution_payload_envelope: WireBody::Json(execution_payload_envelope),
+        kzg_proofs: WireBody::Json(kzg_proofs),
+        blobs: WireBody::Json(blobs),
+        block_ssz: None,
+    })
+}
+
+/// Parse a JSON `BeaconBlock`. Hex `body` uses the eth-types contract; a nested
+/// Gloas JSON object is accepted and stored as opaque JSON bytes (not SSZ).
+fn parse_json_beacon_block(value: &serde_json::Value) -> Result<BeaconBlock, BeaconError> {
+    if let Ok(block) = serde_json::from_value::<BeaconBlock>(value.clone()) {
+        return Ok(block);
+    }
+    let slot = json_quoted_u64(value.get("slot"), "slot")?;
+    let proposer_index = json_quoted_u64(value.get("proposer_index"), "proposer_index")?;
+    let parent_root = json_root_hex(value.get("parent_root"), "parent_root")?;
+    let state_root = json_root_hex(value.get("state_root"), "state_root")?;
+    let body = match value.get("body") {
+        Some(body) if body.is_object() || body.is_array() => serde_json::to_vec(body)
+            .map_err(|e| BeaconError::ParseError(format!("invalid beacon block body: {e}")))?,
+        Some(serde_json::Value::String(s)) => decode_hex_bytes(s, "body")?,
+        Some(_) => {
+            return Err(BeaconError::ParseError("invalid beacon block body".to_string()));
+        }
+        None => return Err(BeaconError::ParseError("beacon block missing body".to_string())),
+    };
+    Ok(BeaconBlock { slot, proposer_index, parent_root, state_root, body })
+}
+
+fn json_quoted_u64(value: Option<&serde_json::Value>, field: &str) -> Result<u64, BeaconError> {
+    match value {
+        Some(serde_json::Value::String(s)) => s
+            .parse::<u64>()
+            .map_err(|_| BeaconError::ParseError(format!("invalid beacon block {field}: {s}"))),
+        Some(serde_json::Value::Number(n)) => n
+            .as_u64()
+            .ok_or_else(|| BeaconError::ParseError(format!("invalid beacon block {field}"))),
+        _ => Err(BeaconError::ParseError(format!("beacon block missing {field}"))),
+    }
+}
+
+fn json_root_hex(value: Option<&serde_json::Value>, field: &str) -> Result<[u8; 32], BeaconError> {
+    let s = value
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| BeaconError::ParseError(format!("beacon block missing {field}")))?;
+    let bytes = decode_hex_bytes(s, field)?;
+    bytes
+        .try_into()
+        .map_err(|_| BeaconError::ParseError(format!("beacon block {field} must be 32 bytes")))
+}
+
+fn decode_hex_bytes(s: &str, field: &str) -> Result<Vec<u8>, BeaconError> {
+    let hex_str = s.strip_prefix("0x").unwrap_or(s);
+    hex::decode(hex_str)
+        .map_err(|e| BeaconError::ParseError(format!("invalid beacon block {field}: {e}")))
 }
 
 /// Response type for attestation data endpoint.
@@ -226,11 +474,20 @@ pub struct StateResponse<T> {
 /// Response type for the beacon state fork endpoint.
 pub type StateForkResponse = StateResponse<StateFork>;
 
-/// Parses a config/spec response into a `ForkSchedule`.
+/// Parses a `/eth/v1/config/spec` map into a [`ForkSchedule`].
 ///
-/// Extracts fork epoch and version fields from the config spec map.
-/// Version fields are hex-encoded (e.g., "0x00000000") and epoch fields
-/// are decimal strings (e.g., "74240").
+/// Extracts fork epoch and version fields. Version fields are hex-encoded
+/// (e.g. `"0x00000000"`) and epoch fields are decimal strings (e.g. `"74240"`).
+/// `FULU_*` and `GLOAS_*` are optional: a missing key uses the unscheduled
+/// sentinels `u64::MAX` / `[0xFF; 4]`. A present but malformed value is a
+/// parse error naming that key.
+///
+/// There is no `/eth/v1/config/fork_schedule` client method —
+/// [`crate::BeaconClient::get_config_spec`] (`/eth/v1/config/spec`) and
+/// [`crate::BeaconClient::get_fork_schedule`] (which derives from it) are
+/// the only schedule sources. This function is the BN half of the two-source
+/// contract; issue 2.10 reconciles the spec-derived schedule against a local
+/// `rvc-config` pair.
 pub fn parse_fork_schedule(
     spec: &HashMap<String, serde_json::Value>,
 ) -> Result<ForkSchedule, BeaconError> {
@@ -252,6 +509,71 @@ pub fn parse_fork_schedule(
             "FULU_FORK_VERSION",
             [0xFF, 0xFF, 0xFF, 0xFF],
         )?,
+        gloas_fork_epoch: parse_epoch_optional(spec, "GLOAS_FORK_EPOCH", u64::MAX)?,
+        gloas_fork_version: parse_version_optional(
+            spec,
+            "GLOAS_FORK_VERSION",
+            [0xFF, 0xFF, 0xFF, 0xFF],
+        )?,
+    })
+}
+
+/// Parses slot duration in milliseconds from a `/eth/v1/config/spec` map.
+///
+/// Accepts either BN wire spelling:
+///
+/// - `SLOT_DURATION_MS` (milliseconds, used as-is)
+/// - `SECONDS_PER_SLOT` (seconds, converted as `seconds * 1000`)
+///
+/// Exactly one key is sufficient. Both may be present during a deprecation
+/// window and are accepted when they agree exactly. Neither key, or both
+/// present with unequal values, is a parse error. Extra keys such as
+/// `INTERVALS_PER_SLOT` are ignored.
+pub fn parse_slot_duration_ms(
+    spec: &HashMap<String, serde_json::Value>,
+) -> Result<u64, BeaconError> {
+    const SLOT_DURATION_MS_KEY: &str = "SLOT_DURATION_MS";
+    const SECONDS_PER_SLOT_KEY: &str = "SECONDS_PER_SLOT";
+
+    match (spec.get(SLOT_DURATION_MS_KEY), spec.get(SECONDS_PER_SLOT_KEY)) {
+        (None, None) => Err(BeaconError::ParseError(format!(
+            "missing config keys: {SLOT_DURATION_MS_KEY} and {SECONDS_PER_SLOT_KEY}"
+        ))),
+        (Some(value), None) => parse_positive_u64(value, SLOT_DURATION_MS_KEY),
+        (None, Some(value)) => seconds_per_slot_to_ms(value),
+        (Some(ms_value), Some(seconds_value)) => {
+            let slot_duration_ms = parse_positive_u64(ms_value, SLOT_DURATION_MS_KEY)?;
+            let from_seconds = seconds_per_slot_to_ms(seconds_value)?;
+            if slot_duration_ms == from_seconds {
+                Ok(slot_duration_ms)
+            } else {
+                let ms_raw = value_to_string(ms_value, SLOT_DURATION_MS_KEY)?;
+                let seconds_raw = value_to_string(seconds_value, SECONDS_PER_SLOT_KEY)?;
+                Err(BeaconError::ParseError(format!(
+                    "conflicting slot duration: {SECONDS_PER_SLOT_KEY}={seconds_raw} {SLOT_DURATION_MS_KEY}={ms_raw}"
+                )))
+            }
+        }
+    }
+}
+
+fn parse_positive_u64(value: &serde_json::Value, key: &str) -> Result<u64, BeaconError> {
+    let s = value_to_string(value, key)?;
+    let n = s
+        .parse::<u64>()
+        .map_err(|e| BeaconError::ParseError(format!("invalid slot duration for {key}: {e}")))?;
+    if n == 0 {
+        return Err(BeaconError::ParseError(format!(
+            "slot duration must be greater than zero for {key}"
+        )));
+    }
+    Ok(n)
+}
+
+fn seconds_per_slot_to_ms(value: &serde_json::Value) -> Result<u64, BeaconError> {
+    let seconds = parse_positive_u64(value, "SECONDS_PER_SLOT")?;
+    seconds.checked_mul(1000).ok_or_else(|| {
+        BeaconError::ParseError(format!("slot duration overflow for SECONDS_PER_SLOT: {seconds}"))
     })
 }
 
@@ -385,8 +707,35 @@ pub struct NodeVersionData {
     pub version: String,
 }
 
-/// Response type for the node version endpoint.
+/// Response type for the node version v1 endpoint.
 pub type NodeVersionResponse = DataResponse<NodeVersionData>;
+
+/// Engine-API `ClientVersionV1` object used by `/eth/v2/node/version`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ClientVersionV1 {
+    pub code: String,
+    pub name: String,
+    pub version: String,
+    pub commit: String,
+}
+
+/// Node version data from `/eth/v2/node/version`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct NodeVersionV2Data {
+    pub beacon_node: ClientVersionV1,
+    #[serde(default)]
+    pub execution_client: Option<ClientVersionV1>,
+}
+
+impl NodeVersionV2Data {
+    /// User-agent-style string for logs (`{name}/{version}`).
+    pub fn version_string(&self) -> String {
+        format!("{}/{}", self.beacon_node.name, self.beacon_node.version)
+    }
+}
+
+/// Response type for the node version v2 endpoint.
+pub type NodeVersionV2Response = DataResponse<NodeVersionV2Data>;
 
 /// Error details for a single attestation that failed validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,11 +744,36 @@ pub struct IndexedAttestationError {
     pub message: String,
 }
 
+/// One failed item in a beacon-APIs `IndexedErrorMessage` (400 partial submit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedFailure {
+    pub index: u32,
+    pub message: String,
+}
+
+/// beacon-APIs `IndexedErrorMessage` body on a 400 partial-failure submit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedErrorMessage {
+    pub code: u16,
+    pub message: String,
+    pub failures: Vec<IndexedFailure>,
+}
+
 /// Result of submitting attestations to the beacon node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubmitAttestationResult {
     Success,
     PartialFailure { failures: Vec<IndexedAttestationError> },
+}
+
+/// Result of `POST /eth/v1/validator/builder_preferences`.
+///
+/// A 400 `IndexedErrorMessage` is [`Self::PartialFailure`]: listed entries
+/// failed, the others were submitted. It is not a BN fault.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmitBuilderPreferencesResult {
+    Success,
+    PartialFailure { failures: Vec<IndexedFailure> },
 }
 
 impl SubmitAttestationResult {
@@ -415,9 +789,23 @@ impl SubmitAttestationResult {
     }
 }
 
+impl SubmitBuilderPreferencesResult {
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success)
+    }
+
+    pub fn failures(&self) -> &[IndexedFailure] {
+        match self {
+            Self::Success => &[],
+            Self::PartialFailure { failures } => failures,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eth_types::ForkName;
     use serde_json::json;
 
     #[test]
@@ -470,8 +858,8 @@ mod tests {
     #[test]
     fn test_attestation_deserialize() {
         let json = r#"{
-            "committee_index": 1,
-            "attester_index": 42,
+            "committee_index": "1",
+            "attester_index": "42",
             "data": {
                 "slot": "1000",
                 "index": "1",
@@ -493,6 +881,27 @@ mod tests {
         assert_eq!(attestation.attester_index, 42);
         assert_eq!(attestation.data.slot, "1000");
         assert_eq!(attestation.signature, "0xsignature");
+    }
+
+    #[test]
+    fn single_attestation_quoted_form_round_trips() {
+        let json = r#"{"committee_index":"3","attester_index":"42","data":{"slot":"1000","index":"1","beacon_block_root":"0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","source":{"epoch":"100","root":"0x1111111111111111111111111111111111111111111111111111111111111111"},"target":{"epoch":"101","root":"0x2222222222222222222222222222222222222222222222222222222222222222"}},"signature":"0xsignature"}"#;
+        let attestation: SingleAttestation = serde_json::from_str(json).unwrap();
+        let reserialized = serde_json::to_string(&attestation).unwrap();
+        assert_eq!(reserialized, json);
+        let again: SingleAttestation = serde_json::from_str(&reserialized).unwrap();
+        assert_eq!(again, attestation);
+    }
+
+    #[test]
+    fn single_attestation_rejects_an_unquoted_integer() {
+        let committee = r#"{"committee_index":3,"attester_index":"42","data":{"slot":"1000","index":"1","beacon_block_root":"0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","source":{"epoch":"100","root":"0x1111111111111111111111111111111111111111111111111111111111111111"},"target":{"epoch":"101","root":"0x2222222222222222222222222222222222222222222222222222222222222222"}},"signature":"0xsignature"}"#;
+        let err = serde_json::from_str::<SingleAttestation>(committee).unwrap_err();
+        assert!(err.to_string().contains("unquoted"), "{err}");
+
+        let attester = r#"{"committee_index":"3","attester_index":42,"data":{"slot":"1000","index":"1","beacon_block_root":"0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890","source":{"epoch":"100","root":"0x1111111111111111111111111111111111111111111111111111111111111111"},"target":{"epoch":"101","root":"0x2222222222222222222222222222222222222222222222222222222222222222"}},"signature":"0xsignature"}"#;
+        let err = serde_json::from_str::<SingleAttestation>(attester).unwrap_err();
+        assert!(err.to_string().contains("unquoted"), "{err}");
     }
 
     #[test]
@@ -573,6 +982,20 @@ mod tests {
     }
 
     #[test]
+    fn test_ptc_duty_deserialize() {
+        let json = r#"{
+            "pubkey": "0xpubkey",
+            "validator_index": "7",
+            "slot": "42"
+        }"#;
+
+        let duty: PtcDuty = serde_json::from_str(json).unwrap();
+        assert_eq!(duty.pubkey, "0xpubkey");
+        assert_eq!(duty.validator_index, "7");
+        assert_eq!(duty.slot, "42");
+    }
+
+    #[test]
     fn test_indexed_attestation_error_deserialize() {
         let json = r#"{
             "index": 0,
@@ -582,6 +1005,20 @@ mod tests {
         let error: IndexedAttestationError = serde_json::from_str(json).unwrap();
         assert_eq!(error.index, 0);
         assert_eq!(error.message, "Invalid signature");
+    }
+
+    #[test]
+    fn test_indexed_error_message_deserialize() {
+        let json = r#"{
+            "code": 400,
+            "message": "some failures",
+            "failures": [{"index": 1, "message": "builder rejected"}]
+        }"#;
+        let err: IndexedErrorMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(err.code, 400);
+        assert_eq!(err.failures.len(), 1);
+        assert_eq!(err.failures[0].index, 1);
+        assert_eq!(err.failures[0].message, "builder rejected");
     }
 
     #[test]
@@ -704,6 +1141,8 @@ mod tests {
         spec.insert("ELECTRA_FORK_VERSION".to_string(), json!("0x05000000"));
         spec.insert("FULU_FORK_EPOCH".to_string(), json!("18446744073709551615"));
         spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!("18446744073709551615"));
+        spec.insert("GLOAS_FORK_VERSION".to_string(), json!("0x07000000"));
         spec
     }
 
@@ -723,6 +1162,10 @@ mod tests {
         assert_eq!(schedule.deneb_fork_version, [4, 0, 0, 0]);
         assert_eq!(schedule.electra_fork_epoch, 364544);
         assert_eq!(schedule.electra_fork_version, [5, 0, 0, 0]);
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.fulu_fork_version, [6, 0, 0, 0]);
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+        assert_eq!(schedule.gloas_fork_version, [7, 0, 0, 0]);
     }
 
     #[test]
@@ -779,6 +1222,91 @@ mod tests {
         spec.insert("GENESIS_FORK_VERSION".to_string(), json!("00000000"));
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.genesis_fork_version, [0, 0, 0, 0]);
+    }
+
+    fn assert_parse_error_contains(result: Result<u64, BeaconError>, needles: &[&str]) {
+        let err = result.expect_err("expected BeaconError::ParseError");
+        assert!(matches!(err, BeaconError::ParseError(_)), "expected ParseError, got {err:?}");
+        let msg = err.to_string();
+        for needle in needles {
+            assert!(msg.contains(needle), "error {msg:?} should contain {needle:?}");
+        }
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_master_keyset() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("SLOT_DURATION_MS".to_string(), json!("12000"));
+        assert!(!spec.contains_key("SECONDS_PER_SLOT"));
+        assert!(!spec.contains_key("INTERVALS_PER_SLOT"));
+        assert_eq!(parse_slot_duration_ms(&spec).unwrap(), 12_000);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_legacy_keyset() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!("12"));
+        spec.insert("INTERVALS_PER_SLOT".to_string(), json!("3"));
+        assert!(!spec.contains_key("SLOT_DURATION_MS"));
+        assert_eq!(parse_slot_duration_ms(&spec).unwrap(), 12_000);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_both_agreeing() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!("12"));
+        spec.insert("SLOT_DURATION_MS".to_string(), json!("12000"));
+        assert_eq!(parse_slot_duration_ms(&spec).unwrap(), 12_000);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_conflicting_keys_error() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!("12"));
+        spec.insert("SLOT_DURATION_MS".to_string(), json!("13000"));
+        assert_parse_error_contains(
+            parse_slot_duration_ms(&spec),
+            &["SECONDS_PER_SLOT", "SLOT_DURATION_MS", "12", "13000"],
+        );
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_neither_key() {
+        let spec = mainnet_config_spec();
+        assert_parse_error_contains(
+            parse_slot_duration_ms(&spec),
+            &["SECONDS_PER_SLOT", "SLOT_DURATION_MS"],
+        );
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_zero() {
+        let mut spec = HashMap::new();
+        spec.insert("SLOT_DURATION_MS".to_string(), json!(0));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["SLOT_DURATION_MS"]);
+
+        let mut spec = HashMap::new();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!(0));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["SECONDS_PER_SLOT"]);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_non_numeric() {
+        let mut spec = HashMap::new();
+        spec.insert("SLOT_DURATION_MS".to_string(), json!("abc"));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["SLOT_DURATION_MS"]);
+
+        let mut spec = HashMap::new();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!("abc"));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["SECONDS_PER_SLOT"]);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_numeric_values() {
+        let mut spec = HashMap::new();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!(12));
+        spec.insert("SLOT_DURATION_MS".to_string(), json!(12000));
+        assert_eq!(parse_slot_duration_ms(&spec).unwrap(), 12_000);
     }
 
     #[test]
@@ -889,6 +1417,67 @@ mod tests {
     }
 
     #[test]
+    fn test_proposer_duties_v2_body_deserializes_as_v1_shape() {
+        // beacon-APIs proposer.v2.yaml uses the same GetProposerDutiesResponse
+        // schema as v1 (dependent_root, execution_optimistic, data[]).
+        let json = r#"{
+            "dependent_root": "0xabc",
+            "execution_optimistic": true,
+            "data": [{
+                "pubkey": "0xpubkey",
+                "validator_index": "7",
+                "slot": "32"
+            }]
+        }"#;
+        let response: ProposerDutiesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.dependent_root, "0xabc");
+        assert!(response.execution_optimistic);
+        assert_eq!(response.data[0].validator_index, "7");
+        assert_eq!(response.data[0].slot, "32");
+    }
+
+    #[test]
+    fn test_node_version_v2_deserialize_with_execution_client() {
+        let json = r#"{
+            "data": {
+                "beacon_node": {
+                    "code": "LH",
+                    "name": "Lighthouse",
+                    "version": "v8.0.1",
+                    "commit": "0xced49dd2"
+                },
+                "execution_client": {
+                    "code": "NM",
+                    "name": "Nethermind",
+                    "version": "v1.35.8",
+                    "commit": "0xc066aee2"
+                }
+            }
+        }"#;
+        let response: NodeVersionV2Response = serde_json::from_str(json).unwrap();
+        assert_eq!(response.data.beacon_node.code, "LH");
+        assert_eq!(response.data.version_string(), "Lighthouse/v8.0.1");
+        assert_eq!(response.data.execution_client.as_ref().unwrap().name, "Nethermind");
+    }
+
+    #[test]
+    fn test_node_version_v2_deserialize_without_execution_client() {
+        let json = r#"{
+            "data": {
+                "beacon_node": {
+                    "code": "LH",
+                    "name": "Lighthouse",
+                    "version": "v8.0.1",
+                    "commit": "0xced49dd2"
+                }
+            }
+        }"#;
+        let response: NodeVersionV2Response = serde_json::from_str(json).unwrap();
+        assert!(response.data.execution_client.is_none());
+        assert_eq!(response.data.version_string(), "Lighthouse/v8.0.1");
+    }
+
+    #[test]
     fn test_produce_block_response_parse_full_block() {
         let block_json = serde_json::json!({
             "slot": "100",
@@ -905,6 +1494,9 @@ mod tests {
             execution_payload_value: Some("12345".to_string()),
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
 
         let block = response.parse_full_block().unwrap();
@@ -929,6 +1521,9 @@ mod tests {
             execution_payload_value: None,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
 
         let block = response.parse_blinded_block().unwrap();
@@ -945,9 +1540,115 @@ mod tests {
             execution_payload_value: None,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
         };
 
         assert!(response.parse_full_block().is_err());
+    }
+
+    fn sample_beacon_block_json() -> serde_json::Value {
+        serde_json::json!({
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        })
+    }
+
+    fn sample_block_contents_json() -> serde_json::Value {
+        serde_json::json!({
+            "block": sample_beacon_block_json(),
+            "execution_payload_envelope": { "builder_index": "0" },
+            "kzg_proofs": ["0xaa"],
+            "blobs": ["0xbb"]
+        })
+    }
+
+    fn produce_json(data: serde_json::Value, payload_included: bool) -> ProduceBlockResponse {
+        ProduceBlockResponse {
+            data,
+            is_blinded: false,
+            consensus_version: "gloas".to_string(),
+            execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included,
+            builder_url: None,
+            consensus_block_value: None,
+        }
+    }
+
+    #[test]
+    fn test_decode_v4_json_beacon_block() {
+        let body = produce_json(sample_beacon_block_json(), false).decode_v4_body().unwrap();
+        match body {
+            ProduceBlockV4Body::BeaconBlock { block, block_ssz } => {
+                assert_eq!(block.slot, 100);
+                assert!(block_ssz.is_none());
+            }
+            other => panic!("expected BeaconBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_v4_json_block_contents() {
+        let body = produce_json(sample_block_contents_json(), true).decode_v4_body().unwrap();
+        match body {
+            ProduceBlockV4Body::BlockContents(contents) => {
+                assert_eq!(contents.block.slot, 100);
+                assert_eq!(
+                    contents.execution_payload_envelope,
+                    WireBody::Json(serde_json::json!({ "builder_index": "0" }))
+                );
+                assert_eq!(contents.kzg_proofs, WireBody::Json(serde_json::json!(["0xaa"])));
+                assert_eq!(contents.blobs, WireBody::Json(serde_json::json!(["0xbb"])));
+            }
+            other => panic!("expected BlockContents, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_v4_json_payload_included_mismatch_is_typed_error() {
+        let err = produce_json(sample_beacon_block_json(), true).decode_v4_body().unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains("payload_included"), "{msg}");
+                assert!(msg.contains("BeaconBlock"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+
+        let err = produce_json(sample_block_contents_json(), false).decode_v4_body().unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains("payload_included"), "{msg}");
+                assert!(msg.contains("BlockContents"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_decode_v4_json_nested_gloas_body_object() {
+        let nested = serde_json::json!({
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": { "randao_reveal": "0xaa", "graffiti": "0xbb" }
+        });
+        let body = produce_json(nested, false).decode_v4_body().unwrap();
+        match body {
+            ProduceBlockV4Body::BeaconBlock { block, .. } => {
+                assert_eq!(block.slot, 100);
+                assert_eq!(block.proposer_index, 42);
+                assert!(!block.body.is_empty());
+            }
+            other => panic!("expected BeaconBlock, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1155,6 +1856,24 @@ mod tests {
     }
 
     #[test]
+    fn test_versioned_attestation_gloas() {
+        let single = SingleAttestation {
+            committee_index: 1,
+            attester_index: 42,
+            data: AttestationData {
+                slot: "100".to_string(),
+                index: "1".to_string(),
+                beacon_block_root: "0xroot".to_string(),
+                source: Checkpoint { epoch: "3".to_string(), root: "0xs".to_string() },
+                target: Checkpoint { epoch: "4".to_string(), root: "0xt".to_string() },
+            },
+            signature: "0xsig".to_string(),
+        };
+        let versioned = VersionedAttestation::Gloas(vec![single]);
+        assert!(matches!(versioned, VersionedAttestation::Gloas(ref v) if v.len() == 1));
+    }
+
+    #[test]
     fn test_versioned_aggregate_attestation_pre_electra() {
         let att = eth_types::Attestation {
             aggregation_bits: vec![0xff],
@@ -1187,6 +1906,24 @@ mod tests {
         };
         let versioned = VersionedAggregateAttestation::Electra(att);
         assert!(matches!(versioned, VersionedAggregateAttestation::Electra(_)));
+    }
+
+    #[test]
+    fn test_versioned_aggregate_attestation_gloas() {
+        let att = eth_types::ElectraAttestation {
+            aggregation_bits: vec![0xff],
+            data: eth_types::AttestationData {
+                slot: 100,
+                index: 1,
+                beacon_block_root: [1u8; 32],
+                source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+            },
+            signature: vec![0xaa; 96],
+            committee_bits: vec![0x01; 8],
+        };
+        let versioned = VersionedAggregateAttestation::Gloas(att);
+        assert!(matches!(versioned, VersionedAggregateAttestation::Gloas(_)));
     }
 
     #[test]
@@ -1239,6 +1976,33 @@ mod tests {
         let versioned = VersionedSignedAggregateAndProof::Electra(proofs);
         assert!(
             matches!(versioned, VersionedSignedAggregateAndProof::Electra(ref v) if v.len() == 1)
+        );
+    }
+
+    #[test]
+    fn test_versioned_signed_aggregate_and_proof_gloas() {
+        let proofs = vec![eth_types::SignedElectraAggregateAndProof {
+            message: eth_types::ElectraAggregateAndProof {
+                aggregator_index: 42,
+                aggregate: eth_types::ElectraAttestation {
+                    aggregation_bits: vec![0xff],
+                    data: eth_types::AttestationData {
+                        slot: 100,
+                        index: 1,
+                        beacon_block_root: [1u8; 32],
+                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                    },
+                    signature: vec![0xaa; 96],
+                    committee_bits: vec![0x01; 8],
+                },
+                selection_proof: vec![0xbb; 96],
+            },
+            signature: vec![0xcc; 96],
+        }];
+        let versioned = VersionedSignedAggregateAndProof::Gloas(proofs);
+        assert!(
+            matches!(versioned, VersionedSignedAggregateAndProof::Gloas(ref v) if v.len() == 1)
         );
     }
 
@@ -1299,6 +2063,7 @@ mod tests {
         spec.insert("DENEB_FORK_EPOCH".to_string(), json!(269568));
         spec.insert("ELECTRA_FORK_EPOCH".to_string(), json!(364544));
         spec.insert("FULU_FORK_EPOCH".to_string(), json!(18446744073709551615_u64));
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!(18446744073709551615_u64));
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.altair_fork_epoch, 74240);
         assert_eq!(schedule.bellatrix_fork_epoch, 144896);
@@ -1306,6 +2071,7 @@ mod tests {
         assert_eq!(schedule.deneb_fork_epoch, 269568);
         assert_eq!(schedule.electra_fork_epoch, 364544);
         assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
     }
 
     #[test]
@@ -1326,6 +2092,66 @@ mod tests {
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
         assert_eq!(schedule.fulu_fork_version, [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_without_gloas() {
+        let mut spec = mainnet_config_spec();
+        spec.remove("GLOAS_FORK_EPOCH");
+        spec.remove("GLOAS_FORK_VERSION");
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+        assert_eq!(schedule.gloas_fork_version, [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_invalid_gloas_epoch() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!("not_a_number"));
+        let result = parse_fork_schedule(&spec);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("GLOAS_FORK_EPOCH"));
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_invalid_gloas_version() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("GLOAS_FORK_VERSION".to_string(), json!("0xZZZZZZZZ"));
+        let result = parse_fork_schedule(&spec);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("GLOAS_FORK_VERSION"));
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_with_gloas() {
+        let mut spec = mainnet_config_spec();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("500000"));
+        spec.insert("FULU_FORK_VERSION".to_string(), json!("0x06000000"));
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!("600000"));
+        spec.insert("GLOAS_FORK_VERSION".to_string(), json!("0x07000000"));
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.gloas_fork_epoch, 600000);
+        assert_eq!(schedule.gloas_fork_version, [0x07, 0, 0, 0]);
+        assert_eq!(ForkName::from_epoch(600000, &schedule), ForkName::Gloas);
+        assert_eq!(ForkName::from_epoch(599999, &schedule), ForkName::Fulu);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_omitted_fulu_and_gloas_share_version_sentinel() {
+        // Both omitted keys default to [0xFF; 4]. SignContext::resolve first-matches
+        // Fulu for that sentinel (`typed_signer::tests::test_resolve_sentinel_collision_first_matches_fulu`).
+        // Issue 2.10's conditional fail-closed rule confines the collision to the
+        // fully-unscheduled case.
+        let mut spec = mainnet_config_spec();
+        spec.remove("FULU_FORK_EPOCH");
+        spec.remove("FULU_FORK_VERSION");
+        spec.remove("GLOAS_FORK_EPOCH");
+        spec.remove("GLOAS_FORK_VERSION");
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+        assert_eq!(schedule.fulu_fork_version, [0xFF; 4]);
+        assert_eq!(schedule.gloas_fork_version, [0xFF; 4]);
     }
 
     #[test]

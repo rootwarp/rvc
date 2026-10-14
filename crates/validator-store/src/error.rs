@@ -6,4 +6,11 @@ pub enum ValidatorStoreError {
     TomlParse(#[from] toml::de::Error),
     #[error("config error: {0}")]
     Config(String),
+    /// The durable update did not publish.
+    ///
+    /// The pubkey was absent when the candidate was cloned, or its identity
+    /// changed during the write (removed or replaced) and the in-flight delta
+    /// was dropped. Neither case is a successful publish.
+    #[error("validator not found")]
+    NotFound,
 }

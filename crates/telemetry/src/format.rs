@@ -27,10 +27,143 @@
 //! redacted — selecting JSON is **not** a redaction bypass (proven by a captured
 //! subscriber test, see this module's tests).
 
-use tracing_subscriber::fmt::format::{DefaultFields, Format};
-use tracing_subscriber::fmt::MakeWriter;
+use std::fmt;
+
+use opentelemetry::trace::{SpanId, TraceId};
+use tracing::Event;
+use tracing_subscriber::fmt::format::{DefaultFields, Format, FormatEvent, FormatFields, Writer};
+use tracing_subscriber::fmt::{FmtContext, MakeWriter};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
+
+use crate::trace_id::{TraceIds, SPAN_ID_KEY, TRACE_ID_KEY};
+
+/// [`FormatEvent`] wrapper that renders cached [`TraceIds`] onto every log line.
+///
+/// Reads ids from the event's parent span extensions (`FmtContext::parent_span`,
+/// which is `Context::event_span` — not bare `lookup_current`) so formatting
+/// aligns with the event parent. When the extension is missing, emits nothing
+/// (keys absent, not empty). Never emits zeroed / invalid ids.
+///
+/// Trace/span ids are **correlators**, not authentication material — do not key
+/// ACL or audit decisions on their presence or the sampled flag.
+///
+/// Applied at all three build sites (pretty console, JSON console, file
+/// appender). Does not record same-name fields onto the event (avoids dual
+/// `trace_id` / `span_id` keys); rendering is this formatter's job alone.
+pub struct TraceIdFormat<F>(pub F);
+
+impl<S, N, F> FormatEvent<S, N> for TraceIdFormat<F>
+where
+    F: FormatEvent<S, N>,
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, N>,
+        writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        // Soft P2: event parent via parent_span (== event_span), not lookup_current.
+        let ids = ctx
+            .parent_span()
+            .and_then(|span| span.extensions().get::<TraceIds>().copied())
+            .filter(|ids| ids.trace_id != TraceId::INVALID && ids.span_id != SpanId::INVALID);
+
+        match ids {
+            None => self.0.format_event(ctx, writer, event),
+            Some(ids) => {
+                // Preserve the caller's Writer by wrapping writes; Format may
+                // still override ANSI via Format::with_ansi (same-crate).
+                let mut inject = TraceIdInject { inner: writer, ids, state: InjectState::Pending };
+                self.0.format_event(ctx, Writer::new(&mut inject), event)
+            }
+        }
+    }
+}
+
+/// Injection state for [`TraceIdInject`].
+#[derive(Debug, Clone, Copy)]
+enum InjectState {
+    /// Waiting for the first write from the inner formatter.
+    Pending,
+    /// JSON `{` + keys written; next content may need a separating comma.
+    NeedComma,
+    /// Keys already injected.
+    Done,
+}
+
+/// Writer adapter that injects `trace_id` / `span_id` using each profile's field
+/// syntax (pretty `key=value`, JSON `"key":"value"`) without `format!` /
+/// `to_string()` on the render path.
+struct TraceIdInject<'a> {
+    inner: Writer<'a>,
+    ids: TraceIds,
+    state: InjectState,
+}
+
+impl fmt::Write for TraceIdInject<'_> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        match self.state {
+            InjectState::Pending => {
+                if let Some(rest) = s.strip_prefix('{') {
+                    // JSON profile: inject top-level keys immediately after `{`.
+                    self.inner.write_char('{')?;
+                    write_json_id_fields(&mut self.inner, &self.ids)?;
+                    if rest.is_empty() {
+                        self.state = InjectState::NeedComma;
+                    } else {
+                        if rest.starts_with('"') {
+                            self.inner.write_char(',')?;
+                        }
+                        self.state = InjectState::Done;
+                        self.inner.write_str(rest)?;
+                    }
+                } else {
+                    // Pretty / full profile: emit key=value before the line body.
+                    write_pretty_id_fields(&mut self.inner, &self.ids)?;
+                    self.state = InjectState::Done;
+                    self.inner.write_str(s)?;
+                }
+            }
+            InjectState::NeedComma => {
+                if s.starts_with('"') {
+                    self.inner.write_char(',')?;
+                }
+                self.state = InjectState::Done;
+                self.inner.write_str(s)?;
+            }
+            InjectState::Done => self.inner.write_str(s)?,
+        }
+        Ok(())
+    }
+}
+
+/// Write `trace_id` / `span_id` as pretty `key=value` fields (no allocation).
+fn write_pretty_id_fields(writer: &mut Writer<'_>, ids: &TraceIds) -> fmt::Result {
+    writer.write_str(TRACE_ID_KEY)?;
+    writer.write_str("=")?;
+    write!(writer, "{}", ids.trace_id)?;
+    writer.write_str(" ")?;
+    writer.write_str(SPAN_ID_KEY)?;
+    writer.write_str("=")?;
+    write!(writer, "{}", ids.span_id)?;
+    writer.write_str(" ")
+}
+
+/// Write `trace_id` / `span_id` as JSON object entries (no allocation).
+fn write_json_id_fields(writer: &mut Writer<'_>, ids: &TraceIds) -> fmt::Result {
+    writer.write_char('"')?;
+    writer.write_str(TRACE_ID_KEY)?;
+    writer.write_str("\":\"")?;
+    write!(writer, "{}", ids.trace_id)?;
+    writer.write_str("\",\"")?;
+    writer.write_str(SPAN_ID_KEY)?;
+    writer.write_str("\":\"")?;
+    write!(writer, "{}", ids.span_id)?;
+    writer.write_char('"')
+}
 
 /// Selects how the **console** log stream is rendered (issue 5.5).
 ///
@@ -144,16 +277,22 @@ where
 /// ANSI styling is enabled only when the process stdout is a terminal, so
 /// piped/redirected console output (journald, docker, test harnesses) stays
 /// free of escape sequences — matching the file appender's `with_ansi(false)`.
+///
+/// Wrapped in [`TraceIdFormat`] so sampled spans carry `trace_id` / `span_id`
+/// (TRC-2c). `Format::with_ansi` mirrors the layer flag so color survives the
+/// writer-adapter wrap inside [`TraceIdFormat`].
 fn fmt_layer_pretty<S, W>(
     make_writer: W,
-) -> tracing_subscriber::fmt::Layer<S, DefaultFields, Format, W>
+) -> tracing_subscriber::fmt::Layer<S, DefaultFields, TraceIdFormat<Format>, W>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
     use std::io::IsTerminal;
+    let ansi = std::io::stdout().is_terminal();
     tracing_subscriber::fmt::layer()
-        .with_ansi(std::io::stdout().is_terminal())
+        .with_ansi(ansi)
+        .event_format(TraceIdFormat(Format::default().with_ansi(ansi)))
         .with_writer(make_writer)
 }
 
@@ -163,6 +302,9 @@ mod json_layer {
     use super::*;
 
     /// The JSON console layer with canonical fields flattened to top-level keys.
+    ///
+    /// [`TraceIdFormat`] wraps the JSON event formatter so `trace_id` /
+    /// `span_id` land as top-level keys (T6) when the span extension is set.
     pub(super) fn json_console_layer<S, W>(make_writer: W) -> impl Layer<S> + Send + Sync
     where
         S: tracing::Subscriber + for<'a> LookupSpan<'a>,
@@ -172,6 +314,7 @@ mod json_layer {
             .json()
             .flatten_event(true)
             .with_current_span(true)
+            .map_event_format(TraceIdFormat)
             .with_writer(make_writer)
     }
 }
@@ -399,7 +542,217 @@ mod tests {
         out
     }
 
-    // ── SECURITY: JSON is not a redaction bypass ──────────────────────────────
+    // ── TraceIdFormat (TRC-2c): T1–T4, T6 ─────────────────────────────────────
+
+    use crate::config::TelemetryConfig;
+    use crate::init::init_tracing;
+    use crate::propagation::inject_trace_context;
+    use crate::trace_id::{TraceIdLayer, SPAN_ID_KEY, TRACE_ID_KEY};
+
+    /// Trace-id hex from a W3C `traceparent` header value.
+    fn trace_id_from_traceparent(tp: &str) -> &str {
+        tp.split('-').nth(1).expect("traceparent must have a trace-id field")
+    }
+
+    /// Extract `key=value` field text from a pretty line (ANSI-stripped).
+    fn pretty_field_value<'a>(plain: &'a str, key: &str) -> Option<&'a str> {
+        let marker = format!("{key}=");
+        let start = plain.find(&marker)? + marker.len();
+        let rest = &plain[start..];
+        Some(rest.split_whitespace().next().unwrap_or(rest))
+    }
+
+    /// Shared stack: OTel → TraceIdLayer → console fmt (Layered, not Vec — so
+    /// `on_register_dispatch` reaches TraceIdLayer).
+    fn with_trace_id_console(
+        otel: Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>,
+        format: LogFormat,
+        buf: SharedBuf,
+    ) -> impl tracing::Subscriber + Send + Sync {
+        let fmt_layer = console_fmt_layer(format, buf);
+        tracing_subscriber::registry().with(otel).with(TraceIdLayer::new()).with(fmt_layer)
+    }
+
+    /// T1: line inside a sampled span carries both keys; rendered `trace_id`
+    /// equals `inject_trace_context` re-inject for that span.
+    #[test]
+    fn t1_sampled_span_line_carries_keys_matching_inject() {
+        let buf = SharedBuf::default();
+        let config = TelemetryConfig { sample_rate: 1.0, ..TelemetryConfig::default() };
+        let (otel, guard) = init_tracing(&config).expect("init_tracing");
+        let subscriber = with_trace_id_console(otel, LogFormat::Pretty, buf.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let span = tracing::info_span!("t1_sampled");
+        let _enter = span.enter();
+        tracing::info!("t1 correlated event");
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        inject_trace_context(&mut headers);
+        let tp = headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .expect("inject_trace_context must yield traceparent under a sampled span");
+        let injected = trace_id_from_traceparent(tp);
+
+        let out = buf.contents();
+        let line =
+            out.lines().find(|l| l.contains("t1 correlated event")).expect("event line present");
+        let plain = strip_ansi(line);
+
+        assert!(
+            plain.contains(TRACE_ID_KEY),
+            "T1: pretty line must carry {TRACE_ID_KEY}; got: {plain:?}"
+        );
+        assert!(
+            plain.contains(SPAN_ID_KEY),
+            "T1: pretty line must carry {SPAN_ID_KEY}; got: {plain:?}"
+        );
+        let rendered =
+            pretty_field_value(&plain, TRACE_ID_KEY).expect("T1: trace_id= value must be present");
+        assert_eq!(
+            rendered, injected,
+            "T1: rendered trace_id must equal inject_trace_context (got {rendered}, injected={tp})"
+        );
+
+        guard.provider.shutdown().ok();
+    }
+
+    /// T2: line outside any span carries neither key — absent, not empty.
+    #[test]
+    fn t2_outside_span_keys_absent() {
+        let buf = SharedBuf::default();
+        let config = TelemetryConfig { sample_rate: 1.0, ..TelemetryConfig::default() };
+        let (otel, guard) = init_tracing(&config).expect("init_tracing");
+        let subscriber = with_trace_id_console(otel, LogFormat::Pretty, buf.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        tracing::info!("t2 root event");
+
+        let out = buf.contents();
+        let line = out.lines().find(|l| l.contains("t2 root event")).expect("event line present");
+        let plain = strip_ansi(line);
+        assert!(
+            !plain.contains(TRACE_ID_KEY),
+            "T2: {TRACE_ID_KEY} must be absent outside a span; got: {plain:?}"
+        );
+        assert!(
+            !plain.contains(SPAN_ID_KEY),
+            "T2: {SPAN_ID_KEY} must be absent outside a span; got: {plain:?}"
+        );
+
+        guard.provider.shutdown().ok();
+    }
+
+    /// T3: `sample_rate: 0.0` → both keys absent (dominant production case).
+    #[test]
+    fn t3_unsampled_keys_absent() {
+        let buf = SharedBuf::default();
+        let config = TelemetryConfig { sample_rate: 0.0, ..TelemetryConfig::default() };
+        let (otel, guard) = init_tracing(&config).expect("init_tracing");
+        let subscriber = with_trace_id_console(otel, LogFormat::Pretty, buf.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let span = tracing::info_span!("t3_unsampled");
+        let _enter = span.enter();
+        tracing::info!("t3 unsampled event");
+
+        let out = buf.contents();
+        let line =
+            out.lines().find(|l| l.contains("t3 unsampled event")).expect("event line present");
+        let plain = strip_ansi(line);
+        assert!(
+            !plain.contains(TRACE_ID_KEY),
+            "T3: {TRACE_ID_KEY} must be absent at sample_rate 0.0; got: {plain:?}"
+        );
+        assert!(
+            !plain.contains(SPAN_ID_KEY),
+            "T3: {SPAN_ID_KEY} must be absent at sample_rate 0.0; got: {plain:?}"
+        );
+
+        guard.provider.shutdown().ok();
+    }
+
+    /// T4: subscriber without `init_tracing` → substring `00000000` never appears.
+    #[test]
+    fn t4_without_otel_never_emits_zeroed_ids() {
+        let buf = SharedBuf::default();
+        // without_time on the inner Format avoids timestamp false-positives on
+        // the literal `00000000` scan (e.g. `00.00000000` in fractional seconds).
+        let fmt_layer = tracing_subscriber::fmt::layer()
+            .with_ansi(false)
+            .event_format(TraceIdFormat(
+                tracing_subscriber::fmt::format().without_time().with_ansi(false),
+            ))
+            .with_writer(buf.clone());
+        let subscriber = tracing_subscriber::registry().with(TraceIdLayer::new()).with(fmt_layer);
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let span = tracing::info_span!("t4_no_otel");
+        let _enter = span.enter();
+        tracing::info!("t4 no otel event");
+
+        let out = buf.contents();
+        let line =
+            out.lines().find(|l| l.contains("t4 no otel event")).expect("event line present");
+        assert!(
+            !line.contains(TRACE_ID_KEY) && !line.contains(SPAN_ID_KEY),
+            "T4: keys must be absent without OTel; got: {line:?}"
+        );
+        assert!(
+            !line.contains("00000000"),
+            "T4: zeroed-id substring must never appear; got: {line:?}"
+        );
+    }
+
+    /// T6: JSON profile yields `v["trace_id"]` and `v["span_id"]` at top level.
+    #[test]
+    fn t6_json_profile_top_level_trace_and_span_id() {
+        let buf = SharedBuf::default();
+        let config = TelemetryConfig { sample_rate: 1.0, ..TelemetryConfig::default() };
+        let (otel, guard) = init_tracing(&config).expect("init_tracing");
+        let subscriber = with_trace_id_console(otel, LogFormat::Json, buf.clone());
+        let _default = tracing::subscriber::set_default(subscriber);
+
+        let span = tracing::info_span!("t6_json");
+        let _enter = span.enter();
+        tracing::info!("t6 json event");
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        inject_trace_context(&mut headers);
+        let tp = headers
+            .get("traceparent")
+            .and_then(|v| v.to_str().ok())
+            .expect("inject_trace_context must yield traceparent");
+        let injected = trace_id_from_traceparent(tp);
+
+        let out = buf.contents();
+        let line = out.lines().find(|l| l.contains("t6 json event")).expect("event line present");
+        let v: serde_json::Value = serde_json::from_str(line).expect("JSON line must parse");
+
+        let tid = v[TRACE_ID_KEY].as_str().expect("T6: top-level trace_id string");
+        let sid = v[SPAN_ID_KEY].as_str().expect("T6: top-level span_id string");
+        assert_eq!(tid, injected, "T6: JSON trace_id must equal inject_trace_context");
+        assert!(!tid.is_empty() && tid != "00000000000000000000000000000000");
+        assert!(!sid.is_empty() && sid != "0000000000000000");
+
+        guard.provider.shutdown().ok();
+    }
+
+    /// REFACTOR: TraceIdFormat render path must not call `format!` / `to_string()`.
+    #[test]
+    fn trace_id_format_render_path_has_no_format_or_to_string() {
+        let src = include_str!("format.rs");
+        let hot = src
+            .split("impl fmt::Write for TraceIdInject")
+            .nth(1)
+            .and_then(|s| s.split("/// Selects how the **console** log stream is rendered").next())
+            .expect("TraceIdInject Write impl + id-field helpers present");
+        assert!(
+            !hot.contains("format!(") && !hot.contains(".to_string()"),
+            "REFACTOR: no format!/to_string() on TraceIdFormat render hot path"
+        );
+    }
 
     /// JSON serialization must NOT undo value-level redaction. Redaction happens
     /// BEFORE recording: a `pubkey` is recorded as the already-truncated

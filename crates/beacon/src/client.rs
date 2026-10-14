@@ -1,23 +1,41 @@
+use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use metrics::{define_int_gauge_vec, IntGaugeVec};
 use reqwest::Client;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, error, trace, warn, Instrument};
 
 use observability::logging::RedactedUrl;
 
-use eth_types::{ForkSchedule, SignedValidatorRegistration, SignedVoluntaryExit};
+use eth_types::{
+    ForkName, ForkSchedule, PayloadAttestationMessage, SignedBlockContentsJson,
+    SignedProposerPreferences, SignedValidatorRegistration, SignedVoluntaryExit,
+};
 
 use crate::http_caps::{read_body_capped, read_body_capped_lossy, ResponseCaps};
 use crate::retry::RetryPolicy;
+use crate::ssz_deser;
 use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
     BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
-    GenesisResponse, IndexedAttestationError, ProduceBlockResponse, ProposerDutiesResponse,
-    ProposerPreparation, SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    GenesisResponse, IndexedAttestationError, IndexedErrorMessage, NodeVersionResponse,
+    NodeVersionV2Response, PayloadAttestationDataResponse, ProduceBlockResponse,
+    ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof,
+    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
     SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
     SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof,
+    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
+};
+use crate::v4_wire::{
+    BuilderConfig, BuilderPreferencesEntry, BUILDER_PREFERENCES_PATH, FIELD_BLOBS,
+    FIELD_KZG_PROOFS, FIELD_SIGNED_EXECUTION_PAYLOAD_ENVELOPE, HEADER_ETH_BLOB_DATA_INCLUDED,
+    HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_BLOCK_VALUE, HEADER_ETH_CONSENSUS_VERSION,
+    HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, PRODUCE_BLOCK_V4_PATH_PREFIX,
+    PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH, QUERY_BROADCAST_VALIDATION, QUERY_GRAFFITI,
+    QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
 };
 use crate::BeaconError;
 
@@ -78,11 +96,133 @@ impl BeaconClientConfig {
     }
 }
 
+/// Parse a required `Eth-Consensus-Version` header into a [`ForkName`].
+///
+/// Absent, non-UTF-8, or unknown values are [`BeaconError::ParseError`] naming
+/// the offending value. Responses that carry a versioned body must not proceed
+/// with an empty string.
+fn required_consensus_version(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<ForkName, BeaconError> {
+    let Some(raw) = headers.get("Eth-Consensus-Version") else {
+        return Err(BeaconError::ParseError("missing Eth-Consensus-Version header".to_string()));
+    };
+    let value = raw.to_str().map_err(|_| {
+        BeaconError::ParseError("unparseable Eth-Consensus-Version header".to_string())
+    })?;
+    ForkName::from_str(value)
+        .map_err(|_| BeaconError::ParseError(format!("invalid Eth-Consensus-Version: {value}")))
+}
+
+/// Distinguishes produce-block wire versions so V4 cannot silently take V3 defaults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProduceBlockApi {
+    V3,
+    V4,
+}
+
+/// V4 produce-block response headers. V3 uses [`ProduceV4Headers::v3_defaults`].
+#[derive(Debug)]
+struct ProduceV4Headers {
+    payload_included: bool,
+    builder_url: Option<String>,
+    consensus_block_value: Option<String>,
+}
+
+impl ProduceV4Headers {
+    /// Pre-Gloas V3 does not send these headers; do not fail closed on their absence.
+    fn v3_defaults() -> Self {
+        Self { payload_included: false, builder_url: None, consensus_block_value: None }
+    }
+}
+
+/// Parse V4 produce-block headers. `Eth-Execution-Payload-Included` is required.
+fn parse_v4_produce_headers(
+    headers: &reqwest::header::HeaderMap,
+) -> Result<ProduceV4Headers, BeaconError> {
+    Ok(ProduceV4Headers {
+        payload_included: required_payload_included(headers)?,
+        builder_url: optional_header_str(headers, HEADER_ETH_BUILDER_URL)?,
+        consensus_block_value: optional_header_str(headers, HEADER_ETH_CONSENSUS_BLOCK_VALUE)?,
+    })
+}
+
+/// After a 2xx, body/timeout/transport failures must not look retryable to
+/// `query_failover` (D29). `ParseError` / `BodyTooLarge` already stop failover.
+fn commit_v4_produce_error(err: BeaconError) -> BeaconError {
+    match err {
+        BeaconError::ParseError(_) | BeaconError::BodyTooLarge { .. } => err,
+        other => BeaconError::ParseError(format!("produce_block_v4 failed after 2xx: {other}")),
+    }
+}
+
+/// Parse a required `Eth-Execution-Payload-Included` header into a bool.
+///
+/// Absent, non-UTF-8, or values other than `true`/`false` are
+/// [`BeaconError::ParseError`] naming the header. Never default.
+fn required_payload_included(headers: &reqwest::header::HeaderMap) -> Result<bool, BeaconError> {
+    let Some(raw) = headers.get(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED) else {
+        return Err(BeaconError::ParseError(format!(
+            "missing {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} header"
+        )));
+    };
+    let value = raw.to_str().map_err(|_| {
+        BeaconError::ParseError(format!(
+            "unparseable {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} header"
+        ))
+    })?;
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(BeaconError::ParseError(format!(
+            "unparseable {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} header: {value}"
+        ))),
+    }
+}
+
+fn optional_header_str(
+    headers: &reqwest::header::HeaderMap,
+    name: &'static str,
+) -> Result<Option<String>, BeaconError> {
+    let Some(raw) = headers.get(name) else {
+        return Ok(None);
+    };
+    let value =
+        raw.to_str().map_err(|_| BeaconError::ParseError(format!("unparseable {name} header")))?;
+    Ok(Some(value.to_string()))
+}
+
+/// Case-insensitive equality of two hex ids, each with an optional `0x`/`0X` prefix.
+pub fn hex_ids_equal(left: &str, right: &str) -> bool {
+    fn body(s: &str) -> &str {
+        let s = s.trim();
+        s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s)
+    }
+    body(left).eq_ignore_ascii_case(body(right))
+}
+
+/// `Ok(genesis)` only when its validators root equals `expected_root_hex`.
+pub fn ensure_genesis_validators_root(
+    genesis: GenesisResponse,
+    expected_root_hex: &str,
+) -> Result<GenesisResponse, BeaconError> {
+    if hex_ids_equal(&genesis.data.genesis_validators_root, expected_root_hex) {
+        Ok(genesis)
+    } else {
+        Err(BeaconError::HttpError(format!(
+            "genesis_validators_root {} does not match configured root",
+            genesis.data.genesis_validators_root
+        )))
+    }
+}
+
 /// Async HTTP client wrapper for beacon node communication.
 #[derive(Clone)]
 pub struct BeaconClient {
     client: Client,
     config: BeaconClientConfig,
+    /// Logs the node-version v1 fallback once per BN (D25).
+    node_version_v1_fallback_logged: Arc<AtomicBool>,
 }
 
 impl BeaconClient {
@@ -107,7 +247,11 @@ impl BeaconClient {
 
         let config = BeaconClientConfig { endpoint: endpoint.to_string(), ..config };
 
-        Ok(Self { client, config })
+        Ok(Self {
+            client,
+            config,
+            node_version_v1_fallback_logged: Arc::new(AtomicBool::new(false)),
+        })
     }
 
     /// Returns the configured endpoint URL.
@@ -341,6 +485,15 @@ impl BeaconClient {
         self.get("/eth/v1/beacon/genesis").await
     }
 
+    /// [`Self::get_genesis`], rejecting a body whose validators root is not
+    /// `expected_root_hex`. A single client has no peer to fail over to.
+    pub async fn get_genesis_matching_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<GenesisResponse, BeaconError> {
+        ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
+    }
+
     /// Fetches fork information for the given state.
     ///
     /// Returns the previous and current fork versions along with the fork epoch.
@@ -360,12 +513,29 @@ impl BeaconClient {
         self.get(&path).await
     }
 
+    /// Path for proposer duties: v1 pre-Gloas, v2 at Gloas.
+    ///
+    /// v1 remains `/eth/v1/validator/duties/proposer/{epoch}` (byte-identical
+    /// to the historical client). Endpoint availability is independent of
+    /// response shape — v1 is kept for the whole pre-Gloas window.
+    fn proposer_duties_path(epoch: u64, schedule: &ForkSchedule) -> String {
+        let version =
+            if ForkName::from_epoch(epoch, schedule) >= ForkName::Gloas { "v2" } else { "v1" };
+        format!("/eth/{version}/validator/duties/proposer/{epoch}")
+    }
+
     /// Fetches proposer duties for the given epoch.
+    ///
+    /// Routes on `ForkName::from_epoch(epoch, schedule)`: v1 for pre-Gloas
+    /// epochs, v2 at Gloas. A 404 on v2 at a Gloas epoch is an error, never a
+    /// silent downgrade to v1 (D25). A 404 on v1 pre-Gloas is the same error
+    /// it is today.
     pub async fn get_proposer_duties(
         &self,
         epoch: u64,
+        schedule: &ForkSchedule,
     ) -> Result<ProposerDutiesResponse, BeaconError> {
-        let path = format!("/eth/v1/validator/duties/proposer/{}", epoch);
+        let path = Self::proposer_duties_path(epoch, schedule);
         self.get(&path)
             .instrument(tracing::info_span!("beacon.get_proposer_duties", epoch = epoch))
             .await
@@ -430,12 +600,8 @@ impl BeaconClient {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        let consensus_version = response
-            .headers()
-            .get("Eth-Consensus-Version")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let consensus_version =
+            required_consensus_version(response.headers())?.as_ref().to_string();
 
         let execution_payload_value = response
             .headers()
@@ -457,6 +623,7 @@ impl BeaconClient {
                 is_blinded,
                 &consensus_version,
                 &execution_payload_value,
+                ProduceV4Headers::v3_defaults(),
             )
             .await
             {
@@ -487,13 +654,132 @@ impl BeaconClient {
                     return Self::parse_produce_block_json(
                         fallback_response,
                         self.config.max_body_bytes,
+                        ProduceBlockApi::V3,
                     )
                     .await;
                 }
             }
         }
 
-        Self::parse_produce_block_json(response, self.config.max_body_bytes).await
+        Self::parse_produce_block_json(response, self.config.max_body_bytes, ProduceBlockApi::V3)
+            .await
+    }
+
+    /// Produces a block for the given slot using the v4 endpoint.
+    ///
+    /// `POST` with a required [`BuilderConfig`] JSON body. Requests SSZ and
+    /// decodes JSON when the BN responds with JSON despite the SSZ preference.
+    /// A 2xx commits this BN: the body is decoded in place — never a second
+    /// produce POST (D29 / empty SSZ is `ParseError`, not a JSON retry).
+    ///
+    /// `skip_all` keeps `randao_reveal` and the builder config out of the span.
+    #[tracing::instrument(name = "beacon.produce_block_v4", level = "debug", skip_all, fields(slot = slot))]
+    pub async fn produce_block_v4(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let slot_s = slot.to_string();
+        let mut query: Vec<(&str, &str)> =
+            vec![(QUERY_RANDAO_REVEAL, randao_reveal), (QUERY_INCLUDE_PAYLOAD, "true")];
+        if let Some(g) = graffiti {
+            query.push((QUERY_GRAFFITI, g));
+        }
+        let prefix = PRODUCE_BLOCK_V4_PATH_PREFIX.trim_start_matches('/');
+        let mut segments: Vec<&str> = prefix.split('/').collect();
+        segments.push(&slot_s);
+        let path = Self::build_path(&segments, &query);
+        let url = self.resolve_url(&path)?;
+
+        let body_bytes = serde_json::to_vec(builder_config).map_err(|e| {
+            BeaconError::HttpError(format!("failed to serialize request body: {e}"))
+        })?;
+
+        let response = self
+            .execute_with_retry_raw(
+                "POST",
+                &url,
+                || {
+                    let body_bytes = body_bytes.clone();
+                    let url = url.clone();
+                    async move {
+                        Self::traced(
+                            self.client
+                                .post(&url)
+                                .header(reqwest::header::ACCEPT, Self::SSZ_ACCEPT_HEADER)
+                                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                                .header(HEADER_ETH_CONSENSUS_VERSION, ForkName::Gloas.as_ref())
+                                .body(body_bytes),
+                        )
+                        .send()
+                        .await
+                    }
+                },
+                Self::take_success_response,
+            )
+            .await?;
+
+        // D29: this 2xx is the production attempt. Decode in place; never POST
+        // BuilderConfig (and its SignedBuilderRequestAuth) a second time.
+        self.decode_produce_block_v4(slot, response).await.map_err(commit_v4_produce_error)
+    }
+
+    async fn decode_produce_block_v4(
+        &self,
+        slot: u64,
+        response: reqwest::Response,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let is_blinded = response
+            .headers()
+            .get("Eth-Execution-Payload-Blinded")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
+        let consensus_version =
+            required_consensus_version(response.headers())?.as_ref().to_string();
+
+        let execution_payload_value = response
+            .headers()
+            .get("Eth-Execution-Payload-Value")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.to_string());
+
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/json")
+            .to_string();
+
+        if content_type.starts_with("application/octet-stream") {
+            let v4 = parse_v4_produce_headers(response.headers())?;
+            return match Self::try_process_ssz_body(
+                response,
+                slot,
+                is_blinded,
+                &consensus_version,
+                &execution_payload_value,
+                v4,
+            )
+            .await
+            {
+                Ok(result) => Ok(result),
+                Err(ssz_err) => {
+                    warn!(
+                        slot = slot,
+                        error = %ssz_err,
+                        "SSZ produce_block_v4 body unusable after 2xx; not retrying"
+                    );
+                    Err(ssz_err)
+                }
+            };
+        }
+
+        Self::parse_produce_block_json(response, self.config.max_body_bytes, ProduceBlockApi::V4)
+            .await
     }
 
     /// Attempt to read and validate the SSZ body from an HTTP response.
@@ -503,6 +789,7 @@ impl BeaconClient {
         is_blinded: bool,
         consensus_version: &str,
         execution_payload_value: &Option<String>,
+        v4: ProduceV4Headers,
     ) -> Result<ProduceBlockResponse, BeaconError> {
         // H-12 (SSZ path): cap before allocation — read_body_capped streams in chunks
         // and returns BodyTooLarge before allocating more than MAX_SSZ_BLOCK_BYTES.
@@ -529,6 +816,9 @@ impl BeaconClient {
             execution_payload_value: execution_payload_value.clone(),
             is_ssz: true,
             ssz_bytes: Some(ssz_bytes),
+            payload_included: v4.payload_included,
+            builder_url: v4.builder_url,
+            consensus_block_value: v4.consensus_block_value,
         })
     }
 
@@ -541,6 +831,7 @@ impl BeaconClient {
     async fn parse_produce_block_json(
         response: reqwest::Response,
         max_body_bytes: usize,
+        api: ProduceBlockApi,
     ) -> Result<ProduceBlockResponse, BeaconError> {
         // Extract all headers before consuming the body (reqwest moves the
         // response when reading the body, so we capture metadata first).
@@ -551,18 +842,19 @@ impl BeaconClient {
             .map(|v| v == "true")
             .unwrap_or(false);
 
-        let consensus_version = response
-            .headers()
-            .get("Eth-Consensus-Version")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+        let consensus_version =
+            required_consensus_version(response.headers())?.as_ref().to_string();
 
         let execution_payload_value = response
             .headers()
             .get("Eth-Execution-Payload-Value")
             .and_then(|v| v.to_str().ok())
             .map(|v| v.to_string());
+
+        let v4_headers = match api {
+            ProduceBlockApi::V4 => parse_v4_produce_headers(response.headers())?,
+            ProduceBlockApi::V3 => ProduceV4Headers::v3_defaults(),
+        };
 
         // H-12: cap the body before deserialising.
         let bytes = read_body_capped(response, max_body_bytes).await?;
@@ -580,22 +872,29 @@ impl BeaconClient {
             execution_payload_value,
             is_ssz: false,
             ssz_bytes: None,
+            payload_included: v4_headers.payload_included,
+            builder_url: v4_headers.builder_url,
+            consensus_block_value: v4_headers.consensus_block_value,
         })
     }
 
     /// Publishes a signed beacon block to the network.
+    ///
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; the header is
+    /// sent only when `Some`.
     pub async fn publish_block<B: Serialize>(
         &self,
         signed_block: &B,
         consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
-        self.post_empty_with_headers(
-            "/eth/v2/beacon/blocks",
-            signed_block,
-            &[("Eth-Consensus-Version", consensus_version)],
-        )
-        .instrument(tracing::info_span!("beacon.publish_block"))
-        .await
+        let mut headers = vec![(HEADER_ETH_CONSENSUS_VERSION, consensus_version)];
+        if let Some(url) = builder_url {
+            headers.push((HEADER_ETH_BUILDER_URL, url));
+        }
+        self.post_empty_with_headers("/eth/v2/beacon/blocks", signed_block, &headers)
+            .instrument(tracing::info_span!("beacon.publish_block"))
+            .await
     }
 
     /// Publishes a signed blinded beacon block to the network.
@@ -616,17 +915,21 @@ impl BeaconClient {
     /// Publishes a block as raw SSZ bytes using `Content-Type: application/octet-stream`.
     ///
     /// Routes to the blinded or unblinded endpoint based on `is_blinded`.
+    /// `builder_url` is the produce-time `Eth-Builder-Url` echo; the header is
+    /// sent only when `Some`.
     pub async fn publish_block_ssz(
         &self,
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
         let path =
             if is_blinded { "/eth/v1/beacon/blinded_blocks" } else { "/eth/v2/beacon/blocks" };
         let url = self.resolve_url(path)?;
         let cv = consensus_version.to_string();
         let body = ssz_bytes.to_vec();
+        let builder_header = builder_url.map(str::to_string);
 
         self.execute_with_retry_raw(
             "POST",
@@ -635,16 +938,18 @@ impl BeaconClient {
                 let cv = cv.clone();
                 let body = body.clone();
                 let url = url.clone();
+                let builder_header = builder_header.clone();
                 async move {
-                    Self::traced(
-                        self.client
-                            .post(&url)
-                            .header("Content-Type", "application/octet-stream")
-                            .header("Eth-Consensus-Version", &cv)
-                            .body(body),
-                    )
-                    .send()
-                    .await
+                    let mut request = self
+                        .client
+                        .post(&url)
+                        .header("Content-Type", "application/octet-stream")
+                        .header(HEADER_ETH_CONSENSUS_VERSION, &cv)
+                        .body(body);
+                    if let Some(ref builder_url) = builder_header {
+                        request = request.header(HEADER_ETH_BUILDER_URL, builder_url);
+                    }
+                    Self::traced(request).send().await
                 }
             },
             |response| async move {
@@ -658,6 +963,110 @@ impl BeaconClient {
         .await
     }
 
+    /// Publishes `{signed_block, kzg_proofs, blobs}` as JSON.
+    ///
+    /// Same headers as [`Self::publish_block`]: `Eth-Consensus-Version`, and the
+    /// produce-time `Eth-Builder-Url` echo when `builder_url` is `Some`.
+    /// `BnManager` fans out here from the JSON block publish path.
+    pub async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        let mut headers = vec![(HEADER_ETH_CONSENSUS_VERSION, consensus_version)];
+        if let Some(url) = builder_url {
+            headers.push((HEADER_ETH_BUILDER_URL, url));
+        }
+        self.post_empty_with_headers("/eth/v2/beacon/blocks", contents, &headers)
+            .instrument(tracing::info_span!("beacon.publish_block_contents"))
+            .await
+    }
+
+    /// Publishes a signed execution payload envelope with blobs and proofs.
+    ///
+    /// Always sends `Eth-Blob-Data-Included: true` so the receiving BN does not
+    /// need the producing BN's cache. `broadcast_validation` is forwarded when set.
+    pub async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        let query: Vec<(&str, &str)> = match broadcast_validation {
+            Some(v) => vec![(QUERY_BROADCAST_VALIDATION, v)],
+            None => vec![],
+        };
+        let prefix = PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH.trim_start_matches('/');
+        let segments: Vec<&str> = prefix.split('/').collect();
+        let path = Self::build_path(&segments, &query);
+        let url = self.resolve_url(&path)?;
+        let cv = consensus_version.to_string();
+
+        let (content_type, body): (&'static str, Vec<u8>) = match (
+            signed_envelope,
+            blobs,
+            kzg_proofs,
+        ) {
+            (WireBody::Json(envelope), WireBody::Json(blobs_json), WireBody::Json(proofs_json)) => {
+                let mut map = serde_json::Map::new();
+                map.insert(FIELD_SIGNED_EXECUTION_PAYLOAD_ENVELOPE.to_string(), envelope.clone());
+                map.insert(FIELD_KZG_PROOFS.to_string(), proofs_json.clone());
+                map.insert(FIELD_BLOBS.to_string(), blobs_json.clone());
+                let bytes = serde_json::to_vec(&serde_json::Value::Object(map)).map_err(|e| {
+                    BeaconError::HttpError(format!("failed to serialize request body: {e}"))
+                })?;
+                ("application/json", bytes)
+            }
+            (WireBody::Ssz(envelope), WireBody::Ssz(blobs_ssz), WireBody::Ssz(proofs_ssz)) => (
+                "application/octet-stream",
+                ssz_deser::encode_signed_envelope_contents(envelope, proofs_ssz, blobs_ssz),
+            ),
+            _ => {
+                return Err(BeaconError::ParseError(
+                    "publish_execution_payload_envelope requires JSON or SSZ for envelope, blobs, and proofs together"
+                        .to_string(),
+                ));
+            }
+        };
+
+        self.execute_with_retry_raw(
+            "POST",
+            &url,
+            || {
+                let cv = cv.clone();
+                let url = url.clone();
+                let body = body.clone();
+                async move {
+                    let request = self
+                        .client
+                        .post(&url)
+                        .header(reqwest::header::CONTENT_TYPE, content_type)
+                        .header(HEADER_ETH_CONSENSUS_VERSION, &cv)
+                        .header(HEADER_ETH_BLOB_DATA_INCLUDED, "true")
+                        .body(body);
+                    Self::traced(request).send().await
+                }
+            },
+            |response| async move {
+                let status = response.status();
+                if status.as_u16() == 202 {
+                    warn!("execution payload envelope broadcast succeeded but integration failed");
+                    return Ok(());
+                }
+                if status.is_success() {
+                    Ok(())
+                } else {
+                    Err(Self::api_error_from_response(response).await)
+                }
+            },
+        )
+        .instrument(tracing::info_span!("beacon.publish_execution_payload_envelope"))
+        .await
+    }
+
     /// Fetches sync committee duties for the given epoch and validator indices.
     pub async fn post_sync_committee_duties(
         &self,
@@ -668,6 +1077,70 @@ impl BeaconClient {
         self.post(&path, &validator_indices)
             .instrument(tracing::info_span!("beacon.get_sync_committee_duties", epoch = epoch))
             .await
+    }
+
+    /// Fetches PTC duties for the given epoch and validator indices.
+    pub async fn post_ptc_duties(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<PtcDutiesResponse, BeaconError> {
+        let path = format!("/eth/v1/validator/duties/ptc/{}", epoch);
+        self.post(&path, &validator_indices)
+            .instrument(tracing::info_span!("beacon.post_ptc_duties", epoch = epoch))
+            .await
+    }
+
+    /// Fetches payload attestation data for the given slot.
+    ///
+    /// HTTP 204 means the beacon node has not seen a block for this slot: skip
+    /// the duty (`Ok(None)`). It is not retried and is never treated as empty data.
+    pub async fn get_payload_attestation_data(
+        &self,
+        slot: u64,
+    ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError> {
+        let slot_s = slot.to_string();
+        let path = Self::build_path(
+            &["eth", "v1", "validator", "payload_attestation_data"],
+            &[("slot", &slot_s)],
+        );
+        let url = self.resolve_url(&path)?;
+        let max_body_bytes = self.config.max_body_bytes;
+
+        self.execute_with_retry_raw(
+            "GET",
+            &url,
+            || async { Self::traced(self.client.get(&url)).send().await },
+            move |response| async move {
+                let status = response.status();
+                if status.as_u16() == 204 {
+                    return Ok(None);
+                }
+                if !status.is_success() {
+                    return Err(Self::api_error_from_response(response).await);
+                }
+                let body = read_body_capped(response, max_body_bytes).await?;
+                serde_json::from_slice::<PayloadAttestationDataResponse>(&body).map(Some).map_err(
+                    |e| BeaconError::ParseError(format!("error decoding response body: {e}")),
+                )
+            },
+        )
+        .instrument(tracing::info_span!("beacon.get_payload_attestation_data", slot = slot))
+        .await
+    }
+
+    /// Submits payload attestation messages to the beacon node pool.
+    pub async fn submit_payload_attestations(
+        &self,
+        messages: &[PayloadAttestationMessage],
+    ) -> Result<(), BeaconError> {
+        self.post_empty_with_headers(
+            "/eth/v1/beacon/pool/payload_attestations",
+            &messages,
+            &[("Eth-Consensus-Version", ForkName::Gloas.as_ref())],
+        )
+        .instrument(tracing::info_span!("beacon.submit_payload_attestations"))
+        .await
     }
 
     /// Submits sync committee messages to the beacon node pool.
@@ -715,31 +1188,247 @@ impl BeaconClient {
 
     /// Fetches an aggregate attestation for the given slot and attestation data root.
     ///
-    /// The `committee_index` parameter is required for Electra and later forks.
-    /// Pass `None` for pre-Electra requests.
+    /// The caller supplies the resolved fork for the slot, not the configured
+    /// head fork. `committee_index` is required for Electra and later. Pass
+    /// `None` for pre-Electra requests.
+    ///
+    /// Electra, Fulu, and Gloas send
+    /// `GET /eth/v2/validator/aggregate_attestation` with
+    /// `Eth-Consensus-Version` set to `fork`. A 200 is accepted only when that
+    /// header, the body `version`, and `fork` are the same [`ForkName`]. The
+    /// payload is not coerced into the requested fork. `committee_bits` must
+    /// include `committee_index`.
+    ///
+    /// HTTP 405 or 501 is one terminal v2 attempt, then one v1 fallback (not a
+    /// retry loop). Other 429/5xx responses, timeouts, and connect failures use
+    /// [`RetryPolicy`](crate::RetryPolicy) and do not fall back. The gap is
+    /// logged at `warn`. `rvc_bn_capability_state` for
+    /// `aggregate_attestation_v2` is set to 0. That 0 means "used v1 once", not
+    /// "drop this BN". A successful agreeing v2 response sets the series to 1.
+    ///
+    /// v1 has no fork field. A Fulu or Gloas 405/501 with `committee_index`
+    /// therefore returns [`VersionedAggregateAttestation::Electra`], not Fulu
+    /// or Gloas. The v1 body is not re-wrapped. Phase0 through Deneb stay on
+    /// v1 and do not send `Eth-Consensus-Version`.
     #[tracing::instrument(name = "beacon.get_aggregate_attestation", skip_all, fields(slot = slot))]
     pub async fn get_aggregate_attestation(
         &self,
         slot: u64,
         attestation_data_root: &str,
         committee_index: Option<u64>,
+        fork: ForkName,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
-        let slot_s = slot.to_string();
-        let ci_s = committee_index.map(|ci| ci.to_string());
-        let mut query: Vec<(&str, &str)> =
-            vec![("slot", &slot_s), ("attestation_data_root", attestation_data_root)];
-        if let Some(ref ci) = ci_s {
-            query.push(("committee_index", ci.as_str()));
+        // Same fork split as `submit_aggregate_and_proofs`: one table per endpoint.
+        match fork {
+            ForkName::Phase0
+            | ForkName::Altair
+            | ForkName::Bellatrix
+            | ForkName::Capella
+            | ForkName::Deneb => {
+                let slot_s = slot.to_string();
+                let ci_s = committee_index.map(|ci| ci.to_string());
+                let mut query: Vec<(&str, &str)> =
+                    vec![("slot", &slot_s), ("attestation_data_root", attestation_data_root)];
+                if let Some(ref ci) = ci_s {
+                    query.push(("committee_index", ci.as_str()));
+                }
+                let path =
+                    Self::build_path(&["eth", "v1", "validator", "aggregate_attestation"], &query);
+                self.read_v1_aggregate(&path, committee_index).await
+            }
+            ForkName::Electra => {
+                self.fetch_aggregate_attestation_v2(
+                    slot,
+                    attestation_data_root,
+                    committee_index,
+                    ForkName::Electra,
+                )
+                .await
+            }
+            ForkName::Fulu => {
+                self.fetch_aggregate_attestation_v2(
+                    slot,
+                    attestation_data_root,
+                    committee_index,
+                    ForkName::Fulu,
+                )
+                .await
+            }
+            ForkName::Gloas => {
+                self.fetch_aggregate_attestation_v2(
+                    slot,
+                    attestation_data_root,
+                    committee_index,
+                    ForkName::Gloas,
+                )
+                .await
+            }
         }
-        let path = Self::build_path(&["eth", "v1", "validator", "aggregate_attestation"], &query);
+    }
 
+    /// v1 body: `Some(committee_index)` is Electra. Pre-Electra has no fork field.
+    async fn read_v1_aggregate(
+        &self,
+        path: &str,
+        committee_index: Option<u64>,
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
         if committee_index.is_some() {
-            let resp: DataResponse<eth_types::ElectraAttestation> = self.get(&path).await?;
+            let resp: DataResponse<eth_types::ElectraAttestation> = self.get(path).await?;
             Ok(VersionedAggregateAttestation::Electra(resp.data))
         } else {
-            let resp: DataResponse<eth_types::Attestation> = self.get(&path).await?;
+            let resp: DataResponse<eth_types::Attestation> = self.get(path).await?;
             Ok(VersionedAggregateAttestation::PreElectra(resp.data))
         }
+    }
+
+    /// Electra+ v2 GET. 405/501 are a capability gap (one attempt, then v1).
+    /// 501 is a 5xx, so it must not go through the shared engine's 5xx retry.
+    async fn fetch_aggregate_attestation_v2(
+        &self,
+        slot: u64,
+        attestation_data_root: &str,
+        committee_index: Option<u64>,
+        fork: ForkName,
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
+        let Some(committee_index) = committee_index else {
+            return Err(BeaconError::ParseError(
+                "committee_index is required for an Electra+ aggregate fetch".to_string(),
+            ));
+        };
+        let slot_s = slot.to_string();
+        let ci_s = committee_index.to_string();
+        let query = [
+            ("slot", slot_s.as_str()),
+            ("attestation_data_root", attestation_data_root),
+            ("committee_index", ci_s.as_str()),
+        ];
+        let path = Self::build_path(&["eth", "v2", "validator", "aggregate_attestation"], &query);
+        let url = self.resolve_url(&path)?;
+        let policy = self.retry_policy();
+        let mut last_error = None;
+
+        for attempt in 0..=policy.max_retries {
+            if attempt > 0 {
+                let backoff = policy.calculate_backoff(attempt - 1);
+                debug!(
+                    attempt,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "Retrying aggregate attestation v2"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+
+            let response = match Self::traced(
+                self.client.get(&url).header(HEADER_ETH_CONSENSUS_VERSION, fork.as_ref()),
+            )
+            .send()
+            .await
+            {
+                Ok(response) => response,
+                Err(e) if e.is_timeout() => {
+                    last_error = Some(BeaconError::Timeout);
+                    warn!(attempt, "Aggregate attestation v2 timed out, will retry");
+                    continue;
+                }
+                Err(e) if e.is_connect() || e.is_request() => {
+                    last_error = Some(BeaconError::HttpError(e.to_string()));
+                    warn!(attempt, error = %e, "Aggregate attestation v2 connect failed, will retry");
+                    continue;
+                }
+                Err(e) => return Err(BeaconError::HttpError(e.to_string())),
+            };
+
+            let status = response.status();
+            if status.as_u16() == 405 || status.as_u16() == 501 {
+                let _ = Self::api_error_from_response(response).await;
+                return self
+                    .fallback_aggregate_attestation_v1(
+                        slot,
+                        attestation_data_root,
+                        committee_index,
+                        status.as_u16(),
+                    )
+                    .await;
+            }
+            if status.as_u16() == 429 {
+                last_error = Some(BeaconError::ApiError {
+                    status: 429,
+                    message: "Too Many Requests".to_string(),
+                });
+                if attempt >= policy.max_retries {
+                    break;
+                }
+                let delay =
+                    RetryPolicy::retry_after_delay(&response, policy.calculate_backoff(attempt));
+                warn!(
+                    attempt,
+                    delay_ms = ?delay.as_millis(),
+                    "Aggregate attestation v2 rate limited (429), backing off"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            if status.is_server_error() {
+                let message = read_body_capped_lossy(response, 16 * 1024).await;
+                last_error = Some(BeaconError::ApiError { status: status.as_u16(), message });
+                warn!(
+                    attempt,
+                    status = status.as_u16(),
+                    "Aggregate attestation v2 server error, will retry"
+                );
+                continue;
+            }
+            if !status.is_success() {
+                return Err(Self::api_error_from_response(response).await);
+            }
+
+            let header_fork = required_consensus_version(response.headers())?;
+            let body = read_body_capped(response, self.config.max_body_bytes).await?;
+            let parsed =
+                serde_json::from_slice::<AggregateAttestationV2Response>(&body).map_err(|e| {
+                    BeaconError::ParseError(format!("error decoding response body: {e}"))
+                })?;
+            let aggregate =
+                decode_versioned_aggregate(fork, header_fork, &parsed.version, parsed.data)?;
+            ensure_requested_committee_bit(&aggregate, committee_index)?;
+            self.record_aggregate_v2_capability(true);
+            return Ok(aggregate);
+        }
+
+        Err(last_error.unwrap_or_else(|| BeaconError::HttpError("Unknown error".to_string())))
+    }
+
+    async fn fallback_aggregate_attestation_v1(
+        &self,
+        slot: u64,
+        attestation_data_root: &str,
+        committee_index: u64,
+        status: u16,
+    ) -> Result<VersionedAggregateAttestation, BeaconError> {
+        self.record_aggregate_v2_capability(false);
+        warn!(
+            bn_url = %RedactedUrl(self.endpoint()),
+            http.status_code = status,
+            "aggregate attestation v2 unavailable; falling back to v1 once"
+        );
+        // v1 classifies Some(committee_index) as Electra. Fulu/Gloas are not
+        // re-wrapped onto that body.
+        let slot_s = slot.to_string();
+        let ci_s = committee_index.to_string();
+        let query = [
+            ("slot", slot_s.as_str()),
+            ("attestation_data_root", attestation_data_root),
+            ("committee_index", ci_s.as_str()),
+        ];
+        let path = Self::build_path(&["eth", "v1", "validator", "aggregate_attestation"], &query);
+        self.read_v1_aggregate(&path, Some(committee_index)).await
+    }
+
+    fn record_aggregate_v2_capability(&self, capable: bool) {
+        let endpoint = capability_endpoint_label(self.endpoint());
+        RVC_BN_CAPABILITY_STATE
+            .with_label_values(&[endpoint.as_str(), CAPABILITY_AGGREGATE_ATTESTATION_V2])
+            .set(i64::from(capable));
     }
 
     /// Submits signed aggregate and proofs to the beacon node.
@@ -756,7 +1445,7 @@ impl BeaconClient {
                 self.post_empty_with_headers(
                     "/eth/v2/validator/aggregate_and_proofs",
                     ps,
-                    &[("Eth-Consensus-Version", "electra")],
+                    &[("Eth-Consensus-Version", ForkName::Electra.as_ref())],
                 )
                 .instrument(span)
                 .await
@@ -765,7 +1454,16 @@ impl BeaconClient {
                 self.post_empty_with_headers(
                     "/eth/v2/validator/aggregate_and_proofs",
                     ps,
-                    &[("Eth-Consensus-Version", "fulu")],
+                    &[("Eth-Consensus-Version", ForkName::Fulu.as_ref())],
+                )
+                .instrument(span)
+                .await
+            }
+            VersionedSignedAggregateAndProof::Gloas(ps) => {
+                self.post_empty_with_headers(
+                    "/eth/v2/validator/aggregate_and_proofs",
+                    ps,
+                    &[("Eth-Consensus-Version", ForkName::Gloas.as_ref())],
                 )
                 .instrument(span)
                 .await
@@ -786,6 +1484,79 @@ impl BeaconClient {
             .await
     }
 
+    /// Submits signed proposer preferences (`POST /eth/v1/validator/proposer_preferences`).
+    ///
+    /// `Eth-Consensus-Version` is required by beacon-APIs; a BN that rejects the
+    /// request is returned as an error, never skipped.
+    pub async fn submit_proposer_preferences(
+        &self,
+        preferences: &[SignedProposerPreferences],
+    ) -> Result<(), BeaconError> {
+        self.post_empty_with_headers(
+            "/eth/v1/validator/proposer_preferences",
+            &preferences,
+            &[("Eth-Consensus-Version", ForkName::Gloas.as_ref())],
+        )
+        .instrument(tracing::info_span!("beacon.submit_proposer_preferences"))
+        .await
+    }
+
+    /// Submits builder preferences (`POST /eth/v1/validator/builder_preferences`).
+    ///
+    /// JSON body (BN also accepts SSZ). A 400 with `IndexedErrorMessage` is
+    /// [`SubmitBuilderPreferencesResult::PartialFailure`] and is not retried —
+    /// other entries were submitted. It is not a BN fault.
+    pub async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        let url = self.resolve_url(BUILDER_PREFERENCES_PATH)?;
+        let body_bytes = serde_json::to_vec(entries).map_err(|e| {
+            BeaconError::HttpError(format!("failed to serialize request body: {e}"))
+        })?;
+        let consensus_version = ForkName::Gloas.as_ref();
+
+        self.execute_with_retry_raw(
+            "POST",
+            &url,
+            || {
+                let body_bytes = body_bytes.clone();
+                let url = url.clone();
+                async move {
+                    Self::traced(
+                        self.client
+                            .post(&url)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .header(HEADER_ETH_CONSENSUS_VERSION, consensus_version)
+                            .body(body_bytes),
+                    )
+                    .send()
+                    .await
+                }
+            },
+            |response| async move {
+                let status = response.status();
+                if status.is_success() {
+                    return Ok(SubmitBuilderPreferencesResult::Success);
+                }
+                if status.as_u16() == 400 {
+                    let body = read_body_capped_lossy(response, 16 * 1024).await;
+                    if let Ok(indexed) = serde_json::from_str::<IndexedErrorMessage>(&body) {
+                        if !indexed.failures.is_empty() {
+                            return Ok(SubmitBuilderPreferencesResult::PartialFailure {
+                                failures: indexed.failures,
+                            });
+                        }
+                    }
+                    return Err(BeaconError::ApiError { status: 400, message: body });
+                }
+                Err(Self::api_error_from_response(response).await)
+            },
+        )
+        .instrument(tracing::info_span!("beacon.submit_builder_preferences"))
+        .await
+    }
+
     /// Posts validator indices to check liveness for the given epoch.
     ///
     /// Returns liveness data indicating whether each validator was active
@@ -798,6 +1569,15 @@ impl BeaconClient {
     ) -> Result<ValidatorLivenessResponse, BeaconError> {
         let path = format!("/eth/v1/validator/liveness/{}", epoch);
         self.post(&path, &validator_indices).await
+    }
+
+    /// Single-BN merge is a self-delegation: this node is the only source.
+    pub async fn post_validator_liveness_merged(
+        &self,
+        epoch: u64,
+        validator_indices: &[String],
+    ) -> Result<ValidatorLivenessResponse, BeaconError> {
+        self.post_validator_liveness(epoch, validator_indices).await
     }
 
     /// Submits a signed voluntary exit to the beacon node pool.
@@ -848,10 +1628,32 @@ impl BeaconClient {
     }
 
     /// Fetches the node version string from the beacon node.
+    ///
+    /// Tries `/eth/v2/node/version` first and, **only on HTTP 404**, falls back
+    /// to `/eth/v1/node/version`. This is the only beacon endpoint allowed to
+    /// route on a response status code: the payload is informational (logs /
+    /// metrics) and no duty or signature depends on it (D25). A 404 on v2 is
+    /// logged once per BN; any other v2 error is returned as-is.
     #[tracing::instrument(name = "beacon.get_node_version", skip_all)]
     pub async fn get_node_version(&self) -> Result<String, BeaconError> {
-        let response: crate::types::NodeVersionResponse = self.get("/eth/v1/node/version").await?;
-        Ok(response.data.version)
+        match self.get::<NodeVersionV2Response>("/eth/v2/node/version").await {
+            Ok(response) => Ok(response.data.version_string()),
+            Err(BeaconError::ApiError { status: 404, .. }) => {
+                if self
+                    .node_version_v1_fallback_logged
+                    .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    warn!(
+                        bn_url = %RedactedUrl(self.endpoint()),
+                        "GET /eth/v2/node/version returned 404; falling back to /eth/v1/node/version (informational only — no duty or signature depends on this endpoint)"
+                    );
+                }
+                let response: NodeVersionResponse = self.get("/eth/v1/node/version").await?;
+                Ok(response.data.version)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Submits signed attestations to the beacon node.
@@ -875,9 +1677,10 @@ impl BeaconClient {
         );
 
         let (consensus_version, attestation_count) = match attestations {
-            VersionedAttestation::PreElectra(atts) => ("phase0", atts.len()),
-            VersionedAttestation::Electra(atts) => ("electra", atts.len()),
-            VersionedAttestation::Fulu(atts) => ("fulu", atts.len()),
+            VersionedAttestation::PreElectra(atts) => (ForkName::Phase0.as_ref(), atts.len()),
+            VersionedAttestation::Electra(atts) => (ForkName::Electra.as_ref(), atts.len()),
+            VersionedAttestation::Fulu(atts) => (ForkName::Fulu.as_ref(), atts.len()),
+            VersionedAttestation::Gloas(atts) => (ForkName::Gloas.as_ref(), atts.len()),
         };
 
         debug!(
@@ -903,7 +1706,9 @@ impl BeaconClient {
                             .send()
                             .await
                         }
-                        VersionedAttestation::Electra(atts) | VersionedAttestation::Fulu(atts) => {
+                        VersionedAttestation::Electra(atts)
+                        | VersionedAttestation::Fulu(atts)
+                        | VersionedAttestation::Gloas(atts) => {
                             Self::traced(
                                 self.client
                                     .post(&url)
@@ -1098,15 +1903,19 @@ impl BeaconClient {
                     span.record("http.status_code", status.as_u16());
 
                     if status.as_u16() == 429 {
+                        last_error = Some(BeaconError::ApiError {
+                            status: 429,
+                            message: "Too Many Requests".to_string(),
+                        });
+                        if attempt >= policy.max_retries {
+                            // Last attempt: do not sleep Retry-After into a wrapper Timeout.
+                            break;
+                        }
                         let delay = RetryPolicy::retry_after_delay(
                             &response,
                             policy.calculate_backoff(attempt),
                         );
                         warn!(attempt = attempt, delay_ms = ?delay.as_millis(), "Rate limited (429), backing off");
-                        last_error = Some(BeaconError::ApiError {
-                            status: 429,
-                            message: "Too Many Requests".to_string(),
-                        });
                         tokio::time::sleep(delay).await;
                         continue;
                     }
@@ -1191,6 +2000,118 @@ impl BeaconClient {
     }
 }
 
+/// `capability` label on the existing `rvc_bn_capability_state` family.
+const CAPABILITY_AGGREGATE_ATTESTATION_V2: &str = "aggregate_attestation_v2";
+
+/// Same family bn-manager owns. `register_metric` returns the existing handle
+/// when that crate registered first, so this is not a second Prometheus family.
+static RVC_BN_CAPABILITY_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    define_int_gauge_vec(
+        "rvc_bn_capability_state",
+        "Whether a beacon node can serve a capability (1=capable, 0=incapable)",
+        &["endpoint", "capability"],
+    )
+});
+
+#[derive(Debug, Deserialize)]
+struct AggregateAttestationV2Response {
+    version: String,
+    data: serde_json::Value,
+}
+
+/// `scheme://host:port` without userinfo or path, matching the series label.
+fn capability_endpoint_label(endpoint: &str) -> String {
+    match url::Url::parse(endpoint) {
+        Ok(mut parsed) if parsed.scheme() == "http" || parsed.scheme() == "https" => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_path("");
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string().trim_end_matches('/').to_string()
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+/// Accept a v2 body only when header, body `version`, and the request fork agree.
+///
+/// Phase0–Deneb is not decoded as [`VersionedAggregateAttestation::PreElectra`]
+/// on this path: an Electra+ request never takes that arm, and a pre-Electra
+/// `fork` here is a programming error rather than a v1 payload.
+fn decode_versioned_aggregate(
+    requested: ForkName,
+    header_fork: ForkName,
+    version: &str,
+    data: serde_json::Value,
+) -> Result<VersionedAggregateAttestation, BeaconError> {
+    let body_fork = ForkName::from_str(version).map_err(|_| {
+        BeaconError::ParseError(format!("invalid aggregate attestation version: {version}"))
+    })?;
+    if header_fork != requested || body_fork != requested {
+        return Err(BeaconError::ParseError(format!(
+            "aggregate attestation fork mismatch: requested {}, header {}, body {}",
+            requested.as_ref(),
+            header_fork.as_ref(),
+            body_fork.as_ref()
+        )));
+    }
+    match requested {
+        ForkName::Electra => {
+            Ok(VersionedAggregateAttestation::Electra(decode_aggregate_data(data)?))
+        }
+        ForkName::Fulu => Ok(VersionedAggregateAttestation::Fulu(decode_aggregate_data(data)?)),
+        ForkName::Gloas => Ok(VersionedAggregateAttestation::Gloas(decode_aggregate_data(data)?)),
+        ForkName::Phase0
+        | ForkName::Altair
+        | ForkName::Bellatrix
+        | ForkName::Capella
+        | ForkName::Deneb => Err(BeaconError::ParseError(
+            "pre-Electra aggregate fetch does not use the v2 decoder".to_string(),
+        )),
+    }
+}
+
+/// SSZ `Bitvector`: bit `index` is the LSB-first bit of `bits[index / 8]`.
+fn committee_bits_include_index(bits: &[u8], index: u64) -> bool {
+    let Some(byte_index) = usize::try_from(index / 8).ok() else {
+        return false;
+    };
+    let Some(byte) = bits.get(byte_index) else {
+        return false;
+    };
+    let shift = u32::try_from(index % 8).unwrap_or(0);
+    byte & (1u8 << shift) != 0
+}
+
+fn ensure_requested_committee_bit(
+    aggregate: &VersionedAggregateAttestation,
+    index: u64,
+) -> Result<(), BeaconError> {
+    let bits = match aggregate {
+        VersionedAggregateAttestation::Electra(att)
+        | VersionedAggregateAttestation::Fulu(att)
+        | VersionedAggregateAttestation::Gloas(att) => att.committee_bits.as_slice(),
+        VersionedAggregateAttestation::PreElectra(_) => {
+            return Err(BeaconError::ParseError(
+                "Electra+ aggregate response decoded as pre-Electra".to_string(),
+            ));
+        }
+    };
+    if committee_bits_include_index(bits, index) {
+        Ok(())
+    } else {
+        Err(BeaconError::ParseError(format!(
+            "aggregate committee_bits does not include committee_index {index}"
+        )))
+    }
+}
+
+fn decode_aggregate_data<T: DeserializeOwned>(data: serde_json::Value) -> Result<T, BeaconError> {
+    serde_json::from_value(data)
+        .map_err(|e| BeaconError::ParseError(format!("error decoding response body: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1261,11 +2182,163 @@ mod tests {
     }
 
     #[test]
+    fn committee_bits_include_index_is_little_endian() {
+        let bits = [0x20, 0, 0, 0, 0, 0, 0, 0];
+        assert!(committee_bits_include_index(&bits, 5));
+        assert!(!committee_bits_include_index(&bits, 0));
+        assert!(!committee_bits_include_index(&bits, 8));
+        assert!(!committee_bits_include_index(&bits, 64));
+        assert!(!committee_bits_include_index(&[], 0));
+    }
+
+    #[test]
     fn test_timeout_accessor() {
         let config =
             BeaconClientConfig::new("http://localhost:5052").with_timeout(Duration::from_secs(60));
         let client = BeaconClient::new(config).unwrap();
         assert_eq!(client.timeout(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn test_required_consensus_version_missing() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = required_consensus_version(&headers).unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains("Eth-Consensus-Version"), "{msg}");
+                assert!(msg.contains("missing"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_required_consensus_version_unknown() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers
+            .insert("Eth-Consensus-Version", reqwest::header::HeaderValue::from_static("gloas2"));
+        let err = required_consensus_version(&headers).unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains("gloas2"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_required_consensus_version_known() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("Eth-Consensus-Version", reqwest::header::HeaderValue::from_static("deneb"));
+        assert_eq!(required_consensus_version(&headers).unwrap(), ForkName::Deneb);
+    }
+
+    #[test]
+    fn test_parse_v4_produce_headers_missing_payload_included() {
+        let headers = reqwest::header::HeaderMap::new();
+        let err = parse_v4_produce_headers(&headers).unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED), "{msg}");
+                assert!(msg.contains("missing"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_v4_produce_headers_unparseable_payload_included() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+            reqwest::header::HeaderValue::from_static("yes"),
+        );
+        let err = parse_v4_produce_headers(&headers).unwrap_err();
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert!(msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED), "{msg}");
+                assert!(msg.contains("yes"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_v4_produce_headers_true_false_and_optionals() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+            reqwest::header::HeaderValue::from_static("true"),
+        );
+        headers.insert(
+            HEADER_ETH_BUILDER_URL,
+            reqwest::header::HeaderValue::from_static("https://builder.example"),
+        );
+        headers.insert(
+            HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+            reqwest::header::HeaderValue::from_static("999999999999999999999"),
+        );
+        let parsed = parse_v4_produce_headers(&headers).unwrap();
+        assert!(parsed.payload_included);
+        assert_eq!(parsed.builder_url.as_deref(), Some("https://builder.example"));
+        assert_eq!(parsed.consensus_block_value.as_deref(), Some("999999999999999999999"));
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+            reqwest::header::HeaderValue::from_static("false"),
+        );
+        let parsed = parse_v4_produce_headers(&headers).unwrap();
+        assert!(!parsed.payload_included);
+        assert_eq!(parsed.builder_url, None);
+        assert_eq!(parsed.consensus_block_value, None);
+    }
+
+    #[test]
+    fn test_commit_v4_produce_error_maps_timeout_and_keeps_parse() {
+        let parse = BeaconError::ParseError("empty SSZ".to_string());
+        assert!(matches!(
+            commit_v4_produce_error(parse),
+            BeaconError::ParseError(msg) if msg == "empty SSZ"
+        ));
+        let too_large = BeaconError::BodyTooLarge { expected: 8, got_so_far: 16 };
+        assert!(matches!(
+            commit_v4_produce_error(too_large),
+            BeaconError::BodyTooLarge { expected: 8, got_so_far: 16 }
+        ));
+        match commit_v4_produce_error(BeaconError::Timeout) {
+            BeaconError::ParseError(msg) => assert!(msg.contains("after 2xx"), "{msg}"),
+            other => panic!("Timeout after 2xx must be ParseError, got {other:?}"),
+        }
+    }
+
+    fn fulu_gloas_schedule() -> ForkSchedule {
+        let mut schedule = ForkSchedule::unscheduled_gloas();
+        schedule.fulu_fork_epoch = 500_000;
+        schedule.gloas_fork_epoch = 600_000;
+        schedule
+    }
+
+    #[test]
+    fn test_proposer_duties_path_v1_at_fulu_epoch() {
+        let schedule = fulu_gloas_schedule();
+        assert_eq!(
+            BeaconClient::proposer_duties_path(500_000, &schedule),
+            "/eth/v1/validator/duties/proposer/500000"
+        );
+        assert_eq!(
+            BeaconClient::proposer_duties_path(599_999, &schedule),
+            "/eth/v1/validator/duties/proposer/599999"
+        );
+    }
+
+    #[test]
+    fn test_proposer_duties_path_v2_at_gloas_epoch() {
+        let schedule = fulu_gloas_schedule();
+        assert_eq!(
+            BeaconClient::proposer_duties_path(600_000, &schedule),
+            "/eth/v2/validator/duties/proposer/600000"
+        );
     }
 
     #[test]
@@ -1380,10 +2453,10 @@ mod tests {
                 expected: "/eth/v3/validator/blocks/42?randao_reveal=0xabc&builder_boost_factor=50",
             },
             Case {
-                segments: &["eth", "v1", "validator", "aggregate_attestation"],
+                segments: &["eth", "v2", "validator", "aggregate_attestation"],
                 query: &[("slot", "100"), ("attestation_data_root", "0xdeadbeef")],
                 expected:
-                    "/eth/v1/validator/aggregate_attestation?slot=100&attestation_data_root=0xdeadbeef",
+                    "/eth/v2/validator/aggregate_attestation?slot=100&attestation_data_root=0xdeadbeef",
             },
         ];
 

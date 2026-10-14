@@ -9,7 +9,7 @@
 //! message, not a structured key).
 //!
 //! **Bounded coverage — read this before trusting the gate.** Gate 5 enforces a CURATED,
-//! explicitly-enumerated set of 16 hot-path events ([`COVERED_EVENTS`]), NOT the full 23-crate
+//! explicitly-enumerated set of 17 hot-path events ([`COVERED_EVENTS`]), NOT the full 23-crate
 //! breadth of the workspace. A passing gate proves the *covered* events use only canonical keys;
 //! it is **not** an exhaustive guarantee that every log line in every crate conforms. Widening
 //! enforcement to full breadth is a later (post-5.2) dataflow-lint decision (issue 5.6 / P2-4);
@@ -99,7 +99,7 @@ struct CoveredEvent {
     keys: &'static [&'static str],
 }
 
-/// The explicit, enumerable BLOCKING covered-event surface (16 rows). Each row names one event
+/// The explicit, enumerable BLOCKING covered-event surface (17 rows). Each row names one event
 /// family and the canonical keys it carries; the emission in [`emit_canonical_hot_path_events`]
 /// mirrors this table 1:1 and in order. A reviewer can read this table to audit the contract
 /// without parsing the macros, and [`covered_event_table_matches_emission`] **enforces** the
@@ -177,6 +177,14 @@ const COVERED_EVENTS: &[CoveredEvent] = &[
         crate_name: "correlation-kit",
         event: "slot phase reached",
         keys: &["slot", "time_into_slot"],
+    },
+    // --- trace correlation (observability::logging) — TRACE_ID / SPAN_ID registry pin ---
+    // Gate 5's KeyCapture visits event fields only, so this row proves registration of the
+    // formatter-injected keys — not that a formatter rendered them (T7′ / TRC-2a).
+    CoveredEvent {
+        crate_name: "correlation-kit",
+        event: "trace correlated",
+        keys: &["trace_id", "span_id"],
     },
     // --- generic milestone advisory key ---
     CoveredEvent { crate_name: "orchestrator", event: "validators loaded", keys: &["count"] },
@@ -267,6 +275,15 @@ fn emit_canonical_hot_path_events(cap: &KeyCapture) {
         );
         tracing::debug!(slot = 1u64, time_into_slot = 1333u64, "slot phase reached");
 
+        // --- trace correlation (observability::logging) — TRACE_ID / SPAN_ID registry pin ---
+        // Emitted as event fields so Gate 5 can observe them. Production injection is via
+        // formatter/span layers (TRC-2b+); KeyCapture cannot see those (T7′).
+        tracing::debug!(
+            trace_id = "00000000000000000000000000000000",
+            span_id = "0000000000000000",
+            "trace correlated"
+        );
+
         // --- generic milestone advisory key ---
         tracing::info!(count = 42u64, "validators loaded");
     });
@@ -304,7 +321,7 @@ fn gate5_canonical_field_conformance_blocking() {
 /// silently drift from what the gate emits. It captures the emitted keys **grouped per event**
 /// (`cap.per_event()`) and asserts:
 ///   1. the emitted event COUNT equals `COVERED_EVENTS.len()` — so adding an emitted event without
-///      a matching table row (the reviewer's 17th-event probe), or deleting a row without removing
+///      a matching table row (the reviewer's 18th-event probe), or deleting a row without removing
 ///      its emission, FAILS here; and
 ///   2. each emitted event's key-SET equals its `COVERED_EVENTS` row's key-set (order-independent
 ///      within an event, since a row lists keys as authored; event ORDER is pinned by position) —

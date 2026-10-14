@@ -14,18 +14,28 @@ mod error;
 mod fail_closed;
 mod gate;
 mod locks;
+pub mod metrics;
 mod service_util;
 mod traits;
 
 #[cfg(any(test, feature = "test-utils"))]
 mod test_utils;
 
-pub use crypto::is_aggregator;
+pub use eth_types::is_aggregator;
 // SigningEnablement was relocated from rvc-signer to rvc-doppelganger (Issue 2.6)
 // to allow ForwardWindowMachine to implement it without a doppelganger→signer cycle.
+#[cfg(any(test, feature = "test-utils"))]
+pub use core::PreReserveBarrier;
+#[allow(deprecated)]
+pub use core::StagedRow;
+#[cfg(any(test, feature = "test-utils"))]
 pub use core::{
-    sign_slashable, NoopSignHooks, SignHooks, SignSlashableRequest, SlashableSignSession,
-    StagedRow, StandardSlashableHooks, TimeoutPolicy, TimeoutPolicySource,
+    block_reserve_interval_count, clear_block_reserve_intervals, take_block_reserve_intervals,
+};
+pub use core::{
+    sign_nonslashable_core, sign_slashable, NonSlashableFailure, NoopSignHooks, SignHooks,
+    SignSlashableRequest, SlashableKind, SlashableSignSession, StandardSlashableHooks,
+    TimeoutPolicy, TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
 };
 pub use doppelganger::SigningEnablement;
 pub use error::{classify, GateErrClass, SigningGateError};
@@ -35,12 +45,15 @@ pub use locks::ValidatorLockMap;
 /// Shared duty-crate helpers (circuit breaker, …). Home for types that must not
 /// create peer domain edges (block-service must not depend on builder for this).
 pub use service_util::CircuitBreakerState;
-pub use traits::ValidatorSigner;
+pub use traits::{BeaconBlockHeaderFields, ValidatorSigner};
 
 /// Test-only stubs (`StubValidatorSigner`, `mock_sig`). Enable via `test-utils`.
 #[cfg(any(test, feature = "test-utils"))]
 pub use test_utils::{mock_sig, StubValidatorSigner};
 
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -49,16 +62,18 @@ use thiserror::Error;
 use tracing::{debug, error, warn};
 
 use crypto::{
-    signing_root_for, signing_root_with_fork_version, CompositeSigner, DutyRef, PublicKey,
-    Signature, Signer, SigningCtx, SigningError,
+    capella_capped_fork_version, signing_root_for, signing_root_with_fork_version, CompositeSigner,
+    DutyRef, PublicKey, SignContext, Signature, Signer, SigningCtx, SigningError, TypedSigner,
 };
 use eth_types::{
-    AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    AggregateAndProof, Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock,
+    BuilderRequestAuth, ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, ForkName,
+    ForkSchedule, PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
+    VoluntaryExit, SLOTS_PER_EPOCH,
 };
 use observability::logging::fields::Duty;
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
-use slashing::{PubkeyScopedDb, SlashingDb, SlashingError};
+use slashing::{SlashingDb, SlashingError};
 
 /// Errors that can occur during signing operations (VC / `SignerService` path).
 ///
@@ -103,6 +118,21 @@ pub enum SignerError {
     /// No slashing-DB row was staged or committed.
     #[error("signing blocked by doppelganger gate")]
     BlockedByDoppelganger,
+
+    /// This signer cannot produce a signature for the named duty.
+    ///
+    /// The duty is dropped; implementations must not sign under a fallback
+    /// domain. No slashing-DB row is written.
+    #[error("unsupported duty: {duty}")]
+    UnsupportedDuty { duty: &'static str },
+
+    /// A self-build envelope was already reserved or signed for this slot.
+    ///
+    /// In-process single-flight (VC-only; SignRoot has no slot). Not a
+    /// slashing-DB event. Timeout, remote errors, and a dropped sign future
+    /// retain the reservation so a retry cannot produce a second signature.
+    #[error("execution payload envelope already signed for slot {slot}")]
+    EnvelopeSlotAlreadySigned { slot: Slot },
 }
 
 impl SignerError {
@@ -143,6 +173,9 @@ fn truncate_error_body(msg: &str, max: usize) -> String {
 
 impl From<SigningError> for SignerError {
     fn from(e: SigningError) -> Self {
+        // Issue 8.4: increment at classifying call sites (`record_signing_error`),
+        // not here. A `From` impl is a pure conversion; recording here would
+        // double-count `Backend(e).into()` and fire on `#[cfg(test)]` `.into()`.
         match e {
             SigningError::KeyNotFound(pk) => SignerError::KeyNotFound(pk),
             SigningError::LocalRejected(msg) => {
@@ -157,18 +190,18 @@ impl From<SigningError> for SignerError {
             SigningError::UnsupportedSigningType(msg) => {
                 SignerError::SigningFailed(format!("unsupported remote signing type: {msg}"))
             }
+            SigningError::UnsupportedDuty { duty } => SignerError::UnsupportedDuty { duty },
+            SigningError::SignerLacksGloasSupport { rpc, details } => {
+                SignerError::SigningFailed(truncate_error_body(
+                    &format!("signer does not support Gloas duties ({rpc}): {details}"),
+                    200,
+                ))
+            }
         }
     }
 }
 
-/// Default per-sign timeout: 4 seconds — well under a 12-second Ethereum slot.
-///
-/// Bounds BLS sign calls (slashable and non-slashable) so a wedged remote
-/// backend cannot hang the VC duty loop indefinitely (F37). Matches
-/// [`crate::gate`]'s default.
-const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
-
-/// Audit CN recorded by [`PubkeyScopedDb`] on the VC slashable path.
+/// Audit CN recorded by [`slashing::PubkeyScopedDb`] on the VC slashable path.
 const AUDIT_CN_VC: &str = "local-vc";
 
 /// How the composite routes a pubkey — drives fail-closed [`TimeoutPolicy`].
@@ -202,13 +235,14 @@ pub enum BackendKind {
 ///
 /// Slashable paths (`sign_block` / `sign_attestation`) delegate to
 /// [`sign_slashable`]: outer enablement → per-validator lock → enablement
-/// re-check under lock → `PubkeyScopedDb` stage → timed sign → commit/discard
+/// re-check under lock → [`slashing::PubkeyScopedDb`] stage → timed sign → commit/discard
 /// per per-pubkey [`TimeoutPolicy`] (fail-closed retain for remote/unknown).
 /// Metrics use [`StandardSlashableHooks`] (same families as the gate).
 ///
-/// Non-slashable paths share the private `sign_nonslashable` helper: enablement →
-/// `tokio::time::timeout(sign_timeout, backend.sign(...))` with uniform error
-/// mapping. They take no per-validator lock and write no slashing-DB row.
+/// Non-slashable paths: `ensure_signing_enabled` then
+/// [`sign_nonslashable_core`] (timeout + uniform classification). They take
+/// no per-validator lock and write no slashing-DB row. VC-specific `debug!`
+/// timing stays in the wrapper.
 pub struct SignerService {
     signer: Arc<CompositeSigner>,
     /// BLS backend used by slashable and non-slashable sign paths.
@@ -225,6 +259,74 @@ pub struct SignerService {
     /// Expiry returns `Err(SigningFailed("signer timed out"))`. Defaults to 4s.
     /// On retain policies the staged slashing row is **committed**, not discarded.
     sign_timeout: Duration,
+    /// In-process single-flight for self-build envelope roots (not slashable).
+    ///
+    /// Per-slot uniqueness is VC-only: SignRoot/PartialSignRoot carry no slot.
+    envelope_slots: parking_lot::Mutex<HashMap<([u8; 48], Slot), EnvelopeSlotState>>,
+    /// Test-only park between the under-lock enablement check and reserve.
+    ///
+    /// Compiled out unless this crate is built as a test or with `test-utils`.
+    /// Release `rvc-bin` does not enable that feature.
+    #[cfg(any(test, feature = "test-utils"))]
+    pre_reserve_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
+}
+
+/// Per-slot envelope reservation. In-flight is refused the same as signed so
+/// two concurrent calls cannot produce two signatures for one slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeSlotState {
+    InFlight,
+    Signed,
+}
+
+/// Drop retains the slot (timeout / remote / cancelled future may still sign).
+/// [`Self::release`] only for unambiguous no-signature errors.
+struct EnvelopeSlotGuard<'a> {
+    slots: &'a parking_lot::Mutex<HashMap<([u8; 48], Slot), EnvelopeSlotState>>,
+    key: ([u8; 48], Slot),
+    release: bool,
+}
+
+impl<'a> EnvelopeSlotGuard<'a> {
+    fn reserve(
+        slots: &'a parking_lot::Mutex<HashMap<([u8; 48], Slot), EnvelopeSlotState>>,
+        pk: [u8; 48],
+        slot: Slot,
+    ) -> Result<Self, SignerError> {
+        let key = (pk, slot);
+        let mut map = slots.lock();
+        if map.contains_key(&key) {
+            return Err(SignerError::EnvelopeSlotAlreadySigned { slot });
+        }
+        map.insert(key, EnvelopeSlotState::InFlight);
+        Ok(Self { slots, key, release: false })
+    }
+
+    fn release(&mut self) {
+        self.release = true;
+    }
+}
+
+impl Drop for EnvelopeSlotGuard<'_> {
+    fn drop(&mut self) {
+        let mut map = self.slots.lock();
+        if self.release {
+            if map.get(&self.key) == Some(&EnvelopeSlotState::InFlight) {
+                map.remove(&self.key);
+            }
+        } else {
+            map.insert(self.key, EnvelopeSlotState::Signed);
+        }
+    }
+}
+
+fn envelope_slot_is_unambiguous_no_signature(err: &SignerError) -> bool {
+    matches!(
+        err,
+        SignerError::KeyNotFound(_)
+            | SignerError::BlockedByDoppelganger
+            | SignerError::UnsupportedDuty { .. }
+    )
 }
 
 /// Fail-closed enablement used when no `with_enablement` was provided.
@@ -267,12 +369,101 @@ pub fn always_enabled() -> Arc<dyn SigningEnablement> {
     Arc::new(AlwaysEnabled)
 }
 
-/// 1-in-N rate for the attestation-stage trace (issue 5.3). The site fires once per
-/// validator per slot; at 16 a 1000-validator load drops ~63 trace lines/slot to ~4
-/// while still proving the path is live. Per-call-site counter the sampler advances.
-const ATTESTATION_STAGE_TRACE_SAMPLE_N: u64 = 16;
-static ATTESTATION_STAGE_TRACE_CTR: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+/// One-shot factory invoked inside the existing timeout envelope.
+type TypedSignFut = Pin<Box<dyn Future<Output = Result<Signature, SigningError>> + Send>>;
+type TypedSignFactory = Box<dyn FnOnce() -> TypedSignFut + Send>;
+
+/// Adapts a typed gRPC sign into [`Signer::sign`] so slashable/non-slashable
+/// cores keep their lock / stage / timeout path. Verifies the signature against
+/// the staged `signing_root` before returning (HTTP remote already does this).
+struct TypedSignAdapter {
+    factory: parking_lot::Mutex<Option<TypedSignFactory>>,
+    expected_root: Root,
+    pubkey: PublicKey,
+}
+
+#[async_trait]
+impl Signer for TypedSignAdapter {
+    async fn sign(
+        &self,
+        signing_root: &Root,
+        _pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        if signing_root != &self.expected_root {
+            return Err(SigningError::LocalRejected(
+                "typed sign adapter: signing_root mismatch".to_string(),
+            ));
+        }
+        let factory = self.factory.lock().take().ok_or_else(|| {
+            SigningError::LocalRejected("typed sign adapter: already consumed".to_string())
+        })?;
+        let sig = factory().await?;
+        if sig.verify(&self.pubkey, signing_root).is_err() {
+            return Err(SigningError::InvalidRemoteSignature);
+        }
+        Ok(sig)
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        vec![self.pubkey.to_bytes()]
+    }
+}
+
+fn grpc_raw_root_rejected() -> TypedSignFactory {
+    Box::new(|| {
+        Box::pin(async {
+            Err(SigningError::LocalRejected(
+                "raw-root signing is not supported for gRPC remote signers; \
+                 use TypedSigner::sign_block / sign_attestation / etc."
+                    .to_string(),
+            ))
+        })
+    })
+}
+
+fn sign_context_at_epoch(
+    pubkey: PublicKey,
+    fork_schedule: &ForkSchedule,
+    genesis_validators_root: Root,
+    epoch: Epoch,
+) -> SignContext {
+    let fork_name = ForkName::from_epoch(epoch, fork_schedule);
+    let current_version = fork_name.fork_version(fork_schedule);
+    let previous_version = fork_name.previous_fork(fork_schedule).fork_version(fork_schedule);
+    SignContext::new(
+        pubkey,
+        ForkInfo { previous_version, current_version, genesis_validators_root },
+        fork_name,
+    )
+}
+
+fn electra_aggregate_as_legacy(e: &ElectraAggregateAndProof) -> AggregateAndProof {
+    AggregateAndProof {
+        aggregator_index: e.aggregator_index,
+        aggregate: Attestation {
+            aggregation_bits: e.aggregate.aggregation_bits.clone(),
+            data: e.aggregate.data.clone(),
+            signature: e.aggregate.signature.clone(),
+        },
+        selection_proof: e.selection_proof.clone(),
+    }
+}
+
+fn sign_context_for_exit(
+    pubkey: PublicKey,
+    fork_schedule: &ForkSchedule,
+    genesis_validators_root: Root,
+    epoch: Epoch,
+) -> SignContext {
+    let fork_name = ForkName::from_epoch(epoch, fork_schedule);
+    let current_version = capella_capped_fork_version(epoch, fork_schedule);
+    let previous_version = fork_name.previous_fork(fork_schedule).fork_version(fork_schedule);
+    SignContext::new(
+        pubkey,
+        ForkInfo { previous_version, current_version, genesis_validators_root },
+        fork_name,
+    )
+}
 
 impl SignerService {
     /// Creates a new SignerService with the provided composite signer and slashing database.
@@ -293,7 +484,25 @@ impl SignerService {
             validator_locks: ValidatorLockMap::new(),
             enablement: Arc::new(FailClosedEnablement),
             sign_timeout: DEFAULT_SIGN_TIMEOUT,
+            envelope_slots: parking_lot::Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Install a test barrier on later slashable signs.
+    ///
+    /// The sign waits after the under-lock enablement re-check and before
+    /// reserve, while holding the per-pubkey lock. `None` clears it. Absent
+    /// from production builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_pre_reserve_barrier(&self, barrier: Option<Arc<dyn core::PreReserveBarrier>>) {
+        *self.pre_reserve_barrier.lock() = barrier;
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn pre_reserve_barrier(&self) -> Option<Arc<dyn core::PreReserveBarrier>> {
+        self.pre_reserve_barrier.lock().clone()
     }
 
     /// Replace the signing enablement gate (builder style).
@@ -402,6 +611,35 @@ impl SignerService {
         Err(SignerError::BlockedByDoppelganger)
     }
 
+    /// Raw-root [`Self::sign_backend`] for local/HTTP keys; typed adapter for gRPC.
+    fn bls_backend_for_duty(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+        typed: Option<TypedSignFactory>,
+    ) -> Arc<dyn Signer> {
+        if self.signer.has_grpc_remote(&pubkey.to_bytes()) {
+            Arc::new(TypedSignAdapter {
+                factory: parking_lot::Mutex::new(Some(
+                    typed.unwrap_or_else(grpc_raw_root_rejected),
+                )),
+                expected_root: signing_root,
+                pubkey: pubkey.clone(),
+            })
+        } else {
+            Arc::clone(&self.sign_backend)
+        }
+    }
+
+    fn grpc_typed_factory<F, Fut>(&self, pubkey: &PublicKey, f: F) -> Option<TypedSignFactory>
+    where
+        F: FnOnce(Arc<dyn TypedSigner + Send + Sync>) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<Signature, SigningError>> + Send + 'static,
+    {
+        let grpc = self.signer.get_grpc_remote(&pubkey.to_bytes())?;
+        Some(Box::new(move || Box::pin(f(grpc))))
+    }
+
     /// Map shared-core [`SigningGateError`] into the VC [`SignerError`] surface.
     fn map_gate_error(err: SigningGateError, pubkey_hex: &str) -> SignerError {
         match err {
@@ -429,46 +667,26 @@ impl SignerService {
     //
     // Pattern (mirrors SigningGate):
     //   1. Root derivation in the public wrapper
-    //   2. `sign_nonslashable`: enablement → timeout(sign) → uniform mapping
-    // No per-validator lock, no slashing-DB staging.
+    //   2. `ensure_signing_enabled` (Result) then `sign_nonslashable_core`
+    // No per-validator lock, no slashing-DB staging. VC `debug!`/timing stay here.
 
-    /// Execute the non-slashable signing flow: enablement gate → BLS sign with timeout.
+    /// Facade wrapper: `ensure_signing_enabled` then [`sign_nonslashable_core`].
     ///
-    /// Shared by all non-slashable methods so enablement, timeout, and error
-    /// mapping live in one place.
-    ///
-    /// # No-lock invariant
-    ///
-    /// This helper deliberately does **NOT** acquire the per-pubkey
-    /// `ValidatorLockMap` lock and does **NOT** call any of
-    /// `stage_block`, `stage_attestation`, or `commit`.
-    /// Non-slashable operations have no slashing-DB transaction to serialize,
-    /// so the lock is unnecessary overhead.
-    ///
-    /// **If a future variant of this helper needs to write to the slashing DB,
-    /// it MUST add the per-pubkey lock and the staging/commit/discard pattern
-    /// used by `sign_block` / `sign_attestation`.**
-    ///
-    /// # TOCTOU note
-    ///
-    /// There is a micro-window between `ensure_signing_enabled` returning `Ok`
-    /// and `signer.sign().await` completing during which the doppelganger state
-    /// could theoretically change.  This window is intentionally accepted:
-    /// these operations are **not slashable**, so the worst case is a
-    /// signature produced for a pubkey that was concurrently disabled — a
-    /// tolerable transient condition.  No additional synchronization is needed
-    /// to shrink this window.
+    /// VC-specific `debug!` / elapsed timing stay here (operator output, not
+    /// core behaviour). `KeyNotFound` and other backend errors fold through
+    /// [`SignerError`]'s `From<SigningError>`.
     async fn sign_nonslashable(
         &self,
         pubkey: &PublicKey,
         signing_root: Root,
         op_name: &str,
+        backend: Arc<dyn Signer>,
+        fork_name: Option<ForkName>,
     ) -> Result<Signature, SignerError> {
-        // Step 1: doppelganger gate (same gate point as slashable early check).
+        // Same gate point as slashable early check (Result, not a bool).
         self.ensure_signing_enabled(pubkey)?;
 
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
         let start = Instant::now();
 
         debug!(
@@ -477,24 +695,16 @@ impl SignerService {
             "Signing non-slashable duty"
         );
 
-        // Step 2: BLS sign with timeout — no slashing DB, no spawn_blocking.
-        let sign_result = tokio::time::timeout(
+        match sign_nonslashable_core(
+            self.enablement.as_ref(),
+            backend.as_ref(),
+            pubkey,
+            signing_root,
             self.sign_timeout,
-            self.sign_backend.sign(&signing_root, &pubkey_bytes),
         )
-        .await;
-
-        match sign_result {
-            Err(_elapsed) => {
-                error!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    op = op_name,
-                    timeout_secs = self.sign_timeout.as_secs_f64(),
-                    "SignerService: non-slashable signer timed out"
-                );
-                Err(SignerError::SigningFailed("signer timed out".to_string()))
-            }
-            Ok(Ok(sig)) => {
+        .await
+        {
+            Ok(sig) => {
                 debug!(
                     duration_ms = start.elapsed().as_millis() as u64,
                     signing_type = op_name,
@@ -502,12 +712,35 @@ impl SignerService {
                 );
                 Ok(sig)
             }
-            Ok(Err(e)) => {
+            Err(NonSlashableFailure::Blocked) => Err(SignerError::BlockedByDoppelganger),
+            Err(NonSlashableFailure::TimedOut { after }) => {
+                error!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    op = op_name,
+                    timeout_secs = after.as_secs_f64(),
+                    "SignerService: non-slashable signer timed out"
+                );
+                Err(SignerError::SigningFailed("signer timed out".to_string()))
+            }
+            Err(NonSlashableFailure::KeyNotFound) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    signing_type = op_name,
+                    "Signing failed"
+                );
+                Err(SigningError::KeyNotFound(pubkey_hex).into())
+            }
+            Err(NonSlashableFailure::Backend(e)) => {
                 warn!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     error = %e,
                     signing_type = op_name,
                     "Signing failed"
+                );
+                crate::metrics::record_signing_error(
+                    &e,
+                    crate::metrics::sign_type_from_op_name(op_name),
+                    crate::metrics::version_label(fork_name),
                 );
                 Err(e.into())
             }
@@ -522,6 +755,37 @@ impl SignerService {
     /// Returns a reference to the underlying slashing database.
     pub fn slashing_db(&self) -> &SlashingDb {
         &self.slashing_db
+    }
+
+    /// Wait until the slashable per-pubkey lock is free, then drop it.
+    /// Returns `false` if `timeout` elapses first.
+    ///
+    /// Slashable duties (`sign_block`, `sign_attestation`) hold this lock across
+    /// the under-lock enablement re-check and the signature. Non-slashable
+    /// duties do not take it, so a `true` result does not mean those signatures
+    /// have finished. On timeout this wait is dropped; the task that holds the
+    /// lock is not cancelled.
+    #[must_use = "false means the slashable-lock drain timed out; the holder may still be signing"]
+    pub async fn drain_pubkey(&self, pubkey: &[u8; 48], timeout: Duration) -> bool {
+        // Acquire-and-drop. Dropping the wait on timeout removes only this waiter.
+        match tokio::time::timeout(timeout, self.validator_locks.lock(pubkey)).await {
+            Ok(guard) => {
+                drop(guard);
+                true
+            }
+            Err(_elapsed) => false,
+        }
+    }
+
+    /// Hold the per-pubkey signing lock. Test stand-in for an in-flight signature:
+    /// drop the guard to let [`Self::drain_pubkey`] proceed. Not a signing API.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub async fn acquire_signing_lock_for_test(
+        &self,
+        pubkey: &[u8; 48],
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.validator_locks.lock(pubkey).await
     }
 }
 
@@ -583,62 +847,37 @@ impl ValidatorSigner for SignerService {
         let _slashing_span = tracing::info_span!("slashing.check").entered();
         drop(_slashing_span);
 
-        let db = Arc::clone(&self.slashing_db);
         let gvr = *genesis_validators_root;
-        let pubkey_hex_clone = pubkey_hex.clone();
-        let slot_for_log = data.slot;
         // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
         let policy = self.timeout_policy_source(pubkey);
-        let span = tracing::Span::current();
 
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &self.validator_locks,
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.sign_backend),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy,
-                hooks: Arc::new(StandardSlashableHooks::attestation()),
-                op_name: "sign_attestation",
-            },
-            move |session| {
-                let _e = span.enter();
-                // Sampled 1-in-N stage trace (issue 5.3); zero-cost when TRACE off.
-                if tracing::enabled!(tracing::Level::TRACE)
-                    && observability::logging::should_log_sampled(
-                        &ATTESTATION_STAGE_TRACE_CTR,
-                        ATTESTATION_STAGE_TRACE_SAMPLE_N,
-                    )
-                {
-                    tracing::trace!(
-                        "staging attestation slashing-protection record on blocking thread (sampled 1-in-{ATTESTATION_STAGE_TRACE_SAMPLE_N})"
-                    );
-                }
-                let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
-                session.stage_then_sign(|| {
-                    scoped
-                        .stage_attestation(
-                            &pubkey_hex_clone,
-                            source_epoch,
-                            target_epoch,
-                            Some(hex::encode(signing_root)),
-                        )
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                slot = slot_for_log,
-                                source_epoch = source_epoch,
-                                target_epoch = target_epoch,
-                                rejection_reason = %e,
-                                "Slashing protection rejected attestation"
-                            );
-                            e
-                        })
-                })
-            },
-        )
+        let data_owned = data.clone();
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, data.target.epoch);
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_attestation(&data_owned, &sign_ctx).await
+        });
+        let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        #[cfg(any(test, feature = "test-utils"))]
+        let pre_reserve_barrier = self.pre_reserve_barrier();
+
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &self.validator_locks,
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer,
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy,
+            hooks: Arc::new(StandardSlashableHooks::attestation()),
+            op_name: "sign_attestation",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: AUDIT_CN_VC.to_string(),
+            gvr,
+            kind: SlashableKind::Attestation { source_epoch, target_epoch },
+            fork_name: Some(ForkName::from_epoch(data.target.epoch, fork_schedule)),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier,
+        })
         .await;
 
         match result {
@@ -696,44 +935,145 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::BlockRoot { root: block_root, slot }, &ctx);
 
-        let db = Arc::clone(&self.slashing_db);
         let gvr = *genesis_validators_root;
-        let pubkey_hex_clone = pubkey_hex.clone();
         // SEC-1: resolve policy under the per-validator lock (and recheck pre-sign).
         let policy = self.timeout_policy_source(pubkey);
-        let span = tracing::Span::current();
+        let signer = self.bls_backend_for_duty(pubkey, signing_root, None);
+        #[cfg(any(test, feature = "test-utils"))]
+        let pre_reserve_barrier = self.pre_reserve_barrier();
 
-        let result = sign_slashable(
-            SignSlashableRequest {
-                locks: &self.validator_locks,
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.sign_backend),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy,
-                hooks: Arc::new(StandardSlashableHooks::block()),
-                op_name: "sign_block",
-            },
-            move |session| {
-                let _e = span.enter();
-                tracing::trace!("staging block slashing-protection record on blocking thread");
-                let scoped = PubkeyScopedDb::new(db, AUDIT_CN_VC.to_string(), gvr);
-                session.stage_then_sign(|| {
-                    scoped
-                        .stage_block(&pubkey_hex_clone, slot, Some(hex::encode(signing_root)))
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                slot = slot,
-                                rejection_reason = %e,
-                                "Slashing protection rejected block proposal"
-                            );
-                            e
-                        })
-                })
-            },
-        )
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &self.validator_locks,
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer,
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy,
+            hooks: Arc::new(StandardSlashableHooks::block()),
+            op_name: "sign_block",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: AUDIT_CN_VC.to_string(),
+            gvr,
+            kind: SlashableKind::Block { slot },
+            fork_name: Some(ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule)),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier,
+        })
+        .await;
+
+        match result {
+            Ok(bytes) => {
+                observability::logging::record_display(
+                    &tracing::Span::current(),
+                    "slashing_result",
+                    "safe",
+                );
+                debug!(
+                    duration_ms = start.elapsed().as_millis() as u64,
+                    signing_type = "block",
+                    "Signing completed"
+                );
+                Self::signature_from_bytes(bytes)
+            }
+            Err(e) => {
+                if matches!(e, SigningGateError::SlashingBlocked(_)) {
+                    observability::logging::record_display(
+                        &tracing::Span::current(),
+                        "slashing_result",
+                        "blocked",
+                    );
+                }
+                Err(Self::map_gate_error(e, &pubkey_hex))
+            }
+        }
+    }
+
+    /// Signs a block from five header leaves after slashing protection.
+    ///
+    /// Raw-root keys hash the header into [`DutyRef::BlockRoot`] (byte-identical
+    /// to [`Self::sign_block`] for the same object root). gRPC keys call
+    /// [`TypedSigner::sign_block_header`].
+    #[tracing::instrument(name = "sign.block", skip_all, fields(slot = header.slot, duty = %Duty::Block.as_str(), slashing_result = tracing::field::Empty))]
+    async fn sign_block_header(
+        &self,
+        header: &BeaconBlockHeaderFields,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        self.ensure_signing_enabled(pubkey)?;
+
+        let start = Instant::now();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let slot = header.slot;
+
+        debug!(
+            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+            slot = slot,
+            signing_type = "block",
+            "Signing block header"
+        );
+
+        let block_root: Root = header.object_root();
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::BlockRoot { root: &block_root, slot }, &ctx);
+
+        let gvr = *genesis_validators_root;
+        let policy = self.timeout_policy_source(pubkey);
+
+        let header_owned = header.clone();
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            // Gloas: always SignBlockHeader so Gloas body SSZ never enters a
+            // legacy decoder RPC. Pre-Gloas: legacy SSZ RPCs when body bytes
+            // remain; header-only callers still use sign_block_header.
+            if sign_ctx.fork_name >= ForkName::Gloas || header_owned.body_ssz.is_empty() {
+                grpc.sign_block_header(&header_owned.spec_header(), &sign_ctx).await
+            } else if header_owned.is_blinded {
+                let blinded = BlindedBeaconBlock {
+                    slot: header_owned.slot,
+                    proposer_index: header_owned.proposer_index,
+                    parent_root: header_owned.parent_root,
+                    state_root: header_owned.state_root,
+                    body: header_owned.body_ssz,
+                };
+                grpc.sign_blinded_block(&blinded, &sign_ctx).await
+            } else {
+                let block = BeaconBlock {
+                    slot: header_owned.slot,
+                    proposer_index: header_owned.proposer_index,
+                    parent_root: header_owned.parent_root,
+                    state_root: header_owned.state_root,
+                    body: header_owned.body_ssz,
+                };
+                grpc.sign_block(&block, &sign_ctx).await
+            }
+        });
+        let signer = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        #[cfg(any(test, feature = "test-utils"))]
+        let pre_reserve_barrier = self.pre_reserve_barrier();
+
+        let result = sign_slashable(SignSlashableRequest {
+            locks: &self.validator_locks,
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer,
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy,
+            hooks: Arc::new(StandardSlashableHooks::block()),
+            op_name: "sign_block_header",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: AUDIT_CN_VC.to_string(),
+            gvr,
+            kind: SlashableKind::Block { slot },
+            fork_name: Some(fork_name),
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier,
+        })
         .await;
 
         match result {
@@ -774,7 +1114,15 @@ impl ValidatorSigner for SignerService {
     ) -> Result<Signature, SignerError> {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::Randao(epoch), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "randao").await
+        let gvr = *genesis_validators_root;
+        let epoch_c = epoch;
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_randao_reveal(epoch_c, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "randao", backend, Some(fork_name)).await
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
@@ -790,7 +1138,188 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::SyncMessage { beacon_block_root, slot }, &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "sync_committee_message").await
+        let gvr = *genesis_validators_root;
+        let root = *beacon_block_root;
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_sync_committee_message(slot, root, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "sync_committee_message",
+            backend,
+            Some(fork_name),
+        )
+        .await
+    }
+
+    /// Signs payload attestation data with `DOMAIN_PTC_ATTESTER`.
+    ///
+    /// Non-slashable: routes through [`Self::sign_nonslashable`], not
+    /// [`sign_slashable`].
+    #[tracing::instrument(name = "sign.payload_attestation", skip_all, fields(slot = data.slot))]
+    async fn sign_payload_attestation(
+        &self,
+        data: &PayloadAttestationData,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::PtcAttestation(data), &ctx);
+        let gvr = *genesis_validators_root;
+        let data_owned = data.clone();
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, data.slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_payload_attestation(&data_owned, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "payload_attestation",
+            backend,
+            Some(fork_name),
+        )
+        .await
+    }
+
+    /// Signs proposer preferences with `DOMAIN_PROPOSER_PREFERENCES`.
+    ///
+    /// Non-slashable: routes through [`Self::sign_nonslashable`], not
+    /// [`sign_slashable`].
+    #[tracing::instrument(
+        name = "sign.proposer_preferences",
+        skip_all,
+        fields(slot = prefs.proposal_slot)
+    )]
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(&DutyRef::ProposerPreferences(prefs), &ctx);
+        let gvr = *genesis_validators_root;
+        let prefs_owned = prefs.clone();
+        let sign_ctx = sign_context_at_epoch(
+            pubkey.clone(),
+            fork_schedule,
+            gvr,
+            prefs.proposal_slot / SLOTS_PER_EPOCH,
+        );
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_proposer_preferences(&prefs_owned, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "proposer_preferences",
+            backend,
+            Some(fork_name),
+        )
+        .await
+    }
+
+    /// Signs a builder request auth with `DOMAIN_BUILDER_REQUEST_AUTH`.
+    ///
+    /// Non-slashable: routes through [`Self::sign_nonslashable`], not
+    /// [`sign_slashable`]. Genesis fork version + zero GVR (builder-registration
+    /// idiom).
+    #[tracing::instrument(name = "sign.builder_request_auth", skip_all, fields(slot = auth.slot()))]
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        let signing_root = signing_root_with_fork_version(
+            auth,
+            eth_types::DOMAIN_BUILDER_REQUEST_AUTH,
+            genesis_fork_version,
+            [0u8; 32],
+        );
+        let auth_owned = auth.clone();
+        let fv = genesis_fork_version;
+        let sign_ctx = SignContext::new(
+            pubkey.clone(),
+            ForkInfo {
+                previous_version: genesis_fork_version,
+                current_version: genesis_fork_version,
+                genesis_validators_root: [0u8; 32],
+            },
+            ForkName::Phase0,
+        );
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_builder_request_auth(&auth_owned, fv, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "builder_request_auth",
+            backend,
+            Some(ForkName::Phase0),
+        )
+        .await
+    }
+
+    /// Signs a self-build envelope root with `DOMAIN_BEACON_BUILDER`.
+    ///
+    /// Non-slashable: routes through [`Self::sign_nonslashable`], not
+    /// [`sign_slashable`]. Per-slot uniqueness is VC-only. A second call for
+    /// the same slot is refused. Timeout, remote errors, and a dropped future
+    /// keep the reservation (the backend may still complete).
+    #[tracing::instrument(name = "sign.execution_payload_envelope", skip_all, fields(slot = slot))]
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root = signing_root_for(
+            &DutyRef::ExecutionPayloadEnvelopeRoot { root: object_root, slot },
+            &ctx,
+        );
+        let gvr = *genesis_validators_root;
+        let root = *object_root;
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_execution_payload_envelope_root(&root, slot, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+
+        let mut guard = EnvelopeSlotGuard::reserve(&self.envelope_slots, pubkey.to_bytes(), slot)?;
+        let result = self
+            .sign_nonslashable(
+                pubkey,
+                signing_root,
+                "execution_payload_envelope",
+                backend,
+                Some(fork_name),
+            )
+            .await;
+        if let Err(e) = &result {
+            if envelope_slot_is_unambiguous_no_signature(e) {
+                guard.release();
+            }
+        }
+        result
     }
 
     /// Signs a slot with DOMAIN_SELECTION_PROOF to produce a selection proof.
@@ -804,7 +1333,15 @@ impl ValidatorSigner for SignerService {
     ) -> Result<Signature, SignerError> {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::SelectionProof(slot), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "selection_proof").await
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, None);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "selection_proof",
+            backend,
+            Some(ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule)),
+        )
+        .await
     }
 
     /// Signs an AggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -819,9 +1356,68 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
+        if ForkName::from_epoch(epoch, fork_schedule) >= ForkName::Gloas {
+            crate::metrics::record_rejection(
+                crate::metrics::rejection_reason::UNSUPPORTED_TYPE,
+                crate::metrics::rejection_sign_type::AGGREGATE_AND_PROOF,
+                crate::metrics::version_label(Some(ForkName::from_epoch(epoch, fork_schedule))),
+            );
+            return Err(SignerError::UnsupportedDuty { duty: "aggregate_and_proof" });
+        }
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::AggregateAndProof(aggregate_and_proof), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "aggregate_and_proof").await
+        let gvr = *genesis_validators_root;
+        let agg = aggregate_and_proof.clone();
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_aggregate_and_proof(&agg, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "aggregate_and_proof",
+            backend,
+            Some(fork_name),
+        )
+        .await
+    }
+
+    /// Signs a precomputed aggregate-and-proof root with DOMAIN_AGGREGATE_AND_PROOF.
+    ///
+    /// Non-slashable: same chain-of-custody rule as [`Self::sign_aggregate_and_proof`].
+    /// Gloas island HTR; `slot` selects the fork. Does not use [`EnvelopeSlotGuard`].
+    #[tracing::instrument(name = "sign.aggregate_and_proof_root", skip_all, fields(duty = %Duty::Aggregate.as_str(), slot = slot))]
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
+        let signing_root =
+            signing_root_for(&DutyRef::AggregateAndProofRoot { root: object_root, slot }, &ctx);
+        let gvr = *genesis_validators_root;
+        let root = *object_root;
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_aggregate_and_proof_root(&root, slot, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "aggregate_and_proof_root",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs an ElectraAggregateAndProof with DOMAIN_AGGREGATE_AND_PROOF.
@@ -835,10 +1431,49 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
+        let epoch = aggregate_and_proof.aggregate.data.slot / SLOTS_PER_EPOCH;
+        if ForkName::from_epoch(epoch, fork_schedule) >= ForkName::Gloas {
+            crate::metrics::record_rejection(
+                crate::metrics::rejection_reason::UNSUPPORTED_TYPE,
+                crate::metrics::rejection_sign_type::AGGREGATE_AND_PROOF,
+                crate::metrics::version_label(Some(ForkName::from_epoch(epoch, fork_schedule))),
+            );
+            return Err(SignerError::UnsupportedDuty { duty: "electra_aggregate_and_proof" });
+        }
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
-        let signing_root =
-            signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "electra_aggregate_and_proof").await
+        let gvr = *genesis_validators_root;
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let fork_name = sign_ctx.fork_name;
+        let pk = pubkey.to_bytes();
+        if self.signer.has_grpc_remote(&pk) {
+            // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
+            let legacy = electra_aggregate_as_legacy(aggregate_and_proof);
+            let signing_root = signing_root_for(&DutyRef::AggregateAndProof(&legacy), &ctx);
+            let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+                grpc.sign_aggregate_and_proof(&legacy, &sign_ctx).await
+            });
+            let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+            self.sign_nonslashable(
+                pubkey,
+                signing_root,
+                "electra_aggregate_and_proof",
+                backend,
+                Some(fork_name),
+            )
+            .await
+        } else {
+            let signing_root =
+                signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
+            let backend = self.bls_backend_for_duty(pubkey, signing_root, None);
+            self.sign_nonslashable(
+                pubkey,
+                signing_root,
+                "electra_aggregate_and_proof",
+                backend,
+                Some(fork_name),
+            )
+            .await
+        }
     }
 
     /// Signs a voluntary exit with DOMAIN_VOLUNTARY_EXIT.
@@ -864,7 +1499,17 @@ impl ValidatorSigner for SignerService {
         // EIP-7044 Capella cap is applied inside signing_root_for.
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::VoluntaryExit(voluntary_exit), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "voluntary_exit").await
+        let gvr = *genesis_validators_root;
+        let exit = voluntary_exit.clone();
+        let sign_ctx =
+            sign_context_for_exit(pubkey.clone(), fork_schedule, gvr, voluntary_exit.epoch);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_voluntary_exit(&exit, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(pubkey, signing_root, "voluntary_exit", backend, Some(fork_name))
+            .await
     }
 
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
@@ -885,7 +1530,29 @@ impl ValidatorSigner for SignerService {
             fork_version,
             [0u8; 32],
         );
-        self.sign_nonslashable(pubkey, signing_root, "builder_registration").await
+        let reg = registration.clone();
+        let fv = fork_version;
+        let sign_ctx = SignContext::new(
+            pubkey.clone(),
+            ForkInfo {
+                previous_version: fork_version,
+                current_version: fork_version,
+                genesis_validators_root: [0u8; 32],
+            },
+            ForkName::Phase0,
+        );
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_builder_registration(&reg, fv, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "builder_registration",
+            backend,
+            Some(ForkName::Phase0),
+        )
+        .await
     }
 
     /// Signs a sync committee selection proof for the given slot and subcommittee.
@@ -901,7 +1568,22 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::SyncSelection { slot, subcommittee_index }, &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "sync_committee_selection_proof").await
+        let gvr = *genesis_validators_root;
+        let sign_ctx =
+            sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, slot / SLOTS_PER_EPOCH);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_sync_aggregator_selection(slot, subcommittee_index, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "sync_committee_selection_proof",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs a ContributionAndProof with DOMAIN_CONTRIBUTION_AND_PROOF.
@@ -916,7 +1598,23 @@ impl ValidatorSigner for SignerService {
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root =
             signing_root_for(&DutyRef::ContributionAndProof(contribution_and_proof), &ctx);
-        self.sign_nonslashable(pubkey, signing_root, "contribution_and_proof").await
+        let gvr = *genesis_validators_root;
+        let cap = contribution_and_proof.clone();
+        let epoch = contribution_and_proof.contribution.slot / SLOTS_PER_EPOCH;
+        let sign_ctx = sign_context_at_epoch(pubkey.clone(), fork_schedule, gvr, epoch);
+        let fork_name = sign_ctx.fork_name;
+        let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
+            grpc.sign_contribution_and_proof(&cap, &sign_ctx).await
+        });
+        let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            "contribution_and_proof",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 }
 
@@ -1145,7 +1843,7 @@ mod tests {
         // (1) Re-entry: the attestation blocking-thread marker carries the span.
         let att_scope = events
             .iter()
-            .find(|e| e.message.contains("staging attestation slashing-protection record"))
+            .find(|e| e.message.contains("reserving attestation slashing-protection record"))
             .map(|e| e.scope.clone())
             .expect("attestation blocking-section marker must be captured");
         assert!(
@@ -1208,7 +1906,7 @@ mod tests {
         // ...and the blocking-thread rejection line carries the truncated pubkey.
         let rejection = events
             .iter()
-            .find(|e| e.message.contains("Slashing protection rejected attestation"))
+            .find(|e| e.message.contains("slashing protection rejected duty"))
             .expect("rejection error line must be captured");
         assert!(
             rejection.fields_text.contains("..."),
@@ -1272,6 +1970,8 @@ mod tests {
             electra_fork_version: [0x00, 0x00, 0x00, 0x06],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [0x00, 0x00, 0x00, 0x07],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x00, 0x00, 0x00, 0x08],
         }
     }
 
@@ -1345,6 +2045,8 @@ mod tests {
             electra_fork_version: [0x00, 0x00, 0x00, 0x06],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [0x00, 0x00, 0x00, 0x07],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x00, 0x00, 0x00, 0x08],
         };
         let attestation_data = create_test_attestation_data(50, 51);
         let genesis_root = [0xaa; 32];
@@ -1533,6 +2235,9 @@ mod tests {
 
         let err = SignerError::SigningFailed("remote error".to_string());
         assert!(err.to_string().contains("signing failed"));
+
+        let err = SignerError::UnsupportedDuty { duty: "payload_attestation" };
+        assert_eq!(err.to_string(), "unsupported duty: payload_attestation");
     }
 
     /// RF4-03 (M1): production `sign_block` commit arm returns `CommitFailed`
@@ -1854,6 +2559,8 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: 60,
             fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
         }
     }
 
@@ -1887,6 +2594,42 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].slot, 5);
         assert!(blocks[0].signing_root.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_sign_block_header_matches_sign_block_at_fulu() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let db_header = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let db_block = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let header_svc =
+            SignerService::new(Arc::clone(&signer), db_header).with_enablement(always_enabled());
+        let block_svc = SignerService::new(signer, db_block).with_enablement(always_enabled());
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let slot = 60 * SLOTS_PER_EPOCH;
+        let header = BeaconBlockHeaderFields {
+            slot,
+            proposer_index: 7,
+            parent_root: [0x11; 32],
+            state_root: [0x22; 32],
+            body_root: [0x33; 32],
+            body_ssz: Vec::new(),
+            is_blinded: false,
+        };
+        let block_root = header.object_root();
+
+        let sig_header = header_svc
+            .sign_block_header(&header, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect("header sign");
+        let sig_block = block_svc
+            .sign_block(&block_root, slot, &pubkey, &schedule, &genesis_root)
+            .await
+            .expect("root sign");
+        assert_eq!(sig_header.to_bytes(), sig_block.to_bytes());
     }
 
     #[tokio::test]
@@ -1973,6 +2716,490 @@ mod tests {
         match result.unwrap_err() {
             SignerError::KeyNotFound(_) => {}
             other => panic!("expected KeyNotFound, got: {other:?}"),
+        }
+    }
+
+    fn gloas_ptc_fixture() -> PayloadAttestationData {
+        PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        }
+    }
+
+    fn gloas_ptc_fork_schedule() -> ForkSchedule {
+        let mut schedule = create_test_fork_schedule();
+        schedule.gloas_fork_epoch = 0;
+        schedule.gloas_fork_version = [0x07, 0x00, 0x00, 0x01];
+        schedule
+    }
+
+    /// Signing a payload attestation writes no slashing-DB row (row count
+    /// before and after).
+    #[tokio::test]
+    async fn test_sign_payload_attestation_writes_no_slashing_row() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let before_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let before_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let data = gloas_ptc_fixture();
+        let sig = service
+            .sign_payload_attestation(&data, &pubkey, &schedule, &gvr)
+            .await
+            .expect("payload attestation is non-slashable and must sign");
+
+        let kat_root: Root =
+            hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+                .expect("kat hex")
+                .try_into()
+                .expect("32-byte kat root");
+        assert!(
+            sig.verify(&pubkey, &kat_root).is_ok(),
+            "payload attestation must verify over KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT, not a fallback domain"
+        );
+
+        let after_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_blocks, before_blocks, "payload attestation must not write a block row");
+        assert_eq!(
+            after_attestations, before_attestations,
+            "payload attestation must not write an attestation row"
+        );
+    }
+
+    fn gloas_prefs_fixture() -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// Signing proposer preferences writes no slashing-DB row (row count
+    /// before and after).
+    #[tokio::test]
+    async fn test_sign_proposer_preferences_writes_no_slashing_row() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let before_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let before_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let prefs = gloas_prefs_fixture();
+        let sig = service
+            .sign_proposer_preferences(&prefs, &pubkey, &schedule, &gvr)
+            .await
+            .expect("proposer preferences is non-slashable and must sign");
+
+        let kat_root: Root =
+            hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+                .expect("kat hex")
+                .try_into()
+                .expect("32-byte kat root");
+        assert!(
+            sig.verify(&pubkey, &kat_root).is_ok(),
+            "proposer preferences must verify over KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT, not a fallback domain"
+        );
+
+        let after_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_blocks, before_blocks, "proposer preferences must not write a block row");
+        assert_eq!(
+            after_attestations, before_attestations,
+            "proposer preferences must not write an attestation row"
+        );
+    }
+
+    fn kat_builder_request_auth() -> BuilderRequestAuth {
+        BuilderRequestAuth::new(hex::decode("1234567890abcdef").unwrap(), 1).unwrap()
+    }
+
+    /// Signing builder request auth writes no slashing-DB row.
+    #[tokio::test]
+    async fn test_sign_builder_request_auth_writes_no_slashing_row() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let before_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let before_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+
+        let auth = kat_builder_request_auth();
+        let sig = service
+            .sign_builder_request_auth(&auth, &pubkey, [0; 4])
+            .await
+            .expect("builder request auth is non-slashable and must sign");
+
+        let kat_root: Root = hex::decode(
+            rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT,
+        )
+        .expect("kat hex")
+        .try_into()
+        .expect("32-byte kat root");
+        assert!(
+            sig.verify(&pubkey, &kat_root).is_ok(),
+            "builder request auth must verify over KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT"
+        );
+
+        let after_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_blocks, before_blocks, "builder request auth must not write a block row");
+        assert_eq!(
+            after_attestations, before_attestations,
+            "builder request auth must not write an attestation row"
+        );
+    }
+
+    fn envelope_object_root() -> Root {
+        hex::decode("98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a")
+            .expect("spec envelope object root hex")
+            .try_into()
+            .expect("32-byte object root")
+    }
+
+    /// Signing a self-build envelope writes no slashing-DB row; a second
+    /// call for the same slot is refused (still no row).
+    #[tokio::test]
+    async fn test_sign_execution_payload_envelope_root_single_flight_no_slashing_row() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service =
+            SignerService::new(signer, Arc::clone(&slashing_db)).with_enablement(always_enabled());
+
+        let before_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let before_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let object_root = envelope_object_root();
+        let slot = 1;
+        let sig = service
+            .sign_execution_payload_envelope_root(&object_root, slot, &pubkey, &schedule, &gvr)
+            .await
+            .expect("envelope is non-slashable and must sign");
+
+        let kat_root: Root = hex::decode(
+            rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT,
+        )
+        .expect("kat hex")
+        .try_into()
+        .expect("32-byte kat root");
+        assert!(
+            sig.verify(&pubkey, &kat_root).is_ok(),
+            "envelope must verify over KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT"
+        );
+
+        let after_first_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_first_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_first_blocks, before_blocks, "envelope must not write a block row");
+        assert_eq!(
+            after_first_attestations, before_attestations,
+            "envelope must not write an attestation row"
+        );
+
+        let other_root = [0x22u8; 32];
+        let second = service
+            .sign_execution_payload_envelope_root(&other_root, slot, &pubkey, &schedule, &gvr)
+            .await;
+        match second {
+            Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) => assert_eq!(s, slot),
+            other => panic!("second envelope for the same slot must be refused, got: {other:?}"),
+        }
+
+        let after_blocks = slashing_db.get_blocks(&pubkey_hex).expect("query blocks").len();
+        let after_attestations =
+            slashing_db.get_attestations(&pubkey_hex).expect("query attestations").len();
+        assert_eq!(after_blocks, before_blocks, "refused envelope must not write a block row");
+        assert_eq!(
+            after_attestations, before_attestations,
+            "refused envelope must not write an attestation row"
+        );
+
+        let other_slot = slot + 1;
+        service
+            .sign_execution_payload_envelope_root(&other_root, other_slot, &pubkey, &schedule, &gvr)
+            .await
+            .expect("a different slot must still be signable");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_envelope_timeout_retains_slot() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let mut km = KeyManager::new();
+        km.insert(secret_key);
+        let slow: Arc<dyn Signer> =
+            Arc::new(SlowSigner { inner: LocalSigner::new(km), sleep: Duration::from_millis(400) });
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = SignerService::new(composite, slashing_db)
+            .with_enablement(always_enabled())
+            .with_sign_timeout(Duration::from_millis(50))
+            .with_sign_backend(slow);
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 1;
+        let first = service
+            .sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(
+                first,
+                Err(SignerError::SigningFailed(ref msg)) if msg.contains("timed out")
+            ),
+            "expected timeout, got: {first:?}"
+        );
+
+        let second = service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await;
+        match second {
+            Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) => assert_eq!(s, slot),
+            other => panic!("timeout must retain the slot, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_envelope_dropped_future_retains_slot() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let mut km = KeyManager::new();
+        km.insert(secret_key);
+        let slow: Arc<dyn Signer> =
+            Arc::new(SlowSigner { inner: LocalSigner::new(km), sleep: Duration::from_secs(5) });
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = Arc::new(
+            SignerService::new(composite, slashing_db)
+                .with_enablement(always_enabled())
+                .with_sign_timeout(Duration::from_secs(30))
+                .with_sign_backend(slow),
+        );
+
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 1;
+        let svc = Arc::clone(&service);
+        let pk = pubkey.clone();
+        let sched = schedule.clone();
+        let handle = tokio::spawn(async move {
+            svc.sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pk,
+                &sched,
+                &gvr,
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let second = service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await;
+        match second {
+            Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) => assert_eq!(s, slot),
+            other => panic!("dropped future must retain the slot, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_envelope_concurrent_same_slot_one_ok() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service =
+            Arc::new(SignerService::new(signer, slashing_db).with_enablement(always_enabled()));
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 7;
+        let a = Arc::clone(&service);
+        let b = Arc::clone(&service);
+        let pk_a = pubkey.clone();
+        let pk_b = pubkey.clone();
+        let (r1, r2) = tokio::join!(
+            a.sign_execution_payload_envelope_root(&[0x11u8; 32], slot, &pk_a, &schedule, &gvr),
+            b.sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pk_b, &schedule, &gvr),
+        );
+        let oks = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
+        let refused = [&r1, &r2]
+            .iter()
+            .filter(|r| matches!(r, Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) if *s == slot))
+            .count();
+        assert_eq!(oks, 1, "exactly one concurrent envelope sign must succeed, got {r1:?} {r2:?}");
+        assert_eq!(refused, 1, "the other concurrent sign must be refused, got {r1:?} {r2:?}");
+    }
+
+    #[tokio::test]
+    async fn test_envelope_key_not_found_releases_slot_for_retry() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = SignerService::new(Arc::clone(&composite), slashing_db)
+            .with_enablement(always_enabled());
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 3;
+        let first = service
+            .sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(first, Err(SignerError::KeyNotFound(_))),
+            "expected KeyNotFound, got: {first:?}"
+        );
+
+        composite.add_local_key(secret_key);
+        service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await
+            .expect("KeyNotFound must release the slot so a later sign can proceed");
+    }
+
+    #[tokio::test]
+    async fn test_envelope_doppelganger_releases_slot_for_retry() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let gate = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct FlipEnablement(Arc<std::sync::atomic::AtomicBool>);
+        impl SigningEnablement for FlipEnablement {
+            fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
+                self.0.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+        let service = SignerService::new(signer, slashing_db)
+            .with_enablement(Arc::new(FlipEnablement(Arc::clone(&gate))));
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 4;
+        let first = service
+            .sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(first, Err(SignerError::BlockedByDoppelganger)),
+            "expected BlockedByDoppelganger, got: {first:?}"
+        );
+
+        gate.store(true, std::sync::atomic::Ordering::SeqCst);
+        service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await
+            .expect("doppelganger block must release the slot so a later sign can proceed");
+    }
+
+    #[tokio::test]
+    async fn test_envelope_remote_error_retains_slot() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        struct RemoteErr;
+        #[async_trait]
+        impl Signer for RemoteErr {
+            async fn sign(
+                &self,
+                _signing_root: &Root,
+                _pubkey: &[u8; 48],
+            ) -> Result<Signature, crypto::SigningError> {
+                Err(crypto::SigningError::RemoteSignerError("ambiguous remote".into()))
+            }
+            fn public_keys(&self) -> Vec<[u8; 48]> {
+                Vec::new()
+            }
+        }
+        let composite = create_empty_composite_signer();
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+        let service = SignerService::new(composite, slashing_db)
+            .with_enablement(always_enabled())
+            .with_sign_backend(Arc::new(RemoteErr));
+        let schedule = gloas_ptc_fork_schedule();
+        let gvr = [0u8; 32];
+        let slot = 5;
+        let first = service
+            .sign_execution_payload_envelope_root(
+                &envelope_object_root(),
+                slot,
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(first, Err(SignerError::SigningFailed(_))),
+            "expected remote SigningFailed, got: {first:?}"
+        );
+
+        let second = service
+            .sign_execution_payload_envelope_root(&[0x22u8; 32], slot, &pubkey, &schedule, &gvr)
+            .await;
+        match second {
+            Err(SignerError::EnvelopeSlotAlreadySigned { slot: s }) => assert_eq!(s, slot),
+            other => panic!("remote error must retain the slot, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_unsupported_duty_from_signing_error() {
+        let err: SignerError = SigningError::UnsupportedDuty { duty: "payload_attestation" }.into();
+        match err {
+            SignerError::UnsupportedDuty { duty } => assert_eq!(duty, "payload_attestation"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
         }
     }
 
@@ -2205,6 +3432,11 @@ mod tests {
         assert!(is_aggregator(1, &[0xaa; 96]));
     }
 
+    #[test]
+    fn signer_reexports_is_aggregator_from_eth_types() {
+        assert!(eth_types::is_aggregator(1, &[0x00; 96]));
+    }
+
     fn create_test_electra_aggregate_and_proof(slot: Slot) -> eth_types::ElectraAggregateAndProof {
         eth_types::ElectraAggregateAndProof {
             aggregator_index: 42,
@@ -2250,6 +3482,32 @@ mod tests {
         let domain =
             compute_domain(eth_types::DOMAIN_AGGREGATE_AND_PROOF, fork_version, genesis_root);
         let signing_root = compute_signing_root(&agg_and_proof, domain);
+        assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_sign_aggregate_and_proof_root_success() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let slot: Slot = 100;
+        let object_root: Root = [0x33; 32];
+
+        let result = service
+            .sign_aggregate_and_proof_root(&object_root, slot, &pubkey, &schedule, &genesis_root)
+            .await;
+        assert!(result.is_ok());
+
+        let signature = result.unwrap();
+        let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: genesis_root };
+        let signing_root =
+            signing_root_for(&DutyRef::AggregateAndProofRoot { root: &object_root, slot }, &ctx);
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
     }
 
@@ -2861,9 +4119,9 @@ mod tests {
     }
     impl SigningEnablement for AllowOnceThenDeny {
         fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
-            // fetch_update / swap: first caller sees 1 → true, subsequent → false.
+            // try_update / swap: first caller sees 1 → true, subsequent → false.
             self.remaining
-                .fetch_update(
+                .try_update(
                     std::sync::atomic::Ordering::SeqCst,
                     std::sync::atomic::Ordering::SeqCst,
                     |n| Some(n.saturating_sub(1)),
@@ -2949,6 +4207,8 @@ mod tests {
             electra_fork_version: [0x15, 0, 0, 0],
             fulu_fork_epoch: 60,
             fulu_fork_version: [0x16, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x17, 0, 0, 0],
         };
         let gvr: Root = [0xbb; 32];
         let ctx = SigningCtx { fork_schedule: &schedule, genesis_validators_root: gvr };
@@ -2999,6 +4259,50 @@ mod tests {
         assert!(
             sig.verify(&pubkey, &root).is_ok(),
             "builder registration must preserve per-transport fork version"
+        );
+
+        let ptc = gloas_ptc_fixture();
+        let sig = service.sign_payload_attestation(&ptc, &pubkey, &schedule, &gvr).await.unwrap();
+        let root = signing_root_for(&DutyRef::PtcAttestation(&ptc), &ctx);
+        assert!(
+            sig.verify(&pubkey, &root).is_ok(),
+            "payload attestation root must match signing_root_for"
+        );
+
+        let prefs = gloas_prefs_fixture();
+        let sig =
+            service.sign_proposer_preferences(&prefs, &pubkey, &schedule, &gvr).await.unwrap();
+        let root = signing_root_for(&DutyRef::ProposerPreferences(&prefs), &ctx);
+        assert!(
+            sig.verify(&pubkey, &root).is_ok(),
+            "proposer preferences root must match signing_root_for"
+        );
+
+        let env_root: Root = [0x42; 32];
+        let env_slot = 50 * SLOTS_PER_EPOCH;
+        let sig = service
+            .sign_execution_payload_envelope_root(&env_root, env_slot, &pubkey, &schedule, &gvr)
+            .await
+            .unwrap();
+        let root = signing_root_for(
+            &DutyRef::ExecutionPayloadEnvelopeRoot { root: &env_root, slot: env_slot },
+            &ctx,
+        );
+        assert!(sig.verify(&pubkey, &root).is_ok(), "envelope root must match signing_root_for");
+
+        let agg_root: Root = [0x33; 32];
+        let agg_slot = 50 * SLOTS_PER_EPOCH;
+        let sig = service
+            .sign_aggregate_and_proof_root(&agg_root, agg_slot, &pubkey, &schedule, &gvr)
+            .await
+            .unwrap();
+        let root = signing_root_for(
+            &DutyRef::AggregateAndProofRoot { root: &agg_root, slot: agg_slot },
+            &ctx,
+        );
+        assert!(
+            sig.verify(&pubkey, &root).is_ok(),
+            "aggregate-and-proof root must match signing_root_for"
         );
     }
 
@@ -3126,6 +4430,22 @@ mod tests {
             .sign_contribution_and_proof(&contribution, &pubkey, &schedule, &gvr)
             .await
             .expect("contribution");
+        service
+            .sign_payload_attestation(&gloas_ptc_fixture(), &pubkey, &schedule, &gvr)
+            .await
+            .expect("payload attestation");
+        service
+            .sign_proposer_preferences(&gloas_prefs_fixture(), &pubkey, &schedule, &gvr)
+            .await
+            .expect("proposer preferences");
+        service
+            .sign_execution_payload_envelope_root(&[0x42; 32], 100, &pubkey, &schedule, &gvr)
+            .await
+            .expect("execution payload envelope");
+        service
+            .sign_aggregate_and_proof_root(&[0x33; 32], 100, &pubkey, &schedule, &gvr)
+            .await
+            .expect("aggregate and proof root");
 
         let blocks = slashing_db.get_blocks(&pubkey_hex).expect("get_blocks");
         let attestations = slashing_db.get_attestations(&pubkey_hex).expect("get_attestations");
@@ -3134,6 +4454,191 @@ mod tests {
             attestations.is_empty(),
             "non-slashable must not write attestation rows; found: {attestations:?}"
         );
+    }
+
+    /// ARCH-5c / ARCH-P1-6: both facades classify the same four non-slashable
+    /// outcomes the same way. Return types stay distinct (`SigningGateError` vs
+    /// `SignerError`); only the class must match.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum NonSlashableClass {
+        Success,
+        TimedOut,
+        KeyNotFound,
+        Backend,
+    }
+
+    fn classify_gate_nonslashable(result: Result<Vec<u8>, SigningGateError>) -> NonSlashableClass {
+        match result {
+            Ok(_) => NonSlashableClass::Success,
+            Err(SigningGateError::SigningFailed(ref msg)) if msg.contains("timed out") => {
+                NonSlashableClass::TimedOut
+            }
+            Err(SigningGateError::KeyNotFound) => NonSlashableClass::KeyNotFound,
+            Err(SigningGateError::SigningFailed(_)) => NonSlashableClass::Backend,
+            other => panic!("unexpected gate non-slashable outcome: {other:?}"),
+        }
+    }
+
+    fn classify_service_nonslashable(result: Result<Signature, SignerError>) -> NonSlashableClass {
+        match result {
+            Ok(_) => NonSlashableClass::Success,
+            Err(SignerError::SigningFailed(ref msg)) if msg.contains("timed out") => {
+                NonSlashableClass::TimedOut
+            }
+            Err(SignerError::KeyNotFound(_)) => NonSlashableClass::KeyNotFound,
+            Err(SignerError::SigningFailed(_)) => NonSlashableClass::Backend,
+            other => panic!("unexpected service non-slashable outcome: {other:?}"),
+        }
+    }
+
+    struct RemoteFailSigner;
+
+    #[async_trait]
+    impl Signer for RemoteFailSigner {
+        async fn sign(
+            &self,
+            _signing_root: &Root,
+            _pubkey: &[u8; 48],
+        ) -> Result<Signature, crypto::SigningError> {
+            Err(crypto::SigningError::RemoteSignerError("connection reset mid-response".into()))
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            vec![]
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_nonslashable_path_behaves_identically_through_both_entry_points() {
+        let schedule = create_test_fork_schedule();
+        let gvr = [0xaa; 32];
+        let beacon_block_root = [0x11; 32];
+        let slot = 100;
+
+        // success
+        {
+            let secret_key = SecretKey::generate();
+            let pubkey = secret_key.public_key();
+            let mut km = KeyManager::new();
+            km.insert(secret_key);
+            let backend: Arc<dyn Signer> = Arc::new(LocalSigner::new(km));
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let gate = SigningGate::new_with_raw_signer(
+                Arc::clone(&db),
+                always_enabled(),
+                Arc::clone(&backend),
+                Arc::new(ValidatorLockMap::new()),
+                Duration::from_secs(4),
+            );
+            let service = SignerService::new(create_empty_composite_signer(), db)
+                .with_enablement(always_enabled())
+                .with_sign_backend(backend);
+
+            let gate_class = classify_gate_nonslashable(
+                gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await,
+            );
+            let svc_class = classify_service_nonslashable(
+                service
+                    .sign_sync_committee_message(&beacon_block_root, slot, &pubkey, &schedule, &gvr)
+                    .await,
+            );
+            assert_eq!(gate_class, NonSlashableClass::Success);
+            assert_eq!(svc_class, gate_class, "success class must match through both entry points");
+        }
+
+        // timeout
+        {
+            let secret_key = SecretKey::generate();
+            let pubkey = secret_key.public_key();
+            let mut km = KeyManager::new();
+            km.insert(secret_key);
+            let slow: Arc<dyn Signer> = Arc::new(SlowSigner {
+                inner: LocalSigner::new(km),
+                sleep: Duration::from_millis(400),
+            });
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let gate = SigningGate::new_with_raw_signer(
+                Arc::clone(&db),
+                always_enabled(),
+                Arc::clone(&slow),
+                Arc::new(ValidatorLockMap::new()),
+                Duration::from_millis(50),
+            );
+            let service = SignerService::new(create_empty_composite_signer(), db)
+                .with_enablement(always_enabled())
+                .with_sign_timeout(Duration::from_millis(50))
+                .with_sign_backend(slow);
+
+            let gate_class = classify_gate_nonslashable(
+                gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await,
+            );
+            let svc_class = classify_service_nonslashable(
+                service
+                    .sign_sync_committee_message(&beacon_block_root, slot, &pubkey, &schedule, &gvr)
+                    .await,
+            );
+            assert_eq!(gate_class, NonSlashableClass::TimedOut);
+            assert_eq!(svc_class, gate_class, "timeout class must match through both entry points");
+        }
+
+        // KeyNotFound
+        {
+            let pubkey = SecretKey::generate().public_key();
+            let empty: Arc<dyn Signer> = Arc::new(LocalSigner::new(KeyManager::new()));
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let gate = SigningGate::new_with_raw_signer(
+                Arc::clone(&db),
+                always_enabled(),
+                Arc::clone(&empty),
+                Arc::new(ValidatorLockMap::new()),
+                Duration::from_secs(4),
+            );
+            let service = SignerService::new(create_empty_composite_signer(), db)
+                .with_enablement(always_enabled())
+                .with_sign_backend(empty);
+
+            let gate_class = classify_gate_nonslashable(
+                gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await,
+            );
+            let svc_class = classify_service_nonslashable(
+                service
+                    .sign_sync_committee_message(&beacon_block_root, slot, &pubkey, &schedule, &gvr)
+                    .await,
+            );
+            assert_eq!(gate_class, NonSlashableClass::KeyNotFound);
+            assert_eq!(
+                svc_class, gate_class,
+                "KeyNotFound class must match through both entry points"
+            );
+        }
+
+        // generic backend error
+        {
+            let pubkey = SecretKey::generate().public_key();
+            let failing: Arc<dyn Signer> = Arc::new(RemoteFailSigner);
+            let db = Arc::new(SlashingDb::open_in_memory().expect("open db"));
+            let gate = SigningGate::new_with_raw_signer(
+                Arc::clone(&db),
+                always_enabled(),
+                Arc::clone(&failing),
+                Arc::new(ValidatorLockMap::new()),
+                Duration::from_secs(4),
+            );
+            let service = SignerService::new(create_empty_composite_signer(), db)
+                .with_enablement(always_enabled())
+                .with_sign_backend(failing);
+
+            let gate_class = classify_gate_nonslashable(
+                gate.sign_sync_committee_message(&pubkey, [0xde; 32]).await,
+            );
+            let svc_class = classify_service_nonslashable(
+                service
+                    .sign_sync_committee_message(&beacon_block_root, slot, &pubkey, &schedule, &gvr)
+                    .await,
+            );
+            assert_eq!(gate_class, NonSlashableClass::Backend);
+            assert_eq!(svc_class, gate_class, "backend class must match through both entry points");
+        }
     }
 
     /// All non-slashable methods share the helper's error mapping
@@ -3199,6 +4704,36 @@ mod tests {
                         .sign_contribution_and_proof(&contribution, &pubkey, &schedule, &gvr)
                         .await,
                 ),
+                (
+                    "payload_attestation",
+                    service
+                        .sign_payload_attestation(&gloas_ptc_fixture(), &pubkey, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "proposer_preferences",
+                    service
+                        .sign_proposer_preferences(&gloas_prefs_fixture(), &pubkey, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "execution_payload_envelope",
+                    service
+                        .sign_execution_payload_envelope_root(
+                            &[0x42; 32],
+                            1,
+                            &pubkey,
+                            &schedule,
+                            &gvr,
+                        )
+                        .await,
+                ),
+                (
+                    "aggregate_and_proof_root",
+                    service
+                        .sign_aggregate_and_proof_root(&[0x33; 32], 100, &pubkey, &schedule, &gvr)
+                        .await,
+                ),
             ];
 
             for (name, result) in results {
@@ -3258,6 +4793,41 @@ mod tests {
                         .sign_contribution_and_proof(&contribution, &unknown, &schedule, &gvr)
                         .await,
                 ),
+                (
+                    "payload_attestation",
+                    service
+                        .sign_payload_attestation(&gloas_ptc_fixture(), &unknown, &schedule, &gvr)
+                        .await,
+                ),
+                (
+                    "proposer_preferences",
+                    service
+                        .sign_proposer_preferences(
+                            &gloas_prefs_fixture(),
+                            &unknown,
+                            &schedule,
+                            &gvr,
+                        )
+                        .await,
+                ),
+                (
+                    "execution_payload_envelope",
+                    service
+                        .sign_execution_payload_envelope_root(
+                            &[0x42; 32],
+                            1,
+                            &unknown,
+                            &schedule,
+                            &gvr,
+                        )
+                        .await,
+                ),
+                (
+                    "aggregate_and_proof_root",
+                    service
+                        .sign_aggregate_and_proof_root(&[0x33; 32], 100, &unknown, &schedule, &gvr)
+                        .await,
+                ),
             ];
 
             for (name, result) in results {
@@ -3297,11 +4867,11 @@ mod tests {
     /// Register pubkey as HTTP-remote in the composite (no live dial) so
     /// `backend_kind == Remote` for policy tests.
     fn register_http_remote_marker(composite: &CompositeSigner, pk: [u8; 48]) {
-        let remote = crypto::RemoteSigner::new_for_tests(
-            crypto::RemoteSignerConfig::new("https://127.0.0.1:1"),
+        let remote = remote_signer_client::RemoteSigner::new_for_tests(
+            remote_signer_client::RemoteSignerConfig::new("https://127.0.0.1:1"),
             vec![pk],
         );
-        composite.add_remote_key(pk, remote);
+        composite.add_remote_key(pk, Arc::new(remote));
     }
 
     /// Times out once, then signs promptly (same-root retry after retain).
@@ -3741,7 +5311,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_all_signer_metrics_still_recorded_after_core_delegation() {
-        use metrics::definitions::{
+        use crate::metrics::{
             attestation_status, slashing_result, tx_hold_kind, RVC_ATTESTATIONS_TOTAL,
             RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS, RVC_SIGNING_DURATION_SECONDS,
             RVC_SLASHING_PROTECTION_CHECKS_TOTAL,

@@ -1,0 +1,2 @@
+# TYPE rvc_tasks_running gauge
+rvc_tasks_running{task="orchestrator"} 1

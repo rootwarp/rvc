@@ -1,7 +1,9 @@
 use serde::{Deserialize, Serialize};
 use ssz_derive::{Decode, Encode};
+use tree_hash::TreeHash;
 use tree_hash_derive::TreeHash;
 
+use crate::tree_hash_utils::{impl_container_tree_hash, vec_u8_tree_hash_root};
 use crate::{Epoch, Signature, Slot};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +30,13 @@ pub struct SignedVoluntaryExit {
     #[serde(with = "crate::serde_signature")]
     pub signature: Signature,
 }
+
+// Leaf order: message, signature (Bytes96 / vec_u8 of length 96)
+impl_container_tree_hash!(
+    SignedVoluntaryExit,
+    "valid 96-byte signature",
+    [|s| Ok(s.message.tree_hash_root()), |s| Ok(vec_u8_tree_hash_root(&s.signature)),]
+);
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,16 @@
+{
+  "blocks": {
+    "status": 404,
+    "body": {
+      "code": 404,
+      "message": "Not found"
+    }
+  },
+  "attestations": {
+    "status": 404,
+    "body": {
+      "code": 404,
+      "message": "Not found"
+    }
+  }
+}

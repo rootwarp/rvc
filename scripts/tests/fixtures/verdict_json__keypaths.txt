@@ -1,0 +1,11 @@
+annotations
+exit_code
+gates
+gates.chain_thresholds
+gates.s5a_presence
+gates.s5b_liveness
+gates.s7_blocked
+generated_at
+run_id
+schema_version
+verdict

@@ -1,7 +1,7 @@
 //! Issue 5.3 — log-event sampling (enabled volume-bound + disabled zero-cost).
 //!
 //! Reproduces the EXACT guard shape used at the production call site in
-//! `crates/signer/src/lib.rs` (the per-validator-per-slot attestation-stage trace):
+//! `crates/signer/src/core.rs` (the per-validator-per-slot attestation-stage trace):
 //!
 //!   if tracing::enabled!(tracing::Level::TRACE)
 //!       && observability::logging::should_log_sampled(&CTR, N) { tracing::trace!(...); }

@@ -27,6 +27,10 @@ pub enum BeaconError {
         "response body too large: expected \u{2264} {expected} bytes, received {got_so_far} bytes"
     )]
     BodyTooLarge { expected: usize, got_so_far: usize },
+
+    /// No BN matched the requested role and no `All`-role fallback exists.
+    #[error("no beacon nodes eligible for {operation} (role {role})")]
+    NoEligibleBn { operation: String, role: String },
 }
 
 #[cfg(test)]
@@ -70,5 +74,17 @@ mod tests {
             timeout: Duration::from_secs(3),
         };
         assert_eq!(err.to_string(), "produce_block_v3 timed out after 3s");
+    }
+
+    #[test]
+    fn test_no_eligible_bn_error_display() {
+        let err = BeaconError::NoEligibleBn {
+            operation: "submit_attestation".to_string(),
+            role: "attestation".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "no beacon nodes eligible for submit_attestation (role attestation)"
+        );
     }
 }

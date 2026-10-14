@@ -120,19 +120,19 @@ There are three ways this data can change while `rvc` is running, and they inter
 
 Only three fields are HTTP-writable, via `/eth/v1/validator/{pubkey}/feerecipient`, `/gas_limit`, and `/graffiti` (`GET`/`POST`/`DELETE`). Every `POST`/`DELETE` on these routes:
 
-1. Applies the change to the in-memory `ValidatorStore` (`update_config`).
-2. Immediately calls `ValidatorStore::save_config()`, which serializes the **entire current in-memory snapshot** (defaults + every tracked validator) to a temp file, `fsync`s it, and atomically renames it over the TOML file.
+1. Writes the validators file first (`update_config_durable`: temp file, `fsync`, rename, then `fsync` the parent directory).
+2. Publishes the same change to the live store only after that write succeeds. A failed write leaves the previous live value in place.
 
 This means changes made through the HTTP API **persist across restarts** without needing to touch the file yourself.
 
-**Not exposed over HTTP at all:** `builder_proposals`, `builder_boost_factor`, `block_selection_mode`, and the `enabled` flag have no HTTP setter. The only ways to change them are: hand-edit the TOML and restart, or call `ValidatorStore::update_config`/`set_enabled` directly if you're embedding the crate. (`enabled` does flip indirectly and only in-memory — e.g. the doppelganger-detection window re-enabling a freshly imported key — but that flip is **not persisted**; see below.)
+**Not exposed over HTTP at all:** `builder_proposals`, `builder_boost_factor`, `block_selection_mode`, and the `enabled` flag have no HTTP setter. Hand-edit the TOML and restart, or call `ValidatorStore::update_config` / `set_enabled` if you embed the crate. A slashed-validator disable publishes `enabled = false` before it persists (see below). The doppelganger window's re-enable is written to this file before it is published.
 
 ### 2. Hand-editing the TOML file
 
 Safe **only while the process is stopped**. There is currently no reload trigger while `rvc` is running:
 
 - `ValidatorStore::reload_config()` exists (parses the file fresh, applies parse-first/apply-second so a broken file never partially mutates the store, and preserves any validator that was registered programmatically but isn't in the file) — but **nothing in the shipped `rvc` binary calls it**. No file watcher, no HTTP endpoint, no signal handler triggers it (SIGHUP only reloads the log filter).
-- Because HTTP writes call `save_config()`, which re-serializes from in-memory state rather than re-reading the file, a hand-edit made while the process is running can be **silently overwritten** the next time any fee-recipient/gas-limit/graffiti HTTP write fires.
+- Because HTTP writes call `update_config_durable`, which re-serializes from in-memory state rather than re-reading the file, a hand-edit made while the process is running can be **silently overwritten** the next time any fee-recipient/gas-limit/graffiti HTTP write fires.
 
 **Recommendation:** treat "edit the file directly" and "use the HTTP API" as mutually exclusive while the process is live. Stop `rvc`, edit, restart — or manage everything through the Keymanager API.
 
@@ -143,7 +143,7 @@ These are separate, MEV-boost/Prysm-style config options (`Config.proposer_confi
 - `proposer_config_url` is fetched and parsed on a timer, but the only call site logs the parsed updates and never applies them to `ValidatorStore`.
 - `proposer_config_file` is parsed as a config field but never read from disk by any code path.
 
-**Neither currently affects `validators_config`/`ValidatorStore` state.** `validators_config` (plus the Keymanager HTTP API) is the only mechanism today that actually populates and updates fee recipient / gas limit / graffiti / builder settings.
+**Neither currently affects `validators_config`/`ValidatorStore` state.** `validators_config` and the Keymanager HTTP API populate fee recipient, gas limit, and builder settings. `--graffiti` is an in-memory validator-store default at startup; a per-validator `graffiti` and a keymanager-set default still win. Startup does not rewrite this file. The next keymanager save persists that in-memory default over `[defaults].graffiti`.
 
 ---
 
@@ -195,3 +195,18 @@ pubkey = "0xa1b2c3...another-pubkey..."
 - [`docs/keymanager-api.openapi.yaml`](./keymanager-api.openapi.yaml) — OpenAPI 3.0 spec for the same HTTP API
 - [`docs/running-guide.md`](./running-guide.md) — CLI flags and general operation
 - [`validators.example.toml`](../validators.example.toml) — copy-and-edit sample file
+- [`validator-perf.md`](validator-perf.md) — estimate consensus-layer performance of these pubkeys from a beacon node
+
+## Persist, bounds, and a missing validators file
+
+A change that makes signing safer publishes first. `disable_slashed` and the doppelganger disable set live `enabled = false` immediately, then persist under `save_lock`. If that write fails, the validator stays disabled in memory and the error is returned. The previous file is not put back: a failure after rename already has the safer bytes on disk.
+
+A doppelganger import hold is not an operator or slashing disable. The row stores `doppelganger_hold_until` (a unix-second deadline) beside `enabled = false`. At boot, a hold whose deadline has passed is re-enabled and the field is cleared. A hold that is still open stays disabled. When the keymanager is running, the wall-clock enable task is started again for the time left. A restart does not replay doppelganger observations. An open hold also registers the key Pending on the forward window, so voluntary exit stays blocked until that liveness window completes. Epoch 0 and a recent attestation do not skip it. Any `*.import_meta.json` sidecar does the same, including one older than the 768 second hold. The file stays until this process observes the forward window to Safe and removes it while holding the same lock DELETE and import use, so a concurrent re-import cannot lose a newer marker. A sidecar that cannot be read, a leftover `*.import_meta.json.partial`, or a leftover `*.import_meta.json.removing.*` set-aside from an older cleanup does the same. If `keystore_path` is not a readable directory, or this file cannot be read, every loaded key stays Pending for that start. A missing keystore directory has no sidecars. A row with `enabled = false` and no deadline stays disabled, and importing over that row does not arm a hold or re-enable the key. A failed re-enable is retried. The re-enable task, while holding `state_lock`, releases the key only when `doppelganger_hold_until` is still set. It does not read `key_gen`. Any disable cancels that task. DELETE cancels it before the disable write returns, including when the write fails. If that delete write fails while a hold was set, the validators file is moved off the boot path so a restart cannot reload the old hold and re-enable the key.
+
+A change that makes signing less safe persists first, then publishes. Import, delete, enable, and the doppelganger re-enable build a candidate, write it (temp file, `fsync`, rename, parent-directory `fsync`), and only then update the live store. If the parent-directory `fsync` fails, the previous file is restored and memory is left unchanged. If that restore fails before its own rename, the validators file is moved off the boot path so the rejected document is not loaded. The `.rejected` file holds that rejected document. To recover, copy it aside, set the affected key to `enabled = false`, delete `doppelganger_hold_until`, and replace `validators.toml` with that edited file. Restoring `.rejected` unchanged puts the hold back on the boot path, and boot reconcile re-enables it. Dropping `--validators-config` builds a zero fee recipient and boot fails with `ZeroFeeRecipient`. A windowed keystore import writes `enabled = false` and the hold in one durable update before the signer is published. That import keeps the key files as `.json.partial` until the hold is durable, then renames them and `fsync`s the directory. A duplicate import deletes the keystore json it just renamed, so boot does not load it. A failed import revokes the in-memory key before those files are deleted. The revoke bumps `key_gen` so duty caches drop the key; that bump is not a check the re-enable task performs. A validators row is removed only when that admission created it. A remote import whose lifecycle write fails is reported as an error.
+
+Keymanager fee-recipient, gas-limit, and graffiti setters use the same persist-then-publish path (`update_config_durable`). If `validators_config` is unset, the store is `ValidatorStore::new` and those setters return HTTP 500 with `no validators_config path set; the change is not persisted`. Nothing is published. Set a validators file if those routes must stick.
+
+`gas_limit`, `min_bid`, and `builder_boost_factor` above `i64::MAX` are rejected before a write. `gas_limit` is also rejected at the keymanager API (HTTP 400) and by the proposer-config refresher. `i64::MAX` itself is accepted. TOML cannot store a larger integer.
+
+A slashed validator (`slashed_action = "disable-only"`) is disabled in memory and then written `enabled = false`. If every save fails, the process logs the error and leaves the validator disabled in memory. If that key had a doppelganger hold, the validators file is moved off the boot path so a restart cannot re-enable it.

@@ -1,6 +1,7 @@
 //! Coordinator tests: timeouts.
 
 use super::*;
+use timing::{AGGREGATE_DUE_BPS, ATTESTATION_DUE_BPS};
 
 #[test]
 fn test_timeout_constants_are_reasonable() {
@@ -170,6 +171,24 @@ fn test_builder_registration_timeout_is_reasonable() {
     assert!(BUILDER_REGISTRATION_TIMEOUT.as_secs() <= 15);
 }
 
+#[test]
+fn test_pre_proposal_deadline_default_is_one_second() {
+    assert_eq!(DEFAULT_PRE_PROPOSAL_DEADLINE, Duration::from_millis(1000));
+    let config = create_test_config();
+    assert_eq!(config.pre_proposal_deadline, DEFAULT_PRE_PROPOSAL_DEADLINE);
+}
+
+#[test]
+fn test_cold_proposer_fetch_deadline_default_is_500ms() {
+    assert_eq!(COLD_PROPOSER_FETCH_DEADLINE, Duration::from_millis(500));
+    let config = create_test_config();
+    assert_eq!(config.cold_proposer_fetch_deadline, COLD_PROPOSER_FETCH_DEADLINE);
+    assert!(
+        COLD_PROPOSER_FETCH_DEADLINE <= DEFAULT_PRE_PROPOSAL_DEADLINE,
+        "cold fetch must fit inside the aggregate pre-proposal budget"
+    );
+}
+
 // `as_secs() * 2 / 3`), now exact for non-12 s / Gloas slots (report §4.3).
 #[test]
 fn test_aggregation_waits_until_two_thirds_8000ms_mainnet() {
@@ -222,4 +241,21 @@ fn test_missed_deadline_uses_one_third_bps_at_421_427() {
     assert!(would_warn((TEST_GENESIS_TIME + 8) * 1000), "8 s in: past the window, warn fires");
     // Before the deadline (3 s): not missed.
     assert!(!would_warn((TEST_GENESIS_TIME + 3) * 1000), "3 s in: before the deadline");
+}
+
+#[test]
+fn test_resolved_gloas_deadlines_are_2500_and_5000_bps() {
+    let mut schedule = ForkSchedule::unscheduled_gloas();
+    schedule.gloas_fork_epoch = 1;
+    let config = OrchestratorConfig::new([0xaa; 32], Arc::new(schedule));
+    let pre = ForkName::from_epoch(0, &config.fork_schedule);
+    let gloas = ForkName::from_epoch(1, &config.fork_schedule);
+    let pre_set = config.deadline_schedule.for_fork(pre);
+    let gloas_set = config.deadline_schedule.for_fork(gloas);
+    assert_eq!(due_ms(pre_set.attestation, 12_000), 3999);
+    assert_eq!(due_ms(pre_set.aggregate, 12_000), 8000);
+    assert_eq!(due_ms(gloas_set.attestation, 12_000), 3000);
+    assert_eq!(due_ms(gloas_set.aggregate, 12_000), 6000);
+    assert_eq!(gloas_set.payload, 5000);
+    assert_eq!(gloas_set.payload_attestation, 7500);
 }

@@ -25,8 +25,16 @@ pub mod grpc_sign_type {
     /// Web3Signer `AGGREGATION_SLOT` (HTTP-only; domain 0x05 selection proof).
     /// Not a v2 gRPC RPC, but shares the A7 `sign_*` series when HTTP dispatches.
     pub const AGGREGATION_SLOT: &str = "aggregation_slot";
+    /// Web3Signer `PAYLOAD_ATTESTATION` and gRPC `SignRoot` (domain 0x0C PTC attester).
+    pub const PAYLOAD_ATTESTATION: &str = "payload_attestation";
+    /// Web3Signer `PROPOSER_PREFERENCES` and gRPC `SignRoot` (domain 0x0D).
+    pub const PROPOSER_PREFERENCES: &str = "proposer_preferences";
+    /// Web3Signer `BUILDER_REQUEST_AUTH` and gRPC `SignRoot` (domain 0x0B000001).
+    pub const BUILDER_REQUEST_AUTH: &str = "builder_request_auth";
+    /// gRPC `SignRoot` self-build envelope (domain 0x0B000000). HTTP wire is D19.
+    pub const EXECUTION_PAYLOAD_ENVELOPE: &str = "execution_payload_envelope";
 
-    /// All ten v2 RPC type labels — used by the table-driven recording test.
+    /// All dispatched v2 RPC type labels — used by the table-driven recording test.
     pub const ALL: &[&str] = &[
         BEACON_BLOCK,
         BLINDED_BEACON_BLOCK,
@@ -38,8 +46,15 @@ pub mod grpc_sign_type {
         CONTRIBUTION_AND_PROOF,
         BUILDER_REGISTRATION,
         VOLUNTARY_EXIT,
+        PAYLOAD_ATTESTATION,
+        PROPOSER_PREFERENCES,
+        BUILDER_REQUEST_AUTH,
+        EXECUTION_PAYLOAD_ENVELOPE,
     ];
 }
+
+#[cfg(feature = "dvt")]
+pub use crate::dvt::peer_ready::RVC_DVT_PEER_READY;
 
 #[cfg(feature = "dvt")]
 #[derive(Clone)]
@@ -64,6 +79,10 @@ pub struct SignerMetrics {
     /// HTTP (Web3Signer) sign latency in seconds (Issue 4.5), separate from the
     /// gRPC `sign_duration_seconds` histogram.
     pub http_sign_duration_seconds: HistogramVec,
+    /// Fail-closed type/version rejections (issue 8.4). Same family name as
+    /// `signer::metrics::RVC_SIGNER_REJECTIONS_TOTAL`; this handle is registered
+    /// on the process-local `:9101` registry (not the VC global `REGISTRY`).
+    pub rejections_total: IntCounterVec,
     #[cfg(feature = "dvt")]
     pub dvt: DvtMetrics,
 }
@@ -145,6 +164,18 @@ impl SignerMetrics {
             .register(Box::new(http_sign_duration_seconds.clone()))
             .expect("failed to register rvc_signer_http_sign_duration_seconds");
 
+        let rejections_total = IntCounterVec::new(
+            Opts::new(
+                "rvc_signer_rejections_total",
+                "Fail-closed signer rejections by reason, sign type, and consensus version",
+            ),
+            &["reason", "sign_type", "version"],
+        )
+        .expect("failed to create rvc_signer_rejections_total");
+        registry
+            .register(Box::new(rejections_total.clone()))
+            .expect("failed to register rvc_signer_rejections_total");
+
         #[cfg(feature = "dvt")]
         let dvt = {
             let coordination_duration_seconds = HistogramVec::new(
@@ -198,6 +229,11 @@ impl SignerMetrics {
                 .register(Box::new(partial_sign_duration_seconds.clone()))
                 .expect("failed to register rvc_signer_dvt_partial_sign_duration_seconds");
 
+            crate::dvt::peer_ready::init();
+            registry
+                .register(Box::new(crate::dvt::peer_ready::RVC_DVT_PEER_READY.clone()))
+                .expect("failed to register rvc_dvt_peer_ready");
+
             DvtMetrics {
                 coordination_duration_seconds,
                 peers_responded,
@@ -214,9 +250,15 @@ impl SignerMetrics {
             keys_loaded,
             http_sign_total,
             http_sign_duration_seconds,
+            rejections_total,
             #[cfg(feature = "dvt")]
             dvt,
         }
+    }
+
+    /// Increment the `:9101` twin of `rvc_signer_rejections_total`.
+    pub fn record_rejection(&self, reason: &str, sign_type: &str, version: &str) {
+        self.rejections_total.with_label_values(&[reason, sign_type, version]).inc();
     }
 
     pub fn encode(&self) -> Result<Vec<u8>, prometheus::Error> {
@@ -357,6 +399,7 @@ mod tests {
         // HTTP-path series (Issue 4.5) — registered in the same registry.
         m.http_sign_total.with_label_values(&["ATTESTATION", "success"]).inc();
         m.http_sign_duration_seconds.with_label_values(&[] as &[&str]).observe(0.0);
+        m.record_rejection("unsupported_version", "beacon_block", "unknown");
 
         let gathered = m.registry.gather();
         let names: Vec<&str> = gathered.iter().map(|mf| mf.name()).collect();
@@ -366,6 +409,7 @@ mod tests {
         assert!(names.contains(&"rvc_signer_keys_loaded"));
         assert!(names.contains(&"rvc_signer_http_sign_total"));
         assert!(names.contains(&"rvc_signer_http_sign_duration_seconds"));
+        assert!(names.contains(&"rvc_signer_rejections_total"));
     }
 
     #[test]
@@ -528,8 +572,14 @@ mod tests {
     }
 
     #[test]
-    fn test_grpc_sign_type_all_has_ten_handlers() {
-        assert_eq!(grpc_sign_type::ALL.len(), 10);
+    fn test_grpc_sign_type_all_lists_dispatched_handlers() {
+        assert_eq!(grpc_sign_type::ALL.len(), 14);
+        assert_eq!(grpc_sign_type::ALL[0], grpc_sign_type::BEACON_BLOCK);
+        assert_eq!(grpc_sign_type::ALL[9], grpc_sign_type::VOLUNTARY_EXIT);
+        assert_eq!(grpc_sign_type::ALL[10], grpc_sign_type::PAYLOAD_ATTESTATION);
+        assert_eq!(grpc_sign_type::ALL[11], grpc_sign_type::PROPOSER_PREFERENCES);
+        assert_eq!(grpc_sign_type::ALL[12], grpc_sign_type::BUILDER_REQUEST_AUTH);
+        assert_eq!(grpc_sign_type::ALL[13], grpc_sign_type::EXECUTION_PAYLOAD_ENVELOPE);
     }
 
     #[tokio::test]
@@ -573,6 +623,37 @@ mod tests {
             assert!(names.contains(&"rvc_signer_dvt_peers_responded"));
             assert!(names.contains(&"rvc_signer_dvt_threshold_failures_total"));
             assert!(names.contains(&"rvc_signer_dvt_partial_sign_duration_seconds"));
+        }
+
+        /// 4.11c / D4: reuse `threshold_failures_total`; do not register a new family.
+        /// Pins DVT family *identity*, not an absolute family count.
+        #[test]
+        fn test_signer_server_dvt_metric_families_unchanged() {
+            let m = SignerMetrics::new();
+            // Touch each existing family so gather() emits them.
+            m.dvt.coordination_duration_seconds.with_label_values(&[] as &[&str]).observe(0.0);
+            m.dvt.peers_responded.with_label_values(&[] as &[&str]).observe(0.0);
+            m.dvt.threshold_failures_total.with_label_values(&[] as &[&str]).inc();
+            m.dvt.partial_sign_duration_seconds.with_label_values(&["peer"]).observe(0.0);
+
+            let gathered = m.registry.gather();
+            let names: Vec<&str> = gathered.iter().map(|mf| mf.name()).collect();
+            assert!(
+                !names.iter().any(|n| n.contains("disagreement") || n.contains("ptc_session")),
+                "4.11c must not register a disagreement/session family: {names:?}"
+            );
+            let mut dvt: Vec<&str> =
+                names.iter().copied().filter(|n| n.starts_with("rvc_signer_dvt_")).collect();
+            dvt.sort_unstable();
+            assert_eq!(
+                dvt,
+                [
+                    "rvc_signer_dvt_coordination_duration_seconds",
+                    "rvc_signer_dvt_partial_sign_duration_seconds",
+                    "rvc_signer_dvt_peers_responded",
+                    "rvc_signer_dvt_threshold_failures_total",
+                ]
+            );
         }
 
         #[test]

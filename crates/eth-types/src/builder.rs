@@ -146,6 +146,7 @@ mod tests {
     }
 
     #[test]
+    // kat_exempt: field-sensitivity — different gas_limit must yield different roots; not a container-root KAT
     fn test_builder_registration_tree_hash_different_data_different_root() {
         use tree_hash::TreeHash;
         let reg1 = sample_registration();

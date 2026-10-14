@@ -19,44 +19,20 @@ use beacon::ResponseCaps;
 
 use super::error::ConfigError;
 use super::network::Network;
+use super::start::StartArgs;
+use crate::orchestrator::dispatch::DispatchLimits;
+use rvc_config::ConfigSource;
+use slashing::GroupCommitConfig;
 
-/// Action taken when a managed validator is detected as slashed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum SlashedAction {
-    /// Disable the validator in the store and keep running.
-    #[default]
-    DisableOnly,
-    /// Request process shutdown.
-    Shutdown,
-    /// Do not monitor / take no action.
-    None,
-}
-
-impl fmt::Display for SlashedAction {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::DisableOnly => write!(f, "disable-only"),
-            Self::Shutdown => write!(f, "shutdown"),
-            Self::None => write!(f, "none"),
-        }
-    }
-}
-
-impl FromStr for SlashedAction {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "disable-only" => Ok(Self::DisableOnly),
-            "shutdown" => Ok(Self::Shutdown),
-            "none" => Ok(Self::None),
-            other => Err(format!(
-                "invalid slashed-validators-action '{other}': must be one of disable-only, shutdown, none"
-            )),
-        }
-    }
-}
+pub use rvc_config::{
+    BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, BuilderSettings, DutiesArgs,
+    DutiesConfig, ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs,
+    GrpcSignerConfig, KeymanagerArgs, KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs,
+    LogfileConfig, MonitoringArgs, MonitoringConfig, NetworkArgs, NetworkConfig,
+    ProposerConfigArgs, ProposerConfigSource, SafetyArgs, SafetyConfig, SecretProviderArgs,
+    SecretProviderConfig, ServerArgs, ServerConfig, SlashedAction, SlashingArgs, SlashingConfig,
+    TimingConfig, TracingArgs, TracingConfig, TracingExporter, DEFAULT_TRACING_SAMPLE_RATE,
+};
 
 /// Message types that may be broadcast to all beacon nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -99,44 +75,15 @@ impl FromStr for BroadcastTopic {
     }
 }
 
-/// OpenTelemetry exporter backend selected in config / CLI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TracingExporter {
-    /// OTLP over HTTP (default).
-    #[default]
-    Otlp,
-    /// Google Cloud Trace (requires the `gcp-trace` feature on the binary).
-    Gcp,
-}
-
-impl fmt::Display for TracingExporter {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Otlp => write!(f, "otlp"),
-            Self::Gcp => write!(f, "gcp"),
-        }
-    }
-}
-
-impl FromStr for TracingExporter {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "otlp" => Ok(Self::Otlp),
-            "gcp" => Ok(Self::Gcp),
-            other => Err(format!("invalid tracing_exporter '{other}': must be one of otlp, gcp")),
-        }
-    }
-}
-
 /// Validator client configuration.
 ///
 /// Related knobs are grouped into nested sub-structs (`logfile`, `tracing`,
 /// `keymanager`, `grpc_signer`, `proposer_config`, `monitoring`,
-/// `builder_limits`). Existing operator TOML may still use the pre-nesting
-/// **flat** keys; both spellings are accepted (see `ConfigWire`).
+/// `builder_limits`, `timing`, `duties`, `fork_schedule`). ARCH-4h invents `[beacon]` / `[server]` /
+/// `[network]` / `[safety]` / `[slashing]` / `[keys]` on the wire; `Config`'s
+/// public / serialize shape stays flat so ARCH-4d snapshots stay byte-identical.
+/// Existing operator TOML may still use the **flat** keys; both spellings are
+/// accepted (see `ConfigWire`).
 #[derive(Debug, Clone, Serialize)]
 #[serde(default)]
 pub struct Config {
@@ -162,6 +109,14 @@ pub struct Config {
     #[serde(default)]
     pub allow_fresh_db: bool,
 
+    /// Max slashing-DB reserve checks per COMMIT. `None` uses the measured default of 50.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_commit_batch_size: Option<usize>,
+
+    /// Milliseconds to wait for a group-commit batch to fill. `None` uses 1 ms; 0 disables wait.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_commit_wait_to_fill_ms: Option<u64>,
+
     /// Allow startup when the beacon node's current fork version is not in the
     /// client's fork schedule (SEC-9 / M-15).
     ///
@@ -174,10 +129,6 @@ pub struct Config {
     pub metrics_address: IpAddr,
 
     pub metrics_port: u16,
-
-    pub grpc_port: u16,
-
-    pub grpc_address: String,
 
     pub network: Network,
 
@@ -230,6 +181,21 @@ pub struct Config {
     #[serde(default)]
     pub builder_limits: BuilderLimits,
 
+    /// Global builder URLs / min_bid for produceBlockV4 (`[builder]`).
+    #[serde(default, skip_serializing_if = "BuilderSettings::is_default")]
+    pub builder: BuilderSettings,
+
+    #[serde(default)]
+    pub timing: TimingConfig,
+
+    /// Concurrent duty dispatch (`[duties]`). Omitted from snapshots at the defaults.
+    #[serde(default, skip_serializing_if = "DutiesConfig::is_default")]
+    pub duties: DutiesConfig,
+
+    /// Local Gloas schedule; reconciled against the BN spec at startup.
+    #[serde(default)]
+    pub fork_schedule: ForkScheduleConfig,
+
     // --- Proposer nodes / broadcast (remain flat) ---
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub proposer_nodes: Vec<String>,
@@ -270,26 +236,21 @@ pub struct Config {
     /// the full body is allocated.  Default: 32 MiB.
     #[serde(default = "default_beacon_max_body_bytes")]
     pub beacon_max_body_bytes: usize,
+
+    // --- BN operation timeouts (ARCH-4j) ---
+    // Seconds; `None` folds to `OperationTimeouts::default()` (A-4.12).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub block_production_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attestation_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate_timeout: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duty_fetch_timeout: Option<u64>,
 }
 
 fn default_beacon_max_body_bytes() -> usize {
     ResponseCaps::DEFAULT_MAX_BODY_BYTES
-}
-
-fn default_monitoring_interval() -> u64 {
-    384
-}
-
-fn default_proposer_config_refresh_interval() -> u64 {
-    384
-}
-
-fn default_logfile_max_size() -> u64 {
-    200
-}
-
-fn default_logfile_max_number() -> usize {
-    5
 }
 
 /// Per-BN configuration entry for `[[beacon_nodes]]` TOML tables.
@@ -312,270 +273,6 @@ fn default_validator_registration_batch_delay() -> u64 {
     500
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct SecretProviderConfig {
-    #[serde(default)]
-    pub providers: Vec<String>,
-
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refresh_interval: Option<u64>,
-
-    /// When true, any secret-provider `list_keys` failure aborts startup (SEC-9 / M-9).
-    ///
-    /// Default `false`: a single flaky provider is logged and skipped so healthy
-    /// providers can still load keys. A failure of **all** configured providers
-    /// remains fatal regardless of this flag.
-    #[serde(default)]
-    pub strict: bool,
-
-    #[serde(default)]
-    pub gcp: GcpSecretConfig,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GcpSecretConfig {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-
-    #[serde(default = "default_gcp_secret_prefix")]
-    pub secret_prefix: String,
-}
-
-impl Default for GcpSecretConfig {
-    fn default() -> Self {
-        Self { project_id: None, secret_prefix: default_gcp_secret_prefix() }
-    }
-}
-
-fn default_gcp_secret_prefix() -> String {
-    "validator-key-".to_string()
-}
-
-fn default_keymanager_body_limit() -> usize {
-    10 * 1024 * 1024 // 10 MB
-}
-
-fn default_circuit_breaker_consecutive_limit() -> u32 {
-    3
-}
-
-fn default_circuit_breaker_epoch_limit() -> u32 {
-    5
-}
-
-fn default_tracing_sample_rate() -> f64 {
-    0.01
-}
-
-// ---------------------------------------------------------------------------
-// Nested config groups (RF5-12/RF5-13).
-// ---------------------------------------------------------------------------
-
-/// Log-file rotation settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct LogfileConfig {
-    /// Path to the log file (`logfile` flat key).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub path: Option<PathBuf>,
-    /// Max size in MB before rotation.
-    #[serde(default = "default_logfile_max_size")]
-    pub max_size: u64,
-    /// Max number of rotated files to keep.
-    #[serde(default = "default_logfile_max_number")]
-    pub max_number: usize,
-    /// Compress rotated files.
-    #[serde(default)]
-    pub compress: bool,
-    /// Optional override log level for the file sink.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub level: Option<String>,
-}
-
-impl Default for LogfileConfig {
-    fn default() -> Self {
-        Self {
-            path: None,
-            max_size: default_logfile_max_size(),
-            max_number: default_logfile_max_number(),
-            compress: false,
-            level: None,
-        }
-    }
-}
-
-/// Distributed tracing / OpenTelemetry settings.
-///
-/// `sample_rate` is `Option` end-to-end so an explicit `0.01` is distinguishable
-/// from "unset" (RF5-15 / F20). Resolve with [`TracingConfig::resolve_sample_rate`]
-/// / [`TracingConfig::resolve_endpoint`] — precedence is CLI > file > `OTEL_*` env >
-/// built-in default.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(default)]
-pub struct TracingConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    #[serde(default)]
-    pub exporter: TracingExporter,
-    /// Head-based sampling ratio when set. `None` means "not configured" so
-    /// `OTEL_TRACES_SAMPLER_ARG` and the 0.01 built-in default can apply at
-    /// resolution time.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sample_rate: Option<f64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_queue_size: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_export_batch_size: Option<usize>,
-}
-
-impl TracingConfig {
-    /// Resolve the OTLP endpoint: explicit config/CLI > `OTEL_EXPORTER_OTLP_ENDPOINT`.
-    ///
-    /// Returns `None` when neither source provides a value (tracing stays disabled).
-    pub fn resolve_endpoint(&self) -> Option<String> {
-        self.endpoint.clone().or_else(|| std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok())
-    }
-
-    /// Resolve the sample rate: explicit config/CLI > `OTEL_TRACES_SAMPLER_ARG` > 0.01.
-    ///
-    /// Values outside `0.0..=1.0` are clamped with a warning.
-    pub fn resolve_sample_rate(&self) -> f64 {
-        let mut rate = match self.sample_rate {
-            Some(rate) => rate,
-            None => match std::env::var("OTEL_TRACES_SAMPLER_ARG") {
-                Ok(env_rate) => {
-                    env_rate.parse::<f64>().unwrap_or_else(|_| default_tracing_sample_rate())
-                }
-                Err(_) => default_tracing_sample_rate(),
-            },
-        };
-
-        if !(0.0..=1.0).contains(&rate) {
-            warn!(sample_rate = rate, "tracing_sample_rate out of range 0.0..=1.0, clamping");
-            rate = rate.clamp(0.0, 1.0);
-        }
-        rate
-    }
-}
-
-/// Keymanager API and remote-signer settings.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct KeymanagerConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub address: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub token_file: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_signer_url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub remote_signer_allowed_hosts: Option<Vec<String>>,
-    #[serde(default)]
-    pub allow_insecure_remote_signer: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cors_origins: Vec<String>,
-    #[serde(default = "default_keymanager_body_limit")]
-    pub body_limit: usize,
-}
-
-impl Default for KeymanagerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            address: None,
-            token_file: None,
-            remote_signer_url: None,
-            remote_signer_allowed_hosts: None,
-            allow_insecure_remote_signer: false,
-            cors_origins: Vec::new(),
-            body_limit: default_keymanager_body_limit(),
-        }
-    }
-}
-
-/// gRPC remote signer connection settings.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GrpcSignerConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_cert: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_key: Option<PathBuf>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tls_ca_cert: Option<PathBuf>,
-}
-
-/// Proposer-config URL / file source settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ProposerConfigSource {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub file: Option<String>,
-    #[serde(default = "default_proposer_config_refresh_interval")]
-    pub refresh_interval: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url_token: Option<String>,
-    #[serde(default)]
-    pub url_insecure: bool,
-}
-
-impl Default for ProposerConfigSource {
-    fn default() -> Self {
-        Self {
-            url: None,
-            file: None,
-            refresh_interval: default_proposer_config_refresh_interval(),
-            url_token: None,
-            url_insecure: false,
-        }
-    }
-}
-
-/// Monitoring push-endpoint settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct MonitoringConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    #[serde(default = "default_monitoring_interval")]
-    pub interval: u64,
-    #[serde(default)]
-    pub endpoint_insecure: bool,
-}
-
-impl Default for MonitoringConfig {
-    fn default() -> Self {
-        Self { endpoint: None, interval: default_monitoring_interval(), endpoint_insecure: false }
-    }
-}
-
-/// Builder circuit-breaker limits.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BuilderLimits {
-    #[serde(default = "default_circuit_breaker_consecutive_limit")]
-    pub circuit_breaker_consecutive_limit: u32,
-    #[serde(default = "default_circuit_breaker_epoch_limit")]
-    pub circuit_breaker_epoch_limit: u32,
-}
-
-impl Default for BuilderLimits {
-    fn default() -> Self {
-        Self {
-            circuit_breaker_consecutive_limit: default_circuit_breaker_consecutive_limit(),
-            circuit_breaker_epoch_limit: default_circuit_breaker_epoch_limit(),
-        }
-    }
-}
-
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -585,11 +282,11 @@ impl Default for Config {
             password_file: None,
             slashing_db_path: PathBuf::from("./slashing_protection.sqlite"),
             allow_fresh_db: false,
+            group_commit_batch_size: None,
+            group_commit_wait_to_fill_ms: None,
             allow_unsupported_fork: false,
             metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
             metrics_port: 8080,
-            grpc_port: 50051,
-            grpc_address: "127.0.0.1".to_string(),
             network: Network::Mainnet,
             genesis_time: None,
             genesis_validators_root: None,
@@ -608,6 +305,10 @@ impl Default for Config {
             proposer_config: ProposerConfigSource::default(),
             monitoring: MonitoringConfig::default(),
             builder_limits: BuilderLimits::default(),
+            builder: BuilderSettings::default(),
+            timing: TimingConfig::default(),
+            duties: DutiesConfig::default(),
+            fork_schedule: ForkScheduleConfig::default(),
             proposer_nodes: Vec::new(),
             broadcast: Vec::new(),
             bn_sync_tolerances: None,
@@ -617,14 +318,49 @@ impl Default for Config {
             validator_registration_batch_delay: default_validator_registration_batch_delay(),
             validators_config: None,
             beacon_max_body_bytes: default_beacon_max_body_bytes(),
+            block_production_timeout: None,
+            attestation_timeout: None,
+            aggregate_timeout: None,
+            duty_fetch_timeout: None,
         }
     }
 }
+
+/// `[beacon]` table plus the TOML-only `beacon_nodes_config` array (names
+/// [`BnRole`], so it cannot live on `rvc-config::BeaconConfig`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct BeaconSection {
+    #[serde(flatten)]
+    inner: BeaconConfig,
+    #[serde(default)]
+    beacon_nodes_config: Vec<BeaconNodeEntry>,
+}
+
+/// `[server]` table plus leftover-key sentinels.
+///
+/// Without these fields a leftover `[server] grpc_port` would parse silently
+/// (`#[serde(default)]`, no `deny_unknown_fields`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct ServerSection {
+    #[serde(flatten)]
+    inner: ServerConfig,
+    grpc_port: Option<toml::Value>,
+    grpc_address: Option<toml::Value>,
+}
+
+/// Replacement probes named in `ConfigError::RemovedKey`.
+const GRPC_KEY_REPLACEMENT: &str = "GET /health and GET /readyz on the metrics HTTP server";
 
 /// Intermediate wire format that accepts **both** nested tables and legacy flat
 /// keys. Flat keys fill fields that the corresponding nested table left at
 /// default; when both spellings set the same logical field, the **flat** key
 /// wins (operators with existing files keep working without edits).
+///
+/// ARCH-4h: shrinks to the flat→section lift for the 22 newly sectioned knobs
+/// plus the 31 4f/4g legacy keys (VD-4.1). Not deleted — serde `alias` cannot
+/// lift a top-level key into a nested table.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct ConfigWire {
@@ -633,13 +369,17 @@ struct ConfigWire {
     keystore_path: PathBuf,
     password_file: Option<PathBuf>,
     slashing_db_path: PathBuf,
-    allow_fresh_db: bool,
-    allow_unsupported_fork: bool,
+    /// `Option` so a nested `[slashing] allow_fresh_db` can fill when the
+    /// flat key is absent (bool would treat absent as `false` and clobber).
+    allow_fresh_db: Option<bool>,
+    allow_unsupported_fork: Option<bool>,
     metrics_address: Option<IpAddr>,
     metrics_port: Option<u16>,
-    grpc_port: Option<u16>,
-    grpc_address: Option<String>,
-    network: Option<Network>,
+    /// Presence must fail startup; otherwise leftover TOML is ignored.
+    grpc_port: Option<toml::Value>,
+    grpc_address: Option<toml::Value>,
+    // `network` as a flat string is pulled in Config's custom Deserialize
+    // (dual-shape with `[network]` — same class as `logfile`).
     genesis_time: Option<u64>,
     genesis_validators_root: Option<String>,
     graffiti: Option<String>,
@@ -647,9 +387,9 @@ struct ConfigWire {
     doppelganger_detection: Option<bool>,
     key_decrypt_threads: Option<usize>,
     secret_provider: SecretProviderConfig,
-    disable_attesting: bool,
-    slashed_validators_action: SlashedAction,
-    disable_keystore_locking: bool,
+    disable_attesting: Option<bool>,
+    slashed_validators_action: Option<SlashedAction>,
+    disable_keystore_locking: Option<bool>,
     proposer_nodes: Vec<String>,
     broadcast: Vec<BroadcastTopic>,
     bn_sync_tolerances: Option<String>,
@@ -659,8 +399,25 @@ struct ConfigWire {
     validator_registration_batch_delay: Option<u64>,
     validators_config: Option<PathBuf>,
     beacon_max_body_bytes: Option<usize>,
+    block_production_timeout: Option<u64>,
+    attestation_timeout: Option<u64>,
+    aggregate_timeout: Option<u64>,
+    duty_fetch_timeout: Option<u64>,
 
-    // Nested tables (new spelling)
+    // Nested tables (4f/4g + invented 4h sections). Flat keys above win.
+    #[serde(default)]
+    beacon: BeaconSection,
+    #[serde(default)]
+    keys: KeysConfig,
+    #[serde(default)]
+    server: ServerSection,
+    /// Table half of the `network` dual-shape (string pulled in Deserialize).
+    #[serde(default)]
+    network: NetworkConfig,
+    #[serde(default)]
+    safety: SafetyConfig,
+    #[serde(default)]
+    slashing: SlashingConfig,
     #[serde(default)]
     logfile: LogfileConfig,
     #[serde(default)]
@@ -675,6 +432,14 @@ struct ConfigWire {
     monitoring: MonitoringConfig,
     #[serde(default)]
     builder_limits: BuilderLimits,
+    #[serde(default)]
+    builder: BuilderSettings,
+    #[serde(default)]
+    timing: TimingConfig,
+    #[serde(default)]
+    duties: DutiesConfig,
+    #[serde(default)]
+    fork_schedule: ForkScheduleConfig,
 
     // Flat legacy keys (old spelling) — Option so we can detect presence
     keymanager_enabled: Option<bool>,
@@ -690,6 +455,7 @@ struct ConfigWire {
     tracing_sample_rate: Option<f64>,
     tracing_max_queue_size: Option<usize>,
     tracing_max_export_batch_size: Option<usize>,
+    tracing_service_name: Option<String>,
     grpc_signer_url: Option<String>,
     grpc_signer_tls_cert: Option<PathBuf>,
     grpc_signer_tls_key: Option<PathBuf>,
@@ -710,8 +476,21 @@ struct ConfigWire {
     logfile_level: Option<String>,
 }
 
-impl From<ConfigWire> for Config {
-    fn from(w: ConfigWire) -> Self {
+fn removed_grpc_key(w: &ConfigWire) -> Option<&'static str> {
+    if w.grpc_port.is_some() || w.server.grpc_port.is_some() {
+        Some("grpc_port")
+    } else if w.grpc_address.is_some() || w.server.grpc_address.is_some() {
+        Some("grpc_address")
+    } else {
+        None
+    }
+}
+
+impl Config {
+    fn from_wire(w: ConfigWire) -> Result<Self, ConfigError> {
+        if let Some(key) = removed_grpc_key(&w) {
+            return Err(ConfigError::RemovedKey { key, replacement: GRPC_KEY_REPLACEMENT });
+        }
         let mut logfile = w.logfile;
         if let Some(v) = w.logfile_max_size {
             logfile.max_size = v;
@@ -742,6 +521,9 @@ impl From<ConfigWire> for Config {
         }
         if let Some(v) = w.tracing_max_export_batch_size {
             tracing.max_export_batch_size = Some(v);
+        }
+        if let Some(v) = w.tracing_service_name {
+            tracing.service_name = Some(v);
         }
 
         let mut keymanager = w.keymanager;
@@ -821,37 +603,74 @@ impl From<ConfigWire> for Config {
         }
 
         let def = Config::default();
-        Config {
-            beacon_url: if w.beacon_url.is_empty() { def.beacon_url } else { w.beacon_url },
-            beacon_nodes: w.beacon_nodes,
-            keystore_path: if w.keystore_path.as_os_str().is_empty() {
-                def.keystore_path
+        // Flat-wins lift (VD-4.1): nested 4h tables fill only when the flat
+        // key is absent. The `network` string-or-table split is applied in
+        // Deserialize (same class as `logfile`).
+        Ok(Config {
+            beacon_url: if !w.beacon_url.is_empty() {
+                w.beacon_url
             } else {
+                w.beacon.inner.url.unwrap_or(def.beacon_url)
+            },
+            beacon_nodes: if !w.beacon_nodes.is_empty() {
+                w.beacon_nodes
+            } else {
+                w.beacon.inner.nodes
+            },
+            keystore_path: if !w.keystore_path.as_os_str().is_empty() {
                 w.keystore_path
-            },
-            password_file: w.password_file,
-            slashing_db_path: if w.slashing_db_path.as_os_str().is_empty() {
-                def.slashing_db_path
             } else {
-                w.slashing_db_path
+                w.keys.keystore_path.unwrap_or(def.keystore_path)
             },
-            allow_fresh_db: w.allow_fresh_db,
-            allow_unsupported_fork: w.allow_unsupported_fork,
-            metrics_address: w.metrics_address.unwrap_or(def.metrics_address),
-            metrics_port: w.metrics_port.unwrap_or(def.metrics_port),
-            grpc_port: w.grpc_port.unwrap_or(def.grpc_port),
-            grpc_address: w.grpc_address.unwrap_or(def.grpc_address),
-            network: w.network.unwrap_or(def.network),
-            genesis_time: w.genesis_time,
-            genesis_validators_root: w.genesis_validators_root,
-            graffiti: w.graffiti,
+            password_file: w.password_file.or(w.keys.password_file),
+            slashing_db_path: if !w.slashing_db_path.as_os_str().is_empty() {
+                w.slashing_db_path
+            } else {
+                w.slashing.slashing_db_path.unwrap_or(def.slashing_db_path)
+            },
+            allow_fresh_db: w
+                .allow_fresh_db
+                .or(w.slashing.allow_fresh_db)
+                .unwrap_or(def.allow_fresh_db),
+            group_commit_batch_size: w.slashing.group_commit_batch_size,
+            group_commit_wait_to_fill_ms: w.slashing.group_commit_wait_to_fill_ms,
+            allow_unsupported_fork: w
+                .allow_unsupported_fork
+                .or(w.safety.allow_unsupported_fork)
+                .unwrap_or(def.allow_unsupported_fork),
+            metrics_address: w
+                .metrics_address
+                .or(w.server.inner.metrics_address)
+                .unwrap_or(def.metrics_address),
+            metrics_port: w
+                .metrics_port
+                .or(w.server.inner.metrics_port)
+                .unwrap_or(def.metrics_port),
+            network: w.network.network.unwrap_or(def.network),
+            genesis_time: w.genesis_time.or(w.network.genesis_time),
+            genesis_validators_root: w
+                .genesis_validators_root
+                .or(w.network.genesis_validators_root),
+            graffiti: w.graffiti.or(w.network.graffiti),
             log_level: w.log_level.unwrap_or(def.log_level),
-            doppelganger_detection: w.doppelganger_detection.unwrap_or(def.doppelganger_detection),
-            key_decrypt_threads: w.key_decrypt_threads,
+            doppelganger_detection: w
+                .doppelganger_detection
+                .or(w.safety.doppelganger_detection)
+                .unwrap_or(def.doppelganger_detection),
+            key_decrypt_threads: w.key_decrypt_threads.or(w.keys.key_decrypt_threads),
             secret_provider: w.secret_provider,
-            disable_attesting: w.disable_attesting,
-            slashed_validators_action: w.slashed_validators_action,
-            disable_keystore_locking: w.disable_keystore_locking,
+            disable_attesting: w
+                .disable_attesting
+                .or(w.safety.disable_attesting)
+                .unwrap_or(def.disable_attesting),
+            slashed_validators_action: w
+                .slashed_validators_action
+                .or(w.safety.slashed_validators_action)
+                .unwrap_or(def.slashed_validators_action),
+            disable_keystore_locking: w
+                .disable_keystore_locking
+                .or(w.keys.disable_keystore_locking)
+                .unwrap_or(def.disable_keystore_locking),
             logfile,
             tracing,
             keymanager,
@@ -859,10 +678,18 @@ impl From<ConfigWire> for Config {
             proposer_config,
             monitoring,
             builder_limits,
+            builder: w.builder,
+            timing: w.timing,
+            duties: w.duties,
+            fork_schedule: w.fork_schedule,
             proposer_nodes: w.proposer_nodes,
             broadcast: w.broadcast,
-            bn_sync_tolerances: w.bn_sync_tolerances,
-            beacon_nodes_config: w.beacon_nodes_config,
+            bn_sync_tolerances: w.bn_sync_tolerances.or(w.beacon.inner.bn_sync_tolerances),
+            beacon_nodes_config: if !w.beacon_nodes_config.is_empty() {
+                w.beacon_nodes_config
+            } else {
+                w.beacon.beacon_nodes_config
+            },
             block_selection_mode: w.block_selection_mode,
             validator_registration_batch_size: w
                 .validator_registration_batch_size
@@ -870,9 +697,76 @@ impl From<ConfigWire> for Config {
             validator_registration_batch_delay: w
                 .validator_registration_batch_delay
                 .unwrap_or(def.validator_registration_batch_delay),
-            validators_config: w.validators_config,
-            beacon_max_body_bytes: w.beacon_max_body_bytes.unwrap_or(def.beacon_max_body_bytes),
+            validators_config: w.validators_config.or(w.keys.validators_config),
+            beacon_max_body_bytes: w
+                .beacon_max_body_bytes
+                .or(w.beacon.inner.max_body_bytes)
+                .unwrap_or(def.beacon_max_body_bytes),
+            block_production_timeout: w
+                .block_production_timeout
+                .or(w.beacon.inner.block_production_timeout),
+            attestation_timeout: w.attestation_timeout.or(w.beacon.inner.attestation_timeout),
+            aggregate_timeout: w.aggregate_timeout.or(w.beacon.inner.aggregate_timeout),
+            duty_fetch_timeout: w.duty_fetch_timeout.or(w.beacon.inner.duty_fetch_timeout),
+        })
+    }
+
+    fn from_toml_value(value: toml::Value) -> Result<Self, ConfigError> {
+        let mut map = match value {
+            toml::Value::Table(t) => t,
+            other => {
+                return Err(ConfigError::Invalid {
+                    field: "config",
+                    message: format!("config must be a TOML table, got {other:?}"),
+                    source_layer: ConfigSource::Default,
+                });
+            }
+        };
+
+        let flat_logfile_path = match map.remove("logfile") {
+            Some(toml::Value::String(s)) => Some(PathBuf::from(s)),
+            Some(toml::Value::Table(t)) => {
+                map.insert("logfile".into(), toml::Value::Table(t));
+                None
+            }
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    field: "logfile",
+                    message: format!("logfile must be a string path or a table, got {other:?}"),
+                    source_layer: ConfigSource::Default,
+                });
+            }
+            None => None,
+        };
+
+        let flat_network = match map.remove("network") {
+            Some(toml::Value::String(s)) => Some(
+                Network::deserialize(toml::Value::String(s)).map_err(ConfigError::ParseError)?,
+            ),
+            Some(toml::Value::Table(t)) => {
+                map.insert("network".into(), toml::Value::Table(t));
+                None
+            }
+            Some(other) => {
+                return Err(ConfigError::Invalid {
+                    field: "network",
+                    message: format!("network must be a string preset or a table, got {other:?}"),
+                    source_layer: ConfigSource::Default,
+                });
+            }
+            None => None,
+        };
+
+        let wire: ConfigWire =
+            ConfigWire::deserialize(toml::Value::Table(map)).map_err(ConfigError::ParseError)?;
+        let mut cfg = Self::from_wire(wire)?;
+        if let Some(path) = flat_logfile_path {
+            cfg.logfile.path = Some(path);
         }
+        if let Some(net) = flat_network {
+            cfg.network = net;
+        }
+        Ok(cfg)
     }
 }
 
@@ -881,103 +775,13 @@ impl<'de> Deserialize<'de> for Config {
     where
         D: serde::Deserializer<'de>,
     {
-        // Parse as toml-compatible Value first so we can accept both a flat
-        // `logfile = "path"` string and a `[logfile]` table (same key, different
-        // shapes — not co-representable in one derive struct).
         let value = toml::Value::deserialize(deserializer)?;
-        let mut map = match value {
-            toml::Value::Table(t) => t,
-            other => {
-                return Err(serde::de::Error::custom(format!(
-                    "config must be a TOML table, got {other:?}"
-                )));
-            }
-        };
-
-        // Pull flat logfile path string before nested table deserialize.
-        let flat_logfile_path = match map.remove("logfile") {
-            Some(toml::Value::String(s)) => Some(PathBuf::from(s)),
-            Some(toml::Value::Table(t)) => {
-                // Put nested table back under a private key for ConfigWire
-                map.insert("logfile".into(), toml::Value::Table(t));
-                None
-            }
-            Some(other) => {
-                return Err(serde::de::Error::custom(format!(
-                    "logfile must be a string path or a table, got {other:?}"
-                )));
-            }
-            None => None,
-        };
-
-        let wire: ConfigWire =
-            ConfigWire::deserialize(toml::Value::Table(map)).map_err(serde::de::Error::custom)?;
-        let mut cfg = Config::from(wire);
-        if let Some(path) = flat_logfile_path {
-            cfg.logfile.path = Some(path);
-        }
-        Ok(cfg)
+        Config::from_toml_value(value).map_err(serde::de::Error::custom)
     }
 }
 
-/// Generate `merge_with_cli` arms from a single field list.
-///
-/// Exhaustively destructures [`CliOverrides`] so a new override field that is not
-/// listed fails to compile. Handlers:
-/// - `set` — assign the unwrapped value (CLI `Option<T>` → dest `T`)
-/// - `set_some` — wrap in `Some` (CLI `Option<T>` → dest `Option<T>`)
-/// - `set_true` — only apply when `Some(true)`
-/// - `csv_opt` — comma-separated string → `Option<Vec<String>>`
-/// - `csv_vec` — comma-separated string → `Vec<String>`
-macro_rules! merge_cli_fields {
-    ($self:ident, $cli:ident; $( $field:ident => { $kind:ident : $dst:expr } ),* $(,)?) => {{
-        let CliOverrides {
-            $($field,)*
-        } = $cli;
-        $(
-            merge_cli_fields!(@arm $kind, $field, $dst);
-        )*
-    }};
-
-    (@arm set, $field:ident, $dst:expr) => {
-        if let Some(v) = $field {
-            $dst = v.clone();
-        }
-    };
-    (@arm set_some, $field:ident, $dst:expr) => {
-        if let Some(v) = $field {
-            $dst = Some(v.clone());
-        }
-    };
-    (@arm set_true, $field:ident, $dst:expr) => {
-        if let Some(true) = $field {
-            $dst = true;
-        }
-    };
-    (@arm csv_opt, $field:ident, $dst:expr) => {
-        if let Some(csv) = $field {
-            let items: Vec<String> = csv
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !items.is_empty() {
-                $dst = Some(items);
-            }
-        }
-    };
-    (@arm csv_vec, $field:ident, $dst:expr) => {
-        if let Some(csv) = $field {
-            let items: Vec<String> = csv
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if !items.is_empty() {
-                $dst = items;
-            }
-        }
-    };
+fn csv_items(csv: &str) -> Vec<String> {
+    csv.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
 }
 
 impl Config {
@@ -988,8 +792,8 @@ impl Config {
         }
 
         let content = fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
-        Ok(config)
+        let value: toml::Value = toml::from_str(&content)?;
+        Self::from_toml_value(value)
     }
 
     pub fn effective_genesis_time(&self) -> Result<u64, ConfigError> {
@@ -1042,10 +846,6 @@ impl Config {
             return Err(ConfigError::InvalidPort(self.metrics_port));
         }
 
-        if self.grpc_port == 0 {
-            return Err(ConfigError::InvalidPort(self.grpc_port));
-        }
-
         if let Some(ref graffiti) = self.graffiti {
             if graffiti.len() > 32 {
                 return Err(ConfigError::InvalidGraffiti(
@@ -1091,6 +891,138 @@ impl Config {
             return Err(ConfigError::MissingField(
                 "broadcast topic 'none' cannot be combined with other topics".to_string(),
             ));
+        }
+
+        if self.block_production_timeout == Some(0) {
+            return Err(ConfigError::MissingField(
+                "--block-production-timeout must be greater than 0".to_string(),
+            ));
+        }
+        if self.attestation_timeout == Some(0) {
+            return Err(ConfigError::MissingField(
+                "--attestation-timeout must be greater than 0".to_string(),
+            ));
+        }
+        if self.aggregate_timeout == Some(0) {
+            return Err(ConfigError::MissingField(
+                "--aggregate-timeout must be greater than 0".to_string(),
+            ));
+        }
+        if self.duty_fetch_timeout == Some(0) {
+            return Err(ConfigError::MissingField(
+                "--duty-fetch-timeout must be greater than 0".to_string(),
+            ));
+        }
+        if let Err(e) = GroupCommitConfig::try_from_knobs(
+            self.group_commit_batch_size,
+            self.group_commit_wait_to_fill_ms,
+        ) {
+            return Err(ConfigError::MissingField(e.to_string()));
+        }
+
+        for (field, value) in [
+            ("timing.attestation_due_bps", self.timing.attestation_due_bps),
+            ("timing.aggregate_due_bps", self.timing.aggregate_due_bps),
+            ("timing.attestation_due_bps_gloas", self.timing.attestation_due_bps_gloas),
+            ("timing.aggregate_due_bps_gloas", self.timing.aggregate_due_bps_gloas),
+            ("timing.sync_message_due_bps_gloas", self.timing.sync_message_due_bps_gloas),
+            ("timing.contribution_due_bps_gloas", self.timing.contribution_due_bps_gloas),
+            ("timing.payload_due_bps", self.timing.payload_due_bps),
+            ("timing.payload_attestation_due_bps", self.timing.payload_attestation_due_bps),
+        ] {
+            if !(1..=10000).contains(&value) {
+                return Err(ConfigError::Invalid {
+                    field,
+                    message: format!("must be 1..=10000, got {value}"),
+                    source_layer: ConfigSource::Default,
+                });
+            }
+        }
+
+        if self.timing.attestation_due_bps_gloas > self.timing.aggregate_due_bps_gloas {
+            return Err(ConfigError::Invalid {
+                field: "timing.aggregate_due_bps_gloas",
+                message: format!(
+                    "must be >= timing.attestation_due_bps_gloas ({}), got {}",
+                    self.timing.attestation_due_bps_gloas, self.timing.aggregate_due_bps_gloas
+                ),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        if self.timing.aggregate_due_bps_gloas > self.timing.payload_attestation_due_bps {
+            return Err(ConfigError::Invalid {
+                field: "timing.payload_attestation_due_bps",
+                message: format!(
+                    "must be >= timing.aggregate_due_bps_gloas ({}), got {}",
+                    self.timing.aggregate_due_bps_gloas, self.timing.payload_attestation_due_bps
+                ),
+                source_layer: ConfigSource::Default,
+            });
+        }
+
+        self.builder.validate()?;
+
+        // RR2-02: both gates. Range is the operator bound; `DispatchLimits::validated`
+        // rejects 0 because `ready_chunks(0)` panics (architecture §2.8).
+        let duty_dispatch_concurrency = self.duties.duty_dispatch_concurrency;
+        if !(1..=512).contains(&duty_dispatch_concurrency) {
+            return Err(ConfigError::Invalid {
+                field: "duties.duty_dispatch_concurrency",
+                message: format!("must be 1..=512, got {duty_dispatch_concurrency}"),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        let duty_publish_concurrency = self.duties.duty_publish_concurrency;
+        if !(1..=16).contains(&duty_publish_concurrency) {
+            return Err(ConfigError::Invalid {
+                field: "duties.duty_publish_concurrency",
+                message: format!("must be 1..=16, got {duty_publish_concurrency}"),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        DispatchLimits::validated(duty_dispatch_concurrency, duty_publish_concurrency).map_err(
+            |err| ConfigError::Invalid {
+                field: "duties",
+                message: err.to_string(),
+                source_layer: ConfigSource::Default,
+            },
+        )?;
+
+        // RR2-10: import-time KDF budget. The per-keystore cap is tighten-only
+        // against today's decrypt ceiling.
+        let keymanager_import_kdf_concurrency = self.keymanager.keymanager_import_kdf_concurrency;
+        if !(1..=rvc_config::MAX_IMPORT_KDF_CONCURRENCY)
+            .contains(&keymanager_import_kdf_concurrency)
+        {
+            return Err(ConfigError::Invalid {
+                field: "keymanager_import_kdf_concurrency",
+                message: format!(
+                    "must be 1..={}, got {keymanager_import_kdf_concurrency}",
+                    rvc_config::MAX_IMPORT_KDF_CONCURRENCY
+                ),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        let keymanager_import_kdf_total_mib = self.keymanager.keymanager_import_kdf_total_mib;
+        if keymanager_import_kdf_total_mib < 1 {
+            return Err(ConfigError::Invalid {
+                field: "keymanager_import_kdf_total_mib",
+                message: format!("must be >= 1, got {keymanager_import_kdf_total_mib}"),
+                source_layer: ConfigSource::Default,
+            });
+        }
+        let keymanager_import_kdf_max_keystore_mib =
+            self.keymanager.keymanager_import_kdf_max_keystore_mib;
+        let kdf_ceiling_mib = crypto::MAX_KDF_WORKING_SET_BYTES / (1024 * 1024);
+        let max_keystore_mib = u64::from(keymanager_import_kdf_max_keystore_mib);
+        if max_keystore_mib < 1 || max_keystore_mib > kdf_ceiling_mib {
+            return Err(ConfigError::Invalid {
+                field: "keymanager_import_kdf_max_keystore_mib",
+                message: format!(
+                    "must be 1..={kdf_ceiling_mib} (tighten-only; cannot exceed the decrypt working-set ceiling), got {keymanager_import_kdf_max_keystore_mib}"
+                ),
+                source_layer: ConfigSource::Default,
+            });
         }
 
         // Validate proposer node URLs
@@ -1202,92 +1134,315 @@ impl Config {
         }
     }
 
-    /// Merge present CLI overrides into this config.
+    /// Fold the four `[beacon]` timeout knobs into [`bn_manager::OperationTimeouts`].
     ///
-    /// Generated from a single field list via [`merge_cli_fields!`]. Adding a
-    /// field to [`CliOverrides`] without listing it here fails to compile
-    /// (exhaustive destructure).
-    pub fn merge_with_cli(&mut self, cli: &CliOverrides) {
-        merge_cli_fields! {
-            self, cli;
-            // top-level
-            beacon_url => { set: self.beacon_url },
-            beacon_nodes => { set: self.beacon_nodes },
-            keystore_path => { set: self.keystore_path },
-            password_file => { set_some: self.password_file },
-            slashing_db_path => { set: self.slashing_db_path },
-            init_slashing_db => { set_true: self.allow_fresh_db },
-            allow_unsupported_fork => { set_true: self.allow_unsupported_fork },
-            metrics_address => { set: self.metrics_address },
-            metrics_port => { set: self.metrics_port },
-            grpc_port => { set: self.grpc_port },
-            grpc_address => { set: self.grpc_address },
-            network => { set: self.network },
-            genesis_time => { set_some: self.genesis_time },
-            genesis_validators_root => { set_some: self.genesis_validators_root },
-            graffiti => { set_some: self.graffiti },
-            log_level => { set: self.log_level },
-            doppelganger_detection => { set: self.doppelganger_detection },
-            key_decrypt_threads => { set_some: self.key_decrypt_threads },
-            disable_attesting => { set: self.disable_attesting },
-            slashed_validators_action => { set: self.slashed_validators_action },
-            disable_keystore_locking => { set: self.disable_keystore_locking },
-            proposer_nodes => { set: self.proposer_nodes },
-            broadcast => { set: self.broadcast },
-            block_selection_mode => { set: self.block_selection_mode },
-            validator_registration_batch_size => { set: self.validator_registration_batch_size },
-            validator_registration_batch_delay => { set: self.validator_registration_batch_delay },
-            validators_config => { set_some: self.validators_config },
-            beacon_max_body_bytes => { set: self.beacon_max_body_bytes },
-            // keymanager
-            keymanager_enabled => { set: self.keymanager.enabled },
-            keymanager_address => { set_some: self.keymanager.address },
-            keymanager_token_file => { set_some: self.keymanager.token_file },
-            remote_signer_url => { set_some: self.keymanager.remote_signer_url },
-            remote_signer_allowed_hosts => { csv_opt: self.keymanager.remote_signer_allowed_hosts },
-            allow_insecure_remote_signer => { set: self.keymanager.allow_insecure_remote_signer },
-            keymanager_cors_origins => { set: self.keymanager.cors_origins },
-            keymanager_body_limit => { set: self.keymanager.body_limit },
-            // tracing
-            tracing_endpoint => { set_some: self.tracing.endpoint },
-            tracing_exporter => { set: self.tracing.exporter },
-            tracing_sample_rate => { set_some: self.tracing.sample_rate },
-            tracing_max_queue_size => { set_some: self.tracing.max_queue_size },
-            tracing_max_export_batch_size => { set_some: self.tracing.max_export_batch_size },
-            // secret provider
-            secret_provider => { csv_vec: self.secret_provider.providers },
-            gcp_project_id => { set_some: self.secret_provider.gcp.project_id },
-            gcp_secret_prefix => { set: self.secret_provider.gcp.secret_prefix },
-            secret_refresh_interval => { set_some: self.secret_provider.refresh_interval },
-            secret_provider_strict => { set_true: self.secret_provider.strict },
-            // grpc_signer
-            grpc_signer_url => { set_some: self.grpc_signer.url },
-            grpc_signer_tls_cert => { set_some: self.grpc_signer.tls_cert },
-            grpc_signer_tls_key => { set_some: self.grpc_signer.tls_key },
-            grpc_signer_tls_ca_cert => { set_some: self.grpc_signer.tls_ca_cert },
-            // builder_limits
-            builder_circuit_breaker_consecutive_limit => {
-                set: self.builder_limits.circuit_breaker_consecutive_limit
-            },
-            builder_circuit_breaker_epoch_limit => {
-                set: self.builder_limits.circuit_breaker_epoch_limit
-            },
-            // proposer_config
-            proposer_config_url => { set_some: self.proposer_config.url },
-            proposer_config_file => { set_some: self.proposer_config.file },
-            proposer_config_refresh_interval => { set: self.proposer_config.refresh_interval },
-            proposer_config_url_token => { set_some: self.proposer_config.url_token },
-            proposer_config_url_insecure => { set: self.proposer_config.url_insecure },
-            // monitoring
-            monitoring_endpoint => { set_some: self.monitoring.endpoint },
-            monitoring_interval => { set: self.monitoring.interval },
-            monitoring_endpoint_insecure => { set: self.monitoring.endpoint_insecure },
-            // logfile
-            logfile => { set_some: self.logfile.path },
-            logfile_max_size => { set: self.logfile.max_size },
-            logfile_max_number => { set: self.logfile.max_number },
-            logfile_compress => { set: self.logfile.compress },
-            logfile_level => { set_some: self.logfile.level },
+    /// Unset knobs keep [`bn_manager::OperationTimeouts::default`] (A-4.12).
+    /// `aggregate_timeout` sets both `aggregate_fetch` and `aggregate_submit`.
+    pub fn operation_timeouts(&self) -> bn_manager::OperationTimeouts {
+        let mut timeouts = bn_manager::OperationTimeouts::default();
+        if let Some(secs) = self.block_production_timeout {
+            timeouts.block_production = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = self.attestation_timeout {
+            timeouts.attestation_fetch = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = self.aggregate_timeout {
+            timeouts.aggregate_fetch = std::time::Duration::from_secs(secs);
+            timeouts.aggregate_submit = std::time::Duration::from_secs(secs);
+        }
+        if let Some(secs) = self.duty_fetch_timeout {
+            timeouts.duty_fetch = std::time::Duration::from_secs(secs);
+        }
+        timeouts
+    }
+
+    /// Load with explicit precedence: defaults < file < CLI.
+    ///
+    /// `*Config` stays the live home for defaults (`Config::default` /
+    /// `from_file`). Present CLI flags overlay last. File errors name
+    /// [`ConfigSource::File`]. `resolved()` is not called — empty CLI vecs
+    /// stay unset so they cannot invert ConfigWire's flat-wins lift.
+    pub fn load(file: Option<&Path>, cli: StartArgs) -> Result<Self, ConfigError> {
+        let mut config = match file {
+            Some(path) => Self::from_file(path).map_err(|err| match err {
+                removed @ ConfigError::RemovedKey { .. } => removed,
+                err => ConfigError::Invalid {
+                    field: "config",
+                    message: err.to_string(),
+                    source_layer: ConfigSource::File(path.to_path_buf()),
+                },
+            })?,
+            None => Self::default(),
+        };
+        config.apply_cli(&cli);
+        Ok(config)
+    }
+
+    /// Overlay present `StartArgs` flags onto this config (CLI wins).
+    fn apply_cli(&mut self, cli: &StartArgs) {
+        let StartArgs {
+            config: _,
+            beacon,
+            keys,
+            server,
+            network,
+            logging,
+            tracing,
+            keymanager,
+            grpc_signer,
+            safety,
+            builder,
+            proposer,
+            monitoring,
+            slashing,
+            duties,
+        } = cli;
+
+        if let Some(v) = &beacon.url {
+            self.beacon_url = v.clone();
+        }
+        if let Some(v) = &beacon.nodes {
+            self.beacon_nodes = v.clone();
+        }
+        if let Some(v) = beacon.max_body_bytes {
+            self.beacon_max_body_bytes = v;
+        }
+        if let Some(v) = beacon.block_production_timeout {
+            self.block_production_timeout = Some(v);
+        }
+        if let Some(v) = beacon.attestation_timeout {
+            self.attestation_timeout = Some(v);
+        }
+        if let Some(v) = beacon.aggregate_timeout {
+            self.aggregate_timeout = Some(v);
+        }
+        if let Some(v) = beacon.duty_fetch_timeout {
+            self.duty_fetch_timeout = Some(v);
+        }
+
+        if let Some(v) = &keys.keystore_path {
+            self.keystore_path = v.clone();
+        }
+        if let Some(v) = &keys.password_file {
+            self.password_file = Some(v.clone());
+        }
+        if let Some(v) = keys.key_decrypt_threads {
+            self.key_decrypt_threads = Some(v);
+        }
+        if keys.disable_keystore_locking == Some(true) {
+            self.disable_keystore_locking = true;
+        }
+        if let Some(v) = &keys.validators_config {
+            self.validators_config = Some(v.clone());
+        }
+        if let Some(csv) = &keys.secret_provider.providers {
+            let items = csv_items(csv);
+            if !items.is_empty() {
+                self.secret_provider.providers = items;
+            }
+        }
+        if let Some(v) = &keys.secret_provider.gcp.project_id {
+            self.secret_provider.gcp.project_id = Some(v.clone());
+        }
+        if let Some(v) = &keys.secret_provider.gcp.secret_prefix {
+            self.secret_provider.gcp.secret_prefix = v.clone();
+        }
+        if let Some(v) = keys.secret_provider.refresh_interval {
+            self.secret_provider.refresh_interval = Some(v);
+        }
+        if keys.secret_provider.strict == Some(true) {
+            self.secret_provider.strict = true;
+        }
+
+        if let Some(v) = server.metrics_address {
+            self.metrics_address = v;
+        }
+        if let Some(v) = server.metrics_port {
+            self.metrics_port = v;
+        }
+
+        if let Some(v) = network.network {
+            self.network = v;
+        }
+        if let Some(v) = network.genesis_time {
+            self.genesis_time = Some(v);
+        }
+        if let Some(v) = &network.genesis_validators_root {
+            self.genesis_validators_root = Some(v.clone());
+        }
+        if let Some(v) = &network.graffiti {
+            self.graffiti = Some(v.clone());
+        }
+
+        if let Some(v) = &logging.log_level {
+            self.log_level = v.clone();
+        }
+        if let Some(v) = &logging.logfile.path {
+            self.logfile.path = Some(v.clone());
+        }
+        if let Some(v) = logging.logfile.max_size {
+            self.logfile.max_size = v;
+        }
+        if let Some(v) = logging.logfile.max_number {
+            self.logfile.max_number = v;
+        }
+        if logging.logfile.compress == Some(true) {
+            self.logfile.compress = true;
+        }
+        if let Some(v) = &logging.logfile.level {
+            self.logfile.level = Some(v.clone());
+        }
+
+        if let Some(v) = &tracing.endpoint {
+            self.tracing.endpoint = Some(v.clone());
+        }
+        if let Some(v) = tracing.exporter {
+            self.tracing.exporter = v;
+        }
+        if let Some(v) = tracing.sample_rate {
+            self.tracing.sample_rate = Some(v);
+        }
+        if let Some(v) = tracing.max_queue_size {
+            self.tracing.max_queue_size = Some(v);
+        }
+        if let Some(v) = tracing.max_export_batch_size {
+            self.tracing.max_export_batch_size = Some(v);
+        }
+        if let Some(v) = &tracing.service_name {
+            self.tracing.service_name = Some(v.clone());
+        }
+
+        if keymanager.no_keymanager {
+            self.keymanager.enabled = false;
+        } else if keymanager.enabled == Some(true) {
+            self.keymanager.enabled = true;
+        }
+        if let Some(v) = &keymanager.address {
+            self.keymanager.address = Some(v.clone());
+        }
+        if let Some(v) = &keymanager.token_file {
+            self.keymanager.token_file = Some(v.clone());
+        }
+        if let Some(v) = &keymanager.remote_signer_url {
+            self.keymanager.remote_signer_url = Some(v.clone());
+        }
+        if let Some(csv) = &keymanager.remote_signer_allowed_hosts {
+            let items = csv_items(csv);
+            if !items.is_empty() {
+                self.keymanager.remote_signer_allowed_hosts = Some(items);
+            }
+        }
+        if keymanager.allow_insecure_remote_signer == Some(true) {
+            self.keymanager.allow_insecure_remote_signer = true;
+        }
+        if let Some(v) = &keymanager.cors_origins {
+            self.keymanager.cors_origins = v.clone();
+        }
+        if let Some(v) = keymanager.body_limit {
+            self.keymanager.body_limit = v;
+        }
+        if let Some(v) = keymanager.keymanager_import_kdf_concurrency {
+            self.keymanager.keymanager_import_kdf_concurrency = v;
+        }
+        if let Some(v) = keymanager.keymanager_import_kdf_total_mib {
+            self.keymanager.keymanager_import_kdf_total_mib = v;
+        }
+        if let Some(v) = keymanager.keymanager_import_kdf_max_keystore_mib {
+            self.keymanager.keymanager_import_kdf_max_keystore_mib = v;
+        }
+
+        if let Some(v) = &grpc_signer.url {
+            self.grpc_signer.url = Some(v.clone());
+        }
+        if let Some(v) = &grpc_signer.tls_cert {
+            self.grpc_signer.tls_cert = Some(v.clone());
+        }
+        if let Some(v) = &grpc_signer.tls_key {
+            self.grpc_signer.tls_key = Some(v.clone());
+        }
+        if let Some(v) = &grpc_signer.tls_ca_cert {
+            self.grpc_signer.tls_ca_cert = Some(v.clone());
+        }
+
+        if let Some(v) = builder.builder_limits.circuit_breaker_consecutive_limit {
+            self.builder_limits.circuit_breaker_consecutive_limit = v;
+        }
+        if let Some(v) = builder.builder_limits.circuit_breaker_epoch_limit {
+            self.builder_limits.circuit_breaker_epoch_limit = v;
+        }
+        if let Some(v) = builder.block_selection_mode {
+            self.block_selection_mode = v;
+        }
+        if let Some(v) = builder.validator_registration_batch_size {
+            self.validator_registration_batch_size = v;
+        }
+        if let Some(v) = builder.validator_registration_batch_delay {
+            self.validator_registration_batch_delay = v;
+        }
+
+        if let Some(v) = &proposer.proposer_nodes {
+            self.proposer_nodes = v.clone();
+        }
+        if let Some(v) = &proposer.broadcast {
+            self.broadcast = v.clone();
+        }
+        if let Some(v) = &proposer.proposer_config.url {
+            self.proposer_config.url = Some(v.clone());
+        }
+        if let Some(v) = &proposer.proposer_config.file {
+            self.proposer_config.file = Some(v.clone());
+        }
+        if let Some(v) = proposer.proposer_config.refresh_interval {
+            self.proposer_config.refresh_interval = v;
+        }
+        if let Some(v) = &proposer.proposer_config.url_token {
+            self.proposer_config.url_token = Some(v.clone());
+        }
+        if proposer.proposer_config.url_insecure == Some(true) {
+            self.proposer_config.url_insecure = true;
+        }
+
+        if let Some(v) = &monitoring.endpoint {
+            self.monitoring.endpoint = Some(v.clone());
+        }
+        if let Some(v) = monitoring.interval {
+            self.monitoring.interval = v;
+        }
+        if monitoring.endpoint_insecure == Some(true) {
+            self.monitoring.endpoint_insecure = true;
+        }
+
+        if safety.no_doppelganger_detection {
+            self.doppelganger_detection = false;
+        }
+        if safety.disable_attesting {
+            self.disable_attesting = true;
+        }
+        if let Some(v) = safety.slashed_validators_action {
+            self.slashed_validators_action = v;
+        }
+        if safety.allow_unsupported_fork {
+            self.allow_unsupported_fork = true;
+        }
+
+        if let Some(v) = &slashing.slashing_db_path {
+            self.slashing_db_path = v.clone();
+        }
+        if slashing.init_slashing_db {
+            self.allow_fresh_db = true;
+        }
+        if let Some(v) = slashing.group_commit_batch_size {
+            self.group_commit_batch_size = Some(v);
+        }
+        if let Some(v) = slashing.group_commit_wait_to_fill_ms {
+            self.group_commit_wait_to_fill_ms = Some(v);
+        }
+
+        if let Some(v) = duties.duty_dispatch_concurrency {
+            self.duties.duty_dispatch_concurrency = v;
+        }
+        if let Some(v) = duties.duty_publish_concurrency {
+            self.duties.duty_publish_concurrency = v;
         }
     }
 }
@@ -1309,85 +1464,18 @@ pub fn redact_url(raw: &str) -> String {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct CliOverrides {
-    pub beacon_url: Option<String>,
-    pub beacon_nodes: Option<Vec<String>>,
-    pub keystore_path: Option<PathBuf>,
-    pub password_file: Option<PathBuf>,
-    pub slashing_db_path: Option<PathBuf>,
-    /// When `Some(true)`, enables `Config::allow_fresh_db` (SEC-3 / `--init-slashing-db`).
-    pub init_slashing_db: Option<bool>,
-    /// When `Some(true)`, enables `Config::allow_unsupported_fork` (SEC-9 / M-15).
-    pub allow_unsupported_fork: Option<bool>,
-    pub metrics_address: Option<IpAddr>,
-    pub metrics_port: Option<u16>,
-    pub grpc_port: Option<u16>,
-    pub grpc_address: Option<String>,
-    pub network: Option<Network>,
-    pub genesis_time: Option<u64>,
-    pub genesis_validators_root: Option<String>,
-    pub graffiti: Option<String>,
-    pub log_level: Option<String>,
-    pub doppelganger_detection: Option<bool>,
-    pub keymanager_enabled: Option<bool>,
-    pub keymanager_address: Option<String>,
-    pub keymanager_token_file: Option<PathBuf>,
-    pub remote_signer_url: Option<String>,
-    pub remote_signer_allowed_hosts: Option<String>,
-    pub key_decrypt_threads: Option<usize>,
-    pub tracing_endpoint: Option<String>,
-    pub tracing_exporter: Option<TracingExporter>,
-    pub tracing_sample_rate: Option<f64>,
-    pub tracing_max_queue_size: Option<usize>,
-    pub tracing_max_export_batch_size: Option<usize>,
-    pub secret_provider: Option<String>,
-    pub gcp_project_id: Option<String>,
-    pub gcp_secret_prefix: Option<String>,
-    pub secret_refresh_interval: Option<u64>,
-    /// When `Some(true)`, enables `SecretProviderConfig::strict` (SEC-9 / M-9).
-    pub secret_provider_strict: Option<bool>,
-    pub allow_insecure_remote_signer: Option<bool>,
-    pub keymanager_cors_origins: Option<Vec<String>>,
-    pub keymanager_body_limit: Option<usize>,
-    pub grpc_signer_url: Option<String>,
-    pub grpc_signer_tls_cert: Option<PathBuf>,
-    pub grpc_signer_tls_key: Option<PathBuf>,
-    pub grpc_signer_tls_ca_cert: Option<PathBuf>,
-    pub disable_attesting: Option<bool>,
-    pub slashed_validators_action: Option<SlashedAction>,
-    pub builder_circuit_breaker_consecutive_limit: Option<u32>,
-    pub builder_circuit_breaker_epoch_limit: Option<u32>,
-    pub disable_keystore_locking: Option<bool>,
-    pub proposer_nodes: Option<Vec<String>>,
-    pub broadcast: Option<Vec<BroadcastTopic>>,
-    pub proposer_config_url: Option<String>,
-    pub proposer_config_file: Option<String>,
-    pub proposer_config_refresh_interval: Option<u64>,
-    pub proposer_config_url_token: Option<String>,
-    pub proposer_config_url_insecure: Option<bool>,
-    pub monitoring_endpoint: Option<String>,
-    pub monitoring_interval: Option<u64>,
-    pub monitoring_endpoint_insecure: Option<bool>,
-    pub logfile: Option<PathBuf>,
-    pub logfile_max_size: Option<u64>,
-    pub logfile_max_number: Option<usize>,
-    pub logfile_compress: Option<bool>,
-    pub logfile_level: Option<String>,
-    pub block_selection_mode: Option<validator_store::BlockSelectionMode>,
-    pub validator_registration_batch_size: Option<usize>,
-    pub validator_registration_batch_delay: Option<u64>,
-    pub validators_config: Option<PathBuf>,
-    /// Maximum JSON response body size from the BN (H-12).
-    pub beacon_max_body_bytes: Option<usize>,
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)] // Gate 1: tests round-trip secret material (passwords) for assertions; not a logging surface
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    fn overlay(f: impl FnOnce(&mut StartArgs)) -> Config {
+        let mut cli = StartArgs::default();
+        f(&mut cli);
+        Config::load(None, cli).expect("load")
+    }
 
     #[test]
     fn test_default_config() {
@@ -1396,32 +1484,34 @@ mod tests {
         assert_eq!(config.keystore_path, PathBuf::from("./keystores"));
         assert_eq!(config.metrics_port, 8080);
         assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        assert_eq!(config.grpc_port, 50051);
-        assert_eq!(config.grpc_address, "127.0.0.1");
         assert_eq!(config.network, Network::Mainnet);
         assert!(config.genesis_time.is_none());
         assert!(config.genesis_validators_root.is_none());
+        assert_eq!(config.timing.attestation_due_bps, 3333);
+        assert_eq!(config.timing.aggregate_due_bps, 6667);
+        assert_eq!(config.timing.attestation_due_bps_gloas, 2500);
+        assert_eq!(config.timing.aggregate_due_bps_gloas, 5000);
+        assert_eq!(config.timing.sync_message_due_bps_gloas, 2500);
+        assert_eq!(config.timing.contribution_due_bps_gloas, 5000);
+        assert_eq!(config.timing.payload_due_bps, 5000);
+        assert_eq!(config.timing.payload_attestation_due_bps, 7500);
+        assert!(config.fork_schedule.gloas_fork_epoch.is_none());
+        assert!(config.fork_schedule.gloas_fork_version.is_none());
     }
 
     #[test]
     fn test_merge_with_cli_metrics_address() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            metrics_address: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
-            ..Default::default()
-        };
-
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.server.metrics_address =
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+        });
 
         assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
     }
 
     #[test]
     fn test_merge_with_cli_metrics_address_none_preserves_default() {
-        let mut config = Config::default();
-        let cli = CliOverrides::default();
-
-        config.merge_with_cli(&cli);
+        let config = overlay(|_| {});
 
         assert_eq!(config.metrics_address, std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
     }
@@ -1436,7 +1526,6 @@ beacon_url = "http://beacon:5052"
 keystore_path = "/data/keystores"
 slashing_db_path = "/data/slashing.db"
 metrics_port = 9090
-grpc_port = 50052
 network = "hoodi"
 log_level = "debug"
 "#
@@ -1449,7 +1538,6 @@ log_level = "debug"
         assert_eq!(config.slashing_db_path, PathBuf::from("/data/slashing.db"));
         assert!(!config.allow_fresh_db, "SEC-3: allow_fresh_db defaults false");
         assert_eq!(config.metrics_port, 9090);
-        assert_eq!(config.grpc_port, 50052);
         assert_eq!(config.network, Network::Hoodi);
         assert_eq!(config.log_level, "debug");
     }
@@ -1474,7 +1562,10 @@ allow_fresh_db = true
 
         let mut config = Config::default();
         assert!(!config.allow_fresh_db);
-        config.merge_with_cli(&CliOverrides { init_slashing_db: Some(true), ..Default::default() });
+        config.apply_cli(&StartArgs {
+            slashing: SlashingArgs { init_slashing_db: true, ..Default::default() },
+            ..Default::default()
+        });
         assert!(config.allow_fresh_db);
     }
 
@@ -1531,6 +1622,235 @@ allow_fresh_db = true
     }
 
     #[test]
+    fn config_rejects_zero_duty_concurrency() {
+        for (body, needle) in [
+            ("duty_dispatch_concurrency = 0\n", "duty_dispatch_concurrency"),
+            ("duty_publish_concurrency = 0\n", "duty_publish_concurrency"),
+        ] {
+            let config: Config = toml::from_str(&format!("[duties]\n{body}"))
+                .expect("0 is a u32; reject at validate");
+            let err = config.validate().expect_err("zero duty concurrency must fail validate");
+            let msg = err.to_string();
+            assert!(msg.contains(needle), "{msg}");
+        }
+    }
+
+    #[test]
+    fn config_rejects_duty_concurrency_above_range() {
+        let over_dispatch: Config =
+            toml::from_str("[duties]\nduty_dispatch_concurrency = 513\n").expect("513 parses");
+        let err = over_dispatch.validate().expect_err("513 is above 512");
+        let msg = err.to_string();
+        assert!(msg.contains("duty_dispatch_concurrency"), "{msg}");
+        assert!(msg.contains("513"), "{msg}");
+
+        let over_publish: Config =
+            toml::from_str("[duties]\nduty_publish_concurrency = 17\n").expect("17 parses");
+        let err = over_publish.validate().expect_err("17 is above 16");
+        let msg = err.to_string();
+        assert!(msg.contains("duty_publish_concurrency"), "{msg}");
+        assert!(msg.contains("17"), "{msg}");
+    }
+
+    #[test]
+    fn duty_concurrency_bounds_and_defaults_match_dispatch_limits() {
+        let defaults = Config::default();
+        assert_eq!(defaults.duties.duty_dispatch_concurrency, DispatchLimits::DEFAULT_CONCURRENCY);
+        assert_eq!(
+            defaults.duties.duty_publish_concurrency,
+            DispatchLimits::DEFAULT_PUBLISH_CONCURRENCY
+        );
+        assert_eq!(DispatchLimits::DEFAULT_CONCURRENCY, 32);
+        assert_eq!(DispatchLimits::DEFAULT_PUBLISH_CONCURRENCY, 2);
+        assert!(defaults.validate().is_ok());
+
+        let at_max: Config = toml::from_str(
+            "[duties]\nduty_dispatch_concurrency = 512\nduty_publish_concurrency = 16\n",
+        )
+        .expect("bounds parse");
+        assert!(at_max.validate().is_ok());
+
+        let absent = DutiesArgs::default().resolved();
+        assert_eq!(absent.duty_dispatch_concurrency, defaults.duties.duty_dispatch_concurrency);
+        assert_eq!(absent.duty_publish_concurrency, defaults.duties.duty_publish_concurrency);
+    }
+
+    #[test]
+    fn cli_duty_concurrency_overrides_toml() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "[duties]\nduty_dispatch_concurrency = 8\nduty_publish_concurrency = 3\n")
+            .unwrap();
+        let from_file = Config::load(Some(file.path()), StartArgs::default()).expect("file");
+        assert_eq!(from_file.duties.duty_dispatch_concurrency, 8);
+        assert_eq!(from_file.duties.duty_publish_concurrency, 3);
+
+        let mut cli = StartArgs::default();
+        cli.duties.duty_dispatch_concurrency = Some(64);
+        cli.duties.duty_publish_concurrency = Some(4);
+        let loaded = Config::load(Some(file.path()), cli).expect("file+cli");
+        assert_eq!(loaded.duties.duty_dispatch_concurrency, 64);
+        assert_eq!(loaded.duties.duty_publish_concurrency, 4);
+        assert!(loaded.validate().is_ok());
+    }
+
+    #[test]
+    fn kdf_max_keystore_mib_is_tighten_only() {
+        let ceiling = crypto::MAX_KDF_WORKING_SET_BYTES / (1024 * 1024);
+        assert_eq!(ceiling, 1024, "today's decrypt ceiling is 1024 MiB");
+
+        let above: Config = toml::from_str(&format!(
+            "[keymanager]\nkeymanager_import_kdf_max_keystore_mib = {}\n",
+            ceiling + 1
+        ))
+        .expect("value above the ceiling parses");
+        let err = above.validate().expect_err("above the decrypt ceiling");
+        match &err {
+            ConfigError::Invalid { field, message, .. } => {
+                assert_eq!(*field, "keymanager_import_kdf_max_keystore_mib");
+                assert!(message.contains(&(ceiling + 1).to_string()), "{message}");
+            }
+            other => panic!("expected a named Invalid error, got {other:?}"),
+        }
+        let rendered = err.to_string();
+        assert!(rendered.contains("keymanager_import_kdf_max_keystore_mib"), "{rendered}");
+
+        let smaller: Config = toml::from_str(&format!(
+            "[keymanager]\nkeymanager_import_kdf_max_keystore_mib = {}\n",
+            ceiling - 1
+        ))
+        .expect("smaller cap parses");
+        assert!(smaller.validate().is_ok(), "a cap below the ceiling is accepted");
+        assert_eq!(
+            u64::from(smaller.keymanager.keymanager_import_kdf_max_keystore_mib),
+            ceiling - 1
+        );
+
+        let at_ceiling: Config = toml::from_str(&format!(
+            "[keymanager]\nkeymanager_import_kdf_max_keystore_mib = {ceiling}\n"
+        ))
+        .expect("ceiling parses");
+        assert!(at_ceiling.validate().is_ok(), "the current ceiling stays accepted");
+
+        let zero: Config =
+            toml::from_str("[keymanager]\nkeymanager_import_kdf_max_keystore_mib = 0\n")
+                .expect("0 parses");
+        let err = zero.validate().expect_err("0 is below 1");
+        assert!(
+            matches!(
+                err,
+                ConfigError::Invalid { field: "keymanager_import_kdf_max_keystore_mib", .. }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn import_kdf_defaults_match_kdf_budget_config() {
+        let budget = crate::keymanager_adapters::KdfBudgetConfig::default();
+        let defaults = Config::default();
+        assert_eq!(defaults.keymanager.keymanager_import_kdf_concurrency, budget.concurrency);
+        assert_eq!(
+            u64::from(defaults.keymanager.keymanager_import_kdf_total_mib) * 1024 * 1024,
+            budget.total_bytes
+        );
+        assert_eq!(
+            u64::from(defaults.keymanager.keymanager_import_kdf_max_keystore_mib) * 1024 * 1024,
+            budget.max_keystore_bytes
+        );
+        assert!(defaults.validate().is_ok());
+
+        let absent = StartArgs::default();
+        assert!(absent.keymanager.keymanager_import_kdf_concurrency.is_none());
+        assert!(absent.keymanager.keymanager_import_kdf_total_mib.is_none());
+        assert!(absent.keymanager.keymanager_import_kdf_max_keystore_mib.is_none());
+        let loaded = Config::load(None, absent).expect("defaults");
+        assert_eq!(loaded.keymanager.keymanager_import_kdf_concurrency, budget.concurrency);
+        assert_eq!(
+            loaded.keymanager.keymanager_import_kdf_total_mib,
+            u32::try_from(budget.total_bytes / (1024 * 1024)).unwrap()
+        );
+        assert_eq!(
+            loaded.keymanager.keymanager_import_kdf_max_keystore_mib,
+            u32::try_from(budget.max_keystore_bytes / (1024 * 1024)).unwrap()
+        );
+    }
+
+    #[test]
+    fn config_rejects_zero_import_kdf_concurrency() {
+        let config: Config =
+            toml::from_str("[keymanager]\nkeymanager_import_kdf_concurrency = 0\n")
+                .expect("0 is a u32; reject at validate");
+        let err = config.validate().expect_err("zero import KDF concurrency must fail validate");
+        match err {
+            ConfigError::Invalid { field, message, .. } => {
+                assert_eq!(field, "keymanager_import_kdf_concurrency");
+                assert!(message.contains('0'), "{message}");
+            }
+            other => panic!("expected a named Invalid error, got {other:?}"),
+        }
+
+        let over: Config = toml::from_str("[keymanager]\nkeymanager_import_kdf_concurrency = 33\n")
+            .expect("33 parses");
+        let err = over.validate().expect_err("33 is above 32");
+        assert!(
+            matches!(err, ConfigError::Invalid { field: "keymanager_import_kdf_concurrency", .. }),
+            "{err}"
+        );
+
+        let at_max: Config =
+            toml::from_str("[keymanager]\nkeymanager_import_kdf_concurrency = 32\n")
+                .expect("32 parses");
+        assert!(at_max.validate().is_ok());
+
+        let zero_total: Config =
+            toml::from_str("[keymanager]\nkeymanager_import_kdf_total_mib = 0\n")
+                .expect("0 parses");
+        let err = zero_total.validate().expect_err("zero total MiB");
+        assert!(
+            matches!(err, ConfigError::Invalid { field: "keymanager_import_kdf_total_mib", .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn keymanager_import_kdf_toml_and_cli() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            "[keymanager]\n\
+             keymanager_import_kdf_concurrency = 8\n\
+             keymanager_import_kdf_total_mib = 128\n\
+             keymanager_import_kdf_max_keystore_mib = 1024\n"
+        )
+        .unwrap();
+        let from_file = Config::load(Some(file.path()), StartArgs::default()).expect("file");
+        assert_eq!(from_file.keymanager.keymanager_import_kdf_concurrency, 8);
+        assert_eq!(from_file.keymanager.keymanager_import_kdf_total_mib, 128);
+        assert_eq!(from_file.keymanager.keymanager_import_kdf_max_keystore_mib, 1024);
+        assert!(from_file.validate().is_ok());
+
+        let loaded = overlay(|cli| {
+            cli.keymanager.keymanager_import_kdf_concurrency = Some(4);
+            cli.keymanager.keymanager_import_kdf_total_mib = Some(256);
+            cli.keymanager.keymanager_import_kdf_max_keystore_mib = Some(512);
+        });
+        assert_eq!(loaded.keymanager.keymanager_import_kdf_concurrency, 4);
+        assert_eq!(loaded.keymanager.keymanager_import_kdf_total_mib, 256);
+        assert_eq!(loaded.keymanager.keymanager_import_kdf_max_keystore_mib, 512);
+        assert!(loaded.validate().is_ok());
+
+        let mut cli = StartArgs::default();
+        cli.keymanager.keymanager_import_kdf_concurrency = Some(16);
+        cli.keymanager.keymanager_import_kdf_total_mib = Some(64);
+        cli.keymanager.keymanager_import_kdf_max_keystore_mib = Some(32);
+        let overlaid = Config::load(Some(file.path()), cli).expect("file+cli");
+        assert_eq!(overlaid.keymanager.keymanager_import_kdf_concurrency, 16);
+        assert_eq!(overlaid.keymanager.keymanager_import_kdf_total_mib, 64);
+        assert_eq!(overlaid.keymanager.keymanager_import_kdf_max_keystore_mib, 32);
+        assert!(overlaid.validate().is_ok());
+    }
+
+    #[test]
     fn test_validate_empty_beacon_url() {
         let config = Config { beacon_url: "".to_string(), ..Default::default() };
         assert!(matches!(config.validate(), Err(ConfigError::InvalidBeaconUrl(_))));
@@ -1556,6 +1876,219 @@ allow_fresh_db = true
             ..Default::default()
         };
         assert!(matches!(config.validate(), Err(ConfigError::InvalidGraffiti(_))));
+    }
+
+    #[test]
+    fn test_timing_attestation_due_bps_from_toml_is_observable() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+attestation_due_bps = 2500
+aggregate_due_bps = 4000
+"#,
+        )
+        .expect("[timing] must bind through ConfigWire");
+        assert_eq!(config.timing.attestation_due_bps, 2500);
+        assert_eq!(config.timing.aggregate_due_bps, 4000);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_timing_bps_zero_fails_validate_naming_key() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+attestation_due_bps = 0
+"#,
+        )
+        .expect("0 is a u64; reject at validate");
+        let err = config.validate().expect_err("bps=0 must fail validate");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.attestation_due_bps"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_bps_above_range_fails_validate_naming_key() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+aggregate_due_bps = 10001
+"#,
+        )
+        .expect("10001 is a u64; reject at validate");
+        let err = config.validate().expect_err("bps=10001 must fail validate");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.aggregate_due_bps"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_bps_non_integer_fails_naming_key() {
+        let err = toml::from_str::<Config>(
+            r#"
+[timing]
+attestation_due_bps = "not-an-integer"
+"#,
+        )
+        .expect_err("non-integer bps must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("attestation_due_bps"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_keys_from_toml_are_observable() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+attestation_due_bps_gloas = 2500
+aggregate_due_bps_gloas = 6667
+sync_message_due_bps_gloas = 1111
+contribution_due_bps_gloas = 2222
+payload_due_bps = 3333
+payload_attestation_due_bps = 8000
+"#,
+        )
+        .expect("[timing] Gloas keys must bind through ConfigWire");
+        assert_eq!(config.timing.attestation_due_bps_gloas, 2500);
+        assert_eq!(config.timing.aggregate_due_bps_gloas, 6667);
+        assert_eq!(config.timing.sync_message_due_bps_gloas, 1111);
+        assert_eq!(config.timing.contribution_due_bps_gloas, 2222);
+        assert_eq!(config.timing.payload_due_bps, 3333);
+        assert_eq!(config.timing.payload_attestation_due_bps, 8000);
+        assert_eq!(config.timing.attestation_due_bps, 3333);
+        assert_eq!(config.timing.aggregate_due_bps, 6667);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_timing_aggregate_due_bps_gloas_default_5000_toml_6667() {
+        let defaulted: Config = toml::from_str("").expect("empty config");
+        assert_eq!(defaulted.timing.aggregate_due_bps_gloas, 5000);
+        let from_toml: Config = toml::from_str(
+            r#"
+[timing]
+aggregate_due_bps_gloas = 6667
+"#,
+        )
+        .expect("TOML-only override");
+        assert_eq!(from_toml.timing.aggregate_due_bps_gloas, 6667);
+        assert_eq!(from_toml.timing.attestation_due_bps, 3333);
+        assert_eq!(from_toml.timing.aggregate_due_bps, 6667);
+        assert!(from_toml.validate().is_ok());
+    }
+
+    #[test]
+    fn test_timing_unknown_key_fails_naming_key() {
+        let err = toml::from_str::<Config>(
+            r#"
+[timing]
+not_a_timing_key = 1
+"#,
+        )
+        .expect_err("unknown timing.* key must fail deserialize");
+        let msg = err.to_string();
+        assert!(msg.contains("not_a_timing_key"), "{msg}");
+    }
+
+    #[test]
+    fn test_fork_schedule_from_toml_is_observable() {
+        let config: Config = toml::from_str(
+            r#"
+[fork_schedule]
+gloas_fork_epoch = 600000
+gloas_fork_version = "0X07000000"
+"#,
+        )
+        .expect("[fork_schedule] must bind through ConfigWire");
+        assert_eq!(config.fork_schedule.gloas_fork_epoch, Some(600000));
+        assert_eq!(config.fork_schedule.gloas_fork_version.as_deref(), Some("0X07000000"));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fork_schedule_sentinel_epoch_string_is_u64_max() {
+        let config: Config = toml::from_str(
+            r#"
+[fork_schedule]
+gloas_fork_epoch = "18446744073709551615"
+"#,
+        )
+        .expect("sentinel decimal string must bind");
+        assert_eq!(config.fork_schedule.gloas_fork_epoch, Some(u64::MAX));
+        assert!(config.fork_schedule.gloas_fork_version.is_none());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_fork_schedule_unknown_key_fails_naming_key() {
+        let err = toml::from_str::<Config>(
+            r#"
+[fork_schedule]
+not_a_fork_key = 1
+"#,
+        )
+        .expect_err("unknown fork_schedule.* key must fail deserialize");
+        let msg = err.to_string();
+        assert!(msg.contains("not_a_fork_key"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_bps_zero_fails_validate_naming_key() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+aggregate_due_bps_gloas = 0
+"#,
+        )
+        .expect("0 is a u64; reject at validate");
+        let err = config.validate().expect_err("bps=0 must fail validate");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.aggregate_due_bps_gloas"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_bps_above_range_fails_validate_naming_key() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+payload_attestation_due_bps = 10001
+"#,
+        )
+        .expect("10001 is a u64; reject at validate");
+        let err = config.validate().expect_err("bps=10001 must fail validate");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.payload_attestation_due_bps"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_phase_order_names_aggregate_when_before_attestation() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+attestation_due_bps_gloas = 5000
+aggregate_due_bps_gloas = 4000
+"#,
+        )
+        .expect("in-range values; reject at validate");
+        let err = config.validate().expect_err("attestation > aggregate must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.aggregate_due_bps_gloas"), "{msg}");
+        assert!(msg.contains("4000"), "{msg}");
+    }
+
+    #[test]
+    fn test_timing_gloas_phase_order_names_payload_attestation_when_before_aggregate() {
+        let config: Config = toml::from_str(
+            r#"
+[timing]
+aggregate_due_bps_gloas = 5000
+payload_attestation_due_bps = 4000
+"#,
+        )
+        .expect("in-range values; reject at validate");
+        let err = config.validate().expect_err("aggregate > payload_attestation must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("timing.payload_attestation_due_bps"), "{msg}");
+        assert!(msg.contains("4000"), "{msg}");
     }
 
     #[test]
@@ -1688,51 +2221,15 @@ allow_fresh_db = true
 
     #[test]
     fn test_merge_with_cli() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            beacon_url: Some("http://custom:5052".to_string()),
-            metrics_port: Some(9999),
-            network: Some(Network::Hoodi),
-            ..Default::default()
-        };
-
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.beacon.url = Some("http://custom:5052".to_string());
+            cli.server.metrics_port = Some(9999);
+            cli.network.network = Some(Network::Hoodi);
+        });
 
         assert_eq!(config.beacon_url, "http://custom:5052");
         assert_eq!(config.metrics_port, 9999);
         assert_eq!(config.network, Network::Hoodi);
-        assert_eq!(config.grpc_port, 50051);
-        assert_eq!(config.grpc_address, "127.0.0.1");
-    }
-
-    #[test]
-    fn test_merge_with_cli_grpc_address() {
-        let mut config = Config::default();
-        let cli = CliOverrides { grpc_address: Some("0.0.0.0".to_string()), ..Default::default() };
-
-        config.merge_with_cli(&cli);
-
-        assert_eq!(config.grpc_address, "0.0.0.0");
-    }
-
-    #[test]
-    fn test_config_from_file_with_grpc_address() {
-        let mut file = NamedTempFile::new().unwrap();
-        writeln!(
-            file,
-            r#"
-beacon_url = "http://beacon:5052"
-keystore_path = "/data/keystores"
-slashing_db_path = "/data/slashing.db"
-grpc_address = "192.168.1.1"
-network = "hoodi"
-log_level = "debug"
-"#
-        )
-        .unwrap();
-
-        let config = Config::from_file(file.path()).unwrap();
-        assert_eq!(config.grpc_address, "192.168.1.1");
     }
 
     #[test]
@@ -1775,24 +2272,22 @@ log_level = "debug"
 
     #[test]
     fn test_merge_with_cli_beacon_nodes() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            beacon_nodes: Some(vec!["http://bn1:5052".to_string(), "http://bn2:5052".to_string()]),
-            ..Default::default()
-        };
-
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.beacon.nodes =
+                Some(vec!["http://bn1:5052".to_string(), "http://bn2:5052".to_string()]);
+        });
         assert_eq!(config.beacon_nodes.len(), 2);
         assert_eq!(config.beacon_nodes[0], "http://bn1:5052");
     }
 
     #[test]
     fn test_merge_with_cli_doppelganger_detection() {
-        let mut config = Config::default();
+        let config = Config::default();
         assert!(config.doppelganger_detection);
 
-        let cli = CliOverrides { doppelganger_detection: Some(false), ..Default::default() };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.safety.no_doppelganger_detection = true;
+        });
         assert!(!config.doppelganger_detection);
     }
 
@@ -1855,16 +2350,12 @@ doppelganger_detection = false
 
     #[test]
     fn test_merge_with_cli_keymanager_fields() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            keymanager_enabled: Some(true),
-            keymanager_address: Some("0.0.0.0:5062".to_string()),
-            keymanager_token_file: Some(PathBuf::from("/data/token.txt")),
-            remote_signer_url: Some("https://signer.example.com".to_string()),
-            ..Default::default()
-        };
-
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.keymanager.enabled = Some(true);
+            cli.keymanager.address = Some("0.0.0.0:5062".to_string());
+            cli.keymanager.token_file = Some(PathBuf::from("/data/token.txt"));
+            cli.keymanager.remote_signer_url = Some("https://signer.example.com".to_string());
+        });
 
         assert!(config.keymanager.enabled);
         assert_eq!(config.keymanager.address.as_deref(), Some("0.0.0.0:5062"));
@@ -1906,10 +2397,7 @@ remote_signer_url = "https://signer.example.com"
 
     #[test]
     fn test_merge_with_cli_keymanager_none_preserves_defaults() {
-        let mut config = Config::default();
-        let cli = CliOverrides::default();
-
-        config.merge_with_cli(&cli);
+        let config = overlay(|_| {});
 
         assert!(!config.keymanager.enabled);
         assert!(config.keymanager.address.is_none());
@@ -1927,19 +2415,16 @@ remote_signer_url = "https://signer.example.com"
 
     #[test]
     fn test_merge_with_cli_key_decrypt_threads() {
-        let mut config = Config::default();
-        assert!(config.key_decrypt_threads.is_none());
-
-        let cli = CliOverrides { key_decrypt_threads: Some(4), ..Default::default() };
-        config.merge_with_cli(&cli);
+        assert!(Config::default().key_decrypt_threads.is_none());
+        let config = overlay(|cli| {
+            cli.keys.key_decrypt_threads = Some(4);
+        });
         assert_eq!(config.key_decrypt_threads, Some(4));
     }
 
     #[test]
     fn test_merge_with_cli_key_decrypt_threads_none_preserves_default() {
-        let mut config = Config::default();
-        let cli = CliOverrides::default();
-        config.merge_with_cli(&cli);
+        let config = overlay(|_| {});
         assert!(config.key_decrypt_threads.is_none());
     }
 
@@ -1977,37 +2462,31 @@ key_decrypt_threads = 4
 
     #[test]
     fn test_merge_with_cli_tracing_endpoint() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            tracing_endpoint: Some("http://collector:4318".to_string()),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.tracing.endpoint = Some("http://collector:4318".to_string());
+        });
         assert_eq!(config.tracing.endpoint.as_deref(), Some("http://collector:4318"));
     }
 
     #[test]
     fn test_merge_with_cli_tracing_exporter() {
-        let mut config = Config::default();
-        let cli =
-            CliOverrides { tracing_exporter: Some(TracingExporter::Gcp), ..Default::default() };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.tracing.exporter = Some(TracingExporter::Gcp);
+        });
         assert_eq!(config.tracing.exporter, TracingExporter::Gcp);
     }
 
     #[test]
     fn test_merge_with_cli_tracing_sample_rate() {
-        let mut config = Config::default();
-        let cli = CliOverrides { tracing_sample_rate: Some(0.5), ..Default::default() };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.tracing.sample_rate = Some(0.5);
+        });
         assert_eq!(config.tracing.sample_rate, Some(0.5));
     }
 
     #[test]
     fn test_merge_with_cli_tracing_none_preserves_defaults() {
-        let mut config = Config::default();
-        let cli = CliOverrides::default();
-        config.merge_with_cli(&cli);
+        let config = overlay(|_| {});
         assert!(config.tracing.endpoint.is_none());
         assert_eq!(config.tracing.exporter, TracingExporter::Otlp);
         assert!(config.tracing.sample_rate.is_none());
@@ -2118,8 +2597,8 @@ log_level = "info"
             },
             ..Default::default()
         };
-        cfg.merge_with_cli(&CliOverrides {
-            tracing_endpoint: Some("http://cli:4318".into()),
+        cfg.apply_cli(&StartArgs {
+            tracing: TracingArgs { endpoint: Some("http://cli:4318".into()), ..Default::default() },
             ..Default::default()
         });
         assert_eq!(cfg.tracing.resolve_endpoint().as_deref(), Some("http://cli:4318"));
@@ -2129,19 +2608,14 @@ log_level = "info"
 
     #[test]
     fn test_merge_covers_every_cli_override_field() {
-        // Compile-time exhaustiveness is enforced by merge_cli_fields!'s
-        // destructure of CliOverrides. This runtime smoke check ensures a
-        // representative override from each group still lands on Config.
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            beacon_url: Some("http://bn:5052".into()),
-            tracing_sample_rate: Some(0.01),
-            keymanager_enabled: Some(true),
-            logfile: Some(std::path::PathBuf::from("/tmp/rvc.log")),
-            monitoring_interval: Some(42),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        // Representative override from each group still lands on Config.
+        let config = overlay(|cli| {
+            cli.beacon.url = Some("http://bn:5052".into());
+            cli.tracing.sample_rate = Some(0.01);
+            cli.keymanager.enabled = Some(true);
+            cli.logging.logfile.path = Some(std::path::PathBuf::from("/tmp/rvc.log"));
+            cli.monitoring.interval = Some(42);
+        });
         assert_eq!(config.beacon_url, "http://bn:5052");
         assert_eq!(config.tracing.sample_rate, Some(0.01));
         assert!(config.keymanager.enabled);
@@ -2153,10 +2627,8 @@ log_level = "info"
     fn test_cli_sample_rate_0_01_survives_merge_and_env() {
         let _guard = otel_env_lock();
         std::env::set_var("OTEL_TRACES_SAMPLER_ARG", "0.9");
-        let mut config = Config::default();
-        config.merge_with_cli(&CliOverrides {
-            tracing_sample_rate: Some(0.01),
-            ..Default::default()
+        let config = overlay(|cli| {
+            cli.tracing.sample_rate = Some(0.01);
         });
         assert_eq!(config.tracing.sample_rate, Some(0.01));
         assert!((config.tracing.resolve_sample_rate() - 0.01).abs() < f64::EPSILON);
@@ -2170,31 +2642,39 @@ log_level = "info"
         let config = Config::default();
         assert!(config.tracing.max_queue_size.is_none());
         assert!(config.tracing.max_export_batch_size.is_none());
+        assert!(config.tracing.service_name.is_none());
     }
 
     #[test]
     fn test_merge_with_cli_tracing_max_queue_size() {
-        let mut config = Config::default();
-        let cli = CliOverrides { tracing_max_queue_size: Some(4096), ..Default::default() };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.tracing.max_queue_size = Some(4096);
+        });
         assert_eq!(config.tracing.max_queue_size, Some(4096));
     }
 
     #[test]
     fn test_merge_with_cli_tracing_max_export_batch_size() {
-        let mut config = Config::default();
-        let cli = CliOverrides { tracing_max_export_batch_size: Some(1024), ..Default::default() };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.tracing.max_export_batch_size = Some(1024);
+        });
         assert_eq!(config.tracing.max_export_batch_size, Some(1024));
     }
 
     #[test]
+    fn test_merge_with_cli_tracing_service_name() {
+        let config = overlay(|cli| {
+            cli.tracing.service_name = Some("rvc-signer".into());
+        });
+        assert_eq!(config.tracing.service_name.as_deref(), Some("rvc-signer"));
+    }
+
+    #[test]
     fn test_merge_with_cli_tracing_batch_none_preserves_defaults() {
-        let mut config = Config::default();
-        let cli = CliOverrides::default();
-        config.merge_with_cli(&cli);
+        let config = overlay(|_| {});
         assert!(config.tracing.max_queue_size.is_none());
         assert!(config.tracing.max_export_batch_size.is_none());
+        assert!(config.tracing.service_name.is_none());
     }
 
     #[test]
@@ -2220,6 +2700,26 @@ tracing_max_export_batch_size = 1024
     }
 
     #[test]
+    fn test_config_from_file_with_tracing_service_name() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+beacon_url = "http://beacon:5052"
+keystore_path = "/data/keystores"
+slashing_db_path = "/data/slashing.db"
+network = "mainnet"
+log_level = "info"
+tracing_service_name = "rvc-signer"
+"#
+        )
+        .unwrap();
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert_eq!(config.tracing.service_name.as_deref(), Some("rvc-signer"));
+    }
+
+    #[test]
     fn test_config_from_file_without_tracing_batch_uses_defaults() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
@@ -2237,6 +2737,7 @@ log_level = "info"
         let config = Config::from_file(file.path()).unwrap();
         assert!(config.tracing.max_queue_size.is_none());
         assert!(config.tracing.max_export_batch_size.is_none());
+        assert!(config.tracing.service_name.is_none());
     }
 
     // -- redact_url tests --
@@ -2306,12 +2807,9 @@ log_level = "info"
 
     #[test]
     fn test_merge_with_cli_remote_signer_allowed_hosts() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            remote_signer_allowed_hosts: Some("host1.com,host2.com".to_string()),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.keymanager.remote_signer_allowed_hosts = Some("host1.com,host2.com".to_string());
+        });
         assert_eq!(
             config.keymanager.remote_signer_allowed_hosts,
             Some(vec!["host1.com".to_string(), "host2.com".to_string()])
@@ -2320,12 +2818,10 @@ log_level = "info"
 
     #[test]
     fn test_merge_with_cli_remote_signer_allowed_hosts_with_spaces() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            remote_signer_allowed_hosts: Some(" host1.com , host2.com ".to_string()),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.keymanager.remote_signer_allowed_hosts =
+                Some(" host1.com , host2.com ".to_string());
+        });
         assert_eq!(
             config.keymanager.remote_signer_allowed_hosts,
             Some(vec!["host1.com".to_string(), "host2.com".to_string()])
@@ -2334,9 +2830,7 @@ log_level = "info"
 
     #[test]
     fn test_merge_with_cli_remote_signer_allowed_hosts_none_preserves_default() {
-        let mut config = Config::default();
-        let cli = CliOverrides::default();
-        config.merge_with_cli(&cli);
+        let config = overlay(|_| {});
         assert!(config.keymanager.remote_signer_allowed_hosts.is_none());
     }
 
@@ -2375,14 +2869,11 @@ remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
 
     #[test]
     fn test_merge_with_cli_secret_provider() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            secret_provider: Some("gcp".to_string()),
-            gcp_project_id: Some("my-project".to_string()),
-            gcp_secret_prefix: Some("key-".to_string()),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.keys.secret_provider.providers = Some("gcp".to_string());
+            cli.keys.secret_provider.gcp.project_id = Some("my-project".to_string());
+            cli.keys.secret_provider.gcp.secret_prefix = Some("key-".to_string());
+        });
         assert_eq!(config.secret_provider.providers, vec!["gcp".to_string()]);
         assert_eq!(config.secret_provider.gcp.project_id, Some("my-project".to_string()));
         assert_eq!(config.secret_provider.gcp.secret_prefix, "key-");
@@ -2390,18 +2881,15 @@ remote_signer_allowed_hosts = ["signer1.com", "signer2.com"]
 
     #[test]
     fn test_merge_with_cli_secret_provider_comma_separated() {
-        let mut config = Config::default();
-        let cli =
-            CliOverrides { secret_provider: Some("gcp,aws".to_string()), ..Default::default() };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.keys.secret_provider.providers = Some("gcp,aws".to_string());
+        });
         assert_eq!(config.secret_provider.providers, vec!["gcp".to_string(), "aws".to_string()]);
     }
 
     #[test]
     fn test_merge_with_cli_secret_provider_none_preserves_defaults() {
-        let mut config = Config::default();
-        let cli = CliOverrides::default();
-        config.merge_with_cli(&cli);
+        let config = overlay(|_| {});
         assert!(config.secret_provider.providers.is_empty());
         assert!(config.secret_provider.gcp.project_id.is_none());
         assert_eq!(config.secret_provider.gcp.secret_prefix, "validator-key-");
@@ -2490,8 +2978,7 @@ secret_prefix = "val-key-"
             },
             ..Default::default()
         };
-        let cli = CliOverrides { gcp_secret_prefix: None, ..Default::default() };
-        config.merge_with_cli(&cli);
+        config.apply_cli(&StartArgs::default());
         assert_eq!(
             config.secret_provider.gcp.secret_prefix, "custom-prefix-",
             "config file gcp_secret_prefix should be preserved when CLI does not specify it"
@@ -2591,9 +3078,19 @@ log_level = "info"
             },
             ..Default::default()
         };
-        let cli =
-            CliOverrides { gcp_project_id: Some("cli-project".to_string()), ..Default::default() };
-        config.merge_with_cli(&cli);
+        config.apply_cli(&StartArgs {
+            keys: KeysArgs {
+                secret_provider: SecretProviderArgs {
+                    gcp: GcpSecretArgs {
+                        project_id: Some("cli-project".to_string()),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        });
         assert_eq!(
             config.secret_provider.gcp.project_id,
             Some("cli-project".to_string()),
@@ -2613,9 +3110,9 @@ log_level = "info"
 
     #[test]
     fn test_merge_with_cli_secret_refresh_interval() {
-        let mut config = Config::default();
-        let cli = CliOverrides { secret_refresh_interval: Some(120), ..Default::default() };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.keys.secret_provider.refresh_interval = Some(120);
+        });
         assert_eq!(config.secret_provider.refresh_interval, Some(120));
     }
 
@@ -2628,8 +3125,7 @@ log_level = "info"
             },
             ..Default::default()
         };
-        let cli = CliOverrides::default();
-        config.merge_with_cli(&cli);
+        config.apply_cli(&StartArgs::default());
         assert_eq!(config.secret_provider.refresh_interval, Some(300));
     }
 
@@ -2700,22 +3196,19 @@ log_level = "info"
 
     #[test]
     fn test_merge_circuit_breaker_limits() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            builder_circuit_breaker_consecutive_limit: Some(10),
-            builder_circuit_breaker_epoch_limit: Some(20),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.builder.builder_limits.circuit_breaker_consecutive_limit = Some(10);
+            cli.builder.builder_limits.circuit_breaker_epoch_limit = Some(20);
+        });
         assert_eq!(config.builder_limits.circuit_breaker_consecutive_limit, 10);
         assert_eq!(config.builder_limits.circuit_breaker_epoch_limit, 20);
     }
 
     #[test]
     fn test_merge_disable_keystore_locking() {
-        let mut config = Config::default();
-        let cli = CliOverrides { disable_keystore_locking: Some(true), ..Default::default() };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.keys.disable_keystore_locking = Some(true);
+        });
         assert!(config.disable_keystore_locking);
     }
 
@@ -2888,24 +3381,19 @@ broadcast = ["blocks", "attestations"]
 
     #[test]
     fn test_merge_with_cli_proposer_fields() {
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            proposer_nodes: Some(vec!["http://p1:5052".to_string()]),
-            broadcast: Some(vec![BroadcastTopic::Blocks]),
-            proposer_config_url: Some("https://example.com/config".to_string()),
-            proposer_config_refresh_interval: Some(60),
-            proposer_config_url_token: Some("my-token".to_string()),
-            proposer_config_url_insecure: Some(true),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        let config = overlay(|cli| {
+            cli.proposer.proposer_nodes = Some(vec!["http://p1:5052".to_string()]);
+            cli.proposer.broadcast = Some(vec![BroadcastTopic::Blocks]);
+            cli.proposer.proposer_config.url = Some("https://example.com/config".to_string());
+            cli.proposer.proposer_config.refresh_interval = Some(60);
+            cli.proposer.proposer_config.url_token = Some("my-token".to_string());
+            cli.proposer.proposer_config.url_insecure = Some(true);
+        });
         assert_eq!(config.proposer_nodes.len(), 1);
         assert_eq!(config.broadcast, vec![BroadcastTopic::Blocks]);
         assert_eq!(config.proposer_config.url, Some("https://example.com/config".to_string()));
         assert_eq!(config.proposer_config.refresh_interval, 60);
         assert_eq!(config.proposer_config.url_token, Some("my-token".to_string()));
-        assert!(config.proposer_config.url_insecure);
-        assert_eq!(config.proposer_config.url, Some("https://example.com/config".to_string()));
         assert!(config.proposer_config.url_insecure);
     }
 
@@ -3073,6 +3561,39 @@ roles = ["not-a-role"]
         assert!(config.validate().is_ok());
     }
 
+    #[test]
+    fn builder_section_urls_and_min_bid_parse() {
+        let config: Config = toml::from_str(
+            r#"
+beacon_url = "http://localhost:5052"
+[builder]
+builders = ["https://relay.example"]
+min_bid = 10000000
+builder_boost_factor = 80
+"#,
+        )
+        .expect("parse [builder]");
+        assert_eq!(config.builder.builders, vec!["https://relay.example".to_string()]);
+        assert_eq!(config.builder.min_bid, Some(10_000_000));
+        assert_eq!(config.builder.builder_boost_factor, Some(80));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn builder_section_malformed_url_fails_validate_naming_the_value() {
+        let config: Config = toml::from_str(
+            r#"
+beacon_url = "http://localhost:5052"
+[builder]
+builders = ["not a url"]
+"#,
+        )
+        .expect("parse");
+        let err = config.validate().expect_err("malformed URL");
+        let msg = err.to_string();
+        assert!(msg.contains("not a url"), "{msg}");
+    }
+
     // -- CQ-2.5: strip_prefix_strict adoption test --
 
     /// load_passwords must warn and skip a pubkey entry that carries a double 0x prefix.
@@ -3101,8 +3622,8 @@ roles = ["not-a-role"]
 
     /// Source-level guard: flat field shims must not reappear on `Config`.
     ///
-    /// `CliOverrides` / `ConfigWire` still use the historical flat key names for CLI and
-    /// serde alias compatibility — only the public `Config` shims are forbidden.
+    /// `ConfigWire` still uses the historical flat key names for serde alias
+    /// compatibility — only the public `Config` shims are forbidden.
     #[test]
     fn test_no_flat_field_accessors_remain() {
         let full = include_str!("types.rs");
@@ -3132,6 +3653,10 @@ roles = ["not-a-role"]
             "pub proposer_config: ProposerConfigSource",
             "pub monitoring: MonitoringConfig",
             "pub builder_limits: BuilderLimits",
+            "pub builder: BuilderSettings",
+            "pub timing: TimingConfig",
+            "pub duties: DutiesConfig",
+            "pub fork_schedule: ForkScheduleConfig",
         ] {
             assert!(config_struct.contains(nested), "nested group missing from Config: {nested}");
         }
@@ -3150,6 +3675,7 @@ roles = ["not-a-role"]
             "tracing_sample_rate",
             "tracing_max_queue_size",
             "tracing_max_export_batch_size",
+            "tracing_service_name",
             "grpc_signer_url",
             "grpc_signer_tls_cert",
             "grpc_signer_tls_key",

@@ -1,0 +1,89 @@
+# ARCH-4d corpus: both spellings, different values. Flat keys win.
+# Flat keys listed first so the document carries both spellings cleanly.
+
+keymanager_enabled = true
+keymanager_address = "10.0.0.1:5062"
+keymanager_token_file = "/flat/km.token"
+remote_signer_url = "https://flat-signer:9000"
+remote_signer_allowed_hosts = ["flat.host"]
+allow_insecure_remote_signer = true
+keymanager_cors_origins = ["https://flat.cors"]
+keymanager_body_limit = 2222222
+
+tracing_endpoint = "http://flat-otel:4318"
+tracing_exporter = "gcp"
+tracing_sample_rate = 0.77
+tracing_max_queue_size = 7777
+tracing_max_export_batch_size = 777
+tracing_service_name = "rvc-flat"
+
+grpc_signer_url = "https://flat-grpc:50051"
+grpc_signer_tls_cert = "/flat/client.crt"
+grpc_signer_tls_key = "/flat/client.key"
+grpc_signer_tls_ca_cert = "/flat/ca.crt"
+
+builder_circuit_breaker_consecutive_limit = 8
+builder_circuit_breaker_epoch_limit = 13
+
+monitoring_endpoint = "https://flat.monitor/metrics"
+monitoring_interval = 77
+monitoring_endpoint_insecure = true
+
+proposer_config_url = "https://flat.proposer/config.json"
+proposer_config_file = "/flat/proposer.json"
+proposer_config_refresh_interval = 47
+proposer_config_url_token = "flat-token"
+proposer_config_url_insecure = true
+
+logfile_max_size = 77
+logfile_max_number = 4
+logfile_compress = true
+logfile_level = "warn"
+
+# Nested tables — losing values
+[keymanager]
+enabled = false
+address = "127.0.0.1:1"
+token_file = "/nested/km.token"
+remote_signer_url = "https://nested-signer:9000"
+remote_signer_allowed_hosts = ["nested.host"]
+allow_insecure_remote_signer = false
+cors_origins = ["https://nested.cors"]
+body_limit = 111
+
+[tracing]
+endpoint = "http://nested-otel:4318"
+exporter = "otlp"
+sample_rate = 0.11
+max_queue_size = 11
+max_export_batch_size = 11
+service_name = "rvc-nested"
+
+[grpc_signer]
+url = "https://nested-grpc:50051"
+tls_cert = "/nested/client.crt"
+tls_key = "/nested/client.key"
+tls_ca_cert = "/nested/ca.crt"
+
+[builder_limits]
+circuit_breaker_consecutive_limit = 1
+circuit_breaker_epoch_limit = 1
+
+[monitoring]
+endpoint = "https://nested.monitor/metrics"
+interval = 11
+endpoint_insecure = false
+
+[proposer_config]
+url = "https://nested.proposer/config.json"
+file = "/nested/proposer.json"
+refresh_interval = 11
+url_token = "nested-token"
+url_insecure = false
+
+[logfile]
+path = "/nested/rvc.log"
+max_size = 11
+max_number = 11
+compress = false
+level = "error"

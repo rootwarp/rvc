@@ -1,0 +1,2 @@
+[defaults]
+fee_recipient = "@@FEE_RECIPIENT@@"

@@ -19,29 +19,24 @@
 //! - [`BeaconBlockBodyDeneb`] / [`BlindedBeaconBlockBodyDeneb`] — 12 fields
 //!   (no `execution_requests`; pre-Electra attestation limits/types)
 //!
-//! # Dual-SSZ wire twins
+//! # Dual SSZ — Path C (one struct per container)
 //!
-//! Crate-root types use workspace `ssz` 0.9 (`ssz_derive`); body containers need
-//! `ssz_types` 0.10, which implements `Encode`/`Decode` only against
-//! `ethereum_ssz` 0.8. Eight body-path sub-containers therefore exist as
-//! encode/decode-facing `Wire*` twins of the crate-root forms. Prefer the
-//! crate-root type at the API boundary; use `Wire*` only inside typed body SSZ.
+//! Crate-root types carry both workspace `ssz` 0.9 and `ssz08` 0.8
+//! `Encode`/`Decode`. Typed bodies still encode through `ssz08` because
+//! `ssz_types` 0.10.1 implements those traits against 0.8 only.
 //!
-//! | Wire twin (`block_body`) | Crate-root counterpart | Why both exist |
-//! | --- | --- | --- |
-//! | [`WireCheckpoint`] | [`crate::Checkpoint`] | ssz 0.9 vs ethereum_ssz 0.8 + ssz_types |
-//! | [`WireAttestationData`] | [`crate::AttestationData`] | same |
-//! | [`WireBeaconBlockHeader`] | [`crate::BeaconBlockHeader`] | same |
-//! | [`WireAttestation`] | [`crate::Attestation`] | same |
-//! | [`WireAttestationElectra`] | [`crate::ElectraAttestation`] | same (Electra attestation) |
-//! | [`WireDepositData`] | [`crate::DepositData`] | same |
-//! | [`WireVoluntaryExit`] | [`crate::VoluntaryExit`] | same |
-//! | [`WireSignedVoluntaryExit`] | [`crate::SignedVoluntaryExit`] | same |
+//! Isomorphic containers (primitive / already-aliased fields) use
+//! `ssz_container! { impl Type { fields… } }`. JSON `Vec<u8>` fields that are
+//! spec bitlist / bitvector / Bytes96 get **custom** impls — naive decorate
+//! encodes `Vec<u8>` as List[byte] (variable signature / committee bits).
 //!
-//! **Deletion trigger:** remove the `Wire*` twins when `ssz_types` compiles
-//! against `ethereum_ssz` 0.9 (or workspace `ssz` aligns with the stack
-//! `ssz_types` implements); see plan §5 / F80 full unification (deferred).
+//! **Path C landed ARCH-7h, 2026-08-18, baseline `ce9048c`.** Do not
+//! reintroduce encode/decode-facing twins. Path A (`ssz_types` 0.11+ /
+//! workspace `tree_hash` 0.10) and Path B (drop `ssz` 0.9) are not required;
+//! see `docs/forks.md` §3 and
+//! `plan/architecture-2026-08-12/measurements/wire-twins-spike.md`.
 
+use serde::{Deserialize, Serialize};
 use ssz08::{Decode, DecodeError, Encode, SszDecoderBuilder, SszEncoder, BYTES_PER_LENGTH_OFFSET};
 use ssz_types::{
     typenum::{
@@ -112,6 +107,9 @@ pub type MaxCommitteesPerSlot = U64;
 pub enum BodySszError {
     #[error("invalid SSZ body encoding: {0}")]
     InvalidEncoding(String),
+    /// Gloas has no body decoder yet; fail closed rather than `Ok(vec![])`.
+    #[error("Gloas BeaconBlockBody layout is not supported")]
+    GloasUnsupported,
 }
 
 impl From<DecodeError> for BodySszError {
@@ -124,30 +122,20 @@ impl From<DecodeError> for BodySszError {
 // SSZ container Encode/Decode helper (ethereum_ssz 0.8 trait surface)
 // ---------------------------------------------------------------------------
 
-/// Define an SSZ container struct and its `ssz08::{Encode, Decode}` impls from
-/// a single field list (merkleization- and serialization-sensitive order).
+/// `ssz08::{Encode, Decode}` for an existing container (Path C decorate-macro).
 ///
 /// Field order is merkleization- and serialization-sensitive — keep in sync
-/// with the consensus-specs container. One list feeds both the type definition
-/// and the encoder so they cannot drift.
-macro_rules! ssz_container {
+/// with the consensus-specs container. Used both by [`ssz_container!`] (new
+/// types) and by `ssz_container! { impl ExistingType { … } }` (crate-root
+/// types that already carry `ssz` 0.9 + `TreeHash`).
+macro_rules! ssz08_codec_impls {
     (
-        $(#[$meta:meta])*
-        pub struct $ty:ident {
+        $ty:ty {
             $(
-                $(#[$field_meta:meta])*
-                pub $field:ident : $ftype:ty
+                $field:ident : $ftype:ty
             ),* $(,)?
         }
     ) => {
-        $(#[$meta])*
-        pub struct $ty {
-            $(
-                $(#[$field_meta])*
-                pub $field: $ftype,
-            )*
-        }
-
         impl Encode for $ty {
             fn is_ssz_fixed_len() -> bool {
                 $( <$ftype as Encode>::is_ssz_fixed_len() && )* true
@@ -205,6 +193,487 @@ macro_rules! ssz_container {
                 Ok(Self {
                     $( $field: decoder.decode_next()?, )*
                 })
+            }
+        }
+    };
+}
+
+/// Beacon-API JSON spellings selected by [`ssz_container!`]'s struct arm.
+///
+/// SSZ field types do not carry the wire JSON shape (`u64` is a quoted decimal,
+/// byte arrays and byte lists are `0x` hex, `List[BytesN]` is a JSON array of
+/// hex strings).
+mod beacon_api_json {
+    use serde::ser::SerializeSeq;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use ssz_types::typenum::Unsigned;
+    use ssz_types::{FixedVector, VariableList};
+
+    pub mod uint256 {
+        use super::*;
+        use crate::block_body::Uint256;
+
+        pub fn serialize<S>(value: &Uint256, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_str(&to_decimal(&value.0))
+        }
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Uint256, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            let text = String::deserialize(deserializer)?;
+            let bytes = from_decimal(&text).map_err(serde::de::Error::custom)?;
+            Ok(Uint256(bytes))
+        }
+
+        fn to_decimal(le: &[u8; 32]) -> String {
+            if le.iter().all(|byte| *byte == 0) {
+                return "0".to_string();
+            }
+            let mut be = *le;
+            be.reverse();
+            let mut digits = Vec::new();
+            while be.iter().any(|byte| *byte != 0) {
+                let mut rem = 0u16;
+                for byte in &mut be {
+                    let cur = (rem << 8) | u16::from(*byte);
+                    *byte = (cur / 10) as u8;
+                    rem = cur % 10;
+                }
+                digits.push(char::from(b'0' + rem as u8));
+            }
+            digits.iter().rev().collect()
+        }
+
+        fn from_decimal(text: &str) -> Result<[u8; 32], String> {
+            if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+                return Err(format!("invalid uint256 decimal: {text}"));
+            }
+            let mut be = [0u8; 32];
+            for digit in text.bytes().map(|byte| u16::from(byte - b'0')) {
+                let mut carry = digit;
+                for byte in be.iter_mut().rev() {
+                    let cur = u16::from(*byte) * 10 + carry;
+                    *byte = (cur & 0xff) as u8;
+                    carry = cur >> 8;
+                }
+                if carry != 0 {
+                    return Err(format!("uint256 overflow: {text}"));
+                }
+            }
+            be.reverse();
+            Ok(be)
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use serde::{Deserialize, Serialize};
+
+            #[derive(Debug, PartialEq, Serialize, Deserialize)]
+            struct Wrap {
+                #[serde(with = "super")]
+                value: crate::block_body::Uint256,
+            }
+
+            #[test]
+            fn large_round_trip() {
+                let mut bytes = [0u8; 32];
+                bytes[8] = 1;
+                let wrap = Wrap { value: crate::block_body::Uint256(bytes) };
+                let json = serde_json::to_string(&wrap).unwrap();
+                assert_eq!(json, r#"{"value":"18446744073709551616"}"#);
+                let back: Wrap = serde_json::from_str(&json).unwrap();
+                assert_eq!(back, wrap, "{json}");
+            }
+        }
+    }
+
+    /// `List[Bytes48]` (blob KZG commitments) as a JSON array of `0x` strings.
+    pub mod kzg_commitment_list {
+        use super::*;
+
+        #[derive(Serialize)]
+        #[serde(transparent)]
+        struct Ref<'a>(#[serde(with = "crate::hex_fixed::bytes_48_hex")] &'a [u8; 48]);
+
+        #[derive(Deserialize)]
+        #[serde(transparent)]
+        struct Owned(#[serde(with = "crate::hex_fixed::bytes_48_hex")] [u8; 48]);
+
+        pub fn serialize<S, N>(
+            list: &VariableList<[u8; 48], N>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+            N: Unsigned,
+        {
+            let mut seq = serializer.serialize_seq(Some(list.len()))?;
+            for bytes in list {
+                seq.serialize_element(&Ref(bytes))?;
+            }
+            seq.end()
+        }
+
+        pub fn deserialize<'de, D, N>(
+            deserializer: D,
+        ) -> Result<VariableList<[u8; 48], N>, D::Error>
+        where
+            D: Deserializer<'de>,
+            N: Unsigned,
+        {
+            let items = Vec::<Owned>::deserialize(deserializer)?;
+            VariableList::new(items.into_iter().map(|item| item.0).collect()).map_err(|err| {
+                serde::de::Error::custom(format!("invalid kzg commitment list: {err:?}"))
+            })
+        }
+    }
+
+    /// `Vector[Bytes32]` (deposit proof) as a JSON array of `0x` roots.
+    pub mod bytes32_fixed_vec {
+        use super::*;
+
+        #[derive(Serialize)]
+        #[serde(transparent)]
+        struct Ref<'a>(#[serde(with = "crate::hex_fixed::bytes_32_hex")] &'a [u8; 32]);
+
+        #[derive(Deserialize)]
+        #[serde(transparent)]
+        struct Owned(#[serde(with = "crate::hex_fixed::bytes_32_hex")] [u8; 32]);
+
+        pub fn serialize<S, N>(
+            vector: &FixedVector<[u8; 32], N>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+            N: Unsigned,
+        {
+            let mut seq = serializer.serialize_seq(Some(vector.len()))?;
+            for bytes in vector {
+                seq.serialize_element(&Ref(bytes))?;
+            }
+            seq.end()
+        }
+
+        pub fn deserialize<'de, D, N>(deserializer: D) -> Result<FixedVector<[u8; 32], N>, D::Error>
+        where
+            D: Deserializer<'de>,
+            N: Unsigned,
+        {
+            let items = Vec::<Owned>::deserialize(deserializer)?;
+            FixedVector::new(items.into_iter().map(|item| item.0).collect())
+                .map_err(|err| serde::de::Error::custom(format!("invalid bytes32 vector: {err:?}")))
+        }
+    }
+
+    /// Body JSON rejects bitfields that `as_ssz_bytes` would panic on.
+    /// The shared attestation serde is left alone; accepted bytes are not rewritten.
+    fn canonical_bitlist<N, E>(bytes: &[u8]) -> Result<(), E>
+    where
+        N: Unsigned + Clone,
+        E: serde::de::Error,
+    {
+        use ssz08::{Decode, Encode};
+        use ssz_types::BitList;
+
+        let decoded = BitList::<N>::from_ssz_bytes(bytes)
+            .map_err(|err| E::custom(format!("non-canonical aggregation_bits: {err:?}")))?;
+        if Encode::as_ssz_bytes(&decoded).as_slice() != bytes {
+            return Err(E::custom("non-canonical aggregation_bits"));
+        }
+        Ok(())
+    }
+
+    fn canonical_committee_bits<E>(bytes: &[u8]) -> Result<(), E>
+    where
+        E: serde::de::Error,
+    {
+        use ssz08::{Decode, Encode};
+        use ssz_types::BitVector;
+
+        let decoded = BitVector::<super::MaxCommitteesPerSlot>::from_ssz_bytes(bytes)
+            .map_err(|err| E::custom(format!("committee_bits must be Bitvector[64]: {err:?}")))?;
+        if Encode::as_ssz_bytes(&decoded).as_slice() != bytes {
+            return Err(E::custom("committee_bits must be Bitvector[64]"));
+        }
+        Ok(())
+    }
+
+    pub mod deneb_attestations {
+        use super::*;
+
+        pub fn serialize<S, N>(
+            list: &VariableList<crate::Attestation, N>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+            N: Unsigned,
+        {
+            Serialize::serialize(list, serializer)
+        }
+
+        pub fn deserialize<'de, D, N>(
+            deserializer: D,
+        ) -> Result<VariableList<crate::Attestation, N>, D::Error>
+        where
+            D: Deserializer<'de>,
+            N: Unsigned,
+        {
+            let list = VariableList::<crate::Attestation, N>::deserialize(deserializer)?;
+            for attestation in &list {
+                canonical_bitlist::<super::super::MaxValidatorsPerCommittee, D::Error>(
+                    &attestation.aggregation_bits,
+                )?;
+            }
+            Ok(list)
+        }
+    }
+
+    pub mod electra_attestations {
+        use super::*;
+
+        pub fn serialize<S, N>(
+            list: &VariableList<crate::ElectraAttestation, N>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+            N: Unsigned,
+        {
+            Serialize::serialize(list, serializer)
+        }
+
+        pub fn deserialize<'de, D, N>(
+            deserializer: D,
+        ) -> Result<VariableList<crate::ElectraAttestation, N>, D::Error>
+        where
+            D: Deserializer<'de>,
+            N: Unsigned,
+        {
+            let list = VariableList::<crate::ElectraAttestation, N>::deserialize(deserializer)?;
+            for attestation in &list {
+                canonical_bitlist::<super::super::MaxValidatorsPerSlot, D::Error>(
+                    &attestation.aggregation_bits,
+                )?;
+                canonical_committee_bits::<D::Error>(&attestation.committee_bits)?;
+            }
+            Ok(list)
+        }
+    }
+}
+
+macro_rules! ssz_container_parse {
+    (
+        @go
+        meta: [$($meta:tt)*],
+        name: $ty:ident,
+        sfields: [$($sfields:tt)*],
+        cfields: [$($cfields:tt)*],
+        rest: [@end]
+    ) => {
+        $($meta)*
+        #[derive(Serialize, Deserialize)]
+        pub struct $ty {
+            $($sfields)*
+        }
+
+        ssz08_codec_impls! {
+            $ty {
+                $($cfields)*
+            }
+        }
+    };
+
+    (
+        @push
+        meta: $meta:tt,
+        name: $ty:ident,
+        sfields: [$($sfields:tt)*],
+        cfields: [$($cfields:tt)*],
+        fmeta: [$($fmeta:tt)*],
+        serde: [$($serde_attr:tt)*],
+        field: $field:ident,
+        ftype: [$($ftype:tt)*],
+        rest: [$($rest:tt)*]
+    ) => {
+        ssz_container_parse! {
+            @go
+            meta: $meta,
+            name: $ty,
+            sfields: [
+                $($sfields)*
+                $($fmeta)*
+                $($serde_attr)*
+                pub $field: $($ftype)*,
+            ],
+            cfields: [
+                $($cfields)*
+                $field: $($ftype)*,
+            ],
+            rest: [$($rest)*]
+        }
+    };
+
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : u64, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "serde_utils::quoted_u64")]],
+            field: $field, ftype: [u64], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : [u8; 20], $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "crate::hex_fixed::bytes_20_hex")]],
+            field: $field, ftype: [[u8; 20]], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : [u8; 32], $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "crate::hex_fixed::bytes_32_hex")]],
+            field: $field, ftype: [[u8; 32]], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : [u8; 48], $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "crate::hex_fixed::bytes_48_hex")]],
+            field: $field, ftype: [[u8; 48]], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : [u8; 96], $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "crate::hex_fixed::bytes_96_hex")]],
+            field: $field, ftype: [[u8; 96]], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : [u8; $n:literal], $($rest:tt)*]) => {
+        compile_error!(concat!(
+            "ssz_container JSON: no 0x hex spelling for [u8; ",
+            stringify!($n),
+            "]"
+        ));
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : Uint256, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "beacon_api_json::uint256")]],
+            field: $field, ftype: [Uint256], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : VariableList<u8, $n:ty>, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "ssz_types::serde_utils::hex_var_list")]],
+            field: $field, ftype: [VariableList<u8, $n>], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : VariableList<u64, $n:ty>, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "ssz_types::serde_utils::quoted_u64_var_list")]],
+            field: $field, ftype: [VariableList<u64, $n>], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : VariableList<Transaction, $n:ty>, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "ssz_types::serde_utils::list_of_hex_var_list")]],
+            field: $field, ftype: [VariableList<Transaction, $n>], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : VariableList<KzgCommitment, $n:ty>, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "beacon_api_json::kzg_commitment_list")]],
+            field: $field, ftype: [VariableList<KzgCommitment, $n>], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : FixedVector<u8, $n:ty>, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "ssz_types::serde_utils::hex_fixed_vec")]],
+            field: $field, ftype: [FixedVector<u8, $n>], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : FixedVector<[u8; 32], $n:ty>, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "beacon_api_json::bytes32_fixed_vec")]],
+            field: $field, ftype: [FixedVector<[u8; 32], $n>], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : VariableList<crate::Attestation, $n:ty>, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "beacon_api_json::deneb_attestations")]],
+            field: $field, ftype: [VariableList<crate::Attestation, $n>], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : VariableList<crate::ElectraAttestation, $n:ty>, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [#[serde(with = "beacon_api_json::electra_attestations")]],
+            field: $field, ftype: [VariableList<crate::ElectraAttestation, $n>], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$(#[$fmeta:meta])* pub $field:ident : $ftype:ty, $($rest:tt)*]) => {
+        ssz_container_parse! {
+            @push meta: $meta, name: $ty, sfields: $sfields, cfields: $cfields,
+            fmeta: [$(#[$fmeta])*], serde: [],
+            field: $field, ftype: [$ftype], rest: [$($rest)*]
+        }
+    };
+    (@go meta: $meta:tt, name: $ty:ident, sfields: $sfields:tt, cfields: $cfields:tt, rest: [$($rest:tt)*]) => {
+        compile_error!(concat!(
+            "ssz_container: unrecognized field in ",
+            stringify!($ty),
+            ": ",
+            stringify!($($rest)*)
+        ));
+    };
+}
+
+/// Define an SSZ container struct and its `ssz08::{Encode, Decode}` impls from
+/// a single field list (merkleization- and serialization-sensitive order).
+///
+/// The struct arm also derives Beacon-API JSON. JSON is a representation at
+/// the edge; SSZ stays canonical. The `impl $ty { fields… }` arm decorates an
+/// existing struct (Path C) and leaves its serde untouched.
+macro_rules! ssz_container {
+    (
+        $(#[$meta:meta])*
+        pub struct $ty:ident {
+            $($body:tt)*
+        }
+    ) => {
+        ssz_container_parse! {
+            @go
+            meta: [$(#[$meta])*],
+            name: $ty,
+            sfields: [],
+            cfields: [],
+            rest: [$($body)* @end]
+        }
+    };
+
+    (
+        impl $ty:ty {
+            $(
+                $field:ident : $ftype:ty
+            ),* $(,)?
+        }
+    ) => {
+        ssz08_codec_impls! {
+            $ty {
+                $($field: $ftype),*
             }
         }
     };
@@ -297,40 +766,38 @@ ssz_container! {
     }
 }
 
+// Path C: crate-root Checkpoint already has ssz 0.9 + TreeHash.
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireCheckpoint {
-        pub epoch: u64,
-        pub root: [u8; 32],
+    impl crate::Checkpoint {
+        epoch: crate::Epoch,
+        root: crate::Root,
     }
 }
 
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireAttestationData {
-        pub slot: u64,
-        pub index: u64,
-        pub beacon_block_root: [u8; 32],
-        pub source: WireCheckpoint,
-        pub target: WireCheckpoint,
+    impl crate::AttestationData {
+        slot: crate::Slot,
+        index: crate::CommitteeIndex,
+        beacon_block_root: crate::Root,
+        source: crate::Checkpoint,
+        target: crate::Checkpoint,
     }
 }
 
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireBeaconBlockHeader {
-        pub slot: u64,
-        pub proposer_index: u64,
-        pub parent_root: [u8; 32],
-        pub state_root: [u8; 32],
-        pub body_root: [u8; 32],
+    impl crate::BeaconBlockHeader {
+        slot: crate::Slot,
+        proposer_index: u64,
+        parent_root: crate::Root,
+        state_root: crate::Root,
+        body_root: crate::Root,
     }
 }
 
 ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct SignedBeaconBlockHeader {
-        pub message: WireBeaconBlockHeader,
+        pub message: crate::BeaconBlockHeader,
         pub signature: [u8; 96],
     }
 }
@@ -348,7 +815,7 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct IndexedAttestation {
         pub attesting_indices: VariableList<u64, MaxValidatorsPerCommittee>,
-        pub data: WireAttestationData,
+        pub data: crate::AttestationData,
         pub signature: [u8; 96],
     }
 }
@@ -362,13 +829,148 @@ ssz_container! {
     }
 }
 
-ssz_container! {
-    /// Pre-Electra (phase0–Deneb) SSZ `Attestation` (no `committee_bits`).
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireAttestation {
-        pub aggregation_bits: BitList<MaxValidatorsPerCommittee>,
-        pub data: WireAttestationData,
-        pub signature: [u8; 96],
+// Path C: crate-root Attestation stores JSON `Vec<u8>` for bitlist / Bytes96.
+// Naive decorate-macro would encode those as List[byte] (signature becomes a
+// variable field). Custom impls treat the existing bytes as spec SSZ.
+fn ssz08_bitlist<N: ssz_types::typenum::Unsigned + Clone>(
+    bytes: &[u8],
+) -> Result<BitList<N>, DecodeError> {
+    BitList::<N>::from_ssz_bytes(bytes)
+}
+
+/// Same `Bitlist[MAX_VALIDATORS_PER_SLOT]` decode `ElectraAttestation` Encode uses.
+pub fn try_electra_aggregation_bits(bytes: &[u8]) -> Result<(), DecodeError> {
+    ssz08_bitlist::<MaxValidatorsPerSlot>(bytes).map(|_| ())
+}
+
+fn ssz08_sig96(bytes: &[u8]) -> Result<[u8; 96], DecodeError> {
+    <[u8; 96]>::from_ssz_bytes(bytes)
+}
+
+fn ssz08_bitvector<N: ssz_types::typenum::Unsigned + Clone>(
+    bytes: &[u8],
+) -> Result<BitVector<N>, DecodeError> {
+    BitVector::<N>::from_ssz_bytes(bytes)
+}
+
+/// Variable-length raw bytes for `ssz` 0.9 container fields (bitlist payload).
+struct Ssz09VarBytes<'a>(&'a [u8]);
+
+impl ssz::Encode for Ssz09VarBytes<'_> {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(self.0);
+    }
+}
+
+struct Ssz09VarBytesOwned(Vec<u8>);
+
+impl ssz::Decode for Ssz09VarBytesOwned {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+        Ok(Self(bytes.to_vec()))
+    }
+}
+
+impl Encode for crate::Attestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        BYTES_PER_LENGTH_OFFSET
+            + self.aggregation_bits.len()
+            + <crate::AttestationData as Encode>::ssz_fixed_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let bits = ssz08_bitlist::<MaxValidatorsPerCommittee>(&self.aggregation_bits)
+            .expect("Attestation.aggregation_bits must be Bitlist[MAX_VALIDATORS_PER_COMMITTEE]");
+        let sig = ssz08_sig96(&self.signature).expect("Attestation.signature must be 96 bytes");
+        let offset = <BitList<MaxValidatorsPerCommittee> as Encode>::ssz_fixed_len()
+            + <crate::AttestationData as Encode>::ssz_fixed_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len();
+        let mut encoder = SszEncoder::container(buf, offset);
+        encoder.append(&bits);
+        encoder.append(&self.data);
+        encoder.append(&sig);
+        encoder.finalize();
+    }
+}
+
+impl Decode for crate::Attestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut builder = SszDecoderBuilder::new(bytes);
+        builder.register_type::<BitList<MaxValidatorsPerCommittee>>()?;
+        builder.register_type::<crate::AttestationData>()?;
+        builder.register_type::<[u8; 96]>()?;
+        let mut decoder = builder.build()?;
+        let bits: BitList<MaxValidatorsPerCommittee> = decoder.decode_next()?;
+        let data: crate::AttestationData = decoder.decode_next()?;
+        let sig: [u8; 96] = decoder.decode_next()?;
+        Ok(Self { aggregation_bits: bits.as_ssz_bytes(), data, signature: sig.to_vec() })
+    }
+}
+
+impl ssz::Encode for crate::Attestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        BYTES_PER_LENGTH_OFFSET
+            + self.aggregation_bits.len()
+            + <crate::AttestationData as ssz::Encode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let _ = ssz08_bitlist::<MaxValidatorsPerCommittee>(&self.aggregation_bits)
+            .expect("Attestation.aggregation_bits must be Bitlist[MAX_VALIDATORS_PER_COMMITTEE]");
+        let sig = ssz08_sig96(&self.signature).expect("Attestation.signature must be 96 bytes");
+        let offset = BYTES_PER_LENGTH_OFFSET
+            + <crate::AttestationData as ssz::Encode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Encode>::ssz_fixed_len();
+        let mut encoder = ssz::SszEncoder::container(buf, offset);
+        encoder.append(&Ssz09VarBytes(&self.aggregation_bits));
+        encoder.append(&self.data);
+        encoder.append(&sig);
+        encoder.finalize();
+    }
+}
+
+impl ssz::Decode for crate::Attestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+        let mut builder = ssz::SszDecoderBuilder::new(bytes);
+        builder.register_type::<Ssz09VarBytesOwned>()?;
+        builder.register_type::<crate::AttestationData>()?;
+        builder.register_type::<[u8; 96]>()?;
+        let mut decoder = builder.build()?;
+        let bits = decoder.decode_next::<Ssz09VarBytesOwned>()?;
+        let data: crate::AttestationData = decoder.decode_next()?;
+        let sig: [u8; 96] = decoder.decode_next()?;
+        ssz08_bitlist::<MaxValidatorsPerCommittee>(&bits.0)
+            .map_err(|e| ssz::DecodeError::BytesInvalid(format!("aggregation_bits: {e:?}")))?;
+        Ok(Self { aggregation_bits: bits.0, data, signature: sig.to_vec() })
     }
 }
 
@@ -376,7 +978,7 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct IndexedAttestationElectra {
         pub attesting_indices: VariableList<u64, MaxValidatorsPerSlot>,
-        pub data: WireAttestationData,
+        pub data: crate::AttestationData,
         pub signature: [u8; 96],
     }
 }
@@ -389,23 +991,178 @@ ssz_container! {
     }
 }
 
-ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireAttestationElectra {
-        pub aggregation_bits: BitList<MaxValidatorsPerSlot>,
-        pub data: WireAttestationData,
-        pub signature: [u8; 96],
-        pub committee_bits: BitVector<MaxCommitteesPerSlot>,
+impl Encode for crate::ElectraAttestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        BYTES_PER_LENGTH_OFFSET
+            + self.aggregation_bits.len()
+            + <crate::AttestationData as Encode>::ssz_fixed_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len()
+            + <BitVector<MaxCommitteesPerSlot> as Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let bits = ssz08_bitlist::<MaxValidatorsPerSlot>(&self.aggregation_bits)
+            .expect("ElectraAttestation.aggregation_bits must be Bitlist[MAX_VALIDATORS_PER_SLOT]");
+        let sig =
+            ssz08_sig96(&self.signature).expect("ElectraAttestation.signature must be 96 bytes");
+        let committee = ssz08_bitvector::<MaxCommitteesPerSlot>(&self.committee_bits)
+            .expect("ElectraAttestation.committee_bits must be Bitvector[MAX_COMMITTEES_PER_SLOT]");
+        let offset = <BitList<MaxValidatorsPerSlot> as Encode>::ssz_fixed_len()
+            + <crate::AttestationData as Encode>::ssz_fixed_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len()
+            + <BitVector<MaxCommitteesPerSlot> as Encode>::ssz_fixed_len();
+        let mut encoder = SszEncoder::container(buf, offset);
+        encoder.append(&bits);
+        encoder.append(&self.data);
+        encoder.append(&sig);
+        encoder.append(&committee);
+        encoder.finalize();
+    }
+}
+
+impl Decode for crate::ElectraAttestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut builder = SszDecoderBuilder::new(bytes);
+        builder.register_type::<BitList<MaxValidatorsPerSlot>>()?;
+        builder.register_type::<crate::AttestationData>()?;
+        builder.register_type::<[u8; 96]>()?;
+        builder.register_type::<BitVector<MaxCommitteesPerSlot>>()?;
+        let mut decoder = builder.build()?;
+        let bits: BitList<MaxValidatorsPerSlot> = decoder.decode_next()?;
+        let data: crate::AttestationData = decoder.decode_next()?;
+        let sig: [u8; 96] = decoder.decode_next()?;
+        let committee: BitVector<MaxCommitteesPerSlot> = decoder.decode_next()?;
+        Ok(Self {
+            aggregation_bits: bits.as_ssz_bytes(),
+            data,
+            signature: sig.to_vec(),
+            committee_bits: committee.as_ssz_bytes(),
+        })
+    }
+}
+
+impl ssz::Encode for crate::ElectraAttestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        BYTES_PER_LENGTH_OFFSET
+            + self.aggregation_bits.len()
+            + <crate::AttestationData as ssz::Encode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Encode>::ssz_fixed_len()
+            + 8
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let _ = ssz08_bitlist::<MaxValidatorsPerSlot>(&self.aggregation_bits)
+            .expect("ElectraAttestation.aggregation_bits must be Bitlist[MAX_VALIDATORS_PER_SLOT]");
+        let sig =
+            ssz08_sig96(&self.signature).expect("ElectraAttestation.signature must be 96 bytes");
+        let committee: [u8; 8] = self
+            .committee_bits
+            .as_slice()
+            .try_into()
+            .expect("ElectraAttestation.committee_bits must be Bitvector[64] (8 bytes)");
+        let offset = BYTES_PER_LENGTH_OFFSET
+            + <crate::AttestationData as ssz::Encode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Encode>::ssz_fixed_len()
+            + 8;
+        let mut encoder = ssz::SszEncoder::container(buf, offset);
+        encoder.append(&Ssz09VarBytes(&self.aggregation_bits));
+        encoder.append(&self.data);
+        encoder.append(&sig);
+        encoder.append(&committee);
+        encoder.finalize();
+    }
+}
+
+impl ssz::Decode for crate::ElectraAttestation {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+        let mut builder = ssz::SszDecoderBuilder::new(bytes);
+        builder.register_type::<Ssz09VarBytesOwned>()?;
+        builder.register_type::<crate::AttestationData>()?;
+        builder.register_type::<[u8; 96]>()?;
+        builder.register_type::<[u8; 8]>()?;
+        let mut decoder = builder.build()?;
+        let bits = decoder.decode_next::<Ssz09VarBytesOwned>()?;
+        let data: crate::AttestationData = decoder.decode_next()?;
+        let sig: [u8; 96] = decoder.decode_next()?;
+        let committee: [u8; 8] = decoder.decode_next()?;
+        ssz08_bitlist::<MaxValidatorsPerSlot>(&bits.0)
+            .map_err(|e| ssz::DecodeError::BytesInvalid(format!("aggregation_bits: {e:?}")))?;
+        Ok(Self {
+            aggregation_bits: bits.0,
+            data,
+            signature: sig.to_vec(),
+            committee_bits: committee.to_vec(),
+        })
+    }
+}
+
+impl Encode for crate::ElectraAggregateAndProof {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        <u64 as Encode>::ssz_fixed_len()
+            + BYTES_PER_LENGTH_OFFSET
+            + self.aggregate.ssz_bytes_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let proof = ssz08_sig96(&self.selection_proof)
+            .expect("ElectraAggregateAndProof.selection_proof must be 96 bytes");
+        let offset = <u64 as Encode>::ssz_fixed_len()
+            + <crate::ElectraAttestation as Encode>::ssz_fixed_len()
+            + <[u8; 96] as Encode>::ssz_fixed_len();
+        let mut encoder = SszEncoder::container(buf, offset);
+        encoder.append(&self.aggregator_index);
+        encoder.append(&self.aggregate);
+        encoder.append(&proof);
+        encoder.finalize();
+    }
+}
+
+impl Decode for crate::ElectraAggregateAndProof {
+    fn is_ssz_fixed_len() -> bool {
+        false
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut builder = SszDecoderBuilder::new(bytes);
+        builder.register_type::<u64>()?;
+        builder.register_type::<crate::ElectraAttestation>()?;
+        builder.register_type::<[u8; 96]>()?;
+        let mut decoder = builder.build()?;
+        Ok(Self {
+            aggregator_index: decoder.decode_next()?,
+            aggregate: decoder.decode_next()?,
+            selection_proof: decoder.decode_next::<[u8; 96]>()?.to_vec(),
+        })
     }
 }
 
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireDepositData {
-        pub pubkey: [u8; 48],
-        pub withdrawal_credentials: [u8; 32],
-        pub amount: u64,
-        pub signature: [u8; 96],
+    impl crate::DepositData {
+        pubkey: [u8; 48],
+        withdrawal_credentials: [u8; 32],
+        amount: u64,
+        signature: [u8; 96],
     }
 }
 
@@ -413,23 +1170,106 @@ ssz_container! {
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
     pub struct Deposit {
         pub proof: FixedVector<[u8; 32], DepositProofLength>,
-        pub data: WireDepositData,
+        pub data: crate::DepositData,
     }
 }
 
 ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireVoluntaryExit {
-        pub epoch: u64,
-        pub validator_index: u64,
+    impl crate::VoluntaryExit {
+        epoch: crate::Epoch,
+        validator_index: u64,
     }
 }
 
-ssz_container! {
-    #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
-    pub struct WireSignedVoluntaryExit {
-        pub message: WireVoluntaryExit,
-        pub signature: [u8; 96],
+impl Encode for crate::SignedVoluntaryExit {
+    fn is_ssz_fixed_len() -> bool {
+        true
+    }
+
+    fn ssz_fixed_len() -> usize {
+        <crate::VoluntaryExit as Encode>::ssz_fixed_len() + <[u8; 96] as Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        <Self as Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let sig =
+            ssz08_sig96(&self.signature).expect("SignedVoluntaryExit.signature must be 96 bytes");
+        let offset = <Self as Encode>::ssz_fixed_len();
+        let mut encoder = SszEncoder::container(buf, offset);
+        encoder.append(&self.message);
+        encoder.append(&sig);
+        encoder.finalize();
+    }
+}
+
+impl Decode for crate::SignedVoluntaryExit {
+    fn is_ssz_fixed_len() -> bool {
+        true
+    }
+
+    fn ssz_fixed_len() -> usize {
+        <crate::VoluntaryExit as Decode>::ssz_fixed_len() + <[u8; 96] as Decode>::ssz_fixed_len()
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut builder = SszDecoderBuilder::new(bytes);
+        builder.register_type::<crate::VoluntaryExit>()?;
+        builder.register_type::<[u8; 96]>()?;
+        let mut decoder = builder.build()?;
+        Ok(Self {
+            message: decoder.decode_next()?,
+            signature: decoder.decode_next::<[u8; 96]>()?.to_vec(),
+        })
+    }
+}
+
+impl ssz::Encode for crate::SignedVoluntaryExit {
+    fn is_ssz_fixed_len() -> bool {
+        true
+    }
+
+    fn ssz_fixed_len() -> usize {
+        <crate::VoluntaryExit as ssz::Encode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_bytes_len(&self) -> usize {
+        <Self as ssz::Encode>::ssz_fixed_len()
+    }
+
+    fn ssz_append(&self, buf: &mut Vec<u8>) {
+        let sig =
+            ssz08_sig96(&self.signature).expect("SignedVoluntaryExit.signature must be 96 bytes");
+        let offset = <Self as ssz::Encode>::ssz_fixed_len();
+        let mut encoder = ssz::SszEncoder::container(buf, offset);
+        encoder.append(&self.message);
+        encoder.append(&sig);
+        encoder.finalize();
+    }
+}
+
+impl ssz::Decode for crate::SignedVoluntaryExit {
+    fn is_ssz_fixed_len() -> bool {
+        true
+    }
+
+    fn ssz_fixed_len() -> usize {
+        <crate::VoluntaryExit as ssz::Decode>::ssz_fixed_len()
+            + <[u8; 96] as ssz::Decode>::ssz_fixed_len()
+    }
+
+    fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
+        let mut builder = ssz::SszDecoderBuilder::new(bytes);
+        builder.register_type::<crate::VoluntaryExit>()?;
+        builder.register_type::<[u8; 96]>()?;
+        let mut decoder = builder.build()?;
+        Ok(Self {
+            message: decoder.decode_next()?,
+            signature: decoder.decode_next::<[u8; 96]>()?.to_vec(),
+        })
     }
 }
 
@@ -569,9 +1409,9 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-        pub attestations: VariableList<WireAttestationElectra, MaxAttestationsElectra>,
+        pub attestations: VariableList<crate::ElectraAttestation, MaxAttestationsElectra>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<crate::SignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload: ExecutionPayload,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -601,9 +1441,9 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra>,
-        pub attestations: VariableList<WireAttestationElectra, MaxAttestationsElectra>,
+        pub attestations: VariableList<crate::ElectraAttestation, MaxAttestationsElectra>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<crate::SignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload_header: ExecutionPayloadHeader,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -641,9 +1481,9 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
-        pub attestations: VariableList<WireAttestation, MaxAttestations>,
+        pub attestations: VariableList<crate::Attestation, MaxAttestations>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<crate::SignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload: ExecutionPayload,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -673,9 +1513,9 @@ ssz_container! {
         pub graffiti: [u8; 32],
         pub proposer_slashings: VariableList<ProposerSlashing, MaxProposerSlashings>,
         pub attester_slashings: VariableList<AttesterSlashing, MaxAttesterSlashings>,
-        pub attestations: VariableList<WireAttestation, MaxAttestations>,
+        pub attestations: VariableList<crate::Attestation, MaxAttestations>,
         pub deposits: VariableList<Deposit, MaxDeposits>,
-        pub voluntary_exits: VariableList<WireSignedVoluntaryExit, MaxVoluntaryExits>,
+        pub voluntary_exits: VariableList<crate::SignedVoluntaryExit, MaxVoluntaryExits>,
         pub sync_aggregate: SyncAggregate,
         pub execution_payload_header: ExecutionPayloadHeader,
         pub bls_to_execution_changes: VariableList<SignedBlsToExecutionChange, MaxBlsToExecutionChanges>,
@@ -763,6 +1603,7 @@ pub fn body_tree_hash_root_for_layout(
             Ok(decode_beacon_block_body_electra(bytes)?.tree_hash_root())
         }
         crate::BodyForkLayout::Deneb => Ok(decode_beacon_block_body_deneb(bytes)?.tree_hash_root()),
+        crate::BodyForkLayout::Gloas => Err(BodySszError::GloasUnsupported),
     }
 }
 
@@ -778,6 +1619,7 @@ pub fn blinded_body_tree_hash_root_for_layout(
         crate::BodyForkLayout::Deneb => {
             Ok(decode_blinded_beacon_block_body_deneb(bytes)?.tree_hash_root())
         }
+        crate::BodyForkLayout::Gloas => Err(BodySszError::GloasUnsupported),
     }
 }
 
@@ -1010,6 +1852,309 @@ mod tests {
         Hash256::from_slice(&bytes)
     }
 
+    /// remerkleable `Checkpoint(epoch=100, root=0x00…32)` SSZ + HTR.
+    const SPEC_CHECKPOINT_SSZ_HEX: &str =
+        "64000000000000000000000000000000000000000000000000000000000000000000000000000000";
+    const SPEC_CHECKPOINT_HTR_HEX: &str =
+        "f59927591e6e3283d4419e376e4ebb4e08f4f547a3d1076474a29c9d44a07b28";
+
+    #[test]
+    fn test_checkpoint_ssz09_and_ssz08_match_spec_bytes() {
+        let checkpoint = crate::Checkpoint { epoch: 100, root: [0u8; 32] };
+        let expected = hex::decode(SPEC_CHECKPOINT_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&checkpoint), expected);
+        assert_eq!(Encode::as_ssz_bytes(&checkpoint), expected);
+        assert_eq!(checkpoint.tree_hash_root(), hex32(SPEC_CHECKPOINT_HTR_HEX));
+        let back = <crate::Checkpoint as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, checkpoint);
+    }
+
+    /// remerkleable `AttestationData` matching `aggregation.rs` Electra sample.
+    const SPEC_ATTESTATION_DATA_SSZ_HEX: &str = concat!(
+        "64000000000000000000000000000000",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0300000000000000",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "0400000000000000",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+    );
+    const SPEC_ATTESTATION_DATA_HTR_HEX: &str =
+        "3810cbc2daad89c727791c249ea17025b976d05c2fd41344285bc86ecd5105c6";
+
+    #[test]
+    fn test_attestation_data_ssz09_and_ssz08_match_spec_bytes() {
+        let data = crate::AttestationData {
+            slot: 100,
+            index: 0,
+            beacon_block_root: [1u8; 32],
+            source: crate::Checkpoint { epoch: 3, root: [2u8; 32] },
+            target: crate::Checkpoint { epoch: 4, root: [3u8; 32] },
+        };
+        let expected = hex::decode(SPEC_ATTESTATION_DATA_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&data), expected);
+        assert_eq!(Encode::as_ssz_bytes(&data), expected);
+        assert_eq!(data.tree_hash_root(), hex32(SPEC_ATTESTATION_DATA_HTR_HEX));
+        let back = <crate::AttestationData as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, data);
+    }
+
+    /// remerkleable header from the non-empty-ops fixture (slot=1, proposer=2).
+    const SPEC_BEACON_BLOCK_HEADER_SSZ_HEX: &str = concat!(
+        "01000000000000000200000000000000",
+        "abababababababababababababababababababababababababababababababab",
+        "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+    );
+    const SPEC_BEACON_BLOCK_HEADER_HTR_HEX: &str =
+        "67fcec3237c5acf5a660dda06f4fbe5af7a87620dd6c3cdd4cc9d6b1240f3e29";
+
+    #[test]
+    fn test_beacon_block_header_ssz09_and_ssz08_match_spec_bytes() {
+        let header = crate::BeaconBlockHeader {
+            slot: 1,
+            proposer_index: 2,
+            parent_root: [0xab; 32],
+            state_root: [0xcd; 32],
+            body_root: [0xef; 32],
+        };
+        let expected = hex::decode(SPEC_BEACON_BLOCK_HEADER_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&header), expected);
+        assert_eq!(Encode::as_ssz_bytes(&header), expected);
+        assert_eq!(header.tree_hash_root(), hex32(SPEC_BEACON_BLOCK_HEADER_HTR_HEX));
+        let back = <crate::BeaconBlockHeader as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, header);
+    }
+
+    /// remerkleable `DepositData` from the non-empty-ops fixture.
+    const SPEC_DEPOSIT_DATA_SSZ_HEX: &str = concat!(
+        "dededededededededededededededededededededededededededededededededededededededededededededededede",
+        "adadadadadadadadadadadadadadadadadadadadadadadadadadadadadadadad",
+        "0040597307000000",
+        "bebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebe",
+        "bebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebe",
+        "bebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebebe",
+    );
+    const SPEC_DEPOSIT_DATA_HTR_HEX: &str =
+        "85b8a34fb09ac7acf35e59aca082f742ca0d96abedd61c17cb9a3c6d8abaee5b";
+
+    #[test]
+    fn test_deposit_data_ssz09_and_ssz08_match_spec_bytes() {
+        let data = crate::DepositData {
+            pubkey: [0xde; 48],
+            withdrawal_credentials: [0xad; 32],
+            amount: 32_000_000_000,
+            signature: [0xbe; 96],
+        };
+        let expected = hex::decode(SPEC_DEPOSIT_DATA_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&data), expected);
+        assert_eq!(Encode::as_ssz_bytes(&data), expected);
+        assert_eq!(data.tree_hash_root(), hex32(SPEC_DEPOSIT_DATA_HTR_HEX));
+        let back = <crate::DepositData as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, data);
+    }
+
+    /// remerkleable `VoluntaryExit(epoch=100, validator_index=42)`.
+    const SPEC_VOLUNTARY_EXIT_SSZ_HEX: &str = "64000000000000002a00000000000000";
+    const SPEC_VOLUNTARY_EXIT_HTR_HEX: &str =
+        "e723f4e7c43eee8834008a6a65806077b39842db5e84c590a5d74d2208cc4083";
+
+    #[test]
+    fn test_voluntary_exit_ssz09_and_ssz08_match_spec_bytes() {
+        let exit = crate::VoluntaryExit { epoch: 100, validator_index: 42 };
+        let expected = hex::decode(SPEC_VOLUNTARY_EXIT_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&exit), expected);
+        assert_eq!(Encode::as_ssz_bytes(&exit), expected);
+        assert_eq!(exit.tree_hash_root(), hex32(SPEC_VOLUNTARY_EXIT_HTR_HEX));
+        let back = <crate::VoluntaryExit as Decode>::from_ssz_bytes(&expected).unwrap();
+        assert_eq!(back, exit);
+    }
+
+    /// remerkleable `SignedVoluntaryExit` (exit above + signature `[0xaa;96]`).
+    const SPEC_SIGNED_VOLUNTARY_EXIT_SSZ_HEX: &str = concat!(
+        "64000000000000002a00000000000000",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    );
+    const SPEC_SIGNED_VOLUNTARY_EXIT_HTR_HEX: &str =
+        "e96f711d5a3078da1f80423c46f61362620bb20134c23f1d56fd3b50d74c10b8";
+    const KAT_SIGNED_VOLUNTARY_EXIT_LIST_ROOT_HEX: &str =
+        "eedb73e7adbabc2b1d6571e94a28ce97e43ec229e4a796ac81e6ed30466f7188";
+
+    #[test]
+    fn test_signed_voluntary_exit_ssz09_and_ssz08_match_spec_bytes() {
+        let signed = crate::SignedVoluntaryExit {
+            message: crate::VoluntaryExit { epoch: 100, validator_index: 42 },
+            signature: vec![0xaa; 96],
+        };
+        let expected = hex::decode(SPEC_SIGNED_VOLUNTARY_EXIT_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&signed), expected);
+        assert_eq!(Encode::as_ssz_bytes(&signed), expected);
+        assert_eq!(signed.tree_hash_root(), hex32(SPEC_SIGNED_VOLUNTARY_EXIT_HTR_HEX));
+        assert_eq!(
+            <crate::SignedVoluntaryExit as Decode>::from_ssz_bytes(&expected).unwrap(),
+            signed
+        );
+        assert_eq!(
+            <crate::SignedVoluntaryExit as ssz::Decode>::from_ssz_bytes(&expected).unwrap(),
+            signed
+        );
+        let list =
+            VariableList::<crate::SignedVoluntaryExit, MaxVoluntaryExits>::from(vec![signed]);
+        assert_eq!(Encode::as_ssz_bytes(&list), expected);
+        assert_eq!(list.tree_hash_root(), hex32(KAT_SIGNED_VOLUNTARY_EXIT_LIST_ROOT_HEX));
+    }
+
+    /// remerkleable Electra `Attestation` matching `aggregation.rs` sample:
+    /// Bitlist[131072] of 31 set bits (`0xffffffff`), data as
+    /// [`SPEC_ATTESTATION_DATA_HTR_HEX`], signature `[0xaa;96]`,
+    /// Bitvector[64] = `[0x01;8]`.
+    const KAT_ELECTRA_ATTESTATION_SSZ_HEX: &str = concat!(
+        "ec000000",
+        "64000000000000000000000000000000",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0300000000000000",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "0400000000000000",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0101010101010101",
+        "ffffffff",
+    );
+    const KAT_ELECTRA_ATTESTATION_HTR_HEX: &str =
+        "26b23c318b00c7e774670fa8c54f3ba256018f798226d717df0d82c2e143914f";
+    /// `List[Attestation, MAX_ATTESTATIONS_ELECTRA=8]` of one
+    /// [`KAT_ELECTRA_ATTESTATION_SSZ_HEX`] element (remerkleable).
+    const KAT_ELECTRA_ATTESTATION_LIST_SSZ_HEX: &str = concat!(
+        "04000000",
+        "ec000000",
+        "64000000000000000000000000000000",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0300000000000000",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "0400000000000000",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "0101010101010101",
+        "ffffffff",
+    );
+    const KAT_ELECTRA_ATTESTATION_LIST_ROOT_HEX: &str =
+        "64a119d1221d09e3da3eb8e25bd302f4ccd6498ba3d637bbf4411145c7633af1";
+
+    fn kat_electra_attestation() -> crate::ElectraAttestation {
+        crate::ElectraAttestation {
+            aggregation_bits: vec![0xff; 4],
+            data: crate::AttestationData {
+                slot: 100,
+                index: 0,
+                beacon_block_root: [1u8; 32],
+                source: crate::Checkpoint { epoch: 3, root: [2u8; 32] },
+                target: crate::Checkpoint { epoch: 4, root: [3u8; 32] },
+            },
+            signature: vec![0xaa; 96],
+            committee_bits: vec![0x01; 8],
+        }
+    }
+
+    /// remerkleable pre-Electra `Attestation` matching `aggregation.rs` sample
+    /// (index=1, 31-bit aggregation_bits, signature `[0xaa;96]`).
+    const KAT_ATTESTATION_SSZ_HEX: &str = concat!(
+        "e4000000",
+        "64000000000000000100000000000000",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0300000000000000",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "0400000000000000",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ffffffff",
+    );
+    const KAT_ATTESTATION_HTR_HEX: &str =
+        "9f5f284edccbab25e3cd3686c60131988a0aec3619f026e51b17e90db79f4102";
+    const KAT_ATTESTATION_LIST_SSZ_HEX: &str = concat!(
+        "04000000",
+        "e4000000",
+        "64000000000000000100000000000000",
+        "0101010101010101010101010101010101010101010101010101010101010101",
+        "0300000000000000",
+        "0202020202020202020202020202020202020202020202020202020202020202",
+        "0400000000000000",
+        "0303030303030303030303030303030303030303030303030303030303030303",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ffffffff",
+    );
+    const KAT_ATTESTATION_LIST_ROOT_HEX: &str =
+        "f4fb5c71694f4c9acf6807b74e89a12c866903e15fa36a657734111d95438ec4";
+
+    fn kat_pre_electra_attestation() -> crate::Attestation {
+        crate::Attestation {
+            aggregation_bits: vec![0xff; 4],
+            data: crate::AttestationData {
+                slot: 100,
+                index: 1,
+                beacon_block_root: [1u8; 32],
+                source: crate::Checkpoint { epoch: 3, root: [2u8; 32] },
+                target: crate::Checkpoint { epoch: 4, root: [3u8; 32] },
+            },
+            signature: vec![0xaa; 96],
+        }
+    }
+
+    #[test]
+    fn test_attestation_ssz09_and_ssz08_match_spec_bytes() {
+        let att = kat_pre_electra_attestation();
+        let expected = hex::decode(KAT_ATTESTATION_SSZ_HEX).expect("hex");
+        assert_eq!(ssz::Encode::as_ssz_bytes(&att), expected);
+        assert_eq!(Encode::as_ssz_bytes(&att), expected);
+        assert_eq!(att.tree_hash_root(), hex32(KAT_ATTESTATION_HTR_HEX));
+        assert_eq!(<crate::Attestation as Decode>::from_ssz_bytes(&expected).unwrap(), att);
+        assert_eq!(<crate::Attestation as ssz::Decode>::from_ssz_bytes(&expected).unwrap(), att);
+        let list = VariableList::<crate::Attestation, MaxAttestations>::from(vec![att]);
+        assert_eq!(
+            Encode::as_ssz_bytes(&list),
+            hex::decode(KAT_ATTESTATION_LIST_SSZ_HEX).expect("hex"),
+        );
+        assert_eq!(list.tree_hash_root(), hex32(KAT_ATTESTATION_LIST_ROOT_HEX));
+    }
+
+    #[test]
+    fn test_electra_attestation_list_encode_and_tree_hash_root() {
+        let att = kat_electra_attestation();
+        assert_eq!(
+            att.tree_hash_root(),
+            hex32(KAT_ELECTRA_ATTESTATION_HTR_HEX),
+            "single Electra attestation HTR must match remerkleable KAT"
+        );
+        let expected = hex::decode(KAT_ELECTRA_ATTESTATION_SSZ_HEX).expect("hex");
+        assert_eq!(Encode::as_ssz_bytes(&att), expected);
+        assert_eq!(ssz::Encode::as_ssz_bytes(&att), expected);
+        assert_eq!(<crate::ElectraAttestation as Decode>::from_ssz_bytes(&expected).unwrap(), att);
+        assert_eq!(
+            <crate::ElectraAttestation as ssz::Decode>::from_ssz_bytes(&expected).unwrap(),
+            att
+        );
+        let list =
+            VariableList::<crate::ElectraAttestation, MaxAttestationsElectra>::from(vec![att]);
+        assert_eq!(
+            Encode::as_ssz_bytes(&list),
+            hex::decode(KAT_ELECTRA_ATTESTATION_LIST_SSZ_HEX).expect("hex"),
+            "non-empty Electra attestation list SSZ must match remerkleable"
+        );
+        assert_eq!(
+            list.tree_hash_root(),
+            hex32(KAT_ELECTRA_ATTESTATION_LIST_ROOT_HEX),
+            "non-empty Electra attestation list HTR must match remerkleable"
+        );
+    }
+
     #[test]
     fn test_beacon_block_body_electra_htr_matches_external_vector() {
         let body = external_vector_electra_body();
@@ -1060,7 +2205,7 @@ mod tests {
             hex32("f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"),
         );
         assert_eq!(
-            VariableList::<WireAttestationElectra, MaxAttestationsElectra>::from(vec![])
+            VariableList::<crate::ElectraAttestation, MaxAttestationsElectra>::from(vec![])
                 .tree_hash_root(),
             hex32("e8e527e84f666163a90ef900e013f56b0a4d020148b2224057b719f351b003a6"),
         );
@@ -1173,10 +2318,11 @@ mod tests {
         );
         // Type identity: Deneb attester/attestation lists use pre-Electra containers.
         let _: VariableList<AttesterSlashing, MaxAttesterSlashings> = full_d.attester_slashings;
-        let _: VariableList<WireAttestation, MaxAttestations> = full_d.attestations;
+        let _: VariableList<crate::Attestation, MaxAttestations> = full_d.attestations;
         let _: VariableList<AttesterSlashingElectra, MaxAttesterSlashingsElectra> =
             full_e.attester_slashings;
-        let _: VariableList<WireAttestationElectra, MaxAttestationsElectra> = full_e.attestations;
+        let _: VariableList<crate::ElectraAttestation, MaxAttestationsElectra> =
+            full_e.attestations;
     }
 
     #[test]
@@ -1225,7 +2371,7 @@ mod tests {
             hex32("7a0501f5957bdf9cb3a8ff4966f02265f968658b7a9c62642cba1165e86642f5"),
         );
         assert_eq!(
-            VariableList::<WireAttestation, MaxAttestations>::from(vec![]).tree_hash_root(),
+            VariableList::<crate::Attestation, MaxAttestations>::from(vec![]).tree_hash_root(),
             hex32("96559674a79656e540871e1f39c9b91e152aa8cddb71493e754827c4cc809d57"),
         );
     }
@@ -1254,7 +2400,7 @@ mod tests {
         // Non-empty lists exercise VariableList of composites + FixedVector proof.
         let mut body = external_vector_electra_body();
 
-        let header = WireBeaconBlockHeader {
+        let header = crate::BeaconBlockHeader {
             slot: 1,
             proposer_index: 2,
             parent_root: [0xab; 32],
@@ -1265,7 +2411,7 @@ mod tests {
         let slashing = ProposerSlashing {
             signed_header_1: signed.clone(),
             signed_header_2: SignedBeaconBlockHeader {
-                message: WireBeaconBlockHeader {
+                message: crate::BeaconBlockHeader {
                     slot: 1,
                     proposer_index: 2,
                     parent_root: [0xab; 32],
@@ -1280,7 +2426,7 @@ mod tests {
         let proof_leaves: Vec<[u8; 32]> = (0..33).map(|i| [i as u8; 32]).collect();
         let deposit = Deposit {
             proof: FixedVector::from(proof_leaves),
-            data: WireDepositData {
+            data: crate::DepositData {
                 pubkey: [0xde; 48],
                 withdrawal_credentials: [0xad; 32],
                 amount: 32_000_000_000,
@@ -1320,6 +2466,378 @@ mod tests {
         );
     }
 
+    fn proposer_slashing_sample() -> ProposerSlashing {
+        let header = crate::BeaconBlockHeader {
+            slot: 1,
+            proposer_index: 2,
+            parent_root: [0xab; 32],
+            state_root: [0xcd; 32],
+            body_root: [0xef; 32],
+        };
+        ProposerSlashing {
+            signed_header_1: SignedBeaconBlockHeader { message: header, signature: [0x5a; 96] },
+            signed_header_2: SignedBeaconBlockHeader {
+                message: crate::BeaconBlockHeader {
+                    slot: 1,
+                    proposer_index: 2,
+                    parent_root: [0xab; 32],
+                    state_root: [0xcd; 32],
+                    body_root: [0x11; 32],
+                },
+                signature: [0x5b; 96],
+            },
+        }
+    }
+
+    fn deposit_sample() -> Deposit {
+        let proof_leaves: Vec<[u8; 32]> = (0..33).map(|i| [i as u8; 32]).collect();
+        Deposit {
+            proof: FixedVector::from(proof_leaves),
+            data: crate::DepositData {
+                pubkey: [0xde; 48],
+                withdrawal_credentials: [0xad; 32],
+                amount: 32_000_000_000,
+                signature: [0xbe; 96],
+            },
+        }
+    }
+
+    fn apply_payload_json_leaves(payload: &mut ExecutionPayload) {
+        let mut fee = [0u8; 32];
+        // 2^64, so the quoted decimal is not a u64 hex encoding.
+        fee[8] = 1;
+        payload.base_fee_per_gas = Uint256(fee);
+        payload.extra_data = VariableList::from(vec![0x01, 0x02]);
+        payload.withdrawals = VariableList::from(vec![Withdrawal {
+            index: 9,
+            validator_index: 42,
+            address: [0xca; 20],
+            amount: 1_000,
+        }]);
+        payload.transactions = VariableList::from(vec![VariableList::from(vec![0x02, 0xf8, 0x01])]);
+    }
+
+    fn bls_change_sample() -> SignedBlsToExecutionChange {
+        SignedBlsToExecutionChange {
+            message: BlsToExecutionChange {
+                validator_index: 9,
+                from_bls_pubkey: [0xdd; 48],
+                to_execution_address: [0xee; 20],
+            },
+            signature: [0xff; 96],
+        }
+    }
+
+    fn exit_sample() -> crate::SignedVoluntaryExit {
+        crate::SignedVoluntaryExit {
+            message: crate::VoluntaryExit { epoch: 100, validator_index: 42 },
+            signature: vec![0xaa; 96],
+        }
+    }
+
+    fn execution_requests_sample() -> ExecutionRequests {
+        ExecutionRequests {
+            deposits: VariableList::from(vec![DepositRequest {
+                pubkey: [0x11; 48],
+                withdrawal_credentials: [0x22; 32],
+                amount: 1,
+                signature: [0x33; 96],
+                index: 0,
+            }]),
+            withdrawals: VariableList::from(vec![WithdrawalRequest {
+                source_address: [0x44; 20],
+                validator_pubkey: [0x55; 48],
+                amount: 5,
+            }]),
+            consolidations: VariableList::from(vec![ConsolidationRequest {
+                source_address: [0x66; 20],
+                source_pubkey: [0x77; 48],
+                target_pubkey: [0x88; 48],
+            }]),
+        }
+    }
+
+    fn rich_electra_body() -> BeaconBlockBodyElectra {
+        let mut body = external_vector_electra_body();
+        body.proposer_slashings = VariableList::from(vec![proposer_slashing_sample()]);
+        let indexed = IndexedAttestationElectra {
+            attesting_indices: VariableList::from(vec![1, 2]),
+            data: kat_electra_attestation().data,
+            signature: [0xaa; 96],
+        };
+        body.attester_slashings = VariableList::from(vec![AttesterSlashingElectra {
+            attestation_1: indexed.clone(),
+            attestation_2: indexed,
+        }]);
+        body.attestations = VariableList::from(vec![kat_electra_attestation()]);
+        body.deposits = VariableList::from(vec![deposit_sample()]);
+        body.voluntary_exits = VariableList::from(vec![exit_sample()]);
+        apply_payload_json_leaves(&mut body.execution_payload);
+        body.bls_to_execution_changes = VariableList::from(vec![bls_change_sample()]);
+        body.blob_kzg_commitments = VariableList::from(vec![[0xbb; 48]]);
+        body.execution_requests = execution_requests_sample();
+        body
+    }
+
+    fn rich_deneb_body() -> BeaconBlockBodyDeneb {
+        let mut body = external_vector_deneb_body();
+        body.proposer_slashings = VariableList::from(vec![proposer_slashing_sample()]);
+        let indexed = IndexedAttestation {
+            attesting_indices: VariableList::from(vec![1, 2]),
+            data: kat_pre_electra_attestation().data,
+            signature: [0xaa; 96],
+        };
+        body.attester_slashings = VariableList::from(vec![AttesterSlashing {
+            attestation_1: indexed.clone(),
+            attestation_2: indexed,
+        }]);
+        body.attestations = VariableList::from(vec![kat_pre_electra_attestation()]);
+        body.deposits = VariableList::from(vec![deposit_sample()]);
+        body.voluntary_exits = VariableList::from(vec![exit_sample()]);
+        apply_payload_json_leaves(&mut body.execution_payload);
+        body.bls_to_execution_changes = VariableList::from(vec![bls_change_sample()]);
+        body.blob_kzg_commitments = VariableList::from(vec![[0xbb; 48]]);
+        body
+    }
+
+    fn assert_json_round_trip<T>(value: &T)
+    where
+        T: serde::Serialize + for<'de> serde::Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let json = serde_json::to_string(value).expect("json serialize");
+        let back: T = serde_json::from_str(&json).expect("json deserialize");
+        assert_eq!(&back, value);
+        assert_eq!(serde_json::to_string(&back).expect("json reserialize"), json);
+    }
+
+    fn assert_ssz_round_trip<T>(value: &T)
+    where
+        T: Encode + Decode + PartialEq + std::fmt::Debug,
+    {
+        let bytes = Encode::as_ssz_bytes(value);
+        let back = T::from_ssz_bytes(&bytes).expect("ssz decode");
+        assert_eq!(&back, value);
+        assert_eq!(Encode::as_ssz_bytes(&back), bytes);
+    }
+
+    fn assert_golden_ssz(bytes: &[u8], golden_hex: &str) {
+        assert_eq!(hex::encode(bytes), golden_hex.trim());
+    }
+
+    #[test]
+    fn electra_body_serializes_to_beacon_api_field_spellings() {
+        let body = external_vector_electra_body();
+        let got = serde_json::to_value(&body).unwrap();
+        let sample: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/beacon_api/electra_block_body.json"
+        ))
+        .unwrap();
+        assert_eq!(got, sample);
+        let decoded: BeaconBlockBodyElectra = serde_json::from_value(sample).unwrap();
+        assert_eq!(decoded, body);
+        assert_eq!(got["eth1_data"]["deposit_count"], "7");
+        assert_eq!(got["execution_payload"]["base_fee_per_gas"], "7");
+        assert_eq!(got["execution_payload"]["extra_data"], "0x");
+        assert!(got["randao_reveal"].as_str().unwrap().starts_with("0x"));
+        assert!(got["sync_aggregate"]["sync_committee_bits"].as_str().unwrap().starts_with("0x"));
+        assert!(got["proposer_slashings"].as_array().unwrap().is_empty());
+
+        let rich = serde_json::to_value(rich_electra_body()).unwrap();
+        assert_eq!(rich["proposer_slashings"][0]["signed_header_1"]["message"]["slot"], "1");
+        assert_eq!(
+            rich["attester_slashings"][0]["attestation_1"]["attesting_indices"],
+            serde_json::json!(["1", "2"])
+        );
+        assert_eq!(rich["attestations"][0]["aggregation_bits"], "0xffffffff");
+        assert_eq!(rich["attestations"][0]["committee_bits"], "0x0101010101010101");
+        assert_eq!(rich["attestations"][0]["data"]["slot"], "100");
+        assert_eq!(rich["deposits"][0]["data"]["amount"], "32000000000");
+        assert_eq!(rich["deposits"][0]["proof"].as_array().unwrap().len(), 33);
+        assert_eq!(rich["deposits"][0]["proof"][1], format!("0x{}", "01".repeat(32)));
+        assert_eq!(rich["voluntary_exits"][0]["message"]["validator_index"], "42");
+        assert_eq!(rich["execution_payload"]["transactions"][0], "0x02f801");
+        assert_eq!(rich["execution_payload"]["withdrawals"][0]["amount"], "1000");
+        assert_eq!(rich["execution_payload"]["extra_data"], "0x0102");
+        assert_eq!(rich["execution_payload"]["base_fee_per_gas"], "18446744073709551616");
+        assert_eq!(rich["bls_to_execution_changes"][0]["message"]["validator_index"], "9");
+        assert_eq!(rich["blob_kzg_commitments"][0], format!("0x{}", "bb".repeat(48)));
+        assert_eq!(rich["execution_requests"]["deposits"][0]["index"], "0");
+        assert_eq!(rich["execution_requests"]["withdrawals"][0]["amount"], "5");
+        assert_eq!(
+            rich["execution_requests"]["consolidations"][0]["target_pubkey"],
+            format!("0x{}", "88".repeat(48))
+        );
+        for key in [
+            "randao_reveal",
+            "eth1_data",
+            "graffiti",
+            "proposer_slashings",
+            "attester_slashings",
+            "attestations",
+            "deposits",
+            "voluntary_exits",
+            "sync_aggregate",
+            "execution_payload",
+            "bls_to_execution_changes",
+            "blob_kzg_commitments",
+            "execution_requests",
+        ] {
+            assert!(rich.get(key).is_some(), "missing {key}");
+        }
+
+        let blinded = serde_json::to_value(external_vector_blinded_electra_body()).unwrap();
+        assert!(blinded.get("execution_payload").is_none());
+        assert_eq!(blinded["execution_payload_header"]["base_fee_per_gas"], "7");
+        assert!(blinded["execution_payload_header"]["transactions_root"]
+            .as_str()
+            .unwrap()
+            .starts_with("0x"));
+    }
+
+    #[test]
+    fn deneb_and_electra_bodies_round_trip_through_json() {
+        assert_json_round_trip(&external_vector_electra_body());
+        assert_json_round_trip(&external_vector_deneb_body());
+        assert_json_round_trip(&external_vector_blinded_electra_body());
+        assert_json_round_trip(&external_vector_blinded_deneb_body());
+        let electra = rich_electra_body();
+        let deneb = rich_deneb_body();
+        assert_json_round_trip(&electra);
+        assert_json_round_trip(&deneb);
+        assert_json_round_trip(&electra.execution_payload);
+        assert_json_round_trip(&electra.execution_requests);
+        assert_json_round_trip(&deneb.execution_payload);
+        assert_json_round_trip(&external_vector_execution_payload_header());
+
+        let deneb_json = serde_json::to_value(&deneb).unwrap();
+        assert!(deneb_json.get("execution_requests").is_none());
+        assert_eq!(deneb_json["attestations"][0]["aggregation_bits"], "0xffffffff");
+        assert!(deneb_json["attestations"][0].get("committee_bits").is_none());
+        assert_eq!(
+            deneb_json["attester_slashings"][0]["attestation_1"]["attesting_indices"],
+            serde_json::json!(["1", "2"])
+        );
+        let again = serde_json::to_string(&deneb).unwrap();
+        let back: BeaconBlockBodyDeneb = serde_json::from_str(&again).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), again);
+    }
+
+    #[test]
+    fn body_json_rejects_noncanonical_attestation_bits() {
+        fn reject_electra(edit: impl FnOnce(&mut serde_json::Value)) {
+            let mut json = serde_json::to_value(rich_electra_body()).unwrap();
+            edit(&mut json);
+            assert!(serde_json::from_value::<BeaconBlockBodyElectra>(json).is_err());
+        }
+        reject_electra(|json| json["attestations"][0]["aggregation_bits"] = "0x00".into());
+        reject_electra(|json| json["attestations"][0]["aggregation_bits"] = "0x".into());
+        reject_electra(|json| json["attestations"][0]["aggregation_bits"] = "0x0100".into());
+        reject_electra(|json| json["attestations"][0]["committee_bits"] = "0x01".into());
+        reject_electra(|json| json["attestations"][0]["committee_bits"] = "0x".into());
+
+        let mut deneb_json = serde_json::to_value(rich_deneb_body()).unwrap();
+        deneb_json["attestations"][0]["aggregation_bits"] = "0x00".into();
+        assert!(serde_json::from_value::<BeaconBlockBodyDeneb>(deneb_json).is_err());
+
+        // Canonical short bitlist and an 8-byte bitvector are kept byte-for-byte.
+        let mut electra = external_vector_electra_body();
+        electra.attestations = VariableList::from(vec![crate::ElectraAttestation {
+            aggregation_bits: vec![0x01],
+            committee_bits: vec![0x00; 8],
+            ..kat_electra_attestation()
+        }]);
+        let decoded: BeaconBlockBodyElectra =
+            serde_json::from_str(&serde_json::to_string(&electra).unwrap()).unwrap();
+        assert_eq!(decoded.attestations[0].aggregation_bits, vec![0x01]);
+        assert_eq!(decoded.attestations[0].committee_bits, vec![0x00; 8]);
+        assert_eq!(decoded.as_ssz_bytes(), electra.as_ssz_bytes());
+
+        // Shared attestation JSON still accepts the hex the body path rejects.
+        let mut bare = kat_pre_electra_attestation();
+        bare.aggregation_bits = vec![0x00];
+        let back: crate::Attestation =
+            serde_json::from_str(&serde_json::to_string(&bare).unwrap()).unwrap();
+        assert_eq!(back.aggregation_bits, vec![0x00]);
+    }
+
+    #[test]
+    fn json_derives_do_not_change_any_ssz_encoding() {
+        assert_golden_ssz(
+            &external_vector_electra_body().as_ssz_bytes(),
+            include_str!("../tests/fixtures/ssz/external_electra_body.hex"),
+        );
+        assert_golden_ssz(
+            &external_vector_deneb_body().as_ssz_bytes(),
+            include_str!("../tests/fixtures/ssz/external_deneb_body.hex"),
+        );
+        assert_golden_ssz(
+            &external_vector_blinded_electra_body().as_ssz_bytes(),
+            include_str!("../tests/fixtures/ssz/external_blinded_electra_body.hex"),
+        );
+        assert_golden_ssz(
+            &external_vector_blinded_deneb_body().as_ssz_bytes(),
+            include_str!("../tests/fixtures/ssz/external_blinded_deneb_body.hex"),
+        );
+        assert_golden_ssz(
+            &Encode::as_ssz_bytes(&external_vector_eth1_data()),
+            include_str!("../tests/fixtures/ssz/external_eth1_data.hex"),
+        );
+        assert_golden_ssz(
+            &Encode::as_ssz_bytes(&external_vector_sync_aggregate()),
+            include_str!("../tests/fixtures/ssz/external_sync_aggregate.hex"),
+        );
+        assert_golden_ssz(
+            &Encode::as_ssz_bytes(&external_vector_execution_payload()),
+            include_str!("../tests/fixtures/ssz/external_execution_payload.hex"),
+        );
+        assert_golden_ssz(
+            &Encode::as_ssz_bytes(&external_vector_execution_payload_header()),
+            include_str!("../tests/fixtures/ssz/external_execution_payload_header.hex"),
+        );
+        assert_golden_ssz(
+            &Encode::as_ssz_bytes(&external_vector_empty_execution_requests()),
+            include_str!("../tests/fixtures/ssz/external_execution_requests.hex"),
+        );
+
+        let electra = rich_electra_body();
+        let ssz_before = electra.as_ssz_bytes();
+        let json = serde_json::to_string(&electra).unwrap();
+        let back: BeaconBlockBodyElectra = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.as_ssz_bytes(), ssz_before);
+
+        let deneb = rich_deneb_body();
+        assert_eq!(
+            serde_json::from_str::<BeaconBlockBodyDeneb>(&serde_json::to_string(&deneb).unwrap())
+                .unwrap()
+                .as_ssz_bytes(),
+            deneb.as_ssz_bytes()
+        );
+
+        assert_ssz_round_trip(&electra);
+        assert_ssz_round_trip(&deneb);
+        assert_ssz_round_trip(&external_vector_blinded_electra_body());
+        assert_ssz_round_trip(&external_vector_blinded_deneb_body());
+        assert_ssz_round_trip(&electra.eth1_data);
+        assert_ssz_round_trip(&electra.proposer_slashings[0]);
+        assert_ssz_round_trip(&electra.proposer_slashings[0].signed_header_1);
+        assert_ssz_round_trip(&electra.attester_slashings[0]);
+        assert_ssz_round_trip(&electra.attester_slashings[0].attestation_1);
+        assert_ssz_round_trip(&deneb.attester_slashings[0]);
+        assert_ssz_round_trip(&deneb.attester_slashings[0].attestation_1);
+        assert_ssz_round_trip(&electra.deposits[0]);
+        assert_ssz_round_trip(&electra.sync_aggregate);
+        assert_ssz_round_trip(&electra.execution_payload);
+        assert_ssz_round_trip(&electra.execution_payload.withdrawals[0]);
+        assert_ssz_round_trip(&external_vector_execution_payload_header());
+        assert_ssz_round_trip(&electra.bls_to_execution_changes[0]);
+        assert_ssz_round_trip(&electra.bls_to_execution_changes[0].message);
+        assert_ssz_round_trip(&electra.execution_requests);
+        assert_ssz_round_trip(&electra.execution_requests.deposits[0]);
+        assert_ssz_round_trip(&electra.execution_requests.withdrawals[0]);
+        assert_ssz_round_trip(&electra.execution_requests.consolidations[0]);
+        assert_ssz_round_trip(&electra.execution_payload.base_fee_per_gas);
+    }
+
     #[test]
     fn test_eth1_data_ssz_roundtrip() {
         let eth1 = Eth1Data { deposit_root: [0x22; 32], deposit_count: 7, block_hash: [0x33; 32] };
@@ -1355,5 +2873,62 @@ mod tests {
         let first_var_offset = u32::from_le_bytes(encoded[200..204].try_into().unwrap());
         assert_eq!(first_var_offset, ELECTRA_FIXED_LEN);
         assert!(encoded.len() >= ELECTRA_FIXED_LEN as usize);
+    }
+
+    fn electra_aap_with_bits(aggregation_bits: Vec<u8>) -> crate::ElectraAggregateAndProof {
+        crate::ElectraAggregateAndProof {
+            aggregator_index: 42,
+            aggregate: crate::ElectraAttestation { aggregation_bits, ..kat_electra_attestation() },
+            selection_proof: vec![0xbb; 96],
+        }
+    }
+
+    #[test]
+    fn test_electra_aggregate_and_proof_ssz_roundtrip() {
+        let proof = electra_aap_with_bits(vec![0xff; 4]);
+        let encoded = Encode::as_ssz_bytes(&proof);
+        let decoded = <crate::ElectraAggregateAndProof as Decode>::from_ssz_bytes(&encoded)
+            .expect("decode ElectraAggregateAndProof");
+        assert_eq!(decoded, proof);
+
+        // aggregator_index, aggregate offset, selection_proof, then ElectraAttestation bytes
+        assert_eq!(&encoded[0..8], &42u64.to_le_bytes());
+        let aggregate_offset = u32::from_le_bytes(encoded[8..12].try_into().unwrap());
+        assert_eq!(aggregate_offset, 108);
+        assert_eq!(&encoded[12..108], &[0xbb; 96]);
+        assert_eq!(&encoded[108..], Encode::as_ssz_bytes(&proof.aggregate));
+    }
+
+    #[test]
+    fn test_electra_aggregate_and_proof_ssz_bytes_len_empty_and_dense() {
+        let empty = electra_aap_with_bits(vec![0x01]);
+        let dense = electra_aap_with_bits(vec![0xff; 512]);
+        for proof in [&empty, &dense] {
+            let encoded = Encode::as_ssz_bytes(proof);
+            assert_eq!(encoded.len(), Encode::ssz_bytes_len(proof));
+            let decoded =
+                <crate::ElectraAggregateAndProof as Decode>::from_ssz_bytes(&encoded).unwrap();
+            assert_eq!(&decoded, proof);
+        }
+    }
+
+    #[test]
+    fn test_electra_aggregate_and_proof_rejects_bad_selection_proof_and_overlength_bits() {
+        let mut bad_proof = electra_aap_with_bits(vec![0x01]);
+        bad_proof.selection_proof = vec![0xbb; 95];
+        assert!(ssz08_sig96(&bad_proof.selection_proof).is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Encode::as_ssz_bytes(&bad_proof)
+        }))
+        .is_err());
+
+        // Bitlist[MAX_VALIDATORS_PER_SLOT=131072] encodes in at most 16385 bytes.
+        let over = vec![0xff; 16386];
+        assert!(ssz08_bitlist::<MaxValidatorsPerSlot>(&over).is_err());
+        let over_proof = electra_aap_with_bits(over);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            Encode::as_ssz_bytes(&over_proof)
+        }))
+        .is_err());
     }
 }

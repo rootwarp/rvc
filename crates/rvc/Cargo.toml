@@ -13,6 +13,7 @@ workspace = true
 [features]
 default = []
 gcp-secret = ["secret-provider/gcp-secret"]
+test-utils = []
 
 [dependencies]
 async-trait.workspace = true
@@ -22,16 +23,18 @@ eth-types.workspace = true
 beacon.workspace = true
 bn-manager.workspace = true
 block-service.workspace = true
+clap.workspace = true
 crypto.workspace = true
 observability.workspace = true
+remote-signer-client.workspace = true
 duty-tracker.workspace = true
 fd-lock.workspace = true
+futures.workspace = true
 grpc-signer.workspace = true
 hex.workspace = true
 keymanager-api.workspace = true
 metrics.workspace = true
 parking_lot.workspace = true
-prost.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
 secret-provider.workspace = true
@@ -43,22 +46,25 @@ thiserror.workspace = true
 timing.workspace = true
 libc.workspace = true
 reqwest.workspace = true
+rvc-config.workspace = true
+rvc-gloas.workspace = true
+ssz08.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-tonic.workspace = true
 tracing.workspace = true
 tree_hash.workspace = true
 url.workspace = true
 validator-store.workspace = true
-
-[build-dependencies]
-tonic-build.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
 # test-utils: shared MockBeaconNodeClient for unit/integration tests (RF4-24).
 bn-manager = { workspace = true, features = ["test-utils"] }
-crypto.workspace = true
+crypto = { workspace = true, features = ["test-utils"] }
+# ARCH-7b: valid Deneb body fixtures for proposal success path in M1 harness.
+eth-types = { workspace = true, features = ["test-fixtures"] }
+rvc-gloas = { workspace = true, features = ["test-fixtures"] }
 http-body-util.workspace = true
 # Used by pipeline_slashing.rs to poison a file-backed SlashingDb (DROP TABLE)
 # for the RF1-02 fail-closed DB-error integration test.
@@ -69,14 +75,29 @@ serde_json.workspace = true
 signer = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio-stream.workspace = true
+tonic.workspace = true
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber = { workspace = true, features = ["registry", "fmt"] }
+tracing-opentelemetry.workspace = true
 tracing-test.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+# ARCH-7b: `start_paused` / `time::pause` for virtual multi-second duty stalls.
+tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
 criterion.workspace = true
+# Feature-unify `test-utils` onto the crate-under-test so integration tests
+# can enable the feature. Production dependents do not get this line.
+rvc = { path = ".", features = ["test-utils"] }
 
 # Per-slot latency-sanity companion (issue 2.13). Run via `cargo bench`; NOT a
 # blocking gate and NOT run under nextest/CI.
 [[bench]]
 name = "per_slot"
+harness = false
+
+# Issue 6.14: Gloas attestation deadline via the P4 resolver (D9). Custom
+# harness prints JSON; not a criterion micro-bench and not run under nextest/CI.
+[[bench]]
+name = "deadline_rebenchmark"
 harness = false

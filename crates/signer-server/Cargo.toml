@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [features]
 default = []
 # Enables PeerSignerService client stubs (DVT dial-out) via the shared proto crate.
-dvt = ["vsss-rs", "bls12_381_plus", "rand", "signer-proto/client"]
+dvt = ["vsss-rs", "bls12_381_plus", "rand", "signer-proto/client", "signer-registry/dvt"]
 
 [dependencies]
 async-trait.workspace = true
@@ -27,7 +27,6 @@ crypto.workspace = true
 observability.workspace = true
 eth-types.workspace = true
 hex.workspace = true
-prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 signer.workspace = true
@@ -82,7 +81,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { workspace = true, features = ["util"] }
 rustls-pemfile = "2"
 prometheus.workspace = true
-telemetry.workspace = true
+rvc-config.workspace = true
+telemetry = { workspace = true, features = ["grpc"] }
 # release_max_level_debug: trace! (and below-cap spans) compile to nothing in
 # --release; debug! stays RUST_LOG-switchable. The `log` bridge feature is NOT
 # enabled (it reintroduces cost under a static cap; ADR-001).
@@ -104,10 +104,15 @@ libc = "0.2"
 async-trait.workspace = true
 hex.workspace = true
 reqwest.workspace = true
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
 tracing-subscriber = { workspace = true, features = ["registry"] }
+tracing-opentelemetry.workspace = true
 parking_lot.workspace = true
 rvc-test-support.workspace = true
 tempfile.workspace = true
+# ARCH-5a load harness reads `rvc_signer_slashing_tx_hold_duration_ms`.
+metrics.workspace = true
 proptest.workspace = true
 rand.workspace = true
 tokio-stream.workspace = true
@@ -132,3 +137,5 @@ bls12_381_plus.workspace = true
 
 # M4 enumeration gate (SS-1) — dev-only; must NOT be a production edge
 signer-registry.workspace = true
+# KAT constants for plan-engine PTC signing-root tests. Dev-only; not a production edge.
+rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }

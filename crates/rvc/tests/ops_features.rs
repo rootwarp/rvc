@@ -41,16 +41,12 @@ mod proposer_nodes {
 
     #[test]
     fn proposer_nodes_cli_override() {
-        use rvc::config::CliOverrides;
+        use rvc::config::StartArgs;
 
-        let mut config = Config::default();
-        assert!(config.proposer_nodes.is_empty());
-
-        let cli = CliOverrides {
-            proposer_nodes: Some(vec!["http://override:5052".to_string()]),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        assert!(Config::default().proposer_nodes.is_empty());
+        let mut args = StartArgs::default();
+        args.proposer.proposer_nodes = Some(vec!["http://override:5052".to_string()]);
+        let config = Config::load(None, args).expect("load");
 
         assert_eq!(config.proposer_nodes, vec!["http://override:5052"]);
     }
@@ -103,8 +99,9 @@ mod proposer_nodes {
         );
     }
 
-    /// Call-site guard: `build_beacon` in the VC runtime path is limited to exit
-    /// tooling (keymanager voluntary exit), not block production or the propagator.
+    /// Call-site guard: the single-endpoint `build_beacon()` client is still
+    /// constructed and is not the keymanager exit path, block production, or
+    /// the propagator.
     ///
     /// RF5-10: production path is `crates/rvc` bootstrap phases.
     #[test]
@@ -143,7 +140,11 @@ mod proposer_nodes {
         );
         assert!(
             km_src.contains("VoluntaryExitManagerAdapter::new"),
-            "build_beacon() client should remain available for exit tooling via keymanager adapters"
+            "keymanager still constructs VoluntaryExitManagerAdapter"
+        );
+        assert!(
+            !km_src.contains("build_beacon()"),
+            "keymanager exit must not call build_beacon(); it uses the BN pool"
         );
     }
 }
@@ -240,12 +241,11 @@ mod broadcast_topics {
 
     #[test]
     fn broadcast_topics_cli_override() {
-        use rvc::config::CliOverrides;
+        use rvc::config::StartArgs;
 
-        let mut config = Config::default();
-        let cli =
-            CliOverrides { broadcast: Some(vec![BroadcastTopic::Blocks]), ..Default::default() };
-        config.merge_with_cli(&cli);
+        let mut args = StartArgs::default();
+        args.proposer.broadcast = Some(vec![BroadcastTopic::Blocks]);
+        let config = Config::load(None, args).expect("load");
 
         let topics = config.effective_broadcast_topics();
         assert!(!topics.attestations);
@@ -509,19 +509,16 @@ mod logfile_config {
 
     #[test]
     fn logfile_cli_override() {
-        use rvc::config::CliOverrides;
+        use rvc::config::StartArgs;
         use std::path::PathBuf;
 
-        let mut config = rvc::config::Config::default();
-        let cli = CliOverrides {
-            logfile: Some(PathBuf::from("/tmp/test.log")),
-            logfile_max_size: Some(50),
-            logfile_max_number: Some(3),
-            logfile_compress: Some(true),
-            logfile_level: Some("warn".to_string()),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        let mut args = StartArgs::default();
+        args.logging.logfile.path = Some(PathBuf::from("/tmp/test.log"));
+        args.logging.logfile.max_size = Some(50);
+        args.logging.logfile.max_number = Some(3);
+        args.logging.logfile.compress = Some(true);
+        args.logging.logfile.level = Some("warn".to_string());
+        let config = rvc::config::Config::load(None, args).expect("load");
 
         assert_eq!(config.logfile.path.as_ref().unwrap().to_str().unwrap(), "/tmp/test.log");
         assert_eq!(config.logfile.max_size, 50);
@@ -895,27 +892,24 @@ mod composition {
 
     #[test]
     fn cli_overrides_all_tier3_fields() {
-        use rvc::config::CliOverrides;
+        use rvc::config::StartArgs;
         use std::path::PathBuf;
 
-        let mut config = Config::default();
-        let cli = CliOverrides {
-            proposer_nodes: Some(vec!["http://p:5052".to_string()]),
-            broadcast: Some(vec![BroadcastTopic::Blocks]),
-            monitoring_endpoint: Some("https://monitor.test".to_string()),
-            monitoring_interval: Some(30),
-            monitoring_endpoint_insecure: Some(true),
-            logfile: Some(PathBuf::from("/tmp/rvc.log")),
-            logfile_max_size: Some(50),
-            logfile_max_number: Some(3),
-            logfile_compress: Some(true),
-            logfile_level: Some("warn".to_string()),
-            proposer_config_url: Some("https://config.test".to_string()),
-            proposer_config_refresh_interval: Some(60),
-            proposer_config_url_insecure: Some(true),
-            ..Default::default()
-        };
-        config.merge_with_cli(&cli);
+        let mut args = StartArgs::default();
+        args.proposer.proposer_nodes = Some(vec!["http://p:5052".to_string()]);
+        args.proposer.broadcast = Some(vec![BroadcastTopic::Blocks]);
+        args.monitoring.endpoint = Some("https://monitor.test".to_string());
+        args.monitoring.interval = Some(30);
+        args.monitoring.endpoint_insecure = Some(true);
+        args.logging.logfile.path = Some(PathBuf::from("/tmp/rvc.log"));
+        args.logging.logfile.max_size = Some(50);
+        args.logging.logfile.max_number = Some(3);
+        args.logging.logfile.compress = Some(true);
+        args.logging.logfile.level = Some("warn".to_string());
+        args.proposer.proposer_config.url = Some("https://config.test".to_string());
+        args.proposer.proposer_config.refresh_interval = Some(60);
+        args.proposer.proposer_config.url_insecure = Some(true);
+        let config = Config::load(None, args).expect("load");
 
         assert_eq!(config.proposer_nodes, vec!["http://p:5052"]);
         assert_eq!(config.broadcast, vec![BroadcastTopic::Blocks]);

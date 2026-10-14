@@ -200,6 +200,7 @@ mod tests {
     }
 
     #[test]
+    // kat_exempt: field-sensitivity — different data must yield different roots; not a container-root KAT
     fn test_attestation_tree_hash_different_data_different_root() {
         let att1 = sample_attestation();
         let mut att2 = sample_attestation();
@@ -216,6 +217,7 @@ mod tests {
     }
 
     #[test]
+    // kat_exempt: field-sensitivity — different aggregator_index must yield different roots; not a container-root KAT
     fn test_aggregate_and_proof_tree_hash_different_index_different_root() {
         let proof1 = sample_aggregate_and_proof();
         let mut proof2 = sample_aggregate_and_proof();

@@ -1,0 +1,37 @@
+[package]
+name = "rvc-spec-vectors"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Spec vectors + KAT codegen"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Exposes Gloas/SPEC_* KAT constants to downstream test targets.
+# Enable only from consumers' [dev-dependencies].
+test-fixtures = []
+
+[dependencies]
+flate2.workspace = true
+hex.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+snap.workspace = true
+tar = "0.4"
+thiserror.workspace = true
+
+[dev-dependencies]
+crypto = { workspace = true }
+libssz-merkle.workspace = true
+rvc-gloas = { workspace = true }
+tempfile.workspace = true
+
+[[bin]]
+name = "gen-spec-kat"
+path = "src/bin/gen_spec_kat.rs"

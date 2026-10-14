@@ -108,8 +108,6 @@ fn start_help_exits_zero_and_lists_flags() {
         "--allow-unsupported-fork",
         "--metrics-address",
         "--metrics-port",
-        "--grpc-address",
-        "--grpc-port",
         "--network",
         "--genesis-time",
         "--genesis-validators-root",
@@ -130,6 +128,8 @@ fn start_help_exits_zero_and_lists_flags() {
         "--attestation-timeout",
         "--aggregate-timeout",
         "--duty-fetch-timeout",
+        "--duty-dispatch-concurrency",
+        "--duty-publish-concurrency",
         "--key-decrypt-threads",
         "--tracing-endpoint",
         "--tracing-exporter",
@@ -144,6 +144,9 @@ fn start_help_exits_zero_and_lists_flags() {
         "--allow-insecure-remote-signer",
         "--keymanager-cors-origins",
         "--keymanager-body-limit",
+        "--keymanager-import-kdf-concurrency",
+        "--keymanager-import-kdf-total-mib",
+        "--keymanager-import-kdf-max-keystore-mib",
         "--grpc-signer-url",
         "--grpc-signer-tls-cert",
         "--grpc-signer-tls-key",
@@ -197,6 +200,29 @@ fn unknown_flag_exits_nonzero_with_usage() {
 }
 
 #[test]
+fn test_unknown_grpc_cli_flag_is_rejected() {
+    for args in [
+        ["start", "--grpc-port", "1"].as_slice(),
+        ["start", "--grpc-address", "127.0.0.1"].as_slice(),
+    ] {
+        let output = run_with_timeout(Command::new(rvc_bin()).args(args), Duration::from_secs(10));
+        assert!(
+            !output.status.success(),
+            "{args:?} must exit non-zero after the flags were removed; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unexpected")
+                || stderr.contains("Usage")
+                || stderr.contains("usage")
+                || stderr.contains("error"),
+            "expected clap rejection for {args:?}, got: {stderr}"
+        );
+    }
+}
+
+#[test]
 fn start_unknown_flag_exits_nonzero_with_usage() {
     let output = run_with_timeout(
         Command::new(rvc_bin()).args(["start", "--definitely-not-a-flag"]),
@@ -237,7 +263,6 @@ fn write_start_config(
     slashing_db_path: &Path,
     beacon_url: &str,
     metrics_port: u16,
-    grpc_port: u16,
     extra_toml: &str,
 ) -> NamedTempFile {
     let keystore = dir.path().join("keystores");
@@ -251,8 +276,6 @@ keystore_path = "{keystore}"
 slashing_db_path = "{slashing}"
 metrics_address = "127.0.0.1"
 metrics_port = {metrics_port}
-grpc_address = "127.0.0.1"
-grpc_port = {grpc_port}
 network = "mainnet"
 log_level = "info"
 keymanager_enabled = false
@@ -262,7 +285,6 @@ keymanager_enabled = false
         keystore = keystore.display(),
         slashing = slashing_db_path.display(),
         metrics_port = metrics_port,
-        grpc_port = grpc_port,
         extra = extra_toml,
     )
     .expect("write config");
@@ -278,13 +300,11 @@ fn missing_slashing_db_refuses_start() {
     assert!(!slashing_path.exists());
 
     let metrics = free_port();
-    let grpc = free_port();
     let config = write_start_config(
         &dir,
         &slashing_path,
         "http://127.0.0.1:9", // unreachable; open fails before BN connect
         metrics,
-        grpc,
         "",
     );
 
@@ -297,8 +317,6 @@ fn missing_slashing_db_refuses_start() {
                 // deliberately NO --init-slashing-db
                 "--metrics-port",
                 &metrics.to_string(),
-                "--grpc-port",
-                &grpc.to_string(),
             ])
             .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
             .env_remove("OTEL_TRACES_SAMPLER_ARG"),
@@ -334,13 +352,12 @@ fn tracing_sample_rate_cli_survives_otel_env() {
     let dir = TempDir::new().expect("temp dir");
     let slashing_path = dir.path().join("missing-slashing.db");
     let metrics = free_port();
-    let grpc = free_port();
     // Point OTLP at a closed local port so exporter construction is cheap and
     // does not require a real collector. init_tracing typically succeeds; if it
     // fails we still assert the sample_rate appeared in the enable line or the
     // failure path still exercised merge (test will fail loudly either way).
     let otlp = format!("http://127.0.0.1:{}", free_port());
-    let config = write_start_config(&dir, &slashing_path, "http://127.0.0.1:9", metrics, grpc, "");
+    let config = write_start_config(&dir, &slashing_path, "http://127.0.0.1:9", metrics, "");
 
     let output = run_with_timeout(
         Command::new(rvc_bin())
@@ -354,8 +371,6 @@ fn tracing_sample_rate_cli_survives_otel_env() {
                 "0.01",
                 "--metrics-port",
                 &metrics.to_string(),
-                "--grpc-port",
-                &grpc.to_string(),
             ])
             // Env would win under the pre-F20 bug when the explicit value was 0.01.
             .env("OTEL_TRACES_SAMPLER_ARG", "0.5")
@@ -375,5 +390,130 @@ fn tracing_sample_rate_cli_survives_otel_env() {
     assert!(
         !text.contains("sample_rate: 0.5"),
         "env sample rate must not override explicit CLI 0.01.\n--- combined ---\n{text}"
+    );
+}
+
+/// TRC-1a / ADR-005: resolved sample_rate < 1.0 emits a startup `warn!`
+/// **after** subscriber init (CD-12). Rate `1.0` stays silent; `0.0` names
+/// exporter-receives-nothing.
+fn run_start_with_tracing_sample_rate(rate: &str) -> String {
+    let dir = TempDir::new().expect("temp dir");
+    let slashing_path = dir.path().join("missing-slashing.db");
+    let metrics = free_port();
+    let otlp = format!("http://127.0.0.1:{}", free_port());
+    let config = write_start_config(&dir, &slashing_path, "http://127.0.0.1:9", metrics, "");
+
+    let output = run_with_timeout(
+        Command::new(rvc_bin())
+            .args([
+                "start",
+                "--config",
+                config.path().to_str().unwrap(),
+                "--tracing-endpoint",
+                &otlp,
+                "--tracing-sample-rate",
+                rate,
+                "--metrics-port",
+                &metrics.to_string(),
+            ])
+            .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .env_remove("OTEL_TRACES_SAMPLER_ARG"),
+        Duration::from_secs(25),
+    );
+
+    combined(&output)
+}
+
+#[test]
+fn tracing_sample_rate_below_one_warns_after_subscriber_init() {
+    // Case 1: 0.9 → warn after init (visible on the subscriber).
+    let text_09 = run_start_with_tracing_sample_rate("0.9");
+    assert!(
+        text_09.contains("tracing sample_rate is below 1.0"),
+        "resolved 0.9 must warn after subscriber init.\n--- combined ---\n{text_09}"
+    );
+
+    // Case 2: 0.0 → warn naming exporter-receives-nothing.
+    let text_00 = run_start_with_tracing_sample_rate("0.0");
+    assert!(
+        text_00.contains("exporter receives nothing"),
+        "resolved 0.0 must warn that exporter receives nothing.\n--- combined ---\n{text_00}"
+    );
+
+    // Case 3: 1.0 → silent (no below-1.0 / exporter-nothing warn).
+    let text_10 = run_start_with_tracing_sample_rate("1.0");
+    assert!(
+        !text_10.contains("tracing sample_rate is below 1.0")
+            && !text_10.contains("exporter receives nothing"),
+        "resolved 1.0 must not emit the sample-rate warn.\n--- combined ---\n{text_10}"
+    );
+}
+
+/// TRC-1b: path-less OTLP endpoint is rewritten to `…/v1/traces` in the enable
+/// line, and the non-localhost `http://` warn fires only for dotted remotes
+/// (Compose host `jaeger` and loopback stay silent).
+fn run_start_with_tracing_endpoint(endpoint: &str) -> String {
+    let dir = TempDir::new().expect("temp dir");
+    let slashing_path = dir.path().join("missing-slashing.db");
+    let metrics = free_port();
+    let config = write_start_config(&dir, &slashing_path, "http://127.0.0.1:9", metrics, "");
+
+    let output = run_with_timeout(
+        Command::new(rvc_bin())
+            .args([
+                "start",
+                "--config",
+                config.path().to_str().unwrap(),
+                "--tracing-endpoint",
+                endpoint,
+                "--tracing-sample-rate",
+                "1.0",
+                "--metrics-port",
+                &metrics.to_string(),
+            ])
+            .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
+            .env_remove("OTEL_TRACES_SAMPLER_ARG"),
+        Duration::from_secs(25),
+    );
+
+    combined(&output)
+}
+
+#[test]
+fn tracing_otlp_path_append_and_compose_host_http_warn() {
+    const HTTP_WARN: &str = "tracing endpoint uses http:// with non-localhost host";
+
+    // Path-less Compose host → `/v1/traces` appended; no http warn.
+    let jaeger = run_start_with_tracing_endpoint("http://jaeger:4318");
+    assert!(
+        jaeger.contains("http://jaeger:4318/v1/traces"),
+        "path-less jaeger endpoint must append /v1/traces.\n--- combined ---\n{jaeger}"
+    );
+    assert!(
+        !jaeger.contains(HTTP_WARN),
+        "dot-less compose host must not emit non-localhost http warn.\n--- combined ---\n{jaeger}"
+    );
+
+    // Loopback → path append; no http warn.
+    let loopback = format!("http://127.0.0.1:{}", free_port());
+    let local = run_start_with_tracing_endpoint(&loopback);
+    assert!(
+        local.contains(&format!("{loopback}/v1/traces")),
+        "path-less loopback must append /v1/traces.\n--- combined ---\n{local}"
+    );
+    assert!(
+        !local.contains(HTTP_WARN),
+        "localhost must not emit non-localhost http warn.\n--- combined ---\n{local}"
+    );
+
+    // Dotted remote → warn after subscriber init.
+    let remote = run_start_with_tracing_endpoint("http://collector.example.invalid:9");
+    assert!(
+        remote.contains("http://collector.example.invalid:9/v1/traces"),
+        "path-less remote must append /v1/traces.\n--- combined ---\n{remote}"
+    );
+    assert!(
+        remote.contains(HTTP_WARN),
+        "dotted remote http:// must warn after subscriber init.\n--- combined ---\n{remote}"
     );
 }

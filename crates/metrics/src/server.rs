@@ -98,12 +98,27 @@ pub async fn serve_metrics_with_health(
     port: u16,
     health_status: SharedHealthStatus,
 ) -> Result<(), std::io::Error> {
-    let router = create_metrics_router_with_health(health_status);
     let socket_addr = SocketAddr::from((addr, port));
     let listener = TcpListener::bind(socket_addr)
         .await
         .inspect_err(|e| tracing::error!(error = %e, "metrics server failed to bind"))?;
-    tracing::info!("Metrics server with health endpoint listening on {}", socket_addr);
+    serve_metrics_on(listener, health_status).await
+}
+
+/// Serves the metrics and health endpoints on a caller-supplied listener.
+///
+/// Does not bind. [`serve_metrics_with_health`] binds and then calls this
+/// function. A serve failure is returned as [`std::io::Error`].
+///
+/// # Errors
+/// Returns an error if the server stops serving.
+pub async fn serve_metrics_on(
+    listener: TcpListener,
+    health_status: SharedHealthStatus,
+) -> Result<(), std::io::Error> {
+    let router = create_metrics_router_with_health(health_status);
+    let bound = listener.local_addr()?;
+    tracing::info!("Metrics server with health endpoint listening on {}", bound);
     axum::serve(listener, router)
         .await
         .inspect_err(|e| tracing::error!(error = %e, "metrics server stopped serving"))
@@ -409,5 +424,55 @@ mod tests {
         let handle = tokio::spawn(serve_metrics_with_health(addr, 0, health_status));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         handle.abort();
+    }
+
+    /// Caller binds port 0 and hands the listener to `serve_metrics_on`.
+    /// The scrape must hit that listener's address, not a port the server binds itself.
+    #[tokio::test]
+    async fn serve_metrics_on_accepts_a_prebound_listener() {
+        use std::net::Ipv4Addr;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let health_status = new_health_status();
+        let server = tokio::spawn(serve_metrics_on(listener, health_status));
+
+        let mut stream = None;
+        for _ in 0..50 {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(s) => {
+                    stream = Some(s);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        let mut stream =
+            stream.unwrap_or_else(|| panic!("metrics server did not accept at {addr}"));
+        let req = format!("GET /metrics HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+        let body = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8(buf).unwrap()
+        })
+        .await
+        .expect("scrape /metrics on the pre-bound listener");
+
+        let status = body
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or_else(|| panic!("HTTP status line missing: {body}"));
+        assert_eq!(status, 200, "GET /metrics on {addr} must succeed; body: {body}");
+        assert!(
+            body.to_ascii_lowercase().contains("text/plain; version=0.0.4"),
+            "scrape must be Prometheus text; body: {body}"
+        );
+
+        server.abort();
+        let _ = server.await;
     }
 }

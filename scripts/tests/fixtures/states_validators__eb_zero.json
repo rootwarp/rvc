@@ -1,0 +1,36 @@
+{
+  "execution_optimistic": false,
+  "finalized": false,
+  "data": [
+    {
+      "index": "1",
+      "balance": "0",
+      "status": "active_slashed",
+      "validator": {
+        "pubkey": "0x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+        "withdrawal_credentials": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "effective_balance": "0",
+        "slashed": true,
+        "activation_eligibility_epoch": "0",
+        "activation_epoch": "0",
+        "exit_epoch": "18446744073709551615",
+        "withdrawable_epoch": "18446744073709551615"
+      }
+    },
+    {
+      "index": "2",
+      "balance": "32000000000",
+      "status": "active_ongoing",
+      "validator": {
+        "pubkey": "0x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+        "withdrawal_credentials": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "effective_balance": "32000000000",
+        "slashed": false,
+        "activation_eligibility_epoch": "0",
+        "activation_epoch": "0",
+        "exit_epoch": "18446744073709551615",
+        "withdrawable_epoch": "18446744073709551615"
+      }
+    }
+  ]
+}

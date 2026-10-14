@@ -1,0 +1,17 @@
+K1 rvc_orchestrator_slots_processed_total
+K2 rvc_orchestrator_missed_slots_total
+K3 rvc_orchestrator_slot_processing_duration_seconds
+K4 rvc_attestations_total
+K5 rvc_aggregations_total
+K6 rvc_proposals_total
+K7 rvc_signing_duration_seconds
+K8 rvc_slashing_protection_checks_total
+K9 rvc_slashing_reserve_tx_hold_duration_ms
+K10 rvc_slot_phase_block_start_offset_ms
+K11 rvc_duties_fetched_total
+K11 rvc_duty_reorg_detected_total
+K12 rvc_bn_health_tier
+K12 rvc_proposer_bn_latency_ms
+K13 rvc_tasks_running
+K13 rvc_task_exits_total
+K13 rvc_sse_events_dropped_total

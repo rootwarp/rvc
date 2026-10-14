@@ -7,6 +7,9 @@ pub enum TreeHashError {
     /// Body bytes failed SSZ decode into a typed `BeaconBlockBody` (SEC-6c).
     #[error("invalid SSZ block body: {reason}")]
     InvalidBody { reason: String },
+    /// SSZ `ByteList[N]` was empty or over the type limit.
+    #[error("invalid SSZ byte list: {reason}")]
+    InvalidByteList { reason: String },
 }
 
 /// Implement `try_tree_hash_root` + `TreeHash` for an SSZ container.
@@ -403,6 +406,7 @@ mod tests {
     }
 
     #[test]
+    // kat_exempt: field-sensitivity — Bitlist[N] limit changes the root; not a container-root KAT
     fn test_bitlist_limit_changes_root() {
         // The same SSZ bits hash to different roots under different `Bitlist[N]` limits, because
         // the chunk tree is padded to a different chunk_count. This is the bug this fix closes.

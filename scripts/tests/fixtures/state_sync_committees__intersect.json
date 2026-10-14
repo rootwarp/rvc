@@ -1,0 +1,8 @@
+{
+  "execution_optimistic": false,
+  "finalized": true,
+  "data": {
+    "validators": ["1", "42", "99"],
+    "validator_aggregates": []
+  }
+}

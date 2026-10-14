@@ -12,9 +12,13 @@ description = "Dev-only shared PKI + mTLS test harness (rcgen)"
 workspace = true
 
 # Zero workspace-internal dependencies by design (pinned in ZERO_OUT_EDGE_IF_PRESENT).
-# External-only: rcgen for cert minting, tonic/tokio for the mTLS server helper.
+# External-only: rcgen for cert minting, tonic/tokio for the mTLS server helper,
+# rustls so the harness can install the `ring` provider before tonic builds TLS.
 [dependencies]
 rcgen.workspace = true
+# default-features = false: rustls's default set enables `aws_lc_rs`. This crate
+# only installs the workspace `ring` provider (see `install_ring_crypto_provider`).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio = { workspace = true, features = ["net", "rt", "macros", "time"] }
 tokio-stream.workspace = true
 tonic = { workspace = true, features = ["transport", "tls"] }

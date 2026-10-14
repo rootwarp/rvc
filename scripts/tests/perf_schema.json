@@ -1,0 +1,268 @@
+{
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "network",
+    "window",
+    "beacon",
+    "validators",
+    "aggregate",
+    "degradations",
+    "exit_code"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1] },
+    "generated_at": { "type": "string" },
+    "network": {
+      "type": "object",
+      "required": ["name", "genesis_time", "slots_per_epoch", "seconds_per_slot"],
+      "properties": {
+        "name": { "type": ["string", "null"] },
+        "genesis_time": { "type": "integer" },
+        "slots_per_epoch": { "type": "integer" },
+        "seconds_per_slot": { "type": "integer" }
+      }
+    },
+    "window": {
+      "type": "object",
+      "required": [
+        "from_epoch",
+        "to_epoch",
+        "epochs",
+        "head_epoch",
+        "finalized_epoch",
+        "finalized_only"
+      ],
+      "properties": {
+        "from_epoch": { "type": "integer" },
+        "to_epoch": { "type": "integer" },
+        "epochs": { "type": "integer" },
+        "head_epoch": { "type": "integer" },
+        "finalized_epoch": { "type": "integer" },
+        "finalized_only": { "type": "boolean" }
+      }
+    },
+    "beacon": {
+      "type": "object",
+      "required": ["endpoint", "version", "rewards_api", "endpoints_used"],
+      "properties": {
+        "endpoint": { "type": "string" },
+        "version": { "type": "string" },
+        "rewards_api": {
+          "type": "string",
+          "enum": ["available", "route_absent", "state_unavailable"]
+        },
+        "endpoints_used": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "validators": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "pubkey",
+          "index",
+          "status",
+          "active_epochs",
+          "participation_rate",
+          "source_rate",
+          "target_rate",
+          "head_rate",
+          "missed_attestations",
+          "attester_effectiveness",
+          "effectiveness_method",
+          "leak_epochs_excluded",
+          "proposals",
+          "sync",
+          "balance",
+          "rewards_gwei",
+          "estimated_apr",
+          "reward_source",
+          "degradations"
+        ],
+        "properties": {
+          "pubkey": { "type": "string" },
+          "index": { "type": ["integer", "null"] },
+          "status": { "type": "string" },
+          "active_epochs": { "type": "integer" },
+          "participation_rate": { "type": ["number", "null"] },
+          "source_rate": { "type": ["number", "null"] },
+          "target_rate": { "type": ["number", "null"] },
+          "head_rate": { "type": ["number", "null"] },
+          "missed_attestations": { "type": ["integer", "null"] },
+          "attester_effectiveness": { "type": ["number", "null"] },
+          "effectiveness_method": { "type": "string", "enum": ["reward_ratio"] },
+          "leak_epochs_excluded": { "type": "integer" },
+          "proposals": {
+            "type": ["object", "null"],
+            "required": ["scheduled", "included", "missed"],
+            "properties": {
+              "scheduled": { "type": ["integer", "null"] },
+              "included": { "type": ["integer", "null"] },
+              "missed": { "type": ["integer", "null"] }
+            }
+          },
+          "sync": {
+            "type": ["object", "null"],
+            "required": ["in_committee", "participation_rate"],
+            "properties": {
+              "in_committee": { "type": "boolean" },
+              "participation_rate": { "type": ["number", "null"] }
+            }
+          },
+          "balance": {
+            "type": "object",
+            "required": [
+              "start_gwei",
+              "end_gwei",
+              "delta_gwei",
+              "effective_balance_gwei",
+              "effective_balance_changed",
+              "start_slot",
+              "end_slot",
+              "reconciliation"
+            ],
+            "properties": {
+              "start_gwei": { "type": ["integer", "null"] },
+              "end_gwei": { "type": ["integer", "null"] },
+              "delta_gwei": { "type": ["integer", "null"] },
+              "effective_balance_gwei": { "type": ["integer", "null"] },
+              "effective_balance_changed": { "type": "boolean" },
+              "start_slot": { "type": "integer" },
+              "end_slot": { "type": "integer" },
+              "reconciliation": {
+                "type": "string",
+                "enum": ["consistent", "diverged", "unavailable"]
+              }
+            }
+          },
+          "rewards_gwei": {
+            "type": "object",
+            "required": [
+              "source",
+              "target",
+              "head",
+              "inactivity",
+              "proposer",
+              "sync",
+              "total"
+            ],
+            "properties": {
+              "source": { "type": ["integer", "null"] },
+              "target": { "type": ["integer", "null"] },
+              "head": { "type": ["integer", "null"] },
+              "inactivity": { "type": ["integer", "null"] },
+              "proposer": { "type": ["integer", "null"] },
+              "sync": { "type": ["integer", "null"] },
+              "total": { "type": ["integer", "null"] }
+            }
+          },
+          "estimated_apr": { "type": ["number", "null"] },
+          "reward_source": {
+            "type": ["string", "null"],
+            "enum": ["rewards_api", "balance_delta", null]
+          },
+          "degradations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["metric", "scope", "reason", "detail"],
+              "properties": {
+                "metric": { "type": "string" },
+                "scope": { "type": "string" },
+                "reason": {
+                  "type": "string",
+                  "enum": [
+                    "rewards_api_unsupported",
+                    "state_unavailable",
+                    "inactivity_leak",
+                    "proposer_duties_unavailable",
+                    "block_reward_unavailable",
+                    "ideal_row_missing",
+                    "effective_balance_zero",
+                    "sync_committees_unavailable",
+                    "endpoint_failover"
+                  ]
+                },
+                "detail": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "aggregate": {
+      "type": "object",
+      "required": [
+        "validators",
+        "by_status",
+        "participation_rate",
+        "source_rate",
+        "target_rate",
+        "head_rate",
+        "attester_effectiveness",
+        "missed_attestations",
+        "proposals",
+        "consensus_reward_gwei",
+        "estimated_apr",
+        "reward_source"
+      ],
+      "properties": {
+        "validators": { "type": "integer" },
+        "by_status": { "type": "object" },
+        "participation_rate": { "type": ["number", "null"] },
+        "source_rate": { "type": ["number", "null"] },
+        "target_rate": { "type": ["number", "null"] },
+        "head_rate": { "type": ["number", "null"] },
+        "attester_effectiveness": { "type": ["number", "null"] },
+        "missed_attestations": { "type": ["integer", "null"] },
+        "proposals": {
+          "type": ["object", "null"],
+          "required": ["scheduled", "included", "missed"],
+          "properties": {
+            "scheduled": { "type": ["integer", "null"] },
+            "included": { "type": ["integer", "null"] },
+            "missed": { "type": ["integer", "null"] }
+          }
+        },
+        "consensus_reward_gwei": { "type": ["integer", "null"] },
+        "estimated_apr": { "type": ["number", "null"] },
+        "reward_source": {
+          "type": ["string", "null"],
+          "enum": ["rewards_api", "balance_delta", null]
+        }
+      }
+    },
+    "degradations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["metric", "scope", "reason", "detail"],
+        "properties": {
+          "metric": { "type": "string" },
+          "scope": { "type": "string" },
+          "reason": {
+            "type": "string",
+            "enum": [
+              "rewards_api_unsupported",
+              "state_unavailable",
+              "inactivity_leak",
+              "proposer_duties_unavailable",
+              "block_reward_unavailable",
+              "ideal_row_missing",
+              "effective_balance_zero",
+              "sync_committees_unavailable",
+              "endpoint_failover"
+            ]
+          },
+          "detail": { "type": "string" }
+        }
+      }
+    },
+    "exit_code": { "type": "integer", "enum": [0, 1, 2, 3, 4, 5] }
+  }
+}

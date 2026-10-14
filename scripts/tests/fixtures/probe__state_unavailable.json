@@ -1,0 +1,24 @@
+{
+  "blocks": {
+    "status": 200,
+    "body": {
+      "execution_optimistic": false,
+      "finalized": false,
+      "data": {
+        "proposer_index": "1",
+        "total": "0",
+        "attestations": "0",
+        "sync_aggregate": "0",
+        "proposer_slashings": "0",
+        "attester_slashings": "0"
+      }
+    }
+  },
+  "attestations": {
+    "status": 404,
+    "body": {
+      "code": 404,
+      "message": "Not found"
+    }
+  }
+}

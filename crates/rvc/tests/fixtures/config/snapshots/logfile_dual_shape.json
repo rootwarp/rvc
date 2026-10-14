@@ -1,0 +1,67 @@
+{
+  "beacon_url": "http://localhost:5052",
+  "beacon_nodes": [],
+  "keystore_path": "./keystores",
+  "password_file": null,
+  "slashing_db_path": "./slashing_protection.sqlite",
+  "allow_fresh_db": false,
+  "allow_unsupported_fork": false,
+  "metrics_address": "127.0.0.1",
+  "metrics_port": 8080,
+  "network": "mainnet",
+  "graffiti": null,
+  "log_level": "info",
+  "doppelganger_detection": true,
+  "secret_provider": {
+    "providers": [],
+    "strict": false,
+    "gcp": {
+      "secret_prefix": "validator-key-"
+    }
+  },
+  "disable_attesting": false,
+  "slashed_validators_action": "disable-only",
+  "disable_keystore_locking": false,
+  "logfile": {
+    "path": "/var/log/rvc/wire.log",
+    "max_size": 200,
+    "max_number": 5,
+    "compress": false
+  },
+  "tracing": {
+    "exporter": "otlp"
+  },
+  "keymanager": {
+    "enabled": false,
+    "allow_insecure_remote_signer": false,
+    "body_limit": 10485760
+  },
+  "grpc_signer": {},
+  "proposer_config": {
+    "refresh_interval": 384,
+    "url_insecure": false
+  },
+  "monitoring": {
+    "interval": 384,
+    "endpoint_insecure": false
+  },
+  "builder_limits": {
+    "circuit_breaker_consecutive_limit": 3,
+    "circuit_breaker_epoch_limit": 5
+  },
+  "timing": {
+    "attestation_due_bps": 3333,
+    "aggregate_due_bps": 6667,
+    "attestation_due_bps_gloas": 2500,
+    "aggregate_due_bps_gloas": 5000,
+    "sync_message_due_bps_gloas": 2500,
+    "contribution_due_bps_gloas": 5000,
+    "payload_due_bps": 5000,
+    "payload_attestation_due_bps": 7500
+  },
+  "fork_schedule": {},
+  "block_selection_mode": "max-profit",
+  "validator_registration_batch_size": 500,
+  "validator_registration_batch_delay": 500,
+  "beacon_max_body_bytes": 33554432
+}

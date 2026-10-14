@@ -54,7 +54,7 @@ mod composition {
         // BuilderAlways mode with healthy BN and no CB trip → should proceed with builder
         let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
         let pk = test_pubkey(1);
-        store.add_validator(ValidatorConfig::new(pk));
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
         store.set_global_block_selection_mode(BlockSelectionMode::BuilderAlways);
         assert_eq!(store.effective_block_selection_mode(&pk), BlockSelectionMode::BuilderAlways);
 
@@ -80,10 +80,10 @@ mod composition {
         let mut config1 = ValidatorConfig::new(pk1);
         config1.block_selection_mode = Some(BlockSelectionMode::BuilderAlways);
         config1.builder_proposals = true;
-        store.add_validator(config1);
+        store.add_validator(config1).unwrap();
         let mut config2 = ValidatorConfig::new(pk2);
         config2.builder_proposals = true;
-        store.add_validator(config2);
+        store.add_validator(config2).unwrap();
         store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
 
         assert_eq!(

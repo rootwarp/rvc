@@ -8,7 +8,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use bn_manager::{BeaconNodeClient, BnManager, OperationTimeouts, Propagator};
+use bn_manager::{BeaconNodeClient, BnManager, DutiesProvider, OperationTimeouts, Propagator};
 use builder::BuilderService;
 use duty_tracker::DutyTracker;
 use signer::SignerService;
@@ -24,6 +24,7 @@ use super::BootstrapError;
 use crate::beacon_adapter::BeaconBlockAdapter;
 use crate::config::{Config, ServiceBuilder};
 use crate::orchestrator::OrchestratorConfig;
+use crate::quiesce::QuiesceRegistry;
 use crate::startup::{self, StartupError};
 
 /// Handles produced by [`build_services`].
@@ -34,6 +35,11 @@ use crate::startup::{self, StartupError};
 pub struct ServiceHandles {
     /// Production signer with slashing protection and signing enablement.
     pub signer: Arc<SignerService>,
+    /// Quiesce set read by the signer's [`crate::quiesce::QuiescingEnablement`].
+    ///
+    /// Same `Arc` the decorator holds. This issue exposes no removal; re-admission
+    /// is a later change.
+    pub quiesce_registry: Arc<QuiesceRegistry>,
     /// Per-validator config store (fee recipient, enabled, gas limit).
     pub validator_store: Arc<ValidatorStore>,
     /// Attestation propagator over the main-pool `BnManager`.
@@ -104,7 +110,7 @@ pub async fn build_services(
 ) -> Result<ServiceHandles, BootstrapError> {
     let builder = ServiceBuilder::new(config.clone());
 
-    let signer = builder.build_signer(
+    let (signer, quiesce_registry) = builder.build_signer(
         Arc::clone(&keys.composite_signer),
         slashing_db,
         Arc::clone(&enablement.signing_enablement),
@@ -116,21 +122,38 @@ pub async fn build_services(
     // Without this, the common no-validators_config deployment would have every
     // loaded validator silently blocked from signing.
     builder.register_loaded_validators(&validator_store, &keys.pubkey_map);
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Elapsed doppelganger holds are re-enabled here. A still-open hold stays
+    // disabled. When the keymanager is running, the wall-clock enable task is
+    // started again for the time left. A restart does not replay doppelganger
+    // observations. Boot registration already routed an unfinished import
+    // (open hold, any or unreadable sidecar, or staged sidecar)
+    // through register_for_import, so the signer gate stays Pending until
+    // this process observes the forward window and removes the sidecar.
+    let _open = validator_store.reconcile_doppelganger_holds_at_boot(now_unix);
 
     // Attestation submit path uses the main-pool BnManager (failover-aware).
-    // `build_beacon` remains only for single-client exit tooling
-    // (keymanager voluntary exit). Propagator needs a Sized submitter, so keep
-    // the concrete BnManager here rather than `dyn BeaconNodeClient`.
+    // `build_beacon`'s client is still constructed and is not the keymanager
+    // exit path. Propagator needs a Sized submitter, so keep the concrete
+    // BnManager here rather than `dyn BeaconNodeClient`.
     let propagator = builder.build_propagator(Arc::clone(&beacon.bn_manager));
     // Main-pool trait object for duties and (when no dedicated proposer pool)
     // block production.
     let main_beacon: Arc<dyn BeaconNodeClient> =
         Arc::clone(&beacon.bn_manager) as Arc<dyn BeaconNodeClient>;
-    let validator_indices: Vec<String> =
-        enablement.pubkey_index.read().indices().cloned().collect();
-    let duty_tracker = builder.build_duty_tracker(main_beacon.clone(), validator_indices);
 
-    let slot_clock = match builder.build_slot_clock() {
+    let slot_duration_ms = match builder.resolve_slot_duration_ms(main_beacon.as_ref()).await {
+        Ok(ms) => ms,
+        Err(e) => {
+            error!("Failed to resolve slot duration from beacon node: {}", e);
+            return Err(e.into());
+        }
+    };
+
+    let slot_clock = match builder.build_slot_clock(slot_duration_ms) {
         Ok(clock) => clock,
         Err(e) => {
             error!("Failed to create slot clock: {}", e);
@@ -145,6 +168,28 @@ pub async fn build_services(
             return Err(e.into());
         }
     };
+
+    // D12: local `[fork_schedule]` vs BN `/eth/v1/config/spec`. Not opt-outable.
+    if let Err(e) =
+        startup::reconcile_gloas_fork_schedule(&config.fork_schedule, fork_schedule.as_ref())
+    {
+        error!(error = %e, "Gloas fork schedule reconciliation failed");
+        return Err(e.into());
+    }
+
+    // ADR-R06: registry ∩ PubkeyMap, one snapshot per fetch. The registry has
+    // no remove, so a deleted key leaves the effective set through this read.
+    let index_source = Arc::new(crate::pubkey_index::PubkeyIndexSource {
+        registry: Arc::clone(&enablement.pubkey_index),
+        pubkey_map: Arc::clone(&keys.pubkey_map),
+    });
+    let duty_tracker = Arc::new(
+        DutyTracker::new_with_source(
+            Arc::clone(&beacon.bn_manager) as Arc<dyn DutiesProvider>,
+            index_source,
+        )
+        .with_fork_schedule(fork_schedule.as_ref().clone()),
+    );
 
     // SEC-9 / M-15: fork mismatch is fatal by default (mirrors the GVR chain-swap
     // gate). Opt out with `allow_unsupported_fork` for testnets / experimental forks.
@@ -183,12 +228,12 @@ pub async fn build_services(
         None => Arc::new(BeaconBlockAdapter(main_beacon.clone())),
     };
 
-    #[allow(clippy::arc_with_non_send_sync)]
     let builder_service = Some(builder.build_builder_service(
         signer.clone(),
         main_beacon.clone(),
         validator_store.clone(),
         orchestrator_config.fork_schedule.genesis_fork_version,
+        orchestrator_config.fork_schedule.clone(),
     ));
 
     // Step 7b: Configure remote signer if URL provided
@@ -216,6 +261,7 @@ pub async fn build_services(
 
     Ok(ServiceHandles {
         signer,
+        quiesce_registry,
         validator_store,
         propagator,
         beacon: main_beacon,
@@ -232,12 +278,12 @@ pub async fn build_services(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::{Config, ForkScheduleConfig};
     use crate::orchestrator::PubkeyMap;
     use beacon::BeaconClient;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
     use doppelganger::{DoppelgangerDisabledByOperator, MonotonicEpochClock};
-    use eth_types::Root;
+    use eth_types::{ForkName, Root};
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
@@ -283,33 +329,52 @@ mod tests {
             pubkey_map,
             liveness_task: None,
             pubkey_index: crate::pubkey_index::PubkeyIndexRegistry::shared(),
+            tracked_keys: Arc::new(crate::quiesce::TrackedKeys::new()),
         }
     }
 
     /// Mount fork-schedule (`/eth/v1/config/spec`) + head fork for SEC-9 gate.
     async fn mock_bn_server(head_fork_version: &str) -> MockServer {
+        mock_bn_server_gloas(head_fork_version, Some("18446744073709551615"), Some("0x07000000"))
+            .await
+    }
+
+    async fn mock_bn_server_gloas(
+        head_fork_version: &str,
+        gloas_epoch: Option<&str>,
+        gloas_version: Option<&str>,
+    ) -> MockServer {
         let server = MockServer::start().await;
+
+        let mut data = serde_json::json!({
+            "GENESIS_FORK_VERSION": "0x00000000",
+            "ALTAIR_FORK_EPOCH": "74240",
+            "ALTAIR_FORK_VERSION": "0x01000000",
+            "BELLATRIX_FORK_EPOCH": "144896",
+            "BELLATRIX_FORK_VERSION": "0x02000000",
+            "CAPELLA_FORK_EPOCH": "194048",
+            "CAPELLA_FORK_VERSION": "0x03000000",
+            "DENEB_FORK_EPOCH": "269568",
+            "DENEB_FORK_VERSION": "0x04000000",
+            "ELECTRA_FORK_EPOCH": "364544",
+            "ELECTRA_FORK_VERSION": "0x05000000",
+            "FULU_FORK_EPOCH": "18446744073709551615",
+            "FULU_FORK_VERSION": "0x06000000",
+            "SECONDS_PER_SLOT": "12",
+            "SLOTS_PER_EPOCH": "32"
+        });
+        let map = data.as_object_mut().expect("spec data object");
+        if let Some(epoch) = gloas_epoch {
+            map.insert("GLOAS_FORK_EPOCH".into(), serde_json::json!(epoch));
+        }
+        if let Some(version) = gloas_version {
+            map.insert("GLOAS_FORK_VERSION".into(), serde_json::json!(version));
+        }
 
         Mock::given(method("GET"))
             .and(path("/eth/v1/config/spec"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": {
-                    "GENESIS_FORK_VERSION": "0x00000000",
-                    "ALTAIR_FORK_EPOCH": "74240",
-                    "ALTAIR_FORK_VERSION": "0x01000000",
-                    "BELLATRIX_FORK_EPOCH": "144896",
-                    "BELLATRIX_FORK_VERSION": "0x02000000",
-                    "CAPELLA_FORK_EPOCH": "194048",
-                    "CAPELLA_FORK_VERSION": "0x03000000",
-                    "DENEB_FORK_EPOCH": "269568",
-                    "DENEB_FORK_VERSION": "0x04000000",
-                    "ELECTRA_FORK_EPOCH": "364544",
-                    "ELECTRA_FORK_VERSION": "0x05000000",
-                    "FULU_FORK_EPOCH": "18446744073709551615",
-                    "FULU_FORK_VERSION": "0x06000000",
-                    "SECONDS_PER_SLOT": "12",
-                    "SLOTS_PER_EPOCH": "32"
-                }
+                "data": data
             })))
             .mount(&server)
             .await;
@@ -520,6 +585,61 @@ mod tests {
                 !handles.attesting_enabled.load(Ordering::SeqCst),
                 "disable_attesting must seed toggle false"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_build_services_gloas_both_unscheduled_omitted_keys() {
+        let dir = TempDir::new().unwrap();
+        let server = mock_bn_server_gloas("0x05000000", None, None).await;
+        let config = base_config(&dir, &server.uri());
+        let beacon = beacon_handles(&server.uri()).await;
+        let keys = loaded_keys(pubkey_map_with(&[]));
+
+        let handles =
+            run_phase(&config, &keys, &beacon).await.expect("both sources unscheduled must start");
+        assert_eq!(handles.orchestrator_config.fork_schedule.gloas_fork_epoch, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn test_build_services_gloas_both_scheduled_equal_resolves_gloas() {
+        let dir = TempDir::new().unwrap();
+        let server = mock_bn_server_gloas("0x05000000", Some("600000"), Some("0x07000000")).await;
+        let mut config = base_config(&dir, &server.uri());
+        config.fork_schedule = ForkScheduleConfig {
+            gloas_fork_epoch: Some(600_000),
+            gloas_fork_version: Some("0X07000000".into()),
+        };
+        let beacon = beacon_handles(&server.uri()).await;
+        let keys = loaded_keys(pubkey_map_with(&[]));
+
+        let handles =
+            run_phase(&config, &keys, &beacon).await.expect("equal scheduled pair must start");
+        let schedule = handles.orchestrator_config.fork_schedule.as_ref();
+        assert_eq!(schedule.gloas_fork_epoch, 600_000);
+        assert_eq!(ForkName::from_epoch(600_000, schedule), ForkName::Gloas);
+    }
+
+    #[tokio::test]
+    async fn test_build_services_gloas_disagreement_ignores_allow_unsupported_fork() {
+        let dir = TempDir::new().unwrap();
+        let server = mock_bn_server_gloas("0x05000000", Some("600000"), Some("0x07000000")).await;
+        let mut config = base_config(&dir, &server.uri());
+        config.allow_unsupported_fork = true;
+        let beacon = beacon_handles(&server.uri()).await;
+        let keys = loaded_keys(pubkey_map_with(&[]));
+
+        let result = run_phase(&config, &keys, &beacon).await;
+        assert!(result.is_err(), "D12 disagreement is not opt-outable");
+        match result.err().unwrap() {
+            BootstrapError::Startup(err @ StartupError::ForkScheduleMismatch(_)) => {
+                let msg = err.to_string();
+                assert!(msg.contains("rvc-config"), "{msg}");
+                assert!(msg.contains("/eth/v1/config/spec"), "{msg}");
+                assert!(msg.contains("600000"), "{msg}");
+                assert!(msg.contains("0x07000000"), "{msg}");
+            }
+            other => panic!("expected ForkScheduleMismatch, got {other:?}"),
         }
     }
 

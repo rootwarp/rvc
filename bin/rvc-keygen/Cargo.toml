@@ -31,5 +31,8 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 [dev-dependencies]
+# test-utils: EncryptionKdf cheap-KDF helpers in unit and integration tests (#602).
+# Dev-edge only — production `cargo build -p rvc-keygen` does not enable it.
+crypto = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tracing-test.workspace = true

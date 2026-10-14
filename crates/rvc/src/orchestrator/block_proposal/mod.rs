@@ -30,6 +30,7 @@
 
 use tracing::{error, info, warn};
 
+use block_service::metrics::{proposal_outcome, RVC_PROPOSALS_TOTAL};
 use block_service::BeaconBlockClient;
 use bn_manager::AttestationSubmitter;
 use eth_types::Slot;
@@ -43,8 +44,48 @@ use super::coordinator::DutyOrchestrator;
 use super::slot_context::SlotContext;
 use super::utils;
 
+fn inc_proposal_outcome(outcome: &str) {
+    #[cfg(test)]
+    if !proposal_counter_lock::enabled() {
+        return;
+    }
+    RVC_PROPOSALS_TOTAL.with_label_values(&[outcome]).inc();
+}
+
+/// Serializes proposal-outcome counter delta tests without blocking other callers.
 #[cfg(test)]
-mod tests;
+mod proposal_counter_lock {
+    use std::future::Future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::OnceLock;
+
+    tokio::task_local! {
+        static HELD: ();
+    }
+
+    static DELTA_TESTS: AtomicUsize = AtomicUsize::new(0);
+
+    fn mutex() -> &'static tokio::sync::Mutex<()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
+
+    pub fn enabled() -> bool {
+        if DELTA_TESTS.load(Ordering::SeqCst) == 0 {
+            true
+        } else {
+            HELD.try_with(|_| ()).is_ok()
+        }
+    }
+
+    pub async fn with_held<Fut: Future>(fut: Fut) -> Fut::Output {
+        DELTA_TESTS.fetch_add(1, Ordering::SeqCst);
+        let _guard = mutex().lock().await;
+        let out = HELD.scope((), fut).await;
+        DELTA_TESTS.fetch_sub(1, Ordering::SeqCst);
+        out
+    }
+}
 
 impl<C, S, B> DutyOrchestrator<C, S, B>
 where
@@ -86,22 +127,20 @@ where
             }
         }
 
-        // H-4: parse validator_index for proposer_index validation (returned as String by the BN type)
-        let expected_proposer_index: u64 = match proposer_duty.validator_index.parse() {
-            Ok(v) => v,
-            Err(_) => {
-                error!(slot, raw = %proposer_duty.validator_index,
-                    "Cannot parse proposer duty validator_index as u64 — dropping duty");
-                return;
-            }
-        };
+        // H-4: validator_index was parsed when the proposer duty entered the cache.
+        let expected_proposer_index = proposer_duty.validator_index;
 
         info!(slot, validator_index = %proposer_duty.validator_index, "Proposing block");
 
         // Wrap with combined produce + publish timeout
         match tokio::time::timeout(
             self.config.timeouts.block_production + self.config.timeouts.block_publication,
-            self.block_service.propose_block(slot, &pubkey, expected_proposer_index, ctx.head_root),
+            self.block_service.propose_block(
+                slot,
+                &pubkey,
+                expected_proposer_index,
+                ctx.parent_root,
+            ),
         )
         .await
         {
@@ -112,6 +151,7 @@ where
                 if was_tripped && !self.circuit_breaker.is_tripped() {
                     info!(slot, "Builder circuit breaker reset after successful proposal");
                 }
+                inc_proposal_outcome(proposal_outcome::SUCCESS);
                 info!(
                     slot,
                     blinded = result.is_blinded,
@@ -138,6 +178,7 @@ where
                         warn!(slot, "Builder circuit breaker tripped");
                     }
                 }
+                inc_proposal_outcome(proposal_outcome::FAILED);
                 error!(
                     slot,
                     epoch,
@@ -150,6 +191,7 @@ where
                 // was involved.  Do not record a miss — a transient BN or
                 // network slowdown that fires the outer timeout should not
                 // disable MEV for a full epoch (H-3).
+                inc_proposal_outcome(proposal_outcome::FAILED);
                 error!(
                     slot,
                     epoch,
@@ -162,3 +204,6 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

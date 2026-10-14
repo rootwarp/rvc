@@ -1,43 +1,51 @@
 //! SEC-2c: per-slot forward-window liveness observation loop.
 //!
 //! Drives [`ForwardWindowMachine`] with real network liveness via the bn-manager
-//! (`BeaconNodeClient::post_validator_liveness`, multi-BN `query_first` failover).
+//! (`LivenessApi::post_validator_liveness_merged`, multi-BN OR-merge).
 //!
 //! Each cycle (once per slot):
-//! 1. Periodically re-resolve numeric indices from the live [`PubkeyMap`] (import /
-//!    activation refresh — review Finding 3)
-//! 2. Query liveness for recently completed epochs that still need observation
-//! 3. Translate numeric validator indices → bare pubkey-hex (SEC-001)
-//! 4. `observe_liveness` then `tick`
+//! 1. Query liveness for recently completed epochs that still need observation
+//! 2. Translate numeric validator indices → bare pubkey-hex (SEC-001)
+//! 3. `observe_liveness` then `tick`
+//!
+//! Index refresh is not done here. [`crate::index_resolver::IndexResolver`] is the
+//! single production writer (ADR-R05).
 //!
 //! Detected liveness permanently closes the gate for that key (machine semantics).
 //! A clean fully-observed window opens the gate. This loop is the sole production
-//! doppelganger mechanism (the backward one-shot `DoppelgangerService` is not wired).
+//! doppelganger mechanism.
 //!
-//! # Multi-BN residual (review Finding 2 — accepted)
+//! # Multi-BN OR-merge (ARCH-P1-13)
 //!
-//! Liveness uses bn-manager `query_first`: the first healthy BN that returns HTTP
-//! success wins; there is **no cross-BN OR-merge of `is_live`**. A lagging or
-//! wrong primary that answers all-not-live suppresses secondaries that might
-//! report live activity. Fixing that needs a dedicated multi-query merge in
-//! bn-manager (not a simple existing `query_best` comparator). Residual risk is
-//! documented; loop still fail-closes on errors/incomplete samples.
+//! Liveness fans out to every configured BN via
+//! [`LivenessApi::post_validator_liveness_merged`]. Per validator index,
+//! `is_live` is OR-merged — any BN reporting live wins (fail-safe: a lagging
+//! primary that answers all-not-live cannot suppress a secondary that saw
+//! activity). Errors and non-responses contribute nothing (they are not treated
+//! as "not live"). If every BN fails the call returns `Err` and this loop still
+//! fail-closes on errors/incomplete samples.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bn_manager::BeaconNodeClient;
+use bn_manager::LivenessApi;
+#[cfg(any(test, feature = "test-utils"))]
+use bn_manager::NodeStatusApi;
 use doppelganger::{
     ForwardWindowMachine, ForwardWindowStatus, MonotonicEpochClock, ValidatorLivenessData,
     DEFAULT_MONITORING_EPOCHS,
 };
-use eth_types::{Epoch, SECONDS_PER_SLOT};
+use eth_types::{Epoch, SLOT_DURATION_MS};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
+use crate::bootstrap::executor::{ShutdownTier, TaskExecutor};
 use crate::orchestrator::PubkeyMap;
-use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x, SharedPubkeyIndexRegistry};
+use crate::pubkey_index::SharedPubkeyIndexRegistry;
+#[cfg(any(test, feature = "test-utils"))]
+use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x};
+use crate::quiesce::TrackedKeys;
 
 /// Lookback for completed-epoch liveness queries.
 ///
@@ -48,8 +56,7 @@ const LIVENESS_LOOKBACK_EPOCHS: u64 = DEFAULT_MONITORING_EPOCHS + 2;
 
 /// Merge `pubkey-hex → numeric index` entries into the shared registry.
 ///
-/// Safe to call from import/refresh paths so newly registered keys become
-/// observable without waiting for the next BN re-resolve cycle.
+/// [`crate::index_resolver::IndexResolver`] is the only production caller (ADR-R05).
 pub fn merge_validator_indices(
     registry: &SharedPubkeyIndexRegistry,
     pubkey_to_index: &HashMap<String, String>,
@@ -58,8 +65,10 @@ pub fn merge_validator_indices(
 }
 
 /// Handle returned by [`spawn_liveness_loop`].
+///
+/// The loop future is registered on the process [`TaskExecutor`] (ARCH-2g);
+/// this struct only carries the shared index registry for callers.
 pub struct LivenessLoopSpawn {
-    pub join: tokio::task::JoinHandle<()>,
     /// Shared pubkey↔index registry (import/refresh may call [`merge_validator_indices`]).
     pub pubkey_index: SharedPubkeyIndexRegistry,
 }
@@ -67,7 +76,7 @@ pub struct LivenessLoopSpawn {
 /// Background task that ticks the forward-window machine once per slot.
 pub struct LivenessObservationLoop {
     machine: Arc<ForwardWindowMachine>,
-    beacon: Arc<dyn BeaconNodeClient>,
+    beacon: Arc<dyn LivenessApi>,
     /// Shared pubkey ↔ index registry (liveness uses the reverse index→bare-hex view).
     pubkey_index: SharedPubkeyIndexRegistry,
     /// Live keystore/keymanager pubkey set for periodic BN index re-resolve.
@@ -76,141 +85,18 @@ pub struct LivenessObservationLoop {
     /// Slot duration used for the sleep interval (defaults to mainnet 12s).
     slot_duration: Duration,
     cancel: CancellationToken,
+    /// Keystore directory whose import sidecars are removed once a key is Safe.
+    import_sidecar_dir: Option<std::path::PathBuf>,
+    /// Same lock DELETE/import hold; cleanup takes it across Safe re-check + unlink.
+    tracked_keys: Option<Arc<TrackedKeys>>,
 }
 
-impl LivenessObservationLoop {
-    pub fn new(
-        machine: Arc<ForwardWindowMachine>,
-        beacon: Arc<dyn BeaconNodeClient>,
-        pubkey_index: SharedPubkeyIndexRegistry,
-        epoch_clock: Arc<MonotonicEpochClock>,
-        cancel: CancellationToken,
-    ) -> Self {
-        Self {
-            machine,
-            beacon,
-            pubkey_index,
-            pubkey_map: None,
-            epoch_clock,
-            slot_duration: Duration::from_secs(SECONDS_PER_SLOT),
-            cancel,
-        }
-    }
-
-    /// Attach the production pubkey map so the loop re-resolves indices periodically.
-    pub fn with_pubkey_map(mut self, pubkey_map: PubkeyMap) -> Self {
-        self.pubkey_map = Some(pubkey_map);
-        self
-    }
-
-    /// Override the slot sleep interval (tests).
-    pub fn with_slot_duration(mut self, slot_duration: Duration) -> Self {
-        self.slot_duration = slot_duration;
-        self
-    }
-
-    /// Shared registry handle.
-    pub fn pubkey_index(&self) -> SharedPubkeyIndexRegistry {
-        Arc::clone(&self.pubkey_index)
-    }
-
-    /// Run until cancelled. Spawns no tasks — call from `tokio::spawn`.
-    pub async fn run(self) {
-        info!(
-            slot_duration_secs = self.slot_duration.as_secs(),
-            lookback_epochs = LIVENESS_LOOKBACK_EPOCHS,
-            "SEC-2c: forward-window liveness observation loop started"
-        );
-
-        // Track epochs that completed at least once. While any key remains
-        // Pending we still re-query lookback epochs so a later is_live=true can
-        // Detect after an earlier complete not-live (review Finding 1).
-        let mut observed_epochs: HashSet<Epoch> = HashSet::new();
-        let mut has_pending = true;
-        let mut last_refresh_epoch: Option<Epoch> = None;
-
-        loop {
-            if self.cancel.is_cancelled() {
-                info!("SEC-2c: liveness observation loop cancelled");
-                break;
-            }
-
-            let current_epoch = self.epoch_clock.current_epoch();
-            let slot_in_epoch = self.epoch_clock.slot_in_epoch();
-
-            // Finding 3: re-resolve indices from the live pubkey set at least once
-            // per epoch (covers keymanager import + delayed activation).
-            if last_refresh_epoch != Some(current_epoch) {
-                self.refresh_indices_from_pubkey_map().await;
-                last_refresh_epoch = Some(current_epoch);
-            }
-
-            // Observe completed epochs that may still be needed by Pending keys.
-            if current_epoch > 0 {
-                let lookback_start = current_epoch.saturating_sub(LIVENESS_LOOKBACK_EPOCHS);
-                for epoch in lookback_start..current_epoch {
-                    // Finding 1: re-query while Pending remain; only skip when
-                    // nothing is Pending and this epoch already completed once.
-                    if !has_pending && observed_epochs.contains(&epoch) {
-                        continue;
-                    }
-                    match self.observe_epoch(epoch).await {
-                        Ok(true) => {
-                            observed_epochs.insert(epoch);
-                        }
-                        Ok(false) => {
-                            debug!(epoch, "liveness observation incomplete; will retry");
-                        }
-                        Err(e) => {
-                            warn!(
-                                epoch,
-                                error = %e,
-                                "liveness query failed; will retry next slot (fail-closed)"
-                            );
-                        }
-                    }
-                }
-            }
-
-            let statuses = self.machine.tick(current_epoch, slot_in_epoch);
-            has_pending = statuses.contains(&ForwardWindowStatus::Pending);
-            let detected = statuses.iter().filter(|s| **s == ForwardWindowStatus::Detected).count();
-            let pending = statuses.iter().filter(|s| **s == ForwardWindowStatus::Pending).count();
-            let safe = statuses.iter().filter(|s| **s == ForwardWindowStatus::Safe).count();
-            if detected > 0 {
-                error!(
-                    detected,
-                    pending,
-                    safe,
-                    current_epoch,
-                    slot_in_epoch,
-                    "doppelganger Detected: gate permanently closed for affected keys \
-                     (no signing for those validators)"
-                );
-            } else {
-                debug!(pending, safe, current_epoch, slot_in_epoch, "forward-window tick");
-            }
-
-            // Bound memory; keep more than lookback so re-queries after Pending
-            // drain still skip correctly.
-            if current_epoch > LIVENESS_LOOKBACK_EPOCHS + 4 {
-                let retain_from = current_epoch.saturating_sub(LIVENESS_LOOKBACK_EPOCHS + 4);
-                observed_epochs.retain(|e| *e >= retain_from);
-            }
-
-            tokio::select! {
-                _ = self.cancel.cancelled() => {
-                    info!("SEC-2c: liveness observation loop cancelled");
-                    break;
-                }
-                _ = tokio::time::sleep(self.slot_duration) => {}
-            }
-        }
-    }
-
-    /// Re-resolve validator indices for every key currently in the pubkey map.
-    async fn refresh_indices_from_pubkey_map(&self) {
-        let Some(ref pm) = self.pubkey_map else {
+/// Body of the retained liveness index refresh. Expanded only from the test helper
+/// (and, under `cfg(test)`, from `refresh_indices_from_pubkey_map`).
+#[cfg(any(test, feature = "test-utils"))]
+macro_rules! refresh_indices_from_pubkey_map_impl {
+    ($self:ident, $validators:expr) => {{
+        let Some(ref pm) = $self.pubkey_map else {
             return;
         };
         let pubkeys: Vec<String> = {
@@ -221,9 +107,9 @@ impl LivenessObservationLoop {
             map.keys().map(pubkey_bytes_to_0x).collect()
         };
 
-        match self.beacon.get_validators(&pubkeys).await {
+        match $validators.get_validators(&pubkeys).await {
             Ok(resp) => {
-                let mut w = self.pubkey_index.write();
+                let mut w = $self.pubkey_index.write();
                 let before = w.len();
                 for v in resp.data {
                     if let Some(bytes) = parse_pubkey_bytes(&v.validator.pubkey) {
@@ -248,6 +134,175 @@ impl LivenessObservationLoop {
                 );
             }
         }
+    }};
+}
+
+impl LivenessObservationLoop {
+    pub fn new(
+        machine: Arc<ForwardWindowMachine>,
+        beacon: Arc<dyn LivenessApi>,
+        pubkey_index: SharedPubkeyIndexRegistry,
+        epoch_clock: Arc<MonotonicEpochClock>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            machine,
+            beacon,
+            pubkey_index,
+            pubkey_map: None,
+            epoch_clock,
+            slot_duration: Duration::from_millis(SLOT_DURATION_MS),
+            cancel,
+            import_sidecar_dir: None,
+            tracked_keys: None,
+        }
+    }
+
+    /// Attach the pubkey map used by `refresh_indices_for_test`.
+    ///
+    /// Production index writes belong to [`crate::index_resolver::IndexResolver`]
+    /// (ADR-R05), not this loop.
+    pub fn with_pubkey_map(mut self, pubkey_map: PubkeyMap) -> Self {
+        self.pubkey_map = Some(pubkey_map);
+        self
+    }
+
+    /// Override the slot sleep interval (tests).
+    pub fn with_slot_duration(mut self, slot_duration: Duration) -> Self {
+        self.slot_duration = slot_duration;
+        self
+    }
+
+    /// Directory scanned after each tick. A Safe key's import sidecar is removed.
+    ///
+    /// That removal is the durable record that this process observed the
+    /// forward window. Pending and Detected keys keep their sidecars.
+    /// `tracked_keys` must be the same lock the keystore adapter uses for
+    /// DELETE/import so cleanup cannot race a concurrent re-import.
+    pub fn with_import_sidecar_dir(
+        mut self,
+        dir: std::path::PathBuf,
+        tracked_keys: Arc<TrackedKeys>,
+    ) -> Self {
+        self.import_sidecar_dir = Some(dir);
+        self.tracked_keys = Some(tracked_keys);
+        self
+    }
+
+    /// Shared registry handle.
+    pub fn pubkey_index(&self) -> SharedPubkeyIndexRegistry {
+        Arc::clone(&self.pubkey_index)
+    }
+
+    /// Run until cancelled. Spawns no tasks — register via [`spawn_liveness_loop`].
+    pub async fn run(self) {
+        info!(
+            slot_duration_secs = self.slot_duration.as_secs(),
+            lookback_epochs = LIVENESS_LOOKBACK_EPOCHS,
+            "SEC-2c: forward-window liveness observation loop started"
+        );
+
+        // Track epochs that completed at least once. While any key remains
+        // Pending we still re-query lookback epochs so a later is_live=true can
+        // Detect after an earlier complete not-live (review Finding 1).
+        let mut observed_epochs: HashSet<Epoch> = HashSet::new();
+        let mut has_pending = true;
+
+        // detached: process-lifetime loop root; the tick is the exported span.
+        let loop_span = tracing::debug_span!(parent: None, "liveness_loop");
+        loop {
+            let tick = tracing::debug_span!(parent: None, "liveness_loop.tick");
+            tick.follows_from(&loop_span);
+            let stop = async {
+                if self.cancel.is_cancelled() {
+                    info!("SEC-2c: liveness observation loop cancelled");
+                    return true;
+                }
+
+                let current_epoch = self.epoch_clock.current_epoch();
+                let slot_in_epoch = self.epoch_clock.slot_in_epoch();
+
+                // Observe completed epochs that may still be needed by Pending keys.
+                if current_epoch > 0 {
+                    let lookback_start = current_epoch.saturating_sub(LIVENESS_LOOKBACK_EPOCHS);
+                    for epoch in lookback_start..current_epoch {
+                        // Finding 1: re-query while Pending remain; only skip when
+                        // nothing is Pending and this epoch already completed once.
+                        if !has_pending && observed_epochs.contains(&epoch) {
+                            continue;
+                        }
+                        match self.observe_epoch(epoch).await {
+                            Ok(true) => {
+                                observed_epochs.insert(epoch);
+                            }
+                            Ok(false) => {
+                                debug!(epoch, "liveness observation incomplete; will retry");
+                            }
+                            Err(e) => {
+                                warn!(
+                                    epoch,
+                                    error = %e,
+                                    "liveness query failed; will retry next slot (fail-closed)"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                let statuses = self.machine.tick(current_epoch, slot_in_epoch);
+                self.record_completed_imports();
+                has_pending = statuses.contains(&ForwardWindowStatus::Pending);
+                let detected =
+                    statuses.iter().filter(|s| **s == ForwardWindowStatus::Detected).count();
+                let pending =
+                    statuses.iter().filter(|s| **s == ForwardWindowStatus::Pending).count();
+                let safe = statuses.iter().filter(|s| **s == ForwardWindowStatus::Safe).count();
+                if detected > 0 {
+                    error!(
+                        detected,
+                        pending,
+                        safe,
+                        current_epoch,
+                        slot_in_epoch,
+                        "doppelganger Detected: gate permanently closed for affected keys \
+                         (no signing for those validators)"
+                    );
+                } else {
+                    debug!(pending, safe, current_epoch, slot_in_epoch, "forward-window tick");
+                }
+
+                // Bound memory; keep more than lookback so re-queries after Pending
+                // drain still skip correctly.
+                if current_epoch > LIVENESS_LOOKBACK_EPOCHS + 4 {
+                    let retain_from = current_epoch.saturating_sub(LIVENESS_LOOKBACK_EPOCHS + 4);
+                    observed_epochs.retain(|e| *e >= retain_from);
+                }
+
+                tokio::select! {
+                    _ = self.cancel.cancelled() => {
+                        info!("SEC-2c: liveness observation loop cancelled");
+                        true
+                    }
+                    _ = tokio::time::sleep(self.slot_duration) => false
+                }
+            }
+            .instrument(tick)
+            .await;
+            if stop {
+                break;
+            }
+        }
+    }
+
+    /// Test-only index refresh. Production [`Self::run`] does not call this;
+    /// [`crate::index_resolver::IndexResolver`] is the ongoing writer (ADR-R05).
+    ///
+    /// Unit tests call it through [`Self::refresh_indices_for_test`]. Integration
+    /// tests build this crate without `cfg(test)`, so the helper inlines the same
+    /// body.
+    #[cfg(test)]
+    async fn refresh_indices_from_pubkey_map(&self, validators: &dyn NodeStatusApi) {
+        refresh_indices_from_pubkey_map_impl!(self, validators);
     }
 
     /// Query BN liveness for `epoch`, translate indices, feed the machine.
@@ -263,7 +318,7 @@ impl LivenessObservationLoop {
         let numeric_indices: Vec<String> = index_to_bare.keys().cloned().collect();
         let response = self
             .beacon
-            .post_validator_liveness(epoch, &numeric_indices)
+            .post_validator_liveness_merged(epoch, &numeric_indices)
             .await
             .map_err(|e| e.to_string())?;
 
@@ -297,6 +352,10 @@ impl LivenessObservationLoop {
     /// Single-cycle driver for tests (no sleep / cancel).
     ///
     /// Observes `observe_epoch` if given, then ticks at `(tick_epoch, slot_in_epoch)`.
+    ///
+    /// Compiled only for this crate's tests or when the `test-utils` feature
+    /// is enabled. Integration tests see it through the self dev-dependency.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn drive_once_for_test(
         &self,
         observe_epoch: Option<Epoch>,
@@ -306,12 +365,50 @@ impl LivenessObservationLoop {
         if let Some(epoch) = observe_epoch {
             let _ = self.observe_epoch(epoch).await?;
         }
-        Ok(self.machine.tick(tick_epoch, slot_in_epoch))
+        let statuses = self.machine.tick(tick_epoch, slot_in_epoch);
+        self.record_completed_imports();
+        Ok(statuses)
+    }
+
+    /// Drop import sidecars for loaded keys that are Safe.
+    ///
+    /// Called after every tick. A failed delete leaves the sidecar, so the
+    /// next boot stays Pending. Keys that are not Safe are left alone.
+    fn record_completed_imports(&self) {
+        let (Some(dir), Some(map), Some(tracked)) =
+            (&self.import_sidecar_dir, &self.pubkey_map, &self.tracked_keys)
+        else {
+            return;
+        };
+        let map = Arc::clone(map);
+        let machine = Arc::clone(&self.machine);
+        crate::config::clear_completed_import_sidecars(dir, tracked.as_ref(), move |pk| {
+            let Some(public) = map.read().get(pk).cloned() else {
+                return false;
+            };
+            machine.status(&public) == ForwardWindowStatus::Safe
+        });
     }
 
     /// Test helper: run one index refresh from the attached pubkey map.
-    pub async fn refresh_indices_for_test(&self) {
-        self.refresh_indices_from_pubkey_map().await;
+    ///
+    /// `validators` is the index lookup. The loop client is only [`LivenessApi`],
+    /// which has no `get_validators`. Not a production writer. [`Self::run`]
+    /// must not call this.
+    ///
+    /// Compiled only for this crate's tests or when the `test-utils` feature
+    /// is enabled. Integration tests build this crate without `cfg(test)`, so
+    /// the `test-utils` arm inlines the refresh body.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn refresh_indices_for_test(&self, validators: &dyn NodeStatusApi) {
+        #[cfg(test)]
+        {
+            self.refresh_indices_from_pubkey_map(validators).await;
+        }
+        #[cfg(not(test))]
+        {
+            refresh_indices_from_pubkey_map_impl!(self, validators);
+        }
     }
 }
 
@@ -319,15 +416,20 @@ impl LivenessObservationLoop {
 /// keys (resolved indices and/or a non-empty pubkey map for later re-resolve).
 ///
 /// `pubkey_index` is the workspace-shared registry (same handle used by
-/// `prepare_proposers` / duty tracking). Callers must seed it before spawn or
-/// attach a non-empty `pubkey_map` so re-resolve can fill it later.
+/// `prepare_proposers` / duty tracking). Production index refresh is
+/// [`crate::index_resolver::IndexResolver`]; `pubkey_map` stays attached for
+/// `LivenessObservationLoop::refresh_indices_for_test`.
+///
+/// The loop is registered on `executor` at Orchestrator tier (ARCH-2g P1-7).
 pub fn spawn_liveness_loop(
     machine: Option<Arc<ForwardWindowMachine>>,
-    beacon: Arc<dyn BeaconNodeClient>,
+    beacon: Arc<dyn LivenessApi>,
     pubkey_index: SharedPubkeyIndexRegistry,
     pubkey_map: Option<PubkeyMap>,
     epoch_clock: Arc<MonotonicEpochClock>,
-    cancel: CancellationToken,
+    executor: &TaskExecutor,
+    // Keystore dir + shared DELETE/import lock for Safe sidecar cleanup.
+    import_sidecar: Option<(std::path::PathBuf, Arc<TrackedKeys>)>,
 ) -> Option<LivenessLoopSpawn> {
     let machine = machine?;
     let has_pubkeys = pubkey_map.as_ref().is_some_and(|m| !m.read().is_empty());
@@ -341,28 +443,32 @@ pub fn spawn_liveness_loop(
     }
     if !has_indices {
         info!(
-            "SEC-2c: starting liveness loop with empty indices; will re-resolve from pubkey_map \
-             (pending activation / post-import)"
+            "SEC-2c: starting liveness loop with empty indices \
+             (IndexResolver owns index refresh; pending activation / post-import)"
         );
     }
 
     let pubkey_index_ret = Arc::clone(&pubkey_index);
+    let cancel = executor.token();
     let mut loop_task =
         LivenessObservationLoop::new(machine, beacon, pubkey_index, epoch_clock, cancel);
     if let Some(pm) = pubkey_map {
         loop_task = loop_task.with_pubkey_map(pm);
     }
-    let join = tokio::spawn(async move {
+    if let Some((dir, tracked)) = import_sidecar {
+        loop_task = loop_task.with_import_sidecar_dir(dir, tracked);
+    }
+    executor.spawn("liveness_loop", ShutdownTier::Orchestrator, async move {
         loop_task.run().await;
     });
-    Some(LivenessLoopSpawn { join, pubkey_index: pubkey_index_ret })
+    Some(LivenessLoopSpawn { pubkey_index: pubkey_index_ret })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pubkey_index::PubkeyIndexRegistry;
-    use bn_manager::{BeaconNodeClient, MockBeaconNodeClient};
+    use bn_manager::MockBeaconNodeClient;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use beacon::{
@@ -529,7 +635,7 @@ mod tests {
 
     fn loop_with(
         machine: Arc<ForwardWindowMachine>,
-        beacon: Arc<dyn BeaconNodeClient>,
+        beacon: Arc<dyn LivenessApi>,
         numeric_index: &str,
         pubkey: &crypto::PublicKey,
     ) -> LivenessObservationLoop {
@@ -592,6 +698,71 @@ mod tests {
         assert_eq!(m.status(&pk), ForwardWindowStatus::Safe);
     }
 
+    /// A completed forward window removes the import sidecar. Pending and
+    /// Detected keys keep theirs.
+    #[tokio::test]
+    async fn test_observed_safe_removes_import_sidecar_pending_and_detected_keep_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let m = machine();
+        let safe_pk = new_pk();
+        let pending_pk = new_pk();
+        let detected_pk = new_pk();
+        let start = 20u64;
+        m.register_for_import(&safe_pk, start);
+        m.register_for_import(&pending_pk, start + 50);
+        m.register_for_import(&detected_pk, start);
+
+        let write = |pk: &crypto::PublicKey| {
+            let path =
+                dir.path().join(format!("0x{}.import_meta.json", hex::encode(pk.to_bytes())));
+            std::fs::write(&path, "{\"imported_unix_seconds\":1}").unwrap();
+            path
+        };
+        let safe_path = write(&safe_pk);
+        let pending_path = write(&pending_pk);
+        let detected_path = write(&detected_pk);
+
+        let mut pm = HashMap::new();
+        pm.insert(safe_pk.to_bytes(), safe_pk.clone());
+        pm.insert(pending_pk.to_bytes(), pending_pk.clone());
+        pm.insert(detected_pk.to_bytes(), detected_pk.clone());
+        let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(pm));
+
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(safe_pk.to_bytes(), "7".to_string());
+        reg.write().insert(detected_pk.to_bytes(), "8".to_string());
+        let bn = Arc::new(with_live(&[("7", false), ("8", true)]).0);
+        let loop_ = LivenessObservationLoop::new(
+            Arc::clone(&m),
+            bn,
+            reg,
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
+            CancellationToken::new(),
+        )
+        .with_slot_duration(Duration::from_millis(1))
+        .with_pubkey_map(pubkey_map)
+        .with_import_sidecar_dir(
+            dir.path().to_path_buf(),
+            Arc::new(crate::quiesce::TrackedKeys::new()),
+        );
+
+        // Detected on the first observation. The safe key is still Pending.
+        loop_.drive_once_for_test(Some(start), start, 0).await.unwrap();
+        assert_eq!(m.status(&detected_pk), ForwardWindowStatus::Detected);
+        assert!(detected_path.exists(), "Detected must keep the unfinished marker");
+        assert!(safe_path.exists(), "Pending must keep the unfinished marker");
+
+        let end = start + DEFAULT_MONITORING_EPOCHS;
+        for epoch in (start + 1)..=end {
+            loop_.drive_once_for_test(Some(epoch), epoch, 0).await.unwrap();
+        }
+        loop_.drive_once_for_test(None, end, SLOTS_PER_EPOCH - 1).await.unwrap();
+        assert_eq!(m.status(&safe_pk), ForwardWindowStatus::Safe);
+        assert!(!safe_path.exists(), "Safe observation must remove the import sidecar");
+        assert!(pending_path.exists(), "a key still inside its window keeps its sidecar");
+        assert!(detected_path.exists(), "Detected must keep the unfinished marker");
+    }
+
     #[tokio::test]
     async fn test_liveness_loop_routes_through_bn_manager_failover() {
         let m = machine();
@@ -602,8 +773,8 @@ mod tests {
         // Failover sequence preserved: one call path that succeeds after primary would fail
         // (shared mock returns secondary-style success; primary permanent-down is modeled
         // by always returning the secondary result — loop sees a single Ok, same as before).
-        let failover: Arc<dyn BeaconNodeClient> = Arc::new(build_failover_liveness_mock(&["99"]));
-        let loop_ = loop_with(Arc::clone(&m), Arc::clone(&failover), "99", &pk);
+        let failover = Arc::new(build_failover_liveness_mock(&["99"]));
+        let loop_ = loop_with(Arc::clone(&m), failover.clone(), "99", &pk);
 
         let ok = loop_.drive_once_for_test(Some(start), start, 0).await;
         assert!(ok.is_ok(), "failover must succeed via secondary: {ok:?}");
@@ -634,38 +805,42 @@ mod tests {
 
         let reg = PubkeyIndexRegistry::shared();
         reg.write().insert(pk.to_bytes(), "1".to_string());
-        let bn: Arc<dyn BeaconNodeClient> = Arc::new(all_not_live(&["1"]).0);
-        let cancel = CancellationToken::new();
+        let bn = Arc::new(all_not_live(&["1"]).0);
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
         let handle = spawn_liveness_loop(
             Some(Arc::clone(&m)),
             bn,
             Arc::clone(&reg),
             None,
             Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 1_000_000)),
-            cancel.clone(),
+            &exec,
+            None,
         );
         assert!(handle.is_some(), "production loop must spawn with indices");
-        cancel.cancel();
-        let _ = handle.unwrap().join.await;
+        let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
 
         let empty = PubkeyIndexRegistry::shared();
+        let (exec2, _rx2) = TaskExecutor::new(CancellationToken::new());
         let no_handle = spawn_liveness_loop(
             Some(machine()),
             Arc::new(all_not_live(&[]).0),
             empty,
             None,
             Arc::new(MonotonicEpochClock::new(0)),
-            CancellationToken::new(),
+            &exec2,
+            None,
         );
         assert!(no_handle.is_none());
 
+        let (exec3, _rx3) = TaskExecutor::new(CancellationToken::new());
         let no_machine = spawn_liveness_loop(
             None,
             Arc::new(all_not_live(&["1"]).0),
             Arc::clone(&reg),
             None,
             Arc::new(MonotonicEpochClock::new(0)),
-            CancellationToken::new(),
+            &exec3,
+            None,
         );
         assert!(no_machine.is_none());
     }
@@ -696,7 +871,7 @@ mod tests {
 
         let loop_ = LivenessObservationLoop::new(
             Arc::clone(&m),
-            bn as Arc<dyn BeaconNodeClient>,
+            bn.clone(),
             Arc::clone(&pubkey_index),
             Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
             CancellationToken::new(),
@@ -710,7 +885,7 @@ mod tests {
         assert!(pubkey_index.read().is_empty());
 
         // Refresh pulls index 77 from BN for the pubkey_map key.
-        loop_.refresh_indices_for_test().await;
+        loop_.refresh_indices_for_test(bn.as_ref()).await;
         assert_eq!(pubkey_index.read().bare_hex_of_index("77"), Some(bare.as_str()));
 
         // Now observation succeeds for the imported key.
@@ -776,17 +951,87 @@ mod tests {
         pm.insert(pk.to_bytes(), pk);
         let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(pm));
         let empty = PubkeyIndexRegistry::shared();
-        let cancel = CancellationToken::new();
+        let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
         let spawn = spawn_liveness_loop(
             Some(machine()),
             Arc::new(all_not_live(&[]).0),
             empty,
             Some(pubkey_map),
             Arc::new(MonotonicEpochClock::new(0)),
-            cancel.clone(),
+            &exec,
+            None,
         );
-        assert!(spawn.is_some(), "must start so pending-activation keys can re-resolve");
-        cancel.cancel();
-        let _ = spawn.unwrap().join.await;
+        assert!(
+            spawn.is_some(),
+            "must start with an empty index set and a pubkey map; IndexResolver re-resolves \
+             pending-activation keys, not this loop"
+        );
+        let _ = exec.shutdown(crate::bootstrap::executor::TierBudget::default()).await;
+    }
+
+    /// Production `run` must not refresh indices. The refresh method is `cfg(test)`.
+    #[test]
+    fn has_no_index_refresh_call() {
+        let src = include_str!("liveness_loop.rs");
+        let run_body = src
+            .split("pub async fn run(self)")
+            .nth(1)
+            .expect("run")
+            .split("/// Test-only index refresh")
+            .next()
+            .expect("refresh docs follow run");
+        assert!(
+            !run_body.contains("refresh_indices_from_pubkey_map"),
+            "production liveness loop must not refresh indices"
+        );
+        assert!(
+            !run_body.contains("refresh_indices_for_test"),
+            "production liveness loop must not call the test helper"
+        );
+        let fn_at = src.find("async fn refresh_indices_from_pubkey_map").expect("method");
+        assert!(
+            src[..fn_at].lines().rev().take(12).any(|line| line.trim() == "#[cfg(test)]"),
+            "refresh_indices_from_pubkey_map must be test-only"
+        );
+        assert!(src.contains("fn refresh_indices_for_test"));
+    }
+
+    /// Beacon stand-in that implements [`LivenessApi`] and nothing else.
+    ///
+    /// Construction is the proof: a `BeaconNodeClient` constructor cannot name
+    /// this type.
+    struct LivenessOnlyMock;
+
+    #[async_trait::async_trait]
+    impl LivenessApi for LivenessOnlyMock {
+        async fn post_validator_liveness(
+            &self,
+            _epoch: u64,
+            _validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError> {
+            Ok(ValidatorLivenessResponse { data: vec![] })
+        }
+
+        async fn post_validator_liveness_merged(
+            &self,
+            epoch: u64,
+            validator_indices: &[String],
+        ) -> Result<ValidatorLivenessResponse, BeaconError> {
+            self.post_validator_liveness(epoch, validator_indices).await
+        }
+    }
+
+    /// A liveness-only client must construct [`LivenessObservationLoop`].
+    #[tokio::test]
+    async fn liveness_only_mock_satisfies_observation_loop() {
+        let loop_ = LivenessObservationLoop::new(
+            machine(),
+            Arc::new(LivenessOnlyMock),
+            PubkeyIndexRegistry::shared(),
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
+            CancellationToken::new(),
+        );
+        let statuses = loop_.drive_once_for_test(None, 0, 0).await.expect("tick");
+        assert!(statuses.is_empty());
     }
 }

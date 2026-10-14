@@ -1,0 +1,9 @@
+{
+  "data": {
+    "head_slot": "100",
+    "sync_distance": "12000",
+    "is_syncing": true,
+    "is_optimistic": false,
+    "el_offline": false
+  }
+}

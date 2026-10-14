@@ -17,8 +17,8 @@
 //! without a deliberate policy exception (prefer KAT vectors or a `// kat_exempt: reason` marker
 //! next to the test instead).
 //!
-//! Cross-ref: test-audit issue **3.4** ("Rewrite tautological block root test") is expected to
-//! drop `test_compute_block_root_matches_tree_hash` / sibling self-consistency rows as it lands.
+//! Cross-ref: issue **6.8** KAT-anchored `test_compute_block_root_matches_tree_hash` and
+//! `test_propose_block_ssz_block_root_uses_tree_hash` via `EXTERNAL_ELECTRA_BLOCK_ROOT_HEX`.
 //!
 //! No external dependency (Phase-1 rule P6): hand-rolled scan, same style as `no_rvc_prefix.rs`.
 
@@ -36,11 +36,9 @@ use std::path::{Path, PathBuf};
 /// KAT-anchored assertion (or an in-source `// kat_exempt: <reason>` marker for intentional
 /// false positives) over growing this list. See module docs + CLAUDE.md Testing.
 // Sorted by (path, name). Categories (for humans; order is lexical):
-// - name-pattern false positives (genesis_root, dependent_root, logging, wire paths, …)
+// - name-pattern false positives (genesis_root, dependent_root, wire paths, …)
 // - self-consistency / relative root coverage (H5 targets; test-audit 3.4 shrinks block-service rows)
-// - true KATs using inline EXPECTED* vectors (not yet EXTERNAL_/KAT_/SPEC_ names)
 const EXEMPTIONS: &[(&str, &str)] = &[
-    ("bin/rvc-keygen/src/bls_to_execution.rs", "test_bls_to_execution_uses_actual_genesis_root"),
     ("bin/rvc-keygen/src/deposit.rs", "test_sign_deposit_uses_zeroed_genesis_root"),
     ("bin/rvc-keygen/src/deposit.rs", "test_to_launchpad_json_deposit_data_root"),
     ("bin/rvc-keygen/src/deposit.rs", "test_to_launchpad_json_deposit_message_root"),
@@ -59,26 +57,8 @@ const EXEMPTIONS: &[(&str, &str)] = &[
         "crates/block-service/src/service/tests/propose.rs",
         "test_compute_blinded_block_root_matches_tree_hash",
     ),
-    (
-        "crates/block-service/src/service/tests/propose.rs",
-        "test_compute_block_root_matches_tree_hash",
-    ),
-    (
-        "crates/block-service/src/service/tests/propose.rs",
-        "test_propose_block_publish_truncates_block_root",
-    ),
-    (
-        "crates/block-service/src/service/tests/ssz.rs",
-        "test_propose_block_ssz_block_root_uses_tree_hash",
-    ),
-    (
-        "crates/crypto/src/remote_signer/client_tests.rs",
-        "test_web3signer_client_posts_typed_body_not_bare_root",
-    ),
-    ("crates/crypto/src/remote_signer/wire.rs", "test_all_builders_set_signing_root"),
     ("crates/crypto/src/signing.rs", "test_attestation_data_tree_hash_root"),
     ("crates/crypto/src/signing.rs", "test_checkpoint_tree_hash_root"),
-    ("crates/crypto/src/signing.rs", "test_compute_signing_root_trace_truncates_domain_and_root"),
     ("crates/crypto/src/signing.rs", "test_hash_tree_root_uses_spec_compliant_tree_hash"),
     ("crates/crypto/src/signing.rs", "test_signing_data_tree_hash_root"),
     (
@@ -89,37 +69,7 @@ const EXEMPTIONS: &[(&str, &str)] = &[
         "crates/crypto/src/signing_root.rs",
         "test_signing_root_for_full_block_matches_compute_signing_root",
     ),
-    ("crates/crypto/tests/signing_root_kat.rs", "kat_builder_registration_signing_root"),
-    ("crates/crypto/tests/signing_root_kat.rs", "kat_electra_aggregate_and_proof_signing_root"),
-    ("crates/crypto/tests/signing_root_kat.rs", "kat_typed_signer_attestation_matches_kat_root"),
-    (
-        "crates/crypto/tests/signing_root_kat.rs",
-        "kat_typed_signer_builder_registration_matches_kat_root",
-    ),
-    ("crates/crypto/tests/signing_root_kat.rs", "kat_typed_signer_randao_matches_kat_root"),
-    ("crates/crypto/tests/signing_root_kat.rs", "kat_typed_signer_sync_message_matches_kat_root"),
-    (
-        "crates/crypto/tests/signing_root_kat.rs",
-        "kat_typed_signer_voluntary_exit_eip7044_matches_kat_root",
-    ),
     ("crates/duty-tracker/src/tracker.rs", "test_get_cached_proposer_dependent_root"),
-    (
-        "crates/eth-types/src/aggregation.rs",
-        "test_aggregate_and_proof_tree_hash_different_index_different_root",
-    ),
-    (
-        "crates/eth-types/src/aggregation.rs",
-        "test_attestation_tree_hash_different_data_different_root",
-    ),
-    (
-        "crates/eth-types/src/builder.rs",
-        "test_builder_registration_tree_hash_different_data_different_root",
-    ),
-    (
-        "crates/eth-types/src/sync_committee.rs",
-        "test_sync_committee_contribution_tree_hash_field_sensitivity_block_root",
-    ),
-    ("crates/eth-types/src/tree_hash_utils.rs", "test_bitlist_limit_changes_root"),
     ("crates/rvc/src/config/builder.rs", "test_parse_genesis_validators_root"),
     ("crates/rvc/src/config/network.rs", "test_network_genesis_validators_root"),
     (
@@ -158,7 +108,6 @@ const EXEMPTIONS: &[(&str, &str)] = &[
     ("crates/slashing/src/types.rs", "test_interchange_attestation_without_signing_root"),
     ("crates/slashing/src/types.rs", "test_interchange_block_without_signing_root"),
     ("crates/slashing/src/types.rs", "test_signed_attestation_without_signing_root"),
-    ("crates/slashing/tests/stage.rs", "test_slashing_decision_logged_at_debug_without_root"),
     ("crates/telemetry/src/propagation.rs", "test_set_parent_after_enter_is_noop_root"),
 ];
 
@@ -457,6 +406,16 @@ fn kat_policy_no_unanchored_root_tests() {
     // We do not fail on unused exemptions so renames/deletes can land without a paired EXEMPTIONS
     // edit in the same PR — reviewers still remove rows when converting to KATs.
     let _ = used_exemptions;
+}
+
+/// Shrinking-only ratchet (ARCH-7l). Never raise this bound.
+#[test]
+fn exemptions_count_is_at_most_37() {
+    assert!(
+        EXEMPTIONS.len() <= 37,
+        "EXEMPTIONS is shrinking-only; len={} exceeds ratchet 37",
+        EXEMPTIONS.len()
+    );
 }
 
 #[test]

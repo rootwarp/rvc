@@ -1,8 +1,7 @@
 //! Shared restart-aware safe-skip predicate for doppelganger detection.
 //!
-//! Both [`crate::ForwardWindowMachine::register`] and
-//! [`crate::DoppelgangerService::check_validators`] use this single predicate
-//! so the pre-genesis guard and recency window cannot drift.
+//! [`crate::ForwardWindowMachine::register`] uses this predicate so the
+//! pre-genesis guard and recency window cannot drift.
 
 use eth_types::Epoch;
 
@@ -19,7 +18,7 @@ use eth_types::Epoch;
 /// 4. `current_epoch - last_signed_epoch <= monitoring_epochs`
 ///    (attestation is still within the monitoring window).
 ///
-/// Used by both the forward-window machine and the legacy one-shot service.
+/// Used by the forward-window machine.
 #[must_use]
 pub fn should_skip_restart_monitoring(
     current_epoch: Epoch,

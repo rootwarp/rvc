@@ -100,11 +100,14 @@ pub(crate) fn build_grpc_router(deps: GrpcRouterDeps<'_>) -> Result<BuiltGrpcRou
                      Create a dvt-allowed-peers.toml file and pass its path via --dvt-allowed-peers.",
                 )
             })?;
-        Some(dvt::peer_service::PeerSignerServiceImpl::new(
-            share_map,
-            allow_list,
-            deps.slashing_db.clone(),
-        ))
+        Some(
+            dvt::peer_service::PeerSignerServiceImpl::new(
+                share_map,
+                allow_list,
+                deps.slashing_db.clone(),
+            )
+            .with_genesis_fork_version(deps.resolved.genesis_fork_version),
+        )
     } else {
         None
     };
@@ -239,6 +242,9 @@ mod tests {
             data_dir: None,
             disable_slashing_protection: true,
             init_slashing_db: false,
+            group_commit_batch_size: None,
+            group_commit_wait_to_fill_ms: None,
+            gloas_fork_epoch: u64::MAX,
             metrics_address: "127.0.0.1:0".to_string(),
             enable_log_reload: false,
             allowed_client_cns: None,

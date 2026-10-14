@@ -430,7 +430,7 @@ async fn aggregate_and_proof_v2_electra_kat() {
     let body = p1_body(
         "AGGREGATE_AND_PROOF_V2",
         "aggregate_and_proof",
-        serde_json::to_string(&agg).unwrap(),
+        versioned_aggregate_v2_json("ELECTRA", serde_json::to_string(&agg).unwrap()),
     );
     assert_eq!(sign_ok(body).await, expected.to_vec());
 }
@@ -450,7 +450,7 @@ async fn base_and_electra_aggregate_and_proof_do_not_collide() {
     let electra_body = p1_body(
         "AGGREGATE_AND_PROOF_V2",
         "aggregate_and_proof",
-        serde_json::to_string(&electra).unwrap(),
+        versioned_aggregate_v2_json("ELECTRA", serde_json::to_string(&electra).unwrap()),
     );
     assert_ne!(sign_ok(base_body).await, sign_ok(electra_body).await);
 }
@@ -466,8 +466,9 @@ async fn electra_v2_frozen_fixture_parses_and_signs_to_eth_types_root() {
     // (the same `ElectraAggregateAndProof` serde the server's variant uses),
     // NOT from our own serializer — this is the wire-shape freeze check.
     let v: serde_json::Value = serde_json::from_str(&fixture).unwrap();
+    assert_eq!(v["aggregate_and_proof"]["version"], "ELECTRA");
     let electra: ElectraAggregateAndProof =
-        serde_json::from_value(v["aggregate_and_proof"].clone()).unwrap();
+        serde_json::from_value(v["aggregate_and_proof"]["data"].clone()).unwrap();
     assert!(!electra.aggregate.committee_bits.is_empty(), "Electra committee_bits decoded");
 
     let domain = compute_domain(DOMAIN_AGGREGATE_AND_PROOF, CURRENT_VERSION, expected_gvr());
@@ -480,12 +481,259 @@ async fn electra_v2_frozen_fixture_parses_and_signs_to_eth_types_root() {
     assert_eq!(sign_ok(fixture).await, expected.to_vec());
 }
 
+/// L3: HTTP `PAYLOAD_ATTESTATION` signs the plan-engine / pyspec root.
+#[tokio::test]
+async fn payload_attestation_kat_signs_kat_gloas_payload_attestation_signing_root() {
+    let (sk, _) = test_keypair();
+    let kat: [u8; 32] =
+        hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+            .expect("kat hex")
+            .try_into()
+            .expect("32-byte kat root");
+    let expected = sk.sign(&kat).to_bytes();
+    assert_eq!(sign_ok(payload_attestation_body("GLOAS")).await, expected.to_vec());
+}
+
+/// L3: HTTP `PROPOSER_PREFERENCES` signs the plan-engine / pyspec root.
+#[tokio::test]
+async fn proposer_preferences_kat_signs_kat_gloas_proposer_preferences_signing_root() {
+    let (sk, _) = test_keypair();
+    let kat: [u8; 32] =
+        hex::decode(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+            .expect("kat hex")
+            .try_into()
+            .expect("32-byte kat root");
+    let expected = sk.sign(&kat).to_bytes();
+    assert_eq!(sign_ok(proposer_preferences_body("GLOAS")).await, expected.to_vec());
+}
+
+/// L3: HTTP `BUILDER_REQUEST_AUTH` signs the plan-engine / pyspec root.
+#[tokio::test]
+async fn builder_request_auth_kat_signs_kat_gloas_builder_request_auth_signing_root() {
+    let (sk, _) = test_keypair();
+    let kat: [u8; 32] = hex::decode(
+        rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT,
+    )
+    .expect("kat hex")
+    .try_into()
+    .expect("32-byte kat root");
+    let expected = sk.sign(&kat).to_bytes();
+    assert_eq!(sign_ok(builder_request_auth_body("GLOAS")).await, expected.to_vec());
+}
+
+/// HTTP `PROPOSER_PREFERENCES` must not stage or commit a slashing-DB row.
+#[tokio::test]
+async fn proposer_preferences_http_writes_no_slashing_row() {
+    let (sk, pk_bytes) = test_keypair();
+    let db = Arc::new(slashing::SlashingDb::open_in_memory().expect("in-memory slashing DB"));
+    let backend: Arc<dyn crate::backend::SigningBackend> =
+        Arc::new(RealSigningBackend::with_key(sk));
+    let gate = Arc::new(crate::service::SignerServiceImpl::build_gate(
+        Arc::clone(&backend),
+        Arc::clone(&db),
+    ));
+    let state = crate::http_api::Web3SignerState {
+        gate,
+        backend,
+        audit: crate::http_api::AuditCfg::default(),
+        metrics: Arc::new(crate::metrics::SignerMetrics::new()),
+        client_cn_allow_list: None,
+        genesis_fork_version: crate::sign_plan::BUILDER_FORK_VERSION_MAINNET,
+    };
+    let pk_hex = hex::encode(pk_bytes);
+    let before_blocks = db.get_blocks(&pk_hex).expect("query blocks").len();
+    let before_attestations = db.get_attestations(&pk_hex).expect("query attestations").len();
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let resp = post_sign(state, &id, None, proposer_preferences_body("GLOAS")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        db.get_blocks(&pk_hex).expect("query blocks").len(),
+        before_blocks,
+        "proposer preferences must not write a block row"
+    );
+    assert_eq!(
+        db.get_attestations(&pk_hex).expect("query attestations").len(),
+        before_attestations,
+        "proposer preferences must not write an attestation row"
+    );
+}
+
+/// HTTP `BUILDER_REQUEST_AUTH` must not stage or commit a slashing-DB row.
+#[tokio::test]
+async fn builder_request_auth_http_writes_no_slashing_row() {
+    let (sk, pk_bytes) = test_keypair();
+    let db = Arc::new(slashing::SlashingDb::open_in_memory().expect("in-memory slashing DB"));
+    let backend: Arc<dyn crate::backend::SigningBackend> =
+        Arc::new(RealSigningBackend::with_key(sk));
+    let gate = Arc::new(crate::service::SignerServiceImpl::build_gate(
+        Arc::clone(&backend),
+        Arc::clone(&db),
+    ));
+    let state = crate::http_api::Web3SignerState {
+        gate,
+        backend,
+        audit: crate::http_api::AuditCfg::default(),
+        metrics: Arc::new(crate::metrics::SignerMetrics::new()),
+        client_cn_allow_list: None,
+        genesis_fork_version: crate::sign_plan::BUILDER_FORK_VERSION_MAINNET,
+    };
+    let pk_hex = hex::encode(pk_bytes);
+    let before_blocks = db.get_blocks(&pk_hex).expect("query blocks").len();
+    let before_attestations = db.get_attestations(&pk_hex).expect("query attestations").len();
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let resp = post_sign(state, &id, None, builder_request_auth_body("GLOAS")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        db.get_blocks(&pk_hex).expect("query blocks").len(),
+        before_blocks,
+        "builder request auth must not write a block row"
+    );
+    assert_eq!(
+        db.get_attestations(&pk_hex).expect("query attestations").len(),
+        before_attestations,
+        "builder request auth must not write an attestation row"
+    );
+}
+
+/// A7 label is the bounded `grpc_sign_type::PAYLOAD_ATTESTATION` constant, never
+/// the request's `type` discriminator.
+#[test]
+fn http_a7_sign_type_payload_attestation_is_bounded() {
+    use crate::http_api::request::SignPayload;
+    use crate::metrics::grpc_sign_type;
+    use eth_types::ForkName;
+    use web3signer_wire::VersionedPayload;
+
+    let payload = SignPayload::PayloadAttestation {
+        payload_attestation: VersionedPayload { version: ForkName::Gloas, data: ptc_kat_data() },
+    };
+    let label = http_a7_sign_type(&payload);
+    assert_eq!(label, grpc_sign_type::PAYLOAD_ATTESTATION);
+    assert_eq!(label, "payload_attestation");
+    assert_ne!(label, payload.type_name(), "must not use the request type discriminator");
+}
+
+#[tokio::test]
+async fn payload_attestation_http_a7_records_bounded_label() {
+    use crate::metrics::grpc_sign_type;
+
+    let (sk, pk_bytes) = test_keypair();
+    let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+    let metrics = Arc::clone(&state.metrics);
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let resp = post_sign(state, &id, None, payload_attestation_body("GLOAS")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        metrics
+            .sign_total
+            .with_label_values(&["basic", grpc_sign_type::PAYLOAD_ATTESTATION, "success"])
+            .get(),
+        1,
+        "A7 sign_total uses the bounded payload_attestation label"
+    );
+    assert_eq!(
+        metrics.sign_total.with_label_values(&["basic", "PAYLOAD_ATTESTATION", "success"]).get(),
+        0,
+        "must not record the request type discriminator as the A7 label"
+    );
+}
+
+/// A7 label is the bounded `grpc_sign_type::PROPOSER_PREFERENCES` constant, never
+/// the request's `type` discriminator.
+#[test]
+fn http_a7_sign_type_proposer_preferences_is_bounded() {
+    use crate::http_api::request::SignPayload;
+    use crate::metrics::grpc_sign_type;
+    use eth_types::ForkName;
+    use web3signer_wire::VersionedPayload;
+
+    let payload = SignPayload::ProposerPreferences {
+        proposer_preferences: VersionedPayload { version: ForkName::Gloas, data: prefs_kat_data() },
+    };
+    let label = http_a7_sign_type(&payload);
+    assert_eq!(label, grpc_sign_type::PROPOSER_PREFERENCES);
+    assert_eq!(label, "proposer_preferences");
+    assert_ne!(label, payload.type_name(), "must not use the request type discriminator");
+}
+
+#[tokio::test]
+async fn proposer_preferences_http_a7_records_bounded_label() {
+    use crate::metrics::grpc_sign_type;
+
+    let (sk, pk_bytes) = test_keypair();
+    let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+    let metrics = Arc::clone(&state.metrics);
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let resp = post_sign(state, &id, None, proposer_preferences_body("GLOAS")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        metrics
+            .sign_total
+            .with_label_values(&["basic", grpc_sign_type::PROPOSER_PREFERENCES, "success"])
+            .get(),
+        1,
+        "A7 sign_total uses the bounded proposer_preferences label"
+    );
+    assert_eq!(
+        metrics.sign_total.with_label_values(&["basic", "PROPOSER_PREFERENCES", "success"]).get(),
+        0,
+        "must not record the request type discriminator as the A7 label"
+    );
+}
+
+/// A7 label is the bounded `grpc_sign_type::BUILDER_REQUEST_AUTH` constant, never
+/// the request's `type` discriminator.
+#[test]
+fn http_a7_sign_type_builder_request_auth_is_bounded() {
+    use crate::http_api::request::SignPayload;
+    use crate::metrics::grpc_sign_type;
+    use eth_types::ForkName;
+    use web3signer_wire::VersionedPayload;
+
+    let payload = SignPayload::BuilderRequestAuth {
+        builder_request_auth: VersionedPayload { version: ForkName::Gloas, data: auth_kat_data() },
+    };
+    let label = http_a7_sign_type(&payload);
+    assert_eq!(label, grpc_sign_type::BUILDER_REQUEST_AUTH);
+    assert_eq!(label, "builder_request_auth");
+    assert_ne!(label, payload.type_name(), "must not use the request type discriminator");
+}
+
+#[tokio::test]
+async fn builder_request_auth_http_a7_records_bounded_label() {
+    use crate::metrics::grpc_sign_type;
+
+    let (sk, pk_bytes) = test_keypair();
+    let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));
+    let metrics = Arc::clone(&state.metrics);
+    let id = format!("0x{}", hex::encode(pk_bytes));
+    let resp = post_sign(state, &id, None, builder_request_auth_body("GLOAS")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        metrics
+            .sign_total
+            .with_label_values(&["basic", grpc_sign_type::BUILDER_REQUEST_AUTH, "success"])
+            .get(),
+        1,
+        "A7 sign_total uses the bounded builder_request_auth label"
+    );
+    assert_eq!(
+        metrics.sign_total.with_label_values(&["basic", "BUILDER_REQUEST_AUTH", "success"]).get(),
+        0,
+        "must not record the request type discriminator as the A7 label"
+    );
+}
+
 /// Completeness: every supported type dispatches end-to-end to `200` with a
 /// signature, after the P2 arms landed. A regression in any arm fails here.
 #[tokio::test]
 async fn all_supported_types_dispatch_to_200() {
     let bodies = all_supported_type_bodies();
-    assert_eq!(bodies.len(), 11, "all FR-4..FR-14 types are covered");
+    assert_eq!(
+        bodies.len(),
+        14,
+        "all FR-4..FR-14 types plus PAYLOAD_ATTESTATION, PROPOSER_PREFERENCES, and BUILDER_REQUEST_AUTH are covered"
+    );
     for (type_name, body) in bodies {
         let (sk, pk_bytes) = test_keypair();
         let state = test_state(Arc::new(RealSigningBackend::with_key(sk)));

@@ -25,7 +25,7 @@ fn test_import_keystore_writes_import_meta_sidecar() {
     let before =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
 
-    adapter.import_keystore(&keystore_json, "testpass").unwrap();
+    block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
 
     let after =
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
@@ -62,20 +62,27 @@ fn test_delete_keystore_removes_import_meta_sidecar() {
     )
     .expect("encrypt");
     let keystore_json = serde_json::to_string(&keystore).unwrap();
-    adapter.import_keystore(&keystore_json, "testpass").unwrap();
+    block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
 
     let meta_path = import_meta_path(dir.path(), &pk_bytes);
     assert!(meta_path.exists(), "sidecar should exist after import");
+    let partial = dir.path().join(format!("0x{}.import_meta.json.partial", hex::encode(pk_bytes)));
+    std::fs::write(&partial, "{\"imported_unix_seconds\":1}").unwrap();
+    let removing =
+        dir.path().join(format!("0x{}.import_meta.json.removing.1", hex::encode(pk_bytes)));
+    std::fs::write(&removing, "{\"imported_unix_seconds\":1}").unwrap();
 
     adapter.delete_keystore(&pk_bytes).unwrap();
     assert!(!meta_path.exists(), "sidecar must be removed after delete");
+    assert!(!partial.exists(), "a leftover staged sidecar must be removed after delete");
+    assert!(!removing.exists(), "a leftover .removing.* set-aside must be removed after delete");
 }
 
 /// `scan_and_rearm_gate` must call `start_monitoring` for any key whose
 /// sidecar shows an import timestamp within the configured window.
 #[test]
+#[tracing_test::traced_test]
 fn test_scan_and_rearm_gate_rearms_recent_keys() {
-    use keymanager_api::gate::DoppelgangerGate;
     use keymanager_api::traits::DoppelgangerMonitor;
     let dir = TempDir::new().unwrap();
     let pk: Pubkey = [0xABu8; 48];
@@ -87,21 +94,38 @@ fn test_scan_and_rearm_gate_rearms_recent_keys() {
     std::fs::write(&meta_path, format!("{{\"imported_unix_seconds\":{}}}", now_unix)).unwrap();
 
     let window_secs = 768u64; // 2 epochs on mainnet
-    let gate = DoppelgangerGate::new(std::time::Duration::from_secs(window_secs));
+    let monitor = DoppelgangerDisabledMonitor::new();
 
-    // Before rearm: key is not monitored → safe by default
-    assert!(gate.is_doppelganger_safe(&pk), "key must be safe before monitoring starts");
+    // Opt-out monitor is always safe; re-arm is observed via the scan log.
+    assert!(monitor.is_doppelganger_safe(&pk), "key must be safe before monitoring starts");
 
-    scan_and_rearm_gate(dir.path(), &gate, window_secs);
+    scan_and_rearm_gate(dir.path(), &monitor, window_secs);
 
-    // After rearm: key is monitored → not safe yet (just started)
-    assert!(!gate.is_doppelganger_safe(&pk), "key must be blocked after gate is re-armed");
+    assert!(logs_contain("re-arming"), "recent import must be re-armed");
+    assert!(monitor.is_doppelganger_safe(&pk), "Disabled monitor stays safe after re-arm");
+}
+
+/// Leftover `.removing.*` set-asides must re-arm like a final sidecar.
+#[test]
+#[tracing_test::traced_test]
+fn test_scan_and_rearm_gate_rearms_leftover_removing_sidecar() {
+    let dir = TempDir::new().unwrap();
+    let pk: Pubkey = [0xAEu8; 48];
+    let now_unix =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let removing =
+        dir.path().join(format!("0x{}.import_meta.json.removing.{now_unix}", hex::encode(pk)));
+    std::fs::write(&removing, format!("{{\"imported_unix_seconds\":{now_unix}}}")).unwrap();
+
+    let monitor = DoppelgangerDisabledMonitor::new();
+    scan_and_rearm_gate(dir.path(), &monitor, 768);
+    assert!(logs_contain("re-arming"), "leftover .removing.* must re-arm within the window");
 }
 
 /// `scan_and_rearm_gate` must NOT re-arm keys whose window has already elapsed.
 #[test]
+#[tracing_test::traced_test]
 fn test_scan_and_rearm_gate_skips_expired_keys() {
-    use keymanager_api::gate::DoppelgangerGate;
     let dir = TempDir::new().unwrap();
     let pk: Pubkey = [0xCDu8; 48];
     let window_secs = 768u64;
@@ -115,11 +139,11 @@ fn test_scan_and_rearm_gate_skips_expired_keys() {
     let meta_path = import_meta_path(dir.path(), &pk);
     std::fs::write(&meta_path, format!("{{\"imported_unix_seconds\":{}}}", old_unix)).unwrap();
 
-    let gate = DoppelgangerGate::new(std::time::Duration::from_secs(window_secs));
-    scan_and_rearm_gate(dir.path(), &gate, window_secs);
+    let monitor = DoppelgangerDisabledMonitor::new();
+    scan_and_rearm_gate(dir.path(), &monitor, window_secs);
 
-    // Key should NOT be re-armed because window has expired
-    assert!(gate.is_doppelganger_safe(&pk), "expired key must remain safe (not re-armed)");
+    assert!(!logs_contain("re-arming"), "expired key must not be re-armed");
+    assert!(monitor.is_doppelganger_safe(&pk), "expired key must remain safe (not re-armed)");
 }
 
 // ── SEC-1a: real signing registry for list/has/delete ─────────────────
@@ -201,7 +225,7 @@ fn test_delete_returns_real_eip3076_interchange_for_key_with_history() {
     db.seed_attestation(&pk_hex, 10, 11, None, &gvr_root).expect("seed history");
     db.seed_block(&pk_hex, 42, None, &gvr_root).expect("seed block history");
 
-    let slashing = SlashingProtectionAdapter::new(db, gvr_root);
+    let slashing = SlashingProtectionAdapter::new_in_free_window(db, gvr_root);
 
     assert!(
         adapter.has_key(&pk),
@@ -402,12 +426,12 @@ fn test_reimport_clears_denylist_and_allows_key_again() {
     .expect("encrypt");
     let keystore_json = serde_json::to_string(&keystore).unwrap();
 
-    adapter.import_keystore(&keystore_json, "testpass").unwrap();
+    block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
     assert!(adapter.delete_keystore(&pk).unwrap());
     assert!(denylist.contains(&pk), "delete must denylist");
 
     // Intentional re-import clears denylist so the key is allowed again
-    adapter.import_keystore(&keystore_json, "testpass").unwrap();
+    block_on(adapter.import_keystore(&keystore_json, "testpass")).unwrap();
     assert!(!denylist.contains(&pk), "re-import must clear denylist entry");
     assert!(adapter.has_key(&pk));
     assert!(composite.has_local_key(&pk));
@@ -465,7 +489,7 @@ fn test_failed_reimport_leaves_denylist_intact() {
     assert!(denylist.contains(&pk));
 
     // Invalid keystore JSON fails before any denylist mutation.
-    let err = adapter.import_keystore("not-valid-json", "password");
+    let err = block_on(adapter.import_keystore("not-valid-json", "password"));
     assert!(matches!(err, Err(ImportKeystoreError::InvalidKeystore(_))));
 
     assert!(denylist.contains(&pk), "failed import must not clear denylist");
@@ -498,7 +522,7 @@ fn test_keymanager_import_iv_corrupted_keystore_returns_item_error() {
     keystore.crypto.cipher.params.iv = hex::encode([0u8; 8]);
     let json = keystore.to_json().expect("serialize");
 
-    let err = adapter.import_keystore(&json, password);
+    let err = block_on(adapter.import_keystore(&json, password));
     match err {
         Err(ImportKeystoreError::DecryptionFailed(msg)) => {
             assert!(

@@ -1,8 +1,6 @@
 //! Service builder for constructing all services from configuration.
 
-#![allow(clippy::arc_with_non_send_sync)]
-
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,8 +9,12 @@ use tracing::{error, info, warn};
 
 use observability::logging::RedactedUrl;
 
+use crate::orchestrator::dispatch::DispatchLimits;
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
-use beacon::{BeaconClient, BeaconClientConfig};
+use crate::quiesce::{QuiesceRegistry, QuiescingEnablement, TrackedKeys};
+use beacon::{parse_slot_duration_ms, BeaconClient, BeaconClientConfig};
+#[cfg(test)]
+use bn_manager::DutiesProvider;
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, Propagator};
 use builder::BuilderService;
 use crypto::{CompositeSigner, KeyManager};
@@ -20,11 +22,13 @@ use doppelganger::{
     DoppelgangerDisabledByOperator, ForwardWindowMachine, SigningEnablement,
     DEFAULT_MONITORING_EPOCHS,
 };
+#[cfg(test)]
 use duty_tracker::DutyTracker;
-use eth_types::{Epoch, ForkSchedule, Root};
+use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+use rvc_config::TimingConfig;
 use signer::{SignerService, ValidatorSigner};
-use slashing::SlashingDb;
-use timing::SystemSlotClock;
+use slashing::{GroupCommitConfig, SlashingDb};
+use timing::{DeadlineBps, DeadlineSchedule, SystemSlotClock};
 use validator_store::ValidatorStore;
 
 use secret_provider::SecretProvider;
@@ -123,6 +127,302 @@ pub struct ServiceBuilder {
     config: Config,
 }
 
+/// Wall-clock length of the doppelganger store hold and import-meta re-arm.
+///
+/// [`DEFAULT_MONITORING_EPOCHS`] at the spec slot duration. Boot sidecar
+/// classification does not use this value: a sidecar stays unfinished until
+/// this process removes it after the forward window reaches Safe.
+pub(crate) fn doppelganger_import_window() -> Duration {
+    Duration::from_millis(
+        DEFAULT_MONITORING_EPOCHS.saturating_mul(SLOTS_PER_EPOCH).saturating_mul(SLOT_DURATION_MS),
+    )
+}
+
+/// Pubkeys that must use [`ForwardWindowMachine::register_for_import`] at boot.
+struct UnfinishedImports {
+    /// The keystore directory or validators file could not be read.
+    /// Every loaded key is then import-strict.
+    force_all: bool,
+    pubkeys: HashSet<[u8; 48]>,
+}
+
+impl UnfinishedImports {
+    fn contains(&self, pubkey: &[u8; 48]) -> bool {
+        self.force_all || self.pubkeys.contains(pubkey)
+    }
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Kind of import-meta sidecar on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImportSidecarKind {
+    /// Final `0x<pubkey>.import_meta.json`.
+    Final,
+    /// Staged `0x<pubkey>.import_meta.json.partial`.
+    Partial,
+    /// Leftover `0x<pubkey>.import_meta.json.removing.<n>` from an older
+    /// rename-aside cleanup. Boot treats these as unfinished so a crash
+    /// between rename and put-back cannot lose the marker.
+    Removing,
+}
+
+/// Sidecars under `keystore_dir` that still mark an import as unfinished.
+///
+/// A missing directory is an empty set. A path that is not a directory, or
+/// a directory that cannot be listed, is an error (caller fails closed).
+/// Any `*.import_meta.json`, `*.import_meta.json.partial`, or leftover
+/// `*.import_meta.json.removing.*` is unfinished, whatever its timestamp.
+/// Completion is [`clear_completed_import_sidecars`], which runs only after
+/// this process has observed the forward window to Safe. A sidecar that
+/// cannot be read or parsed is unfinished as well.
+fn scan_import_sidecars(keystore_dir: &Path) -> Result<HashSet<[u8; 48]>, String> {
+    // `Path::exists` collapses permission errors into "missing". A missing
+    // directory has no sidecars. Any other metadata error, or a path that is
+    // not a directory, fails closed.
+    match std::fs::metadata(keystore_dir) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => {
+            return Err(format!("{} is not a directory", keystore_dir.display()));
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HashSet::new());
+        }
+        Err(err) => return Err(err.to_string()),
+    }
+    let entries = std::fs::read_dir(keystore_dir).map_err(|e| e.to_string())?;
+    let mut strict = HashSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some((pubkey, kind)) = import_sidecar_pubkey(&name) else {
+            continue;
+        };
+        note_import_sidecar(&entry.path(), kind);
+        strict.insert(pubkey);
+    }
+    Ok(strict)
+}
+
+/// `(pubkey, kind)` when `name` is an import-meta sidecar (final, partial, or
+/// leftover `.removing.*`).
+pub(crate) fn import_sidecar_pubkey(name: &str) -> Option<([u8; 48], ImportSidecarKind)> {
+    let hex_part = name.strip_prefix("0x")?;
+    let (hex_body, kind) = if let Some(rest) = hex_part.strip_suffix(".import_meta.json.partial") {
+        (rest, ImportSidecarKind::Partial)
+    } else if let Some(idx) = hex_part.find(".import_meta.json.removing.") {
+        let rest = &hex_part[..idx];
+        let after = &hex_part[idx + ".import_meta.json.removing.".len()..];
+        if after.is_empty() || !after.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        (rest, ImportSidecarKind::Removing)
+    } else {
+        let rest = hex_part.strip_suffix(".import_meta.json")?;
+        (rest, ImportSidecarKind::Final)
+    };
+    let bytes = hex::decode(hex_body).ok()?;
+    if bytes.len() != 48 {
+        return None;
+    }
+    let mut pubkey = [0u8; 48];
+    pubkey.copy_from_slice(&bytes);
+    Some((pubkey, kind))
+}
+
+/// Log why a present sidecar keeps its key Pending. Presence itself is the marker.
+fn note_import_sidecar(path: &Path, kind: ImportSidecarKind) {
+    match kind {
+        ImportSidecarKind::Partial => {
+            warn!(
+                path = %path.display(),
+                "doppelganger: staged import sidecar still present; key stays Pending"
+            );
+            return;
+        }
+        ImportSidecarKind::Removing => {
+            warn!(
+                path = %path.display(),
+                "doppelganger: leftover import-sidecar set-aside still present; key stays Pending"
+            );
+            return;
+        }
+        ImportSidecarKind::Final => {}
+    }
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "doppelganger: unreadable import sidecar; key stays Pending"
+            );
+            return;
+        }
+    };
+    let has_timestamp = serde_json::from_str::<serde_json::Value>(&content)
+        .ok()
+        .and_then(|v| v.get("imported_unix_seconds").and_then(|t| t.as_u64()))
+        .is_some();
+    if !has_timestamp {
+        warn!(
+            path = %path.display(),
+            "doppelganger: import sidecar has no imported_unix_seconds; key stays Pending"
+        );
+    }
+}
+
+fn fsync_keystore_dir(keystore_dir: &Path, context: &str) {
+    match std::fs::File::open(keystore_dir) {
+        Ok(dir) => {
+            if let Err(err) = dir.sync_all() {
+                warn!(
+                    path = %keystore_dir.display(),
+                    error = %err,
+                    context,
+                    "doppelganger: failed to fsync keystore directory after import-sidecar update"
+                );
+            }
+        }
+        Err(err) => {
+            warn!(
+                path = %keystore_dir.display(),
+                error = %err,
+                context,
+                "doppelganger: failed to open keystore directory to fsync after import-sidecar update"
+            );
+        }
+    }
+}
+
+/// Remove import sidecars for keys this process has observed to Safe.
+///
+/// The sidecar is the durable unfinished marker. Deleting it, then fsyncing
+/// the directory, records that this VC completed the forward window. A key
+/// that is not Safe keeps its sidecar. A failed delete leaves the marker, so
+/// the next boot stays Pending. Age is not an input.
+///
+/// Unlink holds [`TrackedKeys`] across the Safe re-check and `unlink`, the
+/// same lock DELETE and import use. That serializes cleanup against a
+/// concurrent DELETE + re-import that would otherwise publish a newer sidecar
+/// between the Safe check and the unlink. Markers are never deleted unless
+/// that lock is held and the key is still Safe. Leftover
+/// `*.import_meta.json.removing.*` files from older rename-aside cleanups are
+/// removed the same way when the key is Safe.
+pub(crate) fn clear_completed_import_sidecars(
+    keystore_dir: &Path,
+    tracked_keys: &TrackedKeys,
+    is_safe: impl Fn(&[u8; 48]) -> bool,
+) {
+    clear_completed_import_sidecars_inner(keystore_dir, tracked_keys, is_safe, None);
+}
+
+fn clear_completed_import_sidecars_inner(
+    keystore_dir: &Path,
+    tracked_keys: &TrackedKeys,
+    is_safe: impl Fn(&[u8; 48]) -> bool,
+    during_locked: Option<&dyn Fn(&Path)>,
+) {
+    let entries = match std::fs::read_dir(keystore_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+        Err(err) => {
+            warn!(
+                path = %keystore_dir.display(),
+                error = %err,
+                "doppelganger: cannot list keystore directory to record forward-window completion"
+            );
+            return;
+        }
+    };
+    let mut removed = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let Some((pubkey, _kind)) = import_sidecar_pubkey(&name) else {
+            continue;
+        };
+        // Hold the same lock as DELETE/import for the Safe re-check and unlink.
+        // Releasing earlier would let a concurrent re-import publish a newer
+        // sidecar that this cleanup would then delete.
+        let _guard = tracked_keys.lock();
+        if !is_safe(&pubkey) {
+            continue;
+        }
+        let path = entry.path();
+        // Confirm the path still looks like a marker under the lock. A DELETE
+        // that ran before we took the lock may have already removed it.
+        if !path.exists() {
+            continue;
+        }
+        if !is_safe(&pubkey) {
+            continue;
+        }
+        if let Some(hook) = during_locked {
+            hook(&path);
+        }
+        // Re-check after the test hook: a concurrent re-import that somehow
+        // mutated Safe without the lock must not lose its marker. Production
+        // import holds this same lock, so the hook is the only way Safe can
+        // flip here.
+        if !is_safe(&pubkey) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                removed = true;
+                let pk_hex = hex::encode(pubkey);
+                info!(
+                    pubkey = %observability::logging::TruncatedPubkey::new(&pk_hex),
+                    path = %path.display(),
+                    "doppelganger: forward window observed; removed import sidecar"
+                );
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                warn!(
+                    path = %path.display(),
+                    error = %err,
+                    "doppelganger: failed to unlink import sidecar while holding tracked_keys; \
+                     the marker remains on disk so the next boot stays Pending"
+                );
+            }
+        }
+    }
+    if !removed {
+        return;
+    }
+    fsync_keystore_dir(keystore_dir, "removing an import sidecar");
+}
+
+/// Holds whose deadline is still in the future. An unreadable file is an error.
+fn open_doppelganger_holds(
+    path: &Path,
+    pubkey_map: &PubkeyMap,
+    now_unix: u64,
+) -> Result<HashSet<[u8; 48]>, String> {
+    let store = ValidatorStore::load_from_config(path).map_err(|e| e.to_string())?;
+    let mut open = HashSet::new();
+    for pubkey in pubkey_map.read().keys() {
+        let Some(until) = store.get_config(pubkey).and_then(|cfg| cfg.doppelganger_hold_until)
+        else {
+            continue;
+        };
+        if until > now_unix {
+            open.insert(*pubkey);
+        }
+    }
+    Ok(open)
+}
+
 impl ServiceBuilder {
     pub fn new(config: Config) -> Self {
         Self { config }
@@ -179,12 +479,12 @@ impl ServiceBuilder {
         }
     }
 
-    /// Build a single-endpoint [`BeaconClient`] for exit tooling.
+    /// Build a single-endpoint [`BeaconClient`].
     ///
-    /// Runtime block production, duties, and attestation paths must use
-    /// [`Self::build_bn_manager`] / [`Self::build_proposer_bn_manager`] so
-    /// multi-BN failover applies. This helper is intentionally limited to
-    /// single-client needs (keymanager voluntary exit and similar).
+    /// Still constructed at startup. Not the keymanager voluntary-exit path:
+    /// that uses [`Self::build_bn_manager`]. Runtime block production, duties,
+    /// and attestation use the pool as well ([`Self::build_proposer_bn_manager`]
+    /// when a proposer pool is configured).
     ///
     /// Unlike `BnManager` (which sets `max_retries = 0` and relies on pool
     /// failover — see `bn_manager::BnManager`), a standalone client keeps a
@@ -199,7 +499,7 @@ impl ServiceBuilder {
         info!(
             url = %self.config.beacon_url,
             max_body_bytes = self.config.beacon_max_body_bytes,
-            "Created beacon client (exit tooling)"
+            "Created single-endpoint beacon client (not the keymanager exit path)"
         );
         Ok(Arc::new(client))
     }
@@ -377,23 +677,79 @@ impl ServiceBuilder {
         } else {
             info!(path = ?path, "Opened slashing protection database");
         }
+        db.set_group_commit(
+            GroupCommitConfig::try_from_knobs(
+                self.config.group_commit_batch_size,
+                self.config.group_commit_wait_to_fill_ms,
+            )
+            .map_err(|e| ConfigError::MissingField(e.to_string()))?,
+        );
         Ok(Arc::new(db))
     }
 
     /// Build the production [`SignerService`] with the given signing enablement.
     ///
     /// Callers must supply the enablement produced by
-    /// [`Self::build_signing_enablement`] (or an equivalent). The enablement is
-    /// the doppelganger gate consulted on every duty-signing path (SEC-2a/2b).
+    /// [`Self::build_signing_enablement`] (or an equivalent). That value is
+    /// wrapped in [`QuiescingEnablement`] before [`SignerService::with_enablement`],
+    /// so the signer re-checks the quiesce gate under the per-pubkey lock. The
+    /// returned registry is the one the wrapper reads.
+    ///
+    /// `ValidatorStore`'s `enabled` flag is a different gate and is not installed
+    /// here (SEC-2a/2b). An open doppelganger hold is applied in
+    /// [`Self::build_signing_enablement`]: that key is registered with
+    /// `register_for_import`, so this signer gate stays closed for voluntary
+    /// exit until the forward window completes.
     pub fn build_signer(
         &self,
         composite_signer: Arc<CompositeSigner>,
         slashing_db: Arc<SlashingDb>,
         enablement: Arc<dyn SigningEnablement>,
-    ) -> Arc<SignerService> {
+    ) -> (Arc<SignerService>, Arc<QuiesceRegistry>) {
+        let registry = Arc::new(QuiesceRegistry::new());
+        let enablement: Arc<dyn SigningEnablement> =
+            Arc::new(QuiescingEnablement::new(enablement, Arc::clone(&registry)));
         let signer = SignerService::new(composite_signer, slashing_db).with_enablement(enablement);
         info!("Created signer service with signing enablement (SEC-2b)");
-        Arc::new(signer)
+        (Arc::new(signer), registry)
+    }
+
+    /// Keys whose import did not finish, or whose import evidence cannot be read.
+    ///
+    /// A missing keystore directory is not evidence (no sidecars). An unset
+    /// validators path means there is no hold file. A directory or file that
+    /// exists but cannot be read fails closed: every loaded key is included.
+    fn unfinished_imports(&self, pubkey_map: &PubkeyMap) -> UnfinishedImports {
+        let now_unix = unix_now_secs();
+        let mut unfinished = UnfinishedImports { force_all: false, pubkeys: HashSet::new() };
+
+        match scan_import_sidecars(&self.config.keystore_path) {
+            Ok(keys) => unfinished.pubkeys.extend(keys),
+            Err(err) => {
+                error!(
+                    path = %self.config.keystore_path.display(),
+                    error = %err,
+                    "doppelganger: cannot list keystore directory; every loaded key stays Pending"
+                );
+                unfinished.force_all = true;
+            }
+        }
+
+        if let Some(path) = &self.config.validators_config {
+            match open_doppelganger_holds(path, pubkey_map, now_unix) {
+                Ok(keys) => unfinished.pubkeys.extend(keys),
+                Err(err) => {
+                    error!(
+                        path = %path.display(),
+                        error = %err,
+                        "doppelganger: cannot read validators file; every loaded key stays Pending"
+                    );
+                    unfinished.force_all = true;
+                }
+            }
+        }
+
+        unfinished
     }
 
     /// Construct the production [`SigningEnablement`] (SEC-2b).
@@ -402,9 +758,9 @@ impl ServiceBuilder {
     ///   [`ForwardWindowMachine`], registers every loaded key at
     ///   `current_epoch`, and returns it as the enablement. Keys remain
     ///   closed until the monitoring window elapses with complete liveness
-    ///   observations (driven by SEC-2c). Epoch-0 registration is immediately
-    ///   `Safe` (pre-genesis bypass). Cost: ~[`DEFAULT_MONITORING_EPOCHS`]
-    ///   epochs (~12.8 min on mainnet).
+    ///   observations (driven by SEC-2c). Epoch-0 registration of a
+    ///   normally registered key is immediately `Safe` (pre-genesis bypass).
+    ///   Cost: ~[`DEFAULT_MONITORING_EPOCHS`] epochs (~12.8 min on mainnet).
     /// - When **disabled** (`--no-doppelganger-detection`): returns
     ///   [`DoppelgangerDisabledByOperator`], which enables every key.
     ///
@@ -412,12 +768,29 @@ impl ServiceBuilder {
     /// secret-provider refresh can `register_for_import` against the same
     /// instance (import-strict: no restart Safe-skip).
     ///
-    /// # Restart-aware safe-skip (boot only)
+    /// # Restart-aware safe-skip (boot only, normal keys)
     ///
-    /// Boot `register` may mark a key `Safe` if local slashing history shows a
-    /// recent attestation under this GVR (same-host restart). **Do not copy a
-    /// live slashing DB to a second VC** — that would dual-open signing without
-    /// network liveness. API import uses `register_for_import` and never skips.
+    /// Boot `register` may mark a **normally registered** key `Safe` if local
+    /// slashing history shows a recent attestation under this GVR (same-host
+    /// restart). **Do not copy a live slashing DB to a second VC** — that
+    /// would dual-open signing without network liveness.
+    ///
+    /// A key whose import did not finish does not take that bypass, and does
+    /// not take the epoch-0 bypass. It is registered with `register_for_import`
+    /// when any of the following is true:
+    ///
+    /// - the validators file has `doppelganger_hold_until` still in the future
+    /// - `keystore_path` still has a `*.import_meta.json` sidecar (any age), a
+    ///   leftover `*.import_meta.json.removing.*` set-aside, or that sidecar
+    ///   cannot be read or parsed. The sidecar is removed only after this
+    ///   process observes the forward window to Safe while holding the same
+    ///   `tracked_keys` lock as DELETE/import
+    /// - a staged `*.import_meta.json.partial` sidecar is still present
+    /// - the keystore directory exists but cannot be listed, or the validators
+    ///   file cannot be read (every loaded key stays Pending)
+    ///
+    /// `register_for_import` does not downgrade a key that is already `Safe`,
+    /// so this choice is made on the first registration.
     pub fn build_signing_enablement(
         &self,
         slashing_db: Arc<SlashingDb>,
@@ -438,9 +811,26 @@ impl ServiceBuilder {
         let reader: Arc<dyn slashing::SlashingDbReader> = slashing_db;
         let machine = Arc::new(ForwardWindowMachine::new(reader, DEFAULT_MONITORING_EPOCHS, gvr));
 
+        // Unfinished imports must be classified before `register`. A later
+        // `register_for_import` leaves an existing Safe state unchanged.
+        let unfinished = self.unfinished_imports(pubkey_map);
         let mut registered = 0usize;
+        let mut import_strict = 0usize;
         for pubkey in pubkey_map.read().values() {
-            machine.register(pubkey, current_epoch);
+            let pk_bytes = pubkey.to_bytes();
+            if unfinished.contains(&pk_bytes) {
+                let pk_hex = hex::encode(pk_bytes);
+                warn!(
+                    pubkey = %observability::logging::TruncatedPubkey::new(&pk_hex),
+                    current_epoch,
+                    "doppelganger: unfinished import — boot uses register_for_import \
+                     (no epoch-0 or history bypass)"
+                );
+                machine.register_for_import(pubkey, current_epoch);
+                import_strict += 1;
+            } else {
+                machine.register(pubkey, current_epoch);
+            }
             registered += 1;
         }
 
@@ -448,11 +838,14 @@ impl ServiceBuilder {
             monitoring_epochs = DEFAULT_MONITORING_EPOCHS,
             current_epoch,
             registered,
+            import_strict,
             "ForwardWindowMachine constructed (SEC-2b/2c). Keys stay closed until \
              {DEFAULT_MONITORING_EPOCHS} epochs of network liveness are observed \
              (~12.8 min on mainnet). The per-slot liveness loop (SEC-2c) feeds \
-             observe_liveness via bn-manager failover; epoch-0 bypass and \
-             restart-aware safe-skip still apply on boot register only."
+             observe_liveness via bn-manager failover. Epoch-0 bypass and \
+             restart-aware safe-skip apply only to keys that are not an unfinished \
+             import (open hold, any import sidecar, staged sidecar, \
+             or an unreadable keystore directory or validators file)."
         );
 
         (Arc::clone(&machine) as Arc<dyn SigningEnablement>, Some(machine))
@@ -467,25 +860,49 @@ impl ServiceBuilder {
         Arc::new(propagator)
     }
 
+    /// Test-only duty tracker.
+    ///
+    /// The beacon argument is whatever the test passes. A production caller
+    /// could hand this a single-endpoint client and skip `BnManager` failover.
+    /// Production wiring is `DutyTracker::new_with_source` on `beacon.bn_manager`
+    /// in `bootstrap/services.rs`. This helper is not in a library build.
+    #[cfg(test)]
     pub fn build_duty_tracker(
         &self,
-        beacon: Arc<dyn BeaconNodeClient>,
+        beacon: Arc<dyn DutiesProvider>,
         validator_indices: Vec<String>,
+        fork_schedule: ForkSchedule,
     ) -> Arc<DutyTracker> {
-        let tracker = DutyTracker::new(beacon, validator_indices);
+        let tracker = DutyTracker::new(beacon, validator_indices).with_fork_schedule(fork_schedule);
         info!("Created duty tracker");
         Arc::new(tracker)
     }
 
-    pub fn build_slot_clock(&self) -> Result<Arc<SystemSlotClock>, ConfigError> {
+    pub async fn resolve_slot_duration_ms(
+        &self,
+        beacon: &dyn BeaconNodeClient,
+    ) -> Result<u64, ConfigError> {
+        info!("Fetching slot duration from beacon node config spec");
+        let spec = beacon.get_config_spec().await?;
+        let slot_duration_ms = parse_slot_duration_ms(&spec.data)?;
+        info!(slot_duration_ms, "Resolved slot duration from beacon node spec");
+        Ok(slot_duration_ms)
+    }
+
+    pub fn build_slot_clock(
+        &self,
+        slot_duration_ms: u64,
+    ) -> Result<Arc<SystemSlotClock>, ConfigError> {
         let genesis_time = self.config.effective_genesis_time()?;
-        let slot_duration = Duration::from_secs(self.config.network.seconds_per_slot());
+        let slot_duration = Duration::from_millis(slot_duration_ms);
         let slots_per_epoch = self.config.network.slots_per_epoch();
 
         let clock = SystemSlotClock::new(genesis_time, slot_duration, slots_per_epoch)
-            .map_err(|e| ConfigError::MissingField(format!("invalid slot clock: {e}")))?;
+            .map_err(|e| ConfigError::MissingField(format!("invalid slot clock: {e}")))?
+            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing));
         info!(
             genesis_time = genesis_time,
+            slot_duration_ms,
             slot_duration_secs = slot_duration.as_secs(),
             slots_per_epoch = slots_per_epoch,
             "Created slot clock"
@@ -546,6 +963,8 @@ impl ServiceBuilder {
             electra_version = %format_version(schedule.electra_fork_version),
             fulu_epoch = schedule.fulu_fork_epoch,
             fulu_version = %format_version(schedule.fulu_fork_version),
+            gloas_epoch = schedule.gloas_fork_epoch,
+            gloas_version = %format_version(schedule.gloas_fork_version),
             "Loaded fork schedule from beacon node"
         );
         Ok(Arc::new(schedule))
@@ -556,16 +975,25 @@ impl ServiceBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`ConfigError::ZeroFeeRecipient`] if the effective default fee
-    /// recipient is the zero address.  Operators must set a non-zero address in
-    /// the validators config file passed via `--validators-config`.
+    /// Returns [`ConfigError::EmptyValidatorsConfig`] when the file exists and
+    /// is empty or whitespace. Returns [`ConfigError::ZeroFeeRecipient`] if the
+    /// effective default fee recipient is the zero address. Operators must set
+    /// a non-zero address in the validators config file passed via
+    /// `--validators-config`.
     pub fn build_validator_store(
         &self,
         validators_config: Option<&std::path::Path>,
     ) -> Result<Arc<ValidatorStore>, ConfigError> {
         let store = match validators_config {
-            Some(path) => ValidatorStore::load_from_config(path)
-                .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?,
+            Some(path) => {
+                let raw = std::fs::read_to_string(path)
+                    .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?;
+                if raw.trim().is_empty() {
+                    return Err(ConfigError::EmptyValidatorsConfig);
+                }
+                ValidatorStore::load_from_config(path)
+                    .map_err(|e| ConfigError::ValidatorStoreError(e.to_string()))?
+            }
             None => ValidatorStore::new([0u8; 20], 30_000_000),
         };
 
@@ -573,7 +1001,17 @@ impl ServiceBuilder {
             return Err(ConfigError::ZeroFeeRecipient);
         }
 
-        info!("Created validator store");
+        crate::startup::apply_builder_settings(&store, &self.config.builder)?;
+
+        if let Some(raw) = self.config.graffiti.as_deref() {
+            let applied = validator_store::parse_graffiti(raw);
+            store.set_default_graffiti(applied);
+            // Hex, not Display: CR/LF/ESC in the 32-byte field must not split this line.
+            let graffiti = hex::encode(applied);
+            info!(graffiti = ?graffiti, "Created validator store");
+        } else {
+            info!("Created validator store");
+        }
         Ok(Arc::new(store))
     }
 
@@ -597,7 +1035,9 @@ impl ServiceBuilder {
         for pubkey in pubkey_map.read().values() {
             let pk_bytes = pubkey.to_bytes();
             if !store.has_validator(&pk_bytes) {
-                store.add_validator(validator_store::ValidatorConfig::new(pk_bytes));
+                store
+                    .add_validator(validator_store::ValidatorConfig::new(pk_bytes))
+                    .expect("ValidatorConfig::new has no builder URLs");
                 registered += 1;
             }
         }
@@ -614,6 +1054,7 @@ impl ServiceBuilder {
         beacon: Arc<dyn BeaconNodeClient>,
         validator_store: Arc<ValidatorStore>,
         genesis_fork_version: [u8; 4],
+        fork_schedule: Arc<ForkSchedule>,
     ) -> Arc<BuilderService> {
         // Bridge full trait objects onto the narrow builder seams
         // (`RegistrationSigner` / `BuilderBeaconClient`).
@@ -623,6 +1064,7 @@ impl ServiceBuilder {
             Arc::new(beacon),
             validator_store,
             genesis_fork_version,
+            fork_schedule,
         );
         info!("Created builder service");
         Arc::new(service)
@@ -662,7 +1104,6 @@ impl ServiceBuilder {
                                     )
                                 })?,
                             prefix: self.config.secret_provider.gcp.secret_prefix.clone(),
-                            ..Default::default()
                         };
                         let gcp_provider =
                             GcpSecretProvider::new(gcp_config).await.map_err(|e| {
@@ -692,18 +1133,52 @@ impl ServiceBuilder {
         genesis_validators_root: Root,
         fork_schedule: Arc<ForkSchedule>,
     ) -> OrchestratorConfig {
+        let limits = DispatchLimits::validated(
+            self.config.duties.duty_dispatch_concurrency,
+            self.config.duties.duty_publish_concurrency,
+        )
+        .expect("Config::validate rejects zero duty concurrency");
         OrchestratorConfig::new(genesis_validators_root, fork_schedule)
             .with_shutdown_timeout(Duration::from_secs(30))
+            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing))
+            .with_dispatch_limits(limits)
+    }
+}
+
+/// Build both deadline sets from `[timing]`. Gloas members are listed in full so
+/// omitting one is a compile error; 1.7 serde defaults already fill missing TOML
+/// keys, so runtime "missing" cannot occur.
+fn deadline_schedule_from_timing(timing: &TimingConfig) -> DeadlineSchedule {
+    DeadlineSchedule {
+        pre_gloas: DeadlineBps {
+            attestation: timing.attestation_due_bps,
+            aggregate: timing.aggregate_due_bps,
+            // Pre-Gloas waits: sync messages share attestation, contributions share aggregate.
+            sync_message: timing.attestation_due_bps,
+            contribution: timing.aggregate_due_bps,
+            payload: timing.aggregate_due_bps,
+            payload_attestation: timing.aggregate_due_bps,
+        },
+        gloas: DeadlineBps {
+            attestation: timing.attestation_due_bps_gloas,
+            aggregate: timing.aggregate_due_bps_gloas,
+            sync_message: timing.sync_message_due_bps_gloas,
+            contribution: timing.contribution_due_bps_gloas,
+            payload: timing.payload_due_bps,
+            payload_attestation: timing.payload_attestation_due_bps,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TimingConfig;
+    use crate::orchestrator::dispatch::DispatchLimits;
     use crypto::{LocalSigner, Signer as _};
-    use eth_types::NetworkPreset;
+    use eth_types::{ForkName, NetworkPreset, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
     use tempfile::TempDir;
-    use timing::SlotClock;
+    use timing::{due_ms, SlotClock};
 
     fn create_minimal_config() -> Config {
         Config {
@@ -931,11 +1406,29 @@ mod tests {
     fn test_build_slot_clock() {
         let config = create_minimal_config();
         let builder = ServiceBuilder::new(config);
-        let result = builder.build_slot_clock();
+        let result = builder.build_slot_clock(6_000);
 
         assert!(result.is_ok());
         let clock = result.unwrap();
         assert_eq!(clock.genesis_time(), 1606824023);
+        assert_eq!(clock.slot_duration(), Duration::from_secs(6));
+        assert_eq!(clock.deadlines().attestation, 3333);
+        assert_eq!(clock.deadlines().aggregate, 6667);
+    }
+
+    #[test]
+    fn test_build_slot_clock_forwards_timing_bps_fields() {
+        let config = Config {
+            timing: TimingConfig {
+                attestation_due_bps: 2500,
+                aggregate_due_bps: 4000,
+                ..Default::default()
+            },
+            ..create_minimal_config()
+        };
+        let clock = ServiceBuilder::new(config).build_slot_clock(12_000).unwrap();
+        assert_eq!(clock.deadlines().attestation, 2500);
+        assert_eq!(clock.deadlines().aggregate, 4000);
     }
 
     #[test]
@@ -1010,7 +1503,7 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
-        let signer = builder.build_signer(composite, slashing_db, enablement);
+        let (signer, _quiesce_registry) = builder.build_signer(composite, slashing_db, enablement);
 
         assert!(signer.signer().public_keys().is_empty());
     }
@@ -1021,18 +1514,17 @@ mod tests {
         let builder = ServiceBuilder::new(config);
 
         let beacon = builder.build_beacon().unwrap();
-        let tracker = builder.build_duty_tracker(beacon, vec!["1234".to_string()]);
+        let tracker = builder.build_duty_tracker(
+            beacon,
+            vec!["1234".to_string()],
+            ForkSchedule::unscheduled_gloas(),
+        );
 
         assert!(Arc::strong_count(&tracker) > 0);
     }
 
-    #[test]
-    fn test_build_orchestrator_config() {
-        let config = create_minimal_config();
-        let builder = ServiceBuilder::new(config);
-
-        let root = [0xaa; 32];
-        let fork_schedule = Arc::new(ForkSchedule {
+    fn sample_fork_schedule() -> Arc<ForkSchedule> {
+        Arc::new(ForkSchedule {
             genesis_fork_version: [0, 0, 0, 0],
             altair_fork_epoch: 74240,
             altair_fork_version: [1, 0, 0, 0],
@@ -1046,11 +1538,157 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: u64::MAX,
             fulu_fork_version: [6, 0, 0, 0],
-        });
-        let orch_config = builder.build_orchestrator_config(root, fork_schedule);
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
+        })
+    }
+
+    #[test]
+    fn test_build_orchestrator_config() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+
+        let root = [0xaa; 32];
+        let orch_config = builder.build_orchestrator_config(root, sample_fork_schedule());
 
         assert_eq!(orch_config.genesis_validators_root, root);
         assert_eq!(orch_config.shutdown_timeout, Duration::from_secs(30));
+        assert_eq!(orch_config.deadline_schedule.pre_gloas.attestation, 3333);
+        assert_eq!(orch_config.deadline_schedule.pre_gloas.aggregate, 6667);
+        assert_eq!(orch_config.deadline_schedule.gloas.attestation, 2500);
+        assert_eq!(orch_config.deadline_schedule.gloas.aggregate, 5000);
+        assert_eq!(orch_config.deadline_schedule.gloas.sync_message, 2500);
+        assert_eq!(orch_config.deadline_schedule.gloas.contribution, 5000);
+        assert_eq!(orch_config.deadline_schedule.gloas.payload, 5000);
+        assert_eq!(orch_config.deadline_schedule.gloas.payload_attestation, 7500);
+        assert_eq!(orch_config.dispatch_limits.concurrency, DispatchLimits::DEFAULT_CONCURRENCY);
+        assert_eq!(
+            orch_config.dispatch_limits.publish_concurrency,
+            DispatchLimits::DEFAULT_PUBLISH_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn test_build_orchestrator_config_forwards_timing_bps_fields() {
+        let config = Config {
+            timing: TimingConfig {
+                attestation_due_bps: 2500,
+                aggregate_due_bps: 4000,
+                ..Default::default()
+            },
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        assert_eq!(orch_config.deadline_schedule.pre_gloas.attestation, 2500);
+        assert_eq!(orch_config.deadline_schedule.pre_gloas.aggregate, 4000);
+    }
+
+    #[test]
+    fn test_payload_due_bps_toml_reaches_orchestrator_schedule() {
+        let config = Config {
+            timing: TimingConfig { payload_due_bps: 1234, ..Default::default() },
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        assert_eq!(orch_config.deadline_schedule.gloas.payload, 1234);
+        assert_eq!(
+            timing::due_ms(orch_config.deadline_schedule.gloas.payload, 12_000),
+            timing::due_ms(1234, 12_000)
+        );
+    }
+
+    #[test]
+    fn test_gloas_timing_keys_do_not_change_pre_gloas_deadlines() {
+        let config = Config {
+            timing: TimingConfig {
+                attestation_due_bps: 3333,
+                aggregate_due_bps: 6667,
+                attestation_due_bps_gloas: 2500,
+                aggregate_due_bps_gloas: 6667,
+                sync_message_due_bps_gloas: 2500,
+                contribution_due_bps_gloas: 5000,
+                payload_due_bps: 5000,
+                payload_attestation_due_bps: 7500,
+            },
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        let clock = builder.build_slot_clock(12_000).unwrap();
+        let orch = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        assert_eq!(clock.deadlines().attestation, 3333);
+        assert_eq!(clock.deadlines().aggregate, 6667);
+        assert_eq!(orch.deadline_schedule.pre_gloas.attestation, 3333);
+        assert_eq!(orch.deadline_schedule.pre_gloas.aggregate, 6667);
+        assert_eq!(orch.deadline_schedule.gloas.aggregate, 6667);
+        assert_eq!(orch.deadline_schedule.gloas.contribution, 5000);
+        assert_eq!(orch.deadline_schedule.gloas.payload, 5000);
+        assert_eq!(timing::due_ms(clock.deadlines().attestation, 12_000), 3999);
+        assert_eq!(timing::due_ms(clock.deadlines().aggregate, 12_000), 8000);
+    }
+
+    #[test]
+    fn test_aggregate_due_bps_gloas_toml_changes_offset_without_rebuild() {
+        let root = [0xaau8; 32];
+        let schedule = sample_fork_schedule();
+        let defaulted = ServiceBuilder::new(create_minimal_config())
+            .build_orchestrator_config(root, schedule.clone());
+        assert_eq!(defaulted.deadline_schedule.gloas.aggregate, 5000);
+        assert_eq!(timing::due_ms(defaulted.deadline_schedule.gloas.aggregate, 12_000), 6000);
+
+        let timing: TimingConfig =
+            toml::from_str("aggregate_due_bps_gloas = 6667").expect("TOML-only override");
+        let mut config = create_minimal_config();
+        config.timing = timing;
+        let orch = ServiceBuilder::new(config).build_orchestrator_config(root, schedule);
+        assert_eq!(orch.deadline_schedule.gloas.aggregate, 6667);
+        assert_eq!(timing::due_ms(orch.deadline_schedule.gloas.aggregate, 12_000), 8000);
+        assert_eq!(orch.deadline_schedule.pre_gloas.aggregate, 6667);
+    }
+
+    fn gloas_at_epoch(epoch: u64) -> Arc<ForkSchedule> {
+        let mut schedule = ForkSchedule::unscheduled_gloas();
+        schedule.gloas_fork_epoch = epoch;
+        Arc::new(schedule)
+    }
+
+    /// D9 / 6.14: a TOML-only Gloas attestation bps change moves the benchmark
+    /// helper's reported deadline with no rebuild. The helper is the coordinator
+    /// path (`from_epoch` → `for_fork` → `due_ms`); this test names the config
+    /// key, the bench harness must not.
+    #[test]
+    fn test_attestation_due_bps_gloas_toml_moves_benchmark_deadline_without_rebuild() {
+        let root = [0xaau8; 32];
+        let fork_schedule = gloas_at_epoch(1);
+        let gloas_slot = SLOTS_PER_EPOCH;
+        let pre_gloas_slot = 0;
+        let slot_duration_ms = SLOT_DURATION_MS;
+
+        assert_eq!(
+            ForkName::from_epoch(gloas_slot / SLOTS_PER_EPOCH, &fork_schedule),
+            ForkName::Gloas
+        );
+        assert!(
+            ForkName::from_epoch(pre_gloas_slot / SLOTS_PER_EPOCH, &fork_schedule)
+                < ForkName::Gloas
+        );
+
+        let defaulted = ServiceBuilder::new(create_minimal_config())
+            .build_orchestrator_config(root, fork_schedule.clone());
+        let default_deadline = defaulted.attestation_deadline_ms(gloas_slot, slot_duration_ms);
+        let default_pre = defaulted.attestation_deadline_ms(pre_gloas_slot, slot_duration_ms);
+
+        let timing: TimingConfig =
+            toml::from_str("attestation_due_bps_gloas = 4000").expect("TOML-only override");
+        let mut config = create_minimal_config();
+        config.timing = timing;
+        let orch = ServiceBuilder::new(config).build_orchestrator_config(root, fork_schedule);
+        let moved = orch.attestation_deadline_ms(gloas_slot, slot_duration_ms);
+
+        assert_ne!(moved, default_deadline);
+        assert_eq!(moved, due_ms(4000, slot_duration_ms));
+        assert_eq!(orch.attestation_deadline_ms(pre_gloas_slot, slot_duration_ms), default_pre);
     }
 
     #[test]
@@ -1255,7 +1893,7 @@ mod tests {
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let enablement: Arc<dyn SigningEnablement> = Arc::new(DoppelgangerDisabledByOperator);
-        let signer = builder.build_signer(composite, slashing_db, enablement);
+        let (signer, _quiesce_registry) = builder.build_signer(composite, slashing_db, enablement);
 
         // Build a temp validators config with a non-zero fee_recipient to satisfy the guard.
         let temp_dir = TempDir::new().unwrap();
@@ -1265,8 +1903,13 @@ mod tests {
             .unwrap();
         let validator_store = builder.build_validator_store(Some(&config_path)).unwrap();
 
-        let _builder_service =
-            builder.build_builder_service(signer, beacon, validator_store, [0, 0, 0, 0]);
+        let _builder_service = builder.build_builder_service(
+            signer,
+            beacon,
+            validator_store,
+            [0, 0, 0, 0],
+            Arc::new(eth_types::ForkSchedule::unscheduled_gloas()),
+        );
     }
 
     #[test]
@@ -1338,6 +1981,57 @@ mod tests {
         );
     }
 
+    /// The empty-file error points at the rejected-file recovery steps.
+    #[test]
+    fn test_empty_validators_config_points_at_rejected_recovery() {
+        let msg = ConfigError::EmptyValidatorsConfig.to_string();
+        assert!(
+            !msg.to_ascii_lowercase().contains("fee recipient"),
+            "empty validators config must point at the rejected-file recovery, got {msg}"
+        );
+        assert!(msg.contains("validators.toml.rejected"), "{msg}");
+        assert!(msg.contains("doppelganger_hold_until"), "{msg}");
+    }
+
+    /// Omitting the validators file fails closed with the zero fee recipient.
+    #[test]
+    fn test_docs_say_omitting_validators_config_is_zero_fee_recipient() {
+        let validators = include_str!("../../../../docs/validators-config.md");
+        let notes = include_str!("../../../../docs/releases/UNRELEASED.md");
+        for text in [validators, notes] {
+            assert!(
+                !text.contains("registers every loaded key as enabled"),
+                "dropping --validators-config fails with ZeroFeeRecipient"
+            );
+        }
+    }
+
+    /// An empty validators file is a boot error, distinct from a zero fee recipient.
+    #[test]
+    fn test_empty_validators_config_is_an_explicit_boot_error() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_validator_store(Some(&config_path));
+        assert!(
+            matches!(result, Err(ConfigError::EmptyValidatorsConfig)),
+            "an empty validators file must be an explicit boot error, got {:?}",
+            result.err()
+        );
+
+        std::fs::write(&config_path, " \n\t").unwrap();
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let result = builder.build_validator_store(Some(&config_path));
+        assert!(
+            matches!(result, Err(ConfigError::EmptyValidatorsConfig)),
+            "a whitespace validators file must be an explicit boot error, got {:?}",
+            result.err()
+        );
+    }
+
     /// When the TOML does not specify gas_limit the store must default to 30_000_000.
     #[test]
     fn test_default_gas_limit_30m() {
@@ -1375,6 +2069,53 @@ mod tests {
         let store = result.unwrap();
         assert_eq!(store.default_fee_recipient(), [0xbbu8; 20]);
         assert_eq!(store.default_gas_limit(), 50_000_000);
+    }
+
+    #[test]
+    fn test_build_validator_store_applies_builder_urls() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        std::fs::write(&config_path, format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n"))
+            .unwrap();
+
+        let config = Config {
+            builder: crate::config::BuilderSettings {
+                builders: vec!["https://relay.example".to_string()],
+                min_bid: Some(10_000_000),
+                builder_boost_factor: Some(80),
+            },
+            ..create_minimal_config()
+        };
+        let store =
+            ServiceBuilder::new(config).build_validator_store(Some(&config_path)).expect("store");
+        let unknown = [0xffu8; 48];
+        assert_eq!(store.builders(&unknown), vec!["https://relay.example".to_string()]);
+        assert_eq!(store.min_bid(&unknown), 10_000_000);
+        assert_eq!(store.builder_boost_factor(&unknown), 80);
+    }
+
+    #[test]
+    fn test_build_validator_store_rejects_malformed_builder_url() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("validators.toml");
+        let fr_hex = "0x".to_string() + &hex::encode([0xaau8; 20]);
+        std::fs::write(&config_path, format!("[defaults]\nfee_recipient = \"{fr_hex}\"\n"))
+            .unwrap();
+
+        let config = Config {
+            builder: crate::config::BuilderSettings {
+                builders: vec!["not a url".to_string()],
+                ..Default::default()
+            },
+            ..create_minimal_config()
+        };
+        let err = match ServiceBuilder::new(config).build_validator_store(Some(&config_path)) {
+            Err(e) => e,
+            Ok(_) => panic!("malformed URL"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("not a url"), "{msg}");
     }
 
     // --- D-3 (Issue 2.11): no-availability-regression for fail-closed default ---
@@ -1454,7 +2195,7 @@ mod tests {
         // registration runs.
         let mut disabled = validator_store::ValidatorConfig::new(pk);
         disabled.enabled = false;
-        store.add_validator(disabled);
+        store.add_validator(disabled).unwrap();
 
         builder.register_loaded_validators(&store, &pubkey_map);
 
@@ -1634,5 +2375,608 @@ mod tests {
         // Builder constructs and reads nested keymanager.enabled for feature logging.
         let builder = ServiceBuilder::new(config);
         builder.log_effective_config();
+    }
+
+    #[test]
+    fn doppelganger_import_window_is_two_spec_epochs() {
+        assert_eq!(
+            doppelganger_import_window().as_secs(),
+            DEFAULT_MONITORING_EPOCHS * SLOTS_PER_EPOCH * SLOT_DURATION_MS / 1000
+        );
+    }
+
+    // ── #626: unfinished import must not take the boot bypass ──────────────
+
+    const RESTART_EPOCH: u64 = 100;
+
+    fn restart_keypair() -> (crypto::SecretKey, crypto::PublicKey) {
+        let sk = crypto::SecretKey::generate();
+        let pk = sk.public_key();
+        (sk, pk)
+    }
+
+    fn map_of(keys: &[crypto::PublicKey]) -> PubkeyMap {
+        let mut map = HashMap::new();
+        for pk in keys {
+            map.insert(pk.to_bytes(), pk.clone());
+        }
+        Arc::new(parking_lot::RwLock::new(map))
+    }
+
+    fn composite_with(secrets: Vec<crypto::SecretKey>) -> Arc<CompositeSigner> {
+        let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+        for sk in secrets {
+            composite.add_local_key(sk);
+        }
+        composite
+    }
+
+    fn seed_recent_attestation(db: &SlashingDb, pk: &crypto::PublicKey, gvr: &Root) {
+        seed_attestation_at(db, pk, gvr, RESTART_EPOCH - 1);
+    }
+
+    fn seed_attestation_at(db: &SlashingDb, pk: &crypto::PublicKey, gvr: &Root, target: u64) {
+        let pk_hex = hex::encode(pk.to_bytes());
+        db.set_genesis_validators_root(gvr).unwrap();
+        db.check_and_record_attestation(&pk_hex, target.saturating_sub(1), target, None, gvr)
+            .expect("seed attestation");
+    }
+
+    fn sign_exit(
+        signer: &SignerService,
+        pk: &crypto::PublicKey,
+        gvr: &Root,
+    ) -> Result<crypto::Signature, signer::SignerError> {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(signer.sign_voluntary_exit(
+            &eth_types::VoluntaryExit { epoch: 1, validator_index: 1 },
+            pk,
+            &ForkSchedule::unscheduled_gloas(),
+            gvr,
+        ))
+    }
+
+    fn satisfy_import_window(machine: &ForwardWindowMachine, pk: &crypto::PublicKey) {
+        satisfy_window_from(machine, pk, RESTART_EPOCH);
+    }
+
+    fn satisfy_window_from(machine: &ForwardWindowMachine, pk: &crypto::PublicKey, start: u64) {
+        let end = start + DEFAULT_MONITORING_EPOCHS;
+        let sample = doppelganger::ValidatorLivenessData {
+            index: hex::encode(pk.to_bytes()),
+            is_live: false,
+        };
+        for epoch in start..=end {
+            machine
+                .observe_liveness(epoch, std::slice::from_ref(&sample))
+                .expect("liveness sample");
+        }
+        machine.tick(end, SLOTS_PER_EPOCH - 1);
+    }
+
+    struct RestartPaths {
+        _dir: TempDir,
+        keystores: std::path::PathBuf,
+        validators: std::path::PathBuf,
+    }
+
+    fn restart_paths() -> RestartPaths {
+        let dir = TempDir::new().unwrap();
+        let keystores = dir.path().join("keystores");
+        let validators = dir.path().join("validators.toml");
+        std::fs::create_dir(&keystores).unwrap();
+        RestartPaths { _dir: dir, keystores, validators }
+    }
+
+    fn builder_for(paths: &RestartPaths, validators: bool) -> ServiceBuilder {
+        let mut config = create_minimal_config();
+        config.keystore_path = paths.keystores.clone();
+        if validators {
+            config.validators_config = Some(paths.validators.clone());
+        }
+        ServiceBuilder::new(config)
+    }
+
+    fn write_validators(path: &std::path::Path, rows: &str) {
+        let body = format!(
+            "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\n\n{rows}"
+        );
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn hold_row(pk: &crypto::PublicKey, until: u64) -> String {
+        format!(
+            "[[validators]]\npubkey = \"0x{}\"\nenabled = false\ndoppelganger_hold_until = {until}\n",
+            hex::encode(pk.to_bytes())
+        )
+    }
+
+    fn disabled_row(pk: &crypto::PublicKey) -> String {
+        format!("[[validators]]\npubkey = \"0x{}\"\nenabled = false\n", hex::encode(pk.to_bytes()))
+    }
+
+    fn write_sidecar(
+        dir: &std::path::Path,
+        pk: &crypto::PublicKey,
+        imported_unix: u64,
+        partial: bool,
+    ) {
+        let suffix = if partial { ".import_meta.json.partial" } else { ".import_meta.json" };
+        let name = format!("0x{}{suffix}", hex::encode(pk.to_bytes()));
+        std::fs::write(dir.join(name), format!("{{\"imported_unix_seconds\":{imported_unix}}}"))
+            .unwrap();
+    }
+
+    /// Restart of an interrupted import: open hold, recent slashing history.
+    ///
+    /// The imported key must start Pending and refuse a voluntary exit. A
+    /// normally registered key in the same boot, including one that is
+    /// operator-disabled with no hold, still takes the history bypass.
+    /// After the forward window is observed, the imported key may sign.
+    #[test]
+    fn restart_with_open_hold_stays_pending_and_refuses_voluntary_exit() {
+        let gvr = [0x62u8; 32];
+        let (sk_import, pk_import) = restart_keypair();
+        let (sk_normal, pk_normal) = restart_keypair();
+        let (sk_disabled, pk_disabled) = restart_keypair();
+        let paths = restart_paths();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        write_validators(
+            &paths.validators,
+            &format!(
+                "{}{}",
+                hold_row(&pk_import, now.saturating_add(10_000)),
+                disabled_row(&pk_disabled)
+            ),
+        );
+
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        for pk in [&pk_import, &pk_normal, &pk_disabled] {
+            seed_recent_attestation(&db, pk, &gvr);
+        }
+        let pubkey_map = map_of(&[pk_import.clone(), pk_normal.clone(), pk_disabled.clone()]);
+        let builder = builder_for(&paths, true);
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let composite = composite_with(vec![sk_import, sk_normal, sk_disabled]);
+        let (signer, _quiesce) = builder.build_signer(composite, db, enablement);
+
+        assert_eq!(
+            machine.status(&pk_import),
+            doppelganger::ForwardWindowStatus::Pending,
+            "open hold must start Pending after restart"
+        );
+        assert!(
+            matches!(
+                sign_exit(signer.as_ref(), &pk_import, &gvr),
+                Err(signer::SignerError::BlockedByDoppelganger)
+            ),
+            "voluntary exit must be refused while the import window is open"
+        );
+
+        assert_eq!(
+            machine.status(&pk_normal),
+            doppelganger::ForwardWindowStatus::Safe,
+            "a normally registered key with recent history stays Safe"
+        );
+        assert!(
+            sign_exit(signer.as_ref(), &pk_normal, &gvr).is_ok(),
+            "a normally registered key may still sign a voluntary exit"
+        );
+        assert_eq!(
+            machine.status(&pk_disabled),
+            doppelganger::ForwardWindowStatus::Safe,
+            "an operator disable without a hold is not an unfinished import"
+        );
+
+        satisfy_import_window(&machine, &pk_import);
+        assert_eq!(
+            machine.status(&pk_import),
+            doppelganger::ForwardWindowStatus::Safe,
+            "the import window can still complete after restart"
+        );
+        assert!(
+            sign_exit(signer.as_ref(), &pk_import, &gvr).is_ok(),
+            "voluntary exit is allowed once the restarted window completes"
+        );
+    }
+
+    /// A recent import sidecar, with no validators hold, is the same bypass.
+    #[test]
+    fn restart_with_import_sidecar_stays_pending_and_refuses_voluntary_exit() {
+        let gvr = [0x63u8; 32];
+        let (sk_import, pk_import) = restart_keypair();
+        let (sk_normal, pk_normal) = restart_keypair();
+        let paths = restart_paths();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        write_sidecar(&paths.keystores, &pk_import, now.saturating_sub(10), false);
+
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        seed_recent_attestation(&db, &pk_import, &gvr);
+        seed_recent_attestation(&db, &pk_normal, &gvr);
+        let pubkey_map = map_of(&[pk_import.clone(), pk_normal.clone()]);
+        let builder = builder_for(&paths, false);
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let (signer, _quiesce) =
+            builder.build_signer(composite_with(vec![sk_import, sk_normal]), db, enablement);
+
+        assert_eq!(machine.status(&pk_import), doppelganger::ForwardWindowStatus::Pending);
+        assert!(matches!(
+            sign_exit(signer.as_ref(), &pk_import, &gvr),
+            Err(signer::SignerError::BlockedByDoppelganger)
+        ));
+        assert_eq!(machine.status(&pk_normal), doppelganger::ForwardWindowStatus::Safe);
+        assert!(sign_exit(signer.as_ref(), &pk_normal, &gvr).is_ok());
+    }
+
+    /// Epoch 0 must not Safe-skip a key that still has an open hold.
+    #[test]
+    fn restart_epoch0_open_hold_stays_pending() {
+        let gvr = [0x64u8; 32];
+        let (_sk, pk) = restart_keypair();
+        let paths = restart_paths();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        write_validators(&paths.validators, &hold_row(&pk, now.saturating_add(10_000)));
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let pubkey_map = map_of(std::slice::from_ref(&pk));
+        let builder = builder_for(&paths, true);
+        let (_enablement, machine) = builder.build_signing_enablement(db, gvr, 0, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        assert_eq!(
+            machine.status(&pk),
+            doppelganger::ForwardWindowStatus::Pending,
+            "epoch 0 must not bypass an open import hold"
+        );
+        assert!(!machine.is_signing_enabled(&pk));
+    }
+
+    /// Epoch 0 must not Safe-skip a key that still has an import sidecar.
+    #[test]
+    fn restart_epoch0_import_sidecar_stays_pending_and_refuses_voluntary_exit() {
+        let gvr = [0x6au8; 32];
+        let (sk, pk) = restart_keypair();
+        let paths = restart_paths();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        write_sidecar(&paths.keystores, &pk, now.saturating_sub(900), false);
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let pubkey_map = map_of(std::slice::from_ref(&pk));
+        let builder = builder_for(&paths, false);
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, 0, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
+        assert_eq!(
+            machine.status(&pk),
+            doppelganger::ForwardWindowStatus::Pending,
+            "epoch 0 must not bypass a remaining import sidecar"
+        );
+        assert!(matches!(
+            sign_exit(signer.as_ref(), &pk, &gvr),
+            Err(signer::SignerError::BlockedByDoppelganger)
+        ));
+    }
+
+    /// A leftover staged sidecar means the import publish did not finish.
+    #[test]
+    fn restart_with_partial_import_sidecar_stays_pending() {
+        let gvr = [0x65u8; 32];
+        let (sk, pk) = restart_keypair();
+        let paths = restart_paths();
+        // Timestamp is long expired. The partial file itself is the signal.
+        write_sidecar(&paths.keystores, &pk, 1, true);
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        seed_recent_attestation(&db, &pk, &gvr);
+        let pubkey_map = map_of(std::slice::from_ref(&pk));
+        let builder = builder_for(&paths, false);
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
+        assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
+        assert!(!machine.is_signing_enabled(&pk));
+        assert!(matches!(
+            sign_exit(signer.as_ref(), &pk, &gvr),
+            Err(signer::SignerError::BlockedByDoppelganger)
+        ));
+    }
+
+    /// An unreadable or malformed sidecar cannot prove the window elapsed.
+    #[test]
+    fn restart_with_malformed_import_sidecar_stays_pending() {
+        let gvr = [0x66u8; 32];
+        let (sk, pk) = restart_keypair();
+        let paths = restart_paths();
+        let name = format!("0x{}.import_meta.json", hex::encode(pk.to_bytes()));
+        std::fs::write(paths.keystores.join(name), "not-json").unwrap();
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        seed_recent_attestation(&db, &pk, &gvr);
+        let pubkey_map = map_of(std::slice::from_ref(&pk));
+        let builder = builder_for(&paths, false);
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
+        assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
+        assert!(!machine.is_signing_enabled(&pk));
+        assert!(matches!(
+            sign_exit(signer.as_ref(), &pk, &gvr),
+            Err(signer::SignerError::BlockedByDoppelganger)
+        ));
+    }
+
+    /// Sidecar age is not a completed forward window.
+    ///
+    /// Import epoch `e`, history target `e`, boot at `e+2`. Distance 2 is inside
+    /// the restart skip (`monitoring_epochs` is 2). The sidecar is ~900s old,
+    /// past the 768s store hold, and the hold itself has elapsed. A normal key
+    /// in the same boot still safe-skips. The imported key stays Pending and
+    /// voluntary exit is `BlockedByDoppelganger`.
+    #[test]
+    fn restart_aged_sidecar_before_forward_window_stays_pending() {
+        const IMPORT_EPOCH: u64 = 100;
+        const BOOT_EPOCH: u64 = IMPORT_EPOCH + 2;
+        let gvr = [0x67u8; 32];
+        let (sk_import, pk_import) = restart_keypair();
+        let (sk_normal, pk_normal) = restart_keypair();
+        let paths = restart_paths();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        write_sidecar(&paths.keystores, &pk_import, now.saturating_sub(900), false);
+        write_validators(&paths.validators, &hold_row(&pk_import, now.saturating_sub(100)));
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        seed_attestation_at(&db, &pk_import, &gvr, IMPORT_EPOCH);
+        seed_attestation_at(&db, &pk_normal, &gvr, IMPORT_EPOCH);
+        let pubkey_map = map_of(&[pk_import.clone(), pk_normal.clone()]);
+        let builder = builder_for(&paths, true);
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let (signer, _quiesce) =
+            builder.build_signer(composite_with(vec![sk_import, sk_normal]), db, enablement);
+
+        assert_eq!(
+            machine.status(&pk_import),
+            doppelganger::ForwardWindowStatus::Pending,
+            "a sidecar older than the store hold is still an unfinished import"
+        );
+        assert!(
+            matches!(
+                sign_exit(signer.as_ref(), &pk_import, &gvr),
+                Err(signer::SignerError::BlockedByDoppelganger)
+            ),
+            "voluntary exit must stay blocked until the forward window is observed"
+        );
+        let sidecar = paths
+            .keystores
+            .join(format!("0x{}.import_meta.json", hex::encode(pk_import.to_bytes())));
+        assert!(sidecar.exists(), "boot must not treat sidecar age as completion");
+        assert_eq!(
+            machine.status(&pk_normal),
+            doppelganger::ForwardWindowStatus::Safe,
+            "a key with no import marker still safe-skips from history at e, boot at e+2"
+        );
+        assert!(sign_exit(signer.as_ref(), &pk_normal, &gvr).is_ok());
+    }
+
+    /// A concurrent re-import that takes `tracked_keys` cannot lose its newer
+    /// sidecar to cleanup. Without the lock spanning Safe re-check and unlink,
+    /// the re-import thread would publish gen 999 between those steps and
+    /// cleanup would unlink it.
+    #[test]
+    fn clear_completed_import_sidecars_lock_keeps_concurrent_reimport() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration;
+
+        let dir = TempDir::new().unwrap();
+        let (_sk, pk) = restart_keypair();
+        let path = dir.path().join(format!("0x{}.import_meta.json", hex::encode(pk.to_bytes())));
+        write_sidecar(dir.path(), &pk, 100, false);
+        let tracked = Arc::new(TrackedKeys::new());
+        let still_safe = Arc::new(AtomicBool::new(true));
+        let ready = Arc::new(AtomicBool::new(false));
+
+        let tracked_reimport = Arc::clone(&tracked);
+        let still_safe_reimport = Arc::clone(&still_safe);
+        let ready_reimport = Arc::clone(&ready);
+        let path_reimport = path.clone();
+        let pk_reimport = pk.clone();
+        let reimport = thread::spawn(move || {
+            while !ready_reimport.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(1));
+            }
+            // Same lock order as production DELETE + import.
+            let _guard = tracked_reimport.lock();
+            write_sidecar(path_reimport.parent().unwrap(), &pk_reimport, 999, false);
+            still_safe_reimport.store(false, Ordering::SeqCst);
+        });
+
+        let tracked_cleanup = Arc::clone(&tracked);
+        let still_safe_cleanup = Arc::clone(&still_safe);
+        let ready_cleanup = Arc::clone(&ready);
+        clear_completed_import_sidecars_inner(
+            dir.path(),
+            tracked_cleanup.as_ref(),
+            |_| still_safe_cleanup.load(Ordering::SeqCst),
+            Some(&|_| {
+                ready_cleanup.store(true, Ordering::SeqCst);
+                // Wait until the re-import thread is blocked on tracked_keys.
+                let start = std::time::Instant::now();
+                while tracked_cleanup.contended() == 0 {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(2),
+                        "re-import thread never contended on tracked_keys"
+                    );
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }),
+        );
+        reimport.join().expect("re-import thread");
+        assert!(path.exists(), "a concurrent re-import's sidecar must survive cleanup");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("999"), "cleanup must keep generation 999, not unlink it: {body}");
+    }
+
+    /// If the key leaves Safe while cleanup holds `tracked_keys`, the marker
+    /// is left in place (no rename-aside / restore path).
+    #[test]
+    fn clear_completed_import_sidecars_keeps_marker_when_key_leaves_safe() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = TempDir::new().unwrap();
+        let (_sk, pk) = restart_keypair();
+        let path = dir.path().join(format!("0x{}.import_meta.json", hex::encode(pk.to_bytes())));
+        write_sidecar(dir.path(), &pk, 100, false);
+        let tracked = TrackedKeys::new();
+        let still_safe = AtomicBool::new(true);
+        clear_completed_import_sidecars_inner(
+            dir.path(),
+            &tracked,
+            |_| still_safe.load(Ordering::SeqCst),
+            Some(&|_| {
+                still_safe.store(false, Ordering::SeqCst);
+            }),
+        );
+        assert!(path.exists(), "leaving Safe under the lock must keep the unfinished marker");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("100"), "marker bytes must be unchanged: {body}");
+    }
+
+    /// A leftover `.removing.*` set-aside from an older cleanup is unfinished
+    /// at boot, and Safe cleanup removes it under `tracked_keys`.
+    #[test]
+    fn leftover_removing_sidecar_is_unfinished_and_cleared_when_safe() {
+        let gvr = [0x6cu8; 32];
+        let (sk, pk) = restart_keypair();
+        let paths = restart_paths();
+        let removing = paths
+            .keystores
+            .join(format!("0x{}.import_meta.json.removing.100", hex::encode(pk.to_bytes())));
+        std::fs::write(&removing, "{\"imported_unix_seconds\":100}").unwrap();
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        seed_recent_attestation(&db, &pk, &gvr);
+        let pubkey_map = map_of(std::slice::from_ref(&pk));
+        let builder = builder_for(&paths, false);
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
+        assert_eq!(
+            machine.status(&pk),
+            doppelganger::ForwardWindowStatus::Pending,
+            "leftover .removing.* must fail closed as unfinished"
+        );
+        assert!(matches!(
+            sign_exit(signer.as_ref(), &pk, &gvr),
+            Err(signer::SignerError::BlockedByDoppelganger)
+        ));
+
+        satisfy_window_from(&machine, &pk, RESTART_EPOCH);
+        assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Safe);
+        let tracked = TrackedKeys::new();
+        clear_completed_import_sidecars(&paths.keystores, &tracked, |bytes| {
+            bytes == &pk.to_bytes()
+        });
+        assert!(!removing.exists(), "Safe cleanup must remove leftover .removing.* under the lock");
+    }
+
+    /// Observing the window removes the sidecar. The next boot may safe-skip.
+    #[test]
+    fn restart_after_observed_forward_window_removes_sidecar_and_safe_skips() {
+        const IMPORT_EPOCH: u64 = 100;
+        const BOOT_EPOCH: u64 = IMPORT_EPOCH + 2;
+        let gvr = [0x6bu8; 32];
+        let (sk, pk) = restart_keypair();
+        let paths = restart_paths();
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        write_sidecar(&paths.keystores, &pk, now.saturating_sub(900), false);
+        write_validators(&paths.validators, &hold_row(&pk, now.saturating_sub(100)));
+        let sidecar =
+            paths.keystores.join(format!("0x{}.import_meta.json", hex::encode(pk.to_bytes())));
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        seed_attestation_at(&db, &pk, &gvr, IMPORT_EPOCH);
+        let pubkey_map = map_of(std::slice::from_ref(&pk));
+        let builder = builder_for(&paths, true);
+        let (_enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
+
+        satisfy_window_from(&machine, &pk, BOOT_EPOCH);
+        assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Safe);
+        let tracked = TrackedKeys::new();
+        clear_completed_import_sidecars(&paths.keystores, &tracked, |bytes| {
+            bytes == &pk.to_bytes()
+        });
+        assert!(!sidecar.exists(), "Safe observation must remove the unfinished marker");
+
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
+        assert_eq!(
+            machine.status(&pk),
+            doppelganger::ForwardWindowStatus::Safe,
+            "once the sidecar is gone, an elapsed hold and recent history may safe-skip"
+        );
+        assert!(sign_exit(signer.as_ref(), &pk, &gvr).is_ok());
+    }
+
+    /// A validators file that cannot be parsed must not grant the bypass.
+    #[test]
+    fn restart_unreadable_validators_file_fails_closed() {
+        let gvr = [0x68u8; 32];
+        let (sk, pk) = restart_keypair();
+        let paths = restart_paths();
+        std::fs::write(&paths.validators, "this is not a validators file [[[").unwrap();
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        seed_recent_attestation(&db, &pk, &gvr);
+        let pubkey_map = map_of(std::slice::from_ref(&pk));
+        let builder = builder_for(&paths, true);
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
+        assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
+        assert!(!machine.is_signing_enabled(&pk));
+        assert!(matches!(
+            sign_exit(signer.as_ref(), &pk, &gvr),
+            Err(signer::SignerError::BlockedByDoppelganger)
+        ));
+    }
+
+    /// A keystore directory that cannot be listed must not grant the bypass.
+    #[test]
+    fn restart_unreadable_keystore_dir_fails_closed() {
+        let gvr = [0x69u8; 32];
+        let (sk, pk) = restart_keypair();
+        let dir = TempDir::new().unwrap();
+        let not_a_dir = dir.path().join("keystores");
+        std::fs::write(&not_a_dir, "file").unwrap();
+        let mut config = create_minimal_config();
+        config.keystore_path = not_a_dir;
+        let builder = ServiceBuilder::new(config);
+        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        seed_recent_attestation(&db, &pk, &gvr);
+        let pubkey_map = map_of(std::slice::from_ref(&pk));
+        let (enablement, machine) =
+            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let machine = machine.expect("doppelganger on");
+        let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
+        assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
+        assert!(!machine.is_signing_enabled(&pk));
+        assert!(matches!(
+            sign_exit(signer.as_ref(), &pk, &gvr),
+            Err(signer::SignerError::BlockedByDoppelganger)
+        ));
     }
 }

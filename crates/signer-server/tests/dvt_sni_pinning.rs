@@ -39,6 +39,7 @@ use std::time::Duration;
 use rvc_test_support::{TestPki, TestPkiParams};
 use tempfile::TempDir;
 
+use signer_server::backend::dvt::{PartialSignDuty, PeerRequester};
 use signer_server::dvt::allow_list::{AllowedPeer, AllowedPeers};
 use signer_server::dvt::peer_client::{
     build_peer_connect_infos, GrpcPeerRequester, PeerConnectInfo,
@@ -46,6 +47,7 @@ use signer_server::dvt::peer_client::{
 use signer_server::dvt::peer_service::PeerSignerServiceImpl;
 use signer_server::dvt::types::ShareInfo;
 use signer_server::grpc_tls::TlsConfig;
+use signer_server::proto::signer_v2::{AttestationData, ForkInfo};
 use signer_server::PeerSignerServiceServerV2;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -115,6 +117,45 @@ async fn start_mtls_server(pki: &TestPki) -> u16 {
     addr.port()
 }
 
+/// Body the peer service rejects before signing. Reaching this string means
+/// the TLS handshake completed; a wrong SNI never gets that far.
+const REACHED_PEER_SERVICE: &str = "slashing protection database is not configured";
+
+fn attestation_duty() -> PartialSignDuty {
+    PartialSignDuty::AttestationData {
+        fork_info: ForkInfo {
+            previous_version: vec![0, 0, 0, 0],
+            current_version: vec![1, 0, 0, 0],
+            epoch: 0,
+            genesis_validators_root: vec![0u8; 32],
+        },
+        data: AttestationData {
+            slot: 1,
+            index: 0,
+            beacon_block_root: vec![0u8; 32],
+            source: None,
+            target: None,
+        },
+        fork_id: 4,
+    }
+}
+
+async fn rpc_after_lazy_connect(peer: &PeerConnectInfo, tls: &TlsConfig) -> String {
+    let requester = GrpcPeerRequester::connect(
+        std::slice::from_ref(peer),
+        Some(tls),
+        Duration::from_secs(5),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("lazy connect does not dial");
+    requester
+        .request_partial(&peer.addr, &attestation_duty(), &[0u8; 48], 1)
+        .await
+        .expect_err("fixture peer has no slashing DB")
+        .to_string()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Test 1 (RED → GREEN): wrong SNI — server cert for peer-A rejected for peer-B
 // ─────────────────────────────────────────────────────────────────────────────
@@ -138,13 +179,10 @@ async fn test_wrong_peer_cert_refused() {
     let peer =
         PeerConnectInfo { addr: format!("127.0.0.1:{}", port), sni_cn: "peer-b.local".to_string() };
 
-    let result =
-        GrpcPeerRequester::connect(&[peer], Some(&certs.client_tls_config), Duration::from_secs(5))
-            .await;
-
+    let msg = rpc_after_lazy_connect(&peer, &certs.client_tls_config).await;
     assert!(
-        result.is_err(),
-        "connecting with wrong SNI must fail — cert is for peer-a.local, not peer-b.local"
+        !msg.contains(REACHED_PEER_SERVICE),
+        "wrong SNI must fail the handshake before the peer service; got {msg}"
     );
 }
 
@@ -161,11 +199,11 @@ async fn test_correct_peer_cert_accepted() {
     let peer =
         PeerConnectInfo { addr: format!("127.0.0.1:{}", port), sni_cn: "peer-a.local".to_string() };
 
-    let result =
-        GrpcPeerRequester::connect(&[peer], Some(&certs.client_tls_config), Duration::from_secs(5))
-            .await;
-
-    assert!(result.is_ok(), "connecting with correct SNI must succeed; error: {:?}", result.err());
+    let msg = rpc_after_lazy_connect(&peer, &certs.client_tls_config).await;
+    assert!(
+        msg.contains(REACHED_PEER_SERVICE),
+        "matching SNI must complete the handshake and reach the peer service; got {msg}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

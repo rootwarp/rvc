@@ -1,0 +1,21 @@
+{
+  "epochs": 4,
+  "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "generated_at": "2026-09-12T00:00:00Z",
+  "genesis_validators_root": "0x3333333333333333333333333333333333333333333333333333333333333333",
+  "git_sha": "f110c1e",
+  "images": {
+    "genesis": "ethpandaops/ethereum-genesis-generator:6.2.1@sha256:15bb557cbd6d29fc1b7516a7147326a8c8d3af54f3c3ac534ec8772f6e875256",
+    "geth": "ethereum/client-go:v1.17.5@sha256:523d3ba26623a619e912019068dc2784f02934070ac46bdae4d5b9df0d917814",
+    "lighthouse": "sigp/lighthouse:v8.2.2@sha256:9a62bb8705455136e1cf96613460960f80dc2faa9d75b5c16a3bfcc9210dcdd1"
+  },
+  "key_range": [48, 64],
+  "profile": "fast",
+  "pubkeys": [
+    "0x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+    "0x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222"
+  ],
+  "run_id": "20260912T000000Z-f110c1e-a",
+  "rvc_version": "0.7.0",
+  "schema_version": 1
+}

@@ -1,0 +1,6 @@
+generated_at
+schema_version
+validators
+validators[].index
+validators[].keystore_path
+validators[].pubkey

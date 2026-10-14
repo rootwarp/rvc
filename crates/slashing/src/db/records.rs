@@ -22,18 +22,19 @@ impl SlashingDb {
         attestation: &SignedAttestation,
         gvr: &Root,
     ) -> Result<(), SlashingError> {
-        let pubkey = normalize_pubkey(&attestation.pubkey);
+        let pubkey = attestation.pubkey.as_ref();
         let gvr_hex = Self::root_to_hex(gvr);
+        let signing_root = attestation.signing_root.as_ref().map(|r| r.as_hex());
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO attestations \
              (client_cn, pubkey, source_epoch, target_epoch, signing_root, genesis_validators_root)
              VALUES ('local-vc', ?1, ?2, ?3, ?4, ?5)",
             (
-                &pubkey,
+                pubkey,
                 attestation.source_epoch as i64,
                 attestation.target_epoch as i64,
-                &attestation.signing_root,
+                signing_root,
                 &gvr_hex,
             ),
         )?;
@@ -66,7 +67,7 @@ impl SlashingDb {
         signing_root: Option<String>,
         gvr: &Root,
     ) -> Result<(), SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let gvr_hex = Self::root_to_hex(gvr);
         let conn = self.conn.lock();
         conn.execute(
@@ -76,16 +77,16 @@ impl SlashingDb {
              WHERE NOT EXISTS (
                  SELECT 1 FROM attestations WHERE pubkey = ?1 AND target_epoch = ?3
              )",
-            (&pubkey, source_epoch as i64, target_epoch as i64, &signing_root, &gvr_hex),
+            (pubkey.as_ref(), source_epoch as i64, target_epoch as i64, &signing_root, &gvr_hex),
         )?;
         Ok(())
     }
 
     /// Get all attestations for a given public key.
     pub fn get_attestations(&self, pubkey: &str) -> Result<Vec<SignedAttestation>, SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let conn = self.conn.lock();
-        Self::read_attestations(&conn, &pubkey)
+        Self::read_attestations(&conn, pubkey.as_ref())
     }
 
     /// Read attestations for `pubkey` using a caller-held `Connection`.
@@ -105,12 +106,12 @@ impl SlashingDb {
         )?;
 
         let rows = stmt.query_map([pubkey], |row| {
-            Ok(SignedAttestation {
-                pubkey: row.get(0)?,
-                source_epoch: row.get::<_, i64>(1)? as Epoch,
-                target_epoch: row.get::<_, i64>(2)? as Epoch,
-                signing_root: row.get(3)?,
-            })
+            Ok(SignedAttestation::from_stored(
+                row.get(0)?,
+                row.get::<_, i64>(1)? as Epoch,
+                row.get::<_, i64>(2)? as Epoch,
+                row.get(3)?,
+            ))
         })?;
 
         let mut attestations = Vec::new();
@@ -132,22 +133,23 @@ impl SlashingDb {
         block: &SignedBlock,
         gvr: &Root,
     ) -> Result<(), SlashingError> {
-        let pubkey = normalize_pubkey(&block.pubkey);
+        let pubkey = block.pubkey.as_ref();
         let gvr_hex = Self::root_to_hex(gvr);
+        let signing_root = block.signing_root.as_ref().map(|r| r.as_hex());
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO blocks (client_cn, pubkey, slot, signing_root, genesis_validators_root)
              VALUES ('local-vc', ?1, ?2, ?3, ?4)",
-            (&pubkey, block.slot as i64, &block.signing_root, &gvr_hex),
+            (pubkey, block.slot as i64, signing_root, &gvr_hex),
         )?;
         Ok(())
     }
 
     /// Get all blocks for a given public key.
     pub fn get_blocks(&self, pubkey: &str) -> Result<Vec<SignedBlock>, SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let conn = self.conn.lock();
-        Self::read_blocks(&conn, &pubkey)
+        Self::read_blocks(&conn, pubkey.as_ref())
     }
 
     /// Read blocks for `pubkey` using a caller-held `Connection`.
@@ -167,11 +169,7 @@ impl SlashingDb {
         )?;
 
         let rows = stmt.query_map([pubkey], |row| {
-            Ok(SignedBlock {
-                pubkey: row.get(0)?,
-                slot: row.get::<_, i64>(1)? as u64,
-                signing_root: row.get(2)?,
-            })
+            Ok(SignedBlock::from_stored(row.get(0)?, row.get::<_, i64>(1)? as u64, row.get(2)?))
         })?;
 
         let mut blocks = Vec::new();
@@ -184,11 +182,15 @@ impl SlashingDb {
     /// Read all distinct pubkeys from the DB using a caller-held `Connection`.
     ///
     /// Private helper for `export` so the full export runs under one lock.
+    /// Attestations, blocks, and watermarks: a pruned validator has no rows
+    /// left, and omitting the watermark table would drop it from the file.
     pub(crate) fn read_all_pubkeys(conn: &Connection) -> Result<Vec<String>, SlashingError> {
         let mut stmt = conn.prepare(
             "SELECT DISTINCT pubkey FROM attestations
              UNION
-             SELECT DISTINCT pubkey FROM blocks",
+             SELECT DISTINCT pubkey FROM blocks
+             UNION
+             SELECT DISTINCT pubkey FROM watermarks",
         )?;
 
         let rows = stmt.query_map([], |row| row.get(0))?;
@@ -225,7 +227,7 @@ impl SlashingDb {
         signing_root: Option<String>,
         gvr: &Root,
     ) -> Result<(), SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let gvr_hex = Self::root_to_hex(gvr);
         let conn = self.conn.lock();
         conn.execute(
@@ -234,7 +236,7 @@ impl SlashingDb {
              WHERE NOT EXISTS (
                  SELECT 1 FROM blocks WHERE pubkey = ?1 AND slot = ?2
              )",
-            (&pubkey, slot as i64, &signing_root, &gvr_hex),
+            (pubkey.as_ref(), slot as i64, &signing_root, &gvr_hex),
         )?;
         Ok(())
     }
@@ -246,12 +248,12 @@ impl SlashingDb {
         &self,
         pubkey: &str,
     ) -> Result<Option<Epoch>, SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let conn = self.conn.lock();
         let result: Option<i64> = conn
             .query_row(
                 "SELECT MAX(target_epoch) FROM attestations WHERE pubkey = ?1",
-                [&pubkey],
+                [pubkey.as_ref()],
                 |row| row.get(0),
             )
             .map_err(SlashingError::from)?;
@@ -263,10 +265,10 @@ impl SlashingDb {
     ///
     /// Returns `None` if no blocks have been signed for this validator.
     pub fn last_signed_block_slot(&self, pubkey: &str) -> Result<Option<Slot>, SlashingError> {
-        let pubkey = normalize_pubkey(pubkey);
+        let pubkey = normalize_pubkey(pubkey)?;
         let conn = self.conn.lock();
         let result: Option<i64> = conn
-            .query_row("SELECT MAX(slot) FROM blocks WHERE pubkey = ?1", [&pubkey], |row| {
+            .query_row("SELECT MAX(slot) FROM blocks WHERE pubkey = ?1", [pubkey.as_ref()], |row| {
                 row.get(0)
             })
             .map_err(SlashingError::from)?;
@@ -291,12 +293,8 @@ mod tests {
     fn test_insert_and_get_attestation() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let attestation = SignedAttestation {
-            pubkey: "0x1234".to_string(),
-            source_epoch: 100,
-            target_epoch: 101,
-            signing_root: Some("0xabcd".to_string()),
-        };
+        let attestation =
+            SignedAttestation::new("0x1234", 100, 101, Some("0xabcd")).expect("valid hex pubkey");
 
         db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
@@ -309,12 +307,8 @@ mod tests {
     fn test_insert_attestation_without_signing_root() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let attestation = SignedAttestation {
-            pubkey: "0x1234".to_string(),
-            source_epoch: 100,
-            target_epoch: 101,
-            signing_root: None,
-        };
+        let attestation =
+            SignedAttestation::new("0x1234", 100, 101, None).expect("valid hex pubkey");
 
         db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
 
@@ -336,18 +330,8 @@ mod tests {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         let attestations = vec![
-            SignedAttestation {
-                pubkey: "0x1234".to_string(),
-                source_epoch: 100,
-                target_epoch: 101,
-                signing_root: None,
-            },
-            SignedAttestation {
-                pubkey: "0x1234".to_string(),
-                source_epoch: 101,
-                target_epoch: 102,
-                signing_root: None,
-            },
+            SignedAttestation::new("0x1234", 100, 101, None).expect("valid hex pubkey"),
+            SignedAttestation::new("0x1234", 101, 102, None).expect("valid hex pubkey"),
         ];
 
         for a in &attestations {
@@ -387,11 +371,7 @@ mod tests {
     fn test_insert_and_get_block() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let block = SignedBlock {
-            pubkey: "0x1234".to_string(),
-            slot: 1000,
-            signing_root: Some("0xabcd".to_string()),
-        };
+        let block = SignedBlock::new("0x1234", 1000, Some("0xabcd")).expect("valid hex pubkey");
 
         db.insert_block(&block, &TEST_GVR).expect("failed to insert");
 
@@ -404,7 +384,7 @@ mod tests {
     fn test_insert_block_without_signing_root() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let block = SignedBlock { pubkey: "0x1234".to_string(), slot: 1000, signing_root: None };
+        let block = SignedBlock::new("0x1234", 1000, None).expect("valid hex pubkey");
 
         db.insert_block(&block, &TEST_GVR).expect("failed to insert");
 
@@ -426,8 +406,8 @@ mod tests {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
         let blocks = vec![
-            SignedBlock { pubkey: "0x1234".to_string(), slot: 1000, signing_root: None },
-            SignedBlock { pubkey: "0x1234".to_string(), slot: 1001, signing_root: None },
+            SignedBlock::new("0x1234", 1000, None).expect("valid hex pubkey"),
+            SignedBlock::new("0x1234", 1001, None).expect("valid hex pubkey"),
         ];
 
         for b in &blocks {
@@ -528,19 +508,11 @@ mod tests {
     fn test_different_pubkeys_isolated() {
         let db = SlashingDb::open_in_memory().expect("failed to open db");
 
-        let attestation1 = SignedAttestation {
-            pubkey: "0x1111".to_string(),
-            source_epoch: 100,
-            target_epoch: 101,
-            signing_root: None,
-        };
+        let attestation1 =
+            SignedAttestation::new("0x1111", 100, 101, None).expect("valid hex pubkey");
 
-        let attestation2 = SignedAttestation {
-            pubkey: "0x2222".to_string(),
-            source_epoch: 100,
-            target_epoch: 101,
-            signing_root: None,
-        };
+        let attestation2 =
+            SignedAttestation::new("0x2222", 100, 101, None).expect("valid hex pubkey");
 
         db.insert_attestation(&attestation1, &TEST_GVR).expect("failed to insert");
         db.insert_attestation(&attestation2, &TEST_GVR).expect("failed to insert");
@@ -550,8 +522,8 @@ mod tests {
 
         assert_eq!(result1.len(), 1);
         assert_eq!(result2.len(), 1);
-        assert_eq!(result1[0].pubkey, "0x1111");
-        assert_eq!(result2[0].pubkey, "0x2222");
+        assert_eq!(result1[0].pubkey.as_ref(), "0x1111");
+        assert_eq!(result2[0].pubkey.as_ref(), "0x2222");
     }
 
     #[test]
@@ -561,12 +533,8 @@ mod tests {
 
         {
             let db = SlashingDb::open(&path).expect("failed to open db");
-            let attestation = SignedAttestation {
-                pubkey: "0x1234".to_string(),
-                source_epoch: 100,
-                target_epoch: 101,
-                signing_root: None,
-            };
+            let attestation =
+                SignedAttestation::new("0x1234", 100, 101, None).expect("valid hex pubkey");
             db.insert_attestation(&attestation, &TEST_GVR).expect("failed to insert");
         }
 
@@ -623,10 +591,10 @@ mod tests {
 
         let attestations = db.get_attestations("0x1234").expect("failed to get");
         assert_eq!(attestations.len(), 1);
-        assert_eq!(attestations[0].pubkey, "0x1234");
+        assert_eq!(attestations[0].pubkey.as_ref(), "0x1234");
         assert_eq!(attestations[0].source_epoch, 100);
         assert_eq!(attestations[0].target_epoch, 101);
-        assert_eq!(attestations[0].signing_root, Some("0xabcd".to_string()));
+        assert_eq!(attestations[0].signing_root.as_ref().map(|r| r.as_hex()), Some("0xabcd"));
     }
 
     #[test]
@@ -714,7 +682,7 @@ mod tests {
         let blocks = db.get_blocks("0x1234").expect("failed to get");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].slot, 1000);
-        assert_eq!(blocks[0].signing_root, Some("0xabcd".to_string()));
+        assert_eq!(blocks[0].signing_root.as_ref().map(|r| r.as_hex()), Some("0xabcd"));
     }
 
     #[test]

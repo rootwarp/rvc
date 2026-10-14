@@ -1,0 +1,33 @@
+{
+  "execution_optimistic": false,
+  "finalized": false,
+  "data": {
+    "ideal_rewards": [
+      {
+        "effective_balance": "32000000000",
+        "head": "1834",
+        "target": "14672",
+        "source": "9170",
+        "inclusion_delay": "0",
+        "inactivity": "0"
+      },
+      {
+        "effective_balance": "2048000000000",
+        "head": "0",
+        "target": "0",
+        "source": "0",
+        "inclusion_delay": "0",
+        "inactivity": "0"
+      }
+    ],
+    "total_rewards": [
+      {
+        "validator_index": "1",
+        "head": "0",
+        "target": "0",
+        "source": "0",
+        "inactivity": "0"
+      }
+    ]
+  }
+}

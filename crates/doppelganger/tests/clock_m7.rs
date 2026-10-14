@@ -2,55 +2,45 @@
 //!
 //! Verifies that [`MonotonicEpochClock`] is immune to NTP wall-clock steps
 //! by anchoring epoch computation on a monotonic `Instant` elapsed plus a
-//! `start_unix_time` captured once at construction.  The legacy
-//! `DoppelgangerService` embeds the same clock (no parallel formula).
+//! `start_unix_time` captured once at construction.
 
 use std::time::{Duration, Instant};
 
-use rvc_doppelganger::{
-    DoppelgangerService, LegacySlashingHistoryReader, LivenessChecker, MonotonicEpochClock,
-    ValidatorLivenessData,
-};
+use eth_types::{SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+use rvc_doppelganger::MonotonicEpochClock;
 
-// Epoch length in seconds: SECONDS_PER_SLOT * SLOTS_PER_EPOCH = 12 * 32 = 384
-const SECONDS_PER_EPOCH: u64 = 12 * 32;
+// Epoch length in seconds: SLOT_DURATION_MS * SLOTS_PER_EPOCH / 1000 = 12_000 * 32 / 1000 = 384
+const SECONDS_PER_EPOCH: u64 = SLOT_DURATION_MS * SLOTS_PER_EPOCH / 1000;
 
-// --- Minimal mock implementations (service embedding check) ---
+/// Slot 0 at genesis; one 12_000 ms slot later is slot 1 (not 12_000 s later).
+/// Would fail a naive `secs / SLOT_DURATION_MS` rename of `secs / SECONDS_PER_SLOT`.
+#[test]
+fn test_slot_zero_at_genesis() {
+    let genesis = 1_606_824_023_u64;
+    let clock = MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis);
+    assert_eq!(clock.current_slot(), 0);
+    assert_eq!(clock.current_epoch(), 0);
 
-struct EmptySlashingDb;
+    let one_slot_secs = SLOT_DURATION_MS / 1000;
+    assert_eq!(one_slot_secs, 12, "mainnet slot is 12 s");
+    let one_slot_later =
+        MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis + one_slot_secs);
+    assert_eq!(one_slot_later.current_slot(), 1);
 
-impl LegacySlashingHistoryReader for EmptySlashingDb {
-    fn last_signed_attestation_epoch(
-        &self,
-        _pubkey: &str,
-    ) -> Result<Option<u64>, rvc_doppelganger::DoppelgangerError> {
-        Ok(None)
-    }
+    let still_genesis =
+        MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis + one_slot_secs - 1);
+    assert_eq!(still_genesis.current_slot(), 0);
 }
 
-struct EmptyLivenessChecker;
-
-#[async_trait::async_trait]
-impl LivenessChecker for EmptyLivenessChecker {
-    async fn check_liveness(
-        &self,
-        _epoch: u64,
-        _validator_indices: &[String],
-    ) -> Result<Vec<ValidatorLivenessData>, rvc_doppelganger::DoppelgangerError> {
-        Ok(vec![])
-    }
-}
-
-fn mock_service(
-    genesis_time: u64,
-    start_unix_time: u64,
-    start_instant: Instant,
-) -> DoppelgangerService {
-    use std::sync::Arc;
-    let liveness: Arc<dyn LivenessChecker> = Arc::new(EmptyLivenessChecker);
-    let slashing_db: Arc<dyn LegacySlashingHistoryReader> = Arc::new(EmptySlashingDb);
-    DoppelgangerService::new(liveness, slashing_db, genesis_time)
-        .with_start_time(start_instant, start_unix_time)
+/// One epoch is 384 s (`SLOT_DURATION_MS * SLOTS_PER_EPOCH` ms), matching the pre-ms tree.
+#[test]
+fn test_epoch_duration_is_384_seconds() {
+    assert_eq!(SECONDS_PER_EPOCH, 384);
+    let genesis = 0_u64;
+    let clock =
+        MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis + SECONDS_PER_EPOCH);
+    assert_eq!(clock.current_epoch(), 1);
+    assert_eq!(clock.current_slot(), SLOTS_PER_EPOCH);
 }
 
 /// M-7: A wall-clock step (NTP jump) must NOT shift the computed epoch.
@@ -58,7 +48,7 @@ fn mock_service(
 fn test_wall_clock_jump_does_not_shift_epoch() {
     // Scenario:
     //   genesis_time  = 0
-    //   start_unix    = 384 * 5 = 1920  (service "started" 5 epochs after genesis)
+    //   start_unix    = 384 * 5 = 1920  (clock "started" 5 epochs after genesis)
     //   start_instant = Instant::now()  (zero elapsed so far)
     //
     // current_epoch() = (start_unix + elapsed - genesis) / SECONDS_PER_EPOCH
@@ -69,15 +59,9 @@ fn test_wall_clock_jump_does_not_shift_epoch() {
     let start_instant = Instant::now();
 
     let clock = MonotonicEpochClock::with_start_time(genesis_time, start_instant, start_unix_time);
-    let service = mock_service(genesis_time, start_unix_time, start_instant);
 
     let epoch = clock.current_epoch();
     assert_eq!(epoch, 5, "epoch should be anchored at 5 epochs past genesis");
-    assert_eq!(
-        service.epoch_clock().current_epoch(),
-        epoch,
-        "service must share MonotonicEpochClock formula"
-    );
 
     // Simulate a "wall-clock jump" by observing that our formula does NOT use
     // SystemTime::now().  We verify by cross-checking with the manual formula:

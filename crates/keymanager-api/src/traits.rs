@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -15,6 +17,11 @@ pub enum ImportKeystoreError {
     InvalidKeystore(String),
     #[error("I/O error: {0}")]
     Io(String),
+    /// A DELETE has snapshotted this pubkey and has not finished yet.
+    ///
+    /// The key is not present. This is not [`Self::Duplicate`].
+    #[error("delete in progress")]
+    DeleteInProgress,
 }
 
 #[derive(Debug, Error)]
@@ -24,15 +31,49 @@ pub enum DeleteKeystoreError {
 }
 
 /// Manages BLS keystores: decryption, import, removal, and file operations.
+#[async_trait]
 pub trait KeystoreManager: Send + Sync {
     fn list_keys(&self) -> Vec<Pubkey>;
     fn has_key(&self, pubkey: &Pubkey) -> bool;
-    fn import_keystore(
+    async fn import_keystore(
         &self,
         keystore_json: &str,
         password: &str,
     ) -> Result<Pubkey, ImportKeystoreError>;
     fn delete_keystore(&self, pubkey: &Pubkey) -> Result<bool, DeleteKeystoreError>;
+
+    /// Which of `candidates` are members, decided under the same lock as
+    /// [`Self::import_keystore`] and [`Self::delete_keystore`] when the
+    /// implementor has one.
+    ///
+    /// The VC adapter also records the in-flight DELETE count for that
+    /// snapshot before releasing the lock. [`Self::begin_delete_export`] must
+    /// not count those pubkeys again. [`Self::end_delete_export`] drops the
+    /// count. The default is a `has_key` filter with no count. A key that
+    /// appears after this snapshot must not be removed by a DELETE whose
+    /// export omitted it.
+    fn membership_for_delete(&self, candidates: &[Pubkey]) -> Vec<Pubkey> {
+        let mut members = Vec::new();
+        for pubkey in candidates {
+            if self.has_key(pubkey) && !members.contains(pubkey) {
+                members.push(*pubkey);
+            }
+        }
+        members
+    }
+
+    /// Mark the start of a DELETE whose membership snapshot is already counted.
+    ///
+    /// Must not increment the in-flight count. That count is taken in
+    /// [`Self::membership_for_delete`] under the same lock as the scan.
+    /// Paired with [`Self::end_delete_export`] for the same pubkeys, which
+    /// stays up through export, deletion, drain timeout, and every other
+    /// return. Default is a no-op.
+    fn begin_delete_export(&self, _members: &[Pubkey]) {}
+
+    /// Drop the in-flight count installed by [`Self::membership_for_delete`]
+    /// for `members`.
+    fn end_delete_export(&self, _members: &[Pubkey]) {}
 }
 
 /// Errors from [`SlashingProtection`] trait methods.
@@ -49,22 +90,89 @@ pub enum SlashingProtectionError {
     /// Internal/backend failure. Detail is never echoed to HTTP clients.
     #[error("{0}")]
     Backend(String),
+    /// The estimated interchange hold fits no free slot window.
+    ///
+    /// The string is the gate's named `NoFreeWindow` message. It is safe to
+    /// surface. Retrying the same payload does not succeed; split it.
+    ///
+    /// Additive: architecture §3 did not list this variant. No existing
+    /// variant changed.
+    #[error("{0}")]
+    NoFreeWindow(String),
+    /// The single-flight import queue exceeded its slot bound.
+    ///
+    /// Retryable. `retry_after_secs` is that bound. Additive, same as
+    /// [`Self::NoFreeWindow`].
+    #[error("interchange import queue exceeded the wait bound; retry after {retry_after_secs}s")]
+    ImportQueueFull { retry_after_secs: u64 },
 }
 
 /// Manages EIP-3076 slashing protection interchange data.
+#[async_trait]
 pub trait SlashingProtection: Send + Sync {
-    fn import_interchange(&self, interchange_json: &str) -> Result<(), SlashingProtectionError>;
+    async fn import_interchange(
+        &self,
+        interchange_json: &str,
+    ) -> Result<(), SlashingProtectionError>;
     fn export_interchange(&self, pubkeys: &[Pubkey]) -> Result<String, SlashingProtectionError>;
 }
 
 /// Manages validator configurations (enable/disable).
+///
+/// Each method returns the validators-file error. Callers must not treat a
+/// failed write as success: a disable stays disabled in memory, and an enable
+/// or insert is not published.
 pub trait ValidatorManager: Send + Sync {
-    fn add_validator(&self, pubkey: Pubkey, enabled: bool);
-    fn remove_validator(&self, pubkey: &Pubkey) -> bool;
+    fn add_validator(&self, pubkey: Pubkey, enabled: bool) -> Result<(), String>;
+    fn remove_validator(&self, pubkey: &Pubkey) -> Result<bool, String>;
     /// Flip the attesting-enabled state of an existing validator.
     ///
-    /// No-op if `pubkey` is not tracked (e.g. already deleted).
-    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool);
+    /// No-op `Ok` if `pubkey` is not tracked (e.g. already deleted).
+    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) -> Result<(), String>;
+
+    /// Persist a doppelganger hold that is distinct from an operator disable.
+    ///
+    /// `Ok(true)` means the caller should arm the enable timer. `Ok(false)`
+    /// means the row was already disabled and is not a hold, so the timer
+    /// must not start. `until_unix` is the unix-second deadline. The default
+    /// records a plain disabled validator for tests that do not model the hold
+    /// and reports the timer as armed.
+    fn begin_doppelganger_hold(&self, pubkey: Pubkey, until_unix: u64) -> Result<bool, String> {
+        let _ = until_unix;
+        self.add_validator(pubkey, false)?;
+        Ok(true)
+    }
+
+    /// Unix-second deadline already stored for `pubkey`, when this manager keeps one.
+    ///
+    /// `None` tells the enable task to sleep for its configured window. Test
+    /// doubles that do not store a deadline keep that behavior. Production
+    /// returns the deadline written to the validators file.
+    fn armed_hold_unix(&self, pubkey: &Pubkey) -> Option<u64> {
+        let _ = pubkey;
+        None
+    }
+
+    /// Whether `pubkey` is still a doppelganger hold.
+    ///
+    /// The default is `true` so test doubles that do not model the hold still
+    /// re-enable when the window elapses. Production reads the stored deadline.
+    fn is_doppelganger_hold(&self, pubkey: &Pubkey) -> bool {
+        let _ = pubkey;
+        true
+    }
+
+    /// Enable `pubkey` only when [`Self::is_doppelganger_hold`] is still set.
+    ///
+    /// `Ok(false)` leaves the row unchanged. Production re-checks the deadline
+    /// under the store lock so a disable cannot be overwritten.
+    fn release_doppelganger_hold(&self, pubkey: &Pubkey) -> Result<bool, String> {
+        if !self.is_doppelganger_hold(pubkey) {
+            return Ok(false);
+        }
+        self.set_validator_enabled(pubkey, true)?;
+        Ok(true)
+    }
 }
 
 /// Triggers doppelganger detection for newly imported keys.
@@ -81,8 +189,8 @@ pub trait DoppelgangerMonitor: Send + Sync {
     /// DELETE / hard-remove path: drop all monitoring state so a re-import starts
     /// a fresh window (`ForwardWindowMachine::cancel`).
     ///
-    /// Default: same as [`Self::stop_monitoring`] (time-based gates where both
-    /// mean "prune pending").
+    /// Default: same as [`Self::stop_monitoring`] (log-only / pending-set
+    /// implementors where both mean "prune pending").
     fn cancel_monitoring(&self, pubkey: &Pubkey) {
         self.stop_monitoring(pubkey);
     }
@@ -163,4 +271,43 @@ pub trait VoluntaryExitManager: Send + Sync {
         pubkey: &Pubkey,
         epoch: Option<u64>,
     ) -> Result<eth_types::SignedVoluntaryExit, ApiError>;
+}
+
+/// A drain that did not see the per-pubkey signing lock become free.
+///
+/// Not a success variant. The pubkey stays quiesced; callers must not export
+/// or delete it.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum QuiesceError {
+    /// `waited` is how long the drain blocked before giving up.
+    #[error("signing drain timed out after {waited:?}")]
+    DrainTimedOut { waited: Duration },
+}
+
+/// Close the under-lock signing gate for one pubkey and drain the slashable lock.
+///
+/// This trait lives in `rvc-keymanager-api` because that crate is Infra and
+/// must not depend on `rvc-signer` (Domain). A direct dependency would fail
+/// the G-5b `layer_edges` gate. The VC (`rvc`) implements the trait and calls
+/// the signer's per-pubkey drain; keymanager handlers depend only on this trait.
+///
+/// `Ok` means the pubkey is quiesced, so the enablement gate re-checked under
+/// the slashable per-pubkey lock is closed, and that lock was acquired and
+/// dropped. It does **not** mean every in-flight non-slashable signature has
+/// finished: randao, sync committee, aggregate, and voluntary exit check
+/// enablement and then sign without taking that lock. A later DELETE must not
+/// treat `Ok` as "all duties are idle".
+///
+/// [`QuiesceError::DrainTimedOut`] is an error. A timed-out drain leaves the
+/// pubkey quiesced and must not be ignored.
+#[async_trait]
+pub trait SigningQuiesce: Send + Sync {
+    /// Quiesce `pubkey` and wait up to `timeout` for the slashable per-pubkey lock.
+    ///
+    /// `Ok` — the under-lock gate is closed and that lock was acquired and
+    /// dropped. Non-slashable duties do not hold the lock, so `Ok` does not
+    /// mean they are idle. DELETE must not treat `Ok` as "all duties are idle".
+    ///
+    /// The pubkey remains quiesced on both `Ok` and [`QuiesceError::DrainTimedOut`].
+    async fn quiesce(&self, pubkey: &Pubkey, timeout: Duration) -> Result<(), QuiesceError>;
 }

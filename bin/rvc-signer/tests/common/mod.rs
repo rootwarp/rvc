@@ -157,8 +157,24 @@ fn drain_pipe_thread(
 /// Sets `RUST_LOG=warn` unless the caller already provided `RUST_LOG` in
 /// `extra_env`, keeping startup noise small while still capturing failures.
 pub fn spawn_serve(args: &[&str], extra_env: &[(&str, &str)]) -> SpawnedServe {
+    spawn_serve_clearing(args, extra_env, &[])
+}
+
+/// [`spawn_serve`] that also drops `remove_env` keys from the child.
+///
+/// `Command` inherits the runner environment. T9's negative half must not see
+/// a parent `OTEL_EXPORTER_OTLP_ENDPOINT`, or tracing turns on without a flag.
+pub fn spawn_serve_clearing(
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+    remove_env: &[&str],
+) -> SpawnedServe {
     let mut cmd = Command::new(bin_path());
     cmd.arg("serve").args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    for key in remove_env {
+        cmd.env_remove(key);
+    }
 
     let mut has_rust_log = false;
     for (k, v) in extra_env {

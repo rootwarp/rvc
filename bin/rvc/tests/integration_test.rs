@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use common::MockBn;
 use crypto::{EncryptionKdf, Keystore, SecretKey};
+use eth_types::ForkName;
 use tempfile::{NamedTempFile, TempDir};
 
 /// Ordered log markers that define a successful ready path with a loaded key.
@@ -59,12 +60,11 @@ fn free_port() -> u16 {
 
 struct TestPorts {
     metrics: u16,
-    grpc: u16,
 }
 
 impl TestPorts {
     fn allocate() -> Self {
-        Self { metrics: free_port(), grpc: free_port() }
+        Self { metrics: free_port() }
     }
 }
 
@@ -120,8 +120,6 @@ validators_config = "{validators}"
 password_file = "{password_file}"
 metrics_address = "127.0.0.1"
 metrics_port = {metrics}
-grpc_address = "127.0.0.1"
-grpc_port = {grpc}
 network = "mainnet"
 log_level = "info"
 keymanager_enabled = false
@@ -132,7 +130,6 @@ keymanager_enabled = false
         validators = validators_config.display(),
         password_file = password_file.display(),
         metrics = ports.metrics,
-        grpc = ports.grpc,
     )
     .unwrap();
     file
@@ -140,9 +137,9 @@ keymanager_enabled = false
 
 /// Spawn `rvc start` with `--init-slashing-db` for the fresh-DB SEC-3 path.
 ///
-/// Ports must be passed on the CLI: clap always emits `default_value_t` for
-/// `--metrics-port` / `--grpc-port`, and `merge_with_cli` then overwrites the
-/// config-file values. Clear `OTEL_*` so ambient collector env stays offline.
+/// Ports are still passed on the CLI so parallel tests do not collide.
+/// After ARCH-4i / ADR-009 a TOML `metrics_port` survives when the flag is
+/// absent. Clear `OTEL_*` so ambient collector env stays offline.
 fn spawn_validator(config_path: &std::path::Path, ports: &TestPorts) -> Child {
     let binary_path = get_binary_path();
 
@@ -154,11 +151,7 @@ fn spawn_validator(config_path: &std::path::Path, ports: &TestPorts) -> Child {
             "--init-slashing-db",
             "--metrics-port",
             &ports.metrics.to_string(),
-            "--grpc-port",
-            &ports.grpc.to_string(),
             "--metrics-address",
-            "127.0.0.1",
-            "--grpc-address",
             "127.0.0.1",
         ])
         .env_remove("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -363,6 +356,10 @@ impl SmokeHarness {
         format!("http://127.0.0.1:{}/readyz", self.ports.metrics)
     }
 
+    fn livez_url(&self) -> String {
+        format!("http://127.0.0.1:{}/livez", self.ports.metrics)
+    }
+
     /// Wait until `/health` is HTTP 200 (healthy=true). 503 is not ready.
     async fn wait_until_ready(&self) {
         let health = self.health_url();
@@ -423,6 +420,20 @@ async fn test_startup_reaches_ready_against_mock_bn() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn test_startup_reaches_ready_against_gloas_mock_bn() {
+    let mock_bn = MockBn::with_fork(ForkName::Gloas).start().await;
+    let mut harness = SmokeHarness::start_with_bn(mock_bn).await;
+    harness.wait_until_ready().await;
+    assert_health_json_healthy(&harness.health_url()).await;
+
+    let (status, logs) = harness.shutdown_cleanly().await;
+    assert_startup_sequence(&logs);
+    #[cfg(unix)]
+    assert!(status.success(), "expected exit 0 on SIGTERM, got {status}\n--- stdout ---\n{logs}");
+    let _ = status;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_startup_sequence_markers_in_order() {
     let mut harness = SmokeHarness::start().await;
     let (_status, logs) = harness.shutdown_cleanly().await;
@@ -450,6 +461,49 @@ async fn test_graceful_shutdown_sigterm_exit_code_zero() {
     {
         let _ = (status, logs);
     }
+}
+
+/// ARCH-7e: healthz gRPC is gone; leftover bind knobs are rejected, so this
+/// only asserts the process never logs a gRPC listener start.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_no_grpc_listener_on_startup() {
+    let mut harness = SmokeHarness::start().await;
+    harness.wait_until_ready().await;
+
+    let logs = harness.logs.snapshot();
+    assert!(
+        !logs.contains("Starting gRPC server"),
+        "startup must not bind a gRPC listener.\n--- stdout ---\n{logs}"
+    );
+
+    let (status, _logs) = harness.shutdown_cleanly().await;
+    #[cfg(unix)]
+    assert!(status.success(), "expected exit 0 on SIGTERM, got {status}");
+    let _ = status;
+}
+
+/// ARCH-7d: metrics `/health` and `/readyz` are the live replacement probes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_metrics_server_answers_health_and_readyz() {
+    let mut harness = SmokeHarness::start().await;
+    harness.wait_until_ready().await;
+
+    assert_health_json_healthy(&harness.health_url()).await;
+    assert!(
+        wait_for_http_ok(&harness.readyz_url(), Duration::from_secs(2)).await,
+        "/readyz must answer HTTP 200 when the process is ready.\n--- stdout ---\n{}",
+        harness.logs.snapshot()
+    );
+    assert!(
+        wait_for_http_ok(&harness.livez_url(), Duration::from_secs(2)).await,
+        "/livez must answer HTTP 200 (process-up).\n--- stdout ---\n{}",
+        harness.logs.snapshot()
+    );
+
+    let (status, _logs) = harness.shutdown_cleanly().await;
+    #[cfg(unix)]
+    assert!(status.success(), "expected exit 0 on SIGTERM, got {status}");
+    let _ = status;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -555,6 +609,11 @@ async fn test_startup_fails_closed_on_unsupported_fork() {
     assert!(
         !status.success(),
         "unsupported fork must exit non-zero, got {status}\n--- stdout ---\n{logs}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(13),
+        "unsupported fork must exit 13, got {status}\n--- stdout ---\n{logs}"
     );
     assert!(
         logs.contains("Fork compatibility")

@@ -38,6 +38,26 @@ pub enum SlashingError {
     #[error("invalid interchange format: {0}")]
     InvalidInterchangeFormat(String),
 
+    /// Attestation floor cannot be encoded as one interchange record.
+    ///
+    /// The derived bounds have `source_bound > target_bound`, or only one of
+    /// the source and target watermarks is set (the missing side is `0`).
+    /// The whole export fails; no partial interchange is returned.
+    #[error(
+        "attestation floor for {pubkey} cannot be represented \
+         (source_bound={source_bound}, target_bound={target_bound})"
+    )]
+    UnrepresentableFloor { pubkey: String, source_bound: Epoch, target_bound: Epoch },
+
+    /// Pubkey rejected at internal-record construction ([`crate::SignedBlock::new`] /
+    /// [`crate::SignedAttestation::new`]).
+    #[error("invalid slashing-record pubkey ({0})")]
+    InvalidPubkey(&'static str),
+
+    /// A staging-path invariant that used to be `.expect` (ARCH-5o).
+    #[error("internal slashing invariant violated: {0}")]
+    InternalInvariant(&'static str),
+
     #[error("database integrity check failed: {0}")]
     IntegrityCheckFailed(String),
 
@@ -91,6 +111,48 @@ pub enum SlashingError {
     /// File inspection failed before open (permissions, I/O).
     #[error("failed to inspect slashing protection database at {path}: {message}")]
     InspectFailed { path: String, message: String },
+
+    /// INSERT+COMMIT inside [`crate::SlashingDb::reserve_block`] /
+    /// [`crate::SlashingDb::reserve_attestation`] failed. The transaction was
+    /// rolled back; no new history row exists.
+    ///
+    /// Distinguished from a rule violation (`SlashableBlock` /
+    /// `SlashableAttestation` / watermark floors) so the signer can map this
+    /// to `CommitFailed` (same-root retry safe), never `SlashingBlocked`.
+    /// Classification of this variant is ARCH-5i; the inject is ARCH-5e/5g.
+    #[error("slashing-protection reserve commit failed (no row written): {0}")]
+    ReserveCommitFailed(String),
+
+    /// Compensating delete inside [`crate::SlashingDb::reconcile_unsigned`]
+    /// failed. The reserved history row is **retained** (C1 fail-safe).
+    ///
+    /// Never returned as `Err` from `reconcile_unsigned` — that method returns
+    /// [`crate::ReconcileOutcome::Failed`] so a caller cannot `?` a compensation
+    /// failure off a signing path.
+    #[error("slashing-protection compensating delete failed (row retained): {0}")]
+    ReconcileFailed(String),
+}
+
+impl SlashingError {
+    /// True when a `reserve_*` persist (INSERT/COMMIT, including the test inject)
+    /// failed. Not a slashing-rule verdict.
+    pub fn is_reserve_commit_failure(&self) -> bool {
+        matches!(self, Self::ReserveCommitFailed(_))
+    }
+
+    /// Rule / watermark / GVR rejections that apply to one group-commit member
+    /// without aborting the rest of the batch.
+    pub(crate) fn is_group_member_rejection(&self) -> bool {
+        matches!(
+            self,
+            Self::SlashableBlock(_)
+                | Self::SlashableAttestation(_)
+                | Self::GenesisRootMismatch { .. }
+                | Self::BelowBlockWatermark { .. }
+                | Self::BelowAttestationWatermark { .. }
+                | Self::BelowAttestationSourceWatermark { .. }
+        )
+    }
 }
 
 /// Specific types of attestation slashing violations per EIP-3076.

@@ -4,18 +4,22 @@ use std::sync::Arc;
 
 use crypto::PublicKey;
 use doppelganger::{ForwardWindowMachine, SigningEnablement};
-use eth_types::{Epoch, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use eth_types::{Epoch, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use keymanager_api::traits::{DoppelgangerMonitor, Pubkey};
 use observability::logging::TruncatedPubkey;
 use tracing::{info, warn};
 
 use super::notifier::pubkey_hex;
 
-/// Scan `keystore_dir` for `*.import_meta.json` sidecars and re-arm the
-/// doppelganger `gate` for any key whose import timestamp is recent enough
-/// that the doppelganger window (`window_secs`) has not yet elapsed.
+/// Scan `keystore_dir` for import-meta sidecars and re-arm the doppelganger
+/// `gate` for any key whose import timestamp is recent enough that the
+/// doppelganger window (`window_secs`) has not yet elapsed.
 ///
-/// Called once at startup after the `DoppelgangerGate` is created to restore
+/// Recognizes final `*.import_meta.json` and leftover
+/// `*.import_meta.json.removing.*` set-asides from older rename-aside cleanups.
+/// A crash that left only the set-aside must still re-arm (fail closed).
+///
+/// Called once at startup after the doppelganger monitor is created to restore
 /// in-memory monitoring state that was lost when the process was restarted.
 ///
 /// # Safety guarantee
@@ -54,24 +58,17 @@ pub fn scan_and_rearm_gate(
             None => continue,
         };
 
-        if !name.ends_with(".import_meta.json") {
+        let Some((pubkey_bytes, kind)) = crate::config::import_sidecar_pubkey(&name) else {
+            continue;
+        };
+        // Partials are unfinished for boot register, but they have no durable
+        // import timestamp yet; wall-clock re-arm only applies to final and
+        // leftover `.removing.*` markers.
+        if matches!(kind, crate::config::ImportSidecarKind::Partial) {
             continue;
         }
 
-        // Parse the pubkey hex from the filename: `0x<hex>.import_meta.json`
-        let hex_part =
-            name.strip_prefix("0x").and_then(|s| s.strip_suffix(".import_meta.json")).unwrap_or("");
-
-        let pubkey_bytes = match hex::decode(hex_part) {
-            Ok(b) if b.len() == 48 => {
-                let mut pk = [0u8; 48];
-                pk.copy_from_slice(&b);
-                pk
-            }
-            _ => continue,
-        };
-
-        // Read the sidecar JSON
+        // Read the sidecar JSON (leftover `.removing.*` still carries the body).
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(err) => {
@@ -90,11 +87,16 @@ pub fn scan_and_rearm_gate(
         {
             Some(t) => t,
             None => {
-                warn!(
-                    path = %path.display(),
-                    "import_meta sidecar has unexpected format; skipping"
-                );
-                continue;
+                // Leftover set-aside: generation was also embedded in the name.
+                if let Some(gen) = name.rsplit(".removing.").next().and_then(|s| s.parse().ok()) {
+                    gen
+                } else {
+                    warn!(
+                        path = %path.display(),
+                        "import_meta sidecar has unexpected format; skipping"
+                    );
+                    continue;
+                }
             }
         };
 
@@ -111,16 +113,21 @@ pub fn scan_and_rearm_gate(
         }
     }
 }
-#[derive(Default)]
-pub struct DoppelgangerMonitorAdapter;
 
-impl DoppelgangerMonitorAdapter {
+/// Always-safe [`DoppelgangerMonitor`] for the doppelganger opt-out path.
+///
+/// `is_doppelganger_safe` is always `true`. `cancel_monitoring` inherits the
+/// trait default (`stop_monitoring`) — both are log-only.
+#[derive(Default)]
+pub struct DoppelgangerDisabledMonitor;
+
+impl DoppelgangerDisabledMonitor {
     pub fn new() -> Self {
         Self
     }
 }
 
-impl DoppelgangerMonitor for DoppelgangerMonitorAdapter {
+impl DoppelgangerMonitor for DoppelgangerDisabledMonitor {
     fn start_monitoring(&self, pubkey: Pubkey) {
         info!(pubkey = %pubkey_hex(pubkey), "Doppelganger monitoring requested for new key");
     }
@@ -250,5 +257,5 @@ pub fn wall_clock_epoch(genesis_time: u64) -> Epoch {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    now.saturating_sub(genesis_time) / SECONDS_PER_SLOT / SLOTS_PER_EPOCH
+    now.saturating_sub(genesis_time).saturating_mul(1000) / SLOT_DURATION_MS / SLOTS_PER_EPOCH
 }

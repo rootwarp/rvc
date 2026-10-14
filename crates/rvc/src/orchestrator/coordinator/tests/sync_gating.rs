@@ -20,6 +20,7 @@ async fn build_sync_test_orchestrator(
     let signer =
         Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
 
+    // Upcast: wide object only.
     let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
     // Pre-populate sync committee duties for period 0 (epoch 0).
     duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
@@ -37,7 +38,7 @@ async fn build_sync_test_orchestrator(
     // signing gate permits sync duties (mirrors startup registration). The
     // sync_enabled=false test short-circuits before this gate, so it stays
     // correct regardless.
-    validator_store.add_validator(validator_store::ValidatorConfig::new(pk_bytes));
+    validator_store.add_validator(validator_store::ValidatorConfig::new(pk_bytes)).unwrap();
     let config = create_test_config();
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     clock.set_slot(0);
@@ -174,10 +175,12 @@ async fn test_sync_runs_with_attesting_disabled() {
     // Confirm default: sync is enabled
     assert!(orchestrator.sync_enabled.load(Ordering::Acquire));
 
-    let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+    let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
 
     // Exercise the guarded sync-messages phase directly.
-    orchestrator.run_sync_messages_phase(0, 0, &ctx).await;
+    orchestrator
+        .run_sync_messages_phase(0, 0, &ctx, tokio::time::Instant::now() + Duration::from_secs(60))
+        .await;
 
     let roots = submitted_roots.lock().unwrap();
     assert!(
@@ -215,9 +218,11 @@ async fn test_sync_messages_skipped_when_sync_disabled() {
     orchestrator.set_sync_enabled(false);
     assert!(!orchestrator.sync_enabled.load(Ordering::Acquire));
 
-    let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+    let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
 
-    orchestrator.run_sync_messages_phase(0, 0, &ctx).await;
+    orchestrator
+        .run_sync_messages_phase(0, 0, &ctx, tokio::time::Instant::now() + Duration::from_secs(60))
+        .await;
 
     assert!(
         submitted_roots.lock().unwrap().is_empty(),
@@ -245,7 +250,7 @@ async fn test_sync_contributions_skipped_when_sync_disabled() {
     // Disable sync: contributions must not call the signer.
     orchestrator.set_sync_enabled(false);
 
-    let ctx = SlotContext { slot: 0, epoch: 0, head_root: Some(r_captured) };
+    let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
     // With sync_enabled=false the phase guard returns early before any
     // signer or BN call. The test just verifies no panic and no submission.
     orchestrator.run_sync_contributions_phase(0, 0, &ctx).await;

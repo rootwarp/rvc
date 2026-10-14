@@ -19,8 +19,10 @@ use crypto::{compute_domain, compute_signing_root, PublicKey};
 use eth_types::{
     AttestationData, Root, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
-    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+    DOMAIN_VOLUNTARY_EXIT,
 };
 use signer::{SigningGate, SigningGateError};
 
@@ -99,6 +101,19 @@ pub enum PlanInput {
     BuilderRegistration { object_root: Root, genesis_fork_version: [u8; 4] },
     /// Voluntary exit. Caller supplies a Capella-capped `fork_version` per EIP-7044.
     VoluntaryExit { object_root: Root, fork_version: [u8; 4], gvr: Root },
+    /// Payload attestation (PTC). `object_root` is the tree-hash of
+    /// `PayloadAttestationData` — identity-HTR path, same as [`Self::AggregateAndProof`].
+    PayloadAttestation { object_root: Root, fork_version: [u8; 4], gvr: Root },
+    /// Proposer preferences. `object_root` is the tree-hash of
+    /// `ProposerPreferences` — identity-HTR path, same as [`Self::PayloadAttestation`].
+    ProposerPreferences { object_root: Root, fork_version: [u8; 4], gvr: Root },
+    /// Builder request auth. Domain is fixed over `genesis_fork_version` +
+    /// zero GVR — same idiom as [`Self::BuilderRegistration`].
+    BuilderRequestAuth { object_root: Root, genesis_fork_version: [u8; 4] },
+    /// Self-build execution payload envelope. `object_root` is the island HTR;
+    /// domain is `DOMAIN_BEACON_BUILDER` at the caller's fork version.
+    /// Per-slot uniqueness is VC `SignerService` only — SignRoot has no slot.
+    ExecutionPayloadEnvelope { object_root: Root, fork_version: [u8; 4], gvr: Root },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -173,6 +188,28 @@ pub fn plan_sign(input: &PlanInput) -> SignPlan {
             let root = compute_signing_root(object_root, domain);
             (root, Slashing::NonSlashable, Some(NonSlashableOp::VoluntaryExit))
         }
+        PlanInput::PayloadAttestation { object_root, fork_version, gvr } => {
+            let domain = compute_domain(DOMAIN_PTC_ATTESTER, *fork_version, *gvr);
+            // object_root is already the container HTR; signing root folds it with the domain.
+            let root = compute_signing_root(object_root, domain);
+            (root, Slashing::NonSlashable, Some(NonSlashableOp::PayloadAttestation))
+        }
+        PlanInput::ProposerPreferences { object_root, fork_version, gvr } => {
+            let domain = compute_domain(DOMAIN_PROPOSER_PREFERENCES, *fork_version, *gvr);
+            let root = compute_signing_root(object_root, domain);
+            (root, Slashing::NonSlashable, Some(NonSlashableOp::ProposerPreferences))
+        }
+        PlanInput::BuilderRequestAuth { object_root, genesis_fork_version } => {
+            let domain =
+                compute_domain(DOMAIN_BUILDER_REQUEST_AUTH, *genesis_fork_version, ZERO_ROOT);
+            let root = compute_signing_root(object_root, domain);
+            (root, Slashing::NonSlashable, Some(NonSlashableOp::BuilderRequestAuth))
+        }
+        PlanInput::ExecutionPayloadEnvelope { object_root, fork_version, gvr } => {
+            let domain = compute_domain(DOMAIN_BEACON_BUILDER, *fork_version, *gvr);
+            let root = compute_signing_root(object_root, domain);
+            (root, Slashing::NonSlashable, Some(NonSlashableOp::ExecutionPayloadEnvelope))
+        }
     };
     SignPlan { signing_root, slashing, non_slashable_op }
 }
@@ -225,6 +262,10 @@ pub enum NonSlashableOp {
     ContributionAndProof,
     BuilderRegistration,
     VoluntaryExit,
+    PayloadAttestation,
+    ProposerPreferences,
+    BuilderRequestAuth,
+    ExecutionPayloadEnvelope,
 }
 
 /// Error from [`dispatch_slashable`] / [`dispatch_non_slashable`].
@@ -312,6 +353,18 @@ pub async fn dispatch_non_slashable(
                 gate.sign_builder_registration(&ctx.pubkey, root).await
             }
             NonSlashableOp::VoluntaryExit => gate.sign_voluntary_exit(&ctx.pubkey, root).await,
+            NonSlashableOp::PayloadAttestation => {
+                gate.sign_payload_attestation(&ctx.pubkey, root).await
+            }
+            NonSlashableOp::ProposerPreferences => {
+                gate.sign_proposer_preferences(&ctx.pubkey, root).await
+            }
+            NonSlashableOp::BuilderRequestAuth => {
+                gate.sign_builder_request_auth(&ctx.pubkey, root).await
+            }
+            NonSlashableOp::ExecutionPayloadEnvelope => {
+                gate.sign_execution_payload_envelope(&ctx.pubkey, root).await
+            }
         };
         finish_gate(metrics, backend_name, ctx.rpc_type, started, result)
     } else {
@@ -489,6 +542,37 @@ mod tests {
             ),
             (
                 PlanInput::VoluntaryExit { object_root: [6u8; 32], fork_version: FORK, gvr: GVR },
+                false,
+            ),
+            (
+                PlanInput::PayloadAttestation {
+                    object_root: [7u8; 32],
+                    fork_version: FORK,
+                    gvr: GVR,
+                },
+                false,
+            ),
+            (
+                PlanInput::ProposerPreferences {
+                    object_root: [8u8; 32],
+                    fork_version: FORK,
+                    gvr: GVR,
+                },
+                false,
+            ),
+            (
+                PlanInput::BuilderRequestAuth {
+                    object_root: [9u8; 32],
+                    genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+                },
+                false,
+            ),
+            (
+                PlanInput::ExecutionPayloadEnvelope {
+                    object_root: [0x0au8; 32],
+                    fork_version: FORK,
+                    gvr: GVR,
+                },
                 false,
             ),
         ];
@@ -681,5 +765,475 @@ mod tests {
         assert_eq!(block_plan, plan_sign(&http_block));
         assert_eq!(block_plan, plan_sign(&dvt_block));
         assert_eq!(block_plan.slashing, Slashing::Block { slot: 99, gvr: GVR });
+
+        // PTC: gRPC (future 4.20b), HTTP (4.9b), and DVT all take the same
+        // precomputed object_root + fork_version + gvr.
+        let ptc_object_root = [0x11u8; 32];
+        let grpc_ptc = PlanInput::PayloadAttestation {
+            object_root: ptc_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let http_ptc = PlanInput::PayloadAttestation {
+            object_root: ptc_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let dvt_ptc = PlanInput::PayloadAttestation {
+            object_root: ptc_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let ptc_plan = plan_sign(&grpc_ptc);
+        assert_eq!(ptc_plan, plan_sign(&http_ptc));
+        assert_eq!(ptc_plan, plan_sign(&dvt_ptc));
+        assert_eq!(ptc_plan.slashing, Slashing::NonSlashable);
+        assert_eq!(ptc_plan.non_slashable_op, Some(NonSlashableOp::PayloadAttestation));
+
+        // Proposer preferences: gRPC (future 4.20b), HTTP (4.16), and DVT all
+        // take the same precomputed object_root + fork_version + gvr.
+        let prefs_object_root = [0x33u8; 32];
+        let grpc_prefs = PlanInput::ProposerPreferences {
+            object_root: prefs_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let http_prefs = PlanInput::ProposerPreferences {
+            object_root: prefs_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let dvt_prefs = PlanInput::ProposerPreferences {
+            object_root: prefs_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let prefs_plan = plan_sign(&grpc_prefs);
+        assert_eq!(prefs_plan, plan_sign(&http_prefs));
+        assert_eq!(prefs_plan, plan_sign(&dvt_prefs));
+        assert_eq!(prefs_plan.slashing, Slashing::NonSlashable);
+        assert_eq!(prefs_plan.non_slashable_op, Some(NonSlashableOp::ProposerPreferences));
+
+        // Builder request auth: gRPC SignRoot, HTTP, and DVT all take the
+        // same precomputed object_root + genesis_fork_version (zero GVR).
+        let auth_object_root = [0x44u8; 32];
+        let grpc_auth = PlanInput::BuilderRequestAuth {
+            object_root: auth_object_root,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        let http_auth = PlanInput::BuilderRequestAuth {
+            object_root: auth_object_root,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        let dvt_auth = PlanInput::BuilderRequestAuth {
+            object_root: auth_object_root,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        let auth_plan = plan_sign(&grpc_auth);
+        assert_eq!(auth_plan, plan_sign(&http_auth));
+        assert_eq!(auth_plan, plan_sign(&dvt_auth));
+        assert_eq!(auth_plan.slashing, Slashing::NonSlashable);
+        assert_eq!(auth_plan.non_slashable_op, Some(NonSlashableOp::BuilderRequestAuth));
+
+        // Envelope: gRPC SignRoot and DVT take the same precomputed object_root
+        // + fork_version + gvr. HTTP wire is not added (D19).
+        let env_object_root = [0x55u8; 32];
+        let grpc_env = PlanInput::ExecutionPayloadEnvelope {
+            object_root: env_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let dvt_env = PlanInput::ExecutionPayloadEnvelope {
+            object_root: env_object_root,
+            fork_version: FORK,
+            gvr: GVR,
+        };
+        let env_plan = plan_sign(&grpc_env);
+        assert_eq!(env_plan, plan_sign(&dvt_env));
+        assert_eq!(env_plan.slashing, Slashing::NonSlashable);
+        assert_eq!(env_plan.non_slashable_op, Some(NonSlashableOp::ExecutionPayloadEnvelope));
+    }
+
+    fn parse_kat_root(hex: &str) -> Root {
+        hex::decode(hex).expect("kat hex").try_into().expect("32-byte kat root")
+    }
+
+    fn ptc_kat_plan() -> SignPlan {
+        let object_root =
+            parse_kat_root(rvc_spec_vectors::spec_kat::SPEC_GLOAS_PAYLOADATTESTATIONDATA_ROOT);
+        plan_sign(&PlanInput::PayloadAttestation {
+            object_root,
+            fork_version: [0x07, 0x00, 0x00, 0x01],
+            gvr: [0u8; 32],
+        })
+    }
+
+    struct KeyedBackend {
+        km: std::sync::Arc<crypto::KeyManager>,
+    }
+
+    impl KeyedBackend {
+        fn with_key(sk: crypto::SecretKey) -> Self {
+            let mut km = crypto::KeyManager::new();
+            km.insert(sk);
+            Self { km: std::sync::Arc::new(km) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::backend::SigningBackend for KeyedBackend {
+        async fn sign(
+            &self,
+            signing_root: &[u8; 32],
+            pubkey: &[u8; 48],
+        ) -> Result<[u8; 96], crate::backend::SigningBackendError> {
+            let pk = crypto::PublicKey::from_bytes(pubkey)
+                .map_err(|_| crate::backend::SigningBackendError::KeyNotFound(*pubkey))?;
+            let sk = self
+                .km
+                .get_secret_key(&pk)
+                .ok_or(crate::backend::SigningBackendError::KeyNotFound(*pubkey))?;
+            Ok(sk.sign(signing_root).to_bytes())
+        }
+
+        fn public_keys(&self) -> Vec<[u8; 48]> {
+            self.km.list_public_keys().iter().map(|pk| pk.to_bytes()).collect()
+        }
+    }
+
+    fn ptc_gate_and_ctx(
+        sk: crypto::SecretKey,
+    ) -> (signer::SigningGate, RequestCtx, std::sync::Arc<KeyedBackend>) {
+        let pubkey = sk.public_key();
+        let backend = std::sync::Arc::new(KeyedBackend::with_key(sk));
+        let db = std::sync::Arc::new(slashing::SlashingDb::open_in_memory().expect("slashing db"));
+        let gate = crate::service::SignerServiceImpl::build_gate(
+            std::sync::Arc::clone(&backend) as std::sync::Arc<dyn crate::backend::SigningBackend>,
+            db,
+        );
+        let ctx = RequestCtx {
+            client_cn: "test".into(),
+            pubkey_bytes: pubkey.to_bytes(),
+            pubkey,
+            rpc_type: crate::metrics::grpc_sign_type::PAYLOAD_ATTESTATION,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        (gate, ctx, backend)
+    }
+
+    /// L3: plan engine signing root for the 4.0 pyspec PayloadAttestationData
+    /// fixture (`KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT`).
+    #[test]
+    fn test_plan_payload_attestation_signing_root() {
+        let plan = ptc_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(plan.non_slashable_op, Some(NonSlashableOp::PayloadAttestation));
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_payload_attestation_dispatch_slashable_mismatch() {
+        let plan = ptc_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        let (gate, ctx, _backend) = ptc_gate_and_ctx(crypto::SecretKey::generate());
+        let err = dispatch_slashable(&gate, None, "basic", &ctx, &plan).await.unwrap_err();
+        assert!(matches!(err, DispatchError::PlanMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_plan_payload_attestation_dispatch_sign_success() {
+        let plan = ptc_kat_plan();
+        let (gate, ctx, backend) = ptc_gate_and_ctx(crypto::SecretKey::generate());
+        let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
+            .await
+            .expect("dispatch_sign payload attestation");
+        let direct = gate
+            .sign_payload_attestation(&ctx.pubkey, plan.signing_root)
+            .await
+            .expect("direct gate payload attestation");
+        assert_eq!(sig, direct, "dispatch_sign must use SigningGate::sign_payload_attestation");
+        assert!(crypto::Signature::from_bytes(&sig)
+            .expect("bls sig")
+            .verify(&ctx.pubkey, &plan.signing_root)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_payload_attestation_dispatch_arm_calls_sign_payload_attestation() {
+        let src = include_str!("sign_plan.rs");
+        let rest = src
+            .split_once("pub async fn dispatch_non_slashable")
+            .expect("dispatch_non_slashable")
+            .1;
+        let dispatch = rest.split("pub async fn dispatch_sign").next().expect("dispatch_sign");
+        assert!(
+            dispatch.contains("NonSlashableOp::PayloadAttestation")
+                && dispatch.contains("gate.sign_payload_attestation"),
+            "dispatch_non_slashable must route PayloadAttestation to SigningGate::sign_payload_attestation"
+        );
+    }
+
+    fn prefs_kat_plan() -> SignPlan {
+        let object_root =
+            parse_kat_root(rvc_spec_vectors::spec_kat::SPEC_GLOAS_PROPOSERPREFERENCES_ROOT);
+        plan_sign(&PlanInput::ProposerPreferences {
+            object_root,
+            fork_version: [0x07, 0x00, 0x00, 0x01],
+            gvr: [0u8; 32],
+        })
+    }
+
+    fn prefs_gate_and_ctx(
+        sk: crypto::SecretKey,
+    ) -> (signer::SigningGate, RequestCtx, std::sync::Arc<KeyedBackend>) {
+        let pubkey = sk.public_key();
+        let backend = std::sync::Arc::new(KeyedBackend::with_key(sk));
+        let db = std::sync::Arc::new(slashing::SlashingDb::open_in_memory().expect("slashing db"));
+        let gate = crate::service::SignerServiceImpl::build_gate(
+            std::sync::Arc::clone(&backend) as std::sync::Arc<dyn crate::backend::SigningBackend>,
+            db,
+        );
+        let ctx = RequestCtx {
+            client_cn: "test".into(),
+            pubkey_bytes: pubkey.to_bytes(),
+            pubkey,
+            rpc_type: crate::metrics::grpc_sign_type::PROPOSER_PREFERENCES,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        (gate, ctx, backend)
+    }
+
+    /// L3: plan engine signing root for the 4.0 pyspec ProposerPreferences
+    /// fixture (`KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT`).
+    #[test]
+    fn test_plan_proposer_preferences_signing_root() {
+        let plan = prefs_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(plan.non_slashable_op, Some(NonSlashableOp::ProposerPreferences));
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_proposer_preferences_dispatch_slashable_mismatch() {
+        let plan = prefs_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        let (gate, ctx, _backend) = prefs_gate_and_ctx(crypto::SecretKey::generate());
+        let err = dispatch_slashable(&gate, None, "basic", &ctx, &plan).await.unwrap_err();
+        assert!(matches!(err, DispatchError::PlanMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_plan_proposer_preferences_dispatch_sign_success() {
+        let plan = prefs_kat_plan();
+        let (gate, ctx, backend) = prefs_gate_and_ctx(crypto::SecretKey::generate());
+        let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
+            .await
+            .expect("dispatch_sign proposer preferences");
+        let direct = gate
+            .sign_proposer_preferences(&ctx.pubkey, plan.signing_root)
+            .await
+            .expect("direct gate proposer preferences");
+        assert_eq!(sig, direct, "dispatch_sign must use SigningGate::sign_proposer_preferences");
+        assert!(crypto::Signature::from_bytes(&sig)
+            .expect("bls sig")
+            .verify(&ctx.pubkey, &plan.signing_root)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_proposer_preferences_dispatch_arm_calls_sign_proposer_preferences() {
+        let src = include_str!("sign_plan.rs");
+        let rest = src
+            .split_once("pub async fn dispatch_non_slashable")
+            .expect("dispatch_non_slashable")
+            .1;
+        let dispatch = rest.split("pub async fn dispatch_sign").next().expect("dispatch_sign");
+        assert!(
+            dispatch.contains("NonSlashableOp::ProposerPreferences")
+                && dispatch.contains("gate.sign_proposer_preferences"),
+            "dispatch_non_slashable must route ProposerPreferences to SigningGate::sign_proposer_preferences"
+        );
+    }
+
+    fn auth_kat_plan() -> SignPlan {
+        let object_root = parse_kat_root(
+            rvc_spec_vectors::builder_request_auth_kat::SPEC_GLOAS_BUILDERREQUESTAUTH_ROOT,
+        );
+        plan_sign(&PlanInput::BuilderRequestAuth {
+            object_root,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        })
+    }
+
+    fn auth_gate_and_ctx(
+        sk: crypto::SecretKey,
+    ) -> (signer::SigningGate, RequestCtx, std::sync::Arc<KeyedBackend>) {
+        let pubkey = sk.public_key();
+        let backend = std::sync::Arc::new(KeyedBackend::with_key(sk));
+        let db = std::sync::Arc::new(slashing::SlashingDb::open_in_memory().expect("slashing db"));
+        let gate = crate::service::SignerServiceImpl::build_gate(
+            std::sync::Arc::clone(&backend) as std::sync::Arc<dyn crate::backend::SigningBackend>,
+            db,
+        );
+        let ctx = RequestCtx {
+            client_cn: "test".into(),
+            pubkey_bytes: pubkey.to_bytes(),
+            pubkey,
+            rpc_type: crate::metrics::grpc_sign_type::BUILDER_REQUEST_AUTH,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        (gate, ctx, backend)
+    }
+
+    /// L3: plan engine signing root for the pyspec BuilderRequestAuth fixture.
+    #[test]
+    fn test_plan_builder_request_auth_signing_root() {
+        let plan = auth_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(plan.non_slashable_op, Some(NonSlashableOp::BuilderRequestAuth));
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(
+                rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_plan_builder_request_auth_dispatch_slashable_mismatch() {
+        let plan = auth_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        let (gate, ctx, _backend) = auth_gate_and_ctx(crypto::SecretKey::generate());
+        let err = dispatch_slashable(&gate, None, "basic", &ctx, &plan).await.unwrap_err();
+        assert!(matches!(err, DispatchError::PlanMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_plan_builder_request_auth_dispatch_sign_success() {
+        let plan = auth_kat_plan();
+        let (gate, ctx, backend) = auth_gate_and_ctx(crypto::SecretKey::generate());
+        let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
+            .await
+            .expect("dispatch_sign builder request auth");
+        let direct = gate
+            .sign_builder_request_auth(&ctx.pubkey, plan.signing_root)
+            .await
+            .expect("direct gate builder request auth");
+        assert_eq!(sig, direct, "dispatch_sign must use SigningGate::sign_builder_request_auth");
+        assert!(crypto::Signature::from_bytes(&sig)
+            .expect("bls sig")
+            .verify(&ctx.pubkey, &plan.signing_root)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_builder_request_auth_dispatch_arm_calls_sign_builder_request_auth() {
+        let src = include_str!("sign_plan.rs");
+        let rest = src
+            .split_once("pub async fn dispatch_non_slashable")
+            .expect("dispatch_non_slashable")
+            .1;
+        let dispatch = rest.split("pub async fn dispatch_sign").next().expect("dispatch_sign");
+        assert!(
+            dispatch.contains("NonSlashableOp::BuilderRequestAuth")
+                && dispatch.contains("gate.sign_builder_request_auth"),
+            "dispatch_non_slashable must route BuilderRequestAuth to SigningGate::sign_builder_request_auth"
+        );
+    }
+
+    fn envelope_kat_plan() -> SignPlan {
+        let object_root =
+            parse_kat_root("98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a");
+        plan_sign(&PlanInput::ExecutionPayloadEnvelope {
+            object_root,
+            fork_version: [0x07, 0x00, 0x00, 0x01],
+            gvr: [0u8; 32],
+        })
+    }
+
+    fn envelope_gate_and_ctx(
+        sk: crypto::SecretKey,
+    ) -> (signer::SigningGate, RequestCtx, std::sync::Arc<KeyedBackend>) {
+        let pubkey = sk.public_key();
+        let backend = std::sync::Arc::new(KeyedBackend::with_key(sk));
+        let db = std::sync::Arc::new(slashing::SlashingDb::open_in_memory().expect("slashing db"));
+        let gate = crate::service::SignerServiceImpl::build_gate(
+            std::sync::Arc::clone(&backend) as std::sync::Arc<dyn crate::backend::SigningBackend>,
+            db,
+        );
+        let ctx = RequestCtx {
+            client_cn: "test".into(),
+            pubkey_bytes: pubkey.to_bytes(),
+            pubkey,
+            rpc_type: crate::metrics::grpc_sign_type::EXECUTION_PAYLOAD_ENVELOPE,
+            genesis_fork_version: BUILDER_FORK_VERSION_MAINNET,
+        };
+        (gate, ctx, backend)
+    }
+
+    /// L3: plan engine signing root for the pyspec ExecutionPayloadEnvelope fixture.
+    #[test]
+    fn test_plan_execution_payload_envelope_signing_root() {
+        let plan = envelope_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(plan.non_slashable_op, Some(NonSlashableOp::ExecutionPayloadEnvelope));
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(
+                rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT
+            )
+        );
+        assert_eq!(eth_types::DOMAIN_BEACON_BUILDER, [0x0B, 0x00, 0x00, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn test_plan_execution_payload_envelope_dispatch_slashable_mismatch() {
+        let plan = envelope_kat_plan();
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        let (gate, ctx, _backend) = envelope_gate_and_ctx(crypto::SecretKey::generate());
+        let err = dispatch_slashable(&gate, None, "basic", &ctx, &plan).await.unwrap_err();
+        assert!(matches!(err, DispatchError::PlanMismatch));
+    }
+
+    #[tokio::test]
+    async fn test_plan_execution_payload_envelope_dispatch_sign_success() {
+        let plan = envelope_kat_plan();
+        let (gate, ctx, backend) = envelope_gate_and_ctx(crypto::SecretKey::generate());
+        let sig = dispatch_sign(Some(&gate), backend.as_ref(), None, "basic", &ctx, &plan)
+            .await
+            .expect("dispatch_sign execution payload envelope");
+        let direct = gate
+            .sign_execution_payload_envelope(&ctx.pubkey, plan.signing_root)
+            .await
+            .expect("direct gate execution payload envelope");
+        assert_eq!(
+            sig, direct,
+            "dispatch_sign must use SigningGate::sign_execution_payload_envelope"
+        );
+        assert!(crypto::Signature::from_bytes(&sig)
+            .expect("bls sig")
+            .verify(&ctx.pubkey, &plan.signing_root)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_execution_payload_envelope_dispatch_arm_calls_sign_execution_payload_envelope() {
+        let src = include_str!("sign_plan.rs");
+        let rest = src
+            .split_once("pub async fn dispatch_non_slashable")
+            .expect("dispatch_non_slashable")
+            .1;
+        let dispatch = rest.split("pub async fn dispatch_sign").next().expect("dispatch_sign");
+        assert!(
+            dispatch.contains("NonSlashableOp::ExecutionPayloadEnvelope")
+                && dispatch.contains("gate.sign_execution_payload_envelope"),
+            "dispatch_non_slashable must route ExecutionPayloadEnvelope to SigningGate::sign_execution_payload_envelope"
+        );
     }
 }

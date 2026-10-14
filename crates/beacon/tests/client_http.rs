@@ -9,14 +9,44 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use wiremock::matchers::{body_json, method, path};
+use wiremock::matchers::{body_json, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use beacon::{
-    AttestationData, BeaconClient, BeaconClientConfig, BeaconCommitteeSubscription, BeaconError,
-    Checkpoint, LegacyAttestation, ProposerPreparation, SingleAttestation,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    parse_slot_duration_ms, ssz_deser, AttestationData, BeaconClient, BeaconClientConfig,
+    BeaconCommitteeSubscription, BeaconError, BuilderConfig, BuilderPreferencesEntry, Checkpoint,
+    LegacyAttestation, ProduceBlockV4Body, ProposerPreparation, SignedBuilderRequestAuth,
+    SingleAttestation, SubmitBuilderPreferencesResult, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody, BUILDER_PREFERENCES_PATH,
+    HEADER_ETH_BLOB_DATA_INCLUDED, HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+    HEADER_ETH_CONSENSUS_VERSION, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
+    PRODUCE_BLOCK_V4_PATH_PREFIX, PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH,
+    QUERY_BROADCAST_VALIDATION, QUERY_GRAFFITI, QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
+    QUERY_SKIP_RANDAO_VERIFICATION,
 };
+use eth_types::{ForkName, ForkSchedule};
+use timing::{SlotClock, SystemSlotClock};
+
+fn fulu_gloas_schedule() -> ForkSchedule {
+    let mut schedule = ForkSchedule::unscheduled_gloas();
+    schedule.fulu_fork_epoch = 500_000;
+    schedule.gloas_fork_epoch = 600_000;
+    schedule
+}
+
+fn proposer_duties_body() -> serde_json::Value {
+    serde_json::json!({
+        "dependent_root": "0xabc123",
+        "execution_optimistic": true,
+        "data": [
+            {
+                "pubkey": "0xpubkey1",
+                "validator_index": "100",
+                "slot": "64000"
+            }
+        ]
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct TestData {
@@ -951,6 +981,40 @@ async fn test_submit_attestation_success() {
 }
 
 #[tokio::test]
+async fn single_attestation_submission_body_has_quoted_integers() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .and(body_string_contains(r#""committee_index":"3""#))
+        .and(body_string_contains(r#""attester_index":"7""#))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let attestation = SingleAttestation {
+        committee_index: 3,
+        attester_index: 7,
+        data: AttestationData {
+            slot: "1000".to_string(),
+            index: "1".to_string(),
+            beacon_block_root: "0xabcdef".to_string(),
+            source: Checkpoint { epoch: "100".to_string(), root: "0x1111".to_string() },
+            target: Checkpoint { epoch: "101".to_string(), root: "0x2222".to_string() },
+        },
+        signature: "0xsignature".to_string(),
+    };
+
+    let versioned = VersionedAttestation::Electra(vec![attestation]);
+    let result = client.submit_attestation(&versioned).await.unwrap();
+    assert!(result.is_success());
+}
+
+#[tokio::test]
 async fn test_submit_attestation_invalid_attestation() {
     let mock_server = MockServer::start().await;
 
@@ -1248,6 +1312,87 @@ async fn test_get_config_spec_success() {
     assert_eq!(result.data.len(), 11);
 }
 
+fn slot_clock_from_spec_data(
+    data: &std::collections::HashMap<String, serde_json::Value>,
+) -> SystemSlotClock {
+    let slot_duration_ms = parse_slot_duration_ms(data).unwrap();
+    SystemSlotClock::new(1_606_824_023, Duration::from_millis(slot_duration_ms), 32).unwrap()
+}
+
+#[tokio::test]
+async fn test_get_config_spec_slot_duration_master_keyset() {
+    let mock_server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "data": {
+            "GENESIS_FORK_VERSION": "0x00000000",
+            "ALTAIR_FORK_EPOCH": "74240",
+            "ALTAIR_FORK_VERSION": "0x01000000",
+            "BELLATRIX_FORK_EPOCH": "144896",
+            "BELLATRIX_FORK_VERSION": "0x02000000",
+            "CAPELLA_FORK_EPOCH": "194048",
+            "CAPELLA_FORK_VERSION": "0x03000000",
+            "DENEB_FORK_EPOCH": "269568",
+            "DENEB_FORK_VERSION": "0x04000000",
+            "SLOT_DURATION_MS": "12000",
+            "SLOTS_PER_EPOCH": "32"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/config/spec"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let spec = client.get_config_spec().await.unwrap();
+    assert!(!spec.data.contains_key("SECONDS_PER_SLOT"));
+    assert!(!spec.data.contains_key("INTERVALS_PER_SLOT"));
+    let clock = slot_clock_from_spec_data(&spec.data);
+    assert_eq!(clock.slot_duration(), Duration::from_secs(12));
+}
+
+#[tokio::test]
+async fn test_get_config_spec_slot_duration_legacy_keyset() {
+    let mock_server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "data": {
+            "GENESIS_FORK_VERSION": "0x00000000",
+            "ALTAIR_FORK_EPOCH": "74240",
+            "ALTAIR_FORK_VERSION": "0x01000000",
+            "BELLATRIX_FORK_EPOCH": "144896",
+            "BELLATRIX_FORK_VERSION": "0x02000000",
+            "CAPELLA_FORK_EPOCH": "194048",
+            "CAPELLA_FORK_VERSION": "0x03000000",
+            "DENEB_FORK_EPOCH": "269568",
+            "DENEB_FORK_VERSION": "0x04000000",
+            "SECONDS_PER_SLOT": "12",
+            "INTERVALS_PER_SLOT": "3",
+            "SLOTS_PER_EPOCH": "32"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/config/spec"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let spec = client.get_config_spec().await.unwrap();
+    assert!(!spec.data.contains_key("SLOT_DURATION_MS"));
+    let clock = slot_clock_from_spec_data(&spec.data);
+    assert_eq!(clock.slot_duration(), Duration::from_secs(12));
+}
+
 #[tokio::test]
 async fn test_get_config_spec_api_error() {
     let mock_server = MockServer::start().await;
@@ -1532,6 +1677,8 @@ async fn test_get_fork_schedule_success() {
             "ELECTRA_FORK_VERSION": "0x05000000",
             "FULU_FORK_EPOCH": "18446744073709551615",
             "FULU_FORK_VERSION": "0x06000000",
+            "GLOAS_FORK_EPOCH": "18446744073709551615",
+            "GLOAS_FORK_VERSION": "0x07000000",
             "SECONDS_PER_SLOT": "12",
             "SLOTS_PER_EPOCH": "32"
         }
@@ -1559,6 +1706,8 @@ async fn test_get_fork_schedule_success() {
     assert_eq!(schedule.electra_fork_version, [5, 0, 0, 0]);
     assert_eq!(schedule.fulu_fork_epoch, u64::MAX);
     assert_eq!(schedule.fulu_fork_version, [6, 0, 0, 0]);
+    assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+    assert_eq!(schedule.gloas_fork_version, [7, 0, 0, 0]);
 }
 
 #[tokio::test]
@@ -1618,7 +1767,8 @@ async fn test_get_proposer_duties_success() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_proposer_duties(10000).await.unwrap();
+    let result =
+        client.get_proposer_duties(10000, &ForkSchedule::unscheduled_gloas()).await.unwrap();
 
     assert_eq!(
         result.dependent_root,
@@ -1646,7 +1796,7 @@ async fn test_get_proposer_duties_api_error() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_proposer_duties(999).await;
+    let result = client.get_proposer_duties(999, &ForkSchedule::unscheduled_gloas()).await;
 
     match result {
         Err(BeaconError::ApiError { status, message }) => {
@@ -1698,10 +1848,100 @@ async fn test_produce_block_v3_full_block() {
     assert_eq!(result.execution_payload_value, Some("12345".to_string()));
     assert!(!result.is_ssz);
     assert!(result.ssz_bytes.is_none());
+    assert!(!result.payload_included);
+    assert!(result.builder_url.is_none());
+    assert!(result.consensus_block_value.is_none());
 
     let block = result.parse_full_block().unwrap();
     assert_eq!(block.block().slot, 100);
     assert_eq!(block.block().proposer_index, 42);
+}
+
+#[tokio::test]
+async fn test_produce_block_missing_consensus_version_is_rejected() {
+    let mock_server = MockServer::start().await;
+
+    let envelope = serde_json::json!({
+        "version": "deneb",
+        "execution_optimistic": false,
+        "data": {
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&envelope)
+                .insert_header("Eth-Execution-Payload-Blinded", "false"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.produce_block_v3(100, "0xrandao", None, None).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("Eth-Consensus-Version"), "{msg}");
+        }
+        Ok(resp) => panic!(
+            "missing Eth-Consensus-Version must be Err, got version {:?}",
+            resp.consensus_version
+        ),
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_unknown_consensus_version_is_rejected() {
+    let mock_server = MockServer::start().await;
+
+    let envelope = serde_json::json!({
+        "version": "gloas2",
+        "execution_optimistic": false,
+        "data": {
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&envelope)
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "gloas2"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.produce_block_v3(100, "0xrandao", None, None).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("gloas2"), "error should name the value: {msg}");
+        }
+        Ok(resp) => panic!(
+            "unknown Eth-Consensus-Version must be Err, got version {:?}",
+            resp.consensus_version
+        ),
+        other => panic!("expected ParseError, got {other:?}"),
+    }
 }
 
 /// `produce_block_v3` — the proposer-duty block-production BN call — must run its work
@@ -2194,6 +2434,843 @@ async fn test_produce_block_v3_ssz_fallback_network_error_propagated() {
     assert!(result.is_err());
 }
 
+/// Query names declared in `v4_wire.rs`. Allowlist only — do not assert a param count.
+const V4_DECLARED_QUERY_NAMES: &[&str] =
+    &[QUERY_RANDAO_REVEAL, QUERY_GRAFFITI, QUERY_SKIP_RANDAO_VERIFICATION, QUERY_INCLUDE_PAYLOAD];
+
+fn v4_blocks_path(slot: u64) -> String {
+    format!("{PRODUCE_BLOCK_V4_PATH_PREFIX}/{slot}")
+}
+
+fn v4_json_envelope(slot: u64) -> serde_json::Value {
+    json!({
+        "version": "gloas",
+        "execution_optimistic": false,
+        "data": {
+            "slot": slot.to_string(),
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        }
+    })
+}
+
+fn v4_json_success(slot: u64) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .set_body_json(v4_json_envelope(slot))
+        .insert_header("Eth-Execution-Payload-Blinded", "false")
+        .insert_header("Eth-Consensus-Version", "gloas")
+        .insert_header("Eth-Execution-Payload-Value", "12345")
+        .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true")
+}
+
+fn assert_v4_query_names(req: &wiremock::Request) {
+    let mut saw_include_payload = false;
+    for (name, value) in req.url.query_pairs() {
+        assert!(
+            V4_DECLARED_QUERY_NAMES.contains(&name.as_ref()),
+            "query name {name:?} is not declared in v4_wire.rs"
+        );
+        if name.as_ref() == QUERY_INCLUDE_PAYLOAD {
+            assert_eq!(value.as_ref(), "true", "include_payload must be true on every request");
+            saw_include_payload = true;
+        }
+    }
+    assert!(saw_include_payload, "include_payload=true must be sent on every V4 request");
+    let version = req
+        .headers
+        .get(HEADER_ETH_CONSENSUS_VERSION)
+        .unwrap_or_else(|| panic!("{HEADER_ETH_CONSENSUS_VERSION} request header must be present"));
+    assert_eq!(version.to_str().expect("utf-8 consensus version header"), ForkName::Gloas.as_ref());
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_posts_path_body_and_declared_query_names() {
+    let mock_server = MockServer::start().await;
+    let slot = 100u64;
+    let builder_config =
+        BuilderConfig { min_bid: 10_000_000, builder_boost_factor: 100, builders: Vec::new() };
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .and(body_json(&builder_config))
+        .respond_with(v4_json_success(slot))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result =
+        client.produce_block_v4(slot, "0xrandao", Some("0xgraf"), &builder_config).await.unwrap();
+
+    assert!(!result.is_ssz);
+    assert!(result.ssz_bytes.is_none());
+    assert_eq!(result.consensus_version, "gloas");
+    let block = result.parse_full_block().unwrap();
+    assert_eq!(block.block().slot, slot);
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let req = &requests[0];
+    assert_eq!(req.method.as_str(), "POST");
+    assert_eq!(req.url.path(), v4_blocks_path(slot));
+    let sent: BuilderConfig = serde_json::from_slice(&req.body).expect("BuilderConfig JSON body");
+    assert_eq!(sent, builder_config);
+    assert_v4_query_names(req);
+    let pairs: Vec<(String, String)> =
+        req.url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    assert!(pairs.iter().any(|(n, v)| n == QUERY_RANDAO_REVEAL && v == "0xrandao"));
+    assert!(pairs.iter().any(|(n, v)| n == QUERY_GRAFFITI && v == "0xgraf"));
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_include_payload_true_without_graffiti() {
+    let mock_server = MockServer::start().await;
+    let slot = 101u64;
+    let builder_config = BuilderConfig::default();
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_success(slot))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.produce_block_v4(slot, "0xrandao", None, &builder_config).await.unwrap();
+    assert_eq!(result.consensus_version, "gloas");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_v4_query_names(&requests[0]);
+    let pairs: Vec<(String, String)> =
+        requests[0].url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    assert!(!pairs.iter().any(|(n, _)| n == QUERY_GRAFFITI));
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_400_is_typed_and_not_retried() {
+    let mock_server = MockServer::start().await;
+    let slot = 400u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(ResponseTemplate::new(400).set_body_string("missing or undecodable body"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri())
+        .with_max_retries(3)
+        .with_initial_backoff(Duration::from_millis(1));
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match result {
+        Err(BeaconError::ApiError { status, message }) => {
+            assert_eq!(status, 400);
+            assert!(message.contains("undecodable") || message.contains("missing"), "{message}");
+        }
+        other => panic!("expected ApiError with status 400, got {other:?}"),
+    }
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "400 must not be retried against the same BN");
+    assert_eq!(requests[0].method.as_str(), "POST");
+    assert_v4_query_names(&requests[0]);
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_response() {
+    let mock_server = MockServer::start().await;
+    let slot = 500u64;
+    let ssz_payload = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(ssz_payload.clone(), "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "gloas")
+                .insert_header("Eth-Execution-Payload-Value", "99999")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+
+    assert!(result.is_ssz);
+    assert_eq!(result.ssz_bytes, Some(ssz_payload));
+    assert_eq!(result.data, serde_json::Value::Null);
+    assert_eq!(result.consensus_version, "gloas");
+    assert_eq!(result.execution_payload_value, Some("99999".to_string()));
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_v4_query_names(&requests[0]);
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_empty_body_is_parse_error_not_retried() {
+    let mock_server = MockServer::start().await;
+    let slot = 900u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![], "application/octet-stream")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Consensus-Version", "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(
+                msg.contains("empty SSZ") || msg.contains("after 2xx"),
+                "expected empty-SSZ ParseError, got {msg}"
+            );
+        }
+        other => panic!("empty SSZ 2xx must be ParseError, not a JSON retry: {other:?}"),
+    }
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "2xx must not be followed by a second produce POST");
+    assert_eq!(requests[0].method.as_str(), "POST");
+    assert_v4_query_names(&requests[0]);
+}
+
+fn v4_json_headers(
+    slot: u64,
+    payload_included: &str,
+    builder_url: Option<&str>,
+    consensus_block_value: Option<&str>,
+) -> ResponseTemplate {
+    let mut template = ResponseTemplate::new(200)
+        .set_body_json(v4_json_envelope(slot))
+        .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+        .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, payload_included);
+    if let Some(url) = builder_url {
+        template = template.insert_header(HEADER_ETH_BUILDER_URL, url);
+    }
+    if let Some(value) = consensus_block_value {
+        template = template.insert_header(HEADER_ETH_CONSENSUS_BLOCK_VALUE, value);
+    }
+    template
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_payload_included_true_and_false() {
+    for included in [true, false] {
+        let mock_server = MockServer::start().await;
+        let slot = 110u64;
+        let header_value = if included { "true" } else { "false" };
+
+        Mock::given(method("POST"))
+            .and(path(v4_blocks_path(slot)))
+            .respond_with(v4_json_headers(slot, header_value, None, None))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+        let result = client
+            .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.payload_included, included,
+            "{HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED}={header_value}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_missing_payload_included_is_rejected() {
+    let mock_server = MockServer::start().await;
+    let slot = 111u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(v4_json_envelope(slot))
+                .insert_header("Eth-Consensus-Version", "gloas"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let result = client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(
+                msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED),
+                "error must name {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED}: {msg}"
+            );
+        }
+        Ok(resp) => panic!(
+            "missing {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} must be Err, got payload_included={}",
+            resp.payload_included
+        ),
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_unparseable_payload_included_is_rejected() {
+    let mock_server = MockServer::start().await;
+    let slot = 112u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "yes", None, None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let result = client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(
+                msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED),
+                "error must name {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED}: {msg}"
+            );
+        }
+        Ok(resp) => panic!(
+            "unparseable {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} must be Err, got payload_included={}",
+            resp.payload_included
+        ),
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_builder_url_and_consensus_block_value() {
+    let slot = 113u64;
+    let huge_value = "999999999999999999999";
+    let builder = "https://builder.example.com";
+
+    let mock_present = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "true", Some(builder), Some(huge_value)))
+        .expect(1)
+        .mount(&mock_present)
+        .await;
+    let present = BeaconClient::new(BeaconClientConfig::new(mock_present.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(present.builder_url.as_deref(), Some(builder));
+    assert_eq!(present.consensus_block_value.as_deref(), Some(huge_value));
+
+    let mock_absent = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", None, None))
+        .expect(1)
+        .mount(&mock_absent)
+        .await;
+    let absent = BeaconClient::new(BeaconClientConfig::new(mock_absent.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(absent.builder_url, None);
+    assert_eq!(absent.consensus_block_value, None);
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_payload_included_and_optional_headers() {
+    let mock_server = MockServer::start().await;
+    let slot = 114u64;
+    let ssz_payload = vec![0xde, 0xad, 0xbe, 0xef];
+    let builder = "https://relay.example";
+    let value = "42";
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(ssz_payload.clone(), "application/octet-stream")
+                .insert_header("Eth-Consensus-Version", "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "false")
+                .insert_header(HEADER_ETH_BUILDER_URL, builder)
+                .insert_header(HEADER_ETH_CONSENSUS_BLOCK_VALUE, value),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let result = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+
+    assert!(result.is_ssz);
+    assert!(!result.payload_included);
+    assert_eq!(result.builder_url.as_deref(), Some(builder));
+    assert_eq!(result.consensus_block_value.as_deref(), Some(value));
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_missing_payload_included_is_rejected() {
+    let mock_server = MockServer::start().await;
+    let slot = 115u64;
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(vec![0xde, 0xad, 0xbe, 0xef], "application/octet-stream")
+                .insert_header("Eth-Consensus-Version", "gloas"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let result = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await;
+    match result {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(
+                msg.contains(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED),
+                "error must name {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED}: {msg}"
+            );
+        }
+        Ok(_) => panic!("SSZ missing {HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED} must be Err"),
+        other => panic!("expected ParseError, got {other:?}"),
+    }
+}
+
+fn v4_json_block_contents(slot: u64) -> serde_json::Value {
+    json!({
+        "version": "gloas",
+        "data": {
+            "block": {
+                "slot": slot.to_string(),
+                "proposer_index": "42",
+                "parent_root": format!("0x{}", "01".repeat(32)),
+                "state_root": format!("0x{}", "02".repeat(32)),
+                "body": "0xdead"
+            },
+            "execution_payload_envelope": { "builder_index": "0", "payload": "0xee" },
+            "kzg_proofs": ["0xaa"],
+            "blobs": ["0xbb"]
+        }
+    })
+}
+
+fn build_beacon_block_ssz_for_test(slot: u64, proposer_index: u64, body: &[u8]) -> Vec<u8> {
+    let body_offset: u32 = 84;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&slot.to_le_bytes());
+    buf.extend_from_slice(&proposer_index.to_le_bytes());
+    buf.extend_from_slice(&[0x11; 32]);
+    buf.extend_from_slice(&[0x22; 32]);
+    buf.extend_from_slice(&body_offset.to_le_bytes());
+    buf.extend_from_slice(body);
+    buf
+}
+
+fn build_gloas_block_contents_ssz_for_test(
+    slot: u64,
+    envelope: &[u8],
+    kzg_proofs: &[u8],
+    blobs: &[u8],
+) -> Vec<u8> {
+    let block_ssz = build_beacon_block_ssz_for_test(slot, 42, &[0xde, 0xad]);
+    let block_off: u32 = 16;
+    let envelope_off = block_off + block_ssz.len() as u32;
+    let kzg_off = envelope_off + envelope.len() as u32;
+    let blobs_off = kzg_off + kzg_proofs.len() as u32;
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&block_off.to_le_bytes());
+    buf.extend_from_slice(&envelope_off.to_le_bytes());
+    buf.extend_from_slice(&kzg_off.to_le_bytes());
+    buf.extend_from_slice(&blobs_off.to_le_bytes());
+    buf.extend_from_slice(&block_ssz);
+    buf.extend_from_slice(envelope);
+    buf.extend_from_slice(kzg_proofs);
+    buf.extend_from_slice(blobs);
+    buf
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_json_decodes_beacon_block_and_block_contents() {
+    let slot = 300u64;
+
+    let mock_block = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", None, None))
+        .expect(1)
+        .mount(&mock_block)
+        .await;
+    let block_resp = BeaconClient::new(BeaconClientConfig::new(mock_block.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match block_resp.decode_v4_body().unwrap() {
+        ProduceBlockV4Body::BeaconBlock { block, .. } => assert_eq!(block.slot, slot),
+        other => panic!("expected BeaconBlock, got {other:?}"),
+    }
+
+    let mock_contents = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(v4_json_block_contents(slot))
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .expect(1)
+        .mount(&mock_contents)
+        .await;
+    let contents_resp = BeaconClient::new(BeaconClientConfig::new(mock_contents.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match contents_resp.decode_v4_body().unwrap() {
+        ProduceBlockV4Body::BlockContents(contents) => {
+            assert_eq!(contents.block.slot, slot);
+            assert_eq!(contents.kzg_proofs, WireBody::Json(json!(["0xaa"])));
+            assert_eq!(contents.blobs, WireBody::Json(json!(["0xbb"])));
+        }
+        other => panic!("expected BlockContents, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_json_payload_included_mismatch_is_typed_error() {
+    let slot = 301u64;
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "true", None, None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let resp = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match resp.decode_v4_body() {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("payload_included"), "{msg}");
+            assert!(msg.contains("BeaconBlock"), "{msg}");
+        }
+        other => panic!("expected payload_included mismatch ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_decodes_beacon_block_and_block_contents() {
+    let slot = 302u64;
+    let envelope = vec![0xe0, 0xe1, 0xe2, 0xe3];
+    let kzg = vec![0xaa, 0xab];
+    let blobs = vec![0xbb, 0xbc, 0xbd];
+    let contents_ssz = build_gloas_block_contents_ssz_for_test(slot, &envelope, &kzg, &blobs);
+    let block_ssz = build_beacon_block_ssz_for_test(slot, 7, &[0xca, 0xfe]);
+
+    let mock_contents = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(contents_ssz, "application/octet-stream")
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .expect(1)
+        .mount(&mock_contents)
+        .await;
+    let contents_resp = BeaconClient::new(BeaconClientConfig::new(mock_contents.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match contents_resp.decode_v4_body().unwrap() {
+        ProduceBlockV4Body::BlockContents(contents) => {
+            assert_eq!(contents.block.slot, slot);
+            assert_eq!(contents.execution_payload_envelope, WireBody::Ssz(envelope));
+            assert_eq!(contents.kzg_proofs, WireBody::Ssz(kzg));
+            assert_eq!(contents.blobs, WireBody::Ssz(blobs));
+            assert!(contents.block_ssz.is_some());
+        }
+        other => panic!("expected BlockContents, got {other:?}"),
+    }
+
+    let mock_block = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(block_ssz, "application/octet-stream")
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "false"),
+        )
+        .expect(1)
+        .mount(&mock_block)
+        .await;
+    let block_resp = BeaconClient::new(BeaconClientConfig::new(mock_block.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match block_resp.decode_v4_body().unwrap() {
+        ProduceBlockV4Body::BeaconBlock { block, block_ssz } => {
+            assert_eq!(block.slot, slot);
+            assert!(block_ssz.is_some());
+        }
+        other => panic!("expected BeaconBlock, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_produce_block_v4_ssz_payload_included_mismatch_is_typed_error() {
+    let slot = 303u64;
+    let envelope = vec![0xe0];
+    let contents_ssz = build_gloas_block_contents_ssz_for_test(slot, &envelope, &[0xaa], &[0xbb]);
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(contents_ssz, "application/octet-stream")
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "false"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    let resp = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()))
+        .unwrap()
+        .produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default())
+        .await
+        .unwrap();
+    match resp.decode_v4_body() {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("payload_included"), "{msg}");
+            assert!(msg.contains("BlockContents"), "{msg}");
+        }
+        other => panic!("expected payload_included mismatch ParseError, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_publish_execution_payload_envelope_sends_blob_data_included() {
+    let mock_server = MockServer::start().await;
+    let slot = 304u64;
+    let envelope = vec![0xe0, 0xe1, 0xe2, 0xe3];
+    let kzg = vec![0xaa, 0xab, 0xac];
+    let blobs = vec![0xbb, 0xbc];
+    let contents_ssz = build_gloas_block_contents_ssz_for_test(slot, &envelope, &kzg, &blobs);
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(contents_ssz, "application/octet-stream")
+                .insert_header(HEADER_ETH_CONSENSUS_VERSION, "gloas")
+                .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    let ProduceBlockV4Body::BlockContents(contents) = produced.decode_v4_body().unwrap() else {
+        panic!("expected BlockContents produce response");
+    };
+    let WireBody::Ssz(envelope_ssz) = contents.execution_payload_envelope else {
+        panic!("expected SSZ envelope");
+    };
+    let signed_envelope = ssz_deser::serialize_signed_beacon_block_ssz(&envelope_ssz, &[0x11; 96])
+        .expect("signed envelope frame");
+
+    client
+        .publish_execution_payload_envelope(
+            &WireBody::Ssz(signed_envelope.clone()),
+            &contents.blobs,
+            &contents.kzg_proofs,
+            "gloas",
+            Some("consensus"),
+        )
+        .await
+        .unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish = requests
+        .iter()
+        .find(|r| r.url.path() == PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH)
+        .expect("envelope publish request");
+    let version = publish
+        .headers
+        .get(HEADER_ETH_CONSENSUS_VERSION)
+        .expect("Eth-Consensus-Version")
+        .to_str()
+        .unwrap();
+    assert_eq!(version, "gloas");
+    let blob_included = publish
+        .headers
+        .get(HEADER_ETH_BLOB_DATA_INCLUDED)
+        .expect("Eth-Blob-Data-Included")
+        .to_str()
+        .unwrap();
+    assert_eq!(blob_included, "true");
+    let pairs: Vec<(String, String)> =
+        publish.url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    assert!(
+        pairs.iter().any(|(n, v)| n == QUERY_BROADCAST_VALIDATION && v == "consensus"),
+        "broadcast_validation must be passed through: {pairs:?}"
+    );
+    let expected_body = ssz_deser::encode_signed_envelope_contents(&signed_envelope, &kzg, &blobs);
+    assert_eq!(publish.body, expected_body, "envelope+blobs+proofs must match produce response");
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_publish_execution_payload_envelope_200_and_202() {
+    let envelope = WireBody::Json(json!({"message": {}, "signature": "0xaa"}));
+    let blobs = WireBody::Json(json!(["0xbb"]));
+    let proofs = WireBody::Json(json!(["0xaa"]));
+
+    let mock_200 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_200)
+        .await;
+    BeaconClient::new(BeaconClientConfig::new(mock_200.uri()))
+        .unwrap()
+        .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+        .await
+        .unwrap();
+
+    let mock_202 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(202))
+        .expect(1)
+        .mount(&mock_202)
+        .await;
+    BeaconClient::new(BeaconClientConfig::new(mock_202.uri()))
+        .unwrap()
+        .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+        .await
+        .unwrap();
+    assert!(
+        logs_contain("broadcast succeeded but integration failed"),
+        "202 must be logged as broadcast/integration failure"
+    );
+}
+
+#[tokio::test]
+async fn test_publish_execution_payload_envelope_400_and_503_typed() {
+    let envelope = WireBody::Json(json!({"message": {}}));
+    let blobs = WireBody::Json(json!([]));
+    let proofs = WireBody::Json(json!([]));
+
+    let mock_400 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalid envelope"))
+        .expect(1)
+        .mount(&mock_400)
+        .await;
+    let client_400 = BeaconClient::new(
+        BeaconClientConfig::new(mock_400.uri())
+            .with_max_retries(3)
+            .with_initial_backoff(Duration::from_millis(1)),
+    )
+    .unwrap();
+    match client_400
+        .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+        .await
+    {
+        Err(BeaconError::ApiError { status, message }) => {
+            assert_eq!(status, 400);
+            assert!(message.contains("invalid envelope"), "{message}");
+        }
+        other => panic!("expected ApiError 400, got {other:?}"),
+    }
+    assert_eq!(mock_400.received_requests().await.unwrap().len(), 1, "400 must not be retried");
+
+    let mock_503 = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string("syncing"))
+        .expect(1)
+        .mount(&mock_503)
+        .await;
+    // Default BeaconClient retries 5xx (same as publish_block_ssz). Production
+    // BnManager uses max_retries=0, so 503 is typed and not retried there.
+    let client_503 = BeaconClient::new(
+        BeaconClientConfig::new(mock_503.uri())
+            .with_max_retries(0)
+            .with_initial_backoff(Duration::from_millis(1)),
+    )
+    .unwrap();
+    match client_503
+        .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+        .await
+    {
+        Err(BeaconError::ApiError { status, message }) => {
+            assert_eq!(status, 503);
+            assert!(message.contains("syncing"), "{message}");
+        }
+        other => panic!("expected ApiError 503, got {other:?}"),
+    }
+    assert_eq!(
+        mock_503.received_requests().await.unwrap().len(),
+        1,
+        "503 is typed and not retried when max_retries=0 (BnManager production)"
+    );
+}
+
 #[tokio::test]
 async fn test_publish_block() {
     let mock_server = MockServer::start().await;
@@ -2221,7 +3298,135 @@ async fn test_publish_block() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    client.publish_block(&signed_block, "deneb").await.unwrap();
+    client.publish_block(&signed_block, "deneb", None).await.unwrap();
+}
+
+fn publish_builder_url_header(request: &wiremock::Request) -> Option<&str> {
+    request.headers.get(HEADER_ETH_BUILDER_URL).and_then(|v| v.to_str().ok())
+}
+
+fn electra_signed_block_contents() -> eth_types::SignedBlockContentsJson {
+    let signed = eth_types::SignedBeaconBlock {
+        message: eth_types::external_vector_electra_block(),
+        signature: vec![0xab; eth_types::SIGNATURE_BYTES_LEN],
+    };
+    eth_types::SignedBlockContentsJson::from_signed_block(
+        &signed,
+        vec![vec![0x11; 48], vec![0x12; 48]],
+        vec![vec![0x22; 16]],
+        eth_types::BodyForkLayout::Electra,
+    )
+    .expect("electra body encodes")
+}
+
+#[tokio::test]
+async fn publish_block_contents_posts_the_three_field_container() {
+    let mock_server = MockServer::start().await;
+    let contents = electra_signed_block_contents();
+    let expected = serde_json::to_value(&contents).expect("serialize contents");
+    assert!(expected["signed_block"].is_object());
+    assert!(expected["kzg_proofs"].is_array());
+    assert!(expected["blobs"].is_array());
+    assert!(expected["signed_block"]["message"]["body"].is_object());
+    let builder = "https://builder.example/echo";
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .and(body_json(&expected))
+        .and(wiremock::matchers::header(HEADER_ETH_CONSENSUS_VERSION, "electra"))
+        .and(wiremock::matchers::header(HEADER_ETH_BUILDER_URL, builder))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    client.publish_block_contents(&contents, "electra", Some(builder)).await.unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let posted: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(posted["signed_block"].is_object());
+    assert!(posted["kzg_proofs"].is_array());
+    assert!(posted["blobs"].is_array());
+    assert!(posted["signed_block"]["message"]["body"].is_object());
+    assert_eq!(
+        requests[0].headers.get(HEADER_ETH_CONSENSUS_VERSION).and_then(|v| v.to_str().ok()),
+        Some("electra")
+    );
+    assert_eq!(publish_builder_url_header(&requests[0]), Some(builder));
+}
+
+#[tokio::test]
+async fn test_publish_block_echoes_builder_url_from_produce_response() {
+    let mock_server = MockServer::start().await;
+    let slot = 200u64;
+    let builder = "https://builder.example.com/v1?cluster=a";
+    let signed_block = serde_json::json!({"message": {}});
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", Some(builder), None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .and(wiremock::matchers::header(HEADER_ETH_BUILDER_URL, builder))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(produced.builder_url.as_deref(), Some(builder));
+
+    client.publish_block(&signed_block, "gloas", produced.builder_url.as_deref()).await.unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish =
+        requests.iter().find(|r| r.url.path() == "/eth/v2/beacon/blocks").expect("publish request");
+    assert_eq!(publish_builder_url_header(publish), Some(builder));
+}
+
+#[tokio::test]
+async fn test_publish_block_omits_builder_url_header_when_produce_omitted_it() {
+    let mock_server = MockServer::start().await;
+    let slot = 201u64;
+    let signed_block = serde_json::json!({"message": {}});
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", None, None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(produced.builder_url, None);
+
+    client.publish_block(&signed_block, "gloas", produced.builder_url.as_deref()).await.unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish =
+        requests.iter().find(|r| r.url.path() == "/eth/v2/beacon/blocks").expect("publish request");
+    assert_eq!(
+        publish_builder_url_header(publish),
+        None,
+        "must not send {HEADER_ETH_BUILDER_URL} when produce omitted it"
+    );
 }
 
 #[tokio::test]
@@ -2239,7 +3444,7 @@ async fn test_publish_block_api_error() {
     let client = BeaconClient::new(config).unwrap();
 
     let signed_block = serde_json::json!({"message": {}});
-    let result = client.publish_block(&signed_block, "deneb").await;
+    let result = client.publish_block(&signed_block, "deneb", None).await;
 
     match result {
         Err(BeaconError::ApiError { status, message }) => {
@@ -2332,12 +3537,95 @@ async fn test_get_proposer_duties_with_dependent_root() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_proposer_duties(2000).await.unwrap();
+    let result =
+        client.get_proposer_duties(2000, &ForkSchedule::unscheduled_gloas()).await.unwrap();
 
     assert_eq!(result.dependent_root, "0xabc123");
     assert!(result.execution_optimistic);
     assert_eq!(result.data.len(), 1);
     assert_eq!(result.data[0].pubkey, "0xpubkey1");
+}
+
+#[tokio::test]
+async fn test_get_proposer_duties_v1_at_fulu_epoch() {
+    let mock_server = MockServer::start().await;
+    let body = proposer_duties_body();
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/duties/proposer/550000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/duties/proposer/550000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let result = client.get_proposer_duties(550_000, &fulu_gloas_schedule()).await.unwrap();
+    assert_eq!(result.dependent_root, "0xabc123");
+    assert_eq!(result.data[0].validator_index, "100");
+}
+
+#[tokio::test]
+async fn test_get_proposer_duties_v2_at_gloas_epoch() {
+    let mock_server = MockServer::start().await;
+    let body = proposer_duties_body();
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/duties/proposer/600000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/duties/proposer/600000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let result = client.get_proposer_duties(600_000, &fulu_gloas_schedule()).await.unwrap();
+    assert_eq!(result.dependent_root, "0xabc123");
+    assert!(result.execution_optimistic);
+    assert_eq!(result.data.len(), 1);
+    assert_eq!(result.data[0].pubkey, "0xpubkey1");
+}
+
+#[tokio::test]
+async fn test_get_proposer_duties_v2_404_is_error_not_downgrade() {
+    let mock_server = MockServer::start().await;
+    let body = proposer_duties_body();
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/duties/proposer/600000"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/duties/proposer/600000"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&body))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let result = client.get_proposer_duties(600_000, &fulu_gloas_schedule()).await;
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 404),
+        other => panic!("expected ApiError 404, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -2365,7 +3653,7 @@ async fn test_publish_block_server_error_with_retry() {
     let client = BeaconClient::new(config).unwrap();
 
     let signed_block = serde_json::json!({"message": {}});
-    client.publish_block(&signed_block, "deneb").await.unwrap();
+    client.publish_block(&signed_block, "deneb", None).await.unwrap();
 }
 
 #[tokio::test]
@@ -2665,7 +3953,10 @@ async fn test_get_aggregate_attestation_success() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, None).await.unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, None, ForkName::Phase0)
+        .await
+        .unwrap();
 
     match result {
         VersionedAggregateAttestation::PreElectra(att) => {
@@ -2694,7 +3985,8 @@ async fn test_get_aggregate_attestation_not_found() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, None).await;
+    let result =
+        client.get_aggregate_attestation(100, &att_data_root, None, ForkName::Phase0).await;
 
     match result {
         Err(BeaconError::ApiError { status, message }) => {
@@ -2828,6 +4120,7 @@ async fn test_get_aggregate_attestation_with_committee_index() {
     let sig_hex = format!("0x{}", "aa".repeat(96));
     let committee_bits_hex = "0x2000000000000000";
     let response_body = serde_json::json!({
+        "version": "electra",
         "data": {
             "aggregation_bits": format!("0x{}", "ff".repeat(4)),
             "data": {
@@ -2849,11 +4142,16 @@ async fn test_get_aggregate_attestation_with_committee_index() {
     });
 
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
         .and(wiremock::matchers::query_param("slot", "100"))
         .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
         .and(wiremock::matchers::query_param("committee_index", "5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&response_body)
+                .insert_header("Eth-Consensus-Version", "electra"),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -2861,7 +4159,10 @@ async fn test_get_aggregate_attestation_with_committee_index() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, Some(5)).await.unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
+        .await
+        .unwrap();
     match result {
         VersionedAggregateAttestation::Electra(att) => {
             assert_eq!(att.data.slot, 100);
@@ -3286,9 +4587,79 @@ async fn test_get_node_syncing_error() {
 
 // -- get_node_version tests --
 
+fn node_version_v2_body() -> serde_json::Value {
+    serde_json::json!({
+        "data": {
+            "beacon_node": {
+                "code": "LH",
+                "name": "Lighthouse",
+                "version": "v8.0.1",
+                "commit": "0xced49dd2"
+            },
+            "execution_client": {
+                "code": "NM",
+                "name": "Nethermind",
+                "version": "v1.35.8",
+                "commit": "0xc066aee2"
+            }
+        }
+    })
+}
+
+#[tokio::test]
+async fn test_get_node_version_v2() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/node/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(node_version_v2_body()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": { "version": "should-not-be-used" }
+        })))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let version = client.get_node_version().await.unwrap();
+    assert_eq!(version, "Lighthouse/v8.0.1");
+}
+
 #[tokio::test]
 async fn test_get_node_version_success() {
     let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/node/version"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(node_version_v2_body()))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+    let version = client.get_node_version().await.unwrap();
+    assert_eq!(version, "Lighthouse/v8.0.1");
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_get_node_version_falls_back_to_v1_on_404() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/node/version"))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .expect(2)
+        .mount(&mock_server)
+        .await;
 
     Mock::given(method("GET"))
         .and(path("/eth/v1/node/version"))
@@ -3297,14 +4668,24 @@ async fn test_get_node_version_success() {
                 r#"{"data":{"version":"Lighthouse/v7.1.0-a1b2c3d/x86_64-linux"}}"#,
             ),
         )
-        .expect(1)
+        .expect(2)
         .mount(&mock_server)
         .await;
 
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
-    let version = client.get_node_version().await.unwrap();
-    assert_eq!(version, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    let first = client.get_node_version().await.unwrap();
+    let second = client.get_node_version().await.unwrap();
+    assert_eq!(first, "Lighthouse/v7.1.0-a1b2c3d/x86_64-linux");
+    assert_eq!(second, first);
+
+    logs_assert(|lines: &[&str]| {
+        let n = lines.iter().filter(|l| l.contains("falling back to /eth/v1/node/version")).count();
+        if n != 1 {
+            return Err(format!("expected fallback log once, got {n}: {lines:?}"));
+        }
+        Ok(())
+    });
 }
 
 #[tokio::test]
@@ -3312,9 +4693,19 @@ async fn test_get_node_version_error() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("GET"))
-        .and(path("/eth/v1/node/version"))
+        .and(path("/eth/v2/node/version"))
         .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
         .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/version"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":{"version":"should-not-fallback"}}"#),
+        )
+        .expect(0)
         .mount(&mock_server)
         .await;
 
@@ -3508,7 +4899,8 @@ async fn test_get_aggregate_attestation_pre_electra() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, None).await.unwrap();
+    let result =
+        client.get_aggregate_attestation(100, &att_data_root, None, ForkName::Deneb).await.unwrap();
     match result {
         VersionedAggregateAttestation::PreElectra(att) => {
             assert_eq!(att.data.slot, 100);
@@ -3533,6 +4925,7 @@ async fn test_get_aggregate_attestation_electra() {
     let committee_bits_hex = "0x2000000000000000";
 
     let response_body = serde_json::json!({
+        "version": "electra",
         "data": {
             "aggregation_bits": bits_hex,
             "data": {
@@ -3548,11 +4941,16 @@ async fn test_get_aggregate_attestation_electra() {
     });
 
     Mock::given(method("GET"))
-        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "electra"))
         .and(wiremock::matchers::query_param("slot", "100"))
         .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
         .and(wiremock::matchers::query_param("committee_index", "5"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&response_body)
+                .insert_header("Eth-Consensus-Version", "electra"),
+        )
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -3560,7 +4958,10 @@ async fn test_get_aggregate_attestation_electra() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    let result = client.get_aggregate_attestation(100, &att_data_root, Some(5)).await.unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
+        .await
+        .unwrap();
     match result {
         VersionedAggregateAttestation::Electra(att) => {
             assert_eq!(att.data.slot, 100);
@@ -3631,6 +5032,128 @@ async fn test_submit_aggregate_and_proofs_fulu_has_version_header() {
 
     let proofs =
         VersionedSignedAggregateAndProof::Fulu(vec![eth_types::SignedElectraAggregateAndProof {
+            message: eth_types::ElectraAggregateAndProof {
+                aggregator_index: 42,
+                aggregate: eth_types::ElectraAttestation {
+                    aggregation_bits: vec![0xff; 4],
+                    data: eth_types::AttestationData {
+                        slot: 100,
+                        index: 1,
+                        beacon_block_root: [1u8; 32],
+                        source: eth_types::Checkpoint { epoch: 3, root: [2u8; 32] },
+                        target: eth_types::Checkpoint { epoch: 4, root: [3u8; 32] },
+                    },
+                    signature: vec![0xaa; 96],
+                    committee_bits: vec![0x01; 8],
+                },
+                selection_proof: vec![0xbb; 96],
+            },
+            signature: vec![0xcc; 96],
+        }]);
+
+    let result = client.submit_aggregate_and_proofs(&proofs).await;
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn test_submit_attestation_fulu_has_version_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "fulu"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let attestation = SingleAttestation {
+        attester_index: 0,
+        data: AttestationData {
+            slot: "1000".to_string(),
+            index: "0".to_string(),
+            beacon_block_root: "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                .to_string(),
+            source: Checkpoint {
+                epoch: "100".to_string(),
+                root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            },
+            target: Checkpoint {
+                epoch: "101".to_string(),
+                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            },
+        },
+        committee_index: 0,
+        signature: "0xsignature".to_string(),
+    };
+    let versioned = VersionedAttestation::Fulu(vec![attestation]);
+    let result = client.submit_attestation(&versioned).await.unwrap();
+    assert!(result.is_success());
+}
+
+#[tokio::test]
+async fn test_submit_attestation_gloas_has_version_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/pool/attestations"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let attestation = SingleAttestation {
+        attester_index: 0,
+        data: AttestationData {
+            slot: "1000".to_string(),
+            index: "1".to_string(),
+            beacon_block_root: "0xabcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+                .to_string(),
+            source: Checkpoint {
+                epoch: "100".to_string(),
+                root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                    .to_string(),
+            },
+            target: Checkpoint {
+                epoch: "101".to_string(),
+                root: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            },
+        },
+        committee_index: 0,
+        signature: "0xsignature".to_string(),
+    };
+    let versioned = VersionedAttestation::Gloas(vec![attestation]);
+    let result = client.submit_attestation(&versioned).await.unwrap();
+    assert!(result.is_success());
+}
+
+#[tokio::test]
+async fn test_submit_aggregate_and_proofs_gloas_has_version_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/validator/aggregate_and_proofs"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let proofs =
+        VersionedSignedAggregateAndProof::Gloas(vec![eth_types::SignedElectraAggregateAndProof {
             message: eth_types::ElectraAggregateAndProof {
                 aggregator_index: 42,
                 aggregate: eth_types::ElectraAttestation {
@@ -3773,7 +5296,7 @@ async fn test_publish_block_ssz_retries_on_503() {
     let client = BeaconClient::new(config).unwrap();
 
     let ssz_bytes = vec![0x01, 0x02, 0x03];
-    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false).await;
+    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false, None).await;
     assert!(result.is_ok());
 }
 
@@ -3794,7 +5317,7 @@ async fn test_publish_block_ssz_fails_on_400_no_retry() {
     let client = BeaconClient::new(config).unwrap();
 
     let ssz_bytes = vec![0x01, 0x02, 0x03];
-    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false).await;
+    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false, None).await;
 
     match result {
         Err(BeaconError::ApiError { status, .. }) => {
@@ -3822,7 +5345,7 @@ async fn test_publish_block_ssz_exhausts_retries() {
     let client = BeaconClient::new(config).unwrap();
 
     let ssz_bytes = vec![0x01, 0x02, 0x03];
-    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false).await;
+    let result = client.publish_block_ssz(&ssz_bytes, "deneb", false, None).await;
 
     match result {
         Err(BeaconError::ApiError { status, .. }) => {
@@ -3830,6 +5353,84 @@ async fn test_publish_block_ssz_exhausts_retries() {
         }
         _ => panic!("Expected ApiError with status 503"),
     }
+}
+
+#[tokio::test]
+async fn test_publish_block_ssz_echoes_builder_url_from_produce_response() {
+    let mock_server = MockServer::start().await;
+    let slot = 202u64;
+    let builder = "https://relay.example/ssz";
+    let ssz_bytes = vec![0x01, 0x02, 0x03];
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", Some(builder), None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .and(wiremock::matchers::header(HEADER_ETH_BUILDER_URL, builder))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(produced.builder_url.as_deref(), Some(builder));
+
+    client
+        .publish_block_ssz(&ssz_bytes, "gloas", false, produced.builder_url.as_deref())
+        .await
+        .unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish =
+        requests.iter().find(|r| r.url.path() == "/eth/v2/beacon/blocks").expect("publish request");
+    assert_eq!(publish_builder_url_header(publish), Some(builder));
+}
+
+#[tokio::test]
+async fn test_publish_block_ssz_omits_builder_url_header_when_produce_omitted_it() {
+    let mock_server = MockServer::start().await;
+    let slot = 203u64;
+    let ssz_bytes = vec![0x01, 0x02, 0x03];
+
+    Mock::given(method("POST"))
+        .and(path(v4_blocks_path(slot)))
+        .respond_with(v4_json_headers(slot, "false", None, None))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let produced =
+        client.produce_block_v4(slot, "0xrandao", None, &BuilderConfig::default()).await.unwrap();
+    assert_eq!(produced.builder_url, None);
+
+    client
+        .publish_block_ssz(&ssz_bytes, "gloas", false, produced.builder_url.as_deref())
+        .await
+        .unwrap();
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let publish =
+        requests.iter().find(|r| r.url.path() == "/eth/v2/beacon/blocks").expect("publish request");
+    assert_eq!(
+        publish_builder_url_header(publish),
+        None,
+        "must not send {HEADER_ETH_BUILDER_URL} when produce omitted it"
+    );
 }
 
 // --- COR-08: 429 Retry-After tests ---
@@ -3883,6 +5484,35 @@ async fn test_429_exhausts_retries() {
         BeaconError::ApiError { status, .. } => assert_eq!(status, 429),
         e => panic!("expected ApiError(429), got: {e:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_429_max_retries_zero_does_not_sleep_retry_after() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/genesis"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "30"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let config = BeaconClientConfig::new(server.uri())
+        .with_max_retries(0)
+        .with_initial_backoff(Duration::from_millis(10));
+    let client = BeaconClient::new(config).unwrap();
+
+    let start = tokio::time::Instant::now();
+    let result = client.get_genesis().await;
+    let elapsed = start.elapsed();
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 429),
+        other => panic!("expected ApiError(429), got {other:?}"),
+    }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "max_retries=0 must return 429 without sleeping Retry-After, took {elapsed:?}"
+    );
 }
 
 #[tokio::test]
@@ -4083,4 +5713,883 @@ async fn test_429_without_retry_after_uses_exponential_backoff() {
 
     let result = client.get_genesis().await;
     assert!(result.is_ok(), "Should succeed after 429 retry with fallback backoff");
+}
+
+#[tokio::test]
+async fn test_post_ptc_duties_parses_dependent_root_field() {
+    let mock_server = MockServer::start().await;
+
+    let response_body = serde_json::json!({
+        "dependent_root": "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab",
+        "execution_optimistic": true,
+        "data": [
+            {
+                "pubkey": "0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a",
+                "validator_index": "1234",
+                "slot": "10000"
+            }
+        ]
+    });
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/duties/ptc/100"))
+        .and(body_json(["1234"]))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.post_ptc_duties(100, &["1234".to_string()]).await.unwrap();
+
+    assert_eq!(
+        result.dependent_root,
+        "0xdeproot1234567890abcdef1234567890abcdef1234567890abcdef1234567890ab"
+    );
+    assert!(result.execution_optimistic);
+    assert_eq!(result.data.len(), 1);
+    assert_eq!(result.data[0].validator_index, "1234");
+    assert_eq!(result.data[0].slot, "10000");
+}
+
+#[tokio::test]
+async fn test_post_ptc_duties_500_is_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/duties/ptc/100"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.post_ptc_duties(100, &["1234".to_string()]).await;
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 500),
+        Ok(resp) => panic!("500 must not become an empty duty list, got {} items", resp.data.len()),
+        other => panic!("expected ApiError with status 500, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_get_payload_attestation_data_204_returns_none() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(wiremock::matchers::query_param("slot", "42"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri())
+        .with_max_retries(3)
+        .with_initial_backoff(Duration::from_millis(1));
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.get_payload_attestation_data(42).await.unwrap();
+    assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn test_get_payload_attestation_data_200_parses_data() {
+    let mock_server = MockServer::start().await;
+    let root = format!("0x{}", "11".repeat(32));
+
+    let response_body = serde_json::json!({
+        "version": "gloas",
+        "data": {
+            "beacon_block_root": root,
+            "slot": "42",
+            "payload_present": true,
+            "blob_data_available": false
+        }
+    });
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(wiremock::matchers::query_param("slot", "42"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.get_payload_attestation_data(42).await.unwrap().unwrap();
+    assert_eq!(result.data.slot, 42);
+    assert!(result.data.payload_present);
+    assert!(!result.data.blob_data_available);
+    assert_eq!(result.data.beacon_block_root, [0x11; 32]);
+}
+
+#[tokio::test]
+async fn test_get_payload_attestation_data_500_is_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/payload_attestation_data"))
+        .and(wiremock::matchers::query_param("slot", "42"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    let result = client.get_payload_attestation_data(42).await;
+    match result {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 500),
+        Ok(None) => panic!("500 must not be treated as a 204 skip"),
+        other => panic!("expected ApiError with status 500, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_submit_payload_attestations_sends_consensus_version() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("missing Eth-Consensus-Version"))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    client.submit_payload_attestations(&[]).await.expect("header must be sent");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let version = requests[0]
+        .headers
+        .get("Eth-Consensus-Version")
+        .expect("Eth-Consensus-Version header must be present");
+    assert_eq!(version.to_str().unwrap(), "gloas");
+}
+
+#[tokio::test]
+async fn test_submit_payload_attestations_500_is_error() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/pool/payload_attestations"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri()).with_max_retries(0);
+    let client = BeaconClient::new(config).unwrap();
+
+    match client.submit_payload_attestations(&[]).await {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 500),
+        other => panic!("expected ApiError with status 500, got {other:?}"),
+    }
+}
+
+/// 4.16 KAT object (`gloas_prefs_fixture`) plus a 96-byte signature.
+fn gloas_signed_proposer_preferences() -> eth_types::SignedProposerPreferences {
+    eth_types::SignedProposerPreferences {
+        message: eth_types::ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        },
+        signature: vec![0xaa; 96],
+    }
+}
+
+#[tokio::test]
+async fn test_submit_proposer_preferences_sends_consensus_version() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("missing Eth-Consensus-Version"))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    client.submit_proposer_preferences(&[]).await.expect("header must be sent");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let version = requests[0]
+        .headers
+        .get("Eth-Consensus-Version")
+        .expect("Eth-Consensus-Version header must be present");
+    assert_eq!(version.to_str().unwrap(), "gloas");
+
+    // A BN rejecting the request surfaces as an error, never a silent skip.
+    let reject_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .respond_with(ResponseTemplate::new(400).set_body_string("invalid proposer preferences"))
+        .expect(1)
+        .mount(&reject_server)
+        .await;
+
+    let reject_client =
+        BeaconClient::new(BeaconClientConfig::new(reject_server.uri()).with_max_retries(0))
+            .unwrap();
+    match reject_client.submit_proposer_preferences(&[]).await {
+        Err(BeaconError::ApiError { status, .. }) => assert_eq!(status, 400),
+        other => panic!("BN reject must surface as error, never a silent skip, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_submit_proposer_preferences_round_trips_signed_bytes() {
+    let mock_server = MockServer::start().await;
+    let signed = gloas_signed_proposer_preferences();
+    let expected_body = serde_json::to_vec(std::slice::from_ref(&signed)).expect("serialize");
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/proposer_preferences"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let config = BeaconClientConfig::new(mock_server.uri());
+    let client = BeaconClient::new(config).unwrap();
+
+    client.submit_proposer_preferences(std::slice::from_ref(&signed)).await.expect("submit");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].body, expected_body,
+        "wire body must be byte-identical to the signed object JSON"
+    );
+}
+
+fn signed_builder_request_auth(
+    sk: &crypto::SecretKey,
+    url: &str,
+    slot: u64,
+    genesis_fork_version: [u8; 4],
+) -> (eth_types::SignedBuilderRequestAuth, SignedBuilderRequestAuth) {
+    let message =
+        eth_types::BuilderRequestAuth::new(url.as_bytes().to_vec(), slot).expect("url bytes");
+    let root = crypto::signing_root_with_fork_version(
+        &message,
+        eth_types::DOMAIN_BUILDER_REQUEST_AUTH,
+        genesis_fork_version,
+        [0u8; 32],
+    );
+    let sig = sk.sign(&root);
+    let signed =
+        eth_types::SignedBuilderRequestAuth { message, signature: sig.to_bytes().to_vec() };
+    let wire = SignedBuilderRequestAuth::from_signed(&signed);
+    (signed, wire)
+}
+
+#[tokio::test]
+async fn test_submit_builder_preferences_sends_signed_request_auth() {
+    let mock_server = MockServer::start().await;
+    let sk = crypto::SecretKey::generate();
+    let pk = sk.public_key();
+    let genesis_fork = [0u8; 4];
+    let url = "https://builder.example.com";
+    let slot = 32u64;
+    let (_signed, wire_auth) = signed_builder_request_auth(&sk, url, slot, genesis_fork);
+    let entry = BuilderPreferencesEntry {
+        proposer_pubkey: format!("0x{}", hex::encode(pk.to_bytes())),
+        url: url.to_string(),
+        auth: wire_auth,
+        max_execution_payment: 0,
+    };
+
+    Mock::given(method("POST"))
+        .and(path(BUILDER_PREFERENCES_PATH))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", "gloas"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(BUILDER_PREFERENCES_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_string("missing Eth-Consensus-Version"))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    client.submit_builder_preferences(std::slice::from_ref(&entry)).await.expect("submit");
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let version = requests[0]
+        .headers
+        .get("Eth-Consensus-Version")
+        .expect("Eth-Consensus-Version header must be present");
+    assert_eq!(version.to_str().unwrap(), "gloas");
+
+    let posted: Vec<BuilderPreferencesEntry> =
+        serde_json::from_slice(&requests[0].body).expect("json body");
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0].auth.message.slot, slot);
+    assert_eq!(posted[0], entry);
+
+    let data_hex = posted[0].auth.message.data.trim_start_matches("0x");
+    let data = hex::decode(data_hex).expect("auth data hex");
+    let message = eth_types::BuilderRequestAuth::new(data, posted[0].auth.message.slot)
+        .expect("reconstruct auth");
+    let sig_hex = posted[0].auth.signature.trim_start_matches("0x");
+    let sig = crypto::Signature::from_bytes(&hex::decode(sig_hex).expect("sig hex")).expect("sig");
+    let root = crypto::signing_root_with_fork_version(
+        &message,
+        eth_types::DOMAIN_BUILDER_REQUEST_AUTH,
+        genesis_fork,
+        [0u8; 32],
+    );
+    sig.verify(&pk, &root).expect("signature must verify under DOMAIN_BUILDER_REQUEST_AUTH");
+}
+
+#[tokio::test]
+async fn test_submit_builder_preferences_400_indexed_is_not_retried() {
+    let mock_server = MockServer::start().await;
+    let body = serde_json::json!({
+        "code": 400,
+        "message": "some failures",
+        "failures": [{ "index": 1, "message": "builder rejected" }]
+    });
+
+    Mock::given(method("POST"))
+        .and(path(BUILDER_PREFERENCES_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_json(body))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client =
+        BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(3)).unwrap();
+    match client.submit_builder_preferences(&[]).await {
+        Ok(SubmitBuilderPreferencesResult::PartialFailure { failures }) => {
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].index, 1);
+            assert_eq!(failures[0].message, "builder rejected");
+        }
+        other => panic!("400 IndexedErrorMessage must surface as PartialFailure, got {other:?}"),
+    }
+}
+
+// Pre-Electra aggregate fetch stays on v1. Electra+ uses v2.
+
+fn sample_attestation_data_root() -> String {
+    format!("0x{}", "ab".repeat(32))
+}
+
+/// Committee index 5 is bit 5 of the first byte (`0x20`), LSB-first.
+const AGGREGATE_COMMITTEE_INDEX: &str = "5";
+const AGGREGATE_COMMITTEE_BITS: &str = "0x2000000000000000";
+
+/// `version` wraps the v2 body; v1 responses pass `None`. `committee_bits`
+/// `None` omits the field (pre-Electra).
+fn aggregate_attestation_json(
+    version: Option<&str>,
+    committee_bits: Option<&str>,
+) -> serde_json::Value {
+    let mut data = serde_json::json!({
+        "aggregation_bits": format!("0x{}", "ff".repeat(4)),
+        "data": {
+            "slot": "100",
+            "index": "1",
+            "beacon_block_root": format!("0x{}", "01".repeat(32)),
+            "source": { "epoch": "3", "root": format!("0x{}", "02".repeat(32)) },
+            "target": { "epoch": "4", "root": format!("0x{}", "03".repeat(32)) }
+        },
+        "signature": format!("0x{}", "aa".repeat(96))
+    });
+    if let Some(committee_bits) = committee_bits {
+        data["committee_bits"] = serde_json::json!(committee_bits);
+    }
+    match version {
+        Some(version) => serde_json::json!({ "version": version, "data": data }),
+        None => serde_json::json!({ "data": data }),
+    }
+}
+
+fn bn_capability_state(endpoint: &str, capability: &str) -> Option<f64> {
+    let gathered = metrics::REGISTRY.gather();
+    let family = gathered.iter().find(|metric| metric.name() == "rvc_bn_capability_state")?;
+    for metric in family.get_metric() {
+        let mut got_endpoint = None;
+        let mut got_capability = None;
+        for label in metric.get_label() {
+            match label.name() {
+                "endpoint" => got_endpoint = Some(label.value()),
+                "capability" => got_capability = Some(label.value()),
+                _ => {}
+            }
+        }
+        if got_endpoint == Some(endpoint) && got_capability == Some(capability) {
+            return Some(metric.get_gauge().get_value());
+        }
+    }
+    None
+}
+
+struct AggregateV2Fetch {
+    result: VersionedAggregateAttestation,
+    requests: Vec<wiremock::Request>,
+    endpoint: String,
+}
+
+async fn fetch_aggregate_v2(fork: ForkName, version: &str) -> AggregateV2Fetch {
+    let mock_server = MockServer::start().await;
+    let att_data_root = sample_attestation_data_root();
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .and(wiremock::matchers::header("Eth-Consensus-Version", version))
+        .and(wiremock::matchers::query_param("slot", "100"))
+        .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
+        .and(wiremock::matchers::query_param("committee_index", AGGREGATE_COMMITTEE_INDEX))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(aggregate_attestation_json(
+                    Some(version),
+                    Some(AGGREGATE_COMMITTEE_BITS),
+                ))
+                .insert_header("Eth-Consensus-Version", version),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), fork)
+        .await
+        .unwrap_or_else(|e| panic!("{version} aggregate fetch failed: {e}"));
+    let requests = mock_server.received_requests().await.unwrap();
+    AggregateV2Fetch { result, requests, endpoint: client.endpoint().to_string() }
+}
+
+fn assert_v2_wire(fetch: &AggregateV2Fetch, header: &str) {
+    assert_eq!(fetch.requests.len(), 1, "v2 fetch must be a single request");
+    let request = &fetch.requests[0];
+    assert_eq!(request.url.path(), "/eth/v2/validator/aggregate_attestation");
+    let got = request
+        .headers
+        .get("Eth-Consensus-Version")
+        .expect("Eth-Consensus-Version")
+        .to_str()
+        .unwrap();
+    assert_eq!(got, header);
+    assert_eq!(
+        bn_capability_state(&fetch.endpoint, "aggregate_attestation_v2"),
+        Some(1.0),
+        "successful v2 must mark the capability capable"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_fetch_uses_v2_for_electra() {
+    let fetch = fetch_aggregate_v2(ForkName::Electra, "electra").await;
+    assert_v2_wire(&fetch, "electra");
+    match fetch.result {
+        VersionedAggregateAttestation::Electra(att) => {
+            assert_eq!(att.data.slot, 100);
+            assert_eq!(att.committee_bits, vec![0x20, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        other => panic!("expected Electra aggregate, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn aggregate_fetch_uses_v2_for_fulu() {
+    let fetch = fetch_aggregate_v2(ForkName::Fulu, "fulu").await;
+    assert_v2_wire(&fetch, "fulu");
+    match fetch.result {
+        VersionedAggregateAttestation::Fulu(att) => {
+            assert_eq!(att.data.slot, 100);
+            assert_eq!(att.committee_bits, vec![0x20, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        other => panic!("expected Fulu aggregate, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn aggregate_fetch_uses_v2_for_gloas() {
+    let fetch = fetch_aggregate_v2(ForkName::Gloas, "gloas").await;
+    assert_v2_wire(&fetch, "gloas");
+    match fetch.result {
+        VersionedAggregateAttestation::Gloas(att) => {
+            assert_eq!(att.data.slot, 100);
+            assert_eq!(att.committee_bits, vec![0x20, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        other => panic!("expected Gloas aggregate, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn aggregate_fetch_falls_back_to_v1_once_on_405() {
+    let mock_server = MockServer::start().await;
+    let att_data_root = sample_attestation_data_root();
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .respond_with(ResponseTemplate::new(405).set_body_string("method not allowed"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(aggregate_attestation_json(None, Some(AGGREGATE_COMMITTEE_BITS))),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client =
+        BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(3)).unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
+        .await
+        .unwrap_or_else(|e| panic!("405 must fall back to v1: {e}"));
+    match result {
+        VersionedAggregateAttestation::Electra(att) => assert_eq!(att.data.slot, 100),
+        other => panic!("v1 fallback with committee_index must be Electra, got {other:?}"),
+    }
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let v2: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/eth/v2/validator/aggregate_attestation")
+        .collect();
+    let v1: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/eth/v1/validator/aggregate_attestation")
+        .collect();
+    assert_eq!(v2.len(), 1, "exactly one v2 attempt, got {}", requests.len());
+    assert_eq!(v1.len(), 1, "exactly one v1 fallback");
+    assert_eq!(v2[0].headers.get("Eth-Consensus-Version").unwrap().to_str().unwrap(), "electra");
+    assert!(logs_contain("falling back to v1 once"), "405 fallback must be logged at warn");
+    assert_eq!(
+        bn_capability_state(client.endpoint(), "aggregate_attestation_v2"),
+        Some(0.0),
+        "405 must mark aggregate_attestation_v2 incapable"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_fetch_stays_v1_pre_electra() {
+    let mock_server = MockServer::start().await;
+    let att_data_root = sample_attestation_data_root();
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .and(wiremock::matchers::query_param("slot", "100"))
+        .and(wiremock::matchers::query_param("attestation_data_root", &att_data_root))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(aggregate_attestation_json(None, None)),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let before = bn_capability_state(client.endpoint(), "aggregate_attestation_v2");
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, None, ForkName::Deneb)
+        .await
+        .unwrap_or_else(|e| panic!("pre-Electra fetch failed: {e}"));
+    match result {
+        VersionedAggregateAttestation::PreElectra(att) => {
+            assert_eq!(att.data.slot, 100);
+            assert_eq!(att.aggregation_bits, vec![0xff; 4]);
+        }
+        other => panic!("expected PreElectra aggregate, got {other:?}"),
+    }
+
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].url.path(), "/eth/v1/validator/aggregate_attestation");
+    assert!(requests[0].headers.get("Eth-Consensus-Version").is_none());
+    assert_eq!(
+        bn_capability_state(client.endpoint(), "aggregate_attestation_v2"),
+        before,
+        "pre-Electra must not probe v2 or mark capability"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_fetch_falls_back_to_v1_once_on_501() {
+    let result = fallback_once(501, ForkName::Electra, "electra").await;
+    match result {
+        VersionedAggregateAttestation::Electra(att) => assert_eq!(att.data.slot, 100),
+        other => panic!("501 fallback must be Electra, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn aggregate_fetch_gloas_405_returns_electra_not_gloas() {
+    let result = fallback_once(405, ForkName::Gloas, "gloas").await;
+    match result {
+        VersionedAggregateAttestation::Electra(att) => assert_eq!(att.data.slot, 100),
+        VersionedAggregateAttestation::Gloas(_) => {
+            panic!("v1 fallback must not be re-wrapped as Gloas")
+        }
+        other => panic!("Gloas 405 fallback must be Electra, got {other:?}"),
+    }
+}
+
+/// `max_retries(3)` must not repeat a 405/501. v1 with a committee index is Electra.
+async fn fallback_once(
+    status: u16,
+    fork: ForkName,
+    request_header: &str,
+) -> VersionedAggregateAttestation {
+    let mock_server = MockServer::start().await;
+    let att_data_root = sample_attestation_data_root();
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .respond_with(ResponseTemplate::new(status).set_body_string("unsupported"))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/validator/aggregate_attestation"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(aggregate_attestation_json(None, Some(AGGREGATE_COMMITTEE_BITS))),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client =
+        BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(3)).unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), fork)
+        .await
+        .unwrap_or_else(|e| panic!("{status} must fall back to v1: {e}"));
+
+    let requests = mock_server.received_requests().await.unwrap();
+    let v2: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/eth/v2/validator/aggregate_attestation")
+        .collect();
+    let v1: Vec<_> = requests
+        .iter()
+        .filter(|request| request.url.path() == "/eth/v1/validator/aggregate_attestation")
+        .collect();
+    assert_eq!(v2.len(), 1, "exactly one v2 attempt on {status}");
+    assert_eq!(v1.len(), 1, "exactly one v1 fallback on {status}");
+    assert_eq!(
+        v2[0].headers.get("Eth-Consensus-Version").unwrap().to_str().unwrap(),
+        request_header
+    );
+    assert_eq!(
+        bn_capability_state(client.endpoint(), "aggregate_attestation_v2"),
+        Some(0.0),
+        "{status} must mark aggregate_attestation_v2 incapable"
+    );
+    result
+}
+
+#[tokio::test]
+async fn aggregate_fetch_requires_committee_index_before_get() {
+    for fork in [ForkName::Electra, ForkName::Fulu, ForkName::Gloas] {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+        let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+        let err = client
+            .get_aggregate_attestation(100, &sample_attestation_data_root(), None, fork)
+            .await
+            .expect_err("Electra+ without committee_index must fail before the GET");
+        assert!(
+            matches!(err, BeaconError::ParseError(ref msg) if msg.contains("committee_index")),
+            "{fork:?}: {err:?}"
+        );
+        assert!(mock_server.received_requests().await.unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn aggregate_fetch_rejects_fork_disagreement() {
+    // Body says electra while the request is Gloas. Must not return Electra.
+    let err = v2_disagreement(Some("electra"), Some("gloas")).await;
+    assert!(matches!(err, BeaconError::ParseError(_)), "{err:?}");
+
+    // Header disagrees with the requested fork and the body.
+    let err = v2_disagreement(Some("gloas"), Some("electra")).await;
+    assert!(matches!(err, BeaconError::ParseError(_)), "{err:?}");
+
+    // Missing response header.
+    let err = v2_disagreement(Some("gloas"), None).await;
+    assert!(
+        matches!(err, BeaconError::ParseError(ref msg) if msg.contains("Eth-Consensus-Version")),
+        "{err:?}"
+    );
+
+    // phase0 body must not decode as PreElectra for a Gloas request.
+    let err = v2_disagreement(Some("phase0"), Some("gloas")).await;
+    assert!(matches!(err, BeaconError::ParseError(_)), "{err:?}");
+}
+
+async fn v2_disagreement(body_version: Option<&str>, response_header: Option<&str>) -> BeaconError {
+    let mock_server = MockServer::start().await;
+    let att_data_root = sample_attestation_data_root();
+    let mut response = ResponseTemplate::new(200)
+        .set_body_json(aggregate_attestation_json(body_version, Some(AGGREGATE_COMMITTEE_BITS)));
+    if let Some(header) = response_header {
+        response = response.insert_header("Eth-Consensus-Version", header);
+    }
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .respond_with(response)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let before = bn_capability_state(client.endpoint(), "aggregate_attestation_v2");
+    let err = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Gloas)
+        .await
+        .expect_err("disagreeing v2 response must be ParseError");
+    assert_eq!(
+        bn_capability_state(client.endpoint(), "aggregate_attestation_v2"),
+        before,
+        "a rejected v2 body must not change the capability gauge"
+    );
+    let requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "disagreement is not a v1 fallback");
+    err
+}
+
+#[tokio::test]
+async fn aggregate_fetch_rejects_committee_bits_without_index() {
+    let mock_server = MockServer::start().await;
+    let att_data_root = sample_attestation_data_root();
+    // Bit 0 of every byte, not bit 5.
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(aggregate_attestation_json(
+                    Some("electra"),
+                    Some("0x0101010101010101"),
+                ))
+                .insert_header("Eth-Consensus-Version", "electra"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let before = bn_capability_state(client.endpoint(), "aggregate_attestation_v2");
+    let err = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
+        .await
+        .expect_err("committee_bits missing index 5 must fail");
+    assert!(
+        matches!(err, BeaconError::ParseError(ref msg) if msg.contains("committee_bits")),
+        "{err:?}"
+    );
+    assert_eq!(
+        bn_capability_state(client.endpoint(), "aggregate_attestation_v2"),
+        before,
+        "rejected committee_bits must not change the capability gauge"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_fetch_retries_503_then_succeeds() {
+    let mock_server = MockServer::start().await;
+    let att_data_root = sample_attestation_data_root();
+    let hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let hits_resp = hits.clone();
+    Mock::given(method("GET"))
+        .and(path("/eth/v2/validator/aggregate_attestation"))
+        .respond_with(move |_req: &wiremock::Request| {
+            let n = hits_resp.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                ResponseTemplate::new(503).set_body_string("optimistic")
+            } else {
+                ResponseTemplate::new(200)
+                    .set_body_json(aggregate_attestation_json(
+                        Some("electra"),
+                        Some(AGGREGATE_COMMITTEE_BITS),
+                    ))
+                    .insert_header("Eth-Consensus-Version", "electra")
+            }
+        })
+        .expect(2)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(
+        BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(1)
+            .with_initial_backoff(Duration::from_millis(0)),
+    )
+    .unwrap();
+    let result = client
+        .get_aggregate_attestation(100, &att_data_root, Some(5), ForkName::Electra)
+        .await
+        .unwrap_or_else(|e| panic!("503 must be retried into a 200: {e}"));
+    match result {
+        VersionedAggregateAttestation::Electra(att) => assert_eq!(att.data.slot, 100),
+        other => panic!("expected Electra after retry, got {other:?}"),
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert!(
+        mock_server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .all(|request| request.url.path() == "/eth/v2/validator/aggregate_attestation"),
+        "503 retry must not fall back to v1"
+    );
 }

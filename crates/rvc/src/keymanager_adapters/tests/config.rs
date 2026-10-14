@@ -2,7 +2,8 @@ use super::*;
 
 // --- ValidatorConfigManagerAdapter tests ---
 
-fn create_config_adapter_with_store() -> (ValidatorConfigManagerAdapter, Arc<ValidatorStore>) {
+fn create_config_adapter_with_store(
+) -> (ValidatorConfigManagerAdapter, Arc<ValidatorStore>, TempDir) {
     let dir = TempDir::new().unwrap();
     let config_path = dir.path().join("validators.toml");
     std::fs::write(
@@ -11,21 +12,20 @@ fn create_config_adapter_with_store() -> (ValidatorConfigManagerAdapter, Arc<Val
     )
     .unwrap();
     let store = Arc::new(ValidatorStore::load_from_config(&config_path).unwrap());
-    // Keep TempDir alive by leaking it — tests are short-lived
-    std::mem::forget(dir);
     let adapter = ValidatorConfigManagerAdapter::new(store.clone());
-    (adapter, store)
+    // Bind the guard (`_dir`). A bare `_` drops it before the test body runs.
+    (adapter, store, dir)
 }
 
 fn add_test_validator(store: &ValidatorStore, id: u8) -> Pubkey {
     let pk = test_pubkey(id);
-    store.add_validator(validator_store::ValidatorConfig::new(pk));
+    store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
     pk
 }
 
 #[test]
 fn test_config_adapter_unknown_pubkey_returns_not_found() {
-    let (adapter, _store) = create_config_adapter_with_store();
+    let (adapter, _store, _dir) = create_config_adapter_with_store();
     let pk = test_pubkey(99);
 
     assert!(matches!(adapter.get_fee_recipient(&pk), Err(ApiError::NotFound(_))));
@@ -40,8 +40,28 @@ fn test_config_adapter_unknown_pubkey_returns_not_found() {
 }
 
 #[test]
+fn test_durable_not_found_maps_to_http_404() {
+    // Setters do not pre-check. A missing pubkey reaches
+    // `update_config_durable`, which returns `NotFound` before any write.
+    use axum::response::IntoResponse;
+
+    let pk = test_pubkey(1);
+    let mapped = crate::keymanager_adapters::config::map_durable_update_error(
+        &pk,
+        validator_store::ValidatorStoreError::NotFound,
+    );
+    assert!(matches!(mapped, ApiError::NotFound(_)));
+    assert_eq!(mapped.into_response().status(), axum::http::StatusCode::NOT_FOUND);
+
+    let (adapter, _store, _dir) = create_config_adapter_with_store();
+    let err = adapter.set_fee_recipient(&pk, [0x11; 20]).unwrap_err();
+    assert!(matches!(err, ApiError::NotFound(_)));
+    assert_eq!(err.into_response().status(), axum::http::StatusCode::NOT_FOUND);
+}
+
+#[test]
 fn test_config_adapter_get_fee_recipient_returns_default() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     let fee = adapter.get_fee_recipient(&pk).unwrap();
@@ -53,7 +73,7 @@ fn test_config_adapter_get_fee_recipient_returns_default() {
 
 #[test]
 fn test_config_adapter_fee_recipient_set_get_roundtrip() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     let new_fee = [0xABu8; 20];
@@ -65,7 +85,7 @@ fn test_config_adapter_fee_recipient_set_get_roundtrip() {
 
 #[test]
 fn test_config_adapter_fee_recipient_delete_resets_to_default() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     let new_fee = [0xABu8; 20];
@@ -81,7 +101,7 @@ fn test_config_adapter_fee_recipient_delete_resets_to_default() {
 
 #[test]
 fn test_config_adapter_get_gas_limit_returns_default() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     let limit = adapter.get_gas_limit(&pk).unwrap();
@@ -90,7 +110,7 @@ fn test_config_adapter_get_gas_limit_returns_default() {
 
 #[test]
 fn test_config_adapter_gas_limit_set_get_roundtrip() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     adapter.set_gas_limit(&pk, 50_000_000).unwrap();
@@ -100,7 +120,7 @@ fn test_config_adapter_gas_limit_set_get_roundtrip() {
 
 #[test]
 fn test_config_adapter_gas_limit_delete_resets_to_default() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     adapter.set_gas_limit(&pk, 50_000_000).unwrap();
@@ -111,7 +131,7 @@ fn test_config_adapter_gas_limit_delete_resets_to_default() {
 
 #[test]
 fn test_config_adapter_get_graffiti_returns_empty_when_none() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     let graffiti = adapter.get_graffiti(&pk).unwrap();
@@ -120,7 +140,7 @@ fn test_config_adapter_get_graffiti_returns_empty_when_none() {
 
 #[test]
 fn test_config_adapter_graffiti_set_get_roundtrip() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     adapter.set_graffiti(&pk, "hello world").unwrap();
@@ -130,7 +150,7 @@ fn test_config_adapter_graffiti_set_get_roundtrip() {
 
 #[test]
 fn test_config_adapter_graffiti_delete_resets_to_default() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     adapter.set_graffiti(&pk, "hello").unwrap();
@@ -152,7 +172,7 @@ fn test_config_adapter_save_persists_to_file() {
     let adapter = ValidatorConfigManagerAdapter::new(store.clone());
 
     let pk = test_pubkey(1);
-    store.add_validator(validator_store::ValidatorConfig::new(pk));
+    store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
 
     let fee = [0xFFu8; 20];
     adapter.set_fee_recipient(&pk, fee).unwrap();
@@ -165,7 +185,7 @@ fn test_config_adapter_save_persists_to_file() {
 
 #[test]
 fn test_config_adapter_graffiti_truncates_long_input() {
-    let (adapter, store) = create_config_adapter_with_store();
+    let (adapter, store, _dir) = create_config_adapter_with_store();
     let pk = add_test_validator(&store, 1);
 
     let long_graffiti = "a".repeat(64);
@@ -300,4 +320,39 @@ fn test_config_persistence_concurrent_writes() {
         let gl = reloaded.effective_gas_limit(&pk);
         assert_eq!(gl, 30_000_000 + i as u64 * 1_000_000);
     }
+}
+
+#[test]
+fn test_config_adapter_durable_write_failure_does_not_publish() {
+    use axum::response::IntoResponse;
+
+    let pk = test_pubkey(1);
+    let dir = TempDir::new().unwrap();
+    let nested = dir.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let nested_file = nested.join("validators.toml");
+    std::fs::write(
+        &nested_file,
+        "[defaults]\nfee_recipient = \"0x0000000000000000000000000000000000000001\"\ngas_limit = 30000000\n",
+    )
+    .unwrap();
+    let store = Arc::new(ValidatorStore::load_from_config(&nested_file).unwrap());
+    store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
+    let old = store.effective_fee_recipient(&pk);
+    std::fs::remove_dir_all(&nested).unwrap();
+    let adapter = ValidatorConfigManagerAdapter::new(store.clone());
+    let err = adapter.set_fee_recipient(&pk, [0xab; 20]).unwrap_err();
+    assert_eq!(err.into_response().status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(store.effective_fee_recipient(&pk), old);
+}
+
+#[test]
+fn test_config_adapter_rejects_gas_limit_above_i64_max() {
+    use axum::response::IntoResponse;
+
+    let (adapter, store, _dir) = create_config_adapter_with_store();
+    let pk = add_test_validator(&store, 1);
+    let err = adapter.set_gas_limit(&pk, (i64::MAX as u64).saturating_add(1)).unwrap_err();
+    assert_eq!(err.into_response().status(), axum::http::StatusCode::BAD_REQUEST);
+    assert_eq!(store.effective_gas_limit(&pk), 30_000_000);
 }

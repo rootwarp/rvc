@@ -1,28 +1,29 @@
-//! Bootstrap phase: wire signing enablement (forward window, liveness, refresh).
+//! Bootstrap phase: wire signing enablement (forward window, liveness).
 //!
 //! Extracted from `bin/rvc` startup Step 6 (SEC-2b/2c): constructs the
 //! production [`SigningEnablement`] (fail-closed [`ForwardWindowMachine`] or
-//! operator opt-out), spawns the per-slot liveness observation loop, and
-//! registers secret-provider refresh with import-strict machine registration.
+//! operator opt-out) and spawns the per-slot liveness observation loop.
+//! Secret-provider refresh is spawned later in [`super::run`] once
+//! `validator_store` and `key_gen_tx` are in scope (ARCH-2a / VD-E1).
 
 use std::sync::Arc;
 
-use bn_manager::BeaconNodeClient;
+use bn_manager::{BeaconNodeClient, LivenessApi};
 use doppelganger::{ForwardWindowMachine, MonotonicEpochClock, SigningEnablement};
 use slashing::SlashingDb;
-use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::beacon::BeaconHandles;
+use super::executor::TaskExecutor;
 use super::keys::LoadedKeys;
 use super::BootstrapError;
 use crate::config::{Config, ServiceBuilder};
-use crate::deletion_denylist::DeletionDenylist;
 use crate::liveness_loop::{spawn_liveness_loop, LivenessLoopSpawn};
 use crate::orchestrator::PubkeyMap;
 use crate::pubkey_index::{
     parse_pubkey_bytes, pubkey_bytes_to_0x, PubkeyIndexRegistry, SharedPubkeyIndexRegistry,
 };
+use crate::quiesce::TrackedKeys;
 
 /// Handles produced by [`wire_signing_enablement`].
 ///
@@ -45,31 +46,42 @@ pub struct EnablementHandles {
     /// Shared pubkey ↔ validator-index registry for duty tracking, proposer
     /// preparation, and liveness. Empty when unresolved / no keys.
     pub pubkey_index: SharedPubkeyIndexRegistry,
+    /// Import/delete/sidecar-cleanup lock shared with the keystore adapter.
+    pub tracked_keys: Arc<TrackedKeys>,
 }
 
-/// Construct SEC-2b enablement, spawn the SEC-2c liveness loop, and wire
-/// secret-provider refresh (import-strict registration).
+/// Construct SEC-2b enablement and spawn the SEC-2c liveness loop.
 ///
 /// # Behaviour preserved from `run_validator`
 ///
 /// - Fail-closed machine when doppelganger is on; unregistered keys cannot sign.
 /// - Operator opt-out yields [`doppelganger::DoppelgangerDisabledByOperator`].
-/// - Epoch-0 boot register marks keys Safe (pre-genesis bypass).
-/// - Restart-aware safe-skip on **boot** `register` only (local slashing history
-///   under this GVR). Do **not** copy a live slashing DB to a second VC.
+/// - Epoch-0 boot register marks normally registered keys Safe (pre-genesis bypass).
+/// - Restart-aware safe-skip on **boot** `register` only, and only for keys
+///   with no open import hold and no remaining import sidecar (local slashing
+///   history under this GVR). Do **not** copy a live slashing DB to a second VC.
+/// - An open hold, any import sidecar (any age) or an unreadable one, a leftover
+///   `*.import_meta.json.removing.*` set-aside, a staged
+///   `*.import_meta.json.partial`, or an unreadable keystore directory or
+///   validators file uses `register_for_import` (Pending). An unreadable
+///   directory or file applies that to every loaded key. The liveness loop
+///   removes a sidecar only after that key reaches Safe, while holding the
+///   same `tracked_keys` lock as DELETE/import.
 /// - Dynamically added keys use `register_for_import` (always Pending).
 /// - Liveness goes through `bn_manager` (multi-BN failover) and re-resolves
 ///   indices from `pubkey_map` after import.
 ///
 /// Index resolution failure is fatal only when doppelganger is on and keys are
 /// present (same as prior binary behaviour).
+///
+/// Secret-provider refresh is **not** wired here — see [`super::run::run`]
+/// (ARCH-2a / VD-E1): it needs `validator_store` and `key_gen_tx` in scope.
 pub async fn wire_signing_enablement(
     config: &Config,
     keys: &LoadedKeys,
     beacon: &BeaconHandles,
     slashing_db: Arc<SlashingDb>,
-    denylist: Arc<DeletionDenylist>,
-    shutdown: &CancellationToken,
+    executor: &TaskExecutor,
 ) -> Result<EnablementHandles, BootstrapError> {
     let builder = ServiceBuilder::new(config.clone());
     let doppelganger_enabled = config.doppelganger_detection;
@@ -111,7 +123,9 @@ pub async fn wire_signing_enablement(
     if enablement_epoch == 0 && doppelganger_enabled {
         info!(
             "Doppelganger detection: pre-genesis (epoch 0) startup — \
-             validators will be marked Safe without a monitoring window (boot register)"
+             normally registered validators are marked Safe without a monitoring window. \
+             An unfinished import (open hold, any or unreadable sidecar, or \
+             staged sidecar) stays Pending"
         );
     } else if !doppelganger_enabled {
         warn!("Doppelganger detection is disabled");
@@ -120,11 +134,15 @@ pub async fn wire_signing_enablement(
     // SEC-2b: construct enablement (ForwardWindowMachine or operator opt-out)
     // and hand it to the production SignerService.
     //
-    // Restart-aware safe-skip (boot register only): if local slashing history
-    // shows a recent attestation under this GVR, the key is marked Safe without
-    // network observation. Do NOT copy a live slashing DB to a second VC — that
-    // would open a dual-instance fail-open. API import uses register_for_import
-    // (always Pending).
+    // Restart-aware safe-skip (boot register, normal keys only): if local
+    // slashing history shows a recent attestation under this GVR, the key is
+    // marked Safe without network observation. Do NOT copy a live slashing DB
+    // to a second VC — that would open a dual-instance fail-open. An unfinished
+    // import (open hold, any or unreadable sidecar, staged sidecar, or
+    // an unreadable keystore directory or validators file) uses
+    // register_for_import (always Pending), including at epoch 0. The sidecar
+    // stays until the liveness loop observes Safe and removes it. API import
+    // uses the same path.
     let (signing_enablement, forward_window_machine) = builder.build_signing_enablement(
         Arc::clone(&slashing_db),
         beacon.genesis_validators_root,
@@ -132,66 +150,26 @@ pub async fn wire_signing_enablement(
         &keys.pubkey_map,
     );
 
-    // SEC-2c: spawn the per-slot liveness observation loop (sole production mechanism).
+    // Shared with keymanager DELETE/import and forward-window sidecar cleanup.
+    let tracked_keys = Arc::new(TrackedKeys::new());
+
+    // SEC-2c: spawn the per-slot liveness observation loop when doppelganger is on.
     // bn_manager is Arc; clone for the loop and keep the original for later duties.
-    // Pass pubkey_map so the loop re-resolves indices after keymanager import /
-    // delayed activation (review Finding 3).
+    // pubkey_map stays attached for the retained refresh helper. IndexResolver,
+    // spawned from `run`, is the production index writer (ADR-R05).
     let liveness_task = if doppelganger_enabled {
         spawn_liveness_loop(
             forward_window_machine.clone(),
-            Arc::clone(&beacon.bn_manager) as Arc<dyn BeaconNodeClient>,
+            Arc::clone(&beacon.bn_manager) as Arc<dyn LivenessApi>,
             Arc::clone(&pubkey_index),
             Some(Arc::clone(&keys.pubkey_map)),
             Arc::clone(&epoch_clock),
-            shutdown.clone(),
+            executor,
+            Some((config.keystore_path.clone(), Arc::clone(&tracked_keys))),
         )
     } else {
         None
     };
-
-    // Secret-provider refresh: after machine is available, register newly
-    // discovered local keys (import-strict) so they are not permanently Unmonitored.
-    let refresh_interval = config.secret_provider.refresh_interval.unwrap_or(0);
-    if refresh_interval > 0 && !keys.secret_providers.is_empty() {
-        let denylist_for_refresh = Arc::clone(&denylist);
-        let is_denied: secret_provider::DenylistCheck =
-            Arc::new(move |pk: &[u8; 48]| denylist_for_refresh.contains(pk));
-        let refresh_service = secret_provider::RefreshService::with_denylist(
-            keys.secret_providers.clone(),
-            keys.local_pubkeys.clone(),
-            Some(is_denied),
-            std::time::Duration::from_secs(refresh_interval),
-            shutdown.clone(),
-        );
-        let signer_for_refresh = Arc::clone(&keys.composite_signer);
-        let denylist_for_callback = Arc::clone(&denylist);
-        let machine_for_refresh = forward_window_machine.clone();
-        let epoch_clock_for_refresh = Arc::clone(&epoch_clock);
-        tokio::spawn(async move {
-            refresh_service
-                .run(move |sk| {
-                    let pk_bytes = sk.public_key().to_bytes();
-                    if denylist_for_callback.contains(&pk_bytes) {
-                        tracing::info!(
-                            pubkey = %observability::logging::TruncatedPubkey::new(&format!(
-                                "0x{}",
-                                hex::encode(pk_bytes)
-                            )),
-                            "Skipping denylisted key at refresh callback (DELETE raced refresh)"
-                        );
-                        return;
-                    }
-                    let pk = sk.public_key();
-                    if let Some(ref machine) = machine_for_refresh {
-                        // Import-strict: no restart Safe-skip for dynamically added keys.
-                        machine.register_for_import(&pk, epoch_clock_for_refresh.current_epoch());
-                    }
-                    signer_for_refresh.add_local_key(sk);
-                })
-                .await;
-        });
-        info!(interval_secs = refresh_interval, "Secret provider refresh task started");
-    }
 
     Ok(EnablementHandles {
         signing_enablement,
@@ -200,6 +178,7 @@ pub async fn wire_signing_enablement(
         pubkey_map: Arc::clone(&keys.pubkey_map),
         liveness_task,
         pubkey_index,
+        tracked_keys,
     })
 }
 
@@ -239,16 +218,15 @@ async fn resolve_validator_indices(
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crate::deletion_denylist::DeletionDenylist;
     use beacon::BeaconClient;
     use bn_manager::{BnManager, OperationTimeouts};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey, Signer};
     use doppelganger::ForwardWindowStatus;
-    use eth_types::{Root, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+    use eth_types::{Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
     use slashing::SlashingDbReader;
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
-    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -335,32 +313,21 @@ mod tests {
         }
     }
 
-    fn denylist(dir: &TempDir) -> Arc<DeletionDenylist> {
-        Arc::new(DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys")))
-    }
-
     /// Default (doppelganger on): machine present, registered key gate-closed.
     #[tokio::test]
     async fn test_wire_signing_enablement_returns_fail_closed_machine_by_default() {
-        let dir = TempDir::new().unwrap();
         // genesis_time = 0 → high current epoch (not epoch-0 bypass).
         let (_server, beacon) = mock_beacon(0).await;
         let sk = SecretKey::generate();
         let pk = sk.public_key();
         let keys = loaded_keys_with_pubkey(pk.clone());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
-        let handles = wire_signing_enablement(
-            &base_config(true),
-            &keys,
-            &beacon,
-            slashing_db,
-            denylist(&dir),
-            &shutdown,
-        )
-        .await
-        .expect("phase succeeds with empty index resolution");
+        let handles =
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
+                .await
+                .expect("phase succeeds with empty index resolution");
 
         assert!(
             handles.forward_window_machine.is_some(),
@@ -376,29 +343,22 @@ mod tests {
             !handles.signing_enablement.is_signing_enabled(&other),
             "unregistered key must be fail-closed"
         );
-        shutdown.cancel();
+        executor.token().cancel();
     }
 
     #[tokio::test]
     async fn test_wire_signing_enablement_optout_yields_always_enabled() {
-        let dir = TempDir::new().unwrap();
         let (_server, beacon) = mock_beacon(0).await;
         let sk = SecretKey::generate();
         let pk = sk.public_key();
         let keys = loaded_keys_with_pubkey(pk.clone());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
-        let handles = wire_signing_enablement(
-            &base_config(false),
-            &keys,
-            &beacon,
-            slashing_db,
-            denylist(&dir),
-            &shutdown,
-        )
-        .await
-        .expect("opt-out phase succeeds");
+        let handles =
+            wire_signing_enablement(&base_config(false), &keys, &beacon, slashing_db, &executor)
+                .await
+                .expect("opt-out phase succeeds");
 
         assert!(handles.forward_window_machine.is_none());
         assert!(handles.liveness_task.is_none());
@@ -408,33 +368,28 @@ mod tests {
             handles.signing_enablement.is_signing_enabled(&other),
             "opt-out enables every pubkey"
         );
-        shutdown.cancel();
+        executor.token().cancel();
     }
 
     #[tokio::test]
     async fn test_wire_signing_enablement_preserves_epoch0_bypass() {
-        let dir = TempDir::new().unwrap();
         // Genesis far in the future → MonotonicEpochClock stays at epoch 0.
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let far_future = now.saturating_add(SECONDS_PER_SLOT * SLOTS_PER_EPOCH * 100);
+        let far_future = now.saturating_add(
+            SLOT_DURATION_MS.saturating_mul(SLOTS_PER_EPOCH).saturating_mul(100) / 1000,
+        );
         let (_server, beacon) = mock_beacon(far_future).await;
         let sk = SecretKey::generate();
         let pk = sk.public_key();
         let keys = loaded_keys_with_pubkey(pk.clone());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
-        let handles = wire_signing_enablement(
-            &base_config(true),
-            &keys,
-            &beacon,
-            slashing_db,
-            denylist(&dir),
-            &shutdown,
-        )
-        .await
-        .expect("epoch-0 phase succeeds");
+        let handles =
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
+                .await
+                .expect("epoch-0 phase succeeds");
 
         assert_eq!(handles.epoch_clock.current_epoch(), 0);
         assert!(
@@ -443,34 +398,27 @@ mod tests {
         );
         let machine = handles.forward_window_machine.expect("machine present");
         assert_eq!(machine.status(&pk), ForwardWindowStatus::Safe);
-        shutdown.cancel();
+        executor.token().cancel();
     }
 
     /// Restart safe-skip requires local slashing history under this GVR.
     #[tokio::test]
     async fn test_wire_signing_enablement_restart_safe_skip_requires_local_history() {
-        let dir = TempDir::new().unwrap();
         let (_server, beacon) = mock_beacon(0).await;
         let sk = SecretKey::generate();
         let pk = sk.public_key();
         let pk_hex = hex::encode(pk.to_bytes());
         let keys = loaded_keys_with_pubkey(pk.clone());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
         // Without history: Pending (no safe-skip).
         {
             let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
             slashing_db.set_genesis_validators_root(&GVR).unwrap();
-            let handles = wire_signing_enablement(
-                &base_config(true),
-                &keys,
-                &beacon,
-                slashing_db,
-                denylist(&dir),
-                &shutdown,
-            )
-            .await
-            .expect("phase");
+            let handles =
+                wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
+                    .await
+                    .expect("phase");
             assert!(
                 !handles.signing_enablement.is_signing_enabled(&pk),
                 "no local history → no restart safe-skip"
@@ -492,73 +440,62 @@ mod tests {
                 Some(target)
             );
 
-            let handles = wire_signing_enablement(
-                &base_config(true),
-                &keys,
-                &beacon,
-                slashing_db,
-                denylist(&dir),
-                &shutdown,
-            )
-            .await
-            .expect("phase with history");
+            let handles =
+                wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
+                    .await
+                    .expect("phase with history");
             assert!(
                 handles.signing_enablement.is_signing_enabled(&pk),
                 "recent local attestation under GVR → restart safe-skip → Safe"
             );
         }
-        shutdown.cancel();
+        executor.token().cancel();
     }
 
     #[tokio::test]
     async fn test_liveness_task_cancels_on_shutdown_token() {
-        let dir = TempDir::new().unwrap();
         let (_server, beacon) = mock_beacon(0).await;
         // Non-empty pubkey map so the loop starts (empty indices + pubkeys path).
         let sk = SecretKey::generate();
         let keys = loaded_keys_with_pubkey(sk.public_key());
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
-        let handles = wire_signing_enablement(
-            &base_config(true),
-            &keys,
-            &beacon,
-            slashing_db,
-            denylist(&dir),
-            &shutdown,
+        let handles =
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
+                .await
+                .expect("phase");
+
+        assert!(handles.liveness_task.is_some(), "liveness loop should spawn with pubkeys");
+        assert!(
+            executor.registered_names().contains(&"liveness_loop"),
+            "liveness_loop must be registered on the executor"
+        );
+        // Loop must observe cancellation and exit without hanging.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.shutdown(crate::bootstrap::executor::TierBudget::default()),
         )
         .await
-        .expect("phase");
-
-        let task = handles.liveness_task.expect("liveness loop should spawn with pubkeys");
-        shutdown.cancel();
-        // Loop must observe cancellation and exit without hanging.
-        tokio::time::timeout(Duration::from_secs(5), task.join)
-            .await
-            .expect("liveness task must terminate on shutdown token")
-            .expect("join ok");
+        .expect("liveness task must terminate on shutdown token");
+        assert!(
+            outcome.joined.contains(&"liveness_loop") || outcome.aborted.contains(&"liveness_loop"),
+            "liveness_loop must drain"
+        );
     }
 
     /// Sanity: empty keystore path still produces a usable enablement handle.
     #[tokio::test]
     async fn test_wire_signing_enablement_empty_keys_ok() {
-        let dir = TempDir::new().unwrap();
         let (_server, beacon) = mock_beacon(0).await;
         let keys = empty_loaded_keys();
         let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let shutdown = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
 
-        let handles = wire_signing_enablement(
-            &base_config(true),
-            &keys,
-            &beacon,
-            slashing_db,
-            denylist(&dir),
-            &shutdown,
-        )
-        .await
-        .expect("empty keys ok");
+        let handles =
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
+                .await
+                .expect("empty keys ok");
 
         assert!(handles.forward_window_machine.is_some());
         assert!(handles.liveness_task.is_none(), "no keys → no liveness loop");
@@ -568,6 +505,6 @@ mod tests {
         assert!(!handles.signing_enablement.is_signing_enabled(&other));
         // Silence unused import warning paths
         let _ = Signer::public_keys(keys.composite_signer.as_ref());
-        shutdown.cancel();
+        executor.token().cancel();
     }
 }

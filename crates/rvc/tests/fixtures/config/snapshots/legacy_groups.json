@@ -1,0 +1,91 @@
+{
+  "beacon_url": "http://localhost:5052",
+  "beacon_nodes": [],
+  "keystore_path": "./keystores",
+  "password_file": null,
+  "slashing_db_path": "./slashing_protection.sqlite",
+  "allow_fresh_db": false,
+  "allow_unsupported_fork": false,
+  "metrics_address": "127.0.0.1",
+  "metrics_port": 8080,
+  "network": "mainnet",
+  "graffiti": null,
+  "log_level": "info",
+  "doppelganger_detection": true,
+  "secret_provider": {
+    "providers": [],
+    "strict": false,
+    "gcp": {
+      "secret_prefix": "validator-key-"
+    }
+  },
+  "disable_attesting": false,
+  "slashed_validators_action": "disable-only",
+  "disable_keystore_locking": false,
+  "logfile": {
+    "path": "/var/log/rvc/wire.log",
+    "max_size": 77,
+    "max_number": 4,
+    "compress": true,
+    "level": "warn"
+  },
+  "tracing": {
+    "endpoint": "http://wire-otel:4318",
+    "exporter": "gcp",
+    "sample_rate": 0.37,
+    "max_queue_size": 3333,
+    "max_export_batch_size": 444,
+    "service_name": "rvc-wire"
+  },
+  "keymanager": {
+    "enabled": true,
+    "address": "10.0.0.8:5062",
+    "token_file": "/var/lib/rvc/wire/km.token",
+    "remote_signer_url": "https://wire-signer:9000",
+    "remote_signer_allowed_hosts": [
+      "wire.signer.example"
+    ],
+    "allow_insecure_remote_signer": true,
+    "cors_origins": [
+      "https://wire.cors.example"
+    ],
+    "body_limit": 424242
+  },
+  "grpc_signer": {
+    "url": "https://wire-grpc:50051",
+    "tls_cert": "/etc/rvc/wire/client.crt",
+    "tls_key": "/etc/rvc/wire/client.key",
+    "tls_ca_cert": "/etc/rvc/wire/ca.crt"
+  },
+  "proposer_config": {
+    "url": "https://wire.proposer/config.json",
+    "file": "/etc/rvc/wire/proposer.json",
+    "refresh_interval": 48,
+    "url_token": "wire-token",
+    "url_insecure": true
+  },
+  "monitoring": {
+    "endpoint": "https://wire.monitor/metrics",
+    "interval": 96,
+    "endpoint_insecure": true
+  },
+  "builder_limits": {
+    "circuit_breaker_consecutive_limit": 8,
+    "circuit_breaker_epoch_limit": 13
+  },
+  "timing": {
+    "attestation_due_bps": 3333,
+    "aggregate_due_bps": 6667,
+    "attestation_due_bps_gloas": 2500,
+    "aggregate_due_bps_gloas": 5000,
+    "sync_message_due_bps_gloas": 2500,
+    "contribution_due_bps_gloas": 5000,
+    "payload_due_bps": 5000,
+    "payload_attestation_due_bps": 7500
+  },
+  "fork_schedule": {},
+  "block_selection_mode": "max-profit",
+  "validator_registration_batch_size": 500,
+  "validator_registration_batch_delay": 500,
+  "beacon_max_body_bytes": 33554432
+}

@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [main, develop]
     types: [opened, synchronize, reopened]
+  push:
+    branches: [develop, main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +16,11 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 so the A-12 pin commit is reachable for the T19 stage.rs
+      # byte-identity guard below (shallow tip alone cannot `git diff <pin>`).
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -32,16 +38,43 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Authenticate release lookups. Anonymous setup-protoc calls have failed
+      # this job with "API rate limit exceeded".
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
           version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # T19 / TRC-1e: crates/slashing/src/stage.rs must stay byte-identical to the
+      # A-12 pin (initiative-start / post-ADR-005 redesign). Do not instrument
+      # stage.rs; see plan/tracing-2026-08-06/A-12-stage-rs-repin.md.
+      - name: T19 — stage.rs byte-identical to A-12 pin
+        run: |
+          set -euo pipefail
+          PIN=22aa3de5bf5ed0c03ed571694dc3a5652e460613
+          if ! git cat-file -e "${PIN}^{commit}"; then
+            echo "T19 / A-12: pin commit ${PIN} is not reachable; deepen the checkout."
+            exit 1
+          fi
+          if ! git diff --quiet "${PIN}" -- crates/slashing/src/stage.rs; then
+            echo "T19 / A-12 FAILURE: crates/slashing/src/stage.rs is not byte-identical to the A-12 pin."
+            echo "A-12 pin: ${PIN}"
+            echo "Record: plan/tracing-2026-08-06/A-12-stage-rs-repin.md"
+            echo "Tracing must not instrument stage.rs. Authorized redesigns re-pin via A-12; do not weaken this guard."
+            git diff "${PIN}" -- crates/slashing/src/stage.rs
+            exit 1
+          fi
+          echo "T19: stage.rs byte-identical to A-12 pin ${PIN}"
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run clippy (all features)
+        run: cargo clippy --locked --workspace --all-features --all-targets -- -D warnings
 
       - name: Run clippy (dvt feature — Gate 1 secret-sink coverage)
         run: cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings
@@ -49,15 +82,135 @@ jobs:
       # Dependency hygiene (SEC-10): fail closed on unignored RustSec advisories.
       # Policy ignores for known-blocked transitive crates live in `.cargo/audit.toml`.
       - name: Install cargo-audit
+        if: github.event_name == 'pull_request'
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
 
       - name: Run cargo audit
+        if: github.event_name == 'pull_request'
         run: cargo audit
+
+      # Unused declared deps (ARCH-P2-6 / ARCH-5). cargo-udeps is not adopted:
+      # it needs nightly; CI pins dtolnay/rust-toolchain@stable (A-E3).
+      - name: Install cargo-machete
+        if: github.event_name == 'pull_request'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete
+
+      - name: Run cargo machete
+        if: github.event_name == 'pull_request'
+        run: cargo machete
+
+      # 3.9b + 5.15 / #290: graph assertion on a real libssz consumer.
+      # Not blanket `cargo tree -d` emptiness — ethereum_ssz 0.9 + 0.8.3 is an
+      # intentional existing dual (workspace `ssz` / `ssz08`).
+      # `cargo tree -d` alone is not enough: ruint's primitive-types 0.12.2 is
+      # lock-resident but not tree-linked, so enabling libssz-merkle's
+      # `ethereum_types` feature adds ethereum-types + primitive-types 0.13
+      # without a -d duplicate. Also scan Cargo.lock / invert-tree.
+      # 5.15: no ethereum-types, exactly one primitive-types (island stack purity).
+      - name: Assert no ethereum-types / single primitive-types
+        run: |
+          set -euo pipefail
+          # Non-vacuity: 3.7 put libssz in Cargo.lock; an empty match would
+          # make the graph grep succeed without a consumer.
+          if ! grep -q libssz Cargo.lock; then
+            echo "libssz missing from Cargo.lock — cargo tree -d assertion would be vacuous"
+            exit 1
+          fi
+          echo "=== Cargo.lock libssz ==="
+          grep -n libssz Cargo.lock
+          echo "=== resolved libssz-merkle ==="
+          # CARGO_TERM_COLOR=always would inject ANSI into package lines.
+          tree=$(CARGO_TERM_COLOR=never cargo tree --locked --workspace --color never -i libssz-merkle)
+          printf '%s\n' "$tree"
+          resolved=$(printf '%s\n' "$tree" | sed -n 's/^libssz-merkle v\([0-9][0-9.]*\).*/libssz-merkle \1/p' | head -n 1)
+          if [ "$resolved" != "libssz-merkle 0.3.0" ]; then
+            echo "libssz-merkle 0.3.0 missing from resolved graph (got: ${resolved:-none})"
+            exit 1
+          fi
+          echo "$resolved"
+          echo "=== cargo tree -d --workspace ==="
+          dups=$(CARGO_TERM_COLOR=never cargo tree --locked -d --workspace --color never)
+          printf '%s\n' "$dups"
+          fail=0
+          if printf '%s\n' "$dups" | grep -F -- 'ethereum-types'; then
+            echo "REGRESSION: ethereum-types present in cargo tree -d --workspace"
+            fail=1
+          fi
+          # Duplicate roots are unindented "name vversion".
+          pt_d=$(printf '%s\n' "$dups" | sed -n 's/^primitive-types v\([^ ]*\).*/\1/p' | sort -u | grep -c . || true)
+          if [ "$pt_d" -ge 2 ]; then
+            echo "REGRESSION: second primitive-types in cargo tree -d ($pt_d versions)"
+            fail=1
+          fi
+          # Invert-tree: unique ethereum-types never appears in -d.
+          if et_tree=$(CARGO_TERM_COLOR=never cargo tree --locked --workspace --color never -i ethereum-types --depth 0 2>/dev/null); then
+            echo "REGRESSION: ethereum-types entered the resolved graph:"
+            printf '%s\n' "$et_tree"
+            fail=1
+          fi
+          pt_lock=$(grep -c '^name = "primitive-types"' Cargo.lock || true)
+          echo "Cargo.lock primitive-types packages: $pt_lock"
+          if [ "$pt_lock" -ne 1 ]; then
+            echo "REGRESSION: expected exactly one primitive-types in Cargo.lock, found $pt_lock"
+            awk '/^name = "primitive-types"$/{print; getline; print}' Cargo.lock
+            fail=1
+          fi
+          if grep -q '^name = "ethereum-types"' Cargo.lock; then
+            echo "REGRESSION: ethereum-types entered Cargo.lock"
+            fail=1
+          fi
+          exit "$fail"
+
+      # 5.15 / #290: island build/test against Cargo.lock (no silent dep float).
+      - name: Build rvc-gloas
+        run: cargo build -p rvc-gloas --locked
+
+      - name: Test rvc-gloas
+        run: cargo test -p rvc-gloas --locked --all-targets
+
+  # OQ-3 / #612. Default nextest does not enable test-utils, dvt, or gcp-*.
+  # `cargo test --workspace` deadlocks here; the invariant is nextest (#488).
+  # Do not set RVC_SPEC_VECTORS_REQUIRED: missing vector archives must stay
+  # skipped. The spec-vectors job is the one that fetches them.
+  test-all-features:
+    name: Test (all features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-all-features-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-all-features-
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Run workspace tests (all features)
+        run: cargo nextest run --workspace --all-features --locked
 
   secret-scan:
     name: Secret Scan
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -128,6 +281,7 @@ jobs:
 
   coverage:
     name: Coverage
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
@@ -163,7 +317,7 @@ jobs:
         uses: taiki-e/install-action@nextest
 
       - name: Generate coverage report
-        run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
+        run: cargo llvm-cov nextest --locked --workspace --lcov --output-path lcov.info
 
       - name: Generate coverage summary
         id: coverage
@@ -173,7 +327,7 @@ jobs:
           COVERAGE=$(jq '.data[0].totals.lines.percent' coverage.json)
           COVERED=$(jq '.data[0].totals.lines.covered' coverage.json)
           TOTAL=$(jq '.data[0].totals.lines.count' coverage.json)
-          echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
+          echo "coverage=$COVERAGE" >> "$GITHUB_OUTPUT"
 
           {
             echo "## Coverage Report"
@@ -193,3 +347,188 @@ jobs:
         with:
           header: coverage
           path: coverage-summary.md
+
+  arch-gates:
+    name: Architecture Gates
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-arch-gates-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-arch-gates-
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # G-3 (`tests/env_allowlist.rs`: env allow-list + figment absence) is in this package.
+      - name: Run architecture tests
+        run: cargo nextest run -p rvc-architecture-tests
+
+      # ARCH-7j / M5: enumeration gate under `--features dvt`.
+      # protoc is already installed above (signer-proto build.rs).
+      # Clippy `--features dvt` stays on the check job (Gate 1 secret-sink);
+      # this step is the test run those cfg(dvt) gates need.
+      # `--final-status-level pass` lists passed names so a vacuous empty
+      # feature-gated suite cannot hide in a green summary.
+      - name: Run signer-server DVT enumeration gate
+        run: cargo nextest run -p rvc-signer-server --features dvt --final-status-level pass
+
+      # 7.5: Gloas boundary suite + rvc-bin Gloas-head smoke. Whole packages
+      # (a fork_transition filter would drop the binary smoke). Non-skippable.
+      # Run even if architecture-tests is red (unrelated class-1 inventory debt
+      # must not hide this gate).
+      - name: Run fork-transition gate
+        if: ${{ !cancelled() }}
+        run: make test-fork-transition
+
+  # REQUIRED is job-local: coverage runs --workspace without fetching vectors
+  # and must keep skipping (3.3b). A top-level env would turn that skip into RED.
+  spec-vectors:
+    name: Spec Vectors
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      RVC_SPEC_VECTORS_REQUIRED: "1"
+      PRESET: minimal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-spec-vectors-deps-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-spec-vectors-deps-
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      # Archives only: the pin is the tarball digest, not a restored tests/ tree.
+      # No restore-keys: a lock change must miss, not restore a stale archive.
+      - name: Cache spec-vector archives
+        id: spec-vector-cache
+        uses: actions/cache@v4
+        with:
+          path: crates/rvc-spec-vectors/vectors/**/*.tar.gz
+          key: ${{ runner.os }}-spec-vectors-${{ hashFiles('crates/rvc-spec-vectors/vectors.lock') }}
+
+      - name: Report spec-vector cache
+        run: echo "spec-vector cache-hit=${{ steps.spec-vector-cache.outputs.cache-hit }}"
+
+      - name: Fetch spec vectors
+        run: make spec-vectors
+
+      # 3.4b pyspec artifact is checked in; this step is sha256-only (no Python).
+      # Regeneration is 3.10b nightly.
+      - name: Verify generated vector digest
+        run: make spec-vectors-verify
+
+      - name: Run spec-vector suites
+        run: cargo nextest run -p rvc-spec-vectors --locked --final-status-level pass
+
+  # P1-A5 / issue 1.6: no Rust toolchain. Issue 6.5 widens pytest to
+  # scripts/tests/ (validator_perf + attach + devnet). No cargo, no live job.
+  scripts:
+    name: Scripts
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+        with:
+          version: "0.12.13"
+          checksum: "745765a3b6e360ad76743599ae5c42e9278c7edf8bbff9fc76d05bf2623a04dd"
+
+      - name: Shellcheck
+        run: shellcheck scripts/devnet/*.sh scripts/devnet/lib/common.sh
+
+      - name: Pytest (scripts)
+        run: uv run --with pytest==9.1.1 --with pytest-socket==0.8.1 pytest scripts/tests/ -q
+
+  # TRC-5d / #435. First docker compose job on the PR lane. Not a required check.
+  # 30 minutes covers a cold debug build of bin/rvc and bin/rvc-signer plus the
+  # script's own slot waits. A hung fixture dies here, not at the runner default.
+  trace-e2e:
+    name: Trace continuity (end to end)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      OTEL_TRACES_SAMPLER_ARG: "1.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-trace-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-trace-e2e-
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Host bins. Part 2 resolves target/debug/rvc and target/debug/rvc-signer
+      # (or RVC_BIN / RVC_SIGNER_BIN). OTLP stays the script default, loopback.
+      - name: Build host bins
+        run: cargo build --locked -p rvc-bin -p rvc-signer-bin
+
+      - name: Trace e2e part 1 (fixture beacon node)
+        run: scripts/trace-e2e.sh --part 1
+
+      - name: Trace e2e part 2 (host bins, Jaeger, SIGTERM)
+        run: scripts/trace-e2e.sh --part 2
+
+      - name: Assert trace continuity
+        run: scripts/assert-trace-continuity.sh target/trace-e2e/spans.json
+
+      # Missing spans on an early fail must not fail this step.
+      - name: Upload spans
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trace-e2e-spans
+          path: target/trace-e2e/spans.json
+          if-no-files-found: ignore
+          retention-days: 7

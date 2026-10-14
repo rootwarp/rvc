@@ -10,9 +10,14 @@
 #![allow(dead_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey, Signature, Signer};
+use async_trait::async_trait;
+use crypto::{
+    CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey, Signature, Signer, SigningError,
+};
 use doppelganger::SigningEnablement;
+use eth_types::Root;
 use rvc_signer::{SigningGate, ValidatorLockMap};
 use slashing::SlashingDb;
 
@@ -124,4 +129,203 @@ pub fn open_db() -> Arc<SlashingDb> {
 #[must_use]
 pub fn mock_sig(tag: &[u8]) -> Signature {
     SecretKey::generate().sign(tag)
+}
+
+// ── Fault signers (ARCH-5j matrix) ───────────────────────────────────────────
+// Classification is asserted against `SigningError::is_unambiguous_no_signature`
+// (VD-5.3) so the backends cannot drift from the production classifier.
+
+/// Local BLS success.
+pub struct SucceedingSigner {
+    inner: LocalSigner,
+}
+
+impl SucceedingSigner {
+    #[must_use]
+    pub fn new(sk: SecretKey) -> Self {
+        let mut km = KeyManager::new();
+        km.insert(sk);
+        Self { inner: LocalSigner::new(km) }
+    }
+}
+
+#[async_trait]
+impl Signer for SucceedingSigner {
+    async fn sign(
+        &self,
+        signing_root: &Root,
+        pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        self.inner.sign(signing_root, pubkey).await
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        self.inner.public_keys()
+    }
+}
+
+/// Sleeps longer than the session `sign_timeout`.
+pub struct HangingSigner {
+    sleep: Duration,
+}
+
+impl HangingSigner {
+    #[must_use]
+    pub fn exceeding(timeout: Duration) -> Self {
+        Self { sleep: timeout.saturating_add(Duration::from_millis(350)) }
+    }
+}
+
+#[async_trait]
+impl Signer for HangingSigner {
+    async fn sign(
+        &self,
+        _signing_root: &Root,
+        _pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        tokio::time::sleep(self.sleep).await;
+        Err(SigningError::RemoteSignerError("hang completed after timeout".into()))
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        vec![]
+    }
+}
+
+/// Remote verify-fail: ambiguous (signature bytes may already exist on the wire).
+pub struct AmbiguousErrorSigner;
+
+impl AmbiguousErrorSigner {
+    #[must_use]
+    pub fn classified_error() -> SigningError {
+        let err = SigningError::InvalidRemoteSignature;
+        assert!(
+            !err.is_unambiguous_no_signature(),
+            "AmbiguousErrorSigner must stay outside is_unambiguous_no_signature (VD-5.3)"
+        );
+        err
+    }
+}
+
+#[async_trait]
+impl Signer for AmbiguousErrorSigner {
+    async fn sign(
+        &self,
+        _signing_root: &Root,
+        _pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        Err(Self::classified_error())
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        vec![]
+    }
+}
+
+/// `SigningError::KeyNotFound` — unambiguous no-signature.
+pub struct KeyNotFoundSigner;
+
+impl KeyNotFoundSigner {
+    #[must_use]
+    pub fn classified_error() -> SigningError {
+        let err = SigningError::KeyNotFound("retain-matrix".into());
+        assert!(
+            err.is_unambiguous_no_signature(),
+            "KeyNotFound must stay is_unambiguous_no_signature (VD-5.3)"
+        );
+        err
+    }
+}
+
+#[async_trait]
+impl Signer for KeyNotFoundSigner {
+    async fn sign(
+        &self,
+        _signing_root: &Root,
+        _pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        Err(Self::classified_error())
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        vec![]
+    }
+}
+
+/// `SigningError::LocalRejected` — unambiguous no-signature.
+pub struct LocalRejectedSigner;
+
+impl LocalRejectedSigner {
+    #[must_use]
+    pub fn classified_error() -> SigningError {
+        let err = SigningError::LocalRejected("gRPC raw-root; no remote I/O".into());
+        assert!(
+            err.is_unambiguous_no_signature(),
+            "LocalRejected must stay is_unambiguous_no_signature (VD-5.3)"
+        );
+        err
+    }
+}
+
+#[async_trait]
+impl Signer for LocalRejectedSigner {
+    async fn sign(
+        &self,
+        _signing_root: &Root,
+        _pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        Err(Self::classified_error())
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        vec![]
+    }
+}
+
+/// `SigningError::UnsupportedSigningType` — unambiguous no-signature.
+pub struct UnsupportedSigningTypeSigner;
+
+impl UnsupportedSigningTypeSigner {
+    #[must_use]
+    pub fn classified_error() -> SigningError {
+        let err = SigningError::UnsupportedSigningType("matrix-duty".into());
+        assert!(
+            err.is_unambiguous_no_signature(),
+            "UnsupportedSigningType must stay is_unambiguous_no_signature (VD-5.3)"
+        );
+        err
+    }
+}
+
+#[async_trait]
+impl Signer for UnsupportedSigningTypeSigner {
+    async fn sign(
+        &self,
+        _signing_root: &Root,
+        _pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        Err(Self::classified_error())
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        vec![]
+    }
+}
+
+/// `panic!` inside `Signer::sign`; `spawn_blocking` join maps to `SigningFailed`.
+pub struct PanickingSigner;
+
+#[async_trait]
+impl Signer for PanickingSigner {
+    async fn sign(
+        &self,
+        _signing_root: &Root,
+        _pubkey: &[u8; 48],
+    ) -> Result<Signature, SigningError> {
+        panic!("matrix signer panic");
+    }
+
+    fn public_keys(&self) -> Vec<[u8; 48]> {
+        vec![]
+    }
 }

@@ -1,0 +1,423 @@
+{
+  "issue": "RR0-08",
+  "protocol": "plan/review-2026-10-03/measurements/README.md",
+  "harness": "crates/rvc/tests/vc_scale_profile.rs",
+  "recorded_tree": {
+    "runtime_identical_to": "2a087157293690d277df9c59dd4d35210697577b",
+    "phase0_develop_tip": "2a087157293690d277df9c59dd4d35210697577b",
+    "baseline_sha": "b5543a971266985dcab2d2c60e4cd48e0be1fecc",
+    "git_rev_parse_HEAD_at_process_start": "91fb086fce04f9c90e1368e276b39e06d20cf49d",
+    "harness_source_sha256": "e0383bd0cd90a74641a3f7a7f46bae218c533202b41e062697bf1764d6ef5802",
+    "note": "Each harness JSON sha is git rev-parse HEAD at process start. That SHA is the previous docs-only tip and does not contain this driver. The bytes that ran are the working-tree crates/rvc/tests/vc_scale_profile.rs (sha256 above). git diff 2a087157 -- crates/ is that file only. Production sources match develop 2a087157. This commit contains those harness bytes plus these measurement files."
+  },
+  "host": {
+    "hostname": "cursor",
+    "os": "linux",
+    "arch": "x86_64",
+    "cpu_model_name": "Intel(R) Xeon(R) Processor",
+    "cpu_vendor": "GenuineIntel",
+    "cpu_family": 6,
+    "cpu_model": 207,
+    "cpu_stepping": 2,
+    "cores": 4,
+    "threads_per_core": 1,
+    "sockets": 1,
+    "harness_host_field": "cursor linux/x86_64"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "harness_toolchain_field": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "note": "Workspace rust-version is 1.92. CI installs dtolnay/rust-toolchain@stable. The image default rustc 1.83.0 cannot parse locked cpufeatures 0.3.0 (edition2024). These runs used stable 1.99.0."
+  },
+  "scenario": {
+    "n": 200,
+    "slots": 1,
+    "slot_duration_ms": 12000,
+    "attestation_deadline_ms": 3999,
+    "aggregate_deadline_ms": 8000,
+    "request_delay_ms": 50,
+    "per_slot_budget_ms": 120000,
+    "driver": "DutyOrchestrator::run after prefetch, with_sync_committee(true), with_aggregators(true), clock advanced 8s",
+    "sync_committee_enabled": true,
+    "aggregators_enabled": true,
+    "runs_per_clock_mode": 3,
+    "aggregator": "median",
+    "measured_at_utc": [
+      "2026-10-05T09:45:56Z",
+      "2026-10-05T09:47:11Z"
+    ]
+  },
+  "invocation_wall_seconds": {
+    "wall": [
+      23,
+      23,
+      23
+    ],
+    "paused": [
+      2,
+      2,
+      2
+    ],
+    "note": "Process elapsed seconds around cargo nextest, including startup. Protocol latency is last_publish_ms_after_att_deadline, not this field."
+  },
+  "figures": {
+    "last_publish_ms_after_att_deadline": {
+      "clock_mode": "wall",
+      "role": "latency",
+      "runs": [
+        17910.153543,
+        17739.82913,
+        17666.936998999998
+      ],
+      "median": 17739.82913,
+      "unit": "ms after the 3999 ms attestation deadline; negative would mean the last SubmitAttestation stamp landed before the deadline",
+      "paused_runs_same_key": [
+        16503.0,
+        16503.0,
+        16503.0
+      ]
+    },
+    "aggregate_deadline_misses": {
+      "clock_mode": "wall",
+      "role": "latency",
+      "runs": [
+        1,
+        1,
+        1
+      ],
+      "median": 1,
+      "vacuous": false,
+      "reason": "One SubmitAggregateAndProofs arrival per run. That call carried 200 proofs, all after the 8000 ms deadline. A miss count of 1 is that one late batch, not one validator and not an empty phase.",
+      "paused_runs_same_key": [
+        1,
+        1,
+        1
+      ]
+    },
+    "aggregate_proofs_after_deadline": {
+      "clock_mode": "wall",
+      "role": "latency",
+      "runs": [
+        200,
+        200,
+        200
+      ],
+      "median": 200,
+      "note": "Proofs inside SubmitAggregateAndProofs calls whose stamp was after 8000 ms. Protocol keeps the wall cell next to aggregate_deadline_misses.",
+      "paused_runs_same_key": [
+        200,
+        200,
+        200
+      ]
+    },
+    "overhang_ms": {
+      "clock_mode": "wall",
+      "role": "latency",
+      "runs": [
+        10080.386788,
+        9959.462757000001,
+        9939.599388000002
+      ],
+      "median": 9959.462757000001,
+      "overrun_runs": [
+        true,
+        true,
+        true
+      ],
+      "budget_exceeded_runs": [
+        false,
+        false,
+        false
+      ]
+    },
+    "commits_per_attestation_phase": {
+      "clock_mode": "paused",
+      "role": "count",
+      "runs": [
+        200.0,
+        200.0,
+        200.0
+      ],
+      "median": 200.0
+    },
+    "mean_batch": {
+      "clock_mode": "paused",
+      "role": "count",
+      "runs": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "median": 1.0,
+      "note": "1.0 because attestation duties are still sequential. Aggregation does not enqueue group-commit reserves, so each drain observes one attestation reserve."
+    },
+    "attestation_data_requests_per_slot": {
+      "clock_mode": "paused",
+      "role": "count",
+      "runs": [
+        400.0,
+        400.0,
+        400.0
+      ],
+      "median": 400.0,
+      "note": "400 because both the attestation phase and the aggregation phase call GetAttestationData, 200 each."
+    },
+    "sync_publish_ms_after_slot_start": {
+      "clock_mode": "paused",
+      "role": "ordering",
+      "runs": [
+        20553.0,
+        20553.0,
+        20553.0
+      ],
+      "median": 20553.0,
+      "vacuous": false,
+      "wall_runs_same_key": [
+        22028.691573,
+        21856.693969,
+        21784.416196
+      ],
+      "wall_median": 21856.693969,
+      "note": "Protocol cell is the paused run. Wall copies are real stamps and are not the cell."
+    },
+    "sync_messages_submitted": {
+      "clock_mode": "paused",
+      "role": "count",
+      "runs": [
+        200,
+        200,
+        200
+      ],
+      "median": 200
+    },
+    "sync_submit_calls": {
+      "clock_mode": "paused",
+      "role": "count",
+      "runs": [
+        1,
+        1,
+        1
+      ],
+      "median": 1,
+      "note": "One batched submit_sync_committee_messages call carrying 200 messages."
+    },
+    "aggregate_proofs_submitted": {
+      "clock_mode": "paused",
+      "role": "count",
+      "runs": [
+        200,
+        200,
+        200
+      ],
+      "median": 200
+    },
+    "aggregate_submit_calls": {
+      "clock_mode": "paused",
+      "role": "count",
+      "runs": [
+        1,
+        1,
+        1
+      ],
+      "median": 1,
+      "note": "One batched submit_aggregate_and_proofs call carrying 200 PreElectra proofs."
+    }
+  },
+  "wall_runs": [
+    {
+      "aggregate_deadline_misses": 1,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 200,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 1,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 400.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "wall",
+      "commits_per_attestation_phase": 200.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": 17910.153543,
+      "mean_batch": 1.0,
+      "n": 200,
+      "overhang_ms": 10080.386788,
+      "overrun": true,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "91fb086fce04f9c90e1368e276b39e06d20cf49d",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 22028.691573,
+      "sync_submit_calls": 1,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    },
+    {
+      "aggregate_deadline_misses": 1,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 200,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 1,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 400.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "wall",
+      "commits_per_attestation_phase": 200.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": 17739.82913,
+      "mean_batch": 1.0,
+      "n": 200,
+      "overhang_ms": 9959.462757000001,
+      "overrun": true,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "91fb086fce04f9c90e1368e276b39e06d20cf49d",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 21856.693969,
+      "sync_submit_calls": 1,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    },
+    {
+      "aggregate_deadline_misses": 1,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 200,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 1,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 400.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "wall",
+      "commits_per_attestation_phase": 200.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": 17666.936998999998,
+      "mean_batch": 1.0,
+      "n": 200,
+      "overhang_ms": 9939.599388000002,
+      "overrun": true,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "91fb086fce04f9c90e1368e276b39e06d20cf49d",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 21784.416196,
+      "sync_submit_calls": 1,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    }
+  ],
+  "paused_runs": [
+    {
+      "aggregate_deadline_misses": 1,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 200,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 1,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 400.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "paused",
+      "commits_per_attestation_phase": 200.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": 16503.0,
+      "mean_batch": 1.0,
+      "n": 200,
+      "overhang_ms": 9624.0,
+      "overrun": true,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "91fb086fce04f9c90e1368e276b39e06d20cf49d",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 20553.0,
+      "sync_submit_calls": 1,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    },
+    {
+      "aggregate_deadline_misses": 1,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 200,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 1,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 400.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "paused",
+      "commits_per_attestation_phase": 200.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": 16503.0,
+      "mean_batch": 1.0,
+      "n": 200,
+      "overhang_ms": 9624.0,
+      "overrun": true,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "91fb086fce04f9c90e1368e276b39e06d20cf49d",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 20553.0,
+      "sync_submit_calls": 1,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    },
+    {
+      "aggregate_deadline_misses": 1,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 200,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 1,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 400.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "paused",
+      "commits_per_attestation_phase": 200.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": 16503.0,
+      "mean_batch": 1.0,
+      "n": 200,
+      "overhang_ms": 9624.0,
+      "overrun": true,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "91fb086fce04f9c90e1368e276b39e06d20cf49d",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 20553.0,
+      "sync_submit_calls": 1,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    }
+  ]
+}

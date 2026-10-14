@@ -2,7 +2,8 @@
 //!
 //! Each phase is a free function that takes [`Config`](crate::config::Config) (and
 //! explicit parameters) and returns a small named output struct. [`run`] composes
-//! the phases, owns the duty-loop `select!`, and performs graceful shutdown.
+//! the phases, spawns the duty orchestrator on [`executor::TaskExecutor`], and
+//! drains registered tasks on signal or panic (ARCH-2h).
 //!
 //! Phases never take `&mut BootstrapCtx`. Health-status updates for the production
 //! path live inside [`run`]; individual phase functions still return `Result` only
@@ -10,21 +11,25 @@
 
 mod beacon;
 mod enablement;
+pub mod executor;
 mod keys;
 mod run;
 mod services;
+mod signer_probe;
 mod slashing;
 mod tasks;
 
 pub use beacon::{connect_beacon, BeaconHandles};
 pub use enablement::{wire_signing_enablement, EnablementHandles};
+pub use executor::{ShutdownOutcome, ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
 pub use keys::{load_signing_keys, LoadedKeys};
 pub use run::{run, RunOptions};
 pub use services::{build_services, ServiceHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
 pub use tasks::{
-    check_metrics_bind_gate, spawn_background_tasks, BackgroundTasks,
-    METRICS_ALLOW_NON_LOOPBACK_ENV, METRICS_SHUTDOWN_TIMEOUT,
+    bind_required_listeners, check_metrics_bind_gate, spawn_background_tasks, spawn_sse_subscriber,
+    spawn_sync_monitor, RequiredListeners, METRICS_ALLOW_NON_LOOPBACK_ENV, SSE_CANCEL_TASK_NAME,
+    SSE_TASK_NAME, SYNC_MONITOR_CANCEL_TASK_NAME, SYNC_MONITOR_TASK_NAME,
 };
 
 use std::sync::Arc;
@@ -35,7 +40,7 @@ use ::slashing::SlashingDb;
 use crate::config::ConfigError;
 use crate::deletion_denylist::{DeletionDenylist, DeletionDenylistError};
 use crate::keymanager_adapters::SpawnKeymanagerApiError;
-use crate::startup::StartupError;
+use crate::startup::{StartupError, EXIT_CRITICAL_TASK_FAILED, EXIT_LISTENER_BIND};
 
 /// Values produced by bootstrap phases and consumed by later ones.
 ///
@@ -101,6 +106,17 @@ pub enum BootstrapError {
     /// Invalid runtime configuration (e.g. slashed action string, gRPC address).
     #[error("{0}")]
     InvalidConfig(String),
+
+    /// A required listener failed to bind. Names the listener and address.
+    ///
+    /// Distinct from [`Self::MetricsBind`], which is the non-loopback metrics
+    /// config refusal and still exits 1.
+    #[error("failed to bind {listener} listener at {addr}: {source}")]
+    ListenerBind { listener: &'static str, addr: std::net::SocketAddr, source: std::io::Error },
+
+    /// A registered task panicked. The executor drain has already finished.
+    #[error("critical task '{task}' failed; process exiting")]
+    CriticalTaskFailed { task: &'static str },
 }
 
 impl BootstrapError {
@@ -108,6 +124,8 @@ impl BootstrapError {
     pub fn exit_code(&self) -> i32 {
         match self {
             Self::Startup(e) => e.exit_code(),
+            Self::CriticalTaskFailed { .. } => EXIT_CRITICAL_TASK_FAILED,
+            Self::ListenerBind { .. } => EXIT_LISTENER_BIND,
             _ => 1,
         }
     }
@@ -115,5 +133,61 @@ impl BootstrapError {
     /// Whether this is a keystore lock contention / acquisition failure.
     pub fn is_keystore_locked(&self) -> bool {
         matches!(self, Self::Startup(StartupError::KeystoreLocked(_)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::startup::{
+        StartupError, EXIT_CRITICAL_TASK_FAILED, EXIT_GENESIS_ROOT_MISMATCH,
+        EXIT_INTEGRITY_CHECK_FAILED, EXIT_KEYSTORE_LOCKED, EXIT_LISTENER_BIND,
+        EXIT_UNSUPPORTED_FORK_VERSION,
+    };
+
+    /// ARCH-2i / NFR-3: BootstrapError maps each named startup failure to EXIT_*.
+    #[test]
+    fn test_bootstrap_error_exit_codes_map_startup_gates() {
+        let cases: &[(BootstrapError, i32)] = &[
+            (
+                BootstrapError::Startup(StartupError::IntegrityCheckFailed("x".into())),
+                EXIT_INTEGRITY_CHECK_FAILED,
+            ),
+            (
+                BootstrapError::Startup(StartupError::GenesisRootMismatch {
+                    local: "a".into(),
+                    beacon: "b".into(),
+                }),
+                EXIT_GENESIS_ROOT_MISMATCH,
+            ),
+            (
+                BootstrapError::Startup(StartupError::UnsupportedForkVersion {
+                    version: "0xdead".into(),
+                }),
+                EXIT_UNSUPPORTED_FORK_VERSION,
+            ),
+            (
+                BootstrapError::Startup(StartupError::KeystoreLocked("held".into())),
+                EXIT_KEYSTORE_LOCKED,
+            ),
+            (
+                BootstrapError::CriticalTaskFailed { task: "duty_orchestrator" },
+                EXIT_CRITICAL_TASK_FAILED,
+            ),
+            (
+                BootstrapError::ListenerBind {
+                    listener: "metrics",
+                    addr: "127.0.0.1:9".parse().expect("addr"),
+                    source: std::io::Error::new(std::io::ErrorKind::AddrInUse, "in use"),
+                },
+                EXIT_LISTENER_BIND,
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.exit_code(), *want, "exit_code for {err}");
+        }
+        let locked = BootstrapError::Startup(StartupError::KeystoreLocked("held".into()));
+        assert!(locked.is_keystore_locked());
+        assert!(!BootstrapError::InvalidConfig("x".into()).is_keystore_locked());
     }
 }

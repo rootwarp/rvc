@@ -13,7 +13,7 @@
 //!    [`TimeoutPolicy::DiscardStagedRow`] (in-process / gate backends):
 //!    - acquire the per-pubkey async lock;
 //!    - **re-check** enablement under the lock (Safe→Detected TOCTOU);
-//!    - `spawn_blocking` stage → sign (with timeout) → commit/discard;
+//!    - `spawn_blocking` reserve → sign (with timeout) → reconcile;
 //!    - record the standard RVC slashable metric families via
 //!      [`crate::core::StandardSlashableHooks`].
 //!
@@ -27,14 +27,15 @@
 //! # Non-slashable signing flow
 //!
 //! For each non-slashable operation (`sign_sync_committee_message`,
-//! `sign_aggregate_and_proof`, `sign_contribution_and_proof`,
+//! `sign_aggregate_and_proof`, `sign_payload_attestation`,
+//! `sign_proposer_preferences`, `sign_builder_request_auth`,
+//! `sign_execution_payload_envelope`, `sign_contribution_and_proof`,
 //! `sign_selection_proof`, `sign_randao_reveal`, `sign_voluntary_exit`,
 //! `sign_builder_registration`):
 //!
 //! 1. Check `gate_decision` — if false, return
 //!    `Err(SigningGateError::BlockedByDoppelganger)` immediately.
-//! 2. Call the BLS backend `sign(signing_root, pubkey)` wrapped in the gate's
-//!    `tokio::time::timeout` (same duration as slashable, for consistency).
+//! 2. Delegate to [`crate::sign_nonslashable_core`] (same duration as slashable).
 //!    No slashing-DB staging or committing occurs — these operations are not
 //!    slashable by the Ethereum consensus spec.
 //!
@@ -54,47 +55,51 @@
 //! implementation (e.g. `ForwardWindowMachine`) returns `false`, matching the
 //! fail-closed default `<bool as FailClosedDefault>::default_when_unknown()` = `false`.
 //!
-//! # Cancellation safety and the true double-sign authoritative lock
+//! # Cancellation safety and the sign-span lock
 //!
-//! The per-pubkey `OwnedMutexGuard` (tokio async lock) is held on the *async*
-//! task until `spawn_blocking(...).await` completes.  **If the caller drops the
-//! future mid-flight at that `.await` point, the tokio lock is released while
-//! the blocking task continues to run.**
+//! [`crate::core::sign_slashable`] acquires the per-pubkey `OwnedMutexGuard` and moves it into
+//! `tokio::task::spawn_blocking`.  The acquire is `core.rs:1067` (`req.locks.lock`); the closure
+//! that keeps the guard (`let _guard = guard`) is `core.rs:1116`.  That blocking task owns the
+//! guard for the whole reserve → sign → reconcile body.  Dropping the caller future while it
+//! waits on `spawn_blocking(...).await` leaves the guard on the blocking task until the body
+//! returns, so the same pubkey stays serialized for the in-flight sign.
 //!
-//! This is safe because the AUTHORITATIVE double-sign serializer is the
-//! `parking_lot::MutexGuard<Connection>` held inside the `StagedBlock` /
-//! `StagedAttestation` guard: it owns a `BEGIN IMMEDIATE` SQLite transaction that
-//! keeps all other writers out of the database until `commit()` or `discard()` is
-//! called.  The blocked task therefore still has exclusive DB access; it will
-//! complete (commit or rollback) atomically regardless of the caller's state.
-//! The per-pubkey tokio lock provides an *additional* latency benefit — it avoids
-//! queuing multiple blocking tasks for the same pubkey — but the no-double-sign
-//! invariant is upheld by SQLite even if that outer lock is lost to cancellation.
+//! `reserve_block` / `reserve_attestation` COMMIT the history row and release the SQLite
+//! connection mutex before the BLS call (`SlashingDb::reserve_block` in
+//! `crates/slashing/src/stage.rs`; production order is
+//! [`crate::SlashableSignSession::reserve_then_sign`]: `reserve()`, then the BLS
+//! `signer.sign` call).  From that COMMIT until the blocking body returns, the
+//! per-pubkey lock is the sign-span serializer.  A wedged signer blocks only that pubkey, inside
+//! `tokio::time::timeout`.
 //!
-//! # Signer timeout (BUG-003)
+//! # Signer timeout
 //!
-//! The staging guard holds the SQLite single-writer `parking_lot::MutexGuard`
-//! across the stage→sign→commit window.  A wedged signer would hold this write
-//! lock indefinitely, causing a signing blackout for ALL validators (they queue
-//! behind the same lock).  The gate therefore wraps the sign call in a
-//! `tokio::time::timeout`; on expiry with the gate's `DiscardStagedRow` policy
-//! the staged guard is discarded (ROLLBACK) and
-//! `Err(SigningFailed("signer timed out"))` is returned.  The default is 4 seconds
-//! (well under a 12-second Ethereum slot).  Configure with `with_sign_timeout`.
+//! The BLS call is bounded by `sign_timeout` (default [`DEFAULT_SIGN_TIMEOUT`], 4 seconds) inside
+//! `reserve_then_sign`.  Expiry returns `Err(SigningFailed("signer timed out"))`.  The reserved
+//! row is already committed, so the outcome follows [`TimeoutPolicy`]:
+//!
+//! - [`TimeoutPolicy::DiscardStagedRow`] — this gate, for in-process backends.  Reconcile the row
+//!   with `reconcile_unsigned`.  A failed delete retains the row.
+//! - [`TimeoutPolicy::RetainStagedRow`] — remote-capable backends (`SignerService` maps
+//!   `BackendKind::Remote` and `Unknown` here).  Leave the committed row in place.  This gate
+//!   always passes [`TimeoutPolicy::DiscardStagedRow`].
+//!
+//! Configure the bound with `with_sign_timeout`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use crypto::{CompositeSigner, PublicKey, Signer, SigningError};
+use crypto::{CompositeSigner, PublicKey, Signer};
 use doppelganger::SigningEnablement;
 use eth_types::Root;
 use observability::logging::TruncatedPubkey;
-use slashing::{PubkeyScopedDb, SlashingDb};
+use slashing::SlashingDb;
 use tracing::{error, warn};
 
 use crate::core::{
-    sign_slashable, SignSlashableRequest, StandardSlashableHooks, TimeoutPolicy,
-    TimeoutPolicySource,
+    sign_nonslashable_core, sign_slashable, NonSlashableFailure, SignSlashableRequest,
+    SlashableKind, StandardSlashableHooks, TimeoutPolicy, TimeoutPolicySource,
+    DEFAULT_SIGN_TIMEOUT,
 };
 use crate::error::SigningGateError;
 use crate::fail_closed::FailClosedDefault;
@@ -107,12 +112,6 @@ use crate::locks::ValidatorLockMap;
 /// call site that does not have an mTLS context (e.g. crate-internal callers and
 /// integration tests).
 pub const AUDIT_CN_DEFAULT: &str = "signing-gate";
-
-/// Default per-sign timeout: 4 seconds — well under a 12-second Ethereum slot.
-///
-/// Bounding the signer call is mandatory because the staging guard holds the
-/// SQLite single-writer connection mutex.  See module doc for BUG-003 analysis.
-const DEFAULT_SIGN_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Central signing gate with slashing protection and doppelganger detection.
 ///
@@ -135,8 +134,9 @@ pub struct SigningGate {
     locks: Arc<ValidatorLockMap>,
     /// Maximum wall-clock duration allowed for a single BLS sign call.
     ///
-    /// Expiry is handled by the slashable core's [`TimeoutPolicy`] (gate uses
-    /// discard-on-timeout → ROLLBACK) and returns
+    /// Expiry is handled by the slashable core's [`TimeoutPolicy`].  This gate
+    /// passes [`TimeoutPolicy::DiscardStagedRow`], which reconciles the
+    /// already-committed reservation, and returns
     /// `Err(SigningFailed("signer timed out"))`.  Defaults to 4 seconds.
     sign_timeout: Duration,
 }
@@ -233,10 +233,11 @@ impl SigningGate {
     ///
     /// 1. Outer `gate_decision` — fails closed on false (unknown pubkey → denied).
     /// 2. [`sign_slashable`] with [`TimeoutPolicy::DiscardStagedRow`]: lock →
-    ///    re-check enablement under lock → stage → sign (timeout) → commit/discard.
-    ///    On stage error → `SlashingBlocked`. On commit error → `CommitFailed`
-    ///    (nothing written; same-root retry safe). On timeout with Discard →
-    ///    `discard()` (no phantom row). On other sign errors today → discard.
+    ///    re-check enablement under lock → reserve → sign (timeout) → reconcile.
+    ///    On reserve error → `SlashingBlocked`. On reserve-time persist failure →
+    ///    `CommitFailed` (nothing written; same-root retry safe). On timeout /
+    ///    unambiguous no-signature with Discard → `reconcile_unsigned` (a failed
+    ///    delete retains). See [`SigningGateError::SigningFailed`].
     ///    Records standard RVC slashable metrics.
     pub async fn sign_block(
         &self,
@@ -258,40 +259,26 @@ impl SigningGate {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
-        let db = Arc::clone(&self.slashing_db);
-        let client_cn_owned = client_cn.to_string();
-        let pubkey_hex_clone = pubkey_hex.clone();
-
         // Explicit policy: gate backends are in-process — discard on timeout.
-        sign_slashable(
-            SignSlashableRequest {
-                locks: self.locks.as_ref(),
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.signer),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                hooks: Arc::new(StandardSlashableHooks::block()),
-                op_name: "sign_block",
-            },
-            move |session| {
-                let scoped = PubkeyScopedDb::new(db, client_cn_owned, gvr);
-                session.stage_then_sign(|| {
-                    scoped
-                        .stage_block(&pubkey_hex_clone, slot, Some(hex::encode(signing_root)))
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                slot,
-                                rejection_reason = %e,
-                                "SigningGate: sign_block blocked by slashing protection"
-                            );
-                            e
-                        })
-                })
-            },
-        )
+        sign_slashable(SignSlashableRequest {
+            locks: self.locks.as_ref(),
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer: Arc::clone(&self.signer),
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+            hooks: Arc::new(StandardSlashableHooks::block()),
+            op_name: "sign_block",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: client_cn.to_string(),
+            gvr,
+            kind: SlashableKind::Block { slot },
+            // Gate APIs take a precomputed root; fork is not on this surface.
+            fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
+        })
         .await
     }
 
@@ -317,11 +304,12 @@ impl SigningGate {
     ///
     /// Identical flow to `sign_block`: outer `gate_decision` →
     /// [`sign_slashable`] with [`TimeoutPolicy::DiscardStagedRow`].
-    /// On stage error → `SlashingBlocked` (epoch consumed).
-    /// On commit error → `CommitFailed` (nothing written; same-root retry safe).
-    /// On timeout or ambiguous sign errors with Discard → `discard()` (no phantom
-    /// row). Discard applies to the full [`crate::TimeoutPolicy`] scope on the
-    /// gate path (in-process backends).
+    /// On reserve error → `SlashingBlocked` (epoch consumed).
+    /// On reserve-time persist failure → `CommitFailed` (nothing written;
+    /// same-root retry safe). On timeout or ambiguous sign errors with Discard →
+    /// `reconcile_unsigned` (a failed delete retains). See
+    /// [`SigningGateError::SigningFailed`]. Discard applies to the full
+    /// [`crate::TimeoutPolicy`] scope on the gate path (in-process backends).
     pub async fn sign_attestation(
         &self,
         pubkey: &PublicKey,
@@ -344,95 +332,49 @@ impl SigningGate {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
-        let db = Arc::clone(&self.slashing_db);
-        let client_cn_owned = client_cn.to_string();
-        let pubkey_hex_clone = pubkey_hex.clone();
-
         // Explicit policy: gate backends are in-process — discard on timeout.
-        sign_slashable(
-            SignSlashableRequest {
-                locks: self.locks.as_ref(),
-                pubkey,
-                enablement: self.enablement.as_ref(),
-                signer: Arc::clone(&self.signer),
-                signing_root,
-                sign_timeout: self.sign_timeout,
-                policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
-                hooks: Arc::new(StandardSlashableHooks::attestation()),
-                op_name: "sign_attestation",
-            },
-            move |session| {
-                let scoped = PubkeyScopedDb::new(db, client_cn_owned, gvr);
-                session.stage_then_sign(|| {
-                    scoped
-                        .stage_attestation(
-                            &pubkey_hex_clone,
-                            source_epoch,
-                            target_epoch,
-                            Some(hex::encode(signing_root)),
-                        )
-                        .map_err(|e| {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex_clone),
-                                source_epoch,
-                                target_epoch,
-                                rejection_reason = %e,
-                                "SigningGate: sign_attestation blocked by slashing protection"
-                            );
-                            e
-                        })
-                })
-            },
-        )
+        sign_slashable(SignSlashableRequest {
+            locks: self.locks.as_ref(),
+            pubkey,
+            enablement: self.enablement.as_ref(),
+            signer: Arc::clone(&self.signer),
+            signing_root,
+            sign_timeout: self.sign_timeout,
+            policy: TimeoutPolicySource::Fixed(TimeoutPolicy::DiscardStagedRow),
+            hooks: Arc::new(StandardSlashableHooks::attestation()),
+            op_name: "sign_attestation",
+            slashing_db: Arc::clone(&self.slashing_db),
+            client_cn: client_cn.to_string(),
+            gvr,
+            kind: SlashableKind::Attestation { source_epoch, target_epoch },
+            fork_name: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            pre_reserve_barrier: None,
+        })
         .await
     }
 
     // ── Non-slashable signing methods ─────────────────────────────────────────
     //
-    // All 7 non-slashable methods share the same 2-step flow:
-    //   1. `gate_decision(pubkey)` — fail-closed on false (unknown → denied).
-    //   2. `timeout(sign_timeout, signer.sign(...)).await` — no slashing DB,
-    //      no spawn_blocking (no !Send guard), no commit/discard.
+    // Non-slashable methods: `gate_decision` (bool, fail-closed) then
+    // [`sign_nonslashable_core`]. No slashing DB, no spawn_blocking.
     //
     // Error mapping is uniform: timeout/generic → SigningFailed,
-    // KeyNotFound → KeyNotFound.
+    // KeyNotFound → KeyNotFound (explicit, not folded into Display).
 
-    /// Execute the non-slashable signing flow: gate check → BLS sign with timeout.
+    /// Facade wrapper: `gate_decision` then [`sign_nonslashable_core`].
     ///
-    /// Shared by all 7 non-slashable methods so the error-mapping logic lives
-    /// in one place.
-    ///
-    /// # No-lock invariant
-    ///
-    /// This helper deliberately does **NOT** acquire the per-pubkey
-    /// `ValidatorLockMap` lock and does **NOT** call any of
-    /// `PubkeyScopedDb`, `stage_block`, `stage_attestation`, or `commit`.
-    /// Non-slashable operations have no slashing-DB transaction to serialize,
-    /// so the lock is unnecessary overhead.
-    ///
-    /// **If a future variant of this helper needs to write to the slashing DB,
-    /// it MUST add the per-pubkey lock and the staging/commit/discard pattern
-    /// used by `sign_block` / `sign_attestation`.**
-    ///
-    /// # TOCTOU note
-    ///
-    /// There is a micro-window between `gate_decision` returning `true` and
-    /// `signer.sign().await` completing during which the doppelganger state
-    /// could theoretically change.  This window is intentionally accepted:
-    /// these operations are **not slashable**, so the worst case is a
-    /// signature produced for a pubkey that was concurrently disabled — a
-    /// tolerable transient condition.  No additional synchronization is needed
-    /// to shrink this window.
+    /// Maps the core's neutral [`NonSlashableFailure`] onto [`SigningGateError`].
+    /// The no-lock invariant lives on the core helper.
     async fn sign_nonslashable(
         &self,
         pubkey: &PublicKey,
         signing_root: Root,
         op_name: &str,
     ) -> Result<Vec<u8>, SigningGateError> {
-        let pubkey_bytes = pubkey.to_bytes();
-        let pubkey_hex = hex::encode(pubkey_bytes);
+        let pubkey_hex = hex::encode(pubkey.to_bytes());
 
-        // Step 1: doppelganger gate (same gate_decision point as slashable paths).
+        // Same gate_decision point as slashable paths (bool, fail-closed).
         if !self.gate_decision(pubkey) {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
@@ -442,23 +384,34 @@ impl SigningGate {
             return Err(SigningGateError::BlockedByDoppelganger);
         }
 
-        // Step 2: BLS sign with timeout — no slashing DB, no spawn_blocking.
-        let sign_result =
-            tokio::time::timeout(self.sign_timeout, self.signer.sign(&signing_root, &pubkey_bytes))
-                .await;
-
-        match sign_result {
-            Err(_elapsed) => {
+        match sign_nonslashable_core(
+            self.enablement.as_ref(),
+            self.signer.as_ref(),
+            pubkey,
+            signing_root,
+            self.sign_timeout,
+        )
+        .await
+        {
+            Ok(sig) => Ok(sig.to_bytes().to_vec()),
+            Err(NonSlashableFailure::Blocked) => {
+                warn!(
+                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                    op = op_name,
+                    "SigningGate: non-slashable sign blocked by doppelganger gate"
+                );
+                Err(SigningGateError::BlockedByDoppelganger)
+            }
+            Err(NonSlashableFailure::TimedOut { after }) => {
                 error!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     op = op_name,
-                    timeout_secs = self.sign_timeout.as_secs_f64(),
+                    timeout_secs = after.as_secs_f64(),
                     "SigningGate: non-slashable signer timed out"
                 );
                 Err(SigningGateError::SigningFailed("signer timed out".to_string()))
             }
-            Ok(Ok(sig)) => Ok(sig.to_bytes().to_vec()),
-            Ok(Err(SigningError::KeyNotFound(_))) => {
+            Err(NonSlashableFailure::KeyNotFound) => {
                 warn!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     op = op_name,
@@ -466,12 +419,19 @@ impl SigningGate {
                 );
                 Err(SigningGateError::KeyNotFound)
             }
-            Ok(Err(e)) => {
+            Err(NonSlashableFailure::Backend(e)) => {
                 error!(
                     pubkey = %TruncatedPubkey::new(&pubkey_hex),
                     op = op_name,
                     error = %e,
                     "SigningGate: non-slashable signer error"
+                );
+                // Public gate methods take a precomputed signing_root; fork is not
+                // on this API. Bounded `unknown` rather than a request string.
+                crate::metrics::record_signing_error(
+                    &e,
+                    crate::metrics::sign_type_from_op_name(op_name),
+                    crate::metrics::rejection_reason::UNKNOWN,
                 );
                 Err(SigningGateError::SigningFailed(e.to_string()))
             }
@@ -527,6 +487,40 @@ impl SigningGate {
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
         self.sign_nonslashable(pubkey, signing_root, "sign_aggregate_and_proof").await
+    }
+
+    /// Sign a payload attestation (PTC).
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_PTC_ATTESTER` domain over the `PayloadAttestationData` HTR).
+    pub async fn sign_payload_attestation(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_payload_attestation").await
+    }
+
+    /// Sign proposer preferences.
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_PROPOSER_PREFERENCES` over the `ProposerPreferences` HTR).
+    pub async fn sign_proposer_preferences(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_proposer_preferences").await
     }
 
     /// Sign a contribution-and-proof.
@@ -612,5 +606,27 @@ impl SigningGate {
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
         self.sign_nonslashable(pubkey, signing_root, "sign_builder_registration").await
+    }
+
+    /// Sign a builder request auth (`DOMAIN_BUILDER_REQUEST_AUTH`).
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    pub async fn sign_builder_request_auth(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_builder_request_auth").await
+    }
+
+    /// Sign a self-build execution payload envelope (`DOMAIN_BEACON_BUILDER`).
+    ///
+    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    pub async fn sign_execution_payload_envelope(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(pubkey, signing_root, "sign_execution_payload_envelope").await
     }
 }

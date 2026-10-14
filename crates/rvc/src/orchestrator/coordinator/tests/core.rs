@@ -2,11 +2,68 @@
 
 use super::*;
 
+/// ADR-002 / ARCH-2b: `DutyOrchestrator::run()`'s future must be `Send` so the
+/// orchestrator can be `tokio::spawn`ed (ARCH-2c / ARCH-2h). Compile-time only —
+/// a runtime assertion cannot observe `!Send`.
+#[test]
+fn test_duty_orchestrator_run_future_is_send() {
+    fn assert_send<T: Send>(_: &T) {}
+
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(100);
+
+    let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+    let submitter = Arc::new(MockSubmitter::new());
+    let propagator = Arc::new(Propagator::new(submitter));
+
+    let config = create_test_config();
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+
+    let (mut orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        config,
+        pubkey_map,
+    ));
+
+    let fut = orchestrator.run();
+    assert_send(&fut);
+    // Drop without polling; this test only proves Send.
+    drop(fut);
+}
+
 #[test]
 fn test_orchestrator_config_new() {
     let config = OrchestratorConfig::new([0xbb; 32], create_test_fork_schedule());
     assert_eq!(config.genesis_validators_root, [0xbb; 32]);
     assert_eq!(config.shutdown_timeout, Duration::from_secs(30));
+}
+
+#[test]
+fn test_orchestrator_config_default_bps_fields() {
+    let config = OrchestratorConfig::new([0xbb; 32], create_test_fork_schedule());
+    let defaults = timing::DeadlineBps::default();
+    assert_eq!(config.deadline_schedule.pre_gloas.attestation, defaults.attestation);
+    assert_eq!(config.deadline_schedule.pre_gloas.aggregate, defaults.aggregate);
+    assert_eq!(config.deadline_schedule.gloas.attestation, 2500);
+    assert_eq!(config.deadline_schedule.gloas.aggregate, 5000);
+    assert_eq!(config.deadline_schedule.gloas.payload, 5000);
+    assert_eq!(config.deadline_schedule.gloas.payload_attestation, 7500);
 }
 
 #[test]
@@ -321,6 +378,7 @@ fn test_orchestrator_deps_requires_key_gen_receiver() {
         "key_gen_rx",
         "circuit_breaker",
         "attesting_enabled",
+        "head_gate",
     ];
     assert!(field_names.contains(&"key_gen_rx"), "OrchestratorDeps must require key_gen_rx");
     // Constructing via for_test yields a usable receiver field (type-checked).
@@ -413,11 +471,16 @@ fn test_attestation_result_success() {
     let result = AttestationResult {
         validator_index: "1234".to_string(),
         slot: 100,
-        success: true,
-        error: None,
+        outcome: AttestationOutcome::Published,
     };
-    assert!(result.success);
-    assert!(result.error.is_none());
+    assert!(result.outcome.is_published());
+    match result.outcome {
+        AttestationOutcome::Published => {}
+        AttestationOutcome::Failed(message) => panic!("published is not an error: {message}"),
+        AttestationOutcome::RejectedByBeaconNode { message, bn: _bn } => {
+            panic!("published is not an error: {message}")
+        }
+    }
 }
 
 #[test]
@@ -425,11 +488,79 @@ fn test_attestation_result_failure() {
     let result = AttestationResult {
         validator_index: "1234".to_string(),
         slot: 100,
-        success: false,
-        error: Some("Test error".to_string()),
+        outcome: AttestationOutcome::Failed("Test error".to_string()),
     };
-    assert!(!result.success);
-    assert_eq!(result.error.as_deref(), Some("Test error"));
+    assert!(!result.outcome.is_published());
+    match result.outcome {
+        AttestationOutcome::Failed(message) => assert_eq!(message, "Test error"),
+        AttestationOutcome::Published => panic!("expected Failed"),
+        AttestationOutcome::RejectedByBeaconNode { message, bn: _bn } => {
+            panic!("expected Failed, got beacon rejection: {message}")
+        }
+    }
+}
+
+/// Red-check (issue #598 / Formal S-3): `--exact` needs the fully-qualified name.
+///
+/// ```text
+/// CARGO_TERM_COLOR=never cargo test -p rvc --lib \
+///   orchestrator::coordinator::tests::core::attestation_outcome_is_exhaustive_and_published_is_not_an_error \
+///   --locked -- --exact
+/// ```
+///
+/// An unqualified name with `--exact` filters out every test on tip.
+#[test]
+fn attestation_outcome_is_exhaustive_and_published_is_not_an_error() {
+    let published = AttestationResult {
+        validator_index: "1234".to_string(),
+        slot: 100,
+        outcome: AttestationOutcome::Published,
+    };
+    let failed = AttestationResult {
+        validator_index: "1234".to_string(),
+        slot: 100,
+        outcome: AttestationOutcome::Failed("sign failed".to_string()),
+    };
+    let rejected = AttestationResult {
+        validator_index: "1234".to_string(),
+        slot: 100,
+        outcome: AttestationOutcome::RejectedByBeaconNode {
+            bn: Some("http://bn.example:5052".to_string()),
+            message: "invalid signature".to_string(),
+        },
+    };
+    let rejected_without_bn = AttestationResult {
+        validator_index: "1234".to_string(),
+        slot: 100,
+        outcome: AttestationOutcome::RejectedByBeaconNode {
+            bn: None,
+            message: "rejected".to_string(),
+        },
+    };
+
+    assert!(published.outcome.is_published());
+    assert!(!failed.outcome.is_published());
+    assert!(!rejected.outcome.is_published());
+    assert!(!rejected_without_bn.outcome.is_published());
+
+    for result in [&published, &failed, &rejected, &rejected_without_bn] {
+        match &result.outcome {
+            AttestationOutcome::Published => {
+                assert!(result.outcome.is_published());
+            }
+            AttestationOutcome::Failed(message) => {
+                assert!(!result.outcome.is_published());
+                assert!(!message.is_empty());
+            }
+            AttestationOutcome::RejectedByBeaconNode { bn, message } => {
+                assert!(!result.outcome.is_published());
+                assert!(!message.is_empty());
+                if let Some(endpoint) = bn {
+                    assert!(!endpoint.is_empty(), "a bn-less rejection is None");
+                }
+            }
+        }
+    }
 }
 
 #[tokio::test]

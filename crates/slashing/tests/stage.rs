@@ -33,6 +33,7 @@ fn test_stage_block_discard_no_row_committed() {
 /// signer/gate/DVT error!), and the signing root is never logged.
 #[test]
 #[tracing_test::traced_test]
+// kat_exempt: logging only — asserts the signing root is never logged, not a spec root
 fn test_slashing_decision_logged_at_debug_without_root() {
     let db = SlashingDb::open_in_memory().expect("open");
     db.stage_block(PUBKEY, 100, Some("0xroot_alpha_marker".into()), GVR)

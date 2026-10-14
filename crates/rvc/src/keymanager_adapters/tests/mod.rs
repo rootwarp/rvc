@@ -1,10 +1,10 @@
 use super::keystore::import_meta_path;
 use super::notifier::pubkey_hex;
 use super::{
-    build_keymanager_api, scan_and_rearm_gate, spawn_keymanager_api, DoppelgangerMonitorAdapter,
-    DoppelgangerMonitorKind, ForwardWindowMonitor, KeymanagerApiDeps, KeystoreManagerAdapter,
-    RemoteKeyManagerAdapter, SlashingProtectionAdapter, ValidatorConfigManagerAdapter,
-    ValidatorManagerAdapter, VoluntaryExitManagerAdapter,
+    build_keymanager_api, keymanager_bind_addr, scan_and_rearm_gate, spawn_keymanager_api,
+    DoppelgangerDisabledMonitor, DoppelgangerMonitorKind, ForwardWindowMonitor, KeymanagerApiDeps,
+    KeystoreManagerAdapter, RemoteKeyManagerAdapter, SlashingProtectionAdapter,
+    ValidatorConfigManagerAdapter, ValidatorManagerAdapter, VoluntaryExitManagerAdapter,
 };
 
 use beacon::BeaconClient;
@@ -24,8 +24,10 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tempfile::TempDir;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 use validator_store::ValidatorStore;
 
+use crate::bootstrap::executor::TaskExecutor;
 use crate::orchestrator::PubkeyMap;
 
 fn test_pubkey(id: u8) -> Pubkey {
@@ -64,12 +66,26 @@ fn test_remote_adapter(
     (adapter, pubkey_map, rx)
 }
 
+/// Drive a future that needs a Tokio runtime (`KdfBudget::admit`, `spawn_blocking`).
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(fut)
+}
+
 mod config;
+mod delete_quiesce;
 mod denylist;
 mod exit;
+mod export_floor;
+mod import_budget;
+mod import_window;
 mod keystore;
 mod misc_adapters;
 mod pubkey_map;
+mod quiesce;
 mod remote;
 mod server;
 mod spawn;

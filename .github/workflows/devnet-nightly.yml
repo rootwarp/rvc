@@ -1,0 +1,122 @@
+name: Devnet (nightly)
+
+on:
+  schedule:
+    # 02:00 UTC daily. GitHub only fires `schedule` on the default branch.
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "run.sh --profile (safe is the nightly default)"
+        type: choice
+        default: safe
+        options:
+          - safe
+          - fast
+      epochs:
+        description: "run.sh --epochs (overrides the profile default)"
+        type: string
+        default: "8"
+
+# One unattended soak at a time. A new dispatch cancels an in-flight run.
+concurrency:
+  group: devnet-nightly
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: "27.x"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Package for bin/rvc. A bare --release builds every workspace crate.
+      - name: Build rvc
+        run: cargo build --release --locked -p rvc-bin
+
+      # upload-artifact@v4 strips common leading directories, so the
+      # artifact contains the file "rvc" (not target/release/rvc).
+      - name: Upload rvc
+        uses: actions/upload-artifact@v4
+        with:
+          name: rvc-bin
+          path: target/release/rvc
+          if-no-files-found: error
+
+  soak:
+    name: Soak
+    needs: build
+    runs-on: ubuntu-latest
+    # P6-A3: 83.2 min chain (P6-A2: offset 3 + sample 8 + clamp 2 = head epoch 13
+    # × 32 slots × 12 s) + ~10 min pulls/genesis/attach/report + margin.
+    # Architecture's 75 predates P6-A2; build is a separate 60-minute job.
+    timeout-minutes: 110
+    env:
+      PROFILE: ${{ github.event.inputs.profile || 'safe' }}
+      EPOCHS: ${{ github.event.inputs.epochs || '8' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Place the file at the path run.sh invokes (repo-root target/release/rvc).
+      - name: Download rvc
+        uses: actions/download-artifact@v4
+        with:
+          name: rvc-bin
+          path: target/release
+
+      # Mode bits do not survive the artifact round trip.
+      - name: Make rvc executable
+        run: chmod +x target/release/rvc
+
+      # Mint RUN_ID=${GITHUB_RUN_ID} (ADR-012) so the upload path is one
+      # scripts/devnet/runs/<id>/. Orchestrator exit ≠ 0 fails this step.
+      - name: Soak
+        run: |
+          set -euo pipefail
+          RUN_ID="${GITHUB_RUN_ID}"
+          scripts/devnet/run.sh --profile "${PROFILE}" --epochs "${EPOCHS}" --run-id "${RUN_ID}"
+
+      - name: Upload run dir
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devnet-run-${{ github.run_id }}
+          path: scripts/devnet/runs/${{ github.run_id }}
+          include-hidden-files: true
+          retention-days: 7
+
+      - name: Teardown
+        if: always()
+        run: scripts/devnet/down.sh --data

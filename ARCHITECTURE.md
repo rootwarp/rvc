@@ -1,7 +1,7 @@
 # Architecture
 
 <!-- BEGIN GENERATED -->
-RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 29 crates (3 binaries + 26 libraries).
+RVC is a Rust-based Ethereum Validator Client built as a modular workspace of 32 crates (3 binaries + 29 libraries).
 
 > **Generated section.** Crate count and the dependency graph below are produced from `cargo metadata --format-version=1 --no-deps`. Do not hand-edit this block (the HTML comment markers that wrap it). Regenerate with:
 > ```
@@ -19,15 +19,18 @@ graph TD
     RVC_BLOCK_SERVICE["block-service<br/><i>block proposals</i>"]
     RVC_BN_MANAGER["bn-manager<br/><i>multi-BN</i>"]
     RVC_BUILDER["builder<br/><i>MEV registration</i>"]
-    RVC_CRYPTO["crypto<br/><i>BLS, signing, Web3Signer</i>"]
+    RVC_CONFIG["config<br/><i>operator config names domain concepts</i>"]
+    RVC_CRYPTO["crypto<br/><i>BLS, EIP-2333, keystore</i>"]
     RVC_DOPPELGANGER["doppelganger<br/><i>duplicate detection</i>"]
     RVC_DUTY_TRACKER["duty-tracker<br/><i>duty cache</i>"]
     RVC_ETH_TYPES["eth-types<br/><i>consensus types</i>"]
+    RVC_GLOAS["rvc-gloas<br/><i>Gloas progressive SSZ</i>"]
     RVC_GRPC_SIGNER["grpc-signer<br/><i>gRPC signer client</i>"]
     RVC_KEYGEN["bin/rvc-keygen<br/><i>key generation</i>"]
     RVC_KEYMANAGER_API["keymanager-api<br/><i>key mgmt REST</i>"]
     RVC_METRICS["metrics<br/><i>prometheus</i>"]
     RVC_OBSERVABILITY["observability<br/><i>logging helpers</i>"]
+    RVC_REMOTE_SIGNER_CLIENT["remote-signer-client<br/><i>Web3Signer HTTP client</i>"]
     RVC_SECRET_PROVIDER["secret-provider<br/><i>cloud key mgmt</i>"]
     RVC_SIGNER["signer<br/><i>safe signing</i>"]
     RVC_SIGNER_BIN["bin/rvc-signer<br/><i>gRPC signing server</i>"]
@@ -35,7 +38,7 @@ graph TD
     RVC_SIGNER_REGISTRY["signer-registry<br/><i>sign type table</i>"]
     RVC_SIGNER_SERVER["signer-server<br/><i>remote signing lib</i>"]
     RVC_SLASHING["slashing<br/><i>EIP-3076</i>"]
-    RVC_SYNC_SERVICE["sync-service<br/><i>sync committees</i>"]
+    RVC_SPEC_VECTORS["spec-vectors<br/><i>spec vectors + KAT codegen</i>"]
     RVC_TELEMETRY["telemetry<br/><i>OTel tracing</i>"]
     RVC_TEST_SUPPORT["test-support<br/><i>PKI + mTLS harness</i>"]
     RVC_TIMING["timing<br/><i>slot clock</i>"]
@@ -43,20 +46,24 @@ graph TD
     RVC_WEB3SIGNER_WIRE["web3signer-wire<br/><i>remote sign wire</i>"]
 
     BEACON --> RVC_ETH_TYPES
+    BEACON --> RVC_METRICS
     BEACON --> RVC_OBSERVABILITY
     BEACON --> RVC_TELEMETRY
     RVC --> BEACON
     RVC --> RVC_BLOCK_SERVICE
     RVC --> RVC_BN_MANAGER
     RVC --> RVC_BUILDER
+    RVC --> RVC_CONFIG
     RVC --> RVC_CRYPTO
     RVC --> RVC_DOPPELGANGER
     RVC --> RVC_DUTY_TRACKER
     RVC --> RVC_ETH_TYPES
+    RVC --> RVC_GLOAS
     RVC --> RVC_GRPC_SIGNER
     RVC --> RVC_KEYMANAGER_API
     RVC --> RVC_METRICS
     RVC --> RVC_OBSERVABILITY
+    RVC --> RVC_REMOTE_SIGNER_CLIENT
     RVC --> RVC_SECRET_PROVIDER
     RVC --> RVC_SIGNER
     RVC --> RVC_SLASHING
@@ -64,25 +71,20 @@ graph TD
     RVC --> RVC_VALIDATOR_STORE
     RVC_BIN --> BEACON
     RVC_BIN --> RVC
-    RVC_BIN --> RVC_BN_MANAGER
-    RVC_BIN --> RVC_BUILDER
     RVC_BIN --> RVC_CRYPTO
-    RVC_BIN --> RVC_DOPPELGANGER
     RVC_BIN --> RVC_ETH_TYPES
-    RVC_BIN --> RVC_GRPC_SIGNER
-    RVC_BIN --> RVC_KEYMANAGER_API
     RVC_BIN --> RVC_METRICS
-    RVC_BIN --> RVC_OBSERVABILITY
-    RVC_BIN --> RVC_SECRET_PROVIDER
     RVC_BIN --> RVC_SIGNER
     RVC_BIN --> RVC_SLASHING
     RVC_BIN --> RVC_TELEMETRY
-    RVC_BIN --> RVC_TIMING
     RVC_BLOCK_SERVICE --> BEACON
     RVC_BLOCK_SERVICE --> RVC_CRYPTO
     RVC_BLOCK_SERVICE --> RVC_ETH_TYPES
+    RVC_BLOCK_SERVICE --> RVC_GLOAS
+    RVC_BLOCK_SERVICE --> RVC_METRICS
     RVC_BLOCK_SERVICE --> RVC_OBSERVABILITY
     RVC_BLOCK_SERVICE --> RVC_SIGNER
+    RVC_BLOCK_SERVICE --> RVC_TIMING
     RVC_BLOCK_SERVICE --> RVC_VALIDATOR_STORE
     RVC_BN_MANAGER --> BEACON
     RVC_BN_MANAGER --> RVC_ETH_TYPES
@@ -93,9 +95,9 @@ graph TD
     RVC_BUILDER --> RVC_ETH_TYPES
     RVC_BUILDER --> RVC_SIGNER
     RVC_BUILDER --> RVC_VALIDATOR_STORE
+    RVC_CONFIG --> RVC_ETH_TYPES
     RVC_CRYPTO --> RVC_ETH_TYPES
     RVC_CRYPTO --> RVC_OBSERVABILITY
-    RVC_CRYPTO --> RVC_WEB3SIGNER_WIRE
     RVC_DOPPELGANGER --> RVC_CRYPTO
     RVC_DOPPELGANGER --> RVC_ETH_TYPES
     RVC_DOPPELGANGER --> RVC_OBSERVABILITY
@@ -103,16 +105,24 @@ graph TD
     RVC_DUTY_TRACKER --> RVC_BN_MANAGER
     RVC_DUTY_TRACKER --> RVC_ETH_TYPES
     RVC_DUTY_TRACKER --> RVC_METRICS
+    RVC_DUTY_TRACKER --> RVC_OBSERVABILITY
+    RVC_GLOAS --> RVC_ETH_TYPES
     RVC_GRPC_SIGNER --> RVC_CRYPTO
     RVC_GRPC_SIGNER --> RVC_ETH_TYPES
     RVC_GRPC_SIGNER --> RVC_OBSERVABILITY
     RVC_GRPC_SIGNER --> RVC_SIGNER_PROTO
+    RVC_GRPC_SIGNER --> RVC_TELEMETRY
     RVC_KEYGEN --> RVC_CRYPTO
     RVC_KEYGEN --> RVC_ETH_TYPES
     RVC_KEYGEN --> RVC_OBSERVABILITY
     RVC_KEYMANAGER_API --> RVC_ETH_TYPES
     RVC_KEYMANAGER_API --> RVC_METRICS
     RVC_KEYMANAGER_API --> RVC_OBSERVABILITY
+    RVC_REMOTE_SIGNER_CLIENT --> RVC_CRYPTO
+    RVC_REMOTE_SIGNER_CLIENT --> RVC_ETH_TYPES
+    RVC_REMOTE_SIGNER_CLIENT --> RVC_OBSERVABILITY
+    RVC_REMOTE_SIGNER_CLIENT --> RVC_TELEMETRY
+    RVC_REMOTE_SIGNER_CLIENT --> RVC_WEB3SIGNER_WIRE
     RVC_SECRET_PROVIDER --> RVC_CRYPTO
     RVC_SECRET_PROVIDER --> RVC_ETH_TYPES
     RVC_SECRET_PROVIDER --> RVC_METRICS
@@ -125,6 +135,7 @@ graph TD
     RVC_SIGNER --> RVC_SLASHING
     RVC_SIGNER_BIN --> RVC_SIGNER_SERVER
     RVC_SIGNER_BIN --> RVC_TELEMETRY
+    RVC_SIGNER_SERVER --> RVC_CONFIG
     RVC_SIGNER_SERVER --> RVC_CRYPTO
     RVC_SIGNER_SERVER --> RVC_ETH_TYPES
     RVC_SIGNER_SERVER --> RVC_OBSERVABILITY
@@ -141,42 +152,46 @@ graph TD
     RVC_VALIDATOR_STORE --> RVC_OBSERVABILITY
     RVC_WEB3SIGNER_WIRE --> RVC_ETH_TYPES
 
-    style BEACON fill:#51cf66,color:#fff
+    style BEACON fill:#20c997,color:#fff
     style RVC fill:#ff6b6b,color:#fff
     style RVC_ARCHITECTURE_TESTS fill:#adb5bd,color:#333
     style RVC_BIN fill:#4a9eff,color:#fff
     style RVC_BLOCK_SERVICE fill:#ffd43b,color:#333
-    style RVC_BN_MANAGER fill:#51cf66,color:#fff
+    style RVC_BN_MANAGER fill:#20c997,color:#fff
     style RVC_BUILDER fill:#ffd43b,color:#333
+    style RVC_CONFIG fill:#ffd43b,color:#333
     style RVC_CRYPTO fill:#51cf66,color:#fff
     style RVC_DOPPELGANGER fill:#ffd43b,color:#333
     style RVC_DUTY_TRACKER fill:#ffd43b,color:#333
     style RVC_ETH_TYPES fill:#51cf66,color:#fff
-    style RVC_GRPC_SIGNER fill:#51cf66,color:#fff
+    style RVC_GLOAS fill:#51cf66,color:#fff
+    style RVC_GRPC_SIGNER fill:#20c997,color:#fff
     style RVC_KEYGEN fill:#4a9eff,color:#fff
-    style RVC_KEYMANAGER_API fill:#51cf66,color:#fff
+    style RVC_KEYMANAGER_API fill:#20c997,color:#fff
     style RVC_METRICS fill:#51cf66,color:#fff
     style RVC_OBSERVABILITY fill:#51cf66,color:#fff
-    style RVC_SECRET_PROVIDER fill:#51cf66,color:#fff
+    style RVC_REMOTE_SIGNER_CLIENT fill:#20c997,color:#fff
+    style RVC_SECRET_PROVIDER fill:#20c997,color:#fff
     style RVC_SIGNER fill:#ffd43b,color:#333
     style RVC_SIGNER_BIN fill:#4a9eff,color:#fff
     style RVC_SIGNER_PROTO fill:#51cf66,color:#fff
     style RVC_SIGNER_REGISTRY fill:#51cf66,color:#fff
     style RVC_SIGNER_SERVER fill:#ffd43b,color:#333
-    style RVC_SLASHING fill:#51cf66,color:#fff
-    style RVC_SYNC_SERVICE fill:#ffd43b,color:#333
+    style RVC_SLASHING fill:#20c997,color:#fff
+    style RVC_SPEC_VECTORS fill:#adb5bd,color:#333
     style RVC_TELEMETRY fill:#51cf66,color:#fff
     style RVC_TEST_SUPPORT fill:#adb5bd,color:#333
-    style RVC_TIMING fill:#ffd43b,color:#333
-    style RVC_VALIDATOR_STORE fill:#51cf66,color:#fff
+    style RVC_TIMING fill:#51cf66,color:#fff
+    style RVC_VALIDATOR_STORE fill:#20c997,color:#fff
     style RVC_WEB3SIGNER_WIRE fill:#51cf66,color:#fff
 ```
 
 **Layer colors:**
 - **Blue** — Binary entry point
-- **Red** — Core orchestrator (depends on domain + foundation crates)
+- **Red** — Core orchestrator (depends on domain + base/infra crates)
 - **Yellow** — Domain crates (duty-specific logic)
-- **Green** — Foundation crates (infrastructure, no domain orchestration)
+- **Green** — Base crates (pure leaves; no I/O)
+- **Teal** — Infra crates (I/O services; no domain orchestration)
 - **Gray** — Meta / dev-only crates (architecture gates, test harnesses)
 <!-- END GENERATED -->
 
@@ -250,26 +265,30 @@ block-beta
     block:domain:8
         SIGNER["signer"]
         DUTY["duty-tracker"]
-        TIMING["timing"]
         BLOCK["block-service"]
-        SYNC["sync-service"]
         BUILD["builder"]
         DOPP["doppelganger"]
     end
 
     space:8
 
-    block:foundation:8
+    block:infra:8
         CRYPTO["crypto"]
         SLASHING["slashing"]
         BNM["bn-manager"]
         BEACON["beacon"]
-        METRICS["metrics"]
-        ETH["eth-types"]
         KMA["keymanager-api"]
-        TEL["telemetry"]
         SP["secret-provider"]
         GRPCSIGNER["grpc-signer"]
+    end
+
+    space:8
+
+    block:base:8
+        TIMING["timing"]
+        METRICS["metrics"]
+        ETH["eth-types"]
+        TEL["telemetry"]
     end
 
     BIN --> RVC
@@ -289,7 +308,8 @@ block-beta
     style binary fill:#4a9eff,color:#fff
     style orchestrator fill:#ff6b6b,color:#fff
     style domain fill:#ffd43b,color:#333
-    style foundation fill:#51cf66,color:#fff
+    style infra fill:#20c997,color:#fff
+    style base fill:#51cf66,color:#fff
 ```
 
 ## Slot Processing — 3-Phase Architecture
@@ -342,12 +362,12 @@ flowchart TD
     A[Slot start, validator is proposer] --> B[Sign RANDAO reveal<br/>DOMAIN_RANDAO]
     B --> C[produce_block_v3<br/>graffiti, builder_boost_factor]
     C --> D{Blinded?}
-    D -->|Yes| E[SlashingDb<br/>stage_block]
+    D -->|Yes| E["SlashingDb reserve_block (commit, then release conn)"]
     D -->|No| E
     E -->|Slashable| X1[REJECT: DoubleProposal]
-    E -->|Safe| F[Sign block<br/>DOMAIN_BEACON_PROPOSER]
-    F --> G[commit staged block in SlashingDb]
-    G --> H{Blinded?}
+    E -->|Safe| F[Sign block<br/>DOMAIN_BEACON_PROPOSER<br/>per-pubkey lock held]
+    F -->|Signed| H{Blinded?}
+    F -->|Discard unsigned| G["reconcile reservation (per-pubkey lock held throughout)"]
     H -->|Yes| I[publish_blinded_block<br/>broadcast to all BNs]
     H -->|No| J[publish_block<br/>broadcast to all BNs]
 
@@ -355,6 +375,8 @@ flowchart TD
     style I fill:#51cf66,color:#fff
     style J fill:#51cf66,color:#fff
 ```
+
+`sign_block` reserves with `SlashingDb::reserve_block`, which commits the slashing row and releases the SQLite connection before the BLS sign. The per-pubkey `OwnedMutexGuard` is moved into `spawn_blocking` (`core.rs:1067` and `core.rs:1116` in `crates/signer/src/core.rs`) and stays held through reserve, the sign, and any reconcile. A signed block is published with that row already committed. An unsigned outcome under `DiscardStagedRow` (in-process) reconciles the reservation while the same lock is still held. `RetainStagedRow` (remote-capable) leaves the committed row.
 
 ## Signing Flow
 
@@ -529,17 +551,6 @@ Orchestrates the block proposal lifecycle: RANDAO reveal → block production �
 - **`BeaconBlockClient` trait** — `produce_block`, `publish_block`, `publish_blinded_block`.
 - Handles both full and blinded (MEV) blocks via `Eth-Execution-Payload-Blinded` header.
 
-### `crates/sync-service` — Sync Committee Helpers
-
-Shared sync-committee constants and aggregator selection. Production message and contribution
-lifecycle is owned by the orchestrator's **`SyncCommitteeService`**
-(`crates/rvc/src/orchestrator/sync_committee.rs`), which signs via `SignerService` and submits
-via `BeaconNodeClient` (with timeouts and the D-3 doppelganger gate).
-
-- **`is_sync_committee_aggregator`** — Selection-proof check against `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE`.
-- **Constants** — `SYNC_COMMITTEE_SIZE = 512`, `SYNC_COMMITTEE_SUBNET_COUNT = 4`,
-  `TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE = 16`.
-
 ### `crates/builder` — MEV & Builder Integration
 
 Builder registration management and proposer preparation.
@@ -553,9 +564,9 @@ Builder registration management and proposer preparation.
 
 Detects duplicate validator instances before activating signing (Lodestar pattern).
 
-- **`DoppelgangerService`** — 2-epoch monitoring via `post_validator_liveness` endpoint.
+- **`ForwardWindowMachine`** — 2-epoch forward-window monitoring via `post_validator_liveness`.
 - **Restart-aware** — Validators with recent slashing DB entries skip detection.
-- **`DoppelgangerStatus`** — `Safe`, `DetectionInProgress`, `DoppelgangerDetected`.
+- **`ForwardWindowStatus`** — `Unmonitored`, `Pending`, `Safe`, `Detected`.
 
 ### `crates/beacon` — Beacon Node HTTP Client
 
@@ -671,6 +682,7 @@ Client library for connecting `bin/rvc` to `bin/rvc-signer` via gRPC with mTLS:
 - **`GrpcRemoteSignerConfig`** — mTLS configuration (client cert, key, CA cert).
 - **Proto stubs** — Re-exports `SignerServiceClient` and `PeerSignerServiceClient` generated from `proto/signer.proto`.
 - **Integration** — Added to `CompositeSigner` via `add_remote_signer()` during startup.
+- **Trace propagation** — `sign_rpc` injects W3C `traceparent` into outbound gRPC metadata inside the `sign.grpc_remote_typed` span (`telemetry::inject_trace_context_metadata`, `telemetry` feature `grpc`). Infra → Base.
 
 ### `crates/telemetry` — OpenTelemetry Distributed Tracing
 
@@ -680,7 +692,7 @@ Provides distributed tracing infrastructure using OpenTelemetry:
 - **`ExporterKind`** — `Otlp` (OTLP/HTTP on port 4318) or `Gcp` (Cloud Trace, gated behind `gcp-trace` feature).
 - **`init_tracing`** — Sets up `tracing-opentelemetry` layer with `ParentBased(TraceIdRatioBased)` sampler. Returns `TracingGuard`.
 - **`TracingGuard`** — RAII `#[must_use]` guard that flushes pending spans on drop (5-second timeout).
-- **W3C propagation** — Injects `traceparent` headers into outbound beacon node HTTP requests.
+- **W3C propagation** — Injects `traceparent` into outbound beacon-node HTTP headers and, behind feature `grpc`, into outbound gRPC signer metadata.
 - **Instrumentation pattern** — `#[tracing::instrument(name = "rvc.xxx", skip_all, fields(...))]` with dynamic field recording via `Span::current().record()`.
 
 ## Key Design Patterns
@@ -695,9 +707,9 @@ Provides distributed tracing infrastructure using OpenTelemetry:
   - **Enablement defaults** — Validators stay disabled until doppelganger/enablement gates clear; key import does not enable signing immediately.
   - **Startup** — Slashing DB integrity failure, genesis-validators-root mismatch, and missing DB without `--init-slashing-db` refuse to start (no silent empty-DB create).
   - Prefer typed `Result` flows with explicit allow-lists for any intentional degradation.
-- **Downward-only dependencies** — Binary → Orchestrator → Domain → Foundation. Never upward. The generated graph and `architecture_no_cycles` gate enforce this.
+- **Downward-only dependencies** — Binary → Orchestrator → Domain → Base/Infra. Never upward. The generated graph and `architecture_no_cycles` gate enforce this.
 - **Shutdown idiom** — **`tokio_util::sync::CancellationToken`** is the workspace standard for service lifecycle (supports `child_token` hierarchies). Older loops still use `tokio::sync::watch` (orchestrator coordinator, bn-manager SSE/sync, timing); `bin/rvc` bridges the two. New code and opportunistic rewrites adopt `CancellationToken`; do not introduce new `watch`-based shutdown channels.
-- **Distributed tracing** — OpenTelemetry spans across slot lifecycle, block proposals, attestations, signing, and beacon HTTP requests with W3C trace context propagation.
+- **Distributed tracing** — OpenTelemetry spans across slot lifecycle, block proposals, attestations, signing, beacon HTTP requests, and gRPC signer calls with W3C trace context propagation.
 - **Pluggable secret providers** — `SecretProvider` trait enables cloud key management (GCP Secret Manager) with periodic refresh and `Zeroizing` key material.
 - **Remote signing isolation** — `rvc-signer` runs as a standalone process with mTLS; keys never leave the signer. Slashing protection remains in `rvc`.
 - **DVT threshold signing** — Optional Shamir Secret Sharing backend with peer-to-peer partial signature coordination and Lagrange interpolation.

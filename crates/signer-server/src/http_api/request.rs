@@ -7,8 +7,8 @@
 //! One `serde` model decodes both Lighthouse and Prysm bodies. The shape is intentionally
 //! lenient (research R5): a SCREAMING_SNAKE_CASE `type` discriminator, snake_case payload
 //! fields, `fork_info` as `Option` (per-type enforcement lives in the dispatcher, not here —
-//! `VALIDATOR_REGISTRATION` will omit it), and `signingRoot` accepted from both `signingRoot`
-//! and `signing_root`, treated as absent when empty/zero.
+//! `VALIDATOR_REGISTRATION` and `BUILDER_REQUEST_AUTH` omit it), and `signingRoot` accepted
+//! from both `signingRoot` and `signing_root`, treated as absent when empty/zero.
 //!
 //! This module only *decodes*; the dispatcher computes the domain + signing root and
 //! enforces the per-type `fork_info` requirement.
@@ -52,7 +52,7 @@ mod tests {
         assert_eq!(req.signing_root, Some([0x11u8; 32]));
         match req.payload {
             SignPayload::BlockV2 { beacon_block } => {
-                assert_eq!(beacon_block.version, "DENEB");
+                assert_eq!(beacon_block.version, eth_types::ForkName::Deneb);
                 assert_eq!(beacon_block.block_header.slot, 3_000_000);
                 assert_eq!(beacon_block.block_header.proposer_index, 12_345);
                 assert_eq!(beacon_block.block_header.parent_root, [0xaau8; 32]);

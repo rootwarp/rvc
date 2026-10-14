@@ -1,0 +1,7 @@
+# ARCH-4j: the four BN timeout knobs promoted to [beacon] / Config.
+
+[beacon]
+block_production_timeout = 11
+attestation_timeout = 12
+aggregate_timeout = 13
+duty_fetch_timeout = 14

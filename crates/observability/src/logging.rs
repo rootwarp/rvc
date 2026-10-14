@@ -146,6 +146,12 @@ pub mod fields {
         BLOCK_ROOT = "block_root",
         /// Time into slot (duration / ms) — operator timing signal.
         TIME_INTO_SLOT = "time_into_slot",
+        /// OpenTelemetry trace id. Kept equal to `rvc-telemetry`'s literal by
+        /// `telemetry_field_keys_match_registry` (ADR-002 pin / TRC-2e).
+        TRACE_ID = "trace_id",
+        /// OpenTelemetry span id. Kept equal to `rvc-telemetry`'s literal by
+        /// `telemetry_field_keys_match_registry` (ADR-002 pin / TRC-2e).
+        SPAN_ID = "span_id",
     }
 
     /// Canonical `duty` value strings.
@@ -161,6 +167,7 @@ pub mod fields {
         SyncCommittee,
         SyncContribution,
         ValidatorRegistration,
+        BuilderRequestAuth,
         VoluntaryExit,
     }
 
@@ -174,6 +181,7 @@ pub mod fields {
                 Duty::SyncCommittee => "sync_committee",
                 Duty::SyncContribution => "sync_contribution",
                 Duty::ValidatorRegistration => "validator_registration",
+                Duty::BuilderRequestAuth => "builder_request_auth",
                 Duty::VoluntaryExit => "voluntary_exit",
             }
         }
@@ -345,7 +353,7 @@ mod tests {
         assert_eq!(conformance::CANONICAL, fields::ALL);
         assert!(conformance::CANONICAL.contains(&fields::SLOT));
         assert!(conformance::CANONICAL.contains(&fields::TIME_INTO_SLOT));
-        assert_eq!(conformance::CANONICAL.len(), 12);
+        assert_eq!(conformance::CANONICAL.len(), 14);
     }
 
     // --- TruncatedPubkey tests ---
@@ -520,10 +528,12 @@ mod tests {
         assert_eq!(fields::HEAD, "head");
         assert_eq!(fields::BLOCK_ROOT, "block_root");
         assert_eq!(fields::TIME_INTO_SLOT, "time_into_slot");
+        assert_eq!(fields::TRACE_ID, "trace_id");
+        assert_eq!(fields::SPAN_ID, "span_id");
     }
 
     #[test]
-    fn test_duty_as_str_pins_all_seven_variants() {
+    fn test_duty_as_str_pins_all_eight_variants() {
         use fields::Duty;
         assert_eq!(Duty::Attestation.as_str(), "attestation");
         assert_eq!(Duty::Block.as_str(), "block");
@@ -531,6 +541,7 @@ mod tests {
         assert_eq!(Duty::SyncCommittee.as_str(), "sync_committee");
         assert_eq!(Duty::SyncContribution.as_str(), "sync_contribution");
         assert_eq!(Duty::ValidatorRegistration.as_str(), "validator_registration");
+        assert_eq!(Duty::BuilderRequestAuth.as_str(), "builder_request_auth");
         assert_eq!(Duty::VoluntaryExit.as_str(), "voluntary_exit");
     }
 

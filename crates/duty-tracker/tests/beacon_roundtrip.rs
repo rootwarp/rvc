@@ -9,18 +9,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use beacon::{BeaconClient, BeaconClientConfig};
-use bn_manager::BeaconNodeClient;
+use bn_manager::DutiesProvider;
 use rvc_duty_tracker::DutyTracker;
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-async fn setup_http_beacon() -> (MockServer, Arc<dyn BeaconNodeClient>) {
+async fn setup_http_beacon() -> (MockServer, Arc<dyn DutiesProvider>) {
     let mock_server = MockServer::start().await;
     let config = BeaconClientConfig::new(mock_server.uri())
         .with_timeout(Duration::from_secs(5))
         .with_max_retries(1);
     let client = BeaconClient::new(config).unwrap();
-    (mock_server, Arc::new(client) as Arc<dyn BeaconNodeClient>)
+    (mock_server, Arc::new(client) as Arc<dyn DutiesProvider>)
 }
 
 /// Attester duties: POST path, request body indices, dependent_root caching.
@@ -72,7 +72,8 @@ async fn attester_duties_http_roundtrip() {
     assert_eq!(tracker.get_cached_dependent_root(10).await, Some("0xdeproot_http".to_string()));
 
     let duty = tracker.get_duty(320, 1, 1234).await.unwrap();
-    assert_eq!(duty.committee_index, "1");
+    assert_eq!(duty.committee_index, 1);
+    assert_eq!(duty.raw.committee_index, "1");
 }
 
 /// Proposer + sync-committee duties: GET/POST paths and typed sync pubkey decode.
@@ -120,7 +121,8 @@ async fn proposer_and_sync_duties_http_roundtrip() {
     assert_eq!(proposers.len(), 1);
     assert!(tracker.is_proposer_epoch_cached(10).await);
     let duty = tracker.get_proposer_duty(320).await.unwrap();
-    assert_eq!(duty.validator_index, "1234");
+    assert_eq!(duty.validator_index, 1234);
+    assert_eq!(duty.raw.validator_index, "1234");
 
     let sync_duties = tracker.fetch_sync_committee_duties(10).await.unwrap();
     assert_eq!(sync_duties.len(), 1);

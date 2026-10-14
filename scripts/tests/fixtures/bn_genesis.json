@@ -1,0 +1,8 @@
+{
+  "execution_optimistic": false,
+  "data": {
+    "genesis_time": "1710000000",
+    "genesis_validators_root": "0xabababababababababababababababababababababababababababababababab",
+    "genesis_fork_version": "0x10000000"
+  }
+}

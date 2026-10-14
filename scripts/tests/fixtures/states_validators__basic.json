@@ -1,0 +1,51 @@
+{
+  "execution_optimistic": false,
+  "finalized": false,
+  "data": [
+    {
+      "index": "3",
+      "balance": "32000000000",
+      "status": "pending_queued",
+      "validator": {
+        "pubkey": "0x333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333",
+        "withdrawal_credentials": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "effective_balance": "32000000000",
+        "slashed": false,
+        "activation_eligibility_epoch": "400",
+        "activation_epoch": "500",
+        "exit_epoch": "18446744073709551615",
+        "withdrawable_epoch": "18446744073709551615"
+      }
+    },
+    {
+      "index": "2",
+      "balance": "2048000000000",
+      "status": "active_exiting",
+      "validator": {
+        "pubkey": "0x222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+        "withdrawal_credentials": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "effective_balance": "2048000000000",
+        "slashed": false,
+        "activation_eligibility_epoch": "0",
+        "activation_epoch": "10",
+        "exit_epoch": "200",
+        "withdrawable_epoch": "256"
+      }
+    },
+    {
+      "index": "1",
+      "balance": "32001834000",
+      "status": "active_ongoing",
+      "validator": {
+        "pubkey": "0x111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111",
+        "withdrawal_credentials": "0x0000000000000000000000000000000000000000000000000000000000000000",
+        "effective_balance": "32000000000",
+        "slashed": false,
+        "activation_eligibility_epoch": "0",
+        "activation_epoch": "0",
+        "exit_epoch": "18446744073709551615",
+        "withdrawable_epoch": "18446744073709551615"
+      }
+    }
+  ]
+}

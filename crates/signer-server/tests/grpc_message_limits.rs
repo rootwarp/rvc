@@ -28,9 +28,10 @@ use tonic::{Code, Request, Response, Status};
 use grpc_signer::proto::signer_v2::{
     GetStatusRequest, GetStatusResponse, ListPublicKeysRequest, ListPublicKeysResponse,
     SignAggregateAndProofRequest, SignAttestationDataRequest, SignBeaconBlockRequest,
-    SignBlindedBeaconBlockRequest, SignBuilderRegistrationRequest, SignContributionAndProofRequest,
-    SignRandaoRevealRequest, SignResponse, SignSyncAggregatorSelectionDataRequest,
-    SignSyncCommitteeMessageRequest, SignVoluntaryExitRequest,
+    SignBlindedBeaconBlockRequest, SignBlockHeaderRequest, SignBuilderRegistrationRequest,
+    SignContributionAndProofRequest, SignRandaoRevealRequest, SignResponse, SignRootRequest,
+    SignSyncAggregatorSelectionDataRequest, SignSyncCommitteeMessageRequest,
+    SignVoluntaryExitRequest,
 };
 use grpc_signer::{SignerServiceClientV2, SignerServiceServerV2, SignerServiceV2};
 
@@ -68,7 +69,7 @@ impl TestService {
         Arc::clone(&self.handler_started)
     }
 
-    async fn run_instrumented_handler(&self) -> Result<Response<SignResponse>, Status> {
+    async fn run_instrumented_handler(&self) -> Response<SignResponse> {
         let prev = self.concurrent.fetch_add(1, Ordering::SeqCst);
         let cur = prev + 1;
 
@@ -93,7 +94,7 @@ impl TestService {
         }
 
         self.concurrent.fetch_sub(1, Ordering::SeqCst);
-        Ok(Response::new(SignResponse { signature: vec![0u8; 96] }))
+        Response::new(SignResponse { signature: vec![0u8; 96] })
     }
 }
 
@@ -103,7 +104,7 @@ impl SignerServiceV2 for TestService {
         &self,
         _request: Request<SignBeaconBlockRequest>,
     ) -> Result<Response<SignResponse>, Status> {
-        self.run_instrumented_handler().await
+        Ok(self.run_instrumented_handler().await)
     }
 
     async fn sign_blinded_beacon_block(
@@ -165,6 +166,20 @@ impl SignerServiceV2 for TestService {
     async fn sign_voluntary_exit(
         &self,
         _request: Request<SignVoluntaryExitRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_block_header(
+        &self,
+        _request: Request<SignBlockHeaderRequest>,
+    ) -> Result<Response<SignResponse>, Status> {
+        Err(Status::unimplemented("test mock"))
+    }
+
+    async fn sign_root(
+        &self,
+        _request: Request<SignRootRequest>,
     ) -> Result<Response<SignResponse>, Status> {
         Err(Status::unimplemented("test mock"))
     }

@@ -1,0 +1,52 @@
+# HELP rvc_validator_perf_participation_rate participation rate
+# TYPE rvc_validator_perf_participation_rate gauge
+rvc_validator_perf_participation_rate{pubkey="0x2222…2222",index="2",status="active_ongoing"} 1
+rvc_validator_perf_participation_rate{pubkey="0x1111…1111",index="1",status="active_ongoing"} 0.5
+# HELP rvc_validator_perf_source_rate source rate
+# TYPE rvc_validator_perf_source_rate gauge
+rvc_validator_perf_source_rate{pubkey="0x2222…2222",index="2",status="active_ongoing"} 1
+rvc_validator_perf_source_rate{pubkey="0x1111…1111",index="1",status="active_ongoing"} 0.5
+# HELP rvc_validator_perf_target_rate target rate
+# TYPE rvc_validator_perf_target_rate gauge
+rvc_validator_perf_target_rate{pubkey="0x2222…2222",index="2",status="active_ongoing"} 1
+rvc_validator_perf_target_rate{pubkey="0x1111…1111",index="1",status="active_ongoing"} 0.5
+# HELP rvc_validator_perf_head_rate head rate
+# TYPE rvc_validator_perf_head_rate gauge
+rvc_validator_perf_head_rate{pubkey="0x2222…2222",index="2",status="active_ongoing"} 1
+rvc_validator_perf_head_rate{pubkey="0x1111…1111",index="1",status="active_ongoing"} 0.5
+# HELP rvc_validator_perf_attester_effectiveness attester effectiveness
+# TYPE rvc_validator_perf_attester_effectiveness gauge
+rvc_validator_perf_attester_effectiveness{pubkey="0x2222…2222",index="2",status="active_ongoing"} 1
+rvc_validator_perf_attester_effectiveness{pubkey="0x1111…1111",index="1",status="active_ongoing"} 0.5
+# HELP rvc_validator_perf_missed_attestations_total missed attestations total
+# TYPE rvc_validator_perf_missed_attestations_total gauge
+rvc_validator_perf_missed_attestations_total{pubkey="0x2222…2222",index="2",status="active_ongoing"} 0
+rvc_validator_perf_missed_attestations_total{pubkey="0x1111…1111",index="1",status="active_ongoing"} 16
+# HELP rvc_validator_perf_proposals_included_total proposals included total
+# TYPE rvc_validator_perf_proposals_included_total gauge
+rvc_validator_perf_proposals_included_total{pubkey="0x2222…2222",index="2",status="active_ongoing"} 1
+rvc_validator_perf_proposals_included_total{pubkey="0x9324…a6d3",index="",status="unknown"} 0
+rvc_validator_perf_proposals_included_total{pubkey="0x1111…1111",index="1",status="active_ongoing"} 0
+# HELP rvc_validator_perf_proposals_scheduled_total proposals scheduled total
+# TYPE rvc_validator_perf_proposals_scheduled_total gauge
+rvc_validator_perf_proposals_scheduled_total{pubkey="0x2222…2222",index="2",status="active_ongoing"} 1
+rvc_validator_perf_proposals_scheduled_total{pubkey="0x9324…a6d3",index="",status="unknown"} 0
+rvc_validator_perf_proposals_scheduled_total{pubkey="0x1111…1111",index="1",status="active_ongoing"} 1
+# HELP rvc_validator_perf_sync_participation_rate sync participation rate
+# TYPE rvc_validator_perf_sync_participation_rate gauge
+rvc_validator_perf_sync_participation_rate{pubkey="0x2222…2222",index="2",status="active_ongoing"} 0.5
+# HELP rvc_validator_perf_consensus_reward_gwei consensus reward gwei
+# TYPE rvc_validator_perf_consensus_reward_gwei gauge
+rvc_validator_perf_consensus_reward_gwei{pubkey="0x2222…2222",index="2",status="active_ongoing"} 2000000
+rvc_validator_perf_consensus_reward_gwei{pubkey="0x9324…a6d3",index="",status="unknown"} 0
+rvc_validator_perf_consensus_reward_gwei{pubkey="0x1111…1111",index="1",status="active_ongoing"} 1000000
+# HELP rvc_validator_perf_estimated_apr estimated apr
+# TYPE rvc_validator_perf_estimated_apr gauge
+rvc_validator_perf_estimated_apr{pubkey="0x2222…2222",index="2",status="active_ongoing"} 0.0471
+rvc_validator_perf_estimated_apr{pubkey="0x1111…1111",index="1",status="active_ongoing"} 0.02
+# HELP rvc_validator_perf_run_exit_code run exit code
+# TYPE rvc_validator_perf_run_exit_code gauge
+rvc_validator_perf_run_exit_code{} 0
+# HELP rvc_validator_perf_run_generated_timestamp_seconds run generated timestamp seconds
+# TYPE rvc_validator_perf_run_generated_timestamp_seconds gauge
+rvc_validator_perf_run_generated_timestamp_seconds{} 1788091200

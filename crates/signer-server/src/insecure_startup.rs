@@ -66,17 +66,26 @@ pub fn check_insecure_startup(
 // RF1-12: unit tests mutate env via unsafe set_var/remove_var.
 #[allow(unsafe_code)]
 mod tests {
-    use std::sync::{Mutex, MutexGuard, OnceLock};
-
     use super::*;
 
-    /// Serialise tests in this module that mutate `RVC_SIGNER_ALLOW_INSECURE`.
-    /// Without this lock, parallel cargo-test execution can race and flip the
-    /// env var out from under another test (review MF-2: same pattern as
-    /// `crates/signer-server/tests/insecure_flag_refused.rs::env_lock`).
-    fn env_lock() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    /// Same process-wide lock as [`crate::server::env_lock`].
+    ///
+    /// Unit tests in this crate share one binary. A private mutex here raced
+    /// `server` tests that also mutate `RVC_*` under `cargo test`.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        crate::server::env_lock()
+    }
+
+    /// `insecure_startup` tests take the server suite's env lock, not a private one.
+    #[test]
+    fn test_insecure_startup_env_lock_is_shared_with_the_server_suite() {
+        let _guard = env_lock();
+        let mutex =
+            crate::server::ENV_LOCK.get().expect("env_lock must initialize the server suite lock");
+        assert!(
+            mutex.try_lock().is_err(),
+            "insecure_startup must lock the same mutex as server::env_lock"
+        );
     }
 
     fn loopback() -> SocketAddr {

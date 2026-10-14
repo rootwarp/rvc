@@ -1,5 +1,5 @@
 [workspace]
-members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/architecture-tests", "crates/beacon", "crates/block-service", "crates/bn-manager", "crates/builder", "crates/crypto", "crates/doppelganger", "crates/duty-tracker", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/observability", "crates/rvc", "crates/rvc-test-support", "crates/secret-provider", "crates/signer", "crates/signer-proto", "crates/signer-registry", "crates/signer-server", "crates/slashing", "crates/sync-service", "crates/telemetry", "crates/timing", "crates/validator-store", "crates/web3signer-wire"]
+members = ["bin/rvc", "bin/rvc-keygen", "bin/rvc-signer", "crates/architecture-tests", "crates/beacon", "crates/block-service", "crates/bn-manager", "crates/builder", "crates/crypto", "crates/doppelganger", "crates/duty-tracker", "crates/eth-types", "crates/grpc-signer", "crates/keymanager-api", "crates/metrics", "crates/observability", "crates/remote-signer-client", "crates/rvc", "crates/rvc-config", "crates/rvc-gloas", "crates/rvc-spec-vectors", "crates/rvc-test-support", "crates/secret-provider", "crates/signer", "crates/signer-proto", "crates/signer-registry", "crates/signer-server", "crates/slashing", "crates/telemetry", "crates/timing", "crates/validator-store", "crates/web3signer-wire"]
 default-members = ["bin/rvc", "crates/architecture-tests"]
 resolver = "2"
 
@@ -10,7 +10,7 @@ resolver = "2"
 unsafe_code = "deny"
 
 [workspace.package]
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.92"
 license = "MIT OR Apache-2.0"
@@ -19,18 +19,20 @@ repository = "https://github.com/rootwarp/rvc"
 [workspace.dependencies]
 # Internal
 rvc = { path = "crates/rvc" }
+rvc-config = { path = "crates/rvc-config" }
+rvc-gloas = { path = "crates/rvc-gloas" }
 beacon = { path = "crates/beacon" }
 eth-types = { path = "crates/eth-types", package = "rvc-eth-types" }
 metrics = { path = "crates/metrics", package = "rvc-metrics" }
 slashing = { path = "crates/slashing", package = "rvc-slashing" }
 timing = { path = "crates/timing", package = "rvc-timing" }
 crypto = { path = "crates/crypto", package = "rvc-crypto" }
+remote-signer-client = { path = "crates/remote-signer-client", package = "rvc-remote-signer-client" }
 observability = { path = "crates/observability", package = "rvc-observability" }
 duty-tracker = { path = "crates/duty-tracker", package = "rvc-duty-tracker" }
 signer = { path = "crates/signer", package = "rvc-signer" }
 validator-store = { path = "crates/validator-store", package = "rvc-validator-store" }
 block-service = { path = "crates/block-service", package = "rvc-block-service" }
-sync-service = { path = "crates/sync-service", package = "rvc-sync-service" }
 bn-manager = { path = "crates/bn-manager", package = "rvc-bn-manager" }
 builder = { path = "crates/builder", package = "rvc-builder" }
 doppelganger = { path = "crates/doppelganger", package = "rvc-doppelganger" }
@@ -43,15 +45,17 @@ web3signer-wire = { path = "crates/web3signer-wire", package = "rvc-web3signer-w
 signer-proto = { path = "crates/signer-proto", package = "rvc-signer-proto" }
 signer-server = { path = "crates/signer-server", package = "rvc-signer-server" }
 rvc-test-support = { path = "crates/rvc-test-support" }
+rvc-spec-vectors = { path = "crates/rvc-spec-vectors" }
 
 # External
-async-trait = "0.1"
+async-trait = "0.1.92"
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml = "0.9"
 toml = "0.8"
 parking_lot = "0.12"
 thiserror = "2"
@@ -63,7 +67,11 @@ clap = { version = "4", features = ["derive"] }
 tonic = "0.12"
 prost = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-reqwest-eventsource = "0.6"
+# Beacon-node SSE is framed in `crates/bn-manager/src/sse/frame.rs`.
+# `reqwest-eventsource` 0.6.0 depends on `eventsource-stream` 0.2.3 (latest
+# crates.io release). That parser grows its line and `data` buffers without a
+# cap, and strips a leading U+FEFF with `&str[1..]`, which panics. Do not
+# reintroduce either crate. See `docs/releases/UNRELEASED.md`.
 futures = "0.3"
 hyper = "1"
 http-body-util = "0.1"
@@ -72,7 +80,13 @@ rcgen = "0.13"
 # OpenTelemetry
 opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-client"] }
+# `reqwest-blocking-client`, not `reqwest-client`: BatchSpanProcessor exports on
+# its own thread via `futures_executor::block_on` (no Tokio reactor). The SDK
+# documents the async reqwest client as unsupported there — it panics with
+# "no reactor running", so spans never leave the process. Do not also enable
+# `reqwest-client`; the HTTP exporter selects the blocking client only when
+# that feature is off.
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
 
 # Metrics
 prometheus = { version = "0.14", default-features = false }
@@ -98,6 +112,12 @@ ssz08 = { package = "ethereum_ssz", version = "0.8.3" }
 ssz_types = "0.10.1"
 tree_hash = "0.9"
 tree_hash_derive = "0.9"
+# Exact =0.3.0 (no caret). Do not enable ethereum-types.
+# Published 0.3.0 names: hasher is sha2-backend on libssz-merkle; other crates have no sha2 feature.
+libssz = { version = "=0.3.0", default-features = false, features = ["alloc"] }
+libssz-merkle = { version = "=0.3.0", default-features = false, features = ["alloc", "sha2-backend"] }
+libssz-types = { version = "=0.3.0", default-features = false, features = ["alloc"] }
+libssz-derive = { version = "=0.3.0", default-features = false }
 sha2 = "0.10"
 url = "2"
 scrypt = "0.11"
@@ -137,6 +157,7 @@ libc = "0.2"
 logroller = "0.1"
 tracing-appender = "0.2"
 flate2 = "1"
+snap = "1"
 
 # X.509 parsing (pinned; used by rvc-signer audit/cn.rs — M-4 fix)
 x509-parser = "0.16"

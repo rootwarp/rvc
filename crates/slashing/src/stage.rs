@@ -61,6 +61,48 @@
 //! `StagedAttestation<'_>` are also `!Send`.  Do **not** hold a staged guard
 //! across an `.await` point unless the entire future is pinned to a single
 //! thread (e.g. via `spawn_blocking`).
+//!
+//! ## Additive `reserve_*` (ARCH-5e / ADR-005)
+//!
+//! [`SlashingDb::reserve_block`] / [`SlashingDb::reserve_attestation`] sit
+//! **alongside** `stage_*` (A-5.2). They run rule check + INSERT + COMMIT in
+//! one short write transaction and return a [`CommittedReservation`] that is
+//! `Send` — no `MutexGuard` escapes. Concurrent reserves share one transaction
+//! (group commit) so N members pay one fsync; commit-before-sign is
+//! unchanged. `stage_*`, `commit()`, `discard()`, and `Drop` are unchanged.
+//!
+//! **M-1 prior-art warning** (`crates/signer/tests/phantom_row_m1.rs:1-10`):
+//! this repo already shipped commit-before-sign and reverted it as a bug.
+//! *Before the fix, `sign_attestation` / `sign_block` called
+//! `check_and_record_*` (which committed the row immediately) and only then
+//! called `signer.sign`. A signing failure left a committed row in the DB,
+//! causing the next legitimate sign attempt to look like a DoubleVote.*
+//! M-1's failure mode was **liveness, not safety** (a phantom row refuses a
+//! legitimate sign; it never permits a double-sign).
+//!
+//! [`SlashingDb::reconcile_unsigned`] is the compensating delete that makes
+//! this ordering admissible (ARCH-5f / M-1). It returns
+//! [`ReconcileOutcome`], never `Result`, so a caller cannot `?` a failed
+//! delete off a signing path. A failed delete **retains** the row (C1).
+//!
+//! **Liveness trade (A-5.5).** `SigningGate` is `Fixed(DiscardStagedRow)`.
+//! Under that policy a failed compensating delete leaves a phantom row —
+//! M-1's liveness mode (a phantom refuses a legitimate later sign; it never
+//! permits a double-sign). Accepted because the alternative direction
+//! permits a signature on the wire with no slashing record. Failures are
+//! metered (`rvc_slashing_reconcile_total{outcome="failed"}`) and logged at
+//! `error!`, never silent.
+//!
+//! Reconcile never touches watermark tables (VD-S6): the signing path does
+//! not raise watermarks — they are raised only by interchange import — so a
+//! history-row delete cannot lower a floor or re-open a minified-import slot.
+//!
+//! **C1 (binding):** stage → release → sign → re-check-and-commit is rejected
+//! by name. It cannot retain a released row, so an ambiguous remote sign
+//! silently becomes a rolled-back row — a signature that may exist on the
+//! wire with **no** slashing record. Tentative-commit makes retention the
+//! default (the row is already committed). C9's cancellation-proof
+//! `stage → sign → commit` core is not weakened: `stage_*` stays.
 
 use parking_lot::MutexGuard;
 use rusqlite::Connection;
@@ -68,15 +110,14 @@ use rusqlite::Connection;
 use crate::db::watermarks::{read_watermark, WatermarkKind};
 use crate::error::SlashingError;
 use crate::history::{TargetedSqlAttestationHistory, TargetedSqlBlockHistory};
+use crate::metrics;
 use crate::rules::{
     check_attestation, check_block, AttestationCandidate, AttestationVerdict,
     AttestationWatermarks, BlockCandidate, BlockVerdict, BlockWatermarks,
 };
 use crate::SlashingDb;
-use eth_types::{Epoch, Root, Slot};
+use eth_types::{Epoch, Root, Slot, SLOTS_PER_EPOCH};
 use observability::logging::TruncatedPubkey;
-
-use std::sync::atomic::Ordering;
 
 /// Fixed audit origin written to the `client_cn` column on INSERT.
 ///
@@ -116,6 +157,58 @@ struct AttestationRow {
     /// Hex-encoded genesis validators root to write into the per-row column.
     gvr_hex: String,
     is_duplicate: bool,
+}
+
+// ── CommittedReservation (ARCH-5e) ────────────────────────────────────────────
+
+/// Proof that a history row is COMMITTED and the DB lock is released.
+///
+/// Carries what a compensating delete needs. `Send` — the mutex is gone.
+///
+/// C1 retain-on-ambiguity is the reason the row is committed *before* the
+/// sign: an ambiguous signer error needs no action to retain it.
+/// [`SlashingDb::reconcile_unsigned`] is the only safe way to remove a
+/// reservation that was never signed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommittedReservation {
+    pub pubkey_hex: String,
+    pub kind: ReservationKind,
+    pub signing_root_hex: Option<String>,
+    /// Distinguishes a fresh INSERT (reconcilable) from an idempotent re-sign
+    /// or duplicate, where NOTHING may be deleted.
+    pub inserted: bool,
+}
+
+/// Discriminant stored on [`CommittedReservation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReservationKind {
+    Block { slot: Slot },
+    Attestation { source: Epoch, target: Epoch },
+}
+
+impl ReservationKind {
+    fn metric_kind(self) -> &'static str {
+        match self {
+            Self::Block { .. } => metrics::tx_hold_kind::BLOCK,
+            Self::Attestation { .. } => metrics::tx_hold_kind::ATTESTATION,
+        }
+    }
+}
+
+/// Outcome of [`SlashingDb::reconcile_unsigned`].
+///
+/// **Not a `Result`.** A compensation failure must not abort a signing path
+/// via `?` — failing safe means continuing with the row retained.
+#[must_use = "a Failed reconcile retains the reserved row (C1); do not discard silently"]
+#[derive(Debug)]
+pub enum ReconcileOutcome {
+    /// Targeted DELETE removed exactly one reserved history row.
+    Deleted,
+    /// No-op: `inserted == false` (an earlier legitimate sign owns the row),
+    /// or the targeted `(pubkey, kind, signing_root)` matched zero rows.
+    NotApplicable,
+    /// DELETE/COMMIT failed. The reserved row is still present.
+    Failed(SlashingError),
 }
 
 // ── StagedBlock ───────────────────────────────────────────────────────────────
@@ -170,7 +263,9 @@ impl<'db> StagedBlock<'db> {
             ));
         }
 
-        let guard = self.guard.as_mut().expect("guard is always Some before Drop");
+        let Some(guard) = self.guard.as_mut() else {
+            return Err(SlashingError::InternalInvariant("staged block guard missing at commit"));
+        };
 
         if !self.row.is_resign {
             guard.execute(
@@ -252,7 +347,11 @@ impl<'db> StagedAttestation<'db> {
             ));
         }
 
-        let guard = self.guard.as_mut().expect("guard is always Some before Drop");
+        let Some(guard) = self.guard.as_mut() else {
+            return Err(SlashingError::InternalInvariant(
+                "staged attestation guard missing at commit",
+            ));
+        };
 
         if !self.row.is_duplicate {
             guard.execute(
@@ -351,12 +450,12 @@ impl SlashingDb {
         }
 
         let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
-        let pubkey = crate::db::normalize_pubkey(pubkey_hex);
+        let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
         let guard = self.conn.lock();
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        let strict = self.strict_semantics.load(Ordering::Relaxed);
+        let strict = self.fork_aware_strict(slot / SLOTS_PER_EPOCH);
         // Run violation checks inside a closure so any error — whether a SQL
         // I/O error from `?`-propagation or an EIP-3076 violation — funnels
         // through a single ROLLBACK before we return. Without this wrapper a
@@ -364,12 +463,12 @@ impl SlashingDb {
         // drop the MutexGuard with the transaction still open, leaving the
         // connection in a broken "transaction within transaction" state.
         let outcome = (|| -> Result<BlockVerdict, SlashingError> {
-            let watermark = read_watermark(&guard, &pubkey, WatermarkKind::Block)?;
+            let watermark = read_watermark(&guard, pubkey.as_ref(), WatermarkKind::Block)?;
 
-            let history = TargetedSqlBlockHistory::new(&guard, &pubkey);
+            let history = TargetedSqlBlockHistory::new(&guard, pubkey.as_ref());
             let watermarks = BlockWatermarks { block: watermark.map(|w| w as Slot) };
             let candidate = BlockCandidate { slot, signing_root: signing_root_hex.clone() };
-            check_block(&pubkey, &history, &watermarks, &candidate, strict)
+            check_block(pubkey.as_ref(), &history, &watermarks, &candidate, strict)
         })();
 
         let outcome = match outcome {
@@ -388,7 +487,7 @@ impl SlashingDb {
         Ok(StagedBlock {
             guard: Some(guard),
             row: BlockRow {
-                pubkey,
+                pubkey: pubkey.to_string(),
                 slot,
                 signing_root: signing_root_hex,
                 gvr_hex,
@@ -432,20 +531,22 @@ impl SlashingDb {
         }
 
         let gvr_hex = crate::db::SlashingDb::root_to_hex(gvr);
-        let pubkey = crate::db::normalize_pubkey(pubkey_hex);
+        let pubkey = crate::db::normalize_pubkey(pubkey_hex)?;
         let guard = self.conn.lock();
 
         guard.execute_batch("BEGIN IMMEDIATE")?;
 
-        let strict = self.strict_semantics.load(Ordering::Relaxed);
+        let strict = self.fork_aware_strict(target_epoch);
         // Wrap the violation-check phase so any error — SQL I/O or EIP-3076 —
         // funnels through a single ROLLBACK before we return.  See the
         // matching note in `stage_block`.
         let outcome = (|| -> Result<AttestationVerdict, SlashingError> {
-            let wm_source = read_watermark(&guard, &pubkey, WatermarkKind::AttestationSource)?;
-            let wm_target = read_watermark(&guard, &pubkey, WatermarkKind::AttestationTarget)?;
+            let wm_source =
+                read_watermark(&guard, pubkey.as_ref(), WatermarkKind::AttestationSource)?;
+            let wm_target =
+                read_watermark(&guard, pubkey.as_ref(), WatermarkKind::AttestationTarget)?;
 
-            let history = TargetedSqlAttestationHistory::new(&guard, &pubkey);
+            let history = TargetedSqlAttestationHistory::new(&guard, pubkey.as_ref());
             let watermarks = AttestationWatermarks {
                 source: wm_source.map(|w| w as Epoch),
                 target: wm_target.map(|w| w as Epoch),
@@ -455,7 +556,7 @@ impl SlashingDb {
                 target_epoch,
                 signing_root: signing_root_hex.clone(),
             };
-            check_attestation(&pubkey, &history, &watermarks, &candidate, strict)
+            check_attestation(pubkey.as_ref(), &history, &watermarks, &candidate, strict)
         })();
 
         let verdict = match outcome {
@@ -470,7 +571,7 @@ impl SlashingDb {
         Ok(StagedAttestation {
             guard: Some(guard),
             row: AttestationRow {
-                pubkey,
+                pubkey: pubkey.to_string(),
                 source_epoch,
                 target_epoch,
                 signing_root: signing_root_hex,
@@ -481,4 +582,221 @@ impl SlashingDb {
             inject_fail_commit,
         })
     }
+
+    /// Rule check + INSERT + COMMIT in one short write transaction.
+    ///
+    /// The connection mutex is acquired and released **inside** this call; no
+    /// guard escapes, so the returned [`CommittedReservation`] is `Send`.
+    ///
+    /// GVR is still checked **before** the mutex, preserving the nested-lock
+    /// avoidance already at [`Self::stage_block`].
+    ///
+    /// # C1 / M-1
+    ///
+    /// This commits the row *before* any sign. That is what makes retain-on-
+    /// ambiguity the default (C1). It is **not** the rejected
+    /// stage→release→sign→re-check design. Call [`Self::reconcile_unsigned`]
+    /// on the unambiguous-no-signature class (and, under `DiscardStagedRow`,
+    /// on timeout/ambiguous too — §5.3). A failed delete retains.
+    ///
+    /// # Errors
+    ///
+    /// - [`SlashingError::GenesisRootMismatch`] — before the mutex.
+    /// - [`SlashingError::SlashableBlock`] / watermark floors — rule check;
+    ///   transaction rolled back, no row.
+    /// - [`SlashingError::ReserveCommitFailed`] — INSERT/COMMIT (or the test
+    ///   inject) failed; transaction rolled back, no new row. Distinguishable
+    ///   from a rule violation.
+    pub fn reserve_block(
+        &self,
+        pubkey_hex: &str,
+        slot: Slot,
+        signing_root_hex: Option<String>,
+        gvr: &Root,
+    ) -> Result<CommittedReservation, SlashingError> {
+        self.reserve_block_grouped(pubkey_hex, slot, signing_root_hex, gvr)
+    }
+
+    /// Attestation counterpart of [`Self::reserve_block`].
+    ///
+    /// Same contract: one short write transaction, `Send` token, GVR check
+    /// before the mutex, errors between `BEGIN IMMEDIATE` and return funnel
+    /// through exactly one `ROLLBACK`. Pair with [`Self::reconcile_unsigned`].
+    pub fn reserve_attestation(
+        &self,
+        pubkey_hex: &str,
+        source_epoch: Epoch,
+        target_epoch: Epoch,
+        signing_root_hex: Option<String>,
+        gvr: &Root,
+    ) -> Result<CommittedReservation, SlashingError> {
+        self.reserve_attestation_grouped(
+            pubkey_hex,
+            source_epoch,
+            target_epoch,
+            signing_root_hex,
+            gvr,
+        )
+    }
+
+    /// Best-effort compensating delete of a reserved history row.
+    ///
+    /// Returns [`ReconcileOutcome`], never `Result` — a failed delete must not
+    /// be `?`-propagated off a signing path. Failing safe means continuing
+    /// with the row retained (C1).
+    ///
+    /// - `inserted == false` → [`ReconcileOutcome::NotApplicable`]. Deleting a
+    ///   row an earlier legitimate sign owns would be a **safety** regression.
+    /// - Targeted `DELETE` on `(pubkey, kind-discriminant, signing_root)` in
+    ///   its own short `BEGIN IMMEDIATE` transaction. `changes() == 1` →
+    ///   [`ReconcileOutcome::Deleted`]; `changes() == 0` →
+    ///   [`ReconcileOutcome::NotApplicable`] (never reported as Deleted).
+    ///   `changes() > 1` rolls back.
+    ///
+    /// Watermark tables are never written. Metric emission and the `error!` on
+    /// [`ReconcileOutcome::Failed`] happen **after** the connection mutex is
+    /// released (C2 / G-7).
+    pub fn reconcile_unsigned(&self, reservation: &CommittedReservation) -> ReconcileOutcome {
+        let kind = reservation.kind;
+        if !reservation.inserted {
+            record_reconcile(kind, metrics::reconcile_outcome::NOT_APPLICABLE);
+            return ReconcileOutcome::NotApplicable;
+        }
+
+        let result = {
+            let guard = self.conn.lock();
+            with_immediate_txn(&guard, |conn| reconcile_delete_txn(self, conn, reservation))
+        };
+
+        match result {
+            Ok(true) => {
+                record_reconcile(kind, metrics::reconcile_outcome::DELETED);
+                ReconcileOutcome::Deleted
+            }
+            Ok(false) => {
+                record_reconcile(kind, metrics::reconcile_outcome::NOT_APPLICABLE);
+                ReconcileOutcome::NotApplicable
+            }
+            Err(err) => {
+                record_reconcile(kind, metrics::reconcile_outcome::FAILED);
+                tracing::error!(
+                    pubkey = %TruncatedPubkey::new(&reservation.pubkey_hex),
+                    ?kind,
+                    error = %err,
+                    "reconcile_unsigned failed; retaining reserved slashing row \
+                     (C1 fail-safe; M-1 liveness)"
+                );
+                ReconcileOutcome::Failed(err)
+            }
+        }
+    }
+}
+
+/// DELETE + COMMIT for one reserved row. `Ok(true)` = one row deleted;
+/// `Ok(false)` = targeted identity matched nothing. Any `Err` is rolled back
+/// by [`with_immediate_txn`] so the row is retained.
+fn reconcile_delete_txn(
+    db: &SlashingDb,
+    conn: &Connection,
+    reservation: &CommittedReservation,
+) -> Result<bool, SlashingError> {
+    if db.take_injected_commit_failure() {
+        return Err(SlashingError::ReconcileFailed(
+            "injected reconcile failure (test-utils)".into(),
+        ));
+    }
+
+    let before = if cfg!(debug_assertions) { Some(snapshot_watermarks(conn)?) } else { None };
+
+    let pubkey = crate::db::normalize_pubkey(&reservation.pubkey_hex)?;
+    let changes = delete_reserved_row(conn, pubkey.as_ref(), reservation)
+        .map_err(|e| SlashingError::ReconcileFailed(e.to_string()))?;
+    if changes > 1 {
+        return Err(SlashingError::ReconcileFailed(format!(
+            "targeted delete affected {changes} rows (cap is 1)"
+        )));
+    }
+
+    if let Some(before) = before {
+        let after = snapshot_watermarks(conn)?;
+        debug_assert_eq!(
+            before, after,
+            "reconcile_unsigned must not touch watermark tables (VD-S6)"
+        );
+    }
+
+    conn.execute_batch("COMMIT").map_err(|e| SlashingError::ReconcileFailed(e.to_string()))?;
+    Ok(changes == 1)
+}
+
+/// Targeted DELETE: `(pubkey, kind-discriminant, signing_root)`.
+/// `signing_root IS ?` is NULL-safe so a `None` reservation cannot match a
+/// different row that happens to have a non-NULL root.
+fn delete_reserved_row(
+    conn: &Connection,
+    pubkey: &str,
+    reservation: &CommittedReservation,
+) -> rusqlite::Result<usize> {
+    match reservation.kind {
+        ReservationKind::Block { slot } => conn.execute(
+            "DELETE FROM blocks
+             WHERE pubkey = ?1 AND slot = ?2 AND signing_root IS ?3",
+            (pubkey, slot as i64, &reservation.signing_root_hex),
+        ),
+        ReservationKind::Attestation { source, target } => conn.execute(
+            "DELETE FROM attestations
+             WHERE pubkey = ?1 AND source_epoch = ?2 AND target_epoch = ?3
+               AND signing_root IS ?4",
+            (pubkey, source as i64, target as i64, &reservation.signing_root_hex),
+        ),
+    }
+}
+
+fn snapshot_watermarks(conn: &Connection) -> Result<Vec<(String, String, i64)>, SlashingError> {
+    let mut stmt = conn.prepare(
+        "SELECT pubkey, watermark_type, value FROM watermarks ORDER BY pubkey, watermark_type",
+    )?;
+    let mapped = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+    let mut rows = Vec::new();
+    for row in mapped {
+        rows.push(row?);
+    }
+    Ok(rows)
+}
+
+fn record_reconcile(kind: ReservationKind, outcome: &str) {
+    metrics::RVC_SLASHING_RECONCILE_TOTAL.with_label_values(&[kind.metric_kind(), outcome]).inc();
+}
+
+/// `BEGIN IMMEDIATE` then `body`. Any `Err` from `body` is followed by exactly
+/// one `ROLLBACK` so the connection is never left mid-transaction. A successful
+/// `body` has already `COMMIT`ted or `ROLLBACK`ed (the all-rejected path).
+pub(crate) fn with_immediate_txn<T, F>(conn: &Connection, body: F) -> Result<T, SlashingError>
+where
+    F: FnOnce(&Connection) -> Result<T, SlashingError>,
+{
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match body(conn) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Consume the commit inject (if armed), run `insert`, then `COMMIT`.
+/// INSERT/COMMIT failures become [`SlashingError::ReserveCommitFailed`].
+pub(crate) fn persist_reserved_row(
+    db: &SlashingDb,
+    conn: &Connection,
+    insert: impl FnOnce() -> Result<(), SlashingError>,
+) -> Result<(), SlashingError> {
+    if db.take_injected_commit_failure() {
+        return Err(SlashingError::ReserveCommitFailed(
+            "injected commit failure (test-utils)".into(),
+        ));
+    }
+    insert()?;
+    conn.execute_batch("COMMIT").map_err(|e| SlashingError::ReserveCommitFailed(e.to_string()))
 }

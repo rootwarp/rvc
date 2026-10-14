@@ -37,6 +37,9 @@ pub struct TelemetryConfig {
     /// Binary version for `service.version` resource attribute.
     /// When `None`, falls back to the telemetry crate's own version.
     pub service_version: Option<String>,
+    /// OpenTelemetry `service.name` for resource and tracer (ADR-007 / TRC-1c).
+    /// When `None`, [`crate::init::init_tracing`] falls back to `"rvc"`.
+    pub service_name: Option<String>,
     /// Maximum number of spans queued for export (OTel SDK default: 2048).
     pub max_queue_size: Option<usize>,
     /// Maximum number of spans per export batch (OTel SDK default: 512).
@@ -62,6 +65,7 @@ impl Default for TelemetryConfig {
             sample_rate: 1.0,
             network: "mainnet".to_string(),
             service_version: None,
+            service_name: None,
             max_queue_size: None,
             max_export_batch_size: None,
         }
@@ -268,6 +272,19 @@ mod tests {
         let config =
             TelemetryConfig { service_version: Some("1.2.3".to_string()), ..Default::default() };
         assert_eq!(config.service_version.as_deref(), Some("1.2.3"));
+    }
+
+    #[test]
+    fn test_service_name_default_is_none() {
+        let config = TelemetryConfig::default();
+        assert!(config.service_name.is_none());
+    }
+
+    #[test]
+    fn test_service_name_custom() {
+        let config =
+            TelemetryConfig { service_name: Some("rvc-signer".to_string()), ..Default::default() };
+        assert_eq!(config.service_name.as_deref(), Some("rvc-signer"));
     }
 
     #[test]

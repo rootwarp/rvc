@@ -1,0 +1,41 @@
+{
+  "execution_optimistic": false,
+  "finalized": true,
+  "data": {
+    "ideal_rewards": [
+      {
+        "effective_balance": "2048000000000",
+        "head": "117376",
+        "target": "939008",
+        "source": "586880",
+        "inclusion_delay": "0",
+        "inactivity": "0"
+      },
+      {
+        "effective_balance": "33000000000",
+        "head": "1891",
+        "target": "15131",
+        "source": "9458",
+        "inclusion_delay": "0",
+        "inactivity": "0"
+      },
+      {
+        "effective_balance": "31000000000",
+        "head": "1777",
+        "target": "14213",
+        "source": "8882",
+        "inclusion_delay": "0",
+        "inactivity": "0"
+      }
+    ],
+    "total_rewards": [
+      {
+        "validator_index": "1",
+        "head": "1777",
+        "target": "14213",
+        "source": "8882",
+        "inactivity": "0"
+      }
+    ]
+  }
+}

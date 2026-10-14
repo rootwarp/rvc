@@ -7,15 +7,17 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use block_service::{BeaconBlockClient, BlockServiceError, ProduceBlockResponse};
+use block_service::{
+    BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse, WireBody,
+};
 use bn_manager::BeaconNodeClient;
-use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, Slot};
+use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContentsJson, Slot};
 
 /// Newtype adapter that implements [`BeaconBlockClient`] for any
 /// [`BeaconNodeClient`] (typically a proposer or main-pool `BnManager`).
 pub struct BeaconBlockAdapter(pub Arc<dyn BeaconNodeClient>);
 
-#[async_trait(?Send)]
+#[async_trait]
 impl BeaconBlockClient for BeaconBlockAdapter {
     async fn produce_block_v3(
         &self,
@@ -24,29 +26,45 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        let response = self
-            .0
+        self.0
             .produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor)
             .await
-            .map_err(|e| BlockServiceError::Beacon(e.to_string()))?;
+            .map_err(Into::into)
+    }
 
-        Ok(ProduceBlockResponse {
-            data: response.data,
-            is_blinded: response.is_blinded,
-            consensus_version: response.consensus_version,
-            execution_payload_value: response.execution_payload_value,
-            is_ssz: response.is_ssz,
-            ssz_bytes: response.ssz_bytes,
-        })
+    async fn produce_block_v4(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        self.0
+            .produce_block_v4(slot, randao_reveal, graffiti, builder_config)
+            .await
+            .map_err(Into::into)
     }
 
     async fn publish_block(
         &self,
         signed_block: &SignedBeaconBlock,
         consensus_version: &str,
+        builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         self.0
-            .publish_block(signed_block, consensus_version)
+            .publish_block(signed_block, consensus_version, builder_url)
+            .await
+            .map_err(|e| BlockServiceError::Beacon(e.to_string()))
+    }
+
+    async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        self.0
+            .publish_block_contents(contents, consensus_version, builder_url)
             .await
             .map_err(|e| BlockServiceError::Beacon(e.to_string()))
     }
@@ -67,9 +85,30 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         ssz_bytes: &[u8],
         consensus_version: &str,
         is_blinded: bool,
+        builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         self.0
-            .publish_block_ssz(ssz_bytes, consensus_version, is_blinded)
+            .publish_block_ssz(ssz_bytes, consensus_version, is_blinded, builder_url)
+            .await
+            .map_err(|e| BlockServiceError::Beacon(e.to_string()))
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
+    ) -> Result<(), BlockServiceError> {
+        self.0
+            .publish_execution_payload_envelope(
+                signed_envelope,
+                blobs,
+                kzg_proofs,
+                consensus_version,
+                broadcast_validation,
+            )
             .await
             .map_err(|e| BlockServiceError::Beacon(e.to_string()))
     }
@@ -78,10 +117,27 @@ impl BeaconBlockClient for BeaconBlockAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beacon::{
+        HEADER_ETH_BLOB_DATA_INCLUDED, HEADER_ETH_BUILDER_URL, HEADER_ETH_CONSENSUS_VERSION,
+        HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH,
+    };
     use block_service::BeaconBlockClient;
     use bn_manager::{BnManager, BnManagerConfig};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn sample_signed_block() -> SignedBeaconBlock {
+        SignedBeaconBlock {
+            message: eth_types::BeaconBlock {
+                slot: 100,
+                proposer_index: 42,
+                parent_root: [1u8; 32],
+                state_root: [2u8; 32],
+                body: vec![0xde, 0xad],
+            },
+            signature: vec![0xaa; 96],
+        }
+    }
 
     fn block_response_template(payload_value: &str) -> ResponseTemplate {
         ResponseTemplate::new(200)
@@ -149,6 +205,214 @@ mod tests {
         assert_eq!(produced.execution_payload_value.as_deref(), Some("111"));
     }
 
+    /// Production path: adapter forwards `produce_block_v4` onto BnManager (POST /eth/v4/...).
+    #[tokio::test]
+    async fn test_produce_block_v4_forwards_to_bn_manager() {
+        let server = MockServer::start().await;
+        let slot = 42u64;
+        let builder_config =
+            BuilderConfig { min_bid: 10_000_000, builder_boost_factor: 50, builders: Vec::new() };
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v4/validator/blocks/42"))
+            .and(body_json(&builder_config))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Eth-Consensus-Version", "gloas")
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Execution-Payload-Value", "4242")
+                    .insert_header(HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED, "true")
+                    .set_body_string(
+                        r#"{"data":{"slot":"42","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/42"))
+            .respond_with(block_response_template("v3-should-not-be-hit"))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+
+        let produced = adapter
+            .produce_block_v4(slot, "0xrandao", None, &builder_config)
+            .await
+            .expect("produce_block_v4");
+        assert_eq!(produced.execution_payload_value.as_deref(), Some("4242"));
+        assert_eq!(produced.consensus_version, "gloas");
+        assert!(produced.payload_included);
+    }
+
+    /// Production path: adapter echoes produce-time builder URL on publish.
+    #[tokio::test]
+    async fn test_publish_block_echoes_builder_url() {
+        let server = MockServer::start().await;
+        let builder = "https://builder.example.com/v1?cluster=a";
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .and(wiremock::matchers::header(HEADER_ETH_BUILDER_URL, builder))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        adapter
+            .publish_block(&sample_signed_block(), "deneb", Some(builder))
+            .await
+            .expect("publish_block");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let echoed = requests[0]
+            .headers
+            .get(HEADER_ETH_BUILDER_URL)
+            .expect("Eth-Builder-Url header must be present");
+        assert_eq!(echoed.to_str().unwrap(), builder);
+    }
+
+    /// Production path: no builder-URL header when produce omitted it.
+    #[tokio::test]
+    async fn test_publish_block_omits_builder_url_when_none() {
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        adapter.publish_block(&sample_signed_block(), "deneb", None).await.expect("publish_block");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].headers.get(HEADER_ETH_BUILDER_URL).is_none(),
+            "must not send {HEADER_ETH_BUILDER_URL} when builder_url is None"
+        );
+    }
+
+    /// Production path: adapter echoes produce-time builder URL on SSZ publish.
+    #[tokio::test]
+    async fn test_publish_block_ssz_echoes_builder_url() {
+        let server = MockServer::start().await;
+        let builder = "https://relay.example/ssz";
+        let ssz_bytes = vec![0x01, 0x02, 0x03];
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .and(wiremock::matchers::header(HEADER_ETH_BUILDER_URL, builder))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        adapter
+            .publish_block_ssz(&ssz_bytes, "deneb", false, Some(builder))
+            .await
+            .expect("publish_block_ssz");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let echoed = requests[0]
+            .headers
+            .get(HEADER_ETH_BUILDER_URL)
+            .expect("Eth-Builder-Url header must be present");
+        assert_eq!(echoed.to_str().unwrap(), builder);
+    }
+
+    /// Production path: SSZ publish sends no builder-URL header when produce omitted it.
+    #[tokio::test]
+    async fn test_publish_block_ssz_omits_builder_url_when_none() {
+        let server = MockServer::start().await;
+        let ssz_bytes = vec![0x01, 0x02, 0x03];
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        adapter
+            .publish_block_ssz(&ssz_bytes, "deneb", false, None)
+            .await
+            .expect("publish_block_ssz");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(
+            requests[0].headers.get(HEADER_ETH_BUILDER_URL).is_none(),
+            "must not send {HEADER_ETH_BUILDER_URL} when builder_url is None"
+        );
+    }
+
+    /// Production path: envelope publish uses block-publish policy, never produce failover.
+    #[tokio::test]
+    async fn test_publish_execution_payload_envelope_forwards_and_not_production_failover() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        let envelope = WireBody::Json(serde_json::json!({"message": {}, "signature": "0xaa"}));
+        let blobs = WireBody::Json(serde_json::json!(["0xbb"]));
+        let proofs = WireBody::Json(serde_json::json!(["0xaa"]));
+
+        Mock::given(method("POST"))
+            .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad envelope"))
+            .expect(1)
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&secondary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v4/validator/blocks/1"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&primary)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![primary.uri(), secondary.uri()]))
+            .expect("BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        adapter
+            .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
+            .await
+            .expect("broadcast/submit succeeds if any BN accepts");
+
+        let primary_reqs = primary.received_requests().await.unwrap();
+        let secondary_reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(primary_reqs.len(), 1, "broadcast hits the first BN");
+        assert_eq!(secondary_reqs.len(), 1, "broadcast hits the second BN; not query_failover");
+        let blob_header = secondary_reqs[0]
+            .headers
+            .get(HEADER_ETH_BLOB_DATA_INCLUDED)
+            .expect("Eth-Blob-Data-Included");
+        assert_eq!(blob_header.to_str().unwrap(), "true");
+        assert_eq!(
+            secondary_reqs[0].headers.get(HEADER_ETH_CONSENSUS_VERSION).unwrap().to_str().unwrap(),
+            "gloas"
+        );
+    }
+
     /// Configured proposer pool is preferred: request goes to proposer endpoint,
     /// not the main-pool endpoint.
     #[tokio::test]
@@ -183,5 +447,109 @@ mod tests {
             .await
             .expect("proposer-pool produce_block_v3");
         assert_eq!(produced.execution_payload_value.as_deref(), Some("proposer-value"));
+    }
+
+    /// Pins that the adapter hop keeps all ProduceBlockResponse fields,
+    /// including the SSZ pair that a field-copy can drop. Passes with the
+    /// current copy and after it is deleted.
+    #[tokio::test]
+    async fn beacon_adapter_preserves_all_fields_for_an_ssz_response() {
+        let server = MockServer::start().await;
+        let ssz_payload = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04];
+
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/500"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(ssz_payload.clone(), "application/octet-stream")
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Consensus-Version", "deneb")
+                    .insert_header("Eth-Execution-Payload-Value", "99999"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("ssz BnManager");
+        let adapter = BeaconBlockAdapter(Arc::new(manager));
+
+        let produced = adapter
+            .produce_block_v3(500, "0xrandao", None, None)
+            .await
+            .expect("ssz produce_block_v3");
+
+        assert_eq!(produced.data, serde_json::Value::Null);
+        assert!(!produced.is_blinded);
+        assert_eq!(produced.consensus_version, "deneb");
+        assert_eq!(produced.execution_payload_value.as_deref(), Some("99999"));
+        assert!(produced.is_ssz);
+        assert_eq!(produced.ssz_bytes.as_deref(), Some(ssz_payload.as_slice()));
+        assert!(!produced.payload_included);
+        assert!(produced.builder_url.is_none());
+        assert!(produced.consensus_block_value.is_none());
+    }
+
+    fn electra_signed_block_contents() -> SignedBlockContentsJson {
+        let signed = SignedBeaconBlock {
+            message: eth_types::external_vector_electra_block(),
+            signature: vec![0xaa; eth_types::SIGNATURE_BYTES_LEN],
+        };
+        SignedBlockContentsJson::from_signed_block(
+            &signed,
+            vec![vec![0x11; 48]],
+            vec![vec![0x22; 8]],
+            eth_types::BodyForkLayout::Electra,
+        )
+        .expect("electra body encodes")
+    }
+
+    /// Blocks topic off, so a 503 on BN-1 must fail over instead of broadcasting.
+    #[tokio::test]
+    async fn publish_block_contents_reaches_a_healthy_bn_when_the_first_is_down() {
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        let contents = electra_signed_block_contents();
+
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+            .expect(1)
+            .mount(&primary)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&secondary)
+            .await;
+
+        let mut config = BnManagerConfig::new(vec![primary.uri(), secondary.uri()]);
+        config.broadcast_topics.blocks = false;
+        let manager = Arc::new(BnManager::new(config).expect("BnManager"));
+        let adapter = BeaconBlockAdapter(manager.clone() as Arc<dyn BeaconNodeClient>);
+
+        adapter
+            .publish_block_contents(&contents, "electra", None)
+            .await
+            .expect("failover publish_block_contents");
+
+        let primary_reqs = primary.received_requests().await.unwrap();
+        let secondary_reqs = secondary.received_requests().await.unwrap();
+        assert_eq!(primary_reqs.len(), 1, "BN-1 is attempted once");
+        assert_eq!(secondary_reqs.len(), 1, "healthy BN receives exactly one POST");
+        let body: serde_json::Value =
+            serde_json::from_slice(&secondary_reqs[0].body).expect("json body");
+        let expected = serde_json::to_value(&contents).expect("serialize contents");
+        assert_eq!(body, expected);
+        assert!(body["signed_block"].is_object(), "{body}");
+        assert!(
+            body["kzg_proofs"].is_array() && !body["kzg_proofs"].as_array().unwrap().is_empty()
+        );
+        assert!(body["blobs"].is_array() && !body["blobs"].as_array().unwrap().is_empty());
+
+        let trackers = manager.health_trackers().read().await;
+        assert_eq!(trackers[0].endpoint(), primary.uri());
+        assert!(trackers[0].error_rate() > 0.0, "BN-1's health tracker must record the 503");
     }
 }

@@ -176,3 +176,63 @@ async fn test_sign_builder_registration_blocked_by_doppelganger() {
         "expected BlockedByDoppelganger, got: {result:?}"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_payload_attestation_blocked_by_doppelganger() {
+    let sk = SecretKey::generate();
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, Arc::clone(&db));
+
+    let signing_root: Root = [0x88; 32];
+    let result = gate.sign_payload_attestation(&pubkey, signing_root).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+        "expected BlockedByDoppelganger, got: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_proposer_preferences_blocked_by_doppelganger() {
+    let sk = SecretKey::generate();
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, Arc::clone(&db));
+
+    let signing_root: Root = [0x99; 32];
+    let result = gate.sign_proposer_preferences(&pubkey, signing_root).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+        "expected BlockedByDoppelganger, got: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_builder_request_auth_blocked_by_doppelganger() {
+    let sk = SecretKey::generate();
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, Arc::clone(&db));
+
+    let signing_root: Root = [0x99; 32];
+    let result = gate.sign_builder_request_auth(&pubkey, signing_root).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+        "expected BlockedByDoppelganger, got: {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sign_execution_payload_envelope_blocked_by_doppelganger() {
+    let sk = SecretKey::generate();
+    let db = common::open_db();
+    let (pubkey, gate) = common::gate_denied(sk, Arc::clone(&db));
+
+    let signing_root: Root = [0xaa; 32];
+    let result = gate.sign_execution_payload_envelope(&pubkey, signing_root).await;
+
+    assert!(
+        matches!(result, Err(SigningGateError::BlockedByDoppelganger)),
+        "expected BlockedByDoppelganger, got: {result:?}"
+    );
+}

@@ -1,0 +1,79 @@
+{
+  "beacon_url": "http://top-level:5052",
+  "beacon_nodes": [
+    "http://bn-a:5052",
+    "http://bn-b:5052"
+  ],
+  "keystore_path": "/tmp/top/keystores",
+  "password_file": "/tmp/top/passwords.txt",
+  "slashing_db_path": "/tmp/top/slashing.sqlite",
+  "allow_fresh_db": true,
+  "allow_unsupported_fork": true,
+  "metrics_address": "0.0.0.0",
+  "metrics_port": 9091,
+  "network": "hoodi",
+  "genesis_time": 1606824023,
+  "genesis_validators_root": "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95",
+  "graffiti": "top-level",
+  "log_level": "debug",
+  "doppelganger_detection": false,
+  "key_decrypt_threads": 4,
+  "secret_provider": {
+    "providers": [],
+    "strict": false,
+    "gcp": {
+      "secret_prefix": "validator-key-"
+    }
+  },
+  "disable_attesting": true,
+  "slashed_validators_action": "shutdown",
+  "disable_keystore_locking": true,
+  "logfile": {
+    "max_size": 200,
+    "max_number": 5,
+    "compress": false
+  },
+  "tracing": {
+    "exporter": "otlp"
+  },
+  "keymanager": {
+    "enabled": false,
+    "allow_insecure_remote_signer": false,
+    "body_limit": 10485760
+  },
+  "grpc_signer": {},
+  "proposer_config": {
+    "refresh_interval": 384,
+    "url_insecure": false
+  },
+  "monitoring": {
+    "interval": 384,
+    "endpoint_insecure": false
+  },
+  "builder_limits": {
+    "circuit_breaker_consecutive_limit": 3,
+    "circuit_breaker_epoch_limit": 5
+  },
+  "timing": {
+    "attestation_due_bps": 3333,
+    "aggregate_due_bps": 6667,
+    "attestation_due_bps_gloas": 2500,
+    "aggregate_due_bps_gloas": 5000,
+    "sync_message_due_bps_gloas": 2500,
+    "contribution_due_bps_gloas": 5000,
+    "payload_due_bps": 5000,
+    "payload_attestation_due_bps": 7500
+  },
+  "fork_schedule": {},
+  "proposer_nodes": [
+    "http://proposer-top:5052"
+  ],
+  "broadcast": [
+    "sync-committee"
+  ],
+  "block_selection_mode": "builder-only",
+  "validator_registration_batch_size": 250,
+  "validator_registration_batch_delay": 100,
+  "validators_config": "/tmp/top/validators.toml",
+  "beacon_max_body_bytes": 1048576
+}

@@ -4,12 +4,14 @@
 //! and block publication through the beacon node API.
 
 mod error;
+pub mod metrics;
 mod service;
 mod traits;
 mod types;
 mod validation;
 
+pub use beacon::{BuilderConfig, ProduceBlockResponse, WireBody};
 pub use error::BlockServiceError;
 pub use service::{BlockProposalResult, BlockService};
-pub use traits::{BeaconBlockClient, ProduceBlockResponse};
+pub use traits::{BeaconBlockClient, BuilderConfigProvider};
 pub use types::BlockSelectionMode;

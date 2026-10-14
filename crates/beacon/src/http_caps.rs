@@ -2,9 +2,10 @@
 //!
 //! `ResponseCaps` holds the configurable ceiling for JSON body sizes.
 //! SSE event size is capped in `bn-manager::sse::DEFAULT_MAX_SSE_EVENT_BYTES`
-//! (single source of truth). `read_body_capped` streams the response body in
-//! chunks, counting bytes, and returns `BeaconError::BodyTooLarge` before
-//! allocating more than the configured cap.
+//! (single source of truth) while the frame is read, before the line or the
+//! `data` / `event` / `id` fields grow past it. `read_body_capped` streams the
+//! response body in chunks, counting bytes, and returns
+//! `BeaconError::BodyTooLarge` before allocating more than the configured cap.
 
 use bytes::Bytes;
 

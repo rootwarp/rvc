@@ -26,6 +26,8 @@
 #![allow(unsafe_code)]
 
 use crypto::insecure::{InsecureGate, InsecureMode};
+use rvc::config::{Config, StartArgs};
+use std::io::Write;
 
 const ENV_VAR: &str = "RVC_METRICS_ALLOW_NON_LOOPBACK";
 
@@ -98,4 +100,14 @@ fn test_non_loopback_metrics_env_var_must_be_true_literal() {
     with_env_var(Some("TRUE"), || {
         assert!(metrics_gate().check().is_err(), "env=\"TRUE\" must not bypass the gate");
     });
+}
+
+/// ADR-009 falsifier: a TOML `metrics_port = 9090` is the bind port when the
+/// clap flag is absent. Same shape as the L-10 gate tests — no full process.
+#[test]
+fn toml_metrics_port_9090_binds_9090() {
+    let mut file = tempfile::NamedTempFile::new().expect("temp config");
+    writeln!(file, "metrics_port = 9090").expect("write");
+    let cfg = Config::load(Some(file.path()), StartArgs::default()).expect("load");
+    assert_eq!(cfg.metrics_port, 9090);
 }

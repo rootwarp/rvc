@@ -178,13 +178,15 @@ pub(crate) async fn build_dvt_backend(
 
     let peer_requester = if !peer_infos.is_empty() {
         let requester =
-            dvt::peer_client::GrpcPeerRequester::connect(&peer_infos, tls_config, timeout)
+            dvt::peer_client::GrpcPeerRequester::connect(&peer_infos, tls_config, timeout, timeout)
                 .await
                 .map_err(|e| {
                     ServerError::backend(format!("failed to connect to DVT peers: {e}"))
                 })?;
 
-        tracing::info!(peers = ?requester.peer_addrs(), "Connected to DVT peers");
+        for addr in requester.peer_addrs() {
+            tracing::warn!(peer = %addr, "DVT peer configured, not yet reachable");
+        }
         Some(Arc::new(requester) as Arc<dyn backend::dvt::PeerRequester>)
     } else {
         tracing::info!("No DVT peers configured; running in standalone mode");
@@ -266,6 +268,9 @@ mod tests {
             data_dir: Some(data_dir),
             disable_slashing_protection: false,
             init_slashing_db: false,
+            group_commit_batch_size: None,
+            group_commit_wait_to_fill_ms: None,
+            gloas_fork_epoch: u64::MAX,
             metrics_address: "127.0.0.1:0".to_string(),
             enable_log_reload: false,
             allowed_client_cns: None,

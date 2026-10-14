@@ -11,7 +11,21 @@ pub const DOMAIN_SYNC_COMMITTEE: DomainType = [0x07, 0x00, 0x00, 0x00];
 pub const DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF: DomainType = [0x08, 0x00, 0x00, 0x00];
 pub const DOMAIN_CONTRIBUTION_AND_PROOF: DomainType = [0x09, 0x00, 0x00, 0x00];
 pub const DOMAIN_BLS_TO_EXECUTION_CHANGE: DomainType = [0x0A, 0x00, 0x00, 0x00];
+pub const DOMAIN_PTC_ATTESTER: DomainType = [0x0C, 0x00, 0x00, 0x00];
+pub const DOMAIN_PROPOSER_PREFERENCES: DomainType = [0x0D, 0x00, 0x00, 0x00];
 pub const DOMAIN_APPLICATION_BUILDER: DomainType = [0x00, 0x00, 0x00, 0x01];
+/// consensus-specs `DOMAIN_BEACON_BUILDER` (`0x0B000000`).
+///
+/// Self-build `ExecutionPayloadEnvelope` only (D20, ADR-010): the proposer
+/// signs when `builder_index == BUILDER_INDEX_SELF_BUILD`. Bids and
+/// external-builder envelopes stay builder-signed. Distinct from
+/// builder-specs `DOMAIN_BUILDER_REQUEST_AUTH` (`0x0B000001`).
+pub const DOMAIN_BEACON_BUILDER: DomainType = [0x0B, 0x00, 0x00, 0x00];
+/// builder-specs `DOMAIN_BUILDER_REQUEST_AUTH` (`ethereum/builder-specs@38f11441c194d150386f567b4d7087ec86d4118c`).
+///
+/// Distinct `DomainType` `0x0B000001`, **not** a suffix of consensus-specs
+/// `DOMAIN_BEACON_BUILDER` (`0x0B000000`) and not in consensus-specs.
+pub const DOMAIN_BUILDER_REQUEST_AUTH: DomainType = [0x0B, 0x00, 0x00, 0x01];
 
 #[cfg(test)]
 mod tests {
@@ -50,7 +64,12 @@ mod tests {
                 DOMAIN_BLS_TO_EXECUTION_CHANGE,
                 [0x0A, 0x00, 0x00, 0x00],
             ),
+            ("DOMAIN_PTC_ATTESTER", DOMAIN_PTC_ATTESTER, [0x0C, 0x00, 0x00, 0x00]),
+            ("DOMAIN_PROPOSER_PREFERENCES", DOMAIN_PROPOSER_PREFERENCES, [0x0D, 0x00, 0x00, 0x00]),
             ("DOMAIN_APPLICATION_BUILDER", DOMAIN_APPLICATION_BUILDER, [0x00, 0x00, 0x00, 0x01]),
+            ("DOMAIN_BEACON_BUILDER", DOMAIN_BEACON_BUILDER, [0x0B, 0x00, 0x00, 0x00]),
+            // builder-specs (not consensus-specs): DOMAIN_BUILDER_REQUEST_AUTH 0x0B000001
+            ("DOMAIN_BUILDER_REQUEST_AUTH", DOMAIN_BUILDER_REQUEST_AUTH, [0x0B, 0x00, 0x00, 0x01]),
         ];
         for (name, actual, expected) in table {
             assert_eq!(actual, expected, "{name} must match consensus-specs DomainType");
@@ -58,7 +77,7 @@ mod tests {
 
         // Timing / consensus-spec metadata (replaces three lib.rs constant-echo tests).
         assert_eq!(crate::SLOTS_PER_EPOCH, 32, "SLOTS_PER_EPOCH");
-        assert_eq!(crate::SECONDS_PER_SLOT, 12, "SECONDS_PER_SLOT");
+        assert_eq!(crate::SLOT_DURATION_MS, 12_000, "SLOT_DURATION_MS");
         assert_eq!(crate::CONSENSUS_SPEC_VERSION, "v1.5.0-alpha.12", "CONSENSUS_SPEC_VERSION");
     }
 
@@ -76,7 +95,11 @@ mod tests {
             DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
             DOMAIN_CONTRIBUTION_AND_PROOF,
             DOMAIN_BLS_TO_EXECUTION_CHANGE,
+            DOMAIN_PTC_ATTESTER,
+            DOMAIN_PROPOSER_PREFERENCES,
             DOMAIN_APPLICATION_BUILDER,
+            DOMAIN_BEACON_BUILDER,
+            DOMAIN_BUILDER_REQUEST_AUTH,
         ];
         for i in 0..domains.len() {
             for j in (i + 1)..domains.len() {

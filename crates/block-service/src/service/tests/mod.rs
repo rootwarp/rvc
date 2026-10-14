@@ -5,9 +5,12 @@
 
 // Re-exports for topic submodules (`use super::*`).
 pub(super) use super::{
-    compute_blinded_block_root, compute_block_root, ssz_block_format, BlockService,
+    compute_blinded_block_root, compute_block_root, gloas_header_and_root, ssz_block_format,
+    BlockService, PayloadDeadline,
 };
-pub(super) use crate::traits::{BeaconBlockClient, ProduceBlockResponse};
+pub(super) use crate::traits::{
+    BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse,
+};
 pub(super) use crate::types::BlockSelectionMode;
 pub(super) use crate::BlockServiceError;
 pub(super) use crypto::PublicKey;
@@ -19,5 +22,8 @@ mod mocks;
 pub(crate) use mocks::*;
 
 mod boost;
+mod envelope;
+mod json;
 mod propose;
 mod ssz;
+mod v4;

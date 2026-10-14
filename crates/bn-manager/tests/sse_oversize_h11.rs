@@ -1,7 +1,8 @@
 /// H-11: SSE caps integration tests.
 ///
 /// Verifies:
-/// 1. Per-event size cap: events > 64 KiB are dropped with a warn; loop continues.
+/// 1. Per-event size cap: a frame past 64 KiB closes the connection and counts
+///    as a failure (reconnect / failover). It is not skipped in place.
 /// 2. Content-Type check: wrong CT causes connection drop.
 /// 3. Bounded mpsc dispatch: full channel drops events; loop continues.
 use std::sync::{
@@ -69,31 +70,55 @@ fn sse_event_line(event_type: &str, data: &str) -> String {
     format!("event: {event_type}\ndata: {data}\n\n")
 }
 
-// ── H-11 test 1: oversize event dropped; loop continues ──────────────────────
+/// Send `body` and hold the socket open so a client that skips the frame in
+/// place never observes end-of-stream.
+async fn start_holding_sse_server(body: String) -> (u16, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else { break };
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = stream.write_all(headers.as_bytes()).await;
+                let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
+                let _ = stream.write_all(chunk.as_bytes()).await;
+                let _ = stream.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            });
+        }
+    });
+    (port, handle)
+}
+
+// ── H-11 test 1: oversize frame closes the connection and fails over ─────────
 
 #[tokio::test]
-async fn test_oversize_event_dropped() {
-    // 128 KiB event data (exceeds 64 KiB default cap)
+async fn test_oversize_event_fails_over() {
+    // 128 KiB event data (exceeds the 64 KiB default cap). The socket stays
+    // open afterwards: skipping the frame in place would never fail over.
     let huge_data = "x".repeat(128 * 1024);
-    let normal_event = sse_event_line("head", &head_event_json(1));
     let huge_event = sse_event_line("head", &huge_data);
-    let normal_event2 = sse_event_line("head", &head_event_json(2));
+    let (primary_port, primary_handle) = start_holding_sse_server(huge_event).await;
 
-    // Body: [oversize event] [normal event]  — loop should drop the oversize one
-    // and still dispatch the normal one.
-    let sse_body = format!("{huge_event}{normal_event}{normal_event2}");
-
-    let (port, server_handle) = start_sse_server(sse_body).await;
+    let normal_event = sse_event_line("head", &head_event_json(2));
+    let (secondary_port, secondary_handle) = start_sse_server(normal_event).await;
 
     let received: Arc<AtomicUsize> = Arc::new(AtomicUsize::new(0));
     let received_clone = received.clone();
 
     let (tx_shutdown, rx_shutdown) = watch::channel(false);
-    let config = SseConfig::new(format!("http://127.0.0.1:{port}"));
+    let configs = vec![
+        SseConfig::new(format!("http://127.0.0.1:{primary_port}")),
+        SseConfig::new(format!("http://127.0.0.1:{secondary_port}")),
+    ];
 
     let handle = tokio::spawn(async move {
         subscribe_events(
-            vec![config],
+            configs,
             move |_event: SseEvent| {
                 received_clone.fetch_add(1, Ordering::Relaxed);
             },
@@ -102,21 +127,24 @@ async fn test_oversize_event_dropped() {
         .await;
     });
 
-    // Wait for events
-    for _ in 0..30 {
+    // Three failures on the primary (500 ms apart) then the secondary.
+    for _ in 0..80 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        if received.load(Ordering::Relaxed) >= 2 {
+        if received.load(Ordering::Relaxed) >= 1 {
             break;
         }
     }
 
     tx_shutdown.send(true).unwrap();
-    let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
-    server_handle.abort();
+    let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    primary_handle.abort();
+    secondary_handle.abort();
 
     let got = received.load(Ordering::Relaxed);
-    // The two normal events must be received; the huge event must be dropped.
-    assert!(got >= 2, "expected at least 2 normal events, got {got}");
+    assert!(
+        got >= 1,
+        "oversize frame must count as a failure and fail over to the secondary, got {got}"
+    );
 }
 
 // ── H-11 test 2: wrong Content-Type drops connection ─────────────────────────

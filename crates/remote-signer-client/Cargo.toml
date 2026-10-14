@@ -1,0 +1,37 @@
+[package]
+name = "rvc-remote-signer-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Web3Signer HTTP remote signer client"
+
+[lints]
+workspace = true
+
+[features]
+test-utils = []
+
+[dependencies]
+async-trait.workspace = true
+crypto.workspace = true
+eth-types.workspace = true
+hex.workspace = true
+observability.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+telemetry.workspace = true
+tracing.workspace = true
+web3signer-wire.workspace = true
+
+[dev-dependencies]
+eth-types = { workspace = true, features = ["test-fixtures"] }
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+wiremock.workspace = true

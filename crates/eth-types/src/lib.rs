@@ -3,14 +3,17 @@ use ssz_derive::{Decode, Encode};
 use tree_hash_derive::TreeHash;
 
 mod aggregation;
-mod attestation;
+mod aggregator;
 mod block;
 /// Typed BeaconBlockBody containers + SSZ decode (SEC-6b; foundation for SEC-6c wire).
 ///
-/// Body-path sub-containers that collide with crate-root names are `Wire*` twins
-/// (ssz 0.9 vs ethereum_ssz 0.8); see the twin table in `block_body` module docs.
+/// Path C (ARCH-7h): one struct per container. Crate-root types carry both
+/// `ssz` 0.9 and `ssz08` 0.8 codecs; see `block_body` module docs.
 pub mod block_body;
+/// JSON ↔ SSZ block-body codec. SSZ stays canonical. Produce and JSON publish call it.
+pub mod block_body_json;
 mod builder;
+mod builder_request_auth;
 pub mod canonical;
 mod deposit;
 mod domains;
@@ -18,7 +21,11 @@ mod duties;
 mod fork;
 pub(crate) mod hex_fixed;
 pub mod networks;
+mod payload_attestation;
+mod proposer_preferences;
 pub(crate) mod serde_signature;
+/// Beacon-API `SignedBlockContents` JSON. Body is an object. JSON publish sends this.
+pub mod signed_block_contents_json;
 pub mod ssz_helpers;
 mod sync_committee;
 pub(crate) mod tree_hash_utils;
@@ -26,20 +33,21 @@ pub use aggregation::{
     AggregateAndProof, Attestation, ElectraAggregateAndProof, ElectraAttestation,
     SignedAggregateAndProof, SignedElectraAggregateAndProof,
 };
-pub use attestation::SingleAttestation;
 pub use block::{
-    body_fork_layout, kzg_commitment_list_root, BeaconBlock, BeaconBlockBody, BeaconBlockHeader,
-    BlindedBeaconBlock, BlindedBeaconBlockBody, BlobSidecar, BlockContents, BodyForkLayout,
-    ProducedBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    body_fork_layout, expected_kzg_proof_count, kzg_commitment_list_root, BeaconBlock,
+    BeaconBlockBody, BeaconBlockHeader, BlindedBeaconBlock, BlindedBeaconBlockBody, BlockContents,
+    BlockContentsShapeError, BodyForkLayout, KzgProofCountError, ProducedBlock, SignedBeaconBlock,
+    SignedBlindedBeaconBlock, CELLS_PER_EXT_BLOB,
 };
 pub use block_body::{
     blinded_body_tree_hash_root, blinded_body_tree_hash_root_for_layout, body_tree_hash_root,
     body_tree_hash_root_for_layout, decode_beacon_block_body_deneb,
     decode_beacon_block_body_electra, decode_blinded_beacon_block_body_deneb,
-    decode_blinded_beacon_block_body_electra, BeaconBlockBodyDeneb, BeaconBlockBodyElectra,
-    BlindedBeaconBlockBodyDeneb, BlindedBeaconBlockBodyElectra, BodySszError, ExecutionPayload,
-    ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
+    decode_blinded_beacon_block_body_electra, try_electra_aggregation_bits, BeaconBlockBodyDeneb,
+    BeaconBlockBodyElectra, BlindedBeaconBlockBodyDeneb, BlindedBeaconBlockBodyElectra,
+    BodySszError, ExecutionPayload, ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
 };
+pub use signed_block_contents_json::SignedBlockContentsJson;
 
 /// Deterministic SSZ/KAT bodies and known roots for tests (RF3-19 / G5).
 ///
@@ -64,19 +72,27 @@ pub mod fixtures {
 
 // Crate-root re-exports so existing `eth_types::external_vector_*` / `EXTERNAL_*`
 // paths keep working when the feature is on (dev builds / tests).
+pub use aggregator::is_aggregator;
 pub use builder::{SignedValidatorRegistration, ValidatorRegistrationV1};
+pub use builder_request_auth::{
+    BuilderRequestAuth, BuilderRequestAuthError, SignedBuilderRequestAuth,
+    MAX_BUILDER_AUTH_DATA_SIZE,
+};
 pub use deposit::{BLSToExecutionChange, DepositData, DepositMessage, SignedBLSToExecutionChange};
 pub use domains::{
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE, DOMAIN_CONTRIBUTION_AND_PROOF,
-    DOMAIN_DEPOSIT, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_BLS_TO_EXECUTION_CHANGE,
+    DOMAIN_BUILDER_REQUEST_AUTH, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_DEPOSIT,
+    DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 pub use duties::{ProposerDuty, SignedVoluntaryExit, VoluntaryExit};
 #[cfg(feature = "test-fixtures")]
 pub use fixtures::*;
 pub use fork::{ForkName, ForkSchedule, ParseForkNameError, UnknownForkIdError};
 pub use networks::{from_name as network_from_name, NetworkPreset, ALL as NETWORK_PRESETS};
+pub use payload_attestation::{PayloadAttestationData, PayloadAttestationMessage};
+pub use proposer_preferences::{ProposerPreferences, SignedProposerPreferences};
 pub use ssz_helpers::{
     decode_attestation_ssz, decode_beacon_block_ssz, decode_blinded_beacon_block_ssz,
     decode_sync_committee_contribution_ssz, encode_attestation_ssz, encode_beacon_block_ssz,
@@ -103,7 +119,7 @@ pub type Signature = Vec<u8>;
 pub const SIGNATURE_BYTES_LEN: usize = 96;
 
 pub const SLOTS_PER_EPOCH: u64 = 32;
-pub const SECONDS_PER_SLOT: u64 = 12;
+pub const SLOT_DURATION_MS: u64 = 12_000;
 pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
 
 /// SSZ preset bound on a single committee's size. Sets the `Bitlist[N]` limit for a pre-Electra

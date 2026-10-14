@@ -131,7 +131,7 @@ mod tests {
     use tree_hash::MerkleHasher;
 
     /// Pins `subcommittee_index` to the legacy expression that used to live in
-    /// both `sync-service` and the orchestrator (F99 / RF3-20).
+    /// the orchestrator (F99 / RF3-20).
     #[test]
     fn test_subcommittee_index_matches_both_legacy_closures() {
         for pos in 0..SYNC_COMMITTEE_SIZE {
@@ -438,6 +438,7 @@ mod tests {
     }
 
     #[test]
+    // kat_exempt: field-sensitivity — different beacon_block_root must yield different roots; not a container-root KAT
     fn test_sync_committee_contribution_tree_hash_field_sensitivity_block_root() {
         let contrib1 = sample_contribution();
         let mut contrib2 = contrib1.clone();

@@ -2,16 +2,30 @@
 
 mod builder;
 mod error;
+mod knobs;
 mod network;
+mod start;
 mod types;
 
 pub use bn_manager::BnRole;
 pub use builder::ServiceBuilder;
+pub(crate) use builder::{
+    clear_completed_import_sidecars, doppelganger_import_window, import_sidecar_pubkey,
+    ImportSidecarKind,
+};
 pub use error::ConfigError;
+pub use knobs::OPERATOR_KNOB_NAMES;
 pub use network::Network;
+pub use rvc_config::ConfigSource;
+pub use start::{BuilderArgs, LoggingArgs, ProposerArgs, StartArgs};
 pub use types::{
-    redact_url, BeaconNodeEntry, BroadcastTopic, BuilderLimits, CliOverrides, Config,
-    GcpSecretConfig, GrpcSignerConfig, KeymanagerConfig, LogfileConfig, MonitoringConfig,
-    ProposerConfigSource, SecretProviderConfig, SlashedAction, TracingConfig, TracingExporter,
+    redact_url, BeaconArgs, BeaconConfig, BeaconNodeEntry, BroadcastTopic, BuilderLimits,
+    BuilderLimitsArgs, BuilderSettings, Config, DutiesArgs, DutiesConfig, ForkScheduleConfig,
+    GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs, GrpcSignerConfig, KeymanagerArgs,
+    KeymanagerConfig, KeysArgs, KeysConfig, LogfileArgs, LogfileConfig, MonitoringArgs,
+    MonitoringConfig, NetworkArgs, NetworkConfig, ProposerConfigArgs, ProposerConfigSource,
+    SafetyArgs, SafetyConfig, SecretProviderArgs, SecretProviderConfig, ServerArgs, ServerConfig,
+    SlashedAction, SlashingArgs, SlashingConfig, TimingConfig, TracingArgs, TracingConfig,
+    TracingExporter, DEFAULT_TRACING_SAMPLE_RATE,
 };
 pub use validator_store::BlockSelectionMode;

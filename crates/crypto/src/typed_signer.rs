@@ -7,11 +7,13 @@
 use async_trait::async_trait;
 
 use eth_types::{
-    AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, ContributionAndProof,
-    Epoch, ForkInfo, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
-    DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
-    DOMAIN_BEACON_PROPOSER, DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_RANDAO, DOMAIN_SYNC_COMMITTEE,
-    DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
+    AggregateAndProof, AttestationData, BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock,
+    BuilderRequestAuth, ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo,
+    PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
+    VoluntaryExit, DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
+    DOMAIN_BEACON_BUILDER, DOMAIN_BEACON_PROPOSER, DOMAIN_BUILDER_REQUEST_AUTH,
+    DOMAIN_CONTRIBUTION_AND_PROOF, DOMAIN_PROPOSER_PREFERENCES, DOMAIN_PTC_ATTESTER, DOMAIN_RANDAO,
+    DOMAIN_SYNC_COMMITTEE, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_VOLUNTARY_EXIT,
 };
 
 use crate::bls::{PublicKey, Signature};
@@ -30,6 +32,7 @@ use eth_types::{ForkName, ForkSchedule, SyncAggregatorSelectionData};
 /// (gRPC remote path). Callers that already know the active fork from a
 /// [`ForkSchedule`] should set [`Self::fork_name`] directly; use
 /// [`Self::resolve`] when only version bytes are available.
+#[derive(Clone)]
 pub struct SignContext {
     pub pubkey: PublicKey,
     pub fork_info: ForkInfo,
@@ -92,6 +95,19 @@ pub trait TypedSigner: Send + Sync {
         ctx: &SignContext,
     ) -> Result<Signature, SigningError>;
 
+    /// Sign a five-leaf beacon block header (DOMAIN_BEACON_PROPOSER).
+    ///
+    /// Default: unsupported. Local and gRPC remotes that can hash the header
+    /// (or forward it on the wire) must override.
+    async fn sign_block_header(
+        &self,
+        header: &BeaconBlockHeader,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (header, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "block_header" })
+    }
+
     /// Sign a blinded beacon block (DOMAIN_BEACON_PROPOSER).
     async fn sign_blinded_block(
         &self,
@@ -112,6 +128,19 @@ pub trait TypedSigner: Send + Sync {
         agg: &AggregateAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError>;
+
+    /// Sign an Electra aggregate-and-proof (DOMAIN_AGGREGATE_AND_PROOF).
+    ///
+    /// Default: unsupported. Distinct from [`Self::sign_aggregate_and_proof`]
+    /// because the inner attestation SSZ layout differs.
+    async fn sign_electra_aggregate_and_proof(
+        &self,
+        agg: &ElectraAggregateAndProof,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (agg, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "electra_aggregate_and_proof" })
+    }
 
     /// Sign a sync committee message (DOMAIN_SYNC_COMMITTEE).
     async fn sign_sync_committee_message(
@@ -166,6 +195,77 @@ pub trait TypedSigner: Send + Sync {
         exit: &VoluntaryExit,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError>;
+
+    /// Sign payload attestation data (`DOMAIN_PTC_ATTESTER`).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override.
+    async fn sign_payload_attestation(
+        &self,
+        data: &PayloadAttestationData,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (data, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "payload_attestation" })
+    }
+
+    /// Sign proposer preferences (`DOMAIN_PROPOSER_PREFERENCES`).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override.
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (prefs, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "proposer_preferences" })
+    }
+
+    /// Sign a builder request auth (`DOMAIN_BUILDER_REQUEST_AUTH`, genesis fork,
+    /// zero GVR).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override.
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        genesis_fork_version: [u8; 4],
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (auth, genesis_fork_version, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "builder_request_auth" })
+    }
+
+    /// Sign a self-build execution payload envelope root (`DOMAIN_BEACON_BUILDER`).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override. `slot` is unused here — fork version
+    /// is already resolved on `ctx`; the VC path uses it for single-flight.
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (object_root, slot, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "execution_payload_envelope" })
+    }
+
+    /// Sign a precomputed aggregate-and-proof root (`DOMAIN_AGGREGATE_AND_PROOF`).
+    ///
+    /// Default: the duty is dropped and no signature is produced. Signers that
+    /// support this duty must override. `slot` is unused here — fork version
+    /// is already resolved on `ctx`.
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let _ = (object_root, slot, ctx);
+        Err(SigningError::UnsupportedDuty { duty: "aggregate_and_proof_root" })
+    }
 }
 
 // ============================================================
@@ -181,6 +281,21 @@ impl TypedSigner for LocalSigner {
     ) -> Result<Signature, SigningError> {
         let signing_root = signing_root_with_fork_version(
             block,
+            DOMAIN_BEACON_PROPOSER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_block_header(
+        &self,
+        header: &BeaconBlockHeader,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            header,
             DOMAIN_BEACON_PROPOSER,
             ctx.fork_info.current_version,
             ctx.fork_info.genesis_validators_root,
@@ -224,6 +339,29 @@ impl TypedSigner for LocalSigner {
         agg: &AggregateAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
+        if ctx.fork_name >= ForkName::Gloas {
+            let _ = agg;
+            return Err(SigningError::UnsupportedDuty { duty: "aggregate_and_proof" });
+        }
+        let signing_root = signing_root_with_fork_version(
+            agg,
+            DOMAIN_AGGREGATE_AND_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_electra_aggregate_and_proof(
+        &self,
+        agg: &ElectraAggregateAndProof,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        if ctx.fork_name >= ForkName::Gloas {
+            let _ = agg;
+            return Err(SigningError::UnsupportedDuty { duty: "electra_aggregate_and_proof" });
+        }
         let signing_root = signing_root_with_fork_version(
             agg,
             DOMAIN_AGGREGATE_AND_PROOF,
@@ -330,6 +468,84 @@ impl TypedSigner for LocalSigner {
         let pk = ctx.pubkey.to_bytes();
         Signer::sign(self, &signing_root, &pk).await
     }
+
+    async fn sign_payload_attestation(
+        &self,
+        data: &PayloadAttestationData,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            data,
+            DOMAIN_PTC_ATTESTER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            prefs,
+            DOMAIN_PROPOSER_PREFERENCES,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        genesis_fork_version: [u8; 4],
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            auth,
+            DOMAIN_BUILDER_REQUEST_AUTH,
+            genesis_fork_version,
+            [0u8; 32],
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        object_root: &Root,
+        _slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            object_root,
+            DOMAIN_BEACON_BUILDER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
+
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        object_root: &Root,
+        _slot: Slot,
+        ctx: &SignContext,
+    ) -> Result<Signature, SigningError> {
+        let signing_root = signing_root_with_fork_version(
+            object_root,
+            DOMAIN_AGGREGATE_AND_PROOF,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let pk = ctx.pubkey.to_bytes();
+        Signer::sign(self, &signing_root, &pk).await
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +602,33 @@ mod tests {
             ctx.fork_info.genesis_validators_root,
         );
         let signing_root = compute_signing_root(&block, domain);
+        assert!(sig.verify(&pk, &signing_root).is_ok());
+    }
+
+    // ---- TypedSigner::sign_block_header ----
+
+    #[tokio::test]
+    async fn test_typed_signer_sign_block_header_verifies() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = test_ctx(&sk);
+        let header = BeaconBlockHeader {
+            slot: 100,
+            proposer_index: 1,
+            parent_root: [0x11; 32],
+            state_root: [0x22; 32],
+            body_root: [0x33; 32],
+        };
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_block_header(&signer, &header, &ctx).await.unwrap();
+
+        let domain = compute_domain(
+            DOMAIN_BEACON_PROPOSER,
+            ctx.fork_info.current_version,
+            ctx.fork_info.genesis_validators_root,
+        );
+        let signing_root = compute_signing_root(&header, domain);
         assert!(sig.verify(&pk, &signing_root).is_ok());
     }
 
@@ -634,6 +877,361 @@ mod tests {
         assert!(sig.verify(&pk, &signing_root).is_ok());
     }
 
+    // ---- TypedSigner::sign_payload_attestation ----
+
+    fn parse_kat_root(hex_str: &str) -> Root {
+        hex::decode(hex_str).expect("kat hex").try_into().expect("32-byte kat root")
+    }
+
+    fn gloas_ptc_fixture() -> PayloadAttestationData {
+        PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        }
+    }
+
+    fn gloas_kat_ctx(sk: &SecretKey) -> SignContext {
+        SignContext {
+            pubkey: sk.public_key(),
+            fork_info: ForkInfo {
+                previous_version: [0x06, 0x00, 0x00, 0x01],
+                current_version: [0x07, 0x00, 0x00, 0x01],
+                genesis_validators_root: [0u8; 32],
+            },
+            fork_name: ForkName::Gloas,
+        }
+    }
+
+    /// L3: signature verifies over `KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT`
+    /// (4.2 fixture: block root `[0x11; 32]`, slot 1, payload present, no blob
+    /// data, fork `0x07000001`, GVR zeros).
+    #[tokio::test]
+    async fn test_local_signer_payload_attestation_signature_verifies() {
+        use rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT;
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let data = gloas_ptc_fixture();
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_payload_attestation(&signer, &data, &ctx).await.unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "payload attestation signature must verify over the KAT signing root"
+        );
+    }
+
+    struct CapabilityMissingSigner;
+
+    #[async_trait]
+    impl TypedSigner for CapabilityMissingSigner {
+        async fn sign_block(
+            &self,
+            _block: &BeaconBlock,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_blinded_block(
+            &self,
+            _block: &BlindedBeaconBlock,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_attestation(
+            &self,
+            _data: &AttestationData,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_aggregate_and_proof(
+            &self,
+            _agg: &AggregateAndProof,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_sync_committee_message(
+            &self,
+            _slot: Slot,
+            _beacon_block_root: Root,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_sync_aggregator_selection(
+            &self,
+            _slot: Slot,
+            _subcommittee_index: u64,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_contribution_and_proof(
+            &self,
+            _c: &ContributionAndProof,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_builder_registration(
+            &self,
+            _reg: &ValidatorRegistrationV1,
+            _genesis_fork_version: [u8; 4],
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_randao_reveal(
+            &self,
+            _epoch: Epoch,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+        async fn sign_voluntary_exit(
+            &self,
+            _exit: &VoluntaryExit,
+            _ctx: &SignContext,
+        ) -> Result<Signature, SigningError> {
+            unreachable!("not under test")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_payload_attestation_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let data = gloas_ptc_fixture();
+        let signer = CapabilityMissingSigner;
+
+        let result = TypedSigner::sign_payload_attestation(&signer, &data, &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "payload_attestation");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
+    }
+
+    fn gloas_prefs_fixture() -> ProposerPreferences {
+        ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        }
+    }
+
+    /// L3: signature verifies over `KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT`
+    /// (4.15 fixture: dependent_root `[0x33; 32]`, proposal_slot 32, validator
+    /// index 3, fee recipient `[0x44; 20]`, gas 36_000_000, fork `0x07000001`,
+    /// GVR zeros).
+    #[tokio::test]
+    async fn test_local_signer_proposer_preferences_signature_verifies() {
+        use rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT;
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let prefs = gloas_prefs_fixture();
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_proposer_preferences(&signer, &prefs, &ctx).await.unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "proposer preferences signature must verify over the KAT signing root"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_proposer_preferences_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let prefs = gloas_prefs_fixture();
+        let signer = CapabilityMissingSigner;
+
+        let result = TypedSigner::sign_proposer_preferences(&signer, &prefs, &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "proposer_preferences");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
+    }
+
+    fn kat_builder_request_auth() -> BuilderRequestAuth {
+        use rvc_spec_vectors::builder_request_auth_kat::{
+            KAT_BUILDER_REQUEST_AUTH_DATA_HEX, KAT_BUILDER_REQUEST_AUTH_SLOT,
+        };
+        BuilderRequestAuth::new(
+            hex::decode(KAT_BUILDER_REQUEST_AUTH_DATA_HEX).expect("kat data"),
+            KAT_BUILDER_REQUEST_AUTH_SLOT,
+        )
+        .expect("kat data valid")
+    }
+
+    /// L3: signature verifies over `KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT`.
+    #[tokio::test]
+    async fn test_local_signer_builder_request_auth_signature_verifies() {
+        use rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT;
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let auth = kat_builder_request_auth();
+        let signer = make_local_signer(sk);
+
+        let sig =
+            TypedSigner::sign_builder_request_auth(&signer, &auth, [0; 4], &ctx).await.unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "builder request auth signature must verify over the KAT signing root"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_builder_request_auth_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let auth = kat_builder_request_auth();
+        let signer = CapabilityMissingSigner;
+
+        let result = TypedSigner::sign_builder_request_auth(&signer, &auth, [0; 4], &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "builder_request_auth");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
+    }
+
+    /// L3: signature verifies over `KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT`.
+    #[tokio::test]
+    async fn test_local_signer_execution_payload_envelope_signature_verifies() {
+        use rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT;
+
+        const SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT: &str =
+            "98f593cc36356b342abda8c5d87daa12afb5ea0595eeeb7393bf04d39acc381a";
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let object_root = parse_kat_root(SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT);
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_execution_payload_envelope_root(&signer, &object_root, 1, &ctx)
+            .await
+            .unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "envelope signature must verify over KAT_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SIGNING_ROOT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_execution_payload_envelope_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let object_root = [0x11u8; 32];
+        let signer = CapabilityMissingSigner;
+
+        let result =
+            TypedSigner::sign_execution_payload_envelope_root(&signer, &object_root, 1, &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "execution_payload_envelope");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_local_signer_aggregate_and_proof_root_signature_verifies() {
+        use rvc_spec_vectors::gloas_signing_kat::KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT;
+
+        const SPEC_GLOAS_AGGREGATE_AND_PROOF_ROOT: &str =
+            "8e20d3aab21ae5374ec249d072afa489e501d89e5c098f6792b2771cf5509bd1";
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let ctx = gloas_kat_ctx(&sk);
+        let object_root = parse_kat_root(SPEC_GLOAS_AGGREGATE_AND_PROOF_ROOT);
+        let signer = make_local_signer(sk);
+
+        let sig = TypedSigner::sign_aggregate_and_proof_root(&signer, &object_root, 1, &ctx)
+            .await
+            .unwrap();
+
+        let kat_root = parse_kat_root(KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT);
+        assert!(
+            sig.verify(&pk, &kat_root).is_ok(),
+            "aggregate-and-proof root signature must verify over KAT_GLOAS_AGGREGATE_AND_PROOF_SIGNING_ROOT"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_signer_container_aggregate_refused_at_gloas() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let signer = make_local_signer(sk);
+        let agg = AggregateAndProof {
+            aggregator_index: 1,
+            aggregate: eth_types::Attestation {
+                aggregation_bits: vec![0xff, 0x01],
+                data: AttestationData {
+                    slot: 1,
+                    index: 0,
+                    beacon_block_root: [0x11; 32],
+                    source: eth_types::Checkpoint { epoch: 0, root: [0; 32] },
+                    target: eth_types::Checkpoint { epoch: 0, root: [0; 32] },
+                },
+                signature: vec![0xaa; 96],
+            },
+            selection_proof: vec![0xbb; 96],
+        };
+        match TypedSigner::sign_aggregate_and_proof(&signer, &agg, &ctx).await {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "aggregate_and_proof");
+            }
+            other => panic!("expected UnsupportedDuty, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_typed_signer_aggregate_and_proof_root_unsupported_duty() {
+        let sk = SecretKey::generate();
+        let ctx = gloas_kat_ctx(&sk);
+        let object_root = [0x11u8; 32];
+        let signer = CapabilityMissingSigner;
+
+        let result =
+            TypedSigner::sign_aggregate_and_proof_root(&signer, &object_root, 1, &ctx).await;
+        match result {
+            Err(SigningError::UnsupportedDuty { duty }) => {
+                assert_eq!(duty, "aggregate_and_proof_root");
+            }
+            Ok(_) => panic!("unsupported signer must not produce a signature"),
+            other => panic!("expected UnsupportedDuty, got: {other:?}"),
+        }
+    }
+
     // ---- capella_capped_fork_version ----
 
     #[test]
@@ -652,6 +1250,8 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: 60,
             fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
         };
         // Altair epoch — no cap, returns Altair version
         assert_eq!(capella_capped_fork_version(15, &schedule), [1, 0, 0, 0]);
@@ -673,8 +1273,75 @@ mod tests {
             electra_fork_version: [5, 0, 0, 0],
             fulu_fork_epoch: 60,
             fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [7, 0, 0, 0],
         };
         // Electra epoch — cap at Capella
         assert_eq!(capella_capped_fork_version(55, &schedule), [3, 0, 0, 0]);
+    }
+
+    fn dummy_pubkey() -> PublicKey {
+        SecretKey::generate().public_key()
+    }
+
+    #[test]
+    fn test_resolve_gloas_version_returns_gloas() {
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: 70,
+            gloas_fork_version: [0x07, 0, 0, 0],
+        };
+        let fork_info = ForkInfo {
+            previous_version: [6, 0, 0, 0],
+            current_version: [0x07, 0, 0, 0],
+            genesis_validators_root: [0xaa; 32],
+        };
+        let ctx = SignContext::resolve(dummy_pubkey(), fork_info, &schedule).unwrap();
+        assert_eq!(ctx.fork_name, ForkName::Gloas);
+    }
+
+    #[test]
+    fn test_resolve_sentinel_collision_first_matches_fulu() {
+        // When the BN omits both FULU_* and GLOAS_*, two entries() rows carry
+        // [0xFF; 4] and resolve first-matches Fulu — documented, not incidental.
+        // Issue 2.10's conditional fail-closed rule confines this to the
+        // fully-unscheduled case: a scheduled Gloas requires a real version
+        // from both sources.
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: u64::MAX,
+            fulu_fork_version: [0xFF; 4],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0xFF; 4],
+        };
+        let fork_info = ForkInfo {
+            previous_version: [0xFF; 4],
+            current_version: [0xFF; 4],
+            genesis_validators_root: [0xaa; 32],
+        };
+        let ctx = SignContext::resolve(dummy_pubkey(), fork_info, &schedule).unwrap();
+        assert_eq!(ctx.fork_name, ForkName::Fulu);
     }
 }

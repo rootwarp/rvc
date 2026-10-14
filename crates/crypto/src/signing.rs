@@ -160,6 +160,7 @@ mod tests {
     /// may appear at any level.
     #[test]
     #[tracing_test::traced_test]
+    // kat_exempt: logging truncation only — asserts domain/root hex is redacted, not a spec root
     fn test_compute_signing_root_trace_truncates_domain_and_root() {
         // Distinct bytes (0x00,0x01,…,0x1f) so the full-hex needle is a real,
         // non-vacuous match — a repeating-byte domain plus `?`-Debug's decimal

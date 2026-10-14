@@ -1,0 +1,3 @@
+# beacon_url only; beacon_nodes key absent.
+
+beacon_url = "http://solo.example:5052"

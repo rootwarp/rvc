@@ -1,0 +1,4 @@
+# Empty beacon_nodes is a leftover, not "use nothing"; fall through to beacon_url.
+
+beacon_url = "http://only.example:5052"
+beacon_nodes = []

@@ -20,6 +20,8 @@ fn test_fork_schedule() -> Arc<ForkSchedule> {
         electra_fork_version: [5, 0, 0, 0],
         fulu_fork_epoch: 60,
         fulu_fork_version: [6, 0, 0, 0],
+        gloas_fork_epoch: u64::MAX,
+        gloas_fork_version: [7, 0, 0, 0],
     })
 }
 
@@ -27,6 +29,8 @@ fn spawn_test_deps(
     keystore_dir: &Path,
     forward_window_machine: Option<Arc<ForwardWindowMachine>>,
 ) -> KeymanagerApiDeps {
+    use crate::key_admission::KeyAdmissionService;
+
     let composite = create_empty_composite_signer();
     let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
     let signer = Arc::new(
@@ -34,24 +38,49 @@ fn spawn_test_deps(
             .with_enablement(always_enabled()),
     );
     let beacon_config = beacon::BeaconClientConfig::new("http://127.0.0.1:9");
-    let beacon_client = Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
+    let beacon_client: Arc<dyn bn_manager::BeaconNodeClient> =
+        Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
     let (key_gen_tx, _rx) = watch::channel(0u64);
+    let pubkey_map = create_pubkey_map();
+    let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
+    let deletion_denylist =
+        Arc::new(DeletionDenylist::empty_at(keystore_dir.join(".rvc.deleted_keys")));
+    let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+    let admissions = Arc::new(KeyAdmissionService::new(
+        Arc::clone(&pubkey_map),
+        key_gen_tx.clone(),
+        Arc::clone(&composite),
+        Arc::clone(&validator_store),
+        Arc::clone(&deletion_denylist),
+        forward_window_machine.clone(),
+        Arc::clone(&epoch_clock),
+    ));
     KeymanagerApiDeps {
         composite_signer: composite,
         slashing_db,
         genesis_validators_root: [0x11u8; 32],
-        validator_store: Arc::new(ValidatorStore::new([0u8; 20], 100)),
+        validator_store,
         beacon_client,
         signer,
         fork_schedule: test_fork_schedule(),
-        deletion_denylist: Arc::new(DeletionDenylist::empty_at(
-            keystore_dir.join(".rvc.deleted_keys"),
-        )),
+        deletion_denylist,
         attesting_enabled: Arc::new(AtomicBool::new(true)),
         forward_window_machine,
-        epoch_clock: Arc::new(MonotonicEpochClock::new(0)),
-        pubkey_map: create_pubkey_map(),
+        epoch_clock,
+        pubkey_map,
         key_gen_tx,
+        admissions,
+        quiesce_registry: Arc::new(crate::quiesce::QuiesceRegistry::new()),
+        slot_clock: {
+            let clock = Arc::new(timing::MockSlotClock::new(
+                1_606_824_023,
+                std::time::Duration::from_secs(12),
+                32,
+            ));
+            clock.set_slot_with_offset_ms(0, 8_000);
+            clock
+        },
+        tracked_keys: Arc::new(crate::quiesce::TrackedKeys::new()),
     }
 }
 
@@ -87,7 +116,10 @@ fn test_spawn_keymanager_api_disabled_constructs_nothing() {
 
     // spawn path is also a no-op
     let deps = spawn_test_deps(dir.path(), None);
-    spawn_keymanager_api(&config, deps).expect("disabled spawn is Ok");
+    let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
+    let started = spawn_keymanager_api(&config, deps, None, &exec).expect("disabled spawn is Ok");
+    assert!(!started, "disabled spawn must not start a task");
+    assert!(exec.registered_names().is_empty());
 }
 
 /// Both monitor variants re-arm exactly once (single call site after branch).
@@ -106,16 +138,16 @@ fn test_spawn_keymanager_api_rearms_gate_exactly_once_for_both_monitors() {
     )
     .unwrap();
 
-    // 1) Time-based gate path (no ForwardWindowMachine)
+    // 1) Disabled / no-machine path (window non-zero so re-arm still runs)
     {
         let config = spawn_test_config(&dir, true, "127.0.0.1:0");
         let deps = spawn_test_deps(dir.path(), None);
         let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
-        assert_eq!(built.monitor_kind, DoppelgangerMonitorKind::TimeBasedGate);
+        assert_eq!(built.monitor_kind, DoppelgangerMonitorKind::Disabled);
         assert!(!built.doppelganger_window.is_zero());
         assert!(
-            !built.doppelganger_monitor.is_doppelganger_safe(&pk),
-            "time-based gate must re-arm recent import exactly once"
+            built.doppelganger_monitor.is_doppelganger_safe(&pk),
+            "always-safe Disabled monitor stays safe after re-arm"
         );
     }
 
@@ -144,6 +176,66 @@ fn test_spawn_keymanager_api_rearms_gate_exactly_once_for_both_monitors() {
         // Machine registered the key as Pending (import-strict)
         assert_eq!(machine.status(&crypto_pk), doppelganger::ForwardWindowStatus::Pending);
     }
+}
+
+/// Opt-out (`forward_window_machine: None`) selects the always-safe monitor.
+///
+/// Written against `DoppelgangerMonitorKind::Disabled` so this is RED until
+/// the TimeBasedGate rename lands (ARCH-7c).
+#[test]
+fn test_doppelganger_optout_monitor_reports_every_key_safe() {
+    let dir = TempDir::new().unwrap();
+    let mut config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    config.doppelganger_detection = false;
+    let deps = spawn_test_deps(dir.path(), None);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+
+    assert_eq!(
+        built.monitor_kind,
+        DoppelgangerMonitorKind::Disabled,
+        "opt-out must select the always-safe Disabled monitor"
+    );
+    assert!(
+        built.doppelganger_window.is_zero(),
+        "opt-out window is Duration::ZERO (keys enable immediately)"
+    );
+
+    let unknown = test_pubkey(0x11);
+    assert!(
+        built.doppelganger_monitor.is_doppelganger_safe(&unknown),
+        "unknown key is immediately safe on the opt-out path"
+    );
+
+    let monitored = test_pubkey(0x22);
+    built.doppelganger_monitor.start_monitoring(monitored);
+    assert!(
+        built.doppelganger_monitor.is_doppelganger_safe(&monitored),
+        "freshly start_monitoring-ed key is immediately safe on the opt-out path"
+    );
+}
+
+/// Zero window must skip `scan_and_rearm_gate` (spawn.rs re-arm guard).
+#[test]
+#[tracing_test::traced_test]
+fn test_doppelganger_optout_rearm_is_not_invoked_on_zero_window() {
+    let dir = TempDir::new().unwrap();
+    let pk = test_pubkey(0x33);
+    let now_unix =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    std::fs::write(
+        import_meta_path(dir.path(), &pk),
+        format!("{{\"imported_unix_seconds\":{now_unix}}}"),
+    )
+    .unwrap();
+
+    let mut config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    config.doppelganger_detection = false;
+    let deps = spawn_test_deps(dir.path(), None);
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+
+    assert!(built.doppelganger_window.is_zero());
+    assert_eq!(built.monitor_kind, DoppelgangerMonitorKind::Disabled);
+    assert!(!logs_contain("re-arming"), "zero window must not invoke scan_and_rearm_gate");
 }
 
 /// Machine present → ForwardWindow monitor is selected.
@@ -183,4 +275,118 @@ fn test_spawn_keymanager_api_warns_on_non_loopback_bind() {
     let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
     assert!(!built.addr.ip().is_loopback());
     assert!(logs_contain("non-loopback address"), "must warn when Keymanager binds non-loopback");
+}
+
+/// Loopback remains the default when the keymanager address is unset.
+#[test]
+fn keymanager_bind_addr_defaults_to_loopback() {
+    let dir = TempDir::new().unwrap();
+    let mut config = spawn_test_config(&dir, true, "0.0.0.0:1");
+    config.keymanager.address = None;
+    let addr = keymanager_bind_addr(&config).expect("default addr");
+    assert_eq!(addr, "127.0.0.1:5062".parse().unwrap());
+    assert!(addr.ip().is_loopback(), "unset keymanager address must stay on loopback");
+}
+
+/// `build_keymanager_api` must forward the DB's `GroupCommitConfig` into the
+/// import gate. Reverting `spawn.rs` to `ImportWindowGate::new(clock)` (default
+/// knobs) fails both independent variations below.
+#[test]
+fn build_keymanager_api_wires_group_commit_config_into_import_gate() {
+    use crate::keymanager_adapters::import_window::ImportWindowGate;
+    use slashing::GroupCommitConfig;
+    use std::time::Duration;
+    use timing::{MockSlotClock, SlotClock};
+
+    let default_post = ImportWindowGate::new(Arc::new(MockSlotClock::new(
+        1_606_824_023,
+        Duration::from_secs(12),
+        32,
+    )) as Arc<dyn SlotClock>)
+    .post_admit();
+
+    // Vary batch_size with the default wait-to-fill.
+    {
+        let dir = TempDir::new().unwrap();
+        let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+        let deps = spawn_test_deps(dir.path(), None);
+        let cfg = GroupCommitConfig {
+            batch_size: GroupCommitConfig::DEFAULT_BATCH_SIZE * 2,
+            wait_to_fill: GroupCommitConfig::DEFAULT_WAIT_TO_FILL,
+        };
+        deps.slashing_db.set_group_commit(cfg);
+        let expected = ImportWindowGate::new(Arc::clone(&deps.slot_clock)).with_group_commit(cfg);
+        let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+        assert_ne!(
+            expected.post_admit(),
+            default_post,
+            "fixture batch_size must change post_admit vs default"
+        );
+        assert_eq!(
+            built.import_window_gate.post_admit(),
+            expected.post_admit(),
+            "spawn must wire batch_size from the DB into the gate"
+        );
+    }
+
+    // Vary wait_to_fill_ms with the default batch_size.
+    {
+        let dir = TempDir::new().unwrap();
+        let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+        let deps = spawn_test_deps(dir.path(), None);
+        let cfg = GroupCommitConfig {
+            batch_size: GroupCommitConfig::DEFAULT_BATCH_SIZE,
+            wait_to_fill: Duration::from_millis(50),
+        };
+        deps.slashing_db.set_group_commit(cfg);
+        let expected = ImportWindowGate::new(Arc::clone(&deps.slot_clock)).with_group_commit(cfg);
+        let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+        assert_ne!(
+            expected.post_admit(),
+            default_post,
+            "fixture wait_to_fill must change post_admit vs default"
+        );
+        assert_eq!(
+            built.import_window_gate.post_admit(),
+            expected.post_admit(),
+            "spawn must wire wait_to_fill from the DB into the gate"
+        );
+    }
+}
+
+/// Enabled spawn registers on the executor and drains after token cancel.
+#[tokio::test]
+async fn test_spawn_keymanager_api_returns_a_joinable_handle() {
+    use std::time::Duration;
+
+    use crate::bootstrap::executor::{TaskExecutor, TierBudget};
+
+    let dir = TempDir::new().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = spawn_test_config(&dir, true, &addr.to_string());
+    let deps = spawn_test_deps(dir.path(), None);
+    let token = CancellationToken::new();
+    let (exec, _rx) = TaskExecutor::new(token.clone());
+    let started = spawn_keymanager_api(&config, deps, Some(listener), &exec).expect("spawn");
+    assert!(started, "enabled must start keymanager_api");
+    assert_eq!(exec.registered_names(), vec!["keymanager_api"]);
+
+    // Wait until the listener accepts.
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    token.cancel();
+    let outcome =
+        tokio::time::timeout(Duration::from_secs(2), exec.shutdown(TierBudget::default()))
+            .await
+            .expect("keymanager must complete within 2s after cancel");
+    assert!(
+        outcome.joined.contains(&"keymanager_api") || outcome.aborted.contains(&"keymanager_api"),
+        "keymanager_api must be drained"
+    );
 }

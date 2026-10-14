@@ -89,7 +89,6 @@ impl MockBn {
     }
 
     /// Convenience: builder with a known fork (see [`MockBnBuilder::with_fork`]).
-    #[allow(dead_code)] // known-fork ready path still covered by default Electra
     pub fn with_fork(fork: ForkName) -> MockBnBuilder {
         MockBnBuilder::default().with_fork(fork)
     }
@@ -141,6 +140,8 @@ impl MockBn {
                     "ELECTRA_FORK_VERSION": "0x05000000",
                     "FULU_FORK_EPOCH": "18446744073709551615",
                     "FULU_FORK_VERSION": "0x06000000",
+                    "GLOAS_FORK_EPOCH": "18446744073709551615",
+                    "GLOAS_FORK_VERSION": "0x07000000",
                     "SECONDS_PER_SLOT": "12",
                     "SLOTS_PER_EPOCH": "32"
                 }
@@ -271,5 +272,6 @@ fn fork_version_hex(fork: ForkName) -> String {
         ForkName::Deneb => "0x04000000".to_string(),
         ForkName::Electra => "0x05000000".to_string(),
         ForkName::Fulu => "0x06000000".to_string(),
+        ForkName::Gloas => "0x07000000".to_string(),
     }
 }

@@ -1,0 +1,597 @@
+{
+  "issue": "RR3-07",
+  "protocol": "plan/review-2026-10-03/measurements/README.md",
+  "harness": "crates/rvc/tests/vc_scale_profile.rs",
+  "test": "vc_scale_profile_emits_a_complete_record",
+  "baseline": "plan/review-2026-10-03/measurements/m2-n200.json",
+  "baseline_md": "plan/review-2026-10-03/measurements/m2-n200.md",
+  "baseline_sha": "dd4aec0c4343dcb83d3b7dd7c6d9cd64c9dc1807",
+  "recorded_tree": {
+    "git_rev_parse_HEAD_at_process_start": "1299a49035f00ba6fca59e97b09d865726dedb41",
+    "parent": "1299a49035f00ba6fca59e97b09d865726dedb41",
+    "note": "Each harness JSON sha is git rev-parse HEAD at process start. HEAD was develop 1299a490 with the uncommitted RR3-07 harness in the working tree. vc_scale_profile does not call that harness. This commit adds the harness and these notes together, so the commit SHA is not the harness sha. Profile is the debug nextest profile, matching m2-n200."
+  },
+  "host": {
+    "hostname": "cursor",
+    "os": "linux",
+    "arch": "x86_64",
+    "uname": "Linux cursor 6.12.94+ #1 SMP PREEMPT_DYNAMIC Tue Oct  6 05:59:35 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux",
+    "cpu_model_name": "Intel(R) Xeon(R) Processor",
+    "cpu_vendor": "GenuineIntel",
+    "cpu_family": 6,
+    "cpu_model": 207,
+    "cpu_stepping": 2,
+    "cores": 4,
+    "threads_per_core": 1,
+    "sockets": 1,
+    "mem_total_kb": 16398384,
+    "disk": "ext4 on /dev/vdc",
+    "harness_host_field": "cursor linux/x86_64"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27)",
+    "nextest": "cargo-nextest 0.9.146 (8af696ddc 2026-09-21)",
+    "protoc": "libprotoc 3.21.12",
+    "harness_toolchain_field": "rustc 1.99.0 (b940084d7 2026-09-28)",
+    "profile": "debug (cargo nextest default test profile, unoptimized + debuginfo)",
+    "note": "Workspace rust-version is 1.92. CI installs dtolnay/rust-toolchain@stable. The image default rustc 1.83.0 cannot parse locked cpufeatures 0.3.0 (edition2024). These runs used stable 1.99.0. protoc is the apt protobuf-compiler package. CI's arduino/setup-protoc@v3 was recorded as 27.5 at M0."
+  },
+  "scenario": {
+    "n": 200,
+    "slots": 1,
+    "slot": 32,
+    "clock_mode_latency": "wall",
+    "clock_mode_counts": "paused",
+    "runs_per_clock_mode": 3,
+    "aggregator": "median",
+    "measured_at_utc": {
+      "wall": [
+        "2026-10-08T12:53:46Z",
+        "2026-10-08T12:55:04Z",
+        "2026-10-08T12:55:07Z"
+      ],
+      "paused": [
+        "2026-10-08T12:55:10Z",
+        "2026-10-08T12:55:11Z",
+        "2026-10-08T12:55:12Z"
+      ]
+    },
+    "process_elapsed_s": {
+      "wall": [
+        78,
+        3,
+        3
+      ],
+      "paused": [
+        1,
+        1,
+        1
+      ]
+    },
+    "process_elapsed_note": "Wall run 1 includes the debug compile. Later runs used the built binary. Protocol latency is last_publish_ms_after_att_deadline, not this field."
+  },
+  "invocation": {
+    "command": "VC_SCALE_N=200 VC_SCALE_SLOTS=1 VC_SCALE_CLOCK=<wall|paused> VC_SCALE_OUTPUT=<path> CARGO_BUILD_JOBS=2 cargo nextest run -p rvc --locked --run-ignored ignored-only --no-capture -E 'test(vc_scale_profile_emits_a_complete_record)'",
+    "exit_codes": {
+      "wall": [
+        0,
+        0,
+        0
+      ],
+      "paused": [
+        0,
+        0,
+        0
+      ]
+    }
+  },
+  "baseline_medians": {
+    "source": "plan/review-2026-10-03/measurements/m2-n200.md lines 66-78 and m2-n200.json figures",
+    "last_publish_ms_after_att_deadline": {
+      "clock_mode": "wall",
+      "runs": [
+        -3527.843577,
+        -3500.726064,
+        -3568.643065
+      ],
+      "median": -3527.843577,
+      "into_slot_ms_runs": [
+        471.156423,
+        498.273936,
+        430.356935
+      ],
+      "into_slot_ms_median": 471.156423
+    },
+    "aggregate_deadline_misses": {
+      "clock_mode": "wall",
+      "runs": [
+        0,
+        0,
+        0
+      ],
+      "median": 0
+    },
+    "aggregate_proofs_after_deadline": {
+      "clock_mode": "wall",
+      "runs": [
+        0,
+        0,
+        0
+      ],
+      "median": 0
+    },
+    "overhang_ms": {
+      "clock_mode": "wall",
+      "runs": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "median": 0.0
+    },
+    "commits_per_attestation_phase": {
+      "clock_mode": "paused",
+      "runs": [
+        12.0,
+        11.0,
+        12.0
+      ],
+      "median": 12.0
+    },
+    "mean_batch": {
+      "clock_mode": "paused",
+      "runs": [
+        16.666666666666668,
+        18.181818181818183,
+        16.666666666666668
+      ],
+      "median": 16.666666666666668
+    },
+    "attestation_data_requests_per_slot": {
+      "clock_mode": "paused",
+      "runs": [
+        201.0,
+        201.0,
+        201.0
+      ],
+      "median": 201.0
+    },
+    "sync_publish_ms_after_slot_start": {
+      "clock_mode": "paused",
+      "runs": [
+        153.0,
+        153.0,
+        153.0
+      ],
+      "median": 153.0
+    },
+    "sync_messages_submitted": {
+      "clock_mode": "paused",
+      "runs": [
+        200,
+        200,
+        200
+      ],
+      "median": 200
+    },
+    "sync_submit_calls": {
+      "clock_mode": "paused",
+      "runs": [
+        7,
+        7,
+        7
+      ],
+      "median": 7
+    },
+    "aggregate_proofs_submitted": {
+      "clock_mode": "paused",
+      "runs": [
+        200,
+        200,
+        200
+      ],
+      "median": 200
+    },
+    "aggregate_submit_calls": {
+      "clock_mode": "paused",
+      "runs": [
+        7,
+        7,
+        7
+      ],
+      "median": 7
+    },
+    "paused_last_publish_ms_after_att_deadline": {
+      "runs": [
+        -3642.0,
+        -3591.0,
+        -3591.0
+      ],
+      "median": -3591.0,
+      "note": "virtual time, not the protocol cell"
+    },
+    "wall_sync_publish_ms_after_slot_start": {
+      "runs": [
+        189.91374199999998,
+        180.757005,
+        180.001143
+      ],
+      "median": 180.757005,
+      "note": "not the protocol cell"
+    }
+  },
+  "accept": {
+    "last_publish_ms_after_att_deadline_max": 1000,
+    "into_slot_ms_max": 4999,
+    "aggregate_deadline_misses": 0,
+    "overhang_ms_max": 500,
+    "mean_batch_min": 8,
+    "commits_per_attestation_phase_max": 25,
+    "loosened": false,
+    "rr3_05_region_edited": false
+  },
+  "figures": {
+    "last_publish_ms_after_att_deadline": {
+      "clock_mode": "wall",
+      "runs": [
+        -3504.506697,
+        -3514.365184,
+        -3515.146715
+      ],
+      "median": -3514.365184,
+      "into_slot_ms_runs": [
+        494.493303,
+        484.634816,
+        483.853285
+      ],
+      "into_slot_ms_median": 484.634816,
+      "holds": true
+    },
+    "aggregate_deadline_misses": {
+      "clock_mode": "wall",
+      "runs": [
+        0,
+        0,
+        0
+      ],
+      "median": 0,
+      "holds": true
+    },
+    "aggregate_proofs_after_deadline": {
+      "clock_mode": "wall",
+      "runs": [
+        0,
+        0,
+        0
+      ],
+      "median": 0
+    },
+    "overhang_ms": {
+      "clock_mode": "wall",
+      "runs": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "median": 0.0,
+      "holds": true
+    },
+    "commits_per_attestation_phase": {
+      "clock_mode": "paused",
+      "runs": [
+        16.0,
+        12.0,
+        14.0
+      ],
+      "median": 14.0,
+      "holds": true
+    },
+    "mean_batch": {
+      "clock_mode": "paused",
+      "runs": [
+        12.5,
+        16.666666666666668,
+        14.285714285714286
+      ],
+      "median": 14.285714285714286,
+      "holds": true
+    },
+    "attestation_data_requests_per_slot": {
+      "clock_mode": "paused",
+      "runs": [
+        201.0,
+        201.0,
+        201.0
+      ],
+      "median": 201.0
+    },
+    "sync_publish_ms_after_slot_start": {
+      "clock_mode": "paused",
+      "runs": [
+        153.0,
+        153.0,
+        153.0
+      ],
+      "median": 153.0
+    },
+    "sync_messages_submitted": {
+      "clock_mode": "paused",
+      "runs": [
+        200,
+        200,
+        200
+      ],
+      "median": 200
+    },
+    "sync_submit_calls": {
+      "clock_mode": "paused",
+      "runs": [
+        7,
+        7,
+        7
+      ],
+      "median": 7
+    },
+    "aggregate_proofs_submitted": {
+      "clock_mode": "paused",
+      "runs": [
+        200,
+        200,
+        200
+      ],
+      "median": 200
+    },
+    "aggregate_submit_calls": {
+      "clock_mode": "paused",
+      "runs": [
+        7,
+        7,
+        7
+      ],
+      "median": 7
+    },
+    "paused_last_publish_ms_after_att_deadline": {
+      "runs": [
+        -3591.0,
+        -3642.0,
+        -3642.0
+      ],
+      "median": -3642.0,
+      "note": "virtual time, not the protocol cell"
+    },
+    "wall_sync_publish_ms_after_slot_start": {
+      "runs": [
+        184.872489,
+        179.52250999999998,
+        181.12247200000002
+      ],
+      "median": 181.12247200000002,
+      "note": "not the protocol cell"
+    },
+    "wall_commits_per_attestation_phase": {
+      "runs": [
+        12.0,
+        13.0,
+        13.0
+      ],
+      "median": 13.0,
+      "note": "not the protocol cell"
+    },
+    "wall_mean_batch": {
+      "runs": [
+        16.666666666666668,
+        15.384615384615385,
+        15.384615384615385
+      ],
+      "median": 15.384615384615385,
+      "note": "not the protocol cell"
+    },
+    "wall_aggregate_submit_calls": {
+      "runs": [
+        25,
+        20,
+        23
+      ],
+      "median": 23,
+      "note": "not the protocol cell"
+    }
+  },
+  "wall_runs": [
+    {
+      "aggregate_deadline_misses": 0,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 0,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 25,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 201.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "wall",
+      "commits_per_attestation_phase": 12.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": -3504.506697,
+      "mean_batch": 16.666666666666668,
+      "n": 200,
+      "overhang_ms": 0.0,
+      "overrun": false,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "1299a49035f00ba6fca59e97b09d865726dedb41",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 184.872489,
+      "sync_submit_calls": 7,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    },
+    {
+      "aggregate_deadline_misses": 0,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 0,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 20,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 201.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "wall",
+      "commits_per_attestation_phase": 13.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": -3514.365184,
+      "mean_batch": 15.384615384615385,
+      "n": 200,
+      "overhang_ms": 0.0,
+      "overrun": false,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "1299a49035f00ba6fca59e97b09d865726dedb41",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 179.52250999999998,
+      "sync_submit_calls": 7,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    },
+    {
+      "aggregate_deadline_misses": 0,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 0,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 23,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 201.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "wall",
+      "commits_per_attestation_phase": 13.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": -3515.146715,
+      "mean_batch": 15.384615384615385,
+      "n": 200,
+      "overhang_ms": 0.0,
+      "overrun": false,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "1299a49035f00ba6fca59e97b09d865726dedb41",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 181.12247200000002,
+      "sync_submit_calls": 7,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    }
+  ],
+  "paused_runs": [
+    {
+      "aggregate_deadline_misses": 0,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 0,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 7,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 201.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "paused",
+      "commits_per_attestation_phase": 16.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": -3591.0,
+      "mean_batch": 12.5,
+      "n": 200,
+      "overhang_ms": 0.0,
+      "overrun": false,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "1299a49035f00ba6fca59e97b09d865726dedb41",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 153.0,
+      "sync_submit_calls": 7,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    },
+    {
+      "aggregate_deadline_misses": 0,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 0,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 7,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 201.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "paused",
+      "commits_per_attestation_phase": 12.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": -3642.0,
+      "mean_batch": 16.666666666666668,
+      "n": 200,
+      "overhang_ms": 0.0,
+      "overrun": false,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "1299a49035f00ba6fca59e97b09d865726dedb41",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 153.0,
+      "sync_submit_calls": 7,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    },
+    {
+      "aggregate_deadline_misses": 0,
+      "aggregate_deadline_ms": 8000,
+      "aggregate_proofs_after_deadline": 0,
+      "aggregate_proofs_submitted": 200,
+      "aggregate_submit_calls": 7,
+      "aggregators_enabled": true,
+      "attestation_data_requests_per_slot": 201.0,
+      "attestation_deadline_ms": 3999,
+      "budget_exceeded": false,
+      "clock_mode": "paused",
+      "commits_per_attestation_phase": 14.0,
+      "failures": 0,
+      "host": "cursor linux/x86_64",
+      "issue": "RR0-07",
+      "last_publish_ms_after_att_deadline": -3642.0,
+      "mean_batch": 14.285714285714286,
+      "n": 200,
+      "overhang_ms": 0.0,
+      "overrun": false,
+      "per_slot_budget_ms": 120000,
+      "request_delay_ms": 50,
+      "sha": "1299a49035f00ba6fca59e97b09d865726dedb41",
+      "slot_duration_ms": 12000,
+      "slots": 1,
+      "successes": 200,
+      "sync_committee_enabled": true,
+      "sync_messages_submitted": 200,
+      "sync_publish_ms_after_slot_start": 153.0,
+      "sync_submit_calls": 7,
+      "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)"
+    }
+  ],
+  "gate_holds": true
+}

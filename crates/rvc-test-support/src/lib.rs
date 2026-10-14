@@ -179,6 +179,17 @@ pub struct PemPaths {
 // mTLS server harness
 // ---------------------------------------------------------------------------
 
+/// Install `ring` as rustls's process-global provider.
+///
+/// `--workspace --all-features` unifies `aws_lc_rs` (google-cloud, via
+/// `gcp-secret`) onto the same rustls that the rest of the workspace builds
+/// with `ring`. tonic's `Server::tls_config` then panics in
+/// `CryptoProvider::get_default_or_install_from_crate_features` unless a
+/// default is already installed. Idempotent: a second call is a no-op.
+fn install_ring_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Bind `127.0.0.1:0`, apply mTLS from `pki`, and spawn a tonic server.
 ///
 /// `add_services` receives a post-TLS `Server` and must return a `Router`
@@ -192,6 +203,8 @@ pub async fn start_mtls_server<F>(
 where
     F: FnOnce(Server) -> tonic::transport::server::Router + Send + 'static,
 {
+    // Before the spawned task applies TLS, and before the caller dials.
+    install_ring_crypto_provider();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind 127.0.0.1:0");
     let addr = listener.local_addr().expect("local_addr");
     let tls = pki.server_tls_config();

@@ -1,0 +1,15 @@
+{
+  "scenario": "midrun_promotion",
+  "reason": "endpoint_failover",
+  "declared_by": "VP-3f",
+  "exercised_by": "VP-4a",
+  "rule": "four concurrent failures on one endpoint collapse to one advance",
+  "concurrent_failures": 4,
+  "expected_advances": 1,
+  "endpoints": [
+    "http://bn0:5052",
+    "http://bn1:5052",
+    "http://bn2:5052",
+    "http://bn3:5052"
+  ]
+}

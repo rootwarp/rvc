@@ -1,0 +1,42 @@
+# ARCH-4d corpus: every ConfigWire flat legacy key (:680-710) at a non-default
+# value, plus the dual-shape `logfile` string path.
+
+keymanager_enabled = true
+keymanager_address = "10.0.0.8:5062"
+keymanager_token_file = "/var/lib/rvc/wire/km.token"
+remote_signer_url = "https://wire-signer:9000"
+remote_signer_allowed_hosts = ["wire.signer.example"]
+allow_insecure_remote_signer = true
+keymanager_cors_origins = ["https://wire.cors.example"]
+keymanager_body_limit = 424242
+
+tracing_endpoint = "http://wire-otel:4318"
+tracing_exporter = "gcp"
+tracing_sample_rate = 0.37
+tracing_max_queue_size = 3333
+tracing_max_export_batch_size = 444
+tracing_service_name = "rvc-wire"
+
+grpc_signer_url = "https://wire-grpc:50051"
+grpc_signer_tls_cert = "/etc/rvc/wire/client.crt"
+grpc_signer_tls_key = "/etc/rvc/wire/client.key"
+grpc_signer_tls_ca_cert = "/etc/rvc/wire/ca.crt"
+
+builder_circuit_breaker_consecutive_limit = 8
+builder_circuit_breaker_epoch_limit = 13
+
+monitoring_endpoint = "https://wire.monitor/metrics"
+monitoring_interval = 96
+monitoring_endpoint_insecure = true
+
+proposer_config_url = "https://wire.proposer/config.json"
+proposer_config_file = "/etc/rvc/wire/proposer.json"
+proposer_config_refresh_interval = 48
+proposer_config_url_token = "wire-token"
+proposer_config_url_insecure = true
+
+logfile = "/var/log/rvc/wire.log"
+logfile_max_size = 77
+logfile_max_number = 4
+logfile_compress = true
+logfile_level = "warn"

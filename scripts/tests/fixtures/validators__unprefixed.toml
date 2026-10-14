@@ -1,0 +1,4 @@
+# Modeled on validators.example.toml: pubkey required, 0x prefix optional.
+
+[[validators]]
+pubkey = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"

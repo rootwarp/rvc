@@ -1,0 +1,3 @@
+# ARCH-4d corpus: dual-shape logfile — top-level string path.
+
+logfile = "/var/log/rvc/wire.log"

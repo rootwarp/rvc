@@ -11,11 +11,19 @@
 use async_trait::async_trait;
 use crypto::{PublicKey, SecretKey, Signature};
 use eth_types::{
-    AggregateAndProof, AttestationData, ContributionAndProof, ElectraAggregateAndProof, Epoch,
-    ForkSchedule, Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
+    AggregateAndProof, AttestationData, BuilderRequestAuth, ContributionAndProof,
+    ElectraAggregateAndProof, Epoch, ForkSchedule, PayloadAttestationData, ProposerPreferences,
+    Root, Slot, ValidatorRegistrationV1, VoluntaryExit,
 };
 
-use crate::{SignerError, ValidatorSigner};
+use crate::{BeaconBlockHeaderFields, SignerError, ValidatorSigner};
+
+fn stub_block_sig() -> Signature {
+    thread_local! {
+        static SIG: Signature = SecretKey::generate().sign(b"block");
+    }
+    SIG.with(Clone::clone)
+}
 
 /// Valid-curve mock BLS signature (fresh key each call).
 #[must_use]
@@ -27,7 +35,7 @@ pub fn mock_sig(tag: &[u8]) -> Signature {
 ///
 /// Intended for unit tests that only need a trait object, not call capture.
 /// Consumers that need failure injection or argument recording should wrap or
-/// extend this type rather than re-stubbing all 11 methods.
+/// extend this type rather than re-stubbing all 12 methods.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubValidatorSigner;
 
@@ -58,7 +66,17 @@ impl ValidatorSigner for StubValidatorSigner {
         _fork_schedule: &ForkSchedule,
         _genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        Ok(mock_sig(b"block"))
+        Ok(stub_block_sig())
+    }
+
+    async fn sign_block_header(
+        &self,
+        _header: &BeaconBlockHeaderFields,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(stub_block_sig())
     }
 
     async fn sign_randao_reveal(
@@ -151,6 +169,57 @@ impl ValidatorSigner for StubValidatorSigner {
     ) -> Result<Signature, SignerError> {
         Ok(mock_sig(b"contribution"))
     }
+
+    async fn sign_payload_attestation(
+        &self,
+        _data: &PayloadAttestationData,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"payload-attestation"))
+    }
+
+    async fn sign_proposer_preferences(
+        &self,
+        _prefs: &ProposerPreferences,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"proposer-preferences"))
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        _auth: &BuilderRequestAuth,
+        _pubkey: &PublicKey,
+        _genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"builder-request-auth"))
+    }
+
+    async fn sign_execution_payload_envelope_root(
+        &self,
+        _object_root: &Root,
+        _slot: Slot,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"execution-payload-envelope"))
+    }
+
+    async fn sign_aggregate_and_proof_root(
+        &self,
+        _object_root: &Root,
+        _slot: Slot,
+        _pubkey: &PublicKey,
+        _fork_schedule: &ForkSchedule,
+        _genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        Ok(mock_sig(b"aggregate-and-proof-root"))
+    }
 }
 
 #[cfg(test)]
@@ -159,21 +228,7 @@ mod tests {
     use eth_types::{Checkpoint, ValidatorRegistrationV1};
 
     fn fs() -> ForkSchedule {
-        ForkSchedule {
-            genesis_fork_version: [0; 4],
-            altair_fork_epoch: u64::MAX,
-            altair_fork_version: [0; 4],
-            bellatrix_fork_epoch: u64::MAX,
-            bellatrix_fork_version: [0; 4],
-            capella_fork_epoch: u64::MAX,
-            capella_fork_version: [0; 4],
-            deneb_fork_epoch: u64::MAX,
-            deneb_fork_version: [0; 4],
-            electra_fork_epoch: u64::MAX,
-            electra_fork_version: [0; 4],
-            fulu_fork_epoch: u64::MAX,
-            fulu_fork_version: [0; 4],
-        }
+        crypto::test_utils::sentinel_gloas_schedule()
     }
 
     #[tokio::test]
@@ -192,6 +247,25 @@ mod tests {
         };
         assert!(stub.sign_attestation(&data, &pk, &fork, &gvr).await.is_ok());
         assert!(stub.sign_block(&[4; 32], 1, &pk, &fork, &gvr).await.is_ok());
+        let header = BeaconBlockHeaderFields {
+            slot: 1920,
+            proposer_index: 1,
+            parent_root: [0x11; 32],
+            state_root: [0x22; 32],
+            body_root: [0x33; 32],
+            body_ssz: Vec::new(),
+            is_blinded: false,
+        };
+        // Stub returns a dummy constant (not a BLS signature over the root).
+        // Compare the same dummy from both methods using the spec-header HTR.
+        let object = header.object_root();
+        let sig_header = stub.sign_block_header(&header, &pk, &fork, &gvr).await.unwrap();
+        let sig_block = stub.sign_block(&object, header.slot, &pk, &fork, &gvr).await.unwrap();
+        assert_eq!(
+            sig_header.to_bytes(),
+            sig_block.to_bytes(),
+            "stub sign_block_header must match sign_block of the header object"
+        );
         assert!(stub.sign_randao_reveal(1, &pk, &fork, &gvr).await.is_ok());
         assert!(stub.sign_sync_committee_message(&[5; 32], 1, &pk, &fork, &gvr).await.is_ok());
         assert!(stub.sign_selection_proof(1, &pk, &fork, &gvr).await.is_ok());
@@ -209,5 +283,30 @@ mod tests {
         };
         assert!(stub.sign_builder_registration(&reg, &pk, [0; 4]).await.is_ok());
         assert!(stub.sign_sync_committee_selection_proof(1, 0, &pk, &fork, &gvr).await.is_ok());
+
+        let ptc = PayloadAttestationData {
+            beacon_block_root: [0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        };
+        assert!(stub.sign_payload_attestation(&ptc, &pk, &fork, &gvr).await.is_ok());
+
+        let prefs = ProposerPreferences {
+            dependent_root: [0x33; 32],
+            proposal_slot: 32,
+            validator_index: 3,
+            fee_recipient: [0x44; 20],
+            target_gas_limit: 36_000_000,
+        };
+        assert!(stub.sign_proposer_preferences(&prefs, &pk, &fork, &gvr).await.is_ok());
+
+        let auth = BuilderRequestAuth::new(b"https://builder.example".to_vec(), 1).unwrap();
+        assert!(stub.sign_builder_request_auth(&auth, &pk, [0; 4]).await.is_ok());
+        assert!(stub
+            .sign_execution_payload_envelope_root(&[0x11; 32], 1, &pk, &fork, &gvr)
+            .await
+            .is_ok());
+        assert!(stub.sign_aggregate_and_proof_root(&[0x22; 32], 1, &pk, &fork, &gvr).await.is_ok());
     }
 }

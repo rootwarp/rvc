@@ -1,0 +1,29 @@
+# ARCH-4d corpus: the 28 bare top-level knobs from merge_with_cli (:1214-1241).
+# CLI field `init_slashing_db` is the TOML key `allow_fresh_db`.
+
+beacon_url = "http://top-level:5052"
+beacon_nodes = ["http://bn-a:5052", "http://bn-b:5052"]
+keystore_path = "/tmp/top/keystores"
+password_file = "/tmp/top/passwords.txt"
+slashing_db_path = "/tmp/top/slashing.sqlite"
+allow_fresh_db = true
+allow_unsupported_fork = true
+metrics_address = "0.0.0.0"
+metrics_port = 9091
+network = "hoodi"
+genesis_time = 1606824023
+genesis_validators_root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+graffiti = "top-level"
+log_level = "debug"
+doppelganger_detection = false
+key_decrypt_threads = 4
+disable_attesting = true
+slashed_validators_action = "shutdown"
+disable_keystore_locking = true
+proposer_nodes = ["http://proposer-top:5052"]
+broadcast = ["sync-committee"]
+block_selection_mode = "builder-only"
+validator_registration_batch_size = 250
+validator_registration_batch_delay = 100
+validators_config = "/tmp/top/validators.toml"
+beacon_max_body_bytes = 1048576

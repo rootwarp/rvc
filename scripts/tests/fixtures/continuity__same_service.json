@@ -1,0 +1,66 @@
+{
+  "data": [
+    {
+      "traceID": "cccccccccccccccccccccccccccccccc",
+      "spans": [
+        {
+          "traceID": "cccccccccccccccccccccccccccccccc",
+          "spanID": "6666666666666666",
+          "operationName": "slot.process",
+          "references": [],
+          "startTime": 1710000004000000,
+          "duration": 11000,
+          "tags": [
+            {
+              "key": "service.name",
+              "type": "string",
+              "value": "rvc"
+            }
+          ],
+          "logs": [],
+          "processID": "p1",
+          "warnings": null
+        },
+        {
+          "traceID": "cccccccccccccccccccccccccccccccc",
+          "spanID": "7777777777777777",
+          "operationName": "signer.v2.sign_block_header",
+          "references": [
+            {
+              "refType": "CHILD_OF",
+              "traceID": "cccccccccccccccccccccccccccccccc",
+              "spanID": "6666666666666666"
+            }
+          ],
+          "startTime": 1710000004000500,
+          "duration": 600,
+          "tags": [
+            {
+              "key": "service.name",
+              "type": "string",
+              "value": "rvc-signer"
+            }
+          ],
+          "logs": [],
+          "processID": "p2",
+          "warnings": null
+        }
+      ],
+      "processes": {
+        "p1": {
+          "serviceName": "rvc",
+          "tags": []
+        },
+        "p2": {
+          "serviceName": "rvc",
+          "tags": []
+        }
+      },
+      "warnings": null
+    }
+  ],
+  "total": 0,
+  "limit": 0,
+  "offset": 0,
+  "errors": null
+}

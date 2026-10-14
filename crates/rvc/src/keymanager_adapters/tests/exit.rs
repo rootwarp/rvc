@@ -4,7 +4,8 @@ use super::*;
 
 fn create_exit_adapter(beacon_url: &str, secret_key: SecretKey) -> VoluntaryExitManagerAdapter {
     let beacon_config = beacon::BeaconClientConfig::new(beacon_url);
-    let beacon_client = Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
+    let beacon_client: Arc<dyn bn_manager::BeaconNodeClient> =
+        Arc::new(BeaconClient::new(beacon_config).expect("test beacon client"));
 
     let key_manager = crypto::KeyManager::new();
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
@@ -28,6 +29,8 @@ fn create_exit_adapter(beacon_url: &str, secret_key: SecretKey) -> VoluntaryExit
         electra_fork_version: [5, 0, 0, 0],
         fulu_fork_epoch: 60,
         fulu_fork_version: [6, 0, 0, 0],
+        gloas_fork_epoch: u64::MAX,
+        gloas_fork_version: [7, 0, 0, 0],
     });
 
     let genesis_validators_root = [0xaa; 32];

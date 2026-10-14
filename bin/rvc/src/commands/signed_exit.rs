@@ -126,7 +126,8 @@ pub async fn build_signed_exit(args: ExitCommonArgs) -> anyhow::Result<BuiltSign
                 .map_err(|_| anyhow::anyhow!("system time before UNIX epoch"))?
                 .as_secs();
 
-            let current_slot = now.saturating_sub(genesis_time) / eth_types::SECONDS_PER_SLOT;
+            let current_slot =
+                now.saturating_sub(genesis_time).saturating_mul(1000) / eth_types::SLOT_DURATION_MS;
             current_slot / SLOTS_PER_EPOCH
         }
     };

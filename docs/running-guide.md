@@ -1,5 +1,7 @@
 # Running rvc - Rust Validator Client
 
+To estimate consensus-layer performance of a validator set from a beacon node (without running `rvc`), see [validator-perf.md](validator-perf.md).
+
 ## Prerequisites
 
 - Rust toolchain (edition 2021, MSRV 1.92)
@@ -67,9 +69,7 @@ rvc start [OPTIONS]
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--metrics-port <PORT>` | `8080` | Prometheus metrics HTTP port |
-| `--grpc-port <PORT>` | `50051` | gRPC server port |
-| `--grpc-address <ADDR>` | `127.0.0.1` | gRPC bind address |
+| `--metrics-port <PORT>` | `8080` | Prometheus metrics HTTP port (`/metrics`, `/health`, `/livez`, `/readyz`) |
 
 #### Validator Options
 
@@ -135,6 +135,7 @@ All three TLS flags are required when `--grpc-signer-url` is set.
 | `--tracing-sample-rate <FLOAT>` | `0.01` | Head-based sampling ratio (0.0–1.0) |
 | `--tracing-max-queue-size <N>` | `2048` | Max spans queued for export |
 | `--tracing-max-export-batch-size <N>` | `512` | Max spans per export batch |
+| `--tracing-service-name <NAME>` | `rvc` | OpenTelemetry `service.name` (Jaeger Service dropdown) |
 
 #### Genesis Overrides (for custom networks)
 
@@ -175,7 +176,14 @@ rvc voluntary-exit \
 
 ## Configuration File
 
-Create a TOML file (see `config.example.toml`):
+Create a TOML file (see `config.example.toml`).
+
+Gloas-scheduled networks need extra keys that this sample does not set. See
+[gloas-upgrade.md](gloas-upgrade.md) for `[fork_schedule]`, the six Gloas
+`*_DUE_BPS*` timing keys, the `SECONDS_PER_SLOT` → `SLOT_DURATION_MS` diff,
+the `network = "custom"` devnet fragment, rollback status, and the remote-signer
+gap. Pre-fork alerting rules and dashboard panels:
+[gloas-observability.md](gloas-observability.md).
 
 ```toml
 beacon_url = "http://localhost:5052"
@@ -183,7 +191,6 @@ keystore_path = "./keystores"
 slashing_db_path = "./slashing_protection.sqlite"
 # allow_fresh_db = true   # only for genuine first deploy (prefer --init-slashing-db once)
 metrics_port = 8080
-grpc_port = 50051
 network = "mainnet"
 log_level = "info"
 
@@ -216,6 +223,46 @@ log_level = "info"
 ```
 
 CLI flags override config file values.
+
+### `[timing]` — duty deadlines (TOML only)
+
+These keys have no CLI flags. Values are basis points of the slot duration
+read from the beacon node's `/eth/v1/config/spec` as `SLOT_DURATION_MS`
+(milliseconds). A legacy `SECONDS_PER_SLOT` spelling is still accepted and
+converted (`seconds * 1000`). Deadline milliseconds are
+`bps * slot_duration_ms / 10000`. On mainnet (12000 ms) the pre-Gloas
+defaults are 3999 ms (attestation) and 8000 ms (aggregation).
+
+Gloas keys parse and validate at startup so a devnet can change
+`aggregate_due_bps_gloas` without a rebuild. Runtime selection is
+`DeadlineSchedule::for_fork` (`>= Gloas` takes the Gloas set). Pre-Gloas
+deadlines stay 3999 / 8000 ms on a 12 s slot. Full Gloas operator keys,
+rollback status, and the remote-signer gap: [gloas-upgrade.md](gloas-upgrade.md).
+
+Unknown keys under `[timing]` fail startup and name the offending key.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `attestation_due_bps` | 3333 | Attestation deadline (pre-Gloas) |
+| `aggregate_due_bps` | 6667 | Aggregation deadline (pre-Gloas) |
+| `attestation_due_bps_gloas` | 2500 | Attestation deadline after Gloas |
+| `aggregate_due_bps_gloas` | 5000 | Aggregation deadline after Gloas (devnets may set 6667) |
+| `sync_message_due_bps_gloas` | 2500 | Sync-committee message deadline after Gloas |
+| `contribution_due_bps_gloas` | 5000 | Sync-committee contribution deadline after Gloas |
+| `payload_due_bps` | 5000 | Payload deadline (Gloas) |
+| `payload_attestation_due_bps` | 7500 | Payload attestation deadline (Gloas) |
+
+```toml
+[timing]
+attestation_due_bps = 3333
+aggregate_due_bps = 6667
+attestation_due_bps_gloas = 2500
+aggregate_due_bps_gloas = 5000
+sync_message_due_bps_gloas = 2500
+contribution_due_bps_gloas = 5000
+payload_due_bps = 5000
+payload_attestation_due_bps = 7500
+```
 
 ## Password File Format
 
@@ -276,13 +323,13 @@ Set restrictive permissions: `chmod 600 passwords.txt`
 | Path | Description |
 |------|-------------|
 | `/metrics` | Prometheus metrics |
-| `/health` | Health check |
-| `/livez` | Kubernetes liveness |
+| `/health` | JSON diagnostic (`200` when ready, `503` otherwise). Same readiness predicate as `/readyz`. Not a Kubernetes probe. |
+| `/livez` | Kubernetes liveness (always process-up) |
 | `/readyz` | Kubernetes readiness |
 
-### gRPC (default port 50051)
-
-DutyTracker service.
+The gRPC healthz / DutyTracker listener is gone. Leftover `grpc_port` /
+`grpc_address` keys fail startup. Point probes at `/health`, `/livez`, and
+`/readyz` on this metrics port.
 
 ### Keymanager API (default port 5062, when enabled)
 
@@ -312,7 +359,7 @@ Requires bearer token authentication.
 11. Load validator keys from keystores
 12. Load keys from secret providers (if `--secret-provider` configured)
 13. Start periodic key refresh (if `--secret-refresh-interval` > 0)
-14. Connect gRPC remote signer (if `--grpc-signer-url` configured, lazy, non-fatal)
+14. Connect gRPC remote signer (if `--grpc-signer-url` configured). Failure is non-fatal and is not retried until the next process start.
 15. Run doppelganger detection (if enabled, ~2 epochs)
 16. Build services (signer, propagator, duty tracker, builder)
 17. Start Keymanager API server (if enabled)
@@ -462,6 +509,142 @@ rvc start -c config.toml \
   --tracing-sample-rate 0.01
 ```
 
+#### Local Jaeger v2 (docker compose `tracing` profile)
+
+Bare `docker compose up` stays on `rvc` + `rvc-signer` only. Jaeger v2 is
+opt-in behind `profiles: ["tracing"]`. Compose publishes host-local OTLP/HTTP
+`:4318` and the UI on `127.0.0.1:16686`. The operator recipe below does not
+start a second stack: `scripts/trace-e2e.sh --part 2` brings up that Jaeger,
+then host `bin/rvc` and `bin/rvc-signer` with `OTEL_TRACES_SAMPLER_ARG=1.0`.
+
+Four-step recipe (executed 2026-10-03 against part 2 on develop
+`8fab00400df79c4f111ec69e8e7cb4d633295710`, release binaries, `TRACE_E2E_KEEP=1`):
+
+```bash
+TRACE_E2E_KEEP=1 ./scripts/trace-e2e.sh --part 2
+```
+
+The run printed `trace-e2e: part 2 ok` and wrote
+`target/trace-e2e/spans.json` (Jaeger `GET /api/traces?service=rvc&limit=50`)
+before tearing the stack down.
+
+1. **A warn line that carries a `trace_id`.** From the part-2 `rvc.log`:
+
+   ```text
+   trace_id=90bbcb5135671861a60ac8e363070de8 span_id=7b557055a7f8b910 2026-10-03T14:31:20.490491Z  WARN slot.process{slot=0 epoch=0}:slot.phase.aggregation{time_into_slot=8003}:aggregation.produce{slot=0 validator_index=0 pubkey=0x97f1d3a731...db22c6bb aggregation.fork="electra"}:sign.selection_proof{duty=aggregate}: rvc_signer: Signing failed pubkey=0x97f1d3a731...db22c6bb error=signing rejected locally (no remote contact): raw-root signing is not supported for gRPC remote signers; use TypedSigner::sign_block / sign_attestation / etc. signing_type="selection_proof"
+   ```
+
+2. **That id in Jaeger.** While the part-2 stack was still up:
+
+   ```text
+   GET http://127.0.0.1:16686/api/traces/90bbcb5135671861a60ac8e363070de8
+   ```
+
+   returned the trace (32853 bytes; `traceID` `90bbcb5135671861a60ac8e363070de8`).
+   After the script's flush, the same id is in `target/trace-e2e/spans.json`
+   (96 spans, process `serviceName` values `rvc` and `rvc-signer`).
+   `./scripts/assert-trace-continuity.sh target/trace-e2e/spans.json` exited 0.
+
+3. **Phase breakdown with `time_into_slot`.** Same trace in that Jaeger
+   document (tag on the span, duration in microseconds):
+
+   | Span | `service.name` | `time_into_slot` |
+   |---|---|---|
+   | `slot.phase.block` | `rvc` | 2 |
+   | `slot.phase.attestation` | `rvc` | 4003 |
+   | `slot.phase.aggregation` | `rvc` | 8003 |
+   | `slot.process` | `rvc` | (root span; duration 8009223) |
+
+   `slot.phase.payload_attestation` is present on `rvc` and has no
+   `time_into_slot` tag (pre-Gloas; the phase does not stamp).
+
+4. **Signer span under `rvc-signer`, distinct from `rvc`.** In the same
+   trace, `signer.v2.sign_attestation_data` has process `serviceName`
+   `rvc-signer` (spanID `83d1dab614c8e6ad`, duration 5562 µs). The VC side of
+   the hop is `sign.grpc_remote_typed` on `rvc`. Jaeger `GET /api/services`
+   during the run listed `jaeger`, `rvc`, and `rvc-signer`. The signer log
+   carried the same id on `grpc.sign` / `otel.name="signer.v2.sign_attestation_data"`.
+
+> **Warning:** Compose binds the Jaeger UI to `127.0.0.1:16686` only. Do not
+> republish `16686` on all interfaces. Remote access needs an SSH tunnel
+> (e.g. `ssh -L 16686:127.0.0.1:16686 …`) or an authenticated reverse proxy.
+
+**4317 by design:** OTLP/gRPC port `4317` is **not** published. Use
+OTLP/HTTP on `4318` only. Do not set `COLLECTOR_OTLP_ENABLED` — that is a
+Jaeger v1 env trap; v2 enables OTLP by default.
+
+Tear down with `docker compose --profile tracing down` (or plain
+`docker compose down` after stopping).
+
+#### Dev/demo tail sampling (`tracing-tailsample` profile)
+
+Head sampling decides keep or drop when the root span is created. The
+`"Missed attestation deadline"` warn
+(`crates/rvc/src/orchestrator/coordinator/mod.rs`, `warn_if_attestation_overrun`
+at line 977, `warn!` at line 981) fires seconds later. A head sampler cannot
+go back and keep a trace it already dropped. Collector-side tail sampling
+can: it holds the trace briefly, then decides.
+
+This is a **dev/demo topology, not a production recommendation**. A
+production sampler needs a load-balancing tier so every span of one trace
+lands on the same collector, plus durable storage. That topology is out of
+scope. In-process tail sampling is not added. ADR-005's
+`DEFAULT_TRACING_SAMPLE_RATE` stays **`0.01`**. The `tracing` profile's
+`OTEL_TRACES_SAMPLER_ARG=1.0` is unchanged. Volume context for a 1.0 head
+rate is `plan/tracing-2026-08-06/spans-per-slot.md` (TRC-1f); that
+measurement does not move the default.
+
+The profile uses the same pinned image as `jaeger`
+(`cr.jaegertracing.io/jaegertracing/jaeger:2.11.0`, digest
+`sha256:b585df1b6299bbbd16bf7c679da30389349736e4b6bc8f4f500142a75bf26ca8`).
+That image's `components` list includes the `tail_sampling` processor, so
+the stack does not add `otel-collector-contrib`. Config is
+`config/jaeger/tail-sampling.yaml`. `docker compose up` and
+`docker compose --profile tracing` do not start this service and do not
+change the other services.
+
+Do not combine `--profile tracing-tailsample` with `--profile tracing`.
+Both publish `127.0.0.1:16686` and `127.0.0.1:4318`. OTLP/gRPC `4317` stays
+unpublished. The service is DNS-aliased as `jaeger` on `rvc-net`, so the
+compose endpoint `http://jaeger:4318` reaches it when the `tracing` profile
+is off.
+
+Policy (any match keeps the trace):
+
+| Trace | Decision |
+|---|---|
+| Contains a span event named `Missed attestation deadline` | keep 100% |
+| Contains any span with status `ERROR` | keep 100% |
+| Anything else | keep 10% (`sampling_percentage: 10`) |
+
+The 10% figure is this collector's remainder rate. It is not the ADR-005
+head rate. `tracing-opentelemetry` records the warn as that span event
+only when a span is current; a warn with no current span is a log line
+only and this processor never sees it. `decision_wait` is 20s so spans
+that arrive later in the slot are present before the decision.
+
+```bash
+docker compose --profile tracing-tailsample up -d jaeger-tailsample
+```
+
+UI and query: `http://127.0.0.1:16686`. OTLP/HTTP: `http://127.0.0.1:4318`.
+Tear down with `docker compose --profile tracing-tailsample down`.
+
+Same-run check on 2026-10-04 against the pinned image (one OTLP/HTTP
+export, then `decision_wait`). Both trace ids sit in the 10% policy's
+drop bucket, so a keep is the event or status policy:
+
+| Trace | Id | Jaeger `GET /api/traces/{id}` |
+|---|---|---|
+| Span event `Missed attestation deadline` | `9e3779b97f4a7c15d1b54a32d192ed02` | 200, event present |
+| No warn event, status unset | `3c6ef372fe94f82ad1b54a32d192ed01` | 404, trace not found |
+
+The same export also sent an `ERROR`-status trace
+(`daa66d2c7ddf743fd1b54a32d192ed00`, kept) and one remainder-bucket trace
+with no warn and no error (`4e115049ec25924cd1b54a32d192ed1f`, kept). The
+collector counted 4 traces received, 3 sampled, 1 not sampled
+(`otelcol_processor_tail_sampling_global_count_traces_sampled_total`).
+
 ### With gRPC Remote Signer (rvc-signer)
 
 ```bash
@@ -572,6 +755,8 @@ rvc-signer serve \
 
 # Node 2 and Node 3 similar with their own shares and index
 ```
+
+An unreachable peer is not a startup failure. `rvc-signer` logs one warning per configured peer (`DVT peer configured, not yet reachable`) and keeps serving; `rvc_dvt_peer_ready{peer}` is 0 until the first successful RPC to that address, then 1. A misconfigured peer is fatal: a missing allow-list entry, or an empty SNI hostname when TLS is on, still aborts startup.
 
 ### gRPC Services
 

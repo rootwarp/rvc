@@ -28,8 +28,10 @@
 
 use std::sync::Arc;
 
+use observability::logging::{fields, record_display, TruncatedPubkey};
 use tonic::{Request, Response, Status};
 use tracing::Span;
+use tree_hash::TreeHash;
 
 use crate::audit;
 use crate::dvt::allow_list::AllowedPeers;
@@ -39,15 +41,17 @@ use slashing::PubkeyScopedDb;
 // V2 proto imports
 use crate::proto::signer_v2::peer_signer_service_server::PeerSignerService;
 use crate::proto::signer_v2::{
-    PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest, PartialSignResponse,
-    PartialSignSyncCommitteeRequest,
+    PartialSignAttestationDataRequest, PartialSignBeaconBlockRequest,
+    PartialSignBlockHeaderRequest, PartialSignPayloadAttestationRequest, PartialSignResponse,
+    PartialSignRootRequest, PartialSignSyncCommitteeRequest,
 };
 
 use slashing::SlashingDb;
 
 use crate::grpc_common::{
-    decode_attestation_data, decode_beacon_block, decode_fork_info, validate_pubkey,
-    validate_root32,
+    decode_attestation_data, decode_beacon_block, decode_beacon_block_header, decode_fork_info,
+    decode_payload_attestation_data, root_duty_plan, validate_pubkey, validate_root32,
+    validate_transport_fork_id,
 };
 use crate::sign_plan::{plan_sign, PlanInput};
 
@@ -70,6 +74,9 @@ pub struct PeerSignerServiceImpl {
     allow_list: Arc<AllowedPeers>,
     /// Slashing DB — `None` when slashing protection is disabled.
     slashing_db: Option<Arc<SlashingDb>>,
+    /// Network genesis fork for builder-registration-idiom duties
+    /// (`BUILDER_REQUEST_AUTH`). Must match HTTP/gRPC full-sign.
+    genesis_fork_version: [u8; 4],
 }
 
 impl PeerSignerServiceImpl {
@@ -82,7 +89,18 @@ impl PeerSignerServiceImpl {
         allow_list: Arc<AllowedPeers>,
         slashing_db: Option<Arc<SlashingDb>>,
     ) -> Self {
-        Self { shares, allow_list, slashing_db }
+        Self {
+            shares,
+            allow_list,
+            slashing_db,
+            genesis_fork_version: crate::sign_plan::BUILDER_FORK_VERSION_MAINNET,
+        }
+    }
+
+    /// Set the network genesis fork used for `BUILDER_REQUEST_AUTH` plans.
+    pub fn with_genesis_fork_version(mut self, genesis_fork_version: [u8; 4]) -> Self {
+        self.genesis_fork_version = genesis_fork_version;
+        self
     }
 
     #[allow(clippy::result_large_err)]
@@ -161,6 +179,26 @@ fn authenticate_peer<'a>(
     Ok(allowed)
 }
 
+/// Re-hash `data` and require it to equal the requester's planned `object_root`.
+///
+/// `object_root` is required (exactly 32 bytes). Empty/short values are
+/// `InvalidArgument` so agreement cannot be skipped by omitting the field.
+#[allow(clippy::result_large_err)]
+fn agree_payload_attestation_object_root(
+    data: &eth_types::PayloadAttestationData,
+    requested_object_root: &[u8],
+) -> Result<[u8; 32], Status> {
+    use tree_hash::TreeHash;
+    let requested = validate_root32(requested_object_root, "object_root")?;
+    let computed = data.tree_hash_root().0;
+    if requested != computed {
+        return Err(Status::failed_precondition(
+            "payload attestation data does not re-hash to the requested object_root",
+        ));
+    }
+    Ok(computed)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // PeerSignerService v2 impl
 // ─────────────────────────────────────────────────────────────────────────────
@@ -169,6 +207,10 @@ fn authenticate_peer<'a>(
 impl PeerSignerService for PeerSignerServiceImpl {
     // ── PartialSignBeaconBlock ────────────────────────────────────────────────
 
+    /// `signer.v2.PeerSignerService/PartialSignBeaconBlock` (ARCH-7i).
+    ///
+    /// Enforcement: `GateRouting::SlashingScopedShare` via `stage_block`.
+    /// Not `SigningGate`-routed.
     #[tracing::instrument(
         name = "signer.dvt.partial_sign_beacon_block",
         skip_all,
@@ -199,7 +241,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 2. Validate fields.
         let pubkey = validate_pubkey(&r.pubkey)?;
         let pubkey_hex_str = pubkey_hex(&pubkey);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
 
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
@@ -221,6 +267,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // borrow checker sees the borrow of `shares` is finished before spawn_blocking.
         let share =
             shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
         drop(shares);
 
         // 5. Stage → sign → commit.
@@ -228,8 +276,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let peer_cn_for_log = peer_cn;
 
         // spawn_blocking is required because StagedBlock holds a !Send MutexGuard.
+        let span = tracing::Span::current();
         let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
-            let staged = scoped
+            let _enter = span.enter();
+            let (staged, audit) = scoped
                 .stage_block(&pubkey_hex_str, slot, signing_root_hex)
                 .map_err(slashing_err)?;
 
@@ -237,13 +287,17 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
             match sign_result {
                 Ok(sig) => {
-                    staged
+                    // Emit after commit attempt regardless of success (matches StagedRow bridge).
+                    let commit_result = staged
                         .commit()
-                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")));
+                    audit.emit();
+                    commit_result?;
                     Ok(sig)
                 }
                 Err(e) => {
                     staged.discard();
+                    audit.emit();
                     Err(e)
                 }
             }
@@ -262,11 +316,18 @@ impl PeerSignerService for PeerSignerServiceImpl {
             share_index,
             "partial_sign_beacon_block: success"
         );
-        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
     }
 
     // ── PartialSignAttestationData ────────────────────────────────────────────
 
+    /// `signer.v2.PeerSignerService/PartialSignAttestationData` (ARCH-7i).
+    ///
+    /// Enforcement: `GateRouting::SlashingScopedShare` via `stage_attestation`.
+    /// Not `SigningGate`-routed.
     #[tracing::instrument(
         name = "signer.dvt.partial_sign_attestation_data",
         skip_all,
@@ -297,7 +358,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 2. Validate.
         let pubkey = validate_pubkey(&r.pubkey)?;
         let pubkey_hex_str = pubkey_hex(&pubkey);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
 
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
@@ -313,6 +378,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 4. Get share — clone to own, explicitly drop Arc<HashMap>.
         let share =
             shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
         drop(shares);
 
         // 5. Stage → sign → commit.
@@ -320,8 +387,10 @@ impl PeerSignerService for PeerSignerServiceImpl {
         let peer_cn_for_log = peer_cn;
 
         // spawn_blocking is required because StagedAttestation holds a !Send MutexGuard.
+        let span = tracing::Span::current();
         let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
-            let staged = scoped
+            let _enter = span.enter();
+            let (staged, audit) = scoped
                 .stage_attestation(&pubkey_hex_str, source_epoch, target_epoch, signing_root_hex)
                 .map_err(slashing_err)?;
 
@@ -329,13 +398,17 @@ impl PeerSignerService for PeerSignerServiceImpl {
 
             match sign_result {
                 Ok(sig) => {
-                    staged
+                    // Emit after commit attempt regardless of success (matches StagedRow bridge).
+                    let commit_result = staged
                         .commit()
-                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")))?;
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")));
+                    audit.emit();
+                    commit_result?;
                     Ok(sig)
                 }
                 Err(e) => {
                     staged.discard();
+                    audit.emit();
                     Err(e)
                 }
             }
@@ -355,13 +428,18 @@ impl PeerSignerService for PeerSignerServiceImpl {
             share_index,
             "partial_sign_attestation_data: success"
         );
-        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
     }
 
     // ── PartialSignSyncCommittee ──────────────────────────────────────────────
-    //
-    // Sync committee signing is NOT slashable (per FR-P0-3). No staging.
 
+    /// `signer.v2.PeerSignerService/PartialSignSyncCommittee` (ARCH-7j).
+    ///
+    /// Enforcement: `GateRouting::NonSlashable` (FR-P0-3 / DOMAIN_SYNC_COMMITTEE).
+    /// No `SLASHING_STAGE_METHODS` member — sync is not slashable.
     #[tracing::instrument(
         name = "signer.dvt.partial_sign_sync_committee",
         skip_all,
@@ -390,7 +468,11 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 2. Validate.
         let pubkey = validate_pubkey(&r.pubkey)?;
         let pubkey_hex_str = pubkey_hex(&pubkey);
-        Span::current().record("pubkey", pubkey_hex_str.as_str());
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
 
         let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
 
@@ -406,6 +488,8 @@ impl PeerSignerService for PeerSignerServiceImpl {
         // 4. Get share — clone to own, explicitly drop Arc<HashMap>.
         let share =
             shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
         drop(shares);
 
         // 5. Sign directly — no slashing check for sync committee (FR-P0-3).
@@ -418,7 +502,256 @@ impl PeerSignerService for PeerSignerServiceImpl {
             share_index,
             "partial_sign_sync_committee: success"
         );
-        Ok(Response::new(PartialSignResponse { partial_signature: sig.to_vec(), share_index }))
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
+    }
+
+    // ── PartialSignPayloadAttestation ─────────────────────────────────────────
+
+    /// `signer.v2.PeerSignerService/PartialSignPayloadAttestation` (4.11b).
+    ///
+    /// Enforcement: `GateRouting::NonSlashable` (`DOMAIN_PTC_ATTESTER`).
+    /// No `PubkeyScopedDb` stage/commit — PTC is not slashable.
+    ///
+    /// Agreement: re-hash decoded `PayloadAttestationData` against the requester's
+    /// planned `object_root`. `fork_version` / `gvr` come from `fork_info` (no BN).
+    #[tracing::instrument(
+        name = "signer.dvt.partial_sign_payload_attestation",
+        skip_all,
+        fields(pubkey, slot, peer_cn, share_index)
+    )]
+    #[allow(clippy::result_large_err)]
+    async fn partial_sign_payload_attestation(
+        &self,
+        req: Request<PartialSignPayloadAttestationRequest>,
+    ) -> Result<Response<PartialSignResponse>, Status> {
+        let allow_list = Arc::clone(&self.allow_list);
+        let shares = Arc::clone(&self.shares);
+
+        let peer_cn = audit::cn::extract_client_cn(&req);
+        Span::current().record("peer_cn", peer_cn.as_str());
+
+        let r = req.into_inner();
+
+        // 1. Authenticate.
+        let share_index = {
+            let allowed = authenticate_peer(&allow_list, &peer_cn, r.requester_index)?;
+            allowed.share_index
+        };
+        Span::current().record("share_index", share_index);
+
+        // 2. Validate pubkey, then fork_info — reject a malformed fork_version
+        // before the share map is consulted.
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
+
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+
+        // 3. Decode data; planned object_root must match the re-hash (4.11b agreement).
+        let data = decode_payload_attestation_data(r.data)?;
+        Span::current().record("slot", data.slot);
+
+        let object_root = agree_payload_attestation_object_root(&data, &r.object_root)?;
+        let plan = plan_sign(&PlanInput::PayloadAttestation { object_root, fork_version, gvr });
+        let signing_root = plan.signing_root;
+
+        // 4. Get share — clone to own, explicitly drop Arc<HashMap>.
+        let share =
+            shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
+        drop(shares);
+
+        // 5. Sign directly — no slashing check for PTC.
+        let sig = partial_sign_with_share(&signing_root, &share)?;
+
+        tracing::info!(
+            pubkey = %pubkey_hex_str,
+            slot = data.slot,
+            peer_cn = %peer_cn,
+            share_index,
+            "partial_sign_payload_attestation: success"
+        );
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
+    }
+
+    /// `signer.v2.PeerSignerService/PartialSignBlockHeader` (4.20b).
+    ///
+    /// Slashable: hashes the 5-leaf header and stages `slot` from the same
+    /// message via `PubkeyScopedDb`. Transport fork identity uses
+    /// `ForkName::try_from` (Gloas=7 is valid).
+    #[tracing::instrument(
+        name = "signer.dvt.partial_sign_block_header",
+        skip_all,
+        fields(pubkey, slot, peer_cn, share_index)
+    )]
+    #[allow(clippy::result_large_err)]
+    async fn partial_sign_block_header(
+        &self,
+        req: Request<PartialSignBlockHeaderRequest>,
+    ) -> Result<Response<PartialSignResponse>, Status> {
+        let allow_list = Arc::clone(&self.allow_list);
+        let shares = Arc::clone(&self.shares);
+        let db_arc: Arc<SlashingDb> = Arc::clone(self.require_db()?);
+
+        let peer_cn = audit::cn::extract_client_cn(&req);
+        Span::current().record("peer_cn", peer_cn.as_str());
+
+        let r = req.into_inner();
+
+        let share_index = {
+            let allowed = authenticate_peer(&allow_list, &peer_cn, r.requester_index)?;
+            allowed.share_index
+        };
+        Span::current().record("share_index", share_index);
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
+
+        validate_transport_fork_id(r.fork_id)?;
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+        let header = decode_beacon_block_header(r.header)?;
+        let slot = header.slot;
+        Span::current().record("slot", slot);
+
+        let object_root = header.tree_hash_root().0;
+        let plan = plan_sign(&PlanInput::Block { object_root, slot, fork_version, gvr });
+        let signing_root = plan.signing_root;
+        let signing_root_hex = Some(root_hex(&signing_root));
+
+        let share =
+            shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
+        drop(shares);
+
+        let scoped = PubkeyScopedDb::new(db_arc, peer_cn.clone(), gvr);
+        let peer_cn_for_log = peer_cn;
+
+        let span = tracing::Span::current();
+        let sig = tokio::task::spawn_blocking(move || -> Result<[u8; 96], Status> {
+            let _enter = span.enter();
+            let (staged, audit) = scoped
+                .stage_block(&pubkey_hex_str, slot, signing_root_hex)
+                .map_err(slashing_err)?;
+
+            let sign_result = partial_sign_with_share(&signing_root, &share);
+
+            match sign_result {
+                Ok(sig) => {
+                    let commit_result = staged
+                        .commit()
+                        .map_err(|e| Status::internal(format!("slashing DB commit failed: {e}")));
+                    audit.emit();
+                    commit_result?;
+                    Ok(sig)
+                }
+                Err(e) => {
+                    staged.discard();
+                    audit.emit();
+                    Err(e)
+                }
+            }
+        })
+        .await
+        .map_err(|join_err| {
+            Status::internal(format!(
+                "partial_sign_block_header blocking task panicked: {join_err}"
+            ))
+        })??;
+
+        tracing::info!(
+            pubkey = %pubkey_hex(&pubkey),
+            slot,
+            peer_cn = %peer_cn_for_log,
+            share_index,
+            "partial_sign_block_header: success"
+        );
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
+    }
+
+    /// `signer.v2.PeerSignerService/PartialSignRoot` (4.20b).
+    ///
+    /// Non-slashable: no `PubkeyScopedDb` stage/commit. Same duty mapping as
+    /// `SignRoot`.
+    #[tracing::instrument(
+        name = "signer.dvt.partial_sign_root",
+        skip_all,
+        fields(pubkey, duty, peer_cn, share_index)
+    )]
+    #[allow(clippy::result_large_err)]
+    async fn partial_sign_root(
+        &self,
+        req: Request<PartialSignRootRequest>,
+    ) -> Result<Response<PartialSignResponse>, Status> {
+        let allow_list = Arc::clone(&self.allow_list);
+        let shares = Arc::clone(&self.shares);
+
+        let peer_cn = audit::cn::extract_client_cn(&req);
+        Span::current().record("peer_cn", peer_cn.as_str());
+
+        let r = req.into_inner();
+
+        let share_index = {
+            let allowed = authenticate_peer(&allow_list, &peer_cn, r.requester_index)?;
+            allowed.share_index
+        };
+        Span::current().record("share_index", share_index);
+        Span::current().record("duty", r.duty);
+
+        let pubkey = validate_pubkey(&r.pubkey)?;
+        let pubkey_hex_str = pubkey_hex(&pubkey);
+        record_display(
+            &tracing::Span::current(),
+            fields::PUBKEY,
+            TruncatedPubkey::new(pubkey_hex_str.as_str()),
+        );
+
+        validate_transport_fork_id(r.fork_id)?;
+        let (fork_version, gvr) = decode_fork_info(r.fork_info)?;
+        let object_root = validate_root32(&r.object_root, "object_root")?;
+        let planned =
+            root_duty_plan(r.duty, object_root, fork_version, gvr, self.genesis_fork_version)?;
+        let plan = plan_sign(&planned.input);
+        let signing_root = plan.signing_root;
+
+        let share =
+            shares.get(&pubkey).ok_or_else(|| Status::not_found("unknown public key"))?.clone();
+        // Response index is this node's Shamir share, not the requester's allow-list index.
+        let signing_share_index = share.index;
+        drop(shares);
+
+        let sig = partial_sign_with_share(&signing_root, &share)?;
+
+        tracing::info!(
+            pubkey = %pubkey_hex_str,
+            duty = r.duty,
+            peer_cn = %peer_cn,
+            share_index,
+            "partial_sign_root: success"
+        );
+        Ok(Response::new(PartialSignResponse {
+            partial_signature: sig.to_vec(),
+            share_index: signing_share_index,
+        }))
     }
 }
 
@@ -892,5 +1225,396 @@ mod tests {
         let pubkey_hex_str = pubkey_hex(&pk);
         let blocks = db.get_blocks(&pubkey_hex_str).expect("get_blocks");
         assert!(blocks.is_empty(), "no row must be committed after signer failure");
+    }
+
+    // ── partial_sign_payload_attestation tests (4.11b) ────────────────────────
+
+    fn sample_payload_attestation_data_proto() -> crate::proto::signer_v2::PayloadAttestationData {
+        crate::proto::signer_v2::PayloadAttestationData {
+            beacon_block_root: vec![0x11; 32],
+            slot: 1,
+            payload_present: true,
+            blob_data_available: false,
+        }
+    }
+
+    fn sample_payload_attestation_object_root() -> Vec<u8> {
+        hex::decode(rvc_spec_vectors::spec_kat::SPEC_GLOAS_PAYLOADATTESTATIONDATA_ROOT)
+            .expect("SPEC_GLOAS_PAYLOADATTESTATIONDATA_ROOT")
+    }
+
+    #[test]
+    fn test_sample_ptc_data_matches_spec_kat() {
+        use tree_hash::TreeHash;
+        let computed =
+            decode_payload_attestation_data(Some(sample_payload_attestation_data_proto()))
+                .expect("sample payload attestation data")
+                .tree_hash_root()
+                .0
+                .to_vec();
+        assert_eq!(computed, sample_payload_attestation_object_root());
+        assert_eq!(
+            hex::encode(&computed),
+            rvc_spec_vectors::spec_kat::SPEC_GLOAS_PAYLOADATTESTATIONDATA_ROOT
+        );
+    }
+
+    fn sample_ptc_request(
+        requester_index: u64,
+        pubkey: [u8; 48],
+        fork_info: crate::proto::signer_v2::ForkInfo,
+        object_root: Vec<u8>,
+    ) -> Request<PartialSignPayloadAttestationRequest> {
+        Request::new(PartialSignPayloadAttestationRequest {
+            requester_index,
+            pubkey: pubkey.to_vec(),
+            fork_info: Some(fork_info),
+            data: Some(sample_payload_attestation_data_proto()),
+            fork_id: 7,
+            object_root,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_payload_attestation_happy_path() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let svc = make_service(vec![(pk, share)], al, Some(db));
+
+        let resp = svc
+            .partial_sign_payload_attestation(sample_ptc_request(
+                1,
+                pk,
+                sample_fork_info(),
+                sample_payload_attestation_object_root(),
+            ))
+            .await
+            .unwrap();
+        let inner = resp.into_inner();
+        assert_eq!(inner.partial_signature.len(), 96);
+        assert_eq!(inner.share_index, 1);
+    }
+
+    #[tokio::test]
+    async fn test_dvt_ptc_root_mismatch_produces_no_partial() {
+        // Empty share map: share lookup would be NotFound. FailedPrecondition
+        // proves agreement ran first and no partial was produced.
+        let (pk, _) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let svc = make_service(vec![], al, Some(make_db()));
+
+        let err = svc
+            .partial_sign_payload_attestation(sample_ptc_request(
+                1,
+                pk,
+                sample_fork_info(),
+                vec![0xFF; 32],
+            ))
+            .await
+            .expect_err("mismatched object_root must not produce a partial");
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_ne!(
+            err.code(),
+            tonic::Code::NotFound,
+            "share map must not be consulted on mismatch"
+        );
+        assert!(
+            err.message().contains("object_root"),
+            "typed mismatch error must name object_root, got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dvt_ptc_empty_object_root_rejected_before_share() {
+        let (pk, _) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let svc = make_service(vec![], al, Some(make_db()));
+
+        let err = svc
+            .partial_sign_payload_attestation(sample_ptc_request(1, pk, sample_fork_info(), vec![]))
+            .await
+            .expect_err("empty object_root must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_ne!(err.code(), tonic::Code::NotFound, "share map must not be consulted");
+        assert!(
+            err.message().contains("object_root"),
+            "empty object_root must fail field validation, got: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dvt_ptc_invalid_fork_version_rejected_before_share() {
+        // Empty share map: share lookup would be NotFound. An invalid
+        // current_version error proves decode_fork_info ran first.
+        let (pk, _) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let svc = make_service(vec![], al, Some(make_db()));
+
+        let mut fork_info = sample_fork_info();
+        fork_info.current_version = vec![0x04, 0x00, 0x00];
+
+        let err = svc
+            .partial_sign_payload_attestation(sample_ptc_request(
+                1,
+                pk,
+                fork_info,
+                sample_payload_attestation_object_root(),
+            ))
+            .await
+            .expect_err("invalid fork_version must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(
+            err.message().contains("current_version"),
+            "invalid current_version must fail decode_fork_info, got: {}",
+            err.message()
+        );
+        assert_ne!(
+            err.code(),
+            tonic::Code::NotFound,
+            "share map must not be consulted before fork_info is valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dvt_ptc_writes_no_slashing_row() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let pubkey_hex_str = pubkey_hex(&pk);
+        let before_blocks = db.get_blocks(&pubkey_hex_str).expect("get_blocks before").len();
+        let before_atts =
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations before").len();
+
+        let svc = make_service(vec![(pk, share)], al, Some(Arc::clone(&db)));
+        let resp = svc
+            .partial_sign_payload_attestation(sample_ptc_request(
+                1,
+                pk,
+                sample_fork_info(),
+                sample_payload_attestation_object_root(),
+            ))
+            .await
+            .expect("PTC partial sign must succeed without slashing");
+        assert_eq!(resp.into_inner().partial_signature.len(), 96);
+
+        let after_blocks = db.get_blocks(&pubkey_hex_str).expect("get_blocks after").len();
+        let after_atts =
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations after").len();
+        assert_eq!(after_blocks, before_blocks, "PTC must not write a block row");
+        assert_eq!(after_atts, before_atts, "PTC must not write an attestation row");
+    }
+
+    fn sample_header(slot: u64) -> crate::proto::signer_v2::BeaconBlockHeader {
+        crate::proto::signer_v2::BeaconBlockHeader {
+            slot,
+            proposer_index: 1,
+            parent_root: vec![0x11; 32],
+            state_root: vec![0x22; 32],
+            body_root: vec![0x33; 32],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_block_header_happy_path_gloas() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let svc = make_service(vec![(pk, share)], al, Some(Arc::clone(&db)));
+
+        let resp = svc
+            .partial_sign_block_header(Request::new(PartialSignBlockHeaderRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                header: Some(sample_header(77)),
+                fork_id: 7,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(resp.into_inner().partial_signature.len(), 96);
+
+        let blocks = db.get_blocks(&pubkey_hex(&pk)).expect("get_blocks");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].slot, 77);
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_root_payload_attestation_writes_no_slashing_row() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let pubkey_hex_str = pubkey_hex(&pk);
+        let before_blocks = db.get_blocks(&pubkey_hex_str).expect("get_blocks before").len();
+        let before_atts =
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations before").len();
+
+        let svc = make_service(vec![(pk, share)], al, Some(Arc::clone(&db)));
+        let resp = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: sample_payload_attestation_object_root(),
+                duty: crate::proto::signer_v2::Duty::PayloadAttestation as i32,
+                fork_id: 7,
+            }))
+            .await
+            .expect("partial_sign_root PTC");
+        assert_eq!(resp.into_inner().partial_signature.len(), 96);
+
+        assert_eq!(
+            db.get_blocks(&pubkey_hex_str).expect("get_blocks after").len(),
+            before_blocks,
+            "non-slashable root duty must not write a block row"
+        );
+        assert_eq!(
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations after").len(),
+            before_atts,
+            "non-slashable root duty must not write an attestation row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_root_builder_request_auth_uses_configured_genesis() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let holesky = eth_types::NetworkPreset::HOLESKY.genesis_fork_version;
+        let mainnet = crate::sign_plan::BUILDER_FORK_VERSION_MAINNET;
+        assert_ne!(holesky, mainnet, "holesky genesis must differ from mainnet");
+
+        let object_root = [0x44u8; 32];
+        let fv = [0x04, 0x00, 0x00, 0x00];
+        let gvr = [0u8; 32];
+        let duty = crate::proto::signer_v2::Duty::BuilderRequestAuth as i32;
+        let holesky_root =
+            plan_sign(&root_duty_plan(duty, object_root, fv, gvr, holesky).unwrap().input)
+                .signing_root;
+        let mainnet_root =
+            plan_sign(&root_duty_plan(duty, object_root, fv, gvr, mainnet).unwrap().input)
+                .signing_root;
+        assert_ne!(holesky_root, mainnet_root);
+
+        let expected_holesky = partial_sign_with_share(&holesky_root, &share).unwrap();
+        let expected_mainnet = partial_sign_with_share(&mainnet_root, &share).unwrap();
+        assert_ne!(expected_holesky.as_slice(), expected_mainnet.as_slice());
+
+        let svc =
+            make_service(vec![(pk, share)], al, Some(make_db())).with_genesis_fork_version(holesky);
+        let resp = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: object_root.to_vec(),
+                duty,
+                fork_id: 7,
+            }))
+            .await
+            .expect("partial_sign_root BUILDER_REQUEST_AUTH");
+        let sig = resp.into_inner().partial_signature;
+        assert_eq!(sig.as_slice(), expected_holesky.as_slice());
+        assert_ne!(sig.as_slice(), expected_mainnet.as_slice());
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_root_execution_payload_envelope_writes_no_slashing_row() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let pubkey_hex_str = pubkey_hex(&pk);
+        let before_blocks = db.get_blocks(&pubkey_hex_str).expect("get_blocks before").len();
+        let before_atts =
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations before").len();
+
+        let svc = make_service(vec![(pk, share)], al, Some(Arc::clone(&db)));
+        let resp = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: crate::proto::signer_v2::Duty::ExecutionPayloadEnvelope as i32,
+                fork_id: 7,
+            }))
+            .await
+            .expect("partial_sign_root EXECUTION_PAYLOAD_ENVELOPE");
+        assert_eq!(resp.into_inner().partial_signature.len(), 96);
+
+        assert_eq!(
+            db.get_blocks(&pubkey_hex_str).expect("get_blocks after").len(),
+            before_blocks,
+            "non-slashable envelope duty must not write a block row"
+        );
+        assert_eq!(
+            db.get_attestations(&pubkey_hex_str).expect("get_attestations after").len(),
+            before_atts,
+            "non-slashable envelope duty must not write an attestation row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_root_unspecified_duty_rejected_before_share() {
+        let (pk, _) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let svc = make_service(vec![], al, Some(make_db()));
+
+        let err = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: 0,
+                fork_id: 7,
+            }))
+            .await
+            .expect_err("UNSPECIFIED must fail closed");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_ne!(err.code(), tonic::Code::NotFound, "share map must not be consulted");
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_root_fork_id_8_rejected_before_share() {
+        let (pk, _) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let svc = make_service(vec![], al, Some(make_db()));
+
+        let err = svc
+            .partial_sign_root(Request::new(PartialSignRootRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                object_root: vec![0x11; 32],
+                duty: crate::proto::signer_v2::Duty::PayloadAttestation as i32,
+                fork_id: 8,
+            }))
+            .await
+            .expect_err("fork_id 8 must fail closed");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_ne!(err.code(), tonic::Code::NotFound, "share map must not be consulted");
+    }
+
+    #[tokio::test]
+    async fn test_partial_sign_block_header_legacy_ssz_still_rejects_fork_id_7() {
+        let (pk, share) = make_share(1);
+        let al = make_allow_list(vec![("unknown", 1)]);
+        let db = make_db();
+        let svc = make_service(vec![(pk, share)], al, Some(db));
+
+        let err = svc
+            .partial_sign_beacon_block(Request::new(PartialSignBeaconBlockRequest {
+                requester_index: 1,
+                pubkey: pk.to_vec(),
+                fork_info: Some(sample_fork_info()),
+                block_ssz: sample_block_ssz(42),
+                fork_id: 7,
+            }))
+            .await
+            .expect_err("legacy SSZ path must keep rejecting Gloas");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(err.message().contains("unknown fork_id: 7"));
     }
 }

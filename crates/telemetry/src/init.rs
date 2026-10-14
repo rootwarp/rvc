@@ -34,8 +34,11 @@ pub fn init_tracing(
     let version =
         config.service_version.clone().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
 
+    // Resolve once for both resource and tracer (ADR-007 / TRC-1c).
+    let service_name = config.service_name.as_deref().unwrap_or(SERVICE_NAME).to_string();
+
     let resource = Resource::builder()
-        .with_service_name(SERVICE_NAME)
+        .with_service_name(service_name.clone())
         .with_attributes([
             KeyValue::new("service.version", version),
             KeyValue::new("network.name", config.network.clone()),
@@ -46,7 +49,7 @@ pub fn init_tracing(
 
     let provider = build_provider(config, resource, sampler)?;
 
-    let tracer = provider.tracer(SERVICE_NAME);
+    let tracer = provider.tracer(service_name);
     let layer = OpenTelemetryLayer::new(tracer).boxed();
 
     Ok((layer, TracingGuard { provider }))
@@ -621,6 +624,62 @@ mod tests {
         assert!(result.is_ok());
         let (_layer, guard) = result.unwrap();
         guard.provider.shutdown().ok();
+    }
+
+    /// TRC-1c / ADR-007: `service_name` resolves once and feeds both the
+    /// resource `service.name` attribute and the tracer instrumentation name.
+    #[test]
+    fn test_init_tracing_service_name_applies_to_resource_and_tracer() {
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry::Key;
+
+        let src = include_str!("init.rs");
+        let prod = src.split("#[cfg(test)]").next().expect("production section");
+        assert_eq!(
+            prod.matches("unwrap_or(SERVICE_NAME)").count(),
+            1,
+            "service_name must resolve once via unwrap_or(SERVICE_NAME)"
+        );
+        assert!(
+            prod.contains(".with_service_name(service_name.clone())"),
+            "resource must use the resolved service_name"
+        );
+        assert!(
+            prod.contains("provider.tracer(service_name)"),
+            "tracer must use the resolved service_name"
+        );
+
+        let cases: [(Option<&str>, &str); 2] = [(None, "rvc"), (Some("rvc-signer"), "rvc-signer")];
+
+        for (configured, expected) in cases {
+            let config = TelemetryConfig {
+                service_name: configured.map(str::to_string),
+                ..Default::default()
+            };
+            let resolved = config.service_name.as_deref().unwrap_or(SERVICE_NAME).to_string();
+            assert_eq!(resolved, expected, "resolve None→rvc / Some→configured");
+
+            // Resource attribute (same builder path as init_tracing).
+            let resource = Resource::builder().with_service_name(resolved.clone()).build();
+            let resource_name = resource
+                .get(&Key::from_static_str("service.name"))
+                .map(|v: opentelemetry::Value| v.as_str().into_owned());
+            assert_eq!(
+                resource_name.as_deref(),
+                Some(expected),
+                "resource service.name must be {expected}"
+            );
+
+            // Tracer instrumentation name (Debug exposes scope.name).
+            let (_layer, guard) = init_tracing(&config).expect("init_tracing");
+            let tracer = guard.provider.tracer(resolved);
+            let tracer_debug = format!("{tracer:?}");
+            assert!(
+                tracer_debug.contains(expected),
+                "tracer Debug must include service name {expected}: {tracer_debug}"
+            );
+            guard.provider.shutdown().ok();
+        }
     }
 
     #[test]

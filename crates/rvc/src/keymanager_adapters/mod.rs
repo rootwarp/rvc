@@ -5,6 +5,8 @@
 
 mod config;
 mod doppelganger;
+mod import_window;
+mod kdf_budget;
 mod keystore;
 mod notifier;
 mod remote_keys;
@@ -18,15 +20,18 @@ mod tests;
 
 pub use config::ValidatorConfigManagerAdapter;
 pub use doppelganger::{
-    scan_and_rearm_gate, wall_clock_epoch, DoppelgangerMonitorAdapter, ForwardWindowMonitor,
+    scan_and_rearm_gate, wall_clock_epoch, DoppelgangerDisabledMonitor, ForwardWindowMonitor,
 };
 pub use keystore::KeystoreManagerAdapter;
 pub use notifier::KeyChangeNotifier;
 pub use remote_keys::RemoteKeyManagerAdapter;
 pub use slashing::SlashingProtectionAdapter;
 pub use spawn::{
-    build_keymanager_api, spawn_keymanager_api, BuiltKeymanagerApi, DoppelgangerMonitorKind,
-    KeymanagerApiDeps, SpawnKeymanagerApiError,
+    build_keymanager_api, keymanager_bind_addr, spawn_keymanager_api, BuiltKeymanagerApi,
+    DoppelgangerMonitorKind, KeymanagerApiDeps, SpawnKeymanagerApiError,
 };
 pub use validator::ValidatorManagerAdapter;
 pub use voluntary_exit::VoluntaryExitManagerAdapter;
+
+#[cfg(test)]
+pub(crate) use kdf_budget::KdfBudgetConfig;

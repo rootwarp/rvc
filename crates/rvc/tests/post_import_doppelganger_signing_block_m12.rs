@@ -4,18 +4,16 @@
 //!
 //! 1. `ValidatorStore::is_signing_enabled` blocks newly imported validators
 //!    that are still inside their doppelganger window (enabled=false).
-//! 2. `DoppelgangerGate` and `ValidatorStore` together correctly represent the
-//!    combined gate state: a validator is safe to sign only when both
-//!    - the gate's time window has elapsed (`is_doppelganger_safe` = true), AND
+//! 2. The doppelganger monitor and `ValidatorStore` together represent the
+//!    combined enablement state: a validator is safe to sign only when both
+//!    - the monitor reports `is_doppelganger_safe` = true, AND
 //!    - the validator store's enabled flag is true (`is_signing_enabled` = true).
-//! 3. `scan_and_rearm_gate` re-arms the gate after restart for recently-imported
+//! 3. `scan_and_rearm_gate` re-arms the monitor after restart for recently-imported
 //!    keys (Critical #2 fix).
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
-use keymanager_api::gate::DoppelgangerGate;
-use keymanager_api::traits::DoppelgangerMonitor;
+use keymanager_api::traits::{DoppelgangerMonitor, Pubkey};
 use rvc::keymanager_adapters::scan_and_rearm_gate;
 use validator_store::{ValidatorConfig, ValidatorStore};
 
@@ -23,6 +21,34 @@ fn test_pk(seed: u8) -> [u8; 48] {
     let mut pk = [0u8; 48];
     pk[0] = seed;
     pk
+}
+
+/// Probe for `scan_and_rearm_gate`: records `start_monitoring` calls.
+/// Always-safe so it matches the production opt-out monitor.
+struct RecordingMonitor {
+    started: Mutex<Vec<Pubkey>>,
+}
+
+impl RecordingMonitor {
+    fn new() -> Self {
+        Self { started: Mutex::new(Vec::new()) }
+    }
+
+    fn started(&self) -> Vec<Pubkey> {
+        self.started.lock().unwrap().clone()
+    }
+}
+
+impl DoppelgangerMonitor for RecordingMonitor {
+    fn start_monitoring(&self, pubkey: Pubkey) {
+        self.started.lock().unwrap().push(pubkey);
+    }
+
+    fn stop_monitoring(&self, _pubkey: &Pubkey) {}
+
+    fn is_doppelganger_safe(&self, _pubkey: &Pubkey) -> bool {
+        true
+    }
 }
 
 // ── Critical #1: ValidatorStore gate integration ─────────────────────────────
@@ -35,7 +61,7 @@ fn test_newly_imported_validator_blocked() {
 
     let mut config = ValidatorConfig::new(pk);
     config.enabled = false;
-    store.add_validator(config);
+    store.add_validator(config).unwrap();
 
     assert!(
         !store.is_signing_enabled(&pk),
@@ -51,7 +77,7 @@ fn test_validator_enabled_after_window() {
 
     let mut config = ValidatorConfig::new(pk);
     config.enabled = false;
-    store.add_validator(config);
+    store.add_validator(config).unwrap();
 
     // Simulate window expiring: background task calls set_enabled(true)
     store.set_enabled(&pk, true);
@@ -80,7 +106,7 @@ fn test_untracked_validator_defaults_to_disabled() {
 
 // ── Critical #2: Restart does not bypass the window ─────────────────────────
 
-/// After a restart, `scan_and_rearm_gate` must re-arm the gate for any key
+/// After a restart, `scan_and_rearm_gate` must re-arm the monitor for any key
 /// whose sidecar shows the window has not yet elapsed.
 #[test]
 fn test_scan_rearms_gate_for_recent_import() {
@@ -94,18 +120,14 @@ fn test_scan_rearms_gate_for_recent_import() {
     let meta_path = dir.path().join(format!("0x{}.import_meta.json", hex::encode(pk)));
     std::fs::write(&meta_path, format!("{{\"imported_unix_seconds\":{}}}", now_unix)).unwrap();
 
-    let gate = Arc::new(DoppelgangerGate::new(Duration::from_secs(window_secs)));
+    let monitor = Arc::new(RecordingMonitor::new());
+    assert!(monitor.is_doppelganger_safe(&pk));
+    assert!(monitor.started().is_empty());
 
-    // Before scan: key is NOT monitored → safe by default
-    assert!(gate.is_doppelganger_safe(&pk));
+    scan_and_rearm_gate(dir.path(), monitor.as_ref(), window_secs);
 
-    scan_and_rearm_gate(dir.path(), gate.as_ref(), window_secs);
-
-    // After scan: key IS monitored → not safe (just re-armed)
-    assert!(
-        !gate.is_doppelganger_safe(&pk),
-        "gate must block the key after restart scan detects a recent import"
-    );
+    assert_eq!(monitor.started(), vec![pk], "recent import must be re-armed after restart");
+    assert!(monitor.is_doppelganger_safe(&pk), "recording probe stays always-safe");
 }
 
 /// `scan_and_rearm_gate` must NOT re-arm keys whose window has fully elapsed.
@@ -124,10 +146,10 @@ fn test_scan_skips_expired_import() {
     let meta_path = dir.path().join(format!("0x{}.import_meta.json", hex::encode(pk)));
     std::fs::write(&meta_path, format!("{{\"imported_unix_seconds\":{}}}", old_unix)).unwrap();
 
-    let gate = Arc::new(DoppelgangerGate::new(Duration::from_secs(window_secs)));
+    let monitor = Arc::new(RecordingMonitor::new());
 
-    scan_and_rearm_gate(dir.path(), gate.as_ref(), window_secs);
+    scan_and_rearm_gate(dir.path(), monitor.as_ref(), window_secs);
 
-    // Expired key must NOT be re-armed
-    assert!(gate.is_doppelganger_safe(&pk), "expired key must NOT be re-armed after restart");
+    assert!(monitor.started().is_empty(), "expired key must NOT be re-armed after restart");
+    assert!(monitor.is_doppelganger_safe(&pk), "expired key must remain safe (not re-armed)");
 }

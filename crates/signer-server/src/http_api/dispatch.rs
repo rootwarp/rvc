@@ -15,6 +15,7 @@ use crate::sign_plan::{self, client_signing_root_matches, PlanInput, SignPlan};
 
 use super::request::{SignPayload, SignRequest, WireForkInfo};
 use super::response::HttpSignError;
+use web3signer_wire::reject_gloas_http_wire;
 
 /// Compute the server-side signing root for `req`, enforce the per-type
 /// `fork_info` requirement, and apply the `signingRoot` verification policy
@@ -47,6 +48,9 @@ fn to_plan_input(
 ) -> Result<PlanInput, HttpSignError> {
     match &req.payload {
         SignPayload::BlockV2 { beacon_block } => {
+            // D19: reject Gloas before tree_hash 0.9 derivation.
+            reject_gloas_http_wire(beacon_block.version, "BLOCK_V2")
+                .map_err(|e| HttpSignError::BadRequest(e.to_string()))?;
             let (fork_version, gvr) = require_fork_info(req)?;
             let object_root = beacon_block.block_header.tree_hash_root().0;
             Ok(PlanInput::Block {
@@ -111,11 +115,33 @@ fn to_plan_input(
             Ok(PlanInput::VoluntaryExit { object_root, fork_version, gvr })
         }
         SignPayload::AggregateAndProofV2 { aggregate_and_proof } => {
+            // D19: reject Gloas before tree_hash 0.9 derivation.
+            reject_gloas_http_wire(aggregate_and_proof.version, "AGGREGATE_AND_PROOF_V2")
+                .map_err(|e| HttpSignError::BadRequest(e.to_string()))?;
             let (fork_version, gvr) = require_fork_info(req)?;
-            let object_root = aggregate_and_proof.try_tree_hash_root().map_err(|_| {
+            let object_root = aggregate_and_proof.data.try_tree_hash_root().map_err(|_| {
                 HttpSignError::BadRequest("invalid aggregate_and_proof".to_string())
             })?;
             Ok(PlanInput::AggregateAndProof { object_root: object_root.0, fork_version, gvr })
+        }
+        SignPayload::PayloadAttestation { payload_attestation } => {
+            // D19: Gloas PTC is in scope (unlike BLOCK_V2).
+            let (fork_version, gvr) = require_fork_info(req)?;
+            let object_root = payload_attestation.data.tree_hash_root().0;
+            Ok(PlanInput::PayloadAttestation { object_root, fork_version, gvr })
+        }
+        SignPayload::ProposerPreferences { proposer_preferences } => {
+            // D19: Gloas proposer preferences is in scope (unlike BLOCK_V2).
+            let (fork_version, gvr) = require_fork_info(req)?;
+            let object_root = proposer_preferences.data.tree_hash_root().0;
+            Ok(PlanInput::ProposerPreferences { object_root, fork_version, gvr })
+        }
+        SignPayload::BuilderRequestAuth { builder_request_auth } => {
+            // No fork_info: builder-registration idiom (genesis fork + zero GVR).
+            let object_root = builder_request_auth.data.try_tree_hash_root().map_err(|_| {
+                HttpSignError::BadRequest("invalid builder_request_auth".to_string())
+            })?;
+            Ok(PlanInput::BuilderRequestAuth { object_root: object_root.0, genesis_fork_version })
         }
     }
 }
@@ -137,7 +163,8 @@ mod tests {
     use axum::http::StatusCode;
     use crypto::{compute_domain, compute_signing_root};
     use eth_types::{
-        Root, DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
+        AttestationData, Checkpoint, ElectraAggregateAndProof, ElectraAttestation, Root,
+        DOMAIN_BEACON_ATTESTER, DOMAIN_BEACON_PROPOSER, DOMAIN_RANDAO, DOMAIN_SELECTION_PROOF,
     };
 
     fn fork_info_json() -> &'static str {
@@ -329,5 +356,154 @@ mod tests {
         let (_, missing_body) =
             plan_sign(&randao(false), BUILDER_FORK_VERSION_MAINNET).unwrap_err().status_and_body();
         assert_eq!(missing_body, "fork_info is required for this request type");
+    }
+
+    fn gloas_block_v2() -> SignRequest {
+        parse(&format!(
+            r#"{{ "type": "BLOCK_V2", "fork_info": {fi},
+                  "beacon_block": {{ "version": "GLOAS",
+                                     "block_header": {{ "slot": "3000000",
+                                                        "proposer_index": "12345",
+                                                        "parent_root": "0x{r}",
+                                                        "state_root": "0x{r}",
+                                                        "body_root": "0x{r}" }} }} }}"#,
+            fi = fork_info_json(),
+            r = "aa".repeat(32),
+        ))
+    }
+
+    #[test]
+    fn gloas_block_v2_is_rejected_before_root_derivation() {
+        let err = plan_sign(&gloas_block_v2(), BUILDER_FORK_VERSION_MAINNET)
+            .expect_err("D19: GLOAS BLOCK_V2 must 400");
+        let (status, body) = err.status_and_body();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.contains("BLOCK_V2"), "names the HTTP type: {body}");
+        assert!(body.contains("GLOAS"), "names the version: {body}");
+        assert!(body.contains("Web3Signer HTTP wire"), "names the wire: {body}");
+        assert!(body.contains("deferred"), "names the deferral: {body}");
+    }
+
+    #[test]
+    fn gloas_aggregate_and_proof_v2_is_rejected_before_root_derivation() {
+        let z = [0u8; 32];
+        let unhashable = ElectraAggregateAndProof {
+            aggregator_index: 1,
+            aggregate: ElectraAttestation {
+                // Past the Electra bitlist limit: hashing first would 400 as
+                // `invalid aggregate_and_proof` instead of the D19 deferral.
+                aggregation_bits: vec![0xff; 20_000],
+                data: AttestationData {
+                    slot: 5,
+                    index: 0,
+                    beacon_block_root: z,
+                    source: Checkpoint { epoch: 1, root: z },
+                    target: Checkpoint { epoch: 2, root: z },
+                },
+                signature: vec![0xab; 96],
+                committee_bits: vec![0x01; 8],
+            },
+            selection_proof: vec![0xcd; 96],
+        };
+        let req = parse(&format!(
+            r#"{{ "type": "AGGREGATE_AND_PROOF_V2", "fork_info": {fi},
+                  "aggregate_and_proof": {{ "version": "GLOAS", "data": {data} }} }}"#,
+            fi = fork_info_json(),
+            data = serde_json::to_string(&unhashable).unwrap(),
+        ));
+        let err = plan_sign(&req, BUILDER_FORK_VERSION_MAINNET)
+            .expect_err("D19: GLOAS AGGREGATE_AND_PROOF_V2 must 400");
+        let (status, body) = err.status_and_body();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_ne!(body, "invalid aggregate_and_proof", "must not have hashed first");
+        assert!(body.contains("AGGREGATE_AND_PROOF_V2"), "names the HTTP type: {body}");
+        assert!(body.contains("Web3Signer HTTP wire"), "names the wire: {body}");
+        assert!(body.contains("deferred"), "names the deferral: {body}");
+    }
+
+    fn gloas_payload_attestation() -> SignRequest {
+        parse(&format!(
+            r#"{{ "type": "PAYLOAD_ATTESTATION",
+                  "fork_info": {{ "fork": {{ "previous_version": "0x07000000",
+                                             "current_version": "0x07000001",
+                                             "epoch": "0" }},
+                       "genesis_validators_root": "0x{gvr}" }},
+                  "payload_attestation": {{ "version": "GLOAS",
+                                            "data": {{ "beacon_block_root": "0x{br}",
+                                                       "slot": "1",
+                                                       "payload_present": true,
+                                                       "blob_data_available": false }} }} }}"#,
+            gvr = "00".repeat(32),
+            br = "11".repeat(32),
+        ))
+    }
+
+    fn parse_kat_root(hex: &str) -> Root {
+        hex::decode(hex).expect("kat hex").try_into().expect("32-byte kat root")
+    }
+
+    /// L3: HTTP adapter plans the same root as the plan engine / pyspec artifact.
+    #[test]
+    fn payload_attestation_plan_matches_kat_gloas_payload_attestation_signing_root() {
+        let plan = plan_sign(&gloas_payload_attestation(), BUILDER_FORK_VERSION_MAINNET)
+            .expect("D19: GLOAS PAYLOAD_ATTESTATION is in scope");
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(rvc_spec_vectors::spec_kat::KAT_GLOAS_PAYLOAD_ATTESTATION_SIGNING_ROOT)
+        );
+    }
+
+    fn gloas_proposer_preferences() -> SignRequest {
+        parse(&format!(
+            r#"{{ "type": "PROPOSER_PREFERENCES",
+                  "fork_info": {{ "fork": {{ "previous_version": "0x07000000",
+                                             "current_version": "0x07000001",
+                                             "epoch": "0" }},
+                       "genesis_validators_root": "0x{gvr}" }},
+                  "proposer_preferences": {{ "version": "GLOAS",
+                                            "data": {{ "dependent_root": "0x{dr}",
+                                                       "proposal_slot": "32",
+                                                       "validator_index": "3",
+                                                       "fee_recipient": "0x{fr}",
+                                                       "target_gas_limit": "36000000" }} }} }}"#,
+            gvr = "00".repeat(32),
+            dr = "33".repeat(32),
+            fr = "44".repeat(20),
+        ))
+    }
+
+    /// L3: HTTP adapter plans the same root as the plan engine / pyspec artifact.
+    #[test]
+    fn proposer_preferences_plan_matches_kat_gloas_proposer_preferences_signing_root() {
+        let plan = plan_sign(&gloas_proposer_preferences(), BUILDER_FORK_VERSION_MAINNET)
+            .expect("D19: GLOAS PROPOSER_PREFERENCES is in scope");
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(rvc_spec_vectors::spec_kat::KAT_GLOAS_PROPOSER_PREFERENCES_SIGNING_ROOT)
+        );
+    }
+
+    fn gloas_builder_request_auth() -> SignRequest {
+        parse(
+            r#"{ "type": "BUILDER_REQUEST_AUTH",
+                  "builder_request_auth": { "version": "GLOAS",
+                                            "data": { "data": "0x1234567890abcdef", "slot": "1" } } }"#,
+        )
+    }
+
+    /// L3: HTTP adapter plans the same root as the plan engine / pyspec artifact.
+    #[test]
+    fn builder_request_auth_plan_matches_kat_gloas_builder_request_auth_signing_root() {
+        let plan = plan_sign(&gloas_builder_request_auth(), BUILDER_FORK_VERSION_MAINNET)
+            .expect("BUILDER_REQUEST_AUTH is in scope");
+        assert_eq!(plan.slashing, Slashing::NonSlashable);
+        assert_eq!(
+            plan.signing_root,
+            parse_kat_root(
+                rvc_spec_vectors::builder_request_auth_kat::KAT_GLOAS_BUILDER_REQUEST_AUTH_SIGNING_ROOT
+            )
+        );
     }
 }

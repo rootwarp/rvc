@@ -1,7 +1,7 @@
 //! Per-BN health tracking: EMA latency, sliding window error rate, composite score.
 
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,8 +27,13 @@ const W_ERROR_RATE: f64 = 0.6;
 /// Maximum latency (5s) used for normalization. Latencies above this score 0.
 const MAX_LATENCY_MS: f64 = 5000.0;
 
+/// Mixed-fleet selections to skip before re-including an incapable BN.
+/// One skip matches "excluded from the next selection"; the following
+/// selection re-probes so a recovered peer is not latched out forever.
+const CAPABILITY_REPROBE_SKIP: u32 = 1;
+
 /// Per-BN health tracker.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct BnHealthTracker {
     endpoint: String,
     latency_ema_ms: Option<f64>,
@@ -36,6 +41,30 @@ pub struct BnHealthTracker {
     outcomes: VecDeque<bool>,
     window_size: usize,
     unhealthy_threshold: f64,
+    /// Operations this BN cannot serve (404/405/501 on `/eth/v4`, unrecognised fork).
+    /// Sticky until a later success for that same operation — never latched forever.
+    incapable: HashSet<String>,
+    /// Remaining mixed-fleet skips before a re-probe for each flagged operation.
+    reprobe_skips: HashMap<String, AtomicU32>,
+}
+
+impl Clone for BnHealthTracker {
+    fn clone(&self) -> Self {
+        Self {
+            endpoint: self.endpoint.clone(),
+            latency_ema_ms: self.latency_ema_ms,
+            ema_alpha: self.ema_alpha,
+            outcomes: self.outcomes.clone(),
+            window_size: self.window_size,
+            unhealthy_threshold: self.unhealthy_threshold,
+            incapable: self.incapable.clone(),
+            reprobe_skips: self
+                .reprobe_skips
+                .iter()
+                .map(|(k, v)| (k.clone(), AtomicU32::new(v.load(Ordering::Relaxed))))
+                .collect(),
+        }
+    }
 }
 
 impl BnHealthTracker {
@@ -47,6 +76,8 @@ impl BnHealthTracker {
             outcomes: VecDeque::with_capacity(DEFAULT_WINDOW_SIZE),
             window_size: DEFAULT_WINDOW_SIZE,
             unhealthy_threshold: DEFAULT_UNHEALTHY_THRESHOLD,
+            incapable: HashSet::new(),
+            reprobe_skips: HashMap::new(),
         }
     }
 
@@ -125,6 +156,41 @@ impl BnHealthTracker {
 
     pub fn is_healthy(&self) -> bool {
         self.score() > self.unhealthy_threshold
+    }
+
+    /// `true` unless this operation was flagged incapable and has not succeeded since.
+    pub fn is_capable(&self, operation: &str) -> bool {
+        !self.incapable.contains(operation)
+    }
+
+    pub fn mark_incapable(&mut self, operation: &str) {
+        self.incapable.insert(operation.to_string());
+        self.reprobe_skips.insert(operation.to_string(), AtomicU32::new(CAPABILITY_REPROBE_SKIP));
+    }
+
+    pub fn mark_capable(&mut self, operation: &str) {
+        self.incapable.remove(operation);
+        self.reprobe_skips.remove(operation);
+    }
+
+    /// Consume one mixed-fleet skip. `true` means exclude this selection;
+    /// `false` while still flagged means this selection is a re-probe.
+    pub fn consume_reprobe_skip(&self, operation: &str) -> bool {
+        if !self.incapable.contains(operation) {
+            return false;
+        }
+        let Some(skips) = self.reprobe_skips.get(operation) else {
+            return false;
+        };
+        loop {
+            let n = skips.load(Ordering::Relaxed);
+            if n == 0 {
+                return false;
+            }
+            if skips.compare_exchange_weak(n, n - 1, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                return true;
+            }
+        }
     }
 
     pub fn endpoint(&self) -> &str {
@@ -396,6 +462,56 @@ mod tests {
             }
             Ok(())
         });
+    }
+
+    // -- Per-operation capability --
+
+    #[test]
+    fn test_health_tracker_capable_by_default() {
+        let tracker = BnHealthTracker::new("http://bn:5052".to_string());
+        assert!(tracker.is_capable("produce_block_v4"));
+        assert!(tracker.is_capable("get_attester_duties"));
+    }
+
+    #[test]
+    fn test_health_tracker_mark_incapable_is_sticky_per_operation() {
+        let mut tracker = BnHealthTracker::new("http://bn:5052".to_string());
+        tracker.mark_incapable("produce_block_v4");
+        assert!(!tracker.is_capable("produce_block_v4"));
+        assert!(
+            tracker.is_capable("get_attester_duties"),
+            "capability is per-operation, not a whole-BN latch"
+        );
+        tracker.record_success(Duration::from_millis(10));
+        assert!(
+            !tracker.is_capable("produce_block_v4"),
+            "latency success without an op must not clear a different operation's flag"
+        );
+    }
+
+    #[test]
+    fn test_health_tracker_mark_capable_clears_flag() {
+        let mut tracker = BnHealthTracker::new("http://bn:5052".to_string());
+        tracker.mark_incapable("produce_block_v4");
+        tracker.mark_capable("produce_block_v4");
+        assert!(tracker.is_capable("produce_block_v4"));
+        assert!(!tracker.consume_reprobe_skip("produce_block_v4"));
+    }
+
+    #[test]
+    fn test_health_tracker_reprobe_skip_is_bounded() {
+        let mut tracker = BnHealthTracker::new("http://bn:5052".to_string());
+        tracker.mark_incapable("produce_block_v4");
+        assert!(
+            tracker.consume_reprobe_skip("produce_block_v4"),
+            "the next selection after a gap must skip the BN"
+        );
+        assert!(
+            !tracker.consume_reprobe_skip("produce_block_v4"),
+            "the following selection must re-probe rather than latch forever"
+        );
+        assert!(!tracker.is_capable("produce_block_v4"));
+        assert!(!tracker.consume_reprobe_skip("get_attester_duties"));
     }
 
     // -- SharedHealthTrackers --

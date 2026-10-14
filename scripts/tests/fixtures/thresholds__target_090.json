@@ -1,0 +1,252 @@
+[
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  },
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  },
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  },
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  },
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  },
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  },
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  },
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  },
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  },
+  {
+    "execution_optimistic": false,
+    "finalized": true,
+    "data": {
+      "ideal_rewards": [
+        {
+          "effective_balance": "32000000000",
+          "head": "1834",
+          "target": "14672",
+          "source": "9170",
+          "inclusion_delay": "0",
+          "inactivity": "0"
+        }
+      ],
+      "total_rewards": [
+        {
+          "validator_index": "1",
+          "head": "1834",
+          "target": "-1",
+          "source": "9170",
+          "inactivity": "0"
+        }
+      ]
+    }
+  }
+]

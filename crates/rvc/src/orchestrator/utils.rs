@@ -1,9 +1,8 @@
 use std::future::Future;
 use std::time::Duration;
 
-use beacon::AttesterDuty;
 use crypto::PublicKey;
-use duty_tracker::DutyTracker;
+use duty_tracker::{DutyTracker, TypedAttesterDuty};
 use eth_types::{ForkName, Root, Slot};
 use timing::SLOTS_PER_EPOCH;
 use tracing::warn;
@@ -45,54 +44,38 @@ where
 
 /// Constructs a hex-encoded SSZ bitlist where only the validator's position
 /// in the committee is set (pre-Electra aggregation_bits format).
-pub(crate) fn make_aggregation_bits(duty: &AttesterDuty) -> Option<String> {
-    let committee_length: usize = match duty.committee_length.parse() {
-        Ok(0) => {
-            warn!(
-                validator_index = %duty.validator_index,
-                "committee_length is 0, cannot produce aggregation bits"
-            );
-            return None;
-        }
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                validator_index = %duty.validator_index,
-                raw_value = %duty.committee_length,
-                error = %e,
-                "failed to parse committee_length, skipping duty"
-            );
-            return None;
-        }
-    };
+///
+/// `committee_length` and `validator_committee_index` are the typed duty
+/// fields. `duty.raw.validator_index` is the wire label on the existing warns.
+pub(crate) fn make_aggregation_bits(duty: &TypedAttesterDuty) -> Option<String> {
+    let committee_length_u64 = duty.committee_length;
+    if committee_length_u64 == 0 {
+        warn!(
+            validator_index = %duty.raw.validator_index,
+            "committee_length is 0, cannot produce aggregation bits"
+        );
+        return None;
+    }
 
-    let validator_committee_index: usize = match duty.validator_committee_index.parse() {
-        Ok(v) => v,
-        Err(e) => {
-            warn!(
-                validator_index = %duty.validator_index,
-                raw_value = %duty.validator_committee_index,
-                error = %e,
-                "failed to parse validator_committee_index, skipping duty"
-            );
-            return None;
-        }
-    };
+    let validator_committee_index_u64 = duty.validator_committee_index;
 
     // ISSUE-4.4 / L-4: out-of-bounds validator_committee_index returns None.
     // Previously this fell through to a bitlist with only the sentinel bit
     // set (validator position not bound), which the BN would silently
     // accept as a zero-participation attestation.  The caller's `None`
     // branch already drops the duty.
-    if validator_committee_index >= committee_length {
+    if validator_committee_index_u64 >= committee_length_u64 {
         warn!(
-            validator_index = %duty.validator_index,
-            committee_length = committee_length,
-            validator_committee_index = validator_committee_index,
+            validator_index = %duty.raw.validator_index,
+            committee_length = committee_length_u64,
+            validator_committee_index = validator_committee_index_u64,
             "validator_committee_index is out of range, skipping duty (ISSUE-4.4 / L-4)"
         );
         return None;
     }
+
+    let committee_length = committee_length_u64 as usize;
+    let validator_committee_index = validator_committee_index_u64 as usize;
 
     // SSZ bitlist: ceil((committee_length + 1) / 8) bytes
     // The "+1" is for the length bit at position committee_length
@@ -126,12 +109,31 @@ pub(crate) fn find_pubkey_bytes(
     pubkey_map.read().get(duty_pubkey).cloned()
 }
 
+/// Whether EIP-7549 zeroes `AttestationData.index` at this fork.
+///
+/// Half-open `Electra..Gloas`: Electra and Fulu zero the committee index.
+/// At Gloas the chain asserts `index < 2` (payload EMPTY=0 / FULL=1) and
+/// rs-vc **preserves, never computes**, the BN-supplied value.
+pub(crate) fn zeroes_committee_index(fork: ForkName) -> bool {
+    (ForkName::Electra..ForkName::Gloas).contains(&fork)
+}
+
+/// Whether this fork uses the Electra+ attestation wire.
+///
+/// `SingleAttestation`, the aggregate `committee_index` query, and the
+/// Electra aggregate-and-proof variant. Open-ended so Gloas keeps that
+/// shape; index zeroing is the separate [`zeroes_committee_index`] rule.
+pub(crate) fn uses_electra_attestation_wire(fork: ForkName) -> bool {
+    fork >= ForkName::Electra
+}
+
 /// Converts BN-supplied attestation data and normalizes it per-fork.
 ///
-/// Per EIP-7549 (active in Electra+): `AttestationData.index` must be set to 0
+/// Per EIP-7549 (Electra through Fulu): `AttestationData.index` must be set to 0
 /// before computing the tree-hash root or signing. The BN still returns the
 /// real committee index in the response, so callers must zero it explicitly.
-/// Pre-Electra forks keep the original index intact.
+/// Pre-Electra forks keep the original index intact. At Gloas, `index` is the
+/// payload-status bit and is preserved as supplied by the BN.
 ///
 /// Use this helper everywhere a signing root or aggregate query root is needed
 /// to ensure consistent normalization across the attestation and aggregation paths.
@@ -140,7 +142,7 @@ pub(crate) fn convert_and_normalize_attestation_data(
     fork_name: ForkName,
 ) -> Result<eth_types::AttestationData, OrchestratorError> {
     let mut data = convert_attestation_data(beacon_data)?;
-    if fork_name >= ForkName::Electra {
+    if zeroes_committee_index(fork_name) {
         data.index = 0;
     }
     Ok(data)
@@ -208,7 +210,7 @@ pub(crate) async fn get_duties_for_slot(
     pubkey_map: &PubkeyMap,
     duty_tracker: &DutyTracker,
     slot: Slot,
-) -> Result<Vec<AttesterDuty>, OrchestratorError> {
+) -> Result<Vec<TypedAttesterDuty>, OrchestratorError> {
     // Borrow keys only — no full map clone / PublicKey clone on the hot path.
     let our_keys: std::collections::HashSet<[u8; 48]> = {
         let map = pubkey_map.read();
@@ -225,7 +227,7 @@ pub(crate) async fn get_duties_for_slot(
     }
 
     let all_duties = duty_tracker.get_duties_for_slot(slot).await;
-    let duties: Vec<AttesterDuty> = all_duties
+    let duties: Vec<TypedAttesterDuty> = all_duties
         .into_iter()
         .filter(|duty| {
             parse_pubkey_bytes(&duty.pubkey).is_some_and(|bytes| our_keys.contains(&bytes))
@@ -238,6 +240,8 @@ pub(crate) async fn get_duties_for_slot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use beacon::AttesterDuty;
 
     #[test]
     fn test_parse_hex_root_with_prefix() {
@@ -300,8 +304,8 @@ mod tests {
     fn make_duty_with_committee(
         committee_length: &str,
         validator_committee_index: &str,
-    ) -> AttesterDuty {
-        AttesterDuty {
+    ) -> TypedAttesterDuty {
+        let raw = AttesterDuty {
             pubkey: "0xaabb".to_string(),
             validator_index: "1".to_string(),
             committee_index: "0".to_string(),
@@ -309,7 +313,8 @@ mod tests {
             committees_at_slot: "1".to_string(),
             validator_committee_index: validator_committee_index.to_string(),
             slot: "100".to_string(),
-        }
+        };
+        TypedAttesterDuty::try_from(&raw).expect("numeric committee fixture")
     }
 
     /// ISSUE-4.4 / L-4: validator_committee_index == committee_length must
@@ -385,6 +390,109 @@ mod tests {
                 root: "0x3333333333333333333333333333333333333333333333333333333333333333"
                     .to_string(),
             },
+        }
+    }
+
+    #[test]
+    fn test_zeroes_committee_index_false_phase0_through_deneb_true_electra_and_fulu() {
+        let table = [
+            (ForkName::Phase0, false),
+            (ForkName::Altair, false),
+            (ForkName::Bellatrix, false),
+            (ForkName::Capella, false),
+            (ForkName::Deneb, false),
+            (ForkName::Electra, true),
+            (ForkName::Fulu, true),
+            (ForkName::Gloas, false),
+        ];
+        assert_eq!(table.len(), ForkName::COUNT, "table must cover every ForkName");
+        for (fork, expected) in table {
+            assert_eq!(
+                zeroes_committee_index(fork),
+                expected,
+                "{fork:?}: zeroes_committee_index is false Phase0..=Deneb, true Electra..Gloas"
+            );
+        }
+    }
+
+    #[test]
+    fn test_uses_electra_attestation_wire_false_phase0_through_deneb_true_from_electra() {
+        let table = [
+            (ForkName::Phase0, false),
+            (ForkName::Altair, false),
+            (ForkName::Bellatrix, false),
+            (ForkName::Capella, false),
+            (ForkName::Deneb, false),
+            (ForkName::Electra, true),
+            (ForkName::Fulu, true),
+            (ForkName::Gloas, true),
+        ];
+        assert_eq!(table.len(), ForkName::COUNT, "table must cover every ForkName");
+        for (fork, expected) in table {
+            assert_eq!(
+                uses_electra_attestation_wire(fork),
+                expected,
+                "{fork:?}: Electra+ wire is false Phase0..=Deneb, true Electra onward"
+            );
+        }
+    }
+
+    #[test]
+    fn test_zeroing_and_electra_wire_diverge_only_at_gloas() {
+        for fork in ForkName::ALL {
+            let zero = zeroes_committee_index(fork);
+            let wire = uses_electra_attestation_wire(fork);
+            if fork == ForkName::Gloas {
+                assert!(!zero && wire, "Gloas preserves index but keeps the Electra+ wire");
+            } else {
+                assert_eq!(zero, wire, "{fork:?}: zeroing and Electra+ wire match except at Gloas");
+            }
+        }
+    }
+
+    /// Issue 2.9: with Gloas at the sentinel, realistic epochs keep Fulu
+    /// zeroing and Electra+ wire. `from_epoch(u64::MAX)` is Gloas (intended).
+    #[test]
+    fn test_sentinel_gloas_realistic_epochs_keep_fulu_zeroing_and_electra_wire() {
+        let mut schedule = finite_electra_fulu_gloas_schedule();
+        schedule.gloas_fork_epoch = u64::MAX;
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+
+        for epoch in [0, 269568, 364544, 500000, 1_000_000, u64::MAX - 1] {
+            let fork = ForkName::from_epoch(epoch, &schedule);
+            assert_ne!(fork, ForkName::Gloas, "epoch {epoch} must stay pre-Gloas");
+        }
+
+        let fulu = ForkName::from_epoch(1_000_000, &schedule);
+        assert_eq!(fulu, ForkName::Fulu);
+        assert!(zeroes_committee_index(fulu));
+        assert!(uses_electra_attestation_wire(fulu));
+
+        // Known exception: reverse scan at u64::MAX returns Gloas.
+        let gloas = ForkName::from_epoch(u64::MAX, &schedule);
+        assert_eq!(gloas, ForkName::Gloas);
+        assert!(!zeroes_committee_index(gloas));
+        assert!(uses_electra_attestation_wire(gloas));
+    }
+
+    /// Electra 364544, Fulu 500000, Gloas 600000 — all finite (not `u64::MAX`).
+    fn finite_electra_fulu_gloas_schedule() -> eth_types::ForkSchedule {
+        eth_types::ForkSchedule {
+            genesis_fork_version: [0, 0, 0, 0],
+            altair_fork_epoch: 74240,
+            altair_fork_version: [1, 0, 0, 0],
+            bellatrix_fork_epoch: 144896,
+            bellatrix_fork_version: [2, 0, 0, 0],
+            capella_fork_epoch: 194048,
+            capella_fork_version: [3, 0, 0, 0],
+            deneb_fork_epoch: 269568,
+            deneb_fork_version: [4, 0, 0, 0],
+            electra_fork_epoch: 364544,
+            electra_fork_version: [5, 0, 0, 0],
+            fulu_fork_epoch: 500000,
+            fulu_fork_version: [6, 0, 0, 0],
+            gloas_fork_epoch: 600000,
+            gloas_fork_version: [7, 0, 0, 0],
         }
     }
 
@@ -464,6 +572,134 @@ mod tests {
         let result =
             convert_and_normalize_attestation_data(&beacon_data, ForkName::Electra).unwrap();
         assert_eq!(result.index, 0);
+    }
+
+    #[test]
+    fn test_convert_and_normalize_preserves_gloas_index_zeroes_electra_and_fulu() {
+        let schedule = finite_electra_fulu_gloas_schedule();
+        let beacon_full = make_test_beacon_attestation_data("1");
+        let beacon_empty = make_test_beacon_attestation_data("0");
+
+        let gloas = ForkName::from_epoch(600000, &schedule);
+        assert_eq!(gloas, ForkName::Gloas);
+        assert_eq!(
+            convert_and_normalize_attestation_data(&beacon_full, gloas).unwrap().index,
+            1,
+            "Gloas preserves BN payload FULL=1"
+        );
+        assert_eq!(
+            convert_and_normalize_attestation_data(&beacon_empty, gloas).unwrap().index,
+            0,
+            "Gloas preserves BN payload EMPTY=0"
+        );
+
+        for (label, epoch, expected_fork) in
+            [("electra", 364544, ForkName::Electra), ("fulu", 500000, ForkName::Fulu)]
+        {
+            let fork = ForkName::from_epoch(epoch, &schedule);
+            assert_eq!(fork, expected_fork, "{label}: from_epoch on finite schedule");
+            assert_eq!(
+                convert_and_normalize_attestation_data(&beacon_full, fork).unwrap().index,
+                0,
+                "{label}: EIP-7549 still zeroes BN index 1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_gloas_payload_status_index_unmodified_double_vote() {
+        use slashing::{AttestationSlashingViolation, SlashingDb, SlashingError};
+        use tree_hash::TreeHash;
+
+        let schedule = finite_electra_fulu_gloas_schedule();
+        let gloas = ForkName::from_epoch(600_000, &schedule);
+        assert_eq!(gloas, ForkName::Gloas);
+
+        let empty =
+            convert_and_normalize_attestation_data(&make_test_beacon_attestation_data("0"), gloas)
+                .unwrap();
+        let full =
+            convert_and_normalize_attestation_data(&make_test_beacon_attestation_data("1"), gloas)
+                .unwrap();
+        assert_eq!(empty.index, 0, "Gloas preserves payload EMPTY=0");
+        assert_eq!(full.index, 1, "Gloas preserves payload FULL=1");
+        assert_eq!(empty.source.epoch, full.source.epoch);
+        assert_eq!(full.target.epoch, empty.target.epoch);
+
+        let empty_sr = format!("0x{}", hex::encode(empty.tree_hash_root().as_slice()));
+        let full_sr = format!("0x{}", hex::encode(full.tree_hash_root().as_slice()));
+        assert_ne!(
+            empty_sr, full_sr,
+            "payload-status index must change the object hash reaching the DB"
+        );
+
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_gloas_fork_epoch(600_000);
+        db.check_and_record_attestation(
+            "0xd1",
+            empty.source.epoch,
+            empty.target.epoch,
+            Some(empty_sr),
+            &[0u8; 32],
+        )
+        .expect("first payload-status attestation");
+        let err = db
+            .check_and_record_attestation(
+                "0xd1",
+                full.source.epoch,
+                full.target.epoch,
+                Some(full_sr),
+                &[0u8; 32],
+            )
+            .expect_err("index 0 vs 1 at the same target is a double vote");
+        assert!(
+            matches!(
+                err,
+                SlashingError::SlashableAttestation(
+                    AttestationSlashingViolation::DoubleVote { .. }
+                )
+            ),
+            "got {err:?}"
+        );
+
+        // Electra zeroing would collapse both hashes into a re-sign. 2.3/2.8
+        // must keep Gloas off that path (asserted, not re-implemented).
+        let electra_full = convert_and_normalize_attestation_data(
+            &make_test_beacon_attestation_data("1"),
+            ForkName::Electra,
+        )
+        .unwrap();
+        assert_eq!(electra_full.index, 0);
+        assert_eq!(electra_full.tree_hash_root(), empty.tree_hash_root());
+    }
+
+    /// Issue 6.12: Gloas is outside the half-open EIP-7549 range. The L4
+    /// `index = 1` round-trip relies on this (do not inject a test-only
+    /// parameter into the production helper).
+    #[test]
+    fn test_gloas_index_1_detects_reverted_electra_gloas_guard() {
+        assert!(
+            !zeroes_committee_index(ForkName::Gloas),
+            "production guard is half-open Electra..Gloas"
+        );
+        let bn = make_test_beacon_attestation_data("1");
+        let signed = convert_and_normalize_attestation_data(&bn, ForkName::Gloas).unwrap();
+        assert_eq!(signed.index, 1, "Gloas preserves BN payload FULL=1");
+    }
+
+    #[test]
+    fn test_sentinel_gloas_convert_still_zeroes_index_at_epoch_1_000_000() {
+        let mut schedule = finite_electra_fulu_gloas_schedule();
+        schedule.gloas_fork_epoch = u64::MAX;
+        let fork = ForkName::from_epoch(1_000_000, &schedule);
+        assert_eq!(fork, ForkName::Fulu);
+        let beacon = make_test_beacon_attestation_data("1");
+        assert_eq!(
+            convert_and_normalize_attestation_data(&beacon, fork).unwrap().index,
+            0,
+            "sentinel Gloas: epoch 1_000_000 is Fulu and still zeroes"
+        );
+        assert!(uses_electra_attestation_wire(fork));
     }
 
     // --- RF6-31: find_pubkey O(1) by compressed bytes ---

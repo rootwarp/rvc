@@ -2,10 +2,38 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use eth_types::Slot;
+use eth_types::{ForkName, Slot};
 
 use crate::error::TimingError;
-use crate::{due_ms, ATTESTATION_DUE_BPS, SECONDS_PER_SLOT, SLOTS_PER_EPOCH};
+use crate::{due_ms, DeadlineBps, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+
+/// Pre-Gloas and Gloas deadline sets selected by an already-resolved [`ForkName`].
+///
+/// No `Default`: both sets must be fully specified. 1.7's six Gloas fields have
+/// serde defaults, so a missing member cannot occur at runtime; omitting one at
+/// this boundary is a compile error. Startup errors are reserved for range and
+/// phase order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadlineSchedule {
+    pub pre_gloas: DeadlineBps,
+    pub gloas: DeadlineBps,
+}
+
+impl DeadlineSchedule {
+    /// Both forks share `deadlines`. Used by 1.6's single-set `with_deadlines`.
+    pub const fn uniform(deadlines: DeadlineBps) -> Self {
+        Self { pre_gloas: deadlines, gloas: deadlines }
+    }
+
+    /// Select the set for an already-resolved fork. Does not compare epochs.
+    pub fn for_fork(&self, fork: ForkName) -> DeadlineBps {
+        if fork >= ForkName::Gloas {
+            self.gloas
+        } else {
+            self.pre_gloas
+        }
+    }
+}
 
 /// Slot timing source.
 ///
@@ -16,53 +44,103 @@ pub trait SlotClock: Send + Sync {
     fn genesis_time(&self) -> u64;
     fn slot_duration(&self) -> Duration;
     fn slots_per_epoch(&self) -> u64;
-    fn current_time_secs(&self) -> u64;
+    fn now_since_epoch(&self) -> Duration;
     fn current_slot(&self) -> Result<Slot, TimingError>;
+
+    fn current_time_secs(&self) -> u64 {
+        self.now_since_epoch().as_secs()
+    }
+
+    fn current_time_ms(&self) -> u64 {
+        let now = self.now_since_epoch();
+        now.as_secs() * 1000 + u64::from(now.subsec_millis())
+    }
+
+    fn deadlines(&self) -> DeadlineBps {
+        DeadlineBps::default()
+    }
+
+    /// Deadline set for an already-resolved `fork`. Default body ignores the
+    /// fork and returns [`Self::deadlines`] so 1.6 clocks stay pre-Gloas.
+    fn deadlines_for(&self, _fork: ForkName) -> DeadlineBps {
+        self.deadlines()
+    }
 
     fn slot_start_time(&self, slot: Slot) -> u64 {
         self.genesis_time() + (slot * self.slot_duration().as_secs())
+    }
+
+    /// Unix milliseconds at the start of `slot`.
+    ///
+    /// Uses saturating multiply so oversized genesis/slot values do not wrap
+    /// to a small timestamp. Prefer [`Self::slot_start_ms_checked`] on paths
+    /// that must fail closed (e.g. pre-genesis import).
+    fn slot_start_ms(&self, slot: Slot) -> u64 {
+        self.slot_start_time(slot).saturating_mul(1000)
+    }
+
+    /// Checked unix milliseconds at the start of `slot`.
+    ///
+    /// Fails with [`TimingError::TimeOverflow`] when `genesis_time`, the slot
+    /// offset, or the seconds-to-milliseconds conversion would overflow `u64`.
+    /// Pre-genesis import uses this via [`Self::time_until_slot`]`(0)`.
+    fn slot_start_ms_checked(&self, slot: Slot) -> Result<u64, TimingError> {
+        let slot_secs =
+            slot.checked_mul(self.slot_duration().as_secs()).ok_or(TimingError::TimeOverflow)?;
+        let start_secs =
+            self.genesis_time().checked_add(slot_secs).ok_or(TimingError::TimeOverflow)?;
+        start_secs.checked_mul(1000).ok_or(TimingError::TimeOverflow)
+    }
+
+    fn ms_into_slot(&self, slot: Slot) -> u64 {
+        self.current_time_ms().saturating_sub(self.slot_start_ms(slot))
     }
 
     fn slot_end_time(&self, slot: Slot) -> u64 {
         self.slot_start_time(slot + 1)
     }
 
-    fn attestation_time(&self, slot: Slot) -> u64 {
-        let slot_start_ms = self.slot_start_time(slot) * 1000;
-        let slot_duration_ms = self.slot_duration().as_millis() as u64;
-        (slot_start_ms + due_ms(ATTESTATION_DUE_BPS, slot_duration_ms)) / 1000
-    }
-
     fn time_until_slot(&self, slot: Slot) -> Result<Duration, TimingError> {
-        let current_time = self.current_time_secs();
-        let slot_start = self.slot_start_time(slot);
+        let current_time_ms = self.current_time_ms();
+        let slot_start_ms = self.slot_start_ms_checked(slot)?;
 
-        if current_time >= slot_start {
+        if current_time_ms >= slot_start_ms {
             return Ok(Duration::ZERO);
         }
 
-        Ok(Duration::from_secs(slot_start - current_time))
+        Ok(Duration::from_millis(slot_start_ms - current_time_ms))
     }
 
-    fn time_until_attestation(&self, slot: Slot) -> Result<Duration, TimingError> {
+    fn time_until_due(&self, slot: Slot, bps: u64) -> Result<Duration, TimingError> {
         // Basis-points formula in millisecond arithmetic so the deadline is exact
         // for non-standard slot durations (e.g. 6 s testnets where 1/3 = 2.000 s
         // exactly, but a 7 s slot would be truncated from 2.333 s to 2 s under
         // integer-second division — firing up to ~333 ms early). Mainnet is
         // 3333 * 12000 / 10000 = 3999 ms (report §4.3).
-        //
-        // Sub-second wall-clock precision is intentionally not required: both
-        // impls share this body via `current_time_secs`.
-        let current_time_ms = self.current_time_secs() * 1000;
-        let slot_start_ms = self.slot_start_time(slot) * 1000;
+        let current_time_ms = self.current_time_ms();
+        let slot_start_ms = self.slot_start_ms_checked(slot)?;
         let slot_duration_ms = self.slot_duration().as_millis() as u64;
-        let attestation_time_ms = slot_start_ms + due_ms(ATTESTATION_DUE_BPS, slot_duration_ms);
+        let due_time_ms = slot_start_ms
+            .checked_add(due_ms(bps, slot_duration_ms))
+            .ok_or(TimingError::TimeOverflow)?;
 
-        if current_time_ms >= attestation_time_ms {
+        if current_time_ms >= due_time_ms {
             return Ok(Duration::ZERO);
         }
 
-        Ok(Duration::from_millis(attestation_time_ms - current_time_ms))
+        Ok(Duration::from_millis(due_time_ms - current_time_ms))
+    }
+
+    fn time_until_attestation(&self, slot: Slot) -> Result<Duration, TimingError> {
+        self.time_until_due(slot, self.deadlines().attestation)
+    }
+
+    fn time_until_attestation_for(
+        &self,
+        slot: Slot,
+        fork: ForkName,
+    ) -> Result<Duration, TimingError> {
+        self.time_until_due(slot, self.deadlines_for(fork).attestation)
     }
 
     fn slot_to_epoch(&self, slot: Slot) -> u64 {
@@ -78,6 +156,7 @@ pub struct SystemSlotClock {
     genesis_time: u64,
     slot_duration: Duration,
     slots_per_epoch: u64,
+    schedule: DeadlineSchedule,
 }
 
 impl SystemSlotClock {
@@ -95,15 +174,30 @@ impl SystemSlotClock {
             slots_per_epoch,
             "clock created"
         );
-        Ok(Self { genesis_time, slot_duration, slots_per_epoch })
+        Ok(Self {
+            genesis_time,
+            slot_duration,
+            slots_per_epoch,
+            schedule: DeadlineSchedule::uniform(DeadlineBps::default()),
+        })
+    }
+
+    pub fn with_deadlines(mut self, deadlines: DeadlineBps) -> Self {
+        self.schedule = DeadlineSchedule::uniform(deadlines);
+        self
+    }
+
+    pub fn with_deadline_schedule(mut self, schedule: DeadlineSchedule) -> Self {
+        self.schedule = schedule;
+        self
     }
 
     pub fn new_mainnet(genesis_time: u64) -> Result<Self, TimingError> {
-        Self::new(genesis_time, Duration::from_secs(SECONDS_PER_SLOT), SLOTS_PER_EPOCH)
+        Self::new(genesis_time, Duration::from_millis(SLOT_DURATION_MS), SLOTS_PER_EPOCH)
     }
 
     fn current_unix_time(&self) -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards").as_secs()
+        self.now_since_epoch().as_secs()
     }
 }
 
@@ -120,8 +214,16 @@ impl SlotClock for SystemSlotClock {
         self.slots_per_epoch
     }
 
-    fn current_time_secs(&self) -> u64 {
-        self.current_unix_time()
+    fn deadlines(&self) -> DeadlineBps {
+        self.schedule.pre_gloas
+    }
+
+    fn deadlines_for(&self, fork: ForkName) -> DeadlineBps {
+        self.schedule.for_fork(fork)
+    }
+
+    fn now_since_epoch(&self) -> Duration {
+        SystemTime::now().duration_since(UNIX_EPOCH).expect("time went backwards")
     }
 
     fn current_slot(&self) -> Result<Slot, TimingError> {
@@ -136,8 +238,8 @@ impl SlotClock for SystemSlotClock {
         let slot_duration_secs = self.slot_duration.as_secs();
         let slot = seconds_since_genesis / slot_duration_secs;
         let epoch = slot / self.slots_per_epoch;
-        let time_into_slot_ms = (seconds_since_genesis % slot_duration_secs) * 1000;
-        tracing::trace!(slot, epoch, time_into_slot_ms, "slot transition");
+        let time_into_slot = (seconds_since_genesis % slot_duration_secs) * 1000;
+        tracing::trace!(slot, epoch, time_into_slot, "slot transition");
         Ok(slot)
     }
 }
@@ -146,7 +248,9 @@ pub struct MockSlotClock {
     genesis_time: u64,
     slot_duration: Duration,
     slots_per_epoch: u64,
-    current_time: std::sync::atomic::AtomicU64,
+    /// Unix time in milliseconds since the epoch.
+    current_time_ms: std::sync::atomic::AtomicU64,
+    schedule: DeadlineSchedule,
 }
 
 impl MockSlotClock {
@@ -155,16 +259,40 @@ impl MockSlotClock {
             genesis_time,
             slot_duration,
             slots_per_epoch,
-            current_time: std::sync::atomic::AtomicU64::new(genesis_time),
+            // Saturating so oversized genesis values remain constructible for
+            // overflow tests; [`SlotClock::time_until_slot`] still fails closed.
+            current_time_ms: std::sync::atomic::AtomicU64::new(genesis_time.saturating_mul(1000)),
+            schedule: DeadlineSchedule::uniform(DeadlineBps::default()),
         }
     }
 
+    pub fn with_deadlines(mut self, deadlines: DeadlineBps) -> Self {
+        self.schedule = DeadlineSchedule::uniform(deadlines);
+        self
+    }
+
+    pub fn with_deadline_schedule(mut self, schedule: DeadlineSchedule) -> Self {
+        self.schedule = schedule;
+        self
+    }
+
     pub fn set_current_time(&self, time: u64) {
-        self.current_time.store(time, std::sync::atomic::Ordering::SeqCst);
+        self.current_time_ms.store(time.saturating_mul(1000), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set unix time in milliseconds. `store` (not `fetch_max`) so a smaller
+    /// value steps the clock backwards.
+    pub fn set_current_time_ms(&self, time_ms: u64) {
+        self.current_time_ms.store(time_ms, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn advance_time(&self, seconds: u64) {
-        self.current_time.fetch_add(seconds, std::sync::atomic::Ordering::SeqCst);
+        self.current_time_ms.fetch_add(seconds * 1000, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Advance unix time by `millis`.
+    pub fn advance_ms(&self, millis: u64) {
+        self.current_time_ms.fetch_add(millis, std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn set_slot(&self, slot: Slot) {
@@ -172,8 +300,14 @@ impl MockSlotClock {
         self.set_current_time(slot_start);
     }
 
+    /// Place the clock `offset_ms` after the start of `slot`.
+    pub fn set_slot_with_offset_ms(&self, slot: Slot, offset_ms: u64) {
+        self.set_current_time_ms(self.slot_start_ms(slot) + offset_ms);
+    }
+
+    /// Whole seconds. The sub-second remainder is visible through `now_since_epoch`.
     fn get_current_time(&self) -> u64 {
-        self.current_time.load(std::sync::atomic::Ordering::SeqCst)
+        self.current_time_ms.load(std::sync::atomic::Ordering::SeqCst) / 1000
     }
 }
 
@@ -190,8 +324,16 @@ impl SlotClock for MockSlotClock {
         self.slots_per_epoch
     }
 
-    fn current_time_secs(&self) -> u64 {
-        self.get_current_time()
+    fn deadlines(&self) -> DeadlineBps {
+        self.schedule.pre_gloas
+    }
+
+    fn deadlines_for(&self, fork: ForkName) -> DeadlineBps {
+        self.schedule.for_fork(fork)
+    }
+
+    fn now_since_epoch(&self) -> Duration {
+        Duration::from_millis(self.current_time_ms.load(std::sync::atomic::Ordering::SeqCst))
     }
 
     fn current_slot(&self) -> Result<Slot, TimingError> {
@@ -281,16 +423,6 @@ mod tests {
     }
 
     #[test]
-    fn test_attestation_time() {
-        let clock = create_mock_clock();
-        // Seconds API floors (slot_start_ms + due_ms) / 1000. For a 12 s slot,
-        // due_ms = 3333 * 12000 / 10000 = 3999, so (0 + 3999) / 1000 = genesis + 3
-        // and ((12)*1000 + 3999) / 1000 = genesis + 15 (down from +4 / +16).
-        assert_eq!(clock.attestation_time(0), TEST_GENESIS_TIME + 3);
-        assert_eq!(clock.attestation_time(1), TEST_GENESIS_TIME + 15);
-    }
-
-    #[test]
     fn test_time_until_slot_in_future() {
         let clock = create_mock_clock();
         clock.set_current_time(TEST_GENESIS_TIME);
@@ -304,6 +436,22 @@ mod tests {
         clock.set_current_time(TEST_GENESIS_TIME + 100);
         let time_until = clock.time_until_slot(5).unwrap();
         assert_eq!(time_until, Duration::ZERO);
+    }
+
+    /// Pre-genesis admission calls `time_until_slot(0)`, which is `genesis*1000`.
+    /// Wrapping that multiply would admit with a bogus duration; fail closed.
+    #[test]
+    fn time_until_slot_zero_fails_closed_when_genesis_ms_overflows() {
+        let genesis = (u64::MAX / 1000) + 1;
+        assert!(genesis.checked_mul(1000).is_none(), "fixture must overflow");
+        let clock = MockSlotClock::new(genesis, Duration::from_secs(12), 32);
+        clock.set_current_time_ms(0);
+        let err = clock.time_until_slot(0).expect_err("overflow must refuse");
+        assert!(matches!(err, TimingError::TimeOverflow), "expected TimeOverflow, got {err:?}");
+        assert!(
+            matches!(clock.slot_start_ms_checked(0), Err(TimingError::TimeOverflow)),
+            "slot_start_ms_checked must refuse the same overflow"
+        );
     }
 
     #[test]
@@ -415,9 +563,9 @@ mod tests {
                 "slot_end_time({slot})"
             );
             assert_eq!(
-                system.attestation_time(slot),
-                mock.attestation_time(slot),
-                "attestation_time({slot})"
+                system.slot_start_ms(slot),
+                mock.slot_start_ms(slot),
+                "slot_start_ms({slot})"
             );
             assert_eq!(
                 system.slot_to_epoch(slot),
@@ -447,57 +595,58 @@ mod tests {
         assert_eq!(mock.time_until_attestation(0).unwrap(), Duration::ZERO);
     }
 
+    /// Supplies only the required primitives. Derived methods come from the trait.
+    struct MinimalClock {
+        genesis: u64,
+        slot_secs: u64,
+        spe: u64,
+        now: Duration,
+    }
+
+    impl SlotClock for MinimalClock {
+        fn genesis_time(&self) -> u64 {
+            self.genesis
+        }
+
+        fn slot_duration(&self) -> Duration {
+            Duration::from_secs(self.slot_secs)
+        }
+
+        fn slots_per_epoch(&self) -> u64 {
+            self.spe
+        }
+
+        fn now_since_epoch(&self) -> Duration {
+            self.now
+        }
+
+        fn current_slot(&self) -> Result<Slot, TimingError> {
+            let t = self.now.as_secs();
+            if t < self.genesis {
+                return Err(TimingError::BeforeGenesis {
+                    current_time: t,
+                    genesis_time: self.genesis,
+                });
+            }
+            Ok((t - self.genesis) / self.slot_secs)
+        }
+    }
+
     /// A clock that only implements the required primitives must still get
     /// correct derived results from the trait defaults.
     #[test]
     fn test_default_methods_used_when_impl_omits_them() {
-        struct MinimalClock {
-            genesis: u64,
-            slot_secs: u64,
-            spe: u64,
-            now: u64,
-        }
-
-        impl SlotClock for MinimalClock {
-            fn genesis_time(&self) -> u64 {
-                self.genesis
-            }
-
-            fn slot_duration(&self) -> Duration {
-                Duration::from_secs(self.slot_secs)
-            }
-
-            fn slots_per_epoch(&self) -> u64 {
-                self.spe
-            }
-
-            fn current_time_secs(&self) -> u64 {
-                self.now
-            }
-
-            fn current_slot(&self) -> Result<Slot, TimingError> {
-                let t = self.now;
-                if t < self.genesis {
-                    return Err(TimingError::BeforeGenesis {
-                        current_time: t,
-                        genesis_time: self.genesis,
-                    });
-                }
-                Ok((t - self.genesis) / self.slot_secs)
-            }
-        }
-
         let clock = MinimalClock {
             genesis: TEST_GENESIS_TIME,
             slot_secs: 12,
             spe: 32,
-            now: TEST_GENESIS_TIME,
+            now: Duration::from_secs(TEST_GENESIS_TIME),
         };
 
         assert_eq!(clock.slot_start_time(0), TEST_GENESIS_TIME);
         assert_eq!(clock.slot_start_time(1), TEST_GENESIS_TIME + 12);
         assert_eq!(clock.slot_end_time(0), TEST_GENESIS_TIME + 12);
-        assert_eq!(clock.attestation_time(0), TEST_GENESIS_TIME + 3);
+        assert_eq!(clock.current_time_secs(), TEST_GENESIS_TIME);
         assert_eq!(clock.time_until_slot(10).unwrap(), Duration::from_secs(120));
         assert_eq!(clock.time_until_attestation(0).unwrap(), Duration::from_millis(3999));
         assert_eq!(clock.slot_to_epoch(32), 1);
@@ -508,8 +657,185 @@ mod tests {
             genesis: TEST_GENESIS_TIME,
             slot_secs: 7,
             spe: 32,
-            now: TEST_GENESIS_TIME,
+            now: Duration::from_secs(TEST_GENESIS_TIME),
         };
         assert_eq!(clock7.time_until_attestation(0).unwrap(), Duration::from_millis(2333));
+    }
+
+    #[test]
+    fn test_deadlines_default_matches_pre_gloas_bps() {
+        let mock = create_mock_clock();
+        let system = SystemSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32).unwrap();
+        assert_eq!(mock.deadlines(), DeadlineBps::default());
+        assert_eq!(system.deadlines(), DeadlineBps::default());
+        assert_eq!(mock.deadlines().attestation, crate::ATTESTATION_DUE_BPS);
+        assert_eq!(mock.deadlines().aggregate, crate::AGGREGATE_DUE_BPS);
+    }
+
+    fn bps(attestation: u64, aggregate: u64) -> DeadlineBps {
+        DeadlineBps { attestation, aggregate, ..DeadlineBps::default() }
+    }
+
+    fn spec_gloas_bps() -> DeadlineBps {
+        DeadlineBps {
+            attestation: 2500,
+            aggregate: 5000,
+            sync_message: 2500,
+            contribution: 5000,
+            payload: 5000,
+            payload_attestation: 7500,
+        }
+    }
+
+    #[test]
+    fn test_with_deadlines_2500_bps_12s_is_3000ms() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .with_deadlines(bps(2500, 6667));
+        clock.set_current_time(TEST_GENESIS_TIME);
+        assert_eq!(clock.deadlines().attestation, 2500);
+        assert_eq!(clock.time_until_attestation(0).unwrap(), Duration::from_millis(3000));
+    }
+
+    #[test]
+    fn test_with_deadlines_7000ms_slot_3333_bps_is_2333ms() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_millis(7000), 32)
+            .with_deadlines(bps(3333, 6667));
+        clock.set_current_time(TEST_GENESIS_TIME);
+        assert_eq!(clock.time_until_attestation(0).unwrap(), Duration::from_millis(2333));
+    }
+
+    #[test]
+    fn test_system_slot_clock_with_deadlines() {
+        let clock = SystemSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .unwrap()
+            .with_deadlines(bps(2500, 4000));
+        assert_eq!(clock.deadlines(), bps(2500, 4000));
+    }
+
+    #[test]
+    fn test_deadlines_for_selects_pre_gloas_before_gloas_fork() {
+        let schedule =
+            DeadlineSchedule { pre_gloas: DeadlineBps::default(), gloas: spec_gloas_bps() };
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .with_deadline_schedule(schedule);
+        assert_eq!(clock.deadlines_for(ForkName::Fulu), DeadlineBps::default());
+        assert_eq!(clock.deadlines_for(ForkName::Electra).attestation, 3333);
+        assert_eq!(clock.deadlines(), DeadlineBps::default());
+    }
+
+    #[test]
+    fn test_deadlines_for_selects_gloas_set_at_gloas() {
+        let schedule =
+            DeadlineSchedule { pre_gloas: DeadlineBps::default(), gloas: spec_gloas_bps() };
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .with_deadline_schedule(schedule);
+        assert_eq!(clock.deadlines_for(ForkName::Gloas), spec_gloas_bps());
+        assert_eq!(clock.deadlines_for(ForkName::Gloas).payload, 5000);
+        assert_eq!(clock.deadlines_for(ForkName::Gloas).payload_attestation, 7500);
+    }
+
+    #[test]
+    fn test_time_until_attestation_for_gloas_is_3000ms() {
+        let schedule =
+            DeadlineSchedule { pre_gloas: DeadlineBps::default(), gloas: spec_gloas_bps() };
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32)
+            .with_deadline_schedule(schedule);
+        clock.set_current_time(TEST_GENESIS_TIME);
+        assert_eq!(
+            clock.time_until_attestation_for(0, ForkName::Fulu).unwrap(),
+            Duration::from_millis(3999)
+        );
+        assert_eq!(
+            clock.time_until_attestation_for(0, ForkName::Gloas).unwrap(),
+            Duration::from_millis(3000)
+        );
+        // 1.6 default body stays on the pre-Gloas set.
+        assert_eq!(clock.time_until_attestation(0).unwrap(), Duration::from_millis(3999));
+    }
+
+    #[test]
+    fn test_time_until_due_aggregate_5000_bps_is_6000ms() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32);
+        clock.set_current_time(TEST_GENESIS_TIME);
+        assert_eq!(clock.time_until_due(0, 5000).unwrap(), Duration::from_millis(6000));
+        assert_eq!(clock.time_until_due(0, 6667).unwrap(), Duration::from_millis(8000));
+    }
+
+    fn clock_600ms_into_genesis_second() -> MinimalClock {
+        MinimalClock {
+            genesis: TEST_GENESIS_TIME,
+            slot_secs: 12,
+            spe: 32,
+            now: Duration::from_secs(TEST_GENESIS_TIME) + Duration::from_millis(600),
+        }
+    }
+
+    /// Clock 600 ms into the genesis second: the next slot is one slot duration
+    /// minus that 600 ms, not a whole number of seconds.
+    #[test]
+    fn minimal_clock_time_until_slot_is_sub_second() {
+        let slot_duration = Duration::from_secs(12);
+        let clock = clock_600ms_into_genesis_second();
+        assert_eq!(clock.time_until_slot(1).unwrap(), slot_duration - Duration::from_millis(600));
+    }
+
+    /// 3333 bps of a 12 s slot is 3,999 ms. 600 ms into that slot leaves 3,399 ms.
+    #[test]
+    fn minimal_clock_time_until_due_3333_is_remainder_to_3999ms() {
+        let clock = clock_600ms_into_genesis_second();
+        assert_eq!(clock.time_until_due(0, 3333).unwrap(), Duration::from_millis(3999 - 600));
+    }
+
+    /// `saturating_sub` clamps before the slot start. A wrapping subtract would
+    /// return `u64::MAX` when now is 1 ms before slot 0.
+    #[test]
+    fn ms_into_slot_is_zero_when_now_before_slot_start() {
+        let clock = clock_600ms_into_genesis_second();
+        assert_eq!(clock.ms_into_slot(0), 600);
+        assert_eq!(clock.ms_into_slot(1), 0);
+
+        let early = MinimalClock {
+            genesis: TEST_GENESIS_TIME,
+            slot_secs: 12,
+            spe: 32,
+            now: Duration::from_secs(TEST_GENESIS_TIME) - Duration::from_millis(1),
+        };
+        assert_eq!(early.ms_into_slot(0), 0);
+    }
+
+    /// Genesis + 600 ms is 600 ms into slot 0, so the wait to slot 1 is one
+    /// slot duration minus that 600 ms.
+    #[test]
+    fn mock_clock_expresses_a_mid_second_start() {
+        let clock = create_mock_clock();
+        let genesis_ms = TEST_GENESIS_TIME * 1000;
+        let slot_duration = clock.slot_duration();
+        clock.set_current_time_ms(genesis_ms + 600);
+        assert_eq!(clock.ms_into_slot(0), 600);
+        assert_eq!(clock.time_until_slot(1).unwrap(), slot_duration - Duration::from_millis(600));
+    }
+
+    /// A smaller `set_current_time_ms` must replace the stored instant.
+    /// `fetch_max` would leave the clock at the later value.
+    #[test]
+    fn mock_clock_set_current_time_ms_steps_backwards() {
+        let clock = create_mock_clock();
+        let genesis_ms = TEST_GENESIS_TIME * 1000;
+        clock.set_current_time_ms(genesis_ms + 5_000);
+        clock.set_current_time_ms(genesis_ms + 600);
+        assert_eq!(clock.ms_into_slot(0), 600);
+        assert_eq!(clock.current_time_ms(), genesis_ms + 600);
+        assert_eq!(clock.now_since_epoch(), Duration::from_millis(genesis_ms + 600));
+    }
+
+    #[test]
+    fn mock_clock_set_slot_with_offset_ms_and_advance_ms() {
+        let clock = create_mock_clock();
+        clock.set_slot_with_offset_ms(2, 600);
+        assert_eq!(clock.current_slot().unwrap(), 2);
+        assert_eq!(clock.ms_into_slot(2), 600);
+        clock.advance_ms(400);
+        assert_eq!(clock.ms_into_slot(2), 1_000);
+        assert_eq!(clock.current_time_secs(), TEST_GENESIS_TIME + (2 * 12) + 1);
     }
 }

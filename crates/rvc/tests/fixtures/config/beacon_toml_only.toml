@@ -1,0 +1,8 @@
+# ARCH-4h: TOML-only [beacon] knobs (no CLI flag / CliOverrides entry).
+
+[beacon]
+bn_sync_tolerances = "4,4,16"
+
+[[beacon.beacon_nodes_config]]
+url = "http://bn-section:5052"
+roles = ["proposal"]

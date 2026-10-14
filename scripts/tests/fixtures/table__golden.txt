@@ -1,0 +1,15 @@
+pubkey       index  status          active epochs  part%   src%    tgt%    head%   missed  incl/sched  sync%  Δbal ETH  eff%    APR%
+0x1111…1111  1      active_ongoing  32             50.00   50.00   50.00   50.00   16      0/1         —      0.001834  50.00   2.00
+0x2222…2222  2      active_ongoing  32             100.00  100.00  100.00  100.00  0       1/1         50.00  0.002000  100.00  4.71
+0x9324…a6d3  —      unknown         0              —       —       —       —       —       0/0         —      —         —       —   
+
+validators: 3  (active_ongoing: 2, unknown: 1)
+window: epochs 100–131 (2020-12-01T22:46:47Z – 2020-12-02T02:11:35Z)
+part% 75.00  src% 75.00  tgt% 75.00  head% 75.00  eff% 75.00
+missed 16  incl/sched 1/2  consensus_reward_gwei 3000000  APR% 12.04
+
+inclusion distance is absent because it requires a full block scan
+0/0 proposals is normal at this key count — 200 keys over 32 epochs expect ≈0.19 proposals; proposals_expected is not implemented
+an orphaned block is not canonical and reads as missed
+
+DEGRADED:

@@ -9,7 +9,7 @@ use std::time::Duration;
 use crypto::{KeyManager, LocalSigner, PublicKey, SecretKey};
 use doppelganger::SigningEnablement;
 use eth_types::Root;
-use metrics::definitions::{
+use rvc_signer::metrics::{
     slashing_result, tx_hold_kind, RVC_SIGNER_SLASHING_TX_HOLD_DURATION_MS,
     RVC_SIGNING_DURATION_SECONDS, RVC_SLASHING_PROTECTION_CHECKS_TOTAL,
 };

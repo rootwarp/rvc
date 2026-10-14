@@ -2,7 +2,6 @@
 //!
 //! Allowed `compile_protos` call sites:
 //! - `crates/signer-proto/build.rs` (signer.v2)
-//! - `crates/rvc/build.rs` (duty_tracker only — unrelated service)
 //!
 //! Any other build script compiling protos is a regression of dual-type generation.
 
@@ -53,23 +52,21 @@ fn test_v2_proto_compiled_once() {
         let Ok(src) = std::fs::read_to_string(script) else {
             continue;
         };
-        // Comment-strip is unnecessary: we only care about live compile_protos calls,
-        // and both known sites are active. A commented-out call would still be a smell
-        // but is not the dual-type regression this gate targets.
+        // Comment-strip is unnecessary: we only care about live compile_protos calls.
+        // A commented-out call would still be a smell but is not the dual-type
+        // regression this gate targets.
         if src.contains("compile_protos") {
             compile_sites.push(rel_path(&root, script));
         }
     }
     compile_sites.sort();
 
-    let expected = ["crates/rvc/build.rs", "crates/signer-proto/build.rs"];
+    let expected = ["crates/signer-proto/build.rs"];
     assert_eq!(
         compile_sites, expected,
-        "signer.v2.proto must be compiled only in crates/signer-proto/build.rs \
-         (duty_tracker may remain in crates/rvc/build.rs); found {compile_sites:?}"
+        "signer.v2.proto must be compiled only in crates/signer-proto/build.rs; found {compile_sites:?}"
     );
 
-    // Pin that the signer-proto script targets signer.v2, and rvc targets duty_tracker.
     let signer_proto_build = std::fs::read_to_string(root.join("crates/signer-proto/build.rs"))
         .expect("signer-proto build.rs");
     assert!(
@@ -81,15 +78,9 @@ fn test_v2_proto_compiled_once() {
         "crates/signer-proto must not compile duty_tracker.proto"
     );
 
-    let rvc_build =
-        std::fs::read_to_string(root.join("crates/rvc/build.rs")).expect("rvc build.rs");
     assert!(
-        rvc_build.contains("duty_tracker.proto"),
-        "crates/rvc/build.rs must compile duty_tracker.proto"
-    );
-    assert!(
-        !rvc_build.contains("signer.v2.proto") && !rvc_build.contains("signer.proto"),
-        "crates/rvc/build.rs must not compile signer protos"
+        !root.join("crates/rvc/build.rs").exists(),
+        "crates/rvc/build.rs must be deleted (ARCH-7d)"
     );
 
     // Consumers must not keep a local build.rs.

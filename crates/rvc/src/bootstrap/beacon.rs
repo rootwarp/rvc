@@ -21,7 +21,7 @@ use crate::startup;
 /// Moved into [`super::BootstrapCtx`] by a future `run()` (or held as locals
 /// by the binary composition root until that lands).
 pub struct BeaconHandles {
-    /// Single-endpoint beacon client (exit tooling / keymanager voluntary exit).
+    /// Single-endpoint beacon client. Keymanager voluntary exit uses [`Self::bn_manager`].
     pub beacon_client: Arc<BeaconClient>,
     /// Multi-node beacon pool for runtime duties and genesis validation.
     pub bn_manager: Arc<BnManager>,

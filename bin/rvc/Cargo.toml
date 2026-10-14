@@ -20,23 +20,14 @@ gcp-secret = ["rvc/gcp-secret", "dep:rustls"]
 
 [dependencies]
 beacon.workspace = true
-bn-manager.workspace = true
-builder.workspace = true
 crypto.workspace = true
-observability.workspace = true
-doppelganger.workspace = true
-grpc-signer.workspace = true
 eth-types.workspace = true
 hex.workspace = true
-keymanager-api.workspace = true
 metrics.workspace = true
-parking_lot.workspace = true
 rvc.workspace = true
-secret-provider.workspace = true
 signer.workspace = true
 telemetry.workspace = true
 slashing.workspace = true
-timing.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 clap.workspace = true
@@ -49,16 +40,17 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 anyhow.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tonic.workspace = true
 url.workspace = true
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
 
 [dev-dependencies]
-eth-types.workspace = true
-hex.workspace = true
+# eth-types / hex / serde_json are production deps above; integration tests reuse
+# them via normal dependency inheritance (no duplicate dev-dep lines).
+# test-utils: EncryptionKdf cheap-KDF helpers in integration tests (#602).
+# Dev-edge only — production `cargo build -p rvc-bin` does not enable it.
+crypto = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 reqwest = { workspace = true, features = ["blocking"] }
 libc.workspace = true
 wiremock.workspace = true
-serde_json.workspace = true

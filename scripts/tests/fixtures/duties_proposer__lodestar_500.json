@@ -1,0 +1,4 @@
+{
+  "code": 500,
+  "message": "Historical state regen is not enabled, set --serveHistoricalState to fetch this data"
+}

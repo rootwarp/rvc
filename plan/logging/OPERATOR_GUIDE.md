@@ -543,6 +543,204 @@ The local gates can be confirmed green with the standing invariant
 
 ---
 
+## 10. From a log line to the trace
+
+A `"Missed attestation deadline"` warn (and any other line emitted inside a
+sampled span) can be opened as a trace. This section is the pivot, the
+span-name inventory, the sample-rate trade-off, the `delay_ms` caveat, and
+what a missing `trace_id` means. Span names in this section are unprefixed.
+
+### 10.1 Log to trace pivot
+
+1. Find `trace_id` on a log line that was emitted **inside a sampled span**.
+   Pretty output puts `trace_id=<32 hex>` and `span_id=<16 hex>` on the line;
+   JSON puts both at the top level (§6). Copy the 32 hex digits.
+2. Open that id in the trace backend (Jaeger / Tempo / Grafana / Cloud Trace).
+   The local Jaeger from the compose `tracing` profile is
+   `http://127.0.0.1:16686`; the flag recipe is in
+   [`docs/running-guide.md`](../../docs/running-guide.md) (OTLP/HTTP `:4318`).
+3. Read the slot waterfall on service **`rvc`**:
+   - `slot.process` — the slot root (`slot`, `epoch`).
+   - the three phase children `slot.phase.block`, `slot.phase.attestation`,
+     and `slot.phase.aggregation`. Each stamps sub-second `time_into_slot`
+     when it fires (TRC-4c; §10.4).
+4. Follow the sign hop into **`rvc-signer`**. On `rvc` the client span is
+   `sign.grpc_remote_typed` (it injects `traceparent`). In the same trace the
+   signer span is `signer.v2.sign_*` with `service.name` **`rvc-signer`**.
+   On the signer log that span is `grpc.sign` and the backend name is the
+   `otel.name` field (`signer.v2.sign_attestation_data`, and the rest of
+   §10.2).
+
+**The two services are `rvc` and `rvc-signer`, and they are distinct
+(ADR-007).** They are two processes. The validator client defaults
+`service.name` to `rvc` (`SERVICE_NAME` in `crates/telemetry/src/init.rs`).
+The signer defaults it to `rvc-signer` (`DEFAULT_SIGNER_SERVICE_NAME` in
+`bin/rvc-signer/src/main.rs`) so a shared collector lists two services
+instead of folding the remote signer into the VC. One `trace_id` still joins
+the hop. `--tracing-service-name` overrides either default; leave it unset
+unless you mean to rename a service.
+
+`sign.remote` is the HTTP Web3Signer client span, not this gRPC hop. The
+signer's `:9000` handler span stays `sign` (§4).
+
+### 10.2 Span-name inventory
+
+Unprefixed names only. Every name in the tables is a span this tree emits.
+`slot.phase.payload_attestation` is the Gloas sibling of the three phases in
+§10.1; pre-Gloas it does not stamp `time_into_slot`. The PTC per-slot lookup
+is not a span — there is no fifth `duty_tracker` lookup.
+
+| Span | Where it sits |
+|---|---|
+| `slot.process` | Slot root on `rvc` |
+| `epoch.boundary` | Child of `slot.process` on an epoch-boundary slot |
+| `slot.phase.block` | Child of `slot.process` |
+| `slot.phase.attestation` | Child of `slot.process` |
+| `slot.phase.aggregation` | Child of `slot.process` |
+| `slot.phase.payload_attestation` | Gloas phase, child of `slot.process` |
+
+`duty_tracker.*`, including the four lookups (`get_duty`,
+`get_duties_for_slot`, `get_proposer_duty`, `get_sync_committee_duties`):
+
+| Span | Role |
+|---|---|
+| `duty_tracker.fetch_attester_duties` | Epoch fetch |
+| `duty_tracker.check_attester_reorg` | Epoch reorg check |
+| `duty_tracker.fetch_proposer_duties` | Epoch fetch |
+| `duty_tracker.check_proposer_reorg` | Epoch reorg check |
+| `duty_tracker.fetch_sync_committee_duties` | Epoch fetch |
+| `duty_tracker.fetch_ptc_duties` | Epoch fetch (Gloas) |
+| `duty_tracker.check_ptc_reorg` | Epoch reorg check (Gloas) |
+| `duty_tracker.evict_old_caches` | Epoch cache eviction |
+| `duty_tracker.get_duty` | Lookup |
+| `duty_tracker.get_duties_for_slot` | Lookup |
+| `duty_tracker.get_proposer_duty` | Lookup |
+| `duty_tracker.get_sync_committee_duties` | Lookup |
+
+Sign hop. `signer.v2.sign_*` includes `sign_block_header` and `sign_root`
+(Gloas). In the backend those are the span names; on the signer log they are
+`otel.name` on `grpc.sign`.
+
+| Span |
+|---|
+| `sign.grpc_remote_typed` |
+| `sign.remote` |
+| `signer.v2.sign_beacon_block` |
+| `signer.v2.sign_blinded_beacon_block` |
+| `signer.v2.sign_randao_reveal` |
+| `signer.v2.sign_attestation_data` |
+| `signer.v2.sign_aggregate_and_proof` |
+| `signer.v2.sign_sync_committee_message` |
+| `signer.v2.sign_sync_aggregator_selection_data` |
+| `signer.v2.sign_contribution_and_proof` |
+| `signer.v2.sign_builder_registration` |
+| `signer.v2.sign_voluntary_exit` |
+| `signer.v2.sign_block_header` |
+| `signer.v2.sign_root` |
+
+`signer.dvt.*`:
+
+| Span |
+|---|
+| `signer.dvt.coordinate` |
+| `signer.dvt.partial_sign_beacon_block` |
+| `signer.dvt.partial_sign_attestation_data` |
+| `signer.dvt.partial_sign_sync_committee` |
+| `signer.dvt.partial_sign_payload_attestation` |
+| `signer.dvt.partial_sign_block_header` |
+| `signer.dvt.partial_sign_root` |
+
+Background loop and tick spans (TRC-6b). The loop root is `parent: None`
+(not a child of `slot.process`); the tick `follows_from` that loop. Do not
+look for these inside the slot waterfall.
+
+| Loop | Tick |
+|---|---|
+| `index.resolve` | `index.resolve.tick` |
+| `liveness_loop` | `liveness_loop.tick` |
+| `monitoring_push` | `monitoring_push.tick` |
+| `proposer_config_refresh` | `proposer_config_refresh.tick` |
+| `slashing_monitor` | `slashing_monitor.tick` |
+
+`liveness_loop` and `liveness_loop.tick` are `debug` spans. At `info` they
+are quiet; that is the level, not a missing trace.
+
+### 10.3 Sample rate
+
+The default is **`0.01`** (`DEFAULT_TRACING_SAMPLE_RATE` in
+`crates/rvc-config/src/sections/tracing.rs`, same constant on `rvc-signer`).
+Precedence is explicit `--tracing-sample-rate` / config, then
+`OTEL_TRACES_SAMPLER_ARG`, then `0.01`.
+
+Startup logs the trade-off once the subscriber is up, whenever the resolved
+rate is below `1.0`:
+
+```text
+tracing sample_rate is below 1.0; most traces will be dropped
+```
+
+At `0.0` the line is `tracing sample_rate is 0.0; exporter receives nothing`.
+The default keeps export volume small and drops most traces, so a warn you
+care about often has no `trace_id`. That is the head sampler, not a collector
+outage.
+
+**`--tracing-sample-rate 1.0` / `OTEL_TRACES_SAMPLER_ARG=1.0` is the
+debugging profile.** Set it before the process starts and restart. `SIGHUP`
+reloads `RUST_LOG` only (§2.1); it does not change the sample rate.
+
+Sampling is head-based (`ParentBased` + `TraceIdRatioBased` in
+`crates/telemetry/src/init.rs`). The decision is made when the trace starts.
+**Head sampling cannot keep a dropped trace after the fact** — raising the
+rate later does not recover a trace that was already discarded. Collector-side
+tail sampling is the named forward path (P2, TRC-7c).
+
+### 10.4 `delay_ms` is ±1000 ms
+
+The `"Missed attestation deadline"` warn's `delay_ms` is **accurate to
+±1000 ms**. `SystemSlotClock::current_unix_time`
+(`crates/timing/src/clock.rs:171-173`) is
+`SystemTime::now()….as_secs()` — whole seconds.
+`SlotClock::current_time_secs` (`:197-198`) returns that value.
+`phase_deadline` (`crates/rvc/src/orchestrator/coordinator/mod.rs:927-943`)
+sources the number at `:930`:
+
+```text
+now_ms = self.clock.current_time_secs() * 1000
+```
+
+`overrun_ms` is `now_ms - deadline_ms` (`:941`). The warn logs it at `:981`:
+
+```text
+warn!(slot, delay_ms = deadline.overrun_ms, "Missed attestation deadline");
+```
+
+Because `now_ms` is the start of the current Unix second, the overrun is
+coarse by up to one second. **Precision work is out of this initiative.**
+
+Contrast that with sub-second `time_into_slot` on the phase spans (TRC-4c).
+`record_time_into_slot` (`coordinator/mod.rs:1001-1006`) stamps milliseconds
+from a `tokio::time::Instant` taken once per slot, after `slot.process`
+opens. **`delay_ms` and `time_into_slot` are not the same precision.** A
+phase span at 3999 ms does not confirm or refute a `delay_ms` that only
+moves on whole-second boundaries. The slot clock cannot represent a
+sub-second deadline such as 3999 ms; the phase span can.
+
+### 10.5 Absent, not zero
+
+**No `trace_id` does not mean a bug.** It means one of:
+
+- the line is outside a span,
+- the line is inside an unsampled span (the head sampler dropped the trace,
+  §10.3), or
+- there is no OTel layer (no `--tracing-endpoint` and no
+  `OTEL_EXPORTER_OTLP_ENDPOINT`, so tracing never started).
+
+The formatter does not substitute a zero id. You will not see
+`trace_id=00000000000000000000000000000000` standing in for "missing."
+Absence is the signal.
+
+---
+
 ## See also
 
 - [`STANDARD.md`](./STANDARD.md) — the normative level taxonomy, canonical field registry,

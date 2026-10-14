@@ -1,0 +1,11 @@
+{
+  "scenario": "first_503",
+  "declared_by": "VP-4b",
+  "exercised_by": "VP-4b",
+  "rule": "bn0 503s at selection, run completes on bn1, endpoints_used records both",
+  "selection_status": 503,
+  "endpoints": [
+    "http://bn0:5052",
+    "http://bn1:5052"
+  ]
+}

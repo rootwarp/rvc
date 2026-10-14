@@ -27,8 +27,9 @@
 //! - [`interchange`] — EIP-3076 import/export and GVR metadata
 //! - [`watermarks`] — `WatermarkKind` helpers plus set/get/prune API
 //!
-//! This file retains [`SlashingDb`], accessors, strict-semantics, GVR cache,
-//! integrity check, and `check_and_record_*` rules delegation.
+//! This file retains [`SlashingDb`], accessors, strict-semantics, Gloas
+//! leniency gate, GVR cache, integrity check, and `check_and_record_*` rules
+//! delegation.
 
 mod interchange;
 mod migrations;
@@ -36,9 +37,10 @@ mod open;
 mod records;
 pub mod watermarks;
 
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use rusqlite::Connection;
@@ -50,8 +52,17 @@ use eth_types::{Epoch, Root, Slot};
 ///
 /// Delegates to [`observability::pubkey::CanonicalPubkey`] — the single source of
 /// truth for pubkey normalisation across all crates (CQ-2.4 / C1).
-pub(crate) fn normalize_pubkey(pubkey: &str) -> String {
-    pubkey.parse::<observability::pubkey::CanonicalPubkey>().expect("infallible").to_string()
+///
+/// `CanonicalPubkey::from_str` is [`Infallible`](std::convert::Infallible) by
+/// design (normalisation, not validation). `Result` replaces `.expect`; hex
+/// policy lives only on `SignedBlock::new` / `SignedAttestation::new`.
+pub(crate) fn normalize_pubkey(
+    pubkey: &str,
+) -> Result<observability::pubkey::CanonicalPubkey, SlashingError> {
+    match pubkey.parse::<observability::pubkey::CanonicalPubkey>() {
+        Ok(pk) => Ok(pk),
+        Err(never) => match never {},
+    }
 }
 
 /// SQLite-backed database for storing slashing protection data.
@@ -59,6 +70,12 @@ pub struct SlashingDb {
     pub(crate) conn: Mutex<Connection>,
     path: Option<PathBuf>,
     pub(crate) strict_semantics: AtomicBool,
+    /// Epoch at which FU-33 `None==None` leniency is disabled.
+    ///
+    /// `u64::MAX` is the far-future unscheduled sentinel (same value as
+    /// [`eth_types::ForkSchedule::unscheduled_gloas`]): existing tests and
+    /// pre-Gloas networks stay on `strict_semantics` alone.
+    pub(crate) gloas_fork_epoch: AtomicU64,
     /// One-time cache for `metadata.genesis_validators_root`.
     ///
     /// `None` means "no GVR pinned in metadata" (backward-compat: skip the per-call check).
@@ -78,24 +95,86 @@ pub struct SlashingDb {
     /// observes "no GVR pinned in metadata" so operators can detect a degraded
     /// chain-swap-protection state.
     gvr_skip_warned: OnceLock<()>,
-    /// Per-instance countdown of forced commit failures (`test-utils` only arms it).
+    /// Per-instance countdown of forced persist failures (`test-utils` only arms it).
     ///
     /// Scoped to this `SlashingDb` so parallel tests with separate in-memory DBs
-    /// cannot steal each other's inject. Snapshotted into `Staged*` at `stage_*`.
+    /// cannot steal each other's inject. Snapshotted into `Staged*` at `stage_*`;
+    /// consumed inside `Staged*::commit` (snapshotted at `stage_*`), inside
+    /// group-commit immediately before `COMMIT`, and inside
+    /// `reconcile_unsigned` immediately before the compensating DELETE.
     pub(crate) fail_next_commits: AtomicU32,
+    /// Group-commit knobs. Replaced at startup from operator config.
+    pub(crate) group_commit: Mutex<crate::group_commit::GroupCommitConfig>,
+    pub(crate) pending: Mutex<VecDeque<crate::group_commit::QueuedReserve>>,
+    pub(crate) pending_cv: Condvar,
+    /// Serialises the flusher so wait-to-fill does not hold `conn`.
+    pub(crate) flush_lock: Mutex<()>,
+    /// True while a flusher is responsible for the queue. Enqueue claims it;
+    /// the flusher clears it under `pending` when the queue is empty.
+    pub(crate) leader_active: AtomicBool,
+    /// Test-only: block the next in-txn eval until the release sender fires.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) eval_gate:
+        Mutex<Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>>,
+    /// Skip this many in-txn eval stalls before honouring `eval_gate`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) eval_skip: AtomicU32,
 }
 
 impl SlashingDb {
-    /// Force the next `n` `Staged*::commit` calls on **this** DB to fail before
-    /// INSERT/`COMMIT`. Drop still rolls back. Per-instance — safe under parallel
-    /// tests with separate `open_in_memory()` DBs.
+    pub(crate) fn from_connection(conn: Connection, path: Option<PathBuf>) -> Self {
+        Self {
+            conn: Mutex::new(conn),
+            path,
+            strict_semantics: AtomicBool::new(false),
+            gloas_fork_epoch: AtomicU64::new(u64::MAX),
+            gvr_cache: OnceLock::new(),
+            gvr_skip_warned: OnceLock::new(),
+            fail_next_commits: AtomicU32::new(0),
+            group_commit: Mutex::new(crate::group_commit::GroupCommitConfig::default()),
+            pending: Mutex::new(VecDeque::new()),
+            pending_cv: Condvar::new(),
+            flush_lock: Mutex::new(()),
+            leader_active: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-utils"))]
+            eval_gate: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            eval_skip: AtomicU32::new(0),
+        }
+    }
+}
+
+impl SlashingDb {
+    /// Force the next `n` persist operations on **this** DB to fail:
+    /// `Staged*::commit` (snapshotted at `stage_*`), group-commit `COMMIT`
+    /// (consumed immediately before `COMMIT`), and `reconcile_unsigned`
+    /// (consumed immediately before DELETE). Drop of a staged guard still rolls back.
+    /// Per-instance — safe under parallel tests with separate
+    /// `open_in_memory()` DBs.
+    ///
+    /// Arm this **after** a successful `reserve_*` to fail the compensating
+    /// delete; otherwise `reserve_*` consumes the inject first.
     ///
     /// # Test-only
     ///
-    /// Gated by the `test-utils` feature.
-    #[cfg(feature = "test-utils")]
+    /// Not on the production API. Gated by `cfg(test)` (this crate's unit
+    /// tests) or the `test-utils` feature (other crates' `[dev-dependencies]`,
+    /// and this crate's integration tests via the self-path `test-utils`
+    /// dev-dep). Production binaries cannot arm the inject.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn fail_next_commits(&self, n: u32) {
         self.fail_next_commits.store(n, Ordering::SeqCst);
+    }
+
+    /// Whether the connection mutex is free right now (`try_lock` succeeds).
+    ///
+    /// # Test-only
+    ///
+    /// Lets a tracing subscriber prove an audit event was emitted after the
+    /// staged guard released the connection (ADR-006 / G-7 behavioural proof).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn try_lock_free(&self) -> bool {
+        self.conn.try_lock().is_some()
     }
 
     /// Take one injected commit failure for this DB (used when building a staged guard).
@@ -122,8 +201,32 @@ impl SlashingDb {
     /// When enabled, `None == None` signing roots at the same target epoch
     /// (or slot for blocks) are rejected as potential double votes/proposals.
     /// Default is `false` (lenient: treats `None == None` as a re-sign).
+    ///
+    /// Gloas epochs are strict regardless of this flag — see
+    /// [`Self::set_gloas_fork_epoch`].
     pub fn set_strict_semantics(&self, strict: bool) {
         self.strict_semantics.store(strict, Ordering::Relaxed);
+    }
+
+    /// Set the Gloas fork epoch used by the FU-33 `None==None` leniency gate.
+    ///
+    /// `u64::MAX` is the unscheduled sentinel: every practical epoch stays
+    /// on the operator [`Self::set_strict_semantics`] flag alone. At
+    /// `target_epoch >= gloas_fork_epoch` (and the matching block-slot epoch)
+    /// the lenient `(None, None)` arm is disabled even when `strict_semantics`
+    /// is off.
+    pub fn set_gloas_fork_epoch(&self, epoch: Epoch) {
+        self.gloas_fork_epoch.store(epoch, Ordering::Relaxed);
+    }
+
+    /// Operator-strict **or** the candidate epoch is at/after Gloas.
+    ///
+    /// Two Gloas attestations for one slot share source/target and differ
+    /// only in signing root (payload-status `data.index`). The lenient
+    /// `(None, None)` arm would treat those as a re-sign.
+    pub(crate) fn fork_aware_strict(&self, epoch: Epoch) -> bool {
+        self.strict_semantics.load(Ordering::Relaxed)
+            || epoch >= self.gloas_fork_epoch.load(Ordering::Relaxed)
     }
 
     // ── GVR per-call re-check helpers (M-6 / ISSUE-3.5) ─────────────────────
@@ -240,7 +343,10 @@ impl SlashingDb {
     /// compatibility with pre-existing records that lack roots. With
     /// `strict_semantics = true`: `None==None` is rejected as a potential
     /// double vote, matching Lighthouse/Prysm/Teku conservative behavior.
-    /// See EIP-3076 §Conditions, note on `signing_root` handling.
+    /// Gloas epochs (`target_epoch >= gloas_fork_epoch`) are always strict:
+    /// payload-status `data.index` 0 vs 1 share source/target and would
+    /// otherwise be deduplicated. See EIP-3076 §Conditions, note on
+    /// `signing_root` handling.
     #[tracing::instrument(name = "slashing.db.attestation", skip_all, fields(slashing_result))]
     pub fn check_and_record_attestation(
         &self,
@@ -334,7 +440,7 @@ mod tests {
         let blocks = db.get_blocks("0x1234").expect("failed to get");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].slot, 1000);
-        assert_eq!(blocks[0].signing_root, Some("0xroot1".to_string()));
+        assert_eq!(blocks[0].signing_root.as_ref().map(|r| r.as_hex()), Some("0xroot1"));
     }
 
     #[test]
@@ -916,6 +1022,10 @@ mod edge_case_tests {
     //   double vote. This matches the conservative behavior of Lighthouse,
     //   Prysm, and Teku. Recommended for new deployments where all records
     //   should have roots.
+    //
+    // - Gloas (target_epoch >= gloas_fork_epoch): always strict, even when
+    //   strict_semantics is off. Payload-status index 0 vs 1 share source/
+    //   target; the lenient arm would treat missing roots as a re-sign.
 
     #[test]
     fn test_fu33_none_none_lenient_allows() {
@@ -1005,6 +1115,107 @@ mod edge_case_tests {
             result.is_err(),
             "strict mode: None==None block must be rejected as potential double proposal"
         );
+    }
+
+    #[test]
+    fn test_fu33_gloas_none_none_rejected_on_all_entry_points() {
+        const GLOAS: Epoch = 100;
+        const PRE: Epoch = 99;
+        const GVR: Root = [0u8; 32];
+        let slot = GLOAS * eth_types::SLOTS_PER_EPOCH;
+
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            db.set_gloas_fork_epoch(GLOAS);
+            db.stage_attestation("0xstage_att", PRE, GLOAS, None, &GVR)
+                .expect("first")
+                .commit()
+                .expect("commit");
+            let err = db
+                .stage_attestation("0xstage_att", PRE, GLOAS, None, &GVR)
+                .expect_err("Gloas None==None must double-vote via stage_attestation");
+            assert!(matches!(
+                err,
+                SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
+                    target_epoch: GLOAS
+                })
+            ));
+        }
+
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            db.set_gloas_fork_epoch(GLOAS);
+            db.reserve_attestation("0xres_att", PRE, GLOAS, None, &GVR).expect("first");
+            let err = db
+                .reserve_attestation("0xres_att", PRE, GLOAS, None, &GVR)
+                .expect_err("Gloas None==None must double-vote via reserve_attestation");
+            assert!(matches!(
+                err,
+                SlashingError::SlashableAttestation(AttestationSlashingViolation::DoubleVote {
+                    target_epoch: GLOAS
+                })
+            ));
+        }
+
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            db.set_gloas_fork_epoch(GLOAS);
+            db.stage_block("0xstage_blk", slot, None, &GVR)
+                .expect("first")
+                .commit()
+                .expect("commit");
+            let err = db
+                .stage_block("0xstage_blk", slot, None, &GVR)
+                .expect_err("Gloas None==None must double-propose via stage_block");
+            assert!(matches!(
+                err,
+                SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal { .. })
+            ));
+        }
+
+        {
+            let db = SlashingDb::open_in_memory().expect("open");
+            db.set_gloas_fork_epoch(GLOAS);
+            db.reserve_block("0xres_blk", slot, None, &GVR).expect("first");
+            let err = db
+                .reserve_block("0xres_blk", slot, None, &GVR)
+                .expect_err("Gloas None==None must double-propose via reserve_block");
+            assert!(matches!(
+                err,
+                SlashingError::SlashableBlock(BlockSlashingViolation::DoubleBlockProposal { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn test_fu33_pre_gloas_none_none_still_lenient() {
+        const GLOAS: Epoch = 100;
+        const GVR: Root = [0u8; 32];
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.set_gloas_fork_epoch(GLOAS);
+        db.check_and_record_attestation("0xpre", 1, 5, None, &GVR).expect("first");
+        db.check_and_record_attestation("0xpre", 1, 5, None, &GVR)
+            .expect("pre-Gloas None==None stays a re-sign");
+        let pre_slot = 5 * eth_types::SLOTS_PER_EPOCH;
+        db.check_and_record_block("0xpreb", pre_slot, None, &GVR).expect("first block");
+        db.check_and_record_block("0xpreb", pre_slot, None, &GVR)
+            .expect("pre-Gloas None==None block stays a re-sign");
+    }
+
+    #[test]
+    fn test_fu33_sentinel_gloas_keeps_lenient_none_none() {
+        let db = SlashingDb::open_in_memory().expect("open");
+        db.check_and_record_attestation("0xsent", 1, 5, None, &[0u8; 32]).expect("first");
+        db.check_and_record_attestation("0xsent", 1, 5, None, &[0u8; 32])
+            .expect("sentinel Gloas: None==None is still a re-sign");
+        {
+            let conn = db.conn.lock();
+            assert_eq!(
+                super::migrations::read_schema_version(&conn).unwrap(),
+                Some(3),
+                "FU-33 gate must not add a schema migration"
+            );
+        }
     }
 
     // LOW-13: Validate interchange_format_version on import
@@ -1211,11 +1422,11 @@ mod edge_case_tests {
             use std::sync::Arc;
             let db_arc = Arc::new(SlashingDb::open(&path).expect("open for scoped"));
             let scoped = PubkeyScopedDb::new(Arc::clone(&db_arc), "peer-dvt-x".to_string(), GVR);
-            scoped
+            let (staged, audit) = scoped
                 .stage_block(PUBKEY_BLOCK, 501, Some("0xscopedroot".to_string()))
-                .expect("scoped stage_block must succeed")
-                .commit()
-                .expect("commit");
+                .expect("scoped stage_block must succeed");
+            staged.commit().expect("commit");
+            audit.emit();
         }
 
         drop(db);

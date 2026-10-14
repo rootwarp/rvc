@@ -78,6 +78,10 @@ pub enum ServerError {
     /// Raw I/O failures.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A supervised child panicked, or shutdown exceeded its deadline.
+    #[error("server runtime error: {0}")]
+    Runtime(#[source] Detail),
 }
 
 impl ServerError {
@@ -99,6 +103,10 @@ impl ServerError {
 
     pub fn config(msg: impl Into<Detail>) -> Self {
         Self::Config(msg.into())
+    }
+
+    pub fn runtime(msg: impl Into<Detail>) -> Self {
+        Self::Runtime(msg.into())
     }
 }
 

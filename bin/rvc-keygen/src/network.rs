@@ -16,8 +16,9 @@ pub fn from_name(name: &str) -> Result<&'static KeygenNetwork> {
 
 /// Creates a `ForkSchedule` suitable for EIP-7044 voluntary exit signing.
 ///
-/// Sets Capella as active at epoch 0 and all post-Capella forks at `u64::MAX`,
-/// ensuring `ForkName::from_epoch()` never returns beyond Capella.
+/// Sets Capella as active at epoch 0 and all post-Capella forks at `u64::MAX`.
+/// `from_epoch` at `u64::MAX` therefore picks Gloas; the Capella cap lives in
+/// `>= ForkName::Capella` (`crypto::capella_capped_fork_version`).
 pub fn exit_fork_schedule(network: &KeygenNetwork) -> ForkSchedule {
     ForkSchedule {
         genesis_fork_version: network.genesis_fork_version,
@@ -33,12 +34,15 @@ pub fn exit_fork_schedule(network: &KeygenNetwork) -> ForkSchedule {
         electra_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
         fulu_fork_epoch: u64::MAX,
         fulu_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
+        gloas_fork_epoch: u64::MAX,
+        gloas_fork_version: [0xFF, 0xFF, 0xFF, 0xFF],
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crypto::capella_capped_fork_version;
     use eth_types::ForkName;
 
     // KAT anchors — byte literals that used to live in this file before RF3-04
@@ -211,11 +215,16 @@ mod tests {
         let net = from_name("mainnet").unwrap();
         let schedule = exit_fork_schedule(net);
 
-        // Any epoch should resolve to at most Capella
+        // Any realistic epoch should resolve to at most Capella
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
         assert_eq!(ForkName::from_epoch(0, &schedule), ForkName::Capella);
         assert_eq!(ForkName::from_epoch(1000, &schedule), ForkName::Capella);
-        assert_eq!(ForkName::from_epoch(999999, &schedule), ForkName::Capella);
+        assert_eq!(ForkName::from_epoch(1_000_000, &schedule), ForkName::Capella);
         assert_eq!(ForkName::from_epoch(u64::MAX - 1, &schedule), ForkName::Capella);
+        // Reverse scan at u64::MAX picks Gloas; EIP-7044 cap is independent.
+        assert_eq!(ForkName::from_epoch(u64::MAX, &schedule), ForkName::Gloas);
+        assert_eq!(capella_capped_fork_version(1_000_000, &schedule), net.capella_fork_version);
+        assert_eq!(capella_capped_fork_version(u64::MAX, &schedule), net.capella_fork_version);
     }
 
     #[test]

@@ -11,12 +11,22 @@ pub use server::{
     serve_metrics_with_health, HealthStatus, SharedHealthStatus,
 };
 
+use std::any::Any;
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use lazy_static::lazy_static;
-use prometheus::{Counter, Gauge, Histogram, HistogramOpts, Opts, Registry};
+use prometheus::core::Collector;
+pub use prometheus::{
+    Counter, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec,
+    IntGauge, IntGaugeVec, Opts, Registry,
+};
 
 lazy_static! {
     /// Global prometheus metrics registry.
     pub static ref REGISTRY: Registry = Registry::new();
+    static ref HANDLES: Mutex<HashMap<String, Box<dyn Any + Send + Sync>>> =
+        Mutex::new(HashMap::new());
 }
 
 /// Register a counter metric with a specific registry.
@@ -74,6 +84,115 @@ pub fn register_histogram(
     buckets: Option<Vec<f64>>,
 ) -> prometheus::Result<Histogram> {
     register_histogram_with(&REGISTRY, name, help, buckets)
+}
+
+fn handles() -> std::sync::MutexGuard<'static, HashMap<String, Box<dyn Any + Send + Sync>>> {
+    HANDLES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Register `metric` under `name`, or return the previously registered handle.
+///
+/// Owner crates declare domain metrics against [`REGISTRY`] through this helper
+/// so a second declaration of the same family (or a second `init`) does not panic.
+pub fn register_metric<M>(name: &str, metric: M) -> M
+where
+    M: Clone + Collector + Any + Send + Sync + 'static,
+{
+    let mut map = handles();
+    if let Some(existing) = map.get(name) {
+        return existing
+            .downcast_ref::<M>()
+            .unwrap_or_else(|| panic!("metric {name} already registered with a different type"))
+            .clone();
+    }
+    if let Err(e) = REGISTRY.register(Box::new(metric.clone())) {
+        panic!("Failed to register {name}: {e}");
+    }
+    map.insert(name.to_string(), Box::new(metric.clone()));
+    metric
+}
+
+fn opts_with_consts(name: &str, help: &str, const_labels: &[(&str, &str)]) -> Opts {
+    let mut opts = Opts::new(name, help);
+    for (k, v) in const_labels {
+        opts = opts.const_label((*k).to_string(), (*v).to_string());
+    }
+    opts
+}
+
+/// Idempotent `IntCounter` constructor bound to [`REGISTRY`].
+pub fn define_int_counter(name: &str, help: &str) -> IntCounter {
+    let counter = IntCounter::with_opts(Opts::new(name, help))
+        .unwrap_or_else(|e| panic!("Failed to create {name}: {e}"));
+    register_metric(name, counter)
+}
+
+/// Idempotent `IntCounter` with constant labels.
+pub fn define_int_counter_with_const_labels(
+    name: &str,
+    help: &str,
+    const_labels: &[(&str, &str)],
+) -> IntCounter {
+    let counter = IntCounter::with_opts(opts_with_consts(name, help, const_labels))
+        .unwrap_or_else(|e| panic!("Failed to create {name}: {e}"));
+    register_metric(name, counter)
+}
+
+/// Idempotent `IntCounterVec` constructor bound to [`REGISTRY`].
+pub fn define_int_counter_vec(name: &str, help: &str, labels: &[&str]) -> IntCounterVec {
+    let counter = IntCounterVec::new(Opts::new(name, help), labels)
+        .unwrap_or_else(|e| panic!("Failed to create {name}: {e}"));
+    register_metric(name, counter)
+}
+
+/// Idempotent `IntGauge` constructor bound to [`REGISTRY`].
+pub fn define_int_gauge(name: &str, help: &str) -> IntGauge {
+    let gauge =
+        IntGauge::new(name, help).unwrap_or_else(|e| panic!("Failed to create {name}: {e}"));
+    register_metric(name, gauge)
+}
+
+/// Idempotent `IntGaugeVec` constructor bound to [`REGISTRY`].
+pub fn define_int_gauge_vec(name: &str, help: &str, labels: &[&str]) -> IntGaugeVec {
+    let gauge = IntGaugeVec::new(Opts::new(name, help), labels)
+        .unwrap_or_else(|e| panic!("Failed to create {name}: {e}"));
+    register_metric(name, gauge)
+}
+
+/// Idempotent `Gauge` constructor bound to [`REGISTRY`].
+pub fn define_gauge(name: &str, help: &str) -> Gauge {
+    let gauge = Gauge::with_opts(Opts::new(name, help))
+        .unwrap_or_else(|e| panic!("Failed to create {name}: {e}"));
+    register_metric(name, gauge)
+}
+
+/// Idempotent `GaugeVec` constructor bound to [`REGISTRY`].
+pub fn define_gauge_vec(
+    name: &str,
+    help: &str,
+    labels: &[&str],
+    const_labels: &[(&str, &str)],
+) -> GaugeVec {
+    let gauge = GaugeVec::new(opts_with_consts(name, help, const_labels), labels)
+        .unwrap_or_else(|e| panic!("Failed to create {name}: {e}"));
+    register_metric(name, gauge)
+}
+
+/// Idempotent `HistogramVec` constructor bound to [`REGISTRY`].
+pub fn define_histogram_vec(
+    name: &str,
+    help: &str,
+    labels: &[&str],
+    buckets: &[f64],
+    const_labels: &[(&str, &str)],
+) -> HistogramVec {
+    let mut hopts = HistogramOpts::new(name, help).buckets(buckets.to_vec());
+    for (k, v) in const_labels {
+        hopts = hopts.const_label((*k).to_string(), (*v).to_string());
+    }
+    let histogram =
+        HistogramVec::new(hopts, labels).unwrap_or_else(|e| panic!("Failed to create {name}: {e}"));
+    register_metric(name, histogram)
 }
 
 /// Macro for conveniently registering a counter metric.

@@ -2,11 +2,8 @@
 //!
 //! Pure code motion from the former monolithic `db.rs` (E2 part 1).
 
-use parking_lot::Mutex;
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32};
-use std::sync::OnceLock;
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -74,14 +71,7 @@ impl SlashingDb {
         #[cfg(unix)]
         Self::chmod_main_file(path)?;
 
-        let db = Self {
-            conn: Mutex::new(conn),
-            path: Some(path.to_path_buf()),
-            strict_semantics: AtomicBool::new(false),
-            gvr_cache: OnceLock::new(),
-            gvr_skip_warned: OnceLock::new(),
-            fail_next_commits: AtomicU32::new(0),
-        };
+        let db = Self::from_connection(conn, Some(path.to_path_buf()));
 
         // `migrate()` creates tables if they don't exist (v2-native CREATE TABLE).
         // Then `migrate_to_v2` checks if the existing schema is v1 and upgrades.
@@ -261,17 +251,15 @@ impl SlashingDb {
     /// # Note
     /// This is a test helper. Do not use it in production paths; prefer `open` or
     /// `open_in_memory` instead.
+    ///
+    /// Compiled only for this crate's tests or when the `test-utils` feature
+    /// is enabled. This crate's integration tests see it through the self
+    /// dev-dependency that turns `test-utils` on.
     #[doc(hidden)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn open_with_conn_for_testing(conn: Connection) -> Result<Self, SlashingError> {
         Self::configure_pragmas(&conn)?;
-        let db = Self {
-            conn: Mutex::new(conn),
-            path: None,
-            strict_semantics: AtomicBool::new(false),
-            gvr_cache: OnceLock::new(),
-            gvr_skip_warned: OnceLock::new(),
-            fail_next_commits: AtomicU32::new(0),
-        };
+        let db = Self::from_connection(conn, None);
         db.migrate()?;
         {
             let mut conn = db.conn.lock();
@@ -291,14 +279,7 @@ impl SlashingDb {
     /// Creates the full v3 schema directly (no backup needed — there is no file).
     pub fn open_in_memory() -> Result<Self, SlashingError> {
         let conn = Connection::open_in_memory()?;
-        let db = Self {
-            conn: Mutex::new(conn),
-            path: None,
-            strict_semantics: AtomicBool::new(false),
-            gvr_cache: OnceLock::new(),
-            gvr_skip_warned: OnceLock::new(),
-            fail_next_commits: AtomicU32::new(0),
-        };
+        let db = Self::from_connection(conn, None);
         // Create tables (v2-native layout).
         db.migrate()?;
         // Set schema_version = 2 (CN-keyed indices are created transiently here

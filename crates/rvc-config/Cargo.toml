@@ -1,0 +1,20 @@
+[package]
+name = "rvc-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Operator config sections (ADR-008): clap Args groups with provenance, no figment"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+eth-types.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+url.workspace = true

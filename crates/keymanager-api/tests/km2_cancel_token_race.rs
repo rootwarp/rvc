@@ -11,15 +11,17 @@
 //!   (c) the window-elapsed branch prunes its OWN cancel-token entry;
 //!   (d) concurrent delete+re-import leaves no stale enable task (HTTP e2e).
 
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+mod common;
+
 use rvc_keymanager_api::error::ApiError;
-use rvc_keymanager_api::gate::DoppelgangerGate;
 use rvc_keymanager_api::handlers::{delete_keystores, import_keystores, AppState};
-use rvc_keymanager_api::lifecycle::{DoppelgangerLifecycle, ImportKind};
+use rvc_keymanager_api::lifecycle::{ConfigTouch, DoppelgangerLifecycle, ImportKind};
 use rvc_keymanager_api::traits::{
     DeleteKeystoreError, DeleteRemoteKeyError, DoppelgangerMonitor, ImportKeystoreError,
     ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager, SlashingProtection,
@@ -47,34 +49,36 @@ impl SpyValidatorManager {
 }
 
 impl ValidatorManager for SpyValidatorManager {
-    fn add_validator(&self, pubkey: Pubkey, enabled: bool) {
+    fn add_validator(&self, pubkey: Pubkey, enabled: bool) -> Result<(), String> {
         self.state.lock().unwrap().insert(pubkey, enabled);
+        Ok(())
     }
 
-    fn remove_validator(&self, pubkey: &Pubkey) -> bool {
-        self.state.lock().unwrap().remove(pubkey).is_some()
+    fn remove_validator(&self, pubkey: &Pubkey) -> Result<bool, String> {
+        Ok(self.state.lock().unwrap().remove(pubkey).is_some())
     }
 
-    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) {
+    fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) -> Result<(), String> {
         if let Some(v) = self.state.lock().unwrap().get_mut(pubkey) {
             *v = enabled;
         }
+        Ok(())
     }
 }
 
 /// Doppelganger monitor that can park delete at `cancel_monitoring` /
 /// `stop_monitoring` so HTTP race tests can interleave re-import.
 struct GatedDoppelgangerMonitor {
-    inner: DoppelgangerGate,
+    inner: common::PendingSetMonitor,
     start_signaled: Mutex<Option<mpsc::Sender<()>>>,
     stop_arrived: Mutex<Option<mpsc::Sender<()>>>,
     stop_release: Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl GatedDoppelgangerMonitor {
-    fn new(window: Duration) -> Self {
+    fn new(_window: Duration) -> Self {
         Self {
-            inner: DoppelgangerGate::new(window),
+            inner: common::PendingSetMonitor::new(),
             start_signaled: Mutex::new(None),
             stop_arrived: Mutex::new(None),
             stop_release: Mutex::new(None),
@@ -115,6 +119,7 @@ struct GatedKeystoreManager {
     import_waits_for_delete: bool,
 }
 
+#[async_trait]
 impl KeystoreManager for GatedKeystoreManager {
     fn list_keys(&self) -> Vec<Pubkey> {
         self.keys.lock().unwrap().clone()
@@ -124,7 +129,7 @@ impl KeystoreManager for GatedKeystoreManager {
         self.keys.lock().unwrap().contains(pubkey)
     }
 
-    fn import_keystore(
+    async fn import_keystore(
         &self,
         keystore_json: &str,
         _password: &str,
@@ -180,8 +185,9 @@ impl KeystoreManager for GatedKeystoreManager {
 }
 
 struct NoopSlashingProtection;
+#[async_trait]
 impl SlashingProtection for NoopSlashingProtection {
-    fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+    async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
         Ok(())
     }
     fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
@@ -307,11 +313,11 @@ async fn km2_insert_cancels_displaced_token() {
     let monitor = Arc::new(GatedDoppelgangerMonitor::ungated(window));
     let life = make_lifecycle(window, vm, monitor);
 
-    life.on_import(pubkey, ImportKind::Local);
+    life.on_import(pubkey, ImportKind::Local).expect("import");
     let t1 = life.current_cancel_token(&pubkey).expect("T1 registered after import #1");
     assert!(!t1.is_cancelled());
 
-    life.on_import(pubkey, ImportKind::Local);
+    life.on_import(pubkey, ImportKind::Local).expect("import");
     let t2 = life.current_cancel_token(&pubkey).expect("T2 registered after re-import");
     assert!(!t2.is_cancelled());
     assert!(t1.is_cancelled(), "PRD §KM-2 (a): inserting T2 must cancel the displaced token T1",);
@@ -326,7 +332,7 @@ async fn km2_window_elapsed_prunes_own_cancel_token() {
     let monitor = Arc::new(GatedDoppelgangerMonitor::ungated(window));
     let life = make_lifecycle(window, vm.clone(), monitor);
 
-    life.on_import(pubkey, ImportKind::Local);
+    life.on_import(pubkey, ImportKind::Local).expect("import");
     assert!(life.current_cancel_token(&pubkey).is_some());
     assert!(!vm.is_enabled(&pubkey));
 
@@ -350,14 +356,16 @@ async fn km2_stale_timer_cannot_enable_after_displacement() {
     let monitor = Arc::new(GatedDoppelgangerMonitor::ungated(window));
     let life = make_lifecycle(window, vm.clone(), monitor.clone());
 
-    life.on_import(pubkey, ImportKind::Local);
+    life.on_import(pubkey, ImportKind::Local).expect("import");
     assert!(!vm.is_enabled(&pubkey));
     assert!(!monitor.is_doppelganger_safe(&pubkey));
 
     tokio::time::advance(window + Duration::from_secs(1)).await;
 
-    life.on_delete(&pubkey, ImportKind::Local, || (true, ()));
-    life.on_import(pubkey, ImportKind::Local);
+    let _ = life.on_delete(&pubkey, ImportKind::Local, || {
+        (ConfigTouch::Apply { keystore_present: true }, ())
+    });
+    life.on_import(pubkey, ImportKind::Local).expect("import");
     assert!(!vm.is_enabled(&pubkey));
     assert!(!monitor.is_doppelganger_safe(&pubkey));
 
@@ -380,7 +388,7 @@ async fn km2_remote_import_registers_lifecycle_like_local() {
     let monitor = Arc::new(GatedDoppelgangerMonitor::ungated(window));
     let life = make_lifecycle(window, vm.clone(), monitor.clone());
 
-    life.on_import(pubkey, ImportKind::Remote);
+    life.on_import(pubkey, ImportKind::Remote).expect("remote import");
 
     assert!(!vm.is_tracked(&pubkey), "remote import does not touch ValidatorManager");
     assert!(!monitor.is_doppelganger_safe(&pubkey));
@@ -390,7 +398,7 @@ async fn km2_remote_import_registers_lifecycle_like_local() {
     );
 
     let t1 = life.current_cancel_token(&pubkey).unwrap();
-    life.on_import(pubkey, ImportKind::Remote);
+    life.on_import(pubkey, ImportKind::Remote).expect("remote import");
     assert!(t1.is_cancelled(), "remote re-import displaces like local");
 }
 

@@ -1,3 +1,4 @@
+use beacon::BeaconError;
 use eth_types::Root;
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -34,4 +35,41 @@ pub enum BlockServiceError {
         hex::encode(got)
     )]
     ParentRootMismatch { expected: Root, got: Root },
+
+    /// SSZ format selection has no named arm for this consensus version.
+    #[error("unrecognised consensus version for SSZ block format: {0}")]
+    UnknownSszConsensusVersion(String),
+
+    /// Blinded proposal path is pre-Gloas only; Gloas drops the duty unsigned.
+    #[error("blinded block production is not supported at Gloas (slot {slot})")]
+    BlindedNotSupportedAtGloas { slot: u64 },
+
+    /// `Eth-Consensus-Version` disagreed with the slot-resolved fork. Duty dropped unsigned.
+    #[error("Eth-Consensus-Version {got} does not match slot fork {expected}")]
+    ConsensusVersionMismatch { expected: String, got: String },
+
+    /// Gloas body merkleization failed. Duty dropped unsigned — never an Electra fallback.
+    #[error(transparent)]
+    Gloas(#[from] rvc_gloas::GloasError),
+
+    /// Envelope sign/publish failed after the block was already published.
+    #[error("self-build envelope failed after block publish: {0}")]
+    EnvelopeAfterPublish(String),
+
+    /// This client does not implement the named operation.
+    ///
+    /// `publish_block_contents` returns this by default so a test double fails
+    /// closed instead of dropping sidecars. Override that method on any client
+    /// used for a live JSON publish path.
+    #[error("{0} is unsupported; override it on any client used for a live JSON publish path")]
+    Unsupported(&'static str),
+}
+
+impl From<BeaconError> for BlockServiceError {
+    fn from(err: BeaconError) -> Self {
+        match err {
+            BeaconError::ParseError(msg) => Self::Parse(msg),
+            other => Self::Beacon(other.to_string()),
+        }
+    }
 }

@@ -146,7 +146,7 @@ async fn test_imported_key_clears_duty_cache_without_restart() {
         key_gen_tx,
     );
 
-    adapter.import_keystore(&keystore_json, PASSWORD).expect("import keystore");
+    adapter.import_keystore(&keystore_json, PASSWORD).await.expect("import keystore");
 
     assert!(
         fixture.pubkey_map.read().contains_key(&pubkey_bytes),
@@ -161,7 +161,7 @@ async fn test_imported_key_clears_duty_cache_without_restart() {
     fixture.beacon.set_duty_pubkey(pubkey_hex_0x.clone());
 
     // D-3 store gate open so a successful duty match can reach the signer.
-    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey_bytes));
+    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey_bytes)).unwrap();
 
     // ── Without cache clear: stale epoch cache cannot match the new key ────
     let blocked = fixture.process_slot(SLOT_A).await;
@@ -262,7 +262,7 @@ async fn test_imported_key_produces_no_attestations_during_doppelganger_window()
         Arc::clone(&fixture.pubkey_map),
         key_gen_tx,
     );
-    let pk_bytes = adapter.import_keystore(&keystore_json, PASSWORD).expect("import");
+    let pk_bytes = adapter.import_keystore(&keystore_json, PASSWORD).await.expect("import");
     // Mirror production keymanager handler: register import with the machine.
     monitor.start_monitoring(pk_bytes);
 
@@ -272,16 +272,16 @@ async fn test_imported_key_produces_no_attestations_during_doppelganger_window()
     );
 
     // Store gate open so we reach SignerService enablement (the SEC-2 gate).
-    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes()));
+    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
 
     let results = fixture.process_slot(SLOT_A).await.expect("process_slot returns results");
     assert_eq!(results.len(), 1, "duty must be found for imported key");
     assert!(
-        !results[0].success,
+        !results[0].outcome.is_published(),
         "signing must fail while inside doppelganger window; error={:?}",
-        results[0].error
+        results[0].outcome
     );
-    let err = results[0].error.as_deref().unwrap_or("");
+    let err = common::failed_attestation_message(&results[0]);
     // SignerError::BlockedByDoppelganger displays as
     // "signing blocked by doppelganger gate". Require "doppelganger" so an
     // unrelated sign failure (missing key, slashing, timeout) cannot pass.
@@ -339,13 +339,17 @@ async fn test_imported_key_signs_after_doppelganger_window_clears() {
         Arc::clone(&fixture.pubkey_map),
         key_gen_tx,
     );
-    let pk_bytes = adapter.import_keystore(&keystore_json, PASSWORD).expect("import");
+    let pk_bytes = adapter.import_keystore(&keystore_json, PASSWORD).await.expect("import");
     monitor.start_monitoring(pk_bytes);
-    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes()));
+    fixture.validator_store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
 
     // While Pending: no signature (guard against a broken enablement wire-up).
     let blocked = fixture.process_slot(SLOT_A).await.expect("process during window");
-    assert!(!blocked[0].success, "must not sign during window: {:?}", blocked[0].error);
+    assert!(
+        !blocked[0].outcome.is_published(),
+        "must not sign during window: {:?}",
+        blocked[0].outcome
+    );
     assert_eq!(fixture.submitter.signature_count(), 0);
 
     // Advance the forward window deterministically (no wall sleep).
@@ -356,9 +360,9 @@ async fn test_imported_key_signs_after_doppelganger_window_clears() {
     let results = fixture.process_slot(SLOT_B).await.expect("process after window");
     assert_eq!(results.len(), 1);
     assert!(
-        results[0].success,
+        results[0].outcome.is_published(),
         "imported key must sign after doppelganger window clears; error={:?}",
-        results[0].error
+        results[0].outcome
     );
     assert_eq!(
         fixture.submitter.signature_count(),

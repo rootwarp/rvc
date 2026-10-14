@@ -7,17 +7,18 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use observability::logging::{RedactedUrl, TruncatedPubkey};
 use serde::{Deserialize, Serialize};
-use tracing::{info, warn};
+use tracing::{error, info, warn, Instrument};
 
 use crate::error::{
     map_delete_keystore_item_error, map_delete_remote_key_item_error,
     map_import_keystore_item_error, map_import_remote_key_item_error, map_slashing_export_error,
     map_slashing_protection_error, map_url_validation_error, ApiError,
 };
-use crate::lifecycle::{DoppelgangerLifecycle, ImportKind};
+use crate::lifecycle::{ConfigRemoval, ConfigTouch, DoppelgangerLifecycle, ImportKind};
 use crate::traits::{
-    ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, RemoteKeyManager,
-    SlashingProtection, ValidatorConfigManager, ValidatorManager, VoluntaryExitManager,
+    ImportKeystoreError, ImportRemoteKeyError, KeystoreManager, Pubkey, QuiesceError,
+    RemoteKeyManager, SlashingProtection, ValidatorConfigManager, ValidatorManager,
+    VoluntaryExitManager,
 };
 use crate::types::{
     DeleteKeystoreResult, DeleteKeystoresRequest, DeleteKeystoresResponse, DeleteRemoteKeyResult,
@@ -108,68 +109,128 @@ pub async fn import_keystores(
         "keymanager.import_keystores",
         keymanager.count = request.keystores.len(),
     );
-    let _guard = span.enter();
+    // `Instrument` enters the span per poll. A `Span::enter` guard must not
+    // be held across the import awaits (axum requires the handler future to be Send).
+    async move {
+        // ISSUE-4.7 / L-7: per-API-token rate limit on the decrypt path.
+        // Refused calls return 429 with Retry-After and never reach the
+        // CPU-bound keystore decryption loop.
+        check_import_keystores_rate(&state, &headers)?;
 
-    // ISSUE-4.7 / L-7: per-API-token rate limit on the decrypt path.
-    // Refused calls return 429 with Retry-After and never reach the
-    // CPU-bound keystore decryption loop.
-    check_import_keystores_rate(&state, &headers)?;
+        info!(count = request.keystores.len(), "Importing keystores");
 
-    info!(count = request.keystores.len(), "Importing keystores");
-
-    if request.keystores.len() != request.passwords.len() {
-        return Err(ApiError::BadRequest(
-            "keystores and passwords arrays must have the same length".into(),
-        ));
-    }
-
-    // Import slashing protection FIRST — before any keystores are activated.
-    // This prevents a window where signing keys exist without slashing records.
-    if let Some(ref slashing_json) = request.slashing_protection {
-        if let Err(e) = state.slashing_protection.import_interchange(slashing_json) {
-            return Err(map_slashing_protection_error(e, "slashing protection import failed"));
+        if request.keystores.len() != request.passwords.len() {
+            return Err(ApiError::BadRequest(
+                "keystores and passwords arrays must have the same length".into(),
+            ));
         }
-    }
 
-    let mut results = Vec::with_capacity(request.keystores.len());
-
-    for (keystore_json, password) in request.keystores.iter().zip(request.passwords.iter()) {
-        match state.keystore_manager.import_keystore(keystore_json, password) {
-            Ok(pubkey) => {
-                let pubkey_hex = format!("0x{}", hex::encode(pubkey));
-                info!(
-                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                    status = "imported",
-                    "Keystore import result"
-                );
-                // M-12 + KM-2: register disabled validator, start monitoring,
-                // displace any prior enable task, and spawn the window task.
-                // Owned by [`DoppelgangerLifecycle`] so local and remote imports
-                // share one path (ImportKind::Local).
-                state.doppelganger.on_import(pubkey, ImportKind::Local);
-
-                results.push(ImportKeystoreResult {
-                    status: ImportStatus::Imported,
-                    message: String::new(),
-                });
-            }
-            Err(ImportKeystoreError::Duplicate) => {
-                info!(status = "duplicate", "Keystore import result");
-                results.push(ImportKeystoreResult {
-                    status: ImportStatus::Duplicate,
-                    message: "key already exists".into(),
-                });
-            }
-            Err(e) => {
-                results.push(ImportKeystoreResult {
-                    status: ImportStatus::Error,
-                    message: map_import_keystore_item_error(e),
-                });
+        // Import slashing protection FIRST — before any keystores are activated.
+        // This prevents a window where signing keys exist without slashing records.
+        if let Some(ref slashing_json) = request.slashing_protection {
+            if let Err(e) = state.slashing_protection.import_interchange(slashing_json).await {
+                return Err(map_slashing_protection_error(e, "slashing protection import failed"));
             }
         }
-    }
 
-    Ok(Json(ImportKeystoresResponse { data: results }))
+        let mut results = Vec::with_capacity(request.keystores.len());
+
+        for (keystore_json, password) in request.keystores.iter().zip(request.passwords.iter()) {
+            match state.keystore_manager.import_keystore(keystore_json, password).await {
+                Ok(pubkey) => {
+                    let pubkey_hex = format!("0x{}", hex::encode(pubkey));
+                    info!(
+                        pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                        status = "imported",
+                        "Keystore import result"
+                    );
+                    // M-12 + KM-2: register disabled validator, start monitoring,
+                    // displace any prior enable task, and spawn the window task.
+                    // Owned by [`DoppelgangerLifecycle`] so local and remote imports
+                    // share one path (ImportKind::Local).
+                    //
+                    // A client disconnect drops this handler during `import_keystore`
+                    // and never reaches `on_import`. That skip is intentional.
+                    // The blocking import calls `admit`, which registers the key with
+                    // `ForwardWindowMachine::register_for_import` (Pending;
+                    // Unmonitored cannot sign either) and, when the doppelganger
+                    // window is non-zero, persists `enabled = false` before the
+                    // signer is published. `on_import` repeats that registration and
+                    // starts the wall-clock enable task. The key starts Pending and
+                    // refuses signing while Pending. Liveness can move it to Safe
+                    // without `on_import`; after that, automatic duties stay
+                    // withheld by the store hold, but voluntary exit is gated only
+                    // by the forward window, and the API may report
+                    // `doppelganger_safe = true` while the row stays disabled.
+                    // A disconnect skips `on_import`, so nothing in this process
+                    // releases that hold. A restart reconciles an elapsed hold,
+                    // or an operator recovers the row explicitly. With
+                    // doppelganger disabled there is no hold. A later restart
+                    // with that hold still open, or with an import sidecar still
+                    // on disk, registers the key through `register_for_import`
+                    // again, so epoch 0 and slashing history cannot skip the
+                    // window. The sidecar is removed only after this process
+                    // observes the forward window to Safe.
+                    if let Err(e) = state.doppelganger.on_import(pubkey, ImportKind::Local) {
+                        error!(
+                            pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                            error = %e,
+                            "imported key stays disabled; validators file update failed and a retry is a duplicate"
+                        );
+                        results.push(ImportKeystoreResult {
+                            status: ImportStatus::Error,
+                            message: "imported key stays disabled; validators file update failed and a retry is a duplicate".into(),
+                        });
+                        continue;
+                    }
+
+                    results.push(ImportKeystoreResult {
+                        status: ImportStatus::Imported,
+                        message: String::new(),
+                    });
+                }
+                Err(ImportKeystoreError::Duplicate) => {
+                    info!(status = "duplicate", "Keystore import result");
+                    results.push(ImportKeystoreResult {
+                        status: ImportStatus::Duplicate,
+                        message: "key already exists".into(),
+                    });
+                }
+                Err(ImportKeystoreError::DeleteInProgress) => {
+                    info!(status = "error", "Keystore import result");
+                    results.push(ImportKeystoreResult {
+                        status: ImportStatus::Error,
+                        message: map_import_keystore_item_error(
+                            ImportKeystoreError::DeleteInProgress,
+                        ),
+                    });
+                }
+                Err(e) => {
+                    results.push(ImportKeystoreResult {
+                        status: ImportStatus::Error,
+                        message: map_import_keystore_item_error(e),
+                    });
+                }
+            }
+        }
+
+        Ok(Json(ImportKeystoresResponse { data: results }))
+    }
+    .instrument(span)
+    .await
+}
+
+/// Drops the in-flight count taken by [`KeystoreManager::membership_for_delete`]
+/// for this request's pubkeys on every exit, including a drain timeout.
+struct DeleteExportGuard {
+    keys: Arc<dyn KeystoreManager>,
+    members: Vec<Pubkey>,
+}
+
+impl Drop for DeleteExportGuard {
+    fn drop(&mut self) {
+        self.keys.end_delete_export(&self.members);
+    }
 }
 
 pub async fn delete_keystores(
@@ -180,20 +241,63 @@ pub async fn delete_keystores(
         "keymanager.delete_keystores",
         keymanager.count = request.pubkeys.len(),
     );
-    let _guard = span.enter();
+    // `Instrument` enters the span per poll. A `Span::enter` guard must not
+    // be held across the drain await.
+    async move { delete_keystores_inner(state, request).await }.instrument(span).await
+}
 
+async fn delete_keystores_inner(
+    state: Arc<AppState>,
+    request: DeleteKeystoresRequest,
+) -> Result<Json<DeleteKeystoresResponse>, ApiError> {
     warn!(count = request.pubkeys.len(), "Deleting keystores");
 
-    // Parse all pubkeys and identify which ones exist for slashing export
+    // Parse all pubkeys. Membership is decided under the import/delete lock
+    // (`membership_for_delete`), which also records the in-flight count before
+    // releasing that lock. Only that set is disabled, drained, and exported.
+    // A key admitted afterwards must not be removed. `begin_delete_export`
+    // must not count again.
     let parsed: Vec<Result<Pubkey, String>> =
         request.pubkeys.iter().map(|s| parse_pubkey(s)).collect();
+    let candidates: Vec<Pubkey> = parsed.iter().filter_map(|r| r.as_ref().ok().copied()).collect();
+    let existing_keys = state.keystore_manager.membership_for_delete(&candidates);
+    state.keystore_manager.begin_delete_export(&existing_keys);
+    let _export_guard = DeleteExportGuard {
+        keys: Arc::clone(&state.keystore_manager),
+        members: existing_keys.clone(),
+    };
 
-    let existing_keys: Vec<Pubkey> = parsed
-        .iter()
-        .filter_map(|r| r.as_ref().ok())
-        .filter(|pk| state.keystore_manager.has_key(pk))
-        .copied()
-        .collect();
+    // Disable, then drain, then export, then delete. Disable goes through
+    // `ValidatorManager::set_validator_enabled` (the keymanager entry), which
+    // also cancels a pending enable task so a failed delete cannot be turned
+    // back on. `quiesce` `Ok` means the slashable lock was free and the
+    // under-lock gate is closed — not that non-slashable duties are idle. A
+    // drain timeout aborts before export: nothing is migrated and nothing is
+    // deleted.
+    for pubkey in &existing_keys {
+        if let Err(e) = state.doppelganger.disable_for_delete(pubkey) {
+            error!(error = %e, "failed to persist validator disable before delete");
+            return Err(ApiError::Internal(
+                "validator disable was not persisted; no keystores deleted".into(),
+            ));
+        }
+    }
+    let mut timed_out: Vec<Pubkey> = Vec::new();
+    for pubkey in &existing_keys {
+        match state.doppelganger.quiesce_for_delete(pubkey).await {
+            Ok(()) => {}
+            Err(err) => match err {
+                QuiesceError::DrainTimedOut { .. } => {
+                    if !timed_out.contains(pubkey) {
+                        timed_out.push(*pubkey);
+                    }
+                }
+            },
+        }
+    }
+    if !timed_out.is_empty() {
+        return Err(drain_timed_out(&timed_out));
+    }
 
     // Export slashing protection BEFORE any deletions.
     //
@@ -222,40 +326,79 @@ pub async fn delete_keystores(
         let pubkey_hex = &request.pubkeys[i];
         match parse_result {
             Ok(pubkey) => {
+                // Admitted after the membership snapshot: not in the export.
+                // Do not call `delete_keystore` (it would remove the key).
+                // The adapter also refuses if this check loses the race.
+                if !existing_keys.contains(pubkey) && state.keystore_manager.has_key(pubkey) {
+                    results.push(DeleteKeystoreResult {
+                        status: DeleteStatus::Error,
+                        message: "key appeared after the slashing-protection export; not deleted"
+                            .into(),
+                    });
+                    continue;
+                }
                 // KM-2 (b)+(Finding 3): keystore removal + token cancel (+
                 // remove_validator / cancel_monitoring on success) are one
                 // critical section inside DoppelgangerLifecycle::on_delete.
-                let delete_result = state.doppelganger.on_delete(pubkey, ImportKind::Local, || {
-                    match state.keystore_manager.delete_keystore(pubkey) {
-                        Ok(true) => (true, Ok(true)),
-                        Ok(false) => (false, Ok(false)),
-                        Err(e) => (false, Err(e)),
-                    }
-                });
+                let (config, delete_result) =
+                    state.doppelganger.on_delete(pubkey, ImportKind::Local, || {
+                        match state.keystore_manager.delete_keystore(pubkey) {
+                            // Absent keystore still drops a leftover config row.
+                            Ok(present) => {
+                                (ConfigTouch::Apply { keystore_present: present }, Ok(present))
+                            }
+                            Err(e) => (ConfigTouch::Skip, Err(e)),
+                        }
+                    });
 
                 match delete_result {
-                    Ok(true) => {
-                        warn!(
-                            pubkey = %TruncatedPubkey::new(pubkey_hex),
-                            status = "deleted",
-                            "Keystore delete result"
-                        );
-                        results.push(DeleteKeystoreResult {
-                            status: DeleteStatus::Deleted,
-                            message: String::new(),
-                        });
-                    }
-                    Ok(false) => {
-                        warn!(
-                            pubkey = %TruncatedPubkey::new(pubkey_hex),
-                            status = "not_found",
-                            "Keystore delete result"
-                        );
-                        results.push(DeleteKeystoreResult {
-                            status: DeleteStatus::NotFound,
-                            message: String::new(),
-                        });
-                    }
+                    Ok(present) => match config {
+                        ConfigRemoval::Failed(detail) => {
+                            error!(
+                                pubkey = %TruncatedPubkey::new(pubkey_hex),
+                                error = %detail,
+                                "validator config removal failed after keystore delete"
+                            );
+                            results.push(DeleteKeystoreResult {
+                                status: DeleteStatus::Error,
+                                message: "validator config update failed".into(),
+                            });
+                        }
+                        ConfigRemoval::Removed => {
+                            warn!(
+                                pubkey = %TruncatedPubkey::new(pubkey_hex),
+                                status = "deleted",
+                                "Keystore delete result"
+                            );
+                            results.push(DeleteKeystoreResult {
+                                status: DeleteStatus::Deleted,
+                                message: String::new(),
+                            });
+                        }
+                        ConfigRemoval::Absent | ConfigRemoval::NotAttempted => {
+                            if present {
+                                warn!(
+                                    pubkey = %TruncatedPubkey::new(pubkey_hex),
+                                    status = "deleted",
+                                    "Keystore delete result"
+                                );
+                                results.push(DeleteKeystoreResult {
+                                    status: DeleteStatus::Deleted,
+                                    message: String::new(),
+                                });
+                            } else {
+                                warn!(
+                                    pubkey = %TruncatedPubkey::new(pubkey_hex),
+                                    status = "not_found",
+                                    "Keystore delete result"
+                                );
+                                results.push(DeleteKeystoreResult {
+                                    status: DeleteStatus::NotFound,
+                                    message: String::new(),
+                                });
+                            }
+                        }
+                    },
                     Err(e) => {
                         // M-8: central mapper sanitizes Backend-class payloads.
                         let message = map_delete_keystore_item_error(&e);
@@ -345,7 +488,14 @@ pub async fn import_remote_keys(
                         // SEC-2b: same enablement gate as local imports via
                         // DoppelgangerLifecycle (ImportKind::Remote skips VM
                         // registration; still starts monitoring + enable task).
-                        state.doppelganger.on_import(pubkey, ImportKind::Remote);
+                        if let Err(e) = state.doppelganger.on_import(pubkey, ImportKind::Remote) {
+                            error!(error = %e, "remote import lifecycle failed");
+                            results.push(ImportRemoteKeyResult {
+                                status: ImportRemoteKeyStatus::Error,
+                                message: "remote import was not completed".into(),
+                            });
+                            continue;
+                        }
                         info!(
                             pubkey = %TruncatedPubkey::new(&key_import.pubkey),
                             url = %RedactedUrl(&key_import.url),
@@ -411,12 +561,12 @@ pub async fn delete_remote_keys(
     for pubkey_str in &request.pubkeys {
         match parse_pubkey(pubkey_str) {
             Ok(pubkey) => {
-                let delete_result =
+                let (_config, delete_result) =
                     state.doppelganger.on_delete(&pubkey, ImportKind::Remote, || {
                         match state.remote_key_manager.delete_remote_key(&pubkey) {
-                            Ok(true) => (true, Ok(true)),
-                            Ok(false) => (false, Ok(false)),
-                            Err(e) => (false, Err(e)),
+                            Ok(true) => (ConfigTouch::Apply { keystore_present: true }, Ok(true)),
+                            Ok(false) => (ConfigTouch::Skip, Ok(false)),
+                            Err(e) => (ConfigTouch::Skip, Err(e)),
                         }
                     });
                 match delete_result {
@@ -532,6 +682,11 @@ pub async fn set_gas_limit(
         .gas_limit
         .parse::<u64>()
         .map_err(|_| ApiError::BadRequest("invalid gas_limit: must be a numeric string".into()))?;
+    if limit > i64::MAX as u64 {
+        return Err(ApiError::BadRequest(
+            "invalid gas_limit: must be <= i64::MAX so the validators file can store it".into(),
+        ));
+    }
     state.config_manager.set_gas_limit(&pubkey, limit)?;
     Ok(StatusCode::ACCEPTED)
 }
@@ -665,6 +820,32 @@ pub async fn prepare_exit(
     query: Query<VoluntaryExitQuery>,
 ) -> Result<Json<VoluntaryExitResponse>, ApiError> {
     handle_exit(state, path, query, ExitIntent::SignOnly).await
+}
+
+/// HTTP 500. Pubkeys are truncated; the list itself is capped.
+fn drain_timed_out(pubkeys: &[Pubkey]) -> ApiError {
+    const SHOW: usize = 8;
+    let shown: Vec<String> = pubkeys
+        .iter()
+        .take(SHOW)
+        .map(|pk| {
+            let hex = format!("0x{}", hex::encode(pk));
+            TruncatedPubkey::new(&hex).to_string()
+        })
+        .collect();
+    let mut list = shown.join(", ");
+    let rest = pubkeys.len().saturating_sub(shown.len());
+    if rest > 0 {
+        list.push_str(&format!(", and {rest} more"));
+    }
+    tracing::error!(
+        count = pubkeys.len(),
+        pubkeys = %list,
+        "DELETE aborted: signing drain timed out; no slashing-protection export and no keystores deleted"
+    );
+    ApiError::Internal(format!(
+        "signing drain timed out; no keystores exported or deleted; timed-out pubkeys: {list}"
+    ))
 }
 
 fn parse_pubkey(s: &str) -> Result<Pubkey, String> {
@@ -901,5 +1082,154 @@ mod tests {
         assert!(parse_pubkey(&format!("0X0x{bare}")).is_err());
         assert!(parse_pubkey(&format!("0x{}", "ab".repeat(47))).is_err());
         assert!(parse_pubkey(&format!("0x{}", "zz".repeat(48))).is_err());
+    }
+
+    /// A remote import whose lifecycle persist fails must not report imported.
+    #[tokio::test]
+    async fn test_remote_import_surfaces_lifecycle_error() {
+        use std::time::Duration;
+
+        use crate::lifecycle::arm_import_failure;
+        use crate::traits::{
+            DeleteRemoteKeyError, DoppelgangerMonitor, ImportRemoteKeyError, RemoteKeyManager,
+            SlashingProtection, SlashingProtectionError, ValidatorConfigManager,
+        };
+        use crate::types::RemoteKeyImport;
+
+        struct EmptyKeys;
+        #[async_trait::async_trait]
+        impl KeystoreManager for EmptyKeys {
+            fn list_keys(&self) -> Vec<Pubkey> {
+                Vec::new()
+            }
+            fn has_key(&self, _: &Pubkey) -> bool {
+                false
+            }
+            async fn import_keystore(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Pubkey, crate::traits::ImportKeystoreError> {
+                Ok([0u8; 48])
+            }
+            fn delete_keystore(
+                &self,
+                _: &Pubkey,
+            ) -> Result<bool, crate::traits::DeleteKeystoreError> {
+                Ok(false)
+            }
+        }
+        struct EmptySlash;
+        #[async_trait::async_trait]
+        impl SlashingProtection for EmptySlash {
+            async fn import_interchange(&self, _: &str) -> Result<(), SlashingProtectionError> {
+                Ok(())
+            }
+            fn export_interchange(&self, _: &[Pubkey]) -> Result<String, SlashingProtectionError> {
+                Ok("{}".into())
+            }
+        }
+        struct OkRemote;
+        impl RemoteKeyManager for OkRemote {
+            fn list_remote_keys(&self) -> Vec<(Pubkey, String)> {
+                Vec::new()
+            }
+            fn has_remote_key(&self, _: &Pubkey) -> bool {
+                false
+            }
+            fn import_remote_key(&self, _: Pubkey, _: String) -> Result<(), ImportRemoteKeyError> {
+                Ok(())
+            }
+            fn delete_remote_key(&self, _: &Pubkey) -> Result<bool, DeleteRemoteKeyError> {
+                Ok(false)
+            }
+        }
+        struct NoConfig;
+        impl ValidatorConfigManager for NoConfig {
+            fn get_fee_recipient(&self, _: &Pubkey) -> Result<[u8; 20], ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn set_fee_recipient(&self, _: &Pubkey, _: [u8; 20]) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn delete_fee_recipient(&self, _: &Pubkey) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn get_gas_limit(&self, _: &Pubkey) -> Result<u64, ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn set_gas_limit(&self, _: &Pubkey, _: u64) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn delete_gas_limit(&self, _: &Pubkey) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn get_graffiti(&self, _: &Pubkey) -> Result<String, ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn set_graffiti(&self, _: &Pubkey, _: &str) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+            fn delete_graffiti(&self, _: &Pubkey) -> Result<(), ApiError> {
+                Err(ApiError::Internal("unused".into()))
+            }
+        }
+        struct NoVm;
+        impl ValidatorManager for NoVm {
+            fn add_validator(&self, _: Pubkey, _: bool) -> Result<(), String> {
+                Ok(())
+            }
+            fn remove_validator(&self, _: &Pubkey) -> Result<bool, String> {
+                Ok(false)
+            }
+            fn set_validator_enabled(&self, _: &Pubkey, _: bool) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        struct NoMonitor;
+        impl DoppelgangerMonitor for NoMonitor {
+            fn start_monitoring(&self, _: Pubkey) {}
+            fn stop_monitoring(&self, _: &Pubkey) {}
+            fn is_doppelganger_safe(&self, _: &Pubkey) -> bool {
+                true
+            }
+        }
+        let vm: Arc<dyn ValidatorManager> = Arc::new(NoVm);
+        let state = Arc::new(AppState {
+            keystore_manager: Arc::new(EmptyKeys),
+            slashing_protection: Arc::new(EmptySlash),
+            validator_manager: Arc::clone(&vm),
+            doppelganger: Arc::new(DoppelgangerLifecycle::new(
+                Duration::ZERO,
+                Arc::new(NoMonitor),
+                vm,
+            )),
+            remote_key_manager: Arc::new(OkRemote),
+            config_manager: Arc::new(NoConfig),
+            exit_manager: None,
+            allow_insecure_remote_signer: false,
+            attesting_enabled: Arc::new(AtomicBool::new(true)),
+            last_set_attesting_enabled: Mutex::new(None),
+            import_keystores_rate: Mutex::new(HashMap::new()),
+        });
+        arm_import_failure();
+        let mut pubkey = [0u8; 48];
+        pubkey[0] = 1;
+        let Json(resp) = import_remote_keys(
+            State(state),
+            Json(ImportRemoteKeysRequest {
+                remote_keys: vec![RemoteKeyImport {
+                    pubkey: format!("0x{}", hex::encode(pubkey)),
+                    url: "https://8.8.8.8:9000".into(),
+                }],
+            }),
+        )
+        .await;
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(
+            resp.data[0].status,
+            ImportRemoteKeyStatus::Error,
+            "a failed remote import must not be reported as imported"
+        );
     }
 }

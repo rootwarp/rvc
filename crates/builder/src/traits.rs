@@ -1,14 +1,20 @@
 //! Narrow traits for the builder registration / prepare-proposer path.
 //!
-//! `BuilderService` depends only on these surfaces so unit tests can stub two
-//! beacon methods and one sign method instead of the full BN / signer traits.
+//! `BuilderService` depends only on these surfaces so unit tests can stub the
+//! beacon methods and sign methods instead of the full BN / signer traits.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bn_manager::{BeaconError, BeaconNodeClient, ProposerPreparation, SignedValidatorRegistration};
+use bn_manager::{
+    BeaconError, BeaconNodeClient, BuilderPreferencesEntry, ProposerPreparation,
+    SignedValidatorRegistration, SubmitBuilderPreferencesResult,
+};
 use crypto::{PublicKey, Signature};
-use eth_types::ValidatorRegistrationV1;
+use eth_types::{
+    BuilderRequestAuth, ForkSchedule, ProposerPreferences, Root, SignedProposerPreferences,
+    ValidatorRegistrationV1,
+};
 use signer::{SignerError, ValidatorSigner};
 
 /// Beacon methods used by [`crate::BuilderService`].
@@ -23,6 +29,16 @@ pub trait BuilderBeaconClient: Send + Sync {
         &self,
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError>;
+
+    async fn submit_proposer_preferences(
+        &self,
+        preferences: &[SignedProposerPreferences],
+    ) -> Result<(), BeaconError>;
+
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError>;
 }
 
 /// Production bridge: full BN trait object satisfies the narrow builder surface.
@@ -43,9 +59,24 @@ impl BuilderBeaconClient for Arc<dyn BeaconNodeClient> {
     ) -> Result<(), BeaconError> {
         (**self).prepare_beacon_proposer(preparations).await
     }
+
+    async fn submit_proposer_preferences(
+        &self,
+        preferences: &[SignedProposerPreferences],
+    ) -> Result<(), BeaconError> {
+        (**self).submit_proposer_preferences(preferences).await
+    }
+
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        (**self).submit_builder_preferences(entries).await
+    }
 }
 
-/// Signer methods used by [`crate::BuilderService`] for builder registrations.
+/// Signer methods used by [`crate::BuilderService`] for builder registrations
+/// and Gloas proposer-preferences broadcasts.
 ///
 /// Returns [`crypto::Signature`]; convert with [`Signature::to_bytes`] at the
 /// eth_types / beacon wire boundary only (RF4-12).
@@ -60,6 +91,21 @@ pub trait RegistrationSigner: Send + Sync {
         pubkey: &PublicKey,
         fork_version: [u8; 4],
     ) -> Result<Signature, SignerError>;
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError>;
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError>;
 }
 
 /// Production bridge: full signer trait object satisfies the registration surface.
@@ -72,5 +118,26 @@ impl RegistrationSigner for Arc<dyn ValidatorSigner> {
         fork_version: [u8; 4],
     ) -> Result<Signature, SignerError> {
         (**self).sign_builder_registration(registration, pubkey, fork_version).await
+    }
+
+    async fn sign_proposer_preferences(
+        &self,
+        prefs: &ProposerPreferences,
+        pubkey: &PublicKey,
+        fork_schedule: &ForkSchedule,
+        genesis_validators_root: &Root,
+    ) -> Result<Signature, SignerError> {
+        (**self)
+            .sign_proposer_preferences(prefs, pubkey, fork_schedule, genesis_validators_root)
+            .await
+    }
+
+    async fn sign_builder_request_auth(
+        &self,
+        auth: &BuilderRequestAuth,
+        pubkey: &PublicKey,
+        genesis_fork_version: [u8; 4],
+    ) -> Result<Signature, SignerError> {
+        (**self).sign_builder_request_auth(auth, pubkey, genesis_fork_version).await
     }
 }

@@ -1,0 +1,14 @@
+{
+  "execution_optimistic": false,
+  "finalized": true,
+  "data": [
+    {
+      "validator_index": "1",
+      "reward": "48"
+    },
+    {
+      "validator_index": "2",
+      "reward": "-16"
+    }
+  ]
+}

@@ -4,6 +4,7 @@ mod broadcast;
 mod error;
 mod health;
 mod manager;
+pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 mod mock;
 pub mod sse;
@@ -13,19 +14,21 @@ mod traits;
 pub mod types;
 
 pub use error::BnManagerError;
-pub use manager::BnManager;
+pub use manager::{BnManager, ATTEMPT_TIMEOUT_FLOOR};
 #[cfg(any(test, feature = "test-utils"))]
-pub use mock::MockBeaconNodeClient;
+pub use mock::{MockBeaconNodeClient, MockCallStamp, MockMethod};
 pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,
 };
-pub use submit::{AttestationSubmitter, PropagationResult, Propagator, PropagatorError};
+pub use submit::{
+    AttestationSubmitter, PropagationOutcome, PropagationResult, Propagator, PropagatorError,
+};
 pub use sync_status::{BnSyncDetail, BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
     BroadcastTopics, DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts,
-    SyncCommitteeApi,
+    PayloadAttestationApi, SyncCommitteeApi,
 };
 pub use types::{BnRole, HealthTier, TierThresholds};
 
@@ -33,15 +36,20 @@ pub use types::{BnRole, HealthTier, TierThresholds};
 // don't need to depend on `beacon` directly.
 pub use beacon::{
     AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
-    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, Checkpoint, ConfigSpecResponse,
-    GenesisResponse, IndexedAttestationError, LegacyAttestation, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerDuty, ProposerPreparation, SignedAggregateAndProof,
+    BeaconCommitteeSubscription, BeaconError, BlockRootResponse, BuilderConfig, BuilderEntry,
+    BuilderPreferencesEntry, Checkpoint, ConfigSpecResponse, GenesisResponse,
+    IndexedAttestationError, IndexedFailure, LegacyAttestation, PayloadAttestationDataResponse,
+    ProduceBlockResponse, ProposerDutiesResponse, ProposerDuty, ProposerPreparation,
+    PtcDutiesResponse, PtcDuty, SignedAggregateAndProof, SignedBuilderRequestAuth,
     SignedContributionAndProof, SingleAttestation, StateForkResponse, SubmitAttestationResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingData, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorLiveness,
+    ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
+    FALLBACK_MAX_EXECUTION_PAYMENT, MAX_BUILDER_ENTRIES,
 };
 pub use eth_types::{
-    ForkSchedule, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedValidatorRegistration,
+    ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration,
     ValidatorRegistrationV1,
 };

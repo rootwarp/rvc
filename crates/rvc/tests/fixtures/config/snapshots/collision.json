@@ -1,0 +1,91 @@
+{
+  "beacon_url": "http://localhost:5052",
+  "beacon_nodes": [],
+  "keystore_path": "./keystores",
+  "password_file": null,
+  "slashing_db_path": "./slashing_protection.sqlite",
+  "allow_fresh_db": false,
+  "allow_unsupported_fork": false,
+  "metrics_address": "127.0.0.1",
+  "metrics_port": 8080,
+  "network": "mainnet",
+  "graffiti": null,
+  "log_level": "info",
+  "doppelganger_detection": true,
+  "secret_provider": {
+    "providers": [],
+    "strict": false,
+    "gcp": {
+      "secret_prefix": "validator-key-"
+    }
+  },
+  "disable_attesting": false,
+  "slashed_validators_action": "disable-only",
+  "disable_keystore_locking": false,
+  "logfile": {
+    "path": "/nested/rvc.log",
+    "max_size": 77,
+    "max_number": 4,
+    "compress": true,
+    "level": "warn"
+  },
+  "tracing": {
+    "endpoint": "http://flat-otel:4318",
+    "exporter": "gcp",
+    "sample_rate": 0.77,
+    "max_queue_size": 7777,
+    "max_export_batch_size": 777,
+    "service_name": "rvc-flat"
+  },
+  "keymanager": {
+    "enabled": true,
+    "address": "10.0.0.1:5062",
+    "token_file": "/flat/km.token",
+    "remote_signer_url": "https://flat-signer:9000",
+    "remote_signer_allowed_hosts": [
+      "flat.host"
+    ],
+    "allow_insecure_remote_signer": true,
+    "cors_origins": [
+      "https://flat.cors"
+    ],
+    "body_limit": 2222222
+  },
+  "grpc_signer": {
+    "url": "https://flat-grpc:50051",
+    "tls_cert": "/flat/client.crt",
+    "tls_key": "/flat/client.key",
+    "tls_ca_cert": "/flat/ca.crt"
+  },
+  "proposer_config": {
+    "url": "https://flat.proposer/config.json",
+    "file": "/flat/proposer.json",
+    "refresh_interval": 47,
+    "url_token": "flat-token",
+    "url_insecure": true
+  },
+  "monitoring": {
+    "endpoint": "https://flat.monitor/metrics",
+    "interval": 77,
+    "endpoint_insecure": true
+  },
+  "builder_limits": {
+    "circuit_breaker_consecutive_limit": 8,
+    "circuit_breaker_epoch_limit": 13
+  },
+  "timing": {
+    "attestation_due_bps": 3333,
+    "aggregate_due_bps": 6667,
+    "attestation_due_bps_gloas": 2500,
+    "aggregate_due_bps_gloas": 5000,
+    "sync_message_due_bps_gloas": 2500,
+    "contribution_due_bps_gloas": 5000,
+    "payload_due_bps": 5000,
+    "payload_attestation_due_bps": 7500
+  },
+  "fork_schedule": {},
+  "block_selection_mode": "max-profit",
+  "validator_registration_batch_size": 500,
+  "validator_registration_batch_delay": 500,
+  "beacon_max_body_bytes": 33554432
+}

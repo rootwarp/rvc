@@ -1,0 +1,21 @@
+# BuilderRequestAuth container root and L3 signing root from eth-ssz-specs==0.1.0.
+# compute_domain / compute_signing_root match pyspec phase0.
+# DOMAIN_BUILDER_REQUEST_AUTH 0x0B000001 from builder-specs (not consensus-specs).
+# Domain inputs: compute_domain(DOMAIN_BUILDER_REQUEST_AUTH) with genesis fork
+# 0x00000000 and zero genesis_validators_root (ValidatorRegistrationV1 idiom).
+# Fixture: builder-specs examples/gloas/signed_builder_request_auth.json.
+# Do not copy mix_in_length-wrapped list roots into this file.
+package: eth-ssz-specs==0.1.0
+python: 3.13.7
+builder_specs_revision: '38f11441c194d150386f567b4d7087ec86d4118c'
+domain_builder_request_auth: '0x0b000001'
+genesis_fork_version: '0x00000000'
+genesis_validators_root: '0x0000000000000000000000000000000000000000000000000000000000000000'
+containers:
+  - name: BuilderRequestAuth
+    domain: DOMAIN_BUILDER_REQUEST_AUTH
+    value:
+      data: '0x1234567890abcdef'
+      slot: 1
+    root: '0x3d6f2e216a08828a2bc2c9644edacd56fef00f2be824abc49f6d1a28569bd880'
+    signing_root: '0xeb87fafdb60e7b3174caf705302b2c16b56a85eb6df9e4ab50ba49563977403d'

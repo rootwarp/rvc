@@ -64,17 +64,3 @@ pub trait LivenessChecker: Send + Sync {
         validator_indices: &[String],
     ) -> Result<Vec<ValidatorLivenessData>, DoppelgangerError>;
 }
-
-/// GVR-blind reader used exclusively by [`crate::DoppelgangerService`].
-///
-/// Returns only the most-recent target epoch (no GVR scoping).  Named
-/// `LegacySlashingHistoryReader` to distinguish it from
-/// [`slashing::SlashingDbReader`], the GVR-aware reader consumed by
-/// [`crate::ForwardWindowMachine`].  Using the wrong reader for the
-/// forward-window machine would bypass chain-identity checks.
-pub trait LegacySlashingHistoryReader: Send + Sync {
-    fn last_signed_attestation_epoch(
-        &self,
-        pubkey: &str,
-    ) -> Result<Option<Epoch>, DoppelgangerError>;
-}

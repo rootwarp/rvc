@@ -23,10 +23,11 @@ required-features = ["test-fixtures"]
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
+# Package renames to `serde_utils`; used via #[serde(with = "serde_utils::…")].
 ethereum_serde_utils.workspace = true
 hex.workspace = true
-# Used by `is_sync_committee_aggregator` (RF3-20 / G7). External only — keeps
-# the zero workspace-internal out-edge pin for rvc-eth-types.
+# Used by `is_aggregator` and `is_sync_committee_aggregator`. External only —
+# keeps the zero workspace-internal out-edge pin for rvc-eth-types.
 sha2.workspace = true
 ssz.workspace = true
 ssz_derive.workspace = true
@@ -39,7 +40,12 @@ tree_hash_derive.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+rvc-spec-vectors = { workspace = true, features = ["test-fixtures"] }
 # Independent SSZ-Merkleization oracle for the BeaconBlockHeader KAT (FR-31).
 # Dev-only: not a production out-edge, so the architecture-tests
 # zero-out-edge invariant for rvc-eth-types is unaffected.
 sha2.workspace = true
+
+[package.metadata.cargo-machete]
+# Crate renames to `serde_utils`; only referenced via serde `with` paths.
+ignored = ["ethereum_serde_utils"]

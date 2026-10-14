@@ -1,0 +1,5 @@
+# RR2-02: [duties] concurrency knobs (parity corpus).
+
+[duties]
+duty_dispatch_concurrency = 16
+duty_publish_concurrency = 4

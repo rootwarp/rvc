@@ -10,12 +10,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bn_manager::BeaconNodeClient;
-use doppelganger::{
-    DoppelgangerError, LegacySlashingHistoryReader, LivenessChecker, ValidatorLivenessData,
-};
+use doppelganger::{DoppelgangerError, LivenessChecker, ValidatorLivenessData};
 use eth_types::Epoch;
 use parking_lot::RwLock;
-use slashing::SlashingDb;
 
 /// Adapter implementing [`LivenessChecker`] via
 /// [`BeaconNodeClient::post_validator_liveness`] (bn-manager failover in production).
@@ -79,65 +76,9 @@ impl LivenessChecker for BeaconLivenessAdapter {
     }
 }
 
-/// Adapter implementing [`LegacySlashingHistoryReader`] via
-/// [`SlashingDb::last_signed_attestation_epoch`].
-///
-/// Used by [`doppelganger::DoppelgangerService`] (the GVR-blind service).
-/// [`ForwardWindowMachine`] uses `slashing::SlashingDbReader` directly.
-pub struct SlashingDbReaderAdapter {
-    db: Arc<SlashingDb>,
-}
-
-impl SlashingDbReaderAdapter {
-    pub fn new(db: Arc<SlashingDb>) -> Self {
-        Self { db }
-    }
-}
-
-impl LegacySlashingHistoryReader for SlashingDbReaderAdapter {
-    fn last_signed_attestation_epoch(
-        &self,
-        pubkey: &str,
-    ) -> Result<Option<Epoch>, DoppelgangerError> {
-        self.db
-            .last_signed_attestation_epoch(pubkey)
-            .map_err(|e| DoppelgangerError::SlashingDbError(e.to_string()))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_slashing_db_reader_adapter_no_attestations() {
-        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let adapter = SlashingDbReaderAdapter::new(db);
-        let result = adapter.last_signed_attestation_epoch("0xabc").unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_slashing_db_reader_adapter_with_attestation() {
-        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let gvr = [0u8; 32];
-        db.seed_attestation("0xabc", 5, 10, None, &gvr).unwrap();
-        let adapter = SlashingDbReaderAdapter::new(db);
-        let result = adapter.last_signed_attestation_epoch("0xabc").unwrap();
-        assert_eq!(result, Some(10));
-    }
-
-    #[test]
-    fn test_slashing_db_reader_adapter_returns_max_epoch() {
-        let db = Arc::new(SlashingDb::open_in_memory().unwrap());
-        let gvr = [0u8; 32];
-        db.seed_attestation("0xabc", 1, 5, None, &gvr).unwrap();
-        db.seed_attestation("0xabc", 5, 10, None, &gvr).unwrap();
-        db.seed_attestation("0xabc", 10, 15, None, &gvr).unwrap();
-        let adapter = SlashingDbReaderAdapter::new(db);
-        let result = adapter.last_signed_attestation_epoch("0xabc").unwrap();
-        assert_eq!(result, Some(15));
-    }
 
     #[test]
     fn test_beacon_liveness_adapter_construction() {

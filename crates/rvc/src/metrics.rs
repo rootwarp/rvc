@@ -1,0 +1,347 @@
+//! Orchestrator Prometheus families (ARCH-6h).
+
+use std::sync::LazyLock;
+
+use metrics::{
+    define_gauge, define_histogram_vec, define_int_counter, define_int_counter_vec,
+    define_int_gauge, define_int_gauge_vec, Gauge, Histogram, HistogramOpts, HistogramVec,
+    IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+};
+
+pub use bn_manager::metrics::RVC_ATTESTATIONS_TOTAL;
+pub use duty_tracker::metrics::RVC_DUTIES_FETCHED_TOTAL;
+pub use metrics::definitions::{
+    attestation_status, attestation_trigger_source, orchestrator_result,
+    payload_attestation_skip_reason, pre_proposal_cold_fetch, slot_context_parent_fallback,
+    slot_phase_cache, sync_committee_skip_phase, sync_committee_skip_reason, task_exit_outcome,
+};
+
+/// Counter for slots processed by the orchestrator.
+pub static RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_orchestrator_slots_processed_total",
+        "Total number of slots processed by the orchestrator",
+        &["result"],
+    )
+});
+
+/// Counter for missed slots.
+pub static RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_orchestrator_missed_slots_total",
+        "Total number of missed attestation slots",
+        &[],
+    )
+});
+
+/// Gauge for currently active attestation tasks.
+pub static RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS: LazyLock<Gauge> = LazyLock::new(|| {
+    define_gauge(
+        "rvc_orchestrator_active_attestations",
+        "Number of currently active attestation tasks",
+    )
+});
+
+/// Counter for aggregation operations.
+/// Labels: status (success, failed, skipped)
+pub static RVC_AGGREGATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_aggregations_total",
+        "Total number of attestation aggregation operations",
+        &["status"],
+    )
+});
+
+/// Histogram for slot processing duration in seconds.
+pub static RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS: LazyLock<HistogramVec> =
+    LazyLock::new(|| {
+        define_histogram_vec(
+            "rvc_orchestrator_slot_processing_duration_seconds",
+            "Duration of slot processing operations in seconds",
+            &[],
+            &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0],
+            &[],
+        )
+    });
+
+/// Live size of the pubkey→index registry written by IndexResolver (ADR-R05).
+pub static RVC_DUTY_INDEX_SET_SIZE: LazyLock<IntGauge> = LazyLock::new(|| {
+    define_int_gauge(
+        "rvc_duty_index_set_size",
+        "Number of validator pubkeys with a resolved beacon index",
+    )
+});
+
+/// Counter for duty reorg detections.
+/// Labels: duty_type (attester, proposer, ptc)
+pub static RVC_DUTY_REORG_DETECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_duty_reorg_detected_total",
+        "Total number of duty reorg detections",
+        &["duty_type"],
+    )
+});
+
+/// Counter for proposer config URL refresh successes.
+pub static RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_proposer_config_refresh_success_total",
+        "Total number of successful proposer config URL refreshes",
+    )
+});
+
+/// Counter for proposer config URL refresh failures.
+pub static RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_proposer_config_refresh_failures_total",
+        "Total number of failed proposer config URL refreshes",
+    )
+});
+
+/// Cold-cache pre-proposal proposer-duty fetches (ARCH-3j / C6).
+pub static RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_pre_proposal_cold_fetch_total",
+        "Total pre-proposal cold-cache proposer-duty fetches by outcome",
+        &["outcome"],
+    )
+});
+
+/// Duration of a cold-cache pre-proposal proposer-duty fetch (ARCH-3j).
+pub static RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS: LazyLock<HistogramVec> =
+    LazyLock::new(|| {
+        define_histogram_vec(
+            "rvc_pre_proposal_cold_fetch_duration_seconds",
+            "Duration of pre-proposal cold-cache proposer-duty fetches in seconds",
+            &["outcome"],
+            &[0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0],
+            &[],
+        )
+    });
+
+/// How phase-2 attestation wait returned (ARCH-3m).
+pub static RVC_ATTESTATION_TRIGGER_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_attestation_trigger_total",
+        "Attestation phase-2 waits completed by source (timer or head event)",
+        &["source"],
+    )
+});
+
+/// Sync committee duties skipped because phase-2 `head_root` is missing (ARCH-3e).
+pub static RVC_SYNC_COMMITTEE_SKIPPED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_sync_committee_skipped_total",
+        "Total number of sync committee duties skipped",
+        &["phase", "reason"],
+    )
+});
+
+/// Payload attestation duties skipped (HTTP 204 / no data).
+pub static RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_payload_attestation_skipped_total",
+        "Total number of payload attestation duties skipped",
+        &["reason"],
+    )
+});
+
+/// `outcome` label values for [`RVC_PTC_DUTIES_TOTAL`].
+pub mod ptc_duty_outcome {
+    pub const SCHEDULED: &str = "scheduled";
+    pub const SKIPPED_NO_DATA: &str = "skipped_no_data";
+    pub const DROPPED: &str = "dropped";
+}
+
+/// PTC duty outcomes (issue 7.6 / 8.2).
+/// Labels: outcome (scheduled, skipped_no_data, dropped)
+pub static RVC_PTC_DUTIES_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_ptc_duties_total",
+        "Total number of payload-attestation (PTC) duties by outcome",
+        &["outcome"],
+    )
+});
+
+/// PTC pool-post outcomes (issue 7.6 / 8.2).
+/// Labels: status (success, failed)
+pub static RVC_PTC_ATTESTATIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_ptc_attestations_total",
+        "Total number of payload-attestation (PTC) pool submissions by status",
+        &["status"],
+    )
+});
+
+/// `sign_type` label values for [`RVC_SIGNER_CAPABILITY`].
+pub mod signer_sign_type {
+    pub const PAYLOAD_ATTESTATION: &str = "PAYLOAD_ATTESTATION";
+    pub const PROPOSER_PREFERENCES: &str = "PROPOSER_PREFERENCES";
+    pub const BUILDER_REQUEST_AUTH: &str = "BUILDER_REQUEST_AUTH";
+    pub const ALL: &[&str] = &[PAYLOAD_ATTESTATION, PROPOSER_PREFERENCES, BUILDER_REQUEST_AUTH];
+}
+
+/// Remote-signer Gloas sign-type support (1=supported, 0=unsupported or unknown).
+///
+/// Probe failures are recorded as 0; they must never be reported as supported.
+pub static RVC_SIGNER_CAPABILITY: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    define_int_gauge_vec(
+        "rvc_signer_capability",
+        "Whether the configured remote signer supports a Gloas sign type (1=supported, 0=unsupported or unknown)",
+        &["sign_type"],
+    )
+});
+
+/// Resolved current fork as [`eth_types::ForkName::id`] (PHASE0=0 … GLOAS=7).
+pub static RVC_FORK_CURRENT_ID: LazyLock<IntGauge> = LazyLock::new(|| {
+    define_int_gauge("rvc_fork_current_id", "Numeric id of the fork resolved for the current epoch")
+});
+
+/// Milliseconds spent waiting for an in-flight signature to finish while quiescing
+/// a pubkey. Recorded on both a finished drain and a timeout; the timeout is
+/// still an error (`QuiesceError::DrainTimedOut`), not a success sample.
+pub static RVC_KEYMANAGER_QUIESCE_WAIT_MS: LazyLock<Histogram> = LazyLock::new(|| {
+    let histogram = Histogram::with_opts(
+        HistogramOpts::new(
+            "rvc_keymanager_quiesce_wait_ms",
+            "Milliseconds spent draining in-flight signatures during keymanager signing quiesce",
+        )
+        .buckets(vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0]),
+    )
+    .unwrap_or_else(|e| panic!("Failed to create rvc_keymanager_quiesce_wait_ms: {e}"));
+    metrics::register_metric("rvc_keymanager_quiesce_wait_ms", histogram)
+});
+
+/// Activation epoch of the next scheduled fork.
+///
+/// Labels: `fork` (lowercase [`eth_types::ForkName`] name). The child is omitted
+/// when the next activation is the far-future sentinel (`u64::MAX`).
+pub static RVC_FORK_NEXT_ACTIVATION_EPOCH: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    define_int_gauge_vec(
+        "rvc_fork_next_activation_epoch",
+        "Activation epoch of the next scheduled fork",
+        &["fork"],
+    )
+});
+
+/// Force-register orchestrator families and the other owners rvc composes.
+pub fn init() {
+    metrics::definitions::init_metrics();
+    slashing::metrics::init();
+    signer::metrics::init();
+    duty_tracker::metrics::init();
+    bn_manager::metrics::init();
+    block_service::metrics::init();
+    LazyLock::force(&RVC_ORCHESTRATOR_SLOTS_PROCESSED_TOTAL);
+    LazyLock::force(&RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL);
+    LazyLock::force(&RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS);
+    LazyLock::force(&RVC_AGGREGATIONS_TOTAL);
+    LazyLock::force(&RVC_ORCHESTRATOR_SLOT_PROCESSING_DURATION_SECONDS);
+    LazyLock::force(&RVC_DUTY_INDEX_SET_SIZE);
+    LazyLock::force(&RVC_DUTY_REORG_DETECTED_TOTAL);
+    LazyLock::force(&RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL);
+    LazyLock::force(&RVC_PROPOSER_CONFIG_REFRESH_FAILURES_TOTAL);
+    LazyLock::force(&RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL);
+    LazyLock::force(&RVC_PRE_PROPOSAL_COLD_FETCH_DURATION_SECONDS);
+    LazyLock::force(&RVC_ATTESTATION_TRIGGER_TOTAL);
+    LazyLock::force(&RVC_SYNC_COMMITTEE_SKIPPED_TOTAL);
+    LazyLock::force(&RVC_PAYLOAD_ATTESTATION_SKIPPED_TOTAL);
+    LazyLock::force(&RVC_SIGNER_CAPABILITY);
+    LazyLock::force(&RVC_PTC_DUTIES_TOTAL);
+    LazyLock::force(&RVC_PTC_ATTESTATIONS_TOTAL);
+    LazyLock::force(&RVC_FORK_CURRENT_ID);
+    LazyLock::force(&RVC_FORK_NEXT_ACTIVATION_EPOCH);
+    LazyLock::force(&RVC_KEYMANAGER_QUIESCE_WAIT_MS);
+    let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SCHEDULED]);
+    let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SKIPPED_NO_DATA]);
+    let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::DROPPED]);
+    let _ = RVC_PTC_ATTESTATIONS_TOTAL.with_label_values(&[attestation_status::SUCCESS]);
+    let _ = RVC_PTC_ATTESTATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]);
+    // DSR-2.4: force-register missed-slots zero child (empty label set).
+    let _ = RVC_ORCHESTRATOR_MISSED_SLOTS_TOTAL.with_label_values(&[] as &[&str]);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use metrics::definitions::{slashing_result, task_exit_outcome};
+
+    #[test]
+    fn init_twice_does_not_panic() {
+        super::init();
+        super::init();
+    }
+
+    /// DSR-2.4 / #383: S5A rare-event families must expose numeric samples at init
+    /// (zeros OK) — HELP/TYPE-only is insufficient for scrape presence.
+    #[test]
+    fn init_force_registers_s5a_zero_children_with_samples() {
+        super::init();
+        let gathered = metrics::REGISTRY.gather();
+
+        let missed = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_orchestrator_missed_slots_total")
+            .expect("rvc_orchestrator_missed_slots_total must be gatherable after init");
+        assert!(
+            !missed.get_metric().is_empty(),
+            "missed_slots must expose a numeric sample at init, got HELP/TYPE-only"
+        );
+
+        let exits = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_task_exits_total")
+            .expect("rvc_task_exits_total must be gatherable after init");
+        assert!(
+            !exits.get_metric().is_empty(),
+            "task_exits must expose numeric samples at init, got HELP/TYPE-only"
+        );
+        let outcomes: BTreeSet<&str> = exits
+            .get_metric()
+            .iter()
+            .filter_map(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|label| label.name() == "outcome")
+                    .map(|label| label.value())
+            })
+            .collect();
+        for expected in task_exit_outcome::ALL {
+            assert!(
+                outcomes.contains(expected),
+                "task_exits outcome={expected} must be force-registered at init, got {outcomes:?}"
+            );
+        }
+
+        let health = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_bn_health_tier")
+            .expect("rvc_bn_health_tier must be gatherable after init");
+        assert!(
+            !health.get_metric().is_empty(),
+            "bn_health_tier must expose a numeric sample at init, got HELP/TYPE-only"
+        );
+
+        let slashing = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_slashing_protection_checks_total")
+            .expect("rvc_slashing_protection_checks_total must be gatherable after init");
+        let results: BTreeSet<&str> = slashing
+            .get_metric()
+            .iter()
+            .filter_map(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .find(|label| label.name() == "result")
+                    .map(|label| label.value())
+            })
+            .collect();
+        assert!(
+            results.contains(slashing_result::BLOCKED),
+            "slashing blocked child must be force-registered at init, got {results:?}"
+        );
+    }
+}

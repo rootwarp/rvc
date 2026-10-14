@@ -185,11 +185,11 @@ mod tests {
         let path = dir.path().join("slashing.db");
         seeded_db_with_prunable_rows(&path);
 
-        let before_blocks = metrics::definitions::RVC_SLASHING_DB_PRUNE_TOTAL
-            .with_label_values(&[metrics::definitions::prune_type::BLOCK])
+        let before_blocks = slashing::metrics::RVC_SLASHING_DB_PRUNE_TOTAL
+            .with_label_values(&[slashing::metrics::prune_type::BLOCK])
             .get();
-        let before_atts = metrics::definitions::RVC_SLASHING_DB_PRUNE_TOTAL
-            .with_label_values(&[metrics::definitions::prune_type::ATTESTATION])
+        let before_atts = slashing::metrics::RVC_SLASHING_DB_PRUNE_TOTAL
+            .with_label_values(&[slashing::metrics::prune_type::ATTESTATION])
             .get();
 
         execute_prune(PruneArgs { slashing_db_path: path.clone(), dry_run: false, yes: true })
@@ -199,11 +199,11 @@ mod tests {
         assert_eq!(db.get_blocks("0x1234").unwrap().len(), 3);
         assert_eq!(db.get_attestations("0x1234").unwrap().len(), 3);
 
-        let after_blocks = metrics::definitions::RVC_SLASHING_DB_PRUNE_TOTAL
-            .with_label_values(&[metrics::definitions::prune_type::BLOCK])
+        let after_blocks = slashing::metrics::RVC_SLASHING_DB_PRUNE_TOTAL
+            .with_label_values(&[slashing::metrics::prune_type::BLOCK])
             .get();
-        let after_atts = metrics::definitions::RVC_SLASHING_DB_PRUNE_TOTAL
-            .with_label_values(&[metrics::definitions::prune_type::ATTESTATION])
+        let after_atts = slashing::metrics::RVC_SLASHING_DB_PRUNE_TOTAL
+            .with_label_values(&[slashing::metrics::prune_type::ATTESTATION])
             .get();
         assert!(
             after_blocks >= before_blocks.saturating_add(2),

@@ -1,0 +1,4 @@
+{
+  "code": 400,
+  "message": "Epoch is outside the sync committee period of the state"
+}

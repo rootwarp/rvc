@@ -3,7 +3,8 @@
 //! ## What `fork_id` means here
 //!
 //! Helpers take a numeric `fork_id` matching [`crate::ForkName::id`]
-//! (PHASE0=0 … FULU=6). Unknown ids are rejected via [`crate::ForkName`]'s
+//! (PHASE0=0 … FULU=6). Unknown ids are rejected against
+//! `DECODER_SUPPORTED_FORK_IDS` (`0..=6`), **not** [`crate::ForkName`]'s
 //! `TryFrom<u32>` impl. **`fork_id` is not a layout dispatcher**: encoders
 //! ignore it, and decoders use a single fixed layout per type. In particular
 //! [`decode_attestation_ssz`] always expects the pre-Electra three-field
@@ -12,6 +13,24 @@
 //! working. Electra-shaped four-field buffers are rejected with
 //! [`SszDecodeError::ElectraLayoutUnsupported`] rather than misparsed.
 //! A real `ElectraAttestation` SSZ codec is out of scope for these helpers.
+//!
+//! The allowlist is independent of [`crate::ForkName`] so adding a variant
+//! cannot silently admit new bytes to these fixed pre-Electra decoders. After
+//! issue 2.5b, `ForkName::try_from(7) == Ok(Gloas)` while `validate_fork_id(7)`
+//! stays `Err`. At this commit the two sets are bit-identical (`0..=6`); the
+//! only later behavioural change is id 7 staying rejected. Do not treat
+//! `DECODER_SUPPORTED_FORK_IDS` as a free-floating tuning knob, and do not
+//! widen it to `ForkName::COUNT`.
+//!
+//! Encoded `fork_id` is ignored (`encode_beacon_block_ssz` takes `_fork_id`)
+//! but every `decode_*_ssz` validates, so the gRPC path
+//! `grpc-signer/src/client.rs` (`fork_id = ctx.fork_name.id()`) →
+//! `signer-server/src/grpc_common.rs` fails every remote sign at Gloas with
+//! `UnknownForkId(7)`. That fail-closed verdict is deliberate for Phase 2
+//! (tested end-to-end in 2.5b) and is not the accepted end state for gRPC
+//! duties: Phase 4 adds a Gloas-safe signing contract (precomputed object
+//! root plus explicit fork-version/domain context). No Gloas SSZ bytes may
+//! reach a decoder guarded by `0..=6`.
 //!
 //! ## BeaconBlock container
 //!
@@ -29,11 +48,12 @@
 //!
 //! The fixed part (including the 4-byte offset for `body`) is 84 bytes.
 
+use std::ops::RangeInclusive;
+
 use thiserror::Error;
 
 use crate::{
-    Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock, ForkName,
-    SyncCommitteeContribution,
+    Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock, SyncCommitteeContribution,
 };
 
 /// Errors that can occur when decoding SSZ bytes into a consensus type.
@@ -281,10 +301,23 @@ pub fn decode_sync_committee_contribution_ssz(
 /// (slot, proposer_index, parent_root, state_root, body)
 type BlockFields = (u64, u64, [u8; 32], [u8; 32], Vec<u8>);
 
-/// Validate that a `fork_id` is a known [`ForkName`] id.
+/// Fork ids accepted by the four `decode_*_ssz` entry points (Phase0=0 … Fulu=6).
+///
+/// Not derived from [`crate::ForkName`]: after 2.5b, `ForkName::try_from(7)` is
+/// `Ok(Gloas)` while id 7 stays rejected here so Gloas SSZ never reaches these
+/// fixed pre-Electra layouts. Bit-identical to today's `ForkName` accept set;
+/// do not widen when Gloas lands (and never to `ForkName::COUNT`).
+const DECODER_SUPPORTED_FORK_IDS: RangeInclusive<u32> = 0..=6;
+
+/// Reject `fork_id`s outside [`DECODER_SUPPORTED_FORK_IDS`].
+///
+/// Independent of [`crate::ForkName::try_from`].
 fn validate_fork_id(fork_id: u32) -> Result<(), SszDecodeError> {
-    ForkName::try_from(fork_id).map_err(|e| SszDecodeError::UnknownForkId(e.0))?;
-    Ok(())
+    if DECODER_SUPPORTED_FORK_IDS.contains(&fork_id) {
+        Ok(())
+    } else {
+        Err(SszDecodeError::UnknownForkId(fork_id))
+    }
 }
 
 /// SSZ encode the inner block fields (shared by BeaconBlock and BlindedBeaconBlock).
@@ -382,7 +415,7 @@ mod tests {
     #[test]
     fn test_encode_decode_beacon_block_roundtrip_all_fork_ids() {
         let block = sample_beacon_block();
-        for fork_id in 0u32..=6 {
+        for fork_id in DECODER_SUPPORTED_FORK_IDS {
             let encoded = encode_beacon_block_ssz(&block, fork_id);
             let decoded = decode_beacon_block_ssz(&encoded, fork_id).expect("decode failed");
             assert_eq!(block, decoded, "roundtrip failed for fork_id={fork_id}");
@@ -392,7 +425,7 @@ mod tests {
     #[test]
     fn test_encode_decode_blinded_beacon_block_roundtrip_all_fork_ids() {
         let block = sample_blinded_block();
-        for fork_id in 0u32..=6 {
+        for fork_id in DECODER_SUPPORTED_FORK_IDS {
             let encoded = encode_blinded_beacon_block_ssz(&block, fork_id);
             let decoded =
                 decode_blinded_beacon_block_ssz(&encoded, fork_id).expect("decode failed");
@@ -403,7 +436,7 @@ mod tests {
     #[test]
     fn test_encode_decode_attestation_roundtrip_all_fork_ids() {
         let att = sample_attestation();
-        for fork_id in 0u32..=6 {
+        for fork_id in DECODER_SUPPORTED_FORK_IDS {
             let encoded = encode_attestation_ssz(&att, fork_id);
             let decoded = decode_attestation_ssz(&encoded, fork_id).expect("decode failed");
             assert_eq!(att, decoded, "roundtrip failed for fork_id={fork_id}");
@@ -413,7 +446,7 @@ mod tests {
     #[test]
     fn test_encode_decode_sync_committee_contribution_roundtrip_all_fork_ids() {
         let contrib = sample_contribution();
-        for fork_id in 0u32..=6 {
+        for fork_id in DECODER_SUPPORTED_FORK_IDS {
             let encoded = encode_sync_committee_contribution_ssz(&contrib, fork_id);
             let decoded =
                 decode_sync_committee_contribution_ssz(&encoded, fork_id).expect("decode failed");
@@ -421,6 +454,9 @@ mod tests {
         }
     }
 
+    /// Gloas is fork id 7. These fixed-layout decoders must reject it even
+    /// after `ForkName::try_from(7)` becomes `Ok(Gloas)` (issue 2.5b). The
+    /// allowlist is independent of `ForkName`'s variant set.
     #[test]
     fn test_decode_beacon_block_unknown_fork_id_rejected() {
         let block = sample_beacon_block();
@@ -429,13 +465,15 @@ mod tests {
         assert!(matches!(result, Err(SszDecodeError::UnknownForkId(7))));
     }
 
-    /// RF3-07: `validate_fork_id` delegates to `ForkName::try_from`.
+    /// `validate_fork_id` checks `DECODER_SUPPORTED_FORK_IDS` (`0..=6`), not
+    /// `ForkName::try_from`. After 2.5b, `ForkName::try_from(7) == Ok(Gloas)`
+    /// while this decoder path stays `Err(UnknownForkId(7))`.
     /// Accept 0..=6; reject 7 and `u32::MAX` with `UnknownForkId`.
     #[test]
     fn test_validate_fork_id_accepts_0_through_6_rejects_7_and_max() {
         let block = sample_beacon_block();
         let encoded = encode_beacon_block_ssz(&block, 0);
-        for fork_id in 0u32..=6 {
+        for fork_id in DECODER_SUPPORTED_FORK_IDS {
             decode_beacon_block_ssz(&encoded, fork_id)
                 .unwrap_or_else(|e| panic!("fork_id={fork_id} should be accepted: {e}"));
         }
@@ -445,6 +483,54 @@ mod tests {
                 matches!(result, Err(SszDecodeError::UnknownForkId(id)) if id == fork_id),
                 "fork_id={fork_id} should be UnknownForkId, got {result:?}"
             );
+        }
+    }
+
+    /// B4 (D18): pin allowlist membership as a set, independent of loops that
+    /// iterate `DECODER_SUPPORTED_FORK_IDS`. Widening to include Gloas (7) or
+    /// narrowing must fail even if those loops stay green.
+    #[test]
+    fn test_decoder_supported_fork_ids_membership_is_exactly_0_through_6() {
+        let members: Vec<u32> = DECODER_SUPPORTED_FORK_IDS.collect();
+        assert_eq!(members, vec![0, 1, 2, 3, 4, 5, 6]);
+
+        let block_bytes = encode_beacon_block_ssz(&sample_beacon_block(), 0);
+        let blinded_bytes = encode_blinded_beacon_block_ssz(&sample_blinded_block(), 0);
+        let att_bytes = encode_attestation_ssz(&sample_attestation(), 0);
+        let contrib_bytes = encode_sync_committee_contribution_ssz(&sample_contribution(), 0);
+
+        for fork_id in [0u32, 1, 2, 3, 4, 5, 6] {
+            decode_beacon_block_ssz(&block_bytes, fork_id).unwrap_or_else(|e| {
+                panic!("beacon_block fork_id={fork_id} should be accepted: {e}")
+            });
+            decode_blinded_beacon_block_ssz(&blinded_bytes, fork_id).unwrap_or_else(|e| {
+                panic!("blinded_beacon_block fork_id={fork_id} should be accepted: {e}")
+            });
+            decode_attestation_ssz(&att_bytes, fork_id).unwrap_or_else(|e| {
+                panic!("attestation fork_id={fork_id} should be accepted: {e}")
+            });
+            decode_sync_committee_contribution_ssz(&contrib_bytes, fork_id).unwrap_or_else(|e| {
+                panic!("sync_committee_contribution fork_id={fork_id} should be accepted: {e}")
+            });
+        }
+        for fork_id in [7u32, 8, u32::MAX] {
+            for (name, result) in [
+                ("beacon_block", decode_beacon_block_ssz(&block_bytes, fork_id).map(|_| ())),
+                (
+                    "blinded_beacon_block",
+                    decode_blinded_beacon_block_ssz(&blinded_bytes, fork_id).map(|_| ()),
+                ),
+                ("attestation", decode_attestation_ssz(&att_bytes, fork_id).map(|_| ())),
+                (
+                    "sync_committee_contribution",
+                    decode_sync_committee_contribution_ssz(&contrib_bytes, fork_id).map(|_| ()),
+                ),
+            ] {
+                assert!(
+                    matches!(result, Err(SszDecodeError::UnknownForkId(id)) if id == fork_id),
+                    "{name} fork_id={fork_id} should be UnknownForkId, got {result:?}"
+                );
+            }
         }
     }
 
@@ -599,7 +685,7 @@ mod tests {
         // to return Ok(Attestation) with a corrupted signature region.
         assert_eq!(u32::from_le_bytes(encoded[0..4].try_into().unwrap()), 140);
 
-        for fork_id in 0u32..=6 {
+        for fork_id in DECODER_SUPPORTED_FORK_IDS {
             let result = decode_attestation_ssz(&encoded, fork_id);
             assert!(
                 matches!(
@@ -625,7 +711,7 @@ mod tests {
     #[test]
     fn test_legacy_attestation_roundtrip_all_fork_ids_0_to_6() {
         let att = sample_attestation();
-        for fork_id in 0u32..=6 {
+        for fork_id in DECODER_SUPPORTED_FORK_IDS {
             let encoded = encode_attestation_ssz(&att, fork_id);
             let decoded = decode_attestation_ssz(&encoded, fork_id)
                 .unwrap_or_else(|e| panic!("fork_id={fork_id}: {e}"));

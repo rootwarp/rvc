@@ -16,7 +16,8 @@
 //! non-zero (verified by temporarily adding one during development).
 //!
 //! The statements below mirror the disabled-level logging on the sign hot path
-//! in `crates/signer/src/lib.rs` (`sign_attestation` / `sign_block`) and the
+//! in `crates/signer/src/lib.rs` (`sign_attestation` / `sign_block`),
+//! `crates/signer/src/core.rs` (stage traces), and the
 //! `compute_signing_root` trace in `crates/crypto/src/signing.rs` — the union of
 //! those callsites' fields, so a future eager-alloc field added to any of them is
 //! in the measured region.
