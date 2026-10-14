@@ -8,8 +8,8 @@
 //! provenance-generated: id=gloas-signing-roots sha256=4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-generated: id=progressive sha256=af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-generated: id=signing-roots sha256=ed6ddbabb85f37f3bb5d82ca44f3962aa9d75a4c3f6b1c84850478d38fabc135
-//! provenance-generator: gen-spec-kat 0.7.0
-//! provenance-date: 2026-09-29
+//! provenance-generator: gen-spec-kat 0.8.0
+//! provenance-date: 2026-10-14
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_0/roots.yaml sha256:4fd39bfafadb40d3fca6a6b77e712d1535a0df2fee7ed2d58607cb518a655c22
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_0/serialized.ssz_snappy sha256:cac01c86ff78e57ad395c9e3bf0d0dfbb3dd41640a009b2a0cb8dc95509b3b51
 //! provenance-input: crates/rvc-spec-vectors/tests/fixtures/tests/minimal/electra/ssz_static/AttestationData/ssz_random/case_1/roots.yaml sha256:64150d0e41e95c1a47bf3e67cc36ff1cfb48077e05d6e3ed3e18f814d85a0a72

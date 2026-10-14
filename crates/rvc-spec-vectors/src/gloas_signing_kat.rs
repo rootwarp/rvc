@@ -10,8 +10,8 @@
 //! provenance-python: 3.13.7
 //! provenance-argv: --out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --gloas-out crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml --fork-version 0x07000001 --genesis-validators-root 0x0000000000000000000000000000000000000000000000000000000000000000 --spec-tag v1.7.0-beta.2
 //! provenance-generated: id=gloas-signing-roots sha256=4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
-//! provenance-generator: gen-spec-kat 0.7.0
-//! provenance-date: 2026-09-29
+//! provenance-generator: gen-spec-kat 0.8.0
+//! provenance-date: 2026-10-14
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-input-spec: phase0+gloas beacon-chain.md sha256:e70936c2b4b0ef8e1986ca7507d3ac13746d456f4cebe6aca4ed8a403ba134fe
 //! provenance-fork-version: 0x07000001

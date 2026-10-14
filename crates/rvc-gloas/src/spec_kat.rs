@@ -8,8 +8,8 @@
 //! provenance-generated: id=gloas-signing-roots sha256=4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-generated: id=progressive sha256=af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-generated: id=signing-roots sha256=ed6ddbabb85f37f3bb5d82ca44f3962aa9d75a4c3f6b1c84850478d38fabc135
-//! provenance-generator: gen-spec-kat 0.7.0
-//! provenance-date: 2026-09-29
+//! provenance-generator: gen-spec-kat 0.8.0
+//! provenance-date: 2026-10-14
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/gloas-signing-roots/signing_roots.yaml sha256:4793b7ec18ad4040af55bb49a5f8929c1ea9aa3c8eb7f29065417eeb76567803
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/progressive/roots.yaml sha256:af96bc7dcab81b76427d50bec50944ec72eda3d33ce8426bf8569acebc6bd97f
 //! provenance-input: crates/rvc-spec-vectors/vectors-generated/signing-roots/signing_roots.yaml sha256:ed6ddbabb85f37f3bb5d82ca44f3962aa9d75a4c3f6b1c84850478d38fabc135

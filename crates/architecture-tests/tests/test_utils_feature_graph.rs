@@ -496,14 +496,14 @@ fn package_ids_map_exactly_from_metadata() {
     assert!(output.status.success());
     let metadata: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let id_to_name = package_id_to_name(&metadata);
-    // `rvc` uses the `#0.7.0` form (name is the path basename); substring
+    // `rvc` uses the `#0.8.0` form (name is the path basename); substring
     // fallbacks are forbidden — only the exact id map is used.
     let rvc_id =
         metadata["packages"].as_array().unwrap().iter().find(|p| p["name"] == "rvc").unwrap()["id"]
             .as_str()
             .unwrap();
     assert!(
-        rvc_id.ends_with("#0.7.0") || rvc_id.contains("#rvc@"),
+        rvc_id.ends_with("#0.8.0") || rvc_id.contains("#rvc@"),
         "expected a path-package id for rvc, got {rvc_id}"
     );
     assert_eq!(id_to_name.get(rvc_id).map(String::as_str), Some("rvc"));
