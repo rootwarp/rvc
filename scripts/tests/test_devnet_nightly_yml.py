@@ -96,12 +96,13 @@ def test_build_matches_ci_check_cache_and_pins():
     ci = CI_YML.read_text(encoding="utf-8")
     build = _jobs(nightly)["build"]
     check = _jobs(ci)["check"]
-    cache_key = "${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}"
-    assert cache_key in check
-    assert cache_key in build
-    assert "~/.cargo/registry" in build
-    assert "~/.cargo/git" in build
-    assert "target" in build
+    # Nightly build shares the Check job's rust-cache key (not a full target/ dump).
+    assert "Swatinem/rust-cache@v2" in check
+    assert "Swatinem/rust-cache@v2" in build
+    assert 'shared-key: check' in check
+    assert 'shared-key: check' in build
+    assert 'cache-all-crates: "false"' in check
+    assert 'cache-all-crates: "false"' in build
     assert "dtolnay/rust-toolchain@stable" in build
     assert "arduino/setup-protoc@v3" in build
     assert 'version: "27.x"' in build
