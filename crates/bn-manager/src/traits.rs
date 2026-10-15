@@ -53,6 +53,17 @@ pub trait DutiesProvider: Send + Sync {
     ) -> Result<PtcDutiesResponse, BeaconError>;
 }
 
+/// Duty fields applied before a produced block is ranked or returned.
+#[derive(Debug, Clone, Copy)]
+pub struct ProduceDuty {
+    pub expected_proposer_index: u64,
+    pub expected_parent_root: Option<[u8; 32]>,
+    pub expected_fee_recipient: Option<[u8; 20]>,
+    /// Slot fork. A candidate whose `consensus_version` is not this fork is
+    /// not ranked and does not close the soft deadline.
+    pub expected_consensus_version: ForkName,
+}
+
 /// Block production, publication, proposer preparation, and builder registration.
 #[async_trait]
 pub trait BlockProducer: Send + Sync {
@@ -63,6 +74,28 @@ pub trait BlockProducer: Send + Sync {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BeaconError>;
+
+    /// [`Self::produce_block_v3`] with the duty's slot, proposer, parent,
+    /// consensus version, and full-block fee recipient applied before a block
+    /// is ranked or returned. From Bellatrix on, a full block has to carry
+    /// that fee recipient. A blinded block keeps its builder-header fee
+    /// recipient. A full SSZ block whose fee recipient cannot be read is
+    /// rejected.
+    ///
+    /// Fallback runs only for untried proposal-role beacon nodes above the
+    /// health floor, and only when [`ProduceDuty::expected_parent_root`] is
+    /// `Some`. The default ignores the duty and calls [`Self::produce_block_v3`].
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: ProduceDuty,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let _ = duty;
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
 
     /// Produce a block via `POST /eth/v4/validator/blocks/{slot}`.
     ///

@@ -19,7 +19,7 @@ use validator_store::ValidatorStore;
 
 use crate::metrics::{proposal_outcome, RVC_PROPOSALS_TOTAL};
 use crate::traits::{
-    BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse,
+    BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse, ProduceDuty,
 };
 use crate::types::BlockSelectionMode;
 use crate::validation::BlockResponseValidator;
@@ -313,10 +313,32 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 .instrument(tracing::info_span!("beacon.produce_block_v4"))
                 .await
         } else {
-            self.beacon
-                .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
-                .instrument(tracing::info_span!("beacon.produce_block_v3"))
-                .await
+            match validator {
+                Some(checks) => {
+                    let fee_recipient = self.validator_store.effective_fee_recipient(&pubkey_bytes);
+                    self.beacon
+                        .produce_block_v3_for_duty(
+                            slot,
+                            &randao_hex,
+                            graffiti_hex.as_deref(),
+                            Some(boost),
+                            ProduceDuty {
+                                expected_proposer_index: checks.expected_proposer_index,
+                                expected_parent_root: checks.expected_parent_root,
+                                expected_fee_recipient: Some(fee_recipient),
+                                expected_consensus_version: fork,
+                            },
+                        )
+                        .instrument(tracing::info_span!("beacon.produce_block_v3"))
+                        .await
+                }
+                None => {
+                    self.beacon
+                        .produce_block_v3(slot, &randao_hex, graffiti_hex.as_deref(), Some(boost))
+                        .instrument(tracing::info_span!("beacon.produce_block_v3"))
+                        .await
+                }
+            }
         };
 
         // Handle block-production failure, tagging the error so the coordinator

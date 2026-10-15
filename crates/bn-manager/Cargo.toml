@@ -37,6 +37,7 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+eth-types = { workspace = true, features = ["test-fixtures"] }
 serde_json = { workspace = true }
 wiremock = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }

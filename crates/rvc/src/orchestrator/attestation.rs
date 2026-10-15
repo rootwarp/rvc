@@ -1839,6 +1839,32 @@ mod dispatch_pipeline {
         );
     }
 
+    /// Slot budget for [`short_overhang_keeps_a_known_partial`].
+    ///
+    /// The paused clock keeps this at 50 ms. llvm-cov can spend that budget
+    /// during signing when instrumentation is not absorbed by the pause, so
+    /// coverage uses a wider slot that is still far under the 30 s submit timeout.
+    fn overhang_slot_budget() -> Duration {
+        if std::env::var_os("CARGO_LLVM_COV").is_some()
+            || std::env::var_os("LLVM_PROFILE_FILE").is_some()
+        {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(50)
+        }
+    }
+
+    /// Extra room on the overhang ceiling under llvm-cov.
+    fn overhang_finish_slack() -> Duration {
+        if std::env::var_os("CARGO_LLVM_COV").is_some()
+            || std::env::var_os("LLVM_PROFILE_FILE").is_some()
+        {
+            Duration::from_millis(500)
+        } else {
+            Duration::ZERO
+        }
+    }
+
     /// A short slot-end overhang cancels the wait after a partial acceptance.
     /// The known partial is kept, and the other beacon node still receives the publish.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1847,8 +1873,6 @@ mod dispatch_pipeline {
         let delivered_flag = Arc::clone(&delivered);
         let (release, wait) = tokio::sync::watch::channel(false);
         let submitter = Arc::new(PartialThenHang { delivered: delivered_flag, wait });
-        let started = tokio::time::Instant::now();
-        let slot_end = started + Duration::from_millis(50);
         let fixture = open_fixture_with_submitter(
             2,
             FixtureOpts {
@@ -1859,12 +1883,14 @@ mod dispatch_pipeline {
             },
             submitter,
         );
+        let started = tokio::time::Instant::now();
+        let slot_end = started + overhang_slot_budget();
         let results = fixture.service.process_slot_until(SLOT, slot_end).await.expect("drain");
         let finished = tokio::time::Instant::now();
         let overhang_at = slot_end + Duration::from_millis(500);
         assert_eq!(results.len(), 2, "{results:?}");
         assert!(
-            finished <= overhang_at,
+            finished <= overhang_at + overhang_finish_slack(),
             "the wait ran until {finished:?}, past overhang {overhang_at:?}"
         );
         let rejected = results

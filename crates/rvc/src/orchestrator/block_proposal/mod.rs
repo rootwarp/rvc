@@ -132,9 +132,12 @@ where
 
         info!(slot, validator_index = %proposer_duty.validator_index, "Proposing block");
 
-        // Wrap with combined produce + publish timeout
+        // Produce may run until the block-production budget plus the 250 ms
+        // backstop (`bn_manager::BACKSTOP_MARGIN`). Publication keeps its own
+        // budget on top of that, so the backstop does not come out of publish.
+        let allowance = block_proposal_allowance(&self.config.timeouts);
         match tokio::time::timeout(
-            self.config.timeouts.block_production + self.config.timeouts.block_publication,
+            allowance,
             self.block_service.propose_block(
                 slot,
                 &pubkey,
@@ -195,13 +198,42 @@ where
                 error!(
                     slot,
                     epoch,
-                    "Block proposal timed out after {}s",
-                    (self.config.timeouts.block_production
-                        + self.config.timeouts.block_publication)
-                        .as_secs()
+                    timeout_ms = allowance.as_millis() as u64,
+                    "Block proposal timed out after {}ms",
+                    allowance.as_millis()
                 );
             }
         }
+    }
+}
+
+/// Produce budget, plus the beacon-node backstop, plus publish.
+///
+/// The backstop is the same 250 ms [`bn_manager::BACKSTOP_MARGIN`] that
+/// `produce_block_v3` adds so a block already in hand is not cancelled.
+/// Publication is not asked to absorb that margin.
+fn block_proposal_allowance(timeouts: &bn_manager::OperationTimeouts) -> std::time::Duration {
+    timeouts
+        .block_production
+        .saturating_add(bn_manager::BACKSTOP_MARGIN)
+        .saturating_add(timeouts.block_publication)
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::block_proposal_allowance;
+    use bn_manager::OperationTimeouts;
+
+    #[test]
+    fn proposal_timeout_includes_the_backstop_margin() {
+        let timeouts = OperationTimeouts::default();
+        let allowance = block_proposal_allowance(&timeouts);
+        assert_eq!(bn_manager::BACKSTOP_MARGIN, std::time::Duration::from_millis(250));
+        assert_eq!(
+            allowance,
+            timeouts.block_production + bn_manager::BACKSTOP_MARGIN + timeouts.block_publication
+        );
+        assert!(allowance > timeouts.block_production + timeouts.block_publication);
     }
 }
 

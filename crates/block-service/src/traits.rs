@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 
-use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContentsJson, Slot};
+use eth_types::{
+    ForkName, SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContentsJson, Slot,
+};
 
 use crate::BlockServiceError;
 
@@ -11,6 +13,17 @@ pub use beacon::{BuilderConfig, ProduceBlockResponse, WireBody};
 #[async_trait]
 pub trait BuilderConfigProvider: Send + Sync {
     async fn builder_config_for(&self, pubkey: &[u8; 48], slot: Slot) -> BuilderConfig;
+}
+
+/// Duty fields applied before a produced block is ranked or returned.
+#[derive(Debug, Clone, Copy)]
+pub struct ProduceDuty {
+    pub expected_proposer_index: u64,
+    pub expected_parent_root: Option<[u8; 32]>,
+    pub expected_fee_recipient: Option<[u8; 20]>,
+    /// Slot fork. A candidate whose `consensus_version` is not this fork is
+    /// not ranked and does not close the soft deadline.
+    pub expected_consensus_version: ForkName,
 }
 
 /// Minimal beacon client trait for block production and publication.
@@ -26,6 +39,25 @@ pub trait BeaconBlockClient: Send + Sync {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BlockServiceError>;
+
+    /// [`Self::produce_block_v3`] plus the duty checks applied before ranking.
+    ///
+    /// The default ignores the duty and calls [`Self::produce_block_v3`].
+    /// `BnManager` uses the checks to drop a block that fails slot, proposer,
+    /// parent, or consensus version before it can win, and to keep fallback
+    /// on proposal-role nodes when [`ProduceDuty::expected_parent_root`] is
+    /// known.
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: ProduceDuty,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        let _ = duty;
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
 
     async fn produce_block_v4(
         &self,

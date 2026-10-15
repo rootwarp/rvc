@@ -8,9 +8,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use block_service::{
-    BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse, WireBody,
+    BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse, ProduceDuty,
+    WireBody,
 };
-use bn_manager::BeaconNodeClient;
+use bn_manager::{BeaconNodeClient, ProduceDuty as BnProduceDuty};
 use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContentsJson, Slot};
 
 /// Newtype adapter that implements [`BeaconBlockClient`] for any
@@ -28,6 +29,31 @@ impl BeaconBlockClient for BeaconBlockAdapter {
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
         self.0
             .produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: ProduceDuty,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        self.0
+            .produce_block_v3_for_duty(
+                slot,
+                randao_reveal,
+                graffiti,
+                builder_boost_factor,
+                BnProduceDuty {
+                    expected_proposer_index: duty.expected_proposer_index,
+                    expected_parent_root: duty.expected_parent_root,
+                    expected_fee_recipient: duty.expected_fee_recipient,
+                    expected_consensus_version: duty.expected_consensus_version,
+                },
+            )
             .await
             .map_err(Into::into)
     }

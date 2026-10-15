@@ -8,7 +8,9 @@ mod fan_out;
 pub use fan_out::{
     testing_broadcast_improving_partial_then_slow, testing_broadcast_partial_then_slow,
 };
-pub use fan_out::{AttestationPublishContext, KnownAttestationPublish, ATTESTATION_PUBLISH};
+pub use fan_out::{
+    AttestationPublishContext, KnownAttestationPublish, ATTESTATION_PUBLISH, BACKSTOP_MARGIN,
+};
 mod health;
 mod manager;
 pub mod metrics;
@@ -35,7 +37,7 @@ pub use sync_status::{BnSyncDetail, BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
     BroadcastTopics, DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts,
-    PayloadAttestationApi, SyncCommitteeApi,
+    PayloadAttestationApi, ProduceDuty, SyncCommitteeApi,
 };
 pub use types::{BnRole, HealthTier, TierThresholds};
 
