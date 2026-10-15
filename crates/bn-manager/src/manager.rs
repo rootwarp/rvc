@@ -21,14 +21,15 @@ use eth_types::{
 };
 use futures::future::join_all;
 use tracing::Instrument;
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, warn};
 use url::Url;
 
 use observability::logging::RedactedUrl;
 
 use crate::sync_status::BnSyncStatus;
 
-use crate::broadcast::{BnOutcome, BroadcastResult};
+use crate::broadcast::BroadcastResult;
+use crate::fan_out::{self, BnAttempt};
 use crate::health::{new_shared_health_trackers, BnHealthTracker, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
 use crate::sync_status::{
@@ -42,13 +43,13 @@ use crate::traits::{
 use crate::types::{bn_capability, BnRole, HealthTier, TierThresholds};
 use crate::BnManagerError;
 
-type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send + 'a>>;
+pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send + 'a>>;
 type IndexedTimedResultFut<'a, T> =
     Pin<Box<dyn Future<Output = (usize, String, Result<T, BeaconError>, Duration)> + Send + 'a>>;
 
 /// Health-tracker outcome for one BN attempt (success with latency, or error).
 #[derive(Debug, Clone, Copy)]
-enum TrackerOutcome {
+pub(crate) enum TrackerOutcome {
     Success(Duration),
     Error,
     /// Missing `/eth/v4` (404/405/501) or an unrecognised fork — skip this BN
@@ -95,7 +96,7 @@ fn is_v4_capability_gap(op_name: &str, err: &BeaconError) -> bool {
         && matches!(err, BeaconError::ApiError { status: 404 | 405 | 501, .. })
 }
 
-fn error_outcome(op_name: &str, err: &BeaconError) -> TrackerOutcome {
+pub(crate) fn error_outcome(op_name: &str, err: &BeaconError) -> TrackerOutcome {
     if is_unrecognised_fork(err) {
         TrackerOutcome::Incapable { unrecognised_fork: true }
     } else if is_v4_capability_gap(op_name, err) {
@@ -223,7 +224,7 @@ fn attempt_limit(
 
 /// Await one attempt. Expiry becomes [`BeaconError::OperationTimeout`].
 /// `None` means the caller supplied no deadline.
-async fn await_attempt<T>(
+pub(crate) async fn await_attempt<T>(
     op_name: &str,
     bound: Option<Duration>,
     fut: impl Future<Output = Result<T, BeaconError>>,
@@ -256,12 +257,32 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 ///   are a capability gap (missing `/eth/v4`) and do fail over; a later success
 ///   re-probes. All-incapable is `NoEligibleBn`, never V3.
 /// - **Broadcast**: send to **role-matching** BNs (subject to `BroadcastTopics`),
-///   succeed if any succeeds — attestations, blocks, sync committee messages,
-///   subscriptions, preparations, validator registrations. Role filter only;
-///   health **tier is not applied** and unhealthy role-matching peers are not
-///   dropped (a lagging / previously-erroring BN still gossips). `All`-role
-///   fallback is shared with the query path. An empty role+All selection is
-///   `BeaconError::NoEligibleBn` — never off-role fan-out, never Ok.
+///   return on the first complete `Ok` — attestations, blocks, sync committee
+///   messages, subscriptions, preparations, validator registrations. A partial
+///   attestation acceptance waits for a full acceptance from another node
+///   until the caller deadline or the attempts finish. The best partial seen
+///   so far is kept when that deadline wins. The caller returns 50 ms early
+///   so that result wins the race against the outer timeout; if the timeout
+///   still wins, its error path keeps the same partial. Once any node has
+///   accepted, the remaining publishes run on a detached task, so cancelling
+///   the caller does not cancel them. Each attempt is bounded by that operation's
+///   budget; attempts still running are drained. At most 16 drains record
+///   health at once. That cap limits health recording, not sends. A full pool
+///   still finishes every remaining publish. Those overflow drains end at the
+///   attempt budget, or at the HTTP client timeout when no budget is set.
+///   The overflow gauge drops when the HTTP call finishes. Only a success
+///   health sample is skipped when the pool is full; an error or a timeout
+///   is still recorded when the recorder queue has room. A sample that does
+///   not fit on that queue is counted and dropped, including an error or a
+///   timeout, and the attempt does not wait. The skip is logged and counted.
+///   With no budget configured, attempts stay unbounded up to that HTTP
+///   timeout. The
+///   outer timeout is only a backstop at the budget plus 250 ms. Role filter
+///   only; health **tier is not applied** and unhealthy role-matching peers
+///   are not dropped (a lagging / previously-erroring BN still gossips).
+///   `All`-role fallback is shared with the query path. An empty role+All
+///   selection is `BeaconError::NoEligibleBn` — never off-role fan-out, never
+///   Ok. Liveness and builder-preference merges wait for every BN.
 ///
 /// # Retries under multi-BN failover
 ///
@@ -285,6 +306,82 @@ pub struct BnManager {
     broadcast_topics: crate::traits::BroadcastTopics,
     roles: Vec<HashSet<BnRole>>,
     tier_thresholds: TierThresholds,
+}
+
+/// Apply health-tracker updates. Each call takes the write lock once.
+///
+/// Sequential strategies flush per attempt so cancellation cannot drop
+/// earlier failures. `query_best_inner` still batches at the end of the
+/// round. A broadcast attempt queues this when it finishes and does not wait
+/// on the queue. When the queue is full, an error or a timeout sample can be
+/// dropped, and that drop is counted. Cancelling the caller does not drop a sample
+/// already queued. Process shutdown drops the recorder, so a queued sample
+/// is not kept. A full health-sample pool skips a success that is still in
+/// flight. An error or a timeout is still recorded when the queue has room.
+pub(crate) async fn record_outcomes(
+    health_trackers: &SharedHealthTrackers,
+    op_name: &str,
+    outcomes: &[(usize, TrackerOutcome)],
+) {
+    if outcomes.is_empty() {
+        return;
+    }
+    let observe_latency = crate::metrics::is_proposer_block_production_op(op_name);
+    let mut trackers = health_trackers.write().await;
+    for &(idx, outcome) in outcomes {
+        match outcome {
+            TrackerOutcome::Success(latency) => {
+                if observe_latency {
+                    crate::metrics::observe_proposer_bn_latency(trackers[idx].endpoint(), latency);
+                }
+                trackers[idx].record_success(latency);
+                trackers[idx].mark_capable(op_name);
+                if op_name == bn_capability::PRODUCE_BLOCK_V4 {
+                    let endpoint = trackers[idx].endpoint().to_string();
+                    trackers[idx].mark_capable(bn_capability::FORK_RECOGNISED);
+                    publish_capability(&endpoint, bn_capability::PRODUCE_BLOCK_V4, true);
+                    publish_capability(&endpoint, bn_capability::FORK_RECOGNISED, true);
+                }
+            }
+            TrackerOutcome::Error => trackers[idx].record_error(),
+            TrackerOutcome::Incapable { unrecognised_fork } => {
+                trackers[idx].record_error();
+                trackers[idx].mark_incapable(op_name);
+                let endpoint = trackers[idx].endpoint().to_string();
+                if op_name == bn_capability::PRODUCE_BLOCK_V4 {
+                    publish_capability(&endpoint, bn_capability::PRODUCE_BLOCK_V4, false);
+                }
+                if unrecognised_fork {
+                    trackers[idx].mark_incapable(bn_capability::FORK_RECOGNISED);
+                    publish_capability(&endpoint, bn_capability::FORK_RECOGNISED, false);
+                }
+            }
+        }
+    }
+}
+
+/// Log a partial broadcast failure, including failures the drain records
+/// after the first `Ok` has already been returned.
+pub(crate) fn log_partial_failure_endpoints(
+    op_name: &str,
+    successes: usize,
+    failures: &[(String, Duration)],
+) {
+    if successes == 0 || failures.is_empty() {
+        return;
+    }
+    let failed_endpoints: Vec<String> =
+        failures.iter().map(|(endpoint, _)| RedactedUrl(endpoint).to_string()).collect();
+    let failed_latency_ms: Vec<u64> =
+        failures.iter().map(|(_, latency)| latency.as_millis() as u64).collect();
+    warn!(
+        op = op_name,
+        successes,
+        failures = failures.len(),
+        failed_endpoints = ?failed_endpoints,
+        failed_latency_ms = ?failed_latency_ms,
+        "partial broadcast failure"
+    );
 }
 
 impl BnManager {
@@ -379,8 +476,11 @@ impl BnManager {
     /// Sets per-operation timeouts for BN API calls.
     ///
     /// Query-first sites turn the matching field into an absolute deadline
-    /// before their first await and bound each BN attempt inside it. Broadcast,
-    /// best-of, and `produce_block_v4` keep an outer `tokio::time::timeout`.
+    /// before their first await and bound each BN attempt inside it. Broadcast
+    /// bounds each BN attempt at the same budget and returns on the first `Ok`;
+    /// the outer timeout is a backstop at that budget plus 250 ms. With no
+    /// budget configured, broadcast attempts stay unbounded. Best-of and
+    /// `produce_block_v4` keep an outer `tokio::time::timeout`.
     /// Exceeding the budget returns `BeaconError::OperationTimeout`.
     pub fn with_operation_timeouts(mut self, timeouts: OperationTimeouts) -> Self {
         self.operation_timeouts = Some(timeouts);
@@ -408,59 +508,15 @@ impl BnManager {
         self.operation_timeouts.as_ref().map(f)
     }
 
-    /// Apply health-tracker updates. Each call takes the write lock once.
-    ///
-    /// Sequential strategies flush per attempt so cancellation cannot drop
-    /// earlier failures. [`Self::query_best_inner`] still batches at the end
-    /// of the round.
-    async fn record_outcomes(&self, op_name: &str, outcomes: &[(usize, TrackerOutcome)]) {
-        if outcomes.is_empty() {
-            return;
-        }
-        let observe_latency = crate::metrics::is_proposer_block_production_op(op_name);
-        let mut trackers = self.health_trackers.write().await;
-        for &(idx, outcome) in outcomes {
-            match outcome {
-                TrackerOutcome::Success(latency) => {
-                    if observe_latency {
-                        crate::metrics::observe_proposer_bn_latency(
-                            trackers[idx].endpoint(),
-                            latency,
-                        );
-                    }
-                    trackers[idx].record_success(latency);
-                    trackers[idx].mark_capable(op_name);
-                    if op_name == bn_capability::PRODUCE_BLOCK_V4 {
-                        let endpoint = trackers[idx].endpoint().to_string();
-                        trackers[idx].mark_capable(bn_capability::FORK_RECOGNISED);
-                        publish_capability(&endpoint, bn_capability::PRODUCE_BLOCK_V4, true);
-                        publish_capability(&endpoint, bn_capability::FORK_RECOGNISED, true);
-                    }
-                }
-                TrackerOutcome::Error => trackers[idx].record_error(),
-                TrackerOutcome::Incapable { unrecognised_fork } => {
-                    trackers[idx].record_error();
-                    trackers[idx].mark_incapable(op_name);
-                    let endpoint = trackers[idx].endpoint().to_string();
-                    if op_name == bn_capability::PRODUCE_BLOCK_V4 {
-                        publish_capability(&endpoint, bn_capability::PRODUCE_BLOCK_V4, false);
-                    }
-                    if unrecognised_fork {
-                        trackers[idx].mark_incapable(bn_capability::FORK_RECOGNISED);
-                        publish_capability(&endpoint, bn_capability::FORK_RECOGNISED, false);
-                    }
-                }
-            }
-        }
-    }
-
     /// Dispatch a submission via broadcast or query_first based on the topic flag.
     ///
     /// Encapsulates the repeated `if broadcast_topics.X { broadcast } else { query_first }`
-    /// branch. The broadcast arm keeps [`Self::with_op_timeout`]. The query_first
-    /// arm takes an absolute deadline from `timeout` before it awaits (ADR-R03).
-    async fn submit<'s, T, F>(
-        &'s self,
+    /// branch. The broadcast arm keeps [`Self::with_op_timeout`] as a backstop at
+    /// the budget plus 250 ms. The query_first arm takes an absolute deadline
+    /// from `timeout` before it awaits (ADR-R03). `op` clones the client and
+    /// payload into a `'static` future so both arms can share it.
+    async fn submit<T, F>(
+        &self,
         op_name: &str,
         topic_enabled: bool,
         role: BnRole,
@@ -469,15 +525,19 @@ impl BnManager {
         op: F,
     ) -> Result<T, BeaconError>
     where
-        T: Send + 'static,
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+        T: Clone + Send + 'static,
+        F: Fn(&BeaconClient) -> BoxFut<'static, T>,
     {
         if topic_enabled {
-            self.with_op_timeout(op_name, timeout, self.broadcast_with_result(op_name, role, op))
-                .await
+            self.with_op_timeout(
+                op_name,
+                fan_out::broadcast_backstop(timeout),
+                self.broadcast_with_result(op_name, role, timeout, op),
+            )
+            .await
         } else {
             let deadline = timeout.map(|budget| tokio::time::Instant::now() + budget);
-            self.query_first(op_name, role, min_tier, deadline, op).await
+            self.query_first(op_name, role, min_tier, deadline, |client| op(client)).await
         }
     }
 
@@ -807,7 +867,12 @@ impl BnManager {
                 Ok(result) => {
                     let elapsed = start.elapsed();
                     // Earlier failures were recorded before this attempt.
-                    self.record_outcomes(op_name, &[(i, TrackerOutcome::Success(elapsed))]).await;
+                    record_outcomes(
+                        &self.health_trackers,
+                        op_name,
+                        &[(i, TrackerOutcome::Success(elapsed))],
+                    )
+                    .await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -819,7 +884,12 @@ impl BnManager {
                     return Ok((client.endpoint().to_string(), result));
                 }
                 Err(e) => {
-                    self.record_outcomes(op_name, &[(i, error_outcome(op_name, &e))]).await;
+                    record_outcomes(
+                        &self.health_trackers,
+                        op_name,
+                        &[(i, error_outcome(op_name, &e))],
+                    )
+                    .await;
                     if let Some(&next_i) = indices.get(pos + 1) {
                         let next_client = &self.clients[next_i];
                         warn!(
@@ -929,7 +999,12 @@ impl BnManager {
                 Ok(Some(result)) => {
                     let elapsed = start.elapsed();
                     // Earlier failures were recorded before this attempt.
-                    self.record_outcomes(op_name, &[(i, TrackerOutcome::Success(elapsed))]).await;
+                    record_outcomes(
+                        &self.health_trackers,
+                        op_name,
+                        &[(i, TrackerOutcome::Success(elapsed))],
+                    )
+                    .await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -950,7 +1025,12 @@ impl BnManager {
                     );
                 }
                 Err(e) => {
-                    self.record_outcomes(op_name, &[(i, error_outcome(op_name, &e))]).await;
+                    record_outcomes(
+                        &self.health_trackers,
+                        op_name,
+                        &[(i, error_outcome(op_name, &e))],
+                    )
+                    .await;
                     if matches!(e, BeaconError::OperationTimeout { .. }) {
                         let has_next = pos + 1 < indices.len();
                         if !has_next {
@@ -1095,7 +1175,12 @@ impl BnManager {
                 Ok(value) => {
                     let elapsed = start.elapsed();
                     // Earlier failures were recorded before this attempt.
-                    self.record_outcomes(op_name, &[(i, TrackerOutcome::Success(elapsed))]).await;
+                    record_outcomes(
+                        &self.health_trackers,
+                        op_name,
+                        &[(i, TrackerOutcome::Success(elapsed))],
+                    )
+                    .await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -1112,7 +1197,7 @@ impl BnManager {
                     if matches!(outcome, TrackerOutcome::Incapable { .. }) {
                         incapable_count += 1;
                     }
-                    self.record_outcomes(op_name, &[(i, outcome)]).await;
+                    record_outcomes(&self.health_trackers, op_name, &[(i, outcome)]).await;
                     if is_production_failover_error(&e) {
                         if let Some(&next_i) = indices.get(pos + 1) {
                             warn!(
@@ -1214,8 +1299,12 @@ impl BnManager {
             let start = tokio::time::Instant::now();
             match op(client).instrument(attempt_span).await {
                 Ok(result) => {
-                    self.record_outcomes(op_name, &[(i, TrackerOutcome::Success(start.elapsed()))])
-                        .await;
+                    record_outcomes(
+                        &self.health_trackers,
+                        op_name,
+                        &[(i, TrackerOutcome::Success(start.elapsed()))],
+                    )
+                    .await;
                     debug!(
                         op = op_name,
                         bn_index = i,
@@ -1225,7 +1314,12 @@ impl BnManager {
                     return Ok(result);
                 }
                 Err(e) => {
-                    self.record_outcomes(op_name, &[(i, error_outcome(op_name, &e))]).await;
+                    record_outcomes(
+                        &self.health_trackers,
+                        op_name,
+                        &[(i, error_outcome(op_name, &e))],
+                    )
+                    .await;
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -1293,7 +1387,7 @@ impl BnManager {
             }
         }
 
-        self.record_outcomes(op_name, &outcomes).await;
+        record_outcomes(&self.health_trackers, op_name, &outcomes).await;
 
         match best {
             Some((i, value)) => {
@@ -1342,7 +1436,7 @@ impl BnManager {
                 Ok(result) => {
                     let elapsed = start.elapsed();
                     outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    self.record_outcomes(op_name, &outcomes).await;
+                    record_outcomes(&self.health_trackers, op_name, &outcomes).await;
                     warn!(
                         op = op_name,
                         bn_index = i,
@@ -1365,178 +1459,107 @@ impl BnManager {
             }
         }
 
-        self.record_outcomes(op_name, &outcomes).await;
+        record_outcomes(&self.health_trackers, op_name, &outcomes).await;
         None
     }
 
     /// Broadcast an operation to role-matching BNs (**regardless of sync / health
-    /// tier / health-score**). Returns first success. If all fail, returns the last
-    /// error. If no BN matches the role and no `All`-role BN exists, returns
-    /// [`BeaconError::NoEligibleBn`] without publishing (fail-closed).
+    /// tier / health-score**). Returns on the first `Ok`. If all fail, returns
+    /// the last error. If no BN matches the role and no `All`-role BN exists,
+    /// returns [`BeaconError::NoEligibleBn`] without publishing (fail-closed).
     ///
-    /// Role: yes. Tier: no. Health-score prune: no. Selection is
+    /// `budget` bounds each attempt. `None` leaves attempts unbounded. Role:
+    /// yes. Tier: no. Health-score prune: no. Selection is
     /// [`Self::role_matching_indices`] so All-fallback is shared with the query
     /// path but the query last-resort (every client) and the health-score cut
     /// are not. `tried` is the filtered count.
-    async fn broadcast<'s, F>(
-        &'s self,
+    async fn broadcast<F>(
+        &self,
         op_name: &str,
         role: BnRole,
+        budget: Option<Duration>,
         op: F,
     ) -> Result<(), BeaconError>
     where
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, ()>,
+        F: Fn(&BeaconClient) -> BoxFut<'static, ()>,
     {
-        let strategy_span = tracing::info_span!(
-            "bn.strategy.broadcast",
-            strategy = "broadcast",
-            tried = tracing::field::Empty,
-        );
-        async {
-            let broadcast = self.broadcast_inner(op_name, role, &op).await;
-            Self::log_partial_failure(op_name, &broadcast);
-            if broadcast.outcomes.is_empty() {
-                return Err(BeaconError::NoEligibleBn {
-                    operation: op_name.to_string(),
-                    role: role.to_string(),
-                });
-            }
-            broadcast.into_result()
-        }
-        .instrument(strategy_span)
-        .await
+        self.broadcast_with_result(op_name, role, budget, op).await.map(|_| ())
     }
 
-    async fn broadcast_inner<'s, T, F>(
-        &'s self,
-        op_name: &str,
-        role: BnRole,
-        op: &F,
-    ) -> BroadcastResult<T>
+    fn fan_attempts<T, F>(&self, role: BnRole, op: &F) -> Vec<BnAttempt<T>>
     where
-        T: Send + 'static,
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+        F: Fn(&BeaconClient) -> BoxFut<'static, T>,
     {
-        let indices = self.role_matching_indices(role);
-        if indices.is_empty() {
-            warn!(
-                op = op_name,
-                role = %role,
-                "no BNs eligible for broadcast; not publishing to off-role clients"
-            );
-        }
-        tracing::Span::current().record("tried", indices.len());
-
-        let mut futs: Vec<IndexedTimedResultFut<'_, T>> = Vec::with_capacity(indices.len());
-
-        for i in indices {
-            let client = &self.clients[i];
-            let endpoint = client.endpoint().to_string();
-            let fut = op(client);
-            let attempt_span = tracing::info_span!(
-                "bn.attempt",
-                bn_url = %RedactedUrl(client.endpoint()),
-            );
-            futs.push(Box::pin(
-                async move {
-                    let start = tokio::time::Instant::now();
-                    let result = fut.await;
-                    let elapsed = start.elapsed();
-                    (i, endpoint, result, elapsed)
-                }
-                .instrument(attempt_span),
-            ));
-        }
-
-        let results = join_all(futs).await;
-
-        let mut health_outcomes = Vec::with_capacity(results.len());
-        let mut outcomes = Vec::with_capacity(results.len());
-        for (i, endpoint, result, elapsed) in results {
-            match &result {
-                Ok(_) => {
-                    health_outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    // Per-BN broadcast success scales with node count, so it
-                    // is `trace` (the per-item loop rule), not `debug`.
-                    trace!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = %RedactedUrl(&endpoint),
-                        "broadcast succeeded on BN"
-                    );
-                }
-                Err(e) => {
-                    health_outcomes.push((i, error_outcome(op_name, e)));
-                    warn!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = %RedactedUrl(&endpoint),
-                        error = %e,
-                        "broadcast failed on BN"
-                    );
-                }
-            }
-            outcomes.push(BnOutcome { endpoint, result, latency: elapsed });
-        }
-        self.record_outcomes(op_name, &health_outcomes).await;
-
-        BroadcastResult { outcomes }
+        self.role_matching_indices(role)
+            .into_iter()
+            .map(|index| {
+                let client = &self.clients[index];
+                BnAttempt { index, endpoint: client.endpoint().to_string(), fut: op(client) }
+            })
+            .collect()
     }
 
     fn log_partial_failure<T>(op_name: &str, broadcast: &BroadcastResult<T>) {
-        if broadcast.any_success() && !broadcast.all_success() {
-            let (ok, fail) = broadcast.counts();
-            // Redact each endpoint — a raw `Vec<&str>` Debug-printed here would
-            // leak `user:pass@` credentials from the configured BN URLs.
-            let failed_endpoints: Vec<String> =
-                broadcast.failures().into_iter().map(|(e, _)| RedactedUrl(e).to_string()).collect();
-            let failed_latency_ms: Vec<u64> = broadcast
-                .outcomes
-                .iter()
-                .filter(|o| o.result.is_err())
-                .map(|o| o.latency.as_millis() as u64)
-                .collect();
-            warn!(
-                op = op_name,
-                successes = ok,
-                failures = fail,
-                failed_endpoints = ?failed_endpoints,
-                failed_latency_ms = ?failed_latency_ms,
-                "partial broadcast failure"
-            );
+        if !broadcast.any_success() || broadcast.all_success() {
+            return;
         }
+        let (successes, _) = broadcast.counts();
+        // `failures()` is the credential-safe view of which endpoints erred.
+        // Latencies stay on the outcomes; both are redacted at the log site.
+        let erred: std::collections::HashSet<&str> =
+            broadcast.failures().into_iter().map(|(endpoint, _)| endpoint).collect();
+        let failures: Vec<(String, Duration)> = broadcast
+            .outcomes
+            .iter()
+            .filter(|outcome| erred.contains(outcome.endpoint.as_str()))
+            .map(|outcome| (outcome.endpoint.clone(), outcome.latency))
+            .collect();
+        log_partial_failure_endpoints(op_name, successes, &failures);
     }
 
     /// Broadcast an operation that returns a non-unit result.
-    /// Returns first success. If all fail, returns the last error.
-    async fn broadcast_with_result<'s, T, F>(
-        &'s self,
+    /// Returns the first `Ok`. If all fail, returns the last error.
+    async fn broadcast_with_result<T, F>(
+        &self,
         op_name: &str,
         role: BnRole,
+        budget: Option<Duration>,
         op: F,
     ) -> Result<T, BeaconError>
     where
-        T: Send + 'static,
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+        T: Clone + Send + 'static,
+        F: Fn(&BeaconClient) -> BoxFut<'static, T>,
     {
-        self.broadcast_with_result_attributed(op_name, role, op)
-            .await
-            .map(|(_endpoint, value)| value)
+        self.broadcast_with_result_attributed(
+            op_name,
+            role,
+            budget,
+            fan_out::PublishPolicy::any_ok(),
+            op,
+        )
+        .await
+        .map(|(_endpoint, value)| value)
     }
 
-    /// [`Self::broadcast_with_result`] plus the endpoint of the first `Ok`.
+    /// [`Self::broadcast_with_result`] plus the endpoint of the kept `Ok`.
     ///
-    /// No cross-BN merge and no extra retry. A partial failure is `Ok`, so it
-    /// is the result even when a later node accepted the whole batch.
-    async fn broadcast_with_result_attributed<'s, T, F>(
-        &'s self,
+    /// The endpoint is whichever role-matching beacon node produced that
+    /// result, not the lowest index. No cross-BN merge and no extra retry.
+    /// A plain `Ok` returns on the first success. An attestation submit treats
+    /// only a full acceptance as complete: a 400 that lists failed attestations
+    /// waits for another node's full acceptance until the attempts finish, and
+    /// the partial with the fewest failures is kept if none arrives.
+    async fn broadcast_with_result_attributed<T, F>(
+        &self,
         op_name: &str,
         role: BnRole,
+        budget: Option<Duration>,
+        policy: fan_out::PublishPolicy<T>,
         op: F,
     ) -> Result<(String, T), BeaconError>
     where
-        T: Send + 'static,
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+        T: Clone + Send + 'static,
+        F: Fn(&BeaconClient) -> BoxFut<'static, T>,
     {
         let strategy_span = tracing::info_span!(
             "bn.strategy.broadcast",
@@ -1544,19 +1567,54 @@ impl BnManager {
             tried = tracing::field::Empty,
         );
         async {
-            let broadcast = self.broadcast_inner(op_name, role, &op).await;
-            Self::log_partial_failure(op_name, &broadcast);
-            if broadcast.outcomes.is_empty() {
-                return Err(BeaconError::NoEligibleBn {
-                    operation: op_name.to_string(),
-                    role: role.to_string(),
-                });
-            }
-            broadcast.into_result_attributed()
+            let attempts = self.fan_attempts(role, &op);
+            tracing::Span::current().record("tried", attempts.len());
+            fan_out::first_ok_with(
+                op_name,
+                &role.to_string(),
+                attempts,
+                budget,
+                &self.health_trackers,
+                fan_out::global_drain_pool(),
+                policy,
+            )
+            .await
         }
         .instrument(strategy_span)
         .await
     }
+
+    /// Every role-matching BN, each bounded by `budget`. Merges use this so a
+    /// late `Ok` is not dropped when an earlier BN already answered.
+    async fn broadcast_all<T, F>(
+        &self,
+        op_name: &str,
+        role: BnRole,
+        budget: Option<Duration>,
+        op: F,
+    ) -> Result<BroadcastResult<T>, BeaconError>
+    where
+        T: Send + 'static,
+        F: Fn(&BeaconClient) -> BoxFut<'static, T>,
+    {
+        let attempts = self.fan_attempts(role, &op);
+        tracing::Span::current().record("tried", attempts.len());
+        fan_out::all(op_name, &role.to_string(), attempts, budget, &self.health_trackers).await
+    }
+}
+
+/// Clone the beacon client and an `Arc` payload into a `'static` attempt.
+///
+/// The drain outlives the call, so the attempt cannot borrow the request.
+macro_rules! owned_attempt {
+    ($payload:expr, |$client:ident, $payload_ident:ident| $body:expr) => {{
+        let $payload_ident = std::sync::Arc::new($payload);
+        move |$client: &BeaconClient| {
+            let $client = $client.clone();
+            let $payload_ident = std::sync::Arc::clone(&$payload_ident);
+            Box::pin(async move { $body })
+        }
+    }};
 }
 
 /// Compares two `ProduceBlockResponse` values by execution payload value.
@@ -1910,7 +1968,16 @@ impl BlockProducer for BnManager {
             BnRole::Submission,
             HealthTier::LargeLag,
             self.op_timeout(|t| t.block_publication),
-            |c| Box::pin(c.publish_block(signed_block, consensus_version, builder_url)),
+            owned_attempt!(
+                (
+                    signed_block.clone(),
+                    consensus_version.to_owned(),
+                    builder_url.map(str::to_owned)
+                ),
+                |client, payload| client
+                    .publish_block(&payload.0, &payload.1, payload.2.as_deref())
+                    .await
+            ),
         )
         .await
     }
@@ -1927,7 +1994,12 @@ impl BlockProducer for BnManager {
             BnRole::Submission,
             HealthTier::LargeLag,
             self.op_timeout(|t| t.block_publication),
-            |c| Box::pin(c.publish_block_contents(contents, consensus_version, builder_url)),
+            owned_attempt!(
+                (contents.clone(), consensus_version.to_owned(), builder_url.map(str::to_owned)),
+                |client, payload| client
+                    .publish_block_contents(&payload.0, &payload.1, payload.2.as_deref())
+                    .await
+            ),
         )
         .await
     }
@@ -1943,7 +2015,10 @@ impl BlockProducer for BnManager {
             BnRole::Submission,
             HealthTier::LargeLag,
             self.op_timeout(|t| t.block_publication),
-            |c| Box::pin(c.publish_blinded_block(signed_blinded_block, consensus_version)),
+            owned_attempt!(
+                (signed_blinded_block.clone(), consensus_version.to_owned()),
+                |client, payload| client.publish_blinded_block(&payload.0, &payload.1).await
+            ),
         )
         .await
     }
@@ -1956,17 +2031,31 @@ impl BlockProducer for BnManager {
         builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
         if self.broadcast_topics.blocks {
+            let budget = self.op_timeout(|t| t.block_publication);
             self.with_op_timeout(
                 "publish_block_ssz",
-                self.op_timeout(|t| t.block_publication),
-                self.broadcast("publish_block_ssz", BnRole::Submission, |c| {
-                    Box::pin(c.publish_block_ssz(
-                        ssz_bytes,
-                        consensus_version,
-                        is_blinded,
-                        builder_url,
-                    ))
-                }),
+                fan_out::broadcast_backstop(budget),
+                self.broadcast(
+                    "publish_block_ssz",
+                    BnRole::Submission,
+                    budget,
+                    owned_attempt!(
+                        (
+                            ssz_bytes.to_vec(),
+                            consensus_version.to_owned(),
+                            is_blinded,
+                            builder_url.map(str::to_owned),
+                        ),
+                        |client, payload| client
+                            .publish_block_ssz(
+                                &payload.0,
+                                &payload.1,
+                                payload.2,
+                                payload.3.as_deref()
+                            )
+                            .await
+                    ),
+                ),
             )
             .await
         } else {
@@ -2005,15 +2094,24 @@ impl BlockProducer for BnManager {
             BnRole::Submission,
             HealthTier::LargeLag,
             self.op_timeout(|t| t.block_publication),
-            |c| {
-                Box::pin(c.publish_execution_payload_envelope(
-                    signed_envelope,
-                    blobs,
-                    kzg_proofs,
-                    consensus_version,
-                    broadcast_validation,
-                ))
-            },
+            owned_attempt!(
+                (
+                    signed_envelope.clone(),
+                    blobs.clone(),
+                    kzg_proofs.clone(),
+                    consensus_version.to_owned(),
+                    broadcast_validation.map(str::to_owned),
+                ),
+                |client, payload| client
+                    .publish_execution_payload_envelope(
+                        &payload.0,
+                        &payload.1,
+                        &payload.2,
+                        &payload.3,
+                        payload.4.as_deref(),
+                    )
+                    .await
+            ),
         )
         .await
     }
@@ -2024,12 +2122,18 @@ impl BlockProducer for BnManager {
         &self,
         preparations: &[ProposerPreparation],
     ) -> Result<(), BeaconError> {
+        let budget = self.op_timeout(|t| t.preparation);
         self.with_op_timeout(
             "prepare_beacon_proposer",
-            self.op_timeout(|t| t.preparation),
-            self.broadcast("prepare_beacon_proposer", BnRole::Proposal, |c| {
-                Box::pin(c.prepare_beacon_proposer(preparations))
-            }),
+            fan_out::broadcast_backstop(budget),
+            self.broadcast(
+                "prepare_beacon_proposer",
+                BnRole::Proposal,
+                budget,
+                owned_attempt!(preparations.to_vec(), |client, payload| client
+                    .prepare_beacon_proposer(payload.as_slice())
+                    .await),
+            ),
         )
         .await
     }
@@ -2040,12 +2144,18 @@ impl BlockProducer for BnManager {
         &self,
         registrations: &[SignedValidatorRegistration],
     ) -> Result<(), BeaconError> {
+        let budget = self.op_timeout(|t| t.preparation);
         self.with_op_timeout(
             "register_validators",
-            self.op_timeout(|t| t.preparation),
-            self.broadcast("register_validators", BnRole::Proposal, |c| {
-                Box::pin(c.register_validators(registrations))
-            }),
+            fan_out::broadcast_backstop(budget),
+            self.broadcast(
+                "register_validators",
+                BnRole::Proposal,
+                budget,
+                owned_attempt!(registrations.to_vec(), |client, payload| client
+                    .register_validators(payload.as_slice())
+                    .await),
+            ),
         )
         .await
     }
@@ -2054,12 +2164,18 @@ impl BlockProducer for BnManager {
         &self,
         preferences: &[SignedProposerPreferences],
     ) -> Result<(), BeaconError> {
+        let budget = self.op_timeout(|t| t.preparation);
         self.with_op_timeout(
             "submit_proposer_preferences",
-            self.op_timeout(|t| t.preparation),
-            self.broadcast("submit_proposer_preferences", BnRole::Proposal, |c| {
-                Box::pin(c.submit_proposer_preferences(preferences))
-            }),
+            fan_out::broadcast_backstop(budget),
+            self.broadcast(
+                "submit_proposer_preferences",
+                BnRole::Proposal,
+                budget,
+                owned_attempt!(preferences.to_vec(), |client, payload| client
+                    .submit_proposer_preferences(payload.as_slice())
+                    .await),
+            ),
         )
         .await
     }
@@ -2068,9 +2184,10 @@ impl BlockProducer for BnManager {
         &self,
         entries: &[BuilderPreferencesEntry],
     ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        let budget = self.op_timeout(|t| t.preparation);
         self.with_op_timeout(
             "submit_builder_preferences",
-            self.op_timeout(|t| t.preparation),
+            fan_out::broadcast_backstop(budget),
             async {
                 let strategy_span = tracing::info_span!(
                     "bn.strategy.broadcast",
@@ -2079,19 +2196,16 @@ impl BlockProducer for BnManager {
                 );
                 async {
                     let broadcast = self
-                        .broadcast_inner(
+                        .broadcast_all(
                             "submit_builder_preferences",
                             BnRole::Proposal,
-                            &|c: &BeaconClient| Box::pin(c.submit_builder_preferences(entries)),
+                            budget,
+                            owned_attempt!(entries.to_vec(), |client, payload| client
+                                .submit_builder_preferences(payload.as_slice())
+                                .await),
                         )
-                        .await;
+                        .await?;
                     Self::log_partial_failure("submit_builder_preferences", &broadcast);
-                    if broadcast.outcomes.is_empty() {
-                        return Err(BeaconError::NoEligibleBn {
-                            operation: "submit_builder_preferences".to_string(),
-                            role: BnRole::Proposal.to_string(),
-                        });
-                    }
                     merge_builder_preferences_broadcast(broadcast)
                 }
                 .instrument(strategy_span)
@@ -2139,13 +2253,18 @@ impl AttestationApi for BnManager {
         attestations: &VersionedAttestation,
     ) -> Result<(Option<String>, SubmitAttestationResult), BeaconError> {
         if self.broadcast_topics.attestations {
+            let budget = self.op_timeout(|t| t.attestation_submit);
             self.with_op_timeout(
                 "submit_attestation",
-                self.op_timeout(|t| t.attestation_submit),
+                fan_out::broadcast_backstop(budget),
                 self.broadcast_with_result_attributed(
                     "submit_attestation",
                     BnRole::Attestation,
-                    |c| Box::pin(c.submit_attestation(attestations)),
+                    budget,
+                    fan_out::PublishPolicy::attestation(),
+                    owned_attempt!(attestations.clone(), |client, payload| client
+                        .submit_attestation(payload.as_ref())
+                        .await),
                 ),
             )
             .await
@@ -2199,12 +2318,18 @@ impl AttestationApi for BnManager {
         &self,
         proofs: &VersionedSignedAggregateAndProof,
     ) -> Result<(), BeaconError> {
+        let budget = self.op_timeout(|t| t.aggregate_submit);
         self.with_op_timeout(
             "submit_aggregate_and_proofs",
-            self.op_timeout(|t| t.aggregate_submit),
-            self.broadcast("submit_aggregate_and_proofs", BnRole::Aggregation, |c| {
-                Box::pin(c.submit_aggregate_and_proofs(proofs))
-            }),
+            fan_out::broadcast_backstop(budget),
+            self.broadcast(
+                "submit_aggregate_and_proofs",
+                BnRole::Aggregation,
+                budget,
+                owned_attempt!(proofs.clone(), |client, payload| client
+                    .submit_aggregate_and_proofs(payload.as_ref())
+                    .await),
+            ),
         )
         .await
     }
@@ -2221,7 +2346,9 @@ impl AttestationApi for BnManager {
             BnRole::Submission,
             HealthTier::LargeLag,
             self.op_timeout(|t| t.preparation),
-            |c| Box::pin(c.submit_beacon_committee_subscriptions(subscriptions)),
+            owned_attempt!(subscriptions.to_vec(), |client, payload| client
+                .submit_beacon_committee_subscriptions(payload.as_slice())
+                .await),
         )
         .await
     }
@@ -2251,12 +2378,18 @@ impl PayloadAttestationApi for BnManager {
         messages: &[PayloadAttestationMessage],
     ) -> Result<(), BeaconError> {
         if self.broadcast_topics.attestations {
+            let budget = self.op_timeout(|t| t.attestation_submit);
             self.with_op_timeout(
                 "submit_payload_attestations",
-                self.op_timeout(|t| t.attestation_submit),
-                self.broadcast("submit_payload_attestations", BnRole::Attestation, |c| {
-                    Box::pin(c.submit_payload_attestations(messages))
-                }),
+                fan_out::broadcast_backstop(budget),
+                self.broadcast(
+                    "submit_payload_attestations",
+                    BnRole::Attestation,
+                    budget,
+                    owned_attempt!(messages.to_vec(), |client, payload| client
+                        .submit_payload_attestations(payload.as_slice())
+                        .await),
+                ),
             )
             .await
         } else {
@@ -2289,7 +2422,9 @@ impl SyncCommitteeApi for BnManager {
             BnRole::SyncCommittee,
             HealthTier::SmallLag,
             self.op_timeout(|t| t.sync_message),
-            |c| Box::pin(c.submit_sync_committee_messages(messages)),
+            owned_attempt!(messages.to_vec(), |client, payload| client
+                .submit_sync_committee_messages(payload.as_slice())
+                .await),
         )
         .await
     }
@@ -2323,12 +2458,18 @@ impl SyncCommitteeApi for BnManager {
         &self,
         proofs: &[SignedContributionAndProof],
     ) -> Result<(), BeaconError> {
+        let budget = self.op_timeout(|t| t.sync_contribution);
         self.with_op_timeout(
             "submit_contribution_and_proofs",
-            self.op_timeout(|t| t.sync_contribution),
-            self.broadcast("submit_contribution_and_proofs", BnRole::SyncCommittee, |c| {
-                Box::pin(c.submit_contribution_and_proofs(proofs))
-            }),
+            fan_out::broadcast_backstop(budget),
+            self.broadcast(
+                "submit_contribution_and_proofs",
+                BnRole::SyncCommittee,
+                budget,
+                owned_attempt!(proofs.to_vec(), |client, payload| client
+                    .submit_contribution_and_proofs(payload.as_slice())
+                    .await),
+            ),
         )
         .await
     }
@@ -2358,17 +2499,16 @@ impl LivenessApi for BnManager {
         validator_indices: &[String],
     ) -> Result<ValidatorLivenessResponse, BeaconError> {
         let broadcast = self
-            .broadcast_inner("post_validator_liveness_merged", BnRole::All, &|c| {
-                Box::pin(c.post_validator_liveness(epoch, validator_indices))
-            })
-            .await;
+            .broadcast_all(
+                "post_validator_liveness_merged",
+                BnRole::All,
+                None,
+                owned_attempt!((epoch, validator_indices.to_vec()), |client, payload| client
+                    .post_validator_liveness(payload.0, &payload.1)
+                    .await),
+            )
+            .await?;
         Self::log_partial_failure("post_validator_liveness_merged", &broadcast);
-        if broadcast.outcomes.is_empty() {
-            return Err(BeaconError::NoEligibleBn {
-                operation: "post_validator_liveness_merged".to_string(),
-                role: BnRole::All.to_string(),
-            });
-        }
         merge_liveness_broadcast(broadcast)
     }
 }
@@ -2594,6 +2734,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::broadcast::BnOutcome;
     use crate::types::bn_capability;
 
     /// Guard: the passthrough macro list must name every role-trait method.
@@ -3983,8 +4124,27 @@ mod tests {
             .publish_block_contents(&sample_block_contents(), "electra", None)
             .await
             .expect("broadcast publish_block_contents");
-        assert_eq!(bn1.received_requests().await.unwrap().len(), 1);
-        assert_eq!(bn2.received_requests().await.unwrap().len(), 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            fn count_block_posts(requests: &[wiremock::Request]) -> usize {
+                requests
+                    .iter()
+                    .filter(|req| {
+                        req.method.as_str() == "POST" && req.url.path() == "/eth/v2/beacon/blocks"
+                    })
+                    .count()
+            }
+            let n1 = count_block_posts(&bn1.received_requests().await.expect("bn1 requests"));
+            let n2 = count_block_posts(&bn2.received_requests().await.expect("bn2 requests"));
+            if n1 >= 1 && n2 >= 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for both block publishes, saw bn1={n1} bn2={n2}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     /// Hanging BN, blocks topic off so `query_first` owns the deadline.

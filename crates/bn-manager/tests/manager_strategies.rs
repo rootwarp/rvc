@@ -21,11 +21,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use rvc_bn_manager::metrics::{RVC_BN_CAPABILITY_STATE, RVC_PROPOSER_BN_LATENCY_MS};
 use rvc_bn_manager::types::bn_capability;
 use rvc_bn_manager::{
-    AttestationApi, BeaconError, BeaconNodeClient, BlockProducer, BnManager, BnManagerConfig,
-    BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, DutiesProvider, LivenessApi, NodeStatusApi,
-    OperationTimeouts, PayloadAttestationApi, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SubmitAttestationResult, SyncCommitteeApi, VersionedAttestation,
-    VersionedSignedAggregateAndProof,
+    AttestationApi, AttestationData, BeaconError, BeaconNodeClient, BlockProducer, BnManager,
+    BnManagerConfig, BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, Checkpoint, DutiesProvider,
+    LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi, Propagator,
+    SignedBeaconBlock, SignedBlindedBeaconBlock, SingleAttestation, SubmitAttestationResult,
+    SyncCommitteeApi, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
 
 // -- Helper --
@@ -38,6 +38,48 @@ fn make_manager(endpoint: &str) -> BnManager {
 fn make_multi_manager(endpoints: &[&str]) -> BnManager {
     let config = BnManagerConfig::new(endpoints.iter().map(|e| e.to_string()).collect());
     BnManager::new(config).unwrap()
+}
+
+/// A peer's publish can arrive on the drain after the call returns.
+///
+/// Match method and path. A prior `GET /eth/v1/node/syncing` must not satisfy
+/// a wait for the publish.
+async fn poll_received(server: &MockServer, method: &str, path: &str, n: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let requests = server.received_requests().await.expect("received_requests");
+        let got = requests
+            .iter()
+            .filter(|req| req.method.as_str() == method && req.url.path() == path)
+            .count();
+        if got >= n {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {n} {method} {path}, saw {got}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Broadcast health is recorded by the drain, which can finish after the call returns.
+async fn poll_broadcast_health(
+    manager: &BnManager,
+    pred: impl Fn(&[rvc_bn_manager::BnHealthScore]) -> bool,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let scores = manager.health_scores().await;
+        if pred(&scores) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for the broadcast drain to record health: {scores:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 const GENESIS_RESPONSE: &str = r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0xabc","genesis_fork_version":"0x00000000"}}"#;
@@ -703,6 +745,8 @@ async fn test_submit_payload_attestations_failover() {
     let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
     let result = manager.submit_payload_attestations(&[]).await;
     assert!(result.is_ok(), "broadcast any-success must succeed: {result:?}");
+    poll_received(&primary, "POST", "/eth/v1/beacon/pool/payload_attestations", 1).await;
+    poll_received(&secondary, "POST", "/eth/v1/beacon/pool/payload_attestations", 1).await;
 }
 
 /// ARCH-P1-13 / ARCH-3n: fail-safe OR-merge — any BN reporting live wins.
@@ -745,6 +789,47 @@ async fn test_merged_liveness_reports_live_when_any_bn_says_live_fail_safe() {
         .find(|v| v.index == "1")
         .expect("merged response must include index 1");
     assert!(entry.is_live, "fail-safe: any BN reporting live must win over a not-live peer");
+}
+
+/// A later BN that reports live after another BN's 200 still wins the merge.
+/// `first_ok` would return the fast not-live answer and drop this report.
+#[tokio::test]
+async fn merged_liveness_waits_for_a_bn_that_reports_live_after_a_200() {
+    let primary = MockServer::start().await;
+    let secondary = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"index":"1","is_live":false}]}"#),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/validator/liveness/42"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"index":"1","is_live":true}]}"#)
+                .set_delay(Duration::from_millis(150)),
+        )
+        .expect(1)
+        .mount(&secondary)
+        .await;
+
+    let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    let indices = vec!["1".to_string()];
+    let result = manager.post_validator_liveness_merged(42, &indices).await;
+    assert!(result.is_ok(), "merge must wait for every BN: {result:?}");
+    let entry = result
+        .unwrap()
+        .data
+        .into_iter()
+        .find(|v| v.index == "1")
+        .expect("merged response must include index 1");
+    assert!(entry.is_live, "a late is_live=true must still win the OR-merge");
 }
 
 /// An erroring BN contributes nothing (not live, not not-live).
@@ -1899,6 +1984,8 @@ async fn test_multi_broadcast_sends_to_all_bns() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.prepare_beacon_proposer(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
 }
 
 #[tokio::test]
@@ -1925,6 +2012,8 @@ async fn test_multi_broadcast_succeeds_if_one_bn_ok() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.prepare_beacon_proposer(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
 }
 
 #[tokio::test]
@@ -1973,6 +2062,8 @@ async fn test_multi_broadcast_sync_messages() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.submit_sync_committee_messages(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/beacon/pool/sync_committees", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/beacon/pool/sync_committees", 1).await;
 }
 
 #[tokio::test]
@@ -1998,6 +2089,8 @@ async fn test_multi_broadcast_aggregate_proofs() {
     let proofs = VersionedSignedAggregateAndProof::PreElectra(vec![]);
     let result = manager.submit_aggregate_and_proofs(&proofs).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/aggregate_and_proofs", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/aggregate_and_proofs", 1).await;
 }
 
 #[tokio::test]
@@ -2022,6 +2115,8 @@ async fn test_multi_broadcast_committee_subscriptions() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.submit_beacon_committee_subscriptions(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
 }
 
 #[tokio::test]
@@ -2046,6 +2141,8 @@ async fn test_multi_broadcast_contribution_proofs() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let result = manager.submit_contribution_and_proofs(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/contribution_and_proofs", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/contribution_and_proofs", 1).await;
 }
 
 // ===================================================================
@@ -2262,6 +2359,8 @@ async fn test_sync_broadcast_sends_to_all_regardless_of_sync_status() {
 
     let result = manager.prepare_beacon_proposer(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
 }
 
 #[tokio::test]
@@ -2460,6 +2559,10 @@ async fn test_health_scores_tracked_in_broadcast() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let _ = manager.prepare_beacon_proposer(&[]).await;
 
+    poll_broadcast_health(&manager, |scores| {
+        scores[0].error_rate == 0.0 && scores[0].score > 0.8 && scores[1].error_rate == 1.0
+    })
+    .await;
     let scores = manager.health_scores().await;
     // BN1 succeeded
     assert_eq!(scores[0].error_rate, 0.0);
@@ -3231,6 +3334,8 @@ async fn test_broadcast_partial_failure_still_succeeds() {
     // Overall result should be Ok despite BN1 failing
     let result = manager.prepare_beacon_proposer(&[]).await;
     assert!(result.is_ok());
+    poll_received(&bn1, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
+    poll_received(&bn2, "POST", "/eth/v1/validator/prepare_beacon_proposer", 1).await;
 }
 
 #[tokio::test]
@@ -3282,6 +3387,10 @@ async fn test_broadcast_partial_failure_records_health() {
 
     let _ = manager.prepare_beacon_proposer(&[]).await;
 
+    poll_broadcast_health(&manager, |scores| {
+        scores[0].error_rate == 1.0 && scores[1].error_rate == 0.0 && scores[1].score > 0.8
+    })
+    .await;
     // BN1 should have error recorded, BN2 should have success
     let health = manager.health_trackers().read().await;
     assert!(health[0].score() < health[1].score());
@@ -3444,6 +3553,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.sync_committee = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.submit_sync_committee_messages(&[]).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v1/beacon/pool/sync_committees", 1).await;
+        poll_received(&bn2, "POST", "/eth/v1/beacon/pool/sync_committees", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3482,6 +3593,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.subscriptions = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.submit_beacon_committee_subscriptions(&[]).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
+        poll_received(&bn2, "POST", "/eth/v1/validator/beacon_committee_subscriptions", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3521,6 +3634,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.attestations = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.submit_attestation(&empty_atts).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+        poll_received(&bn2, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3559,6 +3674,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.attestations = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.submit_payload_attestations(&[]).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v1/beacon/pool/payload_attestations", 1).await;
+        poll_received(&bn2, "POST", "/eth/v1/beacon/pool/payload_attestations", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3598,6 +3715,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.blocks = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.publish_block(&signed, "deneb", None).await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v2/beacon/blocks", 1).await;
+        poll_received(&bn2, "POST", "/eth/v2/beacon/blocks", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3637,6 +3756,8 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         config.broadcast_topics.blocks = true;
         let manager = BnManager::new(config).unwrap();
         assert!(manager.publish_blinded_block(&blinded, "deneb").await.is_ok());
+        poll_received(&bn1, "POST", "/eth/v1/beacon/blinded_blocks", 1).await;
+        poll_received(&bn2, "POST", "/eth/v1/beacon/blinded_blocks", 1).await;
     }
     {
         let bn1 = MockServer::start().await;
@@ -3660,15 +3781,16 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
     }
 }
 
-/// First `Ok` wins, including a 400 partial failure. The sibling 200 is not merged in.
+/// A fast 400 partial failure does not win. The slow 200 is kept, so the
+/// propagator reports no per-validator failure and none is marked rejected.
 #[tokio::test]
-async fn submit_attestation_attributed_names_first_ok_bn_without_merging() {
+async fn submit_attestation_attributed_prefers_a_later_complete_success() {
     let bn1 = MockServer::start().await;
     let bn2 = MockServer::start().await;
     let partial = serde_json::json!({
         "code": 400,
         "message": "some failures",
-        "failures": [{ "index": 2, "message": "invalid signature" }]
+        "failures": [{ "index": 0, "message": "invalid signature" }]
     });
     Mock::given(method("POST"))
         .and(path("/eth/v2/beacon/pool/attestations"))
@@ -3678,28 +3800,50 @@ async fn submit_attestation_attributed_names_first_ok_bn_without_merging() {
         .await;
     Mock::given(method("POST"))
         .and(path("/eth/v2/beacon/pool/attestations"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("[]"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string("[]").set_delay(Duration::from_millis(40)),
+        )
         .expect(1)
         .mount(&bn2)
         .await;
 
     let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
     config.broadcast_topics.attestations = true;
-    let manager = BnManager::new(config).unwrap();
-    let (reported_by, result) = manager
-        .submit_attestation_attributed(&VersionedAttestation::Electra(vec![]))
+    let manager = Arc::new(BnManager::new(config).unwrap());
+    let attestation = VersionedAttestation::Electra(vec![SingleAttestation {
+        committee_index: 0,
+        attester_index: 7,
+        data: AttestationData {
+            slot: "1".to_string(),
+            index: "0".to_string(),
+            beacon_block_root: "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+            source: Checkpoint {
+                epoch: "0".to_string(),
+                root: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            },
+            target: Checkpoint {
+                epoch: "1".to_string(),
+                root: "0xcccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                    .to_string(),
+            },
+        },
+        signature: "0x00".to_string(),
+    }]);
+    let outcome = Propagator::new(Arc::clone(&manager))
+        .propagate_indexed(&attestation)
         .await
         .expect("attributed submit");
 
-    assert_eq!(reported_by, Some(bn1.uri()));
-    match result {
-        SubmitAttestationResult::PartialFailure { failures } => {
-            assert_eq!(failures.len(), 1);
-            assert_eq!(failures[0].index, 2);
-            assert_eq!(failures[0].message, "invalid signature");
-        }
-        other => panic!("expected the first Ok partial failure, got {other:?}"),
-    }
+    assert_eq!(outcome.reported_by.as_deref(), Some(bn2.uri().as_str()));
+    assert_eq!(outcome.success_count, 1);
+    assert!(
+        outcome.failures.is_empty(),
+        "a complete success must not mark a validator rejected: {outcome:?}"
+    );
+    poll_received(&bn1, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+    poll_received(&bn2, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
 }
 
 #[tokio::test]
@@ -3848,6 +3992,8 @@ async fn test_broadcast_reaches_only_the_matching_role() {
     let (result, tried) = with_broadcast_tried(manager.submit_attestation(&empty)).await;
     assert!(result.is_ok(), "attestation broadcast must succeed: {result:?}");
     assert_eq!(tried, Some(2), "tried must be the role-filtered count, not clients.len()=3");
+    poll_received(&attestation_bn, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+    poll_received(&all_bn, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
 }
 
 /// Guard on the ARCH-P2-8 narrowing: broadcast is role-filtered, never tier-filtered.
@@ -3888,6 +4034,8 @@ async fn test_broadcast_is_not_tier_filtered() {
     let empty = VersionedAttestation::Electra(vec![]);
     let result = manager.submit_attestation(&empty).await;
     assert!(result.is_ok(), "unsynced BN must still receive the publish: {result:?}");
+    poll_received(&synced, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+    poll_received(&unsynced, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
 }
 
 /// Pins All-role fallback: no Attestation specialist → All-role BN is used.
@@ -3956,6 +4104,8 @@ async fn test_broadcast_is_not_health_score_filtered() {
         result.is_ok(),
         "unhealthy role-matching BN must still receive the publish: {result:?}"
     );
+    poll_received(&healthy, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
+    poll_received(&unhealthy, "POST", "/eth/v2/beacon/pool/attestations", 1).await;
 }
 
 // ===================================================================

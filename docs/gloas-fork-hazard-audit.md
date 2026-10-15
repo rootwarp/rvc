@@ -75,11 +75,11 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/signer/src/lib.rs` 1360 | 1 | — | inherit-intentionally | Pre-Electra aggregate signing fails closed at `>= Gloas` rather than using the legacy decoder RPC. | — |
 | `crates/signer/src/lib.rs` 1435 | 1 | — | inherit-intentionally | Electra aggregate path: open-ended `>= Gloas` fails closed instead of the pre-Electra `SignAggregateAndProof` decoder. | 4.20c |
 | `crates/timing/src/clock.rs` 30 | 1 | — | inherit-intentionally | `DeadlineSchedule::for_fork`: open-ended `>= Gloas` selects the Gloas deadline set so later forks keep those offsets rather than silently reverting to pre-Gloas 3333/6667. | 4.19 |
-| `crates/rvc/src/orchestrator/attestation.rs` 833 | 2 | — | must-bound | Submission-path `SingleAttestation.data.index = "0"` inside `zeroes_committee_index`, not the Electra+ wrapper branch, so Gloas preserves the BN value. | 2.8 |
+| `crates/rvc/src/orchestrator/attestation.rs` 865 | 2 | — | must-bound | Submission-path `SingleAttestation.data.index = "0"` inside `zeroes_committee_index`, not the Electra+ wrapper branch, so Gloas preserves the BN value. | 2.8 |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 988 | 2 | — | test-only | Test applies `index = 0` when local `is_electra`. Follows 2.3 helper. | 2.3 |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1117 | 2 | — | test-only | Pre-Electra path does not assign; the `if is_electra` still contains the assignment. 2.3. | 2.3 |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1146 | 2 | — | test-only | Signing-root fixture zeros index by hand. Not a production guard. | 2.3 |
-| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1154 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 833. | 2.8 |
+| `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 1154 | 2 | — | test-only | Reconstructs submitted `index = "0"` to compare roots. Mirrors attestation.rs 865. | 2.8 |
 | `crates/rvc/src/orchestrator/utils.rs` 146 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the half-open `Electra..Gloas` predicate (2.3 / 2.8). | 2.3 |
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 363 | 2 | — | test-only | Gloas round-trip builds a zeroed index to prove the signing path did not zero it. | — |
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 390 | 2 | — | test-only | Electra/Fulu round-trip expects the submitted index to be zeroed. | — |

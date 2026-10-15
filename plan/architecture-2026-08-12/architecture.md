@@ -170,7 +170,11 @@ in its Context rather than inheriting it.
   and A-7's total from 5 s to **6.5 s**. That is a PRD amendment, not a silent absorption.
   Registration must standardise on `Option<JoinHandle>` (`register_opt`), not the finished-no-op-handle
   idiom at `slashing_monitor.rs:122-123`, so `rvc_tasks_running{task}` is honestly 0 when a feature is
-  disabled.
+  disabled. Broadcast overflow drains in `bn-manager` (`fan_out`, no permit) stay unregistered and
+  are not dropped to free a slot: each one ends at the per-attempt budget, or at the HTTP client
+  timeout when no budget is set. `HEALTH_SAMPLE_CAP` limits health recording, not sends. Their
+  in-flight count is therefore publish rate times that timeout, exported per redacted endpoint as
+  `rvc_bn_broadcast_overflow_drains` (#639). Process shutdown drops those unregistered drains.
 
 ---
 

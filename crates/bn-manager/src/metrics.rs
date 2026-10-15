@@ -3,8 +3,8 @@
 use std::sync::LazyLock;
 
 use metrics::{
-    define_gauge_vec, define_histogram_vec, define_int_counter_vec, define_int_gauge_vec, GaugeVec,
-    HistogramVec, IntCounterVec, IntGaugeVec,
+    define_gauge_vec, define_histogram_vec, define_int_counter, define_int_counter_vec,
+    define_int_gauge_vec, GaugeVec, HistogramVec, IntCounter, IntCounterVec, IntGaugeVec,
 };
 use url::Url;
 
@@ -109,11 +109,47 @@ pub static RVC_BN_CAPABILITY_STATE: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     )
 });
 
+/// Health samples not applied because a success was skipped while the
+/// health-sample cap was full, or because the recorder queue did not accept
+/// the sample.
+///
+/// The publish itself still runs. A full pool still records an error or a
+/// timeout when the queue has room. A full queue drops the sample, including
+/// an error or a timeout, and does not block the attempt. The cap limits
+/// health recording, not sends.
+pub static RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(
+    || {
+        define_int_counter(
+        "rvc_bn_broadcast_drain_health_skipped_total",
+        "Broadcast health samples not recorded because the health-sample cap skipped a success, or because the recorder queue was full. When the queue is full, an error or a timeout sample can be dropped, and that drop is counted. The enqueue does not block the publish. A full pool still records an error or a timeout when the queue has room. The publish still runs",
+    )
+    },
+);
+
+/// In-flight overflow publishes, one series per redacted beacon endpoint.
+///
+/// The 16-permit health-sample cap limits health recording, not sends. A
+/// publish past that cap still runs. The gauge drops when that HTTP call
+/// finishes, before the health sample is queued. The `endpoint` label is
+/// [`endpoint_label`] (`scheme://host:port`, userinfo and path stripped) so
+/// a slow beacon node's backlog is visible. Each publish ends at that
+/// attempt's budget, or at the beacon client's HTTP timeout when no budget
+/// is set.
+pub static RVC_BN_BROADCAST_OVERFLOW_DRAINS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
+    define_int_gauge_vec(
+        "rvc_bn_broadcast_overflow_drains",
+        "In-flight broadcast publishes past the health-sample cap, by redacted endpoint. The gauge drops when the HTTP call finishes, or when that attempt is cancelled or panics. The cap limits health recording, not sends. Each publish ends at the attempt budget, or at the HTTP client timeout when no budget is set",
+        &["endpoint"],
+    )
+});
+
 pub fn init() {
     LazyLock::force(&RVC_ATTESTATIONS_TOTAL);
     LazyLock::force(&RVC_PROPOSER_BN_HEALTH_SCORE);
     LazyLock::force(&RVC_PROPOSER_BN_LATENCY_MS);
     LazyLock::force(&RVC_BN_CAPABILITY_STATE);
+    LazyLock::force(&RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL);
+    LazyLock::force(&RVC_BN_BROADCAST_OVERFLOW_DRAINS);
 }
 
 #[cfg(test)]
