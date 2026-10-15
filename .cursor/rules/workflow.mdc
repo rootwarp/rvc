@@ -1,0 +1,9 @@
+---
+description: rvc issue/PR workflow
+alwaysApply: true
+---
+# Workflow
+- Branch from current `develop`; one branch and one PR per issue; PR base `develop`.
+- Exactly one commit ahead of `develop`, author `Joonkyo Kim <rootwarp@gmail.com>`. Review fixes amend + force-push the same branch.
+- Before the PR: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`; include the self-check from `AGENTS.md`.
+- Do not self-review or run a review pass. Reviewers are Harper (Codex) and the Rust Security Auditor only. Do not merge.
