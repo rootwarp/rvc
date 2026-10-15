@@ -28,6 +28,7 @@ cargo test -- --nocapture         # Run with output
 
 - `main` branch: primary branch
 - `develop` branch: development branch
+- Agent workflow rules (branching, one commit per issue, PR into develop, no self-review): see AGENTS.md
 
 ## Code Conventions
 
