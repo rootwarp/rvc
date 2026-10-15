@@ -81,13 +81,20 @@ async fn contents_publish_through_the_production_adapter_uses_the_bn_pool() {
     config.broadcast_topics.blocks = false;
     let manager = Arc::new(BnManager::new(config).expect("BnManager"));
     let beacon = Arc::new(BeaconBlockAdapter(manager.clone() as Arc<dyn BeaconNodeClient>));
-    let store = ValidatorStore::new([0u8; 20], 30_000_000);
+    // Fixture payload fee recipient is 0x66…66. The store default is what
+    // `propose_block` sends as the expected fee for an unknown pubkey.
+    let store = ValidatorStore::new([0x66; 20], 30_000_000);
     store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
+    // The fixture is a Deneb block on slot 3000000. Leave Electra and Fulu
+    // unscheduled so that slot's fork is Deneb, matching the response header.
+    let mut schedule = ForkSchedule::unscheduled_gloas();
+    schedule.electra_fork_epoch = u64::MAX;
+    schedule.fulu_fork_epoch = u64::MAX;
     let service = BlockService::new(
         Arc::new(StubValidatorSigner::new()),
         beacon,
         Arc::new(store),
-        Arc::new(ForkSchedule::unscheduled_gloas()),
+        Arc::new(schedule),
         [0xaa; 32],
     );
     let pubkey = SecretKey::generate().public_key();

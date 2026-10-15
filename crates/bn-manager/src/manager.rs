@@ -19,7 +19,6 @@ use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
     SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration,
 };
-use futures::future::join_all;
 use tracing::Instrument;
 use tracing::{debug, error, warn};
 use url::Url;
@@ -38,14 +37,12 @@ use crate::sync_status::{
 use crate::traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
     DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi,
-    SyncCommitteeApi,
+    ProduceDuty, SyncCommitteeApi,
 };
 use crate::types::{bn_capability, BnRole, HealthTier, TierThresholds};
 use crate::BnManagerError;
 
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send + 'a>>;
-type IndexedTimedResultFut<'a, T> =
-    Pin<Box<dyn Future<Output = (usize, String, Result<T, BeaconError>, Duration)> + Send + 'a>>;
 
 /// Health-tracker outcome for one BN attempt (success with latency, or error).
 #[derive(Debug, Clone, Copy)]
@@ -250,8 +247,21 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 /// Selection is hard-coded per endpoint method (not a config knob):
 /// - **Query-first**: try healthy BNs in health-score order, fail over on error —
 ///   duty fetches, attestation/aggregate data, genesis/config, sync status reads.
-/// - **Best-of**: query healthy BNs in parallel and pick the highest-value result —
-///   block production (`produce_block_v3`).
+/// - **Best-of**: query role-matching synced BNs in parallel and pick the
+///   highest strictly parsed execution payload value plus consensus block
+///   value — `produce_block_v3`. With a block-production budget, accepted
+///   blocks in hand are returned at the soft deadline (half the budget). A
+///   block that fails the slot, proposer, or parent check is not in hand. If
+///   none have been accepted, the first accepted block before the hard
+///   deadline (the budget) is kept. The round also returns once every
+///   selected BN has answered. Attempts still running are drained, and a
+///   timeout is recorded as an error. Health recording is queued and does not
+///   block the return or the drain. Nothing accepted, or every selected BN
+///   failed, falls back only to untried proposal-role BNs above the health
+///   floor, and only when the expected parent root is known, inside the time
+///   left in the backstop (budget plus 250 ms). The outer timeout is that
+///   backstop. A zero budget is no budget. With no budget, the round waits
+///   for every BN.
 /// - **Failover**: sequential, one in-flight; retry connect / timeout / 5xx only —
 ///   `produce_block_v4` (D29). Never after a 2xx, never in parallel. 404/405/501
 ///   are a capability gap (missing `/eth/v4`) and do fail over; a later success
@@ -311,10 +321,11 @@ pub struct BnManager {
 /// Apply health-tracker updates. Each call takes the write lock once.
 ///
 /// Sequential strategies flush per attempt so cancellation cannot drop
-/// earlier failures. `query_best_inner` still batches at the end of the
-/// round. A broadcast attempt queues this when it finishes and does not wait
-/// on the queue. When the queue is full, an error or a timeout sample can be
-/// dropped, and that drop is counted. Cancelling the caller does not drop a sample
+/// earlier failures. Best-of, its drain, and the proposal fallback queue
+/// samples and do not wait on this lock. A broadcast attempt queues this
+/// when it finishes and does not wait on the queue. When the queue is full,
+/// an error or a timeout sample can be dropped, and that drop is counted.
+/// Cancelling the caller does not drop a sample
 /// already queued. Process shutdown drops the recorder, so a queued sample
 /// is not kept. A full health-sample pool skips a success that is still in
 /// flight. An error or a timeout is still recorded when the queue has room.
@@ -382,6 +393,13 @@ pub(crate) fn log_partial_failure_endpoints(
         failed_latency_ms = ?failed_latency_ms,
         "partial broadcast failure"
     );
+}
+
+/// Ranking predicate, pre-rank filter, and whether fallback may run.
+struct BestSelect<'a, T> {
+    pick_best: fn(&T, &T) -> bool,
+    accept: &'a (dyn Fn(&T) -> bool + Sync),
+    allow_fallback: bool,
 }
 
 impl BnManager {
@@ -478,10 +496,12 @@ impl BnManager {
     /// Query-first sites turn the matching field into an absolute deadline
     /// before their first await and bound each BN attempt inside it. Broadcast
     /// bounds each BN attempt at the same budget and returns on the first `Ok`;
-    /// the outer timeout is a backstop at that budget plus 250 ms. With no
-    /// budget configured, broadcast attempts stay unbounded. Best-of and
-    /// `produce_block_v4` keep an outer `tokio::time::timeout`.
-    /// Exceeding the budget returns `BeaconError::OperationTimeout`.
+    /// the outer timeout is a backstop at that budget plus 250 ms. Best-of
+    /// block production uses the same backstop: each attempt is bounded by the
+    /// budget, blocks in hand return at half that budget, and a miss falls
+    /// back inside the remaining margin. With no budget configured, attempts
+    /// stay unbounded. `produce_block_v4` keeps an outer `tokio::time::timeout`
+    /// at the budget. Exceeding the budget returns `BeaconError::OperationTimeout`.
     pub fn with_operation_timeouts(mut self, timeouts: OperationTimeouts) -> Self {
         self.operation_timeouts = Some(timeouts);
         self
@@ -504,8 +524,13 @@ impl BnManager {
     }
 
     /// Returns the per-operation timeout for a given field selector.
+    ///
+    /// A zero duration is not a budget. Configuration rejects zero, but
+    /// [`OperationTimeouts`] is a public struct and can still carry it. Treating
+    /// zero as "no budget" keeps the synced pool from timing out immediately
+    /// and leaving only the fallback window.
     fn op_timeout(&self, f: impl FnOnce(&OperationTimeouts) -> Duration) -> Option<Duration> {
-        self.operation_timeouts.as_ref().map(f)
+        self.operation_timeouts.as_ref().map(f).filter(|budget| !budget.is_zero())
     }
 
     /// Dispatch a submission via broadcast or query_first based on the topic flag.
@@ -1244,44 +1269,75 @@ impl BnManager {
         Err(last_err.unwrap_or_else(|| no_eligible_bn(op_name, role)))
     }
 
-    /// Query using the `Best` strategy: query synced BNs in parallel, pick best result.
+    /// Query synced BNs in parallel and keep the best result.
     ///
-    /// The `pick_best` function returns `true` if the first argument is better than the second.
-    /// Falls back to `First` strategy if only one synced BN is available.
-    /// When all synced BNs fail, falls back to trying unsynced BNs sequentially.
-    async fn query_best<'s, T, F>(
-        &'s self,
+    /// `pick_best` returns `true` when its first argument is better. `budget`
+    /// is the hard deadline; the soft deadline is half of that. `None` waits
+    /// for every selected BN. Every candidate is accepted, and fallback is on.
+    /// That fallback is untried proposal-role BNs above [`FALLBACK_TIER_FLOOR`].
+    /// After a hard-deadline miss it is bounded by the time left before the
+    /// budget plus 250 ms.
+    #[cfg(test)]
+    async fn query_best<T, F>(
+        &self,
         op_name: &str,
         role: BnRole,
         min_tier: HealthTier,
+        budget: Option<Duration>,
         op: F,
         pick_best: fn(&T, &T) -> bool,
     ) -> Result<T, BeaconError>
     where
         T: Send + 'static,
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+        F: Fn(&BeaconClient) -> BoxFut<'static, T>,
+    {
+        let accept = |_: &T| true;
+        self.query_best_filtered(
+            op_name,
+            role,
+            min_tier,
+            budget,
+            op,
+            BestSelect { pick_best, accept: &accept, allow_fallback: true },
+        )
+        .await
+    }
+
+    async fn query_best_filtered<T, F>(
+        &self,
+        op_name: &str,
+        role: BnRole,
+        min_tier: HealthTier,
+        budget: Option<Duration>,
+        op: F,
+        select: BestSelect<'_, T>,
+    ) -> Result<T, BeaconError>
+    where
+        T: Send + 'static,
+        F: Fn(&BeaconClient) -> BoxFut<'static, T>,
     {
         let strategy_span = tracing::info_span!(
             "bn.strategy.best",
             strategy = "best",
             tried = tracing::field::Empty,
         );
-        self.query_best_inner(op_name, role, min_tier, &op, pick_best)
+        self.query_best_inner(op_name, role, min_tier, budget, &op, select)
             .instrument(strategy_span)
             .await
     }
 
-    async fn query_best_inner<'s, T, F>(
-        &'s self,
+    async fn query_best_inner<T, F>(
+        &self,
         op_name: &str,
         role: BnRole,
         min_tier: HealthTier,
+        budget: Option<Duration>,
         op: &F,
-        pick_best: fn(&T, &T) -> bool,
+        select: BestSelect<'_, T>,
     ) -> Result<T, BeaconError>
     where
         T: Send + 'static,
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+        F: Fn(&BeaconClient) -> BoxFut<'static, T>,
     {
         let indices = self.synced_indices(role, min_tier, op_name).await;
         tracing::Span::current().record("tried", indices.len());
@@ -1289,178 +1345,220 @@ impl BnManager {
             return Err(no_eligible_bn(op_name, role));
         }
 
-        if indices.len() == 1 {
-            let client = &self.clients[indices[0]];
-            let i = indices[0];
-            let attempt_span = tracing::info_span!(
-                "bn.attempt",
-                bn_url = %RedactedUrl(client.endpoint()),
-            );
-            let start = tokio::time::Instant::now();
-            match op(client).instrument(attempt_span).await {
-                Ok(result) => {
-                    record_outcomes(
-                        &self.health_trackers,
-                        op_name,
-                        &[(i, TrackerOutcome::Success(start.elapsed()))],
-                    )
-                    .await;
-                    debug!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = %RedactedUrl(client.endpoint()),
-                        "query succeeded (single synced BN)"
-                    );
+        let started = tokio::time::Instant::now();
+        let backstop =
+            budget.map(|budget| started + budget.saturating_add(fan_out::BACKSTOP_MARGIN));
+        let attempts = indices
+            .iter()
+            .map(|&index| {
+                let client = &self.clients[index];
+                BnAttempt { index, endpoint: client.endpoint().to_string(), fut: op(client) }
+            })
+            .collect();
+        let round = fan_out::best_of(
+            op_name,
+            &role.to_string(),
+            attempts,
+            fan_out::BestWindow { soft: budget.map(fan_out::soft_deadline), hard: budget },
+            &self.health_trackers,
+            fan_out::global_drain_pool(),
+            select.accept,
+        )
+        .await?;
+
+        if round.values.is_empty() {
+            if select.allow_fallback {
+                if let Some(result) = self
+                    .fallback_unsynced(op_name, role, op, &indices, backstop, select.accept)
+                    .await
+                {
                     return Ok(result);
                 }
-                Err(e) => {
-                    record_outcomes(
-                        &self.health_trackers,
-                        op_name,
-                        &[(i, error_outcome(op_name, &e))],
-                    )
-                    .await;
-                    warn!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = %RedactedUrl(client.endpoint()),
-                        error = %e,
-                        "BN query failed, trying unsynced BNs"
-                    );
-                    return self.fallback_unsynced(op_name, &op, &indices).await.ok_or(e);
-                }
             }
+            return Err(round.last_error.unwrap_or_else(|| {
+                BeaconError::HttpError(format!("{op_name}: all BNs failed in best-selection"))
+            }));
         }
 
-        let mut futs: Vec<IndexedTimedResultFut<'_, T>> = Vec::with_capacity(indices.len());
-
-        for i in &indices {
-            let client = &self.clients[*i];
-            let endpoint = client.endpoint().to_string();
-            let idx = *i;
-            let fut = op(client);
-            let attempt_span = tracing::info_span!(
-                "bn.attempt",
-                bn_url = %RedactedUrl(client.endpoint()),
-            );
-            futs.push(Box::pin(
-                async move {
-                    let start = tokio::time::Instant::now();
-                    let result = fut.await;
-                    let elapsed = start.elapsed();
-                    (idx, endpoint, result, elapsed)
-                }
-                .instrument(attempt_span),
-            ));
-        }
-
-        let results = join_all(futs).await;
-
-        let mut best: Option<(usize, T)> = None;
-        let mut outcomes: Vec<(usize, TrackerOutcome)> = Vec::with_capacity(results.len());
-
-        for (i, endpoint, result, elapsed) in results {
-            match result {
-                Ok(value) => {
-                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    best = Some(match best {
-                        None => (i, value),
-                        Some((prev_i, prev_value)) => {
-                            if pick_best(&value, &prev_value) {
-                                (i, value)
-                            } else {
-                                (prev_i, prev_value)
-                            }
-                        }
-                    });
-                }
-                Err(e) => {
-                    outcomes.push((i, error_outcome(op_name, &e)));
-                    warn!(
-                        op = op_name,
-                        bn_index = i,
-                        endpoint = %RedactedUrl(&endpoint),
-                        error = %e,
-                        "BN query failed in best-selection"
-                    );
-                }
+        let mut values = round.values.into_iter();
+        let (mut best_index, mut best_value) =
+            values.next().expect("best-of returns at least one value");
+        for (index, value) in values {
+            if (select.pick_best)(&value, &best_value) {
+                best_index = index;
+                best_value = value;
             }
         }
-
-        record_outcomes(&self.health_trackers, op_name, &outcomes).await;
-
-        match best {
-            Some((i, value)) => {
-                debug!(
-                    op = op_name,
-                    bn_index = i,
-                    endpoint = %RedactedUrl(self.clients[i].endpoint()),
-                    "best-selection picked BN"
-                );
-                Ok(value)
-            }
-            None => {
-                if let Some(result) = self.fallback_unsynced(op_name, &op, &indices).await {
-                    return Ok(result);
-                }
-                Err(BeaconError::HttpError(format!("{op_name}: all BNs failed in best-selection")))
-            }
-        }
+        debug!(
+            op = op_name,
+            bn_index = best_index,
+            endpoint = %RedactedUrl(self.clients[best_index].endpoint()),
+            "best-selection picked BN"
+        );
+        Ok(best_value)
     }
 
-    /// Tries unsynced BNs sequentially as a fallback when all synced BNs have failed.
-    async fn fallback_unsynced<'s, T, F>(
-        &'s self,
+    /// Tries untried proposal-role BNs above [`FALLBACK_TIER_FLOOR`].
+    ///
+    /// `deadline` bounds each attempt by the time still left. `None` leaves the
+    /// attempts unbounded, matching a round with no budget configured. An `Ok`
+    /// that fails `accept` is not returned. Health samples are queued per
+    /// attempt and this function does not wait on the health write lock.
+    async fn fallback_unsynced<T, F>(
+        &self,
         op_name: &str,
+        role: BnRole,
         op: &F,
         tried_indices: &[usize],
+        deadline: Option<tokio::time::Instant>,
+        accept: &(dyn Fn(&T) -> bool + Sync),
     ) -> Option<T>
     where
         T: Send,
-        F: Fn(&'s BeaconClient) -> BoxFut<'s, T>,
+        F: Fn(&BeaconClient) -> BoxFut<'static, T>,
     {
-        let unsynced: Vec<usize> =
-            (0..self.clients.len()).filter(|i| !tried_indices.contains(i)).collect();
+        let candidates = {
+            let sync_guard = self.sync_statuses.read().await;
+            let health_guard = self.health_trackers.read().await;
+            self.role_matching_indices(role)
+                .into_iter()
+                .filter(|index| !tried_indices.contains(index))
+                .filter(|&index| {
+                    above_fallback_floor(
+                        &sync_guard[index],
+                        &health_guard[index],
+                        &self.tier_thresholds,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
 
-        if unsynced.is_empty() {
+        if candidates.is_empty() {
+            debug!(op = op_name, "no untried proposal-role BN above the health floor for fallback");
             return None;
         }
 
-        warn!(op = op_name, "all synced BNs failed, falling back to unsynced BNs");
+        warn!(
+            op = op_name,
+            candidates = candidates.len(),
+            "synced proposal BNs failed; trying proposal-role BNs above the health floor"
+        );
 
-        let mut outcomes: Vec<(usize, TrackerOutcome)> = Vec::new();
-        for i in unsynced {
+        for i in candidates {
+            let bound = if let Some(end) = deadline {
+                let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                Some(remaining)
+            } else {
+                None
+            };
             let client = &self.clients[i];
             let start = tokio::time::Instant::now();
-            match op(client).await {
+            let attempt_span = tracing::info_span!(
+                "bn.attempt",
+                bn_url = %RedactedUrl(client.endpoint()),
+            );
+            match await_attempt(op_name, bound, op(client)).instrument(attempt_span).await {
                 Ok(result) => {
                     let elapsed = start.elapsed();
-                    outcomes.push((i, TrackerOutcome::Success(elapsed)));
-                    record_outcomes(&self.health_trackers, op_name, &outcomes).await;
+                    fan_out::queue_health_sample(
+                        &self.health_trackers,
+                        op_name,
+                        i,
+                        TrackerOutcome::Success(elapsed),
+                    );
+                    if !accept(&result) {
+                        warn!(
+                            op = op_name,
+                            bn_index = i,
+                            endpoint = %RedactedUrl(client.endpoint()),
+                            "proposal fallback block failed duty checks"
+                        );
+                        continue;
+                    }
                     warn!(
                         op = op_name,
                         bn_index = i,
                         endpoint = %RedactedUrl(client.endpoint()),
                         latency_ms = elapsed.as_millis() as u64,
-                        "query succeeded on unsynced BN (degraded)"
+                        "query succeeded on a proposal-role fallback BN"
                     );
                     return Some(result);
                 }
                 Err(e) => {
-                    outcomes.push((i, error_outcome(op_name, &e)));
+                    fan_out::queue_health_sample(
+                        &self.health_trackers,
+                        op_name,
+                        i,
+                        error_outcome(op_name, &e),
+                    );
                     warn!(
                         op = op_name,
                         bn_index = i,
                         endpoint = %RedactedUrl(client.endpoint()),
                         error = %e,
-                        "unsynced BN fallback also failed"
+                        "proposal-role fallback BN failed"
                     );
                 }
             }
         }
 
-        record_outcomes(&self.health_trackers, op_name, &outcomes).await;
         None
+    }
+
+    /// Best-of `produce_block_v3`.
+    ///
+    /// `checks` filters candidates before ranking. Slot, proposer, parent,
+    /// and consensus version are applied there. From Bellatrix on, a full
+    /// block has to carry the duty's fee recipient. A blinded block skips
+    /// that check.
+    /// Fallback runs only when the expected parent root is known, and only
+    /// against untried proposal-role BNs above the health floor.
+    async fn produce_block_v3_checked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        checks: Option<BlockDutyChecks>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let budget = self.op_timeout(|t| t.block_production);
+        let randao_reveal = randao_reveal.to_owned();
+        let graffiti = graffiti.map(str::to_owned);
+        let allow_fallback = checks.as_ref().is_some_and(|checks| checks.parent_root.is_some());
+        let accept = |block: &ProduceBlockResponse| match &checks {
+            Some(checks) => block_passes_duty(block, checks),
+            None => true,
+        };
+        self.with_op_timeout(
+            "produce_block_v3",
+            fan_out::broadcast_backstop(budget),
+            self.query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                budget,
+                move |client: &BeaconClient| {
+                    let client = client.clone();
+                    let randao_reveal = randao_reveal.clone();
+                    let graffiti = graffiti.clone();
+                    Box::pin(async move {
+                        client
+                            .produce_block_v3(
+                                slot,
+                                &randao_reveal,
+                                graffiti.as_deref(),
+                                builder_boost_factor,
+                            )
+                            .await
+                    })
+                },
+                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback },
+            ),
+        )
+        .await
     }
 
     /// Broadcast an operation to role-matching BNs (**regardless of sync / health
@@ -1617,14 +1715,264 @@ macro_rules! owned_attempt {
     }};
 }
 
-/// Compares two `ProduceBlockResponse` values by execution payload value.
-/// Returns `true` if `a` is better than `b`.
+/// Fallback may use a proposal-role BN at this tier or healthier.
+///
+/// `SmallLag` is the floor: large-lag, unsynced, optimistic, and
+/// execution-offline nodes stay out. Healthier means `tier <=` this value.
+const FALLBACK_TIER_FLOOR: HealthTier = HealthTier::SmallLag;
+
+/// Slot, proposer, parent, consensus version, and fee recipient for one
+/// `produce_block_v3` duty.
+#[derive(Clone, Copy)]
+struct BlockDutyChecks {
+    slot: u64,
+    proposer_index: u64,
+    parent_root: Option<[u8; 32]>,
+    fee_recipient: Option<[u8; 20]>,
+    consensus_version: ForkName,
+}
+
+fn above_fallback_floor(
+    sync: &crate::sync_status::BnSyncDetail,
+    health: &BnHealthTracker,
+    thresholds: &TierThresholds,
+) -> bool {
+    if sync.is_optimistic || sync.el_offline {
+        return false;
+    }
+    if !health.is_healthy() {
+        return false;
+    }
+    sync.tier(thresholds) <= FALLBACK_TIER_FLOOR
+}
+
+enum FeeOnBlock {
+    /// No full-payload fee recipient (blinded, or JSON without one).
+    Unknown,
+    Present([u8; 20]),
+    /// A fee recipient field is present and is not a 20-byte hex address.
+    Invalid,
+}
+
+struct DutyFields {
+    slot: u64,
+    proposer_index: u64,
+    parent_root: [u8; 32],
+    fee: FeeOnBlock,
+}
+
+/// `true` when `block` matches the duty. The consensus version must be the
+/// duty's fork. A block whose slot, proposer, or parent cannot be read does
+/// not match. From Bellatrix on, a full block has to carry the duty's fee
+/// recipient. A blinded block skips that check. A full SSZ block whose fee
+/// recipient cannot be read does not match.
+fn block_passes_duty(block: &ProduceBlockResponse, checks: &BlockDutyChecks) -> bool {
+    if block.consensus_version.parse::<ForkName>().ok() != Some(checks.consensus_version) {
+        return false;
+    }
+    let Some(fields) = duty_fields(block) else {
+        return false;
+    };
+    if fields.slot != checks.slot || fields.proposer_index != checks.proposer_index {
+        return false;
+    }
+    if let Some(expected) = checks.parent_root {
+        if fields.parent_root != expected {
+            return false;
+        }
+    }
+    // Builder bids carry the builder's address in the payload header. The
+    // proposer's fee recipient is paid inside the builder's transaction.
+    if block.is_blinded {
+        return true;
+    }
+    if let Some(expected) = checks.fee_recipient {
+        match fields.fee {
+            FeeOnBlock::Present(got) if got == expected => {}
+            // Phase0 and Altair have no execution payload, so a missing fee is
+            // not a reject. A present fee that does not match still is.
+            FeeOnBlock::Unknown if !checks.consensus_version.carries_execution_payload() => {}
+            FeeOnBlock::Present(_) | FeeOnBlock::Unknown | FeeOnBlock::Invalid => return false,
+        }
+    }
+    true
+}
+
+fn duty_fields(block: &ProduceBlockResponse) -> Option<DutyFields> {
+    if block.is_ssz {
+        let bytes = block.ssz_bytes.as_deref()?;
+        let format = ssz_produce_format(block.is_blinded, &block.consensus_version)?;
+        let (parsed, _) =
+            beacon::ssz_deser::deserialize_beacon_block_from_ssz(bytes, format).ok()?;
+        let fee = if block.is_blinded {
+            FeeOnBlock::Unknown
+        } else {
+            ssz_execution_fee(&block.consensus_version, &parsed.body)
+        };
+        return Some(DutyFields {
+            slot: parsed.slot,
+            proposer_index: parsed.proposer_index,
+            parent_root: parsed.parent_root,
+            fee,
+        });
+    }
+    json_duty_fields(&block.data)
+}
+
+/// Fee recipient from a full (unblinded) execution payload.
+///
+/// Bellatrix and Capella read the payload fee at the spec offset.
+/// [`ForkName::body_layout`] stays the KZG layout and is `None` for those
+/// forks. Deneb uses the Deneb body layout. Electra and Fulu share the
+/// Electra layout. Anything else, including a body that does not decode, is
+/// [`FeeOnBlock::Invalid`] so the duty check fails closed.
+fn ssz_execution_fee(consensus_version: &str, body: &[u8]) -> FeeOnBlock {
+    let Ok(fork) = consensus_version.parse::<ForkName>() else {
+        return FeeOnBlock::Invalid;
+    };
+    if let Some(fixed_len) = fork.pre_deneb_body_fixed_len() {
+        return execution_fee_at_payload_offset(body, fixed_len);
+    }
+    let address = match fork.body_layout() {
+        Some(eth_types::BodyForkLayout::Deneb) => {
+            eth_types::BeaconBlockBodyDeneb::from_ssz_bytes(body)
+                .ok()
+                .map(|decoded| decoded.execution_payload.fee_recipient)
+        }
+        Some(eth_types::BodyForkLayout::Electra) => {
+            eth_types::BeaconBlockBodyElectra::from_ssz_bytes(body)
+                .ok()
+                .map(|decoded| decoded.execution_payload.fee_recipient)
+        }
+        Some(eth_types::BodyForkLayout::Gloas) | None => None,
+    };
+    address.map_or(FeeOnBlock::Invalid, FeeOnBlock::Present)
+}
+
+fn ssz_produce_format(
+    is_blinded: bool,
+    consensus_version: &str,
+) -> Option<beacon::ssz_deser::SszBlockFormat> {
+    use beacon::ssz_deser::SszBlockFormat;
+    if is_blinded {
+        return Some(SszBlockFormat::BeaconBlock);
+    }
+    match consensus_version {
+        "deneb" | "electra" | "fulu" => Some(SszBlockFormat::BlockContents),
+        "phase0" | "altair" | "bellatrix" | "capella" | "gloas" => {
+            Some(SszBlockFormat::BeaconBlock)
+        }
+        _ => None,
+    }
+}
+
+/// `fee_recipient` from a Bellatrix or Capella execution payload.
+///
+/// `fixed_len` is the body fixed section. The payload offset is the little-endian
+/// u32 at byte 380. The fee recipient is the 20 bytes at payload+32. A short
+/// body, an offset inside the fixed section, or a payload that does not contain
+/// the fee is [`FeeOnBlock::Invalid`].
+fn execution_fee_at_payload_offset(body: &[u8], fixed_len: usize) -> FeeOnBlock {
+    const PAYLOAD_OFFSET_AT: usize = 380;
+    const FEE_AT: usize = 32;
+    const FEE_LEN: usize = 20;
+    let Some(offset_bytes) = body.get(PAYLOAD_OFFSET_AT..PAYLOAD_OFFSET_AT + 4) else {
+        return FeeOnBlock::Invalid;
+    };
+    let offset_bytes: [u8; 4] = offset_bytes.try_into().expect("payload offset is 4 bytes");
+    let offset = u32::from_le_bytes(offset_bytes) as usize;
+    if offset < fixed_len {
+        return FeeOnBlock::Invalid;
+    }
+    let Some(start) = offset.checked_add(FEE_AT) else {
+        return FeeOnBlock::Invalid;
+    };
+    let Some(end) = start.checked_add(FEE_LEN) else {
+        return FeeOnBlock::Invalid;
+    };
+    let Some(fee) = body.get(start..end) else {
+        return FeeOnBlock::Invalid;
+    };
+    let mut address = [0u8; FEE_LEN];
+    address.copy_from_slice(fee);
+    FeeOnBlock::Present(address)
+}
+
+fn json_duty_fields(data: &serde_json::Value) -> Option<DutyFields> {
+    let block = if data.get("slot").is_some() { data } else { data.get("block")? };
+    let slot = json_u64(block.get("slot")?)?;
+    let proposer_index = json_u64(block.get("proposer_index")?)?;
+    let parent_root = json_fixed_hex::<32>(block.get("parent_root")?.as_str()?)?;
+    Some(DutyFields { slot, proposer_index, parent_root, fee: fee_on_block(block.get("body")) })
+}
+
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::String(text) => text.parse().ok(),
+        serde_json::Value::Number(number) => number.as_u64(),
+        _ => None,
+    }
+}
+
+fn fee_on_block(body: Option<&serde_json::Value>) -> FeeOnBlock {
+    let Some(body) = body.filter(|body| body.is_object()) else {
+        return FeeOnBlock::Unknown;
+    };
+    let Some(payload) = body.get("execution_payload") else {
+        return FeeOnBlock::Unknown;
+    };
+    match payload.get("fee_recipient") {
+        Some(value) => match value.as_str().and_then(json_fixed_hex::<20>) {
+            Some(bytes) => FeeOnBlock::Present(bytes),
+            None => FeeOnBlock::Invalid,
+        },
+        None => FeeOnBlock::Unknown,
+    }
+}
+
+fn json_fixed_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+    let hex = text.strip_prefix("0x").unwrap_or(text);
+    if hex.len() != N * 2 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; N];
+    for (index, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Whole decimal wei. A missing, empty, signed, or non-digit string is not a
+/// value. Overflow of `u128` is not a value either.
+fn strict_wei(raw: &str) -> Option<u128> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+/// Execution payload value plus consensus block value.
+///
+/// Both present strings must parse. A missing consensus header adds nothing.
+/// An unparseable string, or a sum that overflows `u128`, is not a rank.
+fn ranked_block_value(block: &ProduceBlockResponse) -> Option<u128> {
+    let execution = strict_wei(block.execution_payload_value.as_deref()?)?;
+    let consensus = match block.consensus_block_value.as_deref() {
+        Some(raw) => strict_wei(raw)?,
+        None => 0,
+    };
+    execution.checked_add(consensus)
+}
+
+/// `true` when `a` ranks strictly above `b`.
+///
+/// An unranked block does not beat a ranked one, including a ranked zero.
 fn is_better_block(a: &ProduceBlockResponse, b: &ProduceBlockResponse) -> bool {
-    let val_a =
-        a.execution_payload_value.as_deref().and_then(|v| v.parse::<u128>().ok()).unwrap_or(0);
-    let val_b =
-        b.execution_payload_value.as_deref().and_then(|v| v.parse::<u128>().ok()).unwrap_or(0);
-    val_a > val_b
+    match (ranked_block_value(a), ranked_block_value(b)) {
+        (Some(left), Some(right)) => left > right,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
 }
 
 /// OR-merge `is_live` per validator index across broadcast outcomes.
@@ -1911,23 +2259,32 @@ impl BlockProducer for BnManager {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BeaconError> {
-        self.with_op_timeout(
-            "produce_block_v3",
-            self.op_timeout(|t| t.block_production),
-            self.query_best(
-                "produce_block_v3",
-                BnRole::Proposal,
-                HealthTier::Synced,
-                |c| {
-                    Box::pin(c.produce_block_v3(
-                        slot,
-                        randao_reveal,
-                        graffiti,
-                        builder_boost_factor,
-                    ))
-                },
-                is_better_block,
-            ),
+        // No duty context: do not fall back. The parent root is unknown, so a
+        // degraded node must not supply the block.
+        self.produce_block_v3_checked(slot, randao_reveal, graffiti, builder_boost_factor, None)
+            .await
+    }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: ProduceDuty,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        self.produce_block_v3_checked(
+            slot,
+            randao_reveal,
+            graffiti,
+            builder_boost_factor,
+            Some(BlockDutyChecks {
+                slot,
+                proposer_index: duty.expected_proposer_index,
+                parent_root: duty.expected_parent_root,
+                fee_recipient: duty.expected_fee_recipient,
+                consensus_version: duty.expected_consensus_version,
+            }),
         )
         .await
     }
@@ -3043,6 +3400,905 @@ mod tests {
         let _dyn_client: Arc<dyn BeaconNodeClient> = Arc::new(client);
     }
 
+    fn block_with_value(value: &str) -> ProduceBlockResponse {
+        ProduceBlockResponse {
+            data: serde_json::Value::Null,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some(value.to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        }
+    }
+
+    fn manager_with_endpoints(endpoints: &[&str]) -> BnManager {
+        let config = BnManagerConfig::new(
+            endpoints.iter().map(|endpoint| format!("http://{endpoint}")).collect(),
+        );
+        BnManager::new(config).unwrap()
+    }
+
+    async fn set_sync(manager: &BnManager, index: usize, status: BnSyncStatus, distance: u64) {
+        manager.sync_statuses().write().await[index] = crate::sync_status::BnSyncDetail {
+            status,
+            sync_distance: Some(distance),
+            head_slot: Some(1000),
+            is_optimistic: false,
+            el_offline: false,
+        };
+    }
+
+    async fn wait_until_error(manager: &BnManager, index: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let scores = manager.health_scores().await;
+            if scores[index].error_rate == 1.0 {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "BN {index} error was not recorded: {scores:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// B-002. Budget 3s, BN-A at 300ms, BN-B at 4s. The block in hand is
+    /// returned at the 1.5s soft deadline and BN-B is recorded as an error.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn best_of_returns_at_soft_deadline_and_records_the_slow_bn() {
+        let manager = manager_with_endpoints(&["bn-a", "bn-b"]);
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-a") {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            Ok(block_with_value("1000"))
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            Ok(block_with_value("9000"))
+                        }
+                    })
+                },
+                is_better_block,
+            )
+            .await
+            .expect("BN-A's block");
+        assert_eq!(start.elapsed(), Duration::from_millis(1500));
+        assert_eq!(result.execution_payload_value.as_deref(), Some("1000"));
+        let recorded = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let scores = manager.health_scores().await;
+            if scores[0].latency_ms > 0.0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < recorded,
+                "BN-A's success was not queued: {scores:?}"
+            );
+            drop(scores);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        wait_until_error(&manager, 1).await;
+    }
+
+    /// No block by the soft deadline. The one at 2s is returned then.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn best_of_returns_the_first_block_after_the_soft_deadline() {
+        let manager = manager_with_endpoints(&["bn-a", "bn-b"]);
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-a") {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            Ok(block_with_value("1000"))
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(4)).await;
+                            Ok(block_with_value("9000"))
+                        }
+                    })
+                },
+                is_better_block,
+            )
+            .await
+            .expect("block at 2s");
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        assert_eq!(result.execution_payload_value.as_deref(), Some("1000"));
+    }
+
+    /// Both blocks arrive before the soft deadline. The higher payload value
+    /// wins, and the round does not wait out the soft deadline.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn best_of_picks_the_higher_value_when_both_arrive_before_soft() {
+        let manager = manager_with_endpoints(&["bn-low", "bn-high"]);
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-low") {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(block_with_value("1000"))
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            Ok(block_with_value("5000"))
+                        }
+                    })
+                },
+                is_better_block,
+            )
+            .await
+            .expect("higher block");
+        assert_eq!(start.elapsed(), Duration::from_millis(200));
+        assert_eq!(result.execution_payload_value.as_deref(), Some("5000"));
+    }
+
+    /// With no budget the round still waits for every selected BN.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn best_of_without_a_budget_waits_for_every_bn() {
+        let manager = manager_with_endpoints(&["bn-fast", "bn-slow"]);
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                None,
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-slow") {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            Ok(block_with_value("9000"))
+                        } else {
+                            Ok(block_with_value("1000"))
+                        }
+                    })
+                },
+                is_better_block,
+            )
+            .await
+            .expect("slow higher block");
+        assert_eq!(start.elapsed(), Duration::from_secs(5));
+        assert_eq!(result.execution_payload_value.as_deref(), Some("9000"));
+    }
+
+    /// One selected BN answers as soon as it is done, not at the soft deadline.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn best_of_single_bn_returns_when_that_bn_answers() {
+        let manager = manager_with_endpoints(&["bn-only"]);
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |_client| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        Ok(block_with_value("2000"))
+                    })
+                },
+                is_better_block,
+            )
+            .await
+            .expect("single block");
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+        assert_eq!(result.execution_payload_value.as_deref(), Some("2000"));
+    }
+
+    /// Every synced BN fails. The unsynced BN's block is returned.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn best_of_falls_back_when_every_synced_bn_fails() {
+        let manager = manager_with_endpoints(&["synced-a", "synced-b", "unsynced"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 2, BnSyncStatus::Syncing, 9).await;
+        let result = manager
+            .query_best(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("unsynced") {
+                            Ok(block_with_value("7000"))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                is_better_block,
+            )
+            .await
+            .expect("unsynced block");
+        assert_eq!(result.execution_payload_value.as_deref(), Some("7000"));
+    }
+
+    /// After the hard deadline the unsynced attempt only gets the backstop.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn best_of_bounds_unsynced_fallback_by_the_backstop() {
+        let manager = manager_with_endpoints(&["synced", "unsynced"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_millis(200)),
+                |_client| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Ok(block_with_value("7000"))
+                    })
+                },
+                is_better_block,
+            )
+            .await;
+        assert!(result.is_err(), "fallback past the backstop must not return a block: {result:?}");
+        assert_eq!(start.elapsed(), Duration::from_millis(450));
+    }
+
+    fn parent_hex(parent: &[u8; 32]) -> String {
+        let mut hex = String::from("0x");
+        for byte in parent {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        hex
+    }
+
+    fn duty_response(
+        execution: &str,
+        slot: u64,
+        proposer: u64,
+        parent: [u8; 32],
+        fee: Option<[u8; 20]>,
+    ) -> ProduceBlockResponse {
+        let body = match fee {
+            Some(fee) => serde_json::json!({
+                "execution_payload": { "fee_recipient": parent_hex_n(&fee) }
+            }),
+            None => serde_json::json!({}),
+        };
+        ProduceBlockResponse {
+            data: serde_json::json!({
+                "slot": slot.to_string(),
+                "proposer_index": proposer.to_string(),
+                "parent_root": parent_hex(&parent),
+                "state_root": parent_hex(&[0u8; 32]),
+                "body": body,
+            }),
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some(execution.to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        }
+    }
+
+    fn parent_hex_n(bytes: &[u8]) -> String {
+        let mut hex = String::from("0x");
+        for byte in bytes {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        hex
+    }
+
+    /// A fast block that fails the proposer check must not close the soft
+    /// window. The later block that matches the duty is the one returned.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn rejected_candidate_does_not_close_the_soft_deadline() {
+        let manager = manager_with_endpoints(&["bn-junk", "bn-valid"]);
+        let parent = [0xabu8; 32];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: None,
+            consensus_version: ForkName::Deneb,
+        };
+        let start = tokio::time::Instant::now();
+        let accept = |block: &ProduceBlockResponse| block_passes_duty(block, &checks);
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-junk") {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            Ok(duty_response("9000", 1, 99, parent, None))
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            Ok(duty_response("1000", 1, 7, parent, None))
+                        }
+                    })
+                },
+                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: false },
+            )
+            .await
+            .expect("the valid block");
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        assert_eq!(result.execution_payload_value.as_deref(), Some("1000"));
+    }
+
+    /// Both candidates are in hand before the soft deadline. The higher value
+    /// fails the duty check, so the lower valid block is the one returned.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn invalid_high_value_candidate_yields_the_next_valid_one() {
+        let parent = [0xabu8; 32];
+        let valid = duty_response("1000", 1, 7, parent, None);
+        let wrong_proposer = duty_response("9000", 1, 99, parent, None);
+        let (elapsed, picked) = ranked_valid_block(wrong_proposer, valid.clone()).await;
+        assert_eq!(picked.execution_payload_value.as_deref(), Some("1000"));
+        assert_eq!(elapsed, Duration::from_millis(80));
+
+        let mut wrong_version = duty_response("9000", 1, 7, parent, None);
+        wrong_version.consensus_version = "phase0".to_string();
+        let (elapsed, picked) = ranked_valid_block(wrong_version, valid).await;
+        assert_eq!(picked.execution_payload_value.as_deref(), Some("1000"));
+        assert_eq!(elapsed, Duration::from_millis(80));
+    }
+
+    async fn ranked_valid_block(
+        junk: ProduceBlockResponse,
+        valid: ProduceBlockResponse,
+    ) -> (Duration, ProduceBlockResponse) {
+        let manager = manager_with_endpoints(&["bn-junk", "bn-valid"]);
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some([0xab; 32]),
+            fee_recipient: None,
+            consensus_version: ForkName::Deneb,
+        };
+        let start = tokio::time::Instant::now();
+        let accept = |block: &ProduceBlockResponse| block_passes_duty(block, &checks);
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    let junk = junk.clone();
+                    let valid = valid.clone();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-junk") {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                            Ok(junk)
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            Ok(valid)
+                        }
+                    })
+                },
+                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: false },
+            )
+            .await
+            .expect("the next valid block");
+        (start.elapsed(), result)
+    }
+
+    /// Fallback stays on untried proposal-role BNs above the health floor.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fallback_stays_on_proposal_role_bns_above_the_health_floor() {
+        let mut manager = manager_with_endpoints(&[
+            "synced",
+            "attest",
+            "stale",
+            "large",
+            "optimistic",
+            "unhealthy",
+            "offline",
+            "small",
+        ]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        set_sync(&manager, 2, BnSyncStatus::Syncing, 500).await;
+        set_sync(&manager, 3, BnSyncStatus::Syncing, 17).await;
+        manager.sync_statuses().write().await[4] = crate::sync_status::BnSyncDetail {
+            status: BnSyncStatus::Syncing,
+            sync_distance: Some(9),
+            head_slot: Some(1000),
+            is_optimistic: true,
+            el_offline: false,
+        };
+        set_sync(&manager, 5, BnSyncStatus::Syncing, 9).await;
+        manager.health_trackers().write().await[5].record_error();
+        manager.sync_statuses().write().await[6] = crate::sync_status::BnSyncDetail {
+            status: BnSyncStatus::Syncing,
+            sync_distance: Some(9),
+            head_slot: Some(1000),
+            is_optimistic: false,
+            el_offline: true,
+        };
+        set_sync(&manager, 7, BnSyncStatus::Syncing, 9).await;
+        manager.roles[1] = std::collections::HashSet::from([BnRole::Attestation]);
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_op = std::sync::Arc::clone(&seen);
+        let accept = |_: &ProduceBlockResponse| true;
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    let seen_op = std::sync::Arc::clone(&seen_op);
+                    Box::pin(async move {
+                        seen_op.lock().expect("seen").push(endpoint.clone());
+                        if endpoint.contains("synced") {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        } else if endpoint.contains("small") {
+                            Ok(block_with_value("7000"))
+                        } else {
+                            Ok(block_with_value("bad"))
+                        }
+                    })
+                },
+                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: true },
+            )
+            .await
+            .expect("small-lag proposal block");
+        assert_eq!(result.execution_payload_value.as_deref(), Some("7000"));
+        let seen = seen.lock().expect("seen");
+        assert!(seen.iter().any(|endpoint| endpoint.contains("synced")));
+        assert!(seen.iter().any(|endpoint| endpoint.contains("small")));
+        for forbidden in ["attest", "stale", "large", "optimistic", "unhealthy", "offline"] {
+            assert!(
+                seen.iter().all(|endpoint| !endpoint.contains(forbidden)),
+                "{forbidden} was tried: {seen:?}"
+            );
+        }
+    }
+
+    /// No known parent root: do not fall back, even when a proposal-role BN
+    /// above the floor would answer.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fallback_requires_a_known_parent() {
+        let manager = manager_with_endpoints(&["synced", "small"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_op = std::sync::Arc::clone(&seen);
+        let accept = |_: &ProduceBlockResponse| true;
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    let seen_op = std::sync::Arc::clone(&seen_op);
+                    Box::pin(async move {
+                        seen_op.lock().expect("seen").push(endpoint.clone());
+                        if endpoint.contains("small") {
+                            Ok(block_with_value("7000"))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: false },
+            )
+            .await;
+        assert!(result.is_err(), "fallback without a parent must not return a block: {result:?}");
+        let seen = seen.lock().expect("seen");
+        assert!(seen.iter().all(|endpoint| !endpoint.contains("small")), "tried {seen:?}");
+    }
+
+    /// A fallback block with the wrong parent or the wrong fee recipient is
+    /// not returned. The next proposal-role BN that matches is.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fallback_rejects_a_parent_or_fee_mismatch() {
+        let manager = manager_with_endpoints(&["synced", "wrong", "right"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        set_sync(&manager, 2, BnSyncStatus::Syncing, 9).await;
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+        };
+        let accept = |block: &ProduceBlockResponse| block_passes_duty(block, &checks);
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("wrong") {
+                            Ok(duty_response("9000", 1, 7, parent, Some([0x22; 20])))
+                        } else if endpoint.contains("right") {
+                            Ok(duty_response("1000", 1, 7, parent, Some(fee)))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: true },
+            )
+            .await
+            .expect("matching fallback block");
+        assert_eq!(result.execution_payload_value.as_deref(), Some("1000"));
+    }
+
+    /// From Bellatrix on, a full block with no fee recipient is not returned.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fallback_rejects_a_block_with_no_fee_recipient() {
+        let manager = manager_with_endpoints(&["synced", "small"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        let parent = [0xabu8; 32];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: Some([0x11; 20]),
+            consensus_version: ForkName::Deneb,
+        };
+        let accept = |block: &ProduceBlockResponse| block_passes_duty(block, &checks);
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("small") {
+                            Ok(duty_response("1000", 1, 7, parent, None))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: true },
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a full block without a fee recipient must not be returned: {result:?}"
+        );
+    }
+
+    #[test]
+    fn zero_operation_budget_is_no_budget() {
+        let manager = manager_with_endpoints(&["bn"]).with_operation_timeouts(OperationTimeouts {
+            block_production: Duration::ZERO,
+            attestation_fetch: Duration::from_millis(1),
+            ..OperationTimeouts::default()
+        });
+        assert_eq!(manager.op_timeout(|timeouts| timeouts.block_production), None);
+        assert_eq!(
+            manager.op_timeout(|timeouts| timeouts.attestation_fetch),
+            Some(Duration::from_millis(1))
+        );
+    }
+
+    #[test]
+    fn ssz_block_passes_slot_proposer_and_parent() {
+        let mut bytes = vec![0u8; 84];
+        bytes[0..8].copy_from_slice(&7u64.to_le_bytes());
+        bytes[8..16].copy_from_slice(&42u64.to_le_bytes());
+        bytes[16..48].copy_from_slice(&[0xab; 32]);
+        bytes[80..84].copy_from_slice(&84u32.to_le_bytes());
+        let block = ProduceBlockResponse {
+            data: serde_json::Value::Null,
+            is_blinded: true,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("1".to_string()),
+            is_ssz: true,
+            ssz_bytes: Some(bytes),
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        };
+        let checks = BlockDutyChecks {
+            slot: 7,
+            proposer_index: 42,
+            parent_root: Some([0xab; 32]),
+            fee_recipient: Some([0x11; 20]),
+            consensus_version: ForkName::Deneb,
+        };
+        assert!(block_passes_duty(&block, &checks));
+        let wrong_parent = BlockDutyChecks { parent_root: Some([0xcd; 32]), ..checks };
+        assert!(!block_passes_duty(&block, &wrong_parent));
+    }
+
+    #[test]
+    fn duty_checks_reject_slot_proposer_parent_and_a_present_wrong_fee() {
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+        };
+        assert!(block_passes_duty(&duty_response("1", 1, 7, parent, Some(fee)), &checks));
+        assert!(!block_passes_duty(&duty_response("1", 2, 7, parent, Some(fee)), &checks));
+        assert!(!block_passes_duty(&duty_response("1", 1, 8, parent, Some(fee)), &checks));
+        assert!(!block_passes_duty(&duty_response("1", 1, 7, [0xcd; 32], Some(fee)), &checks));
+        assert!(!block_passes_duty(&duty_response("1", 1, 7, parent, Some([0x22; 20])), &checks));
+        assert!(!block_passes_duty(&duty_response("1", 1, 7, parent, None), &checks));
+        let mut wrong_version = duty_response("9000", 1, 7, parent, Some(fee));
+        wrong_version.consensus_version = "phase0".to_string();
+        assert!(!block_passes_duty(&wrong_version, &checks));
+        wrong_version.consensus_version = "not-a-fork".to_string();
+        assert!(!block_passes_duty(&wrong_version, &checks));
+    }
+
+    /// A builder header's fee recipient is the builder's address. It must not
+    /// drop the bid. A full block is checked from `execution_payload` only.
+    #[test]
+    fn blinded_header_fee_does_not_reject_the_block() {
+        let parent = [0xabu8; 32];
+        let expected = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: Some(expected),
+            consensus_version: ForkName::Deneb,
+        };
+        let mut blinded = duty_response("1", 1, 7, parent, None);
+        blinded.is_blinded = true;
+        blinded.data["body"] = serde_json::json!({
+            "execution_payload_header": { "fee_recipient": parent_hex_n(&[0x22; 20]) }
+        });
+        assert!(block_passes_duty(&blinded, &checks));
+
+        let mut header_only = blinded.clone();
+        header_only.is_blinded = false;
+        assert!(!block_passes_duty(&header_only, &checks));
+
+        let mut payload = duty_response("1", 1, 7, parent, Some(expected));
+        payload.data["body"]["execution_payload_header"] =
+            serde_json::json!({ "fee_recipient": parent_hex_n(&[0x22; 20]) });
+        assert!(block_passes_duty(&payload, &checks));
+    }
+
+    /// A missing fee recipient passes only before Bellatrix. From Bellatrix on
+    /// a full block has to carry the duty's fee recipient.
+    #[test]
+    fn missing_fee_recipient_passes_only_before_bellatrix() {
+        let parent = [0xabu8; 32];
+        let expected = [0x11u8; 20];
+        let base = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: Some(expected),
+            consensus_version: ForkName::Deneb,
+        };
+        for (fork, version, passes) in [
+            (ForkName::Phase0, "phase0", true),
+            (ForkName::Altair, "altair", true),
+            (ForkName::Bellatrix, "bellatrix", false),
+            (ForkName::Capella, "capella", false),
+            (ForkName::Deneb, "deneb", false),
+            (ForkName::Electra, "electra", false),
+            (ForkName::Fulu, "fulu", false),
+            (ForkName::Gloas, "gloas", false),
+        ] {
+            let checks = BlockDutyChecks { consensus_version: fork, ..base };
+            let mut block = duty_response("1", 1, 7, parent, None);
+            block.consensus_version = version.to_string();
+            assert_eq!(block_passes_duty(&block, &checks), passes, "{version}");
+        }
+
+        let mut present = duty_response("1", 1, 7, parent, Some(expected));
+        present.consensus_version = "bellatrix".to_string();
+        let bellatrix = BlockDutyChecks { consensus_version: ForkName::Bellatrix, ..base };
+        assert!(block_passes_duty(&present, &bellatrix));
+
+        let mut wrong = duty_response("1", 1, 7, parent, Some([0x22; 20]));
+        wrong.consensus_version = "altair".to_string();
+        let altair = BlockDutyChecks { consensus_version: ForkName::Altair, ..base };
+        assert!(!block_passes_duty(&wrong, &altair));
+    }
+
+    fn ssz_contents(
+        slot: u64,
+        proposer: u64,
+        parent: [u8; 32],
+        body: &[u8],
+        version: &str,
+    ) -> ProduceBlockResponse {
+        let encoded = eth_types::encode_beacon_block_ssz(
+            &eth_types::BeaconBlock {
+                slot,
+                proposer_index: proposer,
+                parent_root: parent,
+                state_root: [0u8; 32],
+                body: body.to_vec(),
+            },
+            0,
+        );
+        let block_off = 12u32;
+        let after = block_off + encoded.len() as u32;
+        let mut bytes = Vec::with_capacity(after as usize);
+        bytes.extend_from_slice(&block_off.to_le_bytes());
+        bytes.extend_from_slice(&after.to_le_bytes());
+        bytes.extend_from_slice(&after.to_le_bytes());
+        bytes.extend_from_slice(&encoded);
+        ProduceBlockResponse {
+            data: serde_json::Value::Null,
+            is_blinded: false,
+            consensus_version: version.to_string(),
+            execution_payload_value: Some("1".to_string()),
+            is_ssz: true,
+            ssz_bytes: Some(bytes),
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        }
+    }
+
+    /// Full SSZ blocks carry the fee inside the execution payload. A mismatch
+    /// or a body that does not decode is rejected. Fulu shares the Electra body.
+    #[test]
+    fn full_ssz_fee_must_match_and_an_undecodable_fee_rejects() {
+        let parent = [0xabu8; 32];
+        let mut deneb = eth_types::external_vector_deneb_body();
+        let fee = deneb.execution_payload.fee_recipient;
+        let checks = BlockDutyChecks {
+            slot: 7,
+            proposer_index: 42,
+            parent_root: Some(parent),
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+        };
+        let matching = ssz_contents(7, 42, parent, &deneb.as_ssz_bytes(), "deneb");
+        assert!(block_passes_duty(&matching, &checks));
+
+        deneb.execution_payload.fee_recipient = [0x11; 20];
+        let wrong = ssz_contents(7, 42, parent, &deneb.as_ssz_bytes(), "deneb");
+        assert!(!block_passes_duty(&wrong, &checks));
+
+        let garbage = ssz_contents(7, 42, parent, &[0xff; 8], "deneb");
+        assert!(!block_passes_duty(&garbage, &checks));
+
+        let electra = eth_types::external_vector_electra_body();
+        let fulu_fee = electra.execution_payload.fee_recipient;
+        let fulu = ssz_contents(7, 42, parent, &electra.as_ssz_bytes(), "fulu");
+        let fulu_checks = BlockDutyChecks {
+            fee_recipient: Some(fulu_fee),
+            consensus_version: ForkName::Fulu,
+            ..checks
+        };
+        assert!(block_passes_duty(&fulu, &fulu_checks));
+
+        let gloas = ProduceBlockResponse {
+            data: serde_json::Value::Null,
+            is_blinded: false,
+            consensus_version: "gloas".to_string(),
+            execution_payload_value: Some("1".to_string()),
+            is_ssz: true,
+            ssz_bytes: Some(eth_types::encode_beacon_block_ssz(
+                &eth_types::BeaconBlock {
+                    slot: 7,
+                    proposer_index: 42,
+                    parent_root: parent,
+                    state_root: [0u8; 32],
+                    body: Vec::new(),
+                },
+                0,
+            )),
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        };
+        let gloas_checks = BlockDutyChecks { consensus_version: ForkName::Gloas, ..checks };
+        assert!(!block_passes_duty(&gloas, &gloas_checks));
+    }
+
+    /// Bellatrix and Capella full SSZ bodies have no KZG body layout.
+    /// The fee is the 20 bytes at payload+32, and the payload offset is at byte 380.
+    #[test]
+    fn bellatrix_and_capella_ssz_fees_must_match() {
+        let parent = [0xabu8; 32];
+        let fee = [0x66u8; 20];
+        for (version, fork, fixed_len) in
+            [("bellatrix", ForkName::Bellatrix, 384usize), ("capella", ForkName::Capella, 388)]
+        {
+            let checks = BlockDutyChecks {
+                slot: 7,
+                proposer_index: 42,
+                parent_root: Some(parent),
+                fee_recipient: Some(fee),
+                consensus_version: fork,
+            };
+            let block = |body: Vec<u8>| ProduceBlockResponse {
+                data: serde_json::Value::Null,
+                is_blinded: false,
+                consensus_version: version.to_string(),
+                execution_payload_value: Some("1".to_string()),
+                is_ssz: true,
+                ssz_bytes: Some(eth_types::encode_beacon_block_ssz(
+                    &eth_types::BeaconBlock {
+                        slot: 7,
+                        proposer_index: 42,
+                        parent_root: parent,
+                        state_root: [0u8; 32],
+                        body,
+                    },
+                    0,
+                )),
+                payload_included: false,
+                builder_url: None,
+                consensus_block_value: None,
+            };
+            assert!(
+                block_passes_duty(&block(pre_deneb_body(fixed_len, fee)), &checks),
+                "{version}"
+            );
+            assert!(
+                !block_passes_duty(&block(pre_deneb_body(fixed_len, [0x11; 20])), &checks),
+                "{version} mismatch"
+            );
+            assert!(!block_passes_duty(&block(vec![0u8; 8]), &checks), "{version} short body");
+        }
+    }
+
+    /// Body whose execution payload starts at `fixed_len` and carries `fee` at payload+32.
+    fn pre_deneb_body(fixed_len: usize, fee: [u8; 20]) -> Vec<u8> {
+        const PAYLOAD_OFFSET_AT: usize = 380;
+        let mut body = vec![0u8; fixed_len + 32 + 20];
+        body[PAYLOAD_OFFSET_AT..PAYLOAD_OFFSET_AT + 4]
+            .copy_from_slice(&(fixed_len as u32).to_le_bytes());
+        body[fixed_len + 32..fixed_len + 52].copy_from_slice(&fee);
+        body
+    }
+
     // -- is_better_block unit tests --
 
     #[test]
@@ -3126,6 +4382,54 @@ mod tests {
             consensus_block_value: None,
         };
         assert!(!is_better_block(&a, &b));
+    }
+
+    fn response_with_values(
+        execution: Option<&str>,
+        consensus: Option<&str>,
+    ) -> ProduceBlockResponse {
+        ProduceBlockResponse {
+            data: serde_json::Value::Null,
+            is_blinded: false,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: execution.map(str::to_string),
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: consensus.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_is_better_block_adds_consensus_value() {
+        let with_consensus = response_with_values(Some("1000"), Some("500"));
+        let execution_only = response_with_values(Some("1400"), None);
+        assert!(is_better_block(&with_consensus, &execution_only));
+        assert!(!is_better_block(&execution_only, &with_consensus));
+    }
+
+    #[test]
+    fn test_is_better_block_unparseable_and_overflow_do_not_rank_as_zero() {
+        let garbage = response_with_values(Some("12abc"), None);
+        let zero = response_with_values(Some("0"), None);
+        let strict = response_with_values(Some("1"), None);
+        assert!(is_better_block(&zero, &garbage));
+        assert!(!is_better_block(&garbage, &zero));
+        assert!(is_better_block(&strict, &garbage));
+
+        let bad_consensus = response_with_values(Some("9999"), Some("nope"));
+        assert!(is_better_block(&strict, &bad_consensus));
+        assert!(!is_better_block(&bad_consensus, &strict));
+
+        let overflow = response_with_values(Some(&u128::MAX.to_string()), Some("1"));
+        assert!(is_better_block(&strict, &overflow));
+        assert!(!is_better_block(&overflow, &strict));
+
+        // `"+1".parse::<u128>()` is 1. A leading sign is not a whole decimal.
+        let plus = response_with_values(Some("+1"), None);
+        assert!(is_better_block(&zero, &plus));
+        assert!(!is_better_block(&plus, &zero));
     }
 
     #[test]

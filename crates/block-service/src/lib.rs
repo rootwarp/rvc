@@ -13,5 +13,5 @@ mod validation;
 pub use beacon::{BuilderConfig, ProduceBlockResponse, WireBody};
 pub use error::BlockServiceError;
 pub use service::{BlockProposalResult, BlockService};
-pub use traits::{BeaconBlockClient, BuilderConfigProvider};
+pub use traits::{BeaconBlockClient, BuilderConfigProvider, ProduceDuty};
 pub use types::BlockSelectionMode;

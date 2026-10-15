@@ -117,7 +117,7 @@ const EXPECTED_COUNTS: [(Class, usize); 5] = [
     (Class::GeForkName, 26),
     (Class::IndexZero, 8),
     (Class::MatchForkName, 8),
-    (Class::StringDispatch, 9),
+    (Class::StringDispatch, 10),
     (Class::Entries, 8),
 ];
 
@@ -153,15 +153,6 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        367,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Gloas",
-        Verdict::InheritIntentionally,
-        "—",
-    ),
-    inv(
-        "crates/block-service/src/service/mod.rs",
         389,
         Class::GeForkName,
         false,
@@ -171,16 +162,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1128,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Gloas",
-        Verdict::InheritIntentionally,
-        "6.4",
-    ),
-    inv(
-        "crates/block-service/src/service/mod.rs",
-        1140,
+        411,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -189,7 +171,25 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1144,
+        1150,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "6.4",
+    ),
+    inv(
+        "crates/block-service/src/service/mod.rs",
+        1162,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "—",
+    ),
+    inv(
+        "crates/block-service/src/service/mod.rs",
+        1166,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -461,7 +461,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1106,
+        1128,
         Class::MatchForkName,
         false,
         "match fork {",
@@ -488,7 +488,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        208,
+        229,
         Class::MatchForkName,
         false,
         "match self {",
@@ -578,6 +578,15 @@ const INVENTORY: &[Inv] = &[
         "—",
     ),
     inv(
+        "crates/bn-manager/src/manager.rs",
+        1860,
+        Class::StringDispatch,
+        true,
+        "match consensus_version {",
+        Verdict::MustBound,
+        "—",
+    ),
+    inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
         2431,
         Class::StringDispatch,
@@ -607,7 +616,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        222,
+        243,
         Class::Entries,
         false,
         ".entries()",
@@ -616,7 +625,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        232,
+        253,
         Class::Entries,
         false,
         ".entries()",
@@ -625,7 +634,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        241,
+        262,
         Class::Entries,
         false,
         ".entries()",
@@ -634,7 +643,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        625,
+        655,
         Class::Entries,
         false,
         "schedule.entries()",
@@ -643,7 +652,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/eth-types/src/fork.rs",
-        642,
+        672,
         Class::Entries,
         false,
         "schedule.entries()",

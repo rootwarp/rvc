@@ -13,7 +13,7 @@ use beacon::{
     BeaconClient, BeaconClientConfig, HEADER_ETH_EXECUTION_PAYLOAD_INCLUDED,
     PRODUCE_BLOCK_V4_PATH_PREFIX,
 };
-use eth_types::ForkSchedule;
+use eth_types::{ForkName, ForkSchedule};
 use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -23,7 +23,7 @@ use rvc_bn_manager::types::bn_capability;
 use rvc_bn_manager::{
     AttestationApi, AttestationData, BeaconError, BeaconNodeClient, BlockProducer, BnManager,
     BnManagerConfig, BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, Checkpoint, DutiesProvider,
-    LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi, Propagator,
+    LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi, ProduceDuty, Propagator,
     SignedBeaconBlock, SignedBlindedBeaconBlock, SingleAttestation, SubmitAttestationResult,
     SyncCommitteeApi, VersionedAttestation, VersionedSignedAggregateAndProof,
 };
@@ -1123,6 +1123,259 @@ async fn test_multi_best_single_bn_falls_back_to_first() {
     let manager = make_manager(&bn.uri());
     let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
     assert!(result.is_ok());
+}
+
+fn produce_block_v3_ok(value: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("Eth-Consensus-Version", "deneb")
+        .insert_header("Eth-Execution-Payload-Blinded", "false")
+        .insert_header("Eth-Execution-Payload-Value", value)
+        .set_body_string(
+            r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
+        )
+}
+
+fn manager_with_block_budget(endpoints: &[&str], budget: Duration) -> BnManager {
+    let config = BnManagerConfig::new(endpoints.iter().map(|e| e.to_string()).collect());
+    BnManager::new(config).unwrap().with_operation_timeouts(OperationTimeouts {
+        block_production: budget,
+        ..OperationTimeouts::default()
+    })
+}
+
+/// B-002: a block already in hand is returned at the soft deadline. The slow
+/// peer's timeout is recorded as an error instead of discarding the block.
+///
+/// Budget 3 s, so the soft deadline is 1.5 s. BN-A answers in 300 ms. BN-B
+/// answers in 4 s with a higher payload value. The call must keep BN-A.
+#[tokio::test]
+async fn test_best_of_returns_ready_block_at_soft_deadline_when_peer_is_slow() {
+    let bn_a = MockServer::start().await;
+    let bn_b = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .and(query_param("randao_reveal", "0xrandao"))
+        .respond_with(produce_block_v3_ok("1000").set_delay(Duration::from_millis(300)))
+        .expect(1)
+        .mount(&bn_a)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("9000").set_delay(Duration::from_secs(4)))
+        .expect(1)
+        .mount(&bn_b)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn_a.uri(), &bn_b.uri()], Duration::from_secs(3));
+    let start = tokio::time::Instant::now();
+    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+    let elapsed = start.elapsed();
+
+    let block = result.expect("BN-A's block must be kept");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("1000"));
+    assert!(
+        elapsed >= Duration::from_millis(1000),
+        "returned before the soft deadline ({elapsed:?})"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2800),
+        "waited for the budget instead of the soft deadline ({elapsed:?})"
+    );
+
+    poll_broadcast_health(&manager, |scores| scores[1].error_rate == 1.0).await;
+    let scores = manager.health_scores().await;
+    assert!(scores[0].latency_ms > 0.0, "BN-A's success must be recorded: {scores:?}");
+}
+
+/// No block has arrived at the soft deadline. The one that arrives at 2 s is
+/// returned then, not held until the 3 s budget.
+#[tokio::test]
+async fn test_best_of_returns_first_block_after_soft_without_waiting_for_budget() {
+    let bn_a = MockServer::start().await;
+    let bn_b = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("1000").set_delay(Duration::from_secs(2)))
+        .expect(1)
+        .mount(&bn_a)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("9000").set_delay(Duration::from_secs(4)))
+        .expect(1)
+        .mount(&bn_b)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn_a.uri(), &bn_b.uri()], Duration::from_secs(3));
+    let start = tokio::time::Instant::now();
+    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+    let elapsed = start.elapsed();
+
+    let block = result.expect("the block that arrived at 2s");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("1000"));
+    assert!(
+        elapsed >= Duration::from_millis(1700) && elapsed < Duration::from_millis(2800),
+        "expected return near 2s, not at the 3s budget; took {elapsed:?}"
+    );
+}
+
+/// Every synced BN misses the hard deadline. A small-lag proposal-role BN is
+/// tried inside the backstop when the parent root is known, and its block is
+/// returned.
+#[tokio::test]
+async fn test_best_of_falls_back_to_unsynced_when_every_synced_bn_times_out() {
+    let synced = MockServer::start().await;
+    let unsynced = MockServer::start().await;
+    let parent = [0xabu8; 32];
+    let parent_hex =
+        format!("0x{}", parent.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+    let state_hex = format!("0x{}", "00".repeat(32));
+    let body = format!(
+        r#"{{"data":{{"slot":"1","proposer_index":"0","parent_root":"{parent_hex}","state_root":"{state_hex}","body":{{}}}}}}"#
+    );
+    let fallback_ok = ResponseTemplate::new(200)
+        .insert_header("Eth-Consensus-Version", "deneb")
+        .insert_header("Eth-Execution-Payload-Blinded", "false")
+        .insert_header("Eth-Execution-Payload-Value", "7000")
+        .set_body_string(body);
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+        .mount(&synced)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("1111").set_delay(Duration::from_secs(5)))
+        .expect(1)
+        .mount(&synced)
+        .await;
+
+    const SMALL_LAG_RESPONSE: &str = r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SMALL_LAG_RESPONSE))
+        .mount(&unsynced)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(fallback_ok)
+        .expect(1)
+        .mount(&unsynced)
+        .await;
+
+    let manager =
+        manager_with_block_budget(&[&synced.uri(), &unsynced.uri()], Duration::from_millis(400));
+    manager.check_sync_status().await;
+
+    let start = tokio::time::Instant::now();
+    let result = manager
+        .produce_block_v3_for_duty(
+            1,
+            "0xrandao",
+            None,
+            None,
+            ProduceDuty {
+                expected_proposer_index: 0,
+                expected_parent_root: Some(parent),
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+            },
+        )
+        .await;
+    let elapsed = start.elapsed();
+
+    let block = result.expect("small-lag fallback block");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("7000"));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "fallback must finish inside the backstop, took {elapsed:?}"
+    );
+}
+
+/// `produce_block_v3_for_duty` drops a block whose payload fee recipient
+/// does not match the duty, even when every other field matches.
+#[tokio::test]
+async fn produce_block_v3_for_duty_rejects_a_mismatched_fee() {
+    let bn = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    let state = "00".repeat(32);
+    let fee = "22".repeat(20);
+    let body = format!(
+        r#"{{"data":{{"slot":"1","proposer_index":"7","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}}}}}}"#
+    );
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "9000")
+                .set_body_string(body),
+        )
+        .expect(1)
+        .mount(&bn)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn.uri()], Duration::from_millis(400));
+    let result = manager
+        .produce_block_v3_for_duty(
+            1,
+            "0xrandao",
+            None,
+            None,
+            ProduceDuty {
+                expected_proposer_index: 7,
+                expected_parent_root: Some([0xab; 32]),
+                expected_fee_recipient: Some([0x11; 20]),
+                expected_consensus_version: ForkName::Deneb,
+            },
+        )
+        .await;
+    assert!(result.is_err(), "a mismatched fee must not be returned: {result:?}");
+}
+
+/// No duty, so the parent is unknown. A small-lag proposal BN is not asked.
+#[tokio::test]
+async fn produce_block_v3_without_a_parent_does_not_ask_a_small_lag_bn() {
+    let synced = MockServer::start().await;
+    let small = MockServer::start().await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+        .mount(&synced)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("down"))
+        .expect(1)
+        .mount(&synced)
+        .await;
+
+    const SMALL_LAG_RESPONSE: &str = r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SMALL_LAG_RESPONSE))
+        .mount(&small)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(produce_block_v3_ok("7000"))
+        .expect(0)
+        .mount(&small)
+        .await;
+
+    let manager =
+        manager_with_block_budget(&[&synced.uri(), &small.uri()], Duration::from_millis(400));
+    manager.check_sync_status().await;
+
+    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
+    assert!(result.is_err(), "no parent must not fall back to the small-lag BN: {result:?}");
 }
 
 // -- V4 sequential failover (issue 6.6 / D29) --
@@ -2443,34 +2696,73 @@ async fn test_sync_query_best_falls_back_to_unsynced_when_synced_fail() {
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
         .respond_with(ResponseTemplate::new(500).set_body_string("Error"))
-        .expect(1)
+        .expect(2)
         .mount(&bn1)
         .await;
 
-    // BN2: syncing but block production works
+    // BN2 starts below the fallback floor. One sync read consumes this mock;
+    // the small-lag mock mounted later is what the duty call sees.
     Mock::given(method("GET"))
         .and(path("/eth/v1/node/syncing"))
         .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
-        .mount(&bn2)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/eth/v3/validator/blocks/1"))
-        .respond_with(ResponseTemplate::new(200)
-            .insert_header("Eth-Consensus-Version", "deneb")
-            .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Execution-Payload-Value", "7000")
-            .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
-        .expect(1)
+        .up_to_n_times(1)
         .mount(&bn2)
         .await;
 
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     manager.check_sync_status().await;
 
-    // BN1 (synced) fails, should fall back to BN2 (unsynced)
-    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
-    assert!(result.is_ok());
+    // No known parent: a distance-500 node is below the fallback floor and
+    // produce_block_v3 does not fall back.
+    let without_parent = manager.produce_block_v3(1, "0xrandao", None, None).await;
+    assert!(
+        without_parent.is_err(),
+        "unsynced fallback requires a known parent: {without_parent:?}"
+    );
+
+    // Same nodes, but BN2 is small-lag and the parent is known.
+    let parent = [0xabu8; 32];
+    let parent_hex =
+        format!("0x{}", parent.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+    let state_hex = format!("0x{}", "00".repeat(32));
+    let body = format!(
+        r#"{{"data":{{"slot":"1","proposer_index":"0","parent_root":"{parent_hex}","state_root":"{state_hex}","body":{{}}}}}}"#
+    );
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#,
+        ))
+        .mount(&bn2)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", "7000")
+                .set_body_string(body),
+        )
+        .expect(1)
+        .mount(&bn2)
+        .await;
+    manager.check_sync_status().await;
+    let result = manager
+        .produce_block_v3_for_duty(
+            1,
+            "0xrandao",
+            None,
+            None,
+            ProduceDuty {
+                expected_proposer_index: 0,
+                expected_parent_root: Some(parent),
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
     assert_eq!(result.unwrap().execution_payload_value, Some("7000".to_string()));
 }
 
@@ -2838,7 +3130,11 @@ async fn test_health_best_strategy_records_health() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
     let _ = manager.produce_block_v3(1, "0xrandao", None, None).await.unwrap();
 
-    // Both BNs should have health recorded
+    // Health is queued and applied after the call returns.
+    poll_broadcast_health(&manager, |scores| {
+        scores[0].latency_ms > 0.0 && scores[1].latency_ms > 0.0
+    })
+    .await;
     let scores = manager.health_scores().await;
     assert!(scores[0].latency_ms > 0.0, "BN1 latency should be tracked");
     assert!(scores[1].latency_ms > 0.0, "BN2 latency should be tracked");
@@ -3426,8 +3722,8 @@ fn sample_signed_blinded_block() -> SignedBlindedBeaconBlock {
     }
 }
 
-/// query_best with N parallel BNs must take the health write lock once for
-/// the selection round (not once per result).
+/// A best-of round queues one health sample per BN. The call returns without
+/// waiting on the health write lock; the recorder applies the samples after.
 #[tokio::test]
 async fn test_health_tracker_write_lock_taken_once_per_selection_round() {
     let bn1 = MockServer::start().await;
@@ -3460,18 +3756,15 @@ async fn test_health_tracker_write_lock_taken_once_per_selection_round() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri(), &bn3.uri()]);
     manager.check_sync_status().await;
 
-    manager.health_trackers().reset_write_lock_count();
     let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
     assert!(result.is_ok());
 
-    let writes = manager.health_trackers().write_lock_count();
-    assert_eq!(
-        writes, 1,
-        "query_best must batch health updates into a single write lock (got {writes})"
-    );
+    poll_broadcast_health(&manager, |scores| scores.iter().all(|score| score.latency_ms > 0.0))
+        .await;
 }
 
-/// fallback_unsynced also records under one write per fallback round.
+/// Fallback health is queued per attempt. The block is returned without
+/// waiting on the health write lock.
 #[tokio::test]
 async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
     let bn1 = MockServer::start().await;
@@ -3491,11 +3784,12 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
         .mount(&bn1)
         .await;
 
-    // BN2, BN3: unsynced; BN2 fails, BN3 succeeds
+    // BN2, BN3: small lag (above the fallback floor); BN2 fails, BN3 succeeds.
+    const SMALL_LAG_RESPONSE: &str = r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
     for bn in [&bn2, &bn3] {
         Mock::given(method("GET"))
             .and(path("/eth/v1/node/syncing"))
-            .respond_with(ResponseTemplate::new(200).set_body_string(SYNCING_SYNCING_RESPONSE))
+            .respond_with(ResponseTemplate::new(200).set_body_string(SMALL_LAG_RESPONSE))
             .mount(bn)
             .await;
     }
@@ -3505,6 +3799,13 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
         .expect(1)
         .mount(&bn2)
         .await;
+    let parent = [0xabu8; 32];
+    let parent_hex =
+        format!("0x{}", parent.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
+    let state_hex = format!("0x{}", "00".repeat(32));
+    let body = format!(
+        r#"{{"data":{{"slot":"1","proposer_index":"0","parent_root":"{parent_hex}","state_root":"{state_hex}","body":{{}}}}}}"#
+    );
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
         .respond_with(
@@ -3512,9 +3813,7 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
                 .insert_header("Eth-Consensus-Version", "deneb")
                 .insert_header("Eth-Execution-Payload-Blinded", "false")
                 .insert_header("Eth-Execution-Payload-Value", "7000")
-                .set_body_string(
-                    r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
-                ),
+                .set_body_string(body),
         )
         .expect(1)
         .mount(&bn3)
@@ -3523,14 +3822,26 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri(), &bn3.uri()]);
     manager.check_sync_status().await;
 
-    manager.health_trackers().reset_write_lock_count();
-    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
-    assert!(result.is_ok());
+    let result = manager
+        .produce_block_v3_for_duty(
+            1,
+            "0xrandao",
+            None,
+            None,
+            ProduceDuty {
+                expected_proposer_index: 0,
+                expected_parent_root: Some(parent),
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+            },
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
 
-    // 1 write for the failed synced BN (query_best single path) +
-    // 1 write for the unsynced fallback round (BN2 err + BN3 ok batched).
-    let writes = manager.health_trackers().write_lock_count();
-    assert_eq!(writes, 2, "synced fail (1) + batched unsynced fallback (1) expected; got {writes}");
+    poll_broadcast_health(&manager, |scores| {
+        scores[0].error_rate == 1.0 && scores[1].error_rate == 1.0 && scores[2].latency_ms > 0.0
+    })
+    .await;
 }
 
 /// Each of the six topic-gated submission methods respects its broadcast flag:
@@ -4151,7 +4462,18 @@ async fn test_produce_block_v3_observes_proposer_bn_latency_ms() {
 
     manager.produce_block_v3(1, "0xrandao", None, None).await.expect("produce_block_v3");
 
-    let count_after = proposer_bn_latency_count(&endpoint);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let count_after = loop {
+        let count_after = proposer_bn_latency_count(&endpoint);
+        if count_after > count_before {
+            break count_after;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "produce_block_v3 must observe rvc_proposer_bn_latency_ms; before={count_before}, after={count_after}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
     assert!(
         count_after > count_before,
         "produce_block_v3 must observe rvc_proposer_bn_latency_ms; before={count_before}, after={count_after}"

@@ -3,6 +3,33 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Block production: a slow beacon node no longer drops a block already in hand
+
+`produce_block_v3` returns the blocks that have arrived by half the
+block-production budget and that match the duty's slot, proposer, parent,
+consensus version, and, on a full block, the fee recipient. A block that
+fails those checks does not close
+that window. Ranking adds the execution payload value and the consensus
+block value. Each value has to be a whole decimal number; a value that does
+not parse, or a sum that overflows, does not win. If none have been accepted,
+it returns the first matching block that arrives before the budget. A node
+still in flight is finished afterwards, and a timeout is recorded as an
+error on that node. Recording that sample does not delay the block already
+in hand.
+
+If every synced proposal node fails or misses the budget, another
+proposal-role node is tried only when it is still above the health floor
+(small lag or better, healthy, not optimistic, and execution online) and the
+expected parent root is known. Its block has to match that parent. From
+Bellatrix on, a full block has to carry the duty's fee recipient. A missing
+fee recipient is rejected, and a full SSZ block whose fee recipient cannot
+be read is rejected. A blinded block keeps the builder header's fee
+recipient. The attempt stays inside the time
+left in the backstop (the budget plus 250 ms). The block-proposal deadline
+includes that same 250 ms, so publishing is not shortened by it. A
+block-production budget of zero is treated as no budget. With no budget
+configured, block production still waits for every selected beacon node.
+
 ## Beacon node broadcast: the first complete acceptance completes the call
 
 A submission broadcast returns when the first matching beacon node fully
