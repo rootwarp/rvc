@@ -2,6 +2,13 @@
 
 mod broadcast;
 mod error;
+mod fan_out;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub use fan_out::{
+    testing_broadcast_improving_partial_then_slow, testing_broadcast_partial_then_slow,
+};
+pub use fan_out::{AttestationPublishContext, KnownAttestationPublish, ATTESTATION_PUBLISH};
 mod health;
 mod manager;
 pub mod metrics;

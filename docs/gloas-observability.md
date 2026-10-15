@@ -61,6 +61,13 @@ sample is observed. The per-family notes below say which is which.
 | `rvc_bn_capability_state` | 6.7 / 8.3 · `crates/bn-manager/src/metrics.rs` | gauge | `endpoint` (`scheme://host:port`, no userinfo/path), `capability` = `fork_recognised` / `produce_block_v4` | `BnManager::new` (`crates/bn-manager/src/manager.rs`) publishes **1** for both capabilities **before any probe** (optimistic). A later `record_outcomes` probe writes `1` (v4 success) or `0` (incapable). **`1` is not evidence that v4 was probed.** `0` is a real post-probe incapable sample. Configured endpoints are present from `new()`, not omitted. |
 | `rvc_signer_rejections_total` | 8.4 · `crates/signer/src/metrics.rs` (VC) and `crates/signer-server/src/metrics.rs` (`rvc-signer`) | counter | `reason`, `sign_type`, `version` | Fail-closed type/version rejections. Children omitted until the first rejection. `reason` is `unsupported_type` / `unsupported_version`; `version` is a lowercase fork name or `unknown`. |
 
+Broadcast drain bookkeeping (#639), separate from the six families above:
+
+| Family | Owner | Type | Labels | Emitted when |
+|--------|-------|------|--------|--------------|
+| `rvc_bn_broadcast_drain_health_skipped_total` | #639 · `crates/bn-manager/src/metrics.rs` | counter | none | A broadcast health sample was not recorded. A success is skipped when 16 drains are already recording. When the health-recorder queue is full, an error or a timeout sample can be dropped, and that drop is counted here. The enqueue does not block the publish. A full pool still records an error or a timeout when the queue has room. The cap limits health recording, not sends. The publish still ran. Created at `0` by `metrics::init()`. |
+| `rvc_bn_broadcast_overflow_drains` | #639 · `crates/bn-manager/src/metrics.rs` | gauge | `endpoint` (`scheme://host:port`, no userinfo/path) | In-flight publishes past the 16-permit health-sample cap, per redacted beacon endpoint, so a slow node's backlog is visible. The gauge drops when that HTTP call finishes, or when that attempt is cancelled or panics, before the health sample is queued. The cap limits health recording, not sends. Each publish still runs and ends at the attempt budget, or at the HTTP client timeout when no budget is set (publish rate × that timeout). |
+
 `rvc_validators_slashed_total` (`crates/metrics/src/definitions.rs`) is **not**
 one of the six. It is the paging-immediately slashing gate and is listed with
 the rules so it is not wired as `== 0`.

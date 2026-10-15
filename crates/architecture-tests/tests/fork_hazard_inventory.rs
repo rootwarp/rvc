@@ -361,7 +361,7 @@ const INVENTORY: &[Inv] = &[
     // Class 2
     inv(
         "crates/rvc/src/orchestrator/attestation.rs",
-        833,
+        865,
         Class::IndexZero,
         false,
         ".index = \"0\"",

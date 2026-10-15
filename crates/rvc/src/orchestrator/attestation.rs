@@ -13,7 +13,10 @@ use beacon::{
     AttestationData as BeaconAttestationData, LegacyAttestation, SingleAttestation,
     VersionedAttestation,
 };
-use bn_manager::{AttestationSubmitter, BeaconNodeClient, Propagator};
+use bn_manager::{
+    AttestationPublishContext, AttestationSubmitter, BeaconNodeClient, KnownAttestationPublish,
+    PropagationOutcome, Propagator, ATTESTATION_PUBLISH,
+};
 use duty_tracker::{DutyTracker, TypedAttesterDuty};
 use eth_types::{ForkName, ForkSchedule, Slot};
 use observability::logging::TruncatedPubkey;
@@ -222,7 +225,9 @@ where
     ///
     /// `take_until` bounds the duty input. Signs already in flight drain.
     /// Duties not yet pulled are dropped and counted. Publish is admitted only
-    /// until `slot_end + 500 ms`; a submit still running then is cancelled.
+    /// until `slot_end + 500 ms`. A submit that has not been accepted by then
+    /// is cancelled. A known partial is kept, and beacon-node sends that
+    /// already started are not cancelled.
     #[tracing::instrument(name = "orchestrator.process_slot", level = "debug", skip_all, fields(slot = slot))]
     pub(crate) async fn process_slot_until(
         &self,
@@ -503,7 +508,8 @@ where
     ///
     /// The POST's deadline is the earlier of the `attestation_submit` timeout
     /// and `slot_end` plus 500 ms. Signs already running are not cancelled; a
-    /// wave that becomes ready after that instant is not sent.
+    /// wave that becomes ready after that instant is not sent. A known partial
+    /// is kept when that deadline cancels the wait for a full acceptance.
     async fn publish_wave(
         &self,
         slot: Slot,
@@ -554,72 +560,23 @@ where
         }
 
         let merged = merge_wave(&signed);
-        let submit_result =
-            tokio::time::timeout_at(deadline, self.propagator.propagate_indexed(&merged))
-                .instrument(info_span!("beacon.submit_attestation", slot, count = signed.len()))
-                .await;
+        let known = Arc::new(std::sync::Mutex::new(None));
+        let ctx = AttestationPublishContext { deadline, known: Arc::clone(&known) };
+        let submit_result = ATTESTATION_PUBLISH
+            .scope(
+                ctx,
+                tokio::time::timeout_at(deadline, self.propagator.propagate_indexed(&merged))
+                    .instrument(info_span!(
+                        "beacon.submit_attestation",
+                        slot,
+                        count = signed.len()
+                    )),
+            )
+            .await;
 
         match submit_result {
             Ok(Ok(outcome)) => {
-                // Host-only label for storage and logs (issue #598 / Security S2).
-                // `None` for a bn-less or empty report.
-                let bn = outcome
-                    .reported_by
-                    .filter(|endpoint| !endpoint.is_empty())
-                    .map(|endpoint| bn_manager::metrics::endpoint_label(&endpoint));
-                let bn_log = bn.clone().unwrap_or_default();
-                let mut rejected = HashMap::<u32, String>::new();
-                let mut unattributable = false;
-                for failure in outcome.failures {
-                    let positioned =
-                        usize::try_from(failure.index).ok().and_then(|i| signed.get(i));
-                    match positioned {
-                        Some(entry) => {
-                            warn!(
-                                validator_index = %entry.attribution.validator_index,
-                                pubkey = %TruncatedPubkey::new(&entry.attribution.pubkey),
-                                bn = %bn_log,
-                                message = %failure.message,
-                                "Attestation submission failed"
-                            );
-                            rejected.insert(failure.index, failure.message);
-                        }
-                        None => {
-                            // Out-of-range indices are not Published (issue #598 / S3).
-                            unattributable = true;
-                            warn!(
-                                slot,
-                                index = failure.index,
-                                bn = %bn_log,
-                                message = %failure.message,
-                                "Attestation submission failed for an unknown wave index"
-                            );
-                        }
-                    }
-                }
-                for (index, entry) in signed.into_iter().enumerate() {
-                    let index = u32::try_from(index).unwrap_or(u32::MAX);
-                    if let Some(message) = rejected.remove(&index) {
-                        results.push(AttestationResult {
-                            validator_index: entry.attribution.validator_index,
-                            slot: entry.attribution.slot,
-                            outcome: AttestationOutcome::RejectedByBeaconNode {
-                                bn: bn.clone(),
-                                message,
-                            },
-                        });
-                    } else if unattributable {
-                        results.push(
-                            self.failed_publish(
-                                entry,
-                                "beacon node reported an unattributable attestation failure"
-                                    .to_string(),
-                            ),
-                        );
-                    } else {
-                        results.push(self.successful_publish(entry));
-                    }
-                }
+                results.extend(self.attribute_propagation(slot, signed, outcome));
             }
             Ok(Err(error)) => {
                 let message = format!("Failed to propagate attestation: {error}");
@@ -629,14 +586,89 @@ where
                 }
             }
             Err(_) => {
-                let message = attestation_publish_stop_message(
-                    bounded_by_overhang,
-                    self.config.timeouts.attestation_submit,
-                );
-                tracing::error!(slot, bounded_by_overhang, "Attestation submission timed out");
-                for entry in signed {
-                    results.push(self.failed_publish(entry, message.clone()));
+                if let Some(known) = known.lock().expect("known attestation").take() {
+                    warn!(
+                        slot,
+                        bounded_by_overhang, "attestation publish deadline kept the known partial"
+                    );
+                    let total = signed.len();
+                    results.extend(self.attribute_propagation(
+                        slot,
+                        signed,
+                        outcome_from_known(total, known),
+                    ));
+                } else {
+                    let message = attestation_publish_stop_message(
+                        bounded_by_overhang,
+                        self.config.timeouts.attestation_submit,
+                    );
+                    tracing::error!(slot, bounded_by_overhang, "Attestation submission timed out");
+                    for entry in signed {
+                        results.push(self.failed_publish(entry, message.clone()));
+                    }
                 }
+            }
+        }
+        results
+    }
+
+    fn attribute_propagation(
+        &self,
+        slot: Slot,
+        signed: Vec<WaveEntry>,
+        outcome: PropagationOutcome,
+    ) -> Vec<AttestationResult> {
+        // Host-only label for storage and logs (issue #598 / Security S2).
+        // `None` for a bn-less or empty report.
+        let bn = outcome
+            .reported_by
+            .filter(|endpoint| !endpoint.is_empty())
+            .map(|endpoint| bn_manager::metrics::endpoint_label(&endpoint));
+        let bn_log = bn.clone().unwrap_or_default();
+        let mut rejected = HashMap::<u32, String>::new();
+        let mut unattributable = false;
+        for failure in outcome.failures {
+            let positioned = usize::try_from(failure.index).ok().and_then(|i| signed.get(i));
+            match positioned {
+                Some(entry) => {
+                    warn!(
+                        validator_index = %entry.attribution.validator_index,
+                        pubkey = %TruncatedPubkey::new(&entry.attribution.pubkey),
+                        bn = %bn_log,
+                        message = %failure.message,
+                        "Attestation submission failed"
+                    );
+                    rejected.insert(failure.index, failure.message);
+                }
+                None => {
+                    // Out-of-range indices are not Published (issue #598 / S3).
+                    unattributable = true;
+                    warn!(
+                        slot,
+                        index = failure.index,
+                        bn = %bn_log,
+                        message = %failure.message,
+                        "Attestation submission failed for an unknown wave index"
+                    );
+                }
+            }
+        }
+        let mut results = Vec::with_capacity(signed.len());
+        for (index, entry) in signed.into_iter().enumerate() {
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            if let Some(message) = rejected.remove(&index) {
+                results.push(AttestationResult {
+                    validator_index: entry.attribution.validator_index,
+                    slot: entry.attribution.slot,
+                    outcome: AttestationOutcome::RejectedByBeaconNode { bn: bn.clone(), message },
+                });
+            } else if unattributable {
+                results.push(self.failed_publish(
+                    entry,
+                    "beacon node reported an unattributable attestation failure".to_string(),
+                ));
+            } else {
+                results.push(self.successful_publish(entry));
             }
         }
         results
@@ -904,6 +936,20 @@ fn wave_is_homogeneous(entries: &[WaveEntry]) -> bool {
     entries.iter().all(|entry| attestation_variant_name(&entry.attestation) == kind)
 }
 
+fn outcome_from_known(total: usize, known: KnownAttestationPublish) -> PropagationOutcome {
+    let failures = match known.result {
+        bn_manager::SubmitAttestationResult::Success => Vec::new(),
+        bn_manager::SubmitAttestationResult::PartialFailure { failures } => failures,
+    };
+    let failure_count = failures.len();
+    PropagationOutcome {
+        total,
+        success_count: total.saturating_sub(failure_count),
+        failures,
+        reported_by: Some(known.endpoint),
+    }
+}
+
 /// Concatenate a homogeneous wave into one array body.
 fn merge_wave(entries: &[WaveEntry]) -> VersionedAttestation {
     debug_assert!(wave_is_homogeneous(entries));
@@ -1071,7 +1117,7 @@ mod tests {
 mod dispatch_pipeline {
     use std::future::Future;
     use std::pin::Pin;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1081,7 +1127,10 @@ mod dispatch_pipeline {
         BeaconError, Checkpoint, IndexedAttestationError, SubmitAttestationResult,
         VersionedAttestation,
     };
-    use bn_manager::{AttestationSubmitter, MockBeaconNodeClient, MockMethod, Propagator};
+    use bn_manager::{
+        testing_broadcast_improving_partial_then_slow, testing_broadcast_partial_then_slow,
+        AttestationSubmitter, MockBeaconNodeClient, MockMethod, Propagator,
+    };
     use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
     use duty_tracker::DutyTracker;
     use eth_types::ForkSchedule;
@@ -1788,5 +1837,203 @@ mod dispatch_pipeline {
             fixture.beacon.submit_attestation_calls().is_empty(),
             "the 2 s POST must be cancelled before it completes"
         );
+    }
+
+    /// A short slot-end overhang cancels the wait after a partial acceptance.
+    /// The known partial is kept, and the other beacon node still receives the publish.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn short_overhang_keeps_a_known_partial() {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let delivered_flag = Arc::clone(&delivered);
+        let (release, wait) = tokio::sync::watch::channel(false);
+        let submitter = Arc::new(PartialThenHang { delivered: delivered_flag, wait });
+        let started = tokio::time::Instant::now();
+        let slot_end = started + Duration::from_millis(50);
+        let fixture = open_fixture_with_submitter(
+            2,
+            FixtureOpts {
+                concurrency: 2,
+                publish_concurrency: 1,
+                submit_timeout: Some(Duration::from_secs(30)),
+                ..FixtureOpts::default()
+            },
+            submitter,
+        );
+        let results = fixture.service.process_slot_until(SLOT, slot_end).await.expect("drain");
+        let finished = tokio::time::Instant::now();
+        let overhang_at = slot_end + Duration::from_millis(500);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(
+            finished <= overhang_at,
+            "the wait ran until {finished:?}, past overhang {overhang_at:?}"
+        );
+        let rejected = results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    &result.outcome,
+                    AttestationOutcome::RejectedByBeaconNode { message, .. }
+                        if message.contains("invalid signature")
+                )
+            })
+            .count();
+        let published = results
+            .iter()
+            .filter(|result| matches!(result.outcome, AttestationOutcome::Published))
+            .count();
+        assert_eq!(rejected, 1, "the known partial rejects one attestation: {results:?}");
+        assert_eq!(published, 1, "the other attestation in the partial was accepted: {results:?}");
+        assert!(
+            !delivered.load(Ordering::SeqCst),
+            "the other beacon node must still be in flight when the partial is returned"
+        );
+        release.send(true).expect("release the other beacon node");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !delivered.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the overhang cancelled the other beacon node's publish"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    struct PartialThenHang {
+        delivered: Arc<AtomicBool>,
+        wait: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl AttestationSubmitter for PartialThenHang {
+        fn submit_attestation<'a>(
+            &'a self,
+            _attestations: &'a VersionedAttestation,
+        ) -> Pin<Box<dyn Future<Output = Result<SubmitAttestationResult, BeaconError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(SubmitAttestationResult::Success) })
+        }
+
+        fn submit_attestation_attributed<'a>(
+            &'a self,
+            _attestations: &'a VersionedAttestation,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(Option<String>, SubmitAttestationResult), BeaconError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let delivered = Arc::clone(&self.delivered);
+            let mut wait = self.wait.clone();
+            Box::pin(async move {
+                testing_broadcast_partial_then_slow(Box::pin(async move {
+                    let _ = wait.wait_for(|go| *go).await;
+                    delivered.store(true, Ordering::SeqCst);
+                    Ok(SubmitAttestationResult::Success)
+                }))
+                .await
+                .map(|(endpoint, result)| (Some(endpoint), result))
+            })
+        }
+    }
+
+    /// A worse partial detaches the wait, a later beacon node reports fewer
+    /// failures, and the third hangs. The deadline must attribute the fewer
+    /// failures, and the hang still finishes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn deadline_keeps_the_later_partial_with_fewer_failures() {
+        let delivered = Arc::new(AtomicBool::new(false));
+        let delivered_flag = Arc::clone(&delivered);
+        let (release, wait) = tokio::sync::watch::channel(false);
+        let submitter = Arc::new(ImprovingPartialThenHang { delivered: delivered_flag, wait });
+        let started = tokio::time::Instant::now();
+        let slot_end = started + Duration::from_millis(50);
+        let fixture = open_fixture_with_submitter(
+            2,
+            FixtureOpts {
+                concurrency: 2,
+                publish_concurrency: 1,
+                submit_timeout: Some(Duration::from_secs(30)),
+                ..FixtureOpts::default()
+            },
+            submitter,
+        );
+        let results = fixture.service.process_slot_until(SLOT, slot_end).await.expect("drain");
+        let finished = tokio::time::Instant::now();
+        let overhang_at = slot_end + Duration::from_millis(500);
+        assert_eq!(results.len(), 2, "{results:?}");
+        assert!(
+            finished <= overhang_at,
+            "the wait ran until {finished:?}, past overhang {overhang_at:?}"
+        );
+        let rejected = results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    &result.outcome,
+                    AttestationOutcome::RejectedByBeaconNode { message, .. }
+                        if message.contains("stale head")
+                )
+            })
+            .count();
+        let published = results
+            .iter()
+            .filter(|result| matches!(result.outcome, AttestationOutcome::Published))
+            .count();
+        assert_eq!(rejected, 1, "the deadline must report the fewer-failure partial: {results:?}");
+        assert_eq!(
+            published, 1,
+            "the other attestation in the fewer-failure partial was accepted: {results:?}"
+        );
+        assert!(
+            !delivered.load(Ordering::SeqCst),
+            "the hanging beacon node must still be in flight when the partial is returned"
+        );
+        release.send(true).expect("release the hanging beacon node");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !delivered.load(Ordering::SeqCst) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the deadline cancelled the hanging beacon node's publish"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    struct ImprovingPartialThenHang {
+        delivered: Arc<AtomicBool>,
+        wait: tokio::sync::watch::Receiver<bool>,
+    }
+
+    impl AttestationSubmitter for ImprovingPartialThenHang {
+        fn submit_attestation<'a>(
+            &'a self,
+            _attestations: &'a VersionedAttestation,
+        ) -> Pin<Box<dyn Future<Output = Result<SubmitAttestationResult, BeaconError>> + Send + 'a>>
+        {
+            Box::pin(async { Ok(SubmitAttestationResult::Success) })
+        }
+
+        fn submit_attestation_attributed<'a>(
+            &'a self,
+            _attestations: &'a VersionedAttestation,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(Option<String>, SubmitAttestationResult), BeaconError>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            let delivered = Arc::clone(&self.delivered);
+            let mut wait = self.wait.clone();
+            Box::pin(async move {
+                testing_broadcast_improving_partial_then_slow(Box::pin(async move {
+                    let _ = wait.wait_for(|go| *go).await;
+                    delivered.store(true, Ordering::SeqCst);
+                    Ok(SubmitAttestationResult::Success)
+                }))
+                .await
+                .map(|(endpoint, result)| (Some(endpoint), result))
+            })
+        }
     }
 }

@@ -81,6 +81,24 @@
 //! `committee_index`, `validator_index`, `committee_length`,
 //! `validator_committee_index`). The rest of the epoch stays cached. Dashboards
 //! that alert on malformed beacon duties should bind this name (RR3-04 / #533).
+//! RV-1.1 / #639 adds `rvc_bn_broadcast_drain_health_skipped_total` (family
+//! delta +1): one increment when a broadcast success health sample is skipped
+//! because the health-sample cap is full, or when any sample does not fit on
+//! the health-recorder queue. When that queue is full, an error or a timeout
+//! sample can be dropped, and that drop is counted. The enqueue does not
+//! block the publish. A full pool still records an
+//! error or a timeout when the queue has room. The cap limits health
+//! recording, not sends. The publish still runs. It has no labels. Dashboards
+//! that watch missed beacon-node health samples should bind this name.
+//! RV-1.1 / #639 adds `rvc_bn_broadcast_overflow_drains` (family delta +1):
+//! in-flight broadcast publishes past the health-sample cap. Label `endpoint`
+//! is the redacted beacon endpoint (`scheme://host:port`, userinfo and path
+//! stripped) so a slow beacon node's backlog is visible. The gauge drops when
+//! that HTTP call finishes, or when that attempt is cancelled or panics,
+//! before the health sample is queued. Each publish
+//! still runs and ends at the attempt budget, or at the HTTP client timeout
+//! when no budget is set, so the series tracks publish rate times that timeout.
+//! Dashboards that watch overflow publishes should bind this gauge.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -127,6 +145,8 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_attestations_total",
     "rvc_attesting_enabled",
     "rvc_blob_sidecars_published_total", // operator-facing: pre-Gloas JSON or SSZ SignedBlockContents publishes (RR-1.2)
+    "rvc_bn_broadcast_drain_health_skipped_total", // operator-facing: success skipped at the cap, or any sample when the recorder queue is full; the publish still runs (#639)
+    "rvc_bn_broadcast_overflow_drains", // operator-facing: in-flight overflow publishes by redacted endpoint; drops when the HTTP call finishes (#639)
     "rvc_bn_capability_state",
     "rvc_bn_health_tier",
     "rvc_builder_circuit_breaker_trips_total",
@@ -285,8 +305,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        60,
-        "RR3-02 adds rvc_slashing_import_deferred_ms; count is the list length"
+        62,
+        "#639 adds rvc_bn_broadcast_drain_health_skipped_total and rvc_bn_broadcast_overflow_drains; count is the list length"
     );
 }
 
