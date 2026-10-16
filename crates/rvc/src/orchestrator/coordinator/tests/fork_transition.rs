@@ -2418,6 +2418,7 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
             PRE_GLOAS_SLOT,
             PRE_GLOAS_SLOT / SLOTS_PER_EPOCH,
             &proposal_ctx(PRE_GLOAS_SLOT),
+            None,
         )
         .await;
 
@@ -2433,7 +2434,12 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
 
     clock.set_slot(GLOAS_SLOT);
     orchestrator
-        .maybe_propose_block(GLOAS_SLOT, GLOAS_SLOT / SLOTS_PER_EPOCH, &proposal_ctx(GLOAS_SLOT))
+        .maybe_propose_block(
+            GLOAS_SLOT,
+            GLOAS_SLOT / SLOTS_PER_EPOCH,
+            &proposal_ctx(GLOAS_SLOT),
+            None,
+        )
         .await;
 
     assert_eq!(
@@ -2547,7 +2553,12 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
         GLOAS_SLOT, [3u8; 32],
     )));
     orchestrator
-        .maybe_propose_block(GLOAS_SLOT, GLOAS_SLOT / SLOTS_PER_EPOCH, &proposal_ctx(GLOAS_SLOT))
+        .maybe_propose_block(
+            GLOAS_SLOT,
+            GLOAS_SLOT / SLOTS_PER_EPOCH,
+            &proposal_ctx(GLOAS_SLOT),
+            None,
+        )
         .await;
     assert_eq!(
         block_beacon.publish_block_calls().len(),
@@ -2599,7 +2610,12 @@ async fn test_gloas_builder_win_skips_envelope_and_echoes_builder_url() {
     orchestrator.duty_tracker.fetch_proposer_duties(GLOAS_SLOT / SLOTS_PER_EPOCH).await.unwrap();
 
     orchestrator
-        .maybe_propose_block(GLOAS_SLOT, GLOAS_SLOT / SLOTS_PER_EPOCH, &proposal_ctx(GLOAS_SLOT))
+        .maybe_propose_block(
+            GLOAS_SLOT,
+            GLOAS_SLOT / SLOTS_PER_EPOCH,
+            &proposal_ctx(GLOAS_SLOT),
+            None,
+        )
         .await;
 
     assert!(block_beacon.produce_v3_slots().is_empty());

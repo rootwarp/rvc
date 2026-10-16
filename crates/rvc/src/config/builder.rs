@@ -547,9 +547,13 @@ impl ServiceBuilder {
     ///
     /// Returns `None` if `proposer_nodes` is empty (main pool handles all).
     ///
-    /// Uses the same body-size cap and broadcast-topic policy as the main pool
-    /// so dedicated proposer publish/produce honor operator DoS and broadcast
-    /// settings (not `BnManagerConfig` defaults alone).
+    /// Uses the same body-size cap, broadcast-topic policy, and per-operation
+    /// timeouts as the main pool, so dedicated proposer publish/produce honor
+    /// operator DoS, broadcast, and budget settings.
+    ///
+    /// An empty `proposer_nodes` list returns `Ok(None)` and does not connect.
+    /// A URL that is not `http` or `https` is [`ConfigError::InvalidBeaconUrl`]
+    /// and no manager is returned.
     pub fn build_proposer_bn_manager(&self) -> Result<Option<Arc<BnManager>>, ConfigError> {
         if self.config.proposer_nodes.is_empty() {
             return Ok(None);
@@ -560,7 +564,7 @@ impl ServiceBuilder {
             .map_err(|e| {
                 ConfigError::InvalidBeaconUrl(format!("failed to create proposer BnManager: {}", e))
             })?
-            .with_operation_timeouts(bn_manager::OperationTimeouts::default());
+            .with_operation_timeouts(self.config.operation_timeouts());
         info!(
             endpoints = ?endpoints,
             max_body_bytes = self.config.beacon_max_body_bytes,
@@ -1055,6 +1059,11 @@ impl ServiceBuilder {
     /// effective default fee recipient is the zero address. Operators must set
     /// a non-zero address in the validators config file passed via
     /// `--validators-config`.
+    ///
+    /// `--block-selection-mode` and the top-level TOML key `block_selection_mode`
+    /// become the store's global default after builder settings apply. A
+    /// per-validator mode still wins. A builder-settings error returns before
+    /// that default is published. The mode does not read the fork schedule.
     pub fn build_validator_store(
         &self,
         validators_config: Option<&std::path::Path>,
@@ -1077,6 +1086,7 @@ impl ServiceBuilder {
         }
 
         crate::startup::apply_builder_settings(&store, &self.config.builder)?;
+        store.set_global_block_selection_mode(self.config.block_selection_mode);
 
         if let Some(raw) = self.config.graffiti.as_deref() {
             let applied = validator_store::parse_graffiti(raw);

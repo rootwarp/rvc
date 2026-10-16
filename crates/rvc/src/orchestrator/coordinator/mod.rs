@@ -679,6 +679,7 @@ where
             // One wall-clock read per slot, taken before the pre-proposal timeout.
             // Phase deadlines and offset stamps are absolute from this anchor.
             let anchor = SlotAnchor::capture(&*self.clock, current_slot);
+            let proposal_deadline = self.arm_operation_deadline(current_slot);
 
             // Check if keys changed (dynamic key import/delete via keymanager API).
             // has_changed() does NOT mark the value as seen — mark_unchanged() so
@@ -722,7 +723,9 @@ where
                 // Block fires at t=0: no bps wait, stamp at entry.
                 Self::record_time_into_slot(&phase_span, &anchor);
                 Self::record_phase_offset(slot_phase_offset::BLOCK, &anchor);
-                self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx).instrument(phase_span).await;
+                self.maybe_propose_block(ctx.slot, ctx.epoch, &ctx, Some(proposal_deadline))
+                    .instrument(phase_span)
+                    .await;
             }
 
             if self.check_shutdown() {
@@ -860,6 +863,19 @@ where
                 return Ok(());
             }
         }
+    }
+
+    /// Slot end for proposer-pool block production.
+    ///
+    /// The returned instant is passed only into [`Self::maybe_propose_block`].
+    /// It does not change the main pool, and it does not change attestation,
+    /// sync, or aggregate publication. Those keep slot end plus 500 ms.
+    /// A missing clock reading fails closed: the deadline is now, so a hanging
+    /// proposer beacon node does not run with an unbounded budget.
+    pub(crate) fn arm_operation_deadline(&self, slot: Slot) -> tokio::time::Instant {
+        let remaining =
+            self.clock.time_until_slot(slot.saturating_add(1)).unwrap_or(Duration::ZERO);
+        tokio::time::Instant::now().checked_add(remaining).unwrap_or_else(tokio::time::Instant::now)
     }
 
     /// `prepare_beacon_proposer` and `register_validator` off the slot loop.

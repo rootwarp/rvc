@@ -82,6 +82,36 @@ impl BeaconBlockClient for BeaconBlockAdapter {
             .map_err(Into::into)
     }
 
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
+        let duty = duty.map(|duty| BnProduceDuty {
+            expected_proposer_index: duty.expected_proposer_index,
+            expected_parent_root: duty.expected_parent_root,
+            alternate_parent_root: duty.alternate_parent_root,
+            parent_closed: duty.parent_closed,
+            expected_fee_recipient: duty.expected_fee_recipient,
+            expected_consensus_version: duty.expected_consensus_version,
+        });
+        self.0
+            .produce_block_v3_ranked_by(
+                slot,
+                randao_reveal,
+                graffiti,
+                builder_boost_factor,
+                duty,
+                deadline,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
     async fn produce_block_v4(
         &self,
         slot: Slot,
@@ -91,6 +121,20 @@ impl BeaconBlockClient for BeaconBlockAdapter {
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
         self.0
             .produce_block_v4(slot, randao_reveal, graffiti, builder_config)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        self.0
+            .produce_block_v4_by(slot, randao_reveal, graffiti, builder_config, deadline)
             .await
             .map_err(Into::into)
     }

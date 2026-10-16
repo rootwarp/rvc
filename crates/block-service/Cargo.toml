@@ -21,6 +21,7 @@ sha2.workspace = true
 signer.workspace = true
 thiserror.workspace = true
 timing.workspace = true
+tokio.workspace = true
 tracing.workspace = true
 tree_hash.workspace = true
 serde_json.workspace = true

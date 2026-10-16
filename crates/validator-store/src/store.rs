@@ -195,6 +195,13 @@ struct StoreState {
     /// durable update can tell a field edit from a delete/re-import.
     validator_gen: HashMap<[u8; 48], u64>,
     next_validator_gen: u64,
+    /// Per-field proposer-URL overlay. Lives in this lock with the row and
+    /// `validator_gen`, so a claim, a keymanager write, and a restore each
+    /// finish under one write guard.
+    url_owned: HashMap<[u8; 48], UrlOwned>,
+    /// Live `default_config` overlay. Disk snapshots write `durable`, never
+    /// the remote value.
+    remote_defaults: RemoteDefaults,
 }
 
 impl StoreState {
@@ -208,8 +215,37 @@ impl StoreState {
 
     fn take_validator(&mut self, pubkey: &[u8; 48]) -> Option<ValidatorConfig> {
         self.validator_gen.remove(pubkey);
+        self.url_owned.remove(pubkey);
         self.validators.remove(pubkey)
     }
+}
+
+/// One URL-owned field: `applied` is the remote value, `durable` is what the file keeps.
+#[derive(Clone, Copy)]
+struct OwnedValue<T> {
+    applied: T,
+    durable: T,
+}
+
+/// Proposer-config URL overlay for one pubkey.
+///
+/// `generation` is [`StoreState::validator_gen`] when the URL last claimed a
+/// field. A delete plus re-import assigns a new generation and drops this
+/// overlay in [`StoreState::take_validator`].
+#[derive(Clone, Copy, Default)]
+struct UrlOwned {
+    generation: u64,
+    fee_recipient: Option<OwnedValue<Option<[u8; 20]>>>,
+    gas_limit: Option<OwnedValue<Option<u64>>>,
+    builder_proposals: Option<OwnedValue<bool>>,
+}
+
+/// Local defaults captured when a remote `default_config` first owned each field.
+#[derive(Clone, Copy, Default)]
+struct RemoteDefaults {
+    fee_recipient: Option<OwnedValue<[u8; 20]>>,
+    gas_limit: Option<OwnedValue<u64>>,
+    graffiti: Option<OwnedValue<Option<[u8; 32]>>>,
 }
 
 pub struct ValidatorStore {
@@ -253,6 +289,8 @@ impl ValidatorStore {
                 global_builder_boost_factor: None,
                 validator_gen: HashMap::new(),
                 next_validator_gen: 1,
+                url_owned: HashMap::new(),
+                remote_defaults: RemoteDefaults::default(),
             }),
             config_path: None,
             save_lock: Mutex::new(()),
@@ -312,6 +350,8 @@ impl ValidatorStore {
                 global_builder_boost_factor: None,
                 validator_gen,
                 next_validator_gen,
+                url_owned: HashMap::new(),
+                remote_defaults: RemoteDefaults::default(),
             }),
             config_path: Some(path.to_path_buf()),
             save_lock: Mutex::new(()),
@@ -492,10 +532,10 @@ impl ValidatorStore {
             return Ok(true);
         };
         let live = self.state.read().clone();
-        let previous = snapshot_toml(&live);
+        let previous = self.disk_toml(&live);
         let mut candidate = live;
         candidate.insert_validator(config.clone());
-        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
         self.state.write().insert_validator(config);
         Ok(true)
     }
@@ -521,10 +561,10 @@ impl ValidatorStore {
         let Some(path) = self.config_path.clone() else {
             return Ok(self.state.write().take_validator(pubkey));
         };
-        let previous = snapshot_toml(&live);
+        let previous = self.disk_toml(&live);
         let mut candidate = live;
         candidate.take_validator(pubkey);
-        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
         Ok(self.state.write().take_validator(pubkey))
     }
 
@@ -567,13 +607,13 @@ impl ValidatorStore {
             return Ok(());
         };
         let live = self.state.read().clone();
-        let previous = snapshot_toml(&live);
+        let previous = self.disk_toml(&live);
         let mut candidate = live;
         if let Some(cfg) = candidate.validators.get_mut(pubkey) {
             cfg.enabled = true;
             cfg.doppelganger_hold_until = None;
         }
-        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
         publish_enabled(&mut self.state.write(), pubkey, true);
         Ok(())
     }
@@ -679,10 +719,10 @@ impl ValidatorStore {
             return Ok(true);
         };
         let live = self.state.read().clone();
-        let previous = snapshot_toml(&live);
+        let previous = self.disk_toml(&live);
         let mut candidate = live;
         candidate.insert_validator(config.clone());
-        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
         self.state.write().insert_validator(config);
         Ok(true)
     }
@@ -715,13 +755,13 @@ impl ValidatorStore {
             return Ok(true);
         };
         let live = self.state.read().clone();
-        let previous = snapshot_toml(&live);
+        let previous = self.disk_toml(&live);
         let mut candidate = live;
         if let Some(cfg) = candidate.validators.get_mut(pubkey) {
             cfg.enabled = true;
             cfg.doppelganger_hold_until = None;
         }
-        commit_less_safe(&path, &snapshot_toml(&candidate), &previous)?;
+        commit_less_safe(&path, &self.disk_toml(&candidate), &previous)?;
         publish_enabled(&mut self.state.write(), pubkey, true);
         Ok(true)
     }
@@ -831,7 +871,9 @@ impl ValidatorStore {
         update: ValidatorConfigUpdate,
     ) -> Result<(), ValidatorStoreError> {
         validate_update_ingress(&update)?;
-        let changed_fields = apply_update_locked(&mut self.state.write(), pubkey, &update);
+        let mut state = self.state.write();
+        drop_url_owned_fields(&mut state, pubkey, &update);
+        let changed_fields = apply_update_locked(&mut state, pubkey, &update);
         log_validator_config_updated(pubkey, &changed_fields);
         Ok(())
     }
@@ -873,10 +915,11 @@ impl ValidatorStore {
             return Err(ValidatorStoreError::NotFound);
         }
         let identity = candidate.validator_gen.get(pubkey).copied();
-        let previous = snapshot_toml(&candidate);
+        let previous = self.disk_toml(&candidate);
+        drop_url_owned_fields(&mut candidate, pubkey, &update);
         apply_update_locked(&mut candidate, pubkey, &update);
 
-        commit_less_safe(config_path, &snapshot_toml(&candidate), &previous)?;
+        commit_less_safe(config_path, &self.disk_toml(&candidate), &previous)?;
 
         // `set_enabled` and the proposer-URL refresher do not bump
         // `validator_gen`, so the same identity still takes the delta.
@@ -891,6 +934,7 @@ impl ValidatorStore {
                 let same = state.validators.contains_key(pubkey)
                     && state.validator_gen.get(pubkey).copied() == identity;
                 if same {
+                    drop_url_owned_fields(&mut state, pubkey, &update);
                     let changed_fields = apply_update_locked(&mut state, pubkey, &update);
                     drop(state);
                     log_validator_config_updated(pubkey, &changed_fields);
@@ -904,7 +948,7 @@ impl ValidatorStore {
                 "validator identity changed during durable update; rewriting the file from the live store"
             );
             let gen = live.validator_gen.clone();
-            commit_snapshot(config_path, &snapshot_toml(&live))?;
+            commit_snapshot(config_path, &self.disk_toml(&live))?;
             if self.state.read().validator_gen == gen {
                 return Err(ValidatorStoreError::NotFound);
             }
@@ -939,12 +983,15 @@ impl ValidatorStore {
 
         let mut state = self.state.write();
         if let Some(fr) = update.fee_recipient {
+            state.remote_defaults.fee_recipient = None;
             state.defaults.fee_recipient = fr;
         }
         if let Some(gl) = update.gas_limit {
+            state.remote_defaults.gas_limit = None;
             state.defaults.gas_limit = gl;
         }
         if let Some(g) = update.graffiti {
+            state.remote_defaults.graffiti = None;
             state.defaults.graffiti = g;
         }
 
@@ -956,6 +1003,126 @@ impl ValidatorStore {
 
     pub fn has_validator(&self, pubkey: &[u8; 48]) -> bool {
         self.state.read().validators.contains_key(pubkey)
+    }
+
+    /// Identity assigned at insert and cleared on remove.
+    ///
+    /// `update_config` does not change it. A delete plus re-import does.
+    pub fn validator_generation(&self, pubkey: &[u8; 48]) -> Option<u64> {
+        self.state.read().validator_gen.get(pubkey).copied()
+    }
+
+    /// Apply one remote proposer row under `save_lock` and one state write.
+    ///
+    /// A field the URL does not already own takes its baseline from the live
+    /// value in this same critical section. A field it already owns keeps that
+    /// baseline. A pubkey the store does not contain is left alone.
+    pub fn apply_remote_proposer(
+        &self,
+        pubkey: &[u8; 48],
+        update: ValidatorConfigUpdate,
+    ) -> Result<(), ValidatorStoreError> {
+        validate_update_ingress(&update)?;
+        let _save_guard = self.save_lock.lock();
+        let mut state = self.state.write();
+        let Some(generation) = state.validator_gen.get(pubkey).copied() else {
+            return Ok(());
+        };
+        let (current_fee, current_gas, current_builder) = {
+            let Some(config) = state.validators.get(pubkey) else {
+                return Ok(());
+            };
+            (config.fee_recipient, config.gas_limit, config.builder_proposals)
+        };
+        {
+            let entry = state.url_owned.entry(*pubkey).or_default();
+            if entry.generation != generation {
+                *entry = UrlOwned { generation, ..UrlOwned::default() };
+            }
+            if let Some(fee) = update.fee_recipient {
+                claim_field(&mut entry.fee_recipient, current_fee, fee);
+            }
+            if let Some(gas) = update.gas_limit {
+                claim_field(&mut entry.gas_limit, current_gas, gas);
+            }
+            if let Some(builder) = update.builder_proposals {
+                claim_field(&mut entry.builder_proposals, current_builder, builder);
+            }
+        }
+        apply_update_locked(&mut state, pubkey, &update);
+        Ok(())
+    }
+
+    /// Restore fields this URL still owns, under `save_lock` and one state write.
+    ///
+    /// The generation is read and the restore is written before either lock is
+    /// released. A mismatch drops the overlay and writes nothing.
+    pub fn release_remote_proposer(&self, pubkey: &[u8; 48]) {
+        let _save_guard = self.save_lock.lock();
+        let mut state = self.state.write();
+        let Some(owned) = state.url_owned.get(pubkey).copied() else {
+            return;
+        };
+        let generation = state.validator_gen.get(pubkey).copied();
+        #[cfg(test)]
+        invoke_release_hook();
+        if generation != Some(owned.generation) {
+            state.url_owned.remove(pubkey);
+            return;
+        }
+        if let Some(config) = state.validators.get_mut(pubkey) {
+            if let Some(fee) = owned.fee_recipient {
+                if config.fee_recipient == fee.applied {
+                    config.fee_recipient = fee.durable;
+                }
+            }
+            if let Some(gas) = owned.gas_limit {
+                if config.gas_limit == gas.applied {
+                    config.gas_limit = gas.durable;
+                }
+            }
+            if let Some(builder) = owned.builder_proposals {
+                if config.builder_proposals == builder.applied {
+                    config.builder_proposals = builder.durable;
+                }
+            }
+        }
+        state.url_owned.remove(pubkey);
+    }
+
+    /// Apply a remote `default_config` to the live defaults.
+    ///
+    /// The local value at the moment the remote starts owning a field is what
+    /// disk snapshots keep. A later remote value for that field keeps the
+    /// same local baseline.
+    pub fn apply_remote_defaults(&self, update: DefaultUpdate) -> Result<(), ValidatorStoreError> {
+        if let Some(gl) = update.gas_limit {
+            ensure_toml_u64("gas_limit", gl)?;
+        }
+        let _save_guard = self.save_lock.lock();
+        let mut state = self.state.write();
+        if let Some(fee) = update.fee_recipient {
+            let current = state.defaults.fee_recipient;
+            claim_field(&mut state.remote_defaults.fee_recipient, current, fee);
+            state.defaults.fee_recipient = fee;
+        }
+        if let Some(gas) = update.gas_limit {
+            let current = state.defaults.gas_limit;
+            claim_field(&mut state.remote_defaults.gas_limit, current, gas);
+            state.defaults.gas_limit = gas;
+        }
+        if let Some(graffiti) = update.graffiti {
+            let current = state.defaults.graffiti;
+            claim_field(&mut state.remote_defaults.graffiti, current, graffiti);
+            state.defaults.graffiti = graffiti;
+        }
+        Ok(())
+    }
+
+    fn disk_toml(&self, state: &StoreState) -> TomlConfig {
+        let mut durable = state.clone();
+        revert_remote_overlay(&mut durable);
+        snapshot_toml(&durable)
     }
 
     #[tracing::instrument(name = "validator_store.save_config", skip_all)]
@@ -971,7 +1138,7 @@ impl ValidatorStore {
         // Single state read: defaults + validators under one guard (no
         // multi-lock ordering with `effective_config`). The guard drops
         // before I/O.
-        let toml_config = snapshot_toml(&self.state.read());
+        let toml_config = self.disk_toml(&self.state.read());
 
         commit_snapshot(config_path, &toml_config)
     }
@@ -1008,6 +1175,8 @@ impl ValidatorStore {
         // the file; global_block_selection_mode is left untouched.
         let mut state = self.state.write();
         state.defaults = new_defaults;
+        state.url_owned.clear();
+        state.remote_defaults = RemoteDefaults::default();
         let existing_count = state.validators.len();
         for config in parsed_validators {
             state.insert_validator(config);
@@ -1172,7 +1341,7 @@ fn persist_disabled_snapshot(
         );
         return Err(err);
     };
-    let snapshot = snapshot_toml(&store.state.read());
+    let snapshot = store.disk_toml(&store.state.read());
     commit_snapshot(&path, &snapshot)
 }
 
@@ -1232,6 +1401,88 @@ fn sync_parent_dir(parent: &Path) -> Result<(), ValidatorStoreError> {
 ///
 /// Returns the changed field names when that validator is present, or an empty
 /// vec when it is not (unknown pubkeys stay a no-op).
+fn claim_field<T: Copy>(slot: &mut Option<OwnedValue<T>>, current: T, remote: T) {
+    match slot {
+        Some(owned) => owned.applied = remote,
+        None => *slot = Some(OwnedValue { applied: remote, durable: current }),
+    }
+}
+
+/// A keymanager or other local write of a field drops remote ownership of
+/// that field. The written value is the new baseline.
+fn drop_url_owned_fields(
+    state: &mut StoreState,
+    pubkey: &[u8; 48],
+    update: &ValidatorConfigUpdate,
+) {
+    let empty = {
+        let Some(entry) = state.url_owned.get_mut(pubkey) else {
+            return;
+        };
+        if update.fee_recipient.is_some() {
+            entry.fee_recipient = None;
+        }
+        if update.gas_limit.is_some() {
+            entry.gas_limit = None;
+        }
+        if update.builder_proposals.is_some() {
+            entry.builder_proposals = None;
+        }
+        entry.fee_recipient.is_none()
+            && entry.gas_limit.is_none()
+            && entry.builder_proposals.is_none()
+    };
+    if empty {
+        state.url_owned.remove(pubkey);
+    }
+}
+
+fn revert_remote_overlay(state: &mut StoreState) {
+    let owned = std::mem::take(&mut state.url_owned);
+    for (pubkey, fields) in owned {
+        let Some(generation) = state.validator_gen.get(&pubkey).copied() else {
+            continue;
+        };
+        if generation != fields.generation {
+            continue;
+        }
+        let Some(config) = state.validators.get_mut(&pubkey) else {
+            continue;
+        };
+        if let Some(fee) = fields.fee_recipient {
+            if config.fee_recipient == fee.applied {
+                config.fee_recipient = fee.durable;
+            }
+        }
+        if let Some(gas) = fields.gas_limit {
+            if config.gas_limit == gas.applied {
+                config.gas_limit = gas.durable;
+            }
+        }
+        if let Some(builder) = fields.builder_proposals {
+            if config.builder_proposals == builder.applied {
+                config.builder_proposals = builder.durable;
+            }
+        }
+    }
+    if let Some(fee) = state.remote_defaults.fee_recipient {
+        if state.defaults.fee_recipient == fee.applied {
+            state.defaults.fee_recipient = fee.durable;
+        }
+    }
+    if let Some(gas) = state.remote_defaults.gas_limit {
+        if state.defaults.gas_limit == gas.applied {
+            state.defaults.gas_limit = gas.durable;
+        }
+    }
+    if let Some(graffiti) = state.remote_defaults.graffiti {
+        if state.defaults.graffiti == graffiti.applied {
+            state.defaults.graffiti = graffiti.durable;
+        }
+    }
+    state.remote_defaults = RemoteDefaults::default();
+}
+
 fn apply_update_locked(
     state: &mut StoreState,
     pubkey: &[u8; 48],
@@ -1484,6 +1735,31 @@ fn invoke_reload_after_parse_hook() {
             hook();
         }
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    static RELEASE_HOOK: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+    static RELEASE_PROBE_STORE: std::cell::RefCell<Option<std::sync::Arc<ValidatorStore>>> =
+        const { std::cell::RefCell::new(None) };
+    static RELEASE_LOCKS_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn invoke_release_hook() {
+    if let Some(hook) = RELEASE_HOOK.with(|slot| slot.get()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+fn probe_release_locks() {
+    let store = RELEASE_PROBE_STORE.with(|slot| slot.borrow().clone());
+    let Some(store) = store else {
+        return;
+    };
+    let held = store.save_lock.try_lock().is_none() && store.state.try_write().is_none();
+    RELEASE_LOCKS_HELD.with(|slot| slot.set(held));
 }
 
 #[cfg(test)]
@@ -5023,5 +5299,34 @@ builder_boost_factor = 175
                 },
             )
             .is_err());
+    }
+
+    /// The generation read and the restore write share `save_lock` and the
+    /// state write. A hook between them must see both locks still held.
+    #[test]
+    fn release_holds_the_store_locks_across_the_generation_check() {
+        let store = std::sync::Arc::new(ValidatorStore::new(test_fee_recipient(1), 30_000_000));
+        let pk = test_pubkey(1);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(test_fee_recipient(2));
+        store.add_validator(cfg).unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(test_fee_recipient(3))),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        super::RELEASE_LOCKS_HELD.with(|slot| slot.set(false));
+        super::RELEASE_PROBE_STORE
+            .with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(&store)));
+        super::RELEASE_HOOK.with(|slot| slot.set(Some(super::probe_release_locks)));
+        store.release_remote_proposer(&pk);
+        super::RELEASE_HOOK.with(|slot| slot.set(None));
+        super::RELEASE_PROBE_STORE.with(|slot| *slot.borrow_mut() = None);
+        assert!(super::RELEASE_LOCKS_HELD.with(|slot| slot.get()));
+        assert_eq!(store.get_config(&pk).unwrap().fee_recipient, Some(test_fee_recipient(2)));
     }
 }

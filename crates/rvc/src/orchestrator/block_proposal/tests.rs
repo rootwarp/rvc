@@ -119,7 +119,7 @@ async fn test_maybe_propose_block_bad_proposer_index_drops_duty() {
     // Invoke the proposer path directly.
     let ctx =
         SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
-    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+    orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     // H-4: a forged proposer_index must drop the duty before any
     // signing or publishing occurs.
@@ -232,7 +232,7 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
 
     let ctx =
         SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
-    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+    orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     // D-3: the block must NOT be proposed when is_signing_enabled=false.
     // publish_called stays false because the gate returns early before
@@ -464,7 +464,7 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
     );
     assert_eq!(ctx.head_root, Some(r_curr), "phase-2 head must be slot N");
 
-    orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+    orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     assert!(
         publish_called.load(Ordering::SeqCst),
@@ -648,7 +648,7 @@ async fn test_successful_proposal_increments_success_outcome() {
         let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
 
         let ctx = SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
-        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+        orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
         assert!(published.load(Ordering::SeqCst), "success path must publish");
         assert_eq!(
@@ -739,7 +739,7 @@ async fn test_failed_proposal_increments_failed_outcome() {
         let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
 
         let ctx = SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
-        orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
+        orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
         assert_eq!(
             proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED),

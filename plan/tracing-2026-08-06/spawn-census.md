@@ -28,13 +28,13 @@ That command prints 14 lines, one per row below.
 | `bin/rvc/src/logging.rs` | 312 | `log_reload` | spawn | detached | SIGHUP log-reload handler; process-lifetime signal loop, no caller trace to inherit. |
 | `crates/rvc/src/bootstrap/run.rs` | 364 | `duty_orchestrator` | spawn | detached | Already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B. `executor.spawn_result`. |
 | `crates/rvc/src/bootstrap/run.rs` | 556 | `secret_provider_refresh` | spawn | detached | `secret_provider::RefreshService::run`; loop body is `crates/secret-provider/src/refresh.rs:185`, out of scope. |
-| `crates/rvc/src/bootstrap/tasks.rs` | 118 | `metrics_server` | spawn | detached | Metrics server; serve loop is `crates/metrics/src/server.rs:96` (`serve_metrics_with_health`), out of P1-1 scope. |
-| `crates/rvc/src/bootstrap/tasks.rs` | 140 | `monitoring_push` | spawn | B | Iteration loop. Loop site `crates/rvc/src/background_tasks/monitoring.rs:161`. TRC-6b owns the per-iteration root. |
-| `crates/rvc/src/bootstrap/tasks.rs` | 164 | `proposer_config_refresh` | spawn | B | Iteration loop. Loop site `crates/rvc/src/background_tasks/config_url.rs:358`. TRC-6b owns the per-iteration root. |
-| `crates/rvc/src/bootstrap/tasks.rs` | 210 | `bn.sse` | register | detached | BN SSE subscriber; process-lifetime Infra handle, loop lives in bn-manager, out of P1-1 scope. |
-| `crates/rvc/src/bootstrap/tasks.rs` | 214 | `bn.sse.cancel` | spawn | detached | Cancel-forwarder for `bn.sse`; not an iteration loop. |
-| `crates/rvc/src/bootstrap/tasks.rs` | 249 | `bn.sync_monitor` | register | detached | BN sync monitor; process-lifetime Infra handle, loop lives in bn-manager, out of P1-1 scope. |
-| `crates/rvc/src/bootstrap/tasks.rs` | 253 | `bn.sync_monitor.cancel` | spawn | detached | Cancel-forwarder for `bn.sync_monitor`; not an iteration loop. |
+| `crates/rvc/src/bootstrap/tasks.rs` | 120 | `metrics_server` | spawn | detached | Metrics server; serve loop is `crates/metrics/src/server.rs:96` (`serve_metrics_with_health`), out of P1-1 scope. |
+| `crates/rvc/src/bootstrap/tasks.rs` | 142 | `monitoring_push` | spawn | B | Iteration loop. Loop site `crates/rvc/src/background_tasks/monitoring.rs:161`. TRC-6b owns the per-iteration root. |
+| `crates/rvc/src/bootstrap/tasks.rs` | 171 | `proposer_config_refresh` | spawn | B | Iteration loop. Loop site `crates/rvc/src/background_tasks/config_url.rs:484`. TRC-6b owns the per-iteration root. |
+| `crates/rvc/src/bootstrap/tasks.rs` | 214 | `bn.sse` | register | detached | BN SSE subscriber; process-lifetime Infra handle, loop lives in bn-manager, out of P1-1 scope. |
+| `crates/rvc/src/bootstrap/tasks.rs` | 218 | `bn.sse.cancel` | spawn | detached | Cancel-forwarder for `bn.sse`; not an iteration loop. |
+| `crates/rvc/src/bootstrap/tasks.rs` | 253 | `bn.sync_monitor` | register | detached | BN sync monitor; process-lifetime Infra handle, loop lives in bn-manager, out of P1-1 scope. |
+| `crates/rvc/src/bootstrap/tasks.rs` | 257 | `bn.sync_monitor.cancel` | spawn | detached | Cancel-forwarder for `bn.sync_monitor`; not an iteration loop. |
 | `crates/rvc/src/index_resolver.rs` | 86 | `index.resolve` | spawn | B | Iteration loop. Loop site `crates/rvc/src/index_resolver.rs:114` (`IndexResolver::run`). TRC-6b owns the per-iteration root. |
 | `crates/rvc/src/keymanager_adapters/spawn.rs` | 342 | `keymanager_api` | spawn | detached | Keymanager API server; serve loop is `KeymanagerServer::serve_on` in `crates/keymanager-api/src/server.rs:203`, out of scope. |
 | `crates/rvc/src/liveness_loop.rs` | 494 | `liveness_loop` | spawn | B | Iteration loop. Loop site `crates/rvc/src/liveness_loop.rs:218` (`LivenessObservationLoop::run` loop body). TRC-6b owns the per-iteration root. |
@@ -46,8 +46,8 @@ Shape A = 0 at this HEAD. None of the 14 inherit a caller trace as a shape A roo
 
 | Task | Spawn | Loop |
 |---|---|---|
-| `monitoring_push` | `crates/rvc/src/bootstrap/tasks.rs:140` | `crates/rvc/src/background_tasks/monitoring.rs:161` |
-| `proposer_config_refresh` | `crates/rvc/src/bootstrap/tasks.rs:164` | `crates/rvc/src/background_tasks/config_url.rs:358` |
+| `monitoring_push` | `crates/rvc/src/bootstrap/tasks.rs:142` | `crates/rvc/src/background_tasks/monitoring.rs:161` |
+| `proposer_config_refresh` | `crates/rvc/src/bootstrap/tasks.rs:171` | `crates/rvc/src/background_tasks/config_url.rs:484` |
 | `liveness_loop` | `crates/rvc/src/liveness_loop.rs:494` | `crates/rvc/src/liveness_loop.rs:218` |
 | `slashing_monitor` | `crates/rvc/src/slashing_monitor.rs:145` | `crates/rvc/src/slashing_monitor.rs:148` |
 | `index.resolve` | `crates/rvc/src/index_resolver.rs:86` | `crates/rvc/src/index_resolver.rs:114` |
@@ -67,8 +67,8 @@ done
 
 | File | Line | Call | Mark |
 |---|---:|---|---|
-| `crates/rvc/src/bootstrap/tasks.rs` | 200 | `register_opt::<()>(bn.sse, …, None)` | not-a-site |
-| `crates/rvc/src/bootstrap/tasks.rs` | 240 | `register_opt::<()>(bn.sync_monitor, …, None)` | not-a-site |
+| `crates/rvc/src/bootstrap/tasks.rs` | 204 | `register_opt::<()>(bn.sse, …, None)` | not-a-site |
+| `crates/rvc/src/bootstrap/tasks.rs` | 244 | `register_opt::<()>(bn.sync_monitor, …, None)` | not-a-site |
 | `crates/rvc/src/slashing_monitor.rs` | 139 | `register_opt::<()>("slashing_monitor", …, None)` | not-a-site |
 
 The slashing-monitor `None` call is the old no-op detached site. It left the census.

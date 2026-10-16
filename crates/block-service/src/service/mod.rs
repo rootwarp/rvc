@@ -221,6 +221,21 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     /// `expected_parents` is `Some`, validates `parent_root` against that set
     /// before calling the signer. On validation failure the duty is dropped
     /// with a `warn!` and no signer call is made (H-4).
+    pub async fn propose_block(
+        &self,
+        slot: Slot,
+        pubkey: &PublicKey,
+        expected_proposer_index: u64,
+        expected_parents: Option<ExpectedParents>,
+    ) -> Result<BlockProposalResult, BlockServiceError> {
+        self.propose_block_until(slot, pubkey, expected_proposer_index, expected_parents, None)
+            .await
+    }
+
+    /// [`Self::propose_block`] with a per-call block-production deadline.
+    ///
+    /// `deadline` caps only the proposer-pool produce call. Publication keeps
+    /// its own budget. `None` uses the configured block-production timeout.
     #[tracing::instrument(
         name = "block.propose",
         level = "debug",
@@ -232,16 +247,17 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             block.value_wei = tracing::field::Empty,
         )
     )]
-    pub async fn propose_block(
+    pub async fn propose_block_until(
         &self,
         slot: Slot,
         pubkey: &PublicKey,
         expected_proposer_index: u64,
         expected_parents: Option<ExpectedParents>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<BlockProposalResult, BlockServiceError> {
         let mode = self.validator_store.effective_block_selection_mode(&pubkey.to_bytes());
         let validator = BlockResponseValidator { expected_proposer_index, expected_parents };
-        self.propose_block_impl(slot, pubkey, mode, Some(&validator)).await
+        self.propose_block_impl(slot, pubkey, mode, Some(&validator), deadline).await
     }
 
     /// Mode-override entry point for tests. Not part of the public API —
@@ -255,7 +271,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         mode: BlockSelectionMode,
     ) -> Result<BlockProposalResult, BlockServiceError> {
-        self.propose_block_impl(slot, pubkey, mode, None).await
+        self.propose_block_impl(slot, pubkey, mode, None, None).await
     }
 
     async fn propose_block_impl(
@@ -264,6 +280,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         mode: BlockSelectionMode,
         validator: Option<&BlockResponseValidator>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<BlockProposalResult, BlockServiceError> {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let proposal_start = Instant::now();
@@ -348,7 +365,13 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let produce_result = if fork >= ForkName::Gloas {
             let builder_config = self.v4_builder_config(&pubkey_bytes, slot, boost).await;
             self.beacon
-                .produce_block_v4(slot, &randao_hex, graffiti_hex.as_deref(), &builder_config)
+                .produce_block_v4_by(
+                    slot,
+                    &randao_hex,
+                    graffiti_hex.as_deref(),
+                    &builder_config,
+                    deadline,
+                )
                 .instrument(tracing::info_span!("beacon.produce_block_v4"))
                 .await
                 .map(Produced::V4)
@@ -358,12 +381,13 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 duty_from_validator(checks, fee_recipient, fork)
             });
             self.beacon
-                .produce_block_v3_ranked(
+                .produce_block_v3_ranked_by(
                     slot,
                     &randao_hex,
                     graffiti_hex.as_deref(),
                     Some(boost),
                     duty,
+                    deadline,
                 )
                 .instrument(tracing::info_span!("beacon.produce_block_v3"))
                 .await

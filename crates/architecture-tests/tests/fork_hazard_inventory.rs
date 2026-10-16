@@ -144,7 +144,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        348,
+        365,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -153,7 +153,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        416,
+        440,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -162,7 +162,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1187,
+        1211,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -171,7 +171,16 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1635,
+        1659,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "—",
+    ),
+    inv(
+        "crates/block-service/src/service/mod.rs",
+        1671,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -180,16 +189,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1647,
-        Class::GeForkName,
-        false,
-        ">= ForkName::Gloas",
-        Verdict::InheritIntentionally,
-        "—",
-    ),
-    inv(
-        "crates/block-service/src/service/mod.rs",
-        1651,
+        1675,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -270,7 +270,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/mod.rs",
-        1592,
+        1608,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -461,7 +461,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1613,
+        1637,
         Class::MatchForkName,
         false,
         "match fork {",
@@ -579,7 +579,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/bn-manager/src/manager.rs",
-        2376,
+        2428,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -588,7 +588,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs",
-        2476,
+        2482,
         Class::StringDispatch,
         false,
         "match &envelopes[0]",
