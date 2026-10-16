@@ -19,13 +19,13 @@ eth-types = { workspace = true }
 slashing = { workspace = true }
 hex = { workspace = true }
 parking_lot = { workspace = true }
-thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
 crypto = { workspace = true }
 slashing = { workspace = true }
 hex = { workspace = true }
+proptest.workspace = true
 tokio = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }

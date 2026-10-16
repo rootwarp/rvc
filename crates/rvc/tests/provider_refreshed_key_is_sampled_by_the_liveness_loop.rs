@@ -18,9 +18,8 @@ use bn_manager::MockBeaconNodeClient;
 use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
 use doppelganger::{
     ForwardWindowMachine, ForwardWindowStatus, MonotonicEpochClock, SigningEnablement,
-    DEFAULT_MONITORING_EPOCHS,
+    CLOSED_EPOCH_SLOT, DEFAULT_MONITORING_EPOCHS,
 };
-use eth_types::SLOTS_PER_EPOCH;
 use keymanager_api::traits::KeystoreManager;
 use rvc::deletion_denylist::DeletionDenylist;
 use rvc::key_admission::{AdmissionOutcome, AdmissionSource, KeyAdmissionService};
@@ -135,17 +134,16 @@ async fn a_provider_refreshed_key_leaves_pending() {
     );
 
     let start = epoch_clock.current_epoch().max(1);
-    // Force Pending window at a non-zero epoch so pre-genesis Safe-skip cannot apply.
-    // (register_for_import already ran at admit; if that was epoch 0 the machine may
-    // still be Pending — import path never Safe-skips.)
+    // register_for_import already ran at admit. Import never Safe-skips, and
+    // next_check is the following epoch.
     assert_eq!(machine.status(&pk), ForwardWindowStatus::Pending);
 
-    let end = start + DEFAULT_MONITORING_EPOCHS;
-    for epoch in start..=end {
-        loop_.drive_once_for_test(Some(epoch), epoch, 0).await.expect("drive");
+    let remaining = DEFAULT_MONITORING_EPOCHS + 1;
+    let mut statuses = Vec::new();
+    for offset in 0..remaining {
+        let counted = start + 1 + offset;
+        statuses = loop_.drive_once_for_test(counted + 1, CLOSED_EPOCH_SLOT).await;
     }
-    let statuses =
-        loop_.drive_once_for_test(None, end, SLOTS_PER_EPOCH - 1).await.expect("final tick");
 
     assert!(
         statuses.contains(&ForwardWindowStatus::Safe) || machine.is_signing_enabled(&pk),

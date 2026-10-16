@@ -4423,11 +4423,11 @@ version = "0.8.0"
 dependencies = [
  "hex",
  "parking_lot",
+ "proptest",
  "rvc-crypto",
  "rvc-eth-types",
  "rvc-observability",
  "rvc-slashing",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

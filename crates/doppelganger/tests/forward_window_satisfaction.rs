@@ -2,8 +2,8 @@
 //!
 //! Covers:
 //! - `is_signing_enabled` returns `false` while Pending
-//! - Safe transition fires only at-or-after the last slot of the satisfaction epoch
-//! - Missed-tick recovery: tick past end_epoch still satisfies
+//! - Safe happens only after `monitoring_epochs + 1` closed not-live epochs
+//! - A tick, including one past the old end epoch, does not open the gate
 //! - Restart-aware safe-skip: recent attestation → immediate Safe; stale → Pending
 //! - `register` is idempotent (Pending/Safe/Detected all preserved)
 //! - `observe_liveness` with `is_live = true` → Detected (terminal — no recovery)
@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use rvc_doppelganger::{
     ForwardWindowMachine, ForwardWindowStatus, SigningEnablement, ValidatorLivenessData,
+    CLOSED_EPOCH_SLOT,
 };
 
 use crypto::SecretKey;
@@ -87,7 +88,10 @@ fn observe_complete_window(
     let pubkey_hex = hex::encode(pubkey.to_bytes());
     for epoch in start_epoch..=end_epoch {
         let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
-        machine.observe_liveness(epoch, &samples).expect("complete observation must succeed");
+        assert!(
+            machine.observe_liveness(epoch, &samples, epoch + 1, CLOSED_EPOCH_SLOT).is_empty(),
+            "complete observation must succeed"
+        );
     }
 }
 
@@ -408,6 +412,23 @@ fn test_restart_safe_skip_blocked_at_low_epoch() {
     );
 }
 
+/// Import registration ignores a recent attestation that boot `register` would skip.
+#[test]
+fn test_register_for_import_does_not_apply_restart_skip() {
+    let monitoring_epochs: u64 = 2;
+    let current_epoch: Epoch = 100;
+    let machine = machine_with_prior(monitoring_epochs, current_epoch - 1);
+    let imported = new_pubkey();
+    let booted = new_pubkey();
+    machine.register_for_import(&imported, current_epoch);
+    machine.register(&booted, current_epoch);
+    assert!(
+        !machine.is_signing_enabled(&imported),
+        "register_for_import must stay Pending despite recent history"
+    );
+    assert!(machine.is_signing_enabled(&booted), "boot register still applies the restart skip");
+}
+
 /// Future last_signed target (interchange plant / clock lag) must NOT Safe-skip.
 #[test]
 fn test_restart_safe_skip_rejects_future_last_signed() {
@@ -451,18 +472,22 @@ fn test_imported_key_does_not_attest_until_window_clears() {
         "imported key must not sign until the forward window clears"
     );
 
-    // Mid-window: still Pending even with complete observations so far.
+    // The import epoch itself is before next_check and does not count.
     observe_complete_window(&machine, &pubkey, start_epoch, start_epoch);
-    machine.tick(start_epoch, SLOTS_PER_EPOCH - 1);
-    assert!(!machine.is_signing_enabled(&pubkey), "imported key still Pending mid-window");
+    machine.tick(start_epoch + 50, 0);
+    assert!(
+        !machine.is_signing_enabled(&pubkey),
+        "imported key still Pending after the import epoch"
+    );
 
-    // Complete remaining epochs and tick the satisfaction boundary.
-    observe_complete_window(&machine, &pubkey, start_epoch + 1, end_epoch);
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    // next_check is start + 1. monitoring_epochs + 1 closed epochs open the gate.
+    let last = start_epoch + 1 + monitoring_epochs;
+    observe_complete_window(&machine, &pubkey, start_epoch + 1, last);
     assert!(
         machine.is_signing_enabled(&pubkey),
-        "imported key may sign only after the window fully clears"
+        "imported key may sign only after the closed epochs are observed"
     );
+    let _ = end_epoch;
 }
 
 /// Boot restart without recent local history: register enters Pending; signing
@@ -562,7 +587,12 @@ fn test_register_idempotent_while_detected_does_not_reset() {
 
     // Detect the validator as live.
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    machine.observe_liveness(start_epoch, &samples).expect("must not fail");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "must not fail"
+    );
     assert!(!machine.is_signing_enabled(&pubkey), "Detected → must deny signing");
 
     // Re-register — must NOT reset to Pending.
@@ -590,7 +620,12 @@ fn test_observe_liveness_live_validator_transitions_to_detected() {
 
     // Observe the validator as live in epoch 50.
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    machine.observe_liveness(start_epoch, &samples).expect("observe_liveness must not fail");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "observe_liveness must not fail"
+    );
 
     assert!(!machine.is_signing_enabled(&pubkey), "Detected state must deny signing (fail-closed)");
 }
@@ -610,7 +645,12 @@ fn test_detected_is_terminal_tick_does_not_resurrect() {
 
     // Detect: mark live.
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    machine.observe_liveness(start_epoch, &samples).expect("must not fail");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "must not fail"
+    );
     assert!(!machine.is_signing_enabled(&pubkey), "Detected → signing denied");
 
     // Tick past end_epoch — must STILL be denied (Detected is terminal).
@@ -643,11 +683,19 @@ fn test_observe_liveness_not_live_does_not_detect() {
 
     // Observe start_epoch as not-live (complete entry, present).
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
-    machine.observe_liveness(start_epoch, &samples).expect("must not fail");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "must not fail"
+    );
 
     // Observe end_epoch as not-live (D-2: window is [start, end] inclusive).
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
-    machine.observe_liveness(end_epoch, &samples).expect("must not fail");
+    assert!(
+        machine.observe_liveness(end_epoch, &samples, end_epoch + 1, CLOSED_EPOCH_SLOT).is_empty(),
+        "must not fail"
+    );
 
     // Tick to end — fully observed and not Detected → Safe.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
@@ -679,7 +727,12 @@ fn test_observe_liveness_before_window_is_ignored() {
 
     // Observation at epoch before the window (out-of-window — no in-window expected).
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    machine.observe_liveness(start_epoch - 1, &samples).expect("must not fail");
+    assert!(
+        machine
+            .observe_liveness(start_epoch - 1, &samples, start_epoch - 1 + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "must not fail"
+    );
 
     // Must still be Pending, not Detected.
     assert!(
@@ -698,14 +751,13 @@ fn test_observe_liveness_before_window_is_ignored() {
     );
 }
 
-/// An is_live observation AFTER end_epoch must be ignored.
-///
-/// D-2: complete in-window observation is provided before the final tick.
+/// A live answer at any epoch >= next_check detects, including one past the
+/// old fixed window. Detected stays through later not-live answers.
 #[test]
 fn test_observe_liveness_after_window_is_ignored() {
     let monitoring_epochs: u64 = 1;
     let start_epoch: Epoch = 70;
-    let end_epoch = start_epoch + monitoring_epochs;
+    let later = start_epoch + monitoring_epochs + 5;
 
     let machine = machine_no_prior(monitoring_epochs);
     let pubkey = new_pubkey();
@@ -713,28 +765,20 @@ fn test_observe_liveness_after_window_is_ignored() {
 
     machine.register(&pubkey, start_epoch);
 
-    // Observation at epoch after the window (out-of-window).
-    // Note: the validator is still Pending when this is called; end_epoch+1 is
-    // outside [start_epoch, end_epoch] so the validator is not "expected" for
-    // that epoch.  The call must return Ok (no IncompleteLiveness).
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    machine.observe_liveness(end_epoch + 1, &samples).expect("must not fail");
-
-    // Must still be Pending.
     assert!(
-        !machine.is_signing_enabled(&pubkey),
-        "after-window observation must be ignored — still Pending"
+        machine.observe_liveness(later, &samples, later + 1, CLOSED_EPOCH_SLOT).is_empty(),
+        "a present live index is observed"
     );
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Detected);
 
-    // Provide complete in-window observation before the boundary tick.
-    observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
-
-    // Tick to Safe — confirms not Detected.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
-    assert!(
-        machine.is_signing_enabled(&pubkey),
-        "after-window observation must not Detect; Safe at end_epoch after complete observation"
-    );
+    let quiet = vec![ValidatorLivenessData { index: pubkey_hex, is_live: false }];
+    for epoch in later + 1..later + 4 {
+        let _ = machine.observe_liveness(epoch, &quiet, epoch + 1, CLOSED_EPOCH_SLOT);
+    }
+    machine.tick(later + 20, 0);
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Detected);
+    assert!(!machine.is_signing_enabled(&pubkey), "Detected stays");
 }
 
 // ---------------------------------------------------------------------------

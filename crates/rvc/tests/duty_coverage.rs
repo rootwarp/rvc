@@ -430,17 +430,23 @@ impl Harness {
     fn open_forward_window(&self, pubkey: &PublicKey) {
         let machine = self.machine.as_ref().expect("forward-window machine");
         let start = self.epoch_clock.current_epoch();
-        let end = start + DEFAULT_MONITORING_EPOCHS;
         let bare = hex::encode(pubkey.to_bytes());
-        for epoch in start..=end {
-            machine
-                .observe_liveness(
-                    epoch,
-                    &[ValidatorLivenessData { index: bare.clone(), is_live: false }],
-                )
-                .expect("observe liveness");
+        // Boot counts `start`. Import's next_check is the next epoch, so the
+        // extra observation covers that path. An already-Safe key ignores it.
+        for offset in 0..DEFAULT_MONITORING_EPOCHS + 2 {
+            let epoch = start + offset;
+            assert!(
+                machine
+                    .observe_liveness(
+                        epoch,
+                        &[ValidatorLivenessData { index: bare.clone(), is_live: false }],
+                        epoch + 1,
+                        doppelganger::CLOSED_EPOCH_SLOT,
+                    )
+                    .is_empty(),
+                "observe liveness"
+            );
         }
-        machine.tick(end + 1, 0);
         assert!(
             machine.is_signing_enabled(pubkey),
             "forward-window gate must be open after a clean not-live window"

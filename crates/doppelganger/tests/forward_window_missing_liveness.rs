@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use rvc_doppelganger::{
-    DoppelgangerError, ForwardWindowMachine, SigningEnablement, ValidatorLivenessData,
+    EpochLiveness, ForwardWindowMachine, ForwardWindowStatus, SigningEnablement,
+    ValidatorLivenessData, CLOSED_EPOCH_SLOT,
 };
 
 use crypto::SecretKey;
@@ -58,16 +59,19 @@ fn observe_complete_window(
     let pubkey_hex = hex::encode(pubkey.to_bytes());
     for epoch in start_epoch..=end_epoch {
         let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
-        machine.observe_liveness(epoch, &samples).expect("complete observation must succeed");
+        assert!(
+            machine.observe_liveness(epoch, &samples, epoch + 1, CLOSED_EPOCH_SLOT).is_empty(),
+            "complete observation must succeed"
+        );
     }
 }
 
 // ---------------------------------------------------------------------------
-// D-2: missing entry in response → Err(IncompleteLiveness)
+// D-2: missing entry in response → that pubkey is returned, not decremented
 // ---------------------------------------------------------------------------
 
 /// When `observe_liveness` is called for an epoch with an empty sample slice,
-/// any Pending in-window validator is absent → must return `Err(IncompleteLiveness)`.
+/// any due Pending validator is absent and is returned.
 #[test]
 fn test_observe_liveness_empty_samples_returns_incomplete_liveness_error() {
     let machine = machine();
@@ -76,17 +80,17 @@ fn test_observe_liveness_empty_samples_returns_incomplete_liveness_error() {
     machine.register(&pubkey, start_epoch);
 
     // Empty slice — validator is absent.
-    let result = machine.observe_liveness(start_epoch, &[]);
-    assert!(
-        matches!(result, Err(DoppelgangerError::IncompleteLiveness { missing_count: 1, .. })),
-        "empty samples for in-window Pending validator must return Err(IncompleteLiveness \
-         {{ missing_count: 1, .. }}), got: {:?}",
-        result
+    let pubkey_hex = hex::encode(pubkey.to_bytes());
+    let result = machine.observe_liveness(start_epoch, &[], start_epoch + 1, CLOSED_EPOCH_SLOT);
+    assert_eq!(
+        result,
+        vec![pubkey_hex],
+        "empty samples for a due Pending validator must return that key"
     );
 }
 
 /// When the response contains an entry for a DIFFERENT validator but not for
-/// our validator, the result must be `Err(IncompleteLiveness)`.
+/// our validator, that pubkey is returned and is not decremented.
 #[test]
 fn test_observe_liveness_missing_validator_in_partial_response_returns_error() {
     let machine = machine();
@@ -99,17 +103,16 @@ fn test_observe_liveness_missing_validator_in_partial_response_returns_error() {
     let other_index = "deadbeef".to_string();
     assert_ne!(other_index, pubkey_hex, "test setup: indices must differ");
     let samples = vec![ValidatorLivenessData { index: other_index, is_live: false }];
-    let result = machine.observe_liveness(start_epoch, &samples);
-    assert!(
-        matches!(
-            result,
-            Err(DoppelgangerError::IncompleteLiveness { epoch: 20, missing_count: 1 })
-        ),
-        "response missing our validator's index must return Err(IncompleteLiveness)"
+    let result =
+        machine.observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT);
+    assert_eq!(
+        result,
+        vec![pubkey_hex],
+        "response missing our validator's index must return that key"
     );
 }
 
-/// IncompleteLiveness carries the correct epoch and missing_count.
+/// Every absent due validator is returned, sorted by pubkey hex.
 #[test]
 fn test_incomplete_liveness_error_carries_epoch_and_count() {
     let monitoring_epochs: u64 = 1;
@@ -124,14 +127,10 @@ fn test_incomplete_liveness_error_carries_epoch_and_count() {
     machine.register(&_pk_b, start_epoch);
 
     // Respond with empty samples — both validators are absent.
-    let result = machine.observe_liveness(start_epoch, &[]);
-    match result {
-        Err(DoppelgangerError::IncompleteLiveness { epoch, missing_count }) => {
-            assert_eq!(epoch, start_epoch, "epoch in error must match the queried epoch");
-            assert_eq!(missing_count, 2, "both validators absent → missing_count must be 2");
-        }
-        other => panic!("expected IncompleteLiveness, got {:?}", other),
-    }
+    let result = machine.observe_liveness(start_epoch, &[], start_epoch + 1, CLOSED_EPOCH_SLOT);
+    let mut expected = vec![hex::encode(_pk_a.to_bytes()), hex::encode(_pk_b.to_bytes())];
+    expected.sort();
+    assert_eq!(result, expected, "both absent validators are unobserved");
 }
 
 // ---------------------------------------------------------------------------
@@ -153,13 +152,8 @@ fn test_missing_entry_epoch_keeps_validator_pending_through_boundary() {
     // Call observe_liveness with empty samples for start_epoch.
     // This is an incomplete response — the validator is absent.
     // We assert the error is returned (must_use: errors must not be silently dropped).
-    assert!(
-        matches!(
-            machine.observe_liveness(start_epoch, &[]),
-            Err(DoppelgangerError::IncompleteLiveness { .. })
-        ),
-        "empty samples must return IncompleteLiveness"
-    );
+    let missing = machine.observe_liveness(start_epoch, &[], start_epoch + 1, CLOSED_EPOCH_SLOT);
+    assert_eq!(missing, vec![hex::encode(pubkey.to_bytes())], "empty samples return the key");
 
     // Tick to the satisfaction boundary.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
@@ -171,28 +165,42 @@ fn test_missing_entry_epoch_keeps_validator_pending_through_boundary() {
     );
 }
 
-/// Tick FAR past end_epoch: incomplete observation must still prevent Safe.
+/// A key with no index until E+5 stays Pending across a far tick, then reaches
+/// Safe after three later closed not-live epochs. No re-register.
 #[test]
 fn test_missing_entry_keeps_pending_even_far_past_boundary() {
-    let monitoring_epochs: u64 = 1;
+    let monitoring_epochs: u64 = rvc_doppelganger::DEFAULT_MONITORING_EPOCHS;
     let start_epoch: Epoch = 40;
-    let end_epoch = start_epoch + monitoring_epochs; // 41
 
     let machine = machine_n(monitoring_epochs);
     let pubkey = new_pubkey();
+    let pubkey_hex = hex::encode(pubkey.to_bytes());
     machine.register(&pubkey, start_epoch);
 
-    // Incomplete observation — only start_epoch observed, but end_epoch is missing.
-    let pubkey_hex = hex::encode(pubkey.to_bytes());
-    let not_live = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
-    machine.observe_liveness(start_epoch, &not_live).expect("start_epoch observation must succeed");
+    for epoch in start_epoch..start_epoch + 5 {
+        let missing = machine.observe_liveness(epoch, &[], epoch + 1, CLOSED_EPOCH_SLOT);
+        assert_eq!(missing, vec![pubkey_hex.clone()], "epoch {epoch} has no index");
+        machine.tick(epoch + 50, 0);
+        assert!(
+            !machine.is_signing_enabled(&pubkey),
+            "no index and a far tick must not open the gate at epoch {epoch}"
+        );
+    }
 
-    // end_epoch NOT observed at all — tick far past the boundary.
-    machine.tick(end_epoch + 50, 0);
-
+    let not_live = vec![ValidatorLivenessData { index: pubkey_hex, is_live: false }];
+    for epoch in (start_epoch + 5)..(start_epoch + 8) {
+        assert!(
+            machine.observe_liveness(epoch, &not_live, epoch + 1, CLOSED_EPOCH_SLOT).is_empty(),
+            "epoch {epoch} is answered"
+        );
+        assert!(
+            !machine.is_signing_enabled(&pubkey) || epoch == start_epoch + 7,
+            "Safe only on the third closed not-live epoch"
+        );
+    }
     assert!(
-        !machine.is_signing_enabled(&pubkey),
-        "validator with end_epoch observation missing must NOT become Safe even far past boundary"
+        machine.is_signing_enabled(&pubkey),
+        "three closed not-live epochs after the index appears must reach Safe"
     );
 }
 
@@ -211,17 +219,15 @@ fn test_start_epoch_absent_end_epoch_present_stays_pending() {
     machine.register(&pubkey, start_epoch);
 
     // start_epoch: missing (BN transient omission).
-    assert!(
-        matches!(
-            machine.observe_liveness(start_epoch, &[]),
-            Err(DoppelgangerError::IncompleteLiveness { .. })
-        ),
-        "missing start_epoch must return IncompleteLiveness"
-    );
+    let missing = machine.observe_liveness(start_epoch, &[], start_epoch + 1, CLOSED_EPOCH_SLOT);
+    assert_eq!(missing, vec![pubkey_hex.clone()], "missing start_epoch returns the key");
 
     // end_epoch: present, not-live.
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
-    machine.observe_liveness(end_epoch, &samples).expect("end_epoch observation must succeed");
+    assert!(
+        machine.observe_liveness(end_epoch, &samples, end_epoch + 1, CLOSED_EPOCH_SLOT).is_empty(),
+        "end_epoch observation must succeed"
+    );
 
     // Tick to boundary — start_epoch was never recorded → window incomplete → stays Pending.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
@@ -291,7 +297,12 @@ fn test_partial_observation_only_start_epoch_stays_pending() {
 
     // Observe ONLY start_epoch — middle and end_epoch are missing.
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
-    machine.observe_liveness(start_epoch, &samples).expect("start_epoch must succeed");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "start_epoch must succeed"
+    );
 
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
@@ -317,9 +328,12 @@ fn test_complete_observation_with_live_transitions_to_detected() {
 
     // Present AND is_live=true → must Detect.
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    machine
-        .observe_liveness(start_epoch, &samples)
-        .expect("observe_liveness must succeed when index is present");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "a present index is observed"
+    );
 
     assert!(
         !machine.is_signing_enabled(&pubkey),
@@ -341,7 +355,12 @@ fn test_detected_is_terminal_tick_past_boundary_still_denied() {
 
     // Detect the validator.
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    machine.observe_liveness(start_epoch, &samples).expect("must not fail");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "must not fail"
+    );
     assert!(!machine.is_signing_enabled(&pubkey), "Detected → signing denied");
 
     // Tick far past end_epoch.
@@ -362,10 +381,11 @@ fn test_live_validator_present_does_not_return_error() {
     machine.register(&pubkey, start_epoch);
 
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    let result = machine.observe_liveness(start_epoch, &samples);
+    let result =
+        machine.observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT);
     assert!(
-        result.is_ok(),
-        "is_live=true but index is PRESENT in response → must be Ok (no IncompleteLiveness)"
+        result.is_empty(),
+        "is_live=true with the index present is observed, not reported missing"
     );
 }
 
@@ -383,16 +403,47 @@ fn test_duplicate_sample_or_semantics_true_wins() {
     let start_epoch: Epoch = 85;
     machine.register(&pubkey, start_epoch);
 
-    // (pk, false) then (pk, true) — last-wins naive collect would keep false; OR-fold must detect.
+    // (false, true): a first-wins fold keeps false and misses the detection.
     let samples = vec![
         ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false },
         ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true },
     ];
-    machine.observe_liveness(start_epoch, &samples).expect("must succeed (index present)");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "must succeed (index present)"
+    );
 
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "OR-fold: (false, true) → is_live=true must win → Detected"
+    );
+}
+
+/// (true, false): a last-wins fold keeps false and misses the detection.
+#[test]
+fn test_duplicate_sample_reverse_order_true_then_false_detects() {
+    let machine = machine();
+    let pubkey = new_pubkey();
+    let pubkey_hex = hex::encode(pubkey.to_bytes());
+    let start_epoch: Epoch = 85;
+    machine.register(&pubkey, start_epoch);
+
+    let samples = vec![
+        ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true },
+        ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false },
+    ];
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "must succeed (index present)"
+    );
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Detected);
+    assert!(
+        !machine.is_signing_enabled(&pubkey),
+        "OR-fold: (true, false) → is_live=true must win → Detected"
     );
 }
 
@@ -413,11 +464,19 @@ fn test_duplicate_sample_or_semantics_both_false_stays_pending() {
         ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false },
         ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false },
     ];
-    machine.observe_liveness(start_epoch, &samples).expect("must succeed (index present)");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "must succeed (index present)"
+    );
 
     // Observe end_epoch too, then tick.
     let samples2 = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
-    machine.observe_liveness(end_epoch, &samples2).expect("end_epoch must succeed");
+    assert!(
+        machine.observe_liveness(end_epoch, &samples2, end_epoch + 1, CLOSED_EPOCH_SLOT).is_empty(),
+        "end_epoch must succeed"
+    );
 
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
@@ -430,8 +489,8 @@ fn test_duplicate_sample_or_semantics_both_false_stays_pending() {
 // D-2: out-of-window observations still ignored (D-1 preserved)
 // ---------------------------------------------------------------------------
 
-/// An is_live observation before start_epoch: ignored (not counted as observed,
-/// not detected, does not affect IncompleteLiveness for that epoch).
+/// An is_live observation before `next_check_epoch` is ignored: not counted,
+/// not detected, and not reported as unobserved.
 #[test]
 fn test_out_of_window_before_start_ignored_completely() {
     let monitoring_epochs: u64 = 1;
@@ -446,9 +505,10 @@ fn test_out_of_window_before_start_ignored_completely() {
     // Call observe_liveness for an epoch BEFORE the window.
     // The validator IS in the response, but the epoch is out-of-window.
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    let result = machine.observe_liveness(start_epoch - 1, &samples);
-    // No in-window Pending validator was expected for this epoch → Ok (no IncompleteLiveness).
-    assert!(result.is_ok(), "out-of-window epoch: no in-window validator expected → must be Ok");
+    let result =
+        machine.observe_liveness(start_epoch - 1, &samples, start_epoch - 1 + 1, CLOSED_EPOCH_SLOT);
+    // No due Pending validator for this epoch, so the key is not reported.
+    assert!(result.is_empty(), "epoch before next_check is not an unobserved failure");
 
     // Confirm the validator is still Pending (not Detected) — out-of-window is_live ignored.
     assert!(
@@ -465,8 +525,8 @@ fn test_out_of_window_before_start_ignored_completely() {
     );
 }
 
-/// observe_liveness returns Ok when no Pending in-window validators are expected
-/// (e.g. all registered validators are already Safe or Detected).
+/// observe_liveness returns no keys when none are still Pending
+/// (every registered validator is already Safe or Detected).
 #[test]
 fn test_observe_liveness_returns_ok_when_no_pending_in_window_validators() {
     let monitoring_epochs: u64 = 1;
@@ -484,11 +544,8 @@ fn test_observe_liveness_returns_ok_when_no_pending_in_window_validators() {
 
     // Now call observe_liveness for another epoch with empty samples.
     // The only validator is Safe (not Pending) — no expected in-window validator → Ok.
-    let result = machine.observe_liveness(end_epoch + 1, &[]);
-    assert!(
-        result.is_ok(),
-        "no Pending in-window validators → empty samples must be Ok (no IncompleteLiveness)"
-    );
+    let result = machine.observe_liveness(end_epoch + 1, &[], end_epoch + 1 + 1, CLOSED_EPOCH_SLOT);
+    assert!(result.is_empty(), "a Safe validator is not reported unobserved");
 }
 
 // ---------------------------------------------------------------------------
@@ -496,9 +553,9 @@ fn test_observe_liveness_returns_ok_when_no_pending_in_window_validators() {
 // ---------------------------------------------------------------------------
 
 /// Multi-validator: A present, B absent in the same epoch.
-/// - returns Err(IncompleteLiveness, missing_count=1)
-/// - A's epoch is recorded; B's is not
-/// - After retry with a complete response for B, both reach Safe.
+/// - only B is returned
+/// - A's epoch counts; B's does not
+/// - After a complete retry for B, both reach Safe.
 #[test]
 fn test_multi_validator_partial_response_a_present_b_absent() {
     let monitoring_epochs: u64 = 1;
@@ -516,14 +573,12 @@ fn test_multi_validator_partial_response_a_present_b_absent() {
 
     // start_epoch: A is present, B is absent.
     let samples = vec![ValidatorLivenessData { index: hex_a.clone(), is_live: false }];
-    let result = machine.observe_liveness(start_epoch, &samples);
-    assert!(
-        matches!(
-            result,
-            Err(DoppelgangerError::IncompleteLiveness { epoch: 300, missing_count: 1 })
-        ),
-        "A present, B absent → must be IncompleteLiveness(missing=1), got: {:?}",
-        result
+    let result =
+        machine.observe_liveness(start_epoch, &samples, start_epoch + 1, CLOSED_EPOCH_SLOT);
+    assert_eq!(
+        result,
+        vec![hex_b.clone()],
+        "A present, B absent → only B is unobserved, got {result:?}"
     );
 
     // Both are still Pending; A has start_epoch recorded, B does not.
@@ -531,19 +586,29 @@ fn test_multi_validator_partial_response_a_present_b_absent() {
     assert!(!machine.is_signing_enabled(&pk_b), "B must still be Pending");
 
     // Retry B for start_epoch with a complete response (A already recorded, B missing).
-    // We send BOTH to avoid triggering IncompleteLiveness for A again.
+    // Both are present so neither key is reported unobserved.
     let retry = vec![
         ValidatorLivenessData { index: hex_a.clone(), is_live: false },
         ValidatorLivenessData { index: hex_b.clone(), is_live: false },
     ];
-    machine.observe_liveness(start_epoch, &retry).expect("retry must succeed");
+    assert!(
+        machine
+            .observe_liveness(start_epoch, &retry, start_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "retry must succeed"
+    );
 
     // Observe end_epoch for both.
     let end_samples = vec![
         ValidatorLivenessData { index: hex_a.clone(), is_live: false },
         ValidatorLivenessData { index: hex_b.clone(), is_live: false },
     ];
-    machine.observe_liveness(end_epoch, &end_samples).expect("end_epoch must succeed");
+    assert!(
+        machine
+            .observe_liveness(end_epoch, &end_samples, end_epoch + 1, CLOSED_EPOCH_SLOT)
+            .is_empty(),
+        "end_epoch must succeed"
+    );
 
     // Tick to boundary — both should now be Safe.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
@@ -571,14 +636,15 @@ fn test_multi_validator_b_never_retried_stays_pending() {
 
     // start_epoch: A present, B absent (never retried).
     let samples_start = vec![ValidatorLivenessData { index: hex_a.clone(), is_live: false }];
-    let _err = machine.observe_liveness(start_epoch, &samples_start);
-    // Error is intentionally checked only for the must_use; result already asserted above.
-    assert!(matches!(_err, Err(DoppelgangerError::IncompleteLiveness { .. })));
+    let missing =
+        machine.observe_liveness(start_epoch, &samples_start, start_epoch + 1, CLOSED_EPOCH_SLOT);
+    assert_eq!(missing, vec![hex::encode(pk_b.to_bytes())]);
 
     // end_epoch: A present (complete), B still absent.
     let samples_end = vec![ValidatorLivenessData { index: hex_a.clone(), is_live: false }];
-    let _err2 = machine.observe_liveness(end_epoch, &samples_end);
-    assert!(matches!(_err2, Err(DoppelgangerError::IncompleteLiveness { .. })));
+    let missing_end =
+        machine.observe_liveness(end_epoch, &samples_end, end_epoch + 1, CLOSED_EPOCH_SLOT);
+    assert_eq!(missing_end, vec![hex::encode(pk_b.to_bytes())]);
 
     // Tick to boundary.
     machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
@@ -590,4 +656,136 @@ fn test_multi_validator_b_never_retried_stays_pending() {
         !machine.is_signing_enabled(&pk_b),
         "B (never retried) must stay Pending (fail-closed)"
     );
+}
+
+fn not_live(hex: &str) -> Option<Vec<ValidatorLivenessData>> {
+    Some(vec![ValidatorLivenessData { index: hex.to_string(), is_live: false }])
+}
+
+fn live(hex: &str) -> Option<Vec<ValidatorLivenessData>> {
+    Some(vec![ValidatorLivenessData { index: hex.to_string(), is_live: true }])
+}
+
+/// `monitoring_epochs = 1` starts `remaining` at 2. One closed tick leaves it at 1.
+fn close_once(machine: &ForwardWindowMachine, hex: &str, start: Epoch) {
+    let current = start + 1;
+    let answers = [
+        EpochLiveness { epoch: start, samples: not_live(hex) },
+        EpochLiveness { epoch: current, samples: not_live(hex) },
+    ];
+    assert!(machine.apply_liveness_tick(&answers, current, CLOSED_EPOCH_SLOT).is_empty());
+}
+
+#[test]
+fn test_opening_tick_live_current_epoch_is_detected() {
+    let machine = machine_n(1);
+    let pubkey = new_pubkey();
+    let hex = hex::encode(pubkey.to_bytes());
+    let start = 10u64;
+    machine.register(&pubkey, start);
+    close_once(&machine, &hex, start);
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Pending);
+
+    let current = start + 2;
+    let answers = [
+        EpochLiveness { epoch: start + 1, samples: not_live(&hex) },
+        EpochLiveness { epoch: current, samples: live(&hex) },
+    ];
+    let _ = machine.apply_liveness_tick(&answers, current, CLOSED_EPOCH_SLOT);
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Detected);
+    assert!(!machine.is_signing_enabled(&pubkey));
+}
+
+#[test]
+fn test_opening_tick_live_current_epoch_wins_in_reverse_answer_order() {
+    let machine = machine_n(1);
+    let pubkey = new_pubkey();
+    let hex = hex::encode(pubkey.to_bytes());
+    let start = 20u64;
+    machine.register(&pubkey, start);
+    close_once(&machine, &hex, start);
+
+    let current = start + 2;
+    let answers = [
+        EpochLiveness { epoch: current, samples: live(&hex) },
+        EpochLiveness { epoch: start + 1, samples: not_live(&hex) },
+    ];
+    let _ = machine.apply_liveness_tick(&answers, current, CLOSED_EPOCH_SLOT);
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Detected);
+    assert!(!machine.is_signing_enabled(&pubkey));
+}
+
+#[test]
+fn test_opening_tick_failed_current_epoch_stays_pending() {
+    let machine = machine_n(1);
+    let pubkey = new_pubkey();
+    let hex = hex::encode(pubkey.to_bytes());
+    let start = 30u64;
+    machine.register(&pubkey, start);
+    close_once(&machine, &hex, start);
+
+    let current = start + 2;
+    let answers = [
+        EpochLiveness { epoch: start + 1, samples: not_live(&hex) },
+        EpochLiveness { epoch: current, samples: None },
+    ];
+    let missing = machine.apply_liveness_tick(&answers, current, CLOSED_EPOCH_SLOT);
+    assert_eq!(missing, vec![(current, hex)]);
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Pending);
+    assert!(!machine.is_signing_enabled(&pubkey));
+}
+
+#[test]
+fn test_opening_tick_partial_current_epoch_stays_pending() {
+    let machine = machine_n(1);
+    let pubkey = new_pubkey();
+    let hex = hex::encode(pubkey.to_bytes());
+    let start = 40u64;
+    machine.register(&pubkey, start);
+    close_once(&machine, &hex, start);
+
+    let current = start + 2;
+    let answers = [
+        EpochLiveness { epoch: start + 1, samples: not_live(&hex) },
+        EpochLiveness {
+            epoch: current,
+            samples: Some(vec![ValidatorLivenessData {
+                index: "other".to_string(),
+                is_live: false,
+            }]),
+        },
+    ];
+    let missing = machine.apply_liveness_tick(&answers, current, CLOSED_EPOCH_SLOT);
+    assert_eq!(missing, vec![(current, hex.clone())]);
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Pending);
+    assert!(!machine.is_signing_enabled(&pubkey));
+}
+
+#[test]
+fn test_import_starts_counting_in_the_next_epoch() {
+    let monitoring_epochs = 2u64;
+    let machine = machine_n(monitoring_epochs);
+    let pubkey = new_pubkey();
+    let hex = hex::encode(pubkey.to_bytes());
+    let start = 10u64;
+    machine.register_for_import(&pubkey, start);
+
+    let live_import = vec![ValidatorLivenessData { index: hex.clone(), is_live: true }];
+    assert!(
+        machine.observe_liveness(start, &live_import, start + 1, CLOSED_EPOCH_SLOT).is_empty(),
+        "the import epoch is before next_check"
+    );
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Pending);
+    assert!(!machine.is_signing_enabled(&pubkey));
+
+    for epoch in (start + 1)..=(start + monitoring_epochs) {
+        let samples = vec![ValidatorLivenessData { index: hex.clone(), is_live: false }];
+        assert!(machine.observe_liveness(epoch, &samples, epoch + 1, CLOSED_EPOCH_SLOT).is_empty());
+        assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Pending);
+    }
+    let last = start + 1 + monitoring_epochs;
+    let samples = vec![ValidatorLivenessData { index: hex, is_live: false }];
+    assert!(machine.observe_liveness(last, &samples, last + 1, CLOSED_EPOCH_SLOT).is_empty());
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Safe);
+    assert!(machine.is_signing_enabled(&pubkey));
 }

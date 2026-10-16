@@ -563,7 +563,7 @@ Attach timeout (`--timeout`, default 120 s) kills the spawned pid, copies `rvc.l
 
 ### Doppelganger only under `--profile safe`
 
-`fast` sets `FAST_DOPPELGANGER=off` so S1/S3 fit in one sitting (~2 epochs ≈ 12.8 min otherwise). `--profile safe` turns detection on (`SAFE_DOPPELGANGER=on`) and is what proves the DN-5 disjoint split (DN-18, Phase 6). A `fast` green run does **not** prove "no key overlap".
+`fast` sets `FAST_DOPPELGANGER=off` so S1/S3 fit in one sitting (three closed epochs otherwise, and a gap delays that). `--profile safe` turns detection on (`SAFE_DOPPELGANGER=on`) and is what proves the DN-5 disjoint split (DN-18, Phase 6). A `fast` green run does **not** prove "no key overlap".
 
 ### Docker VM RAM / missing binary (this host's 5.6 / 6.6 snag)
 

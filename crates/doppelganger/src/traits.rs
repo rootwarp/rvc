@@ -18,7 +18,7 @@ pub struct ValidatorLivenessData {
     /// index → pubkey-hex BEFORE constructing `ValidatorLivenessData` and
     /// passing the slice to `observe_liveness`.  Any index that cannot be
     /// translated (unknown pubkey) MUST be omitted, which causes
-    /// `observe_liveness` to treat the corresponding validator as missing
+    /// `observe_liveness` to report that validator as unobserved
     /// (fail-closed).  The production wiring and translation land in
     /// Issue 2.10.
     pub index: String,

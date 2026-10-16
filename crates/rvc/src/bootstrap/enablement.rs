@@ -40,8 +40,7 @@ pub struct EnablementHandles {
     pub epoch_clock: Arc<MonotonicEpochClock>,
     /// Byte-keyed pubkey map (same `Arc` as [`LoadedKeys::pubkey_map`]).
     pub pubkey_map: PubkeyMap,
-    /// Spawned SEC-2c liveness loop; `None` when doppelganger is off or there
-    /// are no keys/indices to observe.
+    /// Spawned SEC-2c liveness loop; `None` only when doppelganger is off.
     pub liveness_task: Option<LivenessLoopSpawn>,
     /// Shared pubkey ↔ validator-index registry for duty tracking, proposer
     /// preparation, and liveness. Empty when unresolved / no keys.
@@ -56,7 +55,8 @@ pub struct EnablementHandles {
 ///
 /// - Fail-closed machine when doppelganger is on; unregistered keys cannot sign.
 /// - Operator opt-out yields [`doppelganger::DoppelgangerDisabledByOperator`].
-/// - Epoch-0 boot register marks normally registered keys Safe (pre-genesis bypass).
+/// - Epoch-0 boot register marks normally registered keys Safe only after the
+///   clock has reached genesis. A reading before genesis is not a counted epoch.
 /// - Restart-aware safe-skip on **boot** `register` only, and only for keys
 ///   with no open import hold and no remaining import sidecar (local slashing
 ///   history under this GVR). Do **not** copy a live slashing DB to a second VC.
@@ -91,6 +91,9 @@ pub async fn wire_signing_enablement(
     let epoch_clock =
         Arc::new(MonotonicEpochClock::new(beacon.genesis_time, beacon.slot_duration_ms));
     let enablement_epoch = epoch_clock.current_epoch();
+    // Named-network confirmation is not enough: a clock still before genesis
+    // saturates to epoch 0 and must not take the Safe bypass.
+    let epoch0_bypass = beacon.genesis_confirmed && !epoch_clock.before_genesis();
 
     // Resolve validator indices into the shared registry (duty tracker + liveness
     // + prepare_proposers all share this handle).
@@ -107,8 +110,8 @@ pub async fn wire_signing_enablement(
                 warn!(
                     total = keys.pubkey_map.read().len(),
                     "No validator indices resolved; validators may be pending activation. \
-                     Forward-window liveness loop will not start (gate stays fail-safe closed \
-                     for Pending keys)"
+                     The liveness loop stays on and will not mark those keys Safe until a \
+                     closed epoch includes their index"
                 );
             }
             Err(e) => {
@@ -121,7 +124,7 @@ pub async fn wire_signing_enablement(
         pubkey_index.write().extend_from(reg);
     }
 
-    if enablement_epoch == 0 && doppelganger_enabled {
+    if epoch0_bypass && doppelganger_enabled {
         info!(
             "Doppelganger detection: pre-genesis (epoch 0) startup — \
              normally registered validators are marked Safe without a monitoring window. \
@@ -149,7 +152,7 @@ pub async fn wire_signing_enablement(
         beacon.genesis_validators_root,
         enablement_epoch,
         &keys.pubkey_map,
-        beacon.genesis_confirmed,
+        epoch0_bypass,
     );
 
     // Shared with keymanager DELETE/import and forward-window sidecar cleanup.
@@ -376,8 +379,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_wire_signing_enablement_preserves_epoch0_bypass() {
-        // Genesis far in the future → MonotonicEpochClock stays at epoch 0.
+    async fn test_clock_before_genesis_does_not_mark_boot_keys_safe() {
+        // Genesis far in the future → the clock saturates to epoch 0.
         let now =
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         let far_future = now.saturating_add(
@@ -393,12 +396,42 @@ mod tests {
         let handles =
             wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
                 .await
+                .expect("pre-genesis phase succeeds");
+
+        assert_eq!(handles.epoch_clock.current_epoch(), 0);
+        assert!(handles.epoch_clock.before_genesis());
+        assert!(
+            !handles.signing_enablement.is_signing_enabled(&pk),
+            "a clock before genesis must not mark boot keys Safe"
+        );
+        let machine = handles.forward_window_machine.expect("machine present");
+        assert_eq!(machine.status(&pk), ForwardWindowStatus::Pending);
+        executor.token().cancel();
+    }
+
+    #[tokio::test]
+    async fn test_epoch0_after_genesis_still_bypasses() {
+        // Thirty seconds after genesis is still epoch 0 (one epoch is 384s at 12s slots).
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let genesis = now.saturating_sub(30);
+        let (_server, beacon) = mock_beacon(genesis).await;
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let keys = loaded_keys_with_pubkey(pk.clone());
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+
+        let handles =
+            wire_signing_enablement(&base_config(true), &keys, &beacon, slashing_db, &executor)
+                .await
                 .expect("epoch-0 phase succeeds");
 
         assert_eq!(handles.epoch_clock.current_epoch(), 0);
+        assert!(!handles.epoch_clock.before_genesis());
         assert!(
             handles.signing_enablement.is_signing_enabled(&pk),
-            "epoch-0 boot register must immediately enable signing (pre-genesis bypass)"
+            "epoch 0 after genesis still marks a boot key Safe"
         );
         let machine = handles.forward_window_machine.expect("machine present");
         assert_eq!(machine.status(&pk), ForwardWindowStatus::Safe);
@@ -502,14 +535,48 @@ mod tests {
                 .expect("empty keys ok");
 
         assert!(handles.forward_window_machine.is_some());
-        assert!(handles.liveness_task.is_none(), "no keys → no liveness loop");
+        assert!(handles.liveness_task.is_some(), "a zero-key boot still starts the liveness loop");
         assert!(handles.pubkey_index.read().is_empty());
         // Fail-closed for any random key.
         let other = SecretKey::generate().public_key();
         assert!(!handles.signing_enablement.is_signing_enabled(&other));
         // Silence unused import warning paths
         let _ = Signer::public_keys(keys.composite_signer.as_ref());
+
+        let machine = handles.forward_window_machine.clone().expect("machine");
         executor.token().cancel();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.shutdown(crate::bootstrap::executor::TierBudget::default()),
+        )
+        .await
+        .expect("liveness loop stops before the import is registered");
+
+        let pk = SecretKey::generate().public_key();
+        let epoch = 40u64;
+        machine.register_for_import(&pk, epoch);
+        assert_eq!(machine.status(&pk), ForwardWindowStatus::Pending);
+        let bare = hex::encode(pk.to_bytes());
+        let sample = doppelganger::ValidatorLivenessData { index: bare, is_live: false };
+        for offset in 0..3 {
+            let counted = epoch + 1 + offset;
+            assert!(
+                machine
+                    .observe_liveness(
+                        counted,
+                        std::slice::from_ref(&sample),
+                        counted + 1,
+                        doppelganger::CLOSED_EPOCH_SLOT,
+                    )
+                    .is_empty(),
+                "closed epoch {counted}"
+            );
+        }
+        assert_eq!(
+            machine.status(&pk),
+            ForwardWindowStatus::Safe,
+            "register_for_import reaches Safe after 3 closed not-live epochs"
+        );
     }
 
     /// BN `SLOT_DURATION_MS=6000` and genesis 10 epochs ago at 6 s slots.
