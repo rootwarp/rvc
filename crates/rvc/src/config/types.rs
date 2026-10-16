@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use bn_manager::BnRole;
+use bn_manager::{BnRole, FeeRecipientPolicy};
 use observability::hex::{strip_prefix_strict, HexError};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
@@ -247,6 +247,15 @@ pub struct Config {
     pub aggregate_timeout: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duty_fetch_timeout: Option<u64>,
+
+    /// Readable fee-recipient mismatch on `produceBlockV3`.
+    ///
+    /// `sign` (default) still signs the best remaining block. `reject` drops
+    /// it. A missing or unreadable fee on a full Bellatrix+ block is rejected
+    /// either way. Omitted from snapshots at the default so the operator-knob
+    /// inventory stays unchanged.
+    #[serde(default, skip_serializing_if = "FeeRecipientPolicy::is_default")]
+    pub fee_recipient_policy: FeeRecipientPolicy,
 }
 
 fn default_beacon_max_body_bytes() -> usize {
@@ -322,6 +331,7 @@ impl Default for Config {
             attestation_timeout: None,
             aggregate_timeout: None,
             duty_fetch_timeout: None,
+            fee_recipient_policy: FeeRecipientPolicy::Sign,
         }
     }
 }
@@ -403,6 +413,8 @@ struct ConfigWire {
     attestation_timeout: Option<u64>,
     aggregate_timeout: Option<u64>,
     duty_fetch_timeout: Option<u64>,
+    #[serde(default)]
+    fee_recipient_policy: FeeRecipientPolicy,
 
     // Nested tables (4f/4g + invented 4h sections). Flat keys above win.
     #[serde(default)]
@@ -708,6 +720,7 @@ impl Config {
             attestation_timeout: w.attestation_timeout.or(w.beacon.inner.attestation_timeout),
             aggregate_timeout: w.aggregate_timeout.or(w.beacon.inner.aggregate_timeout),
             duty_fetch_timeout: w.duty_fetch_timeout.or(w.beacon.inner.duty_fetch_timeout),
+            fee_recipient_policy: w.fee_recipient_policy,
         })
     }
 
@@ -3616,6 +3629,19 @@ builders = ["not a url"]
             "valid entry must be present (prefix stripped)"
         );
         assert!(logs_contain("double 0x prefix"), "expected warn log about double prefix");
+    }
+
+    #[test]
+    fn test_fee_recipient_policy_defaults_to_sign_and_parses_reject() {
+        let defaulted: Config = toml::from_str("").expect("empty config");
+        assert_eq!(defaulted.fee_recipient_policy, FeeRecipientPolicy::Sign);
+        let snapshot = serde_json::to_value(&defaulted).expect("snapshot");
+        assert!(snapshot.get("fee_recipient_policy").is_none());
+
+        let reject: Config =
+            toml::from_str("fee_recipient_policy = \"reject\"").expect("reject parses");
+        assert_eq!(reject.fee_recipient_policy, FeeRecipientPolicy::Reject);
+        assert!(reject.validate().is_ok());
     }
 
     // -- RF5-13: nested call sites; flat shims deleted --

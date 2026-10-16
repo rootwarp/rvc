@@ -377,17 +377,23 @@ impl DutyManagementService {
     }
 
     #[tracing::instrument(name = "orchestrator.prepare_proposers", level = "debug", skip_all, fields(epoch = epoch))]
-    pub(crate) async fn prepare_proposers(&self, epoch: u64) {
+    /// `true` when this epoch needs no further send.
+    ///
+    /// Gloas, and a process with no local validators, are done. Validators
+    /// whose index is not known yet, and a failed or timed-out POST, are not:
+    /// startup retries once per slot.
+    pub(crate) async fn prepare_proposers(&self, epoch: u64) -> bool {
         let fork = ForkName::from_epoch(epoch, &self.config.fork_schedule);
         if legacy_proposer_ops_retired(fork) {
             info!(epoch, fork = fork.as_ref(), "Skipping prepare_beacon_proposer at Gloas");
-            return;
+            return true;
         }
 
         // O(validators): one registry lookup per local key — no duty-cache scan.
         // Build the preparations list under short sync locks (no await held).
-        let preparations: Vec<ProposerPreparation> = {
+        let (preparations, had_local_validators): (Vec<ProposerPreparation>, bool) = {
             let pubkey_snapshot = self.pubkey_map.read().clone();
+            let had_local_validators = !pubkey_snapshot.is_empty();
             let index_registry = self.pubkey_index.read();
             let mut out = Vec::with_capacity(pubkey_snapshot.len());
             for (pubkey_bytes, pubkey) in &pubkey_snapshot {
@@ -410,11 +416,11 @@ impl DutyManagementService {
                     }
                 }
             }
-            out
+            (out, had_local_validators)
         };
 
         if preparations.is_empty() {
-            return;
+            return !had_local_validators;
         }
 
         let count = preparations.len();
@@ -425,13 +431,20 @@ impl DutyManagementService {
         )
         .await
         {
-            TimedOutcome::Ok(_) => info!(count, "Sent proposer preparations"),
-            TimedOutcome::Err(e) => warn!(error = %e, "Failed to send proposer preparations"),
+            TimedOutcome::Ok(_) => {
+                info!(count, "Sent proposer preparations");
+                true
+            }
+            TimedOutcome::Err(e) => {
+                warn!(error = %e, "Failed to send proposer preparations");
+                false
+            }
             TimedOutcome::Timeout => {
                 warn!(
                     "Proposer preparation timed out after {}s",
                     self.config.timeouts.preparation.as_secs()
-                )
+                );
+                false
             }
         }
     }

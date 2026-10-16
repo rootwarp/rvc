@@ -126,6 +126,18 @@ pub static RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL: LazyLock<IntCounter> = L
     },
 );
 
+/// Blocks returned for signing even though the fee recipient did not match.
+///
+/// Incremented once per chosen block, not once per penalized candidate that
+/// lost to a matching block. A [`crate::FeeRecipientPolicy::Reject`] drop is
+/// not counted here.
+pub static RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_produce_block_fee_recipient_penalty_total",
+        "Blocks returned for signing despite a readable fee-recipient mismatch",
+    )
+});
+
 /// In-flight overflow publishes, one series per redacted beacon endpoint.
 ///
 /// The 16-permit health-sample cap limits health recording, not sends. A
@@ -150,6 +162,7 @@ pub fn init() {
     LazyLock::force(&RVC_BN_CAPABILITY_STATE);
     LazyLock::force(&RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL);
     LazyLock::force(&RVC_BN_BROADCAST_OVERFLOW_DRAINS);
+    LazyLock::force(&RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL);
 }
 
 #[cfg(test)]
@@ -196,7 +209,7 @@ pub(crate) fn gather_health_tier_series() -> Vec<(String, i64)> {
 mod tests {
     use super::{
         endpoint_label, is_proposer_block_production_op, observe_proposer_bn_latency,
-        RVC_PROPOSER_BN_LATENCY_MS,
+        RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL, RVC_PROPOSER_BN_LATENCY_MS,
     };
     use std::time::Duration;
 
@@ -247,5 +260,12 @@ mod tests {
             after > before,
             "observe must bump histogram count; before={before}, after={after}"
         );
+    }
+
+    #[test]
+    fn penalized_fee_counter_increments_once_per_win() {
+        let before = RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+        RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.inc();
+        assert_eq!(RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
     }
 }

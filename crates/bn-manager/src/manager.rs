@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -36,8 +37,8 @@ use crate::sync_status::{
 };
 use crate::traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
-    DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi,
-    ProduceDuty, SyncCommitteeApi,
+    DutiesProvider, FeeRecipientPolicy, LivenessApi, NodeStatusApi, OperationTimeouts,
+    PayloadAttestationApi, ProduceDuty, SyncCommitteeApi,
 };
 use crate::types::{bn_capability, BnRole, HealthTier, TierThresholds};
 use crate::BnManagerError;
@@ -316,6 +317,7 @@ pub struct BnManager {
     broadcast_topics: crate::traits::BroadcastTopics,
     roles: Vec<HashSet<BnRole>>,
     tier_thresholds: TierThresholds,
+    fee_recipient_policy: FeeRecipientPolicy,
 }
 
 /// Apply health-tracker updates. Each call takes the write lock once.
@@ -395,12 +397,30 @@ pub(crate) fn log_partial_failure_endpoints(
     );
 }
 
+type Pred<T> = Arc<dyn Fn(&T) -> bool + Send + Sync>;
+type Rank<T> = Arc<dyn Fn(&T, &T) -> bool + Send + Sync>;
+type RejectFn<T> = Arc<dyn Fn(usize, &str, &T) + Send + Sync>;
+type ChosenFn<T> = Arc<dyn Fn(usize, &T) + Send + Sync>;
+
 /// Ranking predicate, pre-rank filter, and whether fallback may run.
-struct BestSelect<'a, T> {
-    pick_best: fn(&T, &T) -> bool,
-    accept: &'a (dyn Fn(&T) -> bool + Sync),
+struct BestSelect<T> {
+    pick_best: Rank<T>,
+    /// Hard checks. `false` is dropped.
+    accept: Pred<T>,
+    /// Hard checks and the right fee. Closes the soft window and stops fallback.
+    in_hand: Pred<T>,
+    /// Called once for each `Ok` that fails [`Self::accept`], including on the drain.
+    on_reject: RejectFn<T>,
+    /// Called once for the block that is actually returned.
+    on_chosen: ChosenFn<T>,
     allow_fallback: bool,
 }
+
+/// Return a held block this long before the outer backstop.
+///
+/// [`BnManager::with_op_timeout`] uses that same backstop. Waiting until the
+/// instant itself drops the held block as `OperationTimeout`.
+const HELD_RETURN_MARGIN: Duration = Duration::from_millis(50);
 
 impl BnManager {
     /// Creates a new `BnManager` from the given configuration.
@@ -478,7 +498,15 @@ impl BnManager {
             broadcast_topics,
             roles,
             tier_thresholds,
+            fee_recipient_policy: config.fee_recipient_policy,
         })
+    }
+
+    /// Override [`FeeRecipientPolicy`]. Tests and the config builder use this
+    /// after [`Self::new`].
+    pub fn with_fee_recipient_policy(mut self, policy: FeeRecipientPolicy) -> Self {
+        self.fee_recipient_policy = policy;
+        self
     }
 
     /// Returns the shared sync status tracker.
@@ -1291,14 +1319,30 @@ impl BnManager {
         T: Send + 'static,
         F: Fn(&BeaconClient) -> BoxFut<'static, T>,
     {
-        let accept = |_: &T| true;
+        let accept: Pred<T> = Arc::new(|_: &T| true);
+        let op_label = op_name.to_owned();
+        let on_reject: RejectFn<T> = Arc::new(move |index, endpoint, _: &T| {
+            warn!(
+                op = %op_label,
+                bn_index = index,
+                endpoint = %RedactedUrl(endpoint),
+                "best-of candidate rejected"
+            );
+        });
         self.query_best_filtered(
             op_name,
             role,
             min_tier,
             budget,
             op,
-            BestSelect { pick_best, accept: &accept, allow_fallback: true },
+            BestSelect {
+                pick_best: Arc::new(pick_best),
+                in_hand: Arc::clone(&accept),
+                accept,
+                on_reject,
+                on_chosen: Arc::new(|_, _| {}),
+                allow_fallback: true,
+            },
         )
         .await
     }
@@ -1310,7 +1354,7 @@ impl BnManager {
         min_tier: HealthTier,
         budget: Option<Duration>,
         op: F,
-        select: BestSelect<'_, T>,
+        select: BestSelect<T>,
     ) -> Result<T, BeaconError>
     where
         T: Send + 'static,
@@ -1333,7 +1377,7 @@ impl BnManager {
         min_tier: HealthTier,
         budget: Option<Duration>,
         op: &F,
-        select: BestSelect<'_, T>,
+        select: BestSelect<T>,
     ) -> Result<T, BeaconError>
     where
         T: Send + 'static,
@@ -1362,57 +1406,82 @@ impl BnManager {
             fan_out::BestWindow { soft: budget.map(fan_out::soft_deadline), hard: budget },
             &self.health_trackers,
             fan_out::global_drain_pool(),
-            select.accept,
+            &fan_out::BestFilter {
+                accept: Arc::clone(&select.accept),
+                in_hand: Arc::clone(&select.in_hand),
+                on_reject: Arc::clone(&select.on_reject),
+            },
         )
         .await?;
 
         if round.values.is_empty() {
+            let mut held = round.held;
             if select.allow_fallback {
-                if let Some(result) = self
-                    .fallback_unsynced(op_name, role, op, &indices, backstop, select.accept)
+                match self
+                    .fallback_unsynced(
+                        op_name,
+                        role,
+                        op,
+                        &indices,
+                        FallbackWindow { deadline: backstop, already_held: !held.is_empty() },
+                        &select,
+                    )
                     .await
                 {
-                    return Ok(result);
+                    Some(FallbackPick::Ready(index, value)) => {
+                        self.log_best_pick(op_name, index);
+                        (select.on_chosen)(index, &value);
+                        return Ok(value);
+                    }
+                    Some(FallbackPick::Held(more)) => held.extend(more),
+                    None => {}
                 }
+            }
+            if let Some((index, value)) = pick_owned(held, select.pick_best.as_ref()) {
+                self.log_best_pick(op_name, index);
+                (select.on_chosen)(index, &value);
+                return Ok(value);
             }
             return Err(round.last_error.unwrap_or_else(|| {
                 BeaconError::HttpError(format!("{op_name}: all BNs failed in best-selection"))
             }));
         }
 
-        let mut values = round.values.into_iter();
-        let (mut best_index, mut best_value) =
-            values.next().expect("best-of returns at least one value");
-        for (index, value) in values {
-            if (select.pick_best)(&value, &best_value) {
-                best_index = index;
-                best_value = value;
-            }
-        }
+        let (best_index, best_value) =
+            pick_owned(round.values, select.pick_best.as_ref()).expect("values is non-empty");
+        self.log_best_pick(op_name, best_index);
+        (select.on_chosen)(best_index, &best_value);
+        Ok(best_value)
+    }
+
+    fn log_best_pick(&self, op_name: &str, index: usize) {
         debug!(
             op = op_name,
-            bn_index = best_index,
-            endpoint = %RedactedUrl(self.clients[best_index].endpoint()),
+            bn_index = index,
+            endpoint = %RedactedUrl(self.clients[index].endpoint()),
             "best-selection picked BN"
         );
-        Ok(best_value)
     }
 
     /// Tries untried proposal-role BNs above [`FALLBACK_TIER_FLOOR`].
     ///
-    /// `deadline` bounds each attempt by the time still left. `None` leaves the
-    /// attempts unbounded, matching a round with no budget configured. An `Ok`
-    /// that fails `accept` is not returned. Health samples are queued per
-    /// attempt and this function does not wait on the health write lock.
+    /// `window.deadline` bounds each attempt by the time still left. `None`
+    /// leaves the attempts unbounded, matching a round with no budget configured. An `Ok`
+    /// that fails `accept` is not returned. A candidate that is not in hand is
+    /// held so a later matching candidate can win. Once a block is held, a
+    /// later attempt stops [`HELD_RETURN_MARGIN`] before `deadline`, so the
+    /// outer backstop cannot drop that block. The best held candidate is
+    /// returned when none match. Health samples are queued per attempt and
+    /// this function does not wait on the health write lock.
     async fn fallback_unsynced<T, F>(
         &self,
         op_name: &str,
         role: BnRole,
         op: &F,
         tried_indices: &[usize],
-        deadline: Option<tokio::time::Instant>,
-        accept: &(dyn Fn(&T) -> bool + Sync),
-    ) -> Option<T>
+        window: FallbackWindow,
+        select: &BestSelect<T>,
+    ) -> Option<FallbackPick<T>>
     where
         T: Send,
         F: Fn(&BeaconClient) -> BoxFut<'static, T>,
@@ -1444,16 +1513,13 @@ impl BnManager {
             "synced proposal BNs failed; trying proposal-role BNs above the health floor"
         );
 
+        let mut held: Vec<(usize, T)> = Vec::new();
+        let mut holding = window.already_held;
         for i in candidates {
-            let bound = if let Some(end) = deadline {
-                let remaining = end.saturating_duration_since(tokio::time::Instant::now());
-                if remaining.is_zero() {
-                    break;
-                }
-                Some(remaining)
-            } else {
-                None
-            };
+            let bound = fallback_attempt_bound(window.deadline, holding);
+            if window.deadline.is_some() && bound.is_none() {
+                break;
+            }
             let client = &self.clients[i];
             let start = tokio::time::Instant::now();
             let attempt_span = tracing::info_span!(
@@ -1469,13 +1535,13 @@ impl BnManager {
                         i,
                         TrackerOutcome::Success(elapsed),
                     );
-                    if !accept(&result) {
-                        warn!(
-                            op = op_name,
-                            bn_index = i,
-                            endpoint = %RedactedUrl(client.endpoint()),
-                            "proposal fallback block failed duty checks"
-                        );
+                    if !(select.accept)(&result) {
+                        (select.on_reject)(i, client.endpoint(), &result);
+                        continue;
+                    }
+                    if !(select.in_hand)(&result) {
+                        keep_better(&mut held, i, result, select.pick_best.as_ref());
+                        holding = true;
                         continue;
                     }
                     warn!(
@@ -1485,7 +1551,7 @@ impl BnManager {
                         latency_ms = elapsed.as_millis() as u64,
                         "query succeeded on a proposal-role fallback BN"
                     );
-                    return Some(result);
+                    return Some(FallbackPick::Ready(i, result));
                 }
                 Err(e) => {
                     fan_out::queue_health_sample(
@@ -1505,15 +1571,24 @@ impl BnManager {
             }
         }
 
-        None
+        if held.is_empty() {
+            None
+        } else {
+            Some(FallbackPick::Held(held))
+        }
     }
 
     /// Best-of `produce_block_v3`.
     ///
     /// `checks` filters candidates before ranking. Slot, proposer, parent,
-    /// and consensus version are applied there. From Bellatrix on, a full
-    /// block has to carry the duty's fee recipient. A blinded block skips
-    /// that check.
+    /// and consensus version are hard checks, as are an unreadable fee, a
+    /// missing fee on a full Bellatrix-or-later block, and a header-only full
+    /// block. A readable wrong fee is a penalty under [`FeeRecipientPolicy::Sign`]:
+    /// it does not count as in hand, and it is returned only when no matching
+    /// block arrives before every beacon node has answered or the hard
+    /// deadline passes. [`FeeRecipientPolicy::Reject`] drops that mismatch.
+    /// A blinded block skips the fee penalty. The penalty warning is emitted
+    /// only for the block that is returned.
     /// Fallback runs only when the expected parent root is known, and only
     /// against untried proposal-role BNs above the health floor.
     async fn produce_block_v3_checked(
@@ -1527,11 +1602,7 @@ impl BnManager {
         let budget = self.op_timeout(|t| t.block_production);
         let randao_reveal = randao_reveal.to_owned();
         let graffiti = graffiti.map(str::to_owned);
-        let allow_fallback = checks.as_ref().is_some_and(|checks| checks.parent_root.is_some());
-        let accept = |block: &ProduceBlockResponse| match &checks {
-            Some(checks) => block_passes_duty(block, checks),
-            None => true,
-        };
+        let select = produce_best_select(checks, self.fee_recipient_policy);
         self.with_op_timeout(
             "produce_block_v3",
             fan_out::broadcast_backstop(budget),
@@ -1555,7 +1626,7 @@ impl BnManager {
                             .await
                     })
                 },
-                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback },
+                select,
             ),
         )
         .await
@@ -1715,6 +1786,100 @@ macro_rules! owned_attempt {
     }};
 }
 
+/// Hard deadline for fallback attempts, and whether a signable block is already held.
+struct FallbackWindow {
+    deadline: Option<tokio::time::Instant>,
+    already_held: bool,
+}
+
+enum FallbackPick<T> {
+    /// Hard checks and the right fee. Fallback stops on this block.
+    Ready(usize, T),
+    /// Readable wrong-fee blocks. The caller ranks them with any earlier hold.
+    Held(Vec<(usize, T)>),
+}
+
+fn pick_owned<T>(items: Vec<(usize, T)>, pick_best: &dyn Fn(&T, &T) -> bool) -> Option<(usize, T)> {
+    let mut items = items.into_iter();
+    let (mut best_index, mut best_value) = items.next()?;
+    for (index, value) in items {
+        if pick_best(&value, &best_value) {
+            best_index = index;
+            best_value = value;
+        }
+    }
+    Some((best_index, best_value))
+}
+
+fn keep_better<T>(
+    held: &mut Vec<(usize, T)>,
+    index: usize,
+    result: T,
+    pick_best: &dyn Fn(&T, &T) -> bool,
+) {
+    match held.pop() {
+        None => held.push((index, result)),
+        Some((_current_index, current)) if pick_best(&result, &current) => {
+            held.push((index, result));
+        }
+        Some(current) => held.push(current),
+    }
+}
+
+/// Bound for one fallback attempt.
+///
+/// `None` with a `deadline` of `Some` means the window is already closed.
+/// Once a block is held, the bound ends [`HELD_RETURN_MARGIN`] before the
+/// outer backstop.
+fn fallback_attempt_bound(
+    deadline: Option<tokio::time::Instant>,
+    holding: bool,
+) -> Option<Duration> {
+    let end = deadline?;
+    let end = if holding { end.checked_sub(HELD_RETURN_MARGIN).unwrap_or(end) } else { end };
+    let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(remaining)
+    }
+}
+
+fn produce_best_select(
+    checks: Option<BlockDutyChecks>,
+    policy: FeeRecipientPolicy,
+) -> BestSelect<ProduceBlockResponse> {
+    let allow_fallback = checks.as_ref().is_some_and(|checks| checks.parent_root.is_some());
+    let accept_checks = checks;
+    let accept: Pred<ProduceBlockResponse> = Arc::new(move |block| match accept_checks.as_ref() {
+        Some(checks) => block_passes_duty(block, checks, policy),
+        None => true,
+    });
+    let hand_checks = checks;
+    let in_hand: Pred<ProduceBlockResponse> = Arc::new(move |block| match hand_checks.as_ref() {
+        Some(checks) => block_passes_duty(block, checks, policy) && fee_preferred(block, checks),
+        None => true,
+    });
+    let rank_checks = checks;
+    let pick_best: Rank<ProduceBlockResponse> =
+        Arc::new(move |left, right| candidate_ranks_above(left, right, rank_checks.as_ref()));
+    let reject_checks = checks;
+    let on_reject: RejectFn<ProduceBlockResponse> = Arc::new(move |index, endpoint, block| {
+        if let Some(checks) = reject_checks.as_ref() {
+            log_produce_rejection(index, endpoint, block, checks, policy);
+        }
+    });
+    let chosen_checks = checks;
+    let on_chosen: ChosenFn<ProduceBlockResponse> = Arc::new(move |index, block| {
+        let Some(checks) = chosen_checks.as_ref() else { return };
+        if block_passes_duty(block, checks, policy) && !fee_preferred(block, checks) {
+            log_fee_penalty(index, block, checks);
+            crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.inc();
+        }
+    });
+    BestSelect { pick_best, accept, in_hand, on_reject, on_chosen, allow_fallback }
+}
+
 /// Fallback may use a proposal-role BN at this tier or healthier.
 ///
 /// `SmallLag` is the floor: large-lag, unsynced, optimistic, and
@@ -1761,41 +1926,248 @@ struct DutyFields {
     fee: FeeOnBlock,
 }
 
-/// `true` when `block` matches the duty. The consensus version must be the
-/// duty's fork. A block whose slot, proposer, or parent cannot be read does
-/// not match. From Bellatrix on, a full block has to carry the duty's fee
-/// recipient. A blinded block skips that check. A full SSZ block whose fee
-/// recipient cannot be read does not match.
-fn block_passes_duty(block: &ProduceBlockResponse, checks: &BlockDutyChecks) -> bool {
+/// Why a candidate is dropped before ranking.
+enum HardReject {
+    Fork,
+    Unreadable,
+    Slot,
+    Proposer,
+    Parent,
+    /// Unreadable fee, missing fee on a full Bellatrix+ block, header-only
+    /// full block, or a readable mismatch under [`FeeRecipientPolicy::Reject`].
+    Fee,
+}
+
+fn hard_reject_label(reason: HardReject) -> &'static str {
+    match reason {
+        HardReject::Fork => "fork",
+        HardReject::Unreadable => "unreadable",
+        HardReject::Slot => "slot",
+        HardReject::Proposer => "proposer",
+        HardReject::Parent => "parent",
+        HardReject::Fee => "fee",
+    }
+}
+
+/// `true` when `block` passes the hard duty checks.
+///
+/// The consensus version must be the duty's fork. A block whose slot,
+/// proposer, or parent cannot be read does not match. A missing or unreadable
+/// fee on a full post-Bellatrix block does not match. A readable wrong fee
+/// matches only under [`FeeRecipientPolicy::Sign`].
+fn block_passes_duty(
+    block: &ProduceBlockResponse,
+    checks: &BlockDutyChecks,
+    policy: FeeRecipientPolicy,
+) -> bool {
+    hard_reject_reason(block, checks, policy).is_none()
+}
+
+fn hard_reject_reason(
+    block: &ProduceBlockResponse,
+    checks: &BlockDutyChecks,
+    policy: FeeRecipientPolicy,
+) -> Option<HardReject> {
     if block.consensus_version.parse::<ForkName>().ok() != Some(checks.consensus_version) {
-        return false;
+        return Some(HardReject::Fork);
     }
     let Some(fields) = duty_fields(block) else {
-        return false;
+        return Some(HardReject::Unreadable);
     };
-    if fields.slot != checks.slot || fields.proposer_index != checks.proposer_index {
-        return false;
+    if fields.slot != checks.slot {
+        return Some(HardReject::Slot);
+    }
+    if fields.proposer_index != checks.proposer_index {
+        return Some(HardReject::Proposer);
     }
     if let Some(expected) = checks.parent_root {
         if fields.parent_root != expected {
-            return false;
+            return Some(HardReject::Parent);
         }
     }
-    // Builder bids carry the builder's address in the payload header. The
-    // proposer's fee recipient is paid inside the builder's transaction.
+    if fee_is_hard_reject(block, checks, &fields, policy) {
+        return Some(HardReject::Fee);
+    }
+    None
+}
+
+/// Unreadable, missing, or policy-rejected fee.
+///
+/// A blinded block is never a fee reject. Before Bellatrix a missing fee is
+/// not a fee reject. A readable wrong fee is a reject only when `policy` is
+/// [`FeeRecipientPolicy::Reject`].
+fn fee_is_hard_reject(
+    block: &ProduceBlockResponse,
+    checks: &BlockDutyChecks,
+    fields: &DutyFields,
+    policy: FeeRecipientPolicy,
+) -> bool {
+    if block.is_blinded {
+        return false;
+    }
+    let Some(expected) = checks.fee_recipient else {
+        return false;
+    };
+    match fields.fee {
+        FeeOnBlock::Present(got) if got == expected => false,
+        FeeOnBlock::Present(_) => policy == FeeRecipientPolicy::Reject,
+        FeeOnBlock::Unknown if !checks.consensus_version.carries_execution_payload() => false,
+        FeeOnBlock::Unknown | FeeOnBlock::Invalid => true,
+    }
+}
+
+/// `true` when `block` should outrank a fee-penalized candidate.
+///
+/// A blinded block is preferred: the builder header's fee recipient is the
+/// builder's address, and the proposer is paid inside the builder's
+/// transaction. With no expected fee, every block is preferred. Before
+/// Bellatrix a missing fee is preferred. Only a readable fee that does not
+/// match is penalized. An unreadable or missing post-Bellatrix fee is a hard
+/// reject, not a penalty.
+fn fee_preferred(block: &ProduceBlockResponse, checks: &BlockDutyChecks) -> bool {
     if block.is_blinded {
         return true;
     }
-    if let Some(expected) = checks.fee_recipient {
-        match fields.fee {
-            FeeOnBlock::Present(got) if got == expected => {}
-            // Phase0 and Altair have no execution payload, so a missing fee is
-            // not a reject. A present fee that does not match still is.
-            FeeOnBlock::Unknown if !checks.consensus_version.carries_execution_payload() => {}
-            FeeOnBlock::Present(_) | FeeOnBlock::Unknown | FeeOnBlock::Invalid => return false,
+    let Some(expected) = checks.fee_recipient else {
+        return true;
+    };
+    let Some(fields) = duty_fields(block) else {
+        return false;
+    };
+    match fields.fee {
+        FeeOnBlock::Present(got) if got == expected => true,
+        FeeOnBlock::Unknown if !checks.consensus_version.carries_execution_payload() => true,
+        FeeOnBlock::Present(_) | FeeOnBlock::Unknown | FeeOnBlock::Invalid => false,
+    }
+}
+
+/// `true` when `left` ranks strictly above `right`.
+///
+/// A fee-preferred block outranks a penalized one regardless of value. Within
+/// the same fee class, [`is_better_block`] decides.
+fn candidate_ranks_above(
+    left: &ProduceBlockResponse,
+    right: &ProduceBlockResponse,
+    checks: Option<&BlockDutyChecks>,
+) -> bool {
+    if let Some(checks) = checks {
+        match (fee_preferred(left, checks), fee_preferred(right, checks)) {
+            (true, false) => return true,
+            (false, true) => return false,
+            (true, true) | (false, false) => {}
         }
     }
-    true
+    is_better_block(left, right)
+}
+
+struct ObservedDuty {
+    slot: Option<u64>,
+    proposer: Option<u64>,
+    parent: Option<[u8; 32]>,
+    fee: FeeOnBlock,
+}
+
+fn observe_duty(block: &ProduceBlockResponse) -> ObservedDuty {
+    match duty_fields(block) {
+        Some(fields) => ObservedDuty {
+            slot: Some(fields.slot),
+            proposer: Some(fields.proposer_index),
+            parent: Some(fields.parent_root),
+            fee: fields.fee,
+        },
+        None => ObservedDuty { slot: None, proposer: None, parent: None, fee: FeeOnBlock::Unknown },
+    }
+}
+
+fn log_produce_rejection(
+    index: usize,
+    endpoint: &str,
+    block: &ProduceBlockResponse,
+    checks: &BlockDutyChecks,
+    policy: FeeRecipientPolicy,
+) {
+    let observed = observe_duty(block);
+    let reason =
+        hard_reject_reason(block, checks, policy).map(hard_reject_label).unwrap_or("rejected");
+    warn!(
+        op = "produce_block_v3",
+        bn_index = index,
+        endpoint = %RedactedUrl(endpoint),
+        reason,
+        slot_expected = checks.slot,
+        slot_got = %display_opt_u64(observed.slot),
+        proposer_expected = checks.proposer_index,
+        proposer_got = %display_opt_u64(observed.proposer),
+        parent_expected = %display_expected_root(checks.parent_root),
+        parent_got = %display_opt_root(observed.parent),
+        fork_expected = checks.consensus_version.as_ref(),
+        fork_got = %block.consensus_version,
+        fee_expected = %display_fee_expected(checks.fee_recipient),
+        fee_got = %display_fee_got(&observed.fee),
+        value_parse = %display_value_parse(block),
+        "best-of candidate rejected"
+    );
+}
+
+fn log_fee_penalty(index: usize, block: &ProduceBlockResponse, checks: &BlockDutyChecks) {
+    let observed = observe_duty(block);
+    warn!(
+        op = "produce_block_v3",
+        bn_index = index,
+        slot = checks.slot,
+        proposer = checks.proposer_index,
+        parent = %display_expected_root(checks.parent_root),
+        fork = checks.consensus_version.as_ref(),
+        fee_expected = %display_fee_expected(checks.fee_recipient),
+        fee_got = %display_fee_got(&observed.fee),
+        value_parse = %display_value_parse(block),
+        "signing block with fee-recipient mismatch"
+    );
+}
+
+fn display_opt_u64(value: Option<u64>) -> String {
+    value.map(|n| n.to_string()).unwrap_or_else(|| "unreadable".to_string())
+}
+
+fn display_opt_root(value: Option<[u8; 32]>) -> String {
+    value.map(|root| hex_prefixed(&root)).unwrap_or_else(|| "unreadable".to_string())
+}
+
+fn display_expected_root(value: Option<[u8; 32]>) -> String {
+    value.map(|root| hex_prefixed(&root)).unwrap_or_else(|| "unset".to_string())
+}
+
+fn display_fee_expected(value: Option<[u8; 20]>) -> String {
+    value.map(|fee| hex_prefixed(&fee)).unwrap_or_else(|| "unset".to_string())
+}
+
+fn display_fee_got(fee: &FeeOnBlock) -> String {
+    match fee {
+        FeeOnBlock::Present(bytes) => hex_prefixed(bytes),
+        FeeOnBlock::Unknown => "missing".to_string(),
+        FeeOnBlock::Invalid => "invalid".to_string(),
+    }
+}
+
+fn display_value_parse(block: &ProduceBlockResponse) -> String {
+    match ranked_block_value(block) {
+        Some(wei) => format!("ok:{wei}"),
+        None => match block.execution_payload_value.as_deref() {
+            Some("") => "unparsed:empty".to_string(),
+            Some(raw) => format!("unparsed:{raw}"),
+            None => "unparsed:missing".to_string(),
+        },
+    }
+}
+
+fn hex_prefixed(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(2 + bytes.len() * 2);
+    out.push_str("0x");
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
 }
 
 fn duty_fields(block: &ProduceBlockResponse) -> Option<DutyFields> {
@@ -3094,6 +3466,27 @@ mod tests {
     use crate::broadcast::BnOutcome;
     use crate::types::bn_capability;
 
+    fn testing_select(
+        accept: impl Fn(&ProduceBlockResponse) -> bool + Send + Sync + 'static,
+        in_hand: impl Fn(&ProduceBlockResponse) -> bool + Send + Sync + 'static,
+        pick_best: impl Fn(&ProduceBlockResponse, &ProduceBlockResponse) -> bool + Send + Sync + 'static,
+        on_reject: impl Fn(usize, &str, &ProduceBlockResponse) + Send + Sync + 'static,
+        allow_fallback: bool,
+    ) -> BestSelect<ProduceBlockResponse> {
+        BestSelect {
+            pick_best: Arc::new(pick_best),
+            accept: Arc::new(accept),
+            in_hand: Arc::new(in_hand),
+            on_reject: Arc::new(on_reject),
+            on_chosen: Arc::new(|_, _| {}),
+            allow_fallback,
+        }
+    }
+
+    fn passes_sign(block: &ProduceBlockResponse, checks: &BlockDutyChecks) -> bool {
+        block_passes_duty(block, checks, FeeRecipientPolicy::Sign)
+    }
+
     /// Guard: the passthrough macro list must name every role-trait method.
     /// Primary enforcement is compile-time (missing method → trait not satisfied).
     /// This test documents the expected surface and catches accidental list drift.
@@ -3728,7 +4121,6 @@ mod tests {
             consensus_version: ForkName::Deneb,
         };
         let start = tokio::time::Instant::now();
-        let accept = |block: &ProduceBlockResponse| block_passes_duty(block, &checks);
         let result = manager
             .query_best_filtered(
                 "produce_block_v3",
@@ -3747,7 +4139,13 @@ mod tests {
                         }
                     })
                 },
-                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: false },
+                testing_select(
+                    move |block| passes_sign(block, &checks),
+                    move |block| passes_sign(block, &checks),
+                    is_better_block,
+                    |_, _, _| {},
+                    false,
+                ),
             )
             .await
             .expect("the valid block");
@@ -3786,7 +4184,6 @@ mod tests {
             consensus_version: ForkName::Deneb,
         };
         let start = tokio::time::Instant::now();
-        let accept = |block: &ProduceBlockResponse| block_passes_duty(block, &checks);
         let result = manager
             .query_best_filtered(
                 "produce_block_v3",
@@ -3807,7 +4204,13 @@ mod tests {
                         }
                     })
                 },
-                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: false },
+                testing_select(
+                    move |block| passes_sign(block, &checks),
+                    move |block| passes_sign(block, &checks),
+                    is_better_block,
+                    |_, _, _| {},
+                    false,
+                ),
             )
             .await
             .expect("the next valid block");
@@ -3852,7 +4255,6 @@ mod tests {
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen_op = std::sync::Arc::clone(&seen);
-        let accept = |_: &ProduceBlockResponse| true;
         let result = manager
             .query_best_filtered(
                 "produce_block_v3",
@@ -3873,7 +4275,7 @@ mod tests {
                         }
                     })
                 },
-                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: true },
+                testing_select(|_| true, |_| true, is_better_block, |_, _, _| {}, true),
             )
             .await
             .expect("small-lag proposal block");
@@ -3898,7 +4300,6 @@ mod tests {
         set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen_op = std::sync::Arc::clone(&seen);
-        let accept = |_: &ProduceBlockResponse| true;
         let result = manager
             .query_best_filtered(
                 "produce_block_v3",
@@ -3917,7 +4318,7 @@ mod tests {
                         }
                     })
                 },
-                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: false },
+                testing_select(|_| true, |_| true, is_better_block, |_, _, _| {}, false),
             )
             .await;
         assert!(result.is_err(), "fallback without a parent must not return a block: {result:?}");
@@ -3925,10 +4326,10 @@ mod tests {
         assert!(seen.iter().all(|endpoint| !endpoint.contains("small")), "tried {seen:?}");
     }
 
-    /// A fallback block with the wrong parent or the wrong fee recipient is
-    /// not returned. The next proposal-role BN that matches is.
+    /// A fallback block with the wrong parent is not returned. A fee mismatch
+    /// is held so the later matching proposal-role BN wins.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn fallback_rejects_a_parent_or_fee_mismatch() {
+    async fn fallback_rejects_a_parent_mismatch_and_ranks_fee_below_a_match() {
         let manager = manager_with_endpoints(&["synced", "wrong", "right"]);
         set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
         set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
@@ -3942,7 +4343,6 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
         };
-        let accept = |block: &ProduceBlockResponse| block_passes_duty(block, &checks);
         let result = manager
             .query_best_filtered(
                 "produce_block_v3",
@@ -3961,14 +4361,20 @@ mod tests {
                         }
                     })
                 },
-                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: true },
+                testing_select(
+                    move |block| passes_sign(block, &checks),
+                    move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
+                    move |left, right| candidate_ranks_above(left, right, Some(&checks)),
+                    |_, _, _| {},
+                    true,
+                ),
             )
             .await
             .expect("matching fallback block");
         assert_eq!(result.execution_payload_value.as_deref(), Some("1000"));
     }
 
-    /// From Bellatrix on, a full block with no fee recipient is not returned.
+    /// A full Bellatrix+ block with no fee recipient is a hard reject.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn fallback_rejects_a_block_with_no_fee_recipient() {
         let manager = manager_with_endpoints(&["synced", "small"]);
@@ -3982,7 +4388,6 @@ mod tests {
             fee_recipient: Some([0x11; 20]),
             consensus_version: ForkName::Deneb,
         };
-        let accept = |block: &ProduceBlockResponse| block_passes_duty(block, &checks);
         let result = manager
             .query_best_filtered(
                 "produce_block_v3",
@@ -3999,13 +4404,180 @@ mod tests {
                         }
                     })
                 },
-                BestSelect { pick_best: is_better_block, accept: &accept, allow_fallback: true },
+                testing_select(
+                    move |block| passes_sign(block, &checks),
+                    move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
+                    is_better_block,
+                    |_, _, _| {},
+                    true,
+                ),
             )
             .await;
         assert!(
             result.is_err(),
-            "a full block without a fee recipient must not be returned: {result:?}"
+            "a full block without a fee recipient must be rejected: {result:?}"
         );
+    }
+
+    /// A wrong fee at 50ms must not close the soft window. The matching fee
+    /// at 1.6s, past the 1.5s soft deadline of a 3s budget, is the block returned.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn wrong_fee_at_50ms_loses_to_a_correct_fee_at_1600ms() {
+        let manager = manager_with_endpoints(&["bn-wrong", "bn-right"]);
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+        };
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-wrong") {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(duty_response("9000", 1, 7, parent, Some([0x22; 20])))
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(1600)).await;
+                            Ok(duty_response("1000", 1, 7, parent, Some(fee)))
+                        }
+                    })
+                },
+                testing_select(
+                    move |block| passes_sign(block, &checks),
+                    move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
+                    move |left, right| candidate_ranks_above(left, right, Some(&checks)),
+                    |_, _, _| {},
+                    false,
+                ),
+            )
+            .await
+            .expect("the matching fee");
+        assert_eq!(result.execution_payload_value.as_deref(), Some("1000"));
+        assert_eq!(start.elapsed(), Duration::from_millis(1600));
+    }
+
+    /// BN1 returns a signable wrong-fee block. BN2 hangs. The held block must
+    /// come back before the outer backstop turns it into OperationTimeout.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_fee_penalty_returns_before_the_outer_backstop_when_fallback_hangs() {
+        let budget = Duration::from_millis(200);
+        let manager =
+            manager_with_endpoints(&["synced", "penalty", "hang"]).with_operation_timeouts(
+                OperationTimeouts { block_production: budget, ..OperationTimeouts::default() },
+            );
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        set_sync(&manager, 2, BnSyncStatus::Syncing, 9).await;
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+        };
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .with_op_timeout(
+                "produce_block_v3",
+                fan_out::broadcast_backstop(Some(budget)),
+                manager.query_best_filtered(
+                    "produce_block_v3",
+                    BnRole::Proposal,
+                    HealthTier::Synced,
+                    Some(budget),
+                    move |client| {
+                        let endpoint = client.endpoint().to_string();
+                        Box::pin(async move {
+                            if endpoint.contains("penalty") {
+                                Ok(duty_response("9000", 1, 7, parent, Some([0x22; 20])))
+                            } else if endpoint.contains("hang") {
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                Ok(duty_response("1", 1, 7, parent, Some(fee)))
+                            } else {
+                                Err(BeaconError::ApiError {
+                                    status: 500,
+                                    message: "no".to_string(),
+                                })
+                            }
+                        })
+                    },
+                    testing_select(
+                        move |block| passes_sign(block, &checks),
+                        move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
+                        move |left, right| candidate_ranks_above(left, right, Some(&checks)),
+                        |_, _, _| {},
+                        true,
+                    ),
+                ),
+            )
+            .await;
+        let elapsed = start.elapsed();
+        let block = result.expect("a held wrong-fee block must beat the outer backstop");
+        assert_eq!(block.execution_payload_value.as_deref(), Some("9000"));
+        assert!(
+            elapsed < budget + fan_out::BACKSTOP_MARGIN,
+            "held block returned at {elapsed:?}, which is the outer backstop"
+        );
+    }
+
+    /// Two penalized fallback blocks and no match: the higher value wins.
+    /// Keeping the first held block would return 1000.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn held_fee_penalty_keeps_the_higher_value_not_the_first() {
+        let manager = manager_with_endpoints(&["synced", "low", "high"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        set_sync(&manager, 2, BnSyncStatus::Syncing, 9).await;
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+        };
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("low") {
+                            Ok(duty_response("1000", 1, 7, parent, Some([0x22; 20])))
+                        } else if endpoint.contains("high") {
+                            Ok(duty_response("9000", 1, 7, parent, Some([0x33; 20])))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                testing_select(
+                    move |block| passes_sign(block, &checks),
+                    move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
+                    move |left, right| candidate_ranks_above(left, right, Some(&checks)),
+                    |_, _, _| {},
+                    true,
+                ),
+            )
+            .await
+            .expect("the higher penalized block");
+        assert_eq!(result.execution_payload_value.as_deref(), Some("9000"));
     }
 
     #[test]
@@ -4047,13 +4619,13 @@ mod tests {
             fee_recipient: Some([0x11; 20]),
             consensus_version: ForkName::Deneb,
         };
-        assert!(block_passes_duty(&block, &checks));
+        assert!(passes_sign(&block, &checks));
         let wrong_parent = BlockDutyChecks { parent_root: Some([0xcd; 32]), ..checks };
-        assert!(!block_passes_duty(&block, &wrong_parent));
+        assert!(!passes_sign(&block, &wrong_parent));
     }
 
     #[test]
-    fn duty_checks_reject_slot_proposer_parent_and_a_present_wrong_fee() {
+    fn duty_checks_reject_slot_proposer_parent_and_fork_not_a_wrong_fee() {
         let parent = [0xabu8; 32];
         let fee = [0x11u8; 20];
         let checks = BlockDutyChecks {
@@ -4063,17 +4635,82 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
         };
-        assert!(block_passes_duty(&duty_response("1", 1, 7, parent, Some(fee)), &checks));
-        assert!(!block_passes_duty(&duty_response("1", 2, 7, parent, Some(fee)), &checks));
-        assert!(!block_passes_duty(&duty_response("1", 1, 8, parent, Some(fee)), &checks));
-        assert!(!block_passes_duty(&duty_response("1", 1, 7, [0xcd; 32], Some(fee)), &checks));
-        assert!(!block_passes_duty(&duty_response("1", 1, 7, parent, Some([0x22; 20])), &checks));
-        assert!(!block_passes_duty(&duty_response("1", 1, 7, parent, None), &checks));
+        let matching = duty_response("1", 1, 7, parent, Some(fee));
+        assert!(passes_sign(&matching, &checks));
+        assert!(fee_preferred(&matching, &checks));
+        assert!(!passes_sign(&duty_response("1", 2, 7, parent, Some(fee)), &checks));
+        assert!(!passes_sign(&duty_response("1", 1, 8, parent, Some(fee)), &checks));
+        assert!(!passes_sign(&duty_response("1", 1, 7, [0xcd; 32], Some(fee)), &checks));
+        let mismatched = duty_response("1", 1, 7, parent, Some([0x22; 20]));
+        assert!(passes_sign(&mismatched, &checks));
+        assert!(!fee_preferred(&mismatched, &checks));
+        let missing = duty_response("1", 1, 7, parent, None);
+        assert!(!passes_sign(&missing, &checks));
+        assert!(!block_passes_duty(&mismatched, &checks, FeeRecipientPolicy::Reject));
         let mut wrong_version = duty_response("9000", 1, 7, parent, Some(fee));
         wrong_version.consensus_version = "phase0".to_string();
-        assert!(!block_passes_duty(&wrong_version, &checks));
+        assert!(!passes_sign(&wrong_version, &checks));
         wrong_version.consensus_version = "not-a-fork".to_string();
-        assert!(!block_passes_duty(&wrong_version, &checks));
+        assert!(!passes_sign(&wrong_version, &checks));
+
+        let high = duty_response("9000", 1, 7, parent, Some([0x22; 20]));
+        let low = duty_response("1000", 1, 7, parent, Some(fee));
+        assert!(candidate_ranks_above(&low, &high, Some(&checks)));
+        assert!(!candidate_ranks_above(&high, &low, Some(&checks)));
+    }
+
+    /// A hard reject logs slot, proposer, parent, fork, fee, and the value parse.
+    #[tokio::test(flavor = "current_thread")]
+    #[tracing_test::traced_test]
+    async fn rejected_candidate_logs_the_duty_comparison() {
+        let manager = manager_with_endpoints(&["bn-junk"]);
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+        };
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |_client| {
+                    Box::pin(async move { Ok(duty_response("1", 2, 7, parent, Some(fee))) })
+                },
+                testing_select(
+                    move |block| passes_sign(block, &checks),
+                    move |block| passes_sign(block, &checks),
+                    is_better_block,
+                    move |index, endpoint, block| {
+                        log_produce_rejection(
+                            index,
+                            endpoint,
+                            block,
+                            &checks,
+                            FeeRecipientPolicy::Sign,
+                        );
+                    },
+                    false,
+                ),
+            )
+            .await;
+        assert!(result.is_err(), "a wrong slot must still be rejected: {result:?}");
+        assert!(logs_contain("best-of candidate rejected"));
+        assert!(logs_contain("reason=slot") || logs_contain("reason=\"slot\""));
+        assert!(logs_contain("slot_expected=1"));
+        assert!(logs_contain("slot_got=2"));
+        assert!(logs_contain("proposer_expected=7"));
+        assert!(logs_contain("proposer_got=7"));
+        assert!(logs_contain("fork_expected=deneb") || logs_contain("fork_expected=\"deneb\""));
+        assert!(logs_contain("fork_got=deneb") || logs_contain("fork_got=\"deneb\""));
+        assert!(logs_contain("0x1111111111111111111111111111111111111111"));
+        assert!(logs_contain(&hex_prefixed(&parent)));
+        assert!(logs_contain("value_parse=ok:1") || logs_contain("value_parse=\"ok:1\""));
     }
 
     /// A builder header's fee recipient is the builder's address. It must not
@@ -4094,22 +4731,33 @@ mod tests {
         blinded.data["body"] = serde_json::json!({
             "execution_payload_header": { "fee_recipient": parent_hex_n(&[0x22; 20]) }
         });
-        assert!(block_passes_duty(&blinded, &checks));
+        assert!(passes_sign(&blinded, &checks));
+        assert!(
+            fee_preferred(&blinded, &checks),
+            "a blinded header fee is the builder's address and must stay preferred"
+        );
+        let wrong_full = duty_response("9000", 1, 7, parent, Some([0x22; 20]));
+        assert!(candidate_ranks_above(&blinded, &wrong_full, Some(&checks)));
+        assert!(!candidate_ranks_above(&wrong_full, &blinded, Some(&checks)));
 
         let mut header_only = blinded.clone();
         header_only.is_blinded = false;
-        assert!(!block_passes_duty(&header_only, &checks));
+        assert!(
+            !passes_sign(&header_only, &checks),
+            "a full block that only carries a header fee is unreadable"
+        );
 
         let mut payload = duty_response("1", 1, 7, parent, Some(expected));
         payload.data["body"]["execution_payload_header"] =
             serde_json::json!({ "fee_recipient": parent_hex_n(&[0x22; 20]) });
-        assert!(block_passes_duty(&payload, &checks));
+        assert!(passes_sign(&payload, &checks));
+        assert!(fee_preferred(&payload, &checks));
     }
 
-    /// A missing fee recipient passes only before Bellatrix. From Bellatrix on
-    /// a full block has to carry the duty's fee recipient.
+    /// A missing fee recipient is preferred only before Bellatrix. From
+    /// Bellatrix on a full block with no fee is a hard reject.
     #[test]
-    fn missing_fee_recipient_passes_only_before_bellatrix() {
+    fn missing_fee_recipient_is_rejected_from_bellatrix() {
         let parent = [0xabu8; 32];
         let expected = [0x11u8; 20];
         let base = BlockDutyChecks {
@@ -4119,7 +4767,7 @@ mod tests {
             fee_recipient: Some(expected),
             consensus_version: ForkName::Deneb,
         };
-        for (fork, version, passes) in [
+        for (fork, version, preferred) in [
             (ForkName::Phase0, "phase0", true),
             (ForkName::Altair, "altair", true),
             (ForkName::Bellatrix, "bellatrix", false),
@@ -4132,18 +4780,21 @@ mod tests {
             let checks = BlockDutyChecks { consensus_version: fork, ..base };
             let mut block = duty_response("1", 1, 7, parent, None);
             block.consensus_version = version.to_string();
-            assert_eq!(block_passes_duty(&block, &checks), passes, "{version}");
+            assert_eq!(passes_sign(&block, &checks), preferred, "{version}");
+            assert_eq!(fee_preferred(&block, &checks), preferred, "{version}");
         }
 
         let mut present = duty_response("1", 1, 7, parent, Some(expected));
         present.consensus_version = "bellatrix".to_string();
         let bellatrix = BlockDutyChecks { consensus_version: ForkName::Bellatrix, ..base };
-        assert!(block_passes_duty(&present, &bellatrix));
+        assert!(passes_sign(&present, &bellatrix));
+        assert!(fee_preferred(&present, &bellatrix));
 
         let mut wrong = duty_response("1", 1, 7, parent, Some([0x22; 20]));
         wrong.consensus_version = "altair".to_string();
         let altair = BlockDutyChecks { consensus_version: ForkName::Altair, ..base };
-        assert!(!block_passes_duty(&wrong, &altair));
+        assert!(passes_sign(&wrong, &altair));
+        assert!(!fee_preferred(&wrong, &altair));
     }
 
     fn ssz_contents(
@@ -4184,9 +4835,10 @@ mod tests {
     }
 
     /// Full SSZ blocks carry the fee inside the execution payload. A mismatch
-    /// or a body that does not decode is rejected. Fulu shares the Electra body.
+    /// or a body that does not decode stays eligible and is penalized. Fulu
+    /// shares the Electra body.
     #[test]
-    fn full_ssz_fee_must_match_and_an_undecodable_fee_rejects() {
+    fn full_ssz_fee_mismatch_or_undecodable_fee_is_penalized() {
         let parent = [0xabu8; 32];
         let mut deneb = eth_types::external_vector_deneb_body();
         let fee = deneb.execution_payload.fee_recipient;
@@ -4198,14 +4850,16 @@ mod tests {
             consensus_version: ForkName::Deneb,
         };
         let matching = ssz_contents(7, 42, parent, &deneb.as_ssz_bytes(), "deneb");
-        assert!(block_passes_duty(&matching, &checks));
+        assert!(passes_sign(&matching, &checks));
+        assert!(fee_preferred(&matching, &checks));
 
         deneb.execution_payload.fee_recipient = [0x11; 20];
         let wrong = ssz_contents(7, 42, parent, &deneb.as_ssz_bytes(), "deneb");
-        assert!(!block_passes_duty(&wrong, &checks));
+        assert!(passes_sign(&wrong, &checks));
+        assert!(!fee_preferred(&wrong, &checks));
 
         let garbage = ssz_contents(7, 42, parent, &[0xff; 8], "deneb");
-        assert!(!block_passes_duty(&garbage, &checks));
+        assert!(!passes_sign(&garbage, &checks), "undecodable SSZ fee is a hard reject");
 
         let electra = eth_types::external_vector_electra_body();
         let fulu_fee = electra.execution_payload.fee_recipient;
@@ -4215,7 +4869,7 @@ mod tests {
             consensus_version: ForkName::Fulu,
             ..checks
         };
-        assert!(block_passes_duty(&fulu, &fulu_checks));
+        assert!(passes_sign(&fulu, &fulu_checks));
 
         let gloas = ProduceBlockResponse {
             data: serde_json::Value::Null,
@@ -4238,7 +4892,7 @@ mod tests {
             consensus_block_value: None,
         };
         let gloas_checks = BlockDutyChecks { consensus_version: ForkName::Gloas, ..checks };
-        assert!(!block_passes_duty(&gloas, &gloas_checks));
+        assert!(!passes_sign(&gloas, &gloas_checks), "an unreadable Gloas fee is a hard reject");
     }
 
     /// Bellatrix and Capella full SSZ bodies have no KZG body layout.
@@ -4277,15 +4931,14 @@ mod tests {
                 builder_url: None,
                 consensus_block_value: None,
             };
-            assert!(
-                block_passes_duty(&block(pre_deneb_body(fixed_len, fee)), &checks),
-                "{version}"
-            );
-            assert!(
-                !block_passes_duty(&block(pre_deneb_body(fixed_len, [0x11; 20])), &checks),
-                "{version} mismatch"
-            );
-            assert!(!block_passes_duty(&block(vec![0u8; 8]), &checks), "{version} short body");
+            let matching = block(pre_deneb_body(fixed_len, fee));
+            assert!(passes_sign(&matching, &checks), "{version}");
+            assert!(fee_preferred(&matching, &checks), "{version}");
+            let mismatched = block(pre_deneb_body(fixed_len, [0x11; 20]));
+            assert!(passes_sign(&mismatched, &checks), "{version} mismatch stays eligible");
+            assert!(!fee_preferred(&mismatched, &checks), "{version} mismatch");
+            let short = block(vec![0u8; 8]);
+            assert!(!passes_sign(&short, &checks), "{version} short body is a hard reject");
         }
     }
 

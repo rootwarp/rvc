@@ -76,11 +76,15 @@ pub trait BlockProducer: Send + Sync {
     ) -> Result<ProduceBlockResponse, BeaconError>;
 
     /// [`Self::produce_block_v3`] with the duty's slot, proposer, parent,
-    /// consensus version, and full-block fee recipient applied before a block
-    /// is ranked or returned. From Bellatrix on, a full block has to carry
-    /// that fee recipient. A blinded block keeps its builder-header fee
-    /// recipient. A full SSZ block whose fee recipient cannot be read is
-    /// rejected.
+    /// and consensus version applied before a block is ranked or returned.
+    /// Those four checks, plus an unreadable or missing fee on a full
+    /// Bellatrix-or-later block, are hard rejects. A readable fee that does
+    /// not match is a soft penalty under [`FeeRecipientPolicy::Sign`]: it
+    /// ranks below a matching candidate and does not close the soft window.
+    /// It is returned only after every beacon node has answered or the hard
+    /// deadline passes, and only when no matching block is available.
+    /// [`FeeRecipientPolicy::Reject`] drops that mismatch. A blinded block
+    /// keeps its builder-header fee recipient and is not penalized.
     ///
     /// Fallback runs only for untried proposal-role beacon nodes above the
     /// health floor, and only when [`ProduceDuty::expected_parent_root`] is
@@ -422,6 +426,28 @@ impl Default for BroadcastTopics {
     }
 }
 
+/// What to do with a produced block whose fee recipient is readable and wrong.
+///
+/// The fee recipient belongs to the beacon node and the execution layer. A
+/// missed proposal is worse than signing the wrong recipient, so the default
+/// is [`Self::Sign`]. [`Self::Reject`] restores a hard drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FeeRecipientPolicy {
+    /// Sign the best remaining block and log a warning.
+    #[default]
+    Sign,
+    /// Drop the block. Slot, proposer, parent, and fork stay hard checks either way.
+    Reject,
+}
+
+impl FeeRecipientPolicy {
+    /// `true` for the default, so a config snapshot can omit the field.
+    pub fn is_default(policy: &Self) -> bool {
+        *policy == Self::Sign
+    }
+}
+
 /// Configuration for the beacon node manager.
 ///
 /// BN selection is not configurable: strategy is fixed per operation on
@@ -447,6 +473,8 @@ pub struct BnManagerConfig {
     /// Applied to every `BeaconClient` created by `BnManager::new`.
     /// Default: 32 MiB (`ResponseCaps::DEFAULT_MAX_BODY_BYTES`).
     pub max_body_bytes: usize,
+    /// Readable fee-recipient mismatch. Default: sign the block.
+    pub fee_recipient_policy: FeeRecipientPolicy,
 }
 
 impl BnManagerConfig {
@@ -466,6 +494,7 @@ impl BnManagerConfig {
             ],
             tier_thresholds: crate::types::TierThresholds::default(),
             max_body_bytes: beacon::ResponseCaps::DEFAULT_MAX_BODY_BYTES,
+            fee_recipient_policy: FeeRecipientPolicy::Sign,
         }
     }
 

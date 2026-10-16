@@ -99,6 +99,11 @@
 //! still runs and ends at the attempt budget, or at the HTTP client timeout
 //! when no budget is set, so the series tracks publish rate times that timeout.
 //! Dashboards that watch overflow publishes should bind this gauge.
+//! #679 adds `rvc_produce_block_fee_recipient_penalty_total` (family delta +1):
+//! one increment when a block is returned for signing despite a readable
+//! fee-recipient mismatch. A mismatch that loses to a matching block, and a
+//! drop under `fee_recipient_policy = reject`, are not counted. It has no
+//! labels. Dashboards that watch signed fee mismatches should bind this name.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -169,6 +174,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_payload_attestation_skipped_total",
     "rvc_pre_proposal_cold_fetch_duration_seconds",
     "rvc_pre_proposal_cold_fetch_total",
+    "rvc_produce_block_fee_recipient_penalty_total", // operator-facing: signed blocks whose readable fee recipient did not match (#679)
     "rvc_proposals_total", // operator-facing: proposal outcomes success/failed/envelope_late (issue 6.20 / #377)
     "rvc_proposer_bn_health_score",
     "rvc_proposer_bn_latency_ms",
@@ -305,8 +311,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        62,
-        "#639 adds rvc_bn_broadcast_drain_health_skipped_total and rvc_bn_broadcast_overflow_drains; count is the list length"
+        63,
+        "#679 adds rvc_produce_block_fee_recipient_penalty_total; count is the list length"
     );
 }
 

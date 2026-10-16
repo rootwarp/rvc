@@ -27,7 +27,7 @@ use crate::metrics::{
     RVC_PRE_PROPOSAL_COLD_FETCH_TOTAL,
 };
 use signer::{CircuitBreakerState, SignerService, ValidatorSigner};
-use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, SLOTS_PER_EPOCH};
+use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, TimingError, SLOTS_PER_EPOCH};
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
@@ -220,6 +220,87 @@ pub enum AttestationOutcome {
     },
 }
 
+async fn run_startup_proposer_preparation<C: SlotClock>(
+    duty: Arc<DutyManagementService>,
+    builder: Option<Arc<BuilderService>>,
+    clock: Arc<C>,
+    shutdown: &mut watch::Receiver<bool>,
+) {
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        let epoch = match clock.current_slot() {
+            Ok(slot) => slot / SLOTS_PER_EPOCH,
+            Err(TimingError::BeforeGenesis { .. }) => 0,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "startup proposer preparation: current slot is unavailable"
+                );
+                if sleep_or_shutdown(shutdown, Duration::from_secs(1)).await {
+                    return;
+                }
+                continue;
+            }
+        };
+        let prepared = duty.prepare_proposers(epoch).await;
+        let registered = startup_register_validators(builder.as_ref(), epoch).await;
+        if prepared && registered {
+            info!(epoch, "startup proposer preparation completed");
+            return;
+        }
+        warn!(
+            epoch,
+            prepared, registered, "startup proposer preparation failed; retrying next slot"
+        );
+        if sleep_or_shutdown(shutdown, startup_retry_delay(clock.as_ref())).await {
+            return;
+        }
+    }
+}
+
+async fn startup_register_validators(builder: Option<&Arc<BuilderService>>, epoch: u64) -> bool {
+    let Some(bs) = builder else {
+        return true;
+    };
+    match tokio::time::timeout(BUILDER_REGISTRATION_TIMEOUT, bs.register_validators(epoch)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            warn!(epoch, error = %e, "startup register_validator failed (non-fatal)");
+            false
+        }
+        Err(_) => {
+            warn!(
+                epoch,
+                "startup register_validator timed out after {}s (non-fatal)",
+                BUILDER_REGISTRATION_TIMEOUT.as_secs()
+            );
+            false
+        }
+    }
+}
+
+fn startup_retry_delay(clock: &impl SlotClock) -> Duration {
+    let delay = match clock.current_slot() {
+        Ok(slot) => clock.time_until_slot(slot.saturating_add(1)).unwrap_or(Duration::ZERO),
+        Err(_) => clock.time_until_slot(0).unwrap_or(Duration::ZERO),
+    };
+    if delay.is_zero() {
+        clock.slot_duration()
+    } else {
+        delay
+    }
+}
+
+/// `true` when shutdown was requested.
+async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, delay: Duration) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => false,
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+    }
+}
+
 impl AttestationOutcome {
     /// Whether this duty was published.
     ///
@@ -375,7 +456,7 @@ where
     pub(crate) aggregation_service: AggregationService,
     pub(crate) sync_committee_service: SyncCommitteeService,
     pub(crate) payload_attestation_service: PayloadAttestationService,
-    pub(crate) duty_management: DutyManagementService,
+    pub(crate) duty_management: Arc<DutyManagementService>,
     pub(crate) key_gen_rx: watch::Receiver<u64>,
     pub(crate) shutdown_rx: watch::Receiver<bool>,
     pub(crate) attesting_enabled: Arc<AtomicBool>,
@@ -508,7 +589,7 @@ where
             aggregation_service,
             sync_committee_service,
             payload_attestation_service,
-            duty_management,
+            duty_management: Arc::new(duty_management),
             key_gen_rx,
             shutdown_rx,
             attesting_enabled,
@@ -534,6 +615,12 @@ where
     /// - post-duty: epoch duty fetches, epoch-boundary prep, builder registration
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
         info!("Starting duty orchestrator");
+        // Epoch-boundary prep runs after that slot's proposal. Send the fee
+        // recipient on its own task so epoch 0–1 proposals are not built
+        // against a junk address, and so a slow beacon node cannot hold the
+        // slot loop. Before genesis the epoch is 0. A failure retries once
+        // per slot.
+        self.spawn_startup_proposer_preparation();
 
         // Defence-in-depth behind the wall-based inter-slot wait. A backward
         // clock step must not re-run a slot whose phases already finished.
@@ -771,6 +858,22 @@ where
                 return Ok(());
             }
         }
+    }
+
+    /// `prepare_beacon_proposer` and `register_validator` off the slot loop.
+    ///
+    /// No builder jitter. Before genesis the epoch is 0, so the beacon node
+    /// learns the fee recipient without waiting for slot 0. A failure retries
+    /// once per slot until both calls succeed. Both helpers no-op at Gloas.
+    /// A beacon-node error does not stop the duty loop.
+    fn spawn_startup_proposer_preparation(&self) {
+        let duty = Arc::clone(&self.duty_management);
+        let builder = self.builder_service.clone();
+        let clock = Arc::clone(&self.clock);
+        let mut shutdown = self.shutdown_rx.clone();
+        tokio::spawn(async move {
+            run_startup_proposer_preparation(duty, builder, clock, &mut shutdown).await;
+        });
     }
 
     /// Legacy register (pre-Gloas) and preferences for Gloas+ proposal slots.

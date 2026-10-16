@@ -38,6 +38,11 @@ keystore_path = "./keystores"
 # Block graffiti included in proposed blocks (optional, max 32 bytes)
 # graffiti = "rvc"
 
+# Readable fee-recipient mismatch on produceBlockV3. `sign` (default) still
+# signs the best remaining block and logs a warning. `reject` drops it. A
+# missing or unreadable fee on a full Bellatrix+ block is always rejected.
+# fee_recipient_policy = "sign"
+
 # ---------------------------------------------------------------------------
 # Slashing Protection
 # ---------------------------------------------------------------------------

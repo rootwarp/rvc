@@ -18,14 +18,17 @@ use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use rvc_bn_manager::metrics::{RVC_BN_CAPABILITY_STATE, RVC_PROPOSER_BN_LATENCY_MS};
+use rvc_bn_manager::metrics::{
+    RVC_BN_CAPABILITY_STATE, RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL, RVC_PROPOSER_BN_LATENCY_MS,
+};
 use rvc_bn_manager::types::bn_capability;
 use rvc_bn_manager::{
     AttestationApi, AttestationData, BeaconError, BeaconNodeClient, BlockProducer, BnManager,
     BnManagerConfig, BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, Checkpoint, DutiesProvider,
-    LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi, ProduceDuty, Propagator,
-    SignedBeaconBlock, SignedBlindedBeaconBlock, SingleAttestation, SubmitAttestationResult,
-    SyncCommitteeApi, VersionedAttestation, VersionedSignedAggregateAndProof,
+    FeeRecipientPolicy, LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi,
+    ProduceDuty, Propagator, SignedBeaconBlock, SignedBlindedBeaconBlock, SingleAttestation,
+    SubmitAttestationResult, SyncCommitteeApi, VersionedAttestation,
+    VersionedSignedAggregateAndProof,
 };
 
 // -- Helper --
@@ -1297,46 +1300,153 @@ async fn test_best_of_falls_back_to_unsynced_when_every_synced_bn_times_out() {
     );
 }
 
-/// `produce_block_v3_for_duty` drops a block whose payload fee recipient
-/// does not match the duty, even when every other field matches.
+fn duty_block_body(parent: &str, proposer: u64, fee: &str) -> String {
+    let state = "00".repeat(32);
+    format!(
+        r#"{{"data":{{"slot":"1","proposer_index":"{proposer}","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}}}}}}"#
+    )
+}
+
+fn mount_duty_block(value: &str, body: String) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("Eth-Consensus-Version", "deneb")
+        .insert_header("Eth-Execution-Payload-Blinded", "false")
+        .insert_header("Eth-Execution-Payload-Value", value)
+        .set_body_string(body)
+}
+
+fn deneb_fee_duty(fee: [u8; 20]) -> ProduceDuty {
+    ProduceDuty {
+        expected_proposer_index: 7,
+        expected_parent_root: Some([0xab; 32]),
+        expected_fee_recipient: Some(fee),
+        expected_consensus_version: ForkName::Deneb,
+    }
+}
+
+/// A sole beacon node whose payload fee recipient does not match the duty
+/// still returns the block. The VC signs it. A missed proposal is worse than
+/// paying the beacon node's fee recipient.
 #[tokio::test]
-async fn produce_block_v3_for_duty_rejects_a_mismatched_fee() {
+#[tracing_test::traced_test]
+async fn produce_block_v3_for_duty_returns_a_mismatched_fee_for_signing() {
     let bn = MockServer::start().await;
     let parent = "ab".repeat(32);
-    let state = "00".repeat(32);
     let fee = "22".repeat(20);
-    let body = format!(
-        r#"{{"data":{{"slot":"1","proposer_index":"7","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}}}}}}"#
-    );
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .insert_header("Eth-Consensus-Version", "deneb")
-                .insert_header("Eth-Execution-Payload-Blinded", "false")
-                .insert_header("Eth-Execution-Payload-Value", "9000")
-                .set_body_string(body),
-        )
+        .respond_with(mount_duty_block("9000", duty_block_body(&parent, 7, &fee)))
+        .expect(1)
+        .mount(&bn)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn.uri()], Duration::from_millis(400));
+    let before = RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+    let result = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
+        .await;
+    let block = result.expect("a mismatched fee must still be returned for signing");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("9000"));
+    assert!(
+        logs_contain("signing block with fee-recipient mismatch"),
+        "signing a fee mismatch must log a warning"
+    );
+    assert!(logs_contain("bn_index=0"));
+    assert!(logs_contain("fee_expected=0x1111111111111111111111111111111111111111"));
+    assert!(logs_contain("fee_got=0x2222222222222222222222222222222222222222"));
+    assert!(logs_contain("value_parse=ok:9000"));
+    assert_eq!(RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
+}
+
+/// `fee_recipient_policy = "reject"` drops a readable mismatch.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn produce_block_v3_for_duty_rejects_a_mismatched_fee_when_configured() {
+    let bn = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("9000", duty_block_body(&parent, 7, &"22".repeat(20))))
+        .expect(1)
+        .mount(&bn)
+        .await;
+
+    let manager = manager_with_block_budget(&[&bn.uri()], Duration::from_millis(400))
+        .with_fee_recipient_policy(FeeRecipientPolicy::Reject);
+    let before = RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+    let result = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
+        .await;
+    assert!(result.is_err(), "reject policy must drop a wrong fee: {result:?}");
+    assert!(logs_contain("best-of candidate rejected"));
+    assert!(logs_contain("reason=fee") || logs_contain("reason=\"fee\""));
+    assert!(!logs_contain("signing block with fee-recipient mismatch"));
+    assert_eq!(RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before);
+}
+
+/// The production reject path logs the duty comparison, not only a test double.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn produce_block_v3_for_duty_logs_a_hard_reject() {
+    let bn = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("1", duty_block_body(&parent, 99, &"11".repeat(20))))
         .expect(1)
         .mount(&bn)
         .await;
 
     let manager = manager_with_block_budget(&[&bn.uri()], Duration::from_millis(400));
     let result = manager
-        .produce_block_v3_for_duty(
-            1,
-            "0xrandao",
-            None,
-            None,
-            ProduceDuty {
-                expected_proposer_index: 7,
-                expected_parent_root: Some([0xab; 32]),
-                expected_fee_recipient: Some([0x11; 20]),
-                expected_consensus_version: ForkName::Deneb,
-            },
-        )
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
         .await;
-    assert!(result.is_err(), "a mismatched fee must not be returned: {result:?}");
+    assert!(result.is_err(), "a wrong proposer must be rejected: {result:?}");
+    assert!(logs_contain("best-of candidate rejected"));
+    assert!(logs_contain("reason=proposer") || logs_contain("reason=\"proposer\""));
+    assert!(logs_contain("proposer_expected=7"));
+    assert!(logs_contain("proposer_got=99"));
+    assert!(logs_contain("slot_expected=1"));
+    assert!(!logs_contain("signing block with fee-recipient mismatch"));
+}
+
+/// A higher-value candidate with the wrong fee recipient ranks below a
+/// matching one. The signed block is the match, and the penalty warning is
+/// not emitted for the candidate that lost.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn produce_block_v3_for_duty_ranks_a_fee_mismatch_below_a_match() {
+    let mismatch = MockServer::start().await;
+    let matching = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("9000", duty_block_body(&parent, 7, &"22".repeat(20))))
+        .expect(1)
+        .mount(&mismatch)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("1000", duty_block_body(&parent, 7, &"11".repeat(20))))
+        .expect(1)
+        .mount(&matching)
+        .await;
+
+    let manager =
+        manager_with_block_budget(&[&mismatch.uri(), &matching.uri()], Duration::from_secs(3));
+    let block = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
+        .await
+        .expect("a matching candidate must be returned");
+    assert_eq!(
+        block.execution_payload_value.as_deref(),
+        Some("1000"),
+        "the matching fee recipient must outrank the higher mismatched value"
+    );
+    assert!(
+        !logs_contain("signing block with fee-recipient mismatch"),
+        "the penalty warning is only for the block that is signed"
+    );
 }
 
 /// No duty, so the parent is unknown. A small-lag proposal BN is not asked.
