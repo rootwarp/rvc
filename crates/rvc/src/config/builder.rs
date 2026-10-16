@@ -19,7 +19,7 @@ use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerCon
 use builder::BuilderService;
 use crypto::{CompositeSigner, KeyManager};
 use doppelganger::{
-    DoppelgangerDisabledByOperator, ForwardWindowMachine, SigningEnablement,
+    DoppelgangerDisabledByOperator, ForwardWindowMachine, MonotonicEpochClock, SigningEnablement,
     DEFAULT_MONITORING_EPOCHS,
 };
 #[cfg(test)]
@@ -763,10 +763,11 @@ impl ServiceBuilder {
     /// - When doppelganger detection is **enabled** (default): builds a
     ///   [`ForwardWindowMachine`], registers every loaded key at
     ///   `current_epoch`, and returns it as the enablement. Keys remain
-    ///   closed until the monitoring window elapses with complete liveness
-    ///   observations (driven by SEC-2c). Epoch-0 registration of a
-    ///   normally registered key is immediately `Safe` (pre-genesis bypass).
-    ///   Cost: ~[`DEFAULT_MONITORING_EPOCHS`] epochs (~12.8 min on mainnet).
+    ///   closed until `monitoring_epochs + 1` closed not-live epochs are
+    ///   observed (driven by SEC-2c). A gap delays `Safe`; there is no
+    ///   timeout. Epoch-0 registration of a normally registered key is
+    ///   immediately `Safe` (pre-genesis bypass). Default cost: three closed
+    ///   epochs (`DEFAULT_MONITORING_EPOCHS + 1`).
     /// - When **disabled** (`--no-doppelganger-detection`): returns
     ///   [`DoppelgangerDisabledByOperator`], which enables every key.
     ///
@@ -805,12 +806,14 @@ impl ServiceBuilder {
         pubkey_map: &PubkeyMap,
         genesis_confirmed: bool,
     ) -> (Arc<dyn SigningEnablement>, Option<Arc<ForwardWindowMachine>>) {
+        let closed_epochs = DEFAULT_MONITORING_EPOCHS + 1;
         if !self.config.doppelganger_detection {
             tracing::warn!(
+                closed_epochs,
                 "Doppelganger detection disabled by operator (--no-doppelganger-detection). \
                  Forward-window protection is off; a duplicate live instance can double-sign. \
-                 Default on costs ~{DEFAULT_MONITORING_EPOCHS} epochs of withheld signing \
-                 (~12.8 min on mainnet)."
+                 Default on withholds signing until {closed_epochs} closed not-live epochs \
+                 are observed (a gap delays Safe)."
             );
             return (Arc::new(DoppelgangerDisabledByOperator), None);
         }
@@ -847,12 +850,13 @@ impl ServiceBuilder {
 
         info!(
             monitoring_epochs = DEFAULT_MONITORING_EPOCHS,
+            closed_epochs,
             current_epoch,
             registered,
             import_strict,
             "ForwardWindowMachine constructed (SEC-2b/2c). Keys stay closed until \
-             {DEFAULT_MONITORING_EPOCHS} epochs of network liveness are observed \
-             (~12.8 min on mainnet). The per-slot liveness loop (SEC-2c) feeds \
+             {closed_epochs} closed not-live epochs are observed (a gap delays \
+             Safe; there is no timeout). The liveness loop (SEC-2c) feeds \
              observe_liveness via bn-manager failover. Epoch-0 bypass and \
              restart-aware safe-skip apply only to keys that are not an unfinished \
              import (open hold, any import sidecar, staged sidecar, \
@@ -899,9 +903,10 @@ impl ServiceBuilder {
     /// a bound failure, or a disagreement fails closed.
     ///
     /// The returned flag is the epoch-0 Safe bypass. It is set only on a
-    /// named network, where the preset duration and genesis are independent
-    /// of the beacon nodes. Custom duration comes from those same nodes, so
-    /// an inflated length can hold the clock at epoch 0; the flag stays false.
+    /// named network whose clock has reached genesis. Custom duration comes
+    /// from the beacon nodes, so an inflated length can hold the clock at
+    /// epoch 0; the flag stays false. A clock reading before genesis is not
+    /// a counted epoch, and the flag stays false there too.
     pub async fn resolve_slot_duration_ms(
         &self,
         beacon: &BnManager,
@@ -937,7 +942,9 @@ impl ServiceBuilder {
             )));
         }
         info!(slot_duration_ms, slots_per_epoch, genesis_time, "Resolved chain timing");
-        let genesis_confirmed = !matches!(self.config.network, super::Network::Custom);
+        let named_network = !matches!(self.config.network, super::Network::Custom);
+        let genesis_confirmed =
+            MonotonicEpochClock::allow_epoch0_bypass(named_network, unix_now_secs(), genesis_time);
         Ok((slot_duration_ms, genesis_confirmed))
     }
 
@@ -2926,17 +2933,27 @@ mod tests {
     }
 
     fn satisfy_window_from(machine: &ForwardWindowMachine, pk: &crypto::PublicKey, start: u64) {
-        let end = start + DEFAULT_MONITORING_EPOCHS;
         let sample = doppelganger::ValidatorLivenessData {
             index: hex::encode(pk.to_bytes()),
             is_live: false,
         };
-        for epoch in start..=end {
-            machine
-                .observe_liveness(epoch, std::slice::from_ref(&sample))
-                .expect("liveness sample");
+        // Import sets next_check to start + 1 and needs monitoring_epochs + 1
+        // closed not-live epochs. The registration epoch itself does not count.
+        let remaining = DEFAULT_MONITORING_EPOCHS + 1;
+        for offset in 0..remaining {
+            let epoch = start + 1 + offset;
+            assert!(
+                machine
+                    .observe_liveness(
+                        epoch,
+                        std::slice::from_ref(&sample),
+                        epoch + 1,
+                        doppelganger::CLOSED_EPOCH_SLOT,
+                    )
+                    .is_empty(),
+                "liveness sample"
+            );
         }
-        machine.tick(end, SLOTS_PER_EPOCH - 1);
     }
 
     struct RestartPaths {

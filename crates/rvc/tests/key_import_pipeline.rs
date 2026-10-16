@@ -57,17 +57,22 @@ fn encrypt_keystore(sk: &SecretKey) -> String {
 /// Observe every epoch in `[start, end]` as complete and not-live, then tick
 /// past the satisfaction boundary so the validator becomes Safe.
 fn clear_forward_window(machine: &ForwardWindowMachine, pubkey: &crypto::PublicKey, start: Epoch) {
-    let end = start.saturating_add(MONITORING_EPOCHS);
+    // register_for_import sets next_check to start + 1.
+    let remaining = MONITORING_EPOCHS + 1;
     let pubkey_hex = hex::encode(pubkey.to_bytes());
-    for epoch in start..=end {
+    for offset in 0..remaining {
+        let epoch = start + 1 + offset;
         let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false }];
-        machine.observe_liveness(epoch, &samples).expect("complete observation");
+        assert!(
+            machine
+                .observe_liveness(epoch, &samples, epoch + 1, doppelganger::CLOSED_EPOCH_SLOT,)
+                .is_empty(),
+            "complete observation"
+        );
     }
-    // Past-boundary tick with full observation → Safe.
-    machine.tick(end + 1, 0);
     assert!(
         machine.is_signing_enabled(pubkey),
-        "window must be clear after observe+tick past end_epoch"
+        "window must be clear after the closed not-live epochs"
     );
 }
 

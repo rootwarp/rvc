@@ -3,6 +3,21 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Doppelganger liveness runs even with no keys loaded
+
+The liveness loop starts whenever doppelganger protection is on, including a
+boot with an empty keystore. It asks beacon nodes only for the previous epoch
+and the current epoch, and an empty index registry makes no liveness call.
+A key becomes Safe after three closed not-live epochs (the previous epoch,
+answered at or after three quarters of an epoch — slot 24 when an epoch has
+32 slots). A gap, a missing index, or a failed query does not count and
+delays Safe. A live answer in the same check as the last closed epoch stays
+Detected; that check does not open the gate first. A failed or partial
+answer for the current epoch does not let the last closed epoch open the
+gate. A clock reading before genesis does not mark boot keys Safe. There is
+no timeout that opens the gate. An imported key starts counting at the epoch
+after import. A live answer at or after that epoch closes the gate for good.
+
 ## Slot duration comes from the beacon node
 
 Doppelganger epoch, liveness sleep, the index-resolver tick, the import hold,

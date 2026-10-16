@@ -17,11 +17,11 @@ use eth_types::{Epoch, SLOTS_PER_EPOCH};
 ///
 /// `slot_duration_ms` is the beacon node's resolved slot length. A zero
 /// duration does not yield epoch 0: that epoch is the pre-genesis signing
-/// bypass. If `genesis_time` is far in the future relative to process start,
-/// epoch computation saturates to 0. Callers that must not apply the
-/// pre-genesis Safe bypass (API import) should use
-/// [`crate::ForwardWindowMachine::register_for_import`] rather than trusting
-/// epoch 0 as "safe to sign".
+/// bypass. If the clock is before `genesis_time`, slot math saturates to 0.
+/// That is not a counted epoch. [`Self::allow_epoch0_bypass`] stays false
+/// until the clock reaches genesis, so boot registration does not mark keys
+/// Safe. API import uses [`crate::ForwardWindowMachine::register_for_import`]
+/// and never takes the bypass.
 #[derive(Debug, Clone)]
 pub struct MonotonicEpochClock {
     genesis_time: u64,
@@ -70,7 +70,32 @@ impl MonotonicEpochClock {
         self.slot_duration_ms
     }
 
+    /// `true` when this clock's anchored unix time is still before genesis.
+    ///
+    /// Slot math then saturates to epoch 0. That epoch has not started, so it
+    /// must not count and must not take the epoch-0 Safe bypass.
+    pub fn before_genesis(&self) -> bool {
+        Self::now_unix(self.start_unix_time, self.start_instant.elapsed().as_secs())
+            < self.genesis_time
+    }
+
+    /// Epoch-0 Safe bypass for a named network whose clock has reached genesis.
+    ///
+    /// A custom network stays closed. A clock reading before genesis stays
+    /// closed even on a named network: no epoch has been counted yet.
+    pub fn allow_epoch0_bypass(named_network: bool, now_unix: u64, genesis_time: u64) -> bool {
+        named_network && now_unix >= genesis_time
+    }
+
+    fn now_unix(start_unix_time: u64, elapsed_secs: u64) -> u64 {
+        start_unix_time.saturating_add(elapsed_secs)
+    }
+
     /// Current epoch from the monotonic clock.
+    ///
+    /// Before genesis this is 0 only because subtraction saturates. Callers
+    /// that register boot keys must consult [`Self::before_genesis`] or
+    /// [`Self::allow_epoch0_bypass`] before treating that 0 as the Safe bypass.
     pub fn current_epoch(&self) -> Epoch {
         self.current_slot() / SLOTS_PER_EPOCH
     }
@@ -87,7 +112,9 @@ impl MonotonicEpochClock {
             return u64::MAX;
         }
         let elapsed_secs = self.start_instant.elapsed().as_secs();
-        let now_unix = self.start_unix_time.saturating_add(elapsed_secs);
+        let now_unix = Self::now_unix(self.start_unix_time, elapsed_secs);
+        // Before genesis this saturates to 0. That is not slot 0 of epoch 0;
+        // `before_genesis` is how boot refuses the Safe bypass.
         let secs_since_genesis = now_unix.saturating_sub(self.genesis_time);
         let elapsed_ms = secs_since_genesis.saturating_mul(1000);
         elapsed_ms.checked_div(self.slot_duration_ms).unwrap_or(u64::MAX)
@@ -96,5 +123,37 @@ impl MonotonicEpochClock {
     /// Slot index within the current epoch (`0..SLOTS_PER_EPOCH`).
     pub fn slot_in_epoch(&self) -> u64 {
         self.current_slot() % SLOTS_PER_EPOCH
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn clock_before_genesis_is_not_a_counted_epoch() {
+        let genesis = 1_700_000_000u64;
+        let clock = MonotonicEpochClock::with_start_time(
+            genesis,
+            Instant::now(),
+            genesis.saturating_sub(10_000),
+            12_000,
+        );
+        assert!(clock.before_genesis());
+        assert_eq!(clock.current_epoch(), 0);
+        assert_eq!(clock.current_slot(), 0);
+        assert!(!MonotonicEpochClock::allow_epoch0_bypass(true, genesis - 1, genesis));
+        assert!(!MonotonicEpochClock::allow_epoch0_bypass(false, genesis, genesis));
+    }
+
+    #[test]
+    fn at_genesis_epoch_zero_may_bypass_on_a_named_network() {
+        let genesis = 1_700_000_000u64;
+        let clock = MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis, 12_000);
+        assert!(!clock.before_genesis());
+        assert_eq!(clock.current_epoch(), 0);
+        assert!(MonotonicEpochClock::allow_epoch0_bypass(true, genesis, genesis));
+        assert!(!MonotonicEpochClock::allow_epoch0_bypass(false, genesis, genesis));
     }
 }

@@ -431,12 +431,13 @@ fn satisfy_window(machine: &ForwardWindowMachine, clock: &MonotonicEpochClock, p
     let now = clock.current_epoch();
     let index = hex::encode(pk.to_bytes());
     for epoch in now.saturating_sub(1)..=now.saturating_add(2) {
-        machine
-            .observe_liveness(
-                epoch,
-                &[ValidatorLivenessData { index: index.clone(), is_live: false }],
-            )
-            .unwrap_or_else(|err| panic!("observe epoch {epoch}: {err}"));
+        let missing = machine.observe_liveness(
+            epoch,
+            &[ValidatorLivenessData { index: index.clone(), is_live: false }],
+            epoch + 1,
+            doppelganger::CLOSED_EPOCH_SLOT,
+        );
+        assert!(missing.is_empty(), "observe epoch {epoch} left keys unobserved: {missing:?}");
     }
     let _ = machine.tick(now.saturating_add(4), 0);
     assert_eq!(machine.status(pk), ForwardWindowStatus::Safe, "doppelganger window must open");

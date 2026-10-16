@@ -1,66 +1,56 @@
-//! Forward-window doppelganger state machine (D-1/D-2, Issues 2.6/2.7).
+//! Remaining-epoch doppelganger state machine.
 //!
-//! Implements the Lighthouse v5.3.0 forward-window pattern: a validator is
-//! withheld from signing for `monitoring_epochs` epochs after registration.
-//! The monitoring window closes — and signing is permitted — only at or after
-//! the LAST slot of `start_epoch + monitoring_epochs`.  Any unexplained
-//! `is_live` observation during the window transitions the validator to
-//! `Detected`, which permanently denies signing (fail-closed).
+//! A validator stays withheld until `monitoring_epochs + 1` closed, fully
+//! observed not-live epochs have been counted. A closed epoch is the previous
+//! one, and only an answer taken at slot >= [`CLOSED_EPOCH_SLOT`] of the
+//! following epoch decrements. A live answer at any epoch at or after
+//! `next_check_epoch` moves the validator to `Detected`, which permanently
+//! denies signing. Time passing without those answers does not open the gate.
 //!
-//! # D-2: Fail-closed on incomplete liveness (Issue 2.7)
-//!
-//! A validator reaches `Safe` ONLY if EVERY epoch in its monitoring window
-//! `[start_epoch, end_epoch]` (INCLUSIVE — `end_epoch = start_epoch +
-//! monitoring_epochs`) had a COMPLETE liveness observation: the validator's
-//! pubkey-hex index was present in the beacon-node response for that epoch.
-//! An epoch whose response omits the validator's index is NOT recorded as
-//! observed; the validator remains `Pending` through the satisfaction boundary.
-//! This is "fail-closed": missing data never grants signing permission.
-//!
-//! # Caller polling contract
-//!
-//! Each slot cycle, the orchestrator SHOULD call these methods in order:
-//!
-//! 1. `observe_liveness(epoch, samples)` — record the beacon-node liveness
-//!    response for `epoch`.  The registration epoch (`start_epoch`) must be
-//!    observed just like any other window epoch; it is NOT exempted.  If the
-//!    method returns `Err(IncompleteLiveness)`, the caller MUST retry the
-//!    liveness check for that epoch rather than suppressing the error.
-//! 2. `tick(current_epoch, slot_in_epoch)` — advance the state machine.
-//!
-//! Calling `tick` before `observe_liveness` at the satisfaction boundary is
-//! safe but will leave the validator `Pending` for one more cycle: the
-//! `past_boundary` arm (`current_epoch > end_epoch`) will catch it on the next
-//! tick once observation is complete.
-//!
-//! # Pubkey-hex key contract (SEC-001)
-//!
-//! The machine keys its internal state by `hex::encode(pubkey.to_bytes())`
-//! (lowercase hex).  `ValidatorLivenessData.index` values in the `samples`
-//! slice passed to `observe_liveness` MUST use the same encoding.  Beacon
-//! nodes return NUMERIC validator indices; the orchestrator/adapter is
-//! responsible for translating numeric index → pubkey-hex BEFORE calling
-//! `observe_liveness`.  An index that cannot be translated MUST be treated as
-//! a missing entry (fail-closed).  The production wiring and translation land
-//! in Issue 2.10.
+//! [`ForwardWindowMachine::apply_liveness_tick`] takes every epoch fetched for
+//! one slot and applies them under one lock. Any live answer at or after
+//! `next_check_epoch` is `Detected` before a decrement. The decrement that
+//! would reach zero does not run when the current epoch failed or omitted the
+//! key.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use eth_types::{Epoch, Root, SLOTS_PER_EPOCH};
-use parking_lot::Mutex;
+use eth_types::{Epoch, Root};
 
 use crate::enablement::SigningEnablement;
-use crate::error::DoppelgangerError;
 use crate::restart_skip::should_skip_restart_monitoring;
-use crate::state::{ForwardWindowStatus, ValidatorState};
+use crate::state::{ForwardWindowStatus, PendingKey, ValidatorState};
 use crate::traits::ValidatorLivenessData;
+use crate::CLOSED_EPOCH_SLOT;
+
+/// One epoch's liveness answer, collected before the machine changes state.
+///
+/// `samples == None` is a failed query. `Some` is the translated pubkey-hex
+/// samples from a successful query. An empty vec named no validator.
+#[derive(Debug, Clone)]
+pub struct EpochLiveness {
+    pub epoch: Epoch,
+    pub samples: Option<Vec<ValidatorLivenessData>>,
+}
+
+/// Any `is_live = true` for a pubkey wins. Order does not matter.
+fn or_fold_samples(samples: &[ValidatorLivenessData]) -> HashMap<&str, bool> {
+    let mut response: HashMap<&str, bool> = HashMap::with_capacity(samples.len());
+    for sample in samples {
+        response
+            .entry(sample.index.as_str())
+            .and_modify(|live| *live |= sample.is_live)
+            .or_insert(sample.is_live);
+    }
+    response
+}
 
 /// Forward-window doppelganger state machine.
 ///
 /// Thread-safe via an internal `parking_lot::Mutex`.
 pub struct ForwardWindowMachine {
-    states: Mutex<HashMap<String, ValidatorState>>,
+    states: parking_lot::Mutex<HashMap<String, ValidatorState>>,
     monitoring_epochs: u64,
     slashing_reader: Arc<dyn slashing::SlashingDbReader>,
     gvr: Root,
@@ -81,7 +71,7 @@ impl ForwardWindowMachine {
     ) -> Self {
         assert!(monitoring_epochs >= 1, "monitoring_epochs must be >= 1");
         Self {
-            states: Mutex::new(HashMap::new()),
+            states: parking_lot::Mutex::new(HashMap::new()),
             monitoring_epochs,
             slashing_reader,
             gvr,
@@ -97,11 +87,18 @@ impl ForwardWindowMachine {
         self
     }
 
+    fn initial_remaining(&self) -> u64 {
+        self.monitoring_epochs.saturating_add(1)
+    }
+
     /// Register a validator for monitoring, starting at `current_epoch`.
     ///
     /// IDEMPOTENT: calling twice for the same pubkey does NOT reset state.  A
     /// validator that is already `Pending`, `Safe`, or `Detected` is left
     /// unchanged.
+    ///
+    /// `next_check_epoch` is `current_epoch`, so the registration epoch itself
+    /// counts once it is closed. `remaining` starts at `monitoring_epochs + 1`.
     ///
     /// Restart-aware safe-skip (Layer 4): if `last_signed_attestation` returns a
     /// target epoch that is RECENT (within the monitoring window), the validator
@@ -120,18 +117,13 @@ impl ForwardWindowMachine {
             }
         }
 
-        // Pre-genesis bypass (S-3, Issue 2.8): at epoch 0 no slots have occurred,
-        // so liveness-based detection is not meaningful.  Mirror the documented
-        // Lighthouse behaviour (remaining_epochs = 0) by marking the validator
-        // `Safe` immediately and emitting an explicit log so operators see the
-        // deliberate decision in the startup logs rather than a silent skip.
-        //
-        // Rationale: placing this branch AFTER the idempotency guard ensures that
-        // a validator already in Pending/Safe/Detected keeps its existing state
-        // even if `register` is called again at epoch 0 (idempotency wins).
-        // Epoch 0 is also what an inflated slot duration produces. That must
-        // not open signing. The bypass runs only when genesis was confirmed
-        // from the named-network preset, not from the beacon-reported duration.
+        // Epoch 0 after genesis is the Safe bypass: no slots of this chain have
+        // been missed yet. A clock still before genesis also saturates to epoch
+        // 0, and that is not a counted epoch — callers must leave
+        // `genesis_confirmed` false until [`crate::MonotonicEpochClock::allow_epoch0_bypass`]
+        // is true. An inflated slot duration must not set the flag either.
+        // This branch stays after the idempotency guard, so a second register
+        // does not rewrite Pending, Safe, or Detected.
         if current_epoch == 0 && self.genesis_confirmed {
             tracing::info!(
                 pubkey = %observability::logging::TruncatedPubkey::new(&pubkey_hex),
@@ -148,13 +140,11 @@ impl ForwardWindowMachine {
             return;
         }
 
-        let end_epoch = current_epoch.saturating_add(self.monitoring_epochs);
         states.insert(
             pubkey_hex,
             ValidatorState::Pending {
-                start_epoch: current_epoch,
-                end_epoch,
-                observed_epochs: BTreeSet::new(),
+                next_check_epoch: current_epoch,
+                remaining: self.initial_remaining(),
             },
         );
     }
@@ -169,7 +159,11 @@ impl ForwardWindowMachine {
     /// genesis can yield epoch 0, and interchange import can plant recent
     /// attestation history that would Safe-skip before any network liveness
     /// is observed (SEC-2b review Finding 1 / 2). Imported keys always enter
-    /// `Pending` until SEC-2c observation + tick (or operator opt-out).
+    /// `Pending` until observation counts `monitoring_epochs + 1` closed
+    /// not-live epochs (or operator opt-out).
+    ///
+    /// `next_check_epoch` is `current_epoch + 1`: the import epoch itself
+    /// does not count and does not detect.
     ///
     /// Idempotent: existing non-`Unmonitored` state is left unchanged.
     pub fn register_for_import(&self, pubkey: &crypto::PublicKey, current_epoch: Epoch) {
@@ -182,163 +176,215 @@ impl ForwardWindowMachine {
             }
         }
 
-        let end_epoch = current_epoch.saturating_add(self.monitoring_epochs);
+        let next_check_epoch = current_epoch.saturating_add(1);
         tracing::info!(
             pubkey = %observability::logging::TruncatedPubkey::new(&pubkey_hex),
             current_epoch,
-            end_epoch,
+            next_check_epoch,
             "doppelganger: import/register_for_import — forced Pending (no epoch-0 / restart safe-skip)"
         );
         states.insert(
             pubkey_hex,
-            ValidatorState::Pending {
-                start_epoch: current_epoch,
-                end_epoch,
-                observed_epochs: BTreeSet::new(),
-            },
+            ValidatorState::Pending { next_check_epoch, remaining: self.initial_remaining() },
         );
     }
 
-    /// Advance the state machine by one slot tick.
+    /// Report status. Does not open the gate.
     ///
-    /// A `Pending` validator transitions to `Safe` when ALL of the following hold:
-    ///
-    /// - The satisfaction boundary has been reached: `current_epoch > end_epoch`,
-    ///   OR `current_epoch == end_epoch && slot_in_epoch >= SLOTS_PER_EPOCH - 1`.
-    ///   This "at-or-after" semantics means a missed tick (e.g. after a restart)
-    ///   does not leave the validator stuck `Pending` forever.
-    /// - Every epoch in the monitoring window `[start_epoch, end_epoch]`
-    ///   (INCLUSIVE) has a COMPLETE liveness observation recorded in
-    ///   `observed_epochs` (D-2, Issue 2.7).  A missing-entry epoch prevents the
-    ///   `Safe` transition (fail-closed).
-    ///
-    /// `Detected` is TERMINAL: a validator in the `Detected` state is never
-    /// transitioned to `Safe` by `tick`, regardless of how much time has passed.
-    ///
-    /// Returns the current status of every registered validator.
-    pub fn tick(&self, current_epoch: Epoch, slot_in_epoch: u64) -> Vec<ForwardWindowStatus> {
-        let mut states = self.states.lock();
+    /// Safe happens only inside [`Self::observe_liveness`] or
+    /// [`Self::apply_liveness_tick`] when `remaining` hits 0. A tick past any
+    /// epoch, including one far ahead, leaves `Pending` keys `Pending`.
+    pub fn tick(&self, _current_epoch: Epoch, _slot_in_epoch: u64) -> Vec<ForwardWindowStatus> {
+        let states = self.states.lock();
         let mut statuses = Vec::with_capacity(states.len());
-
-        for state in states.values_mut() {
-            if let ValidatorState::Pending { start_epoch, end_epoch, observed_epochs } = state {
-                let at_boundary =
-                    current_epoch == *end_epoch && slot_in_epoch >= SLOTS_PER_EPOCH - 1;
-                let past_boundary = current_epoch > *end_epoch;
-
-                if at_boundary || past_boundary {
-                    // D-2: Safe requires complete observation of every window epoch.
-                    let window_fully_observed =
-                        (*start_epoch..=*end_epoch).all(|e| observed_epochs.contains(&e));
-                    if window_fully_observed {
-                        *state = ValidatorState::Safe;
-                    }
-                }
-            }
-
+        for state in states.values() {
             statuses.push(Self::status_of(state));
         }
-
         statuses
     }
 
-    /// Record liveness observations for a given epoch.
+    /// Pubkeys still `Pending`, including those with no validator index yet.
+    pub fn pending_keys(&self) -> Vec<PendingKey> {
+        let states = self.states.lock();
+        let mut keys = Vec::new();
+        for (pubkey_hex, state) in states.iter() {
+            if let ValidatorState::Pending { next_check_epoch, .. } = state {
+                keys.push(PendingKey {
+                    pubkey_hex: pubkey_hex.clone(),
+                    next_check_epoch: *next_check_epoch,
+                });
+            }
+        }
+        keys.sort_by(|a, b| a.pubkey_hex.cmp(&b.pubkey_hex));
+        keys
+    }
+
+    /// Apply one epoch's liveness answer, taken at `(current_epoch, slot_in_epoch)`.
     ///
     /// # Pubkey-hex key contract (SEC-001)
     ///
-    /// Each `ValidatorLivenessData.index` in `samples` MUST be the lowercase
-    /// `hex::encode(pubkey.to_bytes())` for the corresponding validator — the
-    /// same encoding used as the state-map key in [`Self::register`].  Beacon
-    /// nodes return NUMERIC validator indices; the orchestrator/adapter MUST
-    /// translate numeric index → pubkey-hex before calling this method, and
-    /// MUST treat any untranslatable index as a missing entry (fail-closed).
-    /// See the module-level doc and Issue 2.10 for production wiring details.
+    /// Each `ValidatorLivenessData.index` MUST be the lowercase
+    /// `hex::encode(pubkey.to_bytes())` for that validator. The caller
+    /// translates beacon-node numeric indices first and omits any index it
+    /// cannot translate.
     ///
-    /// # Behaviour for each `Pending` in-window validator
+    /// # What counts
     ///
-    /// For each `Pending` validator whose monitoring window `[start_epoch,
-    /// end_epoch]` includes `epoch`:
+    /// For each `Pending` key with `epoch >= next_check_epoch`:
     ///
-    /// - If the validator's index **is present** in `samples`:
-    ///   - `epoch` is recorded as completely observed in `observed_epochs`.
-    ///   - If ANY sample for that index has `is_live == true` (OR-fold over
-    ///     duplicate entries), the validator transitions to `Detected`.
-    /// - If the validator's index **is absent** from `samples`:
-    ///   - `epoch` is NOT recorded (incomplete response — fail-closed per D-2).
-    ///   - The validator stays `Pending` and cannot satisfy the window.
+    /// - Index present and any sample `is_live` (OR-fold over duplicates) →
+    ///   `Detected`.
+    /// - Index present, not live, `epoch == current_epoch - 1`, and
+    ///   `slot_in_epoch >= CLOSED_EPOCH_SLOT` → decrement `remaining` and set
+    ///   `next_check_epoch = epoch + 1`. `remaining == 0` → `Safe`.
+    /// - Index absent → the key is returned and is not decremented.
     ///
-    /// After processing all in-window validators, the method returns
-    /// `Err(DoppelgangerError::IncompleteLiveness { epoch, missing_count })`
-    /// if ANY expected validator was absent from the response.  Callers MUST
-    /// log this error and retry the liveness check for the same epoch; they
-    /// MUST NOT suppress it.
+    /// Epochs before `next_check_epoch`, and not-live answers that are not a
+    /// closed previous epoch, do not change state and are not returned.
     ///
-    /// # Out-of-window and non-Pending behaviour
+    /// The returned pubkey-hex list is sorted. Callers must log or retry it:
+    /// a missing answer never opens the gate.
     ///
-    /// Out-of-window epochs (before `start_epoch` or after `end_epoch` for a
-    /// specific validator) are ignored for that validator.  If no `Pending`
-    /// in-window validator is expected for `epoch` at all (because all
-    /// validators are `Safe`, `Detected`, or out-of-window), the method
-    /// returns `Ok(())` regardless of what `samples` contains.
+    /// One epoch on its own may open the gate. The production loop fetches the
+    /// previous epoch and the current epoch first and applies both through
+    /// [`Self::apply_liveness_tick`], so a live current epoch is not dropped
+    /// on the tick that would otherwise reach `Safe`.
+    #[must_use = "unobserved keys stay Pending; log or retry them"]
     pub fn observe_liveness(
         &self,
         epoch: Epoch,
         samples: &[ValidatorLivenessData],
-    ) -> Result<(), DoppelgangerError> {
-        // Build a lookup map of index → is_live using OR-fold over duplicates
-        // (SEC-008): if a pubkey appears more than once, ANY is_live=true wins.
-        // A naive HashMap::collect keeps the LAST entry, which could allow a
-        // malicious/buggy BN to append (pk, false) after (pk, true) and
-        // silently suppress a detection.
-        let mut response: HashMap<&str, bool> = HashMap::with_capacity(samples.len());
-        for s in samples {
-            response.entry(s.index.as_str()).and_modify(|v| *v |= s.is_live).or_insert(s.is_live);
-        }
+        current_epoch: Epoch,
+        slot_in_epoch: u64,
+    ) -> Vec<String> {
+        // OR-fold duplicates (SEC-008): any is_live=true wins. A first-wins
+        // fold drops a later true. A last-wins fold drops an earlier true.
+        let response = or_fold_samples(samples);
+
+        let closed =
+            current_epoch > 0 && epoch == current_epoch - 1 && slot_in_epoch >= CLOSED_EPOCH_SLOT;
 
         let mut states = self.states.lock();
-
-        // Phase 1: collect keys of Pending validators whose window includes epoch.
-        // Gathered first so Phase 2 can use get_mut without borrow conflicts.
-        let pending_in_window_keys: Vec<String> = states
-            .iter()
-            .filter_map(|(key, state)| {
-                if let ValidatorState::Pending { start_epoch, end_epoch, .. } = state {
-                    if epoch >= *start_epoch && epoch <= *end_epoch {
-                        return Some(key.clone());
+        let keys: Vec<String> = states.keys().cloned().collect();
+        let mut unobserved = Vec::new();
+        for key in keys {
+            let Some(state) = states.get_mut(&key) else { continue };
+            let ValidatorState::Pending { next_check_epoch, remaining } = *state else {
+                continue;
+            };
+            if epoch < next_check_epoch {
+                continue;
+            }
+            match response.get(key.as_str()).copied() {
+                Some(true) => {
+                    *state = ValidatorState::Detected;
+                }
+                Some(false) if closed => {
+                    let Some(next_check) = epoch.checked_add(1) else {
+                        continue;
+                    };
+                    let next_remaining = remaining.saturating_sub(1);
+                    if next_remaining == 0 {
+                        *state = ValidatorState::Safe;
+                    } else {
+                        *state = ValidatorState::Pending {
+                            next_check_epoch: next_check,
+                            remaining: next_remaining,
+                        };
                     }
                 }
-                None
-            })
-            .collect();
-
-        // Phase 2: process each in-window Pending validator.
-        let mut missing_count: usize = 0;
-        for key in &pending_in_window_keys {
-            let Some(state) = states.get_mut(key) else { continue };
-
-            match response.get(key.as_str()) {
-                Some(&is_live) => {
-                    // Index is present → record the epoch as completely observed.
-                    if let ValidatorState::Pending { observed_epochs, .. } = state {
-                        observed_epochs.insert(epoch);
-                    }
-                    // Transition to Detected if the validator is live (OR-folded above).
-                    if is_live {
-                        *state = ValidatorState::Detected;
-                    }
-                }
-                None => {
-                    // Index is absent from the response → incomplete (fail-closed D-2).
-                    missing_count += 1;
-                }
+                Some(false) => {}
+                None => unobserved.push(key),
             }
         }
+        unobserved.sort();
+        unobserved
+    }
 
-        if missing_count > 0 {
-            Err(DoppelgangerError::IncompleteLiveness { epoch, missing_count })
-        } else {
-            Ok(())
+    /// Apply every answer fetched for one slot, under one lock.
+    ///
+    /// Live is decided first: any sample with `is_live` at an epoch at or
+    /// after `next_check_epoch` moves that key to `Detected`, and no decrement
+    /// runs for it. Otherwise a closed not-live previous epoch decrements.
+    /// When `remaining` is 1, that decrement runs only if the current epoch's
+    /// answer includes the key as not live. A failed query, a response that
+    /// omits the key, or a missing current-epoch answer leaves the key
+    /// `Pending`.
+    ///
+    /// Returned pairs are `(epoch, pubkey-hex)` for a due key with no sample,
+    /// sorted by epoch then pubkey. Signing stays at its previous value until
+    /// this function returns.
+    #[must_use = "unobserved keys stay Pending; log or retry them"]
+    pub fn apply_liveness_tick(
+        &self,
+        answers: &[EpochLiveness],
+        current_epoch: Epoch,
+        slot_in_epoch: u64,
+    ) -> Vec<(Epoch, String)> {
+        let folded: Vec<(Epoch, Option<HashMap<&str, bool>>)> = answers
+            .iter()
+            .map(|answer| (answer.epoch, answer.samples.as_deref().map(or_fold_samples)))
+            .collect();
+        let closed_slot = slot_in_epoch >= CLOSED_EPOCH_SLOT;
+
+        let mut states = self.states.lock();
+        let keys: Vec<String> = states.keys().cloned().collect();
+        let mut unobserved = Vec::new();
+        for key in keys {
+            let Some(state) = states.get_mut(&key) else { continue };
+            let ValidatorState::Pending { next_check_epoch, remaining } = *state else {
+                continue;
+            };
+
+            let mut saw_live = false;
+            let mut closed_not_live_epoch: Option<Epoch> = None;
+            let mut current_not_live = false;
+            for (epoch, response) in &folded {
+                if *epoch < next_check_epoch {
+                    continue;
+                }
+                match response {
+                    None => unobserved.push((*epoch, key.clone())),
+                    Some(samples) => match samples.get(key.as_str()).copied() {
+                        Some(true) => saw_live = true,
+                        Some(false) => {
+                            let previous =
+                                current_epoch > 0 && *epoch == current_epoch - 1 && closed_slot;
+                            if previous {
+                                closed_not_live_epoch = Some(*epoch);
+                            }
+                            if *epoch == current_epoch {
+                                current_not_live = true;
+                            }
+                        }
+                        None => unobserved.push((*epoch, key.clone())),
+                    },
+                }
+            }
+
+            if saw_live {
+                *state = ValidatorState::Detected;
+                continue;
+            }
+            let Some(epoch) = closed_not_live_epoch else { continue };
+            // The last count would open the gate. It needs a successful
+            // not-live answer for the epoch being entered.
+            if remaining == 1 && !current_not_live {
+                continue;
+            }
+            let Some(next_check) = epoch.checked_add(1) else { continue };
+            let next_remaining = remaining.saturating_sub(1);
+            if next_remaining == 0 {
+                *state = ValidatorState::Safe;
+            } else {
+                *state = ValidatorState::Pending {
+                    next_check_epoch: next_check,
+                    remaining: next_remaining,
+                };
+            }
         }
+        unobserved.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        unobserved
     }
 
     /// Remove the validator from the state map.

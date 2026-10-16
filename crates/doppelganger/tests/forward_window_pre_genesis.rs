@@ -12,7 +12,9 @@
 
 use std::sync::Arc;
 
-use rvc_doppelganger::{ForwardWindowMachine, SigningEnablement, ValidatorLivenessData};
+use rvc_doppelganger::{
+    ForwardWindowMachine, SigningEnablement, ValidatorLivenessData, CLOSED_EPOCH_SLOT,
+};
 
 use crypto::SecretKey;
 use eth_types::Root;
@@ -142,7 +144,10 @@ fn test_epoch_0_bypass_does_not_override_detected_state() {
 
     // Observe as live → Detected (terminal).
     let samples = vec![ValidatorLivenessData { index: pubkey_hex.clone(), is_live: true }];
-    machine.observe_liveness(5, &samples).expect("observe_liveness must not fail");
+    assert!(
+        machine.observe_liveness(5, &samples, 5 + 1, CLOSED_EPOCH_SLOT).is_empty(),
+        "observe_liveness must not fail"
+    );
     assert!(!machine.is_signing_enabled(&pubkey), "Detected → signing denied");
 
     // Re-register at epoch 0 — idempotency guard must win; state stays Detected.
