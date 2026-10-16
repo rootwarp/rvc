@@ -11,12 +11,16 @@ fn gloas_unblinded(slot: Slot) -> MockBeaconClient {
 }
 
 fn gloas_ssz_client(slot: Slot) -> MockBeaconClient {
-    let body = gloas_body_ssz();
+    let parent_root = [0x11; 32];
+    let spec = gloas_body_ssz();
+    let index = rvc_gloas::gloas_bid_builder_index(&spec).expect("spec body");
+    let body = rvc_gloas::body_with_bid_binding(&spec, index, slot, parent_root)
+        .expect("spec body accepts a bid binding");
     let body_offset: u32 = 84;
     let mut ssz_bytes = Vec::new();
     ssz_bytes.extend_from_slice(&slot.to_le_bytes());
     ssz_bytes.extend_from_slice(&42u64.to_le_bytes());
-    ssz_bytes.extend_from_slice(&[0x11; 32]);
+    ssz_bytes.extend_from_slice(&parent_root);
     ssz_bytes.extend_from_slice(&[0x22; 32]);
     ssz_bytes.extend_from_slice(&body_offset.to_le_bytes());
     ssz_bytes.extend_from_slice(&body);
@@ -248,24 +252,28 @@ async fn test_builder_only_circuit_breaker_fails_at_gloas() {
 }
 
 #[tokio::test]
-async fn test_gloas_does_not_branch_on_is_blinded() {
+async fn test_gloas_blinded_flag_drops_the_duty() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
     let mut beacon = gloas_unblinded(slot);
     beacon.produce_response.as_mut().unwrap().is_blinded = true;
     let beacon = Arc::new(beacon);
+    let signer = Arc::new(MockSigner::new());
     let service = BlockService::new(
-        Arc::new(MockSigner::new()),
+        signer.clone(),
         beacon.clone(),
         Arc::new(test_validator_store(&pubkey)),
         Arc::new(test_fork_schedule_with_near_gloas()),
         [0xaa; 32],
     );
 
-    let result = service.propose_block(slot, &pubkey, 42, None).await;
-    assert!(result.is_ok(), "Gloas must not drop the duty on is_blinded: {result:?}");
-    assert!(!result.unwrap().is_blinded, "Gloas publish path is never blinded");
-    assert_eq!(beacon.publish_calls.lock().unwrap().len(), 1);
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("blinded at Gloas");
+    assert!(
+        matches!(err, BlockServiceError::BlindedNotSupportedAtGloas { slot: got } if got == slot),
+        "{err:?}"
+    );
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_calls.lock().unwrap().is_empty());
     assert!(beacon.publish_blinded_calls.lock().unwrap().is_empty());
     assert!(beacon.publish_blinded_full_calls.lock().unwrap().is_empty());
 }
@@ -297,13 +305,16 @@ async fn test_gloas_electra_body_fails_closed_without_signer() {
 async fn test_gloas_header_uses_island_body_leaf() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
-    let body = gloas_body_ssz();
-    assert!(body_tree_hash_root(&body).is_err(), "fixture must not be Electra/Deneb-decodable");
-    let expected = rvc_gloas::gloas_body_root(&body).expect("valid Gloas body");
-    let expected_hex = rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT;
-    assert_eq!(hex::encode(expected), expected_hex);
+    let spec_body = gloas_body_ssz();
+    assert!(
+        body_tree_hash_root(&spec_body).is_err(),
+        "fixture must not be Electra/Deneb-decodable"
+    );
+    let spec_root = rvc_gloas::gloas_body_root(&spec_body).expect("valid Gloas body");
+    assert_eq!(hex::encode(spec_root), rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT);
 
     let block = gloas_block(slot);
+    let expected = rvc_gloas::gloas_body_root(&block.body).expect("aligned Gloas body");
     let island_root = rvc_gloas::gloas_block_root(
         &rvc_gloas::HeaderFields {
             slot: block.slot,
@@ -337,9 +348,9 @@ async fn test_gloas_header_uses_island_body_leaf() {
 async fn test_gloas_ssz_e2e_signs_with_island_body_leaf() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
-    let body = gloas_body_ssz();
-    let expected = rvc_gloas::gloas_body_root(&body).unwrap();
-    assert_eq!(hex::encode(expected), rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT);
+    let spec_body = gloas_body_ssz();
+    let spec_root = rvc_gloas::gloas_body_root(&spec_body).unwrap();
+    assert_eq!(hex::encode(spec_root), rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT);
 
     let beacon = Arc::new(gloas_ssz_client(slot));
     let signer = Arc::new(MockSigner::new());
@@ -351,13 +362,13 @@ async fn test_gloas_ssz_e2e_signs_with_island_body_leaf() {
         [0xaa; 32],
     );
 
+    let parent_root = [0x11; 32];
+    let index = rvc_gloas::gloas_bid_builder_index(&spec_body).expect("spec body");
+    let body = rvc_gloas::body_with_bid_binding(&spec_body, index, slot, parent_root)
+        .expect("spec body accepts a bid binding");
+    let expected = rvc_gloas::gloas_body_root(&body).expect("aligned Gloas body");
     let island_root = rvc_gloas::gloas_block_root(
-        &rvc_gloas::HeaderFields {
-            slot,
-            proposer_index: 42,
-            parent_root: [0x11; 32],
-            state_root: [0x22; 32],
-        },
+        &rvc_gloas::HeaderFields { slot, proposer_index: 42, parent_root, state_root: [0x22; 32] },
         &body,
     )
     .expect("valid Gloas body");
@@ -391,9 +402,17 @@ async fn test_v4_builder_config_reuses_provider_auth_and_mode_boost() {
     let result = service.propose_block(slot, &pubkey, 42, None).await;
     assert!(result.is_ok(), "{result:?}");
     let captured = &beacon.produce_v4_calls.lock().unwrap()[0].builder_config;
-    assert_eq!(captured.builders, provided.builders);
     assert_eq!(captured.builder_boost_factor, 150);
     assert_eq!(captured.min_bid, 0);
+    assert_eq!(captured.builders.len(), 1);
+    let entry = &captured.builders[0];
+    let provided_entry = &provided.builders[0];
+    assert_eq!(entry.url, provided_entry.url);
+    assert_eq!(entry.auth, provided_entry.auth);
+    assert_eq!(entry.builder_pubkeys, provided_entry.builder_pubkeys);
+    assert_eq!(entry.max_execution_payment, provided_entry.max_execution_payment);
+    assert_eq!(entry.builder_boost_factor, 150);
+    assert_eq!(entry.min_bid, 0);
 }
 
 #[tokio::test]
@@ -502,7 +521,19 @@ fn test_gloas_v4_helpers_do_not_read_is_blinded_or_electra_htr() {
         let rest = &src[start..];
         let end = rest.find("\n    async fn ").expect("helper must be followed by another method");
         let body = &rest[..end];
-        assert!(!body.contains("is_blinded"), "{name} must not read is_blinded:\n{body}");
+        if name == "sign_and_publish_v4" {
+            assert!(
+                body.contains("reject_blinded_at_gloas"),
+                "{name} must reject a blinded Gloas response"
+            );
+            assert_eq!(
+                body.matches("is_blinded").count(),
+                1,
+                "{name} must pass the blinded flag only into reject_blinded_at_gloas:\n{body}"
+            );
+        } else {
+            assert!(!body.contains("is_blinded"), "{name} must not read is_blinded:\n{body}");
+        }
         assert!(!body.contains("compute_block_root"), "{name} must not call compute_block_root");
         assert!(!body.contains("body_tree_hash_root"), "{name} must not call body_tree_hash_root");
         assert!(!body.contains("header_from_full"), "{name} must not call header_from_full");

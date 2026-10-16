@@ -74,13 +74,14 @@ async fn test_builder_always_falls_back_on_circuit_breaker() {
 async fn test_builder_only_sets_boost_factor_max() {
     let pubkey = test_pubkey();
     let slot = 100;
-    let beacon = MockBeaconClient::unblinded(test_block(slot));
+    let beacon = MockBeaconClient::blinded(test_blinded_block(slot));
     let cb = Arc::new(CircuitBreakerState::new(0, 0));
     let service = build_service_with_mode(beacon, &pubkey, cb);
 
     let result =
         service.propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly).await;
-    assert!(result.is_ok());
+    assert!(result.is_ok(), "BuilderOnly signs a blinded block: {result:?}");
+    assert!(result.unwrap().is_blinded);
 
     let boost = service.beacon.last_produce_call().builder_boost_factor;
     assert_eq!(boost, Some(u64::MAX));

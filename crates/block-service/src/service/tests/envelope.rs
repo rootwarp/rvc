@@ -2,6 +2,7 @@
 
 use super::*;
 use beacon::WireBody;
+use eth_types::BeaconBlock;
 use std::sync::Arc;
 use std::time::Duration;
 use timing::{DeadlineBps, DeadlineSchedule};
@@ -28,19 +29,25 @@ fn tight_payload_schedule() -> DeadlineSchedule {
 async fn test_self_build_json_signs_block_then_envelope() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
-    let envelope_ssz = gloas_envelope_ssz();
-    let expected_root = rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz)
-        .expect("valid envelope SSZ");
+    let spec_root = rvc_gloas::gloas_execution_payload_envelope_root(&gloas_envelope_ssz())
+        .expect("spec envelope SSZ");
     assert_eq!(
-        hex::encode(expected_root),
+        hex::encode(spec_root),
         rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_ROOT
     );
+    let response = self_build_json_response(slot);
+    let envelope_hex = response.data["execution_payload_envelope"]
+        .as_str()
+        .expect("bound envelope hex")
+        .to_string();
+    let envelope_ssz = hex::decode(envelope_hex.strip_prefix("0x").expect("0x prefix"))
+        .expect("bound envelope hex");
+    let expected_root =
+        rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz).expect("bound envelope");
 
     let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
     let signer = Arc::new(MockSigner::new().with_trace(trace.clone()));
-    let beacon = Arc::new(
-        MockBeaconClient::from_response(self_build_json_response(slot)).with_trace(trace.clone()),
-    );
+    let beacon = Arc::new(MockBeaconClient::from_response(response).with_trace(trace.clone()));
     let service = gloas_service(signer.clone(), beacon.clone(), &pubkey);
 
     let result = service.propose_block(slot, &pubkey, 42, None).await;
@@ -59,7 +66,7 @@ async fn test_self_build_json_signs_block_then_envelope() {
     assert_eq!(envelopes[0].consensus_version, "gloas");
     match &envelopes[0].signed_envelope {
         WireBody::Json(value) => {
-            assert_eq!(value["message"], serde_json::json!(gloas_envelope_hex()));
+            assert_eq!(value["message"], serde_json::json!(envelope_hex));
             assert_eq!(
                 value["signature"],
                 serde_json::json!(format!("0x{}", hex::encode(mock_envelope_sig().to_bytes())))
@@ -77,15 +84,20 @@ async fn test_self_build_json_signs_block_then_envelope() {
 async fn test_self_build_ssz_signs_block_then_envelope() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
-    let envelope_ssz = gloas_envelope_ssz();
-    let expected_root = rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz)
-        .expect("valid envelope SSZ");
+    let response = self_build_ssz_response(slot);
+    let envelope_ssz = bound_self_build_envelope(&BeaconBlock {
+        slot,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: self_build_body(slot, [0x11; 32]),
+    });
+    let expected_root =
+        rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz).expect("bound envelope");
 
     let trace = Arc::new(std::sync::Mutex::new(Vec::new()));
     let signer = Arc::new(MockSigner::new().with_trace(trace.clone()));
-    let beacon = Arc::new(
-        MockBeaconClient::from_response(self_build_ssz_response(slot)).with_trace(trace.clone()),
-    );
+    let beacon = Arc::new(MockBeaconClient::from_response(response).with_trace(trace.clone()));
     let service = gloas_service(signer.clone(), beacon.clone(), &pubkey);
 
     let result = service.propose_block(slot, &pubkey, 42, None).await;
@@ -162,7 +174,7 @@ async fn test_builder_win_ssz_echoes_url_and_skips_envelope() {
 }
 
 fn gloas_ssz_builder_win(slot: Slot) -> MockBeaconClient {
-    let body = gloas_body_ssz();
+    let body = external_bid_body(slot, [0x11; 32]);
     let ssz_bytes = build_gloas_beacon_block_ssz(slot, 42, [0x11; 32], [0x22; 32], &body);
     MockBeaconClient::from_response(ProduceBlockResponse {
         data: serde_json::Value::Null,
@@ -199,8 +211,13 @@ async fn test_json_envelope_object_drops_duty_before_sign() {
 async fn test_invalid_envelope_ssz_drops_duty_before_sign() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
-    let block_ssz =
-        build_gloas_beacon_block_ssz(slot, 42, [0x11; 32], [0x22; 32], &gloas_body_ssz());
+    let block_ssz = build_gloas_beacon_block_ssz(
+        slot,
+        42,
+        [0x11; 32],
+        [0x22; 32],
+        &self_build_body(slot, [0x11; 32]),
+    );
     let ssz_bytes = build_gloas_block_contents_ssz(&block_ssz, &[0xde, 0xad], &[0xaa], &[0xbb]);
     let response = ProduceBlockResponse {
         data: serde_json::Value::Null,

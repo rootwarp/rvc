@@ -1,6 +1,30 @@
 use eth_types::Root;
 
+use crate::types::{BlockSelectionMode, CandidateShape};
 use crate::BlockServiceError;
+
+/// Reject a produced shape that the selection mode must not sign.
+///
+/// Builder-only accepts a pre-Gloas blinded block and a Gloas external bid.
+/// Execution-only accepts a pre-Gloas unblinded block and a Gloas self-build
+/// (`builder_index == BUILDER_INDEX_SELF_BUILD`). Max-profit and builder-always
+/// accept every shape. A rejection is not signed; the caller skips that candidate.
+pub(crate) fn check_mode_shape(
+    mode: BlockSelectionMode,
+    shape: CandidateShape,
+) -> Result<(), BlockServiceError> {
+    let builder_shape = matches!(shape, CandidateShape::Blinded | CandidateShape::BuilderWin);
+    let allowed = match mode {
+        BlockSelectionMode::MaxProfit | BlockSelectionMode::BuilderAlways => true,
+        BlockSelectionMode::BuilderOnly => builder_shape,
+        BlockSelectionMode::ExecutionOnly => !builder_shape,
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(BlockServiceError::ModeShapeMismatch { mode, shape })
+    }
+}
 
 /// Roots a block proposed at slot N may use as `parent_root`.
 ///
@@ -219,6 +243,52 @@ mod tests {
         assert!(text.contains("no parent accepted"), "{text}");
         assert!(matches!(err, BlockServiceError::ParentRootMismatch { closed: true, .. }));
         assert!(v.validate(42, [0xff; 32]).is_err());
+    }
+
+    /// Spec table for `check_mode_shape`. The rows are the allowed pairs;
+    /// they are not derived by calling the function under test.
+    #[test]
+    fn test_check_mode_shape_matrix() {
+        use BlockSelectionMode::{BuilderAlways, BuilderOnly, ExecutionOnly, MaxProfit};
+        use CandidateShape::{Blinded, BuilderWin, SelfBuild, Unblinded};
+
+        // (mode, shape, allowed). 4 modes × 4 shapes.
+        let cases = [
+            (BuilderOnly, Unblinded, false),
+            (BuilderOnly, Blinded, true),
+            (BuilderOnly, SelfBuild, false),
+            (BuilderOnly, BuilderWin, true),
+            (ExecutionOnly, Unblinded, true),
+            (ExecutionOnly, Blinded, false),
+            (ExecutionOnly, SelfBuild, true),
+            (ExecutionOnly, BuilderWin, false),
+            (MaxProfit, Unblinded, true),
+            (MaxProfit, Blinded, true),
+            (MaxProfit, SelfBuild, true),
+            (MaxProfit, BuilderWin, true),
+            (BuilderAlways, Unblinded, true),
+            (BuilderAlways, Blinded, true),
+            (BuilderAlways, SelfBuild, true),
+            (BuilderAlways, BuilderWin, true),
+        ];
+        assert_eq!(cases.len(), 16);
+
+        for (mode, shape, allowed) in cases {
+            let result = check_mode_shape(mode, shape);
+            if allowed {
+                assert!(result.is_ok(), "{mode} must accept {shape}");
+                continue;
+            }
+            match result {
+                Err(BlockServiceError::ModeShapeMismatch { mode: got_mode, shape: got_shape }) => {
+                    assert_eq!(got_mode, mode);
+                    assert_eq!(got_shape, shape);
+                }
+                other => panic!("{mode} {shape}: {other:?}"),
+            }
+            let text = check_mode_shape(mode, shape).expect_err("rejected pair").to_string();
+            assert_eq!(text, format!("mode {mode} rejects shape {shape}"));
+        }
     }
 
     /// A header below N-1 does not accept that header's parent.

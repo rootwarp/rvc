@@ -81,6 +81,36 @@ with the keystore before the deletion denylist entry. A keystore whose
 `pubkey` field is missing, not lowercase bare hex, or not the decrypted key
 is rejected and nothing is written.
 
+## Block production: the selection mode binds the response and the V4 builder list
+
+Builder-only rejects a pre-Gloas unblinded block and a Gloas self-build
+bid. Execution-only rejects a pre-Gloas blinded block and a Gloas external
+bid. On Gloas the bid is the block's `builder_index`: the self-build index
+is `18446744073709551615`, and every other index is an external bid. Wrapping
+an external bid in `BlockContents`, or sending a self-build as a bare
+`BeaconBlock`, does not change that. The envelope is present exactly when
+the bid is a self-build, in every mode. A self-build envelope is signed only
+when its `builder_index`, `beacon_block_root`, and `parent_beacon_block_root`
+match the block. The bid `slot` and `parent_block_root` must match the block
+as well, including a bare external bid. A mismatch is dropped before the
+block is signed. A Gloas response flagged blinded
+is dropped before decode; that drop is not a shape rejection. The shape
+check runs on each candidate before the block is signed. A rejected
+candidate is skipped, and each shape rejection increments
+`rvc_block_shape_rejections_total`. When a builder-only candidate was the
+wrong shape, the proposal still returns a builder-only error and names that
+shape, even if a later candidate fails for another reason. A lone wrong-slot
+blinded block stays a slot mismatch. Execution-only returns a mode mismatch, which does not trip
+the builder circuit breaker. Max-profit and builder-always still accept
+either shape.
+
+On `produceBlockV4`, a boost of 0 clears `builders`. That is execution-only,
+and max-profit or builder-always while the circuit breaker is tripped. A
+non-zero boost writes that boost and the validator's `min_bid` onto every
+per-builder entry, including a duplicate URL. Entries cannot keep a provider
+boost that would ask for a bid after the mode turned builders off. A fresh
+process starts with the breaker clear, so those entries are sent again.
+
 ## Block production: a block may build on the parent of the previous slot
 
 At proposal slot N, the parent walk reads `GET /eth/v1/beacon/headers/{block_id}`.

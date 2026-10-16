@@ -1,6 +1,8 @@
 use beacon::BeaconError;
 use eth_types::Root;
 
+use crate::types::{BlockSelectionMode, CandidateShape};
+
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum BlockServiceError {
     #[error("signer error: {0}")]
@@ -17,6 +19,14 @@ pub enum BlockServiceError {
 
     #[error("builder-only mode: {0}")]
     BuilderOnly(String),
+
+    /// Produced shape contradicts the validator's selection mode.
+    ///
+    /// Raised before `sign_block_header`. Builder-only proposals surface this
+    /// as [`Self::BuilderOnly`] so the coordinator's builder-miss handling is
+    /// unchanged. The message names `mode` and `shape`.
+    #[error("mode {mode} rejects shape {shape}")]
+    ModeShapeMismatch { mode: BlockSelectionMode, shape: CandidateShape },
 
     /// Returned when `produce_block_v3` fails **and** the request used a
     /// non-zero `builder_boost_factor` (i.e. the builder relay was attempted).
