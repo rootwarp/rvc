@@ -20,6 +20,15 @@ pub trait BuilderConfigProvider: Send + Sync {
 pub struct ProduceDuty {
     pub expected_proposer_index: u64,
     pub expected_parent_root: Option<[u8; 32]>,
+    /// Parent of [`Self::expected_parent_root`] when that header is at N-1.
+    ///
+    /// A block on this root is accepted, but it does not close the soft
+    /// deadline and the unsynced fallback does not use it. `None` when the
+    /// captured header is below N-1, or when the primary parent is unknown.
+    pub alternate_parent_root: Option<[u8; 32]>,
+    /// The parent walk cannot name an ancestor. Every parent is rejected.
+    /// [`Self::expected_parent_root`] stays `None`.
+    pub parent_closed: bool,
     pub expected_fee_recipient: Option<[u8; 20]>,
     /// Slot fork. A candidate whose `consensus_version` is not this fork is
     /// not ranked and does not close the soft deadline.

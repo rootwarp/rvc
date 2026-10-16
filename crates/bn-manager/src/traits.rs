@@ -4,13 +4,13 @@ use async_trait::async_trait;
 
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
-    BlockRootResponse, BuilderConfig, BuilderPreferencesEntry, ConfigSpecResponse, GenesisResponse,
-    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
-    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse,
-    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
-    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof, WireBody,
+    BlockHeaderSummary, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry,
+    ConfigSpecResponse, GenesisResponse, PayloadAttestationDataResponse, ProduceBlockResponse,
+    ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof,
+    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -58,6 +58,15 @@ pub trait DutiesProvider: Send + Sync {
 pub struct ProduceDuty {
     pub expected_proposer_index: u64,
     pub expected_parent_root: Option<[u8; 32]>,
+    /// Parent of [`Self::expected_parent_root`] when that header is at N-1.
+    ///
+    /// A block on this root is accepted, but it does not close the soft
+    /// deadline and the unsynced fallback does not use it. `None` when the
+    /// captured header is below N-1, or when the primary parent is unknown.
+    pub alternate_parent_root: Option<[u8; 32]>,
+    /// The parent walk cannot name an ancestor. Every parent is rejected.
+    /// [`Self::expected_parent_root`] stays `None`.
+    pub parent_closed: bool,
     pub expected_fee_recipient: Option<[u8; 20]>,
     /// Slot fork. A candidate whose `consensus_version` is not this fork is
     /// not ranked and does not close the soft deadline.
@@ -88,7 +97,9 @@ pub trait BlockProducer: Send + Sync {
     ///
     /// Fallback runs only for untried proposal-role beacon nodes above the
     /// health floor, and only when [`ProduceDuty::expected_parent_root`] is
-    /// `Some`. The default ignores the duty and calls [`Self::produce_block_v3`].
+    /// `Some` and [`ProduceDuty::parent_closed`] is false. A fallback block
+    /// must use that primary parent; the re-org parent is not accepted there.
+    /// The default ignores the duty and calls [`Self::produce_block_v3`].
     async fn produce_block_v3_for_duty(
         &self,
         slot: u64,
@@ -347,6 +358,9 @@ pub trait NodeStatusApi: Send + Sync {
     async fn get_validators(&self, pubkeys: &[String]) -> Result<ValidatorsResponse, BeaconError>;
 
     async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError>;
+
+    /// `GET /eth/v1/beacon/headers/{block_id}`: root, slot, proposer index, parent root.
+    async fn get_block_header(&self, block_id: &str) -> Result<BlockHeaderSummary, BeaconError>;
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError>;
 

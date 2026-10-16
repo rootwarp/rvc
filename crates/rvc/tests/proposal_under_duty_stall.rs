@@ -191,6 +191,12 @@ impl NodeStatusApi for DutyStallBeacon {
         // H-4 parent-root check stays inert (empty-slot 404 behaviour).
         self.inner.get_block_root(block_id).await
     }
+    async fn get_block_header(
+        &self,
+        block_id: &str,
+    ) -> Result<beacon::BlockHeaderSummary, BeaconError> {
+        self.inner.get_block_header(block_id).await
+    }
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
         self.inner.get_node_syncing().await
     }

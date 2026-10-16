@@ -93,20 +93,65 @@ async fn test_propose_block_ssz_blinded_passes_is_blinded_flag() {
     assert!(ssz_calls[0].is_blinded);
 }
 
+/// Each SSZ arm returns `SlotMismatch` by variant. A matching slot on that
+/// same arm is signed and published.
 #[tokio::test]
-async fn test_propose_block_ssz_slot_mismatch_returns_error() {
-    let pubkey = test_pubkey();
-    let requested_slot = 100;
-    let ssz_slot = 200; // mismatch!
-    let beacon = MockBeaconClient::ssz(ssz_slot, 42, false);
-    let signer = MockSigner::new();
-    let service = build_service(signer, beacon, &pubkey);
+#[tracing_test::traced_test]
+async fn test_propose_block_ssz_slot_mismatch_is_slot_mismatch_on_every_arm() {
+    let arms = [
+        (true, "deneb", "blinded deneb"),
+        (false, "deneb", "unblinded deneb BlockContents"),
+        (false, "phase0", "unblinded phase0 BeaconBlock"),
+    ];
+    for (blinded, version, label) in arms {
+        let pubkey = test_pubkey();
+        let requested_slot = 100;
+        let got_slot = 200;
+        let beacon = MockBeaconClient::ssz_with_version(got_slot, 42, blinded, version);
+        let signer = Arc::new(MockSigner::new());
+        let beacon_arc = Arc::new(beacon);
+        let service = BlockService::new(
+            signer.clone(),
+            beacon_arc.clone(),
+            Arc::new(test_validator_store(&pubkey)),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+        let result = service.propose_block(requested_slot, &pubkey, 42, None).await;
+        assert!(
+            matches!(
+                result,
+                Err(BlockServiceError::SlotMismatch { requested, got })
+                if requested == requested_slot && got == got_slot
+            ),
+            "{label}: expected SlotMismatch, got {result:?}"
+        );
+        assert!(
+            signer.block_calls.lock().unwrap().is_empty(),
+            "{label}: signer must not run after a slot rejection"
+        );
+        assert!(
+            beacon_arc.publish_ssz_calls.lock().unwrap().is_empty(),
+            "{label}: a rejected block must not be published"
+        );
 
-    let result = service.propose_block(requested_slot, &pubkey, 42, None).await;
-
-    assert!(result.is_err());
-    let err = result.unwrap_err().to_string();
-    assert!(err.contains("slot mismatch"), "error should mention slot mismatch: {err}");
+        let matching = MockBeaconClient::ssz_with_version(requested_slot, 42, blinded, version);
+        let signer_ok = Arc::new(MockSigner::new());
+        let beacon_ok = Arc::new(matching);
+        let service_ok = BlockService::new(
+            signer_ok.clone(),
+            beacon_ok.clone(),
+            Arc::new(test_validator_store(&pubkey)),
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+        let accepted = service_ok.propose_block(requested_slot, &pubkey, 42, None).await;
+        assert!(accepted.is_ok(), "{label}: matching slot must publish, got {accepted:?}");
+        assert_eq!(signer_ok.block_calls.lock().unwrap().len(), 1, "{label}");
+        assert_eq!(beacon_ok.publish_ssz_calls.lock().unwrap().len(), 1, "{label}");
+    }
+    assert!(logs_contain("BN block response rejected"));
+    assert!(logs_contain("slot mismatch"));
 }
 
 #[tokio::test]

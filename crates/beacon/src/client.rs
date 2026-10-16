@@ -20,14 +20,15 @@ use crate::retry::RetryPolicy;
 use crate::ssz_deser;
 use crate::types::{
     parse_fork_schedule, AttestationDataResponse, AttesterDutiesResponse,
-    BeaconCommitteeSubscription, BlockRootResponse, ConfigSpecResponse, DataResponse,
-    GenesisResponse, IndexedAttestationError, IndexedErrorMessage, NodeVersionResponse,
-    NodeVersionV2Response, PayloadAttestationDataResponse, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof,
-    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
+    BeaconCommitteeSubscription, BlockHeaderSummary, BlockRootResponse, ConfigSpecResponse,
+    DataResponse, GenesisResponse, IndexedAttestationError, IndexedErrorMessage,
+    NodeVersionResponse, NodeVersionV2Response, PayloadAttestationDataResponse,
+    ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody,
 };
 use crate::v4_wire::{
     BuilderConfig, BuilderPreferencesEntry, BUILDER_PREFERENCES_PATH, FIELD_BLOBS,
@@ -511,6 +512,22 @@ impl BeaconClient {
     pub async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
         let path = Self::build_path(&["eth", "v1", "beacon", "blocks", block_id, "root"], &[]);
         self.get(&path).await
+    }
+
+    /// Fetches one beacon header (`GET /eth/v1/beacon/headers/{block_id}`).
+    ///
+    /// Returns the block root, slot, proposer index, and parent root. Slot and
+    /// proposer index must be decimal integers. Roots must be 32 bytes. The
+    /// header message carries no fork; callers check the produced block's
+    /// consensus version against the duty fork.
+    #[tracing::instrument(name = "beacon.get_block_header", skip_all)]
+    pub async fn get_block_header(
+        &self,
+        block_id: &str,
+    ) -> Result<BlockHeaderSummary, BeaconError> {
+        let path = Self::build_path(&["eth", "v1", "beacon", "headers", block_id], &[]);
+        let response: BlockHeaderWire = self.get(&path).await?;
+        parse_block_header(response)
     }
 
     /// Path for proposer duties: v1 pre-Gloas, v2 at Gloas.
@@ -1932,6 +1949,18 @@ impl BeaconClient {
                         continue;
                     }
 
+                    // A later 404 must not erase a 5xx, 429, timeout, or connect error.
+                    if status.as_u16() == 404 && prior_failure_hidden_by_not_found(&last_error) {
+                        warn!(
+                            attempt,
+                            "HTTP 404 after a retryable failure; keeping the earlier error"
+                        );
+                        if attempt >= policy.max_retries {
+                            break;
+                        }
+                        continue;
+                    }
+
                     // Success, client errors, and other non-retry statuses → caller.
                     if status.is_success() {
                         let latency_ms = request_start.elapsed().as_millis() as u64;
@@ -1997,6 +2026,15 @@ impl BeaconClient {
         } else {
             Err(Self::api_error_from_response(response).await)
         }
+    }
+}
+
+/// `true` when `last_error` is a failure a following 404 must not replace.
+fn prior_failure_hidden_by_not_found(last_error: &Option<BeaconError>) -> bool {
+    match last_error {
+        Some(BeaconError::ApiError { status, .. }) if *status == 429 || *status >= 500 => true,
+        Some(BeaconError::Timeout | BeaconError::HttpError(_)) => true,
+        _ => false,
     }
 }
 
@@ -2110,6 +2148,66 @@ fn ensure_requested_committee_bit(
 fn decode_aggregate_data<T: DeserializeOwned>(data: serde_json::Value) -> Result<T, BeaconError> {
     serde_json::from_value(data)
         .map_err(|e| BeaconError::ParseError(format!("error decoding response body: {e}")))
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockHeaderWire {
+    data: BlockHeaderDataWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct BlockHeaderDataWire {
+    root: String,
+    header: SignedBeaconHeaderWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct SignedBeaconHeaderWire {
+    message: BeaconHeaderMessageWire,
+}
+
+#[derive(Debug, Deserialize)]
+struct BeaconHeaderMessageWire {
+    slot: String,
+    proposer_index: String,
+    parent_root: String,
+}
+
+fn parse_block_header(wire: BlockHeaderWire) -> Result<BlockHeaderSummary, BeaconError> {
+    let message = wire.data.header.message;
+    Ok(BlockHeaderSummary {
+        root: parse_root_hex(&wire.data.root, "root")?,
+        slot: parse_u64_decimal(&message.slot, "slot")?,
+        proposer_index: parse_u64_decimal(&message.proposer_index, "proposer_index")?,
+        parent_root: parse_root_hex(&message.parent_root, "parent_root")?,
+    })
+}
+
+fn parse_u64_decimal(text: &str, field: &str) -> Result<u64, BeaconError> {
+    text.parse::<u64>()
+        .map_err(|_| BeaconError::ParseError(format!("beacon header {field} is not a u64")))
+}
+
+fn parse_root_hex(text: &str, field: &str) -> Result<[u8; 32], BeaconError> {
+    let hex_str = text.strip_prefix("0x").unwrap_or(text);
+    if hex_str.len() != 64 {
+        return Err(BeaconError::ParseError(format!("beacon header {field} must be 32 bytes")));
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let start = index.checked_mul(2).ok_or_else(|| {
+            BeaconError::ParseError(format!("beacon header {field} must be 32 bytes"))
+        })?;
+        let end = start.checked_add(2).ok_or_else(|| {
+            BeaconError::ParseError(format!("beacon header {field} must be 32 bytes"))
+        })?;
+        let digits = hex_str.get(start..end).ok_or_else(|| {
+            BeaconError::ParseError(format!("beacon header {field} must be 32 bytes"))
+        })?;
+        *byte = u8::from_str_radix(digits, 16)
+            .map_err(|_| BeaconError::ParseError(format!("beacon header {field} is not hex")))?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

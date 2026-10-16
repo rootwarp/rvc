@@ -1285,6 +1285,8 @@ async fn test_best_of_falls_back_to_unsynced_when_every_synced_bn_times_out() {
             ProduceDuty {
                 expected_proposer_index: 0,
                 expected_parent_root: Some(parent),
+                alternate_parent_root: None,
+                parent_closed: false,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
             },
@@ -1319,6 +1321,8 @@ fn deneb_fee_duty(fee: [u8; 20]) -> ProduceDuty {
     ProduceDuty {
         expected_proposer_index: 7,
         expected_parent_root: Some([0xab; 32]),
+        alternate_parent_root: None,
+        parent_closed: false,
         expected_fee_recipient: Some(fee),
         expected_consensus_version: ForkName::Deneb,
     }
@@ -2867,6 +2871,8 @@ async fn test_sync_query_best_falls_back_to_unsynced_when_synced_fail() {
             ProduceDuty {
                 expected_proposer_index: 0,
                 expected_parent_root: Some(parent),
+                alternate_parent_root: None,
+                parent_closed: false,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
             },
@@ -3941,6 +3947,8 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
             ProduceDuty {
                 expected_proposer_index: 0,
                 expected_parent_root: Some(parent),
+                alternate_parent_root: None,
+                parent_closed: false,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
             },

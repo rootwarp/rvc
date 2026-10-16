@@ -1124,8 +1124,8 @@ mod dispatch_pipeline {
     use async_trait::async_trait;
     use beacon::{
         AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
-        BeaconError, Checkpoint, IndexedAttestationError, SubmitAttestationResult,
-        VersionedAttestation,
+        BeaconError, Checkpoint, IndexedAttestationError, LegacyAttestation,
+        SubmitAttestationResult, VersionedAttestation,
     };
     use bn_manager::{
         testing_broadcast_improving_partial_then_slow, testing_broadcast_partial_then_slow,
@@ -1139,9 +1139,11 @@ mod dispatch_pipeline {
     use timing::MockSlotClock;
     use tracing_test::traced_test;
 
-    use super::super::dispatch::DispatchLimits;
+    use super::super::dispatch::{DispatchLimits, WaveAttribution, WaveEntry};
     use super::AttestationService;
-    use crate::orchestrator::{AttestationOutcome, OrchestratorConfig, PubkeyMap};
+    use crate::orchestrator::{
+        AttestationOutcome, AttestationResult, OrchestratorConfig, PubkeyMap,
+    };
 
     const SLOT: u64 = 1_600;
     const GENESIS: u64 = 1_606_824_023;
@@ -1865,6 +1867,36 @@ mod dispatch_pipeline {
         }
     }
 
+    /// Two already-signed attestations for one `publish_wave`.
+    ///
+    /// The paused clock decides which partial is kept. Building the wave here
+    /// keeps that decision off the blocking-pool order of `spawn_blocking`.
+    fn signed_pair() -> Vec<Result<WaveEntry, AttestationResult>> {
+        let root = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        (0..2)
+            .map(|offset| {
+                Ok(WaveEntry {
+                    attribution: WaveAttribution {
+                        validator_index: (1000 + offset).to_string(),
+                        pubkey: "0x00".to_string(),
+                        slot: SLOT,
+                    },
+                    attestation: VersionedAttestation::PreElectra(vec![LegacyAttestation {
+                        aggregation_bits: "0x01".to_string(),
+                        data: AttestationData {
+                            slot: SLOT.to_string(),
+                            index: "0".to_string(),
+                            beacon_block_root: root.to_string(),
+                            source: Checkpoint { epoch: "0".to_string(), root: root.to_string() },
+                            target: Checkpoint { epoch: "1".to_string(), root: root.to_string() },
+                        },
+                        signature: "0x00".to_string(),
+                    }]),
+                })
+            })
+            .collect()
+    }
+
     /// A short slot-end overhang cancels the wait after a partial acceptance.
     /// The known partial is kept, and the other beacon node still receives the publish.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -1885,7 +1917,7 @@ mod dispatch_pipeline {
         );
         let started = tokio::time::Instant::now();
         let slot_end = started + overhang_slot_budget();
-        let results = fixture.service.process_slot_until(SLOT, slot_end).await.expect("drain");
+        let results = fixture.service.publish_wave(SLOT, slot_end, signed_pair()).await;
         let finished = tokio::time::Instant::now();
         let overhang_at = slot_end + Duration::from_millis(500);
         assert_eq!(results.len(), 2, "{results:?}");
@@ -1983,7 +2015,7 @@ mod dispatch_pipeline {
             },
             submitter,
         );
-        let results = fixture.service.process_slot_until(SLOT, slot_end).await.expect("drain");
+        let results = fixture.service.publish_wave(SLOT, slot_end, signed_pair()).await;
         let finished = tokio::time::Instant::now();
         let overhang_at = slot_end + Duration::from_millis(500);
         assert_eq!(results.len(), 2, "{results:?}");

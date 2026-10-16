@@ -2235,7 +2235,13 @@ async fn build_proposal_boundary_orchestrator(
 }
 
 fn proposal_ctx(slot: Slot) -> SlotContext {
-    SlotContext { slot, epoch: slot / SLOTS_PER_EPOCH, parent_root: None, head_root: None }
+    SlotContext {
+        slot,
+        epoch: slot / SLOTS_PER_EPOCH,
+        parent_root: None,
+        expected_parents: None,
+        head_root: None,
+    }
 }
 
 fn gloas_beacon_block(slot: Slot) -> eth_types::BeaconBlock {

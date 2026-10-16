@@ -13,7 +13,8 @@
 
 use tracing::warn;
 
-use beacon::BeaconError;
+use beacon::{BeaconError, BlockHeaderSummary};
+use block_service::ExpectedParents;
 use bn_manager::BeaconNodeClient;
 use eth_types::{Epoch, Root, Slot};
 use metrics::definitions::{slot_context_parent_fallback, RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL};
@@ -32,8 +33,13 @@ pub(crate) struct SlotContext {
     /// The epoch this slot belongs to.
     pub epoch: Epoch,
     /// Parent of a block proposed for `slot`. Captured at t=0 by walking
-    /// back from `slot - 1`. `None` if every attempt failed.
+    /// back from `slot - 1`. This is the found header's root, kept for
+    /// `capture_head`. `None` if every attempt failed.
     pub parent_root: Option<Root>,
+    /// Parents a block at `slot` may build on. `None` means no parent check
+    /// (the walk stopped on a non-404 error, or no header was found).
+    /// [`ExpectedParents::closed`] rejects every parent.
+    pub expected_parents: Option<ExpectedParents>,
     /// Canonical head as of phase 2. Captured once at t=slot/3 and reused
     /// at phase 3 (H-5). Left `None` at t=0 — a current-slot 404 then is
     /// the normal path, not an exception. `None` after phase 2 means the
@@ -45,15 +51,22 @@ impl SlotContext {
     /// Captures `parent_root` at t=0 by walking back `slot-1` … `slot-4`.
     ///
     /// First 200 wins. Four misses fall back to `"head"` (warn + metric).
-    /// Only a spec 404 continues the walk; any other error stops with
-    /// `parent_root = None`. `head_root` stays `None`.
+    /// Only a spec 404 continues the walk. A non-404 error stops with no
+    /// parent check. A header slot that disagrees with the requested id, or a
+    /// head at slot N or later, rejects every parent. `head_root` stays `None`.
     pub(crate) async fn capture_parent(
         beacon: &dyn BeaconNodeClient,
         slot: Slot,
         epoch: Epoch,
     ) -> Self {
-        let parent_root = walk_back_parent_root(beacon, slot).await;
-        Self { slot, epoch, parent_root, head_root: None }
+        let (parent_root, expected_parents) = match walk_back_parent(beacon, slot).await {
+            ParentCapture::Header(header) => {
+                (Some(header.root), Some(expected_parents_for(slot, &header)))
+            }
+            ParentCapture::Unchecked => (None, None),
+            ParentCapture::Closed => (None, Some(ExpectedParents::closed())),
+        };
+        Self { slot, epoch, parent_root, expected_parents, head_root: None }
     }
 
     /// Captures `head_root` at phase 2 from the slot-qualified current slot.
@@ -69,23 +82,40 @@ impl SlotContext {
     }
 }
 
-enum ParentLookup {
-    Found(Root),
-    Miss,
-    Stop,
+enum ParentCapture {
+    Header(BlockHeaderSummary),
+    /// Non-404, or no header. The parent check is skipped.
+    Unchecked,
+    /// The header slot cannot be an ancestor. Reject every parent.
+    Closed,
 }
 
-async fn walk_back_parent_root(beacon: &dyn BeaconNodeClient, slot: Slot) -> Option<Root> {
+enum ParentLookup {
+    Found(BlockHeaderSummary),
+    Miss,
+    Unchecked,
+    Closed,
+}
+
+/// Header at N-1 accepts its root and its parent. A header below N-1 accepts
+/// only its root.
+fn expected_parents_for(proposal_slot: Slot, header: &BlockHeaderSummary) -> ExpectedParents {
+    let at_previous = proposal_slot.checked_sub(1).is_some_and(|previous| header.slot == previous);
+    ExpectedParents::open(header.root, at_previous.then_some(header.parent_root))
+}
+
+async fn walk_back_parent(beacon: &dyn BeaconNodeClient, slot: Slot) -> ParentCapture {
     let mut attempts = 0u32;
     for offset in 1..=PARENT_WALKBACK_ATTEMPTS {
         let Some(parent_slot) = slot.checked_sub(offset) else {
             break;
         };
         attempts += 1;
-        match lookup_parent_root(beacon, &parent_slot.to_string(), slot).await {
-            ParentLookup::Found(root) => return Some(root),
+        match lookup_header(beacon, &parent_slot.to_string(), slot).await {
+            ParentLookup::Found(header) => return ParentCapture::Header(header),
             ParentLookup::Miss => {}
-            ParentLookup::Stop => return None,
+            ParentLookup::Unchecked => return ParentCapture::Unchecked,
+            ParentLookup::Closed => return ParentCapture::Closed,
         }
     }
 
@@ -93,32 +123,53 @@ async fn walk_back_parent_root(beacon: &dyn BeaconNodeClient, slot: Slot) -> Opt
     RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL
         .with_label_values(&[slot_context_parent_fallback::WALK_BACK_EXHAUSTED])
         .inc();
-    fetch_slot_qualified_root(beacon, "head", slot).await
+    match lookup_header(beacon, "head", slot).await {
+        ParentLookup::Found(header) if header.slot >= slot => {
+            warn!(
+                slot,
+                header_slot = header.slot,
+                "head fallback header is not before the proposal slot"
+            );
+            ParentCapture::Closed
+        }
+        ParentLookup::Found(header) => ParentCapture::Header(header),
+        ParentLookup::Miss | ParentLookup::Unchecked => ParentCapture::Unchecked,
+        ParentLookup::Closed => ParentCapture::Closed,
+    }
 }
 
-async fn lookup_parent_root(
-    beacon: &dyn BeaconNodeClient,
-    block_id: &str,
-    slot: Slot,
-) -> ParentLookup {
-    match beacon.get_block_root(block_id).await {
-        Ok(response) => match parse_hex_root(&response.data.root) {
-            Ok(root) => ParentLookup::Found(root),
-            Err(e) => {
-                // Unusable 200 is not a skip — N-1 may still have a block.
-                warn!(slot, error = %e, "Failed to parse block root for slot context");
-                ParentLookup::Stop
+async fn lookup_header(beacon: &dyn BeaconNodeClient, block_id: &str, slot: Slot) -> ParentLookup {
+    match beacon.get_block_header(block_id).await {
+        Ok(header) => {
+            if let Some(requested) = decimal_slot_id(block_id) {
+                if header.slot != requested {
+                    warn!(
+                        slot,
+                        block_id,
+                        header_slot = header.slot,
+                        "block header slot does not match the requested block id"
+                    );
+                    return ParentLookup::Closed;
+                }
             }
-        },
+            ParentLookup::Found(header)
+        }
         // ARCH-3a: only ApiError { status: 404 } is a spec skip.
         Err(BeaconError::ApiError { status: 404, .. }) => ParentLookup::Miss,
         // 5xx/429/transport/parse/body-too-large: stop so we do not bind
         // root(N-2) while N-1 still exists (H-4 ParentRootMismatch).
         Err(e) => {
-            warn!(slot, error = %e, "Failed to fetch block root for slot context");
-            ParentLookup::Stop
+            warn!(slot, error = %e, "Failed to fetch block header for slot context");
+            ParentLookup::Unchecked
         }
     }
+}
+
+fn decimal_slot_id(block_id: &str) -> Option<Slot> {
+    if block_id.is_empty() || !block_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    block_id.parse().ok()
 }
 
 async fn fetch_slot_qualified_root(
@@ -169,7 +220,7 @@ mod tests {
     }
 
     fn error_beacon() -> MockBeaconNodeClient {
-        MockBeaconNodeClient::new().with_get_block_root(|_| {
+        MockBeaconNodeClient::new().with_get_block_header(|_| {
             Err(beacon::BeaconError::HttpError("simulated BN error".to_string()))
         })
     }
@@ -242,6 +293,11 @@ mod tests {
             Some(expected),
             "capture_parent must use slot-qualified slot-1, not 'head'"
         );
+        assert_eq!(
+            ctx.expected_parents,
+            Some(ExpectedParents { root: expected, parent: Some([0x42; 32]), closed: false }),
+            "a header at N-1 accepts its root and its parent"
+        );
         assert!(ctx.head_root.is_none());
 
         ctx.capture_head(&beacon).await;
@@ -269,6 +325,7 @@ mod tests {
             ctx.parent_root.is_none(),
             "BN error must yield parent_root = None, not a panic or propagated error"
         );
+        assert!(ctx.expected_parents.is_none(), "a non-404 error skips the parent check");
         assert!(ctx.head_root.is_none());
 
         ctx.capture_head(&beacon).await;
@@ -336,11 +393,21 @@ mod tests {
         let parent_slot = slot - 1;
         let parent_hex = format!("0x{}", "11".repeat(32));
         Mock::given(method("GET"))
-            .and(path(format!("/eth/v1/beacon/blocks/{parent_slot}/root")))
+            .and(path(format!("/eth/v1/beacon/headers/{parent_slot}")))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "execution_optimistic": false,
                 "finalized": false,
-                "data": { "root": parent_hex }
+                "data": {
+                    "root": parent_hex,
+                    "header": {
+                        "message": {
+                            "slot": parent_slot.to_string(),
+                            "proposer_index": "1",
+                            "parent_root": format!("0x{}", "22".repeat(32))
+                        },
+                        "signature": format!("0x{}", "33".repeat(96))
+                    }
+                }
             })))
             .expect(1)
             .mount(&mock_server)
@@ -445,33 +512,52 @@ mod tests {
         let head_hex =
             "0x3333333333333333333333333333333333333333333333333333333333333333".to_string();
 
-        let beacon = MockBeaconNodeClient::new().with_get_block_root({
-            let parent_hex = parent_hex.clone();
-            let current_hex = current_hex.clone();
-            let head_hex = head_hex.clone();
-            move |block_id| {
-                let root = if block_id == "head" {
-                    head_hex.clone()
-                } else if block_id == slot.to_string() {
-                    current_hex.clone()
-                } else if block_id == (slot - 1).to_string() {
-                    parent_hex.clone()
-                } else {
-                    return Err(beacon::BeaconError::HttpError(format!(
-                        "unexpected block_id {block_id}"
-                    )));
-                };
-                Ok(DataResponse { data: BlockRootData { root } })
-            }
-        });
+        let beacon = MockBeaconNodeClient::new()
+            .with_get_block_header({
+                let parent_hex = parent_hex.clone();
+                move |block_id| {
+                    if block_id != (slot - 1).to_string() {
+                        return Err(beacon::BeaconError::HttpError(format!(
+                            "unexpected block_id {block_id}"
+                        )));
+                    }
+                    Ok(BlockHeaderSummary {
+                        root: parse_hex_root(&parent_hex).expect("parent hex"),
+                        slot: slot - 1,
+                        proposer_index: 1,
+                        parent_root: [0x44; 32],
+                    })
+                }
+            })
+            .with_get_block_root({
+                let current_hex = current_hex.clone();
+                let head_hex = head_hex.clone();
+                move |block_id| {
+                    let root = if block_id == "head" {
+                        head_hex.clone()
+                    } else if block_id == slot.to_string() {
+                        current_hex.clone()
+                    } else {
+                        return Err(beacon::BeaconError::HttpError(format!(
+                            "unexpected block_id {block_id}"
+                        )));
+                    };
+                    Ok(DataResponse { data: BlockRootData { root } })
+                }
+            });
 
         let mut ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
         assert_eq!(ctx.slot, slot);
         assert_eq!(ctx.epoch, epoch);
+        let parent = parse_hex_root(&parent_hex).unwrap();
         assert_eq!(
             ctx.parent_root,
-            Some(parse_hex_root(&parent_hex).unwrap()),
+            Some(parent),
             "t=0 must capture slot-1, not the current slot or \"head\""
+        );
+        assert_eq!(
+            ctx.expected_parents,
+            Some(ExpectedParents { root: parent, parent: Some([0x44; 32]), closed: false }),
         );
         assert!(
             ctx.head_root.is_none(),
@@ -500,14 +586,20 @@ mod tests {
 
         let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
 
+        let root = parse_hex_root(&hex_for_slot(slot - 2)).unwrap();
         assert_eq!(
             ctx.parent_root,
-            Some(parse_hex_root(&hex_for_slot(slot - 2)).unwrap()),
+            Some(root),
             "one skipped predecessor must resolve to the root of slot-2"
+        );
+        assert_eq!(
+            ctx.expected_parents,
+            Some(ExpectedParents { root, parent: None, closed: false }),
+            "a header below N-1 accepts only that header's root"
         );
         assert!(ctx.head_root.is_none());
         assert_eq!(
-            beacon.get_block_root_calls(),
+            beacon.get_block_header_calls(),
             vec![(slot - 1).to_string(), (slot - 2).to_string()],
             "first 200 wins; must not keep walking after slot-2"
         );
@@ -524,14 +616,19 @@ mod tests {
 
         let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
 
+        let root = parse_hex_root(&hex_for_slot(slot - 4)).unwrap();
         assert_eq!(
             ctx.parent_root,
-            Some(parse_hex_root(&hex_for_slot(slot - 4)).unwrap()),
+            Some(root),
             "three consecutive skips must resolve to the root of slot-4"
+        );
+        assert_eq!(
+            ctx.expected_parents,
+            Some(ExpectedParents { root, parent: None, closed: false })
         );
         assert!(ctx.head_root.is_none());
         assert_eq!(
-            beacon.get_block_root_calls(),
+            beacon.get_block_header_calls(),
             vec![
                 (slot - 1).to_string(),
                 (slot - 2).to_string(),
@@ -553,14 +650,20 @@ mod tests {
 
         let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
 
+        let root = parse_hex_root(&hex_for_head()).unwrap();
         assert_eq!(
             ctx.parent_root,
-            Some(parse_hex_root(&hex_for_head()).unwrap()),
+            Some(root),
             "four consecutive misses must use the terminal \"head\" root"
+        );
+        assert_eq!(
+            ctx.expected_parents,
+            Some(ExpectedParents { root, parent: None, closed: false }),
+            "head below N-1 accepts only the header root"
         );
         assert!(ctx.head_root.is_none());
         assert_eq!(
-            beacon.get_block_root_calls(),
+            beacon.get_block_header_calls(),
             vec![
                 (slot - 1).to_string(),
                 (slot - 2).to_string(),
@@ -587,11 +690,12 @@ mod tests {
         let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
 
         assert!(ctx.parent_root.is_none());
+        assert!(ctx.expected_parents.is_none());
         assert!(ctx.head_root.is_none());
         assert!(
-            beacon.get_block_root_calls().len() <= 1,
+            beacon.get_block_header_calls().len() <= 1,
             "transport error must stop the walk; issued {} queries",
-            beacon.get_block_root_calls().len()
+            beacon.get_block_header_calls().len()
         );
         assert_eq!(fallback_count(), before, "transport stop is not walk_back_exhausted");
     }
@@ -602,14 +706,19 @@ mod tests {
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;
         let before = fallback_count();
-        let beacon = MockBeaconNodeClient::new().with_get_block_root(move |block_id| {
+        let beacon = MockBeaconNodeClient::new().with_get_block_header(move |block_id| {
             if block_id == (slot - 1).to_string() {
                 return Err(beacon::BeaconError::ApiError {
                     status: 503,
                     message: "service unavailable".to_string(),
                 });
             }
-            Ok(DataResponse { data: BlockRootData { root: hex_for_slot(slot - 2) } })
+            Ok(BlockHeaderSummary {
+                root: parse_hex_root(&hex_for_slot(slot - 2)).expect("slot-2 hex"),
+                slot: slot - 2,
+                proposer_index: 1,
+                parent_root: [0x22; 32],
+            })
         });
 
         let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
@@ -618,9 +727,10 @@ mod tests {
             ctx.parent_root.is_none(),
             "non-404 on slot-1 must not bind slot-2 as expected parent"
         );
+        assert!(ctx.expected_parents.is_none(), "a non-404 error skips the parent check");
         assert!(ctx.head_root.is_none());
         assert_eq!(
-            beacon.get_block_root_calls(),
+            beacon.get_block_header_calls(),
             vec![(slot - 1).to_string()],
             "5xx must not walk to slot-2"
         );
@@ -633,9 +743,9 @@ mod tests {
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;
         let before = fallback_count();
-        let beacon = MockBeaconNodeClient::new().with_get_block_root(move |block_id| {
+        let beacon = MockBeaconNodeClient::new().with_get_block_header(move |block_id| {
             if block_id == (slot - 1).to_string() {
-                return Ok(DataResponse { data: BlockRootData { root: "not-a-root".to_string() } });
+                return Err(beacon::BeaconError::ParseError("not-a-root".to_string()));
             }
             Err(beacon::BeaconError::HttpError(format!("unexpected block_id {block_id}")))
         });
@@ -646,12 +756,135 @@ mod tests {
             ctx.parent_root.is_none(),
             "parse failure on slot-1 must not bind slot-2 as expected parent"
         );
+        assert!(ctx.expected_parents.is_none());
         assert!(ctx.head_root.is_none());
         assert_eq!(
-            beacon.get_block_root_calls(),
+            beacon.get_block_header_calls(),
             vec![(slot - 1).to_string()],
             "parse error must not walk to slot-2"
         );
         assert_eq!(fallback_count(), before, "parse stop is not walk_back_exhausted");
+    }
+
+    /// A numeric id whose header slot disagrees is not a miss. The walk stops.
+    #[tokio::test]
+    async fn test_capture_parent_stops_when_header_slot_disagrees() {
+        let slot: Slot = 100;
+        let epoch: Epoch = slot / 32;
+        let before = fallback_count();
+        let beacon = MockBeaconNodeClient::new().with_get_block_header(move |block_id| {
+            if block_id != (slot - 1).to_string() {
+                return Err(beacon::BeaconError::HttpError(format!(
+                    "unexpected block_id {block_id}"
+                )));
+            }
+            Ok(BlockHeaderSummary {
+                root: [0x11; 32],
+                slot: slot - 5,
+                proposer_index: 1,
+                parent_root: [0x22; 32],
+            })
+        });
+
+        let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
+
+        assert!(ctx.parent_root.is_none());
+        let parents = ctx.expected_parents.expect("slot mismatch fails closed");
+        assert!(parents.closed);
+        assert!(!parents.accepts([0x11; 32]));
+        assert!(!parents.accepts([0xff; 32]));
+        assert_eq!(beacon.get_block_header_calls(), vec![(slot - 1).to_string()]);
+        assert_eq!(fallback_count(), before);
+    }
+
+    /// Head at slot N or later is not an ancestor. Every parent is rejected.
+    #[tokio::test]
+    async fn test_capture_parent_head_at_or_after_proposal_slot_rejects_every_parent() {
+        for header_slot in [100u64, 101] {
+            let slot: Slot = 100;
+            let epoch: Epoch = slot / 32;
+            let beacon = MockBeaconNodeClient::new().with_get_block_header(move |block_id| {
+                if block_id == "head" {
+                    Ok(BlockHeaderSummary {
+                        root: [0x11; 32],
+                        slot: header_slot,
+                        proposer_index: 1,
+                        parent_root: [0x22; 32],
+                    })
+                } else {
+                    Err(beacon::BeaconError::ApiError {
+                        status: 404,
+                        message: "missing".to_string(),
+                    })
+                }
+            });
+
+            let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
+
+            assert!(ctx.parent_root.is_none(), "header slot {header_slot} is not a parent");
+            let parents = ctx.expected_parents.expect("head at N or later fails closed");
+            assert!(parents.closed);
+            assert!(!parents.accepts([0x11; 32]));
+            assert!(!parents.accepts([0x22; 32]));
+            assert!(!parents.accepts([0u8; 32]));
+        }
+    }
+
+    /// Head fallback whose header is exactly N-1 accepts that header's parent.
+    #[tokio::test]
+    async fn test_capture_parent_head_at_previous_slot_keeps_reorg_parent() {
+        let slot: Slot = 100;
+        let epoch: Epoch = slot / 32;
+        let header_root = [0x11; 32];
+        let header_parent = [0x22; 32];
+        let beacon = MockBeaconNodeClient::new().with_get_block_header(move |block_id| {
+            if block_id == "head" {
+                Ok(BlockHeaderSummary {
+                    root: header_root,
+                    slot: slot - 1,
+                    proposer_index: 1,
+                    parent_root: header_parent,
+                })
+            } else {
+                Err(beacon::BeaconError::ApiError { status: 404, message: "missing".to_string() })
+            }
+        });
+
+        let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
+
+        assert_eq!(ctx.parent_root, Some(header_root));
+        assert_eq!(
+            ctx.expected_parents,
+            Some(ExpectedParents { root: header_root, parent: Some(header_parent), closed: false })
+        );
+    }
+
+    /// Head fallback below N-1 accepts only the header root.
+    #[tokio::test]
+    async fn test_capture_parent_head_below_previous_slot_drops_reorg_parent() {
+        let slot: Slot = 100;
+        let epoch: Epoch = slot / 32;
+        let header_root = [0x11; 32];
+        let header_parent = [0x22; 32];
+        let beacon = MockBeaconNodeClient::new().with_get_block_header(move |block_id| {
+            if block_id == "head" {
+                Ok(BlockHeaderSummary {
+                    root: header_root,
+                    slot: slot - 2,
+                    proposer_index: 1,
+                    parent_root: header_parent,
+                })
+            } else {
+                Err(beacon::BeaconError::ApiError { status: 404, message: "missing".to_string() })
+            }
+        });
+
+        let ctx = SlotContext::capture_parent(&beacon, slot, epoch).await;
+
+        assert_eq!(ctx.parent_root, Some(header_root));
+        assert_eq!(
+            ctx.expected_parents,
+            Some(ExpectedParents { root: header_root, parent: None, closed: false })
+        );
     }
 }

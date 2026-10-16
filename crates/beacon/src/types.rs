@@ -420,6 +420,18 @@ pub struct BlockRootData {
 /// Response type for the block root endpoint.
 pub type BlockRootResponse = DataResponse<BlockRootData>;
 
+/// Block header fields from `GET /eth/v1/beacon/headers/{block_id}`.
+///
+/// The beacon header message has no fork. The produced block's consensus
+/// version is checked against the duty fork separately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockHeaderSummary {
+    pub root: [u8; 32],
+    pub slot: u64,
+    pub proposer_index: u64,
+    pub parent_root: [u8; 32],
+}
+
 pub use eth_types::SignedAggregateAndProof;
 pub use eth_types::SignedContributionAndProof;
 pub use eth_types::SyncCommitteeMessage;
