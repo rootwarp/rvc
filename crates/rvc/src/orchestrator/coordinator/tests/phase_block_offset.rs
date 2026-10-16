@@ -65,6 +65,39 @@ async fn mount_slot_loop_mocks(
         .respond_with(root)
         .mount(mock_server)
         .await;
+    // t=0 parent capture reads the header. The delay is what the offset records.
+    let header_delay = root_delay;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/eth/v1/beacon/headers/.*"))
+        .respond_with(move |request: &wiremock::Request| {
+            let id = request.url.path().rsplit('/').next().unwrap_or("1");
+            let slot = if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+                id
+            } else {
+                "1"
+            };
+            let mut header = ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "execution_optimistic": false,
+                "finalized": false,
+                "data": {
+                    "root": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                    "header": {
+                        "message": {
+                            "slot": slot,
+                            "proposer_index": "1",
+                            "parent_root": "0x0000000000000000000000000000000000000000000000000000000000000002"
+                        },
+                        "signature": "0x00"
+                    }
+                }
+            }));
+            if let Some(delay) = header_delay {
+                header = header.set_delay(delay);
+            }
+            header
+        })
+        .mount(mock_server)
+        .await;
 }
 
 fn histogram_count(cache: &str) -> u64 {

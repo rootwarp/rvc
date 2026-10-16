@@ -22,7 +22,7 @@ use crate::traits::{
     BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse, ProduceDuty,
 };
 use crate::types::BlockSelectionMode;
-use crate::validation::BlockResponseValidator;
+use crate::validation::{BlockResponseValidator, ExpectedParents};
 use crate::BlockServiceError;
 
 /// Result of a successful block proposal.
@@ -174,9 +174,9 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     /// Propose a block for the given duty slot and validator key.
     ///
     /// Validates `proposer_index` against `expected_proposer_index` and, when
-    /// `expected_parent_root` is `Some`, validates `parent_root` against the
-    /// previous-slot parent before calling the signer. On validation failure the
-    /// duty is dropped with an `error!` log and no signer call is made (H-4).
+    /// `expected_parents` is `Some`, validates `parent_root` against that set
+    /// before calling the signer. On validation failure the duty is dropped
+    /// with a `warn!` and no signer call is made (H-4).
     #[tracing::instrument(
         name = "block.propose",
         level = "debug",
@@ -193,14 +193,10 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         slot: Slot,
         pubkey: &PublicKey,
         expected_proposer_index: u64,
-        expected_parent_root: Option<Root>,
+        expected_parents: Option<ExpectedParents>,
     ) -> Result<BlockProposalResult, BlockServiceError> {
         let mode = self.validator_store.effective_block_selection_mode(&pubkey.to_bytes());
-        let validator = BlockResponseValidator {
-            expected_proposer_index,
-            expected_parent_root,
-            expected_slot: slot,
-        };
+        let validator = BlockResponseValidator { expected_proposer_index, expected_parents };
         self.propose_block_impl(slot, pubkey, mode, Some(&validator)).await
     }
 
@@ -324,7 +320,17 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                             Some(boost),
                             ProduceDuty {
                                 expected_proposer_index: checks.expected_proposer_index,
-                                expected_parent_root: checks.expected_parent_root,
+                                expected_parent_root: checks
+                                    .expected_parents
+                                    .filter(|parents| !parents.closed)
+                                    .map(|parents| parents.root),
+                                alternate_parent_root: checks
+                                    .expected_parents
+                                    .filter(|parents| !parents.closed)
+                                    .and_then(|parents| parents.parent),
+                                parent_closed: checks
+                                    .expected_parents
+                                    .is_some_and(|parents| parents.closed),
                                 expected_fee_recipient: Some(fee_recipient),
                                 expected_consensus_version: fork,
                             },
@@ -510,15 +516,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 "BlockContents must not include Eth-Builder-Url".to_string(),
             ));
         }
-        if block.slot != slot {
-            return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
-        }
-        if let Some(v) = validator {
-            v.validate_full(&block).map_err(|e| {
-                error!(slot = slot, error = %e, "BN block response validation failed — dropping duty");
-                e
-            })?;
-        }
+        check_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
         let envelope_root = if let Some((ref envelope_body, _, _)) = envelope {
             let envelope_ssz = envelope_ssz_for_island(envelope_body)?;
             Some(rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz)?)
@@ -661,33 +659,23 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             let (block, _) =
                 beacon::ssz_deser::deserialize_blinded_beacon_block_from_ssz(ssz_bytes, format)
                     .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-            if block.slot != slot {
-                return Err(BlockServiceError::Parse(format!(
-                    "SSZ block slot mismatch: header has {}, expected {}",
-                    block.slot, slot,
-                )));
-            }
-            if let Some(v) = validator {
-                v.validate_blinded(&block).map_err(|e| {
-                    error!(slot = slot, error = %e, "BN SSZ blinded block validation failed — dropping duty");
-                    e
-                })?;
-            }
+            check_response_block(
+                validator,
+                slot,
+                block.slot,
+                block.proposer_index,
+                block.parent_root,
+            )?;
             (compute_blinded_block_root(&block)?, header_from_blinded(&block)?)
         } else if let Some(contents) = contents.as_ref() {
             let block = &contents.block;
-            if block.slot != slot {
-                return Err(BlockServiceError::Parse(format!(
-                    "SSZ block slot mismatch: header has {}, expected {}",
-                    block.slot, slot,
-                )));
-            }
-            if let Some(v) = validator {
-                v.validate_full(block).map_err(|e| {
-                    error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
-                    e
-                })?;
-            }
+            check_response_block(
+                validator,
+                slot,
+                block.slot,
+                block.proposer_index,
+                block.parent_root,
+            )?;
             // ISSUE-4.3 (L-3) defense-in-depth: log internal KZG commitment binding.
             // For Deneb+ BlockContents payloads the body includes blob_kzg_commitments;
             // this fingerprint is an rvc-internal binding (NOT spec-aligned —
@@ -712,18 +700,13 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             let (block, _) =
                 beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
                     .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-            if block.slot != slot {
-                return Err(BlockServiceError::Parse(format!(
-                    "SSZ block slot mismatch: header has {}, expected {}",
-                    block.slot, slot,
-                )));
-            }
-            if let Some(v) = validator {
-                v.validate_full(&block).map_err(|e| {
-                    error!(slot = slot, error = %e, "BN SSZ block validation failed — dropping duty");
-                    e
-                })?;
-            }
+            check_response_block(
+                validator,
+                slot,
+                block.slot,
+                block.proposer_index,
+                block.parent_root,
+            )?;
             (compute_block_root(&block)?, header_from_full(&block)?)
         };
 
@@ -789,17 +772,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let block_contents = response.parse_full_block()?;
         let block = block_contents.block().clone();
 
-        if block.slot != slot {
-            return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
-        }
-
-        // H-4: validate proposer_index and parent_root before signing.
-        if let Some(v) = validator {
-            v.validate_full(&block).map_err(|e| {
-                error!(slot = slot, error = %e, "BN block response validation failed — dropping duty");
-                e
-            })?;
-        }
+        check_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
 
         // ISSUE-4.3 (L-3) defense-in-depth: bind blob KZG commitments canonically.
         //
@@ -926,17 +899,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         reject_blinded_at_gloas(true, &response.consensus_version, slot, &self.fork_schedule)?;
         let block = response.parse_blinded_block()?;
 
-        if block.slot != slot {
-            return Err(BlockServiceError::SlotMismatch { requested: slot, got: block.slot });
-        }
-
-        // H-4: validate proposer_index and parent_root before signing.
-        if let Some(v) = validator {
-            v.validate_blinded(&block).map_err(|e| {
-                error!(slot = slot, error = %e, "BN blinded block response validation failed — dropping duty");
-                e
-            })?;
-        }
+        check_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
 
         let block_root = compute_blinded_block_root(&block)?;
         let header = header_from_blinded(&block)?;
@@ -966,6 +929,32 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         Ok((block_root, true))
     }
+}
+
+/// One pre-sign check for every produce arm.
+///
+/// Slot is compared to the duty first. Proposer index and parent root run only
+/// when a validator is present (`propose_block_with_mode` passes `None`). A
+/// rejection is logged at WARN and returned; the signer is not called.
+fn check_response_block(
+    validator: Option<&BlockResponseValidator>,
+    slot: Slot,
+    got_slot: Slot,
+    proposer_index: u64,
+    parent_root: Root,
+) -> Result<(), BlockServiceError> {
+    if got_slot != slot {
+        let err = BlockServiceError::SlotMismatch { requested: slot, got: got_slot };
+        warn!(slot, error = %err, "BN block response rejected");
+        return Err(err);
+    }
+    if let Some(validator) = validator {
+        validator.validate(proposer_index, parent_root).map_err(|err| {
+            warn!(slot, error = %err, "BN block response rejected");
+            err
+        })?;
+    }
+    Ok(())
 }
 
 /// Encode a signed block plus the produce-time arrays. The signed block is not published.

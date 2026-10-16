@@ -3,6 +3,22 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Block production: a block may build on the parent of the previous slot
+
+At proposal slot N, the parent walk reads `GET /eth/v1/beacon/headers/{block_id}`.
+The first header found is the canonical parent. When that header is exactly at
+slot N-1, a block whose parent is that header's own parent is also signed and
+published, but only after the soft deadline and only when no block on the
+header root is in hand. That covers a single-slot proposer re-org. The header
+root ranks ahead of that re-org parent. A header below N-1 accepts only that
+header's root. A non-404 error skips the parent check rather than binding an
+older block. A header whose slot does not match the requested id, or a head
+fallback at slot N or later, rejects every parent. Every produced block is
+still checked for slot, proposer index, and parent before it is signed. A
+block that fails those checks is logged at warning, and that log names the
+re-org parent when one is allowed. A rejection does not stop the search while
+another candidate matches.
+
 ## Block production: a slow beacon node no longer drops a block already in hand
 
 `produce_block_v3` treats a block as in hand only when it passes the hard
@@ -45,7 +61,8 @@ that slot's proposal.
 If every synced proposal node fails or misses the budget, another
 proposal-role node is tried only when it is still above the health floor
 (small lag or better, healthy, not optimistic, and execution online) and the
-expected parent root is known. Its block has to match that parent. A readable
+expected parent root is known. Its block has to match that primary parent.
+The re-org parent is not accepted on this path. A readable
 fee mismatch is kept only when no fee-matching block is available. A blinded
 block keeps the builder header's fee recipient. The attempt stays inside the
 time left in the backstop, and ends 50 ms early once a block is held. The

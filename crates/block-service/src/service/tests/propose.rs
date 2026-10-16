@@ -1014,7 +1014,14 @@ async fn test_propose_block_parent_root_mismatch_drops_duty() {
     );
 
     let expected_parent: Root = [0xee; 32];
-    let result = service.propose_block(slot, &pubkey, 42, Some(expected_parent)).await;
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected_parent, parent: None, closed: false }),
+        )
+        .await;
 
     assert!(result.is_err());
     assert!(
@@ -1053,12 +1060,19 @@ async fn test_propose_block_rejects_a_wrong_ancestor_parent() {
         [0xaa; 32],
     );
 
-    let result = service.propose_block(slot, &pubkey, 42, Some(previous_slot_parent)).await;
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: previous_slot_parent, parent: None, closed: false }),
+        )
+        .await;
 
     assert!(
         matches!(
             result,
-            Err(BlockServiceError::ParentRootMismatch { expected, got })
+            Err(BlockServiceError::ParentRootMismatch { expected, got, .. })
             if expected == previous_slot_parent && got == wrong_ancestor
         ),
         "wrong-ancestor parent must be ParentRootMismatch, got {result:?}"
@@ -1094,7 +1108,14 @@ async fn test_propose_block_accepts_the_previous_slot_parent() {
         [0xaa; 32],
     );
 
-    let result = service.propose_block(slot, &pubkey, 42, Some(previous_slot_parent)).await;
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: previous_slot_parent, parent: None, closed: false }),
+        )
+        .await;
 
     assert!(result.is_ok(), "previous-slot parent must be accepted, got {result:?}");
     assert_eq!(
@@ -1103,6 +1124,124 @@ async fn test_propose_block_accepts_the_previous_slot_parent() {
         "signer must be called when parent is the previous-slot root"
     );
     beacon_arc.assert_last_published_block(slot, 42);
+}
+
+struct ParentProposal {
+    result: Result<BlockProposalResult, BlockServiceError>,
+    signer_calls: usize,
+    publish_calls: usize,
+}
+
+async fn propose_with_parent(
+    slot: Slot,
+    block_parent: Root,
+    expected: Option<ExpectedParents>,
+) -> ParentProposal {
+    let pubkey = test_pubkey();
+    let mut block = test_block(slot);
+    block.parent_root = block_parent;
+    let beacon = Arc::new(MockBeaconClient::unblinded(block));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service.propose_block(slot, &pubkey, 42, expected).await;
+    let signer_calls = signer.block_calls.lock().unwrap().len();
+    let publish_calls = beacon.publish_calls.lock().unwrap().len();
+    ParentProposal { result, signer_calls, publish_calls }
+}
+
+/// Header at N-1 is {R1, parent R2}. A block on R1 and a block on R2 are both
+/// signed and published. A third root is `ParentRootMismatch` and is not signed.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_propose_block_accepts_header_and_reorg_parent() {
+    let header: Root = [0x11; 32];
+    let reorg: Root = [0x22; 32];
+    let third: Root = [0x33; 32];
+    let expected = ExpectedParents { root: header, parent: Some(reorg), closed: false };
+
+    for parent in [header, reorg] {
+        let proposal = propose_with_parent(100, parent, Some(expected)).await;
+        assert!(
+            proposal.result.is_ok(),
+            "parent {parent:?} must be signed and published, got {:?}",
+            proposal.result
+        );
+        assert_eq!(proposal.signer_calls, 1);
+        assert_eq!(proposal.publish_calls, 1);
+    }
+
+    let rejected = propose_with_parent(100, third, Some(expected)).await;
+    let text = rejected.result.as_ref().expect_err("third ancestor").to_string();
+    assert!(
+        matches!(
+            rejected.result,
+            Err(BlockServiceError::ParentRootMismatch { expected, reorg_parent, got, .. })
+            if expected == header && reorg_parent == Some(reorg) && got == third
+        ),
+        "a third ancestor must be ParentRootMismatch, got {:?}",
+        rejected.result
+    );
+    assert!(text.contains(&hex::encode(reorg)), "log and error must name the reorg parent: {text}");
+    assert_eq!(rejected.signer_calls, 0, "signer must not run after a parent rejection");
+    assert_eq!(rejected.publish_calls, 0, "a rejected block must not be published");
+    assert!(logs_contain("BN block response rejected"));
+    assert!(logs_contain("parent_root mismatch"));
+}
+
+/// N % 32 == 0 does not drop the parent of the N-1 header.
+#[tokio::test]
+async fn test_propose_block_accepts_reorg_parent_on_epoch_boundary() {
+    let slot = 40 * SLOTS_PER_EPOCH;
+    assert_eq!(slot % SLOTS_PER_EPOCH, 0);
+    let header: Root = [0x11; 32];
+    let reorg: Root = [0x22; 32];
+    let expected = ExpectedParents { root: header, parent: Some(reorg), closed: false };
+
+    let accepted = propose_with_parent(slot, reorg, Some(expected)).await;
+    assert!(
+        accepted.result.is_ok(),
+        "epoch-boundary reorg parent must be published, got {:?}",
+        accepted.result
+    );
+    assert_eq!(accepted.signer_calls, 1);
+    assert_eq!(accepted.publish_calls, 1);
+
+    let rejected = propose_with_parent(slot, [0x33; 32], Some(expected)).await;
+    assert!(matches!(rejected.result, Err(BlockServiceError::ParentRootMismatch { .. })));
+    assert_eq!(rejected.signer_calls, 0);
+    assert_eq!(rejected.publish_calls, 0);
+}
+
+/// A header below N-1 accepts only that header's root.
+#[tokio::test]
+async fn test_propose_block_rejects_header_parent_when_header_is_older() {
+    let header: Root = [0x11; 32];
+    let header_parent: Root = [0x22; 32];
+    let expected = ExpectedParents { root: header, parent: None, closed: false };
+
+    let accepted = propose_with_parent(100, header, Some(expected)).await;
+    assert!(accepted.result.is_ok(), "header root must be published, got {:?}", accepted.result);
+    assert_eq!(accepted.signer_calls, 1);
+    assert_eq!(accepted.publish_calls, 1);
+
+    let rejected = propose_with_parent(100, header_parent, Some(expected)).await;
+    assert!(
+        matches!(
+            rejected.result,
+            Err(BlockServiceError::ParentRootMismatch { expected, got, .. })
+            if expected == header && got == header_parent
+        ),
+        "header parent must be rejected, got {:?}",
+        rejected.result
+    );
+    assert_eq!(rejected.signer_calls, 0);
+    assert_eq!(rejected.publish_calls, 0);
 }
 
 /// Correct proposer_index with None parent_root — proposal proceeds.

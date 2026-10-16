@@ -708,7 +708,13 @@ mod tests {
         let service = setup_service(beacon, pk_hex, pk, sk).await;
 
         // SlotContext constructed once at slot start — this is the fix's contract.
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some(r_captured),
+        };
 
         // Run both sync-committee phases with the same context.
         service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
@@ -763,7 +769,13 @@ mod tests {
         ));
 
         let service = setup_service(beacon, pk_hex, pk, sk).await;
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: None };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: None,
+        };
 
         let before_messages = skip_count(sync_committee_skip_phase::MESSAGES);
         let before_contributions = skip_count(sync_committee_skip_phase::CONTRIBUTIONS);
@@ -814,7 +826,13 @@ mod tests {
         let service = setup_service(beacon, pk_hex, pk, sk).await;
 
         // head_root = None simulates a BN failure during SlotContext::capture_head.
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: None };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: None,
+        };
 
         service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
 
@@ -851,7 +869,13 @@ mod tests {
         let service = setup_service(beacon, pk_hex, pk, sk).await;
 
         // head_root = None simulates a BN failure during SlotContext::capture_head.
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: None };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: None,
+        };
 
         service.maybe_produce_sync_contributions(0, 0, &ctx).await;
 
@@ -890,7 +914,13 @@ mod tests {
 
         let service = setup_service_with_store(beacon, pk_hex, pk, sk, store).await;
 
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some([0xAA; 32]),
+        };
         service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
 
         // No messages must be submitted for a disabled validator.
@@ -999,7 +1029,13 @@ mod tests {
             store,
         );
 
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some([0xAA; 32]),
+        };
         service.maybe_produce_sync_contributions(0, 0, &ctx).await;
 
         // In GREEN: filter_sync_duties returns [] because the validator is
@@ -1103,7 +1139,13 @@ mod tests {
             store,
         );
 
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some([0xAA; 32]),
+        };
         // Must complete without panic / hang — isolation property.
         service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
 
@@ -1197,7 +1239,13 @@ mod tests {
             store,
         );
 
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some([0xAA; 32]),
+        };
         service.maybe_produce_sync_contributions(0, 0, &ctx).await;
 
         // A and C are aggregators for subcommittee 0 → two contribution fetches
@@ -1320,7 +1368,13 @@ mod tests {
         let service = setup_service(beacon, pk_hex, pk, sk).await;
         let slot_end = tokio::time::Instant::now();
         tokio::time::advance(Duration::from_millis(1)).await;
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some([0xAA; 32]),
+        };
         service.maybe_produce_sync_messages(0, 0, &ctx, slot_end).await;
         assert_eq!(*submitted.lock().unwrap(), 0, "no sync message is published after slot end");
         assert_eq!(service.slot_end_drops(), 1);
@@ -1353,7 +1407,13 @@ mod tests {
             setup_service(Arc::clone(&beacon) as Arc<dyn BeaconNodeClient>, pk_hex, pk, sk).await;
         let started = tokio::time::Instant::now();
         let slot_end = started + Duration::from_millis(50);
-        let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some([0xAA; 32]) };
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some([0xAA; 32]),
+        };
         service.maybe_produce_sync_messages(0, 0, &ctx, slot_end).await;
         let finished = tokio::time::Instant::now();
         let overhang_at = slot_end + Duration::from_millis(500);
@@ -1454,6 +1514,7 @@ mod tests {
                     slot: 0,
                     epoch: 0,
                     parent_root: None,
+                    expected_parents: None,
                     head_root: Some([0xAA; 32]),
                 };
                 let slot_end = tokio::time::Instant::now() + Duration::from_secs(30);

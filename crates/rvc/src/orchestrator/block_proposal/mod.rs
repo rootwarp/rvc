@@ -142,7 +142,7 @@ where
                 slot,
                 &pubkey,
                 expected_proposer_index,
-                ctx.parent_root,
+                ctx.expected_parents,
             ),
         )
         .await

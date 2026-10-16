@@ -1,8 +1,10 @@
 # Fingerprint baseline for Gate 2a (gitleaks). Exact `file:rule:line` only.
 # Regenerated 2026-09-29 for tip 909a705e / PR #396 — prior entries drifted after refactors
 # (e.g. slashing db → interchange.rs). Not related to DSR-3.1 digest pins in docs.
-crates/beacon/src/types.rs:generic-api-key:1391
-crates/beacon/src/types.rs:generic-api-key:928
+# Same attester/proposer duty pubkeys. Lines moved 928 → 940 and 1391 → 1403
+# when BlockHeaderSummary landed in types.rs (#641).
+crates/beacon/src/types.rs:generic-api-key:1403
+crates/beacon/src/types.rs:generic-api-key:940
 crates/crypto/examples/log_sample.rs:generic-api-key:27
 crates/crypto/src/key_manager.rs:generic-api-key:452
 crates/crypto/src/key_manager.rs:generic-api-key:704

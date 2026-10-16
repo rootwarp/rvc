@@ -6,12 +6,13 @@
 // Re-exports for topic submodules (`use super::*`).
 pub(super) use super::{
     compute_blinded_block_root, compute_block_root, gloas_header_and_root, ssz_block_format,
-    BlockService, PayloadDeadline,
+    BlockProposalResult, BlockService, PayloadDeadline,
 };
 pub(super) use crate::traits::{
     BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse,
 };
 pub(super) use crate::types::BlockSelectionMode;
+pub(super) use crate::validation::ExpectedParents;
 pub(super) use crate::BlockServiceError;
 pub(super) use crypto::PublicKey;
 pub(super) use eth_types::{ForkSchedule, Root, Slot, SLOTS_PER_EPOCH};

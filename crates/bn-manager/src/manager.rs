@@ -7,14 +7,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconClient, BeaconCommitteeSubscription,
-    BeaconError, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry, ConfigSpecResponse,
-    GenesisResponse, IndexedFailure, PayloadAttestationDataResponse, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof,
-    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    WireBody,
+    BeaconError, BlockHeaderSummary, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry,
+    ConfigSpecResponse, GenesisResponse, IndexedFailure, PayloadAttestationDataResponse,
+    ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -407,7 +407,9 @@ struct BestSelect<T> {
     pick_best: Rank<T>,
     /// Hard checks. `false` is dropped.
     accept: Pred<T>,
-    /// Hard checks and the right fee. Closes the soft window and stops fallback.
+    /// Fallback hard checks. The re-org parent fails this even when [`Self::accept`] allows it.
+    fallback_accept: Pred<T>,
+    /// Hard checks, the right fee, and the primary parent. Closes the soft window.
     in_hand: Pred<T>,
     /// Called once for each `Ok` that fails [`Self::accept`], including on the drain.
     on_reject: RejectFn<T>,
@@ -1338,6 +1340,7 @@ impl BnManager {
             BestSelect {
                 pick_best: Arc::new(pick_best),
                 in_hand: Arc::clone(&accept),
+                fallback_accept: Arc::clone(&accept),
                 accept,
                 on_reject,
                 on_chosen: Arc::new(|_, _| {}),
@@ -1467,7 +1470,7 @@ impl BnManager {
     ///
     /// `window.deadline` bounds each attempt by the time still left. `None`
     /// leaves the attempts unbounded, matching a round with no budget configured. An `Ok`
-    /// that fails `accept` is not returned. A candidate that is not in hand is
+    /// that fails `fallback_accept` is not returned. A candidate that is not in hand is
     /// held so a later matching candidate can win. Once a block is held, a
     /// later attempt stops [`HELD_RETURN_MARGIN`] before `deadline`, so the
     /// outer backstop cannot drop that block. The best held candidate is
@@ -1535,7 +1538,7 @@ impl BnManager {
                         i,
                         TrackerOutcome::Success(elapsed),
                     );
-                    if !(select.accept)(&result) {
+                    if !(select.fallback_accept)(&result) {
                         (select.on_reject)(i, client.endpoint(), &result);
                         continue;
                     }
@@ -1849,7 +1852,8 @@ fn produce_best_select(
     checks: Option<BlockDutyChecks>,
     policy: FeeRecipientPolicy,
 ) -> BestSelect<ProduceBlockResponse> {
-    let allow_fallback = checks.as_ref().is_some_and(|checks| checks.parent_root.is_some());
+    let allow_fallback =
+        checks.as_ref().is_some_and(|checks| !checks.parent_closed && checks.parent_root.is_some());
     let accept_checks = checks;
     let accept: Pred<ProduceBlockResponse> = Arc::new(move |block| match accept_checks.as_ref() {
         Some(checks) => block_passes_duty(block, checks, policy),
@@ -1857,9 +1861,21 @@ fn produce_best_select(
     });
     let hand_checks = checks;
     let in_hand: Pred<ProduceBlockResponse> = Arc::new(move |block| match hand_checks.as_ref() {
-        Some(checks) => block_passes_duty(block, checks, policy) && fee_preferred(block, checks),
+        Some(checks) => {
+            block_passes_duty(block, checks, policy)
+                && fee_preferred(block, checks)
+                && parent_is_primary(block, checks)
+        }
         None => true,
     });
+    let fallback_checks = checks;
+    let fallback_accept: Pred<ProduceBlockResponse> =
+        Arc::new(move |block| match fallback_checks.as_ref() {
+            Some(checks) => {
+                block_passes_duty(block, checks, policy) && parent_is_primary(block, checks)
+            }
+            None => true,
+        });
     let rank_checks = checks;
     let pick_best: Rank<ProduceBlockResponse> =
         Arc::new(move |left, right| candidate_ranks_above(left, right, rank_checks.as_ref()));
@@ -1877,7 +1893,7 @@ fn produce_best_select(
             crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.inc();
         }
     });
-    BestSelect { pick_best, accept, in_hand, on_reject, on_chosen, allow_fallback }
+    BestSelect { pick_best, accept, fallback_accept, in_hand, on_reject, on_chosen, allow_fallback }
 }
 
 /// Fallback may use a proposal-role BN at this tier or healthier.
@@ -1893,8 +1909,22 @@ struct BlockDutyChecks {
     slot: u64,
     proposer_index: u64,
     parent_root: Option<[u8; 32]>,
+    alternate_parent_root: Option<[u8; 32]>,
+    parent_closed: bool,
     fee_recipient: Option<[u8; 20]>,
     consensus_version: ForkName,
+}
+
+fn checks_from_duty(slot: u64, duty: ProduceDuty) -> BlockDutyChecks {
+    BlockDutyChecks {
+        slot,
+        proposer_index: duty.expected_proposer_index,
+        parent_root: duty.expected_parent_root,
+        alternate_parent_root: duty.alternate_parent_root,
+        parent_closed: duty.parent_closed,
+        fee_recipient: duty.expected_fee_recipient,
+        consensus_version: duty.expected_consensus_version,
+    }
 }
 
 fn above_fallback_floor(
@@ -1980,8 +2010,14 @@ fn hard_reject_reason(
     if fields.proposer_index != checks.proposer_index {
         return Some(HardReject::Proposer);
     }
+    if checks.parent_closed {
+        return Some(HardReject::Parent);
+    }
     if let Some(expected) = checks.parent_root {
-        if fields.parent_root != expected {
+        let on_primary = fields.parent_root == expected;
+        let on_alternate =
+            checks.alternate_parent_root.is_some_and(|alternate| fields.parent_root == alternate);
+        if !on_primary && !on_alternate {
             return Some(HardReject::Parent);
         }
     }
@@ -2041,9 +2077,40 @@ fn fee_preferred(block: &ProduceBlockResponse, checks: &BlockDutyChecks) -> bool
     }
 }
 
+/// `true` when `block` uses the primary parent, or no parent was required.
+///
+/// The re-org parent is accepted by [`block_passes_duty`] and is not primary.
+/// A closed parent set is never primary.
+fn parent_is_primary(block: &ProduceBlockResponse, checks: &BlockDutyChecks) -> bool {
+    if checks.parent_closed {
+        return false;
+    }
+    let Some(expected) = checks.parent_root else {
+        return true;
+    };
+    duty_fields(block).is_some_and(|fields| fields.parent_root == expected)
+}
+
+/// 2 is the primary parent (or no parent constraint), 1 is the re-org parent.
+fn parent_rank(block: &ProduceBlockResponse, checks: &BlockDutyChecks) -> u8 {
+    if checks.parent_closed {
+        return 0;
+    }
+    let Some(fields) = duty_fields(block) else {
+        return 0;
+    };
+    match checks.parent_root {
+        None => 2,
+        Some(expected) if fields.parent_root == expected => 2,
+        Some(_) if checks.alternate_parent_root.is_some_and(|alt| fields.parent_root == alt) => 1,
+        Some(_) => 0,
+    }
+}
+
 /// `true` when `left` ranks strictly above `right`.
 ///
-/// A fee-preferred block outranks a penalized one regardless of value. Within
+/// The primary parent outranks the re-org parent. Within that class, a
+/// fee-preferred block outranks a penalized one regardless of value. Within
 /// the same fee class, [`is_better_block`] decides.
 fn candidate_ranks_above(
     left: &ProduceBlockResponse,
@@ -2051,6 +2118,11 @@ fn candidate_ranks_above(
     checks: Option<&BlockDutyChecks>,
 ) -> bool {
     if let Some(checks) = checks {
+        match parent_rank(left, checks).cmp(&parent_rank(right, checks)) {
+            std::cmp::Ordering::Greater => return true,
+            std::cmp::Ordering::Less => return false,
+            std::cmp::Ordering::Equal => {}
+        }
         match (fee_preferred(left, checks), fee_preferred(right, checks)) {
             (true, false) => return true,
             (false, true) => return false,
@@ -2099,6 +2171,8 @@ fn log_produce_rejection(
         proposer_expected = checks.proposer_index,
         proposer_got = %display_opt_u64(observed.proposer),
         parent_expected = %display_expected_root(checks.parent_root),
+        parent_reorg = %display_expected_root(checks.alternate_parent_root),
+        parent_closed = checks.parent_closed,
         parent_got = %display_opt_root(observed.parent),
         fork_expected = checks.consensus_version.as_ref(),
         fork_got = %block.consensus_version,
@@ -2528,6 +2602,14 @@ impl NodeStatusApi for BnManager {
         .await
     }
 
+    async fn get_block_header(&self, block_id: &str) -> Result<BlockHeaderSummary, BeaconError> {
+        // no budget: header lookup; OperationTimeouts has no field for it
+        self.query_first("get_block_header", BnRole::All, HealthTier::SmallLag, None, |c| {
+            Box::pin(c.get_block_header(block_id))
+        })
+        .await
+    }
+
     // -- Node status: query(First), any role --
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
@@ -2650,13 +2732,7 @@ impl BlockProducer for BnManager {
             randao_reveal,
             graffiti,
             builder_boost_factor,
-            Some(BlockDutyChecks {
-                slot,
-                proposer_index: duty.expected_proposer_index,
-                parent_root: duty.expected_parent_root,
-                fee_recipient: duty.expected_fee_recipient,
-                consensus_version: duty.expected_consensus_version,
-            }),
+            Some(checks_from_duty(slot, duty)),
         )
         .await
     }
@@ -3300,6 +3376,10 @@ impl_beacon_client_passthrough! {
             &self,
             block_id: &str,
         ) -> Result<BlockRootResponse, BeaconError>;
+        async fn get_block_header(
+            &self,
+            block_id: &str,
+        ) -> Result<BlockHeaderSummary, BeaconError>;
         async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError>;
         async fn get_node_version(&self) -> Result<String, BeaconError>;
     }
@@ -3473,9 +3553,11 @@ mod tests {
         on_reject: impl Fn(usize, &str, &ProduceBlockResponse) + Send + Sync + 'static,
         allow_fallback: bool,
     ) -> BestSelect<ProduceBlockResponse> {
+        let accept: Pred<ProduceBlockResponse> = Arc::new(accept);
         BestSelect {
             pick_best: Arc::new(pick_best),
-            accept: Arc::new(accept),
+            fallback_accept: Arc::clone(&accept),
+            accept,
             in_hand: Arc::new(in_hand),
             on_reject: Arc::new(on_reject),
             on_chosen: Arc::new(|_, _| {}),
@@ -3496,10 +3578,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 36 methods across the seven role traits (see impl_beacon_client_passthrough!).
+        // 37 methods across the seven role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            36,
+            37,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -3515,6 +3597,7 @@ mod tests {
         // Spot-check that each role trait is represented.
         for required in [
             "get_genesis",
+            "get_block_header",
             "get_genesis_matching_validators_root",
             "get_attester_duties",
             "post_ptc_duties",
@@ -4117,6 +4200,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: None,
             consensus_version: ForkName::Deneb,
         };
@@ -4180,6 +4265,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some([0xab; 32]),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: None,
             consensus_version: ForkName::Deneb,
         };
@@ -4340,6 +4427,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
         };
@@ -4385,6 +4474,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some([0x11; 20]),
             consensus_version: ForkName::Deneb,
         };
@@ -4430,6 +4521,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
         };
@@ -4484,6 +4577,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
         };
@@ -4546,6 +4641,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
         };
@@ -4616,6 +4713,8 @@ mod tests {
             slot: 7,
             proposer_index: 42,
             parent_root: Some([0xab; 32]),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some([0x11; 20]),
             consensus_version: ForkName::Deneb,
         };
@@ -4632,6 +4731,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
         };
@@ -4659,6 +4760,171 @@ mod tests {
         assert!(!candidate_ranks_above(&high, &low, Some(&checks)));
     }
 
+    /// The re-org parent is copied onto the duty checks, ranks below the
+    /// primary parent, and does not count as in hand.
+    #[test]
+    fn reorg_parent_is_stored_on_the_duty_checks() {
+        let primary = [0x11u8; 32];
+        let reorg = [0x22u8; 32];
+        let checks = checks_from_duty(
+            1,
+            ProduceDuty {
+                expected_proposer_index: 7,
+                expected_parent_root: Some(primary),
+                alternate_parent_root: Some(reorg),
+                parent_closed: false,
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+            },
+        );
+        assert_eq!(checks.parent_root, Some(primary));
+        assert_eq!(checks.alternate_parent_root, Some(reorg));
+        assert!(!checks.parent_closed);
+
+        let primary_block = duty_response("1000", 1, 7, primary, None);
+        let reorg_block = duty_response("9000", 1, 7, reorg, None);
+        let other = duty_response("9000", 1, 7, [0x33; 32], None);
+        assert!(passes_sign(&primary_block, &checks));
+        assert!(passes_sign(&reorg_block, &checks));
+        assert!(!passes_sign(&other, &checks));
+        assert!(parent_is_primary(&primary_block, &checks));
+        assert!(!parent_is_primary(&reorg_block, &checks));
+        assert!(candidate_ranks_above(&primary_block, &reorg_block, Some(&checks)));
+        assert!(!candidate_ranks_above(&reorg_block, &primary_block, Some(&checks)));
+
+        let closed = checks_from_duty(
+            1,
+            ProduceDuty {
+                expected_proposer_index: 7,
+                expected_parent_root: None,
+                alternate_parent_root: None,
+                parent_closed: true,
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+            },
+        );
+        assert!(matches!(
+            hard_reject_reason(&primary_block, &closed, FeeRecipientPolicy::Sign),
+            Some(HardReject::Parent)
+        ));
+        assert!(!passes_sign(&duty_response("1", 1, 7, [0u8; 32], None), &closed));
+    }
+
+    /// A fast re-org parent must not close the soft window ahead of the primary.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn alternate_parent_does_not_close_the_soft_deadline() {
+        let manager = manager_with_endpoints(&["bn-reorg", "bn-primary"]);
+        let primary = [0x11u8; 32];
+        let reorg = [0x22u8; 32];
+        let checks = checks_from_duty(
+            1,
+            ProduceDuty {
+                expected_proposer_index: 7,
+                expected_parent_root: Some(primary),
+                alternate_parent_root: Some(reorg),
+                parent_closed: false,
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+            },
+        );
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-reorg") {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            Ok(duty_response("9000", 1, 7, reorg, None))
+                        } else {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            Ok(duty_response("1000", 1, 7, primary, None))
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+            )
+            .await
+            .expect("primary parent");
+        assert_eq!(result.execution_payload_value.as_deref(), Some("1000"));
+        assert!(
+            start.elapsed() >= Duration::from_secs(2),
+            "reorg parent must not win at the soft deadline, elapsed {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// Fallback keeps the primary parent and drops the re-org parent.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fallback_accepts_only_the_primary_parent() {
+        let primary = [0x11u8; 32];
+        let reorg = [0x22u8; 32];
+        let checks = checks_from_duty(
+            1,
+            ProduceDuty {
+                expected_proposer_index: 7,
+                expected_parent_root: Some(primary),
+                alternate_parent_root: Some(reorg),
+                parent_closed: false,
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+            },
+        );
+
+        let reorg_only = manager_with_endpoints(&["synced", "fallback-reorg"]);
+        set_sync(&reorg_only, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&reorg_only, 1, BnSyncStatus::Syncing, 9).await;
+        let rejected = reorg_only
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("fallback-reorg") {
+                            Ok(duty_response("9000", 1, 7, reorg, None))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+            )
+            .await;
+        assert!(rejected.is_err(), "fallback must not return the reorg parent: {rejected:?}");
+
+        let primary_fallback = manager_with_endpoints(&["synced", "fallback-primary"]);
+        set_sync(&primary_fallback, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&primary_fallback, 1, BnSyncStatus::Syncing, 9).await;
+        let accepted = primary_fallback
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("fallback-primary") {
+                            Ok(duty_response("7000", 1, 7, primary, None))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+            )
+            .await
+            .expect("primary parent on fallback");
+        assert_eq!(accepted.execution_payload_value.as_deref(), Some("7000"));
+    }
+
     /// A hard reject logs slot, proposer, parent, fork, fee, and the value parse.
     #[tokio::test(flavor = "current_thread")]
     #[tracing_test::traced_test]
@@ -4670,6 +4936,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
         };
@@ -4723,6 +4991,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some(expected),
             consensus_version: ForkName::Deneb,
         };
@@ -4764,6 +5034,8 @@ mod tests {
             slot: 1,
             proposer_index: 7,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some(expected),
             consensus_version: ForkName::Deneb,
         };
@@ -4846,6 +5118,8 @@ mod tests {
             slot: 7,
             proposer_index: 42,
             parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
         };
@@ -4908,6 +5182,8 @@ mod tests {
                 slot: 7,
                 proposer_index: 42,
                 parent_root: Some(parent),
+                alternate_parent_root: None,
+                parent_closed: false,
                 fee_recipient: Some(fee),
                 consensus_version: fork,
             };
@@ -5995,7 +6271,7 @@ mod tests {
             .filter(|(_, line)| line.contains("// no budget:"))
             .map(|(index, _)| format!("manager.rs:{}", index + 1))
             .collect();
-        let expected_no_budget_sites = 10;
+        let expected_no_budget_sites = 11;
         let actual_no_budget_sites = no_budget_sites.len();
         let sites = no_budget_sites.join(", ");
         assert_eq!(

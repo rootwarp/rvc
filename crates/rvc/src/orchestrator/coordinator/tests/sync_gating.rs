@@ -175,7 +175,13 @@ async fn test_sync_runs_with_attesting_disabled() {
     // Confirm default: sync is enabled
     assert!(orchestrator.sync_enabled.load(Ordering::Acquire));
 
-    let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
+    let ctx = SlotContext {
+        slot: 0,
+        epoch: 0,
+        parent_root: None,
+        expected_parents: None,
+        head_root: Some(r_captured),
+    };
 
     // Exercise the guarded sync-messages phase directly.
     orchestrator
@@ -218,7 +224,13 @@ async fn test_sync_messages_skipped_when_sync_disabled() {
     orchestrator.set_sync_enabled(false);
     assert!(!orchestrator.sync_enabled.load(Ordering::Acquire));
 
-    let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
+    let ctx = SlotContext {
+        slot: 0,
+        epoch: 0,
+        parent_root: None,
+        expected_parents: None,
+        head_root: Some(r_captured),
+    };
 
     orchestrator
         .run_sync_messages_phase(0, 0, &ctx, tokio::time::Instant::now() + Duration::from_secs(60))
@@ -250,7 +262,13 @@ async fn test_sync_contributions_skipped_when_sync_disabled() {
     // Disable sync: contributions must not call the signer.
     orchestrator.set_sync_enabled(false);
 
-    let ctx = SlotContext { slot: 0, epoch: 0, parent_root: None, head_root: Some(r_captured) };
+    let ctx = SlotContext {
+        slot: 0,
+        epoch: 0,
+        parent_root: None,
+        expected_parents: None,
+        head_root: Some(r_captured),
+    };
     // With sync_enabled=false the phase guard returns early before any
     // signer or BN call. The test just verifies no panic and no submission.
     orchestrator.run_sync_contributions_phase(0, 0, &ctx).await;

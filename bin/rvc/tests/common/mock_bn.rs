@@ -232,6 +232,35 @@ impl MockBn {
             .mount(&self.server)
             .await;
 
+        // Parent capture reads headers. A numeric id must report that slot.
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/eth/v1/beacon/headers/.+$"))
+            .respond_with(|request: &wiremock::Request| {
+                let id = request.url.path().rsplit('/').next().unwrap_or("1");
+                let slot = if !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()) {
+                    id
+                } else {
+                    "1"
+                };
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "execution_optimistic": false,
+                    "finalized": false,
+                    "data": {
+                        "root": "0x0000000000000000000000000000000000000000000000000000000000000001",
+                        "header": {
+                            "message": {
+                                "slot": slot,
+                                "proposer_index": "1",
+                                "parent_root": "0x0000000000000000000000000000000000000000000000000000000000000002"
+                            },
+                            "signature": "0x00"
+                        }
+                    }
+                }))
+            })
+            .mount(&self.server)
+            .await;
+
         Mock::given(method("GET"))
             .and(path_regex(r"^/eth/v1/validator/duties/proposer/\d+$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

@@ -37,6 +37,51 @@ fn block_root_not_found() -> BeaconError {
     BeaconError::ApiError { status: 404, message: "Block not found".to_string() }
 }
 
+/// `None` is `"head"` / `"finalized"`. A slot at or after `head_slot`, or a
+/// skipped slot, is a spec 404.
+fn resolve_block_id(
+    block_id: &str,
+    head_slot: Slot,
+    skipped: &[Slot],
+) -> Result<Option<Slot>, BeaconError> {
+    if block_id == "head" || block_id == "finalized" {
+        return Ok(None);
+    }
+    let parsed = block_id.parse::<Slot>().map_err(|_| block_root_not_found())?;
+    if parsed >= head_slot || skipped.contains(&parsed) {
+        return Err(block_root_not_found());
+    }
+    Ok(Some(parsed))
+}
+
+fn canonical_head_slot(head_slot: Slot, skipped: &[Slot]) -> Slot {
+    let mut slot = head_slot;
+    loop {
+        let Some(prev) = slot.checked_sub(1) else {
+            return 0;
+        };
+        if !skipped.contains(&prev) {
+            return prev;
+        }
+        slot = prev;
+    }
+}
+
+fn parse_mock_root(text: &str) -> Result<[u8; 32], BeaconError> {
+    let hex_str = text.strip_prefix("0x").unwrap_or(text);
+    if hex_str.len() != 64 {
+        return Err(BeaconError::ParseError("block root must be 32 bytes".to_string()));
+    }
+    let mut out = [0u8; 32];
+    for (index, byte) in out.iter_mut().enumerate() {
+        let start = index * 2;
+        let digits = &hex_str[start..start + 2];
+        *byte = u8::from_str_radix(digits, 16)
+            .map_err(|_| BeaconError::ParseError("block root is not hex".to_string()))?;
+    }
+    Ok(out)
+}
+
 struct MethodHook<A, R> {
     handler: Mutex<Option<Handler<A, R>>>,
     calls: Mutex<Vec<A>>,
@@ -86,6 +131,7 @@ pub enum MockMethod {
     GetFork,
     GetValidators,
     GetBlockRoot,
+    GetBlockHeader,
     GetNodeSyncing,
     GetNodeVersion,
     GetAttesterDuties,
@@ -120,7 +166,7 @@ pub enum MockMethod {
 #[cfg(test)]
 impl MockMethod {
     /// Every role-trait method, discriminants `0..ALL.len()` with no gaps.
-    const ALL: [Self; 36] = [
+    const ALL: [Self; 37] = [
         Self::GetGenesis,
         Self::GetGenesisMatchingValidatorsRoot,
         Self::GetConfigSpec,
@@ -128,6 +174,7 @@ impl MockMethod {
         Self::GetFork,
         Self::GetValidators,
         Self::GetBlockRoot,
+        Self::GetBlockHeader,
         Self::GetNodeSyncing,
         Self::GetNodeVersion,
         Self::GetAttesterDuties,
@@ -176,6 +223,7 @@ pub struct MockBeaconNodeClient {
     get_fork: MethodHook<String, StateForkResponse>,
     get_validators: MethodHook<Vec<String>, ValidatorsResponse>,
     get_block_root: MethodHook<String, BlockRootResponse>,
+    get_block_header: MethodHook<String, beacon::BlockHeaderSummary>,
     get_node_syncing: MethodHook<(), SyncingResponse>,
     get_node_version: MethodHook<(), String>,
     // DutiesProvider
@@ -368,28 +416,49 @@ impl MockBeaconNodeClient {
         self
     }
 
+    pub fn with_get_block_header(
+        self,
+        f: impl Fn(String) -> Result<beacon::BlockHeaderSummary, BeaconError> + Send + Sync + 'static,
+    ) -> Self {
+        self.get_block_header.set_handler(Arc::new(f));
+        self
+    }
+
     /// Spec-honest block-root stub: `block_id` values that name a slot at or after
     /// `head_slot` answer `404` the way a conformant BN does (beacon-APIs
     /// `blocks/{block_id}/root`); `"head"`, `"finalized"` and slots <= head resolve
     /// to `root_for(slot)`. Skipped slots named in `skipped` also 404.
+    ///
+    /// The same rules answer `get_block_header`. A numeric id's header slot is
+    /// that id. `"head"` uses the greatest slot below `head_slot` that is not
+    /// skipped. The header parent is a fixed root distinct from `root_for`.
     pub fn with_slot_aware_block_root(
         self,
         head_slot: Slot,
         skipped: &[Slot],
         root_for: impl Fn(Option<Slot>) -> String + Send + Sync + 'static,
     ) -> Self {
+        let root_for: Arc<dyn Fn(Option<Slot>) -> String + Send + Sync> = Arc::new(root_for);
         let skipped = skipped.to_vec();
+        let root_for_header = Arc::clone(&root_for);
+        let skipped_header = skipped.clone();
         self.get_block_root.set_handler(Arc::new(move |block_id: String| {
-            let slot = if block_id == "head" || block_id == "finalized" {
-                None
-            } else {
-                let parsed = block_id.parse::<Slot>().map_err(|_| block_root_not_found())?;
-                if parsed >= head_slot || skipped.contains(&parsed) {
-                    return Err(block_root_not_found());
-                }
-                Some(parsed)
-            };
+            let slot = resolve_block_id(&block_id, head_slot, &skipped)?;
             Ok(BlockRootResponse { data: BlockRootData { root: root_for(slot) } })
+        }));
+        self.get_block_header.set_handler(Arc::new(move |block_id: String| {
+            let queried = resolve_block_id(&block_id, head_slot, &skipped_header)?;
+            let slot = match queried {
+                Some(slot) => slot,
+                None => canonical_head_slot(head_slot, &skipped_header),
+            };
+            let root = parse_mock_root(&root_for_header(queried))?;
+            Ok(beacon::BlockHeaderSummary {
+                root,
+                slot,
+                proposer_index: 0,
+                parent_root: [0x42; 32],
+            })
         }));
         self
     }
@@ -761,6 +830,10 @@ impl MockBeaconNodeClient {
         self.get_block_root.calls()
     }
 
+    pub fn get_block_header_calls(&self) -> Vec<String> {
+        self.get_block_header.calls()
+    }
+
     pub fn get_fork_calls(&self) -> Vec<String> {
         self.get_fork.calls()
     }
@@ -857,6 +930,14 @@ impl NodeStatusApi for MockBeaconNodeClient {
     async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
         self.charge(MockMethod::GetBlockRoot).await;
         self.get_block_root.invoke("get_block_root", block_id.to_string())
+    }
+
+    async fn get_block_header(
+        &self,
+        block_id: &str,
+    ) -> Result<beacon::BlockHeaderSummary, BeaconError> {
+        self.charge(MockMethod::GetBlockHeader).await;
+        self.get_block_header.invoke("get_block_header", block_id.to_string())
     }
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError> {
@@ -1582,6 +1663,9 @@ mod tests {
             }
             MockMethod::GetBlockRoot => {
                 let _ = mock.get_block_root("head").await;
+            }
+            MockMethod::GetBlockHeader => {
+                let _ = mock.get_block_header("head").await;
             }
             MockMethod::GetNodeSyncing => {
                 let _ = mock.get_node_syncing().await;

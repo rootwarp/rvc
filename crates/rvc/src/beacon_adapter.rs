@@ -50,6 +50,8 @@ impl BeaconBlockClient for BeaconBlockAdapter {
                 BnProduceDuty {
                     expected_proposer_index: duty.expected_proposer_index,
                     expected_parent_root: duty.expected_parent_root,
+                    alternate_parent_root: duty.alternate_parent_root,
+                    parent_closed: duty.parent_closed,
                     expected_fee_recipient: duty.expected_fee_recipient,
                     expected_consensus_version: duty.expected_consensus_version,
                 },

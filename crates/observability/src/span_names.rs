@@ -31,6 +31,7 @@ pub const ALL: &[&str] = &[
     "beacon.get_aggregate_attestation",
     "beacon.get_attestation_data",
     "beacon.get_attester_duties",
+    "beacon.get_block_header",
     "beacon.get_block_root",
     "beacon.get_config_spec",
     "beacon.get_fork",

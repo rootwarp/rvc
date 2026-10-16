@@ -29,12 +29,8 @@ pub enum BlockServiceError {
     #[error("proposer_index mismatch: expected {expected}, got {got}")]
     ProposerIndexMismatch { expected: u64, got: u64 },
 
-    #[error(
-        "parent_root mismatch: expected 0x{}, got 0x{}",
-        hex::encode(expected),
-        hex::encode(got)
-    )]
-    ParentRootMismatch { expected: Root, got: Root },
+    #[error("{}", parent_mismatch_message(expected, reorg_parent, got, closed))]
+    ParentRootMismatch { expected: Root, reorg_parent: Option<Root>, got: Root, closed: bool },
 
     /// SSZ format selection has no named arm for this consensus version.
     #[error("unrecognised consensus version for SSZ block format: {0}")]
@@ -63,6 +59,26 @@ pub enum BlockServiceError {
     /// used for a live JSON publish path.
     #[error("{0} is unsupported; override it on any client used for a live JSON publish path")]
     Unsupported(&'static str),
+}
+
+fn parent_mismatch_message(
+    expected: &Root,
+    reorg_parent: &Option<Root>,
+    got: &Root,
+    closed: &bool,
+) -> String {
+    let got = hex::encode(got);
+    if *closed {
+        return format!("parent_root mismatch: no parent accepted, got 0x{got}");
+    }
+    let expected = hex::encode(expected);
+    match reorg_parent {
+        Some(reorg) => format!(
+            "parent_root mismatch: expected 0x{expected} or 0x{}, got 0x{got}",
+            hex::encode(reorg)
+        ),
+        None => format!("parent_root mismatch: expected 0x{expected}, got 0x{got}"),
+    }
 }
 
 impl From<BeaconError> for BlockServiceError {

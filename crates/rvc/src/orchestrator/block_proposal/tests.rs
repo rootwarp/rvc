@@ -117,7 +117,8 @@ async fn test_maybe_propose_block_bad_proposer_index_drops_duty() {
     ));
 
     // Invoke the proposer path directly.
-    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
+    let ctx =
+        SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
     orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
     // H-4: a forged proposer_index must drop the duty before any
@@ -229,7 +230,8 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
         pubkey_map,
     ));
 
-    let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
+    let ctx =
+        SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
     orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
     // D-3: the block must NOT be proposed when is_signing_enabled=false.
@@ -345,23 +347,35 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
     let validator_index = 42u64;
     let r_prev: Root = [0x11; 32];
     let r_curr: Root = [0x22; 32];
-    let r_prev_hex = format!("0x{}", hex::encode(r_prev));
     let r_curr_hex = format!("0x{}", hex::encode(r_curr));
 
     let secret_key = SecretKey::generate();
     let pubkey = secret_key.public_key();
     let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
 
+    let reorg_parent: Root = [0x33; 32];
     let beacon = Arc::new(
         MockBeaconNodeClient::new()
+            .with_get_block_header({
+                move |block_id| {
+                    if block_id != (slot - 1).to_string() {
+                        return Err(beacon::BeaconError::HttpError(format!(
+                            "unexpected block_id {block_id}"
+                        )));
+                    }
+                    Ok(beacon::BlockHeaderSummary {
+                        root: r_prev,
+                        slot: slot - 1,
+                        proposer_index: 1,
+                        parent_root: reorg_parent,
+                    })
+                }
+            })
             .with_get_block_root({
-                let r_prev_hex = r_prev_hex.clone();
                 let r_curr_hex = r_curr_hex.clone();
                 move |block_id| {
                     let root = if block_id == slot.to_string() {
                         r_curr_hex.clone()
-                    } else if block_id == (slot - 1).to_string() {
-                        r_prev_hex.clone()
                     } else {
                         return Err(beacon::BeaconError::HttpError(format!(
                             "unexpected block_id {block_id}"
@@ -439,6 +453,15 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
     let mut ctx = SlotContext::capture_parent(beacon.as_ref(), slot, epoch).await;
     ctx.capture_head(beacon.as_ref()).await;
     assert_eq!(ctx.parent_root, Some(r_prev), "t=0 parent must be slot N-1");
+    assert_eq!(
+        ctx.expected_parents,
+        Some(block_service::ExpectedParents {
+            root: r_prev,
+            parent: Some(reorg_parent),
+            closed: false
+        }),
+        "a header at N-1 keeps its parent for a single-slot re-org"
+    );
     assert_eq!(ctx.head_root, Some(r_curr), "phase-2 head must be slot N");
 
     orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
@@ -624,7 +647,7 @@ async fn test_successful_proposal_increments_success_outcome() {
             proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS);
         let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
 
-        let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
+        let ctx = SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
         orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
         assert!(published.load(Ordering::SeqCst), "success path must publish");
@@ -715,7 +738,7 @@ async fn test_failed_proposal_increments_failed_outcome() {
             proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS);
         let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
 
-        let ctx = SlotContext { slot, epoch, parent_root: None, head_root: None };
+        let ctx = SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
         orchestrator.maybe_propose_block(slot, epoch, &ctx).await;
 
         assert_eq!(

@@ -705,6 +705,7 @@ where
                         slot: current_slot,
                         epoch: current_epoch,
                         parent_root: None,
+                        expected_parents: None,
                         head_root: None,
                     }
                 }

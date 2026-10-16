@@ -6593,3 +6593,105 @@ async fn aggregate_fetch_retries_503_then_succeeds() {
         "503 retry must not fall back to v1"
     );
 }
+
+#[tokio::test]
+async fn test_get_block_header_parses_root_slot_proposer_and_parent() {
+    let mock_server = MockServer::start().await;
+    let root = "0x1111111111111111111111111111111111111111111111111111111111111111";
+    let parent = "0x2222222222222222222222222222222222222222222222222222222222222222";
+    let header_body = |slot: &str, root: &str, parent: &str| {
+        json!({
+            "execution_optimistic": false,
+            "finalized": false,
+            "data": {
+                "root": root,
+                "canonical": true,
+                "header": {
+                    "message": {
+                        "slot": slot,
+                        "proposer_index": "7",
+                        "parent_root": parent,
+                        "state_root": root,
+                        "body_root": root
+                    },
+                    "signature": "0x00"
+                }
+            }
+        })
+    };
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/headers/99"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(header_body("99", root, parent)))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/headers/missing"))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_string(r#"{"code":404,"message":"NOT_FOUND"}"#),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/headers/bad-slot"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(header_body("nope", root, parent)))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/headers/short-root"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(header_body("1", "0xabcd", parent)))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(0))
+        .expect("client");
+
+    let header = client.get_block_header("99").await.expect("header");
+    assert_eq!(header.slot, 99);
+    assert_eq!(header.proposer_index, 7);
+    assert_eq!(header.root, [0x11; 32]);
+    assert_eq!(header.parent_root, [0x22; 32]);
+
+    let missing = client.get_block_header("missing").await;
+    assert!(matches!(missing, Err(BeaconError::ApiError { status: 404, .. })), "{missing:?}");
+
+    let bad_slot = client.get_block_header("bad-slot").await;
+    assert!(matches!(bad_slot, Err(BeaconError::ParseError(_))), "{bad_slot:?}");
+
+    let short_root = client.get_block_header("short-root").await;
+    assert!(matches!(short_root, Err(BeaconError::ParseError(_))), "{short_root:?}");
+}
+
+/// A 404 on a later attempt must not replace an earlier 500.
+#[tokio::test]
+async fn test_later_404_does_not_hide_an_earlier_server_error() {
+    let mock_server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/headers/99"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/headers/99"))
+        .respond_with(
+            ResponseTemplate::new(404).set_body_string(r#"{"code":404,"message":"NOT_FOUND"}"#),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(
+        BeaconClientConfig::new(mock_server.uri())
+            .with_max_retries(1)
+            .with_initial_backoff(Duration::from_millis(1)),
+    )
+    .expect("client");
+    let err = client.get_block_header("99").await.expect_err("500 then 404");
+    assert!(matches!(err, BeaconError::ApiError { status: 500, .. }), "{err:?}");
+}
