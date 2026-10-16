@@ -14,5 +14,5 @@ pub use beacon::{BuilderConfig, ProduceBlockResponse, RankedBlock, WireBody};
 pub use error::BlockServiceError;
 pub use service::{BlockProposalResult, BlockService};
 pub use traits::{BeaconBlockClient, BuilderConfigProvider, ProduceDuty};
-pub use types::BlockSelectionMode;
+pub use types::{BlockSelectionMode, CandidateShape};
 pub use validation::ExpectedParents;

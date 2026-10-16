@@ -6,7 +6,7 @@
 //! `eth_types::Root` (`[u8; 32]`) is used, not re-exported.
 
 use eth_types::Root;
-use libssz::SszDecode;
+use libssz::{SszDecode, SszEncode};
 use libssz_merkle::{HashTreeRoot, Sha2Hasher};
 
 use crate::containers::attestation::{AggregateAndProof, Attestation, IndexedAttestation};
@@ -14,6 +14,13 @@ use crate::containers::block_body::from_ssz_bytes;
 use crate::containers::envelope::ExecutionPayloadEnvelope;
 use crate::containers::leaves::BeaconBlockHeader;
 use crate::error::GloasError;
+
+/// consensus-specs `BUILDER_INDEX_SELF_BUILD` (`ValidatorIndex(UINT64_MAX)`).
+///
+/// A Gloas bid with this `builder_index` is a self-build. Every other index is
+/// an external bid. The produce container (`BlockContents` vs `BeaconBlock`)
+/// does not decide that.
+pub const BUILDER_INDEX_SELF_BUILD: u64 = u64::MAX;
 
 /// Official `MAX_COMMITTEES_PER_SLOT` values. `committee_bits` is `Bitvector[N]`;
 /// SSZ `fixed_part_len` differs, so a payload decodes at exactly one N.
@@ -116,6 +123,138 @@ pub fn gloas_block_root(header: &HeaderFields, body_ssz: &[u8]) -> Result<Root, 
         body_root,
     };
     Ok(block_header.hash_tree_root(&Sha2Hasher))
+}
+
+/// Slot, parent, and `builder_index` of the bid embedded in a Gloas body.
+///
+/// `parent_block_root` is the beacon parent. `parent_block_hash` is the
+/// execution parent and is not part of this binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BidBinding {
+    pub builder_index: u64,
+    pub slot: u64,
+    pub parent_block_root: Root,
+}
+
+/// Bid fields that must match the block before it is signed.
+///
+/// Decode failure is [`GloasError::InvalidBody`]. A body that does not decode
+/// is not treated as self-build or as an external bid.
+pub fn gloas_bid_binding(body_ssz: &[u8]) -> Result<BidBinding, GloasError> {
+    bid_binding_at::<MAX_COMMITTEES_PER_SLOT_MINIMAL, SYNC_COMMITTEE_SIZE_MINIMAL, PTC_SIZE_MINIMAL>(
+        body_ssz,
+    )
+    .or_else(|_| {
+        bid_binding_at::<
+            MAX_COMMITTEES_PER_SLOT_MAINNET,
+            SYNC_COMMITTEE_SIZE_MAINNET,
+            PTC_SIZE_MAINNET,
+        >(body_ssz)
+    })
+}
+
+fn bid_binding_at<const COMMITTEES: usize, const SYNC: usize, const PTC: usize>(
+    body_ssz: &[u8],
+) -> Result<BidBinding, GloasError> {
+    let body = from_ssz_bytes::<COMMITTEES, SYNC, PTC>(body_ssz)?;
+    let bid = &body.signed_execution_payload_bid.message;
+    Ok(BidBinding {
+        builder_index: bid.builder_index,
+        slot: bid.slot,
+        parent_block_root: bid.parent_block_root,
+    })
+}
+
+/// `builder_index` of the signed execution-payload bid embedded in a Gloas body.
+///
+/// Decode failure is [`GloasError::InvalidBody`]. A body that does not decode
+/// is not treated as self-build or as an external bid.
+pub fn gloas_bid_builder_index(body_ssz: &[u8]) -> Result<u64, GloasError> {
+    Ok(gloas_bid_binding(body_ssz)?.builder_index)
+}
+
+/// Fields of an `ExecutionPayloadEnvelope` that must match the block being signed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EnvelopeBinding {
+    pub builder_index: u64,
+    pub beacon_block_root: Root,
+    pub parent_beacon_block_root: Root,
+}
+
+/// Envelope fields that must match the block being signed.
+///
+/// Decode failure is [`GloasError::InvalidBody`].
+pub fn gloas_envelope_binding(ssz: &[u8]) -> Result<EnvelopeBinding, GloasError> {
+    let envelope = ExecutionPayloadEnvelope::from_ssz_bytes(ssz)
+        .map_err(|err| GloasError::InvalidBody { reason: format!("{err:?}") })?;
+    Ok(EnvelopeBinding {
+        builder_index: envelope.builder_index,
+        beacon_block_root: envelope.beacon_block_root,
+        parent_beacon_block_root: envelope.parent_beacon_block_root,
+    })
+}
+
+/// Copy `body_ssz` with the bid `builder_index` replaced. The rest of the body is unchanged.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn body_with_bid_builder_index(
+    body_ssz: &[u8],
+    builder_index: u64,
+) -> Result<Vec<u8>, GloasError> {
+    let binding = gloas_bid_binding(body_ssz)?;
+    body_with_bid_binding(body_ssz, builder_index, binding.slot, binding.parent_block_root)
+}
+
+/// Copy `body_ssz` with the bid index, slot, and beacon parent replaced.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn body_with_bid_binding(
+    body_ssz: &[u8],
+    builder_index: u64,
+    slot: u64,
+    parent_block_root: Root,
+) -> Result<Vec<u8>, GloasError> {
+    fn rewrite<const COMMITTEES: usize, const SYNC: usize, const PTC: usize>(
+        body_ssz: &[u8],
+        builder_index: u64,
+        slot: u64,
+        parent_block_root: Root,
+    ) -> Result<Vec<u8>, GloasError> {
+        let mut body = from_ssz_bytes::<COMMITTEES, SYNC, PTC>(body_ssz)?;
+        let bid = &mut body.signed_execution_payload_bid.message;
+        bid.builder_index = builder_index;
+        bid.slot = slot;
+        bid.parent_block_root = parent_block_root;
+        Ok(body.to_ssz())
+    }
+    rewrite::<MAX_COMMITTEES_PER_SLOT_MINIMAL, SYNC_COMMITTEE_SIZE_MINIMAL, PTC_SIZE_MINIMAL>(
+        body_ssz,
+        builder_index,
+        slot,
+        parent_block_root,
+    )
+    .or_else(|_| {
+        rewrite::<MAX_COMMITTEES_PER_SLOT_MAINNET, SYNC_COMMITTEE_SIZE_MAINNET, PTC_SIZE_MAINNET>(
+            body_ssz,
+            builder_index,
+            slot,
+            parent_block_root,
+        )
+    })
+}
+
+/// Copy envelope SSZ with the three fields that bind it to the signed block.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub fn envelope_with_binding(
+    ssz: &[u8],
+    builder_index: u64,
+    beacon_block_root: Root,
+    parent_beacon_block_root: Root,
+) -> Result<Vec<u8>, GloasError> {
+    let mut envelope = ExecutionPayloadEnvelope::from_ssz_bytes(ssz)
+        .map_err(|err| GloasError::InvalidBody { reason: format!("{err:?}") })?;
+    envelope.builder_index = builder_index;
+    envelope.beacon_block_root = beacon_block_root;
+    envelope.parent_beacon_block_root = parent_beacon_block_root;
+    Ok(envelope.to_ssz())
 }
 
 /// Hash tree root of unsigned Gloas `ExecutionPayloadEnvelope` SSZ.
@@ -380,5 +519,72 @@ mod tests {
             SYNC_COMMITTEE_SIZE_MINIMAL,
             PTC_SIZE_MINIMAL,
         >(body));
+    }
+
+    /// `BUILDER_INDEX_SELF_BUILD` is the spec `UINT64_MAX`. Rewriting the bid index
+    /// round-trips, and the spec envelope binding is readable.
+    #[test]
+    fn test_bid_builder_index_and_envelope_binding_round_trip() {
+        assert_eq!(super::BUILDER_INDEX_SELF_BUILD, 18_446_744_073_709_551_615);
+        let body = parse_hex(minimal::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ);
+        let index = super::gloas_bid_builder_index(&body).expect("spec body");
+        let bid = super::gloas_bid_binding(&body).expect("spec bid");
+        assert_eq!(bid.builder_index, index);
+        let rewritten = super::body_with_bid_builder_index(&body, 1).expect("rewrite to 1");
+        assert_eq!(super::gloas_bid_builder_index(&rewritten).expect("external"), 1);
+        assert_ne!(rewritten, body);
+        let restored =
+            super::body_with_bid_builder_index(&rewritten, index).expect("restore spec index");
+        assert_eq!(restored, body);
+        let moved_bid =
+            super::body_with_bid_binding(&body, 1, 2240, [0x11; 32]).expect("rewrite bid");
+        let moved_binding = super::gloas_bid_binding(&moved_bid).expect("moved bid");
+        assert_eq!(moved_binding.builder_index, 1);
+        assert_eq!(moved_binding.slot, 2240);
+        assert_eq!(moved_binding.parent_block_root, [0x11; 32]);
+        let restored_bid = super::body_with_bid_binding(
+            &moved_bid,
+            bid.builder_index,
+            bid.slot,
+            bid.parent_block_root,
+        )
+        .expect("restore bid");
+        assert_eq!(restored_bid, body);
+        let self_build = super::body_with_bid_builder_index(&body, super::BUILDER_INDEX_SELF_BUILD)
+            .expect("self-build index");
+        assert_eq!(
+            super::gloas_bid_builder_index(&self_build).expect("self-build"),
+            18_446_744_073_709_551_615
+        );
+
+        let envelope = parse_hex(minimal::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ);
+        let binding = super::gloas_envelope_binding(&envelope).expect("spec envelope");
+        let moved =
+            super::envelope_with_binding(&envelope, 1, [0xee; 32], [0xab; 32]).expect("rewrite");
+        let moved_binding = super::gloas_envelope_binding(&moved).expect("moved");
+        assert_eq!(moved_binding.builder_index, 1);
+        assert_eq!(moved_binding.beacon_block_root, [0xee; 32]);
+        assert_eq!(moved_binding.parent_beacon_block_root, [0xab; 32]);
+        assert_ne!(moved, envelope);
+        let back = super::envelope_with_binding(
+            &moved,
+            binding.builder_index,
+            binding.beacon_block_root,
+            binding.parent_beacon_block_root,
+        )
+        .expect("restore");
+        assert_eq!(back, envelope);
+        assert_eq!(index, 3_618_015_003_522_193_470, "spec minimal bid is an external builder");
+        assert_eq!(binding.builder_index, 3_344_796_263_416_987_794);
+        assert_eq!(
+            hex_root(&binding.beacon_block_root),
+            "b737c1158f923acb223d148567091daf9bb38776404c4c95dadc269893b19ca3"
+        );
+        assert_ne!(index, super::BUILDER_INDEX_SELF_BUILD);
+        assert_ne!(binding.builder_index, index);
+    }
+
+    fn hex_root(root: &eth_types::Root) -> String {
+        root.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 }

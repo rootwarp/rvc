@@ -78,11 +78,15 @@ async fn a_real_beacon_api_json_block_is_produced_signed_and_published() {
     let proposer = quoted_u64(&doc["data"]["block"]["proposer_index"]);
     let harness = harness(response, &pubkey);
 
+    let sidecars_before = blob_sidecars_published("deneb");
     let result = harness.service.propose_block(slot, &pubkey, proposer, None).await;
     assert!(result.is_ok(), "real JSON block must publish, got {result:?}");
     assert_eq!(harness.signer.block_calls.lock().unwrap().len(), 1, "block must be signed");
     assert_eq!(harness.beacon.publish_contents_calls.lock().unwrap().len(), 1);
-    assert_eq!(blob_sidecars_published("deneb"), 1, "JSON contents publish increments the counter");
+    assert!(
+        blob_sidecars_published("deneb") > sidecars_before,
+        "JSON contents publish increments the counter"
+    );
     assert!(
         harness.beacon.publish_calls.lock().unwrap().is_empty(),
         "BlockAndBlobs must not publish a bare block"
@@ -107,13 +111,14 @@ async fn published_contents_carry_the_original_kzg_proofs_and_blobs() {
         let proposer = quoted_u64(&data["block"]["proposer_index"]);
         let pubkey = test_pubkey();
         let harness = harness(contents_response(text), &pubkey);
+        let sidecars_before = blob_sidecars_published(label);
         let result = harness.service.propose_block(slot, &pubkey, proposer, None).await;
         assert!(result.is_ok(), "{label} publish failed: {result:?}");
         let calls = harness.beacon.publish_contents_calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "{label}");
         assert_eq!(calls[0].contents.kzg_proofs, proofs, "{label} kzg_proofs");
         assert_eq!(calls[0].contents.blobs, blobs, "{label} blobs");
-        assert_eq!(blob_sidecars_published(label), 1, "{label} counter");
+        assert!(blob_sidecars_published(label) > sidecars_before, "{label} counter");
     }
 }
 

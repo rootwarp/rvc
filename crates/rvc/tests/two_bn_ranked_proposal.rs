@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use beacon::HEADER_ETH_CONSENSUS_BLOCK_VALUE;
-use block_service::{BlockService, ExpectedParents};
+use block_service::{BlockService, BlockServiceError, ExpectedParents};
 use bn_manager::{BnManager, BnManagerConfig};
 use crypto::{PublicKey, SecretKey, Signature};
 use eth_types::{
@@ -19,7 +19,7 @@ use eth_types::{
 };
 use rvc::beacon_adapter::BeaconBlockAdapter;
 use signer::{BeaconBlockHeaderFields, SignerError, StubValidatorSigner, ValidatorSigner};
-use validator_store::{ValidatorConfig, ValidatorStore};
+use validator_store::{BlockSelectionMode, ValidatorConfig, ValidatorStore};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -274,11 +274,44 @@ fn deneb_schedule() -> ForkSchedule {
 }
 
 fn blinded_on(parent: Root) -> Vec<u8> {
+    blinded_with(parent, [0x22; 32])
+}
+
+fn blinded_with(parent: Root, state: Root) -> Vec<u8> {
     let mut block: BlindedBeaconBlock = eth_types::external_vector_deneb_blinded_block();
     block.slot = SLOT;
     block.proposer_index = PROPOSER;
     block.parent_root = parent;
+    block.state_root = state;
     encode_blinded_beacon_block_ssz(&block, 0)
+}
+
+/// Unblinded Deneb `BlockContents`: 3×u32 offsets, then the beacon block, empty sidecars.
+fn local_on(parent: Root, state: Root) -> Vec<u8> {
+    let mut block = eth_types::external_vector_deneb_block();
+    block.slot = SLOT;
+    block.proposer_index = PROPOSER;
+    block.parent_root = parent;
+    block.state_root = state;
+    let block_bytes = eth_types::encode_beacon_block_ssz(&block, 0);
+    let block_off: u32 = 12;
+    let tail = block_off + block_bytes.len() as u32;
+    let mut bytes = Vec::with_capacity(12 + block_bytes.len());
+    bytes.extend_from_slice(&block_off.to_le_bytes());
+    bytes.extend_from_slice(&tail.to_le_bytes());
+    bytes.extend_from_slice(&tail.to_le_bytes());
+    bytes.extend_from_slice(&block_bytes);
+    bytes
+}
+
+fn produce_local(bytes: Vec<u8>, execution_value: &str) -> ResponseTemplate {
+    ResponseTemplate::new(200)
+        .insert_header("Content-Type", "application/octet-stream")
+        .insert_header("Eth-Consensus-Version", "deneb")
+        .insert_header("Eth-Execution-Payload-Blinded", "false")
+        .insert_header("Eth-Execution-Payload-Value", execution_value)
+        .insert_header(HEADER_ETH_CONSENSUS_BLOCK_VALUE, "0")
+        .set_body_bytes(bytes)
 }
 
 fn produce_ssz(bytes: Vec<u8>, execution_value: &str) -> ResponseTemplate {
@@ -364,4 +397,126 @@ async fn test_higher_value_stale_parent_is_not_signed() {
         assert_eq!(&req.body[0..4], &100u32.to_le_bytes(), "signed block offset");
         assert_eq!(&req.body[PARENT_OFFSET..PARENT_OFFSET + 32], &ROOT_N1);
     }
+}
+
+const LOCAL_STATE: Root = [0x55; 32];
+const BLINDED_STATE: Root = [0x44; 32];
+/// `state_root` follows `parent_root` in the block.
+const STATE_OFFSET: usize = PARENT_OFFSET + 32;
+
+fn builder_only_service(
+    endpoints: Vec<String>,
+) -> (BlockService<CountingSigner, BeaconBlockAdapter>, Arc<CountingSigner>, PublicKey) {
+    let mut config = BnManagerConfig::new(endpoints);
+    config.broadcast_topics.blocks = false;
+    let manager = BnManager::new(config).expect("BnManager");
+    let beacon = Arc::new(BeaconBlockAdapter(Arc::new(manager)));
+    let pubkey = SecretKey::generate().public_key();
+    let fee = eth_types::external_vector_deneb_body().execution_payload.fee_recipient;
+    let store = ValidatorStore::new(fee, 30_000_000);
+    store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).expect("validator");
+    store.set_global_block_selection_mode(BlockSelectionMode::BuilderOnly);
+    let signer = Arc::new(CountingSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon,
+        Arc::new(store),
+        Arc::new(deneb_schedule()),
+        [0xaa; 32],
+    );
+    (service, signer, pubkey)
+}
+
+fn parents() -> Option<ExpectedParents> {
+    Some(ExpectedParents { root: ROOT_N1, parent: Some(ROOT_N2), closed: false })
+}
+
+/// Builder-only, candidates [local, blinded]: the blinded block is signed.
+#[tokio::test]
+async fn test_builder_only_signs_blinded_not_the_higher_value_local() {
+    let bn_local = MockServer::start().await;
+    let bn_blinded = MockServer::start().await;
+    let produce_path = format!("/eth/v3/validator/blocks/{SLOT}");
+
+    Mock::given(method("GET"))
+        .and(path(produce_path.as_str()))
+        .respond_with(produce_local(local_on(ROOT_N1, LOCAL_STATE), VALUE_A))
+        .expect(1)
+        .mount(&bn_local)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(produce_path.as_str()))
+        .respond_with(produce_ssz(blinded_with(ROOT_N1, BLINDED_STATE), VALUE_B))
+        .expect(1)
+        .mount(&bn_blinded)
+        .await;
+    for server in [&bn_local, &bn_blinded] {
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/blinded_blocks"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    let (service, signer, pubkey) = builder_only_service(vec![bn_local.uri(), bn_blinded.uri()]);
+    let result = service.propose_block(SLOT, &pubkey, PROPOSER, parents()).await;
+    assert!(result.is_ok(), "the blinded candidate must be proposed: {result:?}");
+    assert!(result.expect("ok").is_blinded);
+    assert_eq!(signer.header_signs(), 1);
+
+    let mut blinded_publishes = Vec::new();
+    let mut local_publishes = Vec::new();
+    for server in [&bn_local, &bn_blinded] {
+        let reqs = server.received_requests().await.expect("recorded requests");
+        for req in reqs {
+            if req.url.path() == "/eth/v1/beacon/blinded_blocks" {
+                blinded_publishes.push(req);
+            } else if req.url.path() == "/eth/v2/beacon/blocks" {
+                local_publishes.push(req);
+            }
+        }
+    }
+    assert!(local_publishes.is_empty(), "the local block must not be published");
+    assert_eq!(blinded_publishes.len(), 1);
+    let body = &blinded_publishes[0].body;
+    assert!(body.len() >= STATE_OFFSET + 32, "publish body {}", body.len());
+    assert_eq!(&body[PARENT_OFFSET..PARENT_OFFSET + 32], &ROOT_N1);
+    assert_eq!(&body[STATE_OFFSET..STATE_OFFSET + 32], &BLINDED_STATE);
+}
+
+/// Builder-only, candidate [local] alone: nothing is signed.
+#[tokio::test]
+async fn test_builder_only_local_alone_signs_nothing() {
+    let bn = MockServer::start().await;
+    let produce_path = format!("/eth/v3/validator/blocks/{SLOT}");
+    Mock::given(method("GET"))
+        .and(path(produce_path.as_str()))
+        .respond_with(produce_local(local_on(ROOT_N1, LOCAL_STATE), VALUE_A))
+        .expect(1)
+        .mount(&bn)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&bn)
+        .await;
+
+    let (service, signer, pubkey) = builder_only_service(vec![bn.uri()]);
+    let err = service
+        .propose_block(SLOT, &pubkey, PROPOSER, parents())
+        .await
+        .expect_err("local fallback is not signed");
+    assert_eq!(signer.header_signs(), 0);
+    assert_eq!(
+        err.to_string(),
+        "builder-only mode: response shape unblinded contradicts builder-only"
+    );
+    assert!(matches!(err, BlockServiceError::BuilderOnly(_)));
+    let reqs = bn.received_requests().await.expect("recorded requests");
+    assert!(reqs.iter().all(|req| req.method.as_str() != "POST"), "nothing published");
 }

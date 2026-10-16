@@ -104,6 +104,11 @@
 //! mismatch. A higher-ranked candidate that is skipped before signing, and a
 //! drop under `fee_recipient_policy = reject`, are not counted. It has no
 //! labels. Dashboards that watch signed fee mismatches should bind this name.
+//! #647 adds `rvc_block_shape_rejections_total` (family delta +1): one
+//! increment when a produced block is rejected because the selection mode
+//! does not allow that shape. Labels are `mode` and `shape`. A Gloas response
+//! flagged blinded is not counted. Dashboards that watch mode mismatches
+//! should bind this name.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -150,6 +155,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_attestations_total",
     "rvc_attesting_enabled",
     "rvc_blob_sidecars_published_total", // operator-facing: pre-Gloas JSON or SSZ SignedBlockContents publishes (RR-1.2)
+    "rvc_block_shape_rejections_total", // operator-facing: produced blocks rejected by selection mode; labels mode, shape (#647)
     "rvc_bn_broadcast_drain_health_skipped_total", // operator-facing: success skipped at the cap, or any sample when the recorder queue is full; the publish still runs (#639)
     "rvc_bn_broadcast_overflow_drains", // operator-facing: in-flight overflow publishes by redacted endpoint; drops when the HTTP call finishes (#639)
     "rvc_bn_capability_state",
@@ -311,8 +317,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        63,
-        "#679 adds rvc_produce_block_fee_recipient_penalty_total; count is the list length"
+        64,
+        "#647 adds rvc_block_shape_rejections_total; count is the list length"
     );
 }
 

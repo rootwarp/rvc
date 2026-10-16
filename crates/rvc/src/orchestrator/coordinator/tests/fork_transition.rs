@@ -2249,28 +2249,67 @@ fn gloas_beacon_block(slot: Slot) -> eth_types::BeaconBlock {
 }
 
 fn gloas_beacon_block_with_state(slot: Slot, state_root: Root) -> eth_types::BeaconBlock {
-    eth_types::BeaconBlock {
-        slot,
-        proposer_index: PROPOSER_INDEX,
-        parent_root: [1u8; 32],
-        state_root,
-        body: hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap(),
-    }
+    let parent_root = [1u8; 32];
+    let spec = spec_body_ssz();
+    let index = rvc_gloas::gloas_bid_builder_index(&spec).expect("spec body");
+    let body = rvc_gloas::body_with_bid_binding(&spec, index, slot, parent_root)
+        .expect("spec body accepts a bid binding");
+    eth_types::BeaconBlock { slot, proposer_index: PROPOSER_INDEX, parent_root, state_root, body }
 }
 
-fn gloas_envelope_hex() -> String {
-    format!("0x{}", rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ)
+fn spec_body_ssz() -> Vec<u8> {
+    hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap()
+}
+
+fn spec_envelope_ssz() -> Vec<u8> {
+    hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ).unwrap()
+}
+
+/// Spec body with `builder_index == BUILDER_INDEX_SELF_BUILD`. The unmodified
+/// spec bid is an external index, so a contents wrapper is not a self-build.
+fn self_build_block_with_state(slot: Slot, state_root: Root) -> eth_types::BeaconBlock {
+    let parent_root = [1u8; 32];
+    let body = rvc_gloas::body_with_bid_binding(
+        &spec_body_ssz(),
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
+        slot,
+        parent_root,
+    )
+    .expect("spec body accepts a self-build index");
+    eth_types::BeaconBlock { slot, proposer_index: PROPOSER_INDEX, parent_root, state_root, body }
+}
+
+fn bound_self_build_envelope_hex(block: &eth_types::BeaconBlock) -> String {
+    let root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("self-build block root");
+    let bound = rvc_gloas::envelope_with_binding(
+        &spec_envelope_ssz(),
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
+        root,
+        block.parent_root,
+    )
+    .expect("spec envelope accepts a binding");
+    format!("0x{}", hex::encode(bound))
 }
 
 fn gloas_block_contents_response(slot: Slot) -> ProduceBlockResponse {
-    gloas_block_contents_response_for(gloas_beacon_block(slot))
+    gloas_block_contents_response_for(self_build_block_with_state(slot, [2u8; 32]))
 }
 
 fn gloas_block_contents_response_for(block: eth_types::BeaconBlock) -> ProduceBlockResponse {
+    let envelope = bound_self_build_envelope_hex(&block);
     ProduceBlockResponse {
         data: serde_json::json!({
             "block": block,
-            "execution_payload_envelope": gloas_envelope_hex(),
+            "execution_payload_envelope": envelope,
             "kzg_proofs": ["0xaa"],
             "blobs": ["0xbb"],
         }),
@@ -2447,13 +2486,16 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
             let WireBody::Json(value) = signed_envelope else {
                 panic!("expected JSON signed envelope, got {signed_envelope:?}");
             };
-            assert_eq!(value["message"], serde_json::json!(gloas_envelope_hex()));
+            let signed_block = self_build_block_with_state(GLOAS_SLOT, [2u8; 32]);
+            assert_eq!(
+                value["message"],
+                serde_json::json!(bound_self_build_envelope_hex(&signed_block))
+            );
             let sig_hex = value["signature"].as_str().expect("envelope signature hex");
             let sig_bytes = hex::decode(sig_hex.trim_start_matches("0x")).expect("sig hex");
             let sig = Signature::from_bytes(&sig_bytes).expect("envelope signature");
-            let envelope_ssz =
-                hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ)
-                    .unwrap();
+            let message = value["message"].as_str().expect("envelope hex");
+            let envelope_ssz = hex::decode(message.trim_start_matches("0x")).expect("envelope ssz");
             let envelope_root =
                 rvc_gloas::gloas_execution_payload_envelope_root(&envelope_ssz).unwrap();
             let schedule = create_test_fork_schedule();
@@ -2479,7 +2521,7 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
         other => panic!("expected envelope publish, got {other:?}"),
     }
 
-    let block = gloas_beacon_block(GLOAS_SLOT);
+    let block = self_build_block_with_state(GLOAS_SLOT, [2u8; 32]);
     assert!(
         block.try_tree_hash_root().is_err(),
         "Gloas body must not merkleize through the Electra/Deneb tree_hash bridge"
@@ -2501,7 +2543,7 @@ async fn test_gloas_slot_dispatches_produce_block_v4() {
     let publish_before = block_beacon.publish_block_calls().len();
     let envelopes_before = block_beacon.envelope_publish_calls().len();
     // Same slot, different signing root — EIP-3076 double proposal, not a re-sign.
-    block_beacon.set_response(gloas_block_contents_response_for(gloas_beacon_block_with_state(
+    block_beacon.set_response(gloas_block_contents_response_for(self_build_block_with_state(
         GLOAS_SLOT, [3u8; 32],
     )));
     orchestrator

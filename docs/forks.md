@@ -69,13 +69,13 @@ Proposal path that already has the BN `consensus_version`:
 
 | What | File | Lines | Role |
 |---|---|---|---|
-| SSZ `BlockContents` KZG bind | `crates/block-service/src/service/mod.rs` | 699–713 | `body_fork_layout` → `blob_kzg_count` / `kzg_commitment_root`. Fail-closed on bad SSZ. Skipped unless `ssz_block_format` returned `BlockContents`. |
-| JSON `BlockAndBlobs` KZG bind | `crates/block-service/src/service/mod.rs` | 816–822 | Same `body_fork_layout` dispatch. |
-| `ssz_block_format` | `crates/block-service/src/service/mod.rs` | 1118–1139 | Exhaustive `match ForkName`. Blinded → always `BeaconBlock`. Unblinded Deneb/Electra/Fulu → `BlockContents`. **Named Gloas `BeaconBlock` arm** (bare `SignedBeaconBlock`; must not share a catch-all with pre-Deneb). Unknown version strings fail closed via `ForkName::from_str`. |
-| `reject_blinded_at_gloas` | `crates/block-service/src/service/mod.rs` | 1144–1158 | Open-ended `>= Gloas` (slot fork or `consensus_version == "gloas"`) drops blinded production. |
-| produceBlockV4 / v3 | `crates/block-service/src/service/mod.rs` | 333–346 | Slot fork `>= Gloas` calls `produce_block_v4` (`POST /eth/v4/validator/blocks/{slot}`); pre-Gloas stays `produce_block_v3` (`GET /eth/v3/validator/blocks/{slot}`). Dispatch is on the slot fork, never on response headers. |
+| SSZ `BlockContents` KZG bind | `crates/block-service/src/service/mod.rs` | 1252–1266 | `body_fork_layout` → `blob_kzg_count` / `kzg_commitment_root`. Fail-closed on bad SSZ. Skipped unless `ssz_block_format` returned `BlockContents`. |
+| JSON `BlockAndBlobs` KZG bind | `crates/block-service/src/service/mod.rs` | 1309–1359 | Same `body_fork_layout` dispatch. |
+| `ssz_block_format` | `crates/block-service/src/service/mod.rs` | 1599–1621 | Exhaustive `match ForkName`. Blinded → always `BeaconBlock`. Unblinded Deneb/Electra/Fulu → `BlockContents`. **Named Gloas `BeaconBlock` arm** (bare `SignedBeaconBlock`; must not share a catch-all with pre-Deneb). Unknown version strings fail closed via `ForkName::from_str`. |
+| `reject_blinded_at_gloas` | `crates/block-service/src/service/mod.rs` | 1625–1640 | Open-ended `>= Gloas` (slot fork or `consensus_version == "gloas"`) drops blinded production. The V4 path calls it before `sign_block_header`. |
+| produceBlockV4 / v3 | `crates/block-service/src/service/mod.rs` | 348–371 | Slot fork `>= Gloas` calls `produce_block_v4` (`POST /eth/v4/validator/blocks/{slot}`); pre-Gloas stays `produce_block_v3` (`GET /eth/v3/validator/blocks/{slot}`). Dispatch is on the slot fork, never on response headers. |
 | V4 HTTP | `crates/beacon/src/client.rs` | 643–693 | `produce_block_v4`; path prefix in `crates/beacon/src/v4_wire.rs` 13. Pre-Gloas v3 is 526. |
-| V4 sign/publish | `crates/block-service/src/service/mod.rs` | 393–424 | Slot fork `>= Gloas` uses `sign_and_publish_v4`; pre-Gloas keeps V3 blinded/unblinded. |
+| V4 sign/publish | `crates/block-service/src/service/mod.rs` | 416–446 | Slot fork `>= Gloas` uses `sign_and_publish_v4`; pre-Gloas keeps V3 blinded/unblinded. |
 
 ### 1.3 Duty and signing dispatch
 
@@ -116,7 +116,7 @@ inventory in [gloas-fork-hazard-audit.md](gloas-fork-hazard-audit.md)):
 | What | File | Lines | Role |
 |---|---|---|---|
 | Proposer-duties v1/v2 | `crates/beacon/src/client.rs` | 482–490 | `>= Gloas` → `/eth/v2/validator/duties/proposer/{epoch}`. No silent v1 fallback. |
-| produceBlockV4 / v3 | `crates/block-service/src/service/mod.rs` | 333–346 | `>= Gloas` → `produce_block_v4` (`POST /eth/v4/validator/blocks/{slot}`); else `produce_block_v3` (`GET /eth/v3/validator/blocks/{slot}`). HTTP in `crates/beacon/src/client.rs` 526 / 643; path prefix `crates/beacon/src/v4_wire.rs` 13. |
+| produceBlockV4 / v3 | `crates/block-service/src/service/mod.rs` | 348–371 | `>= Gloas` → `produce_block_v4` (`POST /eth/v4/validator/blocks/{slot}`); else `produce_block_v3` (`GET /eth/v3/validator/blocks/{slot}`). HTTP in `crates/beacon/src/client.rs` 526 / 643; path prefix `crates/beacon/src/v4_wire.rs` 13. |
 | Deadline set | `crates/timing/src/clock.rs` | 29–35 | `DeadlineSchedule::for_fork`: `>= Gloas` selects the six Gloas `*_DUE_BPS*` offsets. |
 | Coordinator attestation offset | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 162–165, 587–589 | `from_epoch` then `for_fork`; one resolved fork per slot. |
 | PTC phase | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 1479–1514 | `run_payload_attestation_phase`: open-ended `>= Gloas` waits then calls `crates/rvc/src/orchestrator/payload_attestation.rs`. |
@@ -264,7 +264,7 @@ variant and new body structs.
       A body-changing fork adds a `BodyForkLayout` variant and arms in
       `extract_blob_kzg_commitments` (`crates/eth-types/src/block.rs` 57) and both `*_for_layout` functions
       (Gloas → `GloasUnsupported`).
-- [ ] Arm `ssz_block_format` (`crates/block-service/src/service/mod.rs` 1380–1402) with a
+- [ ] Arm `ssz_block_format` (`crates/block-service/src/service/mod.rs` 1599–1621) with a
       **named** exhaustive `match ForkName` arm. Do not reintroduce a `"deneb" | "electra" | "fulu"`
       string table or a catch-all `BeaconBlock` inherit (Gloas's named `BeaconBlock` arm is
       separate from pre-Deneb on purpose).

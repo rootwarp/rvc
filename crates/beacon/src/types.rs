@@ -245,7 +245,10 @@ impl ProduceBlockResponse {
             .map_err(|e| BeaconError::ParseError(format!("invalid blinded block: {}", e)))
     }
 
-    /// Decode a V4 produce body and require `payload_included` to match the shape.
+    /// Decode a V4 produce body and require `payload_included` to match the container.
+    ///
+    /// `BlockContents` versus `BeaconBlock` is only the wire container. Selection
+    /// mode uses the bid `builder_index` inside the block, not this container.
     pub fn decode_v4_body(&self) -> Result<ProduceBlockV4Body, BeaconError> {
         if self.is_ssz {
             self.decode_v4_ssz()

@@ -37,6 +37,19 @@ pub static RVC_BLOB_SIDECARS_PUBLISHED_TOTAL: LazyLock<IntCounterVec> = LazyLock
     )
 });
 
+/// Produced blocks skipped because the selection mode does not allow that shape.
+///
+/// Labels are the mode (`builder-only`, `execution-only`, `max-profit`,
+/// `builder-always`) and the shape (`unblinded`, `blinded`, `self-build`,
+/// `external-bid`). One increment per rejected candidate, before signing.
+pub static RVC_BLOCK_SHAPE_REJECTIONS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_block_shape_rejections_total",
+        "Produced blocks rejected because the selection mode does not allow that shape",
+        &["mode", "shape"],
+    )
+});
+
 /// Blocks signed even though the readable fee recipient did not match.
 ///
 /// The same name is defined in `bn-manager`. Registration is idempotent, so
@@ -56,6 +69,12 @@ pub fn init() {
     }
     LazyLock::force(&RVC_BLOB_SIDECARS_PUBLISHED_TOTAL);
     LazyLock::force(&RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL);
+    LazyLock::force(&RVC_BLOCK_SHAPE_REJECTIONS_TOTAL);
+    for mode in ["builder-only", "execution-only", "max-profit", "builder-always"] {
+        for shape in ["unblinded", "blinded", "self-build", "external-bid"] {
+            let _ = RVC_BLOCK_SHAPE_REJECTIONS_TOTAL.with_label_values(&[mode, shape]);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -99,5 +118,33 @@ mod tests {
             outcomes.contains(super::proposal_outcome::ENVELOPE_LATE),
             "envelope_late child must be force-registered at init, got {outcomes:?}"
         );
+    }
+
+    #[test]
+    fn init_registers_every_mode_and_shape_rejection_child() {
+        super::init();
+        let gathered = metrics::REGISTRY.gather();
+        let family = gathered
+            .iter()
+            .find(|m| m.name() == "rvc_block_shape_rejections_total")
+            .expect("rvc_block_shape_rejections_total must be gatherable after init");
+        let mut pairs = BTreeSet::new();
+        for metric in family.get_metric() {
+            let mut mode = None;
+            let mut shape = None;
+            for label in metric.get_label() {
+                if label.name() == "mode" {
+                    mode = Some(label.value());
+                } else if label.name() == "shape" {
+                    shape = Some(label.value());
+                }
+            }
+            pairs.insert((mode.expect("mode label"), shape.expect("shape label")));
+        }
+        assert_eq!(pairs.len(), 16, "{pairs:?}");
+        assert!(pairs.contains(&("builder-only", "unblinded")), "{pairs:?}");
+        assert!(pairs.contains(&("execution-only", "external-bid")), "{pairs:?}");
+        assert!(pairs.contains(&("max-profit", "self-build")), "{pairs:?}");
+        assert!(pairs.contains(&("builder-always", "blinded")), "{pairs:?}");
     }
 }

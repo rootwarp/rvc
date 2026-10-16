@@ -39,24 +39,45 @@ fn near_gloas_fork() -> ForkSchedule {
     }
 }
 
-fn gloas_block(slot: u64) -> BeaconBlock {
-    BeaconBlock {
+fn self_build_block(slot: u64) -> BeaconBlock {
+    let parent_root = [1u8; 32];
+    let spec = hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap();
+    let body = rvc_gloas::body_with_bid_binding(
+        &spec,
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
         slot,
-        proposer_index: 42,
-        parent_root: [1u8; 32],
-        state_root: [2u8; 32],
-        body: hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_SSZ).unwrap(),
-    }
+        parent_root,
+    )
+    .expect("spec body accepts a self-build index");
+    BeaconBlock { slot, proposer_index: 42, parent_root, state_root: [2u8; 32], body }
 }
 
 fn contents_json(slot: u64) -> serde_json::Value {
-    let envelope =
-        format!("0x{}", rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ);
+    let block = self_build_block(slot);
+    let root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("self-build block root");
+    let spec =
+        hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ).unwrap();
+    let bound = rvc_gloas::envelope_with_binding(
+        &spec,
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
+        root,
+        block.parent_root,
+    )
+    .expect("spec envelope accepts a binding");
     serde_json::json!({
         "version": "gloas",
         "data": {
-            "block": gloas_block(slot),
-            "execution_payload_envelope": envelope,
+            "block": block,
+            "execution_payload_envelope": format!("0x{}", hex::encode(bound)),
             "kzg_proofs": ["0xaa"],
             "blobs": ["0xbb"],
         }

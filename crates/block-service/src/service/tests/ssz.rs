@@ -820,8 +820,14 @@ async fn electra_publish_avoids_offset_out_of_bounds_class() {
 async fn gloas_payload_still_routes_through_sign_and_publish_v4() {
     let pubkey = test_pubkey();
     let slot = test_gloas_slot();
-    let block_ssz =
-        build_gloas_beacon_block_ssz(slot, 42, [0x11; 32], [0x22; 32], &gloas_body_ssz());
+    let spec_body = gloas_body_ssz();
+    let spec_root = rvc_gloas::gloas_body_root(&spec_body).expect("unmodified spec body");
+    assert_eq!(hex::encode(spec_root), rvc_gloas::test_fixtures::SPEC_GLOAS_BEACON_BLOCK_BODY_ROOT);
+    let parent_root = [0x11; 32];
+    let index = rvc_gloas::gloas_bid_builder_index(&spec_body).expect("spec body");
+    let body = rvc_gloas::body_with_bid_binding(&spec_body, index, slot, parent_root)
+        .expect("spec body accepts a bid binding");
+    let block_ssz = build_gloas_beacon_block_ssz(slot, 42, parent_root, [0x22; 32], &body);
     let beacon = MockBeaconClient::from_response(ProduceBlockResponse {
         data: serde_json::Value::Null,
         is_blinded: false,

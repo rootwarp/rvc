@@ -401,6 +401,7 @@ pub(crate) struct MockBeaconClient {
     pub(crate) ranked_candidates: Mutex<Option<Vec<ProduceBlockResponse>>>,
     pub(crate) fail_produce: bool,
     pub(crate) fail_publish: bool,
+    pub(crate) fail_publish_parse: bool,
     pub(crate) envelope_delay: Duration,
     pub(crate) publish_calls: Mutex<Vec<String>>,
     pub(crate) publish_blinded_calls: Mutex<Vec<String>>,
@@ -423,6 +424,7 @@ impl MockBeaconClient {
             ranked_candidates: Mutex::new(None),
             fail_produce: false,
             fail_publish: false,
+            fail_publish_parse: false,
             envelope_delay: Duration::ZERO,
             publish_calls: Mutex::new(Vec::new()),
             publish_blinded_calls: Mutex::new(Vec::new()),
@@ -531,6 +533,12 @@ impl MockBeaconClient {
     }
 
     /// Ranked produce answers returned together. Does not drain `produce_queue`.
+    pub(crate) fn with_ranked_responses(self, responses: Vec<ProduceBlockResponse>) -> Self {
+        *self.ranked_candidates.lock().unwrap() = Some(responses);
+        self
+    }
+
+    /// Ranked produce answers returned together. Does not drain `produce_queue`.
     pub(crate) fn with_ranked_blocks(self, blocks: Vec<BeaconBlock>) -> Self {
         let responses = blocks
             .into_iter()
@@ -558,6 +566,22 @@ impl MockBeaconClient {
     pub(crate) fn with_publish_error(mut self) -> Self {
         self.fail_publish = true;
         self
+    }
+
+    /// Publish returns a parse error after the header has been signed.
+    pub(crate) fn with_publish_parse_error(mut self) -> Self {
+        self.fail_publish_parse = true;
+        self
+    }
+
+    fn publish_failure(&self) -> Result<(), BlockServiceError> {
+        if self.fail_publish_parse {
+            return Err(BlockServiceError::Parse("publish body".to_string()));
+        }
+        if self.fail_publish {
+            return Err(BlockServiceError::Beacon("publish failed".to_string()));
+        }
+        Ok(())
     }
 
     pub(crate) fn from_response(response: ProduceBlockResponse) -> Self {
@@ -766,10 +790,7 @@ impl BeaconBlockClient for MockBeaconClient {
             signature_bytes: signed_block.signature.clone(),
             builder_url: builder_url.map(str::to_string),
         });
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
     }
 
     async fn publish_blinded_block(
@@ -785,10 +806,7 @@ impl BeaconBlockClient for MockBeaconClient {
             signature_bytes: signed_block.signature.clone(),
             builder_url: None,
         });
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
     }
 
     async fn publish_block_ssz(
@@ -805,10 +823,7 @@ impl BeaconBlockClient for MockBeaconClient {
             is_blinded,
             builder_url: builder_url.map(str::to_string),
         });
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
     }
 
     async fn publish_block_contents(
@@ -823,10 +838,7 @@ impl BeaconBlockClient for MockBeaconClient {
             consensus_version: consensus_version.to_string(),
             builder_url: builder_url.map(str::to_string),
         });
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
     }
 
     async fn publish_execution_payload_envelope(
@@ -847,10 +859,7 @@ impl BeaconBlockClient for MockBeaconClient {
         if !self.envelope_delay.is_zero() {
             tokio::time::sleep(self.envelope_delay).await;
         }
-        if self.fail_publish {
-            return Err(BlockServiceError::Beacon("publish failed".to_string()));
-        }
-        Ok(())
+        self.publish_failure()
     }
 }
 // --- Helpers ---
@@ -897,21 +906,74 @@ pub(crate) fn gloas_body_ssz() -> Vec<u8> {
 }
 
 pub(crate) fn gloas_block(slot: Slot) -> BeaconBlock {
+    let parent_root = [1u8; 32];
+    let spec = gloas_body_ssz();
+    let index = rvc_gloas::gloas_bid_builder_index(&spec).expect("spec body");
     BeaconBlock {
         slot,
         proposer_index: 42,
-        parent_root: [1u8; 32],
+        parent_root,
         state_root: [2u8; 32],
-        body: gloas_body_ssz(),
+        body: bid_aligned(&spec, index, slot, parent_root),
     }
+}
+
+/// Spec body with the bid index, slot, and beacon parent set for a signed header.
+fn bid_aligned(
+    body: &[u8],
+    builder_index: u64,
+    slot: Slot,
+    parent_block_root: [u8; 32],
+) -> Vec<u8> {
+    rvc_gloas::body_with_bid_binding(body, builder_index, slot, parent_block_root)
+        .expect("spec body accepts a bid binding")
+}
+
+/// Spec body with `builder_index == BUILDER_INDEX_SELF_BUILD` and a matching slot and parent.
+pub(crate) fn self_build_body(slot: Slot, parent_block_root: [u8; 32]) -> Vec<u8> {
+    bid_aligned(&gloas_body_ssz(), rvc_gloas::BUILDER_INDEX_SELF_BUILD, slot, parent_block_root)
+}
+
+/// Spec body with external bid index 1 and a matching slot and parent.
+pub(crate) fn external_bid_body(slot: Slot, parent_block_root: [u8; 32]) -> Vec<u8> {
+    bid_aligned(&gloas_body_ssz(), 1, slot, parent_block_root)
+}
+
+pub(crate) fn self_build_block(slot: Slot) -> BeaconBlock {
+    let mut block = gloas_block(slot);
+    block.body = self_build_body(slot, block.parent_root);
+    block
+}
+
+pub(crate) fn external_bid_block(slot: Slot) -> BeaconBlock {
+    let mut block = gloas_block(slot);
+    block.body = external_bid_body(slot, block.parent_root);
+    block
+}
+
+/// Envelope whose index, block root, and beacon parent match `block`.
+pub(crate) fn bound_self_build_envelope(block: &BeaconBlock) -> Vec<u8> {
+    let root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("self-build block root");
+    rvc_gloas::envelope_with_binding(
+        &gloas_envelope_ssz(),
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
+        root,
+        block.parent_root,
+    )
+    .expect("spec envelope accepts a binding")
 }
 
 pub(crate) fn gloas_envelope_ssz() -> Vec<u8> {
     hex::decode(rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ).unwrap()
-}
-
-pub(crate) fn gloas_envelope_hex() -> String {
-    format!("0x{}", rvc_gloas::test_fixtures::SPEC_GLOAS_EXECUTION_PAYLOAD_ENVELOPE_SSZ)
 }
 
 pub(crate) fn build_gloas_beacon_block_ssz(
@@ -955,12 +1017,14 @@ pub(crate) fn build_gloas_block_contents_ssz(
 }
 
 pub(crate) fn self_build_json_response(slot: Slot) -> ProduceBlockResponse {
+    let block = self_build_block(slot);
+    let envelope = format!("0x{}", hex::encode(bound_self_build_envelope(&block)));
     let proofs = serde_json::json!(["0xaa"]);
     let blobs = serde_json::json!(["0xbb"]);
     ProduceBlockResponse {
         data: serde_json::json!({
-            "block": gloas_block(slot),
-            "execution_payload_envelope": gloas_envelope_hex(),
+            "block": block,
+            "execution_payload_envelope": envelope,
             "kzg_proofs": proofs,
             "blobs": blobs,
         }),
@@ -976,9 +1040,21 @@ pub(crate) fn self_build_json_response(slot: Slot) -> ProduceBlockResponse {
 }
 
 pub(crate) fn self_build_ssz_response(slot: Slot) -> ProduceBlockResponse {
-    let block_ssz =
-        build_gloas_beacon_block_ssz(slot, 42, [0x11; 32], [0x22; 32], &gloas_body_ssz());
-    let envelope = gloas_envelope_ssz();
+    let block = BeaconBlock {
+        slot,
+        proposer_index: 42,
+        parent_root: [0x11; 32],
+        state_root: [0x22; 32],
+        body: self_build_body(slot, [0x11; 32]),
+    };
+    let block_ssz = build_gloas_beacon_block_ssz(
+        block.slot,
+        block.proposer_index,
+        block.parent_root,
+        block.state_root,
+        &block.body,
+    );
+    let envelope = bound_self_build_envelope(&block);
     let kzg = vec![0xaa, 0xab];
     let blobs = vec![0xbb, 0xbc, 0xbd];
     let ssz_bytes = build_gloas_block_contents_ssz(&block_ssz, &envelope, &kzg, &blobs);
