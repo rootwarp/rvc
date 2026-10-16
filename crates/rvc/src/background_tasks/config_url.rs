@@ -3,13 +3,24 @@
 //! Implements Prysm/Teku-compatible JSON schema for proposer configuration
 //! fetched from a remote URL. Supports per-epoch refresh.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, Instrument};
 use validator_store::{DefaultUpdate, ValidatorStore};
+
+/// One successful proposer-config fetch.
+///
+/// `updates` is `None` when the document has no `proposer_config` object.
+/// `Some` includes an empty object. An empty object omits every previously
+/// named pubkey. A missing object does not.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FetchedProposerConfig {
+    pub updates: Option<Vec<ValidatorConfigUpdate>>,
+    pub default_update: Option<ValidatorConfigUpdate>,
+}
 
 /// Literal pubkey key used for `default_config` entries (Prysm/Teku convention).
 pub const DEFAULT_PUBKEY: &str = "default";
@@ -38,8 +49,11 @@ pub enum ParseError {
 /// Teku (`--validators-proposer-config`) JSON schemas.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProposerConfigResponse {
+    /// Absent on a Teku document that carries only `default_config`.
+    /// Present, including an empty object, is the per-pubkey map.
     #[serde(default)]
-    pub proposer_config: HashMap<String, ProposerEntry>,
+    pub proposer_config: Option<HashMap<String, ProposerEntry>>,
+    #[serde(default)]
     pub default_config: Option<ProposerEntry>,
 }
 
@@ -201,7 +215,7 @@ pub async fn fetch_proposer_config(
     url: &str,
     token: Option<&str>,
     insecure: bool,
-) -> Result<(Vec<ValidatorConfigUpdate>, Option<ValidatorConfigUpdate>), String> {
+) -> Result<FetchedProposerConfig, String> {
     if !insecure && !url.starts_with("https://") {
         return Err(
             "proposer config URL requires HTTPS; use --proposer-config-url-insecure for HTTP"
@@ -229,13 +243,25 @@ pub async fn fetch_proposer_config(
     let body: ProposerConfigResponse =
         response.json().await.map_err(|e| format!("failed to parse proposer config JSON: {e}"))?;
 
-    let mut updates = Vec::new();
-    for (pubkey, entry) in &body.proposer_config {
-        updates.push(
-            entry_to_update(pubkey.clone(), entry)
-                .map_err(|e| format!("invalid proposer config for pubkey {pubkey}: {e}"))?,
+    if body.proposer_config.is_none() && body.default_config.is_none() {
+        return Err(
+            "proposer config JSON has neither proposer_config nor default_config".to_string()
         );
     }
+
+    let updates = match &body.proposer_config {
+        None => None,
+        Some(map) => {
+            let mut updates = Vec::new();
+            for (pubkey, entry) in map {
+                updates
+                    .push(entry_to_update(pubkey.clone(), entry).map_err(|e| {
+                        format!("invalid proposer config for pubkey {pubkey}: {e}")
+                    })?);
+            }
+            Some(updates)
+        }
+    };
 
     let default_update = body
         .default_config
@@ -244,7 +270,21 @@ pub async fn fetch_proposer_config(
         .transpose()
         .map_err(|e| format!("invalid default_config: {e}"))?;
 
-    Ok((updates, default_update))
+    // Validate every entry before the caller applies any of them. One bad
+    // fee, pubkey, or gas limit rejects the whole fetch: a sibling is not
+    // published and an omitted key is not restored.
+    if let Some(updates) = &updates {
+        for update in updates {
+            update.to_store_update().map_err(|e| {
+                format!("invalid proposer config for pubkey {}: {e}", update.pubkey)
+            })?;
+        }
+    }
+    if let Some(update) = &default_update {
+        update.to_default_update().map_err(|e| format!("invalid default_config: {e}"))?;
+    }
+
+    Ok(FetchedProposerConfig { updates, default_update })
 }
 
 /// Build a wire update from a JSON entry.
@@ -280,49 +320,135 @@ fn entry_to_update(
     })
 }
 
-/// Write URL-fetched proposer config into [`ValidatorStore`].
+/// Pubkeys named by the last successful fetch that included `proposer_config`.
 ///
-/// Malformed entries are skipped at `warn` and leave previous store values
-/// intact (never a partial write of a bad entry, never a panic). Successful
-/// defaults go through [`ValidatorStore::apply_default_update`]; per-validator
-/// entries through [`ValidatorStore::update_config`].
-pub fn apply_proposer_config_updates(
-    store: &ValidatorStore,
-    updates: Vec<ValidatorConfigUpdate>,
-    default_update: Option<ValidatorConfigUpdate>,
-) {
-    if let Some(d) = default_update {
-        match d.to_default_update() {
-            Ok(u) => {
-                if let Err(e) = store.apply_default_update(u) {
+/// Call [`Self::apply`] only after a fetch succeeds and every entry validates.
+/// A 401, a body that is not JSON, a body with neither `proposer_config` nor
+/// `default_config`, or one bad entry must not call it.
+///
+/// Ownership of each fee recipient, gas limit, and builder flag lives in
+/// [`ValidatorStore`]. When the URL starts owning a field, the store snapshots
+/// that field's live value under the same lock as the write. A keymanager
+/// write of a field the URL owns drops that ownership, even when the written
+/// value equals the URL value. A later document owns the field again only by
+/// setting a value, and the baseline is the live value at that moment.
+/// Omitting a pubkey restores each field the URL still owns. A fetch with no
+/// `proposer_config` object applies `default_config` only and does not restore.
+///
+/// `default_config` changes the live defaults. The store does not write it
+/// into `[defaults]`. No block is signed or published.
+#[derive(Default)]
+pub struct ProposerConfigApplier {
+    seen: HashSet<[u8; 48]>,
+}
+
+impl ProposerConfigApplier {
+    /// An applier that has not yet seen a successful fetch.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Apply one fully validated fetch.
+    ///
+    /// `updates == None` means the document had no `proposer_config` object.
+    /// Every entry is checked before any store write. One bad pubkey, fee, or
+    /// gas limit leaves the previous URL values in place and does not restore
+    /// omitted keys. No block is signed or published.
+    pub fn apply(
+        &mut self,
+        store: &ValidatorStore,
+        updates: Option<Vec<ValidatorConfigUpdate>>,
+        default_update: Option<ValidatorConfigUpdate>,
+    ) {
+        let Some(updates) = updates else {
+            let default_update = match default_update.as_ref() {
+                None => None,
+                Some(update) => match update.to_default_update() {
+                    Ok(update) => Some(update),
+                    Err(e) => {
+                        warn!(error = %e, "proposer config rejected; previous values stay");
+                        return;
+                    }
+                },
+            };
+            if let Some(update) = default_update {
+                if let Err(e) = store.apply_remote_defaults(update) {
                     warn!(error = %e, "proposer config default entry ignored");
                 }
             }
-            Err(e) => {
+            return;
+        };
+        let Ok(prepared) = prepare_fetch(&updates, default_update.as_ref()) else {
+            return;
+        };
+        if let Some(update) = prepared.default_update {
+            if let Err(e) = store.apply_remote_defaults(update) {
                 warn!(error = %e, "proposer config default entry ignored");
             }
         }
-    }
-    for update in updates {
-        match update.to_store_update() {
-            Ok((pk, u)) => {
-                if let Err(e) = store.update_config(&pk, u) {
-                    warn!(
-                        error = %e,
-                        pubkey = %update.pubkey,
-                        "proposer config entry ignored"
-                    );
-                }
-            }
-            Err(e) => {
+        let mut present = HashSet::new();
+        for (pk, store_update) in prepared.rows {
+            present.insert(pk);
+            if let Err(e) = store.apply_remote_proposer(&pk, store_update) {
                 warn!(
                     error = %e,
-                    pubkey = %update.pubkey,
+                    pubkey_prefix = %pubkey_prefix(&pk),
                     "proposer config entry ignored"
                 );
             }
         }
+        let missing: Vec<[u8; 48]> =
+            self.seen.iter().copied().filter(|pk| !present.contains(pk)).collect();
+        for pk in missing {
+            store.release_remote_proposer(&pk);
+        }
+        self.seen = present;
     }
+}
+
+struct PreparedFetch {
+    default_update: Option<DefaultUpdate>,
+    rows: Vec<([u8; 48], validator_store::ValidatorConfigUpdate)>,
+}
+
+/// Parse every entry. `Err` means the caller must not write or restore.
+fn prepare_fetch(
+    updates: &[ValidatorConfigUpdate],
+    default_update: Option<&ValidatorConfigUpdate>,
+) -> Result<PreparedFetch, ()> {
+    let default_update = match default_update {
+        None => None,
+        Some(update) => match update.to_default_update() {
+            Ok(update) => Some(update),
+            Err(e) => {
+                warn!(error = %e, "proposer config rejected; previous values stay");
+                return Err(());
+            }
+        },
+    };
+    let mut rows = Vec::with_capacity(updates.len());
+    for update in updates {
+        if update.is_default_entry() {
+            warn_ignored_entry(&update.pubkey, &ParseError::IsDefaultPubkey);
+            return Err(());
+        }
+        match update.to_store_update() {
+            Ok((pk, store_update)) => rows.push((pk, store_update)),
+            Err(e) => {
+                warn_ignored_entry(&update.pubkey, &e);
+                return Err(());
+            }
+        }
+    }
+    Ok(PreparedFetch { default_update, rows })
+}
+
+fn warn_ignored_entry(pubkey: &str, error: &impl std::fmt::Display) {
+    warn!(error = %error, pubkey = %pubkey, "proposer config entry ignored");
+}
+
+fn pubkey_prefix(pk: &[u8; 48]) -> String {
+    hex::encode(&pk[..4])
 }
 
 /// Starts the background proposer config refresh task.
@@ -333,13 +459,13 @@ pub fn apply_proposer_config_updates(
 pub async fn start_proposer_config_refresh(
     settings: ProposerConfigUrlSettings,
     shutdown: CancellationToken,
-    apply_fn: impl Fn(Vec<ValidatorConfigUpdate>, Option<ValidatorConfigUpdate>) + Send + 'static,
+    apply_fn: impl Fn(FetchedProposerConfig) + Send + 'static,
 ) {
     // Initial fetch at startup
     match fetch_proposer_config(&settings.url, settings.token.as_deref(), settings.insecure).await {
-        Ok((updates, default_update)) => {
-            let count = updates.len();
-            apply_fn(updates, default_update);
+        Ok(fetched) => {
+            let count = fetched.updates.as_ref().map_or(0, Vec::len);
+            apply_fn(fetched);
             info!(count, "Initial proposer config loaded from URL");
             crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL.inc();
         }
@@ -370,9 +496,9 @@ pub async fn start_proposer_config_refresh(
                         settings.token.as_deref(),
                         settings.insecure,
                     ).await {
-                        Ok((updates, default_update)) => {
-                            let count = updates.len();
-                            apply_fn(updates, default_update);
+                        Ok(fetched) => {
+                            let count = fetched.updates.as_ref().map_or(0, Vec::len);
+                            apply_fn(fetched);
                             debug!(count, "Proposer config refreshed from URL");
                             crate::metrics::RVC_PROPOSER_CONFIG_REFRESH_SUCCESS_TOTAL.inc();
                         }
@@ -419,10 +545,11 @@ mod tests {
         }"#;
 
         let response: ProposerConfigResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.proposer_config.len(), 1);
+        let proposer_config = response.proposer_config.expect("proposer_config");
+        assert_eq!(proposer_config.len(), 1);
         assert!(response.default_config.is_some());
 
-        let entry = &response.proposer_config["0x98765"];
+        let entry = &proposer_config["0x98765"];
         assert_eq!(entry.fee_recipient.as_deref(), Some("0xabcd"));
         assert_eq!(entry.builder.as_ref().unwrap().enabled, Some(true));
         assert_eq!(entry.builder.as_ref().unwrap().gas_limit.as_deref(), Some("30000000"));
@@ -450,7 +577,8 @@ mod tests {
         }"#;
 
         let response: ProposerConfigResponse = serde_json::from_str(json).unwrap();
-        let entry = &response.proposer_config["0x98765"];
+        let proposer_config = response.proposer_config.expect("proposer_config");
+        let entry = &proposer_config["0x98765"];
         assert_eq!(entry.builder.as_ref().unwrap().gas_limit.as_deref(), Some("36000000"));
     }
 
@@ -505,7 +633,7 @@ mod tests {
         }"#;
 
         let response: ProposerConfigResponse = serde_json::from_str(json).unwrap();
-        assert!(response.proposer_config.is_empty());
+        assert!(response.proposer_config.expect("proposer_config").is_empty());
         assert!(response.default_config.is_some());
     }
 
@@ -520,7 +648,7 @@ mod tests {
         }"#;
 
         let response: ProposerConfigResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(response.proposer_config.len(), 1);
+        assert_eq!(response.proposer_config.expect("proposer_config").len(), 1);
         assert!(response.default_config.is_none());
     }
 
@@ -538,18 +666,23 @@ mod tests {
 
         let mock_server = MockServer::start().await;
 
-        let body = r#"{
-            "proposer_config": {
-                "0xaaa": {
-                    "fee_recipient": "0xbbb",
-                    "builder": { "enabled": true, "gas_limit": "30000000" }
-                }
-            },
-            "default_config": {
-                "fee_recipient": "0xccc",
-                "builder": { "enabled": false }
-            }
-        }"#;
+        let pubkey = valid_pubkey_hex();
+        let fee = valid_fee_recipient_hex();
+        let default_fee = fee_hex(0xcc);
+        let body = format!(
+            r#"{{
+            "proposer_config": {{
+                "{pubkey}": {{
+                    "fee_recipient": "{fee}",
+                    "builder": {{ "enabled": true, "gas_limit": "30000000" }}
+                }}
+            }},
+            "default_config": {{
+                "fee_recipient": "{default_fee}",
+                "builder": {{ "enabled": false }}
+            }}
+        }}"#
+        );
 
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
@@ -557,17 +690,18 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let (updates, default_update) =
-            fetch_proposer_config(&mock_server.uri(), None, true).await.unwrap();
+        let fetched = fetch_proposer_config(&mock_server.uri(), None, true).await.unwrap();
+        let updates = fetched.updates.expect("proposer_config");
+        let default_update = fetched.default_update;
 
         assert_eq!(updates.len(), 1);
-        assert_eq!(updates[0].pubkey, "0xaaa");
-        assert_eq!(updates[0].fee_recipient.as_deref(), Some("0xbbb"));
+        assert_eq!(updates[0].pubkey, pubkey);
+        assert_eq!(updates[0].fee_recipient.as_deref(), Some(fee.as_str()));
         assert_eq!(updates[0].builder_enabled, Some(true));
         assert_eq!(updates[0].gas_limit, Some(30000000));
 
         let default = default_update.unwrap();
-        assert_eq!(default.fee_recipient.as_deref(), Some("0xccc"));
+        assert_eq!(default.fee_recipient.as_deref(), Some(default_fee.as_str()));
         assert_eq!(default.builder_enabled, Some(false));
     }
 
@@ -585,10 +719,10 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        let (updates, _) =
+        let fetched =
             fetch_proposer_config(&mock_server.uri(), Some("test-token"), true).await.unwrap();
 
-        assert!(updates.is_empty());
+        assert!(fetched.updates.expect("proposer_config").is_empty());
     }
 
     #[tokio::test]
@@ -622,7 +756,7 @@ mod tests {
         let shutdown_clone = shutdown.clone();
 
         let handle = tokio::spawn(async move {
-            start_proposer_config_refresh(settings, shutdown_clone, |_, _| {}).await;
+            start_proposer_config_refresh(settings, shutdown_clone, |_| {}).await;
         });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -864,14 +998,14 @@ mod tests {
 
         let fr = valid_fee_recipient_hex();
         let default_fr = format!("0x{}", hex::encode([0xbbu8; 20]));
-        apply_proposer_config_updates(
+        ProposerConfigApplier::new().apply(
             &store,
-            vec![ValidatorConfigUpdate {
+            Some(vec![ValidatorConfigUpdate {
                 pubkey: valid_pubkey_hex(),
                 fee_recipient: Some(fr),
                 builder_enabled: Some(true),
                 gas_limit: Some(36_000_000),
-            }],
+            }]),
             Some(ValidatorConfigUpdate {
                 pubkey: DEFAULT_PUBKEY.to_string(),
                 fee_recipient: Some(default_fr),
@@ -898,14 +1032,14 @@ mod tests {
         cfg.fee_recipient = Some([0xaau8; 20]);
         store.add_validator(cfg).unwrap();
 
-        apply_proposer_config_updates(
+        ProposerConfigApplier::new().apply(
             &store,
-            vec![ValidatorConfigUpdate {
+            Some(vec![ValidatorConfigUpdate {
                 pubkey: valid_pubkey_hex(),
                 fee_recipient: Some("not-hex".to_string()),
                 builder_enabled: Some(true),
                 gas_limit: None,
-            }],
+            }]),
             None,
         );
 
@@ -924,14 +1058,14 @@ mod tests {
         store.add_validator(ValidatorConfig::new(pk)).unwrap();
         let huge = (i64::MAX as u64).saturating_add(1);
 
-        apply_proposer_config_updates(
+        ProposerConfigApplier::new().apply(
             &store,
-            vec![ValidatorConfigUpdate {
+            Some(vec![ValidatorConfigUpdate {
                 pubkey: valid_pubkey_hex(),
                 fee_recipient: None,
                 builder_enabled: None,
                 gas_limit: Some(huge),
-            }],
+            }]),
             Some(ValidatorConfigUpdate {
                 pubkey: DEFAULT_PUBKEY.to_string(),
                 fee_recipient: None,
@@ -942,5 +1076,385 @@ mod tests {
 
         assert_eq!(store.effective_gas_limit(&pk), 30_000_000);
         assert_eq!(store.default_gas_limit(), 30_000_000);
+    }
+
+    fn row(
+        pubkey: &str,
+        fee: Option<&str>,
+        builder: Option<bool>,
+        gas: Option<u64>,
+    ) -> ValidatorConfigUpdate {
+        ValidatorConfigUpdate {
+            pubkey: pubkey.to_string(),
+            fee_recipient: fee.map(str::to_string),
+            builder_enabled: builder,
+            gas_limit: gas,
+        }
+    }
+
+    fn fee_hex(byte: u8) -> String {
+        format!("0x{}", hex::encode([byte; 20]))
+    }
+
+    fn tracked_row() -> (ValidatorStore, [u8; 48], ProposerConfigApplier) {
+        let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
+        let pk = [0x11u8; 48];
+        let mut cfg = validator_store::ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some([0xaau8; 20]);
+        cfg.gas_limit = Some(21_000_000);
+        cfg.builder_proposals = false;
+        cfg.graffiti = Some([0x47u8; 32]);
+        store.add_validator(cfg).unwrap();
+        (store, pk, ProposerConfigApplier::new())
+    }
+
+    fn assert_url_values(store: &ValidatorStore, pk: &[u8; 48]) {
+        assert_eq!(store.effective_fee_recipient(pk), [0xbbu8; 20]);
+        assert_eq!(store.effective_gas_limit(pk), 36_000_000);
+        assert!(store.is_builder_enabled(pk));
+    }
+
+    fn assert_baseline(store: &ValidatorStore, pk: &[u8; 48]) {
+        assert_eq!(store.effective_fee_recipient(pk), [0xaau8; 20]);
+        assert_eq!(store.effective_gas_limit(pk), 21_000_000);
+        assert!(!store.is_builder_enabled(pk));
+        assert_eq!(store.get_config(pk).expect("row").graffiti, Some([0x47u8; 32]));
+        assert!(store.get_config(pk).expect("row").enabled);
+    }
+
+    #[test]
+    fn an_omitted_pubkey_restores_the_pre_url_triple_and_leaves_graffiti() {
+        let (store, pk, mut applier) = tracked_row();
+        let hex_pk = valid_pubkey_hex();
+        applier.apply(
+            &store,
+            Some(vec![row(&hex_pk, Some(&fee_hex(0xbb)), Some(true), Some(36_000_000))]),
+            None,
+        );
+        assert_url_values(&store, &pk);
+        applier.apply(&store, Some(Vec::new()), None);
+        assert_baseline(&store, &pk);
+    }
+
+    #[test]
+    fn a_later_url_value_does_not_replace_the_original_snapshot() {
+        let (store, pk, mut applier) = tracked_row();
+        let hex_pk = valid_pubkey_hex();
+        applier.apply(
+            &store,
+            Some(vec![row(&hex_pk, Some(&fee_hex(0xbb)), Some(true), Some(36_000_000))]),
+            None,
+        );
+        applier.apply(
+            &store,
+            Some(vec![row(&hex_pk, Some(&fee_hex(0xcc)), Some(false), Some(40_000_000))]),
+            None,
+        );
+        assert_eq!(store.effective_fee_recipient(&pk), [0xccu8; 20]);
+        assert_eq!(store.effective_gas_limit(&pk), 40_000_000);
+        assert!(!store.is_builder_enabled(&pk));
+        applier.apply(&store, Some(Vec::new()), None);
+        assert_baseline(&store, &pk);
+    }
+
+    #[test]
+    fn a_pubkey_named_again_after_reset_snapshots_the_restored_row() {
+        let (store, pk, mut applier) = tracked_row();
+        let hex_pk = valid_pubkey_hex();
+        applier.apply(
+            &store,
+            Some(vec![row(&hex_pk, Some(&fee_hex(0xbb)), Some(true), Some(36_000_000))]),
+            None,
+        );
+        applier.apply(&store, Some(Vec::new()), None);
+        assert_baseline(&store, &pk);
+        store
+            .update_config(
+                &pk,
+                validator_store::ValidatorConfigUpdate {
+                    fee_recipient: Some(Some([0xeeu8; 20])),
+                    gas_limit: Some(Some(22_000_000)),
+                    builder_proposals: Some(true),
+                    ..validator_store::ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        applier.apply(
+            &store,
+            Some(vec![row(&hex_pk, Some(&fee_hex(0xdd)), Some(false), Some(41_000_000))]),
+            None,
+        );
+        applier.apply(&store, Some(Vec::new()), None);
+        assert_eq!(store.effective_fee_recipient(&pk), [0xeeu8; 20]);
+        assert_eq!(store.effective_gas_limit(&pk), 22_000_000);
+        assert!(store.is_builder_enabled(&pk));
+    }
+
+    #[test]
+    fn a_malformed_fee_on_a_present_pubkey_does_not_restore_the_snapshot() {
+        let (store, pk, mut applier) = tracked_row();
+        let hex_pk = valid_pubkey_hex();
+        applier.apply(
+            &store,
+            Some(vec![row(&hex_pk, Some(&fee_hex(0xbb)), Some(true), Some(36_000_000))]),
+            None,
+        );
+        applier.apply(
+            &store,
+            Some(vec![row(&hex_pk, Some("not-hex"), Some(false), Some(1))]),
+            None,
+        );
+        assert_url_values(&store, &pk);
+    }
+
+    #[test]
+    fn a_gas_limit_above_i64_max_on_a_tracked_pubkey_does_not_restore() {
+        let (store, pk, mut applier) = tracked_row();
+        let hex_pk = valid_pubkey_hex();
+        applier.apply(
+            &store,
+            Some(vec![row(&hex_pk, Some(&fee_hex(0xbb)), Some(true), Some(36_000_000))]),
+            None,
+        );
+        let huge = (i64::MAX as u64).saturating_add(1);
+        applier.apply(&store, Some(vec![row(&hex_pk, None, None, Some(huge))]), None);
+        assert_url_values(&store, &pk);
+    }
+
+    #[test]
+    fn an_unknown_pubkey_is_not_tracked_and_a_later_row_is_not_wiped() {
+        let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
+        let unknown = [0x99u8; 48];
+        let unknown_hex = format!("0x{}", hex::encode(unknown));
+        let mut applier = ProposerConfigApplier::new();
+        applier.apply(
+            &store,
+            Some(vec![row(&unknown_hex, Some(&fee_hex(0xbb)), Some(true), Some(36_000_000))]),
+            None,
+        );
+        assert!(!store.has_validator(&unknown));
+        let mut cfg = validator_store::ValidatorConfig::new(unknown);
+        cfg.fee_recipient = Some([0xddu8; 20]);
+        cfg.gas_limit = Some(22_000_000);
+        cfg.builder_proposals = true;
+        store.add_validator(cfg).unwrap();
+        applier.apply(&store, Some(Vec::new()), None);
+        assert_eq!(store.effective_fee_recipient(&unknown), [0xddu8; 20]);
+        assert_eq!(store.effective_gas_limit(&unknown), 22_000_000);
+        assert!(store.is_builder_enabled(&unknown));
+    }
+
+    #[test]
+    fn a_cleared_fee_and_gas_inherit_the_default_current_at_restore() {
+        let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
+        let pk = [0x11u8; 48];
+        store.add_validator(validator_store::ValidatorConfig::new(pk)).unwrap();
+        let mut applier = ProposerConfigApplier::new();
+        let default_fee = fee_hex(0xcc);
+        applier.apply(
+            &store,
+            Some(vec![row(
+                &valid_pubkey_hex(),
+                Some(&fee_hex(0xbb)),
+                Some(true),
+                Some(36_000_000),
+            )]),
+            Some(row("default", Some(&default_fee), None, Some(40_000_000))),
+        );
+        assert_eq!(store.default_fee_recipient(), [0xccu8; 20]);
+        applier.apply(&store, Some(Vec::new()), None);
+        assert_eq!(store.get_config(&pk).expect("row").fee_recipient, None);
+        assert_eq!(store.get_config(&pk).expect("row").gas_limit, None);
+        assert!(!store.is_builder_enabled(&pk));
+        assert_eq!(store.effective_fee_recipient(&pk), [0xccu8; 20]);
+        assert_eq!(store.effective_gas_limit(&pk), 40_000_000);
+        assert_eq!(store.default_fee_recipient(), [0xccu8; 20]);
+    }
+
+    #[test]
+    fn an_uppercase_pubkey_is_the_same_tracked_key() {
+        let (store, pk, mut applier) = tracked_row();
+        applier.apply(
+            &store,
+            Some(vec![row(
+                &valid_pubkey_hex(),
+                Some(&fee_hex(0xbb)),
+                Some(true),
+                Some(36_000_000),
+            )]),
+            None,
+        );
+        let upper = format!("0x{}", hex::encode(pk).to_uppercase());
+        applier.apply(
+            &store,
+            Some(vec![row(&upper, Some(&fee_hex(0xcc)), Some(true), Some(36_000_000))]),
+            None,
+        );
+        assert_eq!(store.effective_fee_recipient(&pk), [0xccu8; 20]);
+        assert!(store.is_builder_enabled(&pk));
+        applier.apply(&store, Some(Vec::new()), None);
+        assert_baseline(&store, &pk);
+    }
+
+    #[test]
+    fn omitting_one_pubkey_leaves_the_other_url_row_in_place() {
+        let (store, pk, mut applier) = tracked_row();
+        let other = [0x22u8; 48];
+        let mut other_cfg = validator_store::ValidatorConfig::new(other);
+        other_cfg.fee_recipient = Some([0x11u8; 20]);
+        other_cfg.gas_limit = Some(23_000_000);
+        other_cfg.builder_proposals = false;
+        store.add_validator(other_cfg).unwrap();
+        let other_hex = format!("0x{}", hex::encode(other));
+        applier.apply(
+            &store,
+            Some(vec![
+                row(&valid_pubkey_hex(), Some(&fee_hex(0xbb)), Some(true), Some(36_000_000)),
+                row(&other_hex, Some(&fee_hex(0xdd)), Some(true), Some(37_000_000)),
+            ]),
+            None,
+        );
+        applier.apply(
+            &store,
+            Some(vec![row(&other_hex, Some(&fee_hex(0xee)), Some(true), Some(38_000_000))]),
+            None,
+        );
+        assert_baseline(&store, &pk);
+        assert_eq!(store.effective_fee_recipient(&other), [0xeeu8; 20]);
+        assert_eq!(store.effective_gas_limit(&other), 38_000_000);
+        assert!(store.is_builder_enabled(&other));
+    }
+
+    #[test]
+    fn a_malformed_default_rejects_the_whole_fetch() {
+        let (store, pk, mut applier) = tracked_row();
+        applier.apply(
+            &store,
+            Some(vec![row(
+                &valid_pubkey_hex(),
+                Some(&fee_hex(0xbb)),
+                Some(true),
+                Some(36_000_000),
+            )]),
+            Some(row("default", Some(&fee_hex(0xcc)), None, Some(40_000_000))),
+        );
+        assert_eq!(store.default_fee_recipient(), [0xccu8; 20]);
+        applier.apply(&store, Some(Vec::new()), Some(row("default", Some("not-hex"), None, None)));
+        assert_url_values(&store, &pk);
+        assert_eq!(store.default_fee_recipient(), [0xccu8; 20]);
+        assert_eq!(store.default_gas_limit(), 40_000_000);
+    }
+
+    #[test]
+    fn one_bad_entry_does_not_apply_a_sibling_or_restore_an_omission() {
+        let (store, pk, mut applier) = tracked_row();
+        let other = [0x22u8; 48];
+        let mut other_cfg = validator_store::ValidatorConfig::new(other);
+        other_cfg.fee_recipient = Some([0x11u8; 20]);
+        other_cfg.gas_limit = Some(23_000_000);
+        other_cfg.builder_proposals = false;
+        store.add_validator(other_cfg).unwrap();
+        let other_hex = format!("0x{}", hex::encode(other));
+        applier.apply(
+            &store,
+            Some(vec![
+                row(&valid_pubkey_hex(), Some(&fee_hex(0xbb)), Some(true), Some(36_000_000)),
+                row(&other_hex, Some(&fee_hex(0xdd)), Some(true), Some(37_000_000)),
+            ]),
+            None,
+        );
+        applier.apply(
+            &store,
+            Some(vec![
+                row(&valid_pubkey_hex(), Some("not-hex"), Some(false), Some(1)),
+                row(&other_hex, Some(&fee_hex(0xee)), Some(false), Some(38_000_000)),
+            ]),
+            None,
+        );
+        assert_url_values(&store, &pk);
+        assert_eq!(store.effective_fee_recipient(&other), [0xddu8; 20]);
+        assert_eq!(store.effective_gas_limit(&other), 37_000_000);
+        assert!(store.is_builder_enabled(&other));
+    }
+
+    #[test]
+    fn a_body_with_neither_proposer_key_deserializes_and_is_not_a_document() {
+        let body: ProposerConfigResponse =
+            serde_json::from_str(r#"{"status":"ok"}"#).expect("unrelated JSON still parses");
+        assert!(body.proposer_config.is_none());
+        assert!(body.default_config.is_none());
+    }
+
+    #[test]
+    fn a_document_with_only_default_config_parses() {
+        let fee = valid_fee_recipient_hex();
+        let body: ProposerConfigResponse =
+            serde_json::from_str(&format!(r#"{{"default_config":{{"fee_recipient":"{fee}"}}}}"#))
+                .expect("teku default-only document");
+        assert!(body.proposer_config.is_none());
+        assert!(body.default_config.is_some());
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_a_body_with_neither_key_and_accepts_default_only() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let neither = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"status":"ok"}"#))
+            .mount(&neither)
+            .await;
+        let err = fetch_proposer_config(&neither.uri(), None, true).await.expect_err("neither");
+        assert!(err.contains("neither"), "{err}");
+
+        let malformed = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"proposer_config":[]}"#))
+            .mount(&malformed)
+            .await;
+        let err = fetch_proposer_config(&malformed.uri(), None, true).await.expect_err("malformed");
+        assert!(err.contains("parse") || err.contains("proposer"), "{err}");
+
+        let only_default = MockServer::start().await;
+        let fee = valid_fee_recipient_hex();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(format!(
+                    r#"{{"default_config":{{"fee_recipient":"{fee}"}}}}"#
+                )),
+            )
+            .mount(&only_default)
+            .await;
+        let fetched =
+            fetch_proposer_config(&only_default.uri(), None, true).await.expect("default");
+        assert!(fetched.updates.is_none());
+        assert_eq!(
+            fetched.default_update.expect("default").fee_recipient.as_deref(),
+            Some(fee.as_str())
+        );
+    }
+
+    #[test]
+    fn a_default_only_fetch_does_not_restore_a_tracked_pubkey() {
+        let (store, pk, mut applier) = tracked_row();
+        applier.apply(
+            &store,
+            Some(vec![row(
+                &valid_pubkey_hex(),
+                Some(&fee_hex(0xbb)),
+                Some(true),
+                Some(36_000_000),
+            )]),
+            None,
+        );
+        applier.apply(
+            &store,
+            None,
+            Some(row("default", Some(&fee_hex(0xcc)), None, Some(40_000_000))),
+        );
+        assert_url_values(&store, &pk);
+        assert_eq!(store.default_fee_recipient(), [0xccu8; 20]);
+        assert_eq!(store.default_gas_limit(), 40_000_000);
     }
 }

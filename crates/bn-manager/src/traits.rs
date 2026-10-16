@@ -105,6 +105,24 @@ pub trait BlockProducer: Send + Sync {
         Ok(vec![RankedBlock { bn_index: 0, response }])
     }
 
+    /// [`Self::produce_block_v3_ranked`] capped at `deadline` when it is set.
+    ///
+    /// The default ignores `deadline`. [`crate::BnManager`] uses it only for
+    /// this produce call. Other pool operations are not capped by it.
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<RankedBlock>, BeaconError> {
+        let _ = deadline;
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
     /// [`Self::produce_block_v3`] with the duty's slot, proposer, parent,
     /// and consensus version applied before a block is ranked or returned.
     /// Those four checks, plus an unreadable or missing fee on a full
@@ -144,6 +162,22 @@ pub trait BlockProducer: Send + Sync {
         graffiti: Option<&str>,
         builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BeaconError>;
+
+    /// [`Self::produce_block_v4`] capped at `deadline` when it is set.
+    ///
+    /// The default ignores `deadline`. [`crate::BnManager`] applies it only
+    /// to this produce call.
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let _ = deadline;
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
 
     /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block(

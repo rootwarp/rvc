@@ -168,6 +168,40 @@ fn zero_timeout_rejected_from_toml_as_well_as_cli() {
 }
 
 #[test]
+fn timeout_above_one_slot_is_rejected_from_toml_as_well_as_cli() {
+    let cases = [
+        "block_production_timeout",
+        "attestation_timeout",
+        "aggregate_timeout",
+        "duty_fetch_timeout",
+    ];
+    for field in cases {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "{field} = 61").unwrap();
+        let from_toml =
+            Config::load(Some(file.path()), StartArgs::default()).expect("load toml 61");
+        let err = from_toml.validate().expect_err(field);
+        let message = err.to_string();
+        assert!(message.contains("1..=60"), "{field} toml: {message}");
+        assert!(message.contains(field), "{field} toml: {message}");
+
+        let mut cli = StartArgs::default();
+        match field {
+            "block_production_timeout" => cli.beacon.block_production_timeout = Some(u64::MAX),
+            "attestation_timeout" => cli.beacon.attestation_timeout = Some(u64::MAX),
+            "aggregate_timeout" => cli.beacon.aggregate_timeout = Some(u64::MAX),
+            "duty_fetch_timeout" => cli.beacon.duty_fetch_timeout = Some(u64::MAX),
+            _ => unreachable!(),
+        }
+        let from_cli = Config::load(None, cli).expect("load cli max");
+        let err = from_cli.validate().expect_err(field);
+        let message = err.to_string();
+        assert!(message.contains("1..=60"), "{field} cli: {message}");
+        assert!(message.contains(&u64::MAX.to_string()), "{field} cli: {message}");
+    }
+}
+
+#[test]
 fn group_commit_batch_size_zero_is_rejected() {
     let mut file = NamedTempFile::new().unwrap();
     writeln!(file, "[slashing]\ngroup_commit_batch_size = 0").unwrap();

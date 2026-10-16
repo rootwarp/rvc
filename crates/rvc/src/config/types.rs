@@ -24,6 +24,16 @@ use crate::orchestrator::dispatch::DispatchLimits;
 use rvc_config::ConfigSource;
 use slashing::GroupCommitConfig;
 
+/// Upper bound for the four beacon operation timeouts, in seconds.
+///
+/// One maximum slot. [`Config::operation_timeouts`] clamps too, so a skipped
+/// [`Config::validate`] cannot install `u64::MAX`.
+pub(crate) const MAX_OPERATION_TIMEOUT_SECS: u64 = 60;
+
+fn bounded_operation_timeout(secs: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(secs.min(MAX_OPERATION_TIMEOUT_SECS))
+}
+
 pub use rvc_config::{
     BeaconArgs, BeaconConfig, BuilderLimits, BuilderLimitsArgs, BuilderSettings, DutiesArgs,
     DutiesConfig, ForkScheduleConfig, GcpSecretArgs, GcpSecretConfig, GrpcSignerArgs,
@@ -919,26 +929,26 @@ impl Config {
             ));
         }
 
-        if self.block_production_timeout == Some(0) {
-            return Err(ConfigError::MissingField(
-                "--block-production-timeout must be greater than 0".to_string(),
-            ));
-        }
-        if self.attestation_timeout == Some(0) {
-            return Err(ConfigError::MissingField(
-                "--attestation-timeout must be greater than 0".to_string(),
-            ));
-        }
-        if self.aggregate_timeout == Some(0) {
-            return Err(ConfigError::MissingField(
-                "--aggregate-timeout must be greater than 0".to_string(),
-            ));
-        }
-        if self.duty_fetch_timeout == Some(0) {
-            return Err(ConfigError::MissingField(
-                "--duty-fetch-timeout must be greater than 0".to_string(),
-            ));
-        }
+        self.reject_operation_timeout(
+            "block_production_timeout",
+            "--block-production-timeout must be greater than 0",
+            self.block_production_timeout,
+        )?;
+        self.reject_operation_timeout(
+            "attestation_timeout",
+            "--attestation-timeout must be greater than 0",
+            self.attestation_timeout,
+        )?;
+        self.reject_operation_timeout(
+            "aggregate_timeout",
+            "--aggregate-timeout must be greater than 0",
+            self.aggregate_timeout,
+        )?;
+        self.reject_operation_timeout(
+            "duty_fetch_timeout",
+            "--duty-fetch-timeout must be greater than 0",
+            self.duty_fetch_timeout,
+        )?;
         if let Err(e) = GroupCommitConfig::try_from_knobs(
             self.group_commit_batch_size,
             self.group_commit_wait_to_fill_ms,
@@ -1300,19 +1310,37 @@ impl Config {
     pub fn operation_timeouts(&self) -> bn_manager::OperationTimeouts {
         let mut timeouts = bn_manager::OperationTimeouts::default();
         if let Some(secs) = self.block_production_timeout {
-            timeouts.block_production = std::time::Duration::from_secs(secs);
+            timeouts.block_production = bounded_operation_timeout(secs);
         }
         if let Some(secs) = self.attestation_timeout {
-            timeouts.attestation_fetch = std::time::Duration::from_secs(secs);
+            timeouts.attestation_fetch = bounded_operation_timeout(secs);
         }
         if let Some(secs) = self.aggregate_timeout {
-            timeouts.aggregate_fetch = std::time::Duration::from_secs(secs);
-            timeouts.aggregate_submit = std::time::Duration::from_secs(secs);
+            let bounded = bounded_operation_timeout(secs);
+            timeouts.aggregate_fetch = bounded;
+            timeouts.aggregate_submit = bounded;
         }
         if let Some(secs) = self.duty_fetch_timeout {
-            timeouts.duty_fetch = std::time::Duration::from_secs(secs);
+            timeouts.duty_fetch = bounded_operation_timeout(secs);
         }
         timeouts
+    }
+
+    fn reject_operation_timeout(
+        &self,
+        field: &'static str,
+        zero_message: &str,
+        value: Option<u64>,
+    ) -> Result<(), ConfigError> {
+        match value {
+            Some(0) => Err(ConfigError::MissingField(zero_message.to_string())),
+            Some(secs) if secs > MAX_OPERATION_TIMEOUT_SECS => Err(ConfigError::Invalid {
+                field,
+                message: format!("must be 1..={MAX_OPERATION_TIMEOUT_SECS} seconds, got {secs}"),
+                source_layer: ConfigSource::Default,
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// Load with explicit precedence: defaults < file < CLI.

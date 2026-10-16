@@ -3,6 +3,72 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Proposer-pool timeouts, the global selection mode, and URL proposer reset
+
+A dedicated proposer beacon-node pool uses the same operation timeouts as the
+main pool. `block_production_timeout`, `attestation_timeout`,
+`aggregate_timeout`, and `duty_fetch_timeout` apply to that pool. With
+`block_production_timeout = 6`, block production on the proposer pool has a
+6 second budget. The other budgets stay at their built-in values unless they
+are set too. An empty `proposer_nodes` list still builds no proposer pool. A
+proposer URL that is not `http` or `https` fails startup and builds no pool.
+A stored budget of zero is still no budget.
+
+`--block-selection-mode` and the top-level TOML key `block_selection_mode`
+set the global default. A validator with no per-validator mode uses that
+default. A per-validator mode still wins. When both are unset, the global
+default stays `max-profit`. A malformed builder URL, or a zero default fee
+recipient, still refuses to build the store, so the mode is not published.
+The mode and the proposer-pool budget do not read the fork schedule.
+
+A proposer-config URL owns each fee recipient, gas limit, and builder flag
+on its own. When the remote document starts owning a field, that field's
+baseline is the live local value at that moment. A later remote value for a
+field the URL still owns keeps that baseline. Any keymanager or other
+durable write of a field the URL owns drops that ownership, including a
+write of the same value. The written value is the new local baseline, in
+memory and in the validators file. The URL owns the field again only when a
+later document sets it, and the baseline is the live value at that moment.
+A later successful fetch that omits the pubkey restores each field the URL
+still owns. A field the URL does not own is left as it is. Naming the
+pubkey again after that restore starts ownership from the restored row.
+
+Deleting a key removes its ownership record. Importing it again starts from
+the imported row. An omission after that delete does not write the old
+baseline onto the new row. Refresh application, the ownership record, and
+keymanager durable writes run under the store save lock and one state write.
+The generation check stays held across the restore.
+
+URL values stay in memory for proposals and are not written into the
+validators file. A keymanager save of an unrelated field, such as graffiti,
+persists that field and leaves the local baseline of each field the URL
+still owns on disk.
+
+`default_config` changes the live defaults only. It is not written as
+`[defaults]`. After a restart with the remote document gone, a validator
+with no per-validator override uses the local `[defaults]` from the file.
+A later body that omits `default_config` does not restore the previous
+remote defaults.
+
+A 401, a body that is not JSON, a 200 whose JSON has neither
+`proposer_config` nor `default_config`, or one invalid entry leaves every
+previous URL value in place. One bad entry rejects the whole fetch: a
+sibling is not applied and an omission is not restored. A document that has
+only `default_config` is accepted and does not treat missing pubkeys as
+omissions. A pubkey that was not in the store is not tracked. These paths
+do not sign or publish a block.
+
+Each of the four timeout knobs must be from 1 to 60 seconds. Zero is still
+rejected with the existing message. `operation_timeouts` also clamps, so a
+skipped validation cannot store `u64::MAX`. While a slot is open, the slot
+end is passed only into proposer-pool block production. That call is capped
+at the time left in the slot. The main pool keeps its configured budgets.
+Attestation, sync, and aggregate publication keep slot end plus 500 ms.
+Adding a timeout to the clock uses checked arithmetic, so `u64::MAX` seconds
+returns instead of panicking.
+
+Review findings B-033, B-034, and B-114 are fixed.
+
 ## Doppelganger liveness runs even with no keys loaded
 
 The liveness loop starts whenever doppelganger protection is on, including a

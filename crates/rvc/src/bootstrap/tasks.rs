@@ -8,6 +8,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use parking_lot::Mutex;
+
 use bn_manager::BnManager;
 use metrics::SharedHealthStatus;
 use tokio::sync::watch;
@@ -161,16 +163,18 @@ pub fn spawn_background_tasks(
             refresh_interval_secs = config.proposer_config.refresh_interval,
             "Starting proposer config URL refresh task"
         );
+        // The applier remembers seen pubkeys. `apply` takes the store locks.
+        // The store does not call back into the applier. `parking_lot::Mutex`
+        // does not poison.
+        let proposer_config_applier =
+            Arc::new(Mutex::new(crate::background_tasks::config_url::ProposerConfigApplier::new()));
         executor.spawn("proposer_config_refresh", ShutdownTier::Background, async move {
             crate::background_tasks::config_url::start_proposer_config_refresh(
                 settings,
                 config_refresh_shutdown,
-                move |updates, default_update| {
-                    crate::background_tasks::config_url::apply_proposer_config_updates(
-                        &validator_store,
-                        updates,
-                        default_update,
-                    );
+                move |fetched| {
+                    let mut applier = proposer_config_applier.lock();
+                    applier.apply(&validator_store, fetched.updates, fetched.default_update);
                 },
             )
             .await;

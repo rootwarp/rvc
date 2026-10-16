@@ -606,6 +606,49 @@ pub(super) async fn setup_proposer_duty(
         .await;
 }
 
+/// Deleting the body of `arm_operation_deadline` (returning "now") or
+/// ignoring the clock makes this fail. The slot loop passes the returned
+/// instant only into block proposal.
+#[tokio::test]
+async fn arm_operation_deadline_is_the_time_left_in_the_slot() {
+    let beacon = Arc::new(
+        BeaconClient::new(BeaconClientConfig::new("http://127.0.0.1:1".to_string())).unwrap(),
+    );
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), Vec::new()));
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let signer = Arc::new(
+        SignerService::new(composite, Arc::new(SlashingDb::open_in_memory().unwrap()))
+            .with_enablement(always_enabled()),
+    );
+    let propagator = Arc::new(Propagator::new(Arc::new(MockSubmitter::new())));
+    let clock = Arc::new(MockSlotClock::new(0, Duration::from_secs(12), 32));
+    let slot = 5u64;
+    clock.set_slot_with_offset_ms(slot, 11_800);
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        create_test_config(),
+        pubkey_map,
+    ));
+
+    let before = tokio::time::Instant::now();
+    let deadline = orchestrator.arm_operation_deadline(slot);
+    let left = deadline.saturating_duration_since(before);
+    assert!(left > Duration::from_millis(100) && left < Duration::from_millis(400), "{left:?}");
+
+    let src = include_str!("../mod.rs");
+    assert!(src.contains("let proposal_deadline = self.arm_operation_deadline(current_slot);"));
+    assert!(src.contains("Some(proposal_deadline)"));
+    assert!(!src.contains("set_operation_deadline"));
+}
+
 // ── Topic modules ─────────────────────────────────────────────────────
 
 mod aggregation;

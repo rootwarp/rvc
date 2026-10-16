@@ -76,7 +76,7 @@ pubkey = "0xdef456..."
 | `gas_limit` | integer | `30000000` | Execution-layer gas limit target passed to the builder/EL. |
 | `graffiti` | string | none (empty) | UTF-8 string. **Silently truncated to 32 bytes** if longer (byte-level truncation via `parse_graffiti`, `store.rs:435-440`) — unlike the HTTP API, which rejects oversized graffiti with `400` instead of truncating. |
 
-There is **no global `block_selection_mode` key under `[defaults]`** — block selection mode can only be set per-validator (see below) or via the Rust API (`ValidatorStore::set_global_block_selection_mode`), which nothing in the shipped binary currently calls (the effective global default is permanently `max-profit`).
+There is no `block_selection_mode` key under `[defaults]`. The CLI flag `--block-selection-mode` and the top-level TOML key `block_selection_mode` (on the rvc config, not in this file) set the global default. A per-validator `block_selection_mode` still wins. `ValidatorStore::set_global_block_selection_mode` sets the same global. When the flag and the TOML key are both unset, the global default is `max-profit`.
 
 ### `[[validators]]`
 
@@ -89,7 +89,7 @@ There is **no global `block_selection_mode` key under `[defaults]`** — block s
 | `builder_boost_factor` | integer | no | `100` | Weighting used when comparing local vs. builder block value; `0` effectively disables the builder path for this validator, `u64::MAX` forces builder-always/only semantics. |
 | `graffiti` | string | no | inherits `[defaults].graffiti` | Same truncation behavior as above. |
 | `enabled` | bool | no | `true` | Master per-validator signing gate — `false` blocks all attesting/proposing for this key. Unknown pubkeys (not listed here and not loaded from a keystore) are treated as `enabled = false` (fail-closed). |
-| `block_selection_mode` | string | no | falls back to the (currently fixed) global default `max-profit` | One of `max-profit`, `execution-only`, `builder-always`, `builder-only` (kebab-case; no-hyphen spellings like `executiononly` also parse). See below. |
+| `block_selection_mode` | string | no | the global default set by `--block-selection-mode` or the top-level TOML key `block_selection_mode` (`max-profit` when both are unset) | One of `max-profit`, `execution-only`, `builder-always`, `builder-only` (kebab-case; no-hyphen spellings like `executiononly` also parse). A per-validator value wins over that global default. See below. |
 
 **Malformed entries fail the whole file:** an invalid hex string/length in any `fee_recipient` or `pubkey` (defaults or per-validator) makes `load_from_config` return an error and the process refuses to start — there's no partial/best-effort loading of a broken file.
 
@@ -138,12 +138,12 @@ Safe **only while the process is stopped**. There is currently no reload trigger
 
 ### 3. `proposer_config_url` / `proposer_config_file`
 
-These are separate, MEV-boost/Prysm-style config options (`Config.proposer_config_url`, `Config.proposer_config_file`) that parse a different JSON schema keyed by pubkey. As of the current codebase:
+These are separate, MEV-boost/Prysm-style config options (`Config.proposer_config_url`, `Config.proposer_config_file`) that parse a different JSON schema keyed by pubkey.
 
-- `proposer_config_url` is fetched and parsed on a timer, but the only call site logs the parsed updates and never applies them to `ValidatorStore`.
+- `proposer_config_url` is fetched on a timer and applied to the **live** store. Each fee recipient, gas limit, and builder flag is owned on its own. When the URL starts owning a field, the baseline is that field's live value at that moment. A keymanager write of an owned field, including a write of the same value, drops ownership and becomes the new baseline in memory and in this file. A later fetch that sets the field again owns it from the value at that moment. Omitting the pubkey restores each field the URL still owns. A body with neither `proposer_config` nor `default_config`, or any one invalid entry, is rejected and changes nothing. One bad entry rejects the whole fetch. A document with only `default_config` is accepted and does not restore omitted pubkeys. Deleting a key and importing it again drops that key's ownership record. Fields the URL still owns are not written into this file. `default_config` changes the live defaults and is not written as `[defaults]`. After a restart with the remote document gone, validators fall back to the local `[defaults]`.
 - `proposer_config_file` is parsed as a config field but never read from disk by any code path.
 
-**Neither currently affects `validators_config`/`ValidatorStore` state.** `validators_config` and the Keymanager HTTP API populate fee recipient, gas limit, and builder settings. `--graffiti` is an in-memory validator-store default at startup; a per-validator `graffiti` and a keymanager-set default still win. Startup does not rewrite this file. The next keymanager save persists that in-memory default over `[defaults].graffiti`.
+`validators_config` and the Keymanager HTTP API remain the durable source for fee recipient, gas limit, and graffiti. Builder proposals have no HTTP setter; `ValidatorStore::update_config_durable` is the durable path. `--graffiti` is an in-memory validator-store default at startup; a per-validator `graffiti` and a keymanager-set default still win. Startup does not rewrite this file. The next keymanager save persists that in-memory default over `[defaults].graffiti`.
 
 ---
 
@@ -159,7 +159,7 @@ These are separate, MEV-boost/Prysm-style config options (`Config.proposer_confi
 | `is_signing_enabled(pubkey)` | read | none — fail-closed: unknown pubkey → `false` |
 | `list_enabled_pubkeys()` / `has_validator(pubkey)` / `get_config(pubkey)` | read | none |
 | `add_validator(config)` / `remove_validator(pubkey)` / `set_enabled(pubkey, bool)` / `update_config(pubkey, update)` | write | **in-memory only** — does not persist |
-| `save_config()` | write | atomically serializes the full in-memory snapshot to `config_path` (temp file + `fsync` + rename); errors if `config_path` is `None` |
+| `save_config()` | write | atomically serializes the snapshot to `config_path` (temp file + `fsync` + rename). A field a proposer-config URL still owns is written as the local baseline from when the URL started owning it. A remote `default_config` is not written as `[defaults]`. Errors if `config_path` is `None` |
 | `reload_config()` | write | re-reads `config_path` from disk, parse-first/apply-second; not called anywhere in the shipped binary today |
 
 `ValidatorConfigUpdate` (the argument to `update_config`) is a sparse patch: each optional field is `Option<Option<T>>` — outer `None` means "don't touch", `Some(None)` means "clear back to default", `Some(Some(v))` means "set to `v`".

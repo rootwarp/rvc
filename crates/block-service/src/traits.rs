@@ -89,6 +89,23 @@ pub trait BeaconBlockClient: Send + Sync {
         Ok(vec![RankedBlock { bn_index: 0, response }])
     }
 
+    /// [`Self::produce_block_v3_ranked`] capped at `deadline` for this call only.
+    ///
+    /// The default ignores `deadline`.
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
+        let _ = deadline;
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
     async fn produce_block_v4(
         &self,
         slot: Slot,
@@ -96,6 +113,21 @@ pub trait BeaconBlockClient: Send + Sync {
         graffiti: Option<&str>,
         builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BlockServiceError>;
+
+    /// [`Self::produce_block_v4`] capped at `deadline` for this call only.
+    ///
+    /// The default ignores `deadline`.
+    async fn produce_block_v4_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        let _ = deadline;
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
 
     /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block(

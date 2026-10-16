@@ -23,7 +23,7 @@
 //! | `OrchestratorConfig` timeouts | produce+publish timeout envelope |
 //!
 //! Call site today is a single phase in the slot loop
-//! (`maybe_propose_block(slot, epoch, &ctx)`). A service would expose that same
+//! (`maybe_propose_block(slot, epoch, &ctx, proposal_deadline)`). A service would expose that same
 //! entry point; the orchestrator would hold `block_proposal: BlockProposalService`
 //! instead of calling an inherent method. Do **not** introduce the service until
 //! a second caller or a test-double seam justifies the plumbing cost.
@@ -99,7 +99,13 @@ where
     }
 
     #[tracing::instrument(name = "orchestrator.maybe_propose_block", level = "debug", skip_all, fields(slot = slot, epoch = epoch))]
-    pub(crate) async fn maybe_propose_block(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
+    pub(crate) async fn maybe_propose_block(
+        &self,
+        slot: Slot,
+        epoch: u64,
+        ctx: &SlotContext,
+        proposal_deadline: Option<tokio::time::Instant>,
+    ) {
         let proposer_duty = match self.duty_tracker.get_proposer_duty(slot).await {
             Some(duty) => duty,
             None => return,
@@ -132,17 +138,24 @@ where
 
         info!(slot, validator_index = %proposer_duty.validator_index, "Proposing block");
 
-        // Produce may run until the block-production budget plus the 250 ms
-        // backstop (`bn_manager::BACKSTOP_MARGIN`). Publication keeps its own
-        // budget on top of that, so the backstop does not come out of publish.
-        let allowance = block_proposal_allowance(&self.config.timeouts);
+        // The outer timeout is the block-production allowance, and also the
+        // time left in the slot when that is shorter. `proposal_deadline` is
+        // that slot end. It is passed only into proposer-pool block production.
+        // Publication inside the proposal uses its own budget. Attestation,
+        // sync, and aggregate publication are not capped here; they keep
+        // slot end plus 500 ms. Produce may also run the 250 ms backstop
+        // (`bn_manager::BACKSTOP_MARGIN`) inside its own budget.
+        let remaining =
+            self.clock.time_until_slot(slot.saturating_add(1)).unwrap_or(std::time::Duration::ZERO);
+        let allowance = block_proposal_allowance(&self.config.timeouts).min(remaining);
         match tokio::time::timeout(
             allowance,
-            self.block_service.propose_block(
+            self.block_service.propose_block_until(
                 slot,
                 &pubkey,
                 expected_proposer_index,
                 ctx.expected_parents,
+                proposal_deadline,
             ),
         )
         .await

@@ -542,22 +542,29 @@ mod config_url {
 
         let mock_server = MockServer::start().await;
 
-        let body = r#"{
-            "proposer_config": {
-                "0xaaa": {
-                    "fee_recipient": "0xbbb",
-                    "builder": { "enabled": true, "gas_limit": "30000000" }
-                },
-                "0xccc": {
-                    "fee_recipient": "0xddd",
-                    "builder": { "enabled": false }
-                }
-            },
-            "default_config": {
-                "fee_recipient": "0xeee",
-                "builder": { "enabled": true, "gas_limit": "36000000" }
-            }
-        }"#;
+        let pk_a = format!("0x{}", hex::encode([0x11u8; 48]));
+        let pk_b = format!("0x{}", hex::encode([0x22u8; 48]));
+        let fee_a = format!("0x{}", hex::encode([0xaau8; 20]));
+        let fee_b = format!("0x{}", hex::encode([0xbbu8; 20]));
+        let fee_default = format!("0x{}", hex::encode([0xccu8; 20]));
+        let body = format!(
+            r#"{{
+            "proposer_config": {{
+                "{pk_a}": {{
+                    "fee_recipient": "{fee_a}",
+                    "builder": {{ "enabled": true, "gas_limit": "30000000" }}
+                }},
+                "{pk_b}": {{
+                    "fee_recipient": "{fee_b}",
+                    "builder": {{ "enabled": false }}
+                }}
+            }},
+            "default_config": {{
+                "fee_recipient": "{fee_default}",
+                "builder": {{ "enabled": true, "gas_limit": "36000000" }}
+            }}
+        }}"#
+        );
 
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
@@ -565,12 +572,13 @@ mod config_url {
             .mount(&mock_server)
             .await;
 
-        let (updates, default_update) =
-            fetch_proposer_config(&mock_server.uri(), None, true).await.unwrap();
+        let fetched = fetch_proposer_config(&mock_server.uri(), None, true).await.unwrap();
+        let updates = fetched.updates.expect("proposer_config");
+        let default_update = fetched.default_update;
 
         assert_eq!(updates.len(), 2);
         let default = default_update.unwrap();
-        assert_eq!(default.fee_recipient.as_deref(), Some("0xeee"));
+        assert_eq!(default.fee_recipient.as_deref(), Some(fee_default.as_str()));
         assert_eq!(default.builder_enabled, Some(true));
         assert_eq!(default.gas_limit, Some(36000000));
     }
@@ -583,14 +591,18 @@ mod config_url {
 
         let mock_server = MockServer::start().await;
 
-        let body = r#"{
-            "proposer_config": {
-                "0xabc": {
-                    "fee_recipient": "0xdef",
-                    "builder": { "enabled": true, "gas_limit": "30000000" }
-                }
-            }
-        }"#;
+        let pubkey = format!("0x{}", hex::encode([0x11u8; 48]));
+        let fee = format!("0x{}", hex::encode([0xaau8; 20]));
+        let body = format!(
+            r#"{{
+            "proposer_config": {{
+                "{pubkey}": {{
+                    "fee_recipient": "{fee}",
+                    "builder": {{ "enabled": true, "gas_limit": "30000000" }}
+                }}
+            }}
+        }}"#
+        );
 
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_string(body))
@@ -615,8 +627,8 @@ mod config_url {
             rvc::background_tasks::config_url::start_proposer_config_refresh(
                 settings,
                 shutdown_clone,
-                move |updates, _default| {
-                    received_clone.lock().unwrap().push(updates);
+                move |fetched| {
+                    received_clone.lock().unwrap().push(fetched.updates.expect("proposer_config"));
                 },
             )
             .await;
@@ -629,8 +641,8 @@ mod config_url {
         let calls = received_updates.lock().unwrap();
         assert!(!calls.is_empty(), "apply_fn should have been called at least once");
         assert_eq!(calls[0].len(), 1);
-        assert_eq!(calls[0][0].pubkey, "0xabc");
-        assert_eq!(calls[0][0].fee_recipient.as_deref(), Some("0xdef"));
+        assert_eq!(calls[0][0].pubkey, pubkey);
+        assert_eq!(calls[0][0].fee_recipient.as_deref(), Some(fee.as_str()));
     }
 
     #[tokio::test]
@@ -654,9 +666,9 @@ mod config_url {
             .mount(&mock_server)
             .await;
 
-        let (updates, _) =
+        let fetched =
             fetch_proposer_config(&mock_server.uri(), Some("my-secret-token"), true).await.unwrap();
-        assert!(updates.is_empty());
+        assert!(fetched.updates.expect("proposer_config").is_empty());
     }
 
     #[tokio::test]
@@ -693,7 +705,7 @@ mod config_url {
             rvc::background_tasks::config_url::start_proposer_config_refresh(
                 settings,
                 shutdown_clone,
-                |_, _| {},
+                |_| {},
             )
             .await;
         });
@@ -806,7 +818,7 @@ mod composition {
             rvc::background_tasks::config_url::start_proposer_config_refresh(
                 config_settings,
                 shutdown_cfg,
-                move |_, _| {
+                move |_| {
                     *config_received_clone.lock().unwrap() = true;
                 },
             )

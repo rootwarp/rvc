@@ -435,6 +435,24 @@ struct BestSelect<T> {
 /// instant itself drops the held block as `OperationTimeout`.
 const HELD_RETURN_MARGIN: Duration = Duration::from_millis(50);
 
+/// A budget `tokio::time::timeout` can add to `now`, including the 250 ms backstop.
+///
+/// `u64::MAX` seconds cannot. That budget is already due, so the call returns
+/// instead of panicking inside `Instant + Duration`.
+fn representable_budget(budget: Duration) -> Duration {
+    let now = tokio::time::Instant::now();
+    let padded = budget.saturating_add(fan_out::BACKSTOP_MARGIN);
+    if now.checked_add(padded).is_some() {
+        budget
+    } else {
+        Duration::ZERO
+    }
+}
+
+fn checked_deadline(start: tokio::time::Instant, budget: Duration) -> tokio::time::Instant {
+    start.checked_add(budget).unwrap_or(start)
+}
+
 impl BnManager {
     /// Creates a new `BnManager` from the given configuration.
     ///
@@ -551,6 +569,15 @@ impl BnManager {
         self
     }
 
+    /// Returns the budgets stored by [`Self::with_operation_timeouts`].
+    ///
+    /// `None` means [`Self::with_operation_timeouts`] was not called. A stored
+    /// zero duration is returned as zero. Call sites that bound an attempt
+    /// still treat zero as no budget.
+    pub fn operation_timeouts(&self) -> Option<&OperationTimeouts> {
+        self.operation_timeouts.as_ref()
+    }
+
     /// Wraps a future with an optional per-operation timeout.
     async fn with_op_timeout<T>(
         &self,
@@ -572,9 +599,31 @@ impl BnManager {
     /// A zero duration is not a budget. Configuration rejects zero, but
     /// [`OperationTimeouts`] is a public struct and can still carry it. Treating
     /// zero as "no budget" keeps the synced pool from timing out immediately
-    /// and leaving only the fallback window.
+    /// and leaving only the fallback window. This budget is not a slot
+    /// deadline. Proposer-pool block production passes its slot end into
+    /// [`Self::production_budget`]. Attestation, sync, aggregate, duty fetch,
+    /// and publication keep the duration selected here.
     fn op_timeout(&self, f: impl FnOnce(&OperationTimeouts) -> Duration) -> Option<Duration> {
-        self.operation_timeouts.as_ref().map(f).filter(|budget| !budget.is_zero())
+        self.operation_timeouts
+            .as_ref()
+            .map(f)
+            .filter(|budget| !budget.is_zero())
+            .map(representable_budget)
+    }
+
+    /// Block-production budget, capped at a per-call deadline when one is set.
+    ///
+    /// `None` is the configured `block_production` budget. A deadline is the
+    /// end of the proposal slot and applies only to the produce call that
+    /// received it. A later call does not see it.
+    fn production_budget(&self, deadline: Option<tokio::time::Instant>) -> Option<Duration> {
+        let configured = self.op_timeout(|t| t.block_production);
+        let Some(deadline) = deadline else {
+            return configured;
+        };
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let budget = configured.unwrap_or(remaining).min(remaining);
+        Some(representable_budget(budget))
     }
 
     /// Dispatch a submission via broadcast or query_first based on the topic flag.
@@ -605,7 +654,8 @@ impl BnManager {
             )
             .await
         } else {
-            let deadline = timeout.map(|budget| tokio::time::Instant::now() + budget);
+            let deadline =
+                timeout.map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
             self.query_first(op_name, role, min_tier, deadline, |client| op(client)).await
         }
     }
@@ -1243,7 +1293,7 @@ impl BnManager {
             return Err(no_eligible_bn(op_name, role));
         }
 
-        let deadline = budget.map(|d| (tokio::time::Instant::now() + d, d));
+        let deadline = budget.map(|d| (checked_deadline(tokio::time::Instant::now(), d), d));
         let mut last_err = None;
         let mut tried: usize = 0;
         let mut failure_count: usize = 0;
@@ -1455,8 +1505,9 @@ impl BnManager {
         }
 
         let started = tokio::time::Instant::now();
-        let backstop =
-            budget.map(|budget| started + budget.saturating_add(fan_out::BACKSTOP_MARGIN));
+        let backstop = budget.map(|budget| {
+            checked_deadline(started, budget.saturating_add(fan_out::BACKSTOP_MARGIN))
+        });
         let attempts = indices
             .iter()
             .map(|&index| {
@@ -1656,8 +1707,9 @@ impl BnManager {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
         checks: Option<BlockDutyChecks>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<Vec<RankedBlock>, BeaconError> {
-        let budget = self.op_timeout(|t| t.block_production);
+        let budget = self.production_budget(deadline);
         let randao_reveal = randao_reveal.to_owned();
         let graffiti = graffiti.map(str::to_owned);
         let select = produce_best_select(checks, self.fee_recipient_policy);
@@ -2931,8 +2983,9 @@ impl DutiesProvider for BnManager {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<AttesterDutiesResponse, BeaconError> {
-        let deadline =
-            self.op_timeout(|t| t.duty_fetch).map(|budget| tokio::time::Instant::now() + budget);
+        let deadline = self
+            .op_timeout(|t| t.duty_fetch)
+            .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
         self.query_first(
             "get_attester_duties",
             BnRole::Attestation,
@@ -2948,8 +3001,9 @@ impl DutiesProvider for BnManager {
         epoch: u64,
         schedule: &ForkSchedule,
     ) -> Result<ProposerDutiesResponse, BeaconError> {
-        let deadline =
-            self.op_timeout(|t| t.duty_fetch).map(|budget| tokio::time::Instant::now() + budget);
+        let deadline = self
+            .op_timeout(|t| t.duty_fetch)
+            .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
         self.query_first(
             "get_proposer_duties",
             BnRole::Proposal,
@@ -2965,8 +3019,9 @@ impl DutiesProvider for BnManager {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<SyncCommitteeDutiesResponse, BeaconError> {
-        let deadline =
-            self.op_timeout(|t| t.duty_fetch).map(|budget| tokio::time::Instant::now() + budget);
+        let deadline = self
+            .op_timeout(|t| t.duty_fetch)
+            .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
         self.query_first(
             "post_sync_committee_duties",
             BnRole::SyncCommittee,
@@ -2982,8 +3037,9 @@ impl DutiesProvider for BnManager {
         epoch: u64,
         validator_indices: &[String],
     ) -> Result<PtcDutiesResponse, BeaconError> {
-        let deadline =
-            self.op_timeout(|t| t.duty_fetch).map(|budget| tokio::time::Instant::now() + budget);
+        let deadline = self
+            .op_timeout(|t| t.duty_fetch)
+            .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
         self.query_first(
             "post_ptc_duties",
             BnRole::Attestation,
@@ -3022,9 +3078,36 @@ impl BlockProducer for BnManager {
         builder_boost_factor: Option<u64>,
         duty: Option<ProduceDuty>,
     ) -> Result<Vec<RankedBlock>, BeaconError> {
+        self.produce_block_v3_ranked_by(
+            slot,
+            randao_reveal,
+            graffiti,
+            builder_boost_factor,
+            duty,
+            None,
+        )
+        .await
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<RankedBlock>, BeaconError> {
         let checks = duty.map(|duty| checks_from_duty(slot, duty));
-        self.produce_block_v3_checked(slot, randao_reveal, graffiti, builder_boost_factor, checks)
-            .await
+        self.produce_block_v3_checked(
+            slot,
+            randao_reveal,
+            graffiti,
+            builder_boost_factor,
+            checks,
+            deadline,
+        )
+        .await
     }
 
     async fn produce_block_v3_for_duty(
@@ -3054,7 +3137,18 @@ impl BlockProducer for BnManager {
         graffiti: Option<&str>,
         builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BeaconError> {
-        let budget = self.op_timeout(|t| t.block_production);
+        self.produce_block_v4_by(slot, randao_reveal, graffiti, builder_config, None).await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        let budget = self.production_budget(deadline);
         self.with_op_timeout(
             "produce_block_v4",
             budget,
@@ -3176,7 +3270,7 @@ impl BlockProducer for BnManager {
         } else {
             let deadline = self
                 .op_timeout(|t| t.block_publication)
-                .map(|budget| tokio::time::Instant::now() + budget);
+                .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
             self.query_first(
                 "publish_block_ssz",
                 BnRole::Submission,
@@ -3348,7 +3442,7 @@ impl AttestationApi for BnManager {
     ) -> Result<AttestationDataResponse, BeaconError> {
         let deadline = self
             .op_timeout(|t| t.attestation_fetch)
-            .map(|budget| tokio::time::Instant::now() + budget);
+            .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
         self.query_first(
             "get_attestation_data",
             BnRole::Attestation,
@@ -3393,7 +3487,7 @@ impl AttestationApi for BnManager {
         } else {
             let deadline = self
                 .op_timeout(|t| t.attestation_submit)
-                .map(|budget| tokio::time::Instant::now() + budget);
+                .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
             self.query_first_attributed(
                 "submit_attestation",
                 BnRole::Submission,
@@ -3417,7 +3511,7 @@ impl AttestationApi for BnManager {
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
         let deadline = self
             .op_timeout(|t| t.aggregate_fetch)
-            .map(|budget| tokio::time::Instant::now() + budget);
+            .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
         self.query_first(
             "get_aggregate_attestation",
             BnRole::Aggregation,
@@ -3483,7 +3577,7 @@ impl PayloadAttestationApi for BnManager {
     ) -> Result<Option<PayloadAttestationDataResponse>, BeaconError> {
         let deadline = self
             .op_timeout(|t| t.attestation_fetch)
-            .map(|budget| tokio::time::Instant::now() + budget);
+            .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
         self.query_first_prefer_some(
             "get_payload_attestation_data",
             BnRole::Attestation,
@@ -3516,7 +3610,7 @@ impl PayloadAttestationApi for BnManager {
         } else {
             let deadline = self
                 .op_timeout(|t| t.attestation_submit)
-                .map(|budget| tokio::time::Instant::now() + budget);
+                .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
             self.query_first(
                 "submit_payload_attestations",
                 BnRole::Submission,
@@ -3558,7 +3652,7 @@ impl SyncCommitteeApi for BnManager {
     ) -> Result<SyncCommitteeContributionResponse, BeaconError> {
         let deadline = self
             .op_timeout(|t| t.sync_contribution)
-            .map(|budget| tokio::time::Instant::now() + budget);
+            .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
         self.query_first(
             "get_sync_committee_contribution",
             BnRole::SyncCommittee,
@@ -5014,6 +5108,15 @@ mod tests {
             manager.op_timeout(|timeouts| timeouts.attestation_fetch),
             Some(Duration::from_millis(1))
         );
+        let stored = manager.operation_timeouts().expect("budgets were stored");
+        assert_eq!(stored.block_production, Duration::ZERO);
+        assert_eq!(stored.attestation_fetch, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn operation_timeouts_getter_is_none_until_budgets_are_stored() {
+        let manager = manager_with_endpoints(&["bn"]);
+        assert!(manager.operation_timeouts().is_none());
     }
 
     #[test]
@@ -6148,7 +6251,7 @@ mod tests {
 
         let flag = Arc::clone(&secondary_started);
         let hang = ATTEMPT_TIMEOUT_FLOOR + Duration::from_millis(500);
-        let deadline = tokio::time::Instant::now() + budget;
+        let deadline = checked_deadline(tokio::time::Instant::now(), budget);
         let started = std::time::Instant::now();
         let err = manager
             .query_first_prefer_some_inner(
@@ -6282,7 +6385,7 @@ mod tests {
             .await;
 
         let manager = BnManager::new(BnManagerConfig::new(vec![bn.uri()])).unwrap();
-        let deadline = tokio::time::Instant::now() + budget;
+        let deadline = checked_deadline(tokio::time::Instant::now(), budget);
         let started = std::time::Instant::now();
         let err = manager
             .query_first_inner(
@@ -6329,7 +6432,7 @@ mod tests {
 
         let flag = Arc::clone(&secondary_started);
         let hang = ATTEMPT_TIMEOUT_FLOOR + Duration::from_millis(500);
-        let deadline = tokio::time::Instant::now() + budget;
+        let deadline = checked_deadline(tokio::time::Instant::now(), budget);
         let started = std::time::Instant::now();
         let err = manager
             .query_first_inner(
@@ -6643,7 +6746,7 @@ mod tests {
             "expected {expected_no_budget_sites} `// no budget:` markers, found {actual_no_budget_sites}: {sites}"
         );
         assert_eq!(
-            production.matches("tokio::time::Instant::now() + budget").count(),
+            production.matches("checked_deadline(tokio::time::Instant::now(), budget)").count(),
             12,
             "each converted site takes an absolute deadline before it awaits"
         );
@@ -6791,6 +6894,167 @@ mod tests {
             "elapsed {elapsed:?} exceeded block_publication budget+ε ({:?})",
             budget + epsilon
         );
+    }
+
+    fn huge_pool_timeouts() -> OperationTimeouts {
+        let hour = Duration::from_secs(3600);
+        OperationTimeouts {
+            block_production: hour,
+            attestation_fetch: hour,
+            aggregate_fetch: hour,
+            aggregate_submit: hour,
+            duty_fetch: hour,
+            ..OperationTimeouts::default()
+        }
+    }
+
+    async fn hanging_synced_manager(
+        timeouts: OperationTimeouts,
+    ) -> (BnManager, wiremock::MockServer) {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let bn = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string("{}").set_delay(Duration::from_secs(2)),
+            )
+            .mount(&bn)
+            .await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![bn.uri()]))
+            .expect("BnManager")
+            .with_operation_timeouts(timeouts);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        (manager, bn)
+    }
+
+    fn assert_cut_short(label: &str, started: std::time::Instant, err: BeaconError) {
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { .. } | BeaconError::Timeout),
+            "{label} must time out, got {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "{label} held the caller for {elapsed:?}; the 2s hang must not run"
+        );
+    }
+
+    /// A 3600s produce budget must not outlive the per-call slot deadline.
+    /// The hanging beacon node delays every request by 2s. The deadline is
+    /// 40ms ahead and is an argument of that produce call only.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hanging_bn_stops_at_the_remaining_slot_deadline() {
+        let (manager, _bn) = hanging_synced_manager(huge_pool_timeouts()).await;
+        let cap = Duration::from_millis(40);
+        let deadline = tokio::time::Instant::now() + cap;
+
+        let started = std::time::Instant::now();
+        let err = manager
+            .produce_block_v3_ranked_by(1, "0x01", None, None, None, Some(deadline))
+            .await
+            .expect_err("produce v3");
+        assert_cut_short("produce_block_v3", started, err);
+
+        let deadline = tokio::time::Instant::now() + cap;
+        let started = std::time::Instant::now();
+        let err = manager
+            .produce_block_v4_by(1, "0x01", None, &BuilderConfig::default(), Some(deadline))
+            .await
+            .expect_err("produce v4");
+        assert_cut_short("produce_block_v4", started, err);
+    }
+
+    /// A produce deadline from an earlier slot does not clamp a later produce
+    /// call, and it does not clamp attestation, aggregate, or publication.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_stale_produce_deadline_does_not_clamp_the_next_call() {
+        let mut timeouts = huge_pool_timeouts();
+        timeouts.attestation_fetch = Duration::from_millis(120);
+        timeouts.aggregate_fetch = Duration::from_millis(120);
+        timeouts.block_publication = Duration::from_millis(120);
+        let (manager, _bn) = hanging_synced_manager(timeouts).await;
+
+        let stale = tokio::time::Instant::now() + Duration::from_millis(30);
+        let err = manager
+            .produce_block_v3_ranked_by(1, "0x01", None, None, None, Some(stale))
+            .await
+            .expect_err("stale produce");
+        assert!(matches!(err, BeaconError::OperationTimeout { .. } | BeaconError::Timeout));
+
+        let started = std::time::Instant::now();
+        let err = manager
+            .produce_block_v3_ranked_by(
+                2,
+                "0x01",
+                None,
+                None,
+                None,
+                Some(tokio::time::Instant::now() + Duration::from_millis(350)),
+            )
+            .await
+            .expect_err("later produce");
+        let elapsed = started.elapsed();
+        assert!(matches!(err, BeaconError::OperationTimeout { .. } | BeaconError::Timeout));
+        assert!(
+            elapsed > Duration::from_millis(200) && elapsed < Duration::from_millis(700),
+            "later produce used the new deadline, elapsed {elapsed:?}"
+        );
+
+        let started = std::time::Instant::now();
+        let err = manager.get_attestation_data(1, 0).await.expect_err("attestation");
+        assert_own_budget("get_attestation_data", started, err);
+
+        let started = std::time::Instant::now();
+        let err = manager
+            .get_aggregate_attestation(1, "0x01", Some(0), ForkName::Electra)
+            .await
+            .expect_err("aggregate");
+        assert_own_budget("get_aggregate_attestation", started, err);
+
+        let started = std::time::Instant::now();
+        let err = manager
+            .publish_block_contents(&sample_block_contents(), "deneb", None)
+            .await
+            .expect_err("publish");
+        assert_own_budget("publish_block_contents", started, err);
+    }
+
+    fn assert_own_budget(label: &str, started: std::time::Instant, err: BeaconError) {
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { .. } | BeaconError::Timeout),
+            "{label} must time out on its own budget, got {err:?}"
+        );
+        assert!(
+            elapsed > Duration::from_millis(80) && elapsed < Duration::from_millis(400),
+            "{label} must use its 120ms budget, not a leftover slot deadline; elapsed {elapsed:?}"
+        );
+    }
+
+    /// `u64::MAX` seconds must not panic inside `Instant + Duration`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unrepresentable_budget_returns_without_panicking() {
+        let unrepresentable = Duration::from_secs(u64::MAX);
+        let timeouts = OperationTimeouts {
+            block_production: unrepresentable,
+            attestation_fetch: unrepresentable,
+            aggregate_fetch: unrepresentable,
+            duty_fetch: unrepresentable,
+            ..OperationTimeouts::default()
+        };
+        let (manager, _bn) = hanging_synced_manager(timeouts).await;
+
+        let started = std::time::Instant::now();
+        let err = manager.produce_block_v3(1, "0x01", None, None).await.expect_err("produce v3");
+        assert_cut_short("produce_block_v3 u64::MAX", started, err);
+
+        let started = std::time::Instant::now();
+        let err = manager
+            .produce_block_v4(1, "0x01", None, &BuilderConfig::default())
+            .await
+            .expect_err("produce v4");
+        assert_cut_short("produce_block_v4 u64::MAX", started, err);
     }
 
     fn spec_body(slot_ms: &str) -> String {
