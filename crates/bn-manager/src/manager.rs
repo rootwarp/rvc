@@ -7,15 +7,16 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use beacon::{
-    AttestationDataResponse, AttesterDutiesResponse, BeaconClient, BeaconCommitteeSubscription,
-    BeaconError, BlockHeaderSummary, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry,
-    ConfigSpecResponse, GenesisResponse, IndexedFailure, PayloadAttestationDataResponse,
-    ProduceBlockResponse, ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse,
-    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
-    SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
-    SyncCommitteeMessage, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse,
-    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof, WireBody,
+    block_value, AttestationDataResponse, AttesterDutiesResponse, BeaconClient,
+    BeaconCommitteeSubscription, BeaconError, BlockHeaderSummary, BlockRootResponse, BuilderConfig,
+    BuilderPreferencesEntry, ConfigSpecResponse, GenesisResponse, IndexedFailure,
+    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
+    ProposerPreparation, PtcDutiesResponse, RankedBlock, SignedContributionAndProof,
+    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody,
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -420,7 +421,10 @@ struct BestSelect<T> {
     in_hand: Pred<T>,
     /// Called once for each `Ok` that fails [`Self::accept`], including on the drain.
     on_reject: RejectFn<T>,
-    /// Called once for the block that is actually returned.
+    /// Called once for the head of the ranked list.
+    ///
+    /// The fee-penalty warning is not emitted here. Block proposal emits it
+    /// for the candidate that is signed.
     on_chosen: ChosenFn<T>,
     allow_fallback: bool,
 }
@@ -1403,6 +1407,7 @@ impl BnManager {
         .await
     }
 
+    #[cfg(test)]
     async fn query_best_filtered<T, F>(
         &self,
         op_name: &str,
@@ -1421,9 +1426,13 @@ impl BnManager {
             strategy = "best",
             tried = tracing::field::Empty,
         );
-        self.query_best_inner(op_name, role, min_tier, budget, &op, select)
+        let ranked = self
+            .query_best_inner(op_name, role, min_tier, budget, &op, select)
             .instrument(strategy_span)
-            .await
+            .await?;
+        ranked.into_iter().next().map(|(_, value)| value).ok_or_else(|| {
+            BeaconError::HttpError(format!("{op_name}: all BNs failed in best-selection"))
+        })
     }
 
     async fn query_best_inner<T, F>(
@@ -1434,7 +1443,7 @@ impl BnManager {
         budget: Option<Duration>,
         op: &F,
         select: BestSelect<T>,
-    ) -> Result<T, BeaconError>
+    ) -> Result<Vec<(usize, T)>, BeaconError>
     where
         T: Send + 'static,
         F: Fn(&BeaconClient) -> BoxFut<'static, T>,
@@ -1470,44 +1479,36 @@ impl BnManager {
         )
         .await?;
 
-        if round.values.is_empty() {
-            let mut held = round.held;
-            if select.allow_fallback {
-                match self
-                    .fallback_unsynced(
-                        op_name,
-                        role,
-                        op,
-                        &indices,
-                        FallbackWindow { deadline: backstop, already_held: !held.is_empty() },
-                        &select,
-                    )
-                    .await
-                {
-                    Some(FallbackPick::Ready(index, value)) => {
-                        self.log_best_pick(op_name, index);
-                        (select.on_chosen)(index, &value);
-                        return Ok(value);
-                    }
-                    Some(FallbackPick::Held(more)) => held.extend(more),
-                    None => {}
-                }
+        let mut arrived = round.values;
+        let mut held = round.held;
+        if arrived.is_empty() && select.allow_fallback {
+            match self
+                .fallback_unsynced(
+                    op_name,
+                    role,
+                    op,
+                    &indices,
+                    FallbackWindow { deadline: backstop, already_held: !held.is_empty() },
+                    &select,
+                )
+                .await
+            {
+                Some(FallbackPick::Ready(index, value)) => held.push((index, value)),
+                Some(FallbackPick::Held(more)) => held.extend(more),
+                None => {}
             }
-            if let Some((index, value)) = pick_owned(held, select.pick_best.as_ref()) {
-                self.log_best_pick(op_name, index);
-                (select.on_chosen)(index, &value);
-                return Ok(value);
-            }
+        }
+        arrived.extend(held);
+        if arrived.is_empty() {
             return Err(round.last_error.unwrap_or_else(|| {
                 BeaconError::HttpError(format!("{op_name}: all BNs failed in best-selection"))
             }));
         }
-
-        let (best_index, best_value) =
-            pick_owned(round.values, select.pick_best.as_ref()).expect("values is non-empty");
-        self.log_best_pick(op_name, best_index);
-        (select.on_chosen)(best_index, &best_value);
-        Ok(best_value)
+        let ranked = sort_by_pick(arrived, select.pick_best.as_ref());
+        let (best_index, best_value) = &ranked[0];
+        self.log_best_pick(op_name, *best_index);
+        (select.on_chosen)(*best_index, best_value);
+        Ok(ranked)
     }
 
     fn log_best_pick(&self, op_name: &str, index: usize) {
@@ -1643,8 +1644,9 @@ impl BnManager {
     /// it does not count as in hand, and it is returned only when no matching
     /// block arrives before every beacon node has answered or the hard
     /// deadline passes. [`FeeRecipientPolicy::Reject`] drops that mismatch.
-    /// A blinded block skips the fee penalty. The penalty warning is emitted
-    /// only for the block that is returned.
+    /// A blinded block skips the fee penalty. The penalty warning and
+    /// `rvc_produce_block_fee_recipient_penalty_total` are emitted for the
+    /// candidate that is signed, not for the head of this list.
     /// Fallback runs only when the expected parent root is known, and only
     /// against untried proposal-role BNs above the health floor.
     async fn produce_block_v3_checked(
@@ -1654,38 +1656,49 @@ impl BnManager {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
         checks: Option<BlockDutyChecks>,
-    ) -> Result<ProduceBlockResponse, BeaconError> {
+    ) -> Result<Vec<RankedBlock>, BeaconError> {
         let budget = self.op_timeout(|t| t.block_production);
         let randao_reveal = randao_reveal.to_owned();
         let graffiti = graffiti.map(str::to_owned);
         let select = produce_best_select(checks, self.fee_recipient_policy);
-        self.with_op_timeout(
-            "produce_block_v3",
-            fan_out::broadcast_backstop(budget),
-            self.query_best_filtered(
+        let strategy_span = tracing::info_span!(
+            "bn.strategy.best",
+            strategy = "best",
+            tried = tracing::field::Empty,
+        );
+        let ranked = self
+            .with_op_timeout(
                 "produce_block_v3",
-                BnRole::Proposal,
-                HealthTier::Synced,
-                budget,
-                move |client: &BeaconClient| {
-                    let client = client.clone();
-                    let randao_reveal = randao_reveal.clone();
-                    let graffiti = graffiti.clone();
-                    Box::pin(async move {
-                        client
-                            .produce_block_v3(
-                                slot,
-                                &randao_reveal,
-                                graffiti.as_deref(),
-                                builder_boost_factor,
-                            )
-                            .await
-                    })
-                },
-                select,
-            ),
-        )
-        .await
+                fan_out::broadcast_backstop(budget),
+                self.query_best_inner(
+                    "produce_block_v3",
+                    BnRole::Proposal,
+                    HealthTier::Synced,
+                    budget,
+                    &move |client: &BeaconClient| {
+                        let client = client.clone();
+                        let randao_reveal = randao_reveal.clone();
+                        let graffiti = graffiti.clone();
+                        Box::pin(async move {
+                            client
+                                .produce_block_v3(
+                                    slot,
+                                    &randao_reveal,
+                                    graffiti.as_deref(),
+                                    builder_boost_factor,
+                                )
+                                .await
+                        })
+                    },
+                    select,
+                )
+                .instrument(strategy_span),
+            )
+            .await?;
+        Ok(ranked
+            .into_iter()
+            .map(|(bn_index, response)| RankedBlock { bn_index, response })
+            .collect())
     }
 
     /// Broadcast an operation to role-matching BNs (**regardless of sync / health
@@ -1855,16 +1868,21 @@ enum FallbackPick<T> {
     Held(Vec<(usize, T)>),
 }
 
-fn pick_owned<T>(items: Vec<(usize, T)>, pick_best: &dyn Fn(&T, &T) -> bool) -> Option<(usize, T)> {
-    let mut items = items.into_iter();
-    let (mut best_index, mut best_value) = items.next()?;
-    for (index, value) in items {
-        if pick_best(&value, &best_value) {
-            best_index = index;
-            best_value = value;
+/// Better candidates first. Ties keep the lower beacon-node index.
+fn sort_by_pick<T>(
+    mut items: Vec<(usize, T)>,
+    pick_best: &dyn Fn(&T, &T) -> bool,
+) -> Vec<(usize, T)> {
+    items.sort_by(|left, right| {
+        if pick_best(&left.1, &right.1) {
+            std::cmp::Ordering::Less
+        } else if pick_best(&right.1, &left.1) {
+            std::cmp::Ordering::Greater
+        } else {
+            left.0.cmp(&right.0)
         }
-    }
-    Some((best_index, best_value))
+    });
+    items
 }
 
 fn keep_better<T>(
@@ -1938,14 +1956,7 @@ fn produce_best_select(
             log_produce_rejection(index, endpoint, block, checks, policy);
         }
     });
-    let chosen_checks = checks;
-    let on_chosen: ChosenFn<ProduceBlockResponse> = Arc::new(move |index, block| {
-        let Some(checks) = chosen_checks.as_ref() else { return };
-        if block_passes_duty(block, checks, policy) && !fee_preferred(block, checks) {
-            log_fee_penalty(index, block, checks);
-            crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.inc();
-        }
-    });
+    let on_chosen: ChosenFn<ProduceBlockResponse> = Arc::new(|_, _| {});
     BestSelect { pick_best, accept, fallback_accept, in_hand, on_reject, on_chosen, allow_fallback }
 }
 
@@ -2164,7 +2175,8 @@ fn parent_rank(block: &ProduceBlockResponse, checks: &BlockDutyChecks) -> u8 {
 ///
 /// The primary parent outranks the re-org parent. Within that class, a
 /// fee-preferred block outranks a penalized one regardless of value. Within
-/// the same fee class, [`is_better_block`] decides.
+/// the same fee class, [`block_value`] decides. A missing or unparsable
+/// header contributes 0, and the sum saturates.
 fn candidate_ranks_above(
     left: &ProduceBlockResponse,
     right: &ProduceBlockResponse,
@@ -2182,7 +2194,7 @@ fn candidate_ranks_above(
             (true, true) | (false, false) => {}
         }
     }
-    is_better_block(left, right)
+    block_value(left) > block_value(right)
 }
 
 struct ObservedDuty {
@@ -2236,22 +2248,6 @@ fn log_produce_rejection(
     );
 }
 
-fn log_fee_penalty(index: usize, block: &ProduceBlockResponse, checks: &BlockDutyChecks) {
-    let observed = observe_duty(block);
-    warn!(
-        op = "produce_block_v3",
-        bn_index = index,
-        slot = checks.slot,
-        proposer = checks.proposer_index,
-        parent = %display_expected_root(checks.parent_root),
-        fork = checks.consensus_version.as_ref(),
-        fee_expected = %display_fee_expected(checks.fee_recipient),
-        fee_got = %display_fee_got(&observed.fee),
-        value_parse = %display_value_parse(block),
-        "signing block with fee-recipient mismatch"
-    );
-}
-
 fn display_opt_u64(value: Option<u64>) -> String {
     value.map(|n| n.to_string()).unwrap_or_else(|| "unreadable".to_string())
 }
@@ -2277,7 +2273,7 @@ fn display_fee_got(fee: &FeeOnBlock) -> String {
 }
 
 fn display_value_parse(block: &ProduceBlockResponse) -> String {
-    match ranked_block_value(block) {
+    match parsed_display_value(block) {
         Some(wei) => format!("ok:{wei}"),
         None => match block.execution_payload_value.as_deref() {
             Some("") => "unparsed:empty".to_string(),
@@ -2285,6 +2281,27 @@ fn display_value_parse(block: &ProduceBlockResponse) -> String {
             None => "unparsed:missing".to_string(),
         },
     }
+}
+
+/// Execution wei plus consensus wei, when every present header is a whole decimal.
+///
+/// A missing consensus header is 0. An empty, signed, non-digit, or overflowing
+/// header is unparsed, and so is a present consensus header that does not parse.
+/// [`block_value`] still ranks those as 0; this label must not report `ok:0`.
+fn parsed_display_value(block: &ProduceBlockResponse) -> Option<u128> {
+    let execution = strict_wei(block.execution_payload_value.as_deref()?)?;
+    let consensus = match block.consensus_block_value.as_deref() {
+        Some(raw) => strict_wei(raw)?,
+        None => 0,
+    };
+    Some(execution.saturating_add(consensus))
+}
+
+fn strict_wei(raw: &str) -> Option<u128> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
 }
 
 fn hex_prefixed(bytes: &[u8]) -> String {
@@ -2439,39 +2456,6 @@ fn json_fixed_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
         *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
     }
     Some(out)
-}
-
-/// Whole decimal wei. A missing, empty, signed, or non-digit string is not a
-/// value. Overflow of `u128` is not a value either.
-fn strict_wei(raw: &str) -> Option<u128> {
-    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    raw.parse().ok()
-}
-
-/// Execution payload value plus consensus block value.
-///
-/// Both present strings must parse. A missing consensus header adds nothing.
-/// An unparseable string, or a sum that overflows `u128`, is not a rank.
-fn ranked_block_value(block: &ProduceBlockResponse) -> Option<u128> {
-    let execution = strict_wei(block.execution_payload_value.as_deref()?)?;
-    let consensus = match block.consensus_block_value.as_deref() {
-        Some(raw) => strict_wei(raw)?,
-        None => 0,
-    };
-    execution.checked_add(consensus)
-}
-
-/// `true` when `a` ranks strictly above `b`.
-///
-/// An unranked block does not beat a ranked one, including a ranked zero.
-fn is_better_block(a: &ProduceBlockResponse, b: &ProduceBlockResponse) -> bool {
-    match (ranked_block_value(a), ranked_block_value(b)) {
-        (Some(left), Some(right)) => left > right,
-        (Some(_), None) => true,
-        (None, _) => false,
-    }
 }
 
 /// OR-merge `is_live` per validator index across broadcast outcomes.
@@ -3024,7 +3008,22 @@ impl BlockProducer for BnManager {
     ) -> Result<ProduceBlockResponse, BeaconError> {
         // No duty context: do not fall back. The parent root is unknown, so a
         // degraded node must not supply the block.
-        self.produce_block_v3_checked(slot, randao_reveal, graffiti, builder_boost_factor, None)
+        let ranked = self
+            .produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, None)
+            .await?;
+        first_ranked(ranked)
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+    ) -> Result<Vec<RankedBlock>, BeaconError> {
+        let checks = duty.map(|duty| checks_from_duty(slot, duty));
+        self.produce_block_v3_checked(slot, randao_reveal, graffiti, builder_boost_factor, checks)
             .await
     }
 
@@ -3036,14 +3035,16 @@ impl BlockProducer for BnManager {
         builder_boost_factor: Option<u64>,
         duty: ProduceDuty,
     ) -> Result<ProduceBlockResponse, BeaconError> {
-        self.produce_block_v3_checked(
-            slot,
-            randao_reveal,
-            graffiti,
-            builder_boost_factor,
-            Some(checks_from_duty(slot, duty)),
-        )
-        .await
+        let ranked = self
+            .produce_block_v3_ranked(
+                slot,
+                randao_reveal,
+                graffiti,
+                builder_boost_factor,
+                Some(duty),
+            )
+            .await?;
+        first_ranked(ranked)
     }
 
     async fn produce_block_v4(
@@ -3328,6 +3329,12 @@ impl BlockProducer for BnManager {
         )
         .await
     }
+}
+
+fn first_ranked(ranked: Vec<RankedBlock>) -> Result<ProduceBlockResponse, BeaconError> {
+    ranked.into_iter().next().map(|block| block.response).ok_or_else(|| {
+        BeaconError::HttpError("produce_block_v3: all BNs failed in best-selection".into())
+    })
 }
 
 #[async_trait]
@@ -3860,6 +3867,10 @@ mod tests {
     use crate::traits::{LivenessApi, NodeStatusApi};
     use crate::types::bn_capability;
 
+    fn higher_block_value(left: &ProduceBlockResponse, right: &ProduceBlockResponse) -> bool {
+        block_value(left) > block_value(right)
+    }
+
     fn testing_select(
         accept: impl Fn(&ProduceBlockResponse) -> bool + Send + Sync + 'static,
         in_hand: impl Fn(&ProduceBlockResponse) -> bool + Send + Sync + 'static,
@@ -4260,7 +4271,7 @@ mod tests {
                         }
                     })
                 },
-                is_better_block,
+                higher_block_value,
             )
             .await
             .expect("BN-A's block");
@@ -4305,7 +4316,7 @@ mod tests {
                         }
                     })
                 },
-                is_better_block,
+                higher_block_value,
             )
             .await
             .expect("block at 2s");
@@ -4337,7 +4348,7 @@ mod tests {
                         }
                     })
                 },
-                is_better_block,
+                higher_block_value,
             )
             .await
             .expect("higher block");
@@ -4367,7 +4378,7 @@ mod tests {
                         }
                     })
                 },
-                is_better_block,
+                higher_block_value,
             )
             .await
             .expect("slow higher block");
@@ -4392,7 +4403,7 @@ mod tests {
                         Ok(block_with_value("2000"))
                     })
                 },
-                is_better_block,
+                higher_block_value,
             )
             .await
             .expect("single block");
@@ -4423,7 +4434,7 @@ mod tests {
                         }
                     })
                 },
-                is_better_block,
+                higher_block_value,
             )
             .await
             .expect("unsynced block");
@@ -4449,7 +4460,7 @@ mod tests {
                         Ok(block_with_value("7000"))
                     })
                 },
-                is_better_block,
+                higher_block_value,
             )
             .await;
         assert!(result.is_err(), "fallback past the backstop must not return a block: {result:?}");
@@ -4541,7 +4552,7 @@ mod tests {
                 testing_select(
                     move |block| passes_sign(block, &checks),
                     move |block| passes_sign(block, &checks),
-                    is_better_block,
+                    higher_block_value,
                     |_, _, _| {},
                     false,
                 ),
@@ -4608,7 +4619,7 @@ mod tests {
                 testing_select(
                     move |block| passes_sign(block, &checks),
                     move |block| passes_sign(block, &checks),
-                    is_better_block,
+                    higher_block_value,
                     |_, _, _| {},
                     false,
                 ),
@@ -4676,7 +4687,7 @@ mod tests {
                         }
                     })
                 },
-                testing_select(|_| true, |_| true, is_better_block, |_, _, _| {}, true),
+                testing_select(|_| true, |_| true, higher_block_value, |_, _, _| {}, true),
             )
             .await
             .expect("small-lag proposal block");
@@ -4719,7 +4730,7 @@ mod tests {
                         }
                     })
                 },
-                testing_select(|_| true, |_| true, is_better_block, |_, _, _| {}, false),
+                testing_select(|_| true, |_| true, higher_block_value, |_, _, _| {}, false),
             )
             .await;
         assert!(result.is_err(), "fallback without a parent must not return a block: {result:?}");
@@ -4812,7 +4823,7 @@ mod tests {
                 testing_select(
                     move |block| passes_sign(block, &checks),
                     move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
-                    is_better_block,
+                    higher_block_value,
                     |_, _, _| {},
                     true,
                 ),
@@ -5267,7 +5278,7 @@ mod tests {
                 testing_select(
                     move |block| passes_sign(block, &checks),
                     move |block| passes_sign(block, &checks),
-                    is_better_block,
+                    higher_block_value,
                     move |index, endpoint, block| {
                         log_produce_rejection(
                             index,
@@ -5293,6 +5304,27 @@ mod tests {
         assert!(logs_contain("0x1111111111111111111111111111111111111111"));
         assert!(logs_contain(&hex_prefixed(&parent)));
         assert!(logs_contain("value_parse=ok:1") || logs_contain("value_parse=\"ok:1\""));
+    }
+
+    #[test]
+    fn display_value_parse_names_an_unparsed_header() {
+        let parent = [0xabu8; 32];
+        let mut block = duty_response("12abc", 1, 7, parent, None);
+        assert_eq!(display_value_parse(&block), "unparsed:12abc");
+        block.execution_payload_value = Some(String::new());
+        assert_eq!(display_value_parse(&block), "unparsed:empty");
+        block.execution_payload_value = None;
+        assert_eq!(display_value_parse(&block), "unparsed:missing");
+        block.execution_payload_value = Some("5".to_string());
+        block.consensus_block_value = Some("nope".to_string());
+        assert_eq!(display_value_parse(&block), "unparsed:5");
+        block.consensus_block_value = None;
+        assert_eq!(display_value_parse(&block), "ok:5");
+        block.consensus_block_value = Some("10".to_string());
+        assert_eq!(display_value_parse(&block), "ok:15");
+        block.execution_payload_value = Some(u128::MAX.to_string());
+        block.consensus_block_value = Some("1".to_string());
+        assert_eq!(display_value_parse(&block), format!("ok:{}", u128::MAX));
     }
 
     /// A builder header's fee recipient is the builder's address. It must not
@@ -5542,10 +5574,10 @@ mod tests {
         body
     }
 
-    // -- is_better_block unit tests --
+    // -- higher_block_value unit tests --
 
     #[test]
-    fn test_is_better_block_higher_value() {
+    fn test_higher_block_value_higher_value() {
         let a = ProduceBlockResponse {
             data: serde_json::Value::Null,
             is_blinded: false,
@@ -5568,12 +5600,12 @@ mod tests {
             builder_url: None,
             consensus_block_value: None,
         };
-        assert!(is_better_block(&a, &b));
-        assert!(!is_better_block(&b, &a));
+        assert!(higher_block_value(&a, &b));
+        assert!(!higher_block_value(&b, &a));
     }
 
     #[test]
-    fn test_is_better_block_none_vs_some() {
+    fn test_higher_block_value_none_vs_some() {
         let a = ProduceBlockResponse {
             data: serde_json::Value::Null,
             is_blinded: false,
@@ -5596,12 +5628,12 @@ mod tests {
             builder_url: None,
             consensus_block_value: None,
         };
-        assert!(!is_better_block(&a, &b));
-        assert!(is_better_block(&b, &a));
+        assert!(!higher_block_value(&a, &b));
+        assert!(higher_block_value(&b, &a));
     }
 
     #[test]
-    fn test_is_better_block_both_none() {
+    fn test_higher_block_value_both_none() {
         let a = ProduceBlockResponse {
             data: serde_json::Value::Null,
             is_blinded: false,
@@ -5624,7 +5656,7 @@ mod tests {
             builder_url: None,
             consensus_block_value: None,
         };
-        assert!(!is_better_block(&a, &b));
+        assert!(!higher_block_value(&a, &b));
     }
 
     fn response_with_values(
@@ -5645,34 +5677,51 @@ mod tests {
     }
 
     #[test]
-    fn test_is_better_block_adds_consensus_value() {
-        let with_consensus = response_with_values(Some("1000"), Some("500"));
-        let execution_only = response_with_values(Some("1400"), None);
-        assert!(is_better_block(&with_consensus, &execution_only));
-        assert!(!is_better_block(&execution_only, &with_consensus));
+    fn test_block_value_sums_execution_and_consensus() {
+        let with_consensus = response_with_values(Some("5"), Some("10"));
+        let execution_only = response_with_values(Some("10"), Some("0"));
+        assert_eq!(block_value(&with_consensus), 15);
+        assert_eq!(block_value(&execution_only), 10);
+        assert!(higher_block_value(&with_consensus, &execution_only));
+        assert!(!higher_block_value(&execution_only, &with_consensus));
     }
 
     #[test]
-    fn test_is_better_block_unparseable_and_overflow_do_not_rank_as_zero() {
+    fn test_block_value_missing_and_unparsable_headers_are_zero() {
+        let missing = response_with_values(None, None);
+        let empty = response_with_values(Some(""), None);
         let garbage = response_with_values(Some("12abc"), None);
+        let plus = response_with_values(Some("+1"), None);
+        let minus = response_with_values(Some("-1"), None);
         let zero = response_with_values(Some("0"), None);
-        let strict = response_with_values(Some("1"), None);
-        assert!(is_better_block(&zero, &garbage));
-        assert!(!is_better_block(&garbage, &zero));
-        assert!(is_better_block(&strict, &garbage));
+        assert_eq!(block_value(&missing), 0);
+        assert_eq!(block_value(&empty), 0);
+        assert_eq!(block_value(&garbage), 0);
+        assert_eq!(block_value(&plus), 0);
+        assert_eq!(block_value(&minus), 0);
+        assert_eq!(block_value(&zero), 0);
+        assert!(!higher_block_value(&zero, &garbage));
+        assert!(!higher_block_value(&garbage, &zero));
+        assert!(!higher_block_value(&zero, &plus));
+        assert!(!higher_block_value(&plus, &zero));
 
+        // A bad consensus header does not zero a valid execution value.
         let bad_consensus = response_with_values(Some("9999"), Some("nope"));
-        assert!(is_better_block(&strict, &bad_consensus));
-        assert!(!is_better_block(&bad_consensus, &strict));
+        let strict = response_with_values(Some("1"), None);
+        assert_eq!(block_value(&bad_consensus), 9999);
+        assert!(higher_block_value(&bad_consensus, &strict));
+        assert!(!higher_block_value(&strict, &bad_consensus));
 
         let overflow = response_with_values(Some(&u128::MAX.to_string()), Some("1"));
-        assert!(is_better_block(&strict, &overflow));
-        assert!(!is_better_block(&overflow, &strict));
+        assert_eq!(block_value(&overflow), u128::MAX);
+        assert!(higher_block_value(&overflow, &strict));
+        assert!(!higher_block_value(&strict, &overflow));
 
-        // `"+1".parse::<u128>()` is 1. A leading sign is not a whole decimal.
-        let plus = response_with_values(Some("+1"), None);
-        assert!(is_better_block(&zero, &plus));
-        assert!(!is_better_block(&plus, &zero));
+        // 2^128 does not fit in u128.
+        let too_wide = response_with_values(Some("340282366920938463463374607431768211456"), None);
+        assert_eq!(block_value(&too_wide), 0);
+        assert!(!higher_block_value(&too_wide, &zero));
+        assert!(!higher_block_value(&zero, &too_wide));
     }
 
     #[test]
@@ -5806,7 +5855,7 @@ mod tests {
     }
 
     #[test]
-    fn test_is_better_block_equal_values() {
+    fn test_higher_block_value_equal_values() {
         let a = ProduceBlockResponse {
             data: serde_json::Value::Null,
             is_blinded: false,
@@ -5829,7 +5878,7 @@ mod tests {
             builder_url: None,
             consensus_block_value: None,
         };
-        assert!(!is_better_block(&a, &b));
+        assert!(!higher_block_value(&a, &b));
     }
 
     /// BN-1 fails fast, BN-2 hangs past the outer operation budget. The fast

@@ -135,7 +135,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/beacon/src/client.rs",
-        547,
+        558,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -144,7 +144,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        331,
+        333,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -153,7 +153,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        421,
+        401,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -162,7 +162,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        443,
+        1009,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -171,7 +171,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1165,
+        1416,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -180,7 +180,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1177,
+        1428,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -189,7 +189,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1181,
+        1432,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -443,7 +443,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/beacon/src/client.rs",
-        1246,
+        1258,
         Class::MatchForkName,
         false,
         "match fork {",
@@ -452,7 +452,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/beacon/src/client.rs",
-        2123,
+        2135,
         Class::MatchForkName,
         false,
         "match requested {",
@@ -461,7 +461,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1143,
+        1394,
         Class::MatchForkName,
         false,
         "match fork {",
@@ -507,7 +507,7 @@ const INVENTORY: &[Inv] = &[
     // Class 4
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        952,
+        1007,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -516,7 +516,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        966,
+        1021,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -525,7 +525,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        1059,
+        1114,
         Class::StringDispatch,
         false,
         "matches!(consensus_version",
@@ -579,7 +579,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/bn-manager/src/manager.rs",
-        2359,
+        2376,
         Class::StringDispatch,
         true,
         "match consensus_version {",

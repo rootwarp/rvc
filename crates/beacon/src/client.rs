@@ -122,7 +122,7 @@ enum ProduceBlockApi {
     V4,
 }
 
-/// V4 produce-block response headers. V3 uses [`ProduceV4Headers::v3_defaults`].
+/// V4 produce-block response headers. V3 uses [`ProduceV4Headers::v3_from`].
 #[derive(Debug)]
 struct ProduceV4Headers {
     payload_included: bool,
@@ -131,9 +131,20 @@ struct ProduceV4Headers {
 }
 
 impl ProduceV4Headers {
-    /// Pre-Gloas V3 does not send these headers; do not fail closed on their absence.
-    fn v3_defaults() -> Self {
-        Self { payload_included: false, builder_url: None, consensus_block_value: None }
+    /// Pre-Gloas V3 has no payload-included or builder-url header.
+    ///
+    /// `Eth-Consensus-Block-Value` is optional. A missing header ranks as 0.
+    /// A non-UTF-8 header is ignored the same way as `Eth-Execution-Payload-Value`,
+    /// so the block still ranks and the unreadable value contributes 0.
+    fn v3_from(headers: &reqwest::header::HeaderMap) -> Self {
+        Self {
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: headers
+                .get(HEADER_ETH_CONSENSUS_BLOCK_VALUE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string),
+        }
     }
 }
 
@@ -641,13 +652,14 @@ impl BeaconClient {
             .to_string();
 
         if content_type.starts_with("application/octet-stream") {
+            let v3_headers = ProduceV4Headers::v3_from(response.headers());
             match Self::try_process_ssz_body(
                 response,
                 slot,
                 is_blinded,
                 &consensus_version,
                 &execution_payload_value,
-                ProduceV4Headers::v3_defaults(),
+                v3_headers,
             )
             .await
             {
@@ -877,7 +889,7 @@ impl BeaconClient {
 
         let v4_headers = match api {
             ProduceBlockApi::V4 => parse_v4_produce_headers(response.headers())?,
-            ProduceBlockApi::V3 => ProduceV4Headers::v3_defaults(),
+            ProduceBlockApi::V3 => ProduceV4Headers::v3_from(response.headers()),
         };
 
         // H-12: cap the body before deserialising.
@@ -2416,6 +2428,26 @@ mod tests {
         assert!(!parsed.payload_included);
         assert_eq!(parsed.builder_url, None);
         assert_eq!(parsed.consensus_block_value, None);
+    }
+
+    #[test]
+    fn test_v3_from_non_utf8_consensus_block_value_is_absent() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+            reqwest::header::HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
+        );
+        let parsed = ProduceV4Headers::v3_from(&headers);
+        assert_eq!(parsed.consensus_block_value, None);
+        assert!(!parsed.payload_included);
+        assert_eq!(parsed.builder_url, None);
+
+        headers.insert(
+            HEADER_ETH_CONSENSUS_BLOCK_VALUE,
+            reqwest::header::HeaderValue::from_static("10"),
+        );
+        let parsed = ProduceV4Headers::v3_from(&headers);
+        assert_eq!(parsed.consensus_block_value.as_deref(), Some("10"));
     }
 
     #[test]

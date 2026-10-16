@@ -396,6 +396,9 @@ pub(crate) struct MockBeaconClient {
     pub(crate) produce_response: Option<ProduceBlockResponse>,
     /// Extra produce answers, consumed in order before `produce_response`.
     pub(crate) produce_queue: Mutex<Vec<ProduceBlockResponse>>,
+    /// When set, `produce_block_v3_ranked` returns this list and does not drain
+    /// `produce_queue`. `None` keeps the one-candidate default.
+    pub(crate) ranked_candidates: Mutex<Option<Vec<ProduceBlockResponse>>>,
     pub(crate) fail_produce: bool,
     pub(crate) fail_publish: bool,
     pub(crate) envelope_delay: Duration,
@@ -417,6 +420,7 @@ impl MockBeaconClient {
         Self {
             produce_response,
             produce_queue: Mutex::new(Vec::new()),
+            ranked_candidates: Mutex::new(None),
             fail_produce: false,
             fail_publish: false,
             envelope_delay: Duration::ZERO,
@@ -524,6 +528,26 @@ impl MockBeaconClient {
         let mut client = Self::new_with_response(None);
         client.produce_queue = Mutex::new(responses);
         client
+    }
+
+    /// Ranked produce answers returned together. Does not drain `produce_queue`.
+    pub(crate) fn with_ranked_blocks(self, blocks: Vec<BeaconBlock>) -> Self {
+        let responses = blocks
+            .into_iter()
+            .map(|block| ProduceBlockResponse {
+                data: serde_json::to_value(&block).unwrap(),
+                is_blinded: false,
+                consensus_version: "deneb".to_string(),
+                execution_payload_value: Some("12345".to_string()),
+                is_ssz: false,
+                ssz_bytes: None,
+                payload_included: false,
+                builder_url: None,
+                consensus_block_value: None,
+            })
+            .collect();
+        *self.ranked_candidates.lock().unwrap() = Some(responses);
+        self
     }
 
     pub(crate) fn with_produce_error(mut self) -> Self {
@@ -668,6 +692,37 @@ impl BeaconBlockClient for MockBeaconClient {
             return Err(BlockServiceError::Beacon("beacon down".to_string()));
         }
         Ok(self.next_produce_response())
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<crate::ProduceDuty>,
+    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
+        if let Some(list) = self.ranked_candidates.lock().unwrap().clone() {
+            let call = CapturedProduceCall {
+                slot,
+                randao_reveal: randao_reveal.to_string(),
+                graffiti: graffiti.map(|s| s.to_string()),
+                builder_boost_factor,
+            };
+            self.produce_v3_calls.lock().unwrap().push(call.clone());
+            self.produce_full_calls.lock().unwrap().push(call);
+            if self.fail_produce {
+                return Err(BlockServiceError::Beacon("beacon down".to_string()));
+            }
+            return Ok(list
+                .into_iter()
+                .enumerate()
+                .map(|(bn_index, response)| RankedBlock { bn_index, response })
+                .collect());
+        }
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![RankedBlock { bn_index: 0, response }])
     }
 
     async fn produce_block_v4(

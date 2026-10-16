@@ -120,9 +120,9 @@ pub(crate) struct BestWindow {
 
 /// Blocks collected by [`best_of`] before it returned.
 pub(crate) struct BestRound<T> {
-    /// In-hand successes, lowest beacon-node index first.
+    /// In-hand successes, in arrival order. The caller ranks them.
     pub values: Vec<(usize, T)>,
-    /// Accepted successes that are not in hand, lowest index first.
+    /// Accepted successes that are not in hand, in arrival order.
     ///
     /// A fee-penalized block lives here. It does not close the soft window.
     pub held: Vec<(usize, T)>,
@@ -479,8 +479,10 @@ type RejectFn<T> = std::sync::Arc<dyn Fn(usize, &str, &T) + Send + Sync>;
 
 pub(crate) struct BestFilter<T> {
     /// Hard checks. `false` is dropped and passed to [`Self::on_reject`].
+    /// A rejected `Ok` does not close the soft window.
     pub accept: AcceptFn<T>,
-    /// In hand: hard checks and the right fee. Closes the soft window.
+    /// In hand: hard checks and the right fee. Closes the soft window only
+    /// together with [`Self::accept`].
     pub in_hand: AcceptFn<T>,
     pub on_reject: RejectFn<T>,
 }
@@ -499,17 +501,19 @@ impl<T> Clone for BestFilter<T> {
 ///
 /// `window.soft` and `window.hard` are both `None` when no budget is
 /// configured: every attempt is awaited. Otherwise attempts are bounded by
-/// `window.hard`. [`BestFilter::in_hand`] decides which `Ok` closes the soft
-/// window and is returned in [`BestRound::values`]. An accepted `Ok` that is
-/// not in hand is kept in [`BestRound::held`] and does not close the window.
-/// A rejected `Ok` is logged and dropped. The round returns at `window.soft`
-/// once a block is in hand, or sooner once every attempt has finished. If
-/// none are in hand it waits until every attempt finishes or `window.hard`
-/// passes. Finished samples are queued and this function does not wait on
-/// the health write lock. Attempts still running go to the drain; a hard
-/// reject there is logged, a timeout there is an error, and the drain does
-/// not wait on that lock between polls. An empty attempt list is
-/// [`BeaconError::NoEligibleBn`].
+/// `window.hard`. An `Ok` closes the soft window only when it passes both
+/// [`BestFilter::accept`] and [`BestFilter::in_hand`], and that `Ok` is
+/// returned in [`BestRound::values`]. An accepted `Ok` that is not in hand is
+/// kept in [`BestRound::held`] and does not close the window. A rejected `Ok`
+/// is logged and dropped, and it does not close the window. Order inside each
+/// bucket is arrival order; the caller ranks the combined list. The round
+/// returns at `window.soft` once a block is in hand, or sooner once every
+/// attempt has finished. If none are in hand it waits until every attempt
+/// finishes or `window.hard` passes. Finished samples are queued and this
+/// function does not wait on the health write lock. Attempts still running go
+/// to the drain; a hard reject there is logged, a timeout there is an error,
+/// and the drain does not wait on that lock between polls. An empty attempt
+/// list is [`BeaconError::NoEligibleBn`].
 pub(crate) async fn best_of<T: Send + 'static>(
     op_name: &str,
     role: &str,
@@ -604,7 +608,7 @@ fn best_round<T>(finished: Vec<Done<T>>, filter: &BestFilter<T>) -> BestRound<T>
     let mut last_error: Option<(usize, BeaconError)> = None;
     for done in finished {
         match done.result {
-            Ok(value) if (filter.in_hand)(&value) => values.push((done.index, value)),
+            Ok(value) if closes_soft_window(&value, filter) => values.push((done.index, value)),
             Ok(value) if (filter.accept)(&value) => held.push((done.index, value)),
             Ok(_) => {}
             Err(err) => {
@@ -615,14 +619,18 @@ fn best_round<T>(finished: Vec<Done<T>>, filter: &BestFilter<T>) -> BestRound<T>
             }
         }
     }
-    values.sort_by_key(|(index, _)| *index);
-    held.sort_by_key(|(index, _)| *index);
     BestRound { values, held, last_error: last_error.map(|(_, err)| err) }
+}
+
+/// In hand and accepted. A block that fails [`BestFilter::accept`] does not
+/// close the soft window, even when [`BestFilter::in_hand`] would be true.
+fn closes_soft_window<T>(value: &T, filter: &BestFilter<T>) -> bool {
+    (filter.accept)(value) && (filter.in_hand)(value)
 }
 
 fn in_hand<T>(done: &Done<T>, filter: &BestFilter<T>) -> bool {
     match &done.result {
-        Ok(value) => (filter.in_hand)(value),
+        Ok(value) => closes_soft_window(value, filter),
         Err(_) => false,
     }
 }
@@ -1495,6 +1503,56 @@ mod tests {
             vec![2],
             "the drain must log the late hard reject"
         );
+    }
+
+    /// An `Ok` that fails `accept` does not close the soft window, even when
+    /// `in_hand` would be true. The later accepted block is still collected.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn unusable_ok_does_not_close_the_soft_window() {
+        let filter = BestFilter {
+            accept: std::sync::Arc::new(|value: &u32| *value != 9),
+            in_hand: std::sync::Arc::new(|_: &u32| true),
+            on_reject: std::sync::Arc::new(|_index, _endpoint, _value: &u32| {}),
+        };
+        let health = health_for(2);
+        let pool = DrainPool::new(4);
+        let round = best_of(
+            "produce_block_v3",
+            "proposal",
+            vec![
+                BnAttempt {
+                    index: 0,
+                    endpoint: "http://bn0".to_string(),
+                    fut: Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(1600)).await;
+                        Ok::<_, BeaconError>(1u32)
+                    }),
+                },
+                BnAttempt {
+                    index: 1,
+                    endpoint: "http://bn1".to_string(),
+                    fut: Box::pin(async {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(9u32)
+                    }),
+                },
+            ],
+            BestWindow {
+                soft: Some(Duration::from_millis(1500)),
+                hard: Some(Duration::from_secs(3)),
+            },
+            &health,
+            &pool,
+            &filter,
+        )
+        .await
+        .expect("best-of round");
+        assert_eq!(
+            round.values,
+            vec![(0, 1)],
+            "the rejected block must not close the soft window before the later block"
+        );
+        assert!(round.held.is_empty(), "a hard reject is dropped, not held");
     }
 
     #[tokio::test]

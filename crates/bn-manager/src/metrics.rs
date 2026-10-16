@@ -126,15 +126,15 @@ pub static RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL: LazyLock<IntCounter> = L
     },
 );
 
-/// Blocks returned for signing even though the fee recipient did not match.
+/// Blocks signed even though the readable fee recipient did not match.
 ///
-/// Incremented once per chosen block, not once per penalized candidate that
-/// lost to a matching block. A [`crate::FeeRecipientPolicy::Reject`] drop is
-/// not counted here.
+/// Incremented once for the candidate that is signed, not for a higher-ranked
+/// candidate that was skipped before signing. A [`crate::FeeRecipientPolicy::Reject`]
+/// drop is not counted here. Block proposal records the increment.
 pub static RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     define_int_counter(
         "rvc_produce_block_fee_recipient_penalty_total",
-        "Blocks returned for signing despite a readable fee-recipient mismatch",
+        "Blocks signed despite a readable fee-recipient mismatch",
     )
 });
 

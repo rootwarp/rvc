@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use block_service::{
     BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse, ProduceDuty,
-    WireBody,
+    RankedBlock, WireBody,
 };
 use bn_manager::{BeaconNodeClient, ProduceDuty as BnProduceDuty};
 use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContentsJson, Slot};
@@ -56,6 +56,28 @@ impl BeaconBlockClient for BeaconBlockAdapter {
                     expected_consensus_version: duty.expected_consensus_version,
                 },
             )
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
+        let duty = duty.map(|duty| BnProduceDuty {
+            expected_proposer_index: duty.expected_proposer_index,
+            expected_parent_root: duty.expected_parent_root,
+            alternate_parent_root: duty.alternate_parent_root,
+            parent_closed: duty.parent_closed,
+            expected_fee_recipient: duty.expected_fee_recipient,
+            expected_consensus_version: duty.expected_consensus_version,
+        });
+        self.0
+            .produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
             .await
             .map_err(Into::into)
     }

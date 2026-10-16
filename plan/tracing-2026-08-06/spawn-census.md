@@ -88,3 +88,14 @@ git diff 22aa3de5bf5ed0c03ed571694dc3a5652e460613 -- crates/slashing/src/stage.r
 ```
 
 Empty on this commit. `crates/slashing/src/stage.rs` is not edited. Blob sha `205106ae71c9c66d5ae4ad423fc7dd31412f690d` matches the pin.
+
+## bn-manager raw `tokio::spawn` (not executor sites)
+
+These calls are outside the executor scan (`crates/rvc` + `bin/rvc`) and outside `raw_spawn` `ALLOW_LIST` (that list stays empty). #646 shifted them. They are not rows in the production-sites table above.
+
+| File | Line | Call |
+|---|---:|---|
+| `crates/bn-manager/src/fan_out.rs` | 862 | `tokio::spawn` in `wait_for_complete_detached` |
+| `crates/bn-manager/src/fan_out.rs` | 1075 | `tokio::spawn` in `spawn_detached` |
+| `crates/bn-manager/src/fan_out.rs` | 1130 | `tokio::spawn` in `health_sender` |
+| `crates/bn-manager/src/manager.rs` | 714 | `tokio::spawn` in `start_sse` |

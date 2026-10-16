@@ -116,14 +116,27 @@ is `sign` (the default). It does not close the soft window and it does not
 stop the unsynced fallback. It is signed only after every selected beacon
 node has answered or the hard deadline (the budget) passes, and only when no
 fee-matching block is in hand. The warning names the beacon-node index and is
-emitted only for the block that is signed. That win increments
-`rvc_produce_block_fee_recipient_penalty_total`. `fee_recipient_policy =
+emitted for the candidate that is signed. A fee-matching candidate that fails
+the proposal checks is skipped and does not take the penalty. That signed
+mismatch increments `rvc_produce_block_fee_recipient_penalty_total`.
+`fee_recipient_policy =
 "reject"` drops a readable mismatch instead, and that drop is not counted.
 
 Ranking within a fee class adds the execution payload value and the consensus
-block value. Each value has to be a whole decimal number; a value that does
-not parse, or a sum that overflows, does not win. If a fee-matching block is
-in hand by the soft window, that block is returned. A node still in flight is
+block value. Each header is a whole decimal. A missing, empty, signed, or
+non-digit header, or a digit string that does not fit in `u128`, contributes
+0. A non-UTF-8 `Eth-Consensus-Block-Value` on a V3 response is ignored the
+same way: the block is still returned and that header contributes 0. One bad
+header does not zero the other. The sum saturates at `u128::MAX`. An unparsed
+header is logged as `unparsed`, not as `ok:0`.
+Equal totals keep the lower beacon-node index. `produce_block_v3` returns the
+head of that list. `produce_block_v3_ranked` returns every accepted candidate,
+best first, including a fee-penalized block behind a fee-matching one. Block
+proposal walks that list and signs the first candidate whose slot, proposer,
+and parent match the duty. A candidate that fails those checks is logged once
+and skipped. Once a signature exists, a signer or publish error is final and
+the next candidate is not signed. If a fee-matching block is
+in hand by the soft window, that block is the head. A node still in flight is
 finished afterwards, and a timeout is recorded as an error on that node.
 Recording that sample does not delay the block already in hand. Once any
 signable block is held, including a fee-penalized one, it is returned 50 ms

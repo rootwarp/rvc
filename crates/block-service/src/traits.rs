@@ -6,7 +6,7 @@ use eth_types::{
 
 use crate::BlockServiceError;
 
-pub use beacon::{BuilderConfig, ProduceBlockResponse, WireBody};
+pub use beacon::{BuilderConfig, ProduceBlockResponse, RankedBlock, WireBody};
 
 /// Cached V4 `BuilderConfig` (6.17 signed auth). Implemented in `rvc`, not here:
 /// `rvc-block-service → rvc-builder` is a forbidden edge.
@@ -66,6 +66,27 @@ pub trait BeaconBlockClient: Send + Sync {
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
         let _ = duty;
         self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    /// Every arrived produce-block candidate, best first.
+    ///
+    /// The default ignores `duty` and returns one candidate from
+    /// [`Self::produce_block_v3`]. `BnManager` returns the value-ranked list
+    /// and applies `duty` before a candidate can be signed.
+    /// [`Self::produce_block_v3`] and [`Self::produce_block_v3_for_duty`] are
+    /// the head of that list.
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
+        let _ = duty;
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![RankedBlock { bn_index: 0, response }])
     }
 
     async fn produce_block_v4(

@@ -2,9 +2,10 @@
 # Regenerated 2026-09-29 for tip 909a705e / PR #396 — prior entries drifted after refactors
 # (e.g. slashing db → interchange.rs). Not related to DSR-3.1 digest pins in docs.
 # Same attester/proposer duty pubkeys. Lines moved 928 → 940 and 1391 → 1403
-# when BlockHeaderSummary landed in types.rs (#641).
-crates/beacon/src/types.rs:generic-api-key:1464
-crates/beacon/src/types.rs:generic-api-key:978
+# when BlockHeaderSummary landed in types.rs (#641), then 978 → 1009 and
+# 1464 → 1495 when RankedBlock landed (#646).
+crates/beacon/src/types.rs:generic-api-key:1495
+crates/beacon/src/types.rs:generic-api-key:1009
 crates/crypto/examples/log_sample.rs:generic-api-key:27
 # Same test keystore pubkeys. Lines moved 452 → 522, 704 → 774, and 994 → 1064
 # when the password-map key and load report were added (#644).

@@ -1679,3 +1679,241 @@ async fn test_propose_block_rejects_mismatched_proposer_index() {
         "expected ProposerIndexMismatch {{ expected: 42, got: 99 }}"
     );
 }
+
+fn ranked_service(
+    blocks: Vec<BeaconBlock>,
+    signer: MockSigner,
+    beacon_extra: impl FnOnce(MockBeaconClient) -> MockBeaconClient,
+) -> (BlockService<MockSigner, MockBeaconClient>, Arc<MockSigner>, Arc<MockBeaconClient>, PublicKey)
+{
+    let pubkey = test_pubkey();
+    let beacon = Arc::new(beacon_extra(
+        MockBeaconClient::unblinded(test_block(1)).with_ranked_blocks(blocks),
+    ));
+    let signer = Arc::new(signer);
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    (service, signer, beacon, pubkey)
+}
+
+/// A stale-parent candidate is skipped. The next candidate on the expected
+/// parent is the only block signed and published.
+#[tokio::test]
+async fn test_ranked_stale_parent_signs_the_expected_parent() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let stale: Root = [0x33; 32];
+    let mut bad = test_block(slot);
+    bad.parent_root = stale;
+    let mut good = test_block(slot);
+    good.parent_root = expected;
+    good.state_root = [0x44; 32];
+
+    let (service, signer, beacon, pubkey) =
+        ranked_service(vec![bad, good], MockSigner::new(), |client| client);
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: Some([0x22; 32]), closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "expected-parent candidate must be signed: {result:?}");
+
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1, "exactly one sign_block_header");
+    assert_eq!(headers[0].header.parent_root, expected);
+    drop(headers);
+    assert_eq!(signer.block_calls.lock().unwrap().len(), 1);
+    let published = beacon.publish_full_calls.lock().unwrap();
+    assert_eq!(published.len(), 1);
+    assert_eq!(published[0].slot, slot);
+    assert_eq!(published[0].proposer_index, 42);
+}
+
+/// Every candidate fails parent or proposer checks. The last validation error
+/// is returned and the signer is not called.
+#[tokio::test]
+async fn test_ranked_all_candidates_rejected_does_not_sign() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let first_parent: Root = [0x33; 32];
+    let last_parent: Root = [0x44; 32];
+    let mut first = test_block(slot);
+    first.parent_root = first_parent;
+    let mut last = test_block(slot);
+    last.parent_root = last_parent;
+    last.proposer_index = 7;
+
+    let (service, signer, beacon, pubkey) =
+        ranked_service(vec![first, last], MockSigner::new(), |client| client);
+    let err = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: Some([0x22; 32]), closed: false }),
+        )
+        .await
+        .expect_err("both candidates must be rejected");
+    assert!(
+        matches!(err, BlockServiceError::ProposerIndexMismatch { expected: 42, got: 7 }),
+        "last candidate's proposer mismatch is the returned error, got {err:?}"
+    );
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+    assert!(signer.block_calls.lock().unwrap().is_empty());
+    assert!(beacon.publish_full_calls.lock().unwrap().is_empty());
+}
+
+/// Signer refusal on the first passing candidate is final.
+#[tokio::test]
+async fn test_ranked_signer_refusal_does_not_sign_the_next_candidate() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let mut first = test_block(slot);
+    first.parent_root = expected;
+    let mut second = test_block(slot);
+    second.parent_root = expected;
+    second.state_root = [0x55; 32];
+
+    let (service, signer, beacon, pubkey) =
+        ranked_service(vec![first, second], MockSigner::new().with_block_error(), |client| client);
+    let err = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: None, closed: false }),
+        )
+        .await
+        .expect_err("signer refusal must fail the proposal");
+    assert!(matches!(err, BlockServiceError::Signer(_)), "got {err:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].header.parent_root, expected);
+    assert_eq!(headers[0].header.state_root, [2u8; 32]);
+    assert!(beacon.publish_full_calls.lock().unwrap().is_empty());
+}
+
+/// Publish failure after the first signature does not sign another candidate.
+#[tokio::test]
+async fn test_ranked_publish_failure_does_not_sign_the_next_candidate() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let mut first = test_block(slot);
+    first.parent_root = expected;
+    first.state_root = [0x61; 32];
+    let mut second = test_block(slot);
+    second.parent_root = expected;
+    second.state_root = [0x62; 32];
+
+    let (service, signer, beacon, pubkey) =
+        ranked_service(vec![first, second], MockSigner::new(), |client| {
+            client.with_publish_error()
+        });
+    let err = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: None, closed: false }),
+        )
+        .await
+        .expect_err("publish failure must fail the proposal");
+    assert!(matches!(err, BlockServiceError::Beacon(_)), "got {err:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].header.parent_root, expected);
+    assert_eq!(headers[0].header.state_root, [0x61; 32]);
+    assert_eq!(beacon.publish_calls.lock().unwrap().len(), 1);
+}
+
+fn block_with_fee(slot: Slot, parent: Root, state: Root, fee: [u8; 20]) -> BeaconBlock {
+    let mut body = eth_types::external_vector_deneb_body();
+    body.execution_payload.fee_recipient = fee;
+    BeaconBlock {
+        slot,
+        proposer_index: 42,
+        parent_root: parent,
+        state_root: state,
+        body: body.as_ssz_bytes(),
+    }
+}
+
+fn json_fee_response(fee: &str, blinded: bool) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data: serde_json::json!({
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "11".repeat(32)),
+            "state_root": format!("0x{}", "22".repeat(32)),
+            "body": { "execution_payload": { "fee_recipient": fee } },
+        }),
+        is_blinded: blinded,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+    }
+}
+
+/// A readable mismatch increments once. A match, a blinded block, and an
+/// unreadable fee do not.
+#[test]
+fn signed_fee_penalty_counts_only_a_readable_mismatch() {
+    let wrong = "0x2222222222222222222222222222222222222222";
+    let matching = "0x0000000000000000000000000000000000000000";
+    with_signed_fee_penalty_lock(|| {
+        let before = crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+        note_signed_fee_penalty(3, &json_fee_response(wrong, false), [0u8; 20], 100);
+        assert_eq!(crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
+        note_signed_fee_penalty(3, &json_fee_response(matching, false), [0u8; 20], 100);
+        note_signed_fee_penalty(3, &json_fee_response(wrong, true), [0u8; 20], 100);
+        note_signed_fee_penalty(3, &json_fee_response("0xzz", false), [0u8; 20], 100);
+        assert_eq!(crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
+    });
+}
+
+/// The fee-matching head fails prepare. The wrong-fee candidate is signed,
+/// and that signature is the one that warns and counts.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_ranked_skipped_fee_match_signs_the_mismatch() {
+    let slot = 100;
+    let expected: Root = [0x11; 32];
+    let matching = block_with_fee(slot, [0x33; 32], [0x41; 32], [0u8; 20]);
+    let wrong = block_with_fee(slot, expected, [0x44; 32], [0x22; 20]);
+    let before = crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+    let (service, signer, _beacon, pubkey) =
+        ranked_service(vec![matching, wrong], MockSigner::new(), |client| client);
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: expected, parent: Some([0x22; 32]), closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "the wrong-fee candidate must be signed: {result:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1, "the fee-matching stale parent must not be signed");
+    assert_eq!(headers[0].header.parent_root, expected);
+    assert_eq!(headers[0].header.state_root, [0x44; 32]);
+    drop(headers);
+    assert!(logs_contain("signing block with fee-recipient mismatch"));
+    assert!(logs_contain("0x2222222222222222222222222222222222222222"));
+    assert!(logs_contain("fee_expected=0x0000000000000000000000000000000000000000"));
+    assert!(
+        crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get() > before,
+        "signing the mismatch must increment the penalty counter"
+    );
+}
