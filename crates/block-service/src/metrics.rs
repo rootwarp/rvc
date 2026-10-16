@@ -2,7 +2,7 @@
 
 use std::sync::LazyLock;
 
-use metrics::{define_int_counter_vec, IntCounterVec};
+use metrics::{define_int_counter, define_int_counter_vec, IntCounter, IntCounterVec};
 
 /// `outcome` label values for [`RVC_PROPOSALS_TOTAL`].
 pub mod proposal_outcome {
@@ -37,6 +37,17 @@ pub static RVC_BLOB_SIDECARS_PUBLISHED_TOTAL: LazyLock<IntCounterVec> = LazyLock
     )
 });
 
+/// Blocks signed even though the readable fee recipient did not match.
+///
+/// The same name is defined in `bn-manager`. Registration is idempotent, so
+/// whichever crate initializes first owns the help text. Both use this wording.
+pub static RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_produce_block_fee_recipient_penalty_total",
+        "Blocks signed despite a readable fee-recipient mismatch",
+    )
+});
+
 /// Force-register the family and labeled children so scrapes see them before any attempt.
 pub fn init() {
     LazyLock::force(&RVC_PROPOSALS_TOTAL);
@@ -44,6 +55,7 @@ pub fn init() {
         let _ = RVC_PROPOSALS_TOTAL.with_label_values(&[*outcome]);
     }
     LazyLock::force(&RVC_BLOB_SIDECARS_PUBLISHED_TOTAL);
+    LazyLock::force(&RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL);
 }
 
 #[cfg(test)]

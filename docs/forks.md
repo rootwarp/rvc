@@ -264,7 +264,7 @@ variant and new body structs.
       A body-changing fork adds a `BodyForkLayout` variant and arms in
       `extract_blob_kzg_commitments` (`crates/eth-types/src/block.rs` 57) and both `*_for_layout` functions
       (Gloas → `GloasUnsupported`).
-- [ ] Arm `ssz_block_format` (`crates/block-service/src/service/mod.rs` 1118–1139) with a
+- [ ] Arm `ssz_block_format` (`crates/block-service/src/service/mod.rs` 1380–1402) with a
       **named** exhaustive `match ForkName` arm. Do not reintroduce a `"deneb" | "electra" | "fulu"`
       string table or a catch-all `BeaconBlock` inherit (Gloas's named `BeaconBlock` arm is
       separate from pre-Deneb on purpose).

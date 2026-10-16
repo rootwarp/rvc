@@ -6,11 +6,12 @@ use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
     BlockHeaderSummary, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry,
     ConfigSpecResponse, GenesisResponse, PayloadAttestationDataResponse, ProduceBlockResponse,
-    ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof,
-    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
-    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
+    ProposerDutiesResponse, ProposerPreparation, PtcDutiesResponse, RankedBlock,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse,
+    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
+    WireBody,
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -83,6 +84,26 @@ pub trait BlockProducer: Send + Sync {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BeaconError>;
+
+    /// Every arrived produce-block candidate, best first.
+    ///
+    /// The default is one candidate from [`Self::produce_block_v3`] and ignores
+    /// `duty`. `BnManager` returns the value-ranked list and applies `duty`
+    /// before a candidate can be signed. [`Self::produce_block_v3`] is the
+    /// head of that list.
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+    ) -> Result<Vec<RankedBlock>, BeaconError> {
+        let _ = duty;
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![RankedBlock { bn_index: 0, response }])
+    }
 
     /// [`Self::produce_block_v3`] with the duty's slot, proposer, parent,
     /// and consensus version applied before a block is ranked or returned.

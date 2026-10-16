@@ -100,8 +100,8 @@
 //! when no budget is set, so the series tracks publish rate times that timeout.
 //! Dashboards that watch overflow publishes should bind this gauge.
 //! #679 adds `rvc_produce_block_fee_recipient_penalty_total` (family delta +1):
-//! one increment when a block is returned for signing despite a readable
-//! fee-recipient mismatch. A mismatch that loses to a matching block, and a
+//! one increment when a block is signed despite a readable fee-recipient
+//! mismatch. A higher-ranked candidate that is skipped before signing, and a
 //! drop under `fee_recipient_policy = reject`, are not counted. It has no
 //! labels. Dashboards that watch signed fee mismatches should bind this name.
 

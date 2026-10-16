@@ -1022,35 +1022,97 @@ async fn test_multi_best_picks_higher_value_block() {
     let bn1 = MockServer::start().await;
     let bn2 = MockServer::start().await;
 
-    // BN1 returns block with lower value
+    // Execution 10 + consensus 0 loses to execution 5 + consensus 10.
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
         .respond_with(ResponseTemplate::new(200)
             .insert_header("Eth-Consensus-Version", "deneb")
             .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Execution-Payload-Value", "1000")
+            .insert_header("Eth-Execution-Payload-Value", "10")
+            .insert_header("Eth-Consensus-Block-Value", "0")
             .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
         .expect(1)
         .mount(&bn1)
         .await;
 
-    // BN2 returns block with higher value
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
         .respond_with(ResponseTemplate::new(200)
             .insert_header("Eth-Consensus-Version", "deneb")
             .insert_header("Eth-Execution-Payload-Blinded", "false")
-            .insert_header("Eth-Execution-Payload-Value", "5000")
+            .insert_header("Eth-Execution-Payload-Value", "5")
+            .insert_header("Eth-Consensus-Block-Value", "10")
             .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
         .expect(1)
         .mount(&bn2)
         .await;
 
     let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
-    let result = manager.produce_block_v3(1, "0xrandao", None, None).await;
-    assert!(result.is_ok());
-    let block = result.unwrap();
-    assert_eq!(block.execution_payload_value, Some("5000".to_string()));
+    let block = manager.produce_block_v3(1, "0xrandao", None, None).await.expect("ranked head");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("5"));
+    assert_eq!(block.consensus_block_value.as_deref(), Some("10"));
+}
+
+#[tokio::test]
+async fn test_multi_best_missing_headers_rank_as_zero() {
+    let bn1 = MockServer::start().await;
+    let bn2 = MockServer::start().await;
+
+    // Missing headers are 0. Equal to an explicit 0, so the lower index wins.
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Eth-Consensus-Version", "deneb")
+            .insert_header("Eth-Execution-Payload-Blinded", "false")
+            .set_body_string(r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+        .expect(1)
+        .mount(&bn1)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Eth-Consensus-Version", "deneb")
+            .insert_header("Eth-Execution-Payload-Blinded", "false")
+            .insert_header("Eth-Execution-Payload-Value", "0")
+            .set_body_string(r#"{"data":{"slot":"1","proposer_index":"1","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+        .expect(1)
+        .mount(&bn2)
+        .await;
+
+    let manager = make_multi_manager(&[&bn1.uri(), &bn2.uri()]);
+    let tied =
+        manager.produce_block_v3(1, "0xrandao", None, None).await.expect("tie keeps index 0");
+    assert_eq!(tied.execution_payload_value, None);
+    assert_eq!(tied.consensus_block_value, None);
+
+    let bn3 = MockServer::start().await;
+    let bn4 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/2"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Eth-Consensus-Version", "deneb")
+            .insert_header("Eth-Execution-Payload-Blinded", "false")
+            .set_body_string(r#"{"data":{"slot":"2","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+        .expect(1)
+        .mount(&bn3)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/2"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("Eth-Consensus-Version", "deneb")
+            .insert_header("Eth-Execution-Payload-Blinded", "false")
+            .insert_header("Eth-Execution-Payload-Value", "1")
+            .set_body_string(r#"{"data":{"slot":"2","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#))
+        .expect(1)
+        .mount(&bn4)
+        .await;
+
+    let manager = make_multi_manager(&[&bn3.uri(), &bn4.uri()]);
+    let positive =
+        manager.produce_block_v3(2, "0xrandao", None, None).await.expect("1 beats missing");
+    assert_eq!(positive.execution_payload_value.as_deref(), Some("1"));
+    assert_eq!(positive.consensus_block_value, None);
 }
 
 #[tokio::test]
@@ -1329,8 +1391,8 @@ fn deneb_fee_duty(fee: [u8; 20]) -> ProduceDuty {
 }
 
 /// A sole beacon node whose payload fee recipient does not match the duty
-/// still returns the block. The VC signs it. A missed proposal is worse than
-/// paying the beacon node's fee recipient.
+/// still returns the block. The penalty is recorded when that block is signed,
+/// not when it is returned.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn produce_block_v3_for_duty_returns_a_mismatched_fee_for_signing() {
@@ -1352,14 +1414,10 @@ async fn produce_block_v3_for_duty_returns_a_mismatched_fee_for_signing() {
     let block = result.expect("a mismatched fee must still be returned for signing");
     assert_eq!(block.execution_payload_value.as_deref(), Some("9000"));
     assert!(
-        logs_contain("signing block with fee-recipient mismatch"),
-        "signing a fee mismatch must log a warning"
+        !logs_contain("signing block with fee-recipient mismatch"),
+        "returning a mismatch must not log the signing penalty"
     );
-    assert!(logs_contain("bn_index=0"));
-    assert!(logs_contain("fee_expected=0x1111111111111111111111111111111111111111"));
-    assert!(logs_contain("fee_got=0x2222222222222222222222222222222222222222"));
-    assert!(logs_contain("value_parse=ok:9000"));
-    assert_eq!(RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
+    assert_eq!(RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before);
 }
 
 /// `fee_recipient_policy = "reject"` drops a readable mismatch.
@@ -1451,6 +1509,36 @@ async fn produce_block_v3_for_duty_ranks_a_fee_mismatch_below_a_match() {
         !logs_contain("signing block with fee-recipient mismatch"),
         "the penalty warning is only for the block that is signed"
     );
+}
+
+/// A fee-penalized block stays on the ranked list, behind the preferred one.
+#[tokio::test]
+async fn produce_block_v3_ranked_lists_a_held_fee_mismatch_after_the_preferred_block() {
+    let mismatch = MockServer::start().await;
+    let matching = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("9000", duty_block_body(&parent, 7, &"22".repeat(20))))
+        .expect(1)
+        .mount(&mismatch)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("1000", duty_block_body(&parent, 7, &"11".repeat(20))))
+        .expect(1)
+        .mount(&matching)
+        .await;
+
+    let manager =
+        manager_with_block_budget(&[&mismatch.uri(), &matching.uri()], Duration::from_secs(3));
+    let ranked = manager
+        .produce_block_v3_ranked(1, "0xrandao", None, None, Some(deneb_fee_duty([0x11; 20])))
+        .await
+        .expect("both candidates must be returned");
+    assert_eq!(ranked.len(), 2, "the held fee mismatch stays behind the preferred block");
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+    assert_eq!(ranked[1].response.execution_payload_value.as_deref(), Some("9000"));
 }
 
 /// No duty, so the parent is unknown. A small-lag proposal BN is not asked.

@@ -190,8 +190,39 @@ pub struct ProduceBlockResponse {
     /// Required on V4 (fail closed); V3 defaults false.
     pub payload_included: bool,
     pub builder_url: Option<String>,
-    /// Unparsed header; no arithmetic.
+    /// `Eth-Consensus-Block-Value`, whole wei.
+    ///
+    /// [`block_value`] adds this to the execution payload value. A missing or
+    /// unparsable header contributes 0.
     pub consensus_block_value: Option<String>,
+}
+
+/// One produce-block response and the beacon node that returned it.
+#[derive(Debug, Clone)]
+pub struct RankedBlock {
+    /// Index in the beacon-node pool. `0` when the client has a single node.
+    pub bn_index: usize,
+    pub response: ProduceBlockResponse,
+}
+
+/// Execution-payload wei plus consensus-block wei.
+///
+/// Each header is a whole decimal. A missing, empty, signed, or non-digit
+/// header is 0, as is a digit string that does not fit in `u128`. The sum
+/// saturates at `u128::MAX`.
+pub fn block_value(resp: &ProduceBlockResponse) -> u128 {
+    wei_or_zero(resp.execution_payload_value.as_deref())
+        .saturating_add(wei_or_zero(resp.consensus_block_value.as_deref()))
+}
+
+fn wei_or_zero(raw: Option<&str>) -> u128 {
+    let Some(raw) = raw else {
+        return 0;
+    };
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return 0;
+    }
+    raw.parse().unwrap_or(0)
 }
 
 impl ProduceBlockResponse {

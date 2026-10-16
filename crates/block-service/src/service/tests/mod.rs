@@ -5,11 +5,12 @@
 
 // Re-exports for topic submodules (`use super::*`).
 pub(super) use super::{
-    compute_blinded_block_root, compute_block_root, gloas_header_and_root, ssz_block_format,
-    BlockProposalResult, BlockService, PayloadDeadline,
+    compute_blinded_block_root, compute_block_root, gloas_header_and_root, note_signed_fee_penalty,
+    ssz_block_format, with_signed_fee_penalty_lock, BlockProposalResult, BlockService,
+    PayloadDeadline,
 };
 pub(super) use crate::traits::{
-    BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse,
+    BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse, RankedBlock,
 };
 pub(super) use crate::types::BlockSelectionMode;
 pub(super) use crate::validation::ExpectedParents;
