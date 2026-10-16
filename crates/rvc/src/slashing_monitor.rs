@@ -22,9 +22,17 @@ pub enum SlashedOutcome {
     ShutdownRequested,
 }
 
-/// Epoch interval between slashing checks (`SLOT_DURATION_MS * SLOTS_PER_EPOCH`).
-pub fn epoch_check_interval() -> Duration {
-    Duration::from_millis(eth_types::SLOT_DURATION_MS.saturating_mul(eth_types::SLOTS_PER_EPOCH))
+/// Epoch interval between slashing checks at the startup-validated slot length.
+///
+/// A zero or out-of-range duration does not become a zero sleep (that would
+/// spin) and does not assume 12 s. It waits a day.
+pub fn epoch_check_interval(slot_duration_ms: u64) -> Duration {
+    if !(eth_types::MIN_SLOT_DURATION_MS..=eth_types::MAX_SLOT_DURATION_MS)
+        .contains(&slot_duration_ms)
+    {
+        return Duration::from_secs(24 * 60 * 60);
+    }
+    Duration::from_millis(slot_duration_ms.saturating_mul(eth_types::SLOTS_PER_EPOCH))
 }
 
 /// Query enabled validators and apply the configured slashed action.
@@ -114,8 +122,9 @@ pub fn spawn(
     store: Arc<ValidatorStore>,
     action: SlashedAction,
     executor: &TaskExecutor,
+    slot_duration_ms: u64,
 ) {
-    spawn_with_interval(beacon, store, action, executor, epoch_check_interval());
+    spawn_with_interval(beacon, store, action, executor, epoch_check_interval(slot_duration_ms));
 }
 
 fn spawn_with_interval(
@@ -287,13 +296,16 @@ mod tests {
 
     #[test]
     fn test_spawn_uses_epoch_tick_from_eth_types_constants() {
-        let interval = epoch_check_interval();
+        let interval = epoch_check_interval(eth_types::SLOT_DURATION_MS);
         assert_eq!(
             interval,
             Duration::from_millis(
                 eth_types::SLOT_DURATION_MS.saturating_mul(eth_types::SLOTS_PER_EPOCH)
             )
         );
+        assert_eq!(epoch_check_interval(6_000), Duration::from_secs(192));
+        assert_eq!(epoch_check_interval(0), Duration::from_secs(24 * 60 * 60));
+        assert_eq!(epoch_check_interval(u64::MAX), Duration::from_secs(24 * 60 * 60));
         // Same numeric value as the pre-ms tree (384 s epoch). A naive
         // `from_secs(SLOT_DURATION_MS * SLOTS_PER_EPOCH)` is 384_000 s.
         assert_eq!(interval, Duration::from_secs(384));
@@ -385,6 +397,7 @@ mod tests {
             Arc::new(ValidatorStore::new([0u8; 20], 100)),
             SlashedAction::None,
             &exec,
+            12_000,
         );
 
         assert!(exec.registered_names().is_empty(), "SlashedAction::None must register no task");

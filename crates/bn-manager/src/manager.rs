@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -33,7 +34,8 @@ use crate::fan_out::{self, BnAttempt};
 use crate::health::{new_shared_health_trackers, BnHealthTracker, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
 use crate::sync_status::{
-    check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, SharedSyncStatuses,
+    check_all_sync_statuses, new_shared_sync_statuses, start_sync_monitor, AfterSyncPoll,
+    SharedSyncStatuses,
 };
 use crate::traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
@@ -318,6 +320,11 @@ pub struct BnManager {
     roles: Vec<HashSet<BnRole>>,
     tier_thresholds: TierThresholds,
     fee_recipient_policy: FeeRecipientPolicy,
+    /// `true` until boot skips the node. Duties and liveness ignore `false`
+    /// until the node matches the boot chain.
+    admitted: Arc<Vec<AtomicBool>>,
+    /// Identity from the beacon nodes that completed spec and genesis.
+    chain_identity: Arc<tokio::sync::RwLock<Option<AgreedChain>>>,
 }
 
 /// Apply health-tracker updates. Each call takes the write lock once.
@@ -492,6 +499,7 @@ impl BnManager {
                 publish_capability(ep, capability, true);
             }
         }
+        let admitted = Arc::new((0..clients.len()).map(|_| AtomicBool::new(true)).collect());
         Ok(Self {
             clients,
             sync_statuses,
@@ -501,6 +509,8 @@ impl BnManager {
             roles,
             tier_thresholds,
             fee_recipient_policy: config.fee_recipient_policy,
+            admitted,
+            chain_identity: Arc::new(tokio::sync::RwLock::new(None)),
         })
     }
 
@@ -630,6 +640,15 @@ impl BnManager {
     #[tracing::instrument(name = "bn_manager.check_sync_status", skip_all)]
     pub async fn check_sync_status(&self) {
         check_all_sync_statuses(&self.clients, &self.sync_statuses, &self.tier_thresholds).await;
+        // A syncing recovery does not admit a node boot skipped. The identity
+        // check does, and only after this poll shows the node is reachable.
+        admit_reachable_clients(
+            &self.clients,
+            &self.sync_statuses,
+            &self.admitted,
+            &self.chain_identity,
+        )
+        .await;
     }
 
     /// Starts a background task that periodically polls sync status.
@@ -642,12 +661,26 @@ impl BnManager {
         shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
         let interval = interval.unwrap_or(DEFAULT_SYNC_CHECK_INTERVAL);
+        let clients = self.clients.clone();
+        let statuses = Arc::clone(&self.sync_statuses);
+        let admitted = Arc::clone(&self.admitted);
+        let identity = Arc::clone(&self.chain_identity);
+        let after_poll: AfterSyncPoll = Arc::new(move || {
+            let clients = clients.clone();
+            let statuses = Arc::clone(&statuses);
+            let admitted = Arc::clone(&admitted);
+            let identity = Arc::clone(&identity);
+            Box::pin(async move {
+                admit_reachable_clients(&clients, &statuses, &admitted, &identity).await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
         start_sync_monitor(
             self.clients.clone(),
             self.sync_statuses.clone(),
             self.tier_thresholds.clone(),
             interval,
             shutdown,
+            Some(after_poll),
         )
     }
 
@@ -657,8 +690,10 @@ impl BnManager {
         self.clients[0].endpoint()
     }
 
-    /// Starts SSE event subscription on the primary beacon node.
+    /// Starts SSE event subscription on admitted beacon nodes.
     ///
+    /// An unadmitted node is not connected, so its head and reorg events are
+    /// not delivered. Once it is admitted, a later pass may connect.
     /// The returned `JoinHandle` runs the SSE loop in a background task.
     /// Send `true` on `shutdown` to stop the subscription.
     pub fn start_sse<F>(
@@ -671,24 +706,41 @@ impl BnManager {
     {
         let configs: Vec<SseConfig> =
             self.clients.iter().map(|c| SseConfig::new(c.endpoint().to_string())).collect();
+        let admitted = Arc::clone(&self.admitted);
         tokio::spawn(async move {
-            sse::subscribe_events(configs, callback, shutdown).await;
+            sse::subscribe_events_admitted(configs, admitted, callback, shutdown).await;
         })
     }
 
     /// Role match, then `All`-role fallback. Does **not** fall back to every client.
     /// Shared by query (`synced_indices`) and broadcast so All-fallback is one path.
+    fn is_admitted(&self, index: usize) -> bool {
+        self.admitted.get(index).is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    fn mark_unadmitted(&self, index: usize) {
+        if let Some(flag) = self.admitted.get(index) {
+            flag.store(false, Ordering::Release);
+        }
+    }
+
+    /// Role match among admitted beacon nodes, then `All`-role fallback.
+    ///
+    /// Does not fall back to an unadmitted node. An empty result fails closed.
     fn role_matching_indices(&self, role: BnRole) -> Vec<usize> {
-        let matched: Vec<usize> =
-            (0..self.clients.len()).filter(|&i| BnRole::matches(&self.roles[i], role)).collect();
+        let matched: Vec<usize> = (0..self.clients.len())
+            .filter(|&i| self.is_admitted(i) && BnRole::matches(&self.roles[i], role))
+            .collect();
         if !matched.is_empty() {
             return matched;
         }
         warn!(
             role = %role,
-            "no BNs assigned for role, falling back to all-role BNs"
+            "no admitted BNs assigned for role, falling back to admitted all-role BNs"
         );
-        (0..self.clients.len()).filter(|&i| self.roles[i].contains(&BnRole::All)).collect()
+        (0..self.clients.len())
+            .filter(|&i| self.is_admitted(i) && self.roles[i].contains(&BnRole::All))
+            .collect()
     }
 
     /// Returns indices of BNs matching the given role and meeting the minimum health tier,
@@ -699,7 +751,7 @@ impl BnManager {
     /// Fallback chain:
     /// 1. If no BNs match the role, fall back to `All`-role BNs with WARN
     /// 2. If no BNs meet the tier, try the next lower tier with WARN
-    /// 3. If still empty, fall back to all BNs (query path only)
+    /// 3. If still empty, fall back to every admitted BN (query path only)
     /// 4. Capability is a hard exclude for one selection when a capable peer
     ///    remains; the next selection re-probes flagged BNs first (bounded
     ///    schedule). If every remaining BN is incapable of `op_name`, those BNs
@@ -719,10 +771,11 @@ impl BnManager {
 
         let role_indices = self.role_matching_indices(role);
 
-        // If still empty after role fallback, use all BNs
+        // If still empty after role fallback, use every admitted BN.
+        // Unadmitted nodes stay out: a syncing recovery is not chain identity.
         let role_indices = if role_indices.is_empty() {
-            warn!("no BNs with All role either, falling back to all BNs");
-            (0..self.clients.len()).collect()
+            warn!("no admitted BNs with All role either, falling back to all admitted BNs");
+            (0..self.clients.len()).filter(|&i| self.is_admitted(i)).collect()
         } else {
             role_indices
         };
@@ -2484,6 +2537,230 @@ fn merge_builder_preferences_broadcast(
     Ok(SubmitBuilderPreferencesResult::PartialFailure { failures })
 }
 
+/// Which configured beacon nodes must answer before a spec is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecAgreement {
+    /// Custom networks. Every configured BN must respond and the values must agree.
+    All,
+    /// Named networks. The preset already pins duration and genesis, so a BN
+    /// that does not respond is skipped. At least one must respond. Responders
+    /// that disagree fail closed.
+    Responding,
+}
+
+impl BnManager {
+    /// Slot duration, slots per epoch, and genesis time.
+    ///
+    /// A missing key, a value outside the slot-duration bound, or any
+    /// disagreement among responders fails closed. [`SpecAgreement::All`]
+    /// also fails when any configured BN does not respond.
+    /// [`SpecAgreement::Responding`] skips a connect failure, a timeout, or a
+    /// proxy status (429, 502, 503, 504) and fails when nobody returned both
+    /// spec and genesis. A spec is compared before genesis is fetched, so a
+    /// genesis timeout cannot hide a disagreeing spec. `configured_root` seeds
+    /// the validators-root check: a responder that differs is not admitted and
+    /// is not the chain identity. A skipped node stays unadmitted until
+    /// [`Self::admit_skipped_beacon`]. Endpoints are not included in the error.
+    pub async fn agreed_spec_and_genesis(
+        &self,
+        agreement: SpecAgreement,
+        configured_root: &str,
+    ) -> Result<(u64, u64, u64), BeaconError> {
+        if self.clients.is_empty() {
+            return Err(BeaconError::HttpError("no beacon nodes configured".into()));
+        }
+        let mut duration_ms = None;
+        let mut slots_per_epoch = None;
+        let mut genesis_time = None;
+        let mut responded = 0u32;
+        let mut saw_root_mismatch = false;
+        for (index, client) in self.clients.iter().enumerate() {
+            let spec = match client.get_config_spec().await {
+                Ok(spec) => spec,
+                Err(e) if agreement == SpecAgreement::Responding && is_unreachable(&e) => {
+                    self.mark_unadmitted(index);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let ms = beacon::parse_slot_duration_ms(&spec.data)?;
+            let slots = beacon::parse_slots_per_epoch(&spec.data)?;
+            // Compare the spec before fetching genesis. A timeout on genesis
+            // must not discard a duration the other nodes disagree with.
+            duration_ms = agree(duration_ms, ms, "slot duration")?;
+            slots_per_epoch = agree(slots_per_epoch, slots, "SLOTS_PER_EPOCH")?;
+            let genesis = match client.get_genesis().await {
+                Ok(genesis) => genesis,
+                Err(e) if agreement == SpecAgreement::Responding && is_unreachable(&e) => {
+                    self.mark_unadmitted(index);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let parsed_genesis = genesis
+                .data
+                .genesis_time
+                .parse::<u64>()
+                .map_err(|e| BeaconError::ParseError(format!("invalid genesis_time: {e}")))?;
+            genesis_time = agree(genesis_time, parsed_genesis, "genesis_time")?;
+            if !beacon::hex_ids_equal(configured_root, &genesis.data.genesis_validators_root) {
+                saw_root_mismatch = true;
+                self.mark_unadmitted(index);
+                if agreement == SpecAgreement::All {
+                    return Err(BeaconError::ParseError(
+                        "beacon nodes disagree on genesis_validators_root".into(),
+                    ));
+                }
+                continue;
+            }
+            responded += 1;
+        }
+        if responded == 0 {
+            if saw_root_mismatch {
+                return Err(BeaconError::ParseError(
+                    "beacon nodes disagree on genesis_validators_root".into(),
+                ));
+            }
+            return Err(BeaconError::HttpError(
+                "no beacon node responded with spec and genesis".into(),
+            ));
+        }
+        match (duration_ms, slots_per_epoch, genesis_time) {
+            (Some(duration_ms), Some(slots_per_epoch), Some(genesis_time)) => {
+                *self.chain_identity.write().await = Some(AgreedChain {
+                    slot_duration_ms: duration_ms,
+                    slots_per_epoch,
+                    genesis_time,
+                    genesis_validators_root: configured_root.to_string(),
+                });
+                Ok((duration_ms, slots_per_epoch, genesis_time))
+            }
+            _ => {
+                Err(BeaconError::HttpError("no beacon node responded with spec and genesis".into()))
+            }
+        }
+    }
+
+    /// Admit one boot-skipped beacon node after its spec and genesis match
+    /// the chain the responding nodes agreed on.
+    ///
+    /// `/eth/v1/node/syncing` does not admit the node. A mismatch leaves it
+    /// unadmitted.
+    pub async fn admit_skipped_beacon(&self, index: usize) -> Result<(), BeaconError> {
+        admit_client(&self.clients, &self.admitted, &self.chain_identity, index).await
+    }
+}
+
+/// Chain identity the boot responders agreed on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgreedChain {
+    slot_duration_ms: u64,
+    slots_per_epoch: u64,
+    genesis_time: u64,
+    genesis_validators_root: String,
+}
+
+fn is_unreachable(err: &BeaconError) -> bool {
+    match err {
+        BeaconError::HttpError(_) | BeaconError::Timeout | BeaconError::OperationTimeout { .. } => {
+            true
+        }
+        // Proxy unavailable. 500 stays boot-fatal. Production failover does
+        // not treat 429 as a produce failover.
+        BeaconError::ApiError { status, .. } if matches!(*status, 429 | 502..=504) => true,
+        _ => false,
+    }
+}
+
+fn agree(prev: Option<u64>, next: u64, field: &str) -> Result<Option<u64>, BeaconError> {
+    match prev {
+        Some(prev) if prev != next => Err(BeaconError::ParseError(format!(
+            "beacon nodes disagree on {field}: {prev} vs {next}"
+        ))),
+        _ => Ok(Some(next)),
+    }
+}
+
+async fn admit_reachable_clients(
+    clients: &[BeaconClient],
+    statuses: &SharedSyncStatuses,
+    admitted: &Arc<Vec<AtomicBool>>,
+    identity: &tokio::sync::RwLock<Option<AgreedChain>>,
+) {
+    let snapshot = statuses.read().await.clone();
+    for (index, detail) in snapshot.iter().enumerate() {
+        if admitted.get(index).is_some_and(|flag| flag.load(Ordering::Acquire)) {
+            continue;
+        }
+        if matches!(detail.status, BnSyncStatus::Unreachable | BnSyncStatus::Unknown) {
+            continue;
+        }
+        if let Err(err) = admit_client(clients, admitted, identity, index).await {
+            warn!(
+                bn_index = index,
+                error = %err,
+                "skipped beacon node did not match the boot chain"
+            );
+        }
+    }
+}
+
+async fn admit_client(
+    clients: &[BeaconClient],
+    admitted: &[AtomicBool],
+    identity: &tokio::sync::RwLock<Option<AgreedChain>>,
+    index: usize,
+) -> Result<(), BeaconError> {
+    let Some(client) = clients.get(index) else {
+        return Err(BeaconError::HttpError("beacon node index out of range".into()));
+    };
+    // The stored root is the configured genesis validators root, not whichever
+    // responder answered first. A recovered node must match that root.
+    let agreed =
+        identity.read().await.clone().ok_or_else(|| {
+            BeaconError::HttpError("beacon chain identity is not established".into())
+        })?;
+    let spec = client.get_config_spec().await?;
+    let duration_ms = beacon::parse_slot_duration_ms(&spec.data)?;
+    let slots = beacon::parse_slots_per_epoch(&spec.data)?;
+    if duration_ms != agreed.slot_duration_ms {
+        return Err(BeaconError::ParseError(format!(
+            "beacon nodes disagree on slot duration: {} vs {duration_ms}",
+            agreed.slot_duration_ms
+        )));
+    }
+    if slots != agreed.slots_per_epoch {
+        return Err(BeaconError::ParseError(format!(
+            "beacon nodes disagree on SLOTS_PER_EPOCH: {} vs {slots}",
+            agreed.slots_per_epoch
+        )));
+    }
+    let genesis = client.get_genesis().await?;
+    let parsed_genesis = genesis
+        .data
+        .genesis_time
+        .parse::<u64>()
+        .map_err(|e| BeaconError::ParseError(format!("invalid genesis_time: {e}")))?;
+    if parsed_genesis != agreed.genesis_time {
+        return Err(BeaconError::ParseError(format!(
+            "beacon nodes disagree on genesis_time: {} vs {parsed_genesis}",
+            agreed.genesis_time
+        )));
+    }
+    if !beacon::hex_ids_equal(
+        &agreed.genesis_validators_root,
+        &genesis.data.genesis_validators_root,
+    ) {
+        return Err(BeaconError::ParseError(
+            "beacon nodes disagree on genesis_validators_root".into(),
+        ));
+    }
+    if let Some(flag) = admitted.get(index) {
+        flag.store(true, Ordering::Release);
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl NodeStatusApi for BnManager {
     // -- State / Config: query(First), any role, accept SmallLag --
@@ -2527,6 +2804,38 @@ impl NodeStatusApi for BnManager {
                 "no beacon node returned the configured genesis_validators_root".into(),
             )
         })
+    }
+
+    async fn confirm_genesis_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<(), BeaconError> {
+        let mut matched = 0u32;
+        let mut mismatch = None;
+        for (index, client) in self.clients.iter().enumerate() {
+            match client.get_genesis().await {
+                Ok(genesis) => {
+                    if beacon::hex_ids_equal(
+                        &genesis.data.genesis_validators_root,
+                        expected_root_hex,
+                    ) {
+                        matched += 1;
+                    } else {
+                        self.mark_unadmitted(index);
+                        mismatch = Some(genesis.data.genesis_validators_root);
+                    }
+                }
+                Err(err) if is_unreachable(&err) => self.mark_unadmitted(index),
+                Err(err) => return Err(err),
+            }
+        }
+        if matched == 0 {
+            return Err(match mismatch {
+                Some(root) => BeaconError::GenesisValidatorsRootMismatch { root },
+                None => BeaconError::HttpError("no beacon node responded with genesis".into()),
+            });
+        }
+        Ok(())
     }
 
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError> {
@@ -3365,6 +3674,10 @@ impl_beacon_client_passthrough! {
             &self,
             expected_root_hex: &str,
         ) -> Result<GenesisResponse, BeaconError>;
+        async fn confirm_genesis_validators_root(
+            &self,
+            expected_root_hex: &str,
+        ) -> Result<(), BeaconError>;
         async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError>;
         async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError>;
         async fn get_fork(&self, state_id: &str) -> Result<StateForkResponse, BeaconError>;
@@ -3544,6 +3857,7 @@ mod tests {
 
     use super::*;
     use crate::broadcast::BnOutcome;
+    use crate::traits::{LivenessApi, NodeStatusApi};
     use crate::types::bn_capability;
 
     fn testing_select(
@@ -3578,10 +3892,10 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 37 methods across the seven role traits (see impl_beacon_client_passthrough!).
+        // 38 methods across the seven role traits (see impl_beacon_client_passthrough!).
         assert_eq!(
             BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            37,
+            38,
             "update impl_beacon_client_passthrough! when adding a role-trait method"
         );
 
@@ -6428,5 +6742,522 @@ mod tests {
             "elapsed {elapsed:?} exceeded block_publication budget+ε ({:?})",
             budget + epsilon
         );
+    }
+
+    fn spec_body(slot_ms: &str) -> String {
+        format!(r#"{{"data":{{"SLOT_DURATION_MS":"{slot_ms}","SLOTS_PER_EPOCH":"32"}}}}"#)
+    }
+
+    fn genesis_body(genesis_time: &str) -> String {
+        format!(
+            r#"{{"data":{{"genesis_time":"{genesis_time}","genesis_validators_root":"0xabc","genesis_fork_version":"0x00000000"}}}}"#
+        )
+    }
+
+    async fn mount_spec_and_genesis(
+        server: &wiremock::MockServer,
+        slot_ms: &str,
+        genesis_time: &str,
+    ) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(spec_body(slot_ms)))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(genesis_body(genesis_time)))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_on_named_network_skips_an_unreachable_bn() {
+        use wiremock::MockServer;
+        let live = MockServer::start().await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![
+            "http://127.0.0.1:1".to_string(),
+            live.uri(),
+        ]))
+        .expect("manager");
+        let (duration, slots, genesis) = manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("unreachable peer is skipped");
+        assert_eq!((duration, slots, genesis), (12_000, 32, 1_606_824_023));
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_fails_when_no_bn_responds() {
+        let manager = BnManager::new(BnManagerConfig::new(vec!["http://127.0.0.1:1".to_string()]))
+            .expect("manager");
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect_err("at least one response");
+        assert!(err.to_string().contains("no beacon node responded"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_on_custom_requires_every_bn() {
+        use wiremock::MockServer;
+        let live = MockServer::start().await;
+        mount_spec_and_genesis(&live, "6000", "1606824023").await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![
+            "http://127.0.0.1:1".to_string(),
+            live.uri(),
+        ]))
+        .expect("manager");
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::All, "0xabc")
+            .await
+            .expect_err("custom requires every BN");
+        assert!(err.to_string().contains("HTTP request failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_fails_closed_when_responders_disagree() {
+        use wiremock::MockServer;
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        mount_spec_and_genesis(&first, "12000", "1606824023").await;
+        mount_spec_and_genesis(&second, "6000", "1606824023").await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![first.uri(), second.uri()])).expect("manager");
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect_err("disagreement");
+        assert!(err.to_string().contains("disagree"), "{err}");
+    }
+
+    fn manager_with_timeout(endpoints: Vec<String>, timeout: Duration) -> BnManager {
+        let mut config = BnManagerConfig::new(endpoints);
+        config.timeout = timeout;
+        BnManager::new(config).expect("manager")
+    }
+
+    async fn mount_spec(server: &wiremock::MockServer, slot_ms: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(spec_body(slot_ms)))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_genesis_delayed(server: &wiremock::MockServer, delay: Duration) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(genesis_body("1606824023"))
+                    .set_delay(delay),
+            )
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_status(server: &wiremock::MockServer, route: &str, status: u16) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(status).set_body_string("unavailable"))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_synced(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#,
+            ))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_liveness(server: &wiremock::MockServer, status: u16) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let template = if status == 200 {
+            ResponseTemplate::new(200).set_body_string(r#"{"data":[{"index":"1","is_live":true}]}"#)
+        } else {
+            ResponseTemplate::new(status).set_body_string("down")
+        };
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/liveness/1"))
+            .respond_with(template)
+            .mount(server)
+            .await;
+    }
+
+    async fn liveness_hits(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path().contains("/eth/v1/validator/liveness/"))
+            .count()
+    }
+
+    #[test]
+    fn proxy_statuses_count_as_unreachable_and_500_does_not() {
+        for status in [429_u16, 502, 503, 504] {
+            assert!(is_unreachable(&BeaconError::ApiError { status, message: "proxy".into() }));
+        }
+        assert!(!is_unreachable(&BeaconError::ApiError { status: 500, message: "fault".into() }));
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_keeps_a_spec_when_genesis_times_out() {
+        use wiremock::MockServer;
+        let slow = MockServer::start().await;
+        let peer = MockServer::start().await;
+        mount_spec(&slow, "12000").await;
+        mount_genesis_delayed(&slow, Duration::from_millis(300)).await;
+        mount_spec_and_genesis(&peer, "6000", "1606824023").await;
+        let manager = manager_with_timeout(vec![slow.uri(), peer.uri()], Duration::from_millis(50));
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect_err("the timed-out spec must still disagree");
+        let message = err.to_string();
+        assert!(message.contains("disagree on slot duration"), "{message}");
+        assert!(message.contains("12000"), "{message}");
+        assert!(message.contains("6000"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn unvalidated_bn_is_not_used_for_liveness_after_sync_recovers() {
+        use wiremock::MockServer;
+        let skipped = MockServer::start().await;
+        let live = MockServer::start().await;
+        mount_spec(&skipped, "12000").await;
+        mount_genesis_delayed(&skipped, Duration::from_millis(300)).await;
+        mount_synced(&skipped).await;
+        mount_liveness(&skipped, 200).await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        mount_liveness(&live, 200).await;
+        let manager =
+            manager_with_timeout(vec![skipped.uri(), live.uri()], Duration::from_millis(50));
+        manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("the live beacon node completes agreement");
+        assert!(!manager.is_admitted(0), "a genesis timeout must leave the node unadmitted");
+        manager.check_sync_status().await;
+        assert!(!manager.is_admitted(0), "syncing recovery must not admit the node");
+        let indices = vec!["1".to_string()];
+        manager.post_validator_liveness(1, &indices).await.expect("live node answers");
+        manager
+            .post_validator_liveness_merged(1, &indices)
+            .await
+            .expect("merged liveness uses admitted nodes");
+        assert_eq!(liveness_hits(&skipped).await, 0, "the unvalidated node must not be queried");
+        assert!(liveness_hits(&live).await > 0);
+    }
+
+    #[tokio::test]
+    async fn skipped_bn_is_admitted_for_liveness_after_identity_matches() {
+        use wiremock::MockServer;
+        let skipped = MockServer::start().await;
+        let live = MockServer::start().await;
+        mount_spec(&skipped, "12000").await;
+        mount_genesis_delayed(&skipped, Duration::from_millis(300)).await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        mount_liveness(&live, 500).await;
+        let manager =
+            manager_with_timeout(vec![skipped.uri(), live.uri()], Duration::from_millis(50));
+        manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("the live beacon node completes agreement");
+        mount_liveness(&skipped, 200).await;
+        let indices = vec!["1".to_string()];
+        let blocked = manager.post_validator_liveness(1, &indices).await;
+        assert!(blocked.is_err(), "the unadmitted node must not fail over: {blocked:?}");
+        assert_eq!(liveness_hits(&skipped).await, 0);
+
+        skipped.reset().await;
+        mount_spec_and_genesis(&skipped, "12000", "1606824023").await;
+        mount_liveness(&skipped, 200).await;
+        manager.admit_skipped_beacon(0).await.expect("identity matches");
+        assert!(manager.is_admitted(0));
+        manager.post_validator_liveness(1, &indices).await.expect("admitted node answers");
+        assert!(liveness_hits(&skipped).await > 0);
+    }
+
+    #[tokio::test]
+    async fn admit_skipped_beacon_rejects_mismatched_genesis_validators() {
+        use wiremock::MockServer;
+        let skipped = MockServer::start().await;
+        let live = MockServer::start().await;
+        mount_status(&skipped, "/eth/v1/config/spec", 503).await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![skipped.uri(), live.uri()])).expect("manager");
+        manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("503 is skipped");
+        skipped.reset().await;
+        mount_spec(&skipped, "12000").await;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0xdef","genesis_fork_version":"0x00000000"}}"#,
+            ))
+            .mount(&skipped)
+            .await;
+        let err = manager.admit_skipped_beacon(0).await.expect_err("root mismatch");
+        assert!(err.to_string().contains("genesis_validators_root"), "{err}");
+        assert!(!manager.is_admitted(0));
+    }
+
+    #[tokio::test]
+    async fn responding_agreement_skips_proxy_unavailable() {
+        use wiremock::MockServer;
+        for status in [502_u16, 503, 504, 429] {
+            let down = MockServer::start().await;
+            let live = MockServer::start().await;
+            mount_status(&down, "/eth/v1/config/spec", status).await;
+            mount_spec_and_genesis(&live, "12000", "1606824023").await;
+            let manager = BnManager::new(BnManagerConfig::new(vec![down.uri(), live.uri()]))
+                .expect("manager");
+            let agreed = manager
+                .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+                .await
+                .unwrap_or_else(|err| panic!("status {status} must be skipped, got {err}"));
+            assert_eq!(agreed, (12_000, 32, 1_606_824_023));
+            assert!(!manager.is_admitted(0));
+        }
+    }
+
+    #[tokio::test]
+    async fn responding_agreement_treats_500_as_boot_fatal() {
+        use wiremock::MockServer;
+        let down = MockServer::start().await;
+        let live = MockServer::start().await;
+        mount_status(&down, "/eth/v1/config/spec", 500).await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![down.uri(), live.uri()])).expect("manager");
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect_err("500 stays boot-fatal");
+        assert!(matches!(err, BeaconError::ApiError { status: 500, .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn custom_agreement_treats_503_as_boot_fatal() {
+        use wiremock::MockServer;
+        let down = MockServer::start().await;
+        let live = MockServer::start().await;
+        mount_status(&down, "/eth/v1/config/spec", 503).await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![down.uri(), live.uri()])).expect("manager");
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::All, "0xabc")
+            .await
+            .expect_err("custom requires every BN");
+        assert!(matches!(err, BeaconError::ApiError { status: 503, .. }), "{err:?}");
+    }
+
+    async fn mount_genesis_root(server: &wiremock::MockServer, genesis_time: &str, root: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"data":{{"genesis_time":"{genesis_time}","genesis_validators_root":"{root}","genesis_fork_version":"0x00000000"}}}}"#
+            )))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn confirm_genesis_root_checks_every_responder() {
+        use wiremock::MockServer;
+        let good = MockServer::start().await;
+        let wrong = MockServer::start().await;
+        mount_genesis_root(&good, "1606824023", "0xabc").await;
+        mount_genesis_root(&wrong, "1606824023", "0xdef").await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![good.uri(), wrong.uri()])).expect("manager");
+        manager.confirm_genesis_validators_root("0xabc").await.expect("the good node matches");
+        assert!(manager.is_admitted(0));
+        assert!(!manager.is_admitted(1), "a later wrong root must not stay admitted");
+    }
+
+    #[tokio::test]
+    async fn single_wrong_root_node_is_rejected_at_boot() {
+        use wiremock::MockServer;
+        let server = MockServer::start().await;
+        mount_spec(&server, "12000").await;
+        mount_genesis_root(&server, "1606824023", "0xdef").await;
+        mount_liveness(&server, 200).await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("manager");
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect_err("configured root rejects the node");
+        assert!(err.to_string().contains("genesis_validators_root"), "{err}");
+        assert!(!manager.is_admitted(0));
+        let liveness = manager.post_validator_liveness(1, &["1".to_string()]).await;
+        assert!(liveness.is_err(), "an unadmitted node is not a liveness source: {liveness:?}");
+        assert_eq!(liveness_hits(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn wrong_chain_nodes_stay_unadmitted_after_the_good_node_drops() {
+        use wiremock::MockServer;
+        let good = MockServer::start().await;
+        let wrong_a = MockServer::start().await;
+        let wrong_b = MockServer::start().await;
+        mount_spec_and_genesis(&good, "12000", "1606824023").await;
+        for wrong in [&wrong_a, &wrong_b] {
+            mount_spec(wrong, "12000").await;
+            mount_genesis_root(wrong, "1606824023", "0xdef").await;
+            mount_synced(wrong).await;
+            mount_liveness(wrong, 200).await;
+        }
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![good.uri(), wrong_a.uri(), wrong_b.uri()]))
+                .expect("manager");
+        manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("the good node seeds the configured root");
+        assert!(manager.is_admitted(0));
+        assert!(!manager.is_admitted(1));
+        assert!(!manager.is_admitted(2));
+
+        good.reset().await;
+        mount_status(&good, "/eth/v1/config/spec", 503).await;
+        mount_status(&good, "/eth/v1/beacon/genesis", 503).await;
+        manager.check_sync_status().await;
+        let err = manager.admit_skipped_beacon(1).await.expect_err("wrong root");
+        assert!(err.to_string().contains("genesis_validators_root"), "{err}");
+        assert!(!manager.is_admitted(1));
+        assert!(!manager.is_admitted(2));
+        let liveness = manager.post_validator_liveness(1, &["1".to_string()]).await;
+        assert!(liveness.is_err(), "{liveness:?}");
+        assert_eq!(liveness_hits(&wrong_a).await, 0);
+        assert_eq!(liveness_hits(&wrong_b).await, 0);
+    }
+
+    async fn sse_head_server(
+        slot: &str,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_task = Arc::clone(&accepts);
+        let body = format!(
+            "event: head\ndata: {{\"slot\":\"{slot}\",\"block\":\"0xabc\",\"state\":\"0xdef\",\"epoch_transition\":false,\"previous_duty_dependent_root\":\"0x11\",\"current_duty_dependent_root\":\"0x22\",\"execution_optimistic\":false}}\n\nevent: chain_reorg\ndata: {{\"slot\":\"{slot}\",\"depth\":\"1\",\"old_head_block\":\"0x01\",\"new_head_block\":\"0x02\",\"old_head_state\":\"0x03\",\"new_head_state\":\"0x04\",\"epoch\":\"1\",\"execution_optimistic\":false}}\n\n"
+        );
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepts_task.fetch_add(1, Ordering::SeqCst);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let chunk = format!("{:x}\r\n{}\r\n", body.len(), body);
+                    let _ = stream.write_all(chunk.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), accepts, handle)
+    }
+
+    #[tokio::test]
+    async fn sse_does_not_connect_an_unadmitted_bn_until_it_is_admitted() {
+        use std::sync::atomic::Ordering;
+        use std::sync::{Arc, Mutex};
+
+        let (skipped_url, skipped_hits, skipped_server) = sse_head_server("1").await;
+        let (live_url, live_hits, live_server) = sse_head_server("2").await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![skipped_url, live_url])).expect("manager");
+        manager.mark_unadmitted(0);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_cb = Arc::clone(&events);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = manager.start_sse(
+            move |event| {
+                events_cb.lock().expect("events").push(event);
+            },
+            shutdown_rx,
+        );
+
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if live_hits.load(Ordering::SeqCst) > 0 && !events.lock().expect("events").is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            skipped_hits.load(Ordering::SeqCst),
+            0,
+            "an unadmitted node must not be connected"
+        );
+        assert!(live_hits.load(Ordering::SeqCst) > 0, "the admitted node is the stream");
+        let delivered = events.lock().expect("events").clone();
+        assert!(
+            delivered.iter().any(|event| matches!(event, SseEvent::Head(head) if head.slot == "2")),
+            "admitted head must be delivered: {delivered:?}"
+        );
+        assert!(
+            delivered.iter().all(|event| match event {
+                SseEvent::Head(head) => head.slot != "1",
+                SseEvent::ChainReorg(reorg) => reorg.slot != "1",
+                SseEvent::Block(_) | SseEvent::FinalizedCheckpoint(_) => true,
+            }),
+            "unadmitted head and reorg events must be dropped: {delivered:?}"
+        );
+
+        manager.admitted[0].store(true, Ordering::Release);
+        live_server.abort();
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            if skipped_hits.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+        }
+        assert!(
+            skipped_hits.load(Ordering::SeqCst) > 0,
+            "the node may be connected after admission"
+        );
+        shutdown_tx.send(true).expect("shutdown");
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        skipped_server.abort();
     }
 }

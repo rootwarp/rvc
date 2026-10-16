@@ -31,6 +31,10 @@ pub enum BeaconError {
     /// No BN matched the requested role and no `All`-role fallback exists.
     #[error("no beacon nodes eligible for {operation} (role {role})")]
     NoEligibleBn { operation: String, role: String },
+
+    /// The beacon node returned a genesis validators root other than the configured one.
+    #[error("genesis validators root {root} does not match configured root")]
+    GenesisValidatorsRootMismatch { root: String },
 }
 
 #[cfg(test)]

@@ -349,6 +349,15 @@ pub trait NodeStatusApi: Send + Sync {
         expected_root_hex: &str,
     ) -> Result<GenesisResponse, BeaconError>;
 
+    /// Every responder must be checked against `expected_root_hex`.
+    ///
+    /// A pooled client does not stop at the first success. A responder whose
+    /// root differs is rejected. One match is enough; none is an error.
+    async fn confirm_genesis_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<(), BeaconError>;
+
     async fn get_config_spec(&self) -> Result<ConfigSpecResponse, BeaconError>;
 
     async fn get_fork_schedule(&self) -> Result<ForkSchedule, BeaconError>;

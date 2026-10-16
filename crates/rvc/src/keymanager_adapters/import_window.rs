@@ -1383,7 +1383,9 @@ mod tests {
         let genesis = (u64::MAX / 1000) + 1;
         let clock = Arc::new(MockSlotClock::new(genesis, Duration::from_secs(12), 32));
         clock.set_current_time_ms(0);
-        assert!(matches!(clock.current_slot(), Err(TimingError::BeforeGenesis { .. })));
+        // Genesis cannot be represented in milliseconds, so the slot clock
+        // fails closed instead of reporting a pre-genesis epoch.
+        assert!(matches!(clock.current_slot(), Err(TimingError::TimeOverflow)));
         assert!(matches!(clock.time_until_slot(0), Err(TimingError::TimeOverflow)));
         let gate = ImportWindowGate::new(Arc::clone(&clock) as Arc<dyn SlotClock>);
         let err = gate.admit(1).await.expect_err("overflow must refuse import");

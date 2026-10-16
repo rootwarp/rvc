@@ -809,14 +809,27 @@ impl Config {
         Self::from_toml_value(value)
     }
 
+    /// Genesis unix time.
+    ///
+    /// Named networks use the preset. An explicit `genesis_time` that differs
+    /// from that preset is an error. Custom has no preset and requires the field.
     pub fn effective_genesis_time(&self) -> Result<u64, ConfigError> {
-        if let Some(genesis_time) = self.genesis_time {
-            return Ok(genesis_time);
+        match self.network.genesis_time() {
+            Some(preset) => {
+                if let Some(configured) = self.genesis_time {
+                    if configured != preset {
+                        return Err(ConfigError::InvalidNetwork(format!(
+                            "genesis_time {configured} does not match {} preset {preset}",
+                            self.network
+                        )));
+                    }
+                }
+                Ok(preset)
+            }
+            None => self
+                .genesis_time
+                .ok_or_else(|| ConfigError::MissingField("genesis_time".to_string())),
         }
-
-        self.network
-            .genesis_time()
-            .ok_or_else(|| ConfigError::MissingField("genesis_time".to_string()))
     }
 
     pub fn effective_genesis_validators_root(&self) -> Result<String, ConfigError> {
@@ -2116,10 +2129,11 @@ allow_fresh_db = true
     }
 
     #[test]
-    fn test_effective_genesis_time_override() {
+    fn test_effective_genesis_time_override_on_named_network_fails() {
         let config =
             Config { network: Network::Mainnet, genesis_time: Some(12345), ..Default::default() };
-        assert_eq!(config.effective_genesis_time().unwrap(), 12345);
+        let err = config.effective_genesis_time().expect_err("named network is not overridable");
+        assert!(err.to_string().contains("preset"), "{err}");
     }
 
     #[test]

@@ -88,7 +88,8 @@ pub async fn wire_signing_enablement(
 
     // Shared monotonic epoch clock (M-7) for boot register + keymanager import
     // so NTP cannot compress the window and wall-clock alone cannot force epoch 0.
-    let epoch_clock = Arc::new(MonotonicEpochClock::new(beacon.genesis_time));
+    let epoch_clock =
+        Arc::new(MonotonicEpochClock::new(beacon.genesis_time, beacon.slot_duration_ms));
     let enablement_epoch = epoch_clock.current_epoch();
 
     // Resolve validator indices into the shared registry (duty tracker + liveness
@@ -148,6 +149,7 @@ pub async fn wire_signing_enablement(
         beacon.genesis_validators_root,
         enablement_epoch,
         &keys.pubkey_map,
+        beacon.genesis_confirmed,
     );
 
     // Shared with keymanager DELETE/import and forward-window sidecar cleanup.
@@ -300,6 +302,8 @@ mod tests {
                 genesis_validators_root: GVR,
                 genesis_validators_root_hex: format!("0x{}", hex::encode(GVR)),
                 genesis_time,
+                slot_duration_ms: 12_000,
+                genesis_confirmed: true,
             },
         )
     }
@@ -429,7 +433,7 @@ mod tests {
         {
             let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
             slashing_db.set_genesis_validators_root(&GVR).unwrap();
-            let epoch = MonotonicEpochClock::new(0).current_epoch();
+            let epoch = MonotonicEpochClock::new(0, 12_000).current_epoch();
             assert!(epoch > 2, "test needs epoch > monitoring window");
             let target = epoch - 1;
             slashing_db
@@ -505,6 +509,77 @@ mod tests {
         assert!(!handles.signing_enablement.is_signing_enabled(&other));
         // Silence unused import warning paths
         let _ = Signer::public_keys(keys.composite_signer.as_ref());
+        executor.token().cancel();
+    }
+
+    /// BN `SLOT_DURATION_MS=6000` and genesis 10 epochs ago at 6 s slots.
+    ///
+    /// A clock that still divides by 12 s reports epoch 5 for the same instant.
+    #[tokio::test]
+    async fn test_six_second_beacon_spec_reports_epoch_ten() {
+        use crate::bootstrap::connect_beacon;
+
+        let server = MockServer::start().await;
+        let gvr = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let genesis = now - 10 * 192 - 96;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "genesis_time": genesis.to_string(),
+                    "genesis_validators_root": gvr,
+                    "genesis_fork_version": "0x00000000"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "SLOT_DURATION_MS": "6000", "SLOTS_PER_EPOCH": "32" }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/version"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": { "version": "mock-bn/rf5-04" }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let mut config = base_config(true);
+        config.beacon_url = server.uri();
+        config.beacon_nodes = vec![server.uri()];
+        config.network = crate::config::Network::Custom;
+        config.genesis_validators_root = Some(gvr.to_string());
+        config.genesis_time = Some(genesis);
+        config.slashing_db_path = db_path;
+        config.allow_fresh_db = true;
+        config.disable_keystore_locking = true;
+
+        let beacon =
+            connect_beacon(&config, OperationTimeouts::default(), &db).await.expect("connect");
+        assert_eq!(beacon.slot_duration_ms, 6_000);
+
+        let keys = empty_loaded_keys();
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let handles = wire_signing_enablement(
+            &config,
+            &keys,
+            &beacon,
+            Arc::new(SlashingDb::open_in_memory().unwrap()),
+            &executor,
+        )
+        .await
+        .expect("enablement");
+        assert_eq!(handles.epoch_clock.slot_duration_ms(), 6_000);
+        assert_eq!(handles.epoch_clock.current_epoch(), 10);
         executor.token().cancel();
     }
 }

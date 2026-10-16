@@ -210,10 +210,9 @@ pub fn ensure_genesis_validators_root(
     if hex_ids_equal(&genesis.data.genesis_validators_root, expected_root_hex) {
         Ok(genesis)
     } else {
-        Err(BeaconError::HttpError(format!(
-            "genesis_validators_root {} does not match configured root",
-            genesis.data.genesis_validators_root
-        )))
+        Err(BeaconError::GenesisValidatorsRootMismatch {
+            root: genesis.data.genesis_validators_root,
+        })
     }
 }
 
@@ -493,6 +492,14 @@ impl BeaconClient {
         expected_root_hex: &str,
     ) -> Result<GenesisResponse, BeaconError> {
         ensure_genesis_validators_root(self.get_genesis().await?, expected_root_hex)
+    }
+
+    /// One client is the only responder. A different validators root is an error.
+    pub async fn confirm_genesis_validators_root(
+        &self,
+        expected_root_hex: &str,
+    ) -> Result<(), BeaconError> {
+        self.get_genesis_matching_validators_root(expected_root_hex).await.map(|_| ())
     }
 
     /// Fetches fork information for the given state.
@@ -1919,6 +1926,10 @@ impl BeaconClient {
                     let status = response.status();
                     span.record("http.status_code", status.as_u16());
 
+                    // 429 is proxy backpressure, same class as 502/503/504 below.
+                    // The final error stays `ApiError` so callers can match the
+                    // status. BnManager treats that status as unreachable at boot.
+                    // Block production does not fail over on 429.
                     if status.as_u16() == 429 {
                         last_error = Some(BeaconError::ApiError {
                             status: 429,
@@ -1937,6 +1948,21 @@ impl BeaconClient {
                         continue;
                     }
 
+                    // 502/503/504 are proxy-unavailable, grouped with 429: retried,
+                    // returned as `ApiError`, and treated as unreachable at boot.
+                    if matches!(status.as_u16(), 502..=504) {
+                        let message = read_body_capped_lossy(response, 16 * 1024).await;
+                        last_error =
+                            Some(BeaconError::ApiError { status: status.as_u16(), message });
+                        warn!(
+                            attempt = attempt,
+                            status = status.as_u16(),
+                            "Proxy unavailable, will retry"
+                        );
+                        continue;
+                    }
+
+                    // 500 and other 5xx are retried here and stay boot-fatal.
                     if status.is_server_error() {
                         let message = read_body_capped_lossy(response, 16 * 1024).await;
                         last_error =

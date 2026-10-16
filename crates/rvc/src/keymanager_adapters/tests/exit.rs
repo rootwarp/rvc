@@ -35,7 +35,13 @@ fn create_exit_adapter(beacon_url: &str, secret_key: SecretKey) -> VoluntaryExit
 
     let genesis_validators_root = [0xaa; 32];
 
-    VoluntaryExitManagerAdapter::new(beacon_client, signer, fork_schedule, genesis_validators_root)
+    VoluntaryExitManagerAdapter::new(
+        beacon_client,
+        signer,
+        fork_schedule,
+        genesis_validators_root,
+        0,
+    )
 }
 
 #[test]

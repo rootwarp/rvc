@@ -85,6 +85,73 @@ pub fn require_exit_confirm(
     bail!("Voluntary exit aborted: --confirm flag not provided");
 }
 
+/// Epoch from genesis and the beacon node's slot duration.
+///
+/// Reads `/eth/v1/config/spec`. A missing, zero, or conflicting duration is an
+/// error. The 12 s constant is not a fallback.
+async fn default_exit_epoch(
+    beacon_client: &BeaconClient,
+    genesis_time: u64,
+    network: rvc::config::Network,
+) -> anyhow::Result<u64> {
+    // One beacon URL. The daemon cross-checks every configured BN at startup;
+    // this path still fail-closes on the bound, a key conflict, SLOTS_PER_EPOCH,
+    // a named-network duration preset, and a named-network genesis preset.
+    let spec = beacon_client
+        .get_config_spec()
+        .await
+        .context("Failed to read slot duration from beacon node spec")?;
+    let slot_duration_ms = beacon::parse_slot_duration_ms(&spec.data)
+        .map_err(|e| anyhow::anyhow!("failed to parse slot duration from beacon node spec: {e}"))?;
+    let slots_per_epoch = beacon::parse_slots_per_epoch(&spec.data).map_err(|e| {
+        anyhow::anyhow!("failed to parse SLOTS_PER_EPOCH from beacon node spec: {e}")
+    })?;
+    let expected_slots = network.slots_per_epoch();
+    if slots_per_epoch != expected_slots {
+        bail!("SLOTS_PER_EPOCH {slots_per_epoch} does not match preset {expected_slots}");
+    }
+    if !matches!(network, rvc::config::Network::Custom) {
+        let preset = network.slot_duration_ms();
+        if slot_duration_ms != preset {
+            bail!(
+                "slot duration {slot_duration_ms} ms does not match {network} preset {preset} ms"
+            );
+        }
+        if let Some(preset_genesis) = network.genesis_time() {
+            if genesis_time != preset_genesis {
+                bail!(
+                    "beacon genesis_time {genesis_time} does not match {network} preset {preset_genesis}"
+                );
+            }
+        }
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| anyhow::anyhow!("system time before UNIX epoch"))?
+        .as_secs();
+    current_exit_epoch(now, genesis_time, slot_duration_ms)
+}
+
+/// Current epoch at `now_unix_secs`. Zero duration is an error, not epoch 0.
+fn current_exit_epoch(
+    now_unix_secs: u64,
+    genesis_time: u64,
+    slot_duration_ms: u64,
+) -> anyhow::Result<u64> {
+    if !(eth_types::MIN_SLOT_DURATION_MS..=eth_types::MAX_SLOT_DURATION_MS)
+        .contains(&slot_duration_ms)
+    {
+        bail!(
+            "slot duration {slot_duration_ms} ms is outside {}..={}",
+            eth_types::MIN_SLOT_DURATION_MS,
+            eth_types::MAX_SLOT_DURATION_MS
+        );
+    }
+    let current_slot =
+        now_unix_secs.saturating_sub(genesis_time).saturating_mul(1000) / slot_duration_ms;
+    Ok(current_slot / SLOTS_PER_EPOCH)
+}
+
 /// Resolve validator index, epoch, load keys / slashing DB, and sign a voluntary exit.
 ///
 /// Callers differ only in the final step: submit to the BN or write to a file.
@@ -110,6 +177,11 @@ pub async fn build_signed_exit(args: ExitCommonArgs) -> anyhow::Result<BuiltSign
 
     info!(validator_index, pubkey = %pubkey_with_prefix, "Resolved validator index");
 
+    let network = match args.network.as_deref() {
+        Some(name) => name.parse().map_err(|e: String| anyhow::anyhow!("{e}"))?,
+        None => rvc::config::Network::default(),
+    };
+
     let epoch = match args.epoch {
         Some(e) => e,
         None => {
@@ -121,14 +193,7 @@ pub async fn build_signed_exit(args: ExitCommonArgs) -> anyhow::Result<BuiltSign
             let genesis_time: u64 =
                 genesis.data.genesis_time.parse().context("Failed to parse genesis time")?;
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|_| anyhow::anyhow!("system time before UNIX epoch"))?
-                .as_secs();
-
-            let current_slot =
-                now.saturating_sub(genesis_time).saturating_mul(1000) / eth_types::SLOT_DURATION_MS;
-            current_slot / SLOTS_PER_EPOCH
+            default_exit_epoch(&beacon_client, genesis_time, network).await?
         }
     };
 
@@ -149,9 +214,7 @@ pub async fn build_signed_exit(args: ExitCommonArgs) -> anyhow::Result<BuiltSign
     if let Some(db_path) = args.slashing_db_path {
         config.slashing_db_path = db_path;
     }
-    if let Some(network) = args.network {
-        config.network = network.parse().map_err(|e: String| anyhow::anyhow!("{}", e))?;
-    }
+    config.network = network;
 
     let keystore_path = config.keystore_path.clone();
     let builder = ServiceBuilder::new(config);
@@ -256,5 +319,141 @@ mod tests {
             "expected confirm abort message, got: {err}"
         );
         assert!(require_exit_confirm(true, 42, &pk, 100).is_ok());
+    }
+
+    #[test]
+    fn test_current_exit_epoch_six_second_slots_are_epoch_ten() {
+        let genesis = 1_700_000_000_u64;
+        let elapsed = 10 * 192;
+        assert_eq!(current_exit_epoch(genesis + elapsed, genesis, 6_000).unwrap(), 10);
+        assert_eq!(current_exit_epoch(genesis + elapsed, genesis, 12_000).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_current_exit_epoch_zero_duration_is_an_error() {
+        let err = current_exit_epoch(100, 0, 0).unwrap_err();
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    async fn mock_client(
+        spec: serde_json::Value,
+        genesis_time: u64,
+    ) -> (BeaconClient, wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "genesis_time": genesis_time.to_string(),
+                    "genesis_validators_root": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "genesis_fork_version": "0x00000000"
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": spec })),
+            )
+            .mount(&server)
+            .await;
+        let client = BeaconClient::new(beacon::BeaconClientConfig::new(server.uri()))
+            .expect("beacon client");
+        (client, server)
+    }
+
+    #[tokio::test]
+    async fn test_cli_default_exit_epoch_uses_bn_slot_duration() {
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let genesis = now - 10 * 192 - 96;
+        let (client, _server) = mock_client(
+            serde_json::json!({ "SLOT_DURATION_MS": "6000", "SLOTS_PER_EPOCH": "32" }),
+            genesis,
+        )
+        .await;
+        let epoch = default_exit_epoch(&client, genesis, rvc::config::Network::Custom)
+            .await
+            .expect("epoch");
+        assert_eq!(epoch, 10);
+    }
+
+    #[tokio::test]
+    async fn test_cli_default_exit_epoch_fails_when_spec_has_no_duration() {
+        let (client, _server) =
+            mock_client(serde_json::json!({ "SLOTS_PER_EPOCH": "32" }), 1).await;
+        let err = default_exit_epoch(&client, 1, rvc::config::Network::Mainnet)
+            .await
+            .expect_err("missing duration");
+        let msg = err.to_string();
+        assert!(msg.contains("SLOT_DURATION_MS") || msg.contains("SECONDS_PER_SLOT"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_cli_default_exit_epoch_fails_when_spec_keys_conflict() {
+        let (client, _server) = mock_client(
+            serde_json::json!({ "SLOT_DURATION_MS": "6000", "SECONDS_PER_SLOT": "12" }),
+            1,
+        )
+        .await;
+        let err = default_exit_epoch(&client, 1, rvc::config::Network::Custom)
+            .await
+            .expect_err("conflict");
+        assert!(err.to_string().contains("conflicting"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_cli_default_exit_epoch_rejects_huge_duration() {
+        let (client, _server) = mock_client(
+            serde_json::json!({ "SLOT_DURATION_MS": "86400000", "SLOTS_PER_EPOCH": "32" }),
+            1,
+        )
+        .await;
+        let err =
+            default_exit_epoch(&client, 1, rvc::config::Network::Custom).await.expect_err("huge");
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_cli_named_network_rejects_non_preset_duration() {
+        let (client, _server) = mock_client(
+            serde_json::json!({ "SLOT_DURATION_MS": "6000", "SLOTS_PER_EPOCH": "32" }),
+            1,
+        )
+        .await;
+        let err = default_exit_epoch(&client, 1, rvc::config::Network::Mainnet)
+            .await
+            .expect_err("preset");
+        assert!(err.to_string().contains("preset"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_cli_named_network_rejects_genesis_time_that_is_not_the_preset() {
+        let (client, _server) = mock_client(
+            serde_json::json!({ "SLOT_DURATION_MS": "12000", "SLOTS_PER_EPOCH": "32" }),
+            1,
+        )
+        .await;
+        let err = default_exit_epoch(&client, 1, rvc::config::Network::Mainnet)
+            .await
+            .expect_err("genesis");
+        assert!(err.to_string().contains("genesis_time"), "{err}");
+        assert!(err.to_string().contains("preset"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_cli_rejects_slots_per_epoch_that_is_not_the_preset() {
+        let (client, _server) = mock_client(
+            serde_json::json!({ "SLOT_DURATION_MS": "12000", "SLOTS_PER_EPOCH": "16" }),
+            1,
+        )
+        .await;
+        let err =
+            default_exit_epoch(&client, 1, rvc::config::Network::Mainnet).await.expect_err("slots");
+        assert!(err.to_string().contains("SLOTS_PER_EPOCH"), "{err}");
     }
 }

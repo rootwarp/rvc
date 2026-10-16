@@ -4421,7 +4421,6 @@ dependencies = [
 name = "rvc-doppelganger"
 version = "0.8.0"
 dependencies = [
- "async-trait",
  "hex",
  "parking_lot",
  "rvc-crypto",

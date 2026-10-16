@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -195,20 +197,28 @@ async fn check_single_sync_status(client: &BeaconClient) -> BnSyncDetail {
     }
 }
 
+/// Runs after each sync poll. Production uses it to admit a skipped beacon node.
+pub type AfterSyncPoll = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// Starts a background task that periodically polls sync status of all BNs.
 ///
 /// The task runs until the shutdown signal fires. Each poll updates
-/// `rvc_bn_health_tier` via [`check_all_sync_statuses`].
+/// `rvc_bn_health_tier` via [`check_all_sync_statuses`]. `after_poll` runs
+/// after the status write and does not change those statuses.
 pub fn start_sync_monitor(
     clients: Vec<BeaconClient>,
     statuses: SharedSyncStatuses,
     thresholds: TierThresholds,
     interval: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    after_poll: Option<AfterSyncPoll>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             check_all_sync_statuses(&clients, &statuses, &thresholds).await;
+            if let Some(after_poll) = &after_poll {
+                after_poll().await;
+            }
 
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
@@ -691,6 +701,7 @@ mod tests {
             TierThresholds::default(),
             Duration::from_millis(50),
             shutdown_rx,
+            None,
         );
 
         // Wait a bit for at least one poll
@@ -728,6 +739,7 @@ mod tests {
             TierThresholds::default(),
             Duration::from_millis(50),
             shutdown_rx,
+            None,
         );
 
         // Wait for initial poll

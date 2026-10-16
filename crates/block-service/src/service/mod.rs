@@ -45,6 +45,10 @@ pub struct BlockService<S: ValidatorSigner, B: BeaconBlockClient> {
     circuit_breaker: Arc<CircuitBreakerState>,
     builder_config_provider: Option<Arc<dyn BuilderConfigProvider>>,
     deadline_schedule: DeadlineSchedule,
+    /// Beacon-node slot length in milliseconds for the Gloas payload deadline.
+    ///
+    /// [`Self::new`] keeps 12 s. Production passes the resolved duration.
+    slot_duration_ms: u64,
     #[cfg(test)]
     envelope_deadline_note: Mutex<Option<EnvelopeDeadlineNote>>,
 }
@@ -64,10 +68,15 @@ pub(crate) struct PayloadDeadline {
 }
 
 impl PayloadDeadline {
-    fn new(fork: ForkName, schedule: &DeadlineSchedule, start: Instant) -> Self {
+    fn new(
+        fork: ForkName,
+        schedule: &DeadlineSchedule,
+        start: Instant,
+        slot_duration_ms: u64,
+    ) -> Self {
         Self {
             start,
-            deadline_ms: due_ms(schedule.for_fork(fork).payload, SLOT_DURATION_MS),
+            deadline_ms: due_ms(schedule.for_fork(fork).payload, slot_duration_ms),
             first_overrun_stage: None,
         }
     }
@@ -132,6 +141,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             circuit_breaker,
             builder_config_provider: None,
             deadline_schedule: DeadlineSchedule::uniform(DeadlineBps::default()),
+            slot_duration_ms: SLOT_DURATION_MS,
             #[cfg(test)]
             envelope_deadline_note: Mutex::new(None),
         }
@@ -150,6 +160,23 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     pub fn with_deadline_schedule(mut self, schedule: DeadlineSchedule) -> Self {
         self.deadline_schedule = schedule;
         self
+    }
+
+    /// Slot length used by the Gloas payload deadline.
+    ///
+    /// Production passes the duration resolved from the beacon node.
+    pub fn with_slot_duration_ms(mut self, slot_duration_ms: u64) -> Self {
+        self.slot_duration_ms = slot_duration_ms;
+        self
+    }
+
+    /// Slot length in milliseconds stored for [`PayloadDeadline`].
+    pub fn slot_duration_ms(&self) -> u64 {
+        self.slot_duration_ms
+    }
+
+    fn payload_deadline(&self, fork: ForkName, start: Instant) -> PayloadDeadline {
+        PayloadDeadline::new(fork, &self.deadline_schedule, start, self.slot_duration_ms)
     }
 
     #[cfg(test)]
@@ -228,8 +255,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
 
         let epoch = slot / SLOTS_PER_EPOCH;
         let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
-        let mut payload_deadline =
-            PayloadDeadline::new(fork, &self.deadline_schedule, proposal_start);
+        let mut payload_deadline = self.payload_deadline(fork, proposal_start);
 
         // 1. Sign RANDAO reveal
         let randao_start = std::time::Instant::now();

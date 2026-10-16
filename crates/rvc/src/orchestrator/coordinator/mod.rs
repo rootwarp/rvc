@@ -518,7 +518,8 @@ where
             config.genesis_validators_root,
             circuit_breaker.clone(),
         )
-        .with_deadline_schedule(config.deadline_schedule);
+        .with_deadline_schedule(config.deadline_schedule)
+        .with_slot_duration_ms(clock.slot_duration().as_millis() as u64);
         if let Some(ref builder) = builder_service {
             block_service = block_service
                 .with_builder_config_provider(Arc::new(BuilderConfigAdapter(builder.clone())));

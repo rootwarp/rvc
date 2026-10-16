@@ -20,12 +20,6 @@ use eth_types::Epoch;
               fail-closed and MUST be retried, not suppressed"]
 #[derive(Debug, Error)]
 pub enum DoppelgangerError {
-    #[error("liveness check failed: {0}")]
-    LivenessCheckFailed(String),
-
-    #[error("slashing DB query failed: {0}")]
-    SlashingDbError(String),
-
     /// Returned by [`crate::ForwardWindowMachine::observe_liveness`] when the
     /// beacon-node response is missing entries for one or more validators that
     /// were expected (i.e. `Pending` with a window that includes `epoch`).

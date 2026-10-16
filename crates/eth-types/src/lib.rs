@@ -120,6 +120,15 @@ pub const SIGNATURE_BYTES_LEN: usize = 96;
 
 pub const SLOTS_PER_EPOCH: u64 = 32;
 pub const SLOT_DURATION_MS: u64 = 12_000;
+
+/// Inclusive bounds for a beacon-reported slot length.
+///
+/// One second is the duty-clock floor. Sixty seconds still accepts the 6 s
+/// and 12 s lengths this client runs. A length inside this range can still
+/// stretch epoch 0 well past real genesis (60 s × 32 slots). The bound does
+/// not prove the chain is pre-genesis.
+pub const MIN_SLOT_DURATION_MS: u64 = 1_000;
+pub const MAX_SLOT_DURATION_MS: u64 = 60_000;
 pub const TARGET_AGGREGATORS_PER_COMMITTEE: u64 = 16;
 
 /// SSZ preset bound on a single committee's size. Sets the `Bitlist[N]` limit for a pre-Electra

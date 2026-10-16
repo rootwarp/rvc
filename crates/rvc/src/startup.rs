@@ -117,26 +117,26 @@ pub async fn validate_genesis_root(
 ) -> Result<(), StartupError> {
     info!("Validating genesis validators root against beacon node");
 
-    let genesis_response = beacon.get_genesis().await?;
-    let beacon_root = &genesis_response.data.genesis_validators_root;
-
-    let local_normalized = normalize_hex(local_root_hex)?;
-    let beacon_normalized = normalize_hex(beacon_root)?;
-
-    if local_normalized != beacon_normalized {
-        error!(
-            local = %local_root_hex,
-            beacon = %beacon_root,
-            "Genesis validators root mismatch"
-        );
-        return Err(StartupError::GenesisRootMismatch {
-            local: local_root_hex.to_string(),
-            beacon: beacon_root.clone(),
-        });
+    // Every responder, not the first `get_genesis` success. A pooled client
+    // rejects a node whose root differs and still accepts a later match.
+    if let Err(err) = beacon.confirm_genesis_validators_root(local_root_hex).await {
+        if let beacon::BeaconError::GenesisValidatorsRootMismatch { root } = &err {
+            error!(
+                local = %local_root_hex,
+                beacon = %root,
+                "Genesis validators root mismatch"
+            );
+            return Err(StartupError::GenesisRootMismatch {
+                local: local_root_hex.to_string(),
+                beacon: root.clone(),
+            });
+        }
+        return Err(err.into());
     }
 
     // SlashingDb takes a typed Root, compares by bytes, and stores canonical
     // `0x` + lowercase hex. Bare or mixed-case legacy metadata remains compatible.
+    let local_normalized = normalize_hex(local_root_hex)?;
     let local_root = eth_types::canonical::gvr_hex::parse_gvr_hex(&local_normalized)
         .map_err(|e| StartupError::InvalidHexInput(format!("genesis_validators_root: {e}")))?;
     slashing_db.set_genesis_validators_root(&local_root)?;

@@ -474,7 +474,7 @@ mod tests {
             let composite_signer =
                 Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
             let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
-            let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+            let epoch_clock = Arc::new(MonotonicEpochClock::new(0, 12_000));
             let machine = if enable_machine {
                 let db: Arc<dyn slashing::SlashingDbReader> =
                     Arc::new(SlashingDb::open_in_memory().expect("in-memory slashing db"));
@@ -669,7 +669,7 @@ mod tests {
         let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let (key_gen_tx, _key_gen_rx) = watch::channel(0u64);
         let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
-        let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+        let epoch_clock = Arc::new(MonotonicEpochClock::new(0, 12_000));
         let service = KeyAdmissionService::new(
             Arc::clone(&pubkey_map),
             key_gen_tx,
@@ -712,7 +712,7 @@ mod tests {
         let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let (key_gen_tx, _key_gen_rx) = watch::channel(0u64);
         let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
-        let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+        let epoch_clock = Arc::new(MonotonicEpochClock::new(0, 12_000));
         let service = KeyAdmissionService::new(
             Arc::clone(&pubkey_map),
             key_gen_tx,
@@ -772,7 +772,7 @@ mod tests {
         let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let (key_gen_tx, _key_gen_rx) = watch::channel(0u64);
         let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
-        let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+        let epoch_clock = Arc::new(MonotonicEpochClock::new(0, 12_000));
         let service = KeyAdmissionService::new(
             Arc::clone(&pubkey_map),
             key_gen_tx,
@@ -831,7 +831,7 @@ mod tests {
         let pubkey_map: PubkeyMap = Arc::new(parking_lot::RwLock::new(HashMap::new()));
         let (key_gen_tx, _key_gen_rx) = watch::channel(0u64);
         let composite_signer = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
-        let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+        let epoch_clock = Arc::new(MonotonicEpochClock::new(0, 12_000));
         let service = KeyAdmissionService::new(
             Arc::clone(&pubkey_map),
             key_gen_tx,
@@ -898,7 +898,7 @@ mod tests {
             Arc::clone(&validator_store),
             denylist,
             None,
-            Arc::new(MonotonicEpochClock::new(0)),
+            Arc::new(MonotonicEpochClock::new(0, 12_000)),
         );
         let outcome = service.admit(sk, AdmissionSource::RawSecret).expect("admit");
         let (key_gen, inserted_row) = match outcome {

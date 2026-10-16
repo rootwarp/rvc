@@ -45,7 +45,7 @@ fn spawn_test_deps(
     let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 100));
     let deletion_denylist =
         Arc::new(DeletionDenylist::empty_at(keystore_dir.join(".rvc.deleted_keys")));
-    let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+    let epoch_clock = Arc::new(MonotonicEpochClock::new(0, 12_000));
     let admissions = Arc::new(KeyAdmissionService::new(
         Arc::clone(&pubkey_map),
         key_gen_tx.clone(),
@@ -176,6 +176,18 @@ fn test_spawn_keymanager_api_rearms_gate_exactly_once_for_both_monitors() {
         // Machine registered the key as Pending (import-strict)
         assert_eq!(machine.status(&crypto_pk), doppelganger::ForwardWindowStatus::Pending);
     }
+}
+
+/// Two epochs at a 6 s slot is 384 s. A 12 s clock would hold for 768 s.
+#[test]
+fn test_spawn_keymanager_api_six_second_slots_hold_for_two_epochs() {
+    let dir = TempDir::new().unwrap();
+    let config = spawn_test_config(&dir, true, "127.0.0.1:0");
+    let mut deps = spawn_test_deps(dir.path(), None);
+    deps.slot_clock =
+        Arc::new(timing::MockSlotClock::new(1_606_824_023, std::time::Duration::from_secs(6), 32));
+    let built = build_keymanager_api(&config, deps).expect("build").expect("enabled");
+    assert_eq!(built.doppelganger_window, std::time::Duration::from_secs(384));
 }
 
 /// Opt-out (`forward_window_machine: None`) selects the always-safe monitor.

@@ -529,7 +529,7 @@ Central coordination crate. Contains:
 - **`DutyOrchestrator<C, S, B>`** — Main loop with 3-phase slot processing: t=0 block proposals, t=slot/3 attestations + sync messages, t=2*slot/3 aggregations + contributions. Generic over `SlotClock`, `AttestationSubmitter`, and `BeaconBlockClient` for testability.
 - **`Config`** / **`Network`** — Configuration types with network presets (Mainnet, Hoodi, Custom).
 - **`OrchestratorConfig`** — Fork schedule, genesis root, shutdown timeout.
-- **Adapter modules** — `beacon_adapter`, `doppelganger_adapter`, `keymanager_adapters` bridge domain traits to concrete services.
+- **Adapter modules** — `beacon_adapter`, `keymanager_adapters` bridge domain traits to concrete services.
 - **gRPC DutyTracker service** — Exposes a `Healthz` RPC via tonic.
 
 ### `crates/bn-manager` — Multi-BN Management

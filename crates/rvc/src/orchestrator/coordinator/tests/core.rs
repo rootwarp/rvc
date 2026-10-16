@@ -728,3 +728,43 @@ async fn test_find_pubkey_not_found() {
     let found = utils::find_pubkey(&orchestrator.pubkey_map, "0x1234567890abcdef");
     assert!(found.is_none());
 }
+
+fn orchestrator_with_slot(
+    slot: Duration,
+) -> DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon> {
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, slot, 32));
+    let beacon_config = BeaconClientConfig::new("http://localhost:5052");
+    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1234".to_string()]));
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+    let submitter = Arc::new(MockSubmitter::new());
+    let propagator = Arc::new(Propagator::new(submitter));
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        propagator,
+        beacon,
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        create_test_config(),
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+    ));
+    orchestrator
+}
+
+#[test]
+fn test_block_service_takes_slot_duration_from_the_clock() {
+    assert_eq!(
+        orchestrator_with_slot(Duration::from_secs(6)).block_service.slot_duration_ms(),
+        6_000
+    );
+    assert_eq!(
+        orchestrator_with_slot(Duration::from_secs(12)).block_service.slot_duration_ms(),
+        12_000
+    );
+}
