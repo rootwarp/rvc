@@ -136,6 +136,25 @@ async fn test_self_build_publishes_block_and_envelope_through_second_bn() {
     let result = service.propose_block(slot, &pubkey, 42, None).await;
     assert!(result.is_ok(), "second-BN self-build must succeed: {result:?}");
 
+    // Broadcast returns on the first 200 and drains the other BN off the
+    // caller. Wait until that drain is recorded so wiremock's expect() check
+    // on drop does not race the in-flight publish.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let reqs = producer.received_requests().await.unwrap();
+        let saw_block = reqs.iter().any(|r| r.url.path() == "/eth/v2/beacon/blocks");
+        let saw_envelope =
+            reqs.iter().any(|r| r.url.path() == PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH);
+        if saw_block && saw_envelope {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "producer publish was not recorded before the mock server dropped"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
     let publisher_reqs = publisher.received_requests().await.unwrap();
     assert!(
         publisher_reqs.iter().any(|r| r.url.path() == "/eth/v2/beacon/blocks"),

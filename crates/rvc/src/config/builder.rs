@@ -587,12 +587,15 @@ impl ServiceBuilder {
             return Err(ConfigError::KeystorePathNotFound(self.config.keystore_path.clone()));
         }
 
-        let key_manager = KeyManager::load_from_directory_with_threads_filtered(
+        let mut report = crypto::KeystoreLoadReport::default();
+        let key_manager = KeyManager::load_from_directory_with_threads_filtered_reporting(
             &self.config.keystore_path,
             &passwords,
             self.config.key_decrypt_threads,
             denylist,
+            &mut report,
         )?;
+        self.config.reject_undecrypted_import_secrets(&key_manager, denylist, &report)?;
         info!(
             key_count = key_manager.len(),
             path = ?self.config.keystore_path,
@@ -1401,6 +1404,281 @@ mod tests {
         let result = builder.build_key_manager();
 
         assert!(matches!(result, Err(ConfigError::KeystorePathNotFound(_))));
+    }
+
+    #[cfg(unix)]
+    fn write_import_secret(keystore: &std::path::Path, pubkey: &[u8; 48], password: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = keystore.join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
+        dir_perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, dir_perms).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dir.join(format!("0x{}", hex::encode(pubkey))))
+            .unwrap();
+        file.write_all(password.as_bytes()).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn write_encrypted_keystore(dir: &std::path::Path, password: &str) -> [u8; 48] {
+        let sk = crypto::SecretKey::generate();
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .unwrap();
+        let pk = sk.public_key().to_bytes();
+        std::fs::write(
+            dir.join(format!("keystore-{}.json", hex::encode(pk))),
+            serde_json::to_string(&keystore).unwrap(),
+        )
+        .unwrap();
+        pk
+    }
+
+    #[cfg(unix)]
+    fn password_file(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        let path = dir.join("passwords.txt");
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    /// The persisted secret decrypts the key when the password file is wrong.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_secret_wins_over_password_file() {
+        let dir = TempDir::new().unwrap();
+        let secret = "secret-wins-password";
+        let file_pw = "file-entry-password";
+        let wildcard = "wildcard-entry-password";
+        let pk = write_encrypted_keystore(dir.path(), secret);
+        write_import_secret(dir.path(), &pk, secret);
+        let bare = hex::encode(pk);
+        let passwords = password_file(dir.path(), &format!("{bare}={file_pw}\n*={wildcard}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager_owned_filtered(None)
+            .expect("secret decrypts the keystore");
+        assert!(loaded.contains(&pk));
+    }
+
+    /// An uppercase keystore pubkey still selects the lowercase secret.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_loads_an_uppercase_pubkey_with_its_secret() {
+        let dir = TempDir::new().unwrap();
+        let secret = "uppercase-field-secret";
+        let wildcard = "wrong-wildcard-password";
+        let pk = write_encrypted_keystore(dir.path(), secret);
+        let json_path = dir.path().join(format!("keystore-{}.json", hex::encode(pk)));
+        let mut value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
+        let field = value["pubkey"].as_str().unwrap().to_ascii_uppercase();
+        assert!(field.bytes().any(|b| b.is_ascii_uppercase()), "{field}");
+        value["pubkey"] = serde_json::Value::String(field);
+        std::fs::write(&json_path, value.to_string()).unwrap();
+        write_import_secret(dir.path(), &pk, secret);
+        let passwords = password_file(dir.path(), &format!("*={wildcard}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager_owned_filtered(None)
+            .expect("the lowercase secret decrypts an uppercase pubkey field");
+        assert!(loaded.contains(&pk));
+    }
+
+    /// A secret that does not decrypt its keystore aborts, even when the file is right.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn build_key_manager_rejects_a_secret_that_does_not_decrypt() {
+        let dir = TempDir::new().unwrap();
+        let real = "real-keystore-password";
+        let wrong = "wrong-secret-password";
+        let pk = write_encrypted_keystore(dir.path(), real);
+        write_import_secret(dir.path(), &pk, wrong);
+        let bare = hex::encode(pk);
+        let passwords = password_file(dir.path(), &format!("{bare}={real}\n*={real}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let err = match ServiceBuilder::new(config).build_key_manager() {
+            Err(err) => err,
+            Ok(_) => panic!("a secret that does not decrypt must abort startup"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("password did not decrypt the keystore"), "{msg}");
+        assert!(msg.contains(&format!("0x{bare}")), "{msg}");
+        assert!(!msg.contains(real), "{msg}");
+        assert!(!msg.contains(wrong), "{msg}");
+        assert!(!logs_contain(real), "password file value was logged");
+        assert!(!logs_contain(wrong), "import secret was logged");
+    }
+
+    /// A keystore that does not parse is an error when its secret is present.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_errors_on_a_corrupt_keystore_with_a_secret() {
+        let dir = TempDir::new().unwrap();
+        let pk = [0xabu8; 48];
+        let bare = hex::encode(pk);
+        let secret = "corrupt-keystore-secret";
+        std::fs::write(
+            dir.path().join("bad.json"),
+            format!(
+                r#"{{"crypto":{{"kdf":{{"function":"scrypt","params":{{"dklen":32,"n":2,"p":1,"r":1,"salt":"aa"}},"message":""}},"checksum":{{"function":"sha256","params":{{}},"message":"bb"}},"cipher":{{"function":"aes-128-ctr","params":{{"iv":"cc"}},"message":"dd"}}}},"pubkey":"{bare}","path":"m/12381/3600/0/0/0","uuid":"00000000-0000-0000-0000-000000000000","version":3}}"#
+            ),
+        )
+        .unwrap();
+        write_import_secret(dir.path(), &pk, secret);
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let err = match ServiceBuilder::new(config).build_key_manager() {
+            Err(err) => err,
+            Ok(_) => panic!("a corrupt keystore must not be an orphan warning"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("keystore is corrupt"), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(!msg.contains("password did not decrypt"), "{msg}");
+    }
+
+    /// A missing `version` or a `crypto` value that is not an object is corrupt.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_errors_when_version_is_missing_or_crypto_is_not_an_object() {
+        let secret = "malformed-keystore-secret";
+        let cases = [
+            r#"{"crypto":{"kdf":{"function":"scrypt"}},"pubkey":"{bare}"}"#,
+            r#"{"crypto":"not-an-object","pubkey":"{bare}","version":4}"#,
+            r#"{"pubkey":"{bare}","path":"m/12381/3600/0/0/0","version":4}"#,
+        ];
+        for body in cases {
+            let dir = TempDir::new().unwrap();
+            let pk = [0xabu8; 48];
+            let bare = hex::encode(pk);
+            std::fs::write(dir.path().join("bad.json"), body.replace("{bare}", &bare)).unwrap();
+            write_import_secret(dir.path(), &pk, secret);
+            let config =
+                Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+            let err = match ServiceBuilder::new(config).build_key_manager() {
+                Err(err) => err,
+                Ok(_) => panic!("a malformed keystore must not be an orphan warning"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("keystore is corrupt"), "{msg}");
+            assert!(!msg.contains("has no keystore"), "{msg}");
+            assert!(!msg.contains(secret), "{msg}");
+        }
+    }
+
+    /// Deposit data and an interchange file that contain the pubkey do not abort.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn build_key_manager_ignores_deposit_data_and_interchange_json() {
+        let dir = TempDir::new().unwrap();
+        let kept_pw = "kept-keystore-password";
+        let pk = write_encrypted_keystore(dir.path(), kept_pw);
+        write_import_secret(dir.path(), &pk, kept_pw);
+        let bare = hex::encode(pk);
+        std::fs::write(
+            dir.path().join("deposit_data.json"),
+            format!(
+                r#"[{{"pubkey":"{bare}","withdrawal_credentials":"00","amount":32000000000,"signature":"aa","deposit_data_root":"bb"}}]"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("slashing_protection.json"),
+            format!(
+                r#"{{"metadata":{{"interchange_format_version":"5"}},"data":[{{"pubkey":"0x{bare}","signed_blocks":[],"signed_attestations":[]}}]}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("notes.json"), format!("not-json {bare}")).unwrap();
+        let notes_pk = [0x22u8; 48];
+        let notes_secret = "notes-object-secret";
+        write_import_secret(dir.path(), &notes_pk, notes_secret);
+        std::fs::write(
+            dir.path().join("notes_object.json"),
+            format!(r#"{{"pubkey":"{}","note":"not a keystore"}}"#, hex::encode(notes_pk)),
+        )
+        .unwrap();
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager()
+            .expect("deposit data and interchange must not abort boot");
+        assert!(loaded.contains(&pk));
+        assert!(!logs_contain("keystore is corrupt"));
+        assert!(logs_contain("import password secret has no keystore"));
+        assert!(!logs_contain(kept_pw));
+        assert!(!logs_contain(notes_secret));
+    }
+
+    /// An orphan secret warns and does not abort a keystore that still loads.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn build_key_manager_warns_on_an_orphan_import_secret() {
+        let dir = TempDir::new().unwrap();
+        let kept_pw = "kept-keystore-password";
+        let orphan_pw = "orphan-secret-value";
+        let pk = write_encrypted_keystore(dir.path(), kept_pw);
+        let orphan = [0x11u8; 48];
+        write_import_secret(dir.path(), &orphan, orphan_pw);
+        let passwords = password_file(dir.path(), &format!("*={kept_pw}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let loaded =
+            ServiceBuilder::new(config).build_key_manager().expect("an orphan secret is a warning");
+        assert!(loaded.contains(&pk));
+        assert!(logs_contain("import password secret has no keystore"));
+        assert!(!logs_contain(orphan_pw));
+        assert!(!logs_contain(kept_pw));
+    }
+
+    /// A denylisted keystore is not a startup error when its secret is wrong.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_skips_a_denylisted_keystore_with_a_bad_secret() {
+        let dir = TempDir::new().unwrap();
+        let real = "real-keystore-password";
+        let wrong = "wrong-secret-password";
+        let pk = write_encrypted_keystore(dir.path(), real);
+        write_import_secret(dir.path(), &pk, wrong);
+        let passwords = password_file(dir.path(), &format!("*={real}\n"));
+        let config = Config {
+            keystore_path: dir.path().to_path_buf(),
+            password_file: Some(passwords),
+            ..create_minimal_config()
+        };
+        let mut denylist = std::collections::HashSet::new();
+        denylist.insert(pk);
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager_owned_filtered(Some(&denylist))
+            .expect("denylisted keystore is skipped");
+        assert!(!loaded.contains(&pk));
     }
 
     #[test]

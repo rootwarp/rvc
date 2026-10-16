@@ -15,6 +15,16 @@ pub enum ImportKeystoreError {
     DecryptionFailed(String),
     #[error("invalid keystore: {0}")]
     InvalidKeystore(String),
+    /// The keystore `pubkey` field is missing or is not lowercase bare hex.
+    ///
+    /// The message is a fixed phrase. It names the field and contains no secret.
+    #[error("{0}")]
+    PubkeyField(&'static str),
+    /// The password is longer than the 4096-byte body boot will read.
+    ///
+    /// The message is a fixed phrase and contains no secret.
+    #[error("import password exceeds 4096 bytes")]
+    PasswordTooLarge,
     #[error("I/O error: {0}")]
     Io(String),
     /// A DELETE has snapshotted this pubkey and has not finished yet.

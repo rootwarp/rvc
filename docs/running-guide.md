@@ -291,10 +291,18 @@ keystores with one shared password while still overriding individual validators:
 
 The password for each keystore is resolved in this order:
 
-1. the exact `pubkey=password` entry for that validator, if present;
-2. otherwise the `*` wildcard entry, if present;
-3. otherwise the keystore is skipped with a `No password found for public key …`
+1. a persisted keymanager import secret for that pubkey, under
+   `<keystore_path>/.rvc.keymanager-secrets/0x<pubkey>` (file mode `0600`,
+   directory mode `0700`), when that file is present — it wins over the
+   password file;
+2. the exact `pubkey=password` entry for that validator, if present;
+3. otherwise the `*` wildcard entry, if present;
+4. otherwise the keystore is skipped with a `No password found for public key …`
    warning.
+
+A secret that is unreadable, has the wrong mode, or does not decrypt its
+keystore aborts startup. The error names the file and does not print the
+password. A secret with no keystore is a warning.
 
 Existing password files that use only `pubkey=password` lines keep working
 unchanged — the wildcard is purely additive.

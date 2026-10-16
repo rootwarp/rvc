@@ -1,6 +1,6 @@
 //! Configuration types for the validator client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
@@ -1063,7 +1063,34 @@ impl Config {
         }
     }
 
+    /// Directory under `keystore_path` for API-import passwords.
+    ///
+    /// Each file is named `0x` plus the bare pubkey hex.
+    pub const IMPORT_SECRETS_DIR: &str = ".rvc.keymanager-secrets";
+
+    /// Load keystore passwords from `--password-file` and persisted import secrets.
+    ///
+    /// Secrets under [`Self::IMPORT_SECRETS_DIR`] are applied even when no
+    /// password file is set. A secret replaces that pubkey's password-file
+    /// entry, so it also wins over `*` when the key manager looks up the
+    /// specific key first.
+    ///
+    /// A secrets directory that is not mode `0700`, a secret that is not mode
+    /// `0600`, or a secret that cannot be read is an error naming the path.
+    /// The password is not included.
     pub fn load_passwords(&self) -> Result<HashMap<String, SecretString>, ConfigError> {
+        // Secrets are checked before the password file so a bad secret is
+        // reported even when `--password-file` is missing or unreadable.
+        let mut secrets = HashMap::new();
+        self.overlay_import_secrets(&mut secrets)?;
+        let mut passwords = self.read_password_file()?;
+        for (pubkey, password) in secrets {
+            passwords.insert(pubkey, password);
+        }
+        Ok(passwords)
+    }
+
+    fn read_password_file(&self) -> Result<HashMap<String, SecretString>, ConfigError> {
         let password_file = match &self.password_file {
             Some(path) => path,
             None => return Ok(HashMap::new()),
@@ -1095,7 +1122,7 @@ impl Config {
                     continue;
                 }
                 let pubkey = match strip_prefix_strict(pubkey_trimmed) {
-                    Ok(s) => s,
+                    Ok(s) => crypto::password_map_key(s),
                     Err(HexError::DoubleZeroXPrefix) => {
                         warn!(
                             pubkey = pubkey_trimmed,
@@ -1110,6 +1137,112 @@ impl Config {
         }
 
         Ok(passwords)
+    }
+
+    fn import_secrets_dir(&self) -> PathBuf {
+        self.keystore_path.join(Self::IMPORT_SECRETS_DIR)
+    }
+
+    fn overlay_import_secrets(
+        &self,
+        passwords: &mut HashMap<String, SecretString>,
+    ) -> Result<(), ConfigError> {
+        // Boot sweeps staged partials once, here. Reject does not sweep again.
+        // The keystore directory holds R1-era partials; the secrets directory
+        // holds the current staging names.
+        sweep_import_secret_partials(&self.keystore_path)?;
+        let dir = self.import_secrets_dir();
+        if import_secrets_absent(&dir)? {
+            return Ok(());
+        }
+        let base = self.keystore_path.canonicalize().map_err(|_| ConfigError::ImportSecret {
+            path: self.keystore_path.clone(),
+            reason: "unreadable",
+        })?;
+        let canonical_dir = validated_import_secrets_dir(&base, &dir)?;
+        sweep_import_secret_partials(&canonical_dir)?;
+        let entries = fs::read_dir(&canonical_dir)
+            .map_err(|_| ConfigError::ImportSecret { path: dir.clone(), reason: "unreadable" })?;
+        for entry in entries {
+            let entry = entry.map_err(|_| ConfigError::ImportSecret {
+                path: dir.clone(),
+                reason: "unreadable",
+            })?;
+            load_one_import_secret(&canonical_dir, &entry, passwords)?;
+        }
+        Ok(())
+    }
+
+    /// Fail startup when a non-denylisted secret did not load its keystore.
+    ///
+    /// A checksum failure says the password did not decrypt the keystore. A
+    /// keystore that does not parse says it is corrupt. A secret with no
+    /// matching keystore is a warning. Denylisted keystores are skipped. The
+    /// error names the secret file and does not include the password.
+    pub(crate) fn reject_undecrypted_import_secrets(
+        &self,
+        loaded: &crypto::KeyManager,
+        denylist: Option<&HashSet<[u8; crypto::PUBLIC_KEY_BYTES_LEN]>>,
+        report: &crypto::KeystoreLoadReport,
+    ) -> Result<(), ConfigError> {
+        let dir = self.import_secrets_dir();
+        if import_secrets_absent(&dir)? {
+            return Ok(());
+        }
+        let base = self.keystore_path.canonicalize().map_err(|_| ConfigError::ImportSecret {
+            path: self.keystore_path.clone(),
+            reason: "unreadable",
+        })?;
+        let canonical_dir = validated_import_secrets_dir(&base, &dir)?;
+        let declared = index_declared_keystores(&self.keystore_path)?;
+        let entries = fs::read_dir(&canonical_dir).map_err(|_| ConfigError::ImportSecret {
+            path: canonical_dir.clone(),
+            reason: "unreadable",
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|_| ConfigError::ImportSecret {
+                path: canonical_dir.clone(),
+                reason: "unreadable",
+            })?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else {
+                return Err(ConfigError::ImportSecret {
+                    path: canonical_dir.clone(),
+                    reason: "filename is not 0x plus bare pubkey hex",
+                });
+            };
+            let path = entry_error_path(&canonical_dir, name);
+            let pubkey = parse_import_secret_name(name).ok_or(ConfigError::ImportSecret {
+                path: path.clone(),
+                reason: "filename is not 0x plus bare pubkey hex",
+            })?;
+            if denylist.is_some_and(|deny| deny.contains(&pubkey)) {
+                continue;
+            }
+            if loaded.contains(&pubkey) {
+                continue;
+            }
+            let reason = if let Some(keystore) = declared.get(&pubkey) {
+                if !keystore.valid {
+                    "keystore is corrupt"
+                } else if report.password_rejected.contains(&pubkey) {
+                    "password did not decrypt the keystore"
+                } else if report.load_failed.contains(&pubkey) {
+                    "keystore could not be decrypted"
+                } else {
+                    "keystore was not loaded"
+                }
+            } else if report.password_rejected.contains(&pubkey) {
+                "password did not decrypt the keystore"
+            } else if report.load_failed.contains(&pubkey) {
+                "keystore could not be decrypted"
+            } else {
+                warn!(path = %path.display(), "import password secret has no keystore");
+                continue;
+            };
+            return Err(ConfigError::ImportSecret { path, reason });
+        }
+        Ok(())
     }
 
     /// Parses the `broadcast` config field into `BroadcastTopics`.
@@ -1458,6 +1591,394 @@ impl Config {
             self.duties.duty_publish_concurrency = v;
         }
     }
+}
+
+/// Largest import-secret body boot will read. A password is a short string.
+pub(crate) const IMPORT_SECRET_MAX_BYTES: u64 = 4096;
+
+#[cfg(test)]
+thread_local! {
+    /// When set, the next import-secret read on this thread fails as unreadable.
+    static IMPORT_SECRET_READ_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    /// When set, the next owner check compares the file uid with this value.
+    static IMPORT_SECRET_EXPECT_UID: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+    /// When set, the next directory fsync after a boot sweep fails.
+    static IMPORT_SECRET_SWEEP_SYNC_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn read_import_secret_bytes(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    #[cfg(test)]
+    {
+        let fail = IMPORT_SECRET_READ_FAILS.with(|flag| flag.replace(false));
+        if fail {
+            return Err("unreadable");
+        }
+    }
+    read_private_import_secret(path)
+}
+
+/// Open the secret without following a symlink, then check the fd.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn read_private_import_secret(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let mut file = options.open(path).map_err(|err| {
+        if err.raw_os_error() == Some(libc::ELOOP) {
+            "path escapes the keystore directory"
+        } else {
+            "unreadable"
+        }
+    })?;
+    let meta = file.metadata().map_err(|_| "unreadable")?;
+    if !meta.file_type().is_file() {
+        return Err("not a regular file");
+    }
+    if meta.permissions().mode() & 0o777 != 0o600 {
+        return Err("file permissions must be 0600");
+    }
+    // SAFETY: geteuid only reads this process's effective user id.
+    let euid = unsafe { libc::geteuid() };
+    #[cfg(test)]
+    let euid = IMPORT_SECRET_EXPECT_UID.with(|slot| slot.replace(None)).unwrap_or(euid);
+    if meta.uid() != euid {
+        return Err("file owner must be the current user");
+    }
+    read_capped_secret(&mut file, meta.len())
+}
+
+#[cfg(not(unix))]
+fn read_private_import_secret(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    let mut file = fs::File::open(path).map_err(|_| "unreadable")?;
+    let len = file.metadata().map_err(|_| "unreadable")?.len();
+    read_capped_secret(&mut file, len)
+}
+
+/// Read `len` bytes into a buffer that is wiped if the read stops early.
+fn read_capped_secret(
+    file: &mut impl std::io::Read,
+    len: u64,
+) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
+    if len > IMPORT_SECRET_MAX_BYTES {
+        return Err("secret is too large");
+    }
+    let mut buf = zeroize::Zeroizing::new(vec![
+        0u8;
+        usize::try_from(len)
+            .map_err(|_| "secret is too large")?
+    ]);
+    // A short read drops `buf`, which zeroes the partial secret.
+    file.read_exact(&mut buf).map_err(|_| "unreadable")?;
+    Ok(buf)
+}
+
+fn unix_permission_bits(meta: &fs::Metadata) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        Some(meta.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        None
+    }
+}
+
+fn entry_error_path(dir: &Path, name: &str) -> PathBuf {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name == "."
+        || name == ".."
+    {
+        return dir.to_path_buf();
+    }
+    let mut path = dir.to_path_buf();
+    path.push(name);
+    path
+}
+
+fn parse_import_secret_name(name: &str) -> Option<[u8; crypto::PUBLIC_KEY_BYTES_LEN]> {
+    let rest = name.strip_prefix("0x")?;
+    if rest.len() != crypto::PUBLIC_KEY_BYTES_LEN * 2 {
+        return None;
+    }
+    if !rest.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()) {
+        return None;
+    }
+    let bytes = hex::decode(rest).ok()?;
+    if bytes.len() != crypto::PUBLIC_KEY_BYTES_LEN {
+        return None;
+    }
+    let mut pubkey = [0u8; crypto::PUBLIC_KEY_BYTES_LEN];
+    pubkey.copy_from_slice(&bytes);
+    Some(pubkey)
+}
+
+fn import_secrets_absent(dir: &Path) -> Result<bool, ConfigError> {
+    match fs::symlink_metadata(dir) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(_) => Err(ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" }),
+    }
+}
+
+fn validated_import_secrets_dir(keystore_base: &Path, dir: &Path) -> Result<PathBuf, ConfigError> {
+    let meta = fs::symlink_metadata(dir)
+        .map_err(|_| ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" })?;
+    if meta.file_type().is_symlink() {
+        return Err(ConfigError::ImportSecret {
+            path: dir.to_path_buf(),
+            reason: "path escapes the keystore directory",
+        });
+    }
+    if !meta.is_dir() {
+        return Err(ConfigError::ImportSecret {
+            path: dir.to_path_buf(),
+            reason: "not a directory",
+        });
+    }
+    if let Some(mode) = unix_permission_bits(&meta) {
+        if mode != 0o700 {
+            return Err(ConfigError::ImportSecret {
+                path: dir.to_path_buf(),
+                reason: "directory permissions must be 0700",
+            });
+        }
+    }
+    let canonical = dir
+        .canonicalize()
+        .map_err(|_| ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" })?;
+    if !canonical.starts_with(keystore_base) {
+        return Err(ConfigError::ImportSecret {
+            path: dir.to_path_buf(),
+            reason: "path escapes the keystore directory",
+        });
+    }
+    Ok(canonical)
+}
+
+fn load_one_import_secret(
+    secrets_dir: &Path,
+    entry: &fs::DirEntry,
+    passwords: &mut HashMap<String, SecretString>,
+) -> Result<(), ConfigError> {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return Err(ConfigError::ImportSecret {
+            path: secrets_dir.to_path_buf(),
+            reason: "filename is not 0x plus bare pubkey hex",
+        });
+    };
+    let path = entry_error_path(secrets_dir, name);
+    let pubkey = parse_import_secret_name(name).ok_or(ConfigError::ImportSecret {
+        path: path.clone(),
+        reason: "filename is not 0x plus bare pubkey hex",
+    })?;
+    let path = entry.path();
+    let meta = fs::symlink_metadata(&path)
+        .map_err(|_| ConfigError::ImportSecret { path: path.clone(), reason: "unreadable" })?;
+    if meta.file_type().is_symlink() {
+        return Err(ConfigError::ImportSecret {
+            path,
+            reason: "path escapes the keystore directory",
+        });
+    }
+    if !meta.is_file() {
+        return Err(ConfigError::ImportSecret { path, reason: "not a regular file" });
+    }
+    if let Some(mode) = unix_permission_bits(&meta) {
+        if mode != 0o600 {
+            return Err(ConfigError::ImportSecret {
+                path,
+                reason: "file permissions must be 0600",
+            });
+        }
+    }
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| ConfigError::ImportSecret { path: path.clone(), reason: "unreadable" })?;
+    if !canonical.starts_with(secrets_dir) {
+        return Err(ConfigError::ImportSecret {
+            path,
+            reason: "path escapes the keystore directory",
+        });
+    }
+    let bytes = read_import_secret_bytes(&path)
+        .map_err(|reason| ConfigError::ImportSecret { path: path.clone(), reason })?;
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|_| ConfigError::ImportSecret { path: path.clone(), reason: "not valid utf-8" })?;
+    let bare = crypto::password_map_key(&hex::encode(pubkey));
+    passwords.insert(bare, SecretString::from(text.to_owned()));
+    Ok(())
+}
+
+/// `.0x<96 lowercase hex>.<pid>.<nanos>.keymanager-secret.partial`
+pub(crate) fn is_staged_import_secret_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix('.') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_suffix(".keymanager-secret.partial") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let (Some(pubkey), Some(pid), Some(nanos), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let Some(hex_body) = pubkey.strip_prefix("0x") else {
+        return false;
+    };
+    hex_body.len() == crypto::PUBLIC_KEY_BYTES_LEN * 2
+        && hex_body.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        && !pid.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && !nanos.is_empty()
+        && nanos.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn sync_import_secret_dir(dir: &Path) -> Result<(), ConfigError> {
+    #[cfg(test)]
+    if IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.replace(false)) {
+        return Err(ConfigError::ImportSecret {
+            path: dir.to_path_buf(),
+            reason: "sync import secret directory failed",
+        });
+    }
+    let file = fs::File::open(dir).map_err(|_| ConfigError::ImportSecret {
+        path: dir.to_path_buf(),
+        reason: "sync import secret directory failed",
+    })?;
+    file.sync_all().map_err(|_| ConfigError::ImportSecret {
+        path: dir.to_path_buf(),
+        reason: "sync import secret directory failed",
+    })
+}
+
+fn sweep_import_secret_partials(dir: &Path) -> Result<(), ConfigError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {
+            return Err(ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" })
+        }
+    };
+    let mut removed = false;
+    for entry in entries {
+        let entry = entry.map_err(|_| ConfigError::ImportSecret {
+            path: dir.to_path_buf(),
+            reason: "unreadable",
+        })?;
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        if !is_staged_import_secret_name(name) {
+            continue;
+        }
+        let path = entry.path();
+        match fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                if removed {
+                    sync_import_secret_dir(dir)?;
+                }
+                return Err(ConfigError::ImportSecret {
+                    path,
+                    reason: "staged import secret could not be removed",
+                });
+            }
+        }
+    }
+    if removed {
+        sync_import_secret_dir(dir)?;
+    }
+    Ok(())
+}
+
+struct DeclaredKeystore {
+    valid: bool,
+}
+
+/// One pass over `*.json` files. A file that parses and validates is valid.
+/// A pubkey plus a `crypto` or `version` field that fails validation is
+/// corrupt, including a missing `version` or a `crypto` value that is not an
+/// object. Deposit data and slashing interchange do not have that shape.
+fn index_declared_keystores(
+    keystore_dir: &Path,
+) -> Result<HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>, ConfigError> {
+    let mut declared = HashMap::new();
+    let base = keystore_dir.canonicalize().map_err(|_| ConfigError::ImportSecret {
+        path: keystore_dir.to_path_buf(),
+        reason: "unreadable",
+    })?;
+    let entries = fs::read_dir(&base).map_err(|_| ConfigError::ImportSecret {
+        path: keystore_dir.to_path_buf(),
+        reason: "unreadable",
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ConfigError::ImportSecret {
+            path: keystore_dir.to_path_buf(),
+            reason: "unreadable",
+        })?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".json") || name.ends_with(".import_meta.json") {
+            continue;
+        }
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if !canonical.starts_with(&base) {
+            continue;
+        }
+        let content = match fs::read_to_string(&canonical) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        if let Some((pubkey, valid)) = keystore_declaration(&content) {
+            let entry = declared.entry(pubkey).or_insert(DeclaredKeystore { valid: false });
+            if valid {
+                entry.valid = true;
+            }
+        }
+    }
+    Ok(declared)
+}
+
+/// `(pubkey, valid)` for a keystore-shaped file.
+///
+/// Valid means [`crypto::Keystore::from_json`] accepted it. Corrupt means the
+/// JSON has a pubkey and a `crypto` or `version` field, and validation
+/// failed. A missing `version` or a `crypto` value that is not an object is
+/// still that keystore. JSON with neither field is not a keystore.
+fn keystore_declaration(content: &str) -> Option<([u8; crypto::PUBLIC_KEY_BYTES_LEN], bool)> {
+    if let Ok(keystore) = crypto::Keystore::from_json(content) {
+        let pubkey = keystore.pubkey.as_deref().and_then(crypto::decode_password_map_key)?;
+        return Some((pubkey, true));
+    }
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let obj = value.as_object()?;
+    let pubkey = obj
+        .get("pubkey")
+        .and_then(|field| field.as_str())
+        .and_then(crypto::decode_password_map_key)?;
+    if !obj.contains_key("crypto") && !obj.contains_key("version") {
+        return None;
+    }
+    Some((pubkey, false))
 }
 
 /// Redacts credentials from a URL for safe logging.
@@ -2230,6 +2751,380 @@ payload_attestation_due_bps = 4000
 
         assert_eq!(passwords.len(), 1);
         assert_eq!(passwords.get(crypto::WILDCARD_KEY).unwrap().expose_secret(), second_pw);
+    }
+
+    fn config_at(dir: &std::path::Path, password_file: Option<std::path::PathBuf>) -> Config {
+        Config { keystore_path: dir.to_path_buf(), password_file, ..Default::default() }
+    }
+
+    fn assert_import_secret_err(err: &ConfigError, reason: &str, secret: &str) {
+        let msg = err.to_string();
+        assert!(msg.contains("import password secret"), "{msg}");
+        assert!(msg.contains(reason), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(!format!("{err:?}").contains(secret), "{err:?}");
+    }
+
+    #[cfg(unix)]
+    fn write_import_secret(keystore: &std::path::Path, name: &str, bytes: &[u8], mode: u32) {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = keystore.join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut dir_perms = std::fs::metadata(&dir).unwrap().permissions();
+        dir_perms.set_mode(0o700);
+        std::fs::set_permissions(&dir, dir_perms).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(dir.join(name))
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        let mut perms = file.metadata().unwrap().permissions();
+        perms.set_mode(mode);
+        file.set_permissions(perms).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn secret_name(pubkey: &[u8; 48]) -> String {
+        format!("0x{}", hex::encode(pubkey))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_overlays_a_secret_without_a_password_file() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0xabu8; 48];
+        let secret = " import-secret-value";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let passwords = config_at(dir.path(), None).load_passwords().unwrap();
+        let stored = passwords.get(&hex::encode(pubkey)).unwrap();
+        assert_eq!(stored.expose_secret(), secret);
+        assert!(!format!("{stored:?}").contains(secret.trim()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_secret_replaces_the_per_pubkey_entry_and_keeps_wildcard() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0xcd; 48];
+        let bare = hex::encode(pubkey);
+        let secret = "secret-wins-value";
+        let file_pw = "file-entry-value";
+        let wildcard = "wildcard-entry-value";
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "*={wildcard}\n{bare}={file_pw}").unwrap();
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let passwords =
+            config_at(dir.path(), Some(file.path().to_path_buf())).load_passwords().unwrap();
+        assert_eq!(passwords.get(&bare).unwrap().expose_secret(), secret);
+        assert_eq!(passwords.get(crypto::WILDCARD_KEY).unwrap().expose_secret(), wildcard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_0644_secret() {
+        // The mode is set with `chmod`, not `open`, so a root umask cannot
+        // turn the fixture into 0600 and hide the rejection.
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x11; 48]);
+        let secret = "mode-0644-secret";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o644);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "file permissions must be 0600", secret);
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_secrets_directory_that_is_not_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x22; 48];
+        let secret = "dir-mode-secret";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        let mut perms = std::fs::metadata(&secrets).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&secrets, perms).unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "directory permissions must be 0700", secret);
+        assert!(err.to_string().contains(Config::IMPORT_SECRETS_DIR), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_non_utf8_secret() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x33; 48]);
+        write_import_secret(dir.path(), &name, &[0xff, 0xfe], 0o600);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "not valid utf-8", "\u{fffd}");
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_secret_filename_that_is_not_a_pubkey() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let secret = "notes-secret";
+        write_import_secret(dir.path(), "notes.txt", secret.as_bytes(), 0o600);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "filename is not 0x plus bare pubkey hex", secret);
+        assert!(err.to_string().contains("notes.txt"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_an_uppercase_pubkey_filename() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0xab; 48]).to_ascii_uppercase().replace("0X", "0x");
+        assert!(name.contains('A'), "{name}");
+        let secret = "upper-secret";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o600);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "filename is not 0x plus bare pubkey hex", secret);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_directory_named_like_a_secret() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir(&secrets).unwrap();
+        let mut perms = std::fs::metadata(&secrets).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&secrets, perms).unwrap();
+        std::fs::create_dir(secrets.join(secret_name(&[0x44; 48]))).unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "not a regular file", "unused");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_symlink_secret_without_reading_it() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let outside = tempfile::TempDir::new().unwrap();
+        let marker = "leak-marker-value";
+        let target = outside.path().join("outside-secret");
+        std::fs::write(&target, marker).unwrap();
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir(&secrets).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&secrets).unwrap().permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&secrets, perms).unwrap();
+        }
+        std::os::unix::fs::symlink(&target, secrets.join(secret_name(&[0x55; 48]))).unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "path escapes the keystore directory", marker);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_secrets_directory_symlink_inside_the_keystore() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let nested = dir.path().join("nested-secrets");
+        std::fs::create_dir(&nested).unwrap();
+        let mut perms = std::fs::metadata(&nested).unwrap().permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&nested, perms).unwrap();
+        std::os::unix::fs::symlink(&nested, dir.path().join(Config::IMPORT_SECRETS_DIR)).unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "path escapes the keystore directory", "nested-secrets");
+    }
+
+    #[test]
+    fn load_passwords_rejects_a_secrets_path_that_is_not_a_directory() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(Config::IMPORT_SECRETS_DIR), b"not-a-directory").unwrap();
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "not a directory", "not-a-directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_checks_a_secret_before_a_missing_password_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x77; 48]);
+        let secret = "checked-before-password-file";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o644);
+        let missing = dir.path().join("no-such-passwords.txt");
+        let err = config_at(dir.path(), Some(missing)).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "file permissions must be 0600", secret);
+        assert!(!matches!(err, ConfigError::PasswordFileNotFound(_)), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_accepts_a_secret_at_the_size_limit() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x79; 48];
+        let secret = "x".repeat(4096);
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let passwords = config_at(dir.path(), None).load_passwords().unwrap();
+        assert_eq!(passwords.get(&hex::encode(pubkey)).unwrap().expose_secret(), secret);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_keeps_multibyte_and_newline_bytes() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x7a; 48];
+        let secret = "café\nsecond line\n";
+        assert!(
+            secret.len() != secret.chars().count(),
+            "the fixture must contain a multibyte character"
+        );
+        assert!(secret.contains('\n'));
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let passwords = config_at(dir.path(), None).load_passwords().unwrap();
+        assert_eq!(passwords.get(&hex::encode(pubkey)).unwrap().expose_secret(), secret);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_an_oversized_secret() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x78; 48]);
+        let secret = "x".repeat(4097);
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o600);
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "secret is too large", &secret);
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_sweeps_a_stale_secret_partial() {
+        use secrecy::ExposeSecret;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x88; 48];
+        let secret = "kept-after-sweep";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let partial_name = format!(".0x{}.1.2.keymanager-secret.partial", "ab".repeat(48));
+        let partial = dir.path().join(Config::IMPORT_SECRETS_DIR).join(&partial_name);
+        std::fs::write(&partial, b"stale-partial-body").unwrap();
+        let r1 = dir.path().join(format!(".0x{}.9.8.keymanager-secret.partial", "cd".repeat(48)));
+        std::fs::write(&r1, b"r1-partial-body").unwrap();
+        let suffix_only = dir.path().join("notes.keymanager-secret.partial");
+        std::fs::write(&suffix_only, b"not-a-staged-secret").unwrap();
+        let passwords = config_at(dir.path(), None).load_passwords().unwrap();
+        assert_eq!(passwords.get(&hex::encode(pubkey)).unwrap().expose_secret(), secret);
+        assert!(!partial.exists(), "boot removes a staged import secret partial");
+        assert!(!r1.exists(), "boot removes an R1 partial from the keystore directory");
+        assert!(suffix_only.exists(), "a suffix-only name is not a staged secret");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_reports_a_sweep_directory_sync_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x89; 48];
+        let secret = "kept-when-sweep-sync-fails";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let partial_name = format!(".0x{}.1.2.keymanager-secret.partial", "ef".repeat(48));
+        let partial = dir.path().join(Config::IMPORT_SECRETS_DIR).join(&partial_name);
+        std::fs::write(&partial, b"stale-partial-body").unwrap();
+        struct ClearSweepSync;
+        impl Drop for ClearSweepSync {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(false));
+            }
+        }
+        super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(true));
+        let _guard = ClearSweepSync;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "sync import secret directory failed", secret);
+        assert!(!partial.exists(), "the partial is unlinked before the directory fsync");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_secret_owned_by_someone_else() {
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x79; 48]);
+        let secret = "other-owner-secret";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o600);
+        let path = dir.path().join(Config::IMPORT_SECRETS_DIR).join(&name);
+        let other_uid = std::fs::metadata(&path).unwrap().uid().wrapping_add(1);
+        struct ClearOwner;
+        impl Drop for ClearOwner {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_EXPECT_UID.with(|slot| slot.set(None));
+            }
+        }
+        super::IMPORT_SECRET_EXPECT_UID.with(|slot| slot.set(Some(other_uid)));
+        let _guard = ClearOwner;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "file owner must be the current user", secret);
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_an_unreadable_secret() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let name = secret_name(&[0x66; 48]);
+        let secret = "unreadable-secret-value";
+        write_import_secret(dir.path(), &name, secret.as_bytes(), 0o600);
+        struct ClearReadFail;
+        impl Drop for ClearReadFail {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_READ_FAILS.with(|flag| flag.set(false));
+            }
+        }
+        super::IMPORT_SECRET_READ_FAILS.with(|flag| flag.set(true));
+        let _guard = ClearReadFail;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "unreadable", secret);
+        assert!(err.to_string().contains(&name), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_rejects_a_non_utf8_secret_filename() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir(&secrets).unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&secrets).unwrap().permissions();
+            perms.set_mode(0o700);
+            std::fs::set_permissions(&secrets, perms).unwrap();
+        }
+        let path = secrets.join(std::ffi::OsString::from_vec(vec![0xff, 0xfe]));
+        std::fs::write(&path, b"non-utf8-name").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(&path, perms).unwrap();
+        }
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        assert_import_secret_err(&err, "filename is not 0x plus bare pubkey hex", "non-utf8-name");
     }
 
     #[test]

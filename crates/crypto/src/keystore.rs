@@ -236,7 +236,11 @@ impl Keystore {
         Self::from_json(&json)
     }
 
-    fn validate(&self) -> Result<(), KeystoreError> {
+    /// Rejects a keystore this client cannot decrypt.
+    ///
+    /// The version must be 4, the KDF must be scrypt or PBKDF2, the cipher
+    /// must be AES-128-CTR, and the checksum must be SHA-256.
+    pub fn validate(&self) -> Result<(), KeystoreError> {
         if self.version != KEYSTORE_VERSION {
             return Err(KeystoreError::UnsupportedVersion(self.version));
         }

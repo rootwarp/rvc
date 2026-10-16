@@ -14,7 +14,7 @@ use secret_provider::SecretProvider;
 use tracing::{info, warn};
 
 use super::BootstrapError;
-use crate::config::{redact_url, Config, ServiceBuilder};
+use crate::config::{redact_url, Config, ConfigError, ServiceBuilder};
 use crate::deletion_denylist::DeletionDenylist;
 use crate::orchestrator::PubkeyMap;
 
@@ -73,6 +73,7 @@ pub async fn load_signing_keys(
             info!(count = validator_count, "Loaded validator keys");
             km
         }
+        Err(e @ ConfigError::ImportSecret { .. }) => return Err(e.into()),
         Err(e) => {
             warn!("Failed to load keys, continuing without validators: {}", e);
             KeyManager::new()
@@ -371,6 +372,43 @@ mod tests {
         assert!(!loaded.local_pubkeys.contains(&denied_pk));
         assert!(loaded.composite_signer.has_local_key(&kept_pk));
         assert!(!loaded.composite_signer.has_local_key(&denied_pk));
+    }
+
+    /// A mode `0644` import secret aborts startup. Other key-load errors stay non-fatal.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_signing_keys_aborts_on_a_world_readable_import_secret() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let dir = TempDir::new().unwrap();
+        let ks_dir = dir.path().join("keys");
+        std::fs::create_dir_all(&ks_dir).unwrap();
+        let password_file = write_password_file(&dir);
+        let secrets = ks_dir.join(Config::IMPORT_SECRETS_DIR);
+        std::fs::create_dir(&secrets).unwrap();
+        let mut dir_perms = std::fs::metadata(&secrets).unwrap().permissions();
+        dir_perms.set_mode(0o700);
+        std::fs::set_permissions(&secrets, dir_perms).unwrap();
+        let secret = "world-readable-import-secret";
+        let name = format!("0x{}", "ab".repeat(48));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(secrets.join(&name))
+            .unwrap();
+        write!(file, "{secret}").unwrap();
+        let config = base_config(ks_dir, password_file);
+        let denylist = DeletionDenylist::empty_at(dir.path().join(".rvc.deleted_keys"));
+        let err = match load_signing_keys(&config, &denylist).await {
+            Err(err) => err,
+            Ok(_) => panic!("a 0644 import secret aborts startup"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("file permissions must be 0600"), "{msg}");
+        assert!(msg.contains(&name), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
     }
 
     #[tokio::test]
