@@ -36,7 +36,7 @@ use doppelganger::{
     ForwardWindowMachine, ForwardWindowStatus, MonotonicEpochClock, ValidatorLivenessData,
     DEFAULT_MONITORING_EPOCHS,
 };
-use eth_types::{Epoch, SLOT_DURATION_MS};
+use eth_types::Epoch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Instrument};
 
@@ -82,7 +82,7 @@ pub struct LivenessObservationLoop {
     /// Live keystore/keymanager pubkey set for periodic BN index re-resolve.
     pubkey_map: Option<PubkeyMap>,
     epoch_clock: Arc<MonotonicEpochClock>,
-    /// Slot duration used for the sleep interval (defaults to mainnet 12s).
+    /// Slot duration used for the sleep interval (the beacon-node slot length).
     slot_duration: Duration,
     cancel: CancellationToken,
     /// Keystore directory whose import sidecars are removed once a key is Safe.
@@ -137,6 +137,17 @@ macro_rules! refresh_indices_from_pubkey_map_impl {
     }};
 }
 
+/// Sleep between liveness samples.
+///
+/// Zero is not a slot. Sleeping zero would spin the loop, and assuming 12 s
+/// would be wrong on a longer slot. A zero duration waits indefinitely.
+fn slot_sleep(slot_duration_ms: u64) -> Duration {
+    if slot_duration_ms == 0 {
+        return Duration::MAX;
+    }
+    Duration::from_millis(slot_duration_ms)
+}
+
 impl LivenessObservationLoop {
     pub fn new(
         machine: Arc<ForwardWindowMachine>,
@@ -150,8 +161,8 @@ impl LivenessObservationLoop {
             beacon,
             pubkey_index,
             pubkey_map: None,
+            slot_duration: slot_sleep(epoch_clock.slot_duration_ms()),
             epoch_clock,
-            slot_duration: Duration::from_millis(SLOT_DURATION_MS),
             cancel,
             import_sidecar_dir: None,
             tracked_keys: None,
@@ -171,6 +182,11 @@ impl LivenessObservationLoop {
     pub fn with_slot_duration(mut self, slot_duration: Duration) -> Self {
         self.slot_duration = slot_duration;
         self
+    }
+
+    /// Slot sleep used by [`Self::run`].
+    pub fn slot_duration(&self) -> Duration {
+        self.slot_duration
     }
 
     /// Directory scanned after each tick. A Safe key's import sidecar is removed.
@@ -345,7 +361,6 @@ impl LivenessObservationLoop {
                 debug!(epoch = e, missing_count, "observe_liveness incomplete (D-2 fail-closed)");
                 Ok(false)
             }
-            Err(e) => Err(e.to_string()),
         }
     }
 
@@ -645,7 +660,7 @@ mod tests {
             machine,
             beacon,
             reg,
-            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
             CancellationToken::new(),
         )
         .with_slot_duration(Duration::from_millis(1))
@@ -736,7 +751,7 @@ mod tests {
             Arc::clone(&m),
             bn,
             reg,
-            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
             CancellationToken::new(),
         )
         .with_slot_duration(Duration::from_millis(1))
@@ -812,7 +827,12 @@ mod tests {
             bn,
             Arc::clone(&reg),
             None,
-            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 1_000_000)),
+            Arc::new(MonotonicEpochClock::with_start_time(
+                0,
+                std::time::Instant::now(),
+                1_000_000,
+                12_000,
+            )),
             &exec,
             None,
         );
@@ -826,7 +846,7 @@ mod tests {
             Arc::new(all_not_live(&[]).0),
             empty,
             None,
-            Arc::new(MonotonicEpochClock::new(0)),
+            Arc::new(MonotonicEpochClock::new(0, 12_000)),
             &exec2,
             None,
         );
@@ -838,7 +858,7 @@ mod tests {
             Arc::new(all_not_live(&["1"]).0),
             Arc::clone(&reg),
             None,
-            Arc::new(MonotonicEpochClock::new(0)),
+            Arc::new(MonotonicEpochClock::new(0, 12_000)),
             &exec3,
             None,
         );
@@ -873,7 +893,7 @@ mod tests {
             Arc::clone(&m),
             bn.clone(),
             Arc::clone(&pubkey_index),
-            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
             CancellationToken::new(),
         )
         .with_pubkey_map(pubkey_map)
@@ -957,7 +977,7 @@ mod tests {
             Arc::new(all_not_live(&[]).0),
             empty,
             Some(pubkey_map),
-            Arc::new(MonotonicEpochClock::new(0)),
+            Arc::new(MonotonicEpochClock::new(0, 12_000)),
             &exec,
             None,
         );
@@ -1028,10 +1048,32 @@ mod tests {
             machine(),
             Arc::new(LivenessOnlyMock),
             PubkeyIndexRegistry::shared(),
-            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0)),
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
             CancellationToken::new(),
         );
         let statuses = loop_.drive_once_for_test(None, 0, 0).await.expect("tick");
         assert!(statuses.is_empty());
+    }
+
+    fn loop_at(slot_duration_ms: u64) -> LivenessObservationLoop {
+        LivenessObservationLoop::new(
+            machine(),
+            Arc::new(MockBeaconNodeClient::new()),
+            PubkeyIndexRegistry::shared(),
+            Arc::new(MonotonicEpochClock::with_start_time(
+                0,
+                std::time::Instant::now(),
+                0,
+                slot_duration_ms,
+            )),
+            CancellationToken::new(),
+        )
+    }
+
+    #[test]
+    fn slot_sleep_follows_beacon_slot_duration() {
+        assert_eq!(loop_at(6_000).slot_duration(), Duration::from_secs(6));
+        assert_eq!(loop_at(12_000).slot_duration(), Duration::from_secs(12));
+        assert_eq!(loop_at(0).slot_duration(), Duration::MAX);
     }
 }

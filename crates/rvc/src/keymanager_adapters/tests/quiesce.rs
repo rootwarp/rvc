@@ -229,7 +229,7 @@ struct Build {
 fn clock_at(epoch: u64) -> Arc<MonotonicEpochClock> {
     let genesis = 1_700_000_000u64;
     let secs = epoch * SLOTS_PER_EPOCH * SLOT_DURATION_MS / 1000;
-    Arc::new(MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis + secs))
+    Arc::new(MonotonicEpochClock::with_start_time(genesis, Instant::now(), genesis + secs, 12_000))
 }
 
 fn build(opts: Build) -> Harness {
@@ -279,7 +279,7 @@ fn build(opts: Build) -> Harness {
         Arc::clone(&store),
         Arc::clone(&denylist),
         machine.clone(),
-        clock.clone().unwrap_or_else(|| Arc::new(MonotonicEpochClock::new(0))),
+        clock.clone().unwrap_or_else(|| Arc::new(MonotonicEpochClock::new(0, 12_000))),
     ));
     let adapter = Arc::new(
         KeystoreManagerAdapter::new(

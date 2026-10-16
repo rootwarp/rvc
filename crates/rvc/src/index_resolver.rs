@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use bn_manager::BeaconNodeClient;
 use doppelganger::MonotonicEpochClock;
-use eth_types::{SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+use eth_types::SLOTS_PER_EPOCH;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, Instrument};
@@ -107,7 +107,7 @@ impl IndexResolver {
     pub async fn run(mut self) {
         info!("index resolver started");
         self.publish_gauge();
-        let interval = epoch_tick_interval();
+        let interval = self.tick_interval();
         let mut next_tick = tokio::time::Instant::now() + interval;
         // detached: process-lifetime loop root; the tick is the exported span.
         let loop_span = tracing::info_span!(parent: None, "index.resolve");
@@ -142,6 +142,11 @@ impl IndexResolver {
                 break;
             }
         }
+    }
+
+    /// Per-epoch wake interval from the clock's slot duration.
+    pub fn tick_interval(&self) -> Duration {
+        epoch_tick_interval(self.epoch_clock.slot_duration_ms())
     }
 
     /// One resolve pass at `epoch`.
@@ -281,8 +286,21 @@ impl IndexResolver {
     }
 }
 
-fn epoch_tick_interval() -> Duration {
-    Duration::from_millis(SLOTS_PER_EPOCH.saturating_mul(SLOT_DURATION_MS))
+/// One epoch at the beacon-node slot length.
+///
+/// Zero is not a slot. A zero tick would spin the resolver, and assuming 12 s
+/// would be wrong on a longer slot. A zero duration waits indefinitely.
+fn epoch_tick_interval(slot_duration_ms: u64) -> Duration {
+    // `Instant + Duration::MAX` panics. A zero or huge duration waits a day
+    // instead of spinning or aborting the resolver.
+    const CAP: Duration = Duration::from_secs(24 * 60 * 60);
+    if !(eth_types::MIN_SLOT_DURATION_MS..=eth_types::MAX_SLOT_DURATION_MS)
+        .contains(&slot_duration_ms)
+    {
+        return CAP;
+    }
+    let ms = SLOTS_PER_EPOCH.saturating_mul(slot_duration_ms);
+    Duration::from_millis(ms).min(CAP)
 }
 
 #[cfg(test)]
@@ -356,6 +374,8 @@ mod tests {
                 genesis_validators_root: GVR,
                 genesis_validators_root_hex: format!("0x{}", hex::encode(GVR)),
                 genesis_time,
+                slot_duration_ms: 12_000,
+                genesis_confirmed: true,
             },
         )
     }
@@ -398,7 +418,7 @@ mod tests {
                 beacon,
                 key_gen_tx: key_gen_tx.clone(),
                 key_gen_rx: key_gen_rx.clone(),
-                epoch_clock: Arc::new(MonotonicEpochClock::new(0)),
+                epoch_clock: Arc::new(MonotonicEpochClock::new(0, 12_000)),
             },
             CancellationToken::new(),
         );
@@ -791,5 +811,35 @@ mod tests {
         let calls = |src: &str| src.matches("merge_validator_indices(").count();
         assert_eq!(calls(liveness), 1, "liveness keeps the definition only");
         assert_eq!(calls(resolver), 1, "IndexResolver is the only production caller");
+    }
+
+    fn resolver_at(slot_duration_ms: u64) -> IndexResolver {
+        let (key_gen_tx, key_gen_rx) = watch::channel(0u64);
+        IndexResolver::new(
+            IndexResolverDeps {
+                registry: PubkeyIndexRegistry::shared(),
+                pubkey_map: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+                beacon: Arc::new(MockBeaconNodeClient::new()),
+                key_gen_tx,
+                key_gen_rx,
+                epoch_clock: Arc::new(MonotonicEpochClock::with_start_time(
+                    0,
+                    std::time::Instant::now(),
+                    0,
+                    slot_duration_ms,
+                )),
+            },
+            CancellationToken::new(),
+        )
+    }
+
+    #[test]
+    fn tick_interval_follows_beacon_slot_duration() {
+        assert_eq!(resolver_at(6_000).tick_interval(), Duration::from_secs(192));
+        assert_eq!(resolver_at(12_000).tick_interval(), Duration::from_secs(384));
+        let capped = Duration::from_secs(24 * 60 * 60);
+        assert_eq!(resolver_at(0).tick_interval(), capped);
+        assert_eq!(resolver_at(u64::MAX).tick_interval(), capped);
+        assert!(std::time::Instant::now().checked_add(capped).is_some());
     }
 }

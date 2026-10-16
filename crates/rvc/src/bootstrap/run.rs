@@ -12,6 +12,7 @@ use bn_manager::{BeaconNodeClient, OperationTimeouts};
 use metrics::{new_health_status, SharedHealthStatus};
 use observability::logging::TruncatedPubkey;
 use secret_provider::SecretProvider;
+use timing::SlotClock;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -173,6 +174,8 @@ pub async fn run(
         genesis_validators_root,
         genesis_validators_root_hex: _,
         genesis_time: _,
+        slot_duration_ms: _,
+        genesis_confirmed: _,
     } = beacon_handles;
 
     let LoadedKeys {
@@ -294,6 +297,7 @@ pub async fn run(
         .unwrap_or_else(|| crate::orchestrator::HeadEventGate::pair().1);
     // DSR-2.1 / FR-P1-3: register bn.sync_monitor (Background).
     spawn_sync_monitor(Some(Arc::clone(&bn_manager)), &executor, None);
+    let slot_duration_ms = slot_clock.slot_duration().as_millis() as u64;
     let (mut orchestrator, orchestrator_handle) =
         crate::orchestrator::DutyOrchestrator::new(crate::orchestrator::OrchestratorDeps {
             clock: slot_clock,
@@ -321,6 +325,7 @@ pub async fn run(
             validator_store.clone(),
             slashed_action,
             &executor,
+            slot_duration_ms,
         );
         if slashed_action != crate::slashing_monitor::SlashedAction::None {
             info!(action = %slashed_action, "Slashing monitor started");
@@ -918,7 +923,7 @@ mod tests {
             Arc::new(ValidatorStore::new([0u8; 20], 30_000_000)),
             Arc::clone(&denylist),
             None,
-            Arc::new(MonotonicEpochClock::new(0)),
+            Arc::new(MonotonicEpochClock::new(0, 12_000)),
         ));
         (admissions, denylist, pubkey_map)
     }

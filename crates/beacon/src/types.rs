@@ -541,13 +541,17 @@ pub fn parse_fork_schedule(
 /// window and are accepted when they agree exactly. Neither key, or both
 /// present with unequal values, is a parse error. Extra keys such as
 /// `INTERVALS_PER_SLOT` are ignored.
+///
+/// The parsed length must sit in
+/// [`eth_types::MIN_SLOT_DURATION_MS`]..=[`eth_types::MAX_SLOT_DURATION_MS`].
+/// Zero and an unbounded value are parse errors. There is no 12 s fallback.
 pub fn parse_slot_duration_ms(
     spec: &HashMap<String, serde_json::Value>,
 ) -> Result<u64, BeaconError> {
     const SLOT_DURATION_MS_KEY: &str = "SLOT_DURATION_MS";
     const SECONDS_PER_SLOT_KEY: &str = "SECONDS_PER_SLOT";
 
-    match (spec.get(SLOT_DURATION_MS_KEY), spec.get(SECONDS_PER_SLOT_KEY)) {
+    let ms = match (spec.get(SLOT_DURATION_MS_KEY), spec.get(SECONDS_PER_SLOT_KEY)) {
         (None, None) => Err(BeaconError::ParseError(format!(
             "missing config keys: {SLOT_DURATION_MS_KEY} and {SECONDS_PER_SLOT_KEY}"
         ))),
@@ -566,6 +570,40 @@ pub fn parse_slot_duration_ms(
                 )))
             }
         }
+    }?;
+    bound_slot_duration_ms(ms)
+}
+
+/// `SLOTS_PER_EPOCH` from a config spec. Missing or zero is an error.
+///
+/// Callers compare the value to the network preset. This function does not
+/// substitute 32 when the key is absent.
+pub fn parse_slots_per_epoch(
+    spec: &HashMap<String, serde_json::Value>,
+) -> Result<u64, BeaconError> {
+    const KEY: &str = "SLOTS_PER_EPOCH";
+    let value = spec
+        .get(KEY)
+        .ok_or_else(|| BeaconError::ParseError(format!("missing config key: {KEY}")))?;
+    let parsed = value_to_string(value, KEY)?;
+    let n = parsed
+        .parse::<u64>()
+        .map_err(|e| BeaconError::ParseError(format!("invalid {KEY}: {e}")))?;
+    if n == 0 {
+        return Err(BeaconError::ParseError(format!("{KEY} must be greater than zero")));
+    }
+    Ok(n)
+}
+
+fn bound_slot_duration_ms(ms: u64) -> Result<u64, BeaconError> {
+    if (eth_types::MIN_SLOT_DURATION_MS..=eth_types::MAX_SLOT_DURATION_MS).contains(&ms) {
+        Ok(ms)
+    } else {
+        Err(BeaconError::ParseError(format!(
+            "slot duration {ms} ms is outside {}..={}",
+            eth_types::MIN_SLOT_DURATION_MS,
+            eth_types::MAX_SLOT_DURATION_MS
+        )))
     }
 }
 
@@ -1300,6 +1338,29 @@ mod tests {
         let mut spec = HashMap::new();
         spec.insert("SECONDS_PER_SLOT".to_string(), json!(0));
         assert_parse_error_contains(parse_slot_duration_ms(&spec), &["SECONDS_PER_SLOT"]);
+    }
+
+    #[test]
+    fn test_parse_slot_duration_ms_above_bound() {
+        let mut spec = HashMap::new();
+        spec.insert("SLOT_DURATION_MS".to_string(), json!("86400000"));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["outside", "86400000"]);
+
+        let mut spec = HashMap::new();
+        spec.insert("SECONDS_PER_SLOT".to_string(), json!("100"));
+        assert_parse_error_contains(parse_slot_duration_ms(&spec), &["outside"]);
+    }
+
+    #[test]
+    fn test_parse_slots_per_epoch_missing_and_zero() {
+        let spec = HashMap::new();
+        assert_parse_error_contains(parse_slots_per_epoch(&spec), &["SLOTS_PER_EPOCH"]);
+        let mut spec = HashMap::new();
+        spec.insert("SLOTS_PER_EPOCH".to_string(), json!("0"));
+        assert_parse_error_contains(parse_slots_per_epoch(&spec), &["greater than zero"]);
+        let mut spec = HashMap::new();
+        spec.insert("SLOTS_PER_EPOCH".to_string(), json!("32"));
+        assert_eq!(parse_slots_per_epoch(&spec).unwrap(), 32);
     }
 
     #[test]

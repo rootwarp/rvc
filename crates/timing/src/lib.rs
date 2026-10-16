@@ -78,5 +78,21 @@ impl Default for DeadlineBps {
 /// assert_eq!(due_ms(AGGREGATE_DUE_BPS, 12000), 8000);
 /// ```
 pub fn due_ms(bps: u64, slot_duration_ms: u64) -> u64 {
-    bps * slot_duration_ms / BASIS_POINTS
+    match bps.checked_mul(slot_duration_ms) {
+        Some(product) => product / BASIS_POINTS,
+        // A wrapped product must not become 0. Zero would fire the deadline
+        // at the start of the slot. The end of the slot stays inside the slot.
+        None => slot_duration_ms,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn due_ms_overflow_does_not_fire_at_zero() {
+        assert_eq!(due_ms(u64::MAX, u64::MAX), u64::MAX);
+        assert_ne!(due_ms(u64::MAX, u64::MAX), 0);
+    }
 }

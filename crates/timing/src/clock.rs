@@ -66,8 +66,18 @@ pub trait SlotClock: Send + Sync {
         self.deadlines()
     }
 
+    /// Slot length in milliseconds. `0` when the duration does not fit in `u64`.
+    fn slot_duration_ms(&self) -> u64 {
+        u64::try_from(self.slot_duration().as_millis()).unwrap_or(0)
+    }
+
+    /// Unix seconds at the start of `slot`, floored.
+    ///
+    /// Sub-second slot lengths keep the remainder in [`Self::slot_start_ms`].
+    /// A 1500 ms slot starts slot 2 at genesis+3000 ms, which is unix second
+    /// genesis+3, not genesis+2.
     fn slot_start_time(&self, slot: Slot) -> u64 {
-        self.genesis_time() + (slot * self.slot_duration().as_secs())
+        self.slot_start_ms(slot) / 1000
     }
 
     /// Unix milliseconds at the start of `slot`.
@@ -76,20 +86,26 @@ pub trait SlotClock: Send + Sync {
     /// to a small timestamp. Prefer [`Self::slot_start_ms_checked`] on paths
     /// that must fail closed (e.g. pre-genesis import).
     fn slot_start_ms(&self, slot: Slot) -> u64 {
-        self.slot_start_time(slot).saturating_mul(1000)
+        let genesis_ms = self.genesis_time().saturating_mul(1000);
+        let offset = slot.saturating_mul(self.slot_duration_ms());
+        genesis_ms.saturating_add(offset)
     }
 
     /// Checked unix milliseconds at the start of `slot`.
     ///
-    /// Fails with [`TimingError::TimeOverflow`] when `genesis_time`, the slot
-    /// offset, or the seconds-to-milliseconds conversion would overflow `u64`.
-    /// Pre-genesis import uses this via [`Self::time_until_slot`]`(0)`.
+    /// The offset is `slot * slot_duration_ms`, not whole seconds. Fails with
+    /// [`TimingError::TimeOverflow`] when genesis milliseconds or that offset
+    /// would overflow `u64`, and with [`TimingError::InvalidSlotDuration`]
+    /// when the duration is zero. Pre-genesis import uses this via
+    /// [`Self::time_until_slot`]`(0)`.
     fn slot_start_ms_checked(&self, slot: Slot) -> Result<u64, TimingError> {
-        let slot_secs =
-            slot.checked_mul(self.slot_duration().as_secs()).ok_or(TimingError::TimeOverflow)?;
-        let start_secs =
-            self.genesis_time().checked_add(slot_secs).ok_or(TimingError::TimeOverflow)?;
-        start_secs.checked_mul(1000).ok_or(TimingError::TimeOverflow)
+        let slot_ms = self.slot_duration_ms();
+        if slot_ms == 0 {
+            return Err(TimingError::InvalidSlotDuration);
+        }
+        let offset = slot.checked_mul(slot_ms).ok_or(TimingError::TimeOverflow)?;
+        let genesis_ms = self.genesis_time().checked_mul(1000).ok_or(TimingError::TimeOverflow)?;
+        genesis_ms.checked_add(offset).ok_or(TimingError::TimeOverflow)
     }
 
     fn ms_into_slot(&self, slot: Slot) -> u64 {
@@ -195,10 +211,6 @@ impl SystemSlotClock {
     pub fn new_mainnet(genesis_time: u64) -> Result<Self, TimingError> {
         Self::new(genesis_time, Duration::from_millis(SLOT_DURATION_MS), SLOTS_PER_EPOCH)
     }
-
-    fn current_unix_time(&self) -> u64 {
-        self.now_since_epoch().as_secs()
-    }
 }
 
 impl SlotClock for SystemSlotClock {
@@ -227,21 +239,32 @@ impl SlotClock for SystemSlotClock {
     }
 
     fn current_slot(&self) -> Result<Slot, TimingError> {
-        let current_time = self.current_unix_time();
-        if current_time < self.genesis_time {
-            return Err(TimingError::BeforeGenesis {
-                current_time,
-                genesis_time: self.genesis_time,
-            });
-        }
-        let seconds_since_genesis = current_time - self.genesis_time;
-        let slot_duration_secs = self.slot_duration.as_secs();
-        let slot = seconds_since_genesis / slot_duration_secs;
-        let epoch = slot / self.slots_per_epoch;
-        let time_into_slot = (seconds_since_genesis % slot_duration_secs) * 1000;
+        let now = self.now_since_epoch();
+        let now_ms = u64::try_from(now.as_millis()).map_err(|_| TimingError::TimeOverflow)?;
+        let slot = slot_from_millis(now_ms, self.genesis_time, self.slot_duration)?;
+        let epoch = slot / self.slots_per_epoch.max(1);
+        let slot_ms = u64::try_from(self.slot_duration.as_millis()).unwrap_or(0);
+        let genesis_ms = self.genesis_time.saturating_mul(1000);
+        let time_into_slot = now_ms.saturating_sub(genesis_ms) % slot_ms.max(1);
         tracing::trace!(slot, epoch, time_into_slot, "slot transition");
         Ok(slot)
     }
+}
+
+fn slot_from_millis(
+    now_ms: u64,
+    genesis_time: u64,
+    slot_duration: Duration,
+) -> Result<Slot, TimingError> {
+    let genesis_ms = genesis_time.checked_mul(1000).ok_or(TimingError::TimeOverflow)?;
+    if now_ms < genesis_ms {
+        return Err(TimingError::BeforeGenesis { current_time: now_ms / 1000, genesis_time });
+    }
+    let slot_ms = u64::try_from(slot_duration.as_millis()).unwrap_or(0);
+    if slot_ms == 0 {
+        return Err(TimingError::InvalidSlotDuration);
+    }
+    Ok((now_ms - genesis_ms) / slot_ms)
 }
 
 pub struct MockSlotClock {
@@ -296,18 +319,12 @@ impl MockSlotClock {
     }
 
     pub fn set_slot(&self, slot: Slot) {
-        let slot_start = self.genesis_time + (slot * self.slot_duration.as_secs());
-        self.set_current_time(slot_start);
+        self.set_current_time_ms(self.slot_start_ms(slot));
     }
 
     /// Place the clock `offset_ms` after the start of `slot`.
     pub fn set_slot_with_offset_ms(&self, slot: Slot, offset_ms: u64) {
         self.set_current_time_ms(self.slot_start_ms(slot) + offset_ms);
-    }
-
-    /// Whole seconds. The sub-second remainder is visible through `now_since_epoch`.
-    fn get_current_time(&self) -> u64 {
-        self.current_time_ms.load(std::sync::atomic::Ordering::SeqCst) / 1000
     }
 }
 
@@ -337,15 +354,8 @@ impl SlotClock for MockSlotClock {
     }
 
     fn current_slot(&self) -> Result<Slot, TimingError> {
-        let current_time = self.get_current_time();
-        if current_time < self.genesis_time {
-            return Err(TimingError::BeforeGenesis {
-                current_time,
-                genesis_time: self.genesis_time,
-            });
-        }
-        let seconds_since_genesis = current_time - self.genesis_time;
-        Ok(seconds_since_genesis / self.slot_duration.as_secs())
+        let now_ms = self.current_time_ms.load(std::sync::atomic::Ordering::SeqCst);
+        slot_from_millis(now_ms, self.genesis_time, self.slot_duration)
     }
 }
 
@@ -376,6 +386,42 @@ mod tests {
         let clock = create_mock_clock();
         clock.set_current_time(TEST_GENESIS_TIME);
         assert_eq!(clock.current_slot().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_current_slot_keeps_subsecond_slot_length() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_millis(1500), 32);
+        // 2.0 s is slot 1 at 1500 ms (2000/1500). Whole-second math (2/1) reports slot 2.
+        clock.set_current_time_ms(TEST_GENESIS_TIME * 1000 + 2000);
+        assert_eq!(clock.current_slot().unwrap(), 1);
+    }
+
+    /// A 1500 ms slot must not truncate to 1 s. Slot 2 starts at genesis+3000 ms.
+    /// Truncation would start it at genesis+2000 ms, put the attestation
+    /// deadline in the past, and make `time_until_slot(2)` return zero so the
+    /// coordinator wait spins.
+    #[test]
+    fn test_1500ms_slot_two_starts_three_seconds_after_genesis() {
+        let clock = MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_millis(1500), 32);
+        let genesis_ms = TEST_GENESIS_TIME * 1000;
+        assert_eq!(clock.slot_start_ms(2), genesis_ms + 3000);
+        assert_eq!(clock.slot_start_ms_checked(2).unwrap(), genesis_ms + 3000);
+        assert_ne!(clock.slot_start_ms(2), genesis_ms + 2000);
+
+        clock.set_current_time_ms(genesis_ms + 2000);
+        assert_eq!(clock.current_slot().unwrap(), 1);
+        assert_eq!(clock.time_until_slot(2).unwrap(), Duration::from_millis(1000));
+
+        // 100 ms into slot 1. Attestation is 3333 bps of 1500 ms (499 ms).
+        clock.set_current_time_ms(genesis_ms + 1500 + 100);
+        assert_eq!(clock.ms_into_slot(1), 100);
+        let until_due = clock.time_until_due(1, clock.deadlines().attestation).unwrap();
+        assert_eq!(until_due, Duration::from_millis(399));
+        assert_ne!(until_due, Duration::ZERO);
+
+        clock.set_slot(2);
+        assert_eq!(clock.current_time_ms(), genesis_ms + 3000);
+        assert_eq!(clock.current_slot().unwrap(), 2);
     }
 
     #[test]

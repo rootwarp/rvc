@@ -43,7 +43,7 @@ fn new_pubkey() -> crypto::PublicKey {
 
 fn machine(monitoring_epochs: u64) -> ForwardWindowMachine {
     let reader: Arc<dyn slashing::SlashingDbReader> = Arc::new(NoPriorAttestation);
-    ForwardWindowMachine::new(reader, monitoring_epochs, gvr())
+    ForwardWindowMachine::new(reader, monitoring_epochs, gvr()).with_confirmed_genesis()
 }
 
 // ---------------------------------------------------------------------------
@@ -69,6 +69,18 @@ fn test_register_at_epoch_0_is_immediately_safe() {
         machine.is_signing_enabled(&pubkey),
         "register at epoch 0 (pre-genesis) must immediately mark the validator Safe; \
          no tick should be required"
+    );
+}
+
+#[test]
+fn test_register_at_epoch_0_without_genesis_confirmation_stays_pending() {
+    let reader: Arc<dyn slashing::SlashingDbReader> = Arc::new(NoPriorAttestation);
+    let machine = ForwardWindowMachine::new(reader, 2, gvr());
+    let pubkey = new_pubkey();
+    machine.register(&pubkey, 0);
+    assert!(
+        !machine.is_signing_enabled(&pubkey),
+        "epoch 0 without confirmed genesis must stay Pending"
     );
 }
 

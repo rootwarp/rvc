@@ -111,7 +111,7 @@ fn failed_admit_leaves_no_keystore_json() {
         store,
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(admissions);
 
@@ -226,7 +226,7 @@ fn keystore_files_are_durable_before_the_signer_is_live() {
         store,
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(admissions);
 
@@ -294,7 +294,7 @@ fn windowed_import_keeps_the_keystore_partial_until_the_hold_is_durable() {
         Arc::clone(&store),
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(admissions);
     adapter.set_doppelganger_window(std::time::Duration::from_secs(30));
@@ -360,7 +360,7 @@ fn hold_deadline_is_sampled_after_keystore_io() {
         store,
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(admissions);
     adapter.set_doppelganger_window(std::time::Duration::from_secs(30));
@@ -424,7 +424,7 @@ fn rollback_revokes_before_discarding_keystore_files() {
         store,
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(admissions);
 
@@ -483,7 +483,7 @@ fn failed_import_keeps_the_hold_row_until_the_keystore_json_is_unlinked() {
         Arc::clone(&store),
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(admissions);
     adapter.set_doppelganger_window(std::time::Duration::from_secs(30));
@@ -554,7 +554,7 @@ fn failed_unlink_keeps_a_disabled_tombstone() {
         store,
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(admissions);
     adapter.set_doppelganger_window(std::time::Duration::from_secs(30));
@@ -623,7 +623,7 @@ fn publish_failure_after_rename_keeps_the_hold_until_the_json_is_unlinked() {
         store,
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(admissions);
     adapter.set_doppelganger_window(std::time::Duration::from_secs(30));
@@ -695,7 +695,7 @@ fn already_present_import_does_not_unpublish_a_concurrent_refresh() {
         Arc::clone(&store),
         denylist,
         Some(Arc::clone(&machine)),
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(Arc::clone(&admissions));
     adapter.set_doppelganger_window(std::time::Duration::from_secs(30));
@@ -774,7 +774,7 @@ fn already_present_import_leaves_a_midflight_refresh_hold() {
         Arc::clone(&store),
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(Arc::clone(&admissions));
     let window_secs = 30u64;
@@ -901,7 +901,7 @@ fn late_already_present_with_a_failed_refresh_row_is_not_boot_loadable() {
         Arc::clone(&store),
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(Arc::clone(&admissions));
 
@@ -1032,7 +1032,7 @@ fn tombstone_disable_does_not_deadlock_with_delete() {
         Arc::clone(&store),
         denylist,
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = Arc::new(adapter.with_admission_service(admissions));
     adapter.set_doppelganger_window(std::time::Duration::from_secs(30));
@@ -1228,7 +1228,7 @@ async fn disconnect_import_withholds_signing_without_on_import() {
         Arc::clone(&store),
         denylist,
         Some(Arc::clone(&machine)),
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = Arc::new(adapter.with_admission_service(admissions));
     adapter.set_doppelganger_window(Duration::from_secs(30));
@@ -1385,7 +1385,7 @@ fn validators_backed_adapter(
         store,
         Arc::clone(&denylist),
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
     let adapter = adapter.with_admission_service(admissions).with_denylist(denylist);
     (adapter, composite, validators_dir)

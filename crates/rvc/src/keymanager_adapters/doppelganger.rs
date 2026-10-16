@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crypto::PublicKey;
 use doppelganger::{ForwardWindowMachine, SigningEnablement};
-use eth_types::{Epoch, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+use eth_types::Epoch;
 use keymanager_api::traits::{DoppelgangerMonitor, Pubkey};
 use observability::logging::TruncatedPubkey;
 use tracing::{info, warn};
@@ -246,16 +246,4 @@ impl DoppelgangerMonitor for ForwardWindowMonitor {
             Err(_) => false,
         }
     }
-}
-
-/// Wall-clock epoch from genesis.
-///
-/// Prefer [`doppelganger::MonotonicEpochClock`] for production register paths
-/// (M-7). Kept for tests and non-critical fallbacks.
-pub fn wall_clock_epoch(genesis_time: u64) -> Epoch {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now.saturating_sub(genesis_time).saturating_mul(1000) / SLOT_DURATION_MS / SLOTS_PER_EPOCH
 }

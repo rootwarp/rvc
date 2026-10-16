@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use serde::Deserialize;
 
 mod frame;
@@ -243,6 +246,23 @@ fn content_type_is_event_stream(value: &reqwest::header::HeaderValue) -> bool {
 pub async fn subscribe_events<F>(
     configs: Vec<SseConfig>,
     callback: F,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) where
+    F: Fn(SseEvent) + Send + Sync + 'static,
+{
+    let admitted = Arc::new((0..configs.len()).map(|_| AtomicBool::new(true)).collect::<Vec<_>>());
+    subscribe_events_admitted(configs, admitted, callback, shutdown).await
+}
+
+/// [`subscribe_events`], skipping any endpoint whose flag is `false`.
+///
+/// The flag is read before each connection and per chunk.
+/// A node that is unadmitted is not connected. Once the flag becomes `true`,
+/// a later pass may connect.
+pub async fn subscribe_events_admitted<F>(
+    configs: Vec<SseConfig>,
+    admitted: Arc<Vec<AtomicBool>>,
+    callback: F,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) where
     F: Fn(SseEvent) + Send + Sync + 'static,
@@ -279,10 +299,38 @@ pub async fn subscribe_events<F>(
     let mut consecutive_failures: u32 = 0;
     let mut events_since_reconnect: u64;
 
+    let endpoint_admitted =
+        |index: usize| admitted.get(index).is_some_and(|flag| flag.load(Ordering::Acquire));
+
     loop {
         if *shutdown.borrow() {
             info!("SSE subscriber shutting down");
             return;
+        }
+
+        if !endpoint_admitted(current_idx) {
+            // Start after the current index. A scan from 0 returns to a node
+            // that is already failing and never reaches a later admitted peer.
+            let len = configs.len();
+            match (1..len)
+                .map(|offset| (current_idx + offset) % len)
+                .find(|&index| endpoint_admitted(index))
+            {
+                Some(index) => {
+                    current_idx = index;
+                    consecutive_failures = 0;
+                }
+                None => {
+                    tokio::select! {
+                        _ = shutdown.changed() => {
+                            info!("SSE subscriber shutting down");
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+                    }
+                    continue;
+                }
+            }
         }
 
         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
@@ -403,6 +451,9 @@ pub async fn subscribe_events<F>(
 
         let mut framer = SseFramer::new(max_event_bytes);
         loop {
+            if !endpoint_admitted(current_idx) {
+                break;
+            }
             let chunk = tokio::select! {
                 _ = shutdown.changed() => {
                     info!("SSE subscriber shutting down");
@@ -1486,5 +1537,209 @@ mod tests {
         assert!(joined.unwrap().is_ok(), "oversize id field must not panic");
         let connects = connects.load(Ordering::SeqCst);
         assert!(connects >= 2, "oversize id field must close and reconnect, connects={connects}");
+    }
+
+    fn head_frame(slot: &str) -> String {
+        format!(
+            "event: head\ndata: {{\"slot\":\"{slot}\",\"block\":\"0xabc\",\"state\":\"0xdef\",\"epoch_transition\":false,\"previous_duty_dependent_root\":\"0x11\",\"current_duty_dependent_root\":\"0x22\",\"execution_optimistic\":false}}\n\n"
+        )
+    }
+
+    fn reorg_frame(slot: &str) -> String {
+        format!(
+            "event: chain_reorg\ndata: {{\"slot\":\"{slot}\",\"depth\":\"1\",\"old_head_block\":\"0x01\",\"new_head_block\":\"0x02\",\"old_head_state\":\"0x03\",\"new_head_state\":\"0x04\",\"epoch\":\"1\",\"execution_optimistic\":false}}\n\n"
+        )
+    }
+
+    /// Chunked SSE server. Each body is one HTTP chunk. `release` gates every body after the first.
+    async fn gated_sse_server(
+        bodies: Vec<String>,
+        release: Arc<AtomicBool>,
+    ) -> (String, Arc<std::sync::atomic::AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use std::sync::atomic::AtomicUsize;
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_task = Arc::clone(&accepts);
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepts_task.fetch_add(1, Ordering::SeqCst);
+                let bodies = bodies.clone();
+                let release = Arc::clone(&release);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    for (index, body) in bodies.iter().enumerate() {
+                        if index > 0 {
+                            while !release.load(Ordering::Acquire) {
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                            }
+                            // Let the subscriber observe the admission flag between chunks.
+                            if index > 1 {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            }
+                        }
+                        let chunk = format!("{:x}\r\n{body}\r\n", body.len());
+                        let _ = stream.write_all(chunk.as_bytes()).await;
+                        let _ = stream.flush().await;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), accepts, handle)
+    }
+
+    #[tokio::test]
+    async fn sse_failover_reaches_a_later_admitted_node() {
+        use std::sync::Mutex;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let failing_port = listener.local_addr().unwrap().port();
+        let failing_server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                drop(stream);
+            }
+        });
+
+        let hold = Arc::new(AtomicBool::new(true));
+        let (skipped_url, skipped_hits, skipped_server) =
+            gated_sse_server(vec![head_frame("1")], Arc::clone(&hold)).await;
+        let (healthy_url, healthy_hits, healthy_server) =
+            gated_sse_server(vec![head_frame("2")], Arc::clone(&hold)).await;
+        let admitted =
+            Arc::new(vec![AtomicBool::new(true), AtomicBool::new(false), AtomicBool::new(true)]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_cb = Arc::clone(&events);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn({
+            let admitted = Arc::clone(&admitted);
+            async move {
+                subscribe_events_admitted(
+                    vec![
+                        SseConfig::new(format!("http://127.0.0.1:{failing_port}")),
+                        SseConfig::new(skipped_url),
+                        SseConfig::new(healthy_url),
+                    ],
+                    admitted,
+                    move |event| {
+                        events_cb.lock().unwrap().push(event);
+                    },
+                    shutdown_rx,
+                )
+                .await;
+            }
+        });
+
+        for _ in 0..80 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if healthy_hits.load(Ordering::SeqCst) > 0 && !events.lock().unwrap().is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            skipped_hits.load(Ordering::SeqCst),
+            0,
+            "failover must not connect the unadmitted middle node"
+        );
+        assert!(
+            healthy_hits.load(Ordering::SeqCst) > 0,
+            "the later admitted node must be used after the first node fails"
+        );
+        let delivered = events.lock().unwrap().clone();
+        assert!(
+            delivered.iter().any(|event| matches!(event, SseEvent::Head(head) if head.slot == "2")),
+            "head from the later admitted node must be delivered: {delivered:?}"
+        );
+        assert!(
+            delivered.iter().all(|event| match event {
+                SseEvent::Head(head) => head.slot != "1",
+                SseEvent::ChainReorg(reorg) => reorg.slot != "1",
+                SseEvent::Block(_) | SseEvent::FinalizedCheckpoint(_) => true,
+            }),
+            "the unadmitted node must not deliver events: {delivered:?}"
+        );
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        failing_server.abort();
+        skipped_server.abort();
+        healthy_server.abort();
+    }
+
+    #[tokio::test]
+    async fn sse_drops_chunks_after_admission_is_revoked() {
+        use std::sync::Mutex;
+
+        let release = Arc::new(AtomicBool::new(false));
+        let (url, _hits, server) = gated_sse_server(
+            vec![
+                head_frame("1"),
+                head_frame("2"),
+                format!("{}{}", head_frame("3"), reorg_frame("3")),
+            ],
+            Arc::clone(&release),
+        )
+        .await;
+        let admitted = Arc::new(vec![AtomicBool::new(true)]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_cb = Arc::clone(&events);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn({
+            let admitted = Arc::clone(&admitted);
+            async move {
+                subscribe_events_admitted(
+                    vec![SseConfig::new(url)],
+                    admitted,
+                    move |event| {
+                        events_cb.lock().unwrap().push(event);
+                    },
+                    shutdown_rx,
+                )
+                .await;
+            }
+        });
+
+        for _ in 0..40 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            if events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, SseEvent::Head(head) if head.slot == "1"))
+            {
+                break;
+            }
+        }
+        admitted[0].store(false, Ordering::Release);
+        release.store(true, Ordering::Release);
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+        let delivered = events.lock().unwrap().clone();
+        assert!(
+            delivered.iter().any(|event| matches!(event, SseEvent::Head(head) if head.slot == "1")),
+            "the chunk read while admitted must be delivered: {delivered:?}"
+        );
+        assert!(
+            delivered.iter().all(|event| match event {
+                SseEvent::Head(head) => head.slot != "3",
+                SseEvent::ChainReorg(reorg) => reorg.slot != "3",
+                SseEvent::Block(_) | SseEvent::FinalizedCheckpoint(_) => true,
+            }),
+            "the chunk after admission is revoked must be dropped: {delivered:?}"
+        );
+        shutdown_tx.send(true).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        server.abort();
     }
 }

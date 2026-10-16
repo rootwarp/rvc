@@ -3,8 +3,8 @@
 # (e.g. slashing db → interchange.rs). Not related to DSR-3.1 digest pins in docs.
 # Same attester/proposer duty pubkeys. Lines moved 928 → 940 and 1391 → 1403
 # when BlockHeaderSummary landed in types.rs (#641).
-crates/beacon/src/types.rs:generic-api-key:1403
-crates/beacon/src/types.rs:generic-api-key:940
+crates/beacon/src/types.rs:generic-api-key:1464
+crates/beacon/src/types.rs:generic-api-key:978
 crates/crypto/examples/log_sample.rs:generic-api-key:27
 # Same test keystore pubkeys. Lines moved 452 → 522, 704 → 774, and 994 → 1064
 # when the password-map key and load report were added (#644).

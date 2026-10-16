@@ -3,6 +3,47 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Slot duration comes from the beacon node
+
+Doppelganger epoch, liveness sleep, the index-resolver tick, the import hold,
+the keymanager and CLI default exit epoch, the slashing-monitor interval, and
+the Gloas payload deadline use the slot duration from `GET /eth/v1/config/spec`.
+Responding beacon nodes must report the same `SLOT_DURATION_MS` or
+`SECONDS_PER_SLOT`, the same `SLOTS_PER_EPOCH` as the network preset, and the
+same genesis time as the configured genesis. A missing, zero, conflicting,
+out-of-range (outside 1 s..=60 s), or disagreeing value fails startup. A
+named network must report that network's preset duration and preset genesis
+time. An explicit `genesis_time` that differs from the preset is rejected.
+On a named network, a beacon node that does not respond is skipped, and at
+least one must respond. Custom still requires every configured beacon node.
+A beacon node whose genesis validators root is not the configured root is
+rejected. It is not admitted, it is not the chain identity, and it is not a
+source of liveness or head and reorg events. A skipped node stays out of
+duties and liveness until its slot duration, slots per epoch, genesis time,
+and genesis validators root match the boot agreement. Recovering `/eth/v1/node/syncing` does not admit it. A spec that
+arrives before a genesis timeout is still compared. HTTP 502, 503, 504, and
+429 count as not responding. HTTP 500 does not.
+The client does not assume 12 seconds. Slot boundaries use that duration in
+milliseconds, including lengths that are not a whole number of seconds.
+
+The keymanager voluntary exit uses the duration and genesis time checked at
+startup. It does not read the spec or genesis again from whichever pool node
+answers first. The CLI exit command has a single beacon URL, so it cannot
+cross-check a pool; it still rejects a missing, zero, conflicting,
+out-of-range, or non-preset duration, a `SLOTS_PER_EPOCH` that is not the
+preset, and a genesis time that is not the named-network preset.
+
+Epoch 0 marks normally registered keys Safe only on a named network, after
+the responding beacon nodes match that preset genesis. Custom does not open
+the bypass: the same nodes choose the slot duration, and a long duration can
+hold the clock at epoch 0. A duration outside the bound cannot produce epoch 0.
+
+`BlockService::new` still stores the 12 s constant until the coordinator
+passes the beacon-node duration. `KeystoreManagerAdapter::new` builds its
+private admission clock at 12 s; production replaces that clock with
+`with_admission_service`. Those two constructors are the remaining 12 s
+assumptions.
+
 ## Keymanager import passwords survive a restart
 
 `POST /eth/v1/keystores` writes each import password under

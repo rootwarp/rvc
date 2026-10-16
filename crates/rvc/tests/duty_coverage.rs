@@ -141,6 +141,7 @@ impl Harness {
             0,
             std::time::Instant::now(),
             SLOTS_PER_EPOCH * 12,
+            12_000,
         ));
 
         let (enablement, machine) = if doppelganger_enabled {
@@ -736,6 +737,8 @@ async fn beacon_handles(config: &Config) -> BeaconHandles {
         genesis_validators_root: GVR,
         genesis_validators_root_hex: format!("0x{}", hex::encode(GVR)),
         genesis_time: config.genesis_time.unwrap_or(1_606_824_023),
+        slot_duration_ms: 12_000,
+        genesis_confirmed: true,
     }
 }
 

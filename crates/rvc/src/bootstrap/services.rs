@@ -145,13 +145,8 @@ pub async fn build_services(
     let main_beacon: Arc<dyn BeaconNodeClient> =
         Arc::clone(&beacon.bn_manager) as Arc<dyn BeaconNodeClient>;
 
-    let slot_duration_ms = match builder.resolve_slot_duration_ms(main_beacon.as_ref()).await {
-        Ok(ms) => ms,
-        Err(e) => {
-            error!("Failed to resolve slot duration from beacon node: {}", e);
-            return Err(e.into());
-        }
-    };
+    // Same value `connect_beacon` stored. Do not resolve the spec again.
+    let slot_duration_ms = beacon.slot_duration_ms;
 
     let slot_clock = match builder.build_slot_clock(slot_duration_ms) {
         Ok(clock) => clock,
@@ -200,7 +195,7 @@ pub async fn build_services(
     )?;
 
     let orchestrator_config = builder
-        .build_orchestrator_config(beacon.genesis_validators_root, fork_schedule)
+        .build_orchestrator_config(beacon.genesis_validators_root, fork_schedule)?
         .with_timeouts(timeouts);
 
     // Build proposer BnManager if proposer nodes are configured (T3.1)
@@ -287,6 +282,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::Ordering;
     use tempfile::TempDir;
+    use timing::SlotClock;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -325,7 +321,7 @@ mod tests {
         EnablementHandles {
             signing_enablement: Arc::new(DoppelgangerDisabledByOperator),
             forward_window_machine: None,
-            epoch_clock: Arc::new(MonotonicEpochClock::new(0)),
+            epoch_clock: Arc::new(MonotonicEpochClock::new(0, 12_000)),
             pubkey_map,
             liveness_task: None,
             pubkey_index: crate::pubkey_index::PubkeyIndexRegistry::shared(),
@@ -414,6 +410,8 @@ mod tests {
             genesis_validators_root: GVR,
             genesis_validators_root_hex: format!("0x{}", hex::encode(GVR)),
             genesis_time: 0,
+            slot_duration_ms: 12_000,
+            genesis_confirmed: true,
         }
     }
 
@@ -483,6 +481,20 @@ mod tests {
                 "loaded key must be tracked in the store"
             );
         }
+    }
+
+    /// The slot clock is the duration stored by `connect_beacon`, not a second spec read.
+    #[tokio::test]
+    async fn test_build_services_uses_stored_slot_duration() {
+        let dir = TempDir::new().unwrap();
+        let server = mock_bn_server("0x05000000").await;
+        let config = base_config(&dir, &server.uri());
+        let mut beacon = beacon_handles(&server.uri()).await;
+        beacon.slot_duration_ms = 6_000;
+        let keys = loaded_keys(pubkey_map_with(&[]));
+
+        let handles = run_phase(&config, &keys, &beacon).await.expect("phase succeeds");
+        assert_eq!(handles.slot_clock.slot_duration(), std::time::Duration::from_secs(6));
     }
 
     #[tokio::test]

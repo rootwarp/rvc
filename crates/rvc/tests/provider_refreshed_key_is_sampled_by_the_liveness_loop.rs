@@ -42,7 +42,7 @@ async fn a_provider_refreshed_key_leaves_pending() {
     let (key_gen_tx, mut key_gen_rx) = tokio::sync::watch::channel(0u64);
     let composite = Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new())));
     let validator_store = Arc::new(ValidatorStore::new([0u8; 20], 30_000_000));
-    let epoch_clock = Arc::new(MonotonicEpochClock::new(0));
+    let epoch_clock = Arc::new(MonotonicEpochClock::new(0, 12_000));
     let db: Arc<dyn slashing::SlashingDbReader> =
         Arc::new(SlashingDb::open_in_memory().expect("in-memory slashing db"));
     let machine = Arc::new(ForwardWindowMachine::new(db, 2, [0xabu8; 32]));
@@ -189,7 +189,7 @@ async fn keymanager_import_admits_through_the_service() {
         Arc::clone(&validator_store),
         Arc::clone(&denylist),
         None,
-        Arc::new(MonotonicEpochClock::new(0)),
+        Arc::new(MonotonicEpochClock::new(0, 12_000)),
     ));
 
     let adapter = KeystoreManagerAdapter::new(

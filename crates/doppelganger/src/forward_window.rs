@@ -64,6 +64,8 @@ pub struct ForwardWindowMachine {
     monitoring_epochs: u64,
     slashing_reader: Arc<dyn slashing::SlashingDbReader>,
     gvr: Root,
+    /// Epoch 0 marks keys Safe only after genesis times agreed across BNs.
+    genesis_confirmed: bool,
 }
 
 impl ForwardWindowMachine {
@@ -78,7 +80,21 @@ impl ForwardWindowMachine {
         gvr: Root,
     ) -> Self {
         assert!(monitoring_epochs >= 1, "monitoring_epochs must be >= 1");
-        Self { states: Mutex::new(HashMap::new()), monitoring_epochs, slashing_reader, gvr }
+        Self {
+            states: Mutex::new(HashMap::new()),
+            monitoring_epochs,
+            slashing_reader,
+            gvr,
+            genesis_confirmed: false,
+        }
+    }
+
+    /// Allow the epoch-0 Safe bypass. Production sets this only for a named
+    /// network whose responding beacon nodes matched the preset genesis.
+    /// Custom stays closed: those nodes also choose the slot duration.
+    pub fn with_confirmed_genesis(mut self) -> Self {
+        self.genesis_confirmed = true;
+        self
     }
 
     /// Register a validator for monitoring, starting at `current_epoch`.
@@ -113,7 +129,10 @@ impl ForwardWindowMachine {
         // Rationale: placing this branch AFTER the idempotency guard ensures that
         // a validator already in Pending/Safe/Detected keeps its existing state
         // even if `register` is called again at epoch 0 (idempotency wins).
-        if current_epoch == 0 {
+        // Epoch 0 is also what an inflated slot duration produces. That must
+        // not open signing. The bypass runs only when genesis was confirmed
+        // from the named-network preset, not from the beacon-reported duration.
+        if current_epoch == 0 && self.genesis_confirmed {
             tracing::info!(
                 pubkey = %observability::logging::TruncatedPubkey::new(&pubkey_hex),
                 "doppelganger: pre-genesis (epoch 0) bypass — validator marked Safe without a monitoring window"

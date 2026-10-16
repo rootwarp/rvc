@@ -199,6 +199,8 @@ pub fn build_keymanager_api(
     // One gate per `SlashingDb`, built here at bootstrap and stored in the
     // only adapter that imports interchange. The gate must see the DB's
     // effective group-commit knobs (not `GroupCommitConfig::default`).
+    let slot_duration_ms = deps.slot_clock.slot_duration().as_millis() as u64;
+    let genesis_time = deps.slot_clock.genesis_time();
     let import_gate = Arc::new(
         ImportWindowGate::new(deps.slot_clock)
             .with_group_commit(deps.slashing_db.group_commit_config()),
@@ -217,9 +219,10 @@ pub fn build_keymanager_api(
 
     // M-12: time-based window for the delayed set_enabled task. When
     // doppelganger is disabled the window is Duration::ZERO so keys are
-    // immediately enabled. When on: 2 epochs × 32 slots × 12_000 ms = 768 s.
+    // immediately enabled. When on, the hold is two epochs at the beacon
+    // node's slot duration (768 s when that duration is 12 s).
     let doppelganger_window = if config.doppelganger_detection {
-        crate::config::doppelganger_import_window()
+        crate::config::doppelganger_import_window(slot_duration_ms)
     } else {
         Duration::ZERO
     };
@@ -245,13 +248,16 @@ pub fn build_keymanager_api(
     let config_mgr =
         Arc::new(ValidatorConfigManagerAdapter::new(Arc::clone(&deps.validator_store)));
 
-    let exit_mgr: Option<Arc<dyn VoluntaryExitManager>> =
-        Some(Arc::new(VoluntaryExitManagerAdapter::new(
+    let exit_mgr: Option<Arc<dyn VoluntaryExitManager>> = Some(Arc::new(
+        VoluntaryExitManagerAdapter::new(
             deps.beacon_client,
             Arc::clone(&deps.signer),
             deps.fork_schedule,
             deps.genesis_validators_root,
-        )));
+            genesis_time,
+        )
+        .with_slot_duration_ms(slot_duration_ms),
+    ));
 
     let signing_quiesce: Arc<dyn SigningQuiesce> = Arc::new(
         SigningQuiesceAdapter::new(Arc::clone(&deps.quiesce_registry), deps.signer)

@@ -12,7 +12,7 @@ use observability::logging::RedactedUrl;
 use crate::orchestrator::dispatch::DispatchLimits;
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use crate::quiesce::{QuiesceRegistry, QuiescingEnablement, TrackedKeys};
-use beacon::{parse_slot_duration_ms, BeaconClient, BeaconClientConfig};
+use beacon::{BeaconClient, BeaconClientConfig};
 #[cfg(test)]
 use bn_manager::DutiesProvider;
 use bn_manager::{AttestationSubmitter, BeaconNodeClient, BnManager, BnManagerConfig, Propagator};
@@ -24,7 +24,7 @@ use doppelganger::{
 };
 #[cfg(test)]
 use duty_tracker::DutyTracker;
-use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
+use eth_types::{Epoch, ForkSchedule, Root, SLOTS_PER_EPOCH};
 use rvc_config::TimingConfig;
 use signer::{SignerService, ValidatorSigner};
 use slashing::{GroupCommitConfig, SlashingDb};
@@ -129,12 +129,14 @@ pub struct ServiceBuilder {
 
 /// Wall-clock length of the doppelganger store hold and import-meta re-arm.
 ///
-/// [`DEFAULT_MONITORING_EPOCHS`] at the spec slot duration. Boot sidecar
-/// classification does not use this value: a sidecar stays unfinished until
-/// this process removes it after the forward window reaches Safe.
-pub(crate) fn doppelganger_import_window() -> Duration {
+/// [`DEFAULT_MONITORING_EPOCHS`] at `slot_duration_ms` from the beacon node.
+/// Boot sidecar classification does not use this value: a sidecar stays
+/// unfinished until this process removes it after the forward window reaches Safe.
+///
+/// `slot_duration_ms` must be the positive duration from the beacon node spec.
+pub(crate) fn doppelganger_import_window(slot_duration_ms: u64) -> Duration {
     Duration::from_millis(
-        DEFAULT_MONITORING_EPOCHS.saturating_mul(SLOTS_PER_EPOCH).saturating_mul(SLOT_DURATION_MS),
+        DEFAULT_MONITORING_EPOCHS.saturating_mul(SLOTS_PER_EPOCH).saturating_mul(slot_duration_ms),
     )
 }
 
@@ -801,6 +803,7 @@ impl ServiceBuilder {
         gvr: Root,
         current_epoch: Epoch,
         pubkey_map: &PubkeyMap,
+        genesis_confirmed: bool,
     ) -> (Arc<dyn SigningEnablement>, Option<Arc<ForwardWindowMachine>>) {
         if !self.config.doppelganger_detection {
             tracing::warn!(
@@ -813,7 +816,11 @@ impl ServiceBuilder {
         }
 
         let reader: Arc<dyn slashing::SlashingDbReader> = slashing_db;
-        let machine = Arc::new(ForwardWindowMachine::new(reader, DEFAULT_MONITORING_EPOCHS, gvr));
+        let mut machine = ForwardWindowMachine::new(reader, DEFAULT_MONITORING_EPOCHS, gvr);
+        if genesis_confirmed {
+            machine = machine.with_confirmed_genesis();
+        }
+        let machine = Arc::new(machine);
 
         // Unfinished imports must be classified before `register`. A later
         // `register_for_import` leaves an existing Safe state unchanged.
@@ -882,28 +889,85 @@ impl ServiceBuilder {
         Arc::new(tracker)
     }
 
+    /// Duration and confirmation from the configured beacon nodes.
+    ///
+    /// Named networks must report [`Network::slot_duration_ms`]. Responding
+    /// nodes must report the same duration, the same `SLOTS_PER_EPOCH` as
+    /// [`Network::slots_per_epoch`], and the same genesis time as the
+    /// configured genesis. A named network skips a BN that does not respond
+    /// and fails when none do. Custom requires every configured BN. A miss,
+    /// a bound failure, or a disagreement fails closed.
+    ///
+    /// The returned flag is the epoch-0 Safe bypass. It is set only on a
+    /// named network, where the preset duration and genesis are independent
+    /// of the beacon nodes. Custom duration comes from those same nodes, so
+    /// an inflated length can hold the clock at epoch 0; the flag stays false.
     pub async fn resolve_slot_duration_ms(
         &self,
-        beacon: &dyn BeaconNodeClient,
-    ) -> Result<u64, ConfigError> {
-        info!("Fetching slot duration from beacon node config spec");
-        let spec = beacon.get_config_spec().await?;
-        let slot_duration_ms = parse_slot_duration_ms(&spec.data)?;
-        info!(slot_duration_ms, "Resolved slot duration from beacon node spec");
-        Ok(slot_duration_ms)
+        beacon: &BnManager,
+    ) -> Result<(u64, bool), ConfigError> {
+        info!("Fetching slot duration from configured beacon nodes");
+        let agreement = if matches!(self.config.network, super::Network::Custom) {
+            bn_manager::SpecAgreement::All
+        } else {
+            bn_manager::SpecAgreement::Responding
+        };
+        let configured_root = self.config.effective_genesis_validators_root()?;
+        let (slot_duration_ms, slots_per_epoch, genesis_time) =
+            beacon.agreed_spec_and_genesis(agreement, &configured_root).await?;
+        let expected_slots = self.config.network.slots_per_epoch();
+        if slots_per_epoch != expected_slots {
+            return Err(ConfigError::InvalidNetwork(format!(
+                "SLOTS_PER_EPOCH {slots_per_epoch} does not match preset {expected_slots}"
+            )));
+        }
+        if !matches!(self.config.network, super::Network::Custom) {
+            let preset = self.config.network.slot_duration_ms();
+            if slot_duration_ms != preset {
+                return Err(ConfigError::InvalidNetwork(format!(
+                    "slot duration {slot_duration_ms} ms does not match {} preset {preset} ms",
+                    self.config.network
+                )));
+            }
+        }
+        let configured_genesis = self.config.effective_genesis_time()?;
+        if genesis_time != configured_genesis {
+            return Err(ConfigError::InvalidNetwork(format!(
+                "beacon genesis_time {genesis_time} does not match configured {configured_genesis}"
+            )));
+        }
+        info!(slot_duration_ms, slots_per_epoch, genesis_time, "Resolved chain timing");
+        let genesis_confirmed = !matches!(self.config.network, super::Network::Custom);
+        Ok((slot_duration_ms, genesis_confirmed))
     }
 
     pub fn build_slot_clock(
         &self,
         slot_duration_ms: u64,
     ) -> Result<Arc<SystemSlotClock>, ConfigError> {
+        if !(eth_types::MIN_SLOT_DURATION_MS..=eth_types::MAX_SLOT_DURATION_MS)
+            .contains(&slot_duration_ms)
+        {
+            return Err(ConfigError::InvalidNetwork(format!(
+                "slot duration {slot_duration_ms} ms is outside {}..={}",
+                eth_types::MIN_SLOT_DURATION_MS,
+                eth_types::MAX_SLOT_DURATION_MS
+            )));
+        }
         let genesis_time = self.config.effective_genesis_time()?;
         let slot_duration = Duration::from_millis(slot_duration_ms);
+        // Preset value. `resolve_slot_duration_ms` already rejected a BN that
+        // omitted SLOTS_PER_EPOCH or reported a different count.
         let slots_per_epoch = self.config.network.slots_per_epoch();
+        if slots_per_epoch == 0 {
+            return Err(ConfigError::InvalidNetwork(
+                "SLOTS_PER_EPOCH must be greater than zero".to_string(),
+            ));
+        }
 
         let clock = SystemSlotClock::new(genesis_time, slot_duration, slots_per_epoch)
             .map_err(|e| ConfigError::MissingField(format!("invalid slot clock: {e}")))?
-            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing));
+            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing)?);
         info!(
             genesis_time = genesis_time,
             slot_duration_ms,
@@ -1136,42 +1200,98 @@ impl ServiceBuilder {
         &self,
         genesis_validators_root: Root,
         fork_schedule: Arc<ForkSchedule>,
-    ) -> OrchestratorConfig {
+    ) -> Result<OrchestratorConfig, ConfigError> {
         let limits = DispatchLimits::validated(
             self.config.duties.duty_dispatch_concurrency,
             self.config.duties.duty_publish_concurrency,
         )
         .expect("Config::validate rejects zero duty concurrency");
-        OrchestratorConfig::new(genesis_validators_root, fork_schedule)
+        let schedule = deadline_schedule_from_timing(&self.config.timing)?;
+        Ok(OrchestratorConfig::new(genesis_validators_root, fork_schedule)
             .with_shutdown_timeout(Duration::from_secs(30))
-            .with_deadline_schedule(deadline_schedule_from_timing(&self.config.timing))
-            .with_dispatch_limits(limits)
+            .with_deadline_schedule(schedule)
+            .with_dispatch_limits(limits))
     }
 }
 
-/// Build both deadline sets from `[timing]`. Gloas members are listed in full so
-/// omitting one is a compile error; 1.7 serde defaults already fill missing TOML
-/// keys, so runtime "missing" cannot occur.
-fn deadline_schedule_from_timing(timing: &TimingConfig) -> DeadlineSchedule {
-    DeadlineSchedule {
+fn checked_bps(field: &'static str, value: u64) -> Result<u64, ConfigError> {
+    if (1..=timing::BASIS_POINTS).contains(&value) {
+        Ok(value)
+    } else {
+        Err(ConfigError::Invalid {
+            field,
+            message: format!("must be 1..={}, got {value}", timing::BASIS_POINTS),
+            source_layer: rvc_config::ConfigSource::Default,
+        })
+    }
+}
+
+/// Build both deadline sets from `[timing]`.
+///
+/// Every pre-Gloas and Gloas basis-point field must be in `1..=10000`.
+/// Attestation must not land after aggregate, and the Gloas aggregate must
+/// not land after the payload attestation. A zero or oversized field fails
+/// closed instead of building a deadline at the start of the slot.
+fn deadline_schedule_from_timing(timing: &TimingConfig) -> Result<DeadlineSchedule, ConfigError> {
+    let attestation = checked_bps("timing.attestation_due_bps", timing.attestation_due_bps)?;
+    let aggregate = checked_bps("timing.aggregate_due_bps", timing.aggregate_due_bps)?;
+    let attestation_gloas =
+        checked_bps("timing.attestation_due_bps_gloas", timing.attestation_due_bps_gloas)?;
+    let aggregate_gloas =
+        checked_bps("timing.aggregate_due_bps_gloas", timing.aggregate_due_bps_gloas)?;
+    let sync_message =
+        checked_bps("timing.sync_message_due_bps_gloas", timing.sync_message_due_bps_gloas)?;
+    let contribution =
+        checked_bps("timing.contribution_due_bps_gloas", timing.contribution_due_bps_gloas)?;
+    let payload = checked_bps("timing.payload_due_bps", timing.payload_due_bps)?;
+    let payload_attestation =
+        checked_bps("timing.payload_attestation_due_bps", timing.payload_attestation_due_bps)?;
+    if attestation > aggregate {
+        return Err(ConfigError::Invalid {
+            field: "timing.aggregate_due_bps",
+            message: format!(
+                "must be >= timing.attestation_due_bps ({attestation}), got {aggregate}"
+            ),
+            source_layer: rvc_config::ConfigSource::Default,
+        });
+    }
+    if attestation_gloas > aggregate_gloas {
+        return Err(ConfigError::Invalid {
+            field: "timing.aggregate_due_bps_gloas",
+            message: format!(
+                "must be >= timing.attestation_due_bps_gloas ({attestation_gloas}), got {aggregate_gloas}"
+            ),
+            source_layer: rvc_config::ConfigSource::Default,
+        });
+    }
+    if aggregate_gloas > payload_attestation {
+        return Err(ConfigError::Invalid {
+            field: "timing.payload_attestation_due_bps",
+            message: format!(
+                "must be >= timing.aggregate_due_bps_gloas ({aggregate_gloas}), got {payload_attestation}"
+            ),
+            source_layer: rvc_config::ConfigSource::Default,
+        });
+    }
+    Ok(DeadlineSchedule {
         pre_gloas: DeadlineBps {
-            attestation: timing.attestation_due_bps,
-            aggregate: timing.aggregate_due_bps,
+            attestation,
+            aggregate,
             // Pre-Gloas waits: sync messages share attestation, contributions share aggregate.
-            sync_message: timing.attestation_due_bps,
-            contribution: timing.aggregate_due_bps,
-            payload: timing.aggregate_due_bps,
-            payload_attestation: timing.aggregate_due_bps,
+            sync_message: attestation,
+            contribution: aggregate,
+            payload: aggregate,
+            payload_attestation: aggregate,
         },
         gloas: DeadlineBps {
-            attestation: timing.attestation_due_bps_gloas,
-            aggregate: timing.aggregate_due_bps_gloas,
-            sync_message: timing.sync_message_due_bps_gloas,
-            contribution: timing.contribution_due_bps_gloas,
-            payload: timing.payload_due_bps,
-            payload_attestation: timing.payload_attestation_due_bps,
+            attestation: attestation_gloas,
+            aggregate: aggregate_gloas,
+            sync_message,
+            contribution,
+            payload,
+            payload_attestation,
         },
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1711,6 +1831,50 @@ mod tests {
     }
 
     #[test]
+    fn test_build_slot_clock_rejects_zero_and_huge_duration() {
+        let builder = ServiceBuilder::new(create_minimal_config());
+        for bad in [0, 86_400_000] {
+            let err = match builder.build_slot_clock(bad) {
+                Ok(_) => panic!("out of range duration must fail"),
+                Err(err) => err,
+            };
+            assert!(err.to_string().contains("outside"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_gloas_aggregate_deadline_cannot_follow_payload_attestation() {
+        let config = Config {
+            timing: TimingConfig {
+                aggregate_due_bps_gloas: 8000,
+                payload_attestation_due_bps: 7500,
+                ..Default::default()
+            },
+            ..create_minimal_config()
+        };
+        let err = match ServiceBuilder::new(config).build_slot_clock(12_000) {
+            Ok(_) => panic!("Gloas aggregate after payload attestation must fail"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("payload_attestation_due_bps"), "{msg}");
+        assert!(msg.contains("aggregate_due_bps_gloas"), "{msg}");
+    }
+
+    #[test]
+    fn test_build_slot_clock_rejects_zero_gloas_payload_bps() {
+        let config = Config {
+            timing: TimingConfig { payload_due_bps: 0, ..Default::default() },
+            ..create_minimal_config()
+        };
+        let err = match ServiceBuilder::new(config).build_slot_clock(12_000) {
+            Ok(_) => panic!("zero payload bps must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("payload_due_bps"), "{err}");
+    }
+
+    #[test]
     fn test_parse_genesis_validators_root() {
         let config = Config {
             genesis_validators_root: Some(NetworkPreset::MAINNET.genesis_validators_root_hex()),
@@ -1828,7 +1992,8 @@ mod tests {
         let builder = ServiceBuilder::new(config);
 
         let root = [0xaa; 32];
-        let orch_config = builder.build_orchestrator_config(root, sample_fork_schedule());
+        let orch_config =
+            builder.build_orchestrator_config(root, sample_fork_schedule()).expect("timing");
 
         assert_eq!(orch_config.genesis_validators_root, root);
         assert_eq!(orch_config.shutdown_timeout, Duration::from_secs(30));
@@ -1858,7 +2023,8 @@ mod tests {
             ..create_minimal_config()
         };
         let builder = ServiceBuilder::new(config);
-        let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        let orch_config =
+            builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule()).expect("timing");
         assert_eq!(orch_config.deadline_schedule.pre_gloas.attestation, 2500);
         assert_eq!(orch_config.deadline_schedule.pre_gloas.aggregate, 4000);
     }
@@ -1870,7 +2036,8 @@ mod tests {
             ..create_minimal_config()
         };
         let builder = ServiceBuilder::new(config);
-        let orch_config = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        let orch_config =
+            builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule()).expect("timing");
         assert_eq!(orch_config.deadline_schedule.gloas.payload, 1234);
         assert_eq!(
             timing::due_ms(orch_config.deadline_schedule.gloas.payload, 12_000),
@@ -1895,7 +2062,8 @@ mod tests {
         };
         let builder = ServiceBuilder::new(config);
         let clock = builder.build_slot_clock(12_000).unwrap();
-        let orch = builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule());
+        let orch =
+            builder.build_orchestrator_config([0xaa; 32], sample_fork_schedule()).expect("timing");
         assert_eq!(clock.deadlines().attestation, 3333);
         assert_eq!(clock.deadlines().aggregate, 6667);
         assert_eq!(orch.deadline_schedule.pre_gloas.attestation, 3333);
@@ -1912,7 +2080,8 @@ mod tests {
         let root = [0xaau8; 32];
         let schedule = sample_fork_schedule();
         let defaulted = ServiceBuilder::new(create_minimal_config())
-            .build_orchestrator_config(root, schedule.clone());
+            .build_orchestrator_config(root, schedule.clone())
+            .expect("timing");
         assert_eq!(defaulted.deadline_schedule.gloas.aggregate, 5000);
         assert_eq!(timing::due_ms(defaulted.deadline_schedule.gloas.aggregate, 12_000), 6000);
 
@@ -1920,7 +2089,8 @@ mod tests {
             toml::from_str("aggregate_due_bps_gloas = 6667").expect("TOML-only override");
         let mut config = create_minimal_config();
         config.timing = timing;
-        let orch = ServiceBuilder::new(config).build_orchestrator_config(root, schedule);
+        let orch =
+            ServiceBuilder::new(config).build_orchestrator_config(root, schedule).expect("timing");
         assert_eq!(orch.deadline_schedule.gloas.aggregate, 6667);
         assert_eq!(timing::due_ms(orch.deadline_schedule.gloas.aggregate, 12_000), 8000);
         assert_eq!(orch.deadline_schedule.pre_gloas.aggregate, 6667);
@@ -1954,7 +2124,8 @@ mod tests {
         );
 
         let defaulted = ServiceBuilder::new(create_minimal_config())
-            .build_orchestrator_config(root, fork_schedule.clone());
+            .build_orchestrator_config(root, fork_schedule.clone())
+            .expect("timing");
         let default_deadline = defaulted.attestation_deadline_ms(gloas_slot, slot_duration_ms);
         let default_pre = defaulted.attestation_deadline_ms(pre_gloas_slot, slot_duration_ms);
 
@@ -1962,7 +2133,9 @@ mod tests {
             toml::from_str("attestation_due_bps_gloas = 4000").expect("TOML-only override");
         let mut config = create_minimal_config();
         config.timing = timing;
-        let orch = ServiceBuilder::new(config).build_orchestrator_config(root, fork_schedule);
+        let orch = ServiceBuilder::new(config)
+            .build_orchestrator_config(root, fork_schedule)
+            .expect("timing");
         let moved = orch.attestation_deadline_ms(gloas_slot, slot_duration_ms);
 
         assert_ne!(moved, default_deadline);
@@ -2514,7 +2687,7 @@ mod tests {
         let (_, pubkey_map) = loaded_key_manager(&builder, 1);
 
         let (enablement, machine) =
-            builder.build_signing_enablement(slashing_db, gvr, 10, &pubkey_map);
+            builder.build_signing_enablement(slashing_db, gvr, 10, &pubkey_map, false);
 
         let machine = machine.expect("doppelganger on must construct ForwardWindowMachine");
         // Same object is both the enablement and the machine handle.
@@ -2546,7 +2719,7 @@ mod tests {
         let pk = key_manager.list_public_keys()[0].clone();
 
         let (enablement, machine) =
-            builder.build_signing_enablement(slashing_db, gvr, 50, &pubkey_map);
+            builder.build_signing_enablement(slashing_db, gvr, 50, &pubkey_map, false);
         let machine = machine.expect("machine present");
 
         assert!(!enablement.is_signing_enabled(&pk));
@@ -2571,12 +2744,27 @@ mod tests {
         let pk = key_manager.list_public_keys()[0].clone();
 
         let (enablement, machine) =
-            builder.build_signing_enablement(slashing_db, gvr, 0, &pubkey_map);
+            builder.build_signing_enablement(slashing_db, gvr, 0, &pubkey_map, true);
 
         assert!(machine.is_some());
         assert!(
             enablement.is_signing_enabled(&pk),
             "epoch-0 register must immediately enable signing (pre-genesis bypass)"
+        );
+    }
+
+    #[test]
+    fn test_epoch0_without_genesis_confirmation_stays_closed() {
+        let config = create_minimal_config();
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let (key_manager, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = key_manager.list_public_keys()[0].clone();
+        let (enablement, _) =
+            builder.build_signing_enablement(slashing_db, [0x33u8; 32], 0, &pubkey_map, false);
+        assert!(
+            !enablement.is_signing_enabled(&pk),
+            "epoch 0 without a confirmed genesis must not mark keys Safe"
         );
     }
 
@@ -2591,7 +2779,7 @@ mod tests {
         let pk = key_manager.list_public_keys()[0].clone();
 
         let (enablement, machine) =
-            builder.build_signing_enablement(slashing_db, gvr, 99, &pubkey_map);
+            builder.build_signing_enablement(slashing_db, gvr, 99, &pubkey_map, false);
 
         assert!(machine.is_none(), "opt-out must not construct ForwardWindowMachine");
         assert!(
@@ -2675,9 +2863,11 @@ mod tests {
     #[test]
     fn doppelganger_import_window_is_two_spec_epochs() {
         assert_eq!(
-            doppelganger_import_window().as_secs(),
+            doppelganger_import_window(SLOT_DURATION_MS).as_secs(),
             DEFAULT_MONITORING_EPOCHS * SLOTS_PER_EPOCH * SLOT_DURATION_MS / 1000
         );
+        assert_eq!(doppelganger_import_window(6_000).as_secs(), 384);
+        assert_eq!(doppelganger_import_window(12_000).as_secs(), 768);
     }
 
     // ── #626: unfinished import must not take the boot bypass ──────────────
@@ -2832,8 +3022,13 @@ mod tests {
         }
         let pubkey_map = map_of(&[pk_import.clone(), pk_normal.clone(), pk_disabled.clone()]);
         let builder = builder_for(&paths, true);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let composite = composite_with(vec![sk_import, sk_normal, sk_disabled]);
         let (signer, _quiesce) = builder.build_signer(composite, db, enablement);
@@ -2894,8 +3089,13 @@ mod tests {
         seed_recent_attestation(&db, &pk_normal, &gvr);
         let pubkey_map = map_of(&[pk_import.clone(), pk_normal.clone()]);
         let builder = builder_for(&paths, false);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) =
             builder.build_signer(composite_with(vec![sk_import, sk_normal]), db, enablement);
@@ -2921,7 +3121,8 @@ mod tests {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, true);
-        let (_enablement, machine) = builder.build_signing_enablement(db, gvr, 0, &pubkey_map);
+        let (_enablement, machine) =
+            builder.build_signing_enablement(db, gvr, 0, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         assert_eq!(
             machine.status(&pk),
@@ -2944,7 +3145,7 @@ mod tests {
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, false);
         let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, 0, &pubkey_map);
+            builder.build_signing_enablement(Arc::clone(&db), gvr, 0, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(
@@ -2970,8 +3171,13 @@ mod tests {
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, false);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
@@ -2994,8 +3200,13 @@ mod tests {
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, false);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
@@ -3031,7 +3242,7 @@ mod tests {
         let pubkey_map = map_of(&[pk_import.clone(), pk_normal.clone()]);
         let builder = builder_for(&paths, true);
         let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map);
+            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) =
             builder.build_signer(composite_with(vec![sk_import, sk_normal]), db, enablement);
@@ -3160,8 +3371,13 @@ mod tests {
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, false);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(
@@ -3202,7 +3418,7 @@ mod tests {
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, true);
         let (_enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map);
+            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
 
@@ -3215,7 +3431,7 @@ mod tests {
         assert!(!sidecar.exists(), "Safe observation must remove the unfinished marker");
 
         let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map);
+            builder.build_signing_enablement(Arc::clone(&db), gvr, BOOT_EPOCH, &pubkey_map, false);
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(
@@ -3237,8 +3453,13 @@ mod tests {
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
         let builder = builder_for(&paths, true);
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
@@ -3263,8 +3484,13 @@ mod tests {
         let db = Arc::new(SlashingDb::open_in_memory().unwrap());
         seed_recent_attestation(&db, &pk, &gvr);
         let pubkey_map = map_of(std::slice::from_ref(&pk));
-        let (enablement, machine) =
-            builder.build_signing_enablement(Arc::clone(&db), gvr, RESTART_EPOCH, &pubkey_map);
+        let (enablement, machine) = builder.build_signing_enablement(
+            Arc::clone(&db),
+            gvr,
+            RESTART_EPOCH,
+            &pubkey_map,
+            false,
+        );
         let machine = machine.expect("doppelganger on");
         let (signer, _quiesce) = builder.build_signer(composite_with(vec![sk]), db, enablement);
         assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);

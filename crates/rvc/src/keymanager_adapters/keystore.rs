@@ -127,7 +127,7 @@ impl KeystoreManagerAdapter {
             Arc::new(ValidatorStore::new([0u8; 20], 30_000_000)),
             default_denylist,
             None,
-            Arc::new(MonotonicEpochClock::new(0)),
+            Arc::new(MonotonicEpochClock::new(0, 12_000)),
         ));
         Self {
             keystore_dir,

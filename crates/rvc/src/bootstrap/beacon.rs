@@ -31,6 +31,16 @@ pub struct BeaconHandles {
     pub genesis_validators_root_hex: String,
     /// Genesis Unix time from config/network preset (slot/epoch clock anchor).
     pub genesis_time: u64,
+    /// Slot length in milliseconds, resolved once from the beacon node spec.
+    ///
+    /// Doppelganger, liveness, exit, and payload timing share this value.
+    /// A missing, zero, conflicting, out-of-range, or cross-node-disagreement
+    /// spec fails [`connect_beacon`] rather than assuming 12 seconds.
+    pub slot_duration_ms: u64,
+    /// True only on a named network whose responding BNs matched the preset
+    /// genesis. Custom stays false: those BNs also supply the slot duration,
+    /// and an inflated duration can hold the clock at epoch 0.
+    pub genesis_confirmed: bool,
 }
 
 /// Create the beacon client and BnManager, parse GVR once, validate against the
@@ -95,6 +105,18 @@ pub async fn connect_beacon(
         }
     };
 
+    // One resolution for every later clock. Do not fall back to 12 s.
+    // Responding BNs must agree. A named network skips an unreachable BN
+    // and must match its preset. Custom requires every configured BN.
+    let (slot_duration_ms, genesis_confirmed) =
+        match builder.resolve_slot_duration_ms(bn_manager.as_ref()).await {
+            Ok(resolved) => resolved,
+            Err(e) => {
+                error!("Failed to resolve slot duration from beacon node: {}", e);
+                return Err(e.into());
+            }
+        };
+
     // Step 5: Check beacon reachability
     startup::check_beacon_reachability(bn_manager.as_ref()).await;
 
@@ -110,6 +132,8 @@ pub async fn connect_beacon(
         genesis_validators_root,
         genesis_validators_root_hex,
         genesis_time,
+        slot_duration_ms,
+        genesis_confirmed,
     })
 }
 
@@ -154,6 +178,31 @@ mod tests {
             .await;
     }
 
+    async fn mount_spec(server: &MockServer, data: serde_json::Value) {
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": data
+            })))
+            .mount(server)
+            .await;
+    }
+
+    fn expect_err(result: Result<BeaconHandles, BootstrapError>, what: &str) -> BootstrapError {
+        match result {
+            Ok(_) => panic!("{what}"),
+            Err(err) => err,
+        }
+    }
+
+    async fn mount_spec_status(server: &MockServer, status: u16) {
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(status).set_body_string("unavailable"))
+            .mount(server)
+            .await;
+    }
+
     async fn mount_version(server: &MockServer, status: u16) {
         let template = if status == 200 {
             ResponseTemplate::new(200)
@@ -172,6 +221,11 @@ mod tests {
     async fn test_connect_beacon_parses_gvr_once_into_bytes_and_hex() {
         let server = MockServer::start().await;
         mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec(
+            &server,
+            serde_json::json!({ "SLOT_DURATION_MS": "12000", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
         mount_version(&server, 200).await;
 
         let dir = TempDir::new().unwrap();
@@ -194,6 +248,7 @@ mod tests {
             format!("0x{}", hex::encode(handles.genesis_validators_root))
         );
         assert_eq!(handles.genesis_time, NetworkPreset::MAINNET.genesis_time);
+        assert_eq!(handles.slot_duration_ms, 12_000);
         // Clients constructed and usable
         let _ = handles.beacon_client;
         let _ = handles.bn_manager;
@@ -254,6 +309,11 @@ mod tests {
     async fn test_connect_beacon_version_log_is_non_fatal_on_error() {
         let server = MockServer::start().await;
         mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec(
+            &server,
+            serde_json::json!({ "SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
         // Version endpoint fails; connect_beacon must still succeed.
         mount_version(&server, 500).await;
 
@@ -266,5 +326,336 @@ mod tests {
             .await
             .expect("version failure must be non-fatal");
         assert_eq!(handles.genesis_validators_root_hex, MAINNET_GVR.to_lowercase());
+        assert_eq!(handles.slot_duration_ms, 12_000);
+        assert!(handles.genesis_confirmed);
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_six_second_duration_on_named_network() {
+        let server = MockServer::start().await;
+        mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec(
+            &server,
+            serde_json::json!({ "SLOT_DURATION_MS": "6000", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
+        mount_version(&server, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let config = mainnet_config(&server.uri(), &db_path);
+
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "named network must match the preset duration",
+        );
+        assert!(err.to_string().contains("preset"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_custom_network_accepts_six_second_duration() {
+        let server = MockServer::start().await;
+        mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec(
+            &server,
+            serde_json::json!({ "SLOT_DURATION_MS": "6000", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
+        mount_version(&server, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let mut config = mainnet_config(&server.uri(), &db_path);
+        config.network = crate::config::Network::Custom;
+        config.genesis_validators_root = Some(MAINNET_GVR.to_string());
+        config.genesis_time = Some(NetworkPreset::MAINNET.genesis_time);
+
+        let handles = connect_beacon(&config, OperationTimeouts::default(), &db)
+            .await
+            .expect("custom network accepts a bounded 6 s duration");
+        assert_eq!(handles.slot_duration_ms, 6_000);
+        assert!(
+            !handles.genesis_confirmed,
+            "custom duration is not an independent genesis confirmation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_huge_slot_duration() {
+        let server = MockServer::start().await;
+        mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec(
+            &server,
+            serde_json::json!({ "SLOT_DURATION_MS": "86400000", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
+        mount_version(&server, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let config = mainnet_config(&server.uri(), &db_path);
+
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "huge duration must fail closed",
+        );
+        assert!(err.to_string().contains("outside"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_disagreeing_slot_duration() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        mount_genesis(&first, MAINNET_GVR).await;
+        mount_genesis(&second, MAINNET_GVR).await;
+        mount_spec(
+            &first,
+            serde_json::json!({ "SLOT_DURATION_MS": "12000", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
+        mount_spec(
+            &second,
+            serde_json::json!({ "SLOT_DURATION_MS": "6000", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
+        mount_version(&first, 200).await;
+        mount_version(&second, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let mut config = mainnet_config(&first.uri(), &db_path);
+        config.beacon_nodes = vec![first.uri(), second.uri()];
+
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "disagreeing durations must fail closed",
+        );
+        assert!(err.to_string().contains("disagree"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_slots_per_epoch_other_than_preset() {
+        let server = MockServer::start().await;
+        mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec(
+            &server,
+            serde_json::json!({ "SLOT_DURATION_MS": "12000", "SLOTS_PER_EPOCH": "16" }),
+        )
+        .await;
+        mount_version(&server, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let config = mainnet_config(&server.uri(), &db_path);
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "SLOTS_PER_EPOCH must match the preset",
+        );
+        assert!(err.to_string().contains("SLOTS_PER_EPOCH"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_disagreeing_genesis_time() {
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        mount_genesis(&first, MAINNET_GVR).await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "genesis_time": "1",
+                    "genesis_validators_root": MAINNET_GVR,
+                    "genesis_fork_version": "0x00000000"
+                }
+            })))
+            .mount(&second)
+            .await;
+        let spec = serde_json::json!({ "SLOT_DURATION_MS": "12000", "SLOTS_PER_EPOCH": "32" });
+        mount_spec(&first, spec.clone()).await;
+        mount_spec(&second, spec).await;
+        mount_version(&first, 200).await;
+        mount_version(&second, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let mut config = mainnet_config(&first.uri(), &db_path);
+        config.beacon_nodes = vec![first.uri(), second.uri()];
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "genesis times must agree",
+        );
+        assert!(err.to_string().contains("genesis_time"), "{err}");
+    }
+
+    /// Responders agree with each other, but not with the configured genesis.
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_genesis_time_that_is_not_configured() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": {
+                    "genesis_time": "1",
+                    "genesis_validators_root": MAINNET_GVR,
+                    "genesis_fork_version": "0x00000000"
+                }
+            })))
+            .mount(&server)
+            .await;
+        mount_spec(
+            &server,
+            serde_json::json!({ "SLOT_DURATION_MS": "12000", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
+        mount_version(&server, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let config = mainnet_config(&server.uri(), &db_path);
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "BN genesis must match the configured genesis",
+        );
+        assert!(err.to_string().contains("configured"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_named_network_skips_unreachable_bn() {
+        let live = MockServer::start().await;
+        mount_genesis(&live, MAINNET_GVR).await;
+        mount_spec(
+            &live,
+            serde_json::json!({ "SLOT_DURATION_MS": "12000", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
+        mount_version(&live, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let mut config = mainnet_config(&live.uri(), &db_path);
+        config.beacon_nodes = vec!["http://127.0.0.1:1".to_string(), live.uri()];
+
+        let handles = connect_beacon(&config, OperationTimeouts::default(), &db)
+            .await
+            .expect("one unreachable BN must not block a named network");
+        assert_eq!(handles.slot_duration_ms, 12_000);
+        assert!(handles.genesis_confirmed);
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_custom_requires_every_bn() {
+        let live = MockServer::start().await;
+        mount_genesis(&live, MAINNET_GVR).await;
+        mount_spec(
+            &live,
+            serde_json::json!({ "SLOT_DURATION_MS": "6000", "SLOTS_PER_EPOCH": "32" }),
+        )
+        .await;
+        mount_version(&live, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let mut config = mainnet_config(&live.uri(), &db_path);
+        config.network = crate::config::Network::Custom;
+        config.genesis_validators_root = Some(MAINNET_GVR.to_string());
+        config.genesis_time = Some(NetworkPreset::MAINNET.genesis_time);
+        config.beacon_nodes = vec!["http://127.0.0.1:1".to_string(), live.uri()];
+
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "custom must fail when a configured BN does not respond",
+        );
+        assert!(err.to_string().contains("HTTP request failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_spec_without_slot_duration() {
+        let server = MockServer::start().await;
+        mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec(&server, serde_json::json!({ "SLOTS_PER_EPOCH": "32" })).await;
+        mount_version(&server, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let config = mainnet_config(&server.uri(), &db_path);
+
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "missing duration must fail closed",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("SLOT_DURATION_MS") || msg.contains("SECONDS_PER_SLOT"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_conflicting_slot_duration() {
+        let server = MockServer::start().await;
+        mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec(
+            &server,
+            serde_json::json!({ "SLOT_DURATION_MS": "6000", "SECONDS_PER_SLOT": "12" }),
+        )
+        .await;
+        mount_version(&server, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let config = mainnet_config(&server.uri(), &db_path);
+
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "conflicting keys must fail closed",
+        );
+        assert!(err.to_string().contains("conflicting"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_zero_slot_duration() {
+        let server = MockServer::start().await;
+        mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec(&server, serde_json::json!({ "SLOT_DURATION_MS": "0" })).await;
+        mount_version(&server, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let config = mainnet_config(&server.uri(), &db_path);
+
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "zero duration must fail closed",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("greater than zero"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_connect_beacon_rejects_spec_http_error() {
+        let server = MockServer::start().await;
+        mount_genesis(&server, MAINNET_GVR).await;
+        mount_spec_status(&server, 404).await;
+        mount_version(&server, 200).await;
+
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("slashing.db");
+        let db = SlashingDb::open(&db_path).unwrap();
+        let config = mainnet_config(&server.uri(), &db_path);
+
+        let err = expect_err(
+            connect_beacon(&config, OperationTimeouts::default(), &db).await,
+            "spec 404 must fail closed",
+        );
+        assert!(!err.to_string().is_empty());
     }
 }
