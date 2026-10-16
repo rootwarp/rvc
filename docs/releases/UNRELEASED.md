@@ -5,30 +5,54 @@ are folded into `docs/releases/vX.Y.Z.md` at release time.
 
 ## Block production: a slow beacon node no longer drops a block already in hand
 
-`produce_block_v3` returns the blocks that have arrived by half the
-block-production budget and that match the duty's slot, proposer, parent,
-consensus version, and, on a full block, the fee recipient. A block that
-fails those checks does not close
-that window. Ranking adds the execution payload value and the consensus
+`produce_block_v3` treats a block as in hand only when it passes the hard
+checks and carries the expected fee recipient. The hard checks are the duty's
+slot, proposer, parent, and consensus version. A full block from Bellatrix on
+is also rejected when its fee is missing, invalid, or present only on a
+builder header. A blinded block is not: the builder header's fee is the
+builder's. Before Bellatrix a missing fee is still accepted. A block that
+fails a hard check does not close the soft window (half the block-production
+budget). The rejection is logged with the beacon-node index and the expected
+and actual slot, proposer, parent, fork, fee recipient, and value parse. A
+rejection that arrives after the call has already returned is logged the same
+way.
+
+A readable fee that does not match is a penalty when `fee_recipient_policy`
+is `sign` (the default). It does not close the soft window and it does not
+stop the unsynced fallback. It is signed only after every selected beacon
+node has answered or the hard deadline (the budget) passes, and only when no
+fee-matching block is in hand. The warning names the beacon-node index and is
+emitted only for the block that is signed. That win increments
+`rvc_produce_block_fee_recipient_penalty_total`. `fee_recipient_policy =
+"reject"` drops a readable mismatch instead, and that drop is not counted.
+
+Ranking within a fee class adds the execution payload value and the consensus
 block value. Each value has to be a whole decimal number; a value that does
-not parse, or a sum that overflows, does not win. If none have been accepted,
-it returns the first matching block that arrives before the budget. A node
-still in flight is finished afterwards, and a timeout is recorded as an
-error on that node. Recording that sample does not delay the block already
-in hand.
+not parse, or a sum that overflows, does not win. If a fee-matching block is
+in hand by the soft window, that block is returned. A node still in flight is
+finished afterwards, and a timeout is recorded as an error on that node.
+Recording that sample does not delay the block already in hand. Once any
+signable block is held, including a fee-penalized one, it is returned 50 ms
+before the outer backstop (the budget plus 250 ms), so a beacon node that
+never answers cannot turn it into an operation timeout.
+
+`prepare_beacon_proposer` and `register_validator` run on their own task from
+startup, including before genesis (epoch 0), with no builder jitter. A
+failure retries once per slot until both succeed. A slow beacon node on that
+task does not hold the slot loop. The epoch-boundary send still runs after
+that slot's proposal.
 
 If every synced proposal node fails or misses the budget, another
 proposal-role node is tried only when it is still above the health floor
 (small lag or better, healthy, not optimistic, and execution online) and the
-expected parent root is known. Its block has to match that parent. From
-Bellatrix on, a full block has to carry the duty's fee recipient. A missing
-fee recipient is rejected, and a full SSZ block whose fee recipient cannot
-be read is rejected. A blinded block keeps the builder header's fee
-recipient. The attempt stays inside the time
-left in the backstop (the budget plus 250 ms). The block-proposal deadline
-includes that same 250 ms, so publishing is not shortened by it. A
-block-production budget of zero is treated as no budget. With no budget
-configured, block production still waits for every selected beacon node.
+expected parent root is known. Its block has to match that parent. A readable
+fee mismatch is kept only when no fee-matching block is available. A blinded
+block keeps the builder header's fee recipient. The attempt stays inside the
+time left in the backstop, and ends 50 ms early once a block is held. The
+block-proposal deadline includes that same 250 ms, so publishing is not
+shortened by it. A block-production budget of zero is treated as no budget.
+With no budget configured, block production still waits for every selected
+beacon node.
 
 ## Beacon node broadcast: the first complete acceptance completes the call
 

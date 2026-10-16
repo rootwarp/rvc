@@ -270,7 +270,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/mod.rs",
-        1487,
+        1590,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -579,7 +579,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/bn-manager/src/manager.rs",
-        1860,
+        2232,
         Class::StringDispatch,
         true,
         "match consensus_version {",

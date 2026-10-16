@@ -36,8 +36,8 @@ pub use submit::{
 pub use sync_status::{BnSyncDetail, BnSyncStatus, SharedSyncStatuses};
 pub use traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, BnHealthScore, BnManagerConfig,
-    BroadcastTopics, DutiesProvider, LivenessApi, NodeStatusApi, OperationTimeouts,
-    PayloadAttestationApi, ProduceDuty, SyncCommitteeApi,
+    BroadcastTopics, DutiesProvider, FeeRecipientPolicy, LivenessApi, NodeStatusApi,
+    OperationTimeouts, PayloadAttestationApi, ProduceDuty, SyncCommitteeApi,
 };
 pub use types::{BnRole, HealthTier, TierThresholds};
 

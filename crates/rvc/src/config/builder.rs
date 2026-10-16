@@ -510,6 +510,7 @@ impl ServiceBuilder {
         let mut config =
             BnManagerConfig::new(endpoints).with_max_body_bytes(self.config.beacon_max_body_bytes);
         config.broadcast_topics = self.config.effective_broadcast_topics();
+        config.fee_recipient_policy = self.config.fee_recipient_policy;
         config
     }
 
@@ -1745,6 +1746,22 @@ mod tests {
 
         let proposer_cfg = builder.pool_bn_manager_config(vec!["http://proposer:5052".to_string()]);
         assert_eq!(proposer_cfg.broadcast_topics, expected);
+    }
+
+    /// Both pools sign or reject a readable fee mismatch together.
+    #[test]
+    fn test_pool_bn_manager_config_forwards_fee_recipient_policy() {
+        let config = Config {
+            fee_recipient_policy: bn_manager::FeeRecipientPolicy::Reject,
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+
+        let main_cfg = builder.pool_bn_manager_config(vec!["http://main:5052".to_string()]);
+        assert_eq!(main_cfg.fee_recipient_policy, bn_manager::FeeRecipientPolicy::Reject);
+
+        let proposer_cfg = builder.pool_bn_manager_config(vec!["http://proposer:5052".to_string()]);
+        assert_eq!(proposer_cfg.fee_recipient_policy, bn_manager::FeeRecipientPolicy::Reject);
     }
 
     /// End-to-end: `build_bn_manager` applies the operator body cap to clients.

@@ -1444,3 +1444,336 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
         );
     }
 }
+
+/// Records `produce` so a startup test can see the first proposer duty.
+///
+/// Slot 2 is not an epoch boundary, so the post-duty epoch-boundary path does
+/// not send `prepare_beacon_proposer` before that proposal. Startup
+/// preparation runs on its own task and can overlap the proposal.
+struct StartupOrderBlockBeacon {
+    log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+#[async_trait]
+impl BeaconBlockClient for StartupOrderBlockBeacon {
+    async fn produce_block_v3(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_boost_factor: Option<u64>,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        self.log.lock().expect("order log").push("produce");
+        Ok(ProduceBlockResponse {
+            data: serde_json::json!({
+                "slot": "2",
+                "proposer_index": "7",
+                "parent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "state_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "body": {}
+            }),
+            is_blinded: false,
+            consensus_version: "phase0".to_string(),
+            execution_payload_value: Some("1".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        })
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("produce_block_v4 not configured".into()))
+    }
+
+    async fn publish_block(
+        &self,
+        _signed_block: &eth_types::SignedBeaconBlock,
+        _consensus_version: &str,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Ok(())
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        _signed_block: &eth_types::SignedBlindedBeaconBlock,
+        _consensus_version: &str,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Ok(())
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        _ssz_bytes: &[u8],
+        _consensus_version: &str,
+        _is_blinded: bool,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Ok(())
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &WireBody,
+        _blobs: &WireBody,
+        _kzg_proofs: &WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        Ok(())
+    }
+}
+
+struct StartupFeeRun {
+    mock: Arc<bn_manager::MockBeaconNodeClient>,
+    clock: Arc<MockSlotClock>,
+    log: Arc<std::sync::Mutex<Vec<&'static str>>>,
+    handle: OrchestratorHandle,
+    run: tokio::task::JoinHandle<Result<(), super::super::OrchestratorError>>,
+}
+
+fn fee_hex(fee: &[u8; 20]) -> String {
+    format!("0x{}", hex::encode(fee))
+}
+
+/// Local validator index 7, default fee `0xff`, slot 2 (not an epoch boundary).
+async fn spawn_startup_fee_run(
+    mock: bn_manager::MockBeaconNodeClient,
+    clock: Arc<MockSlotClock>,
+    timeouts: OperationTimeouts,
+    seed_duty: bool,
+) -> StartupFeeRun {
+    use signer::ValidatorSigner;
+    use validator_store::{BlockSelectionMode, ValidatorConfig};
+
+    let log = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let local = SecretKey::generate();
+    let local_pk = local.public_key().to_bytes();
+    let local_hex = pubkey_hex(&local_pk);
+    let slot: Slot = 2;
+    let epoch = slot / ::timing::SLOTS_PER_EPOCH;
+
+    let mock = mock.with_get_proposer_duties(move |e| {
+        if e == epoch && seed_duty {
+            Ok(beacon::DependentRootResponse {
+                dependent_root: ZERO_DEPENDENT_ROOT.to_string(),
+                execution_optimistic: false,
+                data: vec![proposer_duty(&local_hex, "7", slot)],
+            })
+        } else {
+            Ok(empty_dependent())
+        }
+    });
+    let mock = Arc::new(mock);
+    let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+
+    let mut key_manager = KeyManager::new();
+    key_manager.insert(local);
+    let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
+    let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+    let signer =
+        Arc::new(SignerService::new(composite, slashing_db).with_enablement(always_enabled()));
+
+    let validator_store = Arc::new(ValidatorStore::new([0xffu8; 20], 30_000_000));
+    let mut cfg = ValidatorConfig::new(local_pk);
+    cfg.builder_proposals = true;
+    validator_store.add_validator(cfg).unwrap();
+    validator_store.set_global_block_selection_mode(BlockSelectionMode::ExecutionOnly);
+
+    let schedule = create_test_fork_schedule();
+    let vs: Arc<dyn ValidatorSigner> = signer.clone();
+    let builder_service = Some(Arc::new(BuilderService::new(
+        Arc::new(vs),
+        Arc::new(beacon.clone()),
+        validator_store.clone(),
+        schedule.genesis_fork_version,
+        schedule.clone(),
+    )));
+
+    let duty_tracker = Arc::new(DutyTracker::new(mock.clone(), vec!["7".to_string()]));
+    if seed_duty {
+        duty_tracker.fetch_proposer_duties(epoch).await.expect("seed proposer duty");
+    }
+
+    let mut pubkey_map_inner = HashMap::new();
+    pubkey_map_inner.insert(local_pk, local_pk_public(&local_pk));
+    let pubkey_map = Arc::new(parking_lot::RwLock::new(pubkey_map_inner));
+    let config = OrchestratorConfig::new([0xaau8; 32], schedule).with_timeouts(timeouts);
+    let deps = OrchestratorDeps::for_test(
+        Arc::clone(&clock),
+        duty_tracker,
+        signer,
+        Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+        beacon,
+        Arc::new(StartupOrderBlockBeacon { log: Arc::clone(&log) }),
+        builder_service,
+        validator_store,
+        config,
+        pubkey_map,
+    );
+    deps.pubkey_index.write().insert(local_pk, "7".to_string());
+    let (mut orchestrator, handle) = DutyOrchestrator::new(deps);
+    let run = tokio::spawn(async move { orchestrator.run().await });
+    StartupFeeRun { mock, clock, log, handle, run }
+}
+
+async fn shutdown_startup_fee_run(started: StartupFeeRun) {
+    started.handle.shutdown();
+    let _ = tokio::time::timeout(Duration::from_millis(500), started.run).await;
+}
+
+#[tokio::test]
+async fn test_prepare_and_register_payloads_at_startup() {
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    clock.advance_time(9);
+    let started =
+        spawn_startup_fee_run(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), true)
+            .await;
+
+    let ready = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let produced = started.log.lock().expect("order log").contains(&"produce");
+            let prepared = !started.mock.prepare_beacon_proposer_calls().is_empty();
+            let registered = !started.mock.register_validators_calls().is_empty();
+            if produced && prepared && registered {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let prepares = started.mock.prepare_beacon_proposer_calls();
+    let registers = started.mock.register_validators_calls();
+    shutdown_startup_fee_run(started).await;
+
+    assert!(ready.is_ok(), "startup prepare, register, and the proposer duty must run");
+    let fee = fee_hex(&[0xff; 20]);
+    assert_eq!(prepares[0].len(), 1);
+    assert_eq!(prepares[0][0].validator_index, "7");
+    assert_eq!(prepares[0][0].fee_recipient, fee);
+    assert_eq!(registers[0][0].message.fee_recipient, [0xff; 20]);
+}
+
+#[tokio::test]
+async fn test_startup_preparation_retries_a_failed_prepare_next_slot() {
+    use beacon::BeaconError;
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let attempts_hook = Arc::clone(&attempts);
+    let mock = retirement_beacon_base().with_prepare_beacon_proposer(move |_preparations| {
+        if attempts_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+            Err(BeaconError::ApiError { status: 500, message: "unavailable".into() })
+        } else {
+            Ok(())
+        }
+    });
+    // 100 ms left in slot 2, so the per-slot retry is short.
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot_with_offset_ms(2, 11_900);
+    let started = spawn_startup_fee_run(mock, Arc::clone(&clock), fast_timeouts(), false).await;
+
+    let ready = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if started.mock.prepare_beacon_proposer_calls().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let calls = started.mock.prepare_beacon_proposer_calls().len();
+    shutdown_startup_fee_run(started).await;
+
+    assert!(ready.is_ok(), "a failed prepare must be retried within 2s; calls={calls}");
+    assert!(calls >= 2, "startup must POST prepare again after the first failure; calls={calls}");
+    assert!(attempts.load(Ordering::SeqCst) >= 2);
+}
+
+#[tokio::test]
+async fn test_startup_preparation_uses_epoch_zero_before_genesis() {
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    let genesis_ms = TEST_GENESIS_TIME.saturating_mul(1000);
+    clock.set_current_time_ms(genesis_ms - 50);
+    assert!(
+        matches!(clock.current_slot(), Err(::timing::TimingError::BeforeGenesis { .. })),
+        "fixture must still be before genesis"
+    );
+    let started =
+        spawn_startup_fee_run(retirement_beacon_base(), Arc::clone(&clock), fast_timeouts(), false)
+            .await;
+
+    let ready = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if !started.mock.prepare_beacon_proposer_calls().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let prepares = started.mock.prepare_beacon_proposer_calls();
+    let still_before =
+        matches!(started.clock.current_slot(), Err(::timing::TimingError::BeforeGenesis { .. }));
+    shutdown_startup_fee_run(started).await;
+
+    assert!(ready.is_ok(), "prepare_beacon_proposer must run before genesis");
+    assert!(still_before, "the clock must still be before genesis when prepare is sent");
+    assert_eq!(prepares[0][0].validator_index, "7");
+    assert_eq!(prepares[0][0].fee_recipient, fee_hex(&[0xff; 20]));
+}
+
+#[tokio::test]
+async fn test_startup_preparation_does_not_block_the_proposer_duty() {
+    use bn_manager::MockMethod;
+
+    let mock = retirement_beacon_base()
+        .with_method_delay(MockMethod::PrepareBeaconProposer, Duration::from_secs(5));
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    clock.advance_time(9);
+    let mut timeouts = fast_timeouts();
+    // Longer than the wait below, so the timed wrapper does not cancel the
+    // in-flight prepare and hide a blocked slot loop.
+    timeouts.preparation = Duration::from_secs(5);
+    let started = spawn_startup_fee_run(mock, clock, timeouts, true).await;
+
+    let ready = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let produced = started.log.lock().expect("order log").contains(&"produce");
+            let arrived = started
+                .mock
+                .call_stamps()
+                .iter()
+                .any(|stamp| stamp.method == MockMethod::PrepareBeaconProposer);
+            if produced && arrived {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    let prepare_finished = !started.mock.prepare_beacon_proposer_calls().is_empty();
+    shutdown_startup_fee_run(started).await;
+
+    assert!(
+        ready.is_ok(),
+        "the proposer duty must run while prepare_beacon_proposer is still in flight"
+    );
+    assert!(
+        !prepare_finished,
+        "prepare must still be sleeping when the proposer duty has already run"
+    );
+}
+
+fn local_pk_public(bytes: &[u8; 48]) -> PublicKey {
+    PublicKey::from_bytes(bytes).expect("pubkey bytes")
+}
