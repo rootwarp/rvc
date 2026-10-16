@@ -6,13 +6,16 @@
 crates/beacon/src/types.rs:generic-api-key:1403
 crates/beacon/src/types.rs:generic-api-key:940
 crates/crypto/examples/log_sample.rs:generic-api-key:27
-crates/crypto/src/key_manager.rs:generic-api-key:452
-crates/crypto/src/key_manager.rs:generic-api-key:704
-crates/crypto/src/key_manager.rs:generic-api-key:994
+# Same test keystore pubkeys. Lines moved 452 → 522, 704 → 774, and 994 → 1064
+# when the password-map key and load report were added (#644).
+crates/crypto/src/key_manager.rs:generic-api-key:522
+crates/crypto/src/key_manager.rs:generic-api-key:774
+crates/crypto/src/key_manager.rs:generic-api-key:1064
 # Same EIP-2335 test-vector pubkeys. Lines moved +8 when the cheap-KDF
-# helpers gained the test-utils cfg (#602).
-crates/crypto/src/keystore.rs:generic-api-key:590
-crates/crypto/src/keystore.rs:generic-api-key:624
+# helpers gained the test-utils cfg (#602), then 590 → 594 and 624 → 628
+# when `Keystore::validate` was made public (#644).
+crates/crypto/src/keystore.rs:generic-api-key:594
+crates/crypto/src/keystore.rs:generic-api-key:628
 # Same private-key stub as the 2026-09-29 baseline; the line moved 1356 → 1392,
 # then 1392 → 1396 when build_endpoint installed the rustls ring provider (#612).
 crates/grpc-signer/src/client.rs:private-key:1396
@@ -50,7 +53,8 @@ crates/slashing/src/types.rs:generic-api-key:457
 crates/slashing/src/types.rs:generic-api-key:531
 crates/telemetry/src/format.rs:generic-api-key:450
 crates/telemetry/src/format.rs:generic-api-key:771
-docs/running-guide.md:generic-api-key:534
+# Line moved +8 when the password-resolution list gained import secrets (#644).
+docs/running-guide.md:generic-api-key:542
 docs/validators-config.md:generic-api-key:178
 docs/validators-config.md:generic-api-key:57
 plan/logging/OPERATOR_GUIDE.md:generic-api-key:365

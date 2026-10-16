@@ -112,9 +112,9 @@ Import one or more keystores. Slashing protection data is imported first, before
 
 | Status | Meaning |
 |--------|---------|
-| `imported` | Key successfully imported and activated |
+| `imported` | Key successfully imported and activated. The password is stored mode `0600` in `<keystore_dir>/.rvc.keymanager-secrets/` (directory mode `0700`) and is loaded on the next start, ahead of `--password-file`. |
 | `duplicate` | Key already exists |
-| `error` | Import failed |
+| `error` | Import failed. A missing, non-lowercase, `0x`-prefixed, or mismatched `pubkey` field is reported by name and writes nothing. |
 
 ---
 
@@ -145,7 +145,7 @@ Delete one or more local keystores. Slashing protection is exported before delet
 
 | Status | Meaning |
 |--------|---------|
-| `deleted` | Key deleted and deactivated |
+| `deleted` | Key deleted and deactivated. The persisted import password is removed with the keystore. |
 | `not_active` | Key exists but is not active |
 | `not_found` | Key not found |
 | `error` | Deletion failed |

@@ -177,10 +177,14 @@ pub fn map_slashing_export_error(err: SlashingProtectionError) -> ApiError {
 
 /// Map a keystore-import per-item error to a client-safe message.
 ///
-/// All variants may embed paths/errno from the backend, so they are sanitized.
+/// Backend variants may embed paths or errno, so they are sanitized.
+/// [`ImportKeystoreError::PubkeyField`] and [`ImportKeystoreError::PasswordTooLarge`]
+/// are fixed phrases.
 pub fn map_import_keystore_item_error(err: ImportKeystoreError) -> String {
     match err {
         ImportKeystoreError::DeleteInProgress => "delete in progress".into(),
+        ImportKeystoreError::PubkeyField(message) => message.to_string(),
+        ImportKeystoreError::PasswordTooLarge => "import password exceeds 4096 bytes".into(),
         other => map_backend_to_item_message(&other.to_string(), "keystore import failed"),
     }
 }

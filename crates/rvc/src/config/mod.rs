@@ -18,6 +18,7 @@ pub use knobs::OPERATOR_KNOB_NAMES;
 pub use network::Network;
 pub use rvc_config::ConfigSource;
 pub use start::{BuilderArgs, LoggingArgs, ProposerArgs, StartArgs};
+pub(crate) use types::{is_staged_import_secret_name, IMPORT_SECRET_MAX_BYTES};
 pub use types::{
     redact_url, BeaconArgs, BeaconConfig, BeaconNodeEntry, BroadcastTopic, BuilderLimits,
     BuilderLimitsArgs, BuilderSettings, Config, DutiesArgs, DutiesConfig, ForkScheduleConfig,

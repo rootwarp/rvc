@@ -89,6 +89,17 @@ pub enum ConfigError {
     #[error("failed to read password file: {0}")]
     PasswordReadError(String),
 
+    /// A persisted keymanager import password cannot be used at boot.
+    ///
+    /// `reason` is a fixed phrase. The password itself is never included.
+    #[error("import password secret at {path} is unusable: {reason}")]
+    ImportSecret {
+        /// File or directory that failed the check.
+        path: PathBuf,
+        /// Why it cannot be used. Never the password bytes.
+        reason: &'static str,
+    },
+
     #[error("key manager error: {0}")]
     KeyManagerError(#[from] crypto::KeyManagerError),
 

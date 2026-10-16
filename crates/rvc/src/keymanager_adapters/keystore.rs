@@ -71,6 +71,9 @@ pub struct KeystoreManagerAdapter {
     /// in and before `decrypt`.
     #[cfg(test)]
     during_blocking: TestHookSlot,
+    /// After the import secret is durable and before the keystore is staged.
+    #[cfg(test)]
+    after_secret_before_keystore: TestHookSlot,
     /// Import KDF admission (RR2-09/10). Decrypt runs only after [`KdfBudget::admit`].
     kdf_budget: Arc<KdfBudget>,
     /// In-flight DELETE counts. Touched only while `tracked_keys` is held.
@@ -153,6 +156,8 @@ impl KeystoreManagerAdapter {
             after_delete_unlock: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             during_blocking: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            after_secret_before_keystore: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -240,6 +245,11 @@ impl KeystoreManagerAdapter {
     #[cfg(test)]
     pub(crate) fn set_during_blocking_hook(&self, hook: TestHook) {
         *self.during_blocking.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_secret_before_keystore_hook(&self, hook: TestHook) {
+        *self.after_secret_before_keystore.lock() = Some(hook);
     }
 }
 
@@ -330,9 +340,265 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ImportKeystoreErr
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static IMPORT_SECRET_DIR_SYNC_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 fn sync_keystore_dir(dir: &Path) -> Result<(), ImportKeystoreError> {
+    #[cfg(test)]
+    if IMPORT_SECRET_DIR_SYNC_FAILS.with(|flag| flag.replace(false)) {
+        return Err(ImportKeystoreError::Io(format!(
+            "sync import secret directory {} failed",
+            dir.display()
+        )));
+    }
     let file = std::fs::File::open(dir).map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
     file.sync_all().map_err(|e| ImportKeystoreError::Io(e.to_string()))
+}
+
+fn io_import(action: &str, path: &Path, err: std::io::Error) -> ImportKeystoreError {
+    ImportKeystoreError::Io(format!("{action} {}: {err}", path.display()))
+}
+
+fn import_secrets_dir(keystore_dir: &Path) -> PathBuf {
+    keystore_dir.join(crate::config::Config::IMPORT_SECRETS_DIR)
+}
+
+fn import_secret_path(keystore_dir: &Path, pubkey: &Pubkey) -> PathBuf {
+    import_secrets_dir(keystore_dir).join(pubkey_hex(pubkey))
+}
+
+/// The keystore `pubkey` field must be the lowercase bare hex boot stores.
+fn reject_unbootable_pubkey(
+    field: Option<&str>,
+    derived: &[u8],
+) -> Result<(), ImportKeystoreError> {
+    let Some(field) = field else {
+        return Err(ImportKeystoreError::PubkeyField("missing pubkey field"));
+    };
+    let lowercase_bare = field.len() == derived.len() * 2
+        && field.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase());
+    if !lowercase_bare {
+        return Err(ImportKeystoreError::PubkeyField("pubkey field must be lowercase bare hex"));
+    }
+    let Ok(bytes) = hex::decode(field) else {
+        return Err(ImportKeystoreError::PubkeyField("pubkey field must be lowercase bare hex"));
+    };
+    if bytes.as_slice() != derived {
+        return Err(ImportKeystoreError::PubkeyField(
+            "pubkey field does not match the decrypted key",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_import_secrets_dir(keystore_dir: &Path) -> Result<PathBuf, ImportKeystoreError> {
+    let secrets_dir = import_secrets_dir(keystore_dir);
+    match std::fs::symlink_metadata(&secrets_dir) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(ImportKeystoreError::Io(format!(
+                "import secret directory {} escapes the keystore directory",
+                secrets_dir.display()
+            )));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&secrets_dir)
+                    .map_err(|e| io_import("create import secret directory", &secrets_dir, e))?;
+            }
+            #[cfg(not(unix))]
+            {
+                std::fs::create_dir(&secrets_dir)
+                    .map_err(|e| io_import("create import secret directory", &secrets_dir, e))?;
+            }
+        }
+        Err(e) => return Err(io_import("stat import secret directory", &secrets_dir, e)),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = std::fs::symlink_metadata(&secrets_dir)
+            .map_err(|e| io_import("stat import secret directory", &secrets_dir, e))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(ImportKeystoreError::Io(format!(
+                "import secret directory {} escapes the keystore directory",
+                secrets_dir.display()
+            )));
+        }
+        let mut perms = meta.permissions();
+        perms.set_mode(0o700);
+        std::fs::set_permissions(&secrets_dir, perms)
+            .map_err(|e| io_import("set import secret directory mode", &secrets_dir, e))?;
+    }
+    let base = keystore_dir
+        .canonicalize()
+        .map_err(|e| io_import("canonicalize keystore directory", keystore_dir, e))?;
+    let canonical = secrets_dir
+        .canonicalize()
+        .map_err(|e| io_import("canonicalize import secret directory", &secrets_dir, e))?;
+    if !canonical.starts_with(&base) {
+        return Err(ImportKeystoreError::Io(format!(
+            "import secret directory {} escapes the keystore directory",
+            secrets_dir.display()
+        )));
+    }
+    Ok(secrets_dir)
+}
+
+fn abandon_staged(path: &Path, err: ImportKeystoreError) -> ImportKeystoreError {
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return ImportKeystoreError::Io(format!(
+                "{err}; staged import secret could not be removed: {e}"
+            ));
+        }
+    }
+    if let Some(dir) = path.parent() {
+        if let Err(sync_err) = sync_keystore_dir(dir) {
+            return ImportKeystoreError::Io(format!("{err}; {sync_err}"));
+        }
+    }
+    err
+}
+
+fn write_new_secret_file(path: &Path, bytes: &[u8]) -> Result<(), ImportKeystoreError> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|e| io_import("create import secret", path, e))?;
+    if let Err(e) = file.write_all(bytes) {
+        return Err(abandon_staged(path, io_import("write import secret", path, e)));
+    }
+    if let Err(e) = file.sync_all() {
+        return Err(abandon_staged(path, io_import("sync import secret", path, e)));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let meta = match file.metadata() {
+            Ok(meta) => meta,
+            Err(e) => return Err(abandon_staged(path, io_import("stat import secret", path, e))),
+        };
+        let mut perms = meta.permissions();
+        perms.set_mode(0o600);
+        if let Err(e) = file.set_permissions(perms) {
+            return Err(abandon_staged(path, io_import("set import secret mode", path, e)));
+        }
+        if let Err(e) = file.sync_all() {
+            return Err(abandon_staged(path, io_import("sync import secret", path, e)));
+        }
+    }
+    Ok(())
+}
+
+fn staged_secret_path(secrets_dir: &Path, pubkey: &Pubkey) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    secrets_dir.join(format!(
+        ".{}.{}.{nanos}.keymanager-secret.partial",
+        pubkey_hex(pubkey),
+        std::process::id()
+    ))
+}
+
+fn remove_staged_secret_partials(
+    secrets_dir: &Path,
+    pubkey: &Pubkey,
+) -> Result<(), ImportKeystoreError> {
+    let prefix = format!(".{}.", pubkey_hex(pubkey));
+    let entries = match std::fs::read_dir(secrets_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(io_import("read import secret directory", secrets_dir, e)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| io_import("read import secret directory", secrets_dir, e))?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || !crate::config::is_staged_import_secret_name(name) {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io_import("remove staged import secret", &entry.path(), e)),
+        }
+    }
+    sync_keystore_dir(secrets_dir)
+}
+
+/// `create_new` a mode `0600` file, fsync it, then rename into the secrets dir.
+///
+/// `write_private_file` keeps an existing file's mode, so the secret uses its
+/// own create-new path. The secret is durable before the caller stages the
+/// keystore. A failure leaves neither the staged file nor the final secret.
+fn persist_import_secret(
+    keystore_dir: &Path,
+    pubkey: &Pubkey,
+    password: &str,
+) -> Result<(), ImportKeystoreError> {
+    let secrets_dir = ensure_import_secrets_dir(keystore_dir)?;
+    remove_staged_secret_partials(&secrets_dir, pubkey)?;
+    let final_path = secrets_dir.join(pubkey_hex(pubkey));
+    let staged = staged_secret_path(&secrets_dir, pubkey);
+    debug_assert!(
+        staged.starts_with(&secrets_dir),
+        "import secret partials are staged inside the secrets directory"
+    );
+    write_new_secret_file(&staged, password.as_bytes())?;
+    if let Err(e) = std::fs::rename(&staged, &final_path) {
+        return Err(abandon_staged(&staged, io_import("rename import secret", &final_path, e)));
+    }
+    if let Err(e) = sync_keystore_dir(&secrets_dir) {
+        return Err(abandon_staged(&final_path, e));
+    }
+    if let Err(e) = sync_keystore_dir(keystore_dir) {
+        return Err(abandon_staged(&final_path, e));
+    }
+    Ok(())
+}
+
+/// Remove the persisted import password.
+///
+/// `NotFound` for the file or the secrets directory is success. A directory
+/// open or fsync error is returned so the caller can retry while the key is
+/// still registered.
+fn remove_import_secret(keystore_dir: &Path, pubkey: &Pubkey) -> Result<(), ImportKeystoreError> {
+    let path = import_secret_path(keystore_dir, pubkey);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to remove an import password secret"
+            );
+            return Err(io_import("remove import password secret", &path, e));
+        }
+    }
+    let secrets_dir = import_secrets_dir(keystore_dir);
+    // Partials are removed before the directory fsync, so a failed import or
+    // DELETE does not leave plaintext durable in the directory.
+    remove_staged_secret_partials(&secrets_dir, pubkey)
 }
 
 /// Unlink staged and final names, then fsync the directory.
@@ -367,6 +633,10 @@ fn discard_staged_keystore(
                 );
             }
         }
+    }
+    if let Err(e) = remove_import_secret(keystore_dir, pubkey) {
+        warn!(error = %e, "failed to remove an import password secret after a failed import");
+        unlink_failed = true;
     }
     let synced = match sync_keystore_dir(keystore_dir) {
         Ok(()) => true,
@@ -408,6 +678,13 @@ fn discard_unrenamed_partials(keystore_dir: &Path, pubkey: &Pubkey) {
             }
         }
     }
+    if let Err(e) = remove_import_secret(keystore_dir, pubkey) {
+        warn!(
+            pubkey = %TruncatedPubkey::new(&hex::encode(pubkey)),
+            error = %e,
+            "failed to remove an import password secret after dropping staged partials"
+        );
+    }
     if let Err(e) = sync_keystore_dir(keystore_dir) {
         warn!(
             error = %e,
@@ -441,6 +718,7 @@ fn discard_renamed_keystore(keystore_dir: &Path, pubkey: &Pubkey) -> bool {
             }
         }
     }
+    discard_renamed_removed_secret(keystore_dir, pubkey, &mut unlink_failed);
     let synced = match sync_keystore_dir(keystore_dir) {
         Ok(()) => true,
         Err(e) => {
@@ -576,6 +854,13 @@ fn remove_matching_keystore_files(
 
     Ok(())
 }
+
+fn discard_renamed_removed_secret(keystore_dir: &Path, pubkey: &Pubkey, unlink_failed: &mut bool) {
+    if let Err(e) = remove_import_secret(keystore_dir, pubkey) {
+        warn!(error = %e, "failed to remove an import password secret after AlreadyPresent");
+        *unlink_failed = true;
+    }
+}
 /// Owned inputs for one import. The closure is `'static`, so every field is
 /// owned or an `Arc` clone. The KDF permit is *not* stored here: the
 /// `spawn_blocking` closure binds it so it cannot be dropped early.
@@ -604,6 +889,8 @@ struct ImportJob {
     after_readmit: TestHookSlot,
     #[cfg(test)]
     during_blocking: TestHookSlot,
+    #[cfg(test)]
+    after_secret_before_keystore: TestHookSlot,
     doppelganger_window_secs: u64,
 }
 
@@ -637,6 +924,8 @@ fn import_keystore_blocking(job: ImportJob) -> Result<Pubkey, ImportKeystoreErro
         after_readmit,
         #[cfg(test)]
         during_blocking,
+        #[cfg(test)]
+        after_secret_before_keystore,
         doppelganger_window_secs,
     } = job;
 
@@ -648,6 +937,7 @@ fn import_keystore_blocking(job: ImportJob) -> Result<Pubkey, ImportKeystoreErro
         .map_err(|e| ImportKeystoreError::DecryptionFailed(e.to_string()))?;
 
     let pubkey_bytes = secret_key.public_key().to_bytes();
+    reject_unbootable_pubkey(keystore.pubkey.as_deref(), &pubkey_bytes)?;
 
     // Hold lock for the entire check-and-insert to prevent TOCTOU race.
     // Duplicate check uses the real local registry (not only API-tracked keys).
@@ -660,6 +950,12 @@ fn import_keystore_blocking(job: ImportJob) -> Result<Pubkey, ImportKeystoreErro
     if delete_inflight.lock().per_key.get(&pubkey_bytes).copied().unwrap_or(0) > 0 {
         return Err(ImportKeystoreError::DeleteInProgress);
     }
+
+    // The secret is durable before the keystore is staged. A later failure
+    // removes it via `discard_staged_keystore` / `rollback_failed_keystore`.
+    persist_import_secret(&keystore_dir, &pubkey_bytes, password.as_str())?;
+    #[cfg(test)]
+    run_hook(&after_secret_before_keystore);
 
     // Stage under a non-`.json` name. Boot load only accepts `*.json`, so a
     // crash before rename cannot resurrect a key the API reported as failed.
@@ -968,10 +1264,16 @@ impl KeystoreManager for KeystoreManagerAdapter {
         keystore_json: &str,
         password: &str,
     ) -> Result<Pubkey, ImportKeystoreError> {
+        if password.len()
+            > usize::try_from(crate::config::IMPORT_SECRET_MAX_BYTES).unwrap_or(usize::MAX)
+        {
+            return Err(ImportKeystoreError::PasswordTooLarge);
+        }
         // Parse on the async side (~1 KB) so admission can read r/N without
         // occupying a blocking thread.
         let keystore: Keystore = serde_json::from_str(keystore_json)
             .map_err(|e| ImportKeystoreError::InvalidKeystore(e.to_string()))?;
+        keystore.validate().map_err(|e| ImportKeystoreError::InvalidKeystore(e.to_string()))?;
 
         // Async wait. A queued import holds no blocking thread.
         let admit = self
@@ -1005,13 +1307,17 @@ impl KeystoreManager for KeystoreManagerAdapter {
             after_readmit: Arc::clone(&self.after_readmit),
             #[cfg(test)]
             during_blocking: Arc::clone(&self.during_blocking),
+            #[cfg(test)]
+            after_secret_before_keystore: Arc::clone(&self.after_secret_before_keystore),
             doppelganger_window_secs: self.doppelganger_window_secs.load(Ordering::Relaxed),
         };
 
         // The permit moves into the closure. A permit held on this future would
         // drop when axum drops the handler on client disconnect, while decrypt
         // kept running. `spawn_blocking` is outside the G-4 ban.
+        let span = tracing::Span::current();
         let joined = tokio::task::spawn_blocking(move || {
+            let _entered = span.enter();
             let _admit = admit;
             import_keystore_blocking(job)
         })
@@ -1035,10 +1341,13 @@ impl KeystoreManager for KeystoreManagerAdapter {
             }
         }
         if !self.composite_signer.has_local_key(pubkey) {
-            // Retry / break-glass: a prior DELETE may have removed the key from
-            // the registry before denylist durability failed. Allow authenticated
-            // DELETE of a non-local pubkey to force-insert the denylist entry so
-            // secret-provider keys cannot resurrect on the next boot.
+            // The key is already absent. A leftover import secret is still
+            // removed, and a failed removal is returned so DELETE does not
+            // report the plaintext as gone. This path does not register the key.
+            // The denylist insert is the break-glass retry for a prior DELETE
+            // that removed the key before denylist durability failed.
+            remove_import_secret(&self.keystore_dir, pubkey)
+                .map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
             if let Some(ref denylist) = self.denylist {
                 denylist.insert(pubkey).map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
             }
@@ -1047,16 +1356,22 @@ impl KeystoreManager for KeystoreManagerAdapter {
 
         // Order (SEC-1b fail-closed for durability):
         //   1. Unlink keystore files (IO failure leaves memory intact)
-        //   2. Durable denylist.insert (IO failure leaves key still local → retryable)
-        //   3. Remove from signing registry
+        //   2. Remove the import secret, including the secrets-dir fsync
+        //      (failure leaves the key local so DELETE can retry)
+        //   3. Durable denylist.insert (IO failure leaves key still local → retryable)
+        //   4. Remove from signing registry
         //
         // Writing the denylist *before* remove_local_key ensures a failed
         // insert does not leave a non-signable key that cannot be re-deleted.
+        // The secret is gone before that insert, so a failed secret removal
+        // does not denylist a key whose plaintext is still on disk.
 
         // Matches any `*.json` whose EIP-2335 pubkey field equals this key
         // (API-import `0x{hex}.json` and boot-loaded names like `validator1.json`).
         // No matching file is OK (secret-provider / already removed).
         remove_matching_keystore_files(&self.keystore_dir, pubkey)?;
+        remove_import_secret(&self.keystore_dir, pubkey)
+            .map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
 
         // M-12 (Critical #2): remove the import-time sidecar so a
         // subsequent re-import starts with a clean timestamp. A leftover

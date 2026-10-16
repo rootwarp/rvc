@@ -3,6 +3,28 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Keymanager import passwords survive a restart
+
+`POST /eth/v1/keystores` writes each import password under
+`<keystore_path>/.rvc.keymanager-secrets/0x<pubkey>` before the keystore file
+is published. A password longer than 4096 bytes is rejected and nothing is
+written. The directory is mode `0700` and the file is mode `0600`. Mode
+`0600` is not encryption at rest, so a backup of that directory holds usable
+keys. The write is a new file, an fsync, and a rename, staged inside the
+secrets directory. Boot loads these passwords even when `--password-file` is
+unset, and a secret overrides a per-pubkey entry and a `*` entry in that
+file. A secret whose mode is not `0600`, whose owner is not the current user,
+or whose body is larger than 4096 bytes, a secrets directory whose mode is
+not `0700`, an unreadable secret, a corrupt keystore for that secret, or a
+secret that does not decrypt its non-denylisted keystore aborts startup. The
+error names the path and the reason, and does not include the password. A
+deposit-data or slashing-interchange JSON file that only contains the pubkey
+does not abort startup. A secret with no keystore is a warning. Imported keys persist across restarts,
+so moving a key needs `DELETE /eth/v1/keystores`, which removes the secret
+with the keystore before the deletion denylist entry. A keystore whose
+`pubkey` field is missing, not lowercase bare hex, or not the decrypted key
+is rejected and nothing is written.
+
 ## Block production: a block may build on the parent of the previous slot
 
 At proposal slot N, the parent walk reads `GET /eth/v1/beacon/headers/{block_id}`.
