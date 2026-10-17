@@ -6,7 +6,9 @@
 //! `eth_types::Root` (`[u8; 32]`) is used, not re-exported.
 
 use eth_types::Root;
-use libssz::{SszDecode, SszEncode};
+use libssz::SszDecode;
+#[cfg(any(test, feature = "test-fixtures"))]
+use libssz::SszEncode;
 use libssz_merkle::{HashTreeRoot, Sha2Hasher};
 
 use crate::containers::attestation::{AggregateAndProof, Attestation, IndexedAttestation};

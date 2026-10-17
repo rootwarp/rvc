@@ -451,7 +451,7 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
     ));
 
     let mut ctx = SlotContext::capture_parent(beacon.as_ref(), slot, epoch).await;
-    ctx.capture_head(beacon.as_ref()).await;
+    ctx.apply_phase2_head(beacon.as_ref()).await;
     assert_eq!(ctx.parent_root, Some(r_prev), "t=0 parent must be slot N-1");
     assert_eq!(
         ctx.expected_parents,

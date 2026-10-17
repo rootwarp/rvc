@@ -14,8 +14,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use rvc_bn_manager::{
     AttestationApi, BeaconError, BlockProducer, BnManager, BnManagerConfig, BroadcastTopics,
-    DutiesProvider, OperationTimeouts, PayloadAttestationApi, SignedBeaconBlock, SyncCommitteeApi,
-    VersionedAttestation, ATTEMPT_TIMEOUT_FLOOR,
+    DutiesProvider, NodeStatusApi, OperationTimeouts, PayloadAttestationApi, SignedBeaconBlock,
+    SyncCommitteeApi, VersionedAttestation, ATTEMPT_TIMEOUT_FLOOR,
 };
 
 /// How long each fixture BN waits before responding. Longer than any row budget.
@@ -111,6 +111,10 @@ fn op_submit_payload_attestations(manager: &BnManager) -> OpFut<'_> {
     Box::pin(async { manager.submit_payload_attestations(&[]).await })
 }
 
+fn op_get_block_root(manager: &BnManager) -> OpFut<'_> {
+    Box::pin(async { manager.get_block_root("33").await.map(|_| ()) })
+}
+
 fn op_get_sync_committee_contribution(manager: &BnManager) -> OpFut<'_> {
     Box::pin(async { manager.get_sync_committee_contribution(1, 0, "0x11").await.map(|_| ()) })
 }
@@ -136,8 +140,9 @@ fn sample_signed_block() -> SignedBeaconBlock {
     }
 }
 
-/// Twelve converted operations, named. `publish_block` is the generic `submit`
-/// helper's query_first arm (broadcast off).
+/// Converted operations, named. `publish_block` is the generic `submit`
+/// helper's query_first arm (broadcast off). `get_block_root` uses the
+/// attestation-fetch budget so a hung node cannot hold head capture.
 static BUDGETED_OPERATIONS: &[BudgetedOperation] = &[
     BudgetedOperation { op_name: "get_attester_duties", invoke: op_get_attester_duties },
     BudgetedOperation { op_name: "get_proposer_duties", invoke: op_get_proposer_duties },
@@ -147,6 +152,7 @@ static BUDGETED_OPERATIONS: &[BudgetedOperation] = &[
     },
     BudgetedOperation { op_name: "post_ptc_duties", invoke: op_post_ptc_duties },
     BudgetedOperation { op_name: "publish_block_ssz", invoke: op_publish_block_ssz },
+    BudgetedOperation { op_name: "get_block_root", invoke: op_get_block_root },
     BudgetedOperation { op_name: "get_attestation_data", invoke: op_get_attestation_data },
     BudgetedOperation { op_name: "submit_attestation", invoke: op_submit_attestation },
     BudgetedOperation {
@@ -257,7 +263,7 @@ async fn harness_actually_hangs_past_the_budget() {
 
 #[tokio::test]
 async fn every_converted_site_still_returns_operation_timeout() {
-    assert_eq!(BUDGETED_OPERATIONS.len(), 12, "one row per converted operation");
+    assert_eq!(BUDGETED_OPERATIONS.len(), 13, "one row per converted operation");
     let names: Vec<&str> = BUDGETED_OPERATIONS.iter().map(|op| op.op_name).collect();
     assert_eq!(
         names,
@@ -267,6 +273,7 @@ async fn every_converted_site_still_returns_operation_timeout() {
             "post_sync_committee_duties",
             "post_ptc_duties",
             "publish_block_ssz",
+            "get_block_root",
             "get_attestation_data",
             "submit_attestation",
             "get_aggregate_attestation",
@@ -381,7 +388,7 @@ async fn every_operation_with_broadcast_on_returns_within_backstop() {
     let hang = Duration::from_millis(800);
     let backstop = Duration::from_millis(250);
     assert!(hang > budget + backstop, "a missing per-BN bound must be able to fail this test");
-    assert_eq!(BUDGETED_OPERATIONS.len(), 12);
+    assert_eq!(BUDGETED_OPERATIONS.len(), 13);
 
     let fleet = HangingFleet::start(2, budget, hang, true).await;
     for op in BUDGETED_OPERATIONS {

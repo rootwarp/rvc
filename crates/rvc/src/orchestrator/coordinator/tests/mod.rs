@@ -660,6 +660,7 @@ mod core;
 mod duty_management;
 mod fork_resolution;
 mod fork_transition;
+mod head_capture;
 mod phase_block_offset;
 mod proposal;
 mod proposal_first;

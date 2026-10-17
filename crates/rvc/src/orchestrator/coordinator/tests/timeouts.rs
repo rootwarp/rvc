@@ -100,37 +100,6 @@ async fn test_sync_message_submit_timeout() {
     assert!(result.is_err(), "Sync message submit should have timed out");
 }
 
-#[tokio::test]
-async fn test_head_block_root_timeout() {
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    let timeouts = OperationTimeouts::default();
-    let mock_server = MockServer::start().await;
-
-    // Mock block root endpoint with delay exceeding sync_message timeout
-    Mock::given(method("GET"))
-        .and(path("/eth/v1/beacon/blocks/head/root"))
-        .respond_with(
-            ResponseTemplate::new(200)
-                .set_body_json(serde_json::json!({
-                    "data": {
-                        "root": "0x0000000000000000000000000000000000000000000000000000000000000000"
-                    }
-                }))
-                .set_delay(timeouts.sync_message + Duration::from_secs(5)),
-        )
-        .mount(&mock_server)
-        .await;
-
-    let beacon_config = beacon::BeaconClientConfig::new(mock_server.uri());
-    let beacon = Arc::new(BeaconClient::new(beacon_config).unwrap());
-
-    let result = tokio::time::timeout(timeouts.sync_message, beacon.get_block_root("head")).await;
-
-    assert!(result.is_err(), "Head block root fetch should have timed out");
-}
-
 #[test]
 fn test_aggregation_timeout_is_reasonable() {
     let timeouts = OperationTimeouts::default();

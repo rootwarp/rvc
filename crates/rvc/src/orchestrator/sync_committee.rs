@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,11 +13,12 @@ use bn_manager::BeaconNodeClient;
 use crypto::PublicKey;
 use duty_tracker::DutyTracker;
 use eth_types::{
-    is_sync_committee_aggregator, subcommittee_index, ContributionAndProof,
-    SignedContributionAndProof, Slot, SyncCommitteeDuty,
+    is_sync_committee_aggregator, subcommittee_index, ContributionAndProof, Root,
+    SignedContributionAndProof, Slot, SyncCommitteeContribution, SyncCommitteeDuty,
+    SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT,
 };
 use observability::logging::TruncatedRoot;
-use signer::{SignerService, ValidatorSigner};
+use signer::ValidatorSigner;
 use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
@@ -24,8 +26,15 @@ use super::dispatch::{SlotEndDropCounter, SLOT_END_PUBLISH_OVERHANG};
 use super::slot_context::SlotContext;
 use super::utils;
 
+/// Aggregation bits for one sync subcommittee: 512/4 bits, 16 bytes.
+const SYNC_SUBCOMMITTEE_BITFIELD_BYTES: usize =
+    (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT / 8) as usize;
+
+/// BLS signature length on the contribution wire.
+const BLS_SIGNATURE_BYTES: usize = 96;
+
 pub(crate) struct SyncCommitteeService {
-    signer: Arc<SignerService>,
+    signer: Arc<dyn ValidatorSigner>,
     beacon: Arc<dyn BeaconNodeClient>,
     duty_tracker: Arc<DutyTracker>,
     pubkey_map: PubkeyMap,
@@ -34,13 +43,16 @@ pub(crate) struct SyncCommitteeService {
     /// present in attestation.rs so that sync messages and contributions
     /// are also suppressed during the post-import doppelganger window.
     validator_store: Arc<ValidatorStore>,
-    /// Sync duties not pulled onto the sign pipeline before slot end.
+    /// Subcommittees not pulled onto the pipeline before slot end.
+    ///
+    /// Cumulative for this service. An in-flight fetch or signature is not
+    /// a drop; only items `take_until(slot_end)` did not yield are counted.
     slot_end_drops: SlotEndDropCounter,
 }
 
 impl SyncCommitteeService {
     pub(crate) fn new(
-        signer: Arc<SignerService>,
+        signer: Arc<dyn ValidatorSigner>,
         beacon: Arc<dyn BeaconNodeClient>,
         duty_tracker: Arc<DutyTracker>,
         pubkey_map: PubkeyMap,
@@ -229,6 +241,7 @@ impl SyncCommitteeService {
         slot: Slot,
         _epoch: u64,
         ctx: &SlotContext,
+        slot_end: tokio::time::Instant,
     ) {
         let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
         if duties.is_empty() {
@@ -260,142 +273,257 @@ impl SyncCommitteeService {
             }
         };
 
-        let head_root_hex = format!("0x{}", hex::encode(head_root));
-        let mut signed_proofs = Vec::new();
-
-        for (duty, pubkey) in matching_duties.iter().zip(matching_pubkeys.iter()) {
-            let subcommittee_indices: BTreeSet<u64> = duty
+        // One item per duty and distinct subcommittee. `take_until` stops
+        // pulling new items at slot end. A fetch already running is bounded
+        // by the same instant as the publish: slot end plus 500 ms.
+        let mut items = Vec::new();
+        for (duty, pubkey) in matching_duties.into_iter().zip(matching_pubkeys) {
+            let subcommittees: BTreeSet<u64> = duty
                 .validator_sync_committee_indices
                 .iter()
-                .map(|&pos| subcommittee_index(pos))
+                .copied()
+                .map(subcommittee_index)
                 .collect();
+            for subcommittee in subcommittees {
+                items.push((duty.clone(), pubkey.clone(), subcommittee));
+            }
+        }
+        let item_count = items.len();
+        let concurrency = self.config.dispatch_limits.concurrency as usize;
+        let publish_concurrency = self.config.dispatch_limits.publish_concurrency as usize;
+        let waves = stream::iter(items)
+            .take_until(tokio::time::sleep_until(slot_end))
+            .map(|(duty, pubkey, subcommittee)| {
+                self.produce_one_contribution(slot, head_root, slot_end, duty, pubkey, subcommittee)
+            })
+            .buffer_unordered(concurrency)
+            .ready_chunks(concurrency)
+            .map(|wave| self.publish_contribution_wave(slot, slot_end, wave))
+            .buffer_unordered(publish_concurrency);
+        let mut waves = std::pin::pin!(waves);
+        let mut dispatched = 0usize;
+        while let Some(attempted) = waves.next().await {
+            dispatched += attempted;
+        }
 
-            for subcommittee_index in &subcommittee_indices {
-                let selection_proof = match self
-                    .signer
-                    .sign_sync_committee_selection_proof(
-                        slot,
-                        *subcommittee_index,
-                        pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .await
-                {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            subcommittee_index,
-                            validator_index = duty.validator_index,
-                            error = %e,
-                            "Failed to sign sync committee selection proof"
-                        );
-                        continue;
-                    }
-                };
+        let dropped = item_count.saturating_sub(dispatched);
+        if dropped > 0 {
+            self.slot_end_drops.record(dropped as u64);
+            warn!(
+                slot,
+                dropped,
+                item_count,
+                total_dropped = self.slot_end_drops.get(),
+                "undispatched sync contribution subcommittees dropped at slot end"
+            );
+        }
+    }
 
-                if !is_sync_committee_aggregator(&selection_proof.to_bytes()) {
-                    debug!(
-                        slot,
-                        subcommittee_index,
-                        validator_index = duty.validator_index,
-                        "Not selected as sync committee aggregator"
-                    );
-                    continue;
-                }
+    /// Selection proof, contribution fetch, and contribution-and-proof signature
+    /// for one subcommittee. Publish is a later wave.
+    ///
+    /// A subcommittee index outside `0..4` returns before any signature.
+    /// The selection proof and the contribution-and-proof signature both stop
+    /// at [`contribution_deadline`]. The contribution body is checked before
+    /// `sign_contribution_and_proof`. A deadline that has already passed does
+    /// not call the signer or the beacon node.
+    async fn produce_one_contribution(
+        &self,
+        slot: Slot,
+        head_root: Root,
+        slot_end: tokio::time::Instant,
+        duty: SyncCommitteeDuty,
+        pubkey: PublicKey,
+        subcommittee_index: u64,
+    ) -> Option<SignedContributionAndProof> {
+        if subcommittee_index >= SYNC_COMMITTEE_SUBNET_COUNT {
+            debug!(
+                slot,
+                subcommittee_index,
+                validator_index = duty.validator_index,
+                "sync subcommittee index is outside 0..4"
+            );
+            return None;
+        }
 
-                debug!(
+        let selection_proof = match sign_before_deadline(
+            slot_end,
+            self.config.timeouts.sync_contribution,
+            self.signer.sign_sync_committee_selection_proof(
+                slot,
+                subcommittee_index,
+                &pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
+            ),
+        )
+        .await
+        {
+            Ok(sig) => sig,
+            Err(SignStop::Stopped { bounded_by_overhang }) => {
+                warn_contribution_stopped(
+                    slot,
+                    bounded_by_overhang,
+                    self.config.timeouts.sync_contribution,
+                );
+                return None;
+            }
+            Err(SignStop::Failed(e)) => {
+                warn!(
                     slot,
                     subcommittee_index,
                     validator_index = duty.validator_index,
-                    "Selected as sync committee aggregator"
+                    error = %e,
+                    "Failed to sign sync committee selection proof"
                 );
-
-                let contribution = match tokio::time::timeout(
-                    self.config.timeouts.sync_contribution,
-                    self.beacon.get_sync_committee_contribution(
-                        slot,
-                        *subcommittee_index,
-                        &head_root_hex,
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(resp)) => resp.data,
-                    Ok(Err(e)) => {
-                        warn!(
-                            slot,
-                            subcommittee_index,
-                            error = %e,
-                            "Failed to get sync committee contribution"
-                        );
-                        continue;
-                    }
-                    Err(_) => {
-                        warn!(
-                            slot,
-                            subcommittee_index,
-                            "Sync committee contribution fetch timed out after {}s",
-                            self.config.timeouts.sync_contribution.as_secs()
-                        );
-                        continue;
-                    }
-                };
-
-                let proof = ContributionAndProof {
-                    aggregator_index: duty.validator_index,
-                    contribution,
-                    selection_proof: selection_proof.to_bytes().to_vec(),
-                };
-
-                let sig = match self
-                    .signer
-                    .sign_contribution_and_proof(
-                        &proof,
-                        pubkey,
-                        &self.config.fork_schedule,
-                        &self.config.genesis_validators_root,
-                    )
-                    .await
-                {
-                    Ok(sig) => sig,
-                    Err(e) => {
-                        warn!(
-                            slot,
-                            subcommittee_index,
-                            validator_index = duty.validator_index,
-                            error = %e,
-                            "Failed to sign contribution and proof"
-                        );
-                        continue;
-                    }
-                };
-
-                signed_proofs.push(SignedContributionAndProof {
-                    message: proof,
-                    signature: sig.to_bytes().to_vec(),
-                });
+                return None;
             }
+        };
+
+        if !is_sync_committee_aggregator(&selection_proof.to_bytes()) {
+            debug!(
+                slot,
+                subcommittee_index,
+                validator_index = duty.validator_index,
+                "Not selected as sync committee aggregator"
+            );
+            return None;
         }
 
-        if !signed_proofs.is_empty() {
-            let count = signed_proofs.len();
-            match tokio::time::timeout(
+        debug!(
+            slot,
+            subcommittee_index,
+            validator_index = duty.validator_index,
+            "Selected as sync committee aggregator"
+        );
+
+        let (deadline, bounded_by_overhang) =
+            contribution_deadline(slot_end, self.config.timeouts.sync_contribution);
+        if tokio::time::Instant::now() >= deadline {
+            warn_contribution_stopped(
+                slot,
+                bounded_by_overhang,
                 self.config.timeouts.sync_contribution,
-                self.beacon.submit_contribution_and_proofs(&signed_proofs),
-            )
-            .await
-            {
-                Ok(Ok(_)) => info!(slot, count, "Submitted sync committee contribution and proofs"),
-                Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit contribution and proofs"),
-                Err(_) => warn!(
-                    slot,
-                    "Contribution and proofs submit timed out after {}s",
-                    self.config.timeouts.sync_contribution.as_secs()
-                ),
-            }
+            );
+            return None;
         }
+
+        let head_root_hex = format!("0x{}", hex::encode(head_root));
+        let contribution = match tokio::time::timeout_at(
+            deadline,
+            self.beacon.get_sync_committee_contribution(slot, subcommittee_index, &head_root_hex),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => resp.data,
+            Ok(Err(e)) => {
+                warn!(
+                    slot,
+                    subcommittee_index,
+                    error = %e,
+                    "Failed to get sync committee contribution"
+                );
+                return None;
+            }
+            Err(_) => {
+                warn_contribution_stopped(
+                    slot,
+                    bounded_by_overhang,
+                    self.config.timeouts.sync_contribution,
+                );
+                return None;
+            }
+        };
+
+        if !contribution_matches(&contribution, slot, head_root, subcommittee_index) {
+            warn!(
+                slot,
+                subcommittee_index,
+                contribution_slot = contribution.slot,
+                "sync contribution does not match the duty; rejecting the body"
+            );
+            return None;
+        }
+
+        let proof = ContributionAndProof {
+            aggregator_index: duty.validator_index,
+            contribution,
+            selection_proof: selection_proof.to_bytes().to_vec(),
+        };
+        let sig = match sign_before_deadline(
+            slot_end,
+            self.config.timeouts.sync_contribution,
+            self.signer.sign_contribution_and_proof(
+                &proof,
+                &pubkey,
+                &self.config.fork_schedule,
+                &self.config.genesis_validators_root,
+            ),
+        )
+        .await
+        {
+            Ok(sig) => sig,
+            Err(SignStop::Stopped { bounded_by_overhang }) => {
+                warn_contribution_stopped(
+                    slot,
+                    bounded_by_overhang,
+                    self.config.timeouts.sync_contribution,
+                );
+                return None;
+            }
+            Err(SignStop::Failed(e)) => {
+                warn!(
+                    slot,
+                    subcommittee_index,
+                    validator_index = duty.validator_index,
+                    error = %e,
+                    "Failed to sign contribution and proof"
+                );
+                return None;
+            }
+        };
+        Some(SignedContributionAndProof { message: proof, signature: sig.to_bytes().to_vec() })
+    }
+
+    /// One batch POST for a wave of signed contribution and proofs.
+    ///
+    /// The POST stops at the earlier of the `sync_contribution` timeout and
+    /// `slot_end` plus 500 ms. A wave that is ready after that instant is not
+    /// sent. Returns how many subcommittees this wave attempted.
+    async fn publish_contribution_wave(
+        &self,
+        slot: Slot,
+        slot_end: tokio::time::Instant,
+        wave: Vec<Option<SignedContributionAndProof>>,
+    ) -> usize {
+        let attempted = wave.len();
+        let proofs: Vec<_> = wave.into_iter().flatten().collect();
+        if proofs.is_empty() {
+            return attempted;
+        }
+        let (deadline, bounded_by_overhang) =
+            contribution_deadline(slot_end, self.config.timeouts.sync_contribution);
+        if tokio::time::Instant::now() >= deadline {
+            warn_contribution_stopped(
+                slot,
+                bounded_by_overhang,
+                self.config.timeouts.sync_contribution,
+            );
+            return attempted;
+        }
+        let count = proofs.len();
+        match tokio::time::timeout_at(deadline, self.beacon.submit_contribution_and_proofs(&proofs))
+            .await
+        {
+            Ok(Ok(_)) => info!(slot, count, "Submitted sync committee contribution and proofs"),
+            Ok(Err(e)) => warn!(slot, error = %e, "Failed to submit contribution and proofs"),
+            Err(_) => warn_contribution_stopped(
+                slot,
+                bounded_by_overhang,
+                self.config.timeouts.sync_contribution,
+            ),
+        }
+        attempted
     }
 
     fn filter_sync_duties(
@@ -428,6 +556,83 @@ impl SyncCommitteeService {
     }
 }
 
+/// Earlier of the sync-contribution timeout and slot end plus 500 ms.
+///
+/// Selection proofs, contribution signatures, fetches, and publishes all
+/// stop at this instant. `checked_add` that cannot represent slot end plus
+/// 500 ms uses `now` as that overhang instant. `checked_add` that cannot
+/// represent `now` plus the timeout uses the overhang instant. A deadline
+/// at or before `now` is already due, and the caller does not send.
+pub(crate) fn contribution_deadline(
+    slot_end: tokio::time::Instant,
+    timeout: Duration,
+) -> (tokio::time::Instant, bool) {
+    let now = tokio::time::Instant::now();
+    let overhang_at = slot_end.checked_add(SLOT_END_PUBLISH_OVERHANG).unwrap_or(now);
+    let submit_at = now.checked_add(timeout).unwrap_or(overhang_at);
+    let deadline = overhang_at.min(submit_at);
+    (deadline, deadline == overhang_at)
+}
+
+enum SignStop<E> {
+    Stopped { bounded_by_overhang: bool },
+    Failed(E),
+}
+
+/// Signs `sign` only when [`contribution_deadline`] is still ahead.
+///
+/// The future is not polled when the deadline is already due: `timeout_at`
+/// on a past instant still polls its inner future once. A running sign is
+/// dropped at the deadline, so a slow remote signer cannot stretch the phase.
+async fn sign_before_deadline<E, Fut>(
+    slot_end: tokio::time::Instant,
+    timeout: Duration,
+    sign: Fut,
+) -> Result<crypto::Signature, SignStop<E>>
+where
+    Fut: Future<Output = Result<crypto::Signature, E>>,
+{
+    let (deadline, bounded_by_overhang) = contribution_deadline(slot_end, timeout);
+    if tokio::time::Instant::now() >= deadline {
+        return Err(SignStop::Stopped { bounded_by_overhang });
+    }
+    match tokio::time::timeout_at(deadline, sign).await {
+        Ok(Ok(signature)) => Ok(signature),
+        Ok(Err(error)) => Err(SignStop::Failed(error)),
+        Err(_) => Err(SignStop::Stopped { bounded_by_overhang }),
+    }
+}
+
+/// The contribution body matches the duty slot, the phase-2 head, and the
+/// subcommittee that was requested. The bitfield is 16 bytes with at least
+/// one participant bit, and the signature is 96 bytes. A mismatch rejects
+/// the body before it is signed.
+fn contribution_matches(
+    contribution: &SyncCommitteeContribution,
+    slot: Slot,
+    head: Root,
+    subcommittee: u64,
+) -> bool {
+    contribution.slot == slot
+        && contribution.beacon_block_root == head
+        && contribution.subcommittee_index == subcommittee
+        && contribution.aggregation_bits.len() == SYNC_SUBCOMMITTEE_BITFIELD_BYTES
+        && contribution.aggregation_bits.iter().any(|byte| *byte != 0)
+        && contribution.signature.len() == BLS_SIGNATURE_BYTES
+}
+
+fn warn_contribution_stopped(slot: Slot, bounded_by_overhang: bool, submit_timeout: Duration) {
+    if bounded_by_overhang {
+        warn!(
+            slot,
+            "sync contribution exceeded the {} ms slot-end overhang",
+            SLOT_END_PUBLISH_OVERHANG.as_millis()
+        );
+    } else {
+        warn!(slot, "sync contribution timed out after {}s", submit_timeout.as_secs());
+    }
+}
+
 fn warn_sync_publish_stopped(slot: Slot, bounded_by_overhang: bool, submit_timeout: Duration) {
     if bounded_by_overhang {
         warn!(
@@ -454,6 +659,7 @@ mod tests {
     use crate::metrics::{
         sync_committee_skip_phase, sync_committee_skip_reason, RVC_SYNC_COMMITTEE_SKIPPED_TOTAL,
     };
+    use async_trait::async_trait;
     use beacon::{DataResponse, ExecutionOptimisticResponse};
     use bn_manager::{BeaconNodeClient, MockBeaconNodeClient, MockMethod};
     use crypto::{CompositeSigner, KeyManager, LocalSigner, SecretKey};
@@ -534,7 +740,29 @@ mod tests {
                 }
                 Ok(())
             })
-            .with_submit_contribution_and_proofs(|_proofs| Ok(()))
+            .with_get_sync_committee_contribution(move |slot, subcommittee, root| {
+                Ok(DataResponse { data: contribution_body(slot, decode_root(&root), subcommittee) })
+            })
+            .with_submit_contribution_and_proofs({
+                let roots = Arc::clone(&submitted_roots);
+                move |proofs| {
+                    let mut guard = roots.lock().unwrap();
+                    for proof in proofs {
+                        guard.push(proof.message.contribution.beacon_block_root);
+                    }
+                    Ok(())
+                }
+            })
+    }
+
+    fn decode_root(hex_root: &str) -> Root {
+        let bytes =
+            hex::decode(hex_root.strip_prefix("0x").unwrap_or(hex_root)).unwrap_or_default();
+        let mut root = [0u8; 32];
+        if bytes.len() == 32 {
+            root.copy_from_slice(&bytes);
+        }
+        root
     }
 
     /// Contrib-gate mock: counts get_sync_committee_contribution fetches.
@@ -561,7 +789,7 @@ mod tests {
                         slot,
                         beacon_block_root: [0xAA; 32],
                         subcommittee_index,
-                        aggregation_bits: vec![0xFF, 0x01],
+                        aggregation_bits: vec![0xff; 16],
                         signature: vec![0u8; 96],
                     },
                 })
@@ -600,7 +828,7 @@ mod tests {
                         slot,
                         beacon_block_root: [0xAA; 32],
                         subcommittee_index,
-                        aggregation_bits: vec![0xFF, 0x01],
+                        aggregation_bits: vec![0xff; 16],
                         signature: vec![0u8; 96],
                     },
                 })
@@ -685,8 +913,8 @@ mod tests {
     // -----------------------------------------------------------------------
     #[tokio::test]
     async fn test_messages_and_contributions_share_head_root() {
-        let sk = SecretKey::generate();
-        let pk = sk.public_key();
+        let config = create_test_config();
+        let (sk, pk) = find_aggregator_for(0, &[0], &config.fork_schedule, [0u8; 32]);
         let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
 
         // R_captured: the root pinned at slot-start in SlotContext.
@@ -718,7 +946,7 @@ mod tests {
 
         // Run both sync-committee phases with the same context.
         service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
-        service.maybe_produce_sync_contributions(0, 0, &ctx).await;
+        service.maybe_produce_sync_contributions(0, 0, &ctx, ample_slot_end()).await;
 
         // Neither phase must call get_block_root: head_root is sourced from SlotContext.
         assert_eq!(
@@ -731,9 +959,8 @@ mod tests {
         // The messages phase must submit messages with the captured root, not the BN root.
         let roots = submitted_roots.lock().unwrap();
         assert!(
-            !roots.is_empty(),
-            "Expected sync committee messages to be submitted; \
-             check that the test key is in the KeyManager and pubkey_map"
+            roots.len() >= 2,
+            "messages and at least one contribution must be published with the captured head"
         );
         for root in roots.iter() {
             assert_eq!(
@@ -781,7 +1008,7 @@ mod tests {
         let before_contributions = skip_count(sync_committee_skip_phase::CONTRIBUTIONS);
 
         service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
-        service.maybe_produce_sync_contributions(0, 0, &ctx).await;
+        service.maybe_produce_sync_contributions(0, 0, &ctx, ample_slot_end()).await;
 
         assert_eq!(
             skip_count(sync_committee_skip_phase::MESSAGES),
@@ -877,7 +1104,7 @@ mod tests {
             head_root: None,
         };
 
-        service.maybe_produce_sync_contributions(0, 0, &ctx).await;
+        service.maybe_produce_sync_contributions(0, 0, &ctx, ample_slot_end()).await;
 
         assert_eq!(
             get_block_root_call_count.load(Ordering::SeqCst),
@@ -1036,7 +1263,7 @@ mod tests {
             expected_parents: None,
             head_root: Some([0xAA; 32]),
         };
-        service.maybe_produce_sync_contributions(0, 0, &ctx).await;
+        service.maybe_produce_sync_contributions(0, 0, &ctx, ample_slot_end()).await;
 
         // In GREEN: filter_sync_duties returns [] because the validator is
         // disabled → the loop body is never entered → get_sync_committee_contribution
@@ -1246,7 +1473,7 @@ mod tests {
             expected_parents: None,
             head_root: Some([0xAA; 32]),
         };
-        service.maybe_produce_sync_contributions(0, 0, &ctx).await;
+        service.maybe_produce_sync_contributions(0, 0, &ctx, ample_slot_end()).await;
 
         // A and C are aggregators for subcommittee 0 → two contribution fetches
         // and two submitted proofs. B skipped after selection-proof KeyNotFound.
@@ -1318,7 +1545,7 @@ mod tests {
         assert!(ctx.head_root.is_none(), "t=0 capture_parent must not populate head_root");
         assert_eq!(ctx.parent_root, Some(expected_parent));
 
-        ctx.capture_head(beacon.as_ref()).await;
+        ctx.apply_phase2_head(beacon.as_ref()).await;
         assert!(
             ctx.head_root.is_some(),
             "phase-2 capture_head must supply a head even when the current slot 404s"
@@ -1530,5 +1757,794 @@ mod tests {
         assert!(published > 0, "sync phase must publish while the slashing connection is held");
         worker.join().expect("sync worker");
         drop(held);
+    }
+
+    fn contribution_body(
+        slot: Slot,
+        head: Root,
+        subcommittee: u64,
+    ) -> eth_types::SyncCommitteeContribution {
+        eth_types::SyncCommitteeContribution {
+            slot,
+            beacon_block_root: head,
+            subcommittee_index: subcommittee,
+            aggregation_bits: vec![0xff; 16],
+            signature: vec![1u8; 96],
+        }
+    }
+
+    fn find_aggregator_for(
+        slot: Slot,
+        subcommittees: &[u64],
+        schedule: &ForkSchedule,
+        genesis: Root,
+    ) -> (SecretKey, crypto::PublicKey) {
+        use eth_types::{
+            is_sync_committee_aggregator, ForkName, SyncAggregatorSelectionData,
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+        };
+        let fork = ForkName::from_epoch(slot / 32, schedule);
+        let domain = crypto::compute_domain(
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF,
+            fork.fork_version(schedule),
+            genesis,
+        );
+        loop {
+            let sk = SecretKey::generate();
+            let selected = subcommittees.iter().all(|subcommittee| {
+                let data = SyncAggregatorSelectionData { slot, subcommittee_index: *subcommittee };
+                let signing_root = crypto::compute_signing_root(&data, domain);
+                is_sync_committee_aggregator(&sk.sign(&signing_root).to_bytes())
+            });
+            if selected {
+                let pk = sk.public_key();
+                return (sk, pk);
+            }
+        }
+    }
+
+    async fn service_with_config(
+        beacon: Arc<dyn BeaconNodeClient>,
+        pk: crypto::PublicKey,
+        sk: SecretKey,
+        config: OrchestratorConfig,
+    ) -> SyncCommitteeService {
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let signer = Arc::new(
+            SignerService::new(
+                Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+                Arc::new(SlashingDb::open_in_memory().unwrap()),
+            )
+            .with_enablement(always_enabled()),
+        );
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+        let mut map = HashMap::new();
+        map.insert(pk.to_bytes(), pk);
+        SyncCommitteeService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            config,
+            store,
+        )
+    }
+
+    fn head_ctx(slot: Slot, head: Root) -> SlotContext {
+        SlotContext {
+            slot,
+            epoch: slot / 32,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some(head),
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn contribution_intake_stops_at_slot_end_while_one_get_is_in_flight() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let config = create_test_config().with_dispatch_limits(
+            crate::orchestrator::dispatch::DispatchLimits::validated(1, 1).unwrap(),
+        );
+        let (sk, pk) = find_aggregator_for(slot, &[0, 1, 2], &config.fork_schedule, [0u8; 32]);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_method_delay(
+                    MockMethod::GetSyncCommitteeContribution,
+                    Duration::from_millis(300),
+                )
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0, 128, 256],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution({
+                    let gets = Arc::clone(&gets);
+                    move |requested, subcommittee, _| {
+                        gets.fetch_add(1, Ordering::SeqCst);
+                        Ok(DataResponse { data: contribution_body(requested, head, subcommittee) })
+                    }
+                })
+                .with_submit_contribution_and_proofs(|_| Ok(())),
+        );
+        let service = service_with_config(beacon, pk, sk, config).await;
+        let slot_end = tokio::time::Instant::now() + Duration::from_millis(200);
+        service.maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), slot_end).await;
+        assert_eq!(gets.load(Ordering::SeqCst), 1, "only the in-flight subcommittee is fetched");
+        assert_eq!(service.slot_end_drops(), 2);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn past_slot_end_publishes_nothing_and_counts_the_drop() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let config = create_test_config();
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let submits = Arc::new(AtomicUsize::new(0));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution(|requested, subcommittee, _| {
+                    Ok(DataResponse {
+                        data: contribution_body(requested, [0xAA; 32], subcommittee),
+                    })
+                })
+                .with_submit_contribution_and_proofs({
+                    let submits = Arc::clone(&submits);
+                    move |proofs| {
+                        submits.fetch_add(proofs.len(), Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        );
+        let service = service_with_config(beacon, pk, sk, config).await;
+        let slot_end = tokio::time::Instant::now() - Duration::from_millis(600);
+        service.maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), slot_end).await;
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
+        assert_eq!(service.slot_end_drops(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn zero_sync_contribution_timeout_does_not_fetch_or_publish() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let mut config = create_test_config();
+        config.timeouts.sync_contribution = Duration::ZERO;
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let submits = Arc::new(AtomicUsize::new(0));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution({
+                    let gets = Arc::clone(&gets);
+                    move |requested, subcommittee, _| {
+                        gets.fetch_add(1, Ordering::SeqCst);
+                        Ok(DataResponse {
+                            data: contribution_body(requested, [0xAA; 32], subcommittee),
+                        })
+                    }
+                })
+                .with_submit_contribution_and_proofs({
+                    let submits = Arc::clone(&submits);
+                    move |proofs| {
+                        submits.fetch_add(proofs.len(), Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        );
+        let service = service_with_config(beacon, pk, sk, config).await;
+        let started = tokio::time::Instant::now();
+        service
+            .maybe_produce_sync_contributions(
+                slot,
+                0,
+                &head_ctx(slot, head),
+                started + Duration::from_secs(30),
+            )
+            .await;
+        assert_eq!(gets.load(Ordering::SeqCst), 0);
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn hung_contribution_submit_stops_at_the_slot_end_overhang() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let mut config = create_test_config();
+        config.timeouts.sync_contribution = Duration::from_secs(10);
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let submits = Arc::new(AtomicUsize::new(0));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_method_delay(MockMethod::SubmitContributionAndProofs, Duration::from_secs(10))
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution(|requested, subcommittee, _| {
+                    Ok(DataResponse {
+                        data: contribution_body(requested, [0xAA; 32], subcommittee),
+                    })
+                })
+                .with_submit_contribution_and_proofs({
+                    let submits = Arc::clone(&submits);
+                    move |proofs| {
+                        submits.fetch_add(proofs.len(), Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        );
+        let service = service_with_config(beacon, pk, sk, config).await;
+        let started = tokio::time::Instant::now();
+        let slot_end = started + Duration::from_secs(2);
+        service.maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), slot_end).await;
+        let elapsed = tokio::time::Instant::now().saturating_duration_since(started);
+        assert!(elapsed <= Duration::from_millis(2_600), "elapsed {elapsed:?}");
+        assert_eq!(submits.load(Ordering::SeqCst), 0, "a cancelled submit is not a publish");
+    }
+
+    #[tokio::test]
+    async fn duplicate_subcommittee_indices_are_fetched_and_signed_once() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let config = create_test_config();
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let proofs = Arc::new(Mutex::new(Vec::new()));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0, 0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution({
+                    let gets = Arc::clone(&gets);
+                    move |requested, subcommittee, _| {
+                        gets.fetch_add(1, Ordering::SeqCst);
+                        Ok(DataResponse { data: contribution_body(requested, head, subcommittee) })
+                    }
+                })
+                .with_submit_contribution_and_proofs({
+                    let proofs = Arc::clone(&proofs);
+                    move |batch| {
+                        proofs.lock().unwrap().extend(batch.iter().cloned());
+                        Ok(())
+                    }
+                }),
+        );
+        let service = service_with_config(beacon, pk, sk, config).await;
+        service
+            .maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), ample_slot_end())
+            .await;
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+        let published = proofs.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].message.contribution.subcommittee_index, 0);
+        assert_eq!(published[0].signature.len(), 96);
+    }
+
+    #[tokio::test]
+    async fn subcommittee_index_at_or_above_four_is_not_signed() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let config = create_test_config();
+        let (sk, pk) = find_aggregator_for(slot, &[0, 4], &config.fork_schedule, [0u8; 32]);
+        let gets = Arc::new(Mutex::new(Vec::new()));
+        let proofs = Arc::new(Mutex::new(Vec::new()));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0, 512],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution({
+                    let gets = Arc::clone(&gets);
+                    move |requested, subcommittee, _| {
+                        gets.lock().unwrap().push(subcommittee);
+                        Ok(DataResponse { data: contribution_body(requested, head, subcommittee) })
+                    }
+                })
+                .with_submit_contribution_and_proofs({
+                    let proofs = Arc::clone(&proofs);
+                    move |batch| {
+                        proofs.lock().unwrap().extend(batch.iter().cloned());
+                        Ok(())
+                    }
+                }),
+        );
+        let service = service_with_config(beacon, pk, sk, config).await;
+        service
+            .maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), ample_slot_end())
+            .await;
+        assert_eq!(*gets.lock().unwrap(), vec![0]);
+        let published = proofs.lock().unwrap().clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].message.contribution.subcommittee_index, 0);
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_contribution_is_not_published_and_a_sibling_is() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let config = create_test_config();
+        let bad_bodies = [
+            contribution_body(slot + 1, head, 1),
+            contribution_body(slot, [0xBB; 32], 1),
+            contribution_body(slot, head, 9),
+            eth_types::SyncCommitteeContribution {
+                aggregation_bits: vec![0xff, 0x01],
+                ..contribution_body(slot, head, 1)
+            },
+            eth_types::SyncCommitteeContribution {
+                signature: vec![1u8; 95],
+                ..contribution_body(slot, head, 1)
+            },
+        ];
+        for bad in bad_bodies {
+            let (sk, pk) = find_aggregator_for(slot, &[0, 1], &config.fork_schedule, [0u8; 32]);
+            let proofs = Arc::new(Mutex::new(Vec::new()));
+            let bad = bad.clone();
+            let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_sync_committee_duties({
+                        let duty_pk = pk.to_bytes();
+                        move |_epoch, _| {
+                            Ok(ExecutionOptimisticResponse {
+                                execution_optimistic: false,
+                                data: vec![SyncCommitteeDuty {
+                                    pubkey: duty_pk,
+                                    validator_index: 1,
+                                    validator_sync_committee_indices: vec![0, 128],
+                                }],
+                            })
+                        }
+                    })
+                    .with_get_sync_committee_contribution({
+                        let bad = bad.clone();
+                        move |requested, subcommittee, _| {
+                            let data = if subcommittee == 0 {
+                                contribution_body(requested, head, 0)
+                            } else {
+                                bad.clone()
+                            };
+                            Ok(DataResponse { data })
+                        }
+                    })
+                    .with_submit_contribution_and_proofs({
+                        let proofs = Arc::clone(&proofs);
+                        move |batch| {
+                            proofs.lock().unwrap().extend(batch.iter().cloned());
+                            Ok(())
+                        }
+                    }),
+            );
+            let service = service_with_config(beacon, pk, sk, config.clone()).await;
+            service
+                .maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), ample_slot_end())
+                .await;
+            let published = proofs.lock().unwrap().clone();
+            assert_eq!(published.len(), 1, "bad body {bad:?} must not be published");
+            assert_eq!(published[0].message.contribution.slot, slot);
+            assert_eq!(published[0].message.contribution.beacon_block_root, head);
+            assert_eq!(published[0].message.contribution.subcommittee_index, 0);
+            assert_eq!(published[0].message.contribution.aggregation_bits.len(), 16);
+            assert_eq!(published[0].signature.len(), 96);
+            assert!(published[0].signature.iter().any(|byte| *byte != 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn each_fork_publishes_the_slot_and_rejects_a_mismatched_slot() {
+        let epochs = [(40u64, "deneb"), (50, "electra"), (60, "fulu"), (70, "gloas")];
+        for (epoch, name) in epochs {
+            let slot = epoch * 32;
+            let head = [0xCD; 32];
+            let mut schedule = (*create_test_fork_schedule()).clone();
+            schedule.gloas_fork_epoch = 70;
+            let schedule = Arc::new(schedule);
+            let mut config = OrchestratorConfig::new([0u8; 32], Arc::clone(&schedule));
+            config.timeouts.sync_contribution = Duration::from_secs(3);
+            let (sk, pk) = find_aggregator_for(slot, &[0], &schedule, [0u8; 32]);
+            let proofs = Arc::new(Mutex::new(Vec::new()));
+            let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_sync_committee_duties({
+                        let duty_pk = pk.to_bytes();
+                        move |_epoch, _| {
+                            Ok(ExecutionOptimisticResponse {
+                                execution_optimistic: false,
+                                data: vec![SyncCommitteeDuty {
+                                    pubkey: duty_pk,
+                                    validator_index: 1,
+                                    validator_sync_committee_indices: vec![0],
+                                }],
+                            })
+                        }
+                    })
+                    .with_get_sync_committee_contribution(move |requested, subcommittee, root| {
+                        assert_eq!(root, format!("0x{}", hex::encode(head)));
+                        Ok(DataResponse { data: contribution_body(requested, head, subcommittee) })
+                    })
+                    .with_submit_contribution_and_proofs({
+                        let proofs = Arc::clone(&proofs);
+                        move |batch| {
+                            proofs.lock().unwrap().extend(batch.iter().cloned());
+                            Ok(())
+                        }
+                    }),
+            );
+            let pk_verify = pk.clone();
+            let service = service_with_config(beacon, pk, sk, config.clone()).await;
+            service
+                .maybe_produce_sync_contributions(
+                    slot,
+                    epoch,
+                    &head_ctx(slot, head),
+                    ample_slot_end(),
+                )
+                .await;
+            let published = proofs.lock().unwrap().clone();
+            assert_eq!(published.len(), 1, "{name}");
+            assert_eq!(published[0].message.contribution.slot, slot, "{name}");
+            assert_eq!(published[0].message.contribution.beacon_block_root, head, "{name}");
+            assert_eq!(published[0].signature.len(), 96, "{name}");
+            assert!(published[0].signature.iter().any(|byte| *byte != 0), "{name}");
+            assert_eq!(eth_types::ForkName::from_epoch(epoch, &schedule).as_ref(), name);
+            let expected = crypto::signing_root_for(
+                &crypto::DutyRef::ContributionAndProof(&published[0].message),
+                &crypto::SigningCtx {
+                    fork_schedule: schedule.as_ref(),
+                    genesis_validators_root: [0u8; 32],
+                },
+            );
+            let signature =
+                crypto::Signature::from_bytes(&published[0].signature).expect("signature bytes");
+            signature.verify(&pk_verify, &expected).expect(name);
+            let wrong_domain = crypto::signing_root_with_fork_version(
+                &published[0].message,
+                eth_types::DOMAIN_CONTRIBUTION_AND_PROOF,
+                [0, 0, 0, 1],
+                [0u8; 32],
+            );
+            assert!(signature.verify(&pk_verify, &wrong_domain).is_err(), "{name}");
+
+            let (sk, pk) = find_aggregator_for(slot, &[0], &schedule, [0u8; 32]);
+            let submits = Arc::new(AtomicUsize::new(0));
+            let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+                MockBeaconNodeClient::new()
+                    .with_post_sync_committee_duties({
+                        let duty_pk = pk.to_bytes();
+                        move |_epoch, _| {
+                            Ok(ExecutionOptimisticResponse {
+                                execution_optimistic: false,
+                                data: vec![SyncCommitteeDuty {
+                                    pubkey: duty_pk,
+                                    validator_index: 1,
+                                    validator_sync_committee_indices: vec![0],
+                                }],
+                            })
+                        }
+                    })
+                    .with_get_sync_committee_contribution(move |requested, subcommittee, _| {
+                        Ok(DataResponse {
+                            data: contribution_body(requested + 1, head, subcommittee),
+                        })
+                    })
+                    .with_submit_contribution_and_proofs({
+                        let submits = Arc::clone(&submits);
+                        move |batch| {
+                            submits.fetch_add(batch.len(), Ordering::SeqCst);
+                            Ok(())
+                        }
+                    }),
+            );
+            let service = service_with_config(beacon, pk, sk, config).await;
+            service
+                .maybe_produce_sync_contributions(
+                    slot,
+                    epoch,
+                    &head_ctx(slot, head),
+                    ample_slot_end(),
+                )
+                .await;
+            assert_eq!(submits.load(Ordering::SeqCst), 0, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_empty_aggregation_bitfield_is_not_signed() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let config = create_test_config();
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let gets = Arc::new(AtomicUsize::new(0));
+        let submits = Arc::new(AtomicUsize::new(0));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution({
+                    let gets = Arc::clone(&gets);
+                    move |requested, subcommittee, _| {
+                        gets.fetch_add(1, Ordering::SeqCst);
+                        let mut body = contribution_body(requested, head, subcommittee);
+                        body.aggregation_bits = vec![0u8; 16];
+                        Ok(DataResponse { data: body })
+                    }
+                })
+                .with_submit_contribution_and_proofs({
+                    let submits = Arc::clone(&submits);
+                    move |batch| {
+                        submits.fetch_add(batch.len(), Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        );
+        let service = service_with_config(beacon, pk, sk, config).await;
+        service
+            .maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), ample_slot_end())
+            .await;
+        assert_eq!(gets.load(Ordering::SeqCst), 1);
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
+    }
+
+    struct SlowSigner {
+        inner: Arc<SignerService>,
+        delay_selection: bool,
+        delay_contribution: bool,
+        delay: Duration,
+        selection_calls: Arc<AtomicUsize>,
+        contribution_calls: Arc<AtomicUsize>,
+    }
+
+    macro_rules! slow_fwd {
+        ($($name:ident($($arg:ident: $ty:ty),* $(,)?));* $(;)?) => {
+            #[async_trait]
+            impl ValidatorSigner for SlowSigner {
+                $(
+                    async fn $name(&self, $($arg: $ty),*) -> Result<crypto::Signature, signer::SignerError> {
+                        slow_fwd!(@arm $name, self, $($arg),*);
+                        self.inner.$name($($arg),*).await
+                    }
+                )*
+            }
+        };
+        (@arm sign_sync_committee_selection_proof, $self:ident, $($arg:ident),*) => {
+            $self.selection_calls.fetch_add(1, Ordering::SeqCst);
+            if $self.delay_selection {
+                tokio::time::sleep($self.delay).await;
+            }
+        };
+        (@arm sign_contribution_and_proof, $self:ident, $($arg:ident),*) => {
+            $self.contribution_calls.fetch_add(1, Ordering::SeqCst);
+            if $self.delay_contribution {
+                tokio::time::sleep($self.delay).await;
+            }
+        };
+        (@arm $name:ident, $self:ident, $($arg:ident),*) => {};
+    }
+
+    slow_fwd! {
+        sign_attestation(data: &eth_types::AttestationData, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_block(block_root: &Root, slot: Slot, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_block_header(header: &signer::BeaconBlockHeaderFields, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_randao_reveal(epoch: eth_types::Epoch, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_sync_committee_message(beacon_block_root: &Root, slot: Slot, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_selection_proof(slot: Slot, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_aggregate_and_proof(aggregate_and_proof: &eth_types::AggregateAndProof, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_electra_aggregate_and_proof(aggregate_and_proof: &eth_types::ElectraAggregateAndProof, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_voluntary_exit(voluntary_exit: &eth_types::VoluntaryExit, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_builder_registration(registration: &eth_types::ValidatorRegistrationV1, pubkey: &crypto::PublicKey, fork_version: [u8; 4]);
+        sign_sync_committee_selection_proof(slot: Slot, subcommittee_index: u64, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_contribution_and_proof(contribution_and_proof: &eth_types::ContributionAndProof, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_payload_attestation(data: &eth_types::PayloadAttestationData, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_execution_payload_envelope_root(object_root: &Root, slot: Slot, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+        sign_aggregate_and_proof_root(object_root: &Root, slot: Slot, pubkey: &crypto::PublicKey, fork_schedule: &eth_types::ForkSchedule, genesis_validators_root: &Root);
+    }
+
+    async fn service_with_signer(
+        beacon: Arc<dyn BeaconNodeClient>,
+        pk: crypto::PublicKey,
+        signer: Arc<dyn ValidatorSigner>,
+        config: OrchestratorConfig,
+    ) -> SyncCommitteeService {
+        let store = Arc::new(ValidatorStore::new([0u8; 20], 0));
+        store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_sync_committee_duties(0).await.unwrap();
+        let mut map = HashMap::new();
+        map.insert(pk.to_bytes(), pk);
+        SyncCommitteeService::new(
+            signer,
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            config,
+            store,
+        )
+    }
+
+    enum SlowCase {
+        Selection,
+        Contribution,
+        AlreadyPast,
+    }
+
+    async fn slow_signer_stops(case: SlowCase) {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let mut config = create_test_config();
+        config.timeouts.sync_contribution = Duration::from_secs(10);
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let selection_calls = Arc::new(AtomicUsize::new(0));
+        let contribution_calls = Arc::new(AtomicUsize::new(0));
+        let gets = Arc::new(AtomicUsize::new(0));
+        let submits = Arc::new(AtomicUsize::new(0));
+        let (delay_selection, delay_contribution) = match case {
+            SlowCase::Selection => (true, false),
+            SlowCase::Contribution => (false, true),
+            SlowCase::AlreadyPast => (true, true),
+        };
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let inner = Arc::new(
+            SignerService::new(
+                Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+                Arc::new(SlashingDb::open_in_memory().unwrap()),
+            )
+            .with_enablement(always_enabled()),
+        );
+        let signer = Arc::new(SlowSigner {
+            inner,
+            delay_selection,
+            delay_contribution,
+            delay: Duration::from_secs(10),
+            selection_calls: Arc::clone(&selection_calls),
+            contribution_calls: Arc::clone(&contribution_calls),
+        });
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution({
+                    let gets = Arc::clone(&gets);
+                    move |requested, subcommittee, _| {
+                        gets.fetch_add(1, Ordering::SeqCst);
+                        Ok(DataResponse { data: contribution_body(requested, head, subcommittee) })
+                    }
+                })
+                .with_submit_contribution_and_proofs({
+                    let submits = Arc::clone(&submits);
+                    move |batch| {
+                        submits.fetch_add(batch.len(), Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        );
+        let service = service_with_signer(beacon, pk, signer, config).await;
+        if matches!(case, SlowCase::AlreadyPast) {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        let started = tokio::time::Instant::now();
+        let slot_end = if matches!(case, SlowCase::AlreadyPast) {
+            started - Duration::from_secs(1)
+        } else {
+            started + Duration::from_millis(200)
+        };
+        service.maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), slot_end).await;
+        let elapsed = started.elapsed();
+        assert!(elapsed < Duration::from_secs(2), "signer stretched the phase to {elapsed:?}");
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
+        match case {
+            SlowCase::Selection => {
+                assert_eq!(selection_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(contribution_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(gets.load(Ordering::SeqCst), 0);
+            }
+            SlowCase::Contribution => {
+                assert_eq!(selection_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(contribution_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(gets.load(Ordering::SeqCst), 1);
+            }
+            SlowCase::AlreadyPast => {
+                assert_eq!(selection_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(contribution_calls.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_slow_contribution_signer_stops_at_the_slot_end_overhang() {
+        slow_signer_stops(SlowCase::Selection).await;
+        slow_signer_stops(SlowCase::Contribution).await;
+        slow_signer_stops(SlowCase::AlreadyPast).await;
     }
 }

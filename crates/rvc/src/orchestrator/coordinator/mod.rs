@@ -37,7 +37,7 @@ use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
 use super::payload_attestation::PayloadAttestationService;
 use super::slot_anchor::SlotAnchor;
-use super::slot_context::SlotContext;
+use super::slot_context::{fetch_head_root, SlotContext};
 use super::sync_committee::SyncCommitteeService;
 use super::utils::{self, TimedOutcome};
 use crate::pubkey_index::SharedPubkeyIndexRegistry;
@@ -478,6 +478,64 @@ where
     next_activation_fork: Option<ForkName>,
 }
 
+/// One phase-2 capture per slot. The owner fetches; every other caller waits.
+pub(crate) struct Phase2Head {
+    started: AtomicBool,
+    done: watch::Sender<bool>,
+}
+
+struct Phase2Finish<'a>(&'a Phase2Head);
+
+impl Phase2Head {
+    pub(crate) fn new() -> Self {
+        let (done, _) = watch::channel(false);
+        Self { started: AtomicBool::new(false), done }
+    }
+
+    /// `true` for the caller that owns the fetch.
+    fn try_begin(&self) -> bool {
+        self.started.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+
+    /// Notifies waiters when the owner returns, including on cancel.
+    fn finish_on_drop(&self) -> Phase2Finish<'_> {
+        Phase2Finish(self)
+    }
+
+    fn finish(&self) {
+        // `send` drops the value when no receiver is alive. The contribution
+        // phase subscribes later, so the stored value has to survive that gap.
+        self.done.send_replace(true);
+    }
+
+    /// Returns when the owner finishes or `deadline` is due.
+    ///
+    /// The watch subscription is read before waiting, so a finish that
+    /// lands between the check and the wait is not missed.
+    async fn wait_until(&self, deadline: tokio::time::Instant) {
+        let mut done = self.done.subscribe();
+        loop {
+            if *done.borrow_and_update() || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::select! {
+                changed = done.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => return,
+            }
+        }
+    }
+}
+
+impl Drop for Phase2Finish<'_> {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
 impl<C, S, B> DutyOrchestrator<C, S, B>
 where
     C: SlotClock + 'static,
@@ -610,8 +668,11 @@ where
     /// Runs the orchestrator main loop with four-phase slot processing:
     /// - t=0: bounded parent capture + block proposal
     /// - attestation due: attestations and sync messages concurrently
-    ///   (HeadEventGate wait; sync has its own span)
-    /// - aggregate due: sync committee contributions + aggregations
+    ///   (HeadEventGate wait; sync has its own span). Head capture is
+    ///   deadline-bounded and does not run while the slot-context lock is held.
+    ///   Attestations do not wait for that fetch.
+    /// - aggregate due: aggregation starts then. Contributions wait for the
+    ///   in-flight phase-2 head, bounded by the contribution signing deadline.
     /// - payload attestation due (Gloas+): payload attestations
     /// - post-duty: epoch duty fetches, epoch-boundary prep, builder registration
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
@@ -737,6 +798,7 @@ where
             // frozen MockSlotClock would fire aggregates at att+agg instead of
             // agg, and wall-clock production already uses remaining time.
             let ctx = tokio::sync::Mutex::new(ctx);
+            let phase2_head = Phase2Head::new();
             let att_phase_span = info_span!(
                 parent: &slot_span,
                 "slot.phase.attestation",
@@ -766,6 +828,7 @@ where
                     att_phase_span,
                     sync_phase_span,
                     &anchor,
+                    &phase2_head,
                 ),
                 self.run_aggregation_and_contribution_phases(
                     current_slot,
@@ -774,6 +837,7 @@ where
                     deadlines,
                     agg_phase_span,
                     &anchor,
+                    &phase2_head,
                 ),
                 self.run_payload_attestation_phase(
                     current_slot,
@@ -1238,10 +1302,52 @@ where
         }
     }
 
-    async fn capture_head_if_needed(&self, ctx: &tokio::sync::Mutex<SlotContext>) {
-        let mut ctx = ctx.lock().await;
-        if ctx.head_root.is_none() {
-            ctx.capture_head(&*self.beacon).await;
+    /// Earlier of slot end and `budget` from now.
+    ///
+    /// A budget `Instant` cannot add, or a slot that has already ended, yields
+    /// a deadline at or before now so [`fetch_head_root`] does not call the
+    /// beacon node.
+    fn head_fetch_deadline(
+        slot_end: tokio::time::Instant,
+        budget: Duration,
+    ) -> tokio::time::Instant {
+        let now = tokio::time::Instant::now();
+        let budget_at = now.checked_add(budget).unwrap_or(now);
+        slot_end.min(budget_at)
+    }
+
+    /// Phase-2 head, when it is still unset.
+    ///
+    /// One capture runs per slot. A second caller waits until that capture
+    /// finishes or `deadline`, whichever is earlier, and does not start
+    /// another fetch. The slot-context lock is not held across the beacon
+    /// fetch. The first root written wins. A timeout or invalid body keeps
+    /// the parent captured at t=0: that parent is the last head this client
+    /// verified, and signing it is valid and non-slashable for sync messages.
+    async fn capture_head_if_needed(
+        &self,
+        ctx: &tokio::sync::Mutex<SlotContext>,
+        deadline: tokio::time::Instant,
+        gate: &Phase2Head,
+    ) {
+        if !gate.try_begin() {
+            gate.wait_until(deadline).await;
+            return;
+        }
+        let _finish = gate.finish_on_drop();
+        let slot = {
+            let guard = ctx.lock().await;
+            if guard.head_root.is_some() {
+                return;
+            }
+            guard.slot
+        };
+        let fetched = fetch_head_root(&*self.beacon, slot, deadline).await;
+        let mut guard = ctx.lock().await;
+        if guard.head_root.is_none() {
+            if let Some(root) = fetched.or(guard.parent_root) {
+                guard.set_head(root);
+            }
         }
     }
 
@@ -1333,6 +1439,7 @@ where
         att_phase_span: tracing::Span,
         sync_phase_span: tracing::Span,
         anchor: &SlotAnchor,
+        gate: &Phase2Head,
     ) -> WaitOutcome {
         if deadlines.attestation == deadlines.sync_message {
             if matches!(
@@ -1356,16 +1463,19 @@ where
             Self::record_phase_offset(slot_phase_offset::ATTESTATION, anchor);
             Self::record_time_into_slot(&sync_phase_span, anchor);
             Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
-            self.capture_head_if_needed(ctx).await;
             self.warn_if_attestation_overrun(anchor, deadlines.attestation);
-            // Snapshot before the join. Inside it, sync would block on the
-            // ctx mutex while attestation holds it across capture_head.
-            let snapshot = self.snapshot_ctx(ctx).await;
             let slot_end = anchor.slot_end();
+            let head_deadline =
+                Self::head_fetch_deadline(slot_end, self.config.timeouts.attestation_fetch);
             tokio::join!(
                 self.run_attestation_phase(current_slot, &att_phase_span, slot_end),
-                self.run_sync_messages_phase(current_slot, current_epoch, &snapshot, slot_end)
-                    .instrument(sync_phase_span),
+                async {
+                    self.capture_head_if_needed(ctx, head_deadline, gate).await;
+                    let snapshot = self.snapshot_ctx(ctx).await;
+                    self.run_sync_messages_phase(current_slot, current_epoch, &snapshot, slot_end)
+                        .instrument(sync_phase_span.clone())
+                        .await;
+                },
             );
             return WaitOutcome::Continue;
         }
@@ -1388,7 +1498,6 @@ where
                 }
                 Self::record_time_into_slot(&att_phase_span, anchor);
                 Self::record_phase_offset(slot_phase_offset::ATTESTATION, anchor);
-                self.capture_head_if_needed(ctx).await;
                 self.warn_if_attestation_overrun(anchor, deadlines.attestation);
                 self.run_attestation_phase(current_slot, &att_phase_span, anchor.slot_end()).await;
                 WaitOutcome::Continue
@@ -1410,7 +1519,11 @@ where
                 }
                 Self::record_time_into_slot(&sync_phase_span, anchor);
                 Self::record_phase_offset(slot_phase_offset::SYNC_MESSAGE, anchor);
-                self.capture_head_if_needed(ctx).await;
+                let head_deadline = Self::head_fetch_deadline(
+                    anchor.slot_end(),
+                    self.config.timeouts.attestation_fetch,
+                );
+                self.capture_head_if_needed(ctx, head_deadline, gate).await;
                 let snapshot = self.snapshot_ctx(ctx).await;
                 self.run_sync_messages_phase(
                     current_slot,
@@ -1434,6 +1547,12 @@ where
 
     /// Contributions share the aggregate wait while their bps match; otherwise
     /// each duty waits from slot start to its own offset.
+    ///
+    /// Aggregation starts at that wait. Contributions then wait for an
+    /// in-flight phase-2 capture, bounded by the contribution signing
+    /// deadline. That wait does not delay aggregation, and it does not start
+    /// a second head fetch while the first capture is running.
+    #[allow(clippy::too_many_arguments)]
     async fn run_aggregation_and_contribution_phases(
         &self,
         current_slot: Slot,
@@ -1442,6 +1561,7 @@ where
         deadlines: DeadlineBps,
         agg_phase_span: tracing::Span,
         anchor: &SlotAnchor,
+        gate: &Phase2Head,
     ) -> WaitOutcome {
         if deadlines.contribution == deadlines.aggregate {
             if matches!(
@@ -1463,18 +1583,28 @@ where
             }
             Self::record_time_into_slot(&agg_phase_span, anchor);
             Self::record_phase_offset(slot_phase_offset::CONTRIBUTION, anchor);
-            let snapshot = self.snapshot_ctx(ctx).await;
-            self.run_sync_contributions_phase(current_slot, current_epoch, &snapshot)
-                .instrument(agg_phase_span.clone())
-                .await;
             Self::record_phase_offset(slot_phase_offset::AGGREGATE, anchor);
-            self.run_aggregation_phase(
-                current_slot,
-                current_epoch,
-                agg_phase_span,
-                anchor.slot_end(),
-            )
-            .await;
+            let slot_end = anchor.slot_end();
+            let contribution_span = agg_phase_span.clone();
+            tokio::join!(
+                async {
+                    let (deadline, _) = super::sync_committee::contribution_deadline(
+                        slot_end,
+                        self.config.timeouts.sync_contribution,
+                    );
+                    self.capture_head_if_needed(ctx, deadline, gate).await;
+                    let snapshot = self.snapshot_ctx(ctx).await;
+                    self.run_sync_contributions_phase(
+                        current_slot,
+                        current_epoch,
+                        &snapshot,
+                        slot_end,
+                    )
+                    .instrument(contribution_span)
+                    .await;
+                },
+                self.run_aggregation_phase(current_slot, current_epoch, agg_phase_span, slot_end,),
+            );
             return WaitOutcome::Continue;
         }
 
@@ -1495,11 +1625,23 @@ where
                     return WaitOutcome::Shutdown;
                 }
                 Self::record_phase_offset(slot_phase_offset::CONTRIBUTION, anchor);
-                self.capture_head_if_needed(ctx).await;
+                let slot_end = anchor.slot_end();
+                let head_deadline =
+                    Self::head_fetch_deadline(slot_end, self.config.timeouts.attestation_fetch);
+                let (sign_deadline, _) = super::sync_committee::contribution_deadline(
+                    slot_end,
+                    self.config.timeouts.sync_contribution,
+                );
+                self.capture_head_if_needed(ctx, head_deadline.min(sign_deadline), gate).await;
                 let snapshot = self.snapshot_ctx(ctx).await;
-                self.run_sync_contributions_phase(current_slot, current_epoch, &snapshot)
-                    .instrument(agg_phase_span.clone())
-                    .await;
+                self.run_sync_contributions_phase(
+                    current_slot,
+                    current_epoch,
+                    &snapshot,
+                    anchor.slot_end(),
+                )
+                .instrument(agg_phase_span.clone())
+                .await;
                 WaitOutcome::Continue
             },
             async {
@@ -1588,9 +1730,20 @@ where
     }
 
     /// Runs the sync-committee contributions phase, gated by `sync_enabled`.
-    async fn run_sync_contributions_phase(&self, slot: Slot, epoch: u64, ctx: &SlotContext) {
+    ///
+    /// Intake stops at `slot_end`. A contribution fetch or publish still
+    /// running stops at `slot_end` plus [`super::dispatch::SLOT_END_PUBLISH_OVERHANG`].
+    async fn run_sync_contributions_phase(
+        &self,
+        slot: Slot,
+        epoch: u64,
+        ctx: &SlotContext,
+        slot_end: tokio::time::Instant,
+    ) {
         if self.sync_enabled.load(Ordering::Acquire) {
-            self.sync_committee_service.maybe_produce_sync_contributions(slot, epoch, ctx).await;
+            self.sync_committee_service
+                .maybe_produce_sync_contributions(slot, epoch, ctx, slot_end)
+                .await;
         }
     }
 
