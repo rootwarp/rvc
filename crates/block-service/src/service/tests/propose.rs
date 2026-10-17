@@ -709,7 +709,7 @@ async fn test_propose_block_at_slot_zero_ssz() {
         Arc::new(MockSigner::new()),
         beacon_arc.clone(),
         Arc::new(store),
-        Arc::new(test_fork_schedule()),
+        Arc::new(test_fork_schedule_for("capella")),
         [0xaa; 32],
     );
 
@@ -1411,7 +1411,7 @@ fn test_l3_kzg_root_changes_on_any_commitment_mutation() {
 #[tokio::test]
 async fn test_l3_propose_block_and_blobs_succeeds_with_matching_commitment_count() {
     let pubkey = test_pubkey();
-    let slot = 1000;
+    let slot = 50 * SLOTS_PER_EPOCH;
     let commitments = [[0xee; 48], [0xff; 48]];
 
     let response = block_and_blobs_response(slot, &commitments);
@@ -1429,7 +1429,7 @@ async fn test_l3_propose_block_and_blobs_succeeds_with_matching_commitment_count
 #[tokio::test]
 async fn commitment_count_mismatch_still_warns_only() {
     let pubkey = test_pubkey();
-    let slot = 2000;
+    let slot = 50 * SLOTS_PER_EPOCH;
 
     // Body has 2 commitments. One blob and one proof: cardinality passes, the
     // commitment count does not.
@@ -1518,13 +1518,14 @@ struct ContentsHarness {
 }
 
 fn contents_harness(response: ProduceBlockResponse, pubkey: &PublicKey) -> ContentsHarness {
+    let version = response.consensus_version.clone();
     let signer = Arc::new(MockSigner::new());
     let beacon = Arc::new(MockBeaconClient::from_response(response));
     let service = BlockService::new(
         signer.clone(),
         beacon.clone(),
         Arc::new(test_validator_store(pubkey)),
-        Arc::new(test_fork_schedule()),
+        Arc::new(test_fork_schedule_for(&version)),
         [0xaa; 32],
     );
     ContentsHarness { service, signer, beacon }

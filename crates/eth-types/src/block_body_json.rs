@@ -7,16 +7,26 @@
 //! a parse failure cannot become a signature. Pre-Deneb forks have no layout
 //! ([`crate::body_fork_layout`] returns `None`) and are unsupported.
 //!
-//! `ProduceBlockResponse::parse_full_block` decodes object bodies here.
-//! `SignedBlockContentsJson` encodes them back on publish. SSZ stays canonical.
+//! Blinded bodies use the same fork split. [`decode_blinded`] and
+//! [`encode_blinded`] read `BlindedBeaconBlockBody{Deneb,Electra}`
+//! (`execution_payload_header` instead of `execution_payload`; Electra still
+//! has `execution_requests`). A full payload object is not a blinded body.
+//! Gloas returns [`BodySszError::GloasUnsupported`] without reading the input.
+//!
+//! `ProduceBlockResponse::parse_full_block` and `parse_blinded_block` decode
+//! object bodies here. `SignedBlockContentsJson` and
+//! `SignedBlindedBeaconBlockJson` encode them back on publish. SSZ stays
+//! canonical.
 
 use serde::Deserialize;
 use serde_json::Value;
 
 use crate::block::BodyForkLayout;
 use crate::block_body::{
-    decode_beacon_block_body_deneb, decode_beacon_block_body_electra, BeaconBlockBodyDeneb,
-    BeaconBlockBodyElectra, BodySszError,
+    decode_beacon_block_body_deneb, decode_beacon_block_body_electra,
+    decode_blinded_beacon_block_body_deneb, decode_blinded_beacon_block_body_electra,
+    BeaconBlockBodyDeneb, BeaconBlockBodyElectra, BlindedBeaconBlockBodyDeneb,
+    BlindedBeaconBlockBodyElectra, BodySszError,
 };
 
 /// JSON object → typed body → canonical SSZ bytes.
@@ -32,6 +42,27 @@ pub fn decode(json: &Value, layout: BodyForkLayout) -> Result<Vec<u8>, BodySszEr
         }
         BodyForkLayout::Electra => {
             let body = BeaconBlockBodyElectra::deserialize(json)
+                .map_err(|err| BodySszError::InvalidEncoding(err.to_string()))?;
+            Ok(body.as_ssz_bytes())
+        }
+        BodyForkLayout::Gloas => Err(BodySszError::GloasUnsupported),
+    }
+}
+
+/// JSON object → typed blinded body → canonical SSZ bytes.
+///
+/// [`BodyForkLayout::Gloas`] returns [`BodySszError::GloasUnsupported`] without
+/// reading `json`. A full `execution_payload` object is [`BodySszError::InvalidEncoding`].
+pub fn decode_blinded(json: &Value, layout: BodyForkLayout) -> Result<Vec<u8>, BodySszError> {
+    reject_beacon_api_lenient_spellings(json)?;
+    match layout {
+        BodyForkLayout::Deneb => {
+            let body = BlindedBeaconBlockBodyDeneb::deserialize(json)
+                .map_err(|err| BodySszError::InvalidEncoding(err.to_string()))?;
+            Ok(body.as_ssz_bytes())
+        }
+        BodyForkLayout::Electra => {
+            let body = BlindedBeaconBlockBodyElectra::deserialize(json)
                 .map_err(|err| BodySszError::InvalidEncoding(err.to_string()))?;
             Ok(body.as_ssz_bytes())
         }
@@ -59,12 +90,84 @@ pub fn encode(ssz: &[u8], layout: BodyForkLayout) -> Result<Value, BodySszError>
     }
 }
 
+/// Canonical blinded SSZ bytes → Beacon-API JSON object.
+///
+/// The inverse of [`decode_blinded`]. [`BodyForkLayout::Gloas`] returns
+/// [`BodySszError::GloasUnsupported`] without reading `ssz`.
+pub fn encode_blinded(ssz: &[u8], layout: BodyForkLayout) -> Result<Value, BodySszError> {
+    match layout {
+        BodyForkLayout::Deneb => {
+            let body = decode_blinded_beacon_block_body_deneb(ssz)?;
+            serde_json::to_value(&body)
+                .map_err(|err| BodySszError::InvalidEncoding(err.to_string()))
+        }
+        BodyForkLayout::Electra => {
+            let body = decode_blinded_beacon_block_body_electra(ssz)?;
+            serde_json::to_value(&body)
+                .map_err(|err| BodySszError::InvalidEncoding(err.to_string()))
+        }
+        BodyForkLayout::Gloas => Err(BodySszError::GloasUnsupported),
+    }
+}
+
+/// Reject Beacon-API spellings the primitive schema does not allow.
+///
+/// [`ethereum/beacon-APIs` `types/primitive.yaml`](https://github.com/ethereum/beacon-APIs/blob/master/types/primitive.yaml):
+/// hex is `^0x[a-fA-F0-9]+$`, so the prefix is lowercase `0x` and the digits
+/// are case-insensitive (`a-fA-F`; the pubkey text says "case insensitive").
+/// `Uint64` and `Uint256` are strings whose example is `"1"`, with no leading
+/// `+`.
+///
+/// Kept lenient on this seam:
+/// - uppercase hex digits, because that pattern allows them
+/// - a raw JSON number where a quoted integer is also accepted (`quoted_u64`
+///   decodes both to the same SSZ)
+///
+/// [`crate::hex_fixed`] and [`crate::canonical`] still accept `0X`. Those
+/// helpers are not this wire seam.
+pub fn reject_beacon_api_lenient_spellings(value: &Value) -> Result<(), BodySszError> {
+    match value {
+        Value::String(text) => {
+            if text.starts_with("0X") {
+                return Err(BodySszError::InvalidEncoding(
+                    "Beacon API hex prefix must be lowercase 0x".into(),
+                ));
+            }
+            if text.len() > 1
+                && text.starts_with('+')
+                && text.as_bytes()[1..].iter().all(|byte| byte.is_ascii_digit())
+            {
+                return Err(BodySszError::InvalidEncoding(
+                    "Beacon API integer must not have a leading +".into(),
+                ));
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for item in items {
+                reject_beacon_api_lenient_spellings(item)?;
+            }
+            Ok(())
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                reject_beacon_api_lenient_spellings(item)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block_body::{
-        body_tree_hash_root_for_layout, external_vector_deneb_body, external_vector_electra_body,
-        EXTERNAL_DENEB_BODY_ROOT_HEX, EXTERNAL_ELECTRA_BODY_ROOT_HEX,
+        blinded_body_tree_hash_root_for_layout, body_tree_hash_root_for_layout,
+        external_vector_blinded_deneb_body, external_vector_blinded_electra_body,
+        external_vector_deneb_body, external_vector_electra_body,
+        EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX, EXTERNAL_DENEB_BODY_ROOT_HEX,
+        EXTERNAL_ELECTRA_BODY_ROOT_HEX,
     };
     use crate::body_fork_layout;
     use tree_hash::TreeHash;
@@ -99,6 +202,12 @@ mod tests {
     /// Not captured. Hoodi head is Fulu; there is no Gloas body to fetch.
     const GLOAS_BODY_JSON: &str =
         include_str!("../tests/fixtures/beacon_api/gloas_block_body.json");
+    /// Beacon-API JSON of [`external_vector_blinded_deneb_body`].
+    const DENEB_BLINDED_BODY_JSON: &str =
+        include_str!("../tests/fixtures/beacon_api/deneb_blinded_block_body.json");
+    /// Beacon-API JSON of [`external_vector_blinded_electra_body`].
+    const ELECTRA_BLINDED_BODY_JSON: &str =
+        include_str!("../tests/fixtures/beacon_api/electra_blinded_block_body.json");
 
     fn parse(text: &str) -> Value {
         serde_json::from_str(text).expect("fixture json")
@@ -219,5 +328,162 @@ mod tests {
                 .iter()
                 .all(|blob| { blob.as_str().is_some_and(|text| text.len() == 2 + 131_072 * 2) }));
         }
+    }
+
+    #[test]
+    fn blinded_deneb_body_round_trip_matches_external_body_root() {
+        let json = parse(DENEB_BLINDED_BODY_JSON);
+        assert!(json["execution_payload_header"].is_object());
+        assert!(json.get("execution_payload").is_none());
+        assert!(json.get("execution_requests").is_none());
+        let ssz = decode_blinded(&json, BodyForkLayout::Deneb).expect("deneb blinded decode");
+        assert_eq!(ssz, external_vector_blinded_deneb_body().as_ssz_bytes());
+        let again = encode_blinded(&ssz, BodyForkLayout::Deneb).expect("deneb blinded encode");
+        assert!(again.is_object());
+        assert_eq!(again, json);
+        let root =
+            blinded_body_tree_hash_root_for_layout(&ssz, BodyForkLayout::Deneb).expect("deneb htr");
+        assert_eq!(hex_root(root), EXTERNAL_DENEB_BODY_ROOT_HEX);
+        // A second parse has no stored state to drift from the first.
+        let again_ssz = decode_blinded(&again, BodyForkLayout::Deneb).expect("second decode");
+        assert_eq!(again_ssz, ssz);
+    }
+
+    #[test]
+    fn blinded_electra_and_fulu_bodies_round_trip_to_the_external_body_root() {
+        let json = parse(ELECTRA_BLINDED_BODY_JSON);
+        assert!(json["execution_payload_header"].is_object());
+        assert!(json["execution_requests"].is_object());
+        assert!(json.get("execution_payload").is_none());
+        for layout in [BodyForkLayout::Electra, body_fork_layout("fulu").expect("fulu layout")] {
+            assert_eq!(layout, BodyForkLayout::Electra);
+            let ssz = decode_blinded(&json, layout).expect("electra blinded decode");
+            assert_eq!(ssz, external_vector_blinded_electra_body().as_ssz_bytes());
+            let again = encode_blinded(&ssz, layout).expect("electra blinded encode");
+            assert_eq!(again, json);
+            let root = blinded_body_tree_hash_root_for_layout(&ssz, layout).expect("electra htr");
+            assert_eq!(hex_root(root), EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX);
+        }
+    }
+
+    #[test]
+    fn blinded_gloas_fails_closed_without_reading_the_input() {
+        assert_eq!(
+            decode_blinded(&Value::Null, BodyForkLayout::Gloas),
+            Err(BodySszError::GloasUnsupported)
+        );
+        assert_eq!(
+            decode_blinded(&parse(ELECTRA_BLINDED_BODY_JSON), BodyForkLayout::Gloas),
+            Err(BodySszError::GloasUnsupported)
+        );
+        assert_eq!(encode_blinded(b"", BodyForkLayout::Gloas), Err(BodySszError::GloasUnsupported));
+        assert_eq!(
+            encode_blinded(b"not-ssz", BodyForkLayout::Gloas),
+            Err(BodySszError::GloasUnsupported)
+        );
+    }
+
+    #[test]
+    fn blinded_decode_rejects_a_partial_or_full_payload_body() {
+        let mut missing = parse(ELECTRA_BLINDED_BODY_JSON);
+        missing.as_object_mut().expect("object").remove("execution_payload_header");
+        let err = decode_blinded(&missing, BodyForkLayout::Electra).expect_err("missing field");
+        assert!(
+            matches!(err, BodySszError::InvalidEncoding(ref msg) if msg.contains("execution_payload_header")),
+            "{err}"
+        );
+
+        // `quoted_u64` accepts a JSON number. The integer is the same SSZ as
+        // the quoted form. A float, a negative, or a non-integer string is not.
+        let mut number = parse(DENEB_BLINDED_BODY_JSON);
+        let quoted = decode_blinded(&number, BodyForkLayout::Deneb).expect("quoted block_number");
+        number["execution_payload_header"]["block_number"] = serde_json::json!(12_345);
+        assert_eq!(
+            decode_blinded(&number, BodyForkLayout::Deneb).expect("raw u64"),
+            quoted,
+            "a raw u64 is the same body as the quoted form"
+        );
+        for bad in [serde_json::json!(1.5), serde_json::json!(-1), serde_json::json!("nope")] {
+            number["execution_payload_header"]["block_number"] = bad;
+            assert!(
+                matches!(
+                    decode_blinded(&number, BodyForkLayout::Deneb),
+                    Err(BodySszError::InvalidEncoding(_))
+                ),
+                "block_number must be an integer"
+            );
+        }
+
+        assert!(matches!(
+            decode_blinded(&parse(ELECTRA_BODY_JSON), BodyForkLayout::Electra),
+            Err(BodySszError::InvalidEncoding(_))
+        ));
+        assert!(matches!(
+            decode_blinded(&Value::Array(vec![]), BodyForkLayout::Deneb),
+            Err(BodySszError::InvalidEncoding(_))
+        ));
+        assert!(matches!(
+            encode_blinded(&external_vector_deneb_body().as_ssz_bytes(), BodyForkLayout::Deneb),
+            Err(BodySszError::InvalidEncoding(_))
+        ));
+        assert!(matches!(
+            encode_blinded(&external_vector_electra_body().as_ssz_bytes(), BodyForkLayout::Electra),
+            Err(BodySszError::InvalidEncoding(_))
+        ));
+        assert!(matches!(
+            encode_blinded(&[0xbe, 0xef], BodyForkLayout::Deneb),
+            Err(BodySszError::InvalidEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn blinded_layout_does_not_decode_the_other_forks_container() {
+        let deneb = parse(DENEB_BLINDED_BODY_JSON);
+        let electra = parse(ELECTRA_BLINDED_BODY_JSON);
+        assert!(matches!(
+            decode_blinded(&deneb, BodyForkLayout::Electra),
+            Err(BodySszError::InvalidEncoding(_))
+        ));
+        assert!(
+            matches!(
+                decode_blinded(&electra, BodyForkLayout::Deneb),
+                Err(BodySszError::InvalidEncoding(_))
+            ),
+            "execution_requests is not a Deneb field"
+        );
+        let mut with_payload = electra;
+        with_payload["execution_payload"] = with_payload["execution_payload_header"].clone();
+        let err = decode_blinded(&with_payload, BodyForkLayout::Electra)
+            .expect_err("execution_payload is not a blinded field");
+        let BodySszError::InvalidEncoding(msg) = err else {
+            panic!("expected InvalidEncoding");
+        };
+        assert!(msg.contains("execution_payload"), "{msg}");
+    }
+
+    #[test]
+    fn blinded_json_rejects_uppercase_prefix_and_a_leading_plus() {
+        let mut body = parse(DENEB_BLINDED_BODY_JSON);
+        let randao = body["randao_reveal"].as_str().expect("randao").to_string();
+        assert!(randao.starts_with("0x"));
+        body["randao_reveal"] = Value::String(randao.replacen("0x", "0X", 1));
+        let err = decode_blinded(&body, BodyForkLayout::Deneb).expect_err("0X");
+        assert!(err.to_string().contains("lowercase 0x"), "{err}");
+
+        let mut upper = parse(DENEB_BLINDED_BODY_JSON);
+        let original = upper["randao_reveal"].as_str().unwrap();
+        let mut chars: Vec<char> = original.chars().collect();
+        chars[2] = 'A';
+        chars[3] = 'B';
+        upper["randao_reveal"] = Value::String(chars.into_iter().collect());
+        assert!(
+            decode_blinded(&upper, BodyForkLayout::Deneb).is_ok(),
+            "primitive.yaml hex digits are a-fA-F"
+        );
+
+        let mut plus = parse(DENEB_BLINDED_BODY_JSON);
+        plus["execution_payload_header"]["block_number"] = Value::String("+1".into());
+        let err = decode_blinded(&plus, BodyForkLayout::Deneb).expect_err("plus");
+        assert!(err.to_string().contains("leading +"), "{err}");
     }
 }

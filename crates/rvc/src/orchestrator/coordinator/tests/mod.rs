@@ -71,7 +71,9 @@ pub(crate) fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         bellatrix_fork_version: [0, 0, 0, 3],
         capella_fork_epoch: 30,
         capella_fork_version: [0, 0, 0, 4],
-        deneb_fork_epoch: 40,
+        // Block produces advertise "deneb". The V3 path requires that header
+        // to match the slot fork, so Deneb starts at genesis in this fixture.
+        deneb_fork_epoch: 0,
         deneb_fork_version: [0, 0, 0, 5],
         electra_fork_epoch: 50,
         electra_fork_version: [0, 0, 0, 6],

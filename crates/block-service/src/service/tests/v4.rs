@@ -98,7 +98,8 @@ async fn test_gloas_epoch_calls_produce_block_v4() {
 async fn test_fulu_epoch_calls_produce_block_v3() {
     let pubkey = test_pubkey();
     let slot = test_fulu_slot();
-    let beacon = Arc::new(MockBeaconClient::unblinded(test_block(slot)));
+    let beacon =
+        Arc::new(MockBeaconClient::unblinded(test_block(slot)).with_consensus_version("fulu"));
     let service = BlockService::new(
         Arc::new(MockSigner::new()),
         beacon.clone(),

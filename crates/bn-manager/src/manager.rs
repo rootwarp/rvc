@@ -3218,16 +3218,29 @@ impl BlockProducer for BnManager {
         signed_blinded_block: &SignedBlindedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BeaconError> {
+        // One JSON object for every fan-out attempt. A bad fork or body returns
+        // before submit, so no beacon node is called and nothing is signed here.
+        let layout = eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
+            BeaconError::ParseError(format!(
+                "JSON blinded block is unsupported for consensus version {consensus_version}"
+            ))
+        })?;
+        let wire = eth_types::SignedBlindedBeaconBlockJson::from_signed_blinded(
+            signed_blinded_block,
+            layout,
+        )
+        .map_err(|err| {
+            BeaconError::ParseError(format!("invalid JSON blinded block body: {err}"))
+        })?;
         self.submit(
             "publish_blinded_block",
             self.broadcast_topics.blocks,
             BnRole::Submission,
             HealthTier::LargeLag,
             self.op_timeout(|t| t.block_publication),
-            owned_attempt!(
-                (signed_blinded_block.clone(), consensus_version.to_owned()),
-                |client, payload| client.publish_blinded_block(&payload.0, &payload.1).await
-            ),
+            owned_attempt!((wire, consensus_version.to_owned()), |client, payload| client
+                .publish_blinded_block(&payload.0, &payload.1)
+                .await),
         )
         .await
     }
@@ -6886,6 +6899,62 @@ mod tests {
             matches!(
                 err,
                 BeaconError::OperationTimeout { ref operation, .. } if operation == "publish_block_contents"
+            ),
+            "{err:?}"
+        );
+        assert!(
+            elapsed <= budget + epsilon,
+            "elapsed {elapsed:?} exceeded block_publication budget+ε ({:?})",
+            budget + epsilon
+        );
+    }
+
+    fn sample_signed_blinded_block() -> SignedBlindedBeaconBlock {
+        SignedBlindedBeaconBlock {
+            message: eth_types::external_vector_deneb_blinded_block(),
+            signature: vec![0xbb; 96],
+        }
+    }
+
+    /// Hanging BN, blocks topic off so `query_first` owns this call's deadline.
+    #[tokio::test(flavor = "current_thread")]
+    async fn publish_blinded_block_uses_the_block_publication_timeout() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let budget = Duration::from_millis(40);
+        let epsilon = Duration::from_millis(50);
+        let hang = Duration::from_millis(400);
+        assert!(hang > ATTEMPT_TIMEOUT_FLOOR, "hang must outlast an uncapped floor");
+        assert!(
+            ATTEMPT_TIMEOUT_FLOOR.saturating_sub(budget) > epsilon * 3,
+            "FLOOR ({ATTEMPT_TIMEOUT_FLOOR:?}) - budget ({budget:?}) must be several times ε ({epsilon:?})"
+        );
+
+        let bn = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}").set_delay(hang))
+            .mount(&bn)
+            .await;
+
+        let mut config = BnManagerConfig::new(vec![bn.uri()]);
+        config.broadcast_topics.blocks = false;
+        let manager =
+            BnManager::new(config).expect("BnManager").with_operation_timeouts(OperationTimeouts {
+                block_publication: budget,
+                ..OperationTimeouts::default()
+            });
+
+        let started = std::time::Instant::now();
+        let err = manager
+            .publish_blinded_block(&sample_signed_blinded_block(), "deneb")
+            .await
+            .expect_err("hanging BN must time out");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(
+                err,
+                BeaconError::OperationTimeout { ref operation, .. } if operation == "publish_blinded_block"
             ),
             "{err:?}"
         );

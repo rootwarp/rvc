@@ -47,7 +47,7 @@ pub use block_body::{
     BeaconBlockBodyElectra, BlindedBeaconBlockBodyDeneb, BlindedBeaconBlockBodyElectra,
     BodySszError, ExecutionPayload, ExecutionPayloadHeader, ExecutionRequests, SyncAggregate,
 };
-pub use signed_block_contents_json::SignedBlockContentsJson;
+pub use signed_block_contents_json::{SignedBlindedBeaconBlockJson, SignedBlockContentsJson};
 
 /// Deterministic SSZ/KAT bodies and known roots for tests (RF3-19 / G5).
 ///

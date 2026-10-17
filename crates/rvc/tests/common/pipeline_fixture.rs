@@ -74,7 +74,8 @@ pub fn create_test_fork_schedule() -> Arc<ForkSchedule> {
         bellatrix_fork_version: [0, 0, 0, 3],
         capella_fork_epoch: 30,
         capella_fork_version: [0, 0, 0, 4],
-        deneb_fork_epoch: 40,
+        // Produce responses advertise "deneb", which must match the slot fork.
+        deneb_fork_epoch: 0,
         deneb_fork_version: [0, 0, 0, 5],
         electra_fork_epoch: 50,
         electra_fork_version: [0, 0, 0, 6],

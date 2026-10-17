@@ -24,8 +24,31 @@ use beacon::{
     QUERY_BROADCAST_VALIDATION, QUERY_GRAFFITI, QUERY_INCLUDE_PAYLOAD, QUERY_RANDAO_REVEAL,
     QUERY_SKIP_RANDAO_VERIFICATION,
 };
-use eth_types::{ForkName, ForkSchedule};
+use eth_types::{
+    BodyForkLayout, ForkName, ForkSchedule, SignedBlindedBeaconBlock, SignedBlindedBeaconBlockJson,
+};
 use timing::{SlotClock, SystemSlotClock};
+
+const DENEB_BLINDED_BODY_JSON: &str =
+    include_str!("../../eth-types/tests/fixtures/beacon_api/deneb_blinded_block_body.json");
+const ELECTRA_BLINDED_BODY_JSON: &str =
+    include_str!("../../eth-types/tests/fixtures/beacon_api/electra_blinded_block_body.json");
+
+fn blinded_body_json(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).expect("blinded body fixture")
+}
+
+/// Wiremock matcher: `message.body` is a JSON object.
+struct MessageBodyObject;
+
+impl wiremock::Match for MessageBodyObject {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|value| value.pointer("/message/body").cloned())
+            .is_some_and(|body| body.is_object())
+    }
+}
 
 fn fulu_gloas_schedule() -> ForkSchedule {
     let mut schedule = ForkSchedule::unscheduled_gloas();
@@ -2036,7 +2059,7 @@ async fn test_produce_block_v3_blinded_block() {
         "proposer_index": "10",
         "parent_root": format!("0x{}", "03".repeat(32)),
         "state_root": format!("0x{}", "04".repeat(32)),
-        "body": "0xbeef"
+        "body": blinded_body_json(DENEB_BLINDED_BODY_JSON),
     });
     let envelope = serde_json::json!({
         "version": "deneb",
@@ -2071,6 +2094,7 @@ async fn test_produce_block_v3_blinded_block() {
     let block = result.parse_blinded_block().unwrap();
     assert_eq!(block.slot, 200);
     assert_eq!(block.proposer_index, 10);
+    assert_eq!(block.body, eth_types::external_vector_blinded_deneb_body().as_ssz_bytes());
 }
 
 #[tokio::test]
@@ -2341,7 +2365,7 @@ async fn test_produce_block_v3_ssz_fallback_json_gets_correct_headers() {
         "proposer_index": "55",
         "parent_root": format!("0x{}", "03".repeat(32)),
         "state_root": format!("0x{}", "04".repeat(32)),
-        "body": "0xbeef"
+        "body": blinded_body_json(ELECTRA_BLINDED_BODY_JSON),
     });
     let json_envelope = serde_json::json!({ "version": "electra", "data": block_data });
 
@@ -2375,6 +2399,9 @@ async fn test_produce_block_v3_ssz_fallback_json_gets_correct_headers() {
     assert!(result.is_blinded);
     assert_eq!(result.consensus_version, "electra");
     assert_eq!(result.execution_payload_value, Some("77777".to_string()));
+    let block = result.parse_blinded_block().expect("fallback JSON is a blinded body");
+    assert_eq!(block.slot, 950);
+    assert_eq!(block.body, eth_types::external_vector_blinded_electra_body().as_ssz_bytes());
 }
 
 #[tokio::test]
@@ -3459,20 +3486,20 @@ async fn test_publish_block_api_error() {
 async fn test_publish_blinded_block() {
     let mock_server = MockServer::start().await;
 
-    let signed_blinded_block = serde_json::json!({
-        "message": {
-            "slot": "200",
-            "proposer_index": "10",
-            "parent_root": "0x0101010101010101010101010101010101010101010101010101010101010101",
-            "state_root": "0x0202020202020202020202020202020202020202020202020202020202020202",
-            "body": "0xbeef"
-        },
-        "signature": "0xbbccdd"
-    });
+    let signed = SignedBlindedBeaconBlock {
+        message: eth_types::external_vector_deneb_blinded_block(),
+        signature: vec![0xbb; 96],
+    };
+    let signed_json =
+        SignedBlindedBeaconBlockJson::from_signed_blinded(&signed, BodyForkLayout::Deneb)
+            .expect("deneb blinded body encodes");
+    let wire = serde_json::to_value(&signed_json).expect("serialize blinded publish");
+    assert!(wire["message"]["body"].is_object());
 
     Mock::given(method("POST"))
         .and(path("/eth/v1/beacon/blinded_blocks"))
-        .and(body_json(&signed_blinded_block))
+        .and(body_json(&wire))
+        .and(MessageBodyObject)
         .and(wiremock::matchers::header("Eth-Consensus-Version", "deneb"))
         .respond_with(ResponseTemplate::new(200))
         .expect(1)
@@ -3482,7 +3509,7 @@ async fn test_publish_blinded_block() {
     let config = BeaconClientConfig::new(mock_server.uri());
     let client = BeaconClient::new(config).unwrap();
 
-    client.publish_blinded_block(&signed_blinded_block, "deneb").await.unwrap();
+    client.publish_blinded_block(&signed_json, "deneb").await.unwrap();
 }
 
 #[tokio::test]

@@ -4,7 +4,7 @@ use super::*;
 use async_trait::async_trait;
 use beacon::WireBody;
 use eth_types::{
-    BeaconBlock, BlindedBeaconBlock, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    BeaconBlock, BlindedBeaconBlock, ForkName, SignedBeaconBlock, SignedBlindedBeaconBlock,
     SignedBlockContentsJson,
 };
 use signer::{BeaconBlockHeaderFields, SignerError};
@@ -873,7 +873,9 @@ pub(crate) fn test_fork_schedule() -> ForkSchedule {
         bellatrix_fork_version: [2, 0, 0, 0],
         capella_fork_epoch: 30,
         capella_fork_version: [3, 0, 0, 0],
-        deneb_fork_epoch: 40,
+        // Proposal mocks advertise "deneb". prepare_v3 requires that header
+        // to match the slot fork, so Deneb is active from genesis until Electra.
+        deneb_fork_epoch: 0,
         deneb_fork_version: [4, 0, 0, 0],
         electra_fork_epoch: 50,
         electra_fork_version: [5, 0, 0, 0],
@@ -886,6 +888,54 @@ pub(crate) fn test_fork_schedule() -> ForkSchedule {
 
 /// Test-only Gloas activation after Fulu (epoch 60). Never a real network value.
 pub(crate) const TEST_GLOAS_EPOCH: u64 = 70;
+
+/// Schedule on which `version` is the fork at every epoch.
+///
+/// Later forks are unscheduled. Unknown text keeps [`test_fork_schedule`].
+pub(crate) fn test_fork_schedule_for(version: &str) -> ForkSchedule {
+    use std::str::FromStr;
+    let mut fork = test_fork_schedule();
+    let Ok(active) = ForkName::from_str(version) else {
+        return fork;
+    };
+    let unscheduled = u64::MAX;
+    if active == ForkName::Phase0 {
+        fork.altair_fork_epoch = unscheduled;
+        fork.bellatrix_fork_epoch = unscheduled;
+        fork.capella_fork_epoch = unscheduled;
+        fork.deneb_fork_epoch = unscheduled;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Altair {
+        fork.altair_fork_epoch = 0;
+        fork.bellatrix_fork_epoch = unscheduled;
+        fork.capella_fork_epoch = unscheduled;
+        fork.deneb_fork_epoch = unscheduled;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Bellatrix {
+        fork.bellatrix_fork_epoch = 0;
+        fork.capella_fork_epoch = unscheduled;
+        fork.deneb_fork_epoch = unscheduled;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Capella {
+        fork.capella_fork_epoch = 0;
+        fork.deneb_fork_epoch = unscheduled;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Deneb {
+        fork.deneb_fork_epoch = 0;
+        fork.electra_fork_epoch = unscheduled;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Electra {
+        fork.electra_fork_epoch = 0;
+        fork.fulu_fork_epoch = unscheduled;
+    } else if active == ForkName::Fulu {
+        fork.fulu_fork_epoch = 0;
+    }
+    fork
+}
 
 pub(crate) fn test_fork_schedule_with_near_gloas() -> ForkSchedule {
     let mut fork = test_fork_schedule();
@@ -1087,8 +1137,9 @@ pub(crate) fn test_body_ssz_for_version(consensus_version: &str) -> Vec<u8> {
 }
 
 pub(crate) fn test_blinded_body_ssz() -> Vec<u8> {
-    // Distinct graffiti so full vs blinded roots differ when headers match.
-    let mut body = eth_types::external_vector_blinded_electra_body();
+    // Deneb, matching the mock's "deneb" consensus version. An Electra body
+    // under that header is rejected before signing.
+    let mut body = eth_types::external_vector_blinded_deneb_body();
     body.graffiti = [0xbe; 32];
     body.as_ssz_bytes()
 }
@@ -1610,7 +1661,7 @@ pub(crate) async fn test_assert_last_sign_block_domain_fails_on_wrong_fork() {
     assert!(result.is_ok());
 
     let mut wrong_fork = test_fork_schedule();
-    wrong_fork.altair_fork_epoch = 999;
+    wrong_fork.deneb_fork_version = [9, 9, 9, 9];
     signer_arc.assert_last_sign_block_domain(&wrong_fork, &gvr);
 }
 
