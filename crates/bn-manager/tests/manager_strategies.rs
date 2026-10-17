@@ -3915,15 +3915,31 @@ fn sample_signed_block() -> SignedBeaconBlock {
 
 fn sample_signed_blinded_block() -> SignedBlindedBeaconBlock {
     SignedBlindedBeaconBlock {
-        message: eth_types::BlindedBeaconBlock {
-            slot: 100,
-            proposer_index: 42,
-            parent_root: [1u8; 32],
-            state_root: [2u8; 32],
-            body: vec![0xbe, 0xef],
-        },
+        message: eth_types::external_vector_deneb_blinded_block(),
         signature: vec![0xbb; 96],
     }
+}
+
+/// `message.body` must be a JSON object. A hex string does not match.
+struct MessageBodyObject;
+
+impl wiremock::Match for MessageBodyObject {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|value| value.pointer("/message/body").cloned())
+            .is_some_and(|body| body.is_object())
+    }
+}
+
+fn blinded_post_body(requests: &[wiremock::Request]) -> serde_json::Value {
+    let post = requests
+        .iter()
+        .find(|req| {
+            req.method.as_str() == "POST" && req.url.path() == "/eth/v1/beacon/blinded_blocks"
+        })
+        .expect("blinded publish");
+    serde_json::from_slice(&post.body).expect("json body")
 }
 
 /// A best-of round queues one health sample per BN. The call returns without
@@ -4264,6 +4280,7 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         for bn in [&bn1, &bn2] {
             Mock::given(method("POST"))
                 .and(path("/eth/v1/beacon/blinded_blocks"))
+                .and(MessageBodyObject)
                 .respond_with(ResponseTemplate::new(200))
                 .expect(1)
                 .mount(bn)
@@ -4272,15 +4289,25 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         let mut config = BnManagerConfig::new(vec![bn1.uri(), bn2.uri()]);
         config.broadcast_topics.blocks = true;
         let manager = BnManager::new(config).unwrap();
+        let body_before = blinded.message.body.clone();
         assert!(manager.publish_blinded_block(&blinded, "deneb").await.is_ok());
+        assert_eq!(blinded.message.body, body_before);
         poll_received(&bn1, "POST", "/eth/v1/beacon/blinded_blocks", 1).await;
         poll_received(&bn2, "POST", "/eth/v1/beacon/blinded_blocks", 1).await;
+        let left = bn1.received_requests().await.expect("bn1");
+        let right = bn2.received_requests().await.expect("bn2");
+        let left_body = blinded_post_body(&left);
+        let right_body = blinded_post_body(&right);
+        assert_eq!(left_body, right_body, "both nodes receive the one prebuilt JSON body");
+        assert!(left_body["message"]["body"].is_object());
+        assert!(left_body["message"]["body"]["execution_payload_header"].is_object());
     }
     {
         let bn1 = MockServer::start().await;
         let bn2 = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/eth/v1/beacon/blinded_blocks"))
+            .and(MessageBodyObject)
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&bn1)
@@ -4296,6 +4323,122 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
         let manager = BnManager::new(config).unwrap();
         assert!(manager.publish_blinded_block(&blinded, "deneb").await.is_ok());
     }
+}
+
+#[tokio::test]
+async fn publish_blinded_block_rejects_unsupported_forks_and_invalid_ssz_before_any_post() {
+    let bn = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/blinded_blocks"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&bn)
+        .await;
+    let mut config = BnManagerConfig::new(vec![bn.uri()]);
+    config.broadcast_topics.blocks = true;
+    let manager = BnManager::new(config).unwrap();
+    let signed = sample_signed_blinded_block();
+
+    for version in ["phase0", "altair", "bellatrix", "capella", "DENEB", ""] {
+        let err = manager.publish_blinded_block(&signed, version).await.expect_err(version);
+        match err {
+            BeaconError::ParseError(msg) => {
+                assert_eq!(
+                    msg,
+                    format!("JSON blinded block is unsupported for consensus version {version}"),
+                    "{version}"
+                );
+            }
+            other => panic!("{version}: {other:?}"),
+        }
+    }
+
+    let gloas = manager.publish_blinded_block(&signed, "gloas").await.expect_err("gloas");
+    match gloas {
+        BeaconError::ParseError(msg) => {
+            assert_eq!(
+                msg,
+                "invalid JSON blinded block body: Gloas BeaconBlockBody layout is not supported"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+
+    let mut garbage = signed.clone();
+    garbage.message.body = vec![0xbe, 0xef];
+    let err = manager.publish_blinded_block(&garbage, "deneb").await.expect_err("bad ssz");
+    match err {
+        BeaconError::ParseError(msg) => {
+            assert!(
+                msg.starts_with("invalid JSON blinded block body: invalid SSZ body encoding:"),
+                "{msg}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(bn.received_requests().await.expect("requests").is_empty());
+}
+
+#[tokio::test]
+async fn concurrent_blinded_publishes_keep_each_body() {
+    let bn = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/blinded_blocks"))
+        .and(MessageBodyObject)
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&bn)
+        .await;
+    let mut config = BnManagerConfig::new(vec![bn.uri()]);
+    config.broadcast_topics.blocks = false;
+    let manager = Arc::new(BnManager::new(config).unwrap());
+    let deneb = sample_signed_blinded_block();
+    let electra = SignedBlindedBeaconBlock {
+        message: eth_types::external_vector_electra_blinded_block(),
+        signature: vec![0xcc; 96],
+    };
+    let left = manager.clone();
+    let right = manager.clone();
+    let deneb_publish = deneb.clone();
+    let electra_publish = electra.clone();
+    let (first, second) = tokio::join!(
+        left.publish_blinded_block(&deneb_publish, "deneb"),
+        right.publish_blinded_block(&electra_publish, "electra"),
+    );
+    assert!(first.is_ok(), "{first:?}");
+    assert!(second.is_ok(), "{second:?}");
+    assert_eq!(deneb.message.body, deneb_publish.message.body);
+    assert_eq!(electra.message.body, electra_publish.message.body);
+
+    let requests = bn.received_requests().await.expect("requests");
+    let posts: Vec<serde_json::Value> = requests
+        .iter()
+        .filter(|req| req.url.path() == "/eth/v1/beacon/blinded_blocks")
+        .map(|req| serde_json::from_slice(&req.body).expect("json"))
+        .collect();
+    assert_eq!(posts.len(), 2);
+    let graffiti: Vec<_> = posts
+        .iter()
+        .map(|post| post["message"]["body"]["graffiti"].as_str().expect("graffiti").to_string())
+        .collect();
+    let deneb_json = eth_types::SignedBlindedBeaconBlockJson::from_signed_blinded(
+        &deneb,
+        eth_types::BodyForkLayout::Deneb,
+    )
+    .expect("deneb")
+    .message
+    .body;
+    let electra_json = eth_types::SignedBlindedBeaconBlockJson::from_signed_blinded(
+        &electra,
+        eth_types::BodyForkLayout::Electra,
+    )
+    .expect("electra")
+    .message
+    .body;
+    assert!(graffiti.contains(&deneb_json["graffiti"].as_str().unwrap().to_string()));
+    assert!(graffiti.contains(&electra_json["graffiti"].as_str().unwrap().to_string()));
+    assert!(posts.iter().all(|post| post["message"]["body"].is_object()));
+    assert_ne!(deneb_json["graffiti"], electra_json["graffiti"]);
 }
 
 /// A fast 400 partial failure does not win. The slow 200 is kept, so the

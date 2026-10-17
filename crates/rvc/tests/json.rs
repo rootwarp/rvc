@@ -119,3 +119,105 @@ async fn contents_publish_through_the_production_adapter_uses_the_bn_pool() {
     assert_eq!(trackers[0].endpoint(), primary.uri());
     assert!(trackers[0].error_rate() > 0.0, "first BN's failure must be recorded");
 }
+
+const ELECTRA_BLINDED_BODY_JSON: &str =
+    include_str!("../../eth-types/tests/fixtures/beacon_api/electra_blinded_block_body.json");
+
+/// `message.body` is a JSON object. A hex string does not match.
+struct MessageBodyObject;
+
+impl wiremock::Match for MessageBodyObject {
+    fn matches(&self, request: &wiremock::Request) -> bool {
+        serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .and_then(|value| value.pointer("/message/body").cloned())
+            .is_some_and(|body| body.is_object())
+    }
+}
+
+/// JSON blinded Electra proposal. The local store has no remote proposer config.
+#[tokio::test]
+async fn blinded_electra_json_publishes_once_and_skips_the_full_block_endpoint() {
+    let body: Value =
+        serde_json::from_str(ELECTRA_BLINDED_BODY_JSON).expect("electra blinded body");
+    let slot = 3_000_000u64;
+    let proposer = 42u64;
+    let envelope = serde_json::json!({
+        "version": "electra",
+        "data": {
+            "slot": "3000000",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "11".repeat(32)),
+            "state_root": format!("0x{}", "22".repeat(32)),
+            "body": body,
+        }
+    });
+
+    let bn = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/eth/v3/validator/blocks/{slot}")))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&envelope)
+                .insert_header("Content-Type", "application/json")
+                .insert_header("Eth-Consensus-Version", "electra")
+                .insert_header("Eth-Execution-Payload-Blinded", "true"),
+        )
+        .expect(1)
+        .mount(&bn)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/blinded_blocks"))
+        .and(MessageBodyObject)
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&bn)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/eth/v2/beacon/blocks"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&bn)
+        .await;
+
+    let mut config = BnManagerConfig::new(vec![bn.uri()]);
+    config.broadcast_topics.blocks = false;
+    let manager = Arc::new(BnManager::new(config).expect("BnManager"));
+    let beacon = Arc::new(BeaconBlockAdapter(manager.clone() as Arc<dyn BeaconNodeClient>));
+    let store = ValidatorStore::new([0x66; 20], 30_000_000);
+    store.set_global_block_selection_mode(BlockSelectionMode::BuilderOnly);
+    let mut schedule = ForkSchedule::unscheduled_gloas();
+    schedule.fulu_fork_epoch = u64::MAX;
+    schedule.gloas_fork_epoch = u64::MAX;
+    let service = BlockService::new(
+        Arc::new(StubValidatorSigner::new()),
+        beacon,
+        Arc::new(store),
+        Arc::new(schedule),
+        [0xaa; 32],
+    );
+    let pubkey = SecretKey::generate().public_key();
+
+    let result = service.propose_block(slot, &pubkey, proposer, None).await;
+    assert!(result.is_ok(), "blinded Electra JSON must publish: {result:?}");
+    let result = result.expect("ok");
+    assert!(result.is_blinded);
+    let expected = hex::decode(eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX).expect("kat");
+    assert_eq!(result.block_root.as_slice(), expected.as_slice());
+
+    let requests = bn.received_requests().await.expect("requests");
+    let blinded: Vec<_> =
+        requests.iter().filter(|req| req.url.path() == "/eth/v1/beacon/blinded_blocks").collect();
+    let full: Vec<_> =
+        requests.iter().filter(|req| req.url.path() == "/eth/v2/beacon/blocks").collect();
+    assert_eq!(blinded.len(), 1, "exactly one blinded POST");
+    assert!(full.is_empty(), "no full-block POST");
+    let wire: Value = serde_json::from_slice(&blinded[0].body).expect("json body");
+    assert!(wire["message"]["body"].is_object(), "message.body is a JSON object: {wire}");
+    assert!(wire["message"]["body"]["execution_payload_header"].is_object());
+    assert!(wire["message"]["body"].get("execution_payload").is_none());
+    assert!(wire.get("signed_block").is_none(), "blinded publish is message and signature");
+    let version =
+        blinded[0].headers.get("eth-consensus-version").and_then(|value| value.to_str().ok());
+    assert_eq!(version, Some("electra"));
+}

@@ -252,8 +252,15 @@ mod beacon_api_json {
             if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
                 return Err(format!("invalid uint256 decimal: {text}"));
             }
+            // 2^256-1 is 78 decimal digits. Leading zeros do not count, and
+            // are stripped once so a long zero prefix is not a per-digit loop.
+            let significant = text.trim_start_matches('0');
+            let significant = if significant.is_empty() { "0" } else { significant };
+            if significant.len() > 78 {
+                return Err(format!("uint256 overflow: {text}"));
+            }
             let mut be = [0u8; 32];
-            for digit in text.bytes().map(|byte| u16::from(byte - b'0')) {
+            for digit in significant.bytes().map(|byte| u16::from(byte - b'0')) {
                 let mut carry = digit;
                 for byte in be.iter_mut().rev() {
                     let cur = u16::from(*byte) * 10 + carry;
@@ -287,6 +294,25 @@ mod beacon_api_json {
                 assert_eq!(json, r#"{"value":"18446744073709551616"}"#);
                 let back: Wrap = serde_json::from_str(&json).unwrap();
                 assert_eq!(back, wrap, "{json}");
+            }
+
+            #[test]
+            fn caps_significant_digits_at_78_and_rejects_a_leading_plus() {
+                let max =
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639935";
+                assert_eq!(max.len(), 78);
+                assert!(super::from_decimal(max).is_ok());
+                let one_past =
+                    "115792089237316195423570985008687907853269984665640564039457584007913129639936";
+                assert!(super::from_decimal(one_past).unwrap_err().contains("overflow"));
+                assert!(super::from_decimal(&"9".repeat(79)).unwrap_err().contains("overflow"));
+                assert!(super::from_decimal(&"1".repeat(78)).is_ok());
+                let padded = format!("{}1", "0".repeat(64));
+                assert_eq!(
+                    super::from_decimal(&padded).unwrap(),
+                    super::from_decimal("1").unwrap()
+                );
+                assert!(super::from_decimal("+1").unwrap_err().contains("invalid uint256"));
             }
         }
     }
@@ -476,8 +502,8 @@ macro_rules! ssz_container_parse {
         cfields: [$($cfields:tt)*],
         rest: [@end]
     ) => {
-        $($meta)*
         #[derive(Serialize, Deserialize)]
+        $($meta)*
         pub struct $ty {
             $($sfields)*
         }
@@ -1403,6 +1429,7 @@ ssz_container! {
     ///
     /// Spec order is merkleization-sensitive — do not reorder.
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    #[serde(deny_unknown_fields)]
     pub struct BeaconBlockBodyElectra {
         pub randao_reveal: [u8; 96],
         pub eth1_data: Eth1Data,
@@ -1435,6 +1462,7 @@ impl BeaconBlockBodyElectra {
 ssz_container! {
     /// Electra blinded body: `execution_payload` → `ExecutionPayloadHeader`.
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    #[serde(deny_unknown_fields)]
     pub struct BlindedBeaconBlockBodyElectra {
         pub randao_reveal: [u8; 96],
         pub eth1_data: Eth1Data,
@@ -1475,6 +1503,7 @@ ssz_container! {
     /// (`MAX_ATTESTER_SLASHINGS=2`, `MAX_ATTESTATIONS=128`, no `committee_bits`).
     /// Spec order is merkleization-sensitive — do not reorder.
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    #[serde(deny_unknown_fields)]
     pub struct BeaconBlockBodyDeneb {
         pub randao_reveal: [u8; 96],
         pub eth1_data: Eth1Data,
@@ -1507,6 +1536,7 @@ ssz_container! {
     /// Deneb blinded body: `execution_payload` → `ExecutionPayloadHeader`, no
     /// `execution_requests`.
     #[derive(Debug, Clone, PartialEq, Eq, TreeHash)]
+    #[serde(deny_unknown_fields)]
     pub struct BlindedBeaconBlockBodyDeneb {
         pub randao_reveal: [u8; 96],
         pub eth1_data: Eth1Data,

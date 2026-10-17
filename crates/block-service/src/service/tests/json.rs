@@ -57,13 +57,22 @@ struct JsonHarness {
 }
 
 fn harness(response: ProduceBlockResponse, pubkey: &PublicKey) -> JsonHarness {
+    let version = response.consensus_version.clone();
+    harness_on(response, pubkey, &test_fork_schedule_for(&version))
+}
+
+fn harness_on(
+    response: ProduceBlockResponse,
+    pubkey: &PublicKey,
+    fork: &ForkSchedule,
+) -> JsonHarness {
     let signer = Arc::new(MockSigner::new());
     let beacon = Arc::new(MockBeaconClient::from_response(response));
     let service = BlockService::new(
         signer.clone(),
         beacon.clone(),
         Arc::new(test_validator_store(pubkey)),
-        Arc::new(test_fork_schedule()),
+        Arc::new(fork.clone()),
         [0xaa; 32],
     );
     JsonHarness { service, signer, beacon }
@@ -232,4 +241,415 @@ async fn signing_root_is_unchanged_for_the_same_block() {
     let calls = harness.signer.block_calls.lock().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].block_root.as_slice(), expected.as_slice());
+}
+
+const DENEB_BLINDED_BODY_JSON: &str =
+    include_str!("../../../../eth-types/tests/fixtures/beacon_api/deneb_blinded_block_body.json");
+const ELECTRA_BLINDED_BODY_JSON: &str =
+    include_str!("../../../../eth-types/tests/fixtures/beacon_api/electra_blinded_block_body.json");
+
+fn blinded_body(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).expect("blinded body fixture")
+}
+
+fn kat_blinded_block(body: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "slot": "3000000",
+        "proposer_index": "42",
+        "parent_root": format!("0x{}", "11".repeat(32)),
+        "state_root": format!("0x{}", "22".repeat(32)),
+        "body": body,
+    })
+}
+
+fn blinded_produce(data: serde_json::Value, version: &str) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data,
+        is_blinded: true,
+        consensus_version: version.to_string(),
+        execution_payload_value: None,
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+    }
+}
+
+fn electra_block_root() -> Vec<u8> {
+    hex::decode(eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX).expect("electra block root")
+}
+
+fn assert_nothing_signed_or_published(harness: &JsonHarness) {
+    assert!(harness.signer.header_calls.lock().unwrap().is_empty(), "header must stay unsigned");
+    assert!(harness.signer.block_calls.lock().unwrap().is_empty(), "block must stay unsigned");
+    assert!(harness.beacon.publish_blinded_calls.lock().unwrap().is_empty());
+    assert!(harness.beacon.publish_blinded_full_calls.lock().unwrap().is_empty());
+    assert!(harness.beacon.publish_calls.lock().unwrap().is_empty());
+    assert!(harness.beacon.publish_full_calls.lock().unwrap().is_empty());
+    assert!(harness.beacon.publish_contents_calls.lock().unwrap().is_empty());
+    assert!(harness.beacon.publish_ssz_calls.lock().unwrap().is_empty());
+    assert!(harness.beacon.envelope_publish_calls.lock().unwrap().is_empty());
+}
+
+fn assert_one_blinded_publish(harness: &JsonHarness, version: &str, root: &[u8]) {
+    assert_eq!(harness.beacon.publish_blinded_calls.lock().unwrap().as_slice(), [version]);
+    assert_eq!(harness.beacon.publish_blinded_full_calls.lock().unwrap().len(), 1);
+    assert!(harness.beacon.publish_calls.lock().unwrap().is_empty());
+    assert!(harness.beacon.publish_contents_calls.lock().unwrap().is_empty());
+    assert!(harness.beacon.publish_ssz_calls.lock().unwrap().is_empty());
+    let headers = harness.signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert!(headers[0].header.is_blinded);
+    let calls = harness.signer.block_calls.lock().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].block_root.as_slice(), root);
+}
+
+#[tokio::test]
+async fn json_blinded_electra_proposal_signs_the_external_block_root() {
+    let body = blinded_body(ELECTRA_BLINDED_BODY_JSON);
+    let response = blinded_produce(kat_blinded_block(body.clone()), "electra");
+    let first = response.parse_blinded_block().expect("first parse");
+    let second = response.parse_blinded_block().expect("second parse");
+    assert_eq!(first.body, second.body, "a second parse matches the first; nothing is stored");
+    assert_eq!(response.data["body"], body);
+
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let result =
+        harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect("publish");
+    let root = electra_block_root();
+    assert!(result.is_blinded);
+    assert_eq!(result.consensus_version, "electra");
+    assert_eq!(result.block_root.as_slice(), root.as_slice());
+    assert_one_blinded_publish(&harness, "electra", &root);
+    let body_root = hex::encode(harness.signer.header_calls.lock().unwrap()[0].header.body_root);
+    assert_eq!(body_root, eth_types::EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX);
+    assert!(
+        harness.beacon.produce_response.as_ref().expect("response").data["body"].is_object(),
+        "stored produce body stays a JSON object"
+    );
+}
+
+#[tokio::test]
+async fn json_blinded_fulu_version_reuses_the_electra_block_root() {
+    let response =
+        blinded_produce(kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON)), "fulu");
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let result = harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect("fulu");
+    let root = electra_block_root();
+    assert_eq!(result.block_root.as_slice(), root.as_slice());
+    assert_eq!(result.consensus_version, "fulu");
+    assert_one_blinded_publish(&harness, "fulu", &root);
+    let body_root = hex::encode(harness.signer.header_calls.lock().unwrap()[0].header.body_root);
+    assert_eq!(body_root, eth_types::EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX);
+}
+
+#[tokio::test]
+async fn json_blinded_deneb_proposal_signs_the_external_body_root() {
+    let response =
+        blinded_produce(kat_blinded_block(blinded_body(DENEB_BLINDED_BODY_JSON)), "deneb");
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let result = harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect("deneb");
+    assert!(result.is_blinded);
+    assert_one_blinded_publish(&harness, "deneb", result.block_root.as_slice());
+    let body_root = hex::encode(harness.signer.header_calls.lock().unwrap()[0].header.body_root);
+    assert_eq!(body_root, eth_types::EXTERNAL_DENEB_BODY_ROOT_HEX);
+    assert_ne!(result.block_root.as_slice(), electra_block_root().as_slice());
+}
+
+#[tokio::test]
+async fn execution_only_rejects_a_blinded_json_block_before_signing() {
+    let response =
+        blinded_produce(kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON)), "electra");
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let err = harness
+        .service
+        .propose_block_with_mode(3_000_000, &pubkey, BlockSelectionMode::ExecutionOnly)
+        .await
+        .expect_err("execution-only");
+    assert!(
+        matches!(
+            err,
+            BlockServiceError::ModeShapeMismatch {
+                mode: BlockSelectionMode::ExecutionOnly,
+                shape: crate::types::CandidateShape::Blinded,
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(err.to_string(), "mode execution-only rejects shape blinded");
+    assert_nothing_signed_or_published(&harness);
+}
+
+#[tokio::test]
+async fn builder_only_publishes_a_blinded_json_block() {
+    let response =
+        blinded_produce(kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON)), "electra");
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let result = harness
+        .service
+        .propose_block_with_mode(3_000_000, &pubkey, BlockSelectionMode::BuilderOnly)
+        .await
+        .expect("builder-only");
+    assert!(result.is_blinded);
+    assert_eq!(result.block_root.as_slice(), electra_block_root().as_slice());
+    assert_one_blinded_publish(&harness, "electra", result.block_root.as_slice());
+}
+
+#[tokio::test]
+async fn builder_only_invalid_body_is_parse_not_a_builder_miss() {
+    let mut body = blinded_body(ELECTRA_BLINDED_BODY_JSON);
+    body.as_object_mut().expect("object").remove("randao_reveal");
+    let response = blinded_produce(kat_blinded_block(body), "electra");
+    let stored = response.data.clone();
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let err = harness
+        .service
+        .propose_block_with_mode(3_000_000, &pubkey, BlockSelectionMode::BuilderOnly)
+        .await
+        .expect_err("partial body");
+    match err {
+        BlockServiceError::Parse(msg) => {
+            assert!(msg.contains("invalid JSON block body"), "{msg}");
+            assert!(msg.contains("randao_reveal"), "{msg}");
+        }
+        other => panic!("expected Parse, got {other:?}"),
+    }
+    assert_nothing_signed_or_published(&harness);
+    assert_eq!(harness.beacon.produce_response.as_ref().expect("response").data, stored);
+}
+
+#[tokio::test]
+async fn pre_deneb_versions_are_parse_before_signing() {
+    for version in ["phase0", "altair", "bellatrix", "capella"] {
+        let response =
+            blinded_produce(kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON)), version);
+        let pubkey = test_pubkey();
+        let harness = harness(response, &pubkey);
+        let err =
+            harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err(version);
+        match err {
+            BlockServiceError::Parse(msg) => {
+                assert_eq!(
+                    msg,
+                    format!("JSON block body is unsupported for consensus version {version}"),
+                    "{version}"
+                );
+            }
+            other => panic!("{version}: {other:?}"),
+        }
+        assert_nothing_signed_or_published(&harness);
+        assert!(
+            harness.beacon.produce_response.as_ref().expect("response").data["body"].is_object()
+        );
+    }
+}
+
+#[tokio::test]
+async fn unknown_consensus_versions_mismatch_before_signing() {
+    for version in ["DENEB", ""] {
+        let response =
+            blinded_produce(kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON)), version);
+        let pubkey = test_pubkey();
+        let harness = harness_on(response, &pubkey, &test_fork_schedule());
+        let err =
+            harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err(version);
+        let BlockServiceError::ConsensusVersionMismatch { expected, got } = err else {
+            panic!("{version}: {err:?}");
+        };
+        assert_eq!(expected, "fulu");
+        assert_eq!(got, version);
+        assert_nothing_signed_or_published(&harness);
+    }
+}
+
+#[tokio::test]
+async fn gloas_blinded_json_is_dropped_before_the_codec_on_the_proposal_path() {
+    let response =
+        blinded_produce(kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON)), "gloas");
+    match response.parse_blinded_block() {
+        Err(beacon::BeaconError::ParseError(msg)) => {
+            assert_eq!(
+                msg,
+                "invalid JSON block body: Gloas BeaconBlockBody layout is not supported"
+            );
+        }
+        other => panic!("codec must fail closed: {other:?}"),
+    }
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let err = harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err("gloas");
+    assert!(
+        matches!(err, BlockServiceError::BlindedNotSupportedAtGloas { slot: 3_000_000 }),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        "blinded block production is not supported at Gloas (slot 3000000)"
+    );
+    assert_nothing_signed_or_published(&harness);
+}
+
+#[tokio::test]
+async fn electra_json_on_a_deneb_header_is_rejected_before_signing() {
+    let response =
+        blinded_produce(kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON)), "deneb");
+    let pubkey = test_pubkey();
+    // Slot 3_000_000 is Fulu on the default schedule. The header says Deneb.
+    let harness = harness_on(response, &pubkey, &test_fork_schedule());
+    let err = harness
+        .service
+        .propose_block(3_000_000, &pubkey, 42, None)
+        .await
+        .expect_err("version must match the slot fork");
+    let BlockServiceError::ConsensusVersionMismatch { expected, got } = err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(expected, "fulu");
+    assert_eq!(got, "deneb");
+    assert_nothing_signed_or_published(&harness);
+}
+
+#[tokio::test]
+async fn deneb_json_as_electra_is_parse_before_signing() {
+    let response =
+        blinded_produce(kat_blinded_block(blinded_body(DENEB_BLINDED_BODY_JSON)), "electra");
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let err = harness
+        .service
+        .propose_block(3_000_000, &pubkey, 42, None)
+        .await
+        .expect_err("missing requests");
+    match err {
+        BlockServiceError::Parse(msg) => {
+            assert!(msg.contains("invalid JSON block body"), "{msg}");
+            assert!(msg.contains("execution_requests"), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_signed_or_published(&harness);
+}
+
+#[tokio::test]
+async fn hex_ssz_blinded_body_keeps_the_electra_block_root() {
+    let ssz = eth_types::external_vector_blinded_electra_body().as_ssz_bytes();
+    let response = blinded_produce(
+        kat_blinded_block(serde_json::Value::String(format!("0x{}", hex::encode(&ssz)))),
+        "electra",
+    );
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let result = harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect("hex");
+    let expected = hex::decode(eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX)
+        .expect("electra block root");
+    assert_eq!(result.block_root.as_slice(), expected.as_slice());
+    assert_one_blinded_publish(&harness, "electra", &expected);
+    assert!(harness.beacon.produce_response.as_ref().expect("response").data["body"].is_string());
+}
+
+#[tokio::test]
+async fn deneb_hex_body_under_electra_or_fulu_signs_nothing() {
+    let ssz = eth_types::external_vector_blinded_deneb_body().as_ssz_bytes();
+    let body = serde_json::Value::String(format!("0x{}", hex::encode(ssz)));
+    for version in ["electra", "fulu"] {
+        let response = blinded_produce(kat_blinded_block(body.clone()), version);
+        let pubkey = test_pubkey();
+        let harness = harness(response, &pubkey);
+        let err =
+            harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err(version);
+        match err {
+            BlockServiceError::Parse(msg) => {
+                assert!(msg.contains("invalid SSZ body encoding"), "{version}: {msg}");
+            }
+            other => panic!("{version}: {other:?}"),
+        }
+        assert_nothing_signed_or_published(&harness);
+        assert!(harness.signer.header_calls.lock().unwrap().is_empty(), "{version}");
+        assert!(harness.beacon.publish_blinded_calls.lock().unwrap().is_empty(), "{version}");
+    }
+}
+
+#[tokio::test]
+async fn short_hex_and_full_payload_bodies_are_parse_before_signing() {
+    let full: serde_json::Value = serde_json::from_str(ELECTRA_BODY_JSON).expect("full body");
+    let cases = [
+        ("short hex", serde_json::Value::String("0x00".to_string()), "invalid SSZ body encoding"),
+        ("full payload", full, "invalid JSON block body"),
+        ("null", serde_json::Value::Null, "invalid blinded block"),
+        ("array", serde_json::Value::Array(vec![]), "invalid blinded block"),
+    ];
+    for (label, body, needle) in cases {
+        let response = blinded_produce(kat_blinded_block(body), "electra");
+        let stored = response.data.clone();
+        let pubkey = test_pubkey();
+        let harness = harness(response, &pubkey);
+        let err =
+            harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err(label);
+        match err {
+            BlockServiceError::Parse(msg) => assert!(msg.contains(needle), "{label}: {msg}"),
+            other => panic!("{label}: {other:?}"),
+        }
+        assert_nothing_signed_or_published(&harness);
+        assert_eq!(
+            harness.beacon.produce_response.as_ref().expect("response").data,
+            stored,
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn short_parent_root_is_rejected_before_signing() {
+    let mut data = kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON));
+    data["parent_root"] = serde_json::json!("0x11");
+    let response = blinded_produce(data, "electra");
+    let stored = response.data.clone();
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let err =
+        harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err("parent");
+    match err {
+        BlockServiceError::Parse(msg) => {
+            assert!(msg.starts_with("invalid blinded block:"), "{msg}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_signed_or_published(&harness);
+    assert_eq!(harness.beacon.produce_response.as_ref().expect("response").data, stored);
+}
+
+#[tokio::test]
+async fn parent_and_slot_mismatch_drop_the_duty_before_signing() {
+    let response =
+        blinded_produce(kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON)), "electra");
+    let pubkey = test_pubkey();
+    let parent_harness = harness(response.clone(), &pubkey);
+    let err = parent_harness
+        .service
+        .propose_block(3_000_000, &pubkey, 42, Some(ExpectedParents::open([0x33; 32], None)))
+        .await
+        .expect_err("parent");
+    assert_eq!(
+        err.to_string(),
+        format!(
+            "parent_root mismatch: expected 0x{}, got 0x{}",
+            hex::encode([0x33u8; 32]),
+            hex::encode([0x11u8; 32])
+        )
+    );
+    assert_nothing_signed_or_published(&parent_harness);
+
+    let slot_harness = harness(response, &pubkey);
+    let err =
+        slot_harness.service.propose_block(3_000_001, &pubkey, 42, None).await.expect_err("slot");
+    assert_eq!(err.to_string(), "slot mismatch: requested 3000001, got 3000000");
+    assert_nothing_signed_or_published(&slot_harness);
 }

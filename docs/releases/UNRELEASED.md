@@ -3,6 +3,36 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## JSON blinded Deneb and Electra blocks
+
+A produce-v3 JSON response with the header `Eth-Execution-Payload-Blinded: true`
+parses a Deneb or Electra blinded block body from a JSON object into canonical
+SSZ before the block is signed. Fulu uses the Electra blinded body. The signed
+publish to `POST /eth/v1/beacon/blinded_blocks` sends `message.body` as that
+JSON object. The object is built once, before the publish is fanned out.
+`Eth-Consensus-Version` must name the slot's fork before the body is decoded
+or signed. A hex `body` is kept as SSZ only when that SSZ is the blinded
+container for the same fork; a Deneb body under an Electra or Fulu header is
+rejected before any signature. Unknown JSON fields are rejected, including
+`execution_requests` on a Deneb body and `execution_payload` beside
+`execution_payload_header`. Duplicate JSON keys are a parse error. A hex
+prefix must be lowercase `0x` (digits may be `A-F`). A quoted integer must
+not start with `+`. A `uint256` decimal longer than 78 significant digits is
+rejected. Gloas and pre-Deneb object bodies fail with a parse error in
+`parse_blinded_block`. On the proposal path a Gloas blinded response is still
+dropped as blinded-not-supported before that parse, and a pre-Deneb object
+body fails with a parse error before the block is signed. A blinded publish
+for Gloas, pre-Deneb, or an invalid body fails before any beacon node is
+called. An invalid or partial body is rejected as a whole: nothing is signed
+and the stored produce payload is left unchanged. SSZ publish is unchanged.
+
+This follows Beacon API `produceBlockV3` and `publishBlindedBlock`, and the
+consensus-specs builder container `BlindedBeaconBlockBody` (the execution
+payload is `execution_payload_header`; Electra also carries
+`execution_requests`).
+
+Review finding B-019 is fixed.
+
 ## Proposer-pool timeouts, the global selection mode, and URL proposer reset
 
 A dedicated proposer beacon-node pool uses the same operation timeouts as the

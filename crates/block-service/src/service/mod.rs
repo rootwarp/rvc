@@ -9,8 +9,7 @@ use tracing::{debug, error, info, warn, Instrument};
 use beacon::{block_value, GloasBlockContents, ProduceBlockV4Body, RankedBlock, WireBody};
 use crypto::PublicKey;
 use eth_types::{
-    blinded_body_tree_hash_root, body_tree_hash_root, ForkName, ForkSchedule, Root, Slot,
-    SLOTS_PER_EPOCH, SLOT_DURATION_MS,
+    body_tree_hash_root, ForkName, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH, SLOT_DURATION_MS,
 };
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use signer::{BeaconBlockHeaderFields, CircuitBreakerState, ValidatorSigner};
@@ -991,6 +990,9 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             &self.fork_schedule,
         )?;
         reject_gloas_version_pre_gloas(&response.consensus_version, fork)?;
+        // Every fork, not only Gloas: the header must name the slot fork
+        // before the body is decoded or signed.
+        cross_check_consensus_version(&response.consensus_version, fork)?;
         let shape =
             if response.is_blinded { CandidateShape::Blinded } else { CandidateShape::Unblinded };
         enforce_mode_shape(mode, shape)?;
@@ -1246,6 +1248,7 @@ fn prepare_ssz(
         None
     };
     if response.is_blinded {
+        let layout = blinded_body_layout(&response.consensus_version)?;
         let (block, _) =
             beacon::ssz_deser::deserialize_blinded_beacon_block_from_ssz(ssz_bytes, format)
                 .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
@@ -1256,8 +1259,8 @@ fn prepare_ssz(
             block.proposer_index,
             block.parent_root,
         )?;
-        let block_root = compute_blinded_block_root(&block)?;
-        let header = header_from_blinded(&block)?;
+        let block_root = compute_blinded_block_root_for_layout(&block, layout)?;
+        let header = header_from_blinded(&block, layout)?;
         return Ok((header, block_root, PreparedPayload::SszWhole(ssz_bytes.clone())));
     }
     if let Some(contents) = contents.as_ref() {
@@ -1394,8 +1397,9 @@ fn prepare_blinded(
 ) -> Result<(BeaconBlockHeaderFields, Root, PreparedPayload), BlockServiceError> {
     let block = response.parse_blinded_block()?;
     validate_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
-    let block_root = compute_blinded_block_root(&block)?;
-    let header = header_from_blinded(&block)?;
+    let layout = blinded_body_layout(&response.consensus_version)?;
+    let block_root = compute_blinded_block_root_for_layout(&block, layout)?;
+    let header = header_from_blinded(&block, layout)?;
     Ok((header, block_root, PreparedPayload::Blinded(block)))
 }
 
@@ -1574,12 +1578,25 @@ fn header_from_full(
     })
 }
 
+fn blinded_body_layout(
+    consensus_version: &str,
+) -> Result<eth_types::BodyForkLayout, BlockServiceError> {
+    eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
+        BlockServiceError::Parse(format!(
+            "JSON blinded block is unsupported for consensus version {consensus_version}"
+        ))
+    })
+}
+
 fn header_from_blinded(
     block: &eth_types::BlindedBeaconBlock,
+    layout: eth_types::BodyForkLayout,
 ) -> Result<BeaconBlockHeaderFields, BlockServiceError> {
-    let body_root = blinded_body_tree_hash_root(&block.body).map(|h| h.0).map_err(|e| {
-        BlockServiceError::Parse(format!("invalid blinded block body for body leaf: {e}"))
-    })?;
+    let body_root = eth_types::blinded_body_tree_hash_root_for_layout(&block.body, layout)
+        .map(|h| h.0)
+        .map_err(|e| {
+            BlockServiceError::Parse(format!("invalid blinded block body for body leaf: {e}"))
+        })?;
     Ok(BeaconBlockHeaderFields {
         slot: block.slot,
         proposer_index: block.proposer_index,
@@ -1606,10 +1623,24 @@ fn compute_block_root(block: &eth_types::BeaconBlock) -> Result<Root, BlockServi
 ///
 /// **Production root path** for blinded proposal signing (prefer this over
 /// `TreeHash::tree_hash_root`). Malformed body → [`BlockServiceError::Parse`].
+#[cfg(test)]
 fn compute_blinded_block_root(
     block: &eth_types::BlindedBeaconBlock,
 ) -> Result<Root, BlockServiceError> {
     block.try_tree_hash_root().map(|h| h.0).map_err(|e| {
+        BlockServiceError::Parse(format!("invalid blinded block body for tree_hash_root: {e}"))
+    })
+}
+
+/// Block root for the layout `consensus_version` names.
+///
+/// Auto-detect would sign a Deneb body under an Electra header and only fail
+/// when the publish encoder demands the header's layout.
+fn compute_blinded_block_root_for_layout(
+    block: &eth_types::BlindedBeaconBlock,
+    layout: eth_types::BodyForkLayout,
+) -> Result<Root, BlockServiceError> {
+    block.try_tree_hash_root_for_layout(layout).map(|h| h.0).map_err(|e| {
         BlockServiceError::Parse(format!("invalid blinded block body for tree_hash_root: {e}"))
     })
 }

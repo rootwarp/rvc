@@ -114,7 +114,7 @@ async fn test_propose_block_ssz_slot_mismatch_is_slot_mismatch_on_every_arm() {
             signer.clone(),
             beacon_arc.clone(),
             Arc::new(test_validator_store(&pubkey)),
-            Arc::new(test_fork_schedule()),
+            Arc::new(test_fork_schedule_for(version)),
             [0xaa; 32],
         );
         let result = service.propose_block(requested_slot, &pubkey, 42, None).await;
@@ -142,7 +142,7 @@ async fn test_propose_block_ssz_slot_mismatch_is_slot_mismatch_on_every_arm() {
             signer_ok.clone(),
             beacon_ok.clone(),
             Arc::new(test_validator_store(&pubkey)),
-            Arc::new(test_fork_schedule()),
+            Arc::new(test_fork_schedule_for(version)),
             [0xaa; 32],
         );
         let accepted = service_ok.propose_block(requested_slot, &pubkey, 42, None).await;
@@ -201,7 +201,7 @@ async fn test_propose_block_ssz_block_root_uses_tree_hash() {
         signer_arc.clone(),
         Arc::new(beacon),
         Arc::new(store),
-        Arc::new(test_fork_schedule()),
+        Arc::new(test_fork_schedule_for("electra")),
         [0xaa; 32],
     );
 
@@ -269,7 +269,13 @@ async fn test_propose_block_ssz_pre_deneb_uses_beacon_block_format() {
     // Pre-Deneb unblinded: raw BeaconBlock SSZ (no BlockContents wrapper)
     let beacon = MockBeaconClient::ssz_with_version(slot, 42, false, "capella");
     let signer = MockSigner::new();
-    let service = build_service(signer, beacon, &pubkey);
+    let service = BlockService::new(
+        Arc::new(signer),
+        Arc::new(beacon),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_for("capella")),
+        [0xaa; 32],
+    );
 
     let result = service.propose_block(slot, &pubkey, 42, None).await;
 
@@ -285,7 +291,13 @@ async fn test_propose_block_ssz_electra_unblinded_uses_block_contents() {
     let slot = 100;
     let beacon = MockBeaconClient::ssz_with_version(slot, 42, false, "electra");
     let signer = MockSigner::new();
-    let service = build_service(signer, beacon, &pubkey);
+    let service = BlockService::new(
+        Arc::new(signer),
+        Arc::new(beacon),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_for("electra")),
+        [0xaa; 32],
+    );
 
     let result = service.propose_block(slot, &pubkey, 42, None).await;
 
@@ -703,7 +715,7 @@ async fn published_payload_is_a_signed_block_contents_container() {
         let block_len = kzg_off - block_off;
         let bn_block = produced[block_off..kzg_off].to_vec();
 
-        let (service, beacon) = service_for(client, &pubkey, test_fork_schedule());
+        let (service, beacon) = service_for(client, &pubkey, test_fork_schedule_for(version));
         let result = service.propose_block(slot, &pubkey, 42, None).await;
         assert!(result.is_ok(), "{version}: {result:?}");
 
@@ -749,7 +761,7 @@ async fn sidecars_reach_publish_block_ssz() {
         let kzg_off = le_u32_at(&produced, 4);
         let bn_block = &produced[block_off..kzg_off];
 
-        let (service, beacon) = service_for(client, &pubkey, test_fork_schedule());
+        let (service, beacon) = service_for(client, &pubkey, test_fork_schedule_for(version));
         service.propose_block(slot, &pubkey, 42, None).await.unwrap();
         let published = beacon.publish_ssz_calls.lock().unwrap()[0].bytes.clone();
         let signed_off = le_u32_at(&published, 0);
@@ -781,7 +793,7 @@ async fn electra_publish_avoids_offset_out_of_bounds_class() {
     let block_off = le_u32_at(&produced, 0);
     let kzg_off = le_u32_at(&produced, 4);
     let block_len = kzg_off - block_off;
-    let (service, beacon) = service_for(client, &pubkey, test_fork_schedule());
+    let (service, beacon) = service_for(client, &pubkey, test_fork_schedule_for("electra"));
     service.propose_block(slot, &pubkey, 42, None).await.unwrap();
     let published = beacon.publish_ssz_calls.lock().unwrap()[0].bytes.clone();
 

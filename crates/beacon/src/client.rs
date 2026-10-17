@@ -894,6 +894,9 @@ impl BeaconClient {
 
         // H-12: cap the body before deserialising.
         let bytes = read_body_capped(response, max_body_bytes).await?;
+        // serde_json::Value keeps the last duplicate key, so deny_unknown_fields
+        // never sees the collision. Reject it on the raw bytes first.
+        reject_duplicate_json_keys(&bytes)?;
         let body: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| BeaconError::ParseError(e.to_string()))?;
 
@@ -2248,11 +2251,198 @@ fn parse_root_hex(text: &str, field: &str) -> Result<[u8; 32], BeaconError> {
     Ok(out)
 }
 
+const JSON_KEY_SCAN_DEPTH: usize = 64;
+
+enum DuplicateJson {
+    Duplicate,
+    TooDeep,
+}
+
+/// Duplicate object keys are a parse error. Malformed JSON returns `Ok` so
+/// `serde_json` reports the syntax error.
+fn reject_duplicate_json_keys(bytes: &[u8]) -> Result<(), BeaconError> {
+    let mut index = 0usize;
+    match scan_json_value(bytes, &mut index, 0) {
+        Ok(()) => Ok(()),
+        Err(DuplicateJson::Duplicate) => Err(BeaconError::ParseError("duplicate JSON key".into())),
+        Err(DuplicateJson::TooDeep) => {
+            Err(BeaconError::ParseError("duplicate JSON key scan exceeded depth".into()))
+        }
+    }
+}
+
+fn scan_json_value(bytes: &[u8], index: &mut usize, depth: usize) -> Result<(), DuplicateJson> {
+    if depth > JSON_KEY_SCAN_DEPTH {
+        return Err(DuplicateJson::TooDeep);
+    }
+    skip_json_ws(bytes, index);
+    if *index >= bytes.len() {
+        return Ok(());
+    }
+    match bytes[*index] {
+        b'{' => scan_json_object(bytes, index, depth),
+        b'[' => scan_json_array(bytes, index, depth),
+        b'"' => {
+            let _ = read_json_string(bytes, index)?;
+            Ok(())
+        }
+        _ => {
+            skip_json_literal(bytes, index);
+            Ok(())
+        }
+    }
+}
+
+fn scan_json_object(bytes: &[u8], index: &mut usize, depth: usize) -> Result<(), DuplicateJson> {
+    *index += 1;
+    let mut keys = std::collections::HashSet::new();
+    loop {
+        skip_json_ws(bytes, index);
+        if *index >= bytes.len() {
+            return Ok(());
+        }
+        if bytes[*index] == b'}' {
+            *index += 1;
+            return Ok(());
+        }
+        if bytes[*index] != b'"' {
+            return Ok(());
+        }
+        let key = read_json_string(bytes, index)?;
+        if !keys.insert(key) {
+            return Err(DuplicateJson::Duplicate);
+        }
+        skip_json_ws(bytes, index);
+        if *index >= bytes.len() || bytes[*index] != b':' {
+            return Ok(());
+        }
+        *index += 1;
+        scan_json_value(bytes, index, depth + 1)?;
+        skip_json_ws(bytes, index);
+        if *index >= bytes.len() {
+            return Ok(());
+        }
+        if bytes[*index] == b',' {
+            *index += 1;
+            continue;
+        }
+        if bytes[*index] == b'}' {
+            *index += 1;
+            return Ok(());
+        }
+        return Ok(());
+    }
+}
+
+fn scan_json_array(bytes: &[u8], index: &mut usize, depth: usize) -> Result<(), DuplicateJson> {
+    *index += 1;
+    loop {
+        skip_json_ws(bytes, index);
+        if *index >= bytes.len() {
+            return Ok(());
+        }
+        if bytes[*index] == b']' {
+            *index += 1;
+            return Ok(());
+        }
+        scan_json_value(bytes, index, depth + 1)?;
+        skip_json_ws(bytes, index);
+        if *index >= bytes.len() {
+            return Ok(());
+        }
+        if bytes[*index] == b',' {
+            *index += 1;
+            continue;
+        }
+        if bytes[*index] == b']' {
+            *index += 1;
+            return Ok(());
+        }
+        return Ok(());
+    }
+}
+
+fn read_json_string(bytes: &[u8], index: &mut usize) -> Result<String, DuplicateJson> {
+    if *index >= bytes.len() || bytes[*index] != b'"' {
+        return Ok(String::new());
+    }
+    *index += 1;
+    let mut out = String::new();
+    while *index < bytes.len() {
+        let byte = bytes[*index];
+        *index += 1;
+        if byte == b'"' {
+            return Ok(out);
+        }
+        if byte != b'\\' {
+            out.push(byte as char);
+            continue;
+        }
+        if *index >= bytes.len() {
+            return Ok(out);
+        }
+        let escaped = bytes[*index];
+        *index += 1;
+        match escaped {
+            b'"' | b'\\' | b'/' => out.push(escaped as char),
+            b'b' => out.push('\u{0008}'),
+            b'f' => out.push('\u{000c}'),
+            b'n' => out.push('\n'),
+            b'r' => out.push('\r'),
+            b't' => out.push('\t'),
+            b'u' => {
+                if *index + 4 > bytes.len() {
+                    return Ok(out);
+                }
+                let hex = &bytes[*index..*index + 4];
+                *index += 4;
+                let digits = std::str::from_utf8(hex).unwrap_or("");
+                let code = u32::from_str_radix(digits, 16).unwrap_or(0);
+                out.push(char::from_u32(code).unwrap_or('\u{fffd}'));
+            }
+            other => out.push(other as char),
+        }
+    }
+    Ok(out)
+}
+
+fn skip_json_ws(bytes: &[u8], index: &mut usize) {
+    while *index < bytes.len() && matches!(bytes[*index], b' ' | b'\n' | b'\r' | b'\t') {
+        *index += 1;
+    }
+}
+
+fn skip_json_literal(bytes: &[u8], index: &mut usize) {
+    while *index < bytes.len()
+        && !matches!(bytes[*index], b' ' | b'\n' | b'\r' | b'\t' | b',' | b'}' | b']')
+    {
+        *index += 1;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn duplicate_json_keys_are_rejected_before_serde_collapses_them() {
+        let err = reject_duplicate_json_keys(br#"{"a":1,"a":2}"#).unwrap_err();
+        assert!(err.to_string().contains("duplicate JSON key"), "{err}");
+        assert!(reject_duplicate_json_keys(br#"{"a":1,"b":2}"#).is_ok());
+        let nested = reject_duplicate_json_keys(br#"{"a":{"b":1,"b":2}}"#).unwrap_err();
+        assert!(nested.to_string().contains("duplicate JSON key"), "{nested}");
+        assert!(reject_duplicate_json_keys(br#"{"a":[1,1]}"#).is_ok());
+        let escaped = reject_duplicate_json_keys(br#"{"a":"q\"","a":1}"#).unwrap_err();
+        assert!(escaped.to_string().contains("duplicate JSON key"), "{escaped}");
+        assert!(reject_duplicate_json_keys(br#"{"\u0061":1,"a":2}"#).is_err());
+        let fixture = include_str!(
+            "../../eth-types/tests/fixtures/beacon_api/electra_blinded_block_body.json"
+        );
+        let wrapped = format!(r#"{{"data":{fixture}}}"#);
+        assert!(reject_duplicate_json_keys(wrapped.as_bytes()).is_ok(), "fixture keys are unique");
+    }
 
     #[test]
     fn test_config_default_values() {

@@ -234,15 +234,26 @@ impl ProduceBlockResponse {
     /// `BeaconBlock`'s `hex_vec` serde is not used on the object itself.
     pub fn parse_full_block(&self) -> Result<BlockContents, BeaconError> {
         let mut data = self.data.clone();
-        replace_json_body_with_ssz(&mut data, &self.consensus_version)?;
+        replace_json_body_with_ssz(&mut data, &self.consensus_version, false)?;
         serde_json::from_value(data)
             .map_err(|e| BeaconError::ParseError(format!("invalid block contents: {e}")))
     }
 
-    /// Parses the raw `data` field into a blinded block.
+    /// Parses `data` into a blinded block, keeping [`eth_types::BlindedBeaconBlock::body`] as SSZ bytes.
+    ///
+    /// A JSON object body is decoded with [`eth_types::body_fork_layout`] of
+    /// `consensus_version` through [`eth_types::block_body_json::decode_blinded`].
+    /// A hex body is kept as SSZ only when it decodes as that same layout.
+    /// Gloas and pre-Deneb object bodies fail closed.
+    /// `BlindedBeaconBlock`'s `hex_vec` serde is not used on the object itself.
+    /// A decode error leaves `data` unchanged.
     pub fn parse_blinded_block(&self) -> Result<BlindedBeaconBlock, BeaconError> {
-        serde_json::from_value(self.data.clone())
-            .map_err(|e| BeaconError::ParseError(format!("invalid blinded block: {}", e)))
+        let mut data = self.data.clone();
+        eth_types::block_body_json::reject_beacon_api_lenient_spellings(&data)
+            .map_err(|err| BeaconError::ParseError(err.to_string()))?;
+        replace_json_body_with_ssz(&mut data, &self.consensus_version, true)?;
+        serde_json::from_value(data)
+            .map_err(|e| BeaconError::ParseError(format!("invalid blinded block: {e}")))
     }
 
     /// Decode a V4 produce body and require `payload_included` to match the container.
@@ -319,17 +330,27 @@ impl ProduceBlockResponse {
     }
 }
 
-/// Swap a Beacon-API object body for canonical SSZ hex so `BeaconBlock` serde stays `hex_vec`.
+/// Swap a Beacon-API object body for canonical SSZ hex so block serde stays `hex_vec`.
 ///
-/// String bodies (pre-Deneb, and any already-SSZ payload) are left in place.
+/// String bodies (already-SSZ payloads) are left in place. A blinded hex body
+/// must still decode under `consensus_version`'s layout; a mismatch errors
+/// before the field is replaced. `blinded` selects
+/// [`eth_types::block_body_json::decode_blinded`]; otherwise the full-body
+/// decoder. Gloas and pre-Deneb object bodies error before the field is replaced.
 fn replace_json_body_with_ssz(
     data: &mut serde_json::Value,
     consensus_version: &str,
+    blinded: bool,
 ) -> Result<(), BeaconError> {
     let Some(body) = json_body_field(data) else {
         return Ok(());
     };
     if !body.is_object() {
+        if blinded {
+            if let Some(text) = body.as_str() {
+                check_blinded_hex_body(text, consensus_version)?;
+            }
+        }
         return Ok(());
     }
     let layout = eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
@@ -337,9 +358,38 @@ fn replace_json_body_with_ssz(
             "JSON block body is unsupported for consensus version {consensus_version}"
         ))
     })?;
-    let ssz = eth_types::block_body_json::decode(body, layout)
+    let decoded = if blinded {
+        eth_types::block_body_json::decode_blinded(body, layout)
+    } else {
+        eth_types::block_body_json::decode(body, layout)
+    };
+    let ssz = decoded
         .map_err(|err| BeaconError::ParseError(format!("invalid JSON block body: {err}")))?;
     *body = serde_json::Value::String(format!("0x{}", hex::encode(ssz)));
+    Ok(())
+}
+
+/// Hex SSZ must be the blinded container for `consensus_version`.
+///
+/// Auto-detect would accept a Deneb body under an Electra header, sign it,
+/// and only fail when publish encodes that header's layout.
+fn check_blinded_hex_body(text: &str, consensus_version: &str) -> Result<(), BeaconError> {
+    let Some(digits) = text.strip_prefix("0x") else {
+        return Ok(());
+    };
+    let bytes = hex::decode(digits).map_err(|err| {
+        BeaconError::ParseError(format!(
+            "invalid JSON blinded block body: invalid SSZ body encoding: {err}"
+        ))
+    })?;
+    let layout = eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
+        BeaconError::ParseError(format!(
+            "JSON block body is unsupported for consensus version {consensus_version}"
+        ))
+    })?;
+    eth_types::blinded_body_tree_hash_root_for_layout(&bytes, layout).map_err(|err| {
+        BeaconError::ParseError(format!("invalid JSON blinded block body: {err}"))
+    })?;
     Ok(())
 }
 
@@ -1611,6 +1661,39 @@ mod tests {
         assert_eq!(block.block().proposer_index, 42);
     }
 
+    const DENEB_BLINDED_BODY_JSON: &str =
+        include_str!("../../eth-types/tests/fixtures/beacon_api/deneb_blinded_block_body.json");
+    const ELECTRA_BLINDED_BODY_JSON: &str =
+        include_str!("../../eth-types/tests/fixtures/beacon_api/electra_blinded_block_body.json");
+
+    fn blinded_body_fixture(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).expect("blinded body fixture")
+    }
+
+    fn blinded_produce(data: serde_json::Value, consensus_version: &str) -> ProduceBlockResponse {
+        ProduceBlockResponse {
+            data,
+            is_blinded: true,
+            consensus_version: consensus_version.to_string(),
+            execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        }
+    }
+
+    fn kat_blinded_block(body: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "slot": "3000000",
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", "11".repeat(32)),
+            "state_root": format!("0x{}", "22".repeat(32)),
+            "body": body,
+        })
+    }
+
     #[test]
     fn test_produce_block_response_parse_blinded_block() {
         let block_json = serde_json::json!({
@@ -1618,24 +1701,115 @@ mod tests {
             "proposer_index": "99",
             "parent_root": format!("0x{}", "03".repeat(32)),
             "state_root": format!("0x{}", "04".repeat(32)),
-            "body": "0xbeef"
+            "body": blinded_body_fixture(DENEB_BLINDED_BODY_JSON),
         });
 
-        let response = ProduceBlockResponse {
-            data: block_json,
-            is_blinded: true,
-            consensus_version: "deneb".to_string(),
-            execution_payload_value: None,
-            is_ssz: false,
-            ssz_bytes: None,
-            payload_included: false,
-            builder_url: None,
-            consensus_block_value: None,
-        };
-
+        let response = blinded_produce(block_json, "deneb");
         let block = response.parse_blinded_block().unwrap();
         assert_eq!(block.slot, 200);
         assert_eq!(block.proposer_index, 99);
+        assert_eq!(block.body, eth_types::external_vector_blinded_deneb_body().as_ssz_bytes());
+        assert!(response.data["body"].is_object(), "stored produce body stays JSON");
+    }
+
+    #[test]
+    fn json_blinded_electra_produce_parses_to_the_external_block_root() {
+        let response = blinded_produce(
+            kat_blinded_block(blinded_body_fixture(ELECTRA_BLINDED_BODY_JSON)),
+            "electra",
+        );
+        let block = response.parse_blinded_block().expect("electra blinded JSON");
+        let root = block.try_tree_hash_root().expect("blinded block root");
+        assert_eq!(
+            hex::encode(root.as_slice()),
+            eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX
+        );
+        assert!(response.data["body"].is_object());
+
+        let fulu = blinded_produce(
+            kat_blinded_block(blinded_body_fixture(ELECTRA_BLINDED_BODY_JSON)),
+            "fulu",
+        );
+        let fulu_block = fulu.parse_blinded_block().expect("fulu reuses the electra body");
+        assert_eq!(
+            hex::encode(fulu_block.try_tree_hash_root().expect("fulu root").as_slice()),
+            eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX
+        );
+    }
+
+    #[test]
+    fn json_blinded_hex_body_passes_through_unchanged() {
+        let ssz = eth_types::external_vector_blinded_electra_body().as_ssz_bytes();
+        let response = blinded_produce(
+            kat_blinded_block(serde_json::Value::String(format!("0x{}", hex::encode(&ssz)))),
+            "electra",
+        );
+        let block = response.parse_blinded_block().expect("hex body");
+        assert_eq!(block.body, ssz);
+        assert_eq!(
+            hex::encode(block.try_tree_hash_root().expect("root").as_slice()),
+            eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX
+        );
+        assert!(response.data["body"].is_string());
+    }
+
+    #[test]
+    fn json_blinded_gloas_and_pre_deneb_fail_with_parse_and_leave_the_body() {
+        let body = blinded_body_fixture(ELECTRA_BLINDED_BODY_JSON);
+        let gloas = blinded_produce(kat_blinded_block(body.clone()), "gloas");
+        match gloas.parse_blinded_block() {
+            Err(BeaconError::ParseError(msg)) => {
+                assert_eq!(
+                    msg,
+                    "invalid JSON block body: Gloas BeaconBlockBody layout is not supported"
+                );
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+        assert!(gloas.data["body"].is_object());
+
+        for version in ["phase0", "altair", "bellatrix", "capella"] {
+            let response = blinded_produce(kat_blinded_block(body.clone()), version);
+            match response.parse_blinded_block() {
+                Err(BeaconError::ParseError(msg)) => {
+                    assert_eq!(
+                        msg,
+                        format!("JSON block body is unsupported for consensus version {version}")
+                    );
+                }
+                other => panic!("{version}: expected ParseError, got {other:?}"),
+            }
+            assert!(response.data["body"].is_object(), "{version}");
+        }
+    }
+
+    #[test]
+    fn json_blinded_partial_body_is_rejected_as_a_whole() {
+        let mut body = blinded_body_fixture(ELECTRA_BLINDED_BODY_JSON);
+        body.as_object_mut().expect("object").remove("randao_reveal");
+        let response = blinded_produce(kat_blinded_block(body), "electra");
+        let original = response.data.clone();
+        match response.parse_blinded_block() {
+            Err(BeaconError::ParseError(msg)) => {
+                assert!(msg.contains("invalid JSON block body"), "{msg}");
+                assert!(msg.contains("randao_reveal"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+        assert_eq!(response.data, original);
+
+        let mut bad_header = kat_blinded_block(blinded_body_fixture(ELECTRA_BLINDED_BODY_JSON));
+        bad_header["parent_root"] = serde_json::json!("0x11");
+        let response = blinded_produce(bad_header, "electra");
+        let original = response.data.clone();
+        match response.parse_blinded_block() {
+            Err(BeaconError::ParseError(msg)) => {
+                assert!(msg.starts_with("invalid blinded block:"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+        assert_eq!(response.data, original);
+        assert!(response.data["body"].is_object());
     }
 
     #[test]
