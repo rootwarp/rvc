@@ -4,7 +4,9 @@
 //! skipped slots (up to four attempts). The first 200 wins. After four
 //! misses the literal `"head"` block_id is a counted last resort (ARCH-3d).
 //! `head_root` is captured at phase 2 (t=slot/3) via the slot-qualified
-//! current slot and reused at phase 3 so messages and contributions agree (H-5).
+//! current slot, bounded by a caller deadline, and reused at phase 3 so
+//! messages and contributions agree (H-5). The fetch does not run while the
+//! slot-context lock is held.
 //!
 //! Primary queries stay slot-qualified. `"head"` is only the terminal
 //! fallback after four misses (L-5). Do not repair the t=0 query to return
@@ -19,8 +21,6 @@ use bn_manager::BeaconNodeClient;
 use eth_types::{Epoch, Root, Slot};
 use metrics::definitions::{slot_context_parent_fallback, RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL};
 
-use super::utils::parse_hex_root;
-
 /// Maximum slot-qualified parent attempts (`slot-1` … `slot-4`).
 const PARENT_WALKBACK_ATTEMPTS: u64 = 4;
 
@@ -33,8 +33,8 @@ pub(crate) struct SlotContext {
     /// The epoch this slot belongs to.
     pub epoch: Epoch,
     /// Parent of a block proposed for `slot`. Captured at t=0 by walking
-    /// back from `slot - 1`. This is the found header's root, kept for
-    /// `capture_head`. `None` if every attempt failed.
+    /// back from `slot - 1`. This is the found header's root, and the phase-2
+    /// fallback when the current slot has no block. `None` if every attempt failed.
     pub parent_root: Option<Root>,
     /// Parents a block at `slot` may build on. `None` means no parent check
     /// (the walk stopped on a non-404 error, or no header was found).
@@ -42,8 +42,12 @@ pub(crate) struct SlotContext {
     pub expected_parents: Option<ExpectedParents>,
     /// Canonical head as of phase 2. Captured once at t=slot/3 and reused
     /// at phase 3 (H-5). Left `None` at t=0 — a current-slot 404 then is
-    /// the normal path, not an exception. `None` after phase 2 means the
-    /// head query failed and sync duties skip.
+    /// the normal path, not an exception. A timeout or a body that is not
+    /// `0x` plus 64 hex digits falls back to [`Self::parent_root`]. That
+    /// fallback is a liveness choice: the parent is the last head this
+    /// client verified, and signing it is valid and non-slashable for sync
+    /// messages. `None` after that fallback means no parent was verified
+    /// either, and sync duties skip.
     pub head_root: Option<Root>,
 }
 
@@ -69,15 +73,55 @@ impl SlotContext {
         Self { slot, epoch, parent_root, expected_parents, head_root: None }
     }
 
-    /// Captures `head_root` at phase 2 from the slot-qualified current slot.
-    ///
-    /// When that slot has no block yet (spec-conformant 404), the chain head
-    /// is the parent already captured at t=0. Phase 3 must reuse this value
-    /// and must not call this again.
-    pub(crate) async fn capture_head(&mut self, beacon: &dyn BeaconNodeClient) {
-        self.head_root = fetch_slot_qualified_root(beacon, &self.slot.to_string(), self.slot).await;
+    /// Records the phase-2 head. The first root wins; a later call leaves it.
+    pub(crate) fn set_head(&mut self, root: Root) {
         if self.head_root.is_none() {
-            self.head_root = self.parent_root;
+            self.head_root = Some(root);
+        }
+    }
+
+    /// Phase-2 head for a test that already owns `self`.
+    ///
+    /// The coordinator must not use this while holding the slot-context lock.
+    /// It fetches with [`fetch_head_root`], then [`Self::set_head`]. A missing
+    /// block falls back to `parent_root`. The deadline is one minute; a past
+    /// deadline does not call the beacon node.
+    #[cfg(test)]
+    pub(crate) async fn apply_phase2_head(&mut self, beacon: &dyn BeaconNodeClient) {
+        let now = tokio::time::Instant::now();
+        let deadline = now.checked_add(std::time::Duration::from_secs(60)).unwrap_or(now);
+        let fetched = fetch_head_root(beacon, self.slot, deadline).await;
+        if let Some(root) = fetched.or(self.parent_root) {
+            self.set_head(root);
+        }
+    }
+}
+
+/// Slot-qualified block root for `slot`, or `None` when the deadline has
+/// passed, the beacon node fails, or the body is not a block root.
+///
+/// Beacon API `GET /eth/v1/beacon/blocks/{block_id}/root` with `block_id`
+/// equal to the decimal slot. A deadline at or before now does not send the
+/// request. The caller applies the parent fallback.
+pub(crate) async fn fetch_head_root(
+    beacon: &dyn BeaconNodeClient,
+    slot: Slot,
+    deadline: tokio::time::Instant,
+) -> Option<Root> {
+    if tokio::time::Instant::now() >= deadline {
+        warn!(slot, "head root deadline already passed; skipping the beacon node");
+        return None;
+    }
+    match tokio::time::timeout_at(
+        deadline,
+        fetch_slot_qualified_root(beacon, &slot.to_string(), slot),
+    )
+    .await
+    {
+        Ok(root) => root,
+        Err(_) => {
+            warn!(slot, "head root fetch exceeded its deadline");
+            None
         }
     }
 }
@@ -165,6 +209,18 @@ async fn lookup_header(beacon: &dyn BeaconNodeClient, block_id: &str, slot: Slot
     }
 }
 
+/// Phase-2 block root: lowercase `0x` and exactly 64 hex digits (`A-F` allowed).
+fn parse_phase2_root(hex_str: &str) -> Option<Root> {
+    let rest = hex_str.strip_prefix("0x")?;
+    if rest.len() != 64 || !rest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes = hex::decode(rest).ok()?;
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&bytes);
+    Some(root)
+}
+
 fn decimal_slot_id(block_id: &str) -> Option<Slot> {
     if block_id.is_empty() || !block_id.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
@@ -178,10 +234,10 @@ async fn fetch_slot_qualified_root(
     slot: Slot,
 ) -> Option<Root> {
     match beacon.get_block_root(block_id).await {
-        Ok(response) => match parse_hex_root(&response.data.root) {
-            Ok(root) => Some(root),
-            Err(e) => {
-                warn!(slot, error = %e, "Failed to parse block root for slot context");
+        Ok(response) => match parse_phase2_root(&response.data.root) {
+            Some(root) => Some(root),
+            None => {
+                warn!(slot, "block root is not 0x plus 64 hex digits");
                 None
             }
         },
@@ -198,6 +254,7 @@ async fn fetch_slot_qualified_root(
 
 #[cfg(test)]
 mod tests {
+    use super::super::utils::parse_hex_root;
     use super::*;
     use beacon::{BlockRootData, DataResponse};
     use bn_manager::MockBeaconNodeClient;
@@ -300,11 +357,11 @@ mod tests {
         );
         assert!(ctx.head_root.is_none());
 
-        ctx.capture_head(&beacon).await;
+        ctx.apply_phase2_head(&beacon).await;
         assert_eq!(
             ctx.head_root,
             Some(expected),
-            "capture_head must use slot-qualified current slot, not 'head'"
+            "phase-2 head must use slot-qualified current slot, not 'head'"
         );
     }
 
@@ -328,7 +385,7 @@ mod tests {
         assert!(ctx.expected_parents.is_none(), "a non-404 error skips the parent check");
         assert!(ctx.head_root.is_none());
 
-        ctx.capture_head(&beacon).await;
+        ctx.apply_phase2_head(&beacon).await;
         assert!(
             ctx.head_root.is_none(),
             "BN error must yield head_root = None, not a panic or propagated error"
@@ -345,7 +402,7 @@ mod tests {
             "spec 404 at the current slot must still resolve slot-1"
         );
         assert!(ctx.head_root.is_none());
-        ctx.capture_head(&beacon).await;
+        ctx.apply_phase2_head(&beacon).await;
         assert_eq!(
             ctx.head_root, ctx.parent_root,
             "phase-2 capture_head falls back to parent when the current slot 404s"
@@ -564,7 +621,7 @@ mod tests {
             "t=0 must leave head_root unset; do not stuff a root into head_root at capture_parent"
         );
 
-        ctx.capture_head(&beacon).await;
+        ctx.apply_phase2_head(&beacon).await;
         assert_eq!(
             ctx.head_root,
             Some(parse_hex_root(&current_hex).unwrap()),
@@ -886,5 +943,94 @@ mod tests {
             ctx.expected_parents,
             Some(ExpectedParents { root: header_root, parent: None, closed: false })
         );
+    }
+
+    fn parent_root() -> Root {
+        [0x11; 32]
+    }
+
+    fn ctx_with_parent(slot: Slot) -> SlotContext {
+        SlotContext {
+            slot,
+            epoch: slot / 32,
+            parent_root: Some(parent_root()),
+            expected_parents: None,
+            head_root: None,
+        }
+    }
+
+    /// A body that is not `0x` plus 64 hex digits is rejected as a whole.
+    /// The stored head is the parent, not a partial decode of the body.
+    #[tokio::test]
+    async fn invalid_block_root_falls_back_to_parent_and_is_not_stored() {
+        let slot: Slot = 40;
+        let bad = [
+            "",
+            "abc",
+            "0xabcd",
+            "0Xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "0xzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        ];
+        for body in bad {
+            let owned = body.to_string();
+            let slot_id = slot.to_string();
+            let beacon = MockBeaconNodeClient::new().with_get_block_root(move |block_id| {
+                if block_id != slot_id {
+                    return Err(beacon::BeaconError::HttpError(format!(
+                        "unexpected block_id {block_id}"
+                    )));
+                }
+                Ok(DataResponse { data: BlockRootData { root: owned.clone() } })
+            });
+            let mut ctx = ctx_with_parent(slot);
+            ctx.apply_phase2_head(&beacon).await;
+            assert_eq!(ctx.head_root, Some(parent_root()), "body {body}");
+            assert_ne!(ctx.head_root, Some([0u8; 32]));
+        }
+    }
+
+    /// Uppercase hex digits under a lowercase `0x` are a block root.
+    #[tokio::test]
+    async fn uppercase_hex_digits_are_a_phase2_head() {
+        let root_hex = format!("0x{}", "AB".repeat(32));
+        let beacon = MockBeaconNodeClient::new().with_slot_aware_block_root(41, &[], {
+            let root_hex = root_hex.clone();
+            move |_| root_hex.clone()
+        });
+        let mut ctx = ctx_with_parent(40);
+        ctx.apply_phase2_head(&beacon).await;
+        assert_eq!(ctx.head_root, Some([0xAB; 32]));
+    }
+
+    /// A deadline that has already passed does not call the beacon node.
+    #[tokio::test(start_paused = true)]
+    async fn past_head_deadline_does_not_call_the_beacon_node() {
+        let beacon = MockBeaconNodeClient::new()
+            .with_slot_aware_block_root(41, &[], |_| format!("0x{}", "cd".repeat(32)));
+        let deadline = tokio::time::Instant::now();
+        let fetched = fetch_head_root(&beacon, 40, deadline).await;
+        assert!(fetched.is_none());
+        assert!(beacon.get_block_root_calls().is_empty());
+    }
+
+    /// The first phase-2 root stays. A second call does not replace it.
+    #[test]
+    fn set_head_keeps_the_first_written_head() {
+        let mut ctx = ctx_with_parent(40);
+        ctx.set_head([0x01; 32]);
+        ctx.set_head([0x02; 32]);
+        assert_eq!(ctx.head_root, Some([0x01; 32]));
+    }
+
+    /// Head lives on the slot context only. A new capture starts at `None`.
+    #[tokio::test]
+    async fn a_new_slot_context_does_not_keep_another_contexts_head() {
+        let beacon = MockBeaconNodeClient::new()
+            .with_get_block_header(|_| Err(beacon::BeaconError::HttpError("no disk".into())));
+        let mut first = ctx_with_parent(40);
+        first.set_head([0x01; 32]);
+        let second = SlotContext::capture_parent(&beacon, 40, 1).await;
+        assert!(second.head_root.is_none());
+        assert_eq!(first.head_root, Some([0x01; 32]));
     }
 }

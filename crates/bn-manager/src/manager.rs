@@ -2940,8 +2940,12 @@ impl NodeStatusApi for BnManager {
     // -- Blocks --
 
     async fn get_block_root(&self, block_id: &str) -> Result<BlockRootResponse, BeaconError> {
-        // no budget: block-root lookup; OperationTimeouts has no field for it
-        self.query_first("get_block_root", BnRole::All, HealthTier::SmallLag, None, |c| {
+        // Head capture uses this budget so one hung beacon node cannot consume
+        // the phase. `query_first` splits the remaining time across attempts.
+        let deadline = self
+            .op_timeout(|t| t.attestation_fetch)
+            .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
+        self.query_first("get_block_root", BnRole::All, HealthTier::SmallLag, deadline, |c| {
             Box::pin(c.get_block_root(block_id))
         })
         .await
@@ -6372,6 +6376,66 @@ mod tests {
         assert!(elapsed < hang, "elapsed {elapsed:?} waited for the primary hang {hang:?}");
     }
 
+    /// BN-1 stalls `blocks/{slot}/root`. BN-2's root is returned inside one
+    /// `attestation_fetch` budget plus BN-2's own latency.
+    #[tokio::test]
+    async fn get_block_root_hung_primary_secondary_answers_within_attestation_fetch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let budget = Duration::from_millis(600);
+        let secondary_delay = Duration::from_millis(40);
+        let epsilon = Duration::from_millis(150);
+        let hang = Duration::from_secs(2);
+        let slot = "33";
+        assert!(budget > ATTEMPT_TIMEOUT_FLOOR);
+        assert_eq!(current_attempt_floor(), ATTEMPT_TIMEOUT_FLOOR);
+
+        let primary_root = "11".repeat(32);
+        let secondary_root = "22".repeat(32);
+        let primary_body = format!(r#"{{"data":{{"root":"0x{primary_root}"}}}}"#);
+        let secondary_body = format!(r#"{{"data":{{"root":"0x{secondary_root}"}}}}"#);
+
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/beacon/blocks/{slot}/root")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(&primary_body).set_delay(hang))
+            .mount(&primary)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/beacon/blocks/{slot}/root")))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(&secondary_body)
+                    .set_delay(secondary_delay),
+            )
+            .expect(1)
+            .mount(&secondary)
+            .await;
+
+        let manager = BnManager::new(BnManagerConfig::new(vec![primary.uri(), secondary.uri()]))
+            .unwrap()
+            .with_operation_timeouts(OperationTimeouts {
+                attestation_fetch: budget,
+                ..OperationTimeouts::default()
+            });
+
+        let started = std::time::Instant::now();
+        let response =
+            manager.get_block_root(slot).await.expect("secondary answers the block root");
+        let elapsed = started.elapsed();
+
+        assert_eq!(response.data.root, format!("0x{secondary_root}"));
+        assert_ne!(response.data.root, format!("0x{primary_root}"));
+        let limit = budget + secondary_delay + epsilon;
+        assert!(
+            elapsed <= limit,
+            "elapsed {elapsed:?} exceeded one attestation_fetch plus BN-2 latency ({limit:?})"
+        );
+        assert!(elapsed < hang, "elapsed {elapsed:?} waited for the primary hang {hang:?}");
+    }
+
     #[tokio::test]
     async fn remaining_below_floor_bounds_the_whole_operation() {
         use wiremock::matchers::{method, path};
@@ -6750,7 +6814,7 @@ mod tests {
             .filter(|(_, line)| line.contains("// no budget:"))
             .map(|(index, _)| format!("manager.rs:{}", index + 1))
             .collect();
-        let expected_no_budget_sites = 11;
+        let expected_no_budget_sites = 10;
         let actual_no_budget_sites = no_budget_sites.len();
         let sites = no_budget_sites.join(", ");
         assert_eq!(
@@ -6760,8 +6824,8 @@ mod tests {
         );
         assert_eq!(
             production.matches("checked_deadline(tokio::time::Instant::now(), budget)").count(),
-            12,
-            "each converted site takes an absolute deadline before it awaits"
+            13,
+            "get_block_root and each earlier converted site take an absolute deadline before they await"
         );
     }
 

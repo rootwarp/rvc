@@ -3,6 +3,54 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Head capture deadline and concurrent sync contributions
+
+Phase-2 head capture calls Beacon API `GET /eth/v1/beacon/blocks/{slot}/root`
+with the decimal slot. The request stops at the earlier of slot end and the
+`attestation_fetch` budget. A deadline that has already passed does not call
+the beacon node. The slot-context lock is not held across that fetch. One
+capture runs per slot. A second caller waits until that capture finishes or
+its own deadline, and does not start another fetch. The first root written
+is kept. A timeout or a body that is not `0x` plus 64 hex digits (`A-F`
+allowed) falls back to the parent captured at t=0. That fallback is a
+liveness choice: the parent is the last head this client verified, and
+signing it is valid and non-slashable for sync messages. Attestations do
+not wait for the fetch. When the attestation and sync-message deadlines
+match, the fetch runs beside attestations. When they differ, the attestation
+arm does not capture the head.
+
+`BnManager::get_block_root` uses the same `attestation_fetch` budget, so a
+hung beacon node fails over inside that budget.
+
+Sync contributions use the phase-2 head. They do not start a second fetch
+while that capture is running. When the contribution and aggregate deadlines
+match, aggregation starts at that shared wait. Contributions wait for the
+in-flight phase-2 capture, bounded by the contribution signing deadline, and
+that wait does not delay aggregation. Contribution intake stops at slot end.
+Subcommittees not pulled onto the pipeline before slot end increment the
+slot-end drop counter. The counter is cumulative for the sync-committee
+service. An in-flight fetch or signature is not a drop; only items
+`take_until(slot_end)` did not yield are counted. A fetch, a signature, or
+a publish already running stops at the earlier of the `sync_contribution`
+timeout and slot end plus 500 ms. Selection proofs and contribution
+signatures stop at that same instant, so a slow remote signer cannot stretch
+the phase. A subcommittee index outside `0..4` is skipped before any
+signature. Duplicate subcommittee indices are one fetch and one
+contribution-and-proof. The contribution body must match the duty slot, the
+phase-2 head, and the requested subcommittee, with a 16-byte aggregation
+bitfield that has at least one participant bit and a 96-byte signature. An
+empty bitfield is rejected before `sign_contribution_and_proof`. A body that
+does not match is rejected as a whole. A sibling subcommittee that matches
+is still published. The head is memory for that slot context only.
+
+Beacon API: block root `GET /eth/v1/beacon/blocks/{block_id}/root`; sync
+contribution `GET /eth/v1/validator/sync_committee_contribution`; publish
+`POST /eth/v1/validator/contribution_and_proofs`. Consensus specs:
+`subcommittee_index = position // (SYNC_COMMITTEE_SIZE // SYNC_COMMITTEE_SUBNET_COUNT)`
+and `is_sync_committee_aggregator`.
+
+Review findings B-008 and B-044 are fixed.
+
 ## JSON blinded Deneb and Electra blocks
 
 A produce-v3 JSON response with the header `Eth-Execution-Payload-Blinded: true`
