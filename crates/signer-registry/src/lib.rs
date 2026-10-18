@@ -170,6 +170,7 @@ pub const SIGNING_GATE_METHODS: &[&str] = &[
     "sign_aggregate_and_proof",
     "sign_contribution_and_proof",
     "sign_selection_proof",
+    "sign_sync_committee_selection_proof",
     "sign_randao_reveal",
     "sign_voluntary_exit",
     "sign_builder_registration",
@@ -250,7 +251,7 @@ pub const REGISTERED_METHODS: &[SigningMethod] = &[
         method: "SignSyncAggregatorSelectionData",
         message_kind: MessageKind::SyncSelection,
         gate_routing: GateRouting::NonSlashable,
-        gate_method: Some("sign_selection_proof"),
+        gate_method: Some("sign_sync_committee_selection_proof"),
     },
     SigningMethod {
         service: V2_SIGNER_SERVICE,

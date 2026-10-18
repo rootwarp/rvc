@@ -248,16 +248,15 @@ pub fn build_keymanager_api(
     let config_mgr =
         Arc::new(ValidatorConfigManagerAdapter::new(Arc::clone(&deps.validator_store)));
 
-    let exit_mgr: Option<Arc<dyn VoluntaryExitManager>> = Some(Arc::new(
-        VoluntaryExitManagerAdapter::new(
+    let exit_mgr: Option<Arc<dyn VoluntaryExitManager>> =
+        Some(Arc::new(VoluntaryExitManagerAdapter::new(
             deps.beacon_client,
             Arc::clone(&deps.signer),
             deps.fork_schedule,
             deps.genesis_validators_root,
             genesis_time,
-        )
-        .with_slot_duration_ms(slot_duration_ms),
-    ));
+            slot_duration_ms,
+        )));
 
     let signing_quiesce: Arc<dyn SigningQuiesce> = Arc::new(
         SigningQuiesceAdapter::new(Arc::clone(&deps.quiesce_registry), deps.signer)

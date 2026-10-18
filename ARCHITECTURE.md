@@ -376,7 +376,7 @@ flowchart TD
     style J fill:#51cf66,color:#fff
 ```
 
-`sign_block` reserves with `SlashingDb::reserve_block`, which commits the slashing row and releases the SQLite connection before the BLS sign. The per-pubkey `OwnedMutexGuard` is moved into `spawn_blocking` (`core.rs:1067` and `core.rs:1116` in `crates/signer/src/core.rs`) and stays held through reserve, the sign, and any reconcile. A signed block is published with that row already committed. An unsigned outcome under `DiscardStagedRow` (in-process) reconciles the reservation while the same lock is still held. `RetainStagedRow` (remote-capable) leaves the committed row.
+`sign_block` reserves with `SlashingDb::reserve_block`, which commits the slashing row and releases the SQLite connection before the BLS sign. The per-pubkey `OwnedMutexGuard` is moved into `spawn_blocking` (`core.rs:1077` and `core.rs:1126` in `crates/signer/src/core.rs`) and stays held through reserve, the sign, and any reconcile. A signed block is published with that row already committed. An unsigned outcome under `DiscardStagedRow` (in-process) reconciles the reservation while the same lock is still held. `RetainStagedRow` (remote-capable) leaves the committed row.
 
 ## Signing Flow
 

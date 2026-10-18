@@ -28,27 +28,25 @@ pub struct VoluntaryExitManagerAdapter {
 
 impl VoluntaryExitManagerAdapter {
     /// `genesis_time` is the startup-validated genesis. It has no zero default.
+    ///
+    /// `slot_duration_ms` is the startup-validated slot length. It is required:
+    /// there is no 12 s fallback.
     pub fn new(
         beacon: Arc<dyn BeaconNodeClient>,
         signer: Arc<SignerService>,
         fork_schedule: Arc<ForkSchedule>,
         genesis_validators_root: Root,
         genesis_time: u64,
+        slot_duration_ms: u64,
     ) -> Self {
         Self {
             beacon,
             signer,
             fork_schedule,
             genesis_validators_root,
-            slot_duration_ms: eth_types::SLOT_DURATION_MS,
+            slot_duration_ms,
             genesis_time,
         }
-    }
-
-    /// Use the duration `connect_beacon` already checked against every BN.
-    pub fn with_slot_duration_ms(mut self, slot_duration_ms: u64) -> Self {
-        self.slot_duration_ms = slot_duration_ms;
-        self
     }
 }
 
@@ -218,13 +216,14 @@ mod tests {
         beacon: Arc<dyn BeaconNodeClient>,
         secret_key: SecretKey,
     ) -> VoluntaryExitManagerAdapter {
-        adapter_at_genesis(beacon, secret_key, 0)
+        adapter_at_genesis(beacon, secret_key, 0, SLOT_DURATION_MS)
     }
 
     fn adapter_at_genesis(
         beacon: Arc<dyn BeaconNodeClient>,
         secret_key: SecretKey,
         genesis_time: u64,
+        slot_duration_ms: u64,
     ) -> VoluntaryExitManagerAdapter {
         let key_manager = KeyManager::new();
         let composite = Arc::new(CompositeSigner::new(LocalSigner::new(key_manager)));
@@ -238,6 +237,7 @@ mod tests {
             test_fork_schedule(),
             [0xaa; 32],
             genesis_time,
+            slot_duration_ms,
         )
     }
 
@@ -440,8 +440,7 @@ mod tests {
         mount_genesis(&server, "1", &format!("0x{}", hex::encode([0xbb_u8; 32]))).await;
         mount_spec(&server, "12000").await;
 
-        let adapter =
-            adapter_at_genesis(pool(vec![server.uri()]), sk, genesis).with_slot_duration_ms(6_000);
+        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, genesis, 6_000);
         let signed = adapter.sign_voluntary_exit(&pubkey, None).await.expect("cached genesis");
         assert_eq!(signed.message.epoch, 10);
 
@@ -462,6 +461,27 @@ mod tests {
             .await;
     }
 
+    /// A caller-supplied 6000 ms slot length is epoch 10. The removed 12 s
+    /// default would report epoch 5 for the same genesis.
+    #[tokio::test]
+    async fn test_exit_adapter_default_epoch_uses_the_given_slot_duration() {
+        let server = MockServer::start().await;
+        let sk = SecretKey::generate();
+        let pubkey = sk.public_key().to_bytes();
+        let hex = super::pubkey_hex(pubkey);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the unix epoch")
+            .as_secs();
+        let genesis = now - 10 * 192 - 96;
+        mount_validators(&server, validator_body(&hex), 200).await;
+
+        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, genesis, 6_000);
+        let signed =
+            adapter.sign_voluntary_exit(&pubkey, None).await.expect("6000 ms slot duration");
+        assert_eq!(signed.message.epoch, 10);
+    }
+
     /// Default exit epoch follows a 6 s beacon node, not the 12 s constant.
     #[tokio::test]
     async fn default_exit_epoch_matches_six_second_slot_clock() {
@@ -479,8 +499,7 @@ mod tests {
         mount_genesis(&server, "1", &configured).await;
         mount_spec(&server, "12000").await;
 
-        let adapter =
-            adapter_at_genesis(pool(vec![server.uri()]), sk, genesis).with_slot_duration_ms(6_000);
+        let adapter = adapter_at_genesis(pool(vec![server.uri()]), sk, genesis, 6_000);
         let signed = adapter.sign_voluntary_exit(&pubkey, None).await.expect("default epoch");
         assert_eq!(signed.message.epoch, 10);
         let paths = request_paths(&server).await;
@@ -503,8 +522,8 @@ mod tests {
 
         for bad in [0_u64, u64::MAX] {
             // Duration is rejected before signing, so the local key is unused.
-            let adapter = adapter_for(pool(vec![server.uri()]), SecretKey::generate())
-                .with_slot_duration_ms(bad);
+            let adapter =
+                adapter_at_genesis(pool(vec![server.uri()]), SecretKey::generate(), 0, bad);
             let err = adapter.sign_voluntary_exit(&pubkey, None).await.expect_err("bad duration");
             assert!(err.to_string().contains("outside"), "{err}");
         }

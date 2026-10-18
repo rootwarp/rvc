@@ -174,6 +174,12 @@ rvc voluntary-exit \
   --confirm
 ```
 
+`rvc voluntary-exit` and `rvc prepare-exit` sign with the local keystore. They
+are offline and are not doppelganger-gated. A voluntary exit is not a slashable
+duty, and the command logs a warning when it signs. `prepare-exit` writes the
+signed message to a file and does not broadcast it. `voluntary-exit` submits
+the signed exit to the beacon node after `--confirm`.
+
 ## Configuration File
 
 Create a TOML file (see `config.example.toml`).

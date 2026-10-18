@@ -36,7 +36,7 @@ That command prints 14 lines, one per row below.
 | `crates/rvc/src/bootstrap/tasks.rs` | 257 | `bn.sync_monitor` | register | detached | BN sync monitor; process-lifetime Infra handle, loop lives in bn-manager, out of P1-1 scope. |
 | `crates/rvc/src/bootstrap/tasks.rs` | 261 | `bn.sync_monitor.cancel` | spawn | detached | Cancel-forwarder for `bn.sync_monitor`; not an iteration loop. |
 | `crates/rvc/src/index_resolver.rs` | 86 | `index.resolve` | spawn | B | Iteration loop. Loop site `crates/rvc/src/index_resolver.rs:114` (`IndexResolver::run`). TRC-6b owns the per-iteration root. |
-| `crates/rvc/src/keymanager_adapters/spawn.rs` | 342 | `keymanager_api` | spawn | detached | Keymanager API server; serve loop is `KeymanagerServer::serve_on` in `crates/keymanager-api/src/server.rs:203`, out of scope. |
+| `crates/rvc/src/keymanager_adapters/spawn.rs` | 341 | `keymanager_api` | spawn | detached | Keymanager API server; serve loop is `KeymanagerServer::serve_on` in `crates/keymanager-api/src/server.rs:203`, out of scope. |
 | `crates/rvc/src/liveness_loop.rs` | 494 | `liveness_loop` | spawn | B | Iteration loop. Loop site `crates/rvc/src/liveness_loop.rs:218` (`LivenessObservationLoop::run` loop body). TRC-6b owns the per-iteration root. |
 | `crates/rvc/src/slashing_monitor.rs` | 145 | `slashing_monitor` | spawn | B | Iteration loop. Loop site `crates/rvc/src/slashing_monitor.rs:148`. TRC-6b owns the per-iteration root. |
 

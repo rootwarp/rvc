@@ -12,6 +12,10 @@ impl SigningEnablement for DenyAll {
     fn is_signing_enabled(&self, _pubkey: &crypto::PublicKey) -> bool {
         false
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
 }
 
 #[test]

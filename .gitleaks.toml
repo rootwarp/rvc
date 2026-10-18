@@ -1,12 +1,22 @@
 # Gate 2 (structured-logging / observability initiative): gitleaks secret-scan config (SOURCE tree).
 #
-# Design (after two review rounds): keep ALL curated gitleaks default rules via `useDefault`.
-# The allow-list contains NO content/value regexes — only PATH allow-lists — because a value
-# regex (even an "obviously test" placeholder like `0xpubkey_`/`abcdef1234567890`) is matched as
-# a SUBSTRING of the detected secret, so it silently smuggles any secret that merely contains it
-# (e.g. `0xpubkey_<real-private-key>`). Instead, every intentional in-`src/` test finding is
-# baselined by EXACT fingerprint (`file:rule:line`) in `.gitleaksignore`. A new secret — even a
-# 64-hex key in one of those same files on a new line — is a new fingerprint and FAILS the gate.
+# Design: keep ALL curated gitleaks default rules via `useDefault`.
+# The global allow-list contains NO content/value regexes and does not set a
+# regex target. Extended default allow regexes therefore stay on the captured
+# secret, which is the gitleaks default. Setting the target to the whole line
+# would make the extended default pattern for the words true, false, and null
+# skip any line that contains those words, including a real secret.
+# Every intentional in-src test finding is baselined by EXACT fingerprint
+# (`file:rule:line`) in `.gitleaksignore`. A new secret — even a 64-hex key
+# in one of those same files on a new line — is a new fingerprint and FAILS the gate.
+# An inline allow signature on the finding's own line is a built-in skip.
+# A comment on a neighboring line does not suppress the finding, so prose
+# around a sample stays scanned. Do not put that signature inside a fenced
+# sample that is shown as program output.
+# The fenced log line in docs/running-guide.md is allowed only by a
+# generic-api-key rule allowlist with condition AND: that path, and the exact
+# captured truncated pubkey. The same value in any other file FAILS the gate.
+# A different secret on that path also FAILS the gate.
 #
 # Path allow-lists:
 #   - `target/`: build artifacts, never source.
@@ -30,8 +40,24 @@ title = "rs-vc secret-scan allowlist (source tree)"
 useDefault = true
 
 [allowlist]
-description = "Build artifacts and whole-test trees (path-scoped only; no value regexes)"
+description = "Build artifacts and whole-test trees"
 paths = [
   '''(^|/)target/''',
   '''(^|/)tests/''',
+]
+
+# Exact captured secret from the running-guide log sample. AND with the path:
+# the same value anywhere else is still a finding. Default regex target (the
+# secret), not the line.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Truncated pubkey on the docs/running-guide.md trace sample line"
+condition = "AND"
+paths = [
+  '''(^|/)docs/running-guide\.md$''',
+]
+regexes = [
+  '''^0x97f1d3a731\.\.\.db22c6bb$''',
 ]
