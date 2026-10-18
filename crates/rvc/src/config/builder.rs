@@ -823,7 +823,13 @@ impl ServiceBuilder {
         }
 
         let reader: Arc<dyn slashing::SlashingDbReader> = slashing_db;
-        let mut machine = ForwardWindowMachine::new(reader, DEFAULT_MONITORING_EPOCHS, gvr);
+        let mut machine = ForwardWindowMachine::new(reader, DEFAULT_MONITORING_EPOCHS, gvr)
+            .with_detection_marker_path(crate::detection_marker::marker_path(
+                &self.config.keystore_path,
+            ))
+            .with_force_window_path(crate::detection_marker::force_window_path(
+                &self.config.keystore_path,
+            ));
         if genesis_confirmed {
             machine = machine.with_confirmed_genesis();
         }
@@ -2748,6 +2754,31 @@ mod tests {
             !enablement.is_signing_enabled(&pk),
             "without complete liveness observation the gate must stay closed (D-2 fail-closed)"
         );
+    }
+
+    /// A detection marker in the keystore directory blocks the epoch-0 bypass.
+    #[test]
+    fn test_detection_marker_blocks_epoch0_bypass() {
+        let dir = tempfile::tempdir().expect("temp");
+        crate::detection_marker::write_marker(
+            dir.path(),
+            &crate::detection_marker::DetectionMarker {
+                epoch: 3,
+                unix_secs: 4,
+                pubkeys: vec!["0x".to_string() + &"ab".repeat(48)],
+            },
+        )
+        .expect("marker");
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let builder = ServiceBuilder::new(config);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let (_, pubkey_map) = loaded_key_manager(&builder, 1);
+        let pk = pubkey_map.read().values().next().unwrap().clone();
+        let (_, machine) =
+            builder.build_signing_enablement(slashing_db, [0x44; 32], 0, &pubkey_map, true);
+        let machine = machine.expect("machine");
+        assert_eq!(machine.status(&pk), doppelganger::ForwardWindowStatus::Pending);
+        assert!(!machine.is_signing_enabled(&pk));
     }
 
     /// Epoch-0 (pre-genesis) bypass: registered keys are immediately Safe.

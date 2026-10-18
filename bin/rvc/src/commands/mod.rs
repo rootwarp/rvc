@@ -1,3 +1,4 @@
+pub mod doppelganger;
 pub mod prepare_exit;
 pub mod signed_exit;
 pub mod slashing;

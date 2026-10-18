@@ -4425,6 +4425,7 @@ name = "rvc-doppelganger"
 version = "0.8.0"
 dependencies = [
  "hex",
+ "libc",
  "parking_lot",
  "proptest",
  "rvc-crypto",

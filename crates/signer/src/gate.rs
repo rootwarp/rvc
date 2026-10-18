@@ -200,6 +200,12 @@ impl SigningGate {
     /// This helper is the single gate-decision point for BOTH slashable and
     /// non-slashable signing paths, ensuring the fail-closed semantics are
     /// applied uniformly.
+    ///
+    /// `signing_allowed` reads the process detection latch. After that latch
+    /// is stored this returns false for every key. Slashable signing checks
+    /// again after the slashing-DB reservation and before BLS. That second
+    /// check is the admission boundary: it is not atomic with the backend
+    /// call. A BLS call already started finishes or hits the sign timeout.
     fn gate_decision(&self, pubkey: &PublicKey, duty: SigningDuty) -> bool {
         let enabled = doppelganger::signing_allowed(self.enablement.as_ref(), pubkey, duty);
         // Codify PRD §6.3: when the enablement returns false (unknown or blocked),
@@ -264,7 +270,7 @@ impl SigningGate {
         sign_slashable(SignSlashableRequest {
             locks: self.locks.as_ref(),
             pubkey,
-            enablement: self.enablement.as_ref(),
+            enablement: Arc::clone(&self.enablement),
             signer: Arc::clone(&self.signer),
             signing_root,
             sign_timeout: self.sign_timeout,
@@ -337,7 +343,7 @@ impl SigningGate {
         sign_slashable(SignSlashableRequest {
             locks: self.locks.as_ref(),
             pubkey,
-            enablement: self.enablement.as_ref(),
+            enablement: Arc::clone(&self.enablement),
             signer: Arc::clone(&self.signer),
             signing_root,
             sign_timeout: self.sign_timeout,

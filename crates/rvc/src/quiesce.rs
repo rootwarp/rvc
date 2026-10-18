@@ -170,6 +170,12 @@ impl SigningEnablement for QuiescingEnablement {
     fn voluntary_exit_only(&self) -> bool {
         self.inner.voluntary_exit_only()
     }
+
+    fn blocked_by_doppelganger(&self, pubkey: &PublicKey) -> bool {
+        // Quiesce closes new admissions. It does not turn an already-admitted
+        // slashable sign into a doppelganger refusal.
+        self.inner.blocked_by_doppelganger(pubkey)
+    }
 }
 
 /// [`SigningQuiesce`] for the VC: insert into the registry the signer's
@@ -294,6 +300,10 @@ impl SigningEnablement for AllowOne {
     }
 
     fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
         false
     }
 }

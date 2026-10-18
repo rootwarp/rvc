@@ -7,6 +7,7 @@
 mod enablement;
 mod epoch_clock;
 mod forward_window;
+pub mod marker_file;
 mod restart_skip;
 mod state;
 mod traits;

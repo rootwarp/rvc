@@ -6,6 +6,7 @@
 
 use std::collections::HashSet;
 use std::future::Future;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use bn_manager::{BeaconNodeClient, OperationTimeouts};
@@ -82,6 +83,12 @@ pub async fn run(
         spec_version = eth_types::CONSENSUS_SPEC_VERSION,
         "Starting validator client"
     );
+
+    refuse_if_detection_records(&config.keystore_path, &config.slashing_db_path)?;
+    if config.doppelganger_detection {
+        ensure_marker_dir_writable(&config.keystore_path)?;
+        ensure_detection_record(&config.keystore_path)?;
+    }
 
     let health_status = new_health_status();
 
@@ -367,12 +374,22 @@ pub async fn run(
 
     // Operator signal, panicking registered tasks, and internal token cancel
     // (e.g. slashing-monitor ShutdownRequested) converge on one drain path.
+    let detection = forward_window_machine.map(|machine| DetectionShutdown {
+        machine,
+        keystore_dir: config.keystore_path.clone(),
+        fallback_dir: crate::detection_marker::fallback_marker_dir(
+            &config.keystore_path,
+            &config.slashing_db_path,
+        ),
+        epoch_clock: Arc::clone(&epoch_clock),
+    });
     let (outcome, res) = await_shutdown_and_drain(ShutdownInputs {
         executor,
         orchestrator_handle,
         shutdown_rx,
         shutdown_token,
         budget: TierBudget::default(),
+        detection,
     })
     .await;
     info!(
@@ -398,6 +415,21 @@ pub(crate) struct ShutdownInputs {
     pub(crate) shutdown_token: CancellationToken,
     /// Per-tier join budgets for the drain.
     pub(crate) budget: TierBudget,
+    /// Set when doppelganger detection is on. The drain writes a marker if
+    /// the latch is set, including when shutdown won the race with the retry.
+    pub(crate) detection: Option<DetectionShutdown>,
+}
+
+/// Machine and directories the drain uses to leave a durable detection record.
+pub(crate) struct DetectionShutdown {
+    /// Process latch and the detected pubkey hexes.
+    pub(crate) machine: Arc<doppelganger::ForwardWindowMachine>,
+    /// Keystore directory. The primary marker is written here.
+    pub(crate) keystore_dir: std::path::PathBuf,
+    /// Parent of the slashing database when that directory is not the keystore.
+    pub(crate) fallback_dir: Option<std::path::PathBuf>,
+    /// Epoch recorded in the marker.
+    pub(crate) epoch_clock: Arc<doppelganger::MonotonicEpochClock>,
 }
 
 /// Wait until an operator signal, a [`ShutdownReason`], or token cancel, then
@@ -405,7 +437,17 @@ pub(crate) struct ShutdownInputs {
 ///
 /// The drain finishes before this returns, on every arm.
 /// [`ShutdownReason::Failure`] becomes [`BootstrapError::CriticalTaskFailed`]
-/// (exit 16). Signal, token, and [`ShutdownReason::Success`] return `Ok`.
+/// (exit 16). A doppelganger exit flag or a set detection latch becomes
+/// [`BootstrapError::DoppelgangerDetected`] (exit 12) and outranks a panic, a
+/// signal, or token cancel. Exit 12 follows only after a write and its fsync
+/// returned `Ok` in this process (a rename also needs the directory fsync).
+/// The record is overwritten in place first; the keystore marker and the
+/// slashing-database parent are additional paths. A later rewrite failure
+/// does not retry once that acknowledgement is set. A read-back, including an
+/// unreadable file, is not durability. When the acknowledgement is still
+/// clear, this keeps retrying and does not return `Ok` or exit 16. `SIGKILL`
+/// before the first successful fsync loses the latch. Signal, token, and
+/// [`ShutdownReason::Success`] return `Ok` when the latch is clear.
 pub(crate) async fn await_shutdown_and_drain(
     inputs: ShutdownInputs,
 ) -> (ShutdownOutcome, Result<(), BootstrapError>) {
@@ -416,12 +458,18 @@ pub(crate) async fn await_shutdown_and_drain(
 ///
 /// Production passes [`shutdown_signal`]. Tests pass a ready or pending future
 /// so the signal arm does not install a process-wide SIGINT handler.
-async fn await_shutdown_and_drain_with_signal(
+pub(crate) async fn await_shutdown_and_drain_with_signal(
     inputs: ShutdownInputs,
     signal: impl Future<Output = ()>,
 ) -> (ShutdownOutcome, Result<(), BootstrapError>) {
-    let ShutdownInputs { executor, orchestrator_handle, mut shutdown_rx, shutdown_token, budget } =
-        inputs;
+    let ShutdownInputs {
+        executor,
+        orchestrator_handle,
+        mut shutdown_rx,
+        shutdown_token,
+        budget,
+        detection,
+    } = inputs;
 
     let failed_task = tokio::select! {
         _ = signal => {
@@ -435,6 +483,11 @@ async fn await_shutdown_and_drain_with_signal(
                     error!(task, "Registered task panicked; initiating process drain");
                     startup::log_shutdown_initiated("task failure");
                     Some(task)
+                }
+                Some(ShutdownReason::DoppelgangerDetected) => {
+                    error!("doppelganger detected; initiating process drain");
+                    startup::log_shutdown_initiated("doppelganger detected");
+                    None
                 }
                 Some(ShutdownReason::Success(msg)) => {
                     info!(reason = msg, "Shutdown reason received");
@@ -459,12 +512,257 @@ async fn await_shutdown_and_drain_with_signal(
     orchestrator_handle.shutdown();
     // Cancels the process token once, then joins each tier under TierBudget.
     // No sleep-as-join: duty_orchestrator is in the registry and is joined here.
+    // The marker retry below sleeps only after this drain returns.
+    // The flag outlives `shutdown`, which consumes the executor. Load it
+    // after the drain so a detection that lands while a tier is still
+    // joining exits 12, not the reason that woke the select.
+    let doppelganger_exit = executor.doppelganger_exit_flag();
     let outcome = executor.shutdown(budget).await;
-    let res = match failed_task {
-        Some(task) => Err(BootstrapError::CriticalTaskFailed { task }),
-        None => Ok(()),
+    // The latch lives on the machine, which this drain holds. A signal, a
+    // token cancel, or a task panic can arrive while the keystore write is
+    // still failing and before the exit flag is stored. Leaving here with
+    // `Ok` or exit 16 would restart the detected key with a fresh window.
+    if let Some(detection) = detection.as_ref() {
+        if persist_latched_detection(detection).await {
+            doppelganger_exit.store(true, Ordering::SeqCst);
+        }
+    }
+    let doppelganger_exit = doppelganger_exit.load(Ordering::SeqCst);
+    let res = if doppelganger_exit {
+        Err(BootstrapError::DoppelgangerDetected)
+    } else {
+        match failed_task {
+            Some(task) => Err(BootstrapError::CriticalTaskFailed { task }),
+            None => Ok(()),
+        }
     };
     (outcome, res)
+}
+
+/// How long the drain waits between attempts when nothing durable exists yet.
+const MARKER_SHUTDOWN_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Operator hint included in a refuse-to-start log. The fallback marker, when
+/// one was written, sits beside the slashing database.
+const DETECTION_CLEAR_HINT: &str = "Clear it with `rvc doppelganger clear-detection \
+     --datadir <data dir> --slashing-db-path <slashing db> --confirm` \
+     after the other instance is gone";
+
+/// Write a durable detection record once the latch is set.
+///
+/// The pre-allocated keystore record is overwritten in place first. The
+/// keystore marker and [`DetectionShutdown::fallback_dir`] are additional
+/// paths. `true` only when this process has seen a write and its fsync return
+/// `Ok` (a rename also needs the directory fsync). A later rewrite failure
+/// does not retry. A read of the record or a marker is not durability, and
+/// neither is an unreadable file. Only a latch whose flag is still clear
+/// sleeps and retries. Exit 12 without a completed fsync is not safe: Compose
+/// `restart: unless-stopped` starts the process again, and the detected key
+/// would get a fresh window.
+async fn persist_latched_detection(detection: &DetectionShutdown) -> bool {
+    if !detection.machine.detected_latch() {
+        return false;
+    }
+    loop {
+        if detection.machine.detection_persisted() {
+            return true;
+        }
+        let epoch = detection.epoch_clock.current_epoch();
+        let unix_secs = crate::detection_marker::unix_secs_now();
+        let marker = crate::detection_marker::DetectionMarker {
+            epoch,
+            unix_secs,
+            pubkeys: detection.machine.detected_hexes(),
+        };
+        if crate::detection_marker::commit_detection_record(
+            &detection.keystore_dir,
+            epoch,
+            unix_secs,
+        )
+        .is_ok()
+        {
+            detection.machine.mark_detection_persisted();
+            if let Err(err) =
+                crate::detection_marker::write_marker(&detection.keystore_dir, &marker)
+            {
+                crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
+                error!(
+                    error = %err,
+                    path = %crate::detection_marker::marker_path(&detection.keystore_dir).display(),
+                    "in-place detection record is durable; the marker write failed"
+                );
+                if let Some(dir) = &detection.fallback_dir {
+                    if let Err(fallback_err) = crate::detection_marker::write_marker(dir, &marker) {
+                        crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
+                        error!(
+                            error = %fallback_err,
+                            path = %crate::detection_marker::marker_path(dir).display(),
+                            "in-place detection record is durable; the fallback marker write failed"
+                        );
+                    }
+                }
+            }
+        } else if crate::detection_marker::write_marker(&detection.keystore_dir, &marker).is_ok() {
+            detection.machine.mark_detection_persisted();
+        } else {
+            crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
+            error!(
+                path = %crate::detection_marker::marker_path(&detection.keystore_dir).display(),
+                "failed to persist doppelganger detection marker during shutdown"
+            );
+            if let Some(dir) = &detection.fallback_dir {
+                if crate::detection_marker::write_marker(dir, &marker).is_ok() {
+                    detection.machine.mark_detection_persisted();
+                    error!(
+                        path = %crate::detection_marker::marker_path(dir).display(),
+                        "persisted doppelganger detection marker beside the slashing database"
+                    );
+                } else {
+                    crate::metrics::RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL.inc();
+                    error!(
+                        path = %crate::detection_marker::marker_path(dir).display(),
+                        "failed to persist the fallback doppelganger detection marker"
+                    );
+                }
+            }
+        }
+        if detection.machine.detection_persisted() {
+            return true;
+        }
+        tokio::time::sleep(MARKER_SHUTDOWN_RETRY).await;
+    }
+}
+
+/// Exit 12 before a signer or the keymanager API is built when a detection
+/// marker or a detected record is present in the keystore directory or, when
+/// that directory is different, a marker is beside the slashing database.
+pub(crate) fn refuse_if_detection_records(
+    keystore_dir: &std::path::Path,
+    slashing_db_path: &std::path::Path,
+) -> Result<(), BootstrapError> {
+    refuse_if_detection_record(keystore_dir)?;
+    refuse_if_detection_marker(keystore_dir)?;
+    if let Some(dir) = crate::detection_marker::fallback_marker_dir(keystore_dir, slashing_db_path)
+    {
+        refuse_if_detection_marker(&dir)?;
+    }
+    Ok(())
+}
+
+/// Exit 12 when the pre-allocated record is `detected` or cannot be trusted.
+fn refuse_if_detection_record(data_dir: &std::path::Path) -> Result<(), BootstrapError> {
+    match crate::detection_marker::inspect_record(data_dir) {
+        crate::detection_marker::RecordInspect::Absent
+        | crate::detection_marker::RecordInspect::Clear => Ok(()),
+        crate::detection_marker::RecordInspect::Detected { epoch, unix_secs } => {
+            error!(
+                epoch,
+                unix_secs,
+                path = %crate::detection_marker::record_path(data_dir).display(),
+                "doppelganger detection record is in the detected state; refusing to start. {}",
+                DETECTION_CLEAR_HINT
+            );
+            Err(BootstrapError::DoppelgangerDetected)
+        }
+        crate::detection_marker::RecordInspect::Unreadable { path, reason } => {
+            error!(
+                path = %path.display(),
+                reason,
+                "doppelganger detection record is unreadable; refusing to start"
+            );
+            Err(BootstrapError::DoppelgangerDetected)
+        }
+    }
+}
+
+/// Exit 12 before a signer or the keymanager API is built when a detection
+/// marker is present, unreadable, or not a valid marker.
+pub(crate) fn refuse_if_detection_marker(data_dir: &std::path::Path) -> Result<(), BootstrapError> {
+    match crate::detection_marker::inspect(data_dir) {
+        crate::detection_marker::MarkerInspect::Absent => Ok(()),
+        crate::detection_marker::MarkerInspect::Present(marker) => {
+            for pubkey in &marker.pubkeys {
+                error!(
+                    pubkey = %TruncatedPubkey::new(pubkey),
+                    epoch = marker.epoch,
+                    unix_secs = marker.unix_secs,
+                    path = %crate::detection_marker::marker_path(data_dir).display(),
+                    "doppelganger detection marker is present; refusing to start. {}",
+                    DETECTION_CLEAR_HINT
+                );
+            }
+            if marker.pubkeys.is_empty() {
+                error!(
+                    epoch = marker.epoch,
+                    path = %crate::detection_marker::marker_path(data_dir).display(),
+                    "doppelganger detection marker listed no keys; refusing to start. {}",
+                    DETECTION_CLEAR_HINT
+                );
+            }
+            Err(BootstrapError::DoppelgangerDetected)
+        }
+        crate::detection_marker::MarkerInspect::Corrupt { path, reason } => {
+            error!(
+                path = %path.display(),
+                reason,
+                "doppelganger detection marker is corrupt; refusing to start"
+            );
+            Err(BootstrapError::DoppelgangerDetected)
+        }
+        crate::detection_marker::MarkerInspect::Unreadable { path, source } => {
+            error!(
+                path = %path.display(),
+                error = %source,
+                "doppelganger detection marker is unreadable; refusing to start"
+            );
+            Err(BootstrapError::DoppelgangerDetected)
+        }
+    }
+}
+
+/// Detection stays on only when the fixed-size record can be pre-allocated.
+///
+/// A failure here is exit 1. The process cannot promise to latch a later
+/// detection if that overwrite has nowhere to land.
+fn ensure_detection_record(data_dir: &std::path::Path) -> Result<(), BootstrapError> {
+    if let Err(err) = crate::detection_marker::preallocate_detection_record(data_dir) {
+        if err.kind() == std::io::ErrorKind::AlreadyExists {
+            error!(
+                path = %crate::detection_marker::record_path(data_dir).display(),
+                "doppelganger detection record is already in the detected state; refusing to start. {}",
+                DETECTION_CLEAR_HINT
+            );
+            return Err(BootstrapError::DoppelgangerDetected);
+        }
+        error!(
+            path = %data_dir.display(),
+            error = %err,
+            "cannot preallocate the doppelganger detection record; the latch cannot be guaranteed"
+        );
+        return Err(BootstrapError::InvalidConfig(format!(
+            "cannot preallocate the doppelganger detection record in {}: {err}. \
+             The process cannot guarantee the detection latch",
+            data_dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// Detection stays on only when the marker directory can take a durable write.
+fn ensure_marker_dir_writable(data_dir: &std::path::Path) -> Result<(), BootstrapError> {
+    if let Err(err) = crate::detection_marker::probe_marker_dir_writable(data_dir) {
+        error!(
+            path = %data_dir.display(),
+            error = %err,
+            "doppelganger detection is enabled but the keystore directory is not writable"
+        );
+        return Err(BootstrapError::InvalidConfig(format!(
+            "keystore_path {} must be a persistent, writable directory while doppelganger \
+             detection is enabled: {err}",
+            data_dir.display()
+        )));
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {
@@ -552,7 +850,7 @@ fn spawn_secret_provider_refresh(
             std::time::Duration::from_secs(refresh_interval),
             executor.token(),
         );
-        // detached: secret_provider::RefreshService::run; loop body is crates/secret-provider/src/refresh.rs:179, out of scope.
+        // detached: secret_provider::RefreshService::run; loop body is crates/secret-provider/src/refresh.rs:185, out of scope.
         executor.spawn("secret_provider_refresh", ShutdownTier::Background, async move {
             refresh_service
                 .run(move |sk| {
@@ -584,9 +882,9 @@ fn spawn_secret_provider_refresh(
 mod tests {
     use super::*;
     use crate::startup::{
-        acquire_keystore_lock, EXIT_CRITICAL_TASK_FAILED, EXIT_GENESIS_ROOT_MISMATCH,
-        EXIT_INTEGRITY_CHECK_FAILED, EXIT_KEYSTORE_LOCKED, EXIT_LISTENER_BIND,
-        EXIT_UNSUPPORTED_FORK_VERSION,
+        acquire_keystore_lock, EXIT_CRITICAL_TASK_FAILED, EXIT_DOPPELGANGER_DETECTED,
+        EXIT_GENESIS_ROOT_MISMATCH, EXIT_INTEGRITY_CHECK_FAILED, EXIT_KEYSTORE_LOCKED,
+        EXIT_LISTENER_BIND, EXIT_UNSUPPORTED_FORK_VERSION,
     };
     use ::slashing::SlashingDb;
     use std::time::Duration;
@@ -619,6 +917,7 @@ mod tests {
             shutdown_rx,
             shutdown_token: token,
             budget: short_budget(),
+            detection: None,
         })
         .await;
 
@@ -654,6 +953,7 @@ mod tests {
             shutdown_rx,
             shutdown_token: token,
             budget: short_budget(),
+            detection: None,
         })
         .await;
 
@@ -696,6 +996,7 @@ mod tests {
             shutdown_rx,
             shutdown_token,
             budget: short_budget(),
+            detection: None,
         }
     }
 
@@ -749,11 +1050,11 @@ mod tests {
     fn test_exit_codes_are_unchanged() {
         assert_eq!(EXIT_INTEGRITY_CHECK_FAILED, 10);
         assert_eq!(EXIT_GENESIS_ROOT_MISMATCH, 11);
+        assert_eq!(EXIT_DOPPELGANGER_DETECTED, 12);
         assert_eq!(EXIT_UNSUPPORTED_FORK_VERSION, 13);
         assert_eq!(EXIT_KEYSTORE_LOCKED, 14);
         assert_eq!(EXIT_LISTENER_BIND, 15);
         assert_eq!(EXIT_CRITICAL_TASK_FAILED, 16);
-        // Reserved historically (one-shot doppelganger); must not be reused.
         assert_ne!(EXIT_INTEGRITY_CHECK_FAILED, 12);
         assert_ne!(EXIT_GENESIS_ROOT_MISMATCH, 12);
         assert_ne!(EXIT_UNSUPPORTED_FORK_VERSION, 12);
@@ -762,16 +1063,215 @@ mod tests {
         assert_ne!(EXIT_CRITICAL_TASK_FAILED, 12);
         let startup_src = include_str!("../startup.rs");
         assert!(
-            startup_src
-                .contains("EXIT 12 reserved historically for one-shot doppelganger detection"),
-            "exit 12 must stay documented as reserved"
+            startup_src.contains("pub const EXIT_DOPPELGANGER_DETECTED: i32 = 12;"),
+            "exit 12 is the doppelganger detection code"
+        );
+        let loop_src = include_str!("../liveness_loop.rs");
+        assert!(
+            loop_src.contains("EXIT_DOPPELGANGER_DETECTED"),
+            "the liveness loop must request exit 12"
         );
         assert!(
-            !startup_src.lines().any(|line| {
-                let trimmed = line.trim();
-                trimmed.starts_with("pub const EXIT_") && trimmed.contains("= 12")
-            }),
-            "exit 12 must stay unused"
+            loop_src.contains("detected_latch"),
+            "the liveness loop must exit from the latch transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_refuses_when_detection_marker_is_present_or_corrupt() {
+        let dir = tempfile::tempdir().expect("temp");
+        crate::detection_marker::write_marker(
+            dir.path(),
+            &crate::detection_marker::DetectionMarker {
+                epoch: 9,
+                unix_secs: 10,
+                pubkeys: vec!["0x".to_string() + &"cd".repeat(48)],
+            },
+        )
+        .expect("marker");
+        let err = boot_with_keystore(dir.path()).await;
+        assert_eq!(err.exit_code(), EXIT_DOPPELGANGER_DETECTED);
+
+        let dir = tempfile::tempdir().expect("temp");
+        crate::detection_marker::write_marker(
+            dir.path(),
+            &crate::detection_marker::DetectionMarker { epoch: 1, unix_secs: 2, pubkeys: vec![] },
+        )
+        .expect("empty");
+        let err = boot_with_keystore(dir.path()).await;
+        assert_eq!(err.exit_code(), 12);
+
+        let dir = tempfile::tempdir().expect("temp");
+        std::fs::write(crate::detection_marker::marker_path(dir.path()), b"{").expect("corrupt");
+        let err = boot_with_keystore(dir.path()).await;
+        assert_eq!(err.exit_code(), 12);
+
+        let dir = tempfile::tempdir().expect("temp");
+        std::fs::create_dir(crate::detection_marker::marker_path(dir.path())).expect("unreadable");
+        let err = boot_with_keystore(dir.path()).await;
+        assert_eq!(err.exit_code(), 12);
+    }
+
+    #[tokio::test]
+    async fn detection_enabled_refuses_a_keystore_dir_that_cannot_hold_the_marker() {
+        let missing = std::env::temp_dir().join(format!(
+            "rvc-dg-unwritable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = crate::config::Config {
+            keystore_path: missing,
+            doppelganger_detection: true,
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        let (executor, rx) = TaskExecutor::new(token);
+        let err = run(
+            config,
+            RunOptions {
+                strict_permissions: false,
+                strict_slashing_semantics: false,
+                timeouts: bn_manager::OperationTimeouts::default(),
+            },
+            executor,
+            rx,
+        )
+        .await
+        .expect_err("an unwritable keystore must not start with detection on");
+        assert_eq!(err.exit_code(), 1);
+        assert!(err.to_string().contains("writable"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn detection_enabled_refuses_when_the_record_cannot_be_preallocated() {
+        let _guard = crate::detection_marker::arm_preallocate_failure();
+        let dir = tempfile::tempdir().expect("temp");
+        let config = crate::config::Config {
+            keystore_path: dir.path().to_path_buf(),
+            doppelganger_detection: true,
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        let (executor, rx) = TaskExecutor::new(token);
+        let err = run(
+            config,
+            RunOptions {
+                strict_permissions: false,
+                strict_slashing_semantics: false,
+                timeouts: bn_manager::OperationTimeouts::default(),
+            },
+            executor,
+            rx,
+        )
+        .await
+        .expect_err("a record that cannot be preallocated must not start");
+        assert_eq!(err.exit_code(), 1);
+        let text = err.to_string();
+        assert!(text.contains("detection record"), "{text}");
+        assert!(text.contains("latch"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn detection_disabled_does_not_probe_marker_writability() {
+        let missing = std::env::temp_dir().join(format!(
+            "rvc-dg-noprobe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let config = crate::config::Config {
+            keystore_path: missing,
+            doppelganger_detection: false,
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        let (executor, rx) = TaskExecutor::new(token);
+        let err = run(
+            config,
+            RunOptions {
+                strict_permissions: false,
+                strict_slashing_semantics: false,
+                timeouts: bn_manager::OperationTimeouts::default(),
+            },
+            executor,
+            rx,
+        )
+        .await
+        .expect_err("startup still fails later without a slashing db");
+        assert_ne!(err.exit_code(), EXIT_DOPPELGANGER_DETECTED);
+        assert!(!err.to_string().contains("writable"), "{err}");
+    }
+
+    async fn boot_with_keystore(dir: &std::path::Path) -> BootstrapError {
+        let config = crate::config::Config {
+            keystore_path: dir.to_path_buf(),
+            // The marker refuses start even when detection is switched off.
+            doppelganger_detection: false,
+            ..Default::default()
+        };
+        let token = CancellationToken::new();
+        let (executor, rx) = TaskExecutor::new(token);
+        run(
+            config,
+            RunOptions {
+                strict_permissions: false,
+                strict_slashing_semantics: false,
+                timeouts: bn_manager::OperationTimeouts::default(),
+            },
+            executor,
+            rx,
+        )
+        .await
+        .expect_err("marker must refuse start")
+    }
+
+    /// A detection that arrives after shutdown has started still exits 12.
+    #[tokio::test]
+    async fn detection_during_drain_still_exits_12() {
+        let token = CancellationToken::new();
+        let (executor, shutdown_rx) = TaskExecutor::new(token.clone());
+        let entered = std::sync::Arc::new(tokio::sync::Notify::new());
+        let task_token = executor.token();
+        let entered_task = std::sync::Arc::clone(&entered);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        executor.spawn("drain_probe", ShutdownTier::Background, async move {
+            task_token.cancelled().await;
+            entered_task.notify_one();
+            let _ = release_rx.await;
+        });
+        let handle = executor.shutdown_handle();
+        let budget = TierBudget::new([
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+        ]);
+        let drain = tokio::spawn(async move {
+            await_shutdown_and_drain_with_signal(
+                ShutdownInputs {
+                    executor,
+                    orchestrator_handle: crate::orchestrator::OrchestratorHandle::for_drain_test(),
+                    shutdown_rx,
+                    shutdown_token: token,
+                    budget,
+                    detection: None,
+                },
+                std::future::ready(()),
+            )
+            .await
+        });
+        entered.notified().await;
+        handle.request_exit(EXIT_DOPPELGANGER_DETECTED);
+        let _ = release_tx.send(());
+        let (_outcome, res) = drain.await.expect("drain task");
+        assert!(
+            matches!(res, Err(BootstrapError::DoppelgangerDetected)),
+            "detection during the drain must exit 12, got {res:?}"
         );
     }
 
@@ -869,15 +1369,12 @@ mod tests {
         );
     }
 
-    /// ARCH-2h: no `sleep` may stand in for a join in the production body.
+    /// ARCH-2h: the production body joins tasks. The marker retry sleep is
+    /// covered by the behavioural drain test, not by counting `sleep` calls.
     #[test]
     fn test_run_rs_has_no_sleep_as_join_substitute() {
         let src = include_str!("run.rs");
         let body = src.split("#[cfg(test)]").next().expect("production body before tests");
-        assert!(
-            !body.contains("tokio::time::sleep"),
-            "bootstrap/run.rs must not use sleep as a join substitute (ARCH-2h / M10)"
-        );
         assert!(
             body.contains("executor.shutdown"),
             "production shutdown must drain via TaskExecutor::shutdown"

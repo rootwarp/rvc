@@ -12,6 +12,7 @@
 
 use std::fmt::Display;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +46,8 @@ pub enum ShutdownReason {
     Success(&'static str),
     /// A registered task panicked or otherwise failed fatally.
     Failure(&'static str),
+    /// The doppelganger latch was stored. Drain, then exit 12.
+    DoppelgangerDetected,
 }
 
 impl ShutdownReason {
@@ -52,6 +55,7 @@ impl ShutdownReason {
     pub fn message(&self) -> &'static str {
         match self {
             Self::Success(msg) | Self::Failure(msg) => msg,
+            Self::DoppelgangerDetected => "doppelganger detected",
         }
     }
 }
@@ -127,9 +131,35 @@ struct Registered {
 /// DSR-2.1 likewise registers `BnManager::start_sync_monitor` as
 /// `"bn.sync_monitor"` (+ `"bn.sync_monitor.cancel"`). `keymanager-api`
 /// lifecycle is per-pubkey/C5-owned.
+/// Cloneable request for a process drain.
+///
+/// [`Self::request_exit`] accepts only doppelganger exit 12. The flag is stored
+/// before the channel send, so a full channel still exits 12 once the drain wakes.
+#[derive(Clone)]
+pub struct ShutdownHandle {
+    tx: mpsc::Sender<ShutdownReason>,
+    doppelganger_exit: Arc<AtomicBool>,
+}
+
+impl ShutdownHandle {
+    /// Request a drain that exits `exit_code`.
+    ///
+    /// Only [`crate::startup::EXIT_DOPPELGANGER_DETECTED`] is accepted. Any other
+    /// code is logged and ignored so a caller cannot invent a process status.
+    pub fn request_exit(&self, exit_code: i32) {
+        if exit_code != crate::startup::EXIT_DOPPELGANGER_DETECTED {
+            error!(exit_code, "shutdown handle refused an unexpected exit code");
+            return;
+        }
+        self.doppelganger_exit.store(true, Ordering::SeqCst);
+        let _ = self.tx.try_send(ShutdownReason::DoppelgangerDetected);
+    }
+}
+
 pub struct TaskExecutor {
     token: CancellationToken,
     shutdown_tx: mpsc::Sender<ShutdownReason>,
+    doppelganger_exit: Arc<AtomicBool>,
     registry: Arc<Mutex<Vec<Registered>>>,
     /// Exit classifications (`ok` / `error` / `panic` / `cancelled`) in completion order.
     /// Written by every monitor; read by unit tests (ARCH-2f will also drive metrics).
@@ -149,10 +179,32 @@ impl TaskExecutor {
         let executor = Self {
             token,
             shutdown_tx,
+            doppelganger_exit: Arc::new(AtomicBool::new(false)),
             registry: Arc::new(Mutex::new(Vec::new())),
             exits: Arc::new(Mutex::new(Vec::new())),
         };
         (executor, shutdown_rx)
+    }
+
+    /// Handle the liveness loop uses to request exit 12.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle {
+            tx: self.shutdown_tx.clone(),
+            doppelganger_exit: Arc::clone(&self.doppelganger_exit),
+        }
+    }
+
+    /// Whether a doppelganger exit was requested. The drain prefers this over
+    /// whichever channel reason woke it.
+    pub fn doppelganger_exit_requested(&self) -> bool {
+        self.doppelganger_exit.load(Ordering::SeqCst)
+    }
+
+    /// Shared exit-12 flag. Clone it before [`Self::shutdown`] and load it
+    /// after the drain returns: `shutdown` consumes `self`, and a detection
+    /// can set the flag while a tier is still joining.
+    pub fn doppelganger_exit_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.doppelganger_exit)
     }
 
     /// Clone of the process cancellation token for cooperative tasks.

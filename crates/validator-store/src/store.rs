@@ -575,12 +575,14 @@ impl ValidatorStore {
     /// Flip `enabled` under `save_lock`, following the signing-safety direction.
     ///
     /// `enabled = false` is published immediately, then persisted. A failed
-    /// write leaves the validator disabled and returns `Err`. When that row
-    /// had a doppelganger hold, the validators file is moved off the boot path
-    /// so a restart cannot reload the hold and re-enable the key. `enabled = true`
-    /// is persisted first and published only after that write succeeds. An
-    /// unknown pubkey is `Ok(())` and does not create a row. A published disable
-    /// notifies the disable hook only after `save_lock` is dropped.
+    /// write leaves the validator disabled in memory and returns `Err`. The
+    /// disable listener does not run, so a doppelganger rollback can retry the
+    /// write. When that row had a doppelganger hold, the validators file is
+    /// moved off the boot path so a restart cannot reload the hold and
+    /// re-enable the key. `enabled = true` is persisted first and published
+    /// only after that write succeeds. An unknown pubkey is `Ok(())` and does
+    /// not create a row. A successful disable notifies the disable hook only
+    /// after `save_lock` is dropped.
     pub fn set_enabled_durable(
         &self,
         pubkey: &[u8; 48],
@@ -590,7 +592,9 @@ impl ValidatorStore {
             return self.persist_signing_enable(pubkey);
         }
         let (result, fire) = self.persist_signing_disable(pubkey);
-        if fire {
+        // A failed write must not cancel the enable task. That task is the
+        // retry. The listener runs only after the disable is durable.
+        if result.is_ok() && fire {
             self.notify_signing_disabled(pubkey);
         }
         result
@@ -5210,6 +5214,38 @@ builder_boost_factor = 175
             !store.is_signing_enabled(&pk),
             "a failed doppelganger disable must not leave the key enabled"
         );
+    }
+
+    /// A failed disable write must not run the listener. That listener cancels
+    /// the enable task, and the task is what retries the rollback.
+    #[test]
+    fn test_failed_disable_does_not_fire_the_listener() {
+        let pk = test_pubkey(1);
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("validators.toml");
+        let mut store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        store.add_validator(ValidatorConfig::new(pk)).unwrap();
+        store.config_path = Some(config_path);
+        store.save_config().unwrap();
+        let fires = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = std::sync::Arc::clone(&fires);
+        store.set_disable_listener(std::sync::Arc::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+        let _clear = ClearHooks;
+        super::TOML_WRITE_FAULT.with(|cell| {
+            cell.set(Some(super::FaultPlan { skip: 0, step: super::TomlWriteFault::Rename }))
+        });
+        assert!(store.set_enabled_durable(&pk, false).is_err());
+        assert_eq!(
+            fires.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a failed disable write must leave the enable task free to retry"
+        );
+
+        clear_test_hooks();
+        store.set_enabled_durable(&pk, false).expect("retry persists");
+        assert_eq!(fires.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     /// Removing `save_lock` from these paths makes `try_lock` succeed.

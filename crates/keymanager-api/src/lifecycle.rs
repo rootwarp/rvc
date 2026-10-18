@@ -125,6 +125,10 @@ pub struct DoppelgangerLifecycle {
     validator_manager: Arc<dyn ValidatorManager>,
     signing_quiesce: Arc<dyn SigningQuiesce>,
     quiesce_timeout: Duration,
+    /// Runs after the hold check and before the enable write. Must not take
+    /// `state_lock`. Test builds only.
+    #[cfg(test)]
+    before_enable_write: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl DoppelgangerLifecycle {
@@ -145,6 +149,24 @@ impl DoppelgangerLifecycle {
             validator_manager,
             signing_quiesce: Arc::new(NoopSigningQuiesce),
             quiesce_timeout: DEFAULT_DELETE_QUIESCE_TIMEOUT,
+            #[cfg(test)]
+            before_enable_write: Mutex::new(None),
+        }
+    }
+
+    /// Park between the enable task's hold check and its store write.
+    ///
+    /// The hook must not acquire `state_lock`. `None` clears it.
+    #[cfg(test)]
+    pub fn set_before_enable_write_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.before_enable_write.lock().expect("before_enable_write poisoned") = hook;
+    }
+
+    #[cfg(test)]
+    fn fire_before_enable_write(&self) {
+        let hook = self.before_enable_write.lock().expect("before_enable_write poisoned").clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -386,41 +408,64 @@ impl DoppelgangerLifecycle {
                     // Re-check the hold under `state_lock` before any enable write.
                     // `release_doppelganger_hold` checks again under the store lock.
                     if !self.validator_manager.is_doppelganger_hold(&pubkey) {
-                        self.cancel_enable_token(&pubkey);
-                        return;
-                    }
-                    match self.validator_manager.release_doppelganger_hold(&pubkey) {
-                        Ok(true) => {
-                            self.complete_enable(&pubkey, &pubkey_hex);
-                            return;
-                        }
-                        Ok(false) => {
-                            if self.validator_manager.is_doppelganger_hold(&pubkey) {
-                                let residual = match self.validator_manager.armed_hold_unix(&pubkey)
-                                {
-                                    Some(stored) => self.clamped_hold_wait(stored),
-                                    None => self.window,
-                                };
-                                // Spawn from a sync helper. Building that future
-                                // inside this async fn, while `state_lock` is
-                                // held, makes the enable task `!Send`.
-                                self.spawn_enable_task(pubkey, kind, residual);
+                        if self.monitor.signing_closed_by_detection(&pubkey) {
+                            if self.rollback_if_detection_closed(&pubkey, &pubkey_hex) {
+                                // Rollback drops the token only for a Detected
+                                // key. This task is finished either way.
+                                self.cancel_enable_token(&pubkey);
                                 return;
                             }
+                        } else {
                             self.cancel_enable_token(&pubkey);
                             return;
                         }
-                        Err(e) => {
-                            error!(
-                                pubkey = %TruncatedPubkey::new(&pubkey_hex),
-                                error = %e,
-                                "doppelganger re-enable was not persisted; retrying"
-                            );
+                    } else {
+                        #[cfg(test)]
+                        self.fire_before_enable_write();
+                        match self.validator_manager.release_doppelganger_hold(&pubkey) {
+                            Ok(true) => {
+                                if self.complete_enable(&pubkey, &pubkey_hex) {
+                                    return;
+                                }
+                            }
+                            Ok(false) => {
+                                if self.validator_manager.is_doppelganger_hold(&pubkey) {
+                                    let residual =
+                                        match self.validator_manager.armed_hold_unix(&pubkey) {
+                                            Some(stored) => self.clamped_hold_wait(stored),
+                                            None => self.window,
+                                        };
+                                    // Spawn from a sync helper. Building that future
+                                    // inside this async fn, while `state_lock` is
+                                    // held, makes the enable task `!Send`.
+                                    self.spawn_enable_task(pubkey, kind, residual);
+                                    return;
+                                }
+                                if self.monitor.signing_closed_by_detection(&pubkey) {
+                                    if self.rollback_if_detection_closed(&pubkey, &pubkey_hex) {
+                                        self.cancel_enable_token(&pubkey);
+                                        return;
+                                    }
+                                } else {
+                                    self.cancel_enable_token(&pubkey);
+                                    return;
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    pubkey = %TruncatedPubkey::new(&pubkey_hex),
+                                    error = %e,
+                                    "doppelganger re-enable was not persisted; retrying"
+                                );
+                            }
                         }
                     }
                 } else {
-                    self.complete_enable(&pubkey, &pubkey_hex);
-                    return;
+                    #[cfg(test)]
+                    self.fire_before_enable_write();
+                    if self.complete_enable(&pubkey, &pubkey_hex) {
+                        return;
+                    }
                 }
             }
             tokio::select! {
@@ -437,7 +482,21 @@ impl DoppelgangerLifecycle {
     }
 
     /// Stop monitoring and prune this task's cancel token. Caller holds `state_lock`.
-    fn complete_enable(&self, pubkey: &Pubkey, pubkey_hex: &str) {
+    ///
+    /// Returns `false` when a detection rollback could not be persisted, so the
+    /// caller retries. The store write has already happened; this is the
+    /// post-write re-check.
+    fn complete_enable(&self, pubkey: &Pubkey, pubkey_hex: &str) -> bool {
+        if !self.rollback_if_detection_closed(pubkey, pubkey_hex) {
+            return false;
+        }
+        if self.monitor.signing_closed_by_detection(pubkey) {
+            // Do not stop_monitoring: the forward window is not satisfied.
+            // The task is done, so drop its cancel token. A non-detected key
+            // keeps the enabled=true that release already wrote.
+            self.cancel_enable_token(pubkey);
+            return true;
+        }
         // SF-4 / SEC-2b: prune wall-clock pending only.
         // Must NOT cancel ForwardWindowMachine state —
         // M-12 elapsed ≠ forward-window satisfied.
@@ -450,6 +509,51 @@ impl DoppelgangerLifecycle {
             pubkey = %TruncatedPubkey::new(pubkey_hex),
             "Doppelganger window elapsed; enabling validator for attestation"
         );
+        true
+    }
+
+    /// Roll `enabled` back when detection closed signing.
+    ///
+    /// `Ok(true)` means the step is finished (nothing to roll back, or the
+    /// rollback landed). `Ok` is not "the key is enabled". `false` means the
+    /// rollback write failed and the caller must retry.
+    ///
+    /// `is_doppelganger_safe` is the monitor's `is_signing_enabled`. It is
+    /// consulted only after this key is itself `Detected`. A `Pending` key,
+    /// and a key that is only closed by the process latch, keeps the
+    /// wall-clock enable (M-12). No machine lock is held across the store
+    /// write: the monitor takes that lock only for the comparison.
+    fn rollback_if_detection_closed(&self, pubkey: &Pubkey, pubkey_hex: &str) -> bool {
+        // The latch closes signing for every key. Only a key that is itself
+        // Detected gets `enabled = false` written back.
+        if !self.monitor.is_detected_key(pubkey) {
+            return true;
+        }
+        let signing_enabled = self.monitor.is_doppelganger_safe(pubkey);
+        if signing_enabled {
+            error!(
+                pubkey = %TruncatedPubkey::new(pubkey_hex),
+                "detection closed signing but is_signing_enabled was true; rolling back anyway"
+            );
+        }
+        match self.validator_manager.set_validator_enabled(pubkey, false) {
+            Ok(()) => {
+                self.cancel_tokens.lock().expect("cancel_tokens poisoned").remove(pubkey);
+                error!(
+                    pubkey = %TruncatedPubkey::new(pubkey_hex),
+                    "doppelganger detection rolled back enabled=true"
+                );
+                true
+            }
+            Err(e) => {
+                error!(
+                    pubkey = %TruncatedPubkey::new(pubkey_hex),
+                    error = %e,
+                    "doppelganger detection rollback was not persisted; retrying"
+                );
+                false
+            }
+        }
     }
 
     /// Caller holds `state_lock`. The spawned task is built in this sync fn.
@@ -1126,5 +1230,231 @@ mod tests {
             *self.releases.lock().unwrap() += 1;
             Ok(false)
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum RaceEvent {
+        Latch(u64),
+        Admit { seq: u64, enabled: bool },
+    }
+
+    struct RaceMonitor {
+        closed: std::sync::atomic::AtomicBool,
+        next: std::sync::atomic::AtomicU64,
+        events: StdMutex<Vec<RaceEvent>>,
+        /// `None` treats every key as detected once `closed` is set.
+        only: Option<Pubkey>,
+    }
+
+    impl DoppelgangerMonitor for RaceMonitor {
+        fn start_monitoring(&self, _pubkey: Pubkey) {}
+
+        fn stop_monitoring(&self, _pubkey: &Pubkey) {}
+
+        fn is_doppelganger_safe(&self, _pubkey: &Pubkey) -> bool {
+            let seq = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let enabled = !self.closed.load(std::sync::atomic::Ordering::SeqCst);
+            self.events.lock().expect("events").push(RaceEvent::Admit { seq, enabled });
+            enabled
+        }
+
+        fn signing_closed_by_detection(&self, _pubkey: &Pubkey) -> bool {
+            self.closed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn is_detected_key(&self, pubkey: &Pubkey) -> bool {
+            if !self.closed.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            self.only.is_none_or(|only| only == *pubkey)
+        }
+    }
+
+    /// Detection between the enable task's check and its store write.
+    ///
+    /// The store must not finish with `enabled = true`, and an admission
+    /// check sequenced after the latch must not return safe.
+    #[tokio::test(start_paused = true)]
+    async fn enable_task_racing_detection_never_leaves_a_detected_key_enabled() {
+        let vm = Arc::new(SpyValidatorManager::new());
+        let monitor = Arc::new(RaceMonitor {
+            closed: std::sync::atomic::AtomicBool::new(false),
+            next: std::sync::atomic::AtomicU64::new(0),
+            events: StdMutex::new(Vec::new()),
+            only: None,
+        });
+        let life = Arc::new(DoppelgangerLifecycle::new(
+            Duration::ZERO,
+            monitor.clone() as Arc<dyn DoppelgangerMonitor>,
+            vm.clone() as Arc<dyn ValidatorManager>,
+        ));
+        let hooked = Arc::clone(&monitor);
+        life.set_before_enable_write_hook(Some(Arc::new(move || {
+            let seq = hooked.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            hooked.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+            hooked.events.lock().expect("events").push(RaceEvent::Latch(seq));
+        })));
+        let pk = test_pubkey(42);
+        life.on_import(pk, ImportKind::Local).expect("import");
+
+        let mut finished = false;
+        for _ in 0..200 {
+            let latched = monitor
+                .events
+                .lock()
+                .expect("events")
+                .iter()
+                .any(|event| matches!(event, RaceEvent::Latch(_)));
+            if latched && life.current_cancel_token(&pk).is_none() {
+                finished = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(finished, "enable task must observe detection and finish");
+        assert!(!vm.is_enabled(&pk), "store must not end enabled");
+
+        let events = monitor.events.lock().expect("events").iter().copied().collect::<Vec<_>>();
+        let latch = events.iter().find_map(|event| match event {
+            RaceEvent::Latch(seq) => Some(*seq),
+            RaceEvent::Admit { .. } => None,
+        });
+        let latch = latch.expect("latch sequence");
+        for event in &events {
+            if let RaceEvent::Admit { seq, enabled: true } = event {
+                assert!(*seq < latch, "admission {seq} followed latch {latch}");
+            }
+        }
+        assert!(!monitor.is_doppelganger_safe(&pk), "a check after the latch is refused");
+    }
+
+    /// The process-wide latch must not persist enabled=false for a key that
+    /// was not itself Detected.
+    #[tokio::test(start_paused = true)]
+    async fn latch_rollback_persists_only_the_detected_key() {
+        let vm = Arc::new(SpyValidatorManager::new());
+        let detected = test_pubkey(7);
+        let other = test_pubkey(8);
+        let monitor = Arc::new(RaceMonitor {
+            closed: std::sync::atomic::AtomicBool::new(false),
+            next: std::sync::atomic::AtomicU64::new(0),
+            events: StdMutex::new(Vec::new()),
+            only: Some(detected),
+        });
+        let life = Arc::new(DoppelgangerLifecycle::new(
+            Duration::ZERO,
+            monitor.clone() as Arc<dyn DoppelgangerMonitor>,
+            vm.clone() as Arc<dyn ValidatorManager>,
+        ));
+        let hooked = Arc::clone(&monitor);
+        life.set_before_enable_write_hook(Some(Arc::new(move || {
+            hooked.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+        life.on_import(detected, ImportKind::Local).expect("detected import");
+        life.on_import(other, ImportKind::Local).expect("other import");
+
+        let mut finished = false;
+        for _ in 0..200 {
+            if life.current_cancel_token(&detected).is_none()
+                && life.current_cancel_token(&other).is_none()
+                && monitor.closed.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                finished = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(finished, "both enable tasks must finish");
+        assert!(!vm.is_enabled(&detected), "the detected key is rolled back");
+        assert!(vm.is_enabled(&other), "a key that was not detected stays enabled");
+    }
+
+    struct FlakyRollback {
+        inner: SpyValidatorManager,
+        fails_left: StdMutex<u32>,
+        attempts: StdMutex<u32>,
+    }
+
+    impl FlakyRollback {
+        fn new(fails: u32) -> Self {
+            Self {
+                inner: SpyValidatorManager::new(),
+                fails_left: StdMutex::new(fails),
+                attempts: StdMutex::new(0),
+            }
+        }
+    }
+
+    impl ValidatorManager for FlakyRollback {
+        fn add_validator(&self, pubkey: Pubkey, enabled: bool) -> Result<(), String> {
+            self.inner.add_validator(pubkey, enabled)
+        }
+
+        fn remove_validator(&self, pubkey: &Pubkey) -> Result<bool, String> {
+            self.inner.remove_validator(pubkey)
+        }
+
+        fn set_validator_enabled(&self, pubkey: &Pubkey, enabled: bool) -> Result<(), String> {
+            if !enabled {
+                *self.attempts.lock().unwrap() += 1;
+                let mut left = self.fails_left.lock().unwrap();
+                if *left > 0 {
+                    *left -= 1;
+                    return Err("rollback persist failed".into());
+                }
+            }
+            self.inner.set_validator_enabled(pubkey, enabled)
+        }
+    }
+
+    /// A failed detection rollback stays armed and retries until the write lands.
+    #[tokio::test(start_paused = true)]
+    async fn failed_rollback_write_is_retried_until_it_persists() {
+        let vm = Arc::new(FlakyRollback::new(1));
+        let pk = test_pubkey(14);
+        let monitor = Arc::new(RaceMonitor {
+            closed: std::sync::atomic::AtomicBool::new(false),
+            next: std::sync::atomic::AtomicU64::new(0),
+            events: StdMutex::new(Vec::new()),
+            only: Some(pk),
+        });
+        let life = Arc::new(DoppelgangerLifecycle::new(
+            Duration::ZERO,
+            monitor.clone() as Arc<dyn DoppelgangerMonitor>,
+            Arc::clone(&vm) as Arc<dyn ValidatorManager>,
+        ));
+        let hooked = Arc::clone(&monitor);
+        life.set_before_enable_write_hook(Some(Arc::new(move || {
+            hooked.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        })));
+        life.on_import(pk, ImportKind::Local).expect("import");
+
+        let mut saw_failure = false;
+        for _ in 0..50 {
+            if *vm.attempts.lock().unwrap() >= 1 {
+                saw_failure = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(saw_failure, "the first rollback write must run");
+        assert!(
+            life.current_cancel_token(&pk).is_some(),
+            "a failed rollback must not cancel its own retry"
+        );
+        assert!(vm.inner.is_enabled(&pk), "enabled=true stays until a rollback write succeeds");
+
+        tokio::time::advance(Duration::from_millis(200)).await;
+        let mut persisted = false;
+        for _ in 0..50 {
+            if !vm.inner.is_enabled(&pk) && life.current_cancel_token(&pk).is_none() {
+                persisted = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_millis(200)).await;
+        }
+        assert!(persisted, "the retry must persist enabled=false");
+        assert!(*vm.attempts.lock().unwrap() >= 2, "the failed write must be attempted again");
     }
 }

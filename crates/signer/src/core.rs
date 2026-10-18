@@ -113,13 +113,15 @@ pub enum NonSlashableFailure {
 ///
 /// # TOCTOU note
 ///
-/// There is a micro-window between `SigningEnablement::is_signing_enabled`
-/// returning `true` and `signer.sign().await` completing during which the
-/// doppelganger state could theoretically change.  This window is
-/// intentionally accepted: these operations are **not slashable**, so the
-/// worst case is a signature produced for a pubkey that was concurrently
-/// disabled — a tolerable transient condition.  No additional
-/// synchronization is needed to shrink this window.
+/// The enablement check is the admission boundary. It is not atomic with the
+/// backend call. Detection can land after [`signing_allowed`] returns true.
+/// A non-slashable sign that already passed this check may finish, bounded by
+/// `sign_timeout`. A slashable sign that has not yet called BLS is refused by
+/// the post-reserve check and keeps its reserved row. A BLS call that has
+/// already started, including a request already sent to a remote signer, still
+/// finishes inside the timeout.
+///
+/// [`signing_allowed`]: doppelganger::signing_allowed
 pub async fn sign_nonslashable_core(
     enablement: &dyn SigningEnablement,
     signer: &dyn Signer,
@@ -128,10 +130,69 @@ pub async fn sign_nonslashable_core(
     sign_timeout: Duration,
     duty: doppelganger::SigningDuty,
 ) -> Result<Signature, NonSlashableFailure> {
+    #[cfg(any(test, feature = "test-utils"))]
+    {
+        return sign_nonslashable_inner(
+            enablement,
+            signer,
+            pubkey,
+            signing_root,
+            sign_timeout,
+            duty,
+            None,
+        )
+        .await;
+    }
+    #[cfg(not(any(test, feature = "test-utils")))]
+    {
+        sign_nonslashable_inner(enablement, signer, pubkey, signing_root, sign_timeout, duty).await
+    }
+}
+
+/// Same flow as [`sign_nonslashable_core`], parking after the enablement check.
+///
+/// The barrier is the accepted gap after admission and before the backend runs.
+/// Test builds only.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn sign_nonslashable_core_paused(
+    enablement: &dyn SigningEnablement,
+    signer: &dyn Signer,
+    pubkey: &PublicKey,
+    signing_root: Root,
+    sign_timeout: Duration,
+    duty: doppelganger::SigningDuty,
+    after_check: Option<Arc<dyn PreReserveBarrier>>,
+) -> Result<Signature, NonSlashableFailure> {
+    sign_nonslashable_inner(
+        enablement,
+        signer,
+        pubkey,
+        signing_root,
+        sign_timeout,
+        duty,
+        after_check,
+    )
+    .await
+}
+
+async fn sign_nonslashable_inner(
+    enablement: &dyn SigningEnablement,
+    signer: &dyn Signer,
+    pubkey: &PublicKey,
+    signing_root: Root,
+    sign_timeout: Duration,
+    duty: doppelganger::SigningDuty,
+    #[cfg(any(test, feature = "test-utils"))] after_check: Option<Arc<dyn PreReserveBarrier>>,
+) -> Result<Signature, NonSlashableFailure> {
     // `duty` is matched exhaustively in `signing_allowed`. Only
     // `SigningDuty::VoluntaryExit` unlocks an exit-only enablement.
     if !doppelganger::signing_allowed(enablement, pubkey, duty) {
         return Err(NonSlashableFailure::Blocked);
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    if let Some(barrier) = after_check {
+        barrier.wait().await;
     }
 
     let pubkey_bytes = pubkey.to_bytes();
@@ -370,6 +431,8 @@ pub struct SlashableSignSession {
     gvr: Root,
     /// Resolved fork when the caller knows it; `None` → version label `unknown`.
     fork_name: Option<ForkName>,
+    /// Re-checked after the slashing-DB reservation and before the BLS call.
+    enablement: Arc<dyn SigningEnablement>,
 }
 
 impl SlashableSignSession {
@@ -406,6 +469,7 @@ impl SlashableSignSession {
             client_cn: "test".to_string(),
             gvr: [0u8; 32],
             fork_name: None,
+            enablement: Arc::new(crate::AlwaysEnabled),
         }
     }
 
@@ -507,6 +571,14 @@ impl SlashableSignSession {
         }
     }
 
+    fn blocked_by_doppelganger(&self) -> bool {
+        match PublicKey::from_bytes(&self.pubkey_bytes) {
+            Ok(pk) => self.enablement.blocked_by_doppelganger(&pk),
+            // Invalid bytes are not a key we can prove is clear.
+            Err(_) => true,
+        }
+    }
+
     /// Reserve (commit) a history row, then sign, then dispatch on architecture §5.3.
     ///
     /// Sibling of [`Self::stage_then_sign`] (ARCH-5i / ADR-005). **Not** a
@@ -554,6 +626,23 @@ impl SlashableSignSession {
         // reconcile. That is still fail-closed. `fail_closed_max` itself is unchanged.
         if let Some(ref recheck) = self.policy_recheck {
             self.policy = TimeoutPolicySource::fail_closed_max(self.policy, recheck());
+        }
+
+        // The row is committed. This check is the admission boundary for a
+        // slashable sign that has not called BLS. It is not atomic with the
+        // backend: detection can land after it passes, and a BLS call that
+        // has already started still finishes inside the sign timeout. If
+        // detection has closed signing, do not call BLS. Leave the row so a
+        // later process cannot sign this duty. Delete quiesce is not this
+        // check: a sign that already passed `is_signing_enabled` still signs
+        // when only the quiesce registry closed.
+        if self.blocked_by_doppelganger() {
+            warn!(
+                pubkey = %TruncatedPubkey::new(&self.pubkey_hex),
+                op = self.op_name,
+                "sign_slashable: blocked by doppelganger gate after reserve, before BLS"
+            );
+            return Err(SigningGateError::BlockedByDoppelganger);
         }
 
         let sign_result = self.handle.block_on(tokio::time::timeout(
@@ -869,7 +958,7 @@ static ATTESTATION_STAGE_TRACE_CTR: AtomicU64 = AtomicU64::new(0);
 pub struct SignSlashableRequest<'a> {
     pub locks: &'a ValidatorLockMap,
     pub pubkey: &'a PublicKey,
-    pub enablement: &'a dyn SigningEnablement,
+    pub enablement: Arc<dyn SigningEnablement>,
     pub signer: Arc<dyn Signer>,
     pub signing_root: Root,
     pub sign_timeout: Duration,
@@ -917,8 +1006,9 @@ pub trait PreReserveBarrier: Send + Sync {
 /// 3. Resolve [`TimeoutPolicy`] under the lock (and re-check before sign when
 ///    using [`TimeoutPolicySource::ResolveUnderLock`] — SEC-1).
 /// 4. `spawn_blocking`: build `PubkeyScopedDb`, reserve per [`SlashableKind`],
+///    re-check enablement after that reservation and before the BLS call,
 ///    then [`SlashableSignSession::reserve_then_sign`] signs with timeout and
-///    reconciles per policy.
+///    reconciles per policy. A refusal after reserve leaves the committed row.
 ///
 /// # Errors
 ///
@@ -1077,7 +1167,8 @@ where
     let guard = req.locks.lock(&pubkey_bytes).await;
 
     // Step 2: re-check enablement under the lock (SigningGate / SignerService parity).
-    if !doppelganger::signing_allowed(req.enablement, req.pubkey, req.kind.signing_duty()) {
+    if !doppelganger::signing_allowed(req.enablement.as_ref(), req.pubkey, req.kind.signing_duty())
+    {
         warn!(
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
             op = op_name,
@@ -1120,6 +1211,7 @@ where
         client_cn: req.client_cn,
         gvr: req.gvr,
         fork_name: req.fork_name,
+        enablement: Arc::clone(&req.enablement),
     };
 
     let result = tokio::task::spawn_blocking(move || {
@@ -1169,6 +1261,10 @@ mod tests {
         }
 
         fn voluntary_exit_only(&self) -> bool {
+            false
+        }
+
+        fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
             false
         }
     }
@@ -1253,7 +1349,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: TEST_TIMEOUT,
@@ -1329,7 +1425,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: Duration::from_secs(4),
@@ -1369,7 +1465,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: Duration::from_secs(4),
@@ -1419,7 +1515,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: TEST_TIMEOUT,
@@ -1461,7 +1557,7 @@ mod tests {
         let result = sign_slashable(SignSlashableRequest {
             locks: &locks,
             pubkey: &pubkey,
-            enablement: &AlwaysEnabled,
+            enablement: Arc::new(AlwaysEnabled),
             signer,
             signing_root,
             sign_timeout: Duration::from_secs(4),
@@ -1506,7 +1602,7 @@ mod tests {
             sign_slashable(SignSlashableRequest {
                 locks: locks_c.as_ref(),
                 pubkey: &pk,
-                enablement: en_c.as_ref(),
+                enablement: en_c,
                 signer,
                 signing_root: [0x44; 32],
                 sign_timeout: Duration::from_secs(4),
@@ -1614,6 +1710,7 @@ mod tests {
             client_cn: "test".to_string(),
             gvr: GVR,
             fork_name: None,
+            enablement: Arc::new(crate::AlwaysEnabled),
         }
     }
 

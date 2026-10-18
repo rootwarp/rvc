@@ -26,8 +26,8 @@ That command prints 14 lines, one per row below.
 | File | Line | Task | Call | Bucket | Reason |
 |---|---:|---|---|---|---|
 | `bin/rvc/src/logging.rs` | 312 | `log_reload` | spawn | detached | SIGHUP log-reload handler; process-lifetime signal loop, no caller trace to inherit. |
-| `crates/rvc/src/bootstrap/run.rs` | 364 | `duty_orchestrator` | spawn | detached | Already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B. `executor.spawn_result`. |
-| `crates/rvc/src/bootstrap/run.rs` | 556 | `secret_provider_refresh` | spawn | detached | `secret_provider::RefreshService::run`; loop body is `crates/secret-provider/src/refresh.rs:185`, out of scope. |
+| `crates/rvc/src/bootstrap/run.rs` | 371 | `duty_orchestrator` | spawn | detached | Already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B. `executor.spawn_result`. |
+| `crates/rvc/src/bootstrap/run.rs` | 854 | `secret_provider_refresh` | spawn | detached | `secret_provider::RefreshService::run`; loop body is `crates/secret-provider/src/refresh.rs:185`, out of scope. |
 | `crates/rvc/src/bootstrap/tasks.rs` | 120 | `metrics_server` | spawn | detached | Metrics server; serve loop is `crates/metrics/src/server.rs:96` (`serve_metrics_with_health`), out of P1-1 scope. |
 | `crates/rvc/src/bootstrap/tasks.rs` | 142 | `monitoring_push` | spawn | B | Iteration loop. Loop site `crates/rvc/src/background_tasks/monitoring.rs:161`. TRC-6b owns the per-iteration root. |
 | `crates/rvc/src/bootstrap/tasks.rs` | 171 | `proposer_config_refresh` | spawn | B | Iteration loop. Loop site `crates/rvc/src/background_tasks/config_url.rs:965`. TRC-6b owns the per-iteration root. |
@@ -37,7 +37,7 @@ That command prints 14 lines, one per row below.
 | `crates/rvc/src/bootstrap/tasks.rs` | 261 | `bn.sync_monitor.cancel` | spawn | detached | Cancel-forwarder for `bn.sync_monitor`; not an iteration loop. |
 | `crates/rvc/src/index_resolver.rs` | 86 | `index.resolve` | spawn | B | Iteration loop. Loop site `crates/rvc/src/index_resolver.rs:114` (`IndexResolver::run`). TRC-6b owns the per-iteration root. |
 | `crates/rvc/src/keymanager_adapters/spawn.rs` | 341 | `keymanager_api` | spawn | detached | Keymanager API server; serve loop is `KeymanagerServer::serve_on` in `crates/keymanager-api/src/server.rs:203`, out of scope. |
-| `crates/rvc/src/liveness_loop.rs` | 494 | `liveness_loop` | spawn | B | Iteration loop. Loop site `crates/rvc/src/liveness_loop.rs:218` (`LivenessObservationLoop::run` loop body). TRC-6b owns the per-iteration root. |
+| `crates/rvc/src/liveness_loop.rs` | 608 | `liveness_loop` | spawn | B | Iteration loop. Loop site `crates/rvc/src/liveness_loop.rs:256` (`LivenessObservationLoop::run` loop body). TRC-6b owns the per-iteration root. |
 | `crates/rvc/src/slashing_monitor.rs` | 145 | `slashing_monitor` | spawn | B | Iteration loop. Loop site `crates/rvc/src/slashing_monitor.rs:148`. TRC-6b owns the per-iteration root. |
 
 Shape A = 0 at this HEAD. None of the 14 inherit a caller trace as a shape A root.
@@ -48,7 +48,7 @@ Shape A = 0 at this HEAD. None of the 14 inherit a caller trace as a shape A roo
 |---|---|---|
 | `monitoring_push` | `crates/rvc/src/bootstrap/tasks.rs:142` | `crates/rvc/src/background_tasks/monitoring.rs:161` |
 | `proposer_config_refresh` | `crates/rvc/src/bootstrap/tasks.rs:171` | `crates/rvc/src/background_tasks/config_url.rs:965` |
-| `liveness_loop` | `crates/rvc/src/liveness_loop.rs:494` | `crates/rvc/src/liveness_loop.rs:218` |
+| `liveness_loop` | `crates/rvc/src/liveness_loop.rs:608` | `crates/rvc/src/liveness_loop.rs:256` |
 | `slashing_monitor` | `crates/rvc/src/slashing_monitor.rs:145` | `crates/rvc/src/slashing_monitor.rs:148` |
 | `index.resolve` | `crates/rvc/src/index_resolver.rs:86` | `crates/rvc/src/index_resolver.rs:114` |
 
@@ -75,9 +75,9 @@ The slashing-monitor `None` call is the old no-op detached site. It left the cen
 
 ## `liveness_loop.rs` `#[cfg(test)]` trap
 
-`crates/rvc/src/liveness_loop.rs` has a method-level `#[cfg(test)]` at `:271` and an inner `#[cfg(test)]` at `:445`. The column-0 module attribute is at `:500`. The production spawn is `:494`, above that module attribute.
+`crates/rvc/src/liveness_loop.rs` has a method-level `#[cfg(test)]` at `:382` and an inner `#[cfg(test)]` at `:556`. The column-0 module attribute is at `:614`. The production spawn is `:608`, above that module attribute.
 
-Truncating the file at the first `#[cfg(test)]` (the method-level attribute at `:271`) hides `:494` and drops a real production site. The command above keeps `:494` because it only treats a column-0 `#[cfg(test)]` as the end of the production region.
+Truncating the file at the first `#[cfg(test)]` (the method-level attribute at `:382`) hides `:608` and drops a real production site. The command above keeps `:608` because it only treats a column-0 `#[cfg(test)]` as the end of the production region.
 
 `crates/architecture-tests/tests/spawn_span_continuity.rs` pins this census at 14 under tracing ADR-009. The gate ends the production region at the first column-0 `#[cfg(test)]` followed by `mod` (not the first bare `#[cfg(test)]`), skips `///` and `//!` lines, and does not count `register_opt(..., None)`. A site passes only when the preceding non-empty line is a `// detached:` comment, or it is one of the five shape-B rows and the loop file in the table above contains `parent: None` and `follows_from` for that task. The allow-list is empty.
 

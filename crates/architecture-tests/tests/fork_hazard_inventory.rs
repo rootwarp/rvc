@@ -324,7 +324,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1200,
+        1296,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -333,7 +333,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1541,
+        1637,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -342,7 +342,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1618,
+        1714,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",

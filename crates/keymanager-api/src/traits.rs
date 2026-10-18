@@ -196,8 +196,8 @@ pub trait DoppelgangerMonitor: Send + Sync {
     /// `ForwardWindowMachine` adapters treat this as a no-op for machine state;
     /// only [`Self::cancel_monitoring`] (DELETE) removes machine registration.
     fn stop_monitoring(&self, pubkey: &Pubkey);
-    /// DELETE / hard-remove path: drop all monitoring state so a re-import starts
-    /// a fresh window (`ForwardWindowMachine::cancel`).
+    /// DELETE / hard-remove path: drop monitoring state so a re-import starts
+    /// a fresh window (`ForwardWindowMachine::cancel`). A `Detected` entry stays.
     ///
     /// Default: same as [`Self::stop_monitoring`] (log-only / pending-set
     /// implementors where both mean "prune pending").
@@ -209,6 +209,27 @@ pub trait DoppelgangerMonitor: Send + Sync {
     /// Keys that are not under active monitoring (e.g. existing keys loaded at
     /// startup) are considered safe and return `true` by default.
     fn is_doppelganger_safe(&self, pubkey: &Pubkey) -> bool;
+
+    /// `true` when this key is `Detected` or the process detection latch is set.
+    ///
+    /// This is not `!is_doppelganger_safe`. A key that is still `Pending` is
+    /// unsafe to sign and must not roll back a wall-clock enable. The default
+    /// is `false` so monitors that do not model detection leave the enable write
+    /// in place.
+    fn signing_closed_by_detection(&self, pubkey: &Pubkey) -> bool {
+        let _ = pubkey;
+        false
+    }
+
+    /// `true` only when this pubkey itself is `Detected`.
+    ///
+    /// The process latch makes [`Self::signing_closed_by_detection`] true for
+    /// every key. This method does not. The enable-task rollback persists
+    /// `enabled = false` only for keys this returns true for.
+    fn is_detected_key(&self, pubkey: &Pubkey) -> bool {
+        let _ = pubkey;
+        false
+    }
 }
 
 /// Errors from remote-key import.

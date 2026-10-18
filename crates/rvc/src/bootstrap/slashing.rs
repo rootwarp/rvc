@@ -97,6 +97,10 @@ pub fn open_slashing_db(
         }
     };
 
+    // The early boot check can pass, then the detecting process can write the
+    // marker and exit before this process takes the lock. Read it again now.
+    super::run::refuse_if_detection_records(&config.keystore_path, &config.slashing_db_path)?;
+
     // Step 2d (SEC-1b): Load deletion denylist so keystore-dir / secret-provider
     // loaders skip keys deleted via the Keymanager API on a prior boot.
     // Path: <keystore_path>/.rvc.deleted_keys (shares the durable data volume).
@@ -171,6 +175,58 @@ mod tests {
             b"not a sqlite database!!!!",
             "must not wipe corrupt file"
         );
+    }
+
+    #[test]
+    fn open_slashing_db_rechecks_the_marker_after_the_keystore_lock() {
+        let dir = TempDir::new().unwrap();
+        let keystore = dir.path().join("keys");
+        std::fs::create_dir_all(&keystore).unwrap();
+        let db_path = dir.path().join("slashing.db");
+        seed_valid_db(&db_path);
+        crate::detection_marker::write_marker(
+            &keystore,
+            &crate::detection_marker::DetectionMarker { epoch: 3, unix_secs: 4, pubkeys: vec![] },
+        )
+        .expect("marker");
+
+        let config = config_with_paths(&keystore, &db_path);
+        match open_slashing_db(&config, false, false) {
+            Err(BootstrapError::DoppelgangerDetected) => {}
+            Ok(_) => panic!("a marker present at the lock must refuse start"),
+            Err(other) => panic!("expected doppelganger exit, got {other}"),
+        }
+
+        let mut unlocked = config_with_paths(&keystore, &db_path);
+        unlocked.disable_keystore_locking = true;
+        match open_slashing_db(&unlocked, false, false) {
+            Err(BootstrapError::DoppelgangerDetected) => {}
+            Ok(_) => panic!("a marker must refuse start even when locking is off"),
+            Err(other) => panic!("expected doppelganger exit, got {other}"),
+        }
+    }
+
+    #[test]
+    fn open_slashing_db_rechecks_a_fallback_marker_beside_the_slashing_db() {
+        let dir = TempDir::new().unwrap();
+        let keystore = dir.path().join("keys");
+        std::fs::create_dir_all(&keystore).unwrap();
+        let slash = dir.path().join("slash");
+        std::fs::create_dir_all(&slash).unwrap();
+        let db_path = slash.join("slashing.db");
+        seed_valid_db(&db_path);
+        crate::detection_marker::write_marker(
+            &slash,
+            &crate::detection_marker::DetectionMarker { epoch: 3, unix_secs: 4, pubkeys: vec![] },
+        )
+        .expect("fallback");
+
+        let config = config_with_paths(&keystore, &db_path);
+        match open_slashing_db(&config, false, false) {
+            Err(BootstrapError::DoppelgangerDetected) => {}
+            Ok(_) => panic!("a fallback marker must refuse start"),
+            Err(other) => panic!("expected doppelganger exit, got {other}"),
+        }
     }
 
     #[test]

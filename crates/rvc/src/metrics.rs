@@ -212,6 +212,26 @@ pub static RVC_KEYMANAGER_QUIESCE_WAIT_MS: LazyLock<Histogram> = LazyLock::new(|
     metrics::register_metric("rvc_keymanager_quiesce_wait_ms", histogram)
 });
 
+/// 1 after this process stores the doppelganger detection latch. 0 before that.
+pub static RVC_DOPPELGANGER_DETECTION_LATCH: LazyLock<IntGauge> = LazyLock::new(|| {
+    define_int_gauge(
+        "rvc_doppelganger_detection_latch",
+        "1 after the doppelganger detection latch is stored in this process",
+    )
+});
+
+/// Failed attempts to persist `.rvc.doppelganger_detected`. A rising value
+/// means a marker write is still failing. Do not stop the process then:
+/// `SIGKILL` before the first durable record loses the latch. Exit 12 still
+/// follows when the in-place record or a marker is already durable.
+pub static RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL: LazyLock<IntCounter> =
+    LazyLock::new(|| {
+        define_int_counter(
+            "rvc_doppelganger_marker_write_failures_total",
+            "Failed attempts to persist the doppelganger detection marker",
+        )
+    });
+
 /// Activation epoch of the next scheduled fork.
 ///
 /// Labels: `fork` (lowercase [`eth_types::ForkName`] name). The child is omitted
@@ -252,6 +272,8 @@ pub fn init() {
     LazyLock::force(&RVC_FORK_CURRENT_ID);
     LazyLock::force(&RVC_FORK_NEXT_ACTIVATION_EPOCH);
     LazyLock::force(&RVC_KEYMANAGER_QUIESCE_WAIT_MS);
+    LazyLock::force(&RVC_DOPPELGANGER_DETECTION_LATCH);
+    LazyLock::force(&RVC_DOPPELGANGER_MARKER_WRITE_FAILURES_TOTAL);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SCHEDULED]);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::SKIPPED_NO_DATA]);
     let _ = RVC_PTC_DUTIES_TOTAL.with_label_values(&[ptc_duty_outcome::DROPPED]);

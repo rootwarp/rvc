@@ -39,6 +39,10 @@ impl SigningEnablement for KnownOnlyEnablement {
     fn voluntary_exit_only(&self) -> bool {
         false
     }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
+    }
 }
 
 const GVR: Root = [0xd3; 32];

@@ -28,6 +28,10 @@ impl SigningEnablement for FlipEnablement {
     fn voluntary_exit_only(&self) -> bool {
         false
     }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
+    }
 }
 
 /// Gate records the same metric families as SignerService on success and on block.
