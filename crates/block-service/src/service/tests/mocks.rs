@@ -1121,8 +1121,10 @@ pub(crate) fn self_build_ssz_response(slot: Slot) -> ProduceBlockResponse {
     }
 }
 
+/// Default full-body fixture. Matches `MockBeaconClient::unblinded`, which
+/// advertises Deneb. An Electra body under that header is a parse error.
 pub(crate) fn test_body_ssz() -> Vec<u8> {
-    eth_types::external_vector_electra_body().as_ssz_bytes()
+    eth_types::external_vector_deneb_body().as_ssz_bytes()
 }
 
 /// Full body SSZ matching `consensus_version` (typed Deneb vs Electra).
@@ -1131,8 +1133,14 @@ pub(crate) fn test_body_ssz() -> Vec<u8> {
 /// same schema the BN advertised.
 pub(crate) fn test_body_ssz_for_version(consensus_version: &str) -> Vec<u8> {
     match consensus_version {
+        "deneb" => eth_types::external_vector_deneb_body().as_ssz_bytes(),
         "electra" | "fulu" => eth_types::external_vector_electra_body().as_ssz_bytes(),
-        _ => eth_types::external_vector_deneb_body().as_ssz_bytes(),
+        // No pre-Deneb or Gloas full-body fixture. These headers are built so
+        // the layout check can reject a Deneb body, not so the body is Capella.
+        "phase0" | "altair" | "bellatrix" | "capella" | "gloas" => {
+            eth_types::external_vector_deneb_body().as_ssz_bytes()
+        }
+        other => panic!("no full-body SSZ fixture for fork {other}"),
     }
 }
 

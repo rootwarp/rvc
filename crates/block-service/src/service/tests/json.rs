@@ -555,6 +555,168 @@ async fn hex_ssz_blinded_body_keeps_the_electra_block_root() {
     assert!(harness.beacon.produce_response.as_ref().expect("response").data["body"].is_string());
 }
 
+fn full_produce(data: serde_json::Value, version: &str) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data,
+        is_blinded: false,
+        consensus_version: version.to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+    }
+}
+
+/// The fee reader and the decoder share one block object.
+#[test]
+fn execution_fee_address_uses_one_block_object() {
+    let parent = format!("0x{}", "ab".repeat(32));
+    let state = format!("0x{}", "00".repeat(32));
+    let nested_fee = format!("0x{}", "22".repeat(20));
+    let top_fee = format!("0x{}", "11".repeat(20));
+    let nested = serde_json::json!({
+        "slot": "1",
+        "proposer_index": "7",
+        "parent_root": parent,
+        "state_root": state,
+        "body": { "execution_payload": { "fee_recipient": nested_fee } },
+    });
+    let contents = serde_json::json!({
+        "block": nested,
+        "kzg_proofs": ["0xab"],
+        "blobs": ["0xcd"],
+    });
+    let got = super::super::execution_fee_address(&full_produce(contents, "deneb"));
+    assert_eq!(got, Some([0x22; 20]));
+
+    let hybrid = serde_json::json!({
+        "slot": "1",
+        "proposer_index": "7",
+        "parent_root": parent,
+        "state_root": state,
+        "body": { "execution_payload": { "fee_recipient": top_fee } },
+        "block": nested,
+        "kzg_proofs": ["0xab"],
+        "blobs": ["0xcd"],
+    });
+    assert!(super::super::execution_fee_address(&full_produce(hybrid, "deneb")).is_none());
+}
+
+/// A blinded document that names two blocks is rejected before signing.
+#[tokio::test]
+async fn blinded_hybrid_document_signs_nothing() {
+    let nested = kat_blinded_block(blinded_body(ELECTRA_BLINDED_BODY_JSON));
+    let mut hybrid = nested.clone();
+    hybrid["block"] = nested;
+    let response = blinded_produce(hybrid, "electra");
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let err =
+        harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err("hybrid");
+    match err {
+        BlockServiceError::Parse(msg) => {
+            assert!(msg.contains("both top-level block fields and a nested block"), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_signed_or_published(&harness);
+}
+
+/// A Deneb JSON object body under an Electra header must not be signed.
+#[tokio::test]
+async fn deneb_object_body_under_electra_header_signs_nothing() {
+    let body = eth_types::block_body_json::encode(
+        &test_body_ssz_for_version("deneb"),
+        eth_types::BodyForkLayout::Deneb,
+    )
+    .expect("deneb object body");
+    assert!(body.is_object());
+    let response = full_produce(kat_blinded_block(body), "electra");
+    let pubkey = test_pubkey();
+    let harness = harness(response, &pubkey);
+    let err =
+        harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err("object body");
+    match err {
+        BlockServiceError::Parse(msg) => {
+            assert!(msg.contains("invalid JSON block body"), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_signed_or_published(&harness);
+}
+
+/// First Electra slot: a Deneb object body is rejected; an Electra object body is signed.
+#[tokio::test]
+async fn fork_boundary_slot_uses_the_slot_fork_for_an_object_body() {
+    let slot = 50 * SLOTS_PER_EPOCH;
+    let pubkey = test_pubkey();
+    let fork = test_fork_schedule();
+
+    let deneb = eth_types::block_body_json::encode(
+        &test_body_ssz_for_version("deneb"),
+        eth_types::BodyForkLayout::Deneb,
+    )
+    .expect("deneb object body");
+    let mut deneb_doc = kat_blinded_block(deneb);
+    deneb_doc["slot"] = serde_json::Value::String(slot.to_string());
+    let rejected = harness_on(full_produce(deneb_doc, "electra"), &pubkey, &fork);
+    let err = rejected.service.propose_block(slot, &pubkey, 42, None).await.expect_err("boundary");
+    match err {
+        BlockServiceError::Parse(msg) => {
+            assert!(msg.contains("invalid JSON block body"), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_signed_or_published(&rejected);
+
+    let electra = eth_types::block_body_json::encode(
+        &test_body_ssz_for_version("electra"),
+        eth_types::BodyForkLayout::Electra,
+    )
+    .expect("electra object body");
+    let mut electra_doc = kat_blinded_block(electra);
+    electra_doc["slot"] = serde_json::Value::String(slot.to_string());
+    let accepted = harness_on(full_produce(electra_doc, "electra"), &pubkey, &fork);
+    let result = accepted.service.propose_block(slot, &pubkey, 42, None).await;
+    assert!(result.is_ok(), "matching object body at the Electra boundary must sign: {result:?}");
+    assert_eq!(accepted.signer.block_calls.lock().unwrap().len(), 1);
+    assert_eq!(accepted.beacon.publish_full_calls.lock().unwrap().len(), 1);
+}
+
+/// A Deneb (or Electra) hex body under another fork's header must not be signed.
+///
+/// Auto-detect would hash the body under the wrong layout and burn the slot.
+#[tokio::test]
+async fn deneb_hex_full_body_under_electra_or_fulu_signs_nothing() {
+    let cases = [("deneb", "electra"), ("deneb", "fulu"), ("electra", "deneb")];
+    for (body_fork, header) in cases {
+        let ssz = test_body_ssz_for_version(body_fork);
+        let body = serde_json::Value::String(format!("0x{}", hex::encode(ssz)));
+        let response = full_produce(kat_blinded_block(body), header);
+        let pubkey = test_pubkey();
+        let harness = harness(response, &pubkey);
+        let err =
+            harness.service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err(header);
+        match err {
+            BlockServiceError::Parse(msg) => {
+                assert!(
+                    msg.contains("invalid block body for tree_hash_root")
+                        && msg.contains("invalid SSZ body encoding"),
+                    "{body_fork} body under {header} must fail the layout-keyed root: {msg}"
+                );
+            }
+            other => panic!("{body_fork} body under {header}: {other:?}"),
+        }
+        assert_nothing_signed_or_published(&harness);
+        assert!(harness.signer.header_calls.lock().unwrap().is_empty(), "{header}");
+        assert!(harness.beacon.publish_calls.lock().unwrap().is_empty(), "{header}");
+        assert!(harness.beacon.publish_contents_calls.lock().unwrap().is_empty(), "{header}");
+        assert!(harness.beacon.publish_ssz_calls.lock().unwrap().is_empty(), "{header}");
+    }
+}
+
 #[tokio::test]
 async fn deneb_hex_body_under_electra_or_fulu_signs_nothing() {
     let ssz = eth_types::external_vector_blinded_deneb_body().as_ssz_bytes();

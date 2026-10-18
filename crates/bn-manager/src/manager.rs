@@ -1893,6 +1893,29 @@ impl BnManager {
     }
 }
 
+/// Deneb, Electra, and Fulu publish `{message, signature}` with an object body.
+///
+/// Gloas and pre-Deneb keep [`SignedBeaconBlock`] serde. Gloas has no JSON
+/// body encoder. A Deneb+ body that does not encode is an error, not hex.
+fn json_signed_block(
+    signed_block: &SignedBeaconBlock,
+    consensus_version: &str,
+) -> Result<serde_json::Value, BeaconError> {
+    match eth_types::body_fork_layout(consensus_version) {
+        Some(layout @ (eth_types::BodyForkLayout::Deneb | eth_types::BodyForkLayout::Electra)) => {
+            let wire = eth_types::signed_block_contents_json::SignedBeaconBlockJson::from_signed(
+                signed_block,
+                layout,
+            )
+            .map_err(|err| BeaconError::ParseError(format!("invalid JSON block body: {err}")))?;
+            serde_json::to_value(&wire)
+                .map_err(|err| BeaconError::ParseError(format!("invalid JSON block body: {err}")))
+        }
+        Some(eth_types::BodyForkLayout::Gloas) | None => serde_json::to_value(signed_block)
+            .map_err(|err| BeaconError::ParseError(format!("invalid JSON block body: {err}"))),
+    }
+}
+
 /// Clone the beacon client and an `Arc` payload into a `'static` attempt.
 ///
 /// The drain outlives the call, so the attempt cannot borrow the request.
@@ -2467,7 +2490,7 @@ fn execution_fee_at_payload_offset(body: &[u8], fixed_len: usize) -> FeeOnBlock 
 }
 
 fn json_duty_fields(data: &serde_json::Value) -> Option<DutyFields> {
-    let block = if data.get("slot").is_some() { data } else { data.get("block")? };
+    let block = eth_types::block_object(data).ok()?;
     let slot = json_u64(block.get("slot")?)?;
     let proposer_index = json_u64(block.get("proposer_index")?)?;
     let parent_root = json_fixed_hex::<32>(block.get("parent_root")?.as_str()?)?;
@@ -3175,6 +3198,9 @@ impl BlockProducer for BnManager {
         consensus_version: &str,
         builder_url: Option<&str>,
     ) -> Result<(), BeaconError> {
+        // Deneb+ JSON is the object body that was hashed. Hex serde of
+        // `BeaconBlock` is what the beacon node rejects after the signature.
+        let wire = json_signed_block(signed_block, consensus_version)?;
         self.submit(
             "publish_block",
             self.broadcast_topics.blocks,
@@ -3182,11 +3208,7 @@ impl BlockProducer for BnManager {
             HealthTier::LargeLag,
             self.op_timeout(|t| t.block_publication),
             owned_attempt!(
-                (
-                    signed_block.clone(),
-                    consensus_version.to_owned(),
-                    builder_url.map(str::to_owned)
-                ),
+                (wire, consensus_version.to_owned(), builder_url.map(str::to_owned)),
                 |client, payload| client
                     .publish_block(&payload.0, &payload.1, payload.2.as_deref())
                     .await
@@ -5488,6 +5510,70 @@ mod tests {
             serde_json::json!({ "fee_recipient": parent_hex_n(&[0x22; 20]) });
         assert!(passes_sign(&payload, &checks));
         assert!(fee_preferred(&payload, &checks));
+    }
+
+    /// A document with both a top-level block and a nested `block` is not ranked.
+    ///
+    /// The top-level fee matches the duty. A reader that prefers `slot` would
+    /// return the block and the nested block would be the one signed.
+    #[tokio::test]
+    async fn hybrid_block_contents_is_a_hard_reject() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let parent = "ab".repeat(32);
+        let state = "00".repeat(32);
+        let fee = "11".repeat(20);
+        let nested = format!(
+            r#"{{"slot":"1","proposer_index":"7","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}}}}"#
+        );
+        let contents =
+            format!(r#"{{"data":{{"block":{nested},"kzg_proofs":["0xab"],"blobs":["0xcd"]}}}}"#);
+        let hybrid = format!(
+            r#"{{"data":{{"slot":"1","proposer_index":"7","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}},"block":{nested},"kzg_proofs":["0xab"],"blobs":["0xcd"]}}}}"#
+        );
+        let duty = ProduceDuty {
+            expected_proposer_index: 7,
+            expected_parent_root: Some([0xab; 32]),
+            alternate_parent_root: None,
+            parent_closed: false,
+            expected_fee_recipient: Some([0x11; 20]),
+            expected_consensus_version: ForkName::Deneb,
+        };
+
+        async fn ranked(body: &str, duty: ProduceDuty) -> Result<Vec<RankedBlock>, BeaconError> {
+            let bn = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/eth/v3/validator/blocks/1"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Eth-Consensus-Version", "deneb")
+                        .insert_header("Eth-Execution-Payload-Blinded", "false")
+                        .insert_header("Eth-Execution-Payload-Value", "9000")
+                        .set_body_string(body),
+                )
+                .expect(1)
+                .mount(&bn)
+                .await;
+            let manager = BnManager::new(BnManagerConfig::new(vec![bn.uri()]))
+                .expect("manager")
+                .with_operation_timeouts(OperationTimeouts {
+                    block_production: Duration::from_secs(5),
+                    ..OperationTimeouts::default()
+                });
+            set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+            manager.produce_block_v3_ranked_by(1, "0xrandao", None, None, Some(duty), None).await
+        }
+
+        let conforming = ranked(&contents, duty).await.expect("BlockContents is one shape");
+        assert_eq!(conforming.len(), 1, "a nested block with no top-level fields is readable");
+
+        let err = ranked(&hybrid, duty).await.expect_err("hybrid must be a hard reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("all BNs failed in best-selection"),
+            "hybrid must be dropped before ranking, got {err:?}"
+        );
     }
 
     /// A missing fee recipient is preferred only before Bellatrix. From

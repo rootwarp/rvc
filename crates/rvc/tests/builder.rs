@@ -1,7 +1,7 @@
 //! Top-level `--graffiti` applied by [`rvc::config::ServiceBuilder::build_validator_store`].
 
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bn_manager::{BeaconNodeClient, MockBeaconNodeClient, ProduceBlockResponse};
 use crypto::SecretKey;
@@ -14,12 +14,21 @@ use signer::StubValidatorSigner;
 use tempfile::TempDir;
 use validator_store::{parse_graffiti, DefaultUpdate, ValidatorStore};
 
+fn store_log_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
 fn fee_recipient_toml(extra: &str) -> String {
     let fr = format!("0x{}", hex::encode([0xaau8; 20]));
     format!("[defaults]\nfee_recipient = \"{fr}\"\n{extra}")
 }
 
 fn build_store(graffiti: Option<&str>, toml_body: &str) -> (TempDir, Arc<ValidatorStore>) {
+    // The "Created validator store" callsite is cached for the process. A
+    // sibling test that logs it with no subscriber disables it for everyone.
+    let _log = store_log_lock().lock().expect("store log");
+    tracing::callsite::rebuild_interest_cache();
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("validators.toml");
     std::fs::write(&path, toml_body).expect("write validators.toml");

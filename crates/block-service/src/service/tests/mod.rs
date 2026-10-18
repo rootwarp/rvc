@@ -5,8 +5,9 @@
 
 // Re-exports for topic submodules (`use super::*`).
 pub(super) use super::{
-    compute_blinded_block_root, compute_block_root, demote_post_sign, gloas_header_and_root,
-    note_signed_fee_penalty, ssz_block_format, with_shape_rejection_lock,
+    compute_blinded_block_root, compute_blinded_block_root_for_layout, compute_block_root,
+    compute_block_root_for_layout, demote_post_sign, gloas_header_and_root, header_from_blinded,
+    header_from_full, note_signed_fee_penalty, ssz_block_format, with_shape_rejection_lock,
     with_signed_fee_penalty_lock, BlockProposalResult, BlockService, PayloadDeadline,
 };
 pub(super) use crate::traits::{

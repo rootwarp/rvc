@@ -8,59 +8,77 @@ use std::sync::Arc;
 fn test_compute_block_root_matches_tree_hash() {
     use tree_hash::TreeHash;
     let block = eth_types::external_vector_electra_block();
-    let root = compute_block_root(&block).expect("valid Electra vector body");
+    let layout = eth_types::BodyForkLayout::Electra;
+    let root = compute_block_root_for_layout(&block, layout).expect("valid Electra vector body");
     assert_eq!(root, block.tree_hash_root().0);
     let expected = hex::decode(eth_types::EXTERNAL_ELECTRA_BLOCK_ROOT_HEX).unwrap();
     assert_eq!(
         root.as_slice(),
         expected.as_slice(),
-        "compute_block_root must match remerkleable EXTERNAL_ELECTRA_BLOCK_ROOT_HEX"
+        "compute_block_root_for_layout must match remerkleable EXTERNAL_ELECTRA_BLOCK_ROOT_HEX"
     );
+    let header = header_from_full(&block, layout).expect("electra header");
+    assert_eq!(header.object_root(), root, "pre-Gloas block root equals the header root");
 }
 
 #[test]
 fn test_compute_blinded_block_root_matches_tree_hash() {
     use tree_hash::TreeHash;
     let block = test_blinded_block(200);
-    let root = compute_blinded_block_root(&block).unwrap();
+    let layout = eth_types::BodyForkLayout::Deneb;
+    let root = compute_blinded_block_root_for_layout(&block, layout).unwrap();
     let expected = block.tree_hash_root();
     assert_eq!(root, expected.0);
+    let header = header_from_blinded(&block, layout).expect("deneb blinded header");
+    assert_eq!(header.object_root(), root, "pre-Gloas blinded block root equals the header root");
 }
 
 #[test]
 fn test_compute_blinded_block_root_matches_external_vector() {
     let block = eth_types::external_vector_electra_blinded_block();
-    let root = compute_blinded_block_root(&block).expect("valid external vector blinded body");
+    let layout = eth_types::BodyForkLayout::Electra;
+    let root = compute_blinded_block_root_for_layout(&block, layout)
+        .expect("valid external vector blinded body");
     let expected = hex::decode(eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX).unwrap();
     assert_eq!(
         root.as_slice(),
         expected.as_slice(),
-        "compute_blinded_block_root must match remerkleable external blinded Electra block root"
+        "compute_blinded_block_root_for_layout must match remerkleable external blinded Electra block root"
     );
+    let header = header_from_blinded(&block, layout).expect("electra blinded header");
+    assert_eq!(header.object_root(), root, "pre-Gloas blinded block root equals the header root");
 }
 
 #[test]
 fn test_compute_block_root_matches_external_deneb_vector() {
     let block = eth_types::external_vector_deneb_block();
-    let root = compute_block_root(&block).expect("valid Deneb external vector body");
+    let layout = eth_types::BodyForkLayout::Deneb;
+    let root =
+        compute_block_root_for_layout(&block, layout).expect("valid Deneb external vector body");
     let expected = hex::decode(eth_types::EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap();
     assert_eq!(
         root.as_slice(),
         expected.as_slice(),
-        "compute_block_root must match remerkleable external Deneb block root"
+        "compute_block_root_for_layout must match remerkleable external Deneb block root"
     );
+    let header = header_from_full(&block, layout).expect("deneb header");
+    assert_eq!(header.object_root(), root, "pre-Gloas block root equals the header root");
 }
 
 #[test]
 fn test_compute_blinded_block_root_matches_external_deneb_vector() {
     let block = eth_types::external_vector_deneb_blinded_block();
-    let root = compute_blinded_block_root(&block).expect("valid Deneb blinded body");
+    let layout = eth_types::BodyForkLayout::Deneb;
+    let root =
+        compute_blinded_block_root_for_layout(&block, layout).expect("valid Deneb blinded body");
     let expected = hex::decode(eth_types::EXTERNAL_DENEB_BLOCK_ROOT_HEX).unwrap();
     assert_eq!(
         root.as_slice(),
         expected.as_slice(),
-        "compute_blinded_block_root must match remerkleable external Deneb block root"
+        "compute_blinded_block_root_for_layout must match remerkleable external Deneb block root"
     );
+    let header = header_from_blinded(&block, layout).expect("deneb blinded header");
+    assert_eq!(header.object_root(), root, "pre-Gloas blinded block root equals the header root");
 }
 
 #[test]
@@ -702,14 +720,15 @@ async fn test_propose_block_at_epoch_boundary() {
 async fn test_propose_block_at_slot_zero_ssz() {
     let pubkey = test_pubkey();
     let slot = 0;
-    let beacon = MockBeaconClient::ssz_with_version(slot, 1, false, "capella");
+    // Deneb is a supported full-block fork. Capella is not; see the pre-Deneb SSZ test.
+    let beacon = MockBeaconClient::ssz_with_version(slot, 1, false, "deneb");
     let beacon_arc = Arc::new(beacon);
     let store = test_validator_store(&pubkey);
     let service = BlockService::new(
         Arc::new(MockSigner::new()),
         beacon_arc.clone(),
         Arc::new(store),
-        Arc::new(test_fork_schedule_for("capella")),
+        Arc::new(test_fork_schedule_for("deneb")),
         [0xaa; 32],
     );
 
@@ -836,8 +855,8 @@ async fn test_blinded_and_unblinded_roots_differ_through_production_logic() {
     let slot = 100;
 
     // Both blocks share the same slot + proposer_index but differ in body.
-    // The point: verify production code (compute_block_root / compute_blinded_block_root)
-    // produces different roots because tree_hash includes the body field.
+    // Tree hash includes the body, so the roots differ. The Deneb fixture
+    // matches the unblinded mock's header, so the signed root is that hash.
     let unblinded_block = BeaconBlock {
         slot,
         proposer_index: 42,

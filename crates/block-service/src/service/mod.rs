@@ -8,9 +8,7 @@ use tracing::{debug, error, info, warn, Instrument};
 
 use beacon::{block_value, GloasBlockContents, ProduceBlockV4Body, RankedBlock, WireBody};
 use crypto::PublicKey;
-use eth_types::{
-    body_tree_hash_root, ForkName, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH, SLOT_DURATION_MS,
-};
+use eth_types::{ForkName, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
 use signer::{BeaconBlockHeaderFields, CircuitBreakerState, ValidatorSigner};
 use timing::{due_ms, DeadlineBps, DeadlineSchedule};
@@ -879,11 +877,7 @@ fn execution_fee_address(response: &ProduceBlockResponse) -> Option<[u8; 20]> {
             beacon::ssz_deser::deserialize_beacon_block_from_ssz(bytes, format).ok()?;
         return fee_from_body_ssz(&response.consensus_version, &block.body);
     }
-    let block = if response.data.get("slot").is_some() {
-        &response.data
-    } else {
-        response.data.get("block")?
-    };
+    let block = eth_types::block_object(&response.data).ok()?;
     let body = block.get("body")?;
     if let Some(hex_body) = body.as_str() {
         let raw = decode_0x(hex_body)?;
@@ -1158,7 +1152,11 @@ struct PreparedProposal {
 }
 
 enum PreparedPayload {
-    /// Blinded or pre-Deneb: the whole unsigned block buffer.
+    /// Blinded SSZ: the whole unsigned block buffer.
+    ///
+    /// A pre-Deneb full SSZ body is not published through this variant.
+    /// `ssz_block_format` selects `BeaconBlock`, then `full_body_layout`
+    /// rejects that fork before a header is signed.
     SszWhole(Vec<u8>),
     /// Deneb+ `BlockContents` regions, copied out before the signature.
     SszContents {
@@ -1261,6 +1259,7 @@ fn prepare_ssz(
         )?;
         let block_root = compute_blinded_block_root_for_layout(&block, layout)?;
         let header = header_from_blinded(&block, layout)?;
+        require_block_root_matches_header(&header, block_root)?;
         return Ok((header, block_root, PreparedPayload::SszWhole(ssz_bytes.clone())));
     }
     if let Some(contents) = contents.as_ref() {
@@ -1272,27 +1271,28 @@ fn prepare_ssz(
             block.proposer_index,
             block.parent_root,
         )?;
+        // The header's fork, already cross-checked against the slot. A body
+        // that only decodes under another fork is Parse before the signer.
+        let layout = full_body_layout(&response.consensus_version)?;
+        let block_root = compute_block_root_for_layout(block, layout)?;
+        let header = header_from_full(block, layout)?;
+        require_block_root_matches_header(&header, block_root)?;
         // ISSUE-4.3 (L-3) defense-in-depth: log internal KZG commitment binding.
         // For Deneb+ BlockContents payloads the body includes blob_kzg_commitments;
         // this fingerprint is an rvc-internal binding (NOT spec-aligned —
         // see kzg_commitment_list_root doc) separate from the signing scope.
-        if let Some(layout) = eth_types::body_fork_layout(&response.consensus_version) {
-            // Fail closed: malformed body must not fingerprint as empty list.
-            let kzg_count = block
-                .blob_kzg_count(layout)
-                .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-            let commitment_root = block
-                .kzg_commitment_root(layout)
-                .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-            debug!(
-                slot = slot,
-                kzg_count = kzg_count,
-                commitment_root = %TruncatedRoot::new(&commitment_root),
-                "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
-            );
-        }
-        let block_root = compute_block_root(block)?;
-        let header = header_from_full(block)?;
+        // Fail closed: malformed body must not fingerprint as empty list.
+        let kzg_count =
+            block.blob_kzg_count(layout).map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+        let commitment_root = block
+            .kzg_commitment_root(layout)
+            .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
+        debug!(
+            slot = slot,
+            kzg_count = kzg_count,
+            commitment_root = %TruncatedRoot::new(&commitment_root),
+            "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
+        );
         return Ok((
             header,
             block_root,
@@ -1303,11 +1303,15 @@ fn prepare_ssz(
             },
         ));
     }
+    // Pre-Deneb full SSZ lands here and fails in `full_body_layout`.
+    // Blinded SSZ already returned. This arm does not publish a pre-Deneb block.
     let (block, _) = beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
         .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
     validate_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
-    let block_root = compute_block_root(&block)?;
-    let header = header_from_full(&block)?;
+    let layout = full_body_layout(&response.consensus_version)?;
+    let block_root = compute_block_root_for_layout(&block, layout)?;
+    let header = header_from_full(&block, layout)?;
+    require_block_root_matches_header(&header, block_root)?;
     Ok((header, block_root, PreparedPayload::SszWhole(ssz_bytes.clone())))
 }
 
@@ -1385,8 +1389,10 @@ fn prepare_full(
         }
     }
 
-    let block_root = compute_block_root(&block)?;
-    let header = header_from_full(&block)?;
+    let layout = full_body_layout(&response.consensus_version)?;
+    let block_root = compute_block_root_for_layout(&block, layout)?;
+    let header = header_from_full(&block, layout)?;
+    require_block_root_matches_header(&header, block_root)?;
     Ok((header, block_root, PreparedPayload::Json(block_contents)))
 }
 
@@ -1400,6 +1406,7 @@ fn prepare_blinded(
     let layout = blinded_body_layout(&response.consensus_version)?;
     let block_root = compute_blinded_block_root_for_layout(&block, layout)?;
     let header = header_from_blinded(&block, layout)?;
+    require_block_root_matches_header(&header, block_root)?;
     Ok((header, block_root, PreparedPayload::Blinded(block)))
 }
 
@@ -1563,8 +1570,9 @@ fn gloas_header_and_root(
 
 fn header_from_full(
     block: &eth_types::BeaconBlock,
+    layout: eth_types::BodyForkLayout,
 ) -> Result<BeaconBlockHeaderFields, BlockServiceError> {
-    let body_root = body_tree_hash_root(&block.body)
+    let body_root = eth_types::body_tree_hash_root_for_layout(&block.body, layout)
         .map(|h| h.0)
         .map_err(|e| BlockServiceError::Parse(format!("invalid block body for body leaf: {e}")))?;
     Ok(BeaconBlockHeaderFields {
@@ -1578,6 +1586,17 @@ fn header_from_full(
     })
 }
 
+/// Layout named by the header. Pre-Deneb has none; trial decoding is not used.
+fn full_body_layout(
+    consensus_version: &str,
+) -> Result<eth_types::BodyForkLayout, BlockServiceError> {
+    eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
+        BlockServiceError::Parse(format!(
+            "full block body is unsupported for consensus version {consensus_version}"
+        ))
+    })
+}
+
 fn blinded_body_layout(
     consensus_version: &str,
 ) -> Result<eth_types::BodyForkLayout, BlockServiceError> {
@@ -1586,6 +1605,19 @@ fn blinded_body_layout(
             "JSON blinded block is unsupported for consensus version {consensus_version}"
         ))
     })
+}
+
+/// `tree_hash` 0.9 of the header must be the block root that was hashed.
+fn require_block_root_matches_header(
+    header: &BeaconBlockHeaderFields,
+    block_root: Root,
+) -> Result<(), BlockServiceError> {
+    if header.object_root() != block_root {
+        return Err(BlockServiceError::Parse(
+            "block root diverged from header object_root".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn header_from_blinded(
@@ -1608,11 +1640,21 @@ fn header_from_blinded(
     })
 }
 
-/// Spec `hash_tree_root(BeaconBlock)` via typed Electra/Deneb body leaf (SEC-6c/6d).
+/// Spec `hash_tree_root(BeaconBlock)` with the header's [`eth_types::BodyForkLayout`].
 ///
-/// **Production root path** for proposal signing (prefer this over
-/// `TreeHash::tree_hash_root`, which panics on malformed body SSZ).
-/// Malformed body SSZ returns [`BlockServiceError::Parse`] rather than panicking.
+/// Production proposal path. Auto-detect would sign a Deneb body under an
+/// Electra or Fulu header. Malformed body SSZ is [`BlockServiceError::Parse`].
+fn compute_block_root_for_layout(
+    block: &eth_types::BeaconBlock,
+    layout: eth_types::BodyForkLayout,
+) -> Result<Root, BlockServiceError> {
+    block.try_tree_hash_root_for_layout(layout).map(|h| h.0).map_err(|e| {
+        BlockServiceError::Parse(format!("invalid block body for tree_hash_root: {e}"))
+    })
+}
+
+/// Auto-detect body fork. Tests only; production uses [`compute_block_root_for_layout`].
+#[cfg(test)]
 fn compute_block_root(block: &eth_types::BeaconBlock) -> Result<Root, BlockServiceError> {
     block.try_tree_hash_root().map(|h| h.0).map_err(|e| {
         BlockServiceError::Parse(format!("invalid block body for tree_hash_root: {e}"))

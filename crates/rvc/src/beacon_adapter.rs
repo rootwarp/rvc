@@ -222,13 +222,7 @@ mod tests {
 
     fn sample_signed_block() -> SignedBeaconBlock {
         SignedBeaconBlock {
-            message: eth_types::BeaconBlock {
-                slot: 100,
-                proposer_index: 42,
-                parent_root: [1u8; 32],
-                state_root: [2u8; 32],
-                body: vec![0xde, 0xad],
-            },
+            message: eth_types::external_vector_deneb_block(),
             signature: vec![0xaa; 96],
         }
     }
