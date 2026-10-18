@@ -41,7 +41,9 @@ pub use keys::{KeysArgs, KeysConfig};
 pub use logfile::{LogfileArgs, LogfileConfig};
 pub use monitoring::{MonitoringArgs, MonitoringConfig};
 pub use network::{NetworkArgs, NetworkConfig};
-pub use proposer_config::{ProposerConfigArgs, ProposerConfigSource};
+pub use proposer_config::{
+    ProposerConfigArgs, ProposerConfigSource, MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS,
+};
 pub use safety::{SafetyArgs, SafetyConfig, SlashedAction};
 pub use secret_provider::{
     GcpSecretArgs, GcpSecretConfig, SecretProviderArgs, SecretProviderConfig,

@@ -11,9 +11,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::ConfigSource;
+
 fn default_proposer_config_refresh_interval() -> u64 {
     384
 }
+
+/// Largest `proposer_config_refresh_interval`, in seconds (24 hours).
+pub const MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS: u64 = 24 * 60 * 60;
 
 /// Clap + serde declaration for the `[proposer_config]` knobs (ADR-008 / A-4.4).
 ///
@@ -76,6 +81,7 @@ impl ProposerConfigArgs {
                 .unwrap_or_else(default_proposer_config_refresh_interval),
             url_token: self.url_token.clone(),
             url_insecure: self.url_insecure.unwrap_or(false),
+            refresh_interval_source: ConfigSource::Default,
         }
     }
 }
@@ -84,7 +90,7 @@ impl ProposerConfigArgs {
 ///
 /// No flat-legacy `#[serde(alias)]` here: those bind inside `[proposer_config]`
 /// (4f SEC).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProposerConfigSource {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -97,7 +103,22 @@ pub struct ProposerConfigSource {
     pub url_token: Option<String>,
     #[serde(default)]
     pub url_insecure: bool,
+    /// Layer that supplied [`Self::refresh_interval`]. Not an operator knob.
+    #[serde(skip)]
+    pub refresh_interval_source: ConfigSource,
 }
+
+impl PartialEq for ProposerConfigSource {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+            && self.file == other.file
+            && self.refresh_interval == other.refresh_interval
+            && self.url_token == other.url_token
+            && self.url_insecure == other.url_insecure
+    }
+}
+
+impl Eq for ProposerConfigSource {}
 
 impl Default for ProposerConfigSource {
     fn default() -> Self {
@@ -107,6 +128,7 @@ impl Default for ProposerConfigSource {
             refresh_interval: default_proposer_config_refresh_interval(),
             url_token: None,
             url_insecure: false,
+            refresh_interval_source: ConfigSource::Default,
         }
     }
 }

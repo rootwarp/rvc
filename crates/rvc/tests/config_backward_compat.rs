@@ -73,6 +73,7 @@ fn expected_production_config() -> Config {
             refresh_interval: 96,
             url_token: Some("prod-token".to_string()),
             url_insecure: false,
+            ..Default::default()
         },
         logfile: LogfileConfig {
             path: Some(PathBuf::from("/var/log/rvc/rvc.log")),

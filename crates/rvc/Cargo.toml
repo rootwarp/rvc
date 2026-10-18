@@ -85,6 +85,12 @@ opentelemetry_sdk.workspace = true
 # ARCH-7b: `start_paused` / `time::pause` for virtual multi-second duty stalls.
 tokio = { workspace = true, features = ["test-util"] }
 wiremock.workspace = true
+rcgen.workspace = true
+# ring only: rustls auto-resolution panics when aws-lc and ring are both
+# unified on, which `--workspace --all-features` does. The HTTPS redirect
+# test installs this provider before `ServerConfig::builder()`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = "0.26"
 criterion.workspace = true
 # Feature-unify `test-utils` onto the crate-under-test so integration tests
 # can enable the feature. Production dependents do not get this line.

@@ -816,7 +816,12 @@ impl Config {
 
         let content = fs::read_to_string(path)?;
         let value: toml::Value = toml::from_str(&content)?;
-        Self::from_toml_value(value)
+        let mut cfg = Self::from_toml_value(value)?;
+        if cfg.proposer_config.refresh_interval != ProposerConfigSource::default().refresh_interval
+        {
+            cfg.proposer_config.refresh_interval_source = ConfigSource::File(path.to_path_buf());
+        }
+        Ok(cfg)
     }
 
     /// Genesis unix time.
@@ -919,6 +924,27 @@ impl Config {
             return Err(ConfigError::MissingField(
                 "--proposer-config-url and --proposer-config-file are mutually exclusive; use only one".to_string(),
             ));
+        }
+        // 0 stays valid when no URL is configured (older configs). A URL uses the
+        // interval, so 0 would panic inside `tokio::time::interval`.
+        if self.proposer_config.url.is_some() && self.proposer_config.refresh_interval == 0 {
+            return Err(ConfigError::Invalid {
+                field: "proposer_config.refresh_interval",
+                message: "must be greater than 0 when proposer_config.url is set".to_string(),
+                source_layer: self.proposer_config.refresh_interval_source.clone(),
+            });
+        }
+        if self.proposer_config.refresh_interval
+            > rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS
+        {
+            return Err(ConfigError::Invalid {
+                field: "proposer_config.refresh_interval",
+                message: format!(
+                    "must be at most {} seconds",
+                    rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS
+                ),
+                source_layer: self.proposer_config.refresh_interval_source.clone(),
+            });
         }
 
         // Broadcast topic values are typed (serde / FromStr). Cross-field rule only:
@@ -1581,6 +1607,7 @@ impl Config {
         }
         if let Some(v) = proposer.proposer_config.refresh_interval {
             self.proposer_config.refresh_interval = v;
+            self.proposer_config.refresh_interval_source = ConfigSource::Cli;
         }
         if let Some(v) = &proposer.proposer_config.url_token {
             self.proposer_config.url_token = Some(v.clone());
@@ -2022,21 +2049,72 @@ fn keystore_declaration(content: &str) -> Option<([u8; crypto::PUBLIC_KEY_BYTES_
     Some((pubkey, false))
 }
 
-/// Redacts credentials from a URL for safe logging.
+/// Redacts credentials, the query, and the fragment from a URL for safe logging.
 ///
-/// If the URL contains a username, both the username and password are replaced
-/// with `***`. Unparseable URLs are returned as-is.
+/// A username or password becomes `***`, including an empty username
+/// (`https://:secret@host`). A query is replaced with `redacted`, including a
+/// query-only string that does not parse. A fragment is dropped. Userinfo on a
+/// string that does not parse is removed.
 pub fn redact_url(raw: &str) -> String {
+    // `user:password@host` parses as scheme `user`. Treat that as userinfo.
+    if bare_userinfo_password(raw) {
+        return redact_unparsed_url(raw);
+    }
     match Url::parse(raw) {
         Ok(mut parsed) => {
-            if !parsed.username().is_empty() {
+            if !parsed.username().is_empty() || parsed.password().is_some() {
                 let _ = parsed.set_username("***");
                 let _ = parsed.set_password(Some("***"));
             }
+            parsed.set_fragment(None);
+            if parsed.query().is_some() {
+                parsed.set_query(None);
+            }
             parsed.to_string()
         }
-        Err(_) => raw.to_string(),
+        Err(_) => redact_unparsed_url(raw),
     }
+}
+
+/// `user:password@host` with no `://`. The `url` crate reads `user` as a scheme.
+fn bare_userinfo_password(raw: &str) -> bool {
+    if raw.contains("://") {
+        return false;
+    }
+    let head = raw.split_once('#').map(|(before, _)| before).unwrap_or(raw);
+    let head = head.split_once('?').map(|(before, _)| before).unwrap_or(head);
+    match head.split_once('@') {
+        Some((userinfo, _)) => userinfo.contains(':'),
+        None => false,
+    }
+}
+
+fn redact_unparsed_url(raw: &str) -> String {
+    let without_fragment = raw.split_once('#').map(|(before, _)| before).unwrap_or(raw);
+    let (head, had_query) = match without_fragment.split_once('?') {
+        Some((before, _)) => (before, true),
+        None => (without_fragment, false),
+    };
+    let head = strip_userinfo(head);
+    if had_query {
+        format!("{head}?redacted")
+    } else {
+        head
+    }
+}
+
+/// Drop `userinfo@` from a string [`Url::parse`] did not accept.
+fn strip_userinfo(raw: &str) -> String {
+    let Some(at) = raw.rfind('@') else {
+        return raw.to_string();
+    };
+    let (prefix, rest) = raw.split_at(at);
+    let host = &rest[1..];
+    let scheme = match prefix.rfind("://") {
+        Some(idx) => &prefix[..idx + 3],
+        None => "",
+    };
+    format!("{scheme}{host}")
 }
 
 #[cfg(test)]
@@ -3729,6 +3807,54 @@ log_level = "info"
     }
 
     #[test]
+    fn test_redact_url_drops_the_query() {
+        let result = redact_url("https://cfg.example/config?token=super-secret&x=1");
+        assert!(!result.contains("super-secret"), "{result}");
+        assert!(!result.contains("token="), "{result}");
+        assert!(result.starts_with("https://cfg.example/config"), "{result}");
+    }
+
+    #[test]
+    fn test_redact_url_query_only_is_not_echoed() {
+        let result = redact_url("?token=super-secret");
+        assert!(!result.contains("super-secret"), "{result}");
+        assert_eq!(result, "?redacted");
+    }
+
+    #[test]
+    fn test_redact_url_masks_password_without_a_scheme() {
+        let result = redact_url("user:s3cret-token@cfg.example/path");
+        assert!(!result.contains("s3cret-token"), "{result}");
+        assert!(!result.contains('@'), "{result}");
+        assert_eq!(result, "cfg.example/path");
+    }
+
+    #[test]
+    fn test_redact_url_masks_password_when_the_user_is_empty() {
+        let result = redact_url("https://:s3cret@cfg.example/path");
+        assert!(!result.contains("s3cret"), "{result}");
+        assert!(result.contains("cfg.example"), "{result}");
+        assert!(result.contains("***"), "{result}");
+    }
+
+    #[test]
+    fn test_redact_url_strips_userinfo_when_unparsed() {
+        let empty_user = redact_url(":s3cret@cfg.example/x");
+        assert!(!empty_user.contains("s3cret"), "{empty_user}");
+        assert_eq!(empty_user, "cfg.example/x");
+    }
+
+    #[test]
+    fn test_redact_url_drops_the_fragment() {
+        let parsed = redact_url("https://cfg.example/config#super-secret");
+        assert!(!parsed.contains("super-secret"), "{parsed}");
+        assert!(!parsed.contains('#'), "{parsed}");
+        let bare = redact_url("not-a-url#super-secret");
+        assert!(!bare.contains("super-secret"), "{bare}");
+        assert_eq!(bare, "not-a-url");
+    }
+
+    #[test]
     fn test_config_from_file_without_key_decrypt_threads() {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
@@ -4345,6 +4471,68 @@ broadcast = ["blocks", "attestations"]
         assert_eq!(config.proposer_config.refresh_interval, 60);
         assert_eq!(config.proposer_config.url_token, Some("my-token".to_string()));
         assert!(config.proposer_config.url_insecure);
+    }
+
+    fn proposer_refresh(url: Option<&str>, interval: u64) -> Config {
+        Config {
+            proposer_config: ProposerConfigSource {
+                url: url.map(str::to_string),
+                refresh_interval: interval,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_validate_proposer_config_refresh_interval_bounds() {
+        let max = rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS;
+        assert!(proposer_refresh(None, 0).validate().is_ok(), "0 without a URL stays valid");
+        let err = proposer_refresh(Some("https://cfg.example/c"), 0)
+            .validate()
+            .expect_err("0 with a URL");
+        let msg = err.to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("greater than 0"), "{msg}");
+        assert!(proposer_refresh(Some("https://cfg.example/c"), max).validate().is_ok());
+        let err = proposer_refresh(None, max + 1).validate().expect_err("max+1");
+        let msg = err.to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("at most"), "{msg}");
+        assert!(msg.contains("from default"), "{msg}");
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+proposer_config_url = "https://cfg.example/c"
+proposer_config_refresh_interval = 0
+"#
+        )
+        .unwrap();
+        let loaded = Config::from_file(file.path()).expect("file");
+        let msg = loaded.validate().expect_err("file interval 0").to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("greater than 0"), "{msg}");
+        assert!(msg.contains("from file"), "{msg}");
+        assert!(msg.contains(&file.path().display().to_string()), "{msg}");
+
+        let from_cli = overlay(|cli| {
+            cli.proposer.proposer_config.url = Some("https://cfg.example/c".to_string());
+            cli.proposer.proposer_config.refresh_interval = Some(0);
+        });
+        let msg = from_cli.validate().expect_err("cli interval 0").to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("greater than 0"), "{msg}");
+        assert!(msg.contains("from cli"), "{msg}");
+
+        let from_cli = overlay(|cli| {
+            cli.proposer.proposer_config.refresh_interval = Some(max + 1);
+        });
+        let msg = from_cli.validate().expect_err("cli max+1").to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("at most"), "{msg}");
+        assert!(msg.contains("from cli"), "{msg}");
     }
 
     // -- RF5-11: typed config enums (fail-early deserialize) --

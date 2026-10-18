@@ -691,9 +691,13 @@ mod config_url {
 
     #[tokio::test]
     async fn refresh_clean_shutdown() {
+        // Accept the TCP handshake and never write a response. Shutdown must
+        // drop the in-flight fetch; the test does not resolve a hostname.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
         let settings = ProposerConfigUrlSettings {
-            url: "http://nonexistent.invalid/config".to_string(),
-            refresh_interval: Duration::from_millis(50),
+            url: format!("http://{addr}/config"),
+            refresh_interval: Duration::from_secs(3600),
             token: None,
             insecure: true,
         };
@@ -710,10 +714,15 @@ mod config_url {
             .await;
         });
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (sock, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+            .await
+            .expect("client connects")
+            .expect("accept");
         shutdown.cancel();
         let result = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        drop(sock);
         assert!(result.is_ok(), "refresh task should shut down within timeout");
+        result.expect("join").expect("refresh task");
     }
 
     #[test]

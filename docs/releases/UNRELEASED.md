@@ -3,6 +3,36 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Proposer-config URL refresh
+
+Shutdown cancels an in-flight proposer-config fetch. Dropping the fetch
+stops this task from waiting on it. A DNS lookup or a connect already
+spawned inside the HTTP stack can outlive that drop until the connect
+timeout or the request deadline. The client uses a 10 second connect
+timeout and a 30 second total deadline. The connect timeout covers DNS,
+TCP, and TLS, not only the TCP handshake. In reqwest 0.12 the 30 second
+deadline covers DNS, connect, TLS, redirects, and the body. There is no
+client-level read timeout. Body reads also use a 10 second idle timeout
+between chunks, re-armed on every chunk, on top of that total deadline. A 4 MiB body needs about 140 KB/s or better
+to finish inside the deadline. A failed fetch is not retried. Responses are
+not decompressed, so `Content-Length` is the wire size. Only a same-origin
+redirect is followed (same scheme, host, and port), in both secure and
+insecure modes. A cross-origin redirect is an error and counts as a refresh
+failure. That includes `https://h:8443` to `http://h:8443` and a redirect
+onto loopback. Redirects do not send `Referer`. Query strings and fragments
+are removed from logged URLs, and query strings are removed from fetch
+errors. A refresh interval of 0 is rejected when a proposer-config URL is
+set, and is still accepted when no URL is configured. The interval cannot
+exceed 24 hours.
+
+A document that names the same validator twice is rejected. That includes
+an exact duplicate JSON key and two spellings of one key (`0x` prefix and
+hex case). No row from that document is applied.
+
+The response body is capped at 4 MiB. A `Content-Length` above the cap is
+rejected before the body is buffered. A chunked body with no
+`Content-Length` is rejected as soon as the bytes read pass the cap.
+
 ## Head capture deadline and concurrent sync contributions
 
 Phase-2 head capture calls Beacon API `GET /eth/v1/beacon/blocks/{slot}/root`
