@@ -173,6 +173,10 @@ pub fn spawn_background_tasks(
                 settings,
                 config_refresh_shutdown,
                 move |fetched| {
+                    // `start_proposer_config_refresh` runs this closure in
+                    // `spawn_blocking`. `apply` waits on `save_lock`, which
+                    // durable writers hold across `write_toml_atomic` and
+                    // `sync_parent_dir`.
                     let mut applier = proposer_config_applier.lock();
                     applier.apply(&validator_store, fetched.updates, fetched.default_update);
                 },

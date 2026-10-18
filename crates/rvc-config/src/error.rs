@@ -6,9 +6,10 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 /// Layer that produced a config value (`defaults < file < CLI`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ConfigSource {
     /// Built-in default.
+    #[default]
     Default,
     /// TOML file at this path.
     File(PathBuf),

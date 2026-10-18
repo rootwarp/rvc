@@ -156,7 +156,6 @@ const UNVALIDATED: &[(&str, &str)] = &[
         "checked via effective_genesis_validators_root(); name not in validate body",
     ),
     ("network.network", "no field-name check in Config::validate"),
-    ("proposer_config.refresh_interval", "no field-name check in Config::validate"),
     ("proposer_config.url_insecure", "no field-name check in Config::validate"),
     ("proposer_config.url_token", "no field-name check in Config::validate"),
     ("safety.allow_unsupported_fork", "no field-name check in Config::validate"),
