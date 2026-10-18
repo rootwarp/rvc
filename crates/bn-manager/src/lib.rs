@@ -1,8 +1,11 @@
 //! Beacon node manager with multi-BN support, failover, and health tracking.
 
+mod admission;
 mod broadcast;
 mod error;
 mod fan_out;
+
+pub use admission::{classify_identity, sync_check_interval_for, ChainIdentity, IdentityClass};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use fan_out::{

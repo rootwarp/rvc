@@ -8,6 +8,7 @@ use eth_types::{
     SignedBlockContentsJson,
 };
 use signer::{BeaconBlockHeaderFields, SignerError};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use validator_store::ValidatorStore;
@@ -414,6 +415,8 @@ pub(crate) struct MockBeaconClient {
     pub(crate) publish_blinded_full_calls: Mutex<Vec<CapturedPublishCall>>,
     pub(crate) envelope_publish_calls: Mutex<Vec<CapturedEnvelopePublish>>,
     pub(crate) call_trace: Arc<Mutex<Vec<&'static str>>>,
+    pub(crate) refuse_admission: bool,
+    pub(crate) revocation: Arc<AtomicU64>,
 }
 
 impl MockBeaconClient {
@@ -437,6 +440,8 @@ impl MockBeaconClient {
             publish_blinded_full_calls: Mutex::new(Vec::new()),
             envelope_publish_calls: Mutex::new(Vec::new()),
             call_trace: Arc::new(Mutex::new(Vec::new())),
+            refuse_admission: false,
+            revocation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -697,6 +702,13 @@ impl MockBeaconClient {
 
 #[async_trait]
 impl BeaconBlockClient for MockBeaconClient {
+    fn duty_fence(&self) -> Result<beacon::DutyFence, BlockServiceError> {
+        if self.refuse_admission {
+            return Err(BlockServiceError::Beacon("no admitted beacon node; duties halted".into()));
+        }
+        Ok(beacon::DutyFence::at(0, Arc::clone(&self.revocation)))
+    }
+
     async fn produce_block_v3(
         &self,
         slot: Slot,

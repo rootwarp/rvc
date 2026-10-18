@@ -20,6 +20,10 @@ pub struct BeaconBlockAdapter(pub Arc<dyn BeaconNodeClient>);
 
 #[async_trait]
 impl BeaconBlockClient for BeaconBlockAdapter {
+    fn duty_fence(&self) -> Result<beacon::DutyFence, BlockServiceError> {
+        self.0.duty_fence().map_err(Into::into)
+    }
+
     async fn produce_block_v3(
         &self,
         slot: Slot,

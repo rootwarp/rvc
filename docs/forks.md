@@ -94,10 +94,10 @@ or to `Electra..Gloas`.
 
 | What | File | Lines | Role |
 |---|---|---|---|
-| Attestation fork + EIP-7549 | `crates/rvc/src/orchestrator/attestation.rs` | 319–320, 412–431 | `from_epoch(target_epoch)`; Electra+ → `SingleAttestation`; exact fork picks `VersionedAttestation::{Electra,Fulu,Gloas}` (not `>= Fulu`). Zeroing only if `zeroes_committee_index`. |
+| Attestation fork + EIP-7549 | `crates/rvc/src/orchestrator/attestation.rs` | 322–323, 415–434 | `from_epoch(target_epoch)`; Electra+ → `SingleAttestation`; exact fork picks `VersionedAttestation::{Electra,Fulu,Gloas}` (not `>= Fulu`). Zeroing only if `zeroes_committee_index`. |
 | Versioned BN wire enums | `crates/beacon/src/types.rs` | 76–99 | `VersionedAttestation` / `VersionedAggregateAttestation` / `VersionedSignedAggregateAndProof` — compile-forced grow-set, each with a **Gloas** arm. |
 | Submit `Eth-Consensus-Version` | `crates/beacon/src/client.rs` | 1403–1413, 1174–1199 | Maps those enums to `"phase0"` / `"electra"` / `"fulu"` / **`"gloas"`**. |
-| Aggregate fork + submit tag | `crates/rvc/src/orchestrator/aggregation.rs` | 84–99, 136–156, 367–372 | Exact Electra/Fulu/Gloas split for the submit tag; `>= Gloas` uses the island root (`sign_and_wrap_gloas`). |
+| Aggregate fork + submit tag | `crates/rvc/src/orchestrator/aggregation.rs` | 84–99, 136–156, 370–375 | Exact Electra/Fulu/Gloas split for the submit tag; `>= Gloas` uses the island root (`sign_and_wrap_gloas`). |
 | EIP-7549 index zeroing | `crates/rvc/src/orchestrator/utils.rs` | 134–136, 162–164 | `zeroes_committee_index`: **`(Electra..Gloas).contains(&fork)`**. Assignment at 163. Shared by attestation and aggregation. |
 | Electra+ attestation wire | `crates/rvc/src/orchestrator/utils.rs` | 143–145 | `uses_electra_attestation_wire`: open-ended `>= Electra` so Gloas keeps `SingleAttestation`. Not the zeroing predicate. |
 | Domain / signing root | `crates/crypto/src/signing_root.rs` | 264–266 | `fork_version_at` = `from_epoch` → `fork_version`. |
@@ -121,8 +121,8 @@ inventory in [gloas-fork-hazard-audit.md](gloas-fork-hazard-audit.md)):
 | Coordinator attestation offset | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 162–165, 587–589 | `from_epoch` then `for_fork`; one resolved fork per slot. |
 | PTC phase | `crates/rvc/src/orchestrator/coordinator/mod.rs` | 1479–1514 | `run_payload_attestation_phase`: open-ended `>= Gloas` waits then calls `crates/rvc/src/orchestrator/payload_attestation.rs`. |
 | Legacy proposer ops | `crates/builder/src/service.rs` | 26–28 | `legacy_proposer_ops_retired`: `>= Gloas` retires `prepare_beacon_proposer` / `register_validator`. |
-| Signer header RPC | `crates/signer/src/lib.rs` | 953 | `>= Gloas` uses `SignBlockHeader` (no Gloas body SSZ into a legacy decoder). |
-| Signer aggregate RPC | `crates/signer/src/lib.rs` | 1229, 1283 | `>= Gloas` rejects legacy `sign_aggregate_and_proof` / `sign_electra_aggregate_and_proof` (`UnsupportedDuty`); Gloas signs via the root RPC (`sign_aggregate_and_proof_root` 1248). |
+| Signer header RPC | `crates/signer/src/lib.rs` | 988 | `>= Gloas` uses `SignBlockHeader` (no Gloas body SSZ into a legacy decoder). |
+| Signer aggregate RPC | `crates/signer/src/lib.rs` | 1264, 1318 | `>= Gloas` rejects legacy `sign_aggregate_and_proof` / `sign_electra_aggregate_and_proof` (`UnsupportedDuty`); Gloas signs via the root RPC (`sign_aggregate_and_proof_root` 1283). |
 | Typed-signer aggregate reject | `crates/crypto/src/typed_signer.rs` | 342, 361 | Same `>= Gloas` `UnsupportedDuty` on the local typed path. |
 | DVT peer Gloas RPC | `crates/signer-server/src/dvt/peer_client.rs` | 210–212 | Same open-ended `>= Gloas` as the gRPC client. |
 

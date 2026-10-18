@@ -1,5 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -102,6 +103,18 @@ pub const DEFAULT_SSE_TOPICS: &[&str] = &["head", "block", "chain_reorg", "final
 /// Maximum consecutive connection failures before falling back to polling.
 const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
+/// Retry delay when the fallback poll interval is zero (slot duration unknown).
+///
+/// A zero interval used to wait on shutdown, so a single beacon node stopped
+/// for good after [`MAX_CONSECUTIVE_FAILURES`]. This backoff is not a slot.
+const ZERO_POLL_RETRY: Duration = Duration::from_millis(200);
+
+/// How often a connected stream with no bytes re-reads the admission generation.
+///
+/// A revoke during connect, or a silent socket after the revoke, has no chunk
+/// on which to notice the generation move. This poll is that notice.
+const SILENT_ADMISSION_POLL: Duration = Duration::from_millis(200);
+
 /// Bounded channel capacity for the callback dispatch queue (H-11).
 const SSE_CALLBACK_CHANNEL_CAPACITY: usize = 64;
 
@@ -121,6 +134,13 @@ pub struct SseConfig {
     /// this size. A frame that would grow past it closes the connection.
     /// Default: 64 KiB.
     pub max_event_bytes: usize,
+    pub poll_interval: Duration,
+}
+
+struct AdmittedSseEvent {
+    index: usize,
+    generation: u64,
+    event: SseEvent,
 }
 
 impl SseConfig {
@@ -129,7 +149,13 @@ impl SseConfig {
             endpoint,
             topics: DEFAULT_SSE_TOPICS.iter().map(|s| s.to_string()).collect(),
             max_event_bytes: DEFAULT_MAX_SSE_EVENT_BYTES,
+            poll_interval: Duration::ZERO,
         }
+    }
+
+    pub fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
     }
 }
 
@@ -149,7 +175,8 @@ fn forward_sse_message(
     endpoint: &str,
     msg: &SseMessage,
     max_event_bytes: usize,
-    tx: &tokio::sync::mpsc::Sender<SseEvent>,
+    tx: &tokio::sync::mpsc::Sender<AdmittedSseEvent>,
+    stamp: (usize, u64),
     consecutive_failures: &mut u32,
     events_since_reconnect: &mut u64,
 ) -> bool {
@@ -185,7 +212,8 @@ fn forward_sse_message(
                 SseEvent::FinalizedCheckpoint(_) => "",
             };
             trace!(event_type = %msg.event, slot = slot, "SSE event received");
-            match tx.try_send(sse_event) {
+            let (index, generation) = stamp;
+            match tx.try_send(AdmittedSseEvent { index, generation, event: sse_event }) {
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) => {
                     warn!("SSE callback channel full; dropping event");
@@ -241,7 +269,8 @@ fn content_type_is_event_stream(value: &reqwest::header::HeaderValue) -> bool {
 /// - Auto-reconnects on connection drop.
 /// - Supports failover to secondary endpoints when multiple configs are provided.
 /// - Falls back to polling after `MAX_CONSECUTIVE_FAILURES` consecutive connection failures
-///   on the current endpoint before switching to the next one.
+///   on the current endpoint before switching to the next one. A zero poll interval
+///   retries after [`ZERO_POLL_RETRY`] instead of waiting for shutdown.
 /// - Stops when `shutdown` resolves.
 pub async fn subscribe_events<F>(
     configs: Vec<SseConfig>,
@@ -251,7 +280,8 @@ pub async fn subscribe_events<F>(
     F: Fn(SseEvent) + Send + Sync + 'static,
 {
     let admitted = Arc::new((0..configs.len()).map(|_| AtomicBool::new(true)).collect::<Vec<_>>());
-    subscribe_events_admitted(configs, admitted, callback, shutdown).await
+    let generations = Arc::new((0..configs.len()).map(|_| AtomicU64::new(0)).collect::<Vec<_>>());
+    subscribe_events_admitted(configs, admitted, generations, callback, shutdown).await
 }
 
 /// [`subscribe_events`], skipping any endpoint whose flag is `false`.
@@ -262,8 +292,35 @@ pub async fn subscribe_events<F>(
 pub async fn subscribe_events_admitted<F>(
     configs: Vec<SseConfig>,
     admitted: Arc<Vec<AtomicBool>>,
+    generations: Arc<Vec<AtomicU64>>,
+    callback: F,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) where
+    F: Fn(SseEvent) + Send + Sync + 'static,
+{
+    subscribe_events_admitted_inner(
+        configs,
+        admitted,
+        generations,
+        callback,
+        shutdown,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn subscribe_events_admitted_inner<F>(
+    configs: Vec<SseConfig>,
+    admitted: Arc<Vec<AtomicBool>>,
+    generations: Arc<Vec<AtomicU64>>,
     callback: F,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    mut chunk_progress: Option<tokio::sync::watch::Sender<usize>>,
+    before_callback: Option<Arc<tokio::sync::Notify>>,
+    decided: Option<tokio::sync::watch::Sender<usize>>,
 ) where
     F: Fn(SseEvent) + Send + Sync + 'static,
 {
@@ -278,10 +335,27 @@ pub async fn subscribe_events_admitted<F>(
 
     // H-11: bounded callback dispatch channel — producer is the event loop,
     // consumer is a dedicated task so a slow callback never blocks the loop.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<SseEvent>(SSE_CALLBACK_CHANNEL_CAPACITY);
+    let (tx, mut rx) =
+        tokio::sync::mpsc::channel::<AdmittedSseEvent>(SSE_CALLBACK_CHANNEL_CAPACITY);
+    let consumer_admitted = Arc::clone(&admitted);
+    let consumer_generations = Arc::clone(&generations);
     tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            callback(event);
+        while let Some(tagged) = rx.recv().await {
+            let still = consumer_admitted
+                .get(tagged.index)
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+                && consumer_generations.get(tagged.index).is_some_and(|generation| {
+                    generation.load(Ordering::Acquire) == tagged.generation
+                });
+            if still {
+                if let Some(gate) = &before_callback {
+                    gate.notified().await;
+                }
+                callback(tagged.event);
+            }
+            if let Some(decided) = &decided {
+                decided.send_modify(|count| *count += 1);
+            }
         }
     });
 
@@ -301,6 +375,14 @@ pub async fn subscribe_events_admitted<F>(
 
     let endpoint_admitted =
         |index: usize| admitted.get(index).is_some_and(|flag| flag.load(Ordering::Acquire));
+    let generation_of = |index: usize| {
+        generations.get(index).map(|generation| generation.load(Ordering::Acquire)).unwrap_or(0)
+    };
+    let note_chunk = |progress: &mut Option<tokio::sync::watch::Sender<usize>>| {
+        if let Some(progress) = progress {
+            progress.send_modify(|count| *count += 1);
+        }
+    };
 
     loop {
         if *shutdown.borrow() {
@@ -352,12 +434,26 @@ pub async fn subscribe_events_admitted<F>(
                 failures = consecutive_failures,
                 "SSE max failures reached, falling back to polling"
             );
+            let poll = configs[current_idx].poll_interval;
+            if poll.is_zero() {
+                warn!("SSE poll interval is zero; retrying the stream after a short backoff");
+                tokio::select! {
+                    _ = shutdown.changed() => {
+                        info!("SSE subscriber shutting down during polling fallback");
+                        return;
+                    }
+                    _ = tokio::time::sleep(ZERO_POLL_RETRY) => {
+                        consecutive_failures = 0;
+                        continue;
+                    }
+                }
+            }
             tokio::select! {
                 _ = shutdown.changed() => {
                     info!("SSE subscriber shutting down during polling fallback");
                     return;
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(12)) => {
+                _ = tokio::time::sleep(poll) => {
                     // Don't reset counter here — require actual events to confirm BN recovery
                     consecutive_failures = 0;
                     continue;
@@ -379,6 +475,9 @@ pub async fn subscribe_events_admitted<F>(
 
         events_since_reconnect = 0;
         let endpoint = config.endpoint.as_str();
+        // Sample before the request. A revoke during `send` must not be
+        // recorded as the generation this socket connected at.
+        let connected_generation = generation_of(current_idx);
 
         let request = client.get(&url).header(ACCEPT, "text/event-stream").send();
         let response = tokio::select! {
@@ -451,57 +550,87 @@ pub async fn subscribe_events_admitted<F>(
 
         let mut framer = SseFramer::new(max_event_bytes);
         loop {
-            if !endpoint_admitted(current_idx) {
-                break;
-            }
             let chunk = tokio::select! {
                 _ = shutdown.changed() => {
                     info!("SSE subscriber shutting down");
                     return;
                 }
-                chunk = resp.chunk() => chunk,
+                chunk = resp.chunk() => Some(chunk),
+                _ = tokio::time::sleep(SILENT_ADMISSION_POLL) => {
+                    if generation_of(current_idx) != connected_generation {
+                        None
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            let Some(chunk) = chunk else {
+                consecutive_failures += 1;
+                break;
             };
             let reconnect = match chunk {
-                Ok(Some(bytes)) => match framer.push(&bytes, |msg| {
-                    forward_sse_message(
-                        endpoint,
-                        &msg,
-                        max_event_bytes,
-                        &tx,
-                        &mut consecutive_failures,
-                        &mut events_since_reconnect,
-                    )
-                }) {
-                    Ok(keep_going) => !keep_going,
-                    Err(err) => {
-                        warn!(
-                            bn_url = %RedactedUrl(endpoint),
-                            error = %err,
-                            cap = max_event_bytes,
-                            "SSE frame rejected; closing connection"
-                        );
+                Ok(Some(bytes)) => {
+                    note_chunk(&mut chunk_progress);
+                    // Generation first: a revoke bumps the epoch and clears the
+                    // flag. Checking the flag first drops the chunk and stays
+                    // on the revoked socket, so a later admitted node is never
+                    // reached. A generation move reconnects (and fails over
+                    // when this endpoint is no longer admitted).
+                    let generation_moved = generation_of(current_idx) != connected_generation;
+                    if generation_moved {
                         true
+                    } else if !endpoint_admitted(current_idx) {
+                        false
+                    } else {
+                        match framer.push(&bytes, |msg| {
+                            forward_sse_message(
+                                endpoint,
+                                &msg,
+                                max_event_bytes,
+                                &tx,
+                                (current_idx, connected_generation),
+                                &mut consecutive_failures,
+                                &mut events_since_reconnect,
+                            )
+                        }) {
+                            Ok(keep_going) => !keep_going,
+                            Err(err) => {
+                                warn!(
+                                    bn_url = %RedactedUrl(endpoint),
+                                    error = %err,
+                                    cap = max_event_bytes,
+                                    "SSE frame rejected; closing connection"
+                                );
+                                true
+                            }
+                        }
                     }
-                },
+                }
                 Ok(None) => {
+                    note_chunk(&mut chunk_progress);
                     // Flush a line that ended with a lone `\r` at EOF before
                     // treating the stream as closed.
-                    if let Err(err) = framer.finish(|msg| {
-                        forward_sse_message(
-                            endpoint,
-                            &msg,
-                            max_event_bytes,
-                            &tx,
-                            &mut consecutive_failures,
-                            &mut events_since_reconnect,
-                        )
-                    }) {
-                        warn!(
-                            bn_url = %RedactedUrl(endpoint),
-                            error = %err,
-                            cap = max_event_bytes,
-                            "SSE frame rejected; closing connection"
-                        );
+                    if endpoint_admitted(current_idx)
+                        && generation_of(current_idx) == connected_generation
+                    {
+                        if let Err(err) = framer.finish(|msg| {
+                            forward_sse_message(
+                                endpoint,
+                                &msg,
+                                max_event_bytes,
+                                &tx,
+                                (current_idx, connected_generation),
+                                &mut consecutive_failures,
+                                &mut events_since_reconnect,
+                            )
+                        }) {
+                            warn!(
+                                bn_url = %RedactedUrl(endpoint),
+                                error = %err,
+                                cap = max_event_bytes,
+                                "SSE frame rejected; closing connection"
+                            );
+                        }
                     }
                     warn!(
                         bn_url = %RedactedUrl(endpoint),
@@ -1545,12 +1674,6 @@ mod tests {
         )
     }
 
-    fn reorg_frame(slot: &str) -> String {
-        format!(
-            "event: chain_reorg\ndata: {{\"slot\":\"{slot}\",\"depth\":\"1\",\"old_head_block\":\"0x01\",\"new_head_block\":\"0x02\",\"old_head_state\":\"0x03\",\"new_head_state\":\"0x04\",\"epoch\":\"1\",\"execution_optimistic\":false}}\n\n"
-        )
-    }
-
     /// Chunked SSE server. Each body is one HTTP chunk. `release` gates every body after the first.
     async fn gated_sse_server(
         bodies: Vec<String>,
@@ -1620,11 +1743,13 @@ mod tests {
             gated_sse_server(vec![head_frame("2")], Arc::clone(&hold)).await;
         let admitted =
             Arc::new(vec![AtomicBool::new(true), AtomicBool::new(false), AtomicBool::new(true)]);
+        let generations = Arc::new(vec![AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)]);
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_cb = Arc::clone(&events);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn({
             let admitted = Arc::clone(&admitted);
+            let generations = Arc::clone(&generations);
             async move {
                 subscribe_events_admitted(
                     vec![
@@ -1633,6 +1758,7 @@ mod tests {
                         SseConfig::new(healthy_url),
                     ],
                     admitted,
+                    generations,
                     move |event| {
                         events_cb.lock().unwrap().push(event);
                     },
@@ -1677,30 +1803,279 @@ mod tests {
         healthy_server.abort();
     }
 
-    #[tokio::test]
-    async fn sse_drops_chunks_after_admission_is_revoked() {
-        use std::sync::Mutex;
+    struct SseProbe {
+        release: tokio::sync::mpsc::Sender<()>,
+        written: tokio::sync::watch::Receiver<usize>,
+        progress: tokio::sync::watch::Receiver<usize>,
+        decided: tokio::sync::watch::Receiver<usize>,
+        events: Arc<std::sync::Mutex<Vec<SseEvent>>>,
+        admitted: Arc<Vec<AtomicBool>>,
+        generations: Arc<Vec<AtomicU64>>,
+        shutdown: tokio::sync::watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+        server: tokio::task::JoinHandle<()>,
+        gate: Arc<tokio::sync::Notify>,
+    }
 
-        let release = Arc::new(AtomicBool::new(false));
-        let (url, _hits, server) = gated_sse_server(
-            vec![
-                head_frame("1"),
-                head_frame("2"),
-                format!("{}{}", head_frame("3"), reorg_frame("3")),
-            ],
-            Arc::clone(&release),
+    impl SseProbe {
+        async fn start(frames: Vec<String>, hold: bool) -> Self {
+            use std::sync::Mutex;
+            use tokio::io::AsyncWriteExt;
+            use tokio::net::TcpListener;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (release, mut release_rx) = tokio::sync::mpsc::channel::<()>(4);
+            let (written_tx, written) = tokio::sync::watch::channel(0usize);
+            let server = tokio::spawn(async move {
+                let Ok((mut stream, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 1024];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                let _ = stream.write_all(headers.as_bytes()).await;
+                for (index, body) in frames.iter().enumerate() {
+                    if index > 0 && release_rx.recv().await.is_none() {
+                        return;
+                    }
+                    let chunk = format!("{:x}\r\n{body}\r\n", body.len());
+                    let _ = stream.write_all(chunk.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    written_tx.send_modify(|count| *count += 1);
+                }
+                let _ = release_rx.recv().await;
+            });
+            let admitted = Arc::new(vec![AtomicBool::new(true)]);
+            let generations = Arc::new(vec![AtomicU64::new(0)]);
+            let (progress_tx, progress) = tokio::sync::watch::channel(0usize);
+            let (decided_tx, decided) = tokio::sync::watch::channel(0usize);
+            let gate = Arc::new(tokio::sync::Notify::new());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let events_cb = Arc::clone(&events);
+            let (shutdown, shutdown_rx) = tokio::sync::watch::channel(false);
+            let handle = tokio::spawn({
+                let admitted = Arc::clone(&admitted);
+                let generations = Arc::clone(&generations);
+                let gate = Arc::clone(&gate);
+                async move {
+                    subscribe_events_admitted_inner(
+                        vec![SseConfig::new(format!("http://127.0.0.1:{port}"))],
+                        admitted,
+                        generations,
+                        move |event| events_cb.lock().unwrap().push(event),
+                        shutdown_rx,
+                        Some(progress_tx),
+                        hold.then_some(gate),
+                        hold.then_some(decided_tx),
+                    )
+                    .await;
+                }
+            });
+            Self {
+                release,
+                written,
+                progress,
+                decided,
+                events,
+                admitted,
+                generations,
+                shutdown,
+                handle,
+                server,
+                gate,
+            }
+        }
+
+        async fn until(&mut self, written: usize, progress: usize) {
+            let _ = self.written.wait_for(|count| *count >= written).await;
+            let _ = self.progress.wait_for(|count| *count >= progress).await;
+        }
+
+        fn revoke(&self, bump: bool) {
+            self.admitted[0].store(false, Ordering::Release);
+            if bump {
+                self.generations[0].fetch_add(1, Ordering::Release);
+            }
+        }
+
+        async fn finish(self) -> Vec<SseEvent> {
+            self.shutdown.send(true).unwrap();
+            let _ = self.handle.await;
+            self.server.abort();
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sse_drops_the_first_chunk_after_admission_is_revoked() {
+        let mut probe =
+            SseProbe::start(vec![head_frame("1"), head_frame("2"), head_frame("3")], false).await;
+        probe.until(1, 1).await;
+        probe.revoke(false);
+        probe.release.send(()).await.unwrap();
+        probe.until(2, 2).await;
+        probe.release.send(()).await.unwrap();
+        probe.until(3, 3).await;
+        let delivered = probe.finish().await;
+        assert!(
+            delivered.iter().any(|event| matches!(event, SseEvent::Head(head) if head.slot == "1")),
+            "{delivered:?}"
+        );
+        assert!(delivered.iter().all(|event| !matches!(event, SseEvent::Head(head) if head.slot == "2" || head.slot == "3")), "{delivered:?}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sse_drops_queued_events_after_revocation() {
+        let mut probe = SseProbe::start(vec![head_frame("1"), head_frame("2")], true).await;
+        probe.until(1, 1).await;
+        probe.release.send(()).await.unwrap();
+        probe.until(2, 2).await;
+        probe.revoke(true);
+        probe.gate.notify_one();
+        // One wake covers the event that was already past the stamp check.
+        // A missing stamp check waits on the gate again and this timeout fires.
+        let decided = tokio::time::timeout(
+            Duration::from_secs(2),
+            probe.decided.wait_for(|count| *count >= 2),
         )
         .await;
-        let admitted = Arc::new(vec![AtomicBool::new(true)]);
+        assert!(
+            decided.is_ok(),
+            "a revoked queued event must be dropped without another callback wake"
+        );
+        drop(decided);
+        let delivered = probe.finish().await;
+        assert!(
+            delivered
+                .iter()
+                .all(|event| !matches!(event, SseEvent::Head(head) if head.slot == "2")),
+            "{delivered:?}"
+        );
+    }
+
+    /// Advance paused time until `pred` is true. Production reconnect and
+    /// zero-poll backoff are `tokio::time::sleep`, so the test does not sleep
+    /// on the wall clock.
+    async fn spin_until(mut pred: impl FnMut() -> bool) -> bool {
+        for _ in 0..50 {
+            for _ in 0..25 {
+                tokio::task::yield_now().await;
+            }
+            if pred() {
+                return true;
+            }
+            tokio::time::advance(Duration::from_millis(500)).await;
+        }
+        false
+    }
+
+    async fn one_shot_sse(
+        frames: Vec<String>,
+    ) -> (
+        String,
+        tokio::sync::mpsc::Sender<()>,
+        tokio::sync::watch::Receiver<usize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release_tx, mut release_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let (written_tx, written) = tokio::sync::watch::channel(0usize);
+        let server = tokio::spawn(async move {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 2048];
+            let _ = AsyncReadExt::read(&mut stream, &mut buf).await;
+            let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+            let _ = stream.write_all(headers.as_bytes()).await;
+            for (index, body) in frames.iter().enumerate() {
+                if index > 0 && release_rx.recv().await.is_none() {
+                    return;
+                }
+                let chunk = format!("{:x}\r\n{body}\r\n", body.len());
+                let _ = stream.write_all(chunk.as_bytes()).await;
+                let _ = stream.flush().await;
+                written_tx.send_modify(|count| *count += 1);
+            }
+            std::future::pending::<()>().await;
+        });
+        (format!("http://127.0.0.1:{port}"), release_tx, written, server)
+    }
+
+    /// First `failures` connections answer 503. The next one is an SSE head.
+    async fn status_then_head(
+        failures: usize,
+        slot: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = head_frame(slot);
+        let server = tokio::spawn(async move {
+            let mut seen = 0usize;
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                seen += 1;
+                let fail = seen <= failures;
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = AsyncReadExt::read(&mut stream, &mut buf).await;
+                    if fail {
+                        let _ = stream
+                            .write_all(
+                                b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
+                            .await;
+                        return;
+                    }
+                    let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                    let chunk = format!("{:x}\r\n{body}\r\n", body.len());
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let _ = stream.write_all(chunk.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), server)
+    }
+
+    fn stop_subscriber(
+        shutdown: tokio::sync::watch::Sender<bool>,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        shutdown.send(true).unwrap();
+        handle.abort();
+    }
+
+    /// A revoke that bumps the generation must leave the socket and deliver a
+    /// later admitted node's head. The post-revoke chunk on the old socket
+    /// is not delivered.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn sse_generation_revoke_fails_over_to_the_next_admitted_node() {
+        use std::sync::Mutex;
+
+        let (revoked_url, release, written, revoked_server) =
+            one_shot_sse(vec![head_frame("1"), head_frame("2")]).await;
+        let (next_url, next_server) = status_then_head(0, "9").await;
+        let admitted = Arc::new(vec![AtomicBool::new(true), AtomicBool::new(true)]);
+        let generations = Arc::new(vec![AtomicU64::new(1), AtomicU64::new(0)]);
         let events = Arc::new(Mutex::new(Vec::new()));
         let events_cb = Arc::clone(&events);
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let handle = tokio::spawn({
             let admitted = Arc::clone(&admitted);
+            let generations = Arc::clone(&generations);
             async move {
                 subscribe_events_admitted(
-                    vec![SseConfig::new(url)],
+                    vec![SseConfig::new(revoked_url), SseConfig::new(next_url)],
                     admitted,
+                    generations,
                     move |event| {
                         events_cb.lock().unwrap().push(event);
                     },
@@ -1710,36 +2085,224 @@ mod tests {
             }
         });
 
-        for _ in 0..40 {
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            if events
+        let saw_first = spin_until(|| {
+            *written.borrow() >= 1
+                && events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event, SseEvent::Head(head) if head.slot == "1"))
+        })
+        .await;
+        assert!(saw_first, "the first head must arrive before the revoke");
+
+        admitted[0].store(false, Ordering::Release);
+        generations[0].fetch_add(1, Ordering::Release);
+        release.send(()).await.unwrap();
+
+        let saw_failover = spin_until(|| {
+            events
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|event| matches!(event, SseEvent::Head(head) if head.slot == "1"))
-            {
-                break;
-            }
-        }
-        admitted[0].store(false, Ordering::Release);
-        release.store(true, Ordering::Release);
-        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-
+                .any(|event| matches!(event, SseEvent::Head(head) if head.slot == "9"))
+        })
+        .await;
         let delivered = events.lock().unwrap().clone();
+        assert!(saw_failover, "a generation revoke must fail over: {delivered:?}");
         assert!(
-            delivered.iter().any(|event| matches!(event, SseEvent::Head(head) if head.slot == "1")),
-            "the chunk read while admitted must be delivered: {delivered:?}"
+            delivered
+                .iter()
+                .all(|event| !matches!(event, SseEvent::Head(head) if head.slot == "2")),
+            "the post-revoke chunk must not be delivered: {delivered:?}"
         );
+
+        stop_subscriber(shutdown_tx, handle);
+        revoked_server.abort();
+        next_server.abort();
+    }
+
+    /// Poll interval 0 used to wait on shutdown after max failures. The stream
+    /// must back off [`ZERO_POLL_RETRY`] and deliver a head once the node accepts.
+    ///
+    /// The gap between the last failing accept and the successful one includes
+    /// the reconnect sleep plus that backoff. Dropping the backoff leaves only
+    /// the reconnect sleep, and this assertion fails.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn sse_zero_poll_retries_after_max_connection_failures() {
+        use std::sync::Mutex;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let failures = MAX_CONSECUTIVE_FAILURES as usize;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = head_frame("7");
+        let accepts = Arc::new(Mutex::new(Vec::<tokio::time::Instant>::new()));
+        let server = tokio::spawn({
+            let accepts = Arc::clone(&accepts);
+            async move {
+                let mut seen = 0usize;
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    accepts.lock().unwrap().push(tokio::time::Instant::now());
+                    seen += 1;
+                    let fail = seen <= failures;
+                    let body = body.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 2048];
+                        let _ = AsyncReadExt::read(&mut stream, &mut buf).await;
+                        if fail {
+                            let _ = stream
+                                .write_all(
+                                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
+                                .await;
+                            return;
+                        }
+                        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                        let chunk = format!("{:x}\r\n{body}\r\n", body.len());
+                        let _ = stream.write_all(headers.as_bytes()).await;
+                        let _ = stream.write_all(chunk.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            }
+        });
+        let admitted = Arc::new(vec![AtomicBool::new(true)]);
+        let generations = Arc::new(vec![AtomicU64::new(0)]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_cb = Arc::clone(&events);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let mut config = SseConfig::new(format!("http://127.0.0.1:{port}"));
+        config.poll_interval = Duration::ZERO;
+        let handle = tokio::spawn(async move {
+            subscribe_events_admitted(
+                vec![config],
+                admitted,
+                generations,
+                move |event| {
+                    events_cb.lock().unwrap().push(event);
+                },
+                shutdown_rx,
+            )
+            .await;
+        });
+
+        let saw = spin_until(|| {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, SseEvent::Head(head) if head.slot == "7"))
+        })
+        .await;
+        let delivered = events.lock().unwrap().clone();
+        assert!(saw, "zero poll must retry after max failures: {delivered:?}");
+        let stamps = accepts.lock().unwrap().clone();
         assert!(
-            delivered.iter().all(|event| match event {
-                SseEvent::Head(head) => head.slot != "3",
-                SseEvent::ChainReorg(reorg) => reorg.slot != "3",
-                SseEvent::Block(_) | SseEvent::FinalizedCheckpoint(_) => true,
-            }),
-            "the chunk after admission is revoked must be dropped: {delivered:?}"
+            stamps.len() > failures,
+            "the retry must connect after {failures} failures: {stamps:?}"
         );
-        shutdown_tx.send(true).unwrap();
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        let gap = stamps[failures].saturating_duration_since(stamps[failures - 1]);
+        assert!(
+            gap >= Duration::from_millis(500) + ZERO_POLL_RETRY,
+            "removing ZERO_POLL_RETRY leaves only the reconnect sleep: gap {gap:?}"
+        );
+
+        stop_subscriber(shutdown_tx, handle);
         server.abort();
+    }
+
+    /// Headers stay unwritten until `release`. A revoke during that connect
+    /// has no body byte. The subscriber must still leave for the next node.
+    async fn hold_before_headers() -> (
+        String,
+        tokio::sync::watch::Receiver<usize>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (accepted_tx, accepted) = tokio::sync::watch::channel(0usize);
+        let server = tokio::spawn({
+            let release = Arc::clone(&release);
+            async move {
+                loop {
+                    let Ok((mut stream, _)) = listener.accept().await else {
+                        break;
+                    };
+                    accepted_tx.send_modify(|count| *count += 1);
+                    let release = Arc::clone(&release);
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 2048];
+                        let _ = AsyncReadExt::read(&mut stream, &mut buf).await;
+                        release.notified().await;
+                        let headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+                        let _ = stream.write_all(headers.as_bytes()).await;
+                        let _ = stream.flush().await;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), accepted, release, server)
+    }
+
+    /// Generation is sampled before the request. A revoke while the connect is
+    /// still waiting for headers, with no later body, must fail over.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn sse_silent_revoke_during_connect_fails_over() {
+        use std::sync::Mutex;
+        let (revoked_url, accepted, release, revoked_server) = hold_before_headers().await;
+        let (next_url, next_server) = status_then_head(0, "9").await;
+        let admitted = Arc::new(vec![AtomicBool::new(true), AtomicBool::new(true)]);
+        let generations = Arc::new(vec![AtomicU64::new(1), AtomicU64::new(0)]);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_cb = Arc::clone(&events);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn({
+            let admitted = Arc::clone(&admitted);
+            let generations = Arc::clone(&generations);
+            async move {
+                subscribe_events_admitted(
+                    vec![SseConfig::new(revoked_url), SseConfig::new(next_url)],
+                    admitted,
+                    generations,
+                    move |event| {
+                        events_cb.lock().unwrap().push(event);
+                    },
+                    shutdown_rx,
+                )
+                .await;
+            }
+        });
+
+        let connected = spin_until(|| *accepted.borrow() >= 1).await;
+        assert!(connected, "the first connect must be in flight before the revoke");
+        admitted[0].store(false, Ordering::Release);
+        generations[0].fetch_add(1, Ordering::Release);
+        release.notify_one();
+
+        let saw_failover = spin_until(|| {
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, SseEvent::Head(head) if head.slot == "9"))
+        })
+        .await;
+        let delivered = events.lock().unwrap().clone();
+        assert!(saw_failover, "a silent revoke during connect must fail over: {delivered:?}");
+
+        stop_subscriber(shutdown_tx, handle);
+        revoked_server.abort();
+        next_server.abort();
     }
 }

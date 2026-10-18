@@ -166,6 +166,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_attesting_enabled",
     "rvc_blob_sidecars_published_total", // operator-facing: pre-Gloas JSON or SSZ SignedBlockContents publishes (RR-1.2)
     "rvc_block_shape_rejections_total", // operator-facing: produced blocks rejected by selection mode; labels mode, shape (#647)
+    "rvc_bn_admitted", // operator-facing: 1 while the beacon node may serve duties (#707)
     "rvc_bn_broadcast_drain_health_skipped_total", // operator-facing: success skipped at the cap, or any sample when the recorder queue is full; the publish still runs (#639)
     "rvc_bn_broadcast_overflow_drains", // operator-facing: in-flight overflow publishes by redacted endpoint; drops when the HTTP call finishes (#639)
     "rvc_bn_capability_state",
@@ -329,8 +330,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        66,
-        "#705 adds the detection latch gauge and the marker-write failure counter"
+        67,
+        "#705 adds the detection latch gauge and the marker-write failure counter; #707 adds rvc_bn_admitted"
     );
 }
 

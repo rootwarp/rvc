@@ -117,8 +117,7 @@ async fn test_maybe_propose_block_bad_proposer_index_drops_duty() {
     ));
 
     // Invoke the proposer path directly.
-    let ctx =
-        SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
+    let ctx = SlotContext::bare(slot, epoch);
     orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     // H-4: a forged proposer_index must drop the duty before any
@@ -230,8 +229,7 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
         pubkey_map,
     ));
 
-    let ctx =
-        SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
+    let ctx = SlotContext::bare(slot, epoch);
     orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
     // D-3: the block must NOT be proposed when is_signing_enabled=false.
@@ -647,7 +645,7 @@ async fn test_successful_proposal_increments_success_outcome() {
             proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS);
         let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
 
-        let ctx = SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
+        let ctx = SlotContext::bare(slot, epoch);
         orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
         assert!(published.load(Ordering::SeqCst), "success path must publish");
@@ -738,7 +736,7 @@ async fn test_failed_proposal_increments_failed_outcome() {
             proposal_outcome_count(block_service::metrics::proposal_outcome::SUCCESS);
         let before_failed = proposal_outcome_count(block_service::metrics::proposal_outcome::FAILED);
 
-        let ctx = SlotContext { slot, epoch, parent_root: None, expected_parents: None, head_root: None };
+        let ctx = SlotContext::bare(slot, epoch);
         orchestrator.maybe_propose_block(slot, epoch, &ctx, None).await;
 
         assert_eq!(

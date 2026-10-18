@@ -198,16 +198,32 @@ impl AggregationService {
             }
         }
 
-        let selection_proof = match self
-            .signer
-            .sign_selection_proof(
-                slot,
-                &pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            )
-            .instrument(agg_span.clone())
-            .await
+        let fence = match self.beacon.admission_duty_fence() {
+            Ok(fence)
+                if !super::slot_context::admission_blocks(
+                    signer::SigningDuty::SelectionProof,
+                    &[&fence],
+                ) =>
+            {
+                fence
+            }
+            _ => {
+                warn!(slot, "skipping aggregation: beacon node admission revoked");
+                return None;
+            }
+        };
+        let selection_proof = match super::slot_context::under_admission(
+            &fence,
+            self.signer
+                .sign_selection_proof(
+                    slot,
+                    &pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .instrument(agg_span.clone()),
+        )
+        .await
         {
             Ok(sig) => sig,
             Err(e) => {
@@ -244,6 +260,7 @@ impl AggregationService {
                 &pubkey,
                 selection_proof.to_bytes().to_vec(),
                 agg_span,
+                &fence,
             )
             .await;
 
@@ -255,6 +272,7 @@ impl AggregationService {
     }
 
     /// Fetch attestation data + aggregate, then sign_and_wrap for the fork.
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_sign_aggregate(
         &self,
         duty: &TypedAttesterDuty,
@@ -263,6 +281,7 @@ impl AggregationService {
         pubkey: &PublicKey,
         selection_proof: Vec<u8>,
         agg_span: Span,
+        fence: &beacon::DutyFence,
     ) -> Option<ProducedAggregate> {
         let uses_electra_wire = utils::uses_electra_attestation_wire(fork_name);
         let committee_index = duty.committee_index;
@@ -389,6 +408,7 @@ impl AggregationService {
                         pubkey,
                         message,
                         agg_span,
+                        fence,
                     )
                     .await?;
                 Some(ProducedAggregate::Gloas(signed))
@@ -400,6 +420,7 @@ impl AggregationService {
                         pubkey,
                         message,
                         agg_span,
+                        fence,
                     )
                     .await?;
                 Some(ProducedAggregate::Electra(signed))
@@ -428,6 +449,7 @@ impl AggregationService {
                     pubkey,
                     message,
                     agg_span,
+                    fence,
                 )
                 .await?;
             Some(ProducedAggregate::PreElectra(signed))
@@ -446,6 +468,7 @@ impl AggregationService {
         pubkey: &PublicKey,
         message: AggregateAndProof,
         agg_span: Span,
+        fence: &beacon::DutyFence,
     ) -> Option<SignedAggregateAndProof> {
         if let Err(e) = message.try_tree_hash_root() {
             warn!(
@@ -457,16 +480,27 @@ impl AggregationService {
             RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
             return None;
         }
-        let signature = match self
-            .signer
-            .sign_aggregate_and_proof(
-                &message,
-                pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            )
-            .instrument(agg_span)
-            .await
+        if !fence.holds() {
+            warn!(
+                slot,
+                validator_index = %validator_index,
+                "skipping aggregate: beacon node admission revoked before sign"
+            );
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+            return None;
+        }
+        let signature = match super::slot_context::under_admission(
+            fence,
+            self.signer
+                .sign_aggregate_and_proof(
+                    &message,
+                    pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .instrument(agg_span),
+        )
+        .await
         {
             Ok(sig) => sig,
             Err(e) => {
@@ -491,6 +525,7 @@ impl AggregationService {
         pubkey: &PublicKey,
         message: ElectraAggregateAndProof,
         agg_span: Span,
+        fence: &beacon::DutyFence,
     ) -> Option<SignedElectraAggregateAndProof> {
         if let Err(e) = message.try_tree_hash_root() {
             warn!(
@@ -502,16 +537,27 @@ impl AggregationService {
             RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
             return None;
         }
-        let signature = match self
-            .signer
-            .sign_electra_aggregate_and_proof(
-                &message,
-                pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            )
-            .instrument(agg_span)
-            .await
+        if !fence.holds() {
+            warn!(
+                slot,
+                validator_index = %validator_index,
+                "skipping aggregate: beacon node admission revoked before sign"
+            );
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+            return None;
+        }
+        let signature = match super::slot_context::under_admission(
+            fence,
+            self.signer
+                .sign_electra_aggregate_and_proof(
+                    &message,
+                    pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .instrument(agg_span),
+        )
+        .await
         {
             Ok(sig) => sig,
             Err(e) => {
@@ -540,6 +586,7 @@ impl AggregationService {
         pubkey: &PublicKey,
         message: ElectraAggregateAndProof,
         agg_span: Span,
+        fence: &beacon::DutyFence,
     ) -> Option<SignedElectraAggregateAndProof> {
         let ssz = match encode_electra_aggregate_and_proof(&message) {
             Ok(ssz) => ssz,
@@ -556,17 +603,28 @@ impl AggregationService {
             }
         };
         let sign_slot = message.aggregate.data.slot;
-        let signature = match self
-            .signer
-            .sign_aggregate_and_proof_root(
-                &object_root,
-                sign_slot,
-                pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            )
-            .instrument(agg_span)
-            .await
+        if !fence.holds() {
+            warn!(
+                slot,
+                validator_index = %validator_index,
+                "skipping aggregate: beacon node admission revoked before sign"
+            );
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+            return None;
+        }
+        let signature = match super::slot_context::under_admission(
+            fence,
+            self.signer
+                .sign_aggregate_and_proof_root(
+                    &object_root,
+                    sign_slot,
+                    pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .instrument(agg_span),
+        )
+        .await
         {
             Ok(sig) => sig,
             Err(e) => {
@@ -1468,6 +1526,128 @@ mod tests {
         assert!(
             !calls.contains(&"sign_aggregate_and_proof_root"),
             "Fulu aggregate must not call sign_aggregate_and_proof_root; calls={calls:?}"
+        );
+    }
+
+    /// Aggregate body is fetched, then admission is revoked, then the signer
+    /// must not see the aggregate. The selection proof already ran.
+    #[tokio::test]
+    async fn aggregate_fetched_before_revocation_is_not_signed() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let rec = Arc::new(RecordingSigner::new());
+        let submit_calls = Arc::new(AtomicUsize::new(0));
+        let fulu_epoch = 60;
+        let slot = fulu_epoch * SLOTS_PER_EPOCH;
+        let beacon = Arc::new(tracking_beacon(
+            pk_hex.clone(),
+            Arc::clone(&submit_calls),
+            slot,
+            VersionedAggregateAttestation::Fulu(electra_attestation(slot)),
+        ));
+        beacon.revoke_after_aggregate();
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(fulu_epoch).await.unwrap();
+        let mut map = HashMap::new();
+        map.insert(pk_bytes, pk);
+        let service = AggregationService::new(
+            rec.clone(),
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            create_test_config(),
+            enabled_store(pk_bytes),
+        );
+        service.maybe_produce_aggregations(slot, fulu_epoch, super::ample_slot_end()).await;
+        let calls = rec.calls();
+        assert!(
+            calls.contains(&"sign_selection_proof"),
+            "selection proof is signed before the aggregate fetch; calls={calls:?}"
+        );
+        assert!(
+            !calls.contains(&"sign_electra_aggregate_and_proof"),
+            "aggregate captured before revocation must not be signed; calls={calls:?}"
+        );
+    }
+
+    /// Pre-Electra aggregate body is fetched, then admission is revoked.
+    /// `sign_aggregate_and_proof` must not run. A holding fence still signs,
+    /// and that sign goes through the admission scope.
+    #[tokio::test]
+    async fn pre_electra_aggregate_fetched_before_revocation_is_not_signed() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let rec = Arc::new(RecordingSigner::new());
+        let submit_calls = Arc::new(AtomicUsize::new(0));
+        let slot = 0u64;
+        let beacon = Arc::new(tracking_beacon(
+            pk_hex.clone(),
+            Arc::clone(&submit_calls),
+            slot,
+            VersionedAggregateAttestation::PreElectra(pre_electra_attestation(slot)),
+        ));
+        beacon.revoke_after_aggregate();
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
+        let mut map = HashMap::new();
+        map.insert(pk_bytes, pk);
+        let service = AggregationService::new(
+            rec.clone(),
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            create_test_config(),
+            enabled_store(pk_bytes),
+        );
+        service.maybe_produce_aggregations(slot, 0, super::ample_slot_end()).await;
+        let calls = rec.calls();
+        assert!(
+            calls.contains(&"sign_selection_proof"),
+            "selection proof is signed before the aggregate fetch; calls={calls:?}"
+        );
+        assert!(
+            !calls.contains(&"sign_aggregate_and_proof"),
+            "pre-Electra aggregate captured before revocation must not be signed; calls={calls:?}"
+        );
+        assert_eq!(submit_calls.load(Ordering::SeqCst), 0);
+
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let submit_calls = Arc::new(AtomicUsize::new(0));
+        let beacon = tracking_beacon(
+            pk_hex,
+            Arc::clone(&submit_calls),
+            slot,
+            VersionedAggregateAttestation::PreElectra(pre_electra_attestation(slot)),
+        );
+        let _generation = beacon.track_admission();
+        let beacon = Arc::new(beacon);
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(0).await.unwrap();
+        let mut map = HashMap::new();
+        map.insert(pk_bytes, pk.clone());
+        let service = AggregationService::new(
+            local_signer_service(sk),
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            create_test_config(),
+            enabled_store(pk_bytes),
+        );
+        signer::require_beacon_admission_scope(async {
+            service.maybe_produce_aggregations(slot, 0, super::ample_slot_end()).await;
+        })
+        .await;
+        assert_eq!(
+            submit_calls.load(Ordering::SeqCst),
+            1,
+            "a holding fence signs the pre-Electra aggregate only inside the admission scope"
         );
     }
 

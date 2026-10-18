@@ -76,6 +76,18 @@ impl SyncCommitteeService {
         self.slot_end_drops.get()
     }
 
+    fn sync_admission_closed(&self, ctx: &SlotContext, duty: signer::SigningDuty) -> bool {
+        let own = self.beacon.duty_fence().unwrap_or_else(|_| beacon::DutyFence::closed());
+        super::slot_context::admission_blocks(duty, &[&own, &ctx.fence])
+    }
+
+    fn skip_sync_revoked(&self, slot: Slot, phase: &'static str) {
+        warn!(slot, "skipping sync committee duty: beacon node admission revoked");
+        RVC_SYNC_COMMITTEE_SKIPPED_TOTAL
+            .with_label_values(&[phase, sync_committee_skip_reason::BN_REVOKED])
+            .inc();
+    }
+
     #[tracing::instrument(name = "orchestrator.produce_sync_messages", level = "debug", skip_all, fields(slot = slot))]
     pub(crate) async fn maybe_produce_sync_messages(
         &self,
@@ -91,6 +103,10 @@ impl SyncCommitteeService {
 
         let (matching_duties, matching_pubkeys) = self.filter_sync_duties(&duties);
         if matching_duties.is_empty() {
+            return;
+        }
+        if self.sync_admission_closed(ctx, signer::SigningDuty::SyncCommitteeMessage) {
+            self.skip_sync_revoked(slot, sync_committee_skip_phase::MESSAGES);
             return;
         }
 
@@ -124,7 +140,7 @@ impl SyncCommitteeService {
         let publish_concurrency = self.config.dispatch_limits.publish_concurrency as usize;
         let waves = stream::iter(pairs)
             .take_until(tokio::time::sleep_until(slot_end))
-            .map(|(duty, pubkey)| self.sign_sync_message(slot, head_root, duty, pubkey))
+            .map(|(duty, pubkey)| self.sign_sync_message(slot, head_root, duty, pubkey, ctx))
             .buffer_unordered(concurrency)
             .ready_chunks(concurrency)
             .map(|wave| self.publish_sync_wave(slot, slot_end, wave))
@@ -155,17 +171,23 @@ impl SyncCommitteeService {
         head_root: eth_types::Root,
         duty: SyncCommitteeDuty,
         pubkey: PublicKey,
+        ctx: &SlotContext,
     ) -> Result<beacon::SyncCommitteeMessage, ()> {
-        match self
-            .signer
-            .sign_sync_committee_message(
+        if self.sync_admission_closed(ctx, signer::SigningDuty::SyncCommitteeMessage) {
+            return Err(());
+        }
+        let fence = self.beacon.duty_fence().unwrap_or_else(|_| beacon::DutyFence::closed());
+        match super::slot_context::under_admission(
+            &fence,
+            self.signer.sign_sync_committee_message(
                 &head_root,
                 slot,
                 &pubkey,
                 &self.config.fork_schedule,
                 &self.config.genesis_validators_root,
-            )
-            .await
+            ),
+        )
+        .await
         {
             Ok(sig) => Ok(beacon::SyncCommitteeMessage {
                 slot,
@@ -252,6 +274,10 @@ impl SyncCommitteeService {
         if matching_duties.is_empty() {
             return;
         }
+        if self.sync_admission_closed(ctx, signer::SigningDuty::SyncCommitteeSelectionProof) {
+            self.skip_sync_revoked(slot, sync_committee_skip_phase::CONTRIBUTIONS);
+            return;
+        }
 
         // H-5: use the head_root captured once at phase 2 instead of
         // fetching independently. If the BN failed during capture_head, skip
@@ -294,7 +320,15 @@ impl SyncCommitteeService {
         let waves = stream::iter(items)
             .take_until(tokio::time::sleep_until(slot_end))
             .map(|(duty, pubkey, subcommittee)| {
-                self.produce_one_contribution(slot, head_root, slot_end, duty, pubkey, subcommittee)
+                self.produce_one_contribution(
+                    slot,
+                    head_root,
+                    slot_end,
+                    duty,
+                    pubkey,
+                    subcommittee,
+                    ctx,
+                )
             })
             .buffer_unordered(concurrency)
             .ready_chunks(concurrency)
@@ -327,6 +361,7 @@ impl SyncCommitteeService {
     /// at [`contribution_deadline`]. The contribution body is checked before
     /// `sign_contribution_and_proof`. A deadline that has already passed does
     /// not call the signer or the beacon node.
+    #[allow(clippy::too_many_arguments)]
     async fn produce_one_contribution(
         &self,
         slot: Slot,
@@ -335,6 +370,7 @@ impl SyncCommitteeService {
         duty: SyncCommitteeDuty,
         pubkey: PublicKey,
         subcommittee_index: u64,
+        ctx: &SlotContext,
     ) -> Option<SignedContributionAndProof> {
         if subcommittee_index >= SYNC_COMMITTEE_SUBNET_COUNT {
             debug!(
@@ -345,16 +381,23 @@ impl SyncCommitteeService {
             );
             return None;
         }
+        if self.sync_admission_closed(ctx, signer::SigningDuty::SyncCommitteeSelectionProof) {
+            return None;
+        }
+        let fence = self.beacon.duty_fence().unwrap_or_else(|_| beacon::DutyFence::closed());
 
         let selection_proof = match sign_before_deadline(
             slot_end,
             self.config.timeouts.sync_contribution,
-            self.signer.sign_sync_committee_selection_proof(
-                slot,
-                subcommittee_index,
-                &pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
+            super::slot_context::under_admission(
+                &fence,
+                self.signer.sign_sync_committee_selection_proof(
+                    slot,
+                    subcommittee_index,
+                    &pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                ),
             ),
         )
         .await
@@ -450,14 +493,21 @@ impl SyncCommitteeService {
             contribution,
             selection_proof: selection_proof.to_bytes().to_vec(),
         };
+        if !fence.holds() {
+            warn!(slot, "skipping sync contribution: beacon node admission revoked before sign");
+            return None;
+        }
         let sig = match sign_before_deadline(
             slot_end,
             self.config.timeouts.sync_contribution,
-            self.signer.sign_contribution_and_proof(
-                &proof,
-                &pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
+            super::slot_context::under_admission(
+                &fence,
+                self.signer.sign_contribution_and_proof(
+                    &proof,
+                    &pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                ),
             ),
         )
         .await
@@ -942,6 +992,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: Some(r_captured),
+            fence: beacon::DutyFence::open(),
         };
 
         // Run both sync-committee phases with the same context.
@@ -1002,6 +1053,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: None,
+            fence: beacon::DutyFence::open(),
         };
 
         let before_messages = skip_count(sync_committee_skip_phase::MESSAGES);
@@ -1059,6 +1111,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: None,
+            fence: beacon::DutyFence::open(),
         };
 
         service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
@@ -1102,6 +1155,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: None,
+            fence: beacon::DutyFence::open(),
         };
 
         service.maybe_produce_sync_contributions(0, 0, &ctx, ample_slot_end()).await;
@@ -1147,6 +1201,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: Some([0xAA; 32]),
+            fence: beacon::DutyFence::open(),
         };
         service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
 
@@ -1155,6 +1210,33 @@ mod tests {
             submitted_roots.lock().unwrap().is_empty(),
             "D-3: sync committee message must not be produced when is_signing_enabled=false"
         );
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn sync_messages_from_a_head_captured_before_revocation_are_not_signed() {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_hex = format!("0x{}", hex::encode(pk.to_bytes()));
+        let submitted_roots = Arc::new(Mutex::new(Vec::<Root>::new()));
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(toctou_beacon(
+            Arc::new(AtomicUsize::new(0)),
+            submitted_roots.clone(),
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            pk.to_bytes(),
+        ));
+        let service = setup_service(beacon, pk_hex, pk, sk).await;
+        let ctx = SlotContext {
+            slot: 0,
+            epoch: 0,
+            parent_root: None,
+            expected_parents: None,
+            head_root: Some([0xAA; 32]),
+            fence: beacon::DutyFence::closed(),
+        };
+        service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
+        assert!(submitted_roots.lock().unwrap().is_empty(), "a revoked head is not signed");
+        assert!(logs_contain("beacon node admission revoked"));
     }
 
     // -----------------------------------------------------------------------
@@ -1262,6 +1344,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: Some([0xAA; 32]),
+            fence: beacon::DutyFence::open(),
         };
         service.maybe_produce_sync_contributions(0, 0, &ctx, ample_slot_end()).await;
 
@@ -1372,6 +1455,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: Some([0xAA; 32]),
+            fence: beacon::DutyFence::open(),
         };
         // Must complete without panic / hang — isolation property.
         service.maybe_produce_sync_messages(0, 0, &ctx, ample_slot_end()).await;
@@ -1472,6 +1556,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: Some([0xAA; 32]),
+            fence: beacon::DutyFence::open(),
         };
         service.maybe_produce_sync_contributions(0, 0, &ctx, ample_slot_end()).await;
 
@@ -1601,6 +1686,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: Some([0xAA; 32]),
+            fence: beacon::DutyFence::open(),
         };
         service.maybe_produce_sync_messages(0, 0, &ctx, slot_end).await;
         assert_eq!(*submitted.lock().unwrap(), 0, "no sync message is published after slot end");
@@ -1640,6 +1726,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: Some([0xAA; 32]),
+            fence: beacon::DutyFence::open(),
         };
         service.maybe_produce_sync_messages(0, 0, &ctx, slot_end).await;
         let finished = tokio::time::Instant::now();
@@ -1743,6 +1830,7 @@ mod tests {
                     parent_root: None,
                     expected_parents: None,
                     head_root: Some([0xAA; 32]),
+                    fence: beacon::DutyFence::open(),
                 };
                 let slot_end = tokio::time::Instant::now() + Duration::from_secs(30);
                 service.maybe_produce_sync_messages(0, 0, &ctx, slot_end).await;
@@ -1841,6 +1929,7 @@ mod tests {
             parent_root: None,
             expected_parents: None,
             head_root: Some(head),
+            fence: beacon::DutyFence::open(),
         }
     }
 
@@ -2546,5 +2635,126 @@ mod tests {
         slow_signer_stops(SlowCase::Selection).await;
         slow_signer_stops(SlowCase::Contribution).await;
         slow_signer_stops(SlowCase::AlreadyPast).await;
+    }
+
+    /// Contribution body is fetched, then admission is revoked. The contribution
+    /// signer must not be entered. A holding fence still signs, and that sign
+    /// is inside the admission scope.
+    #[tokio::test]
+    async fn sync_contribution_fetched_before_revocation_is_not_signed() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let config = create_test_config();
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let selection_calls = Arc::new(AtomicUsize::new(0));
+        let contribution_calls = Arc::new(AtomicUsize::new(0));
+        let submits = Arc::new(AtomicUsize::new(0));
+        let beacon = MockBeaconNodeClient::new();
+        let generation = beacon.track_admission();
+        let beacon = Arc::new(
+            beacon
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution({
+                    let generation = Arc::clone(&generation);
+                    move |requested, subcommittee, _| {
+                        generation.fetch_add(1, Ordering::Release);
+                        Ok(DataResponse { data: contribution_body(requested, head, subcommittee) })
+                    }
+                })
+                .with_submit_contribution_and_proofs({
+                    let submits = Arc::clone(&submits);
+                    move |batch| {
+                        submits.fetch_add(batch.len(), Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        );
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let inner = Arc::new(
+            SignerService::new(
+                Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+                Arc::new(SlashingDb::open_in_memory().unwrap()),
+            )
+            .with_enablement(always_enabled()),
+        );
+        let signer = Arc::new(SlowSigner {
+            inner,
+            delay_selection: false,
+            delay_contribution: false,
+            delay: Duration::ZERO,
+            selection_calls: Arc::clone(&selection_calls),
+            contribution_calls: Arc::clone(&contribution_calls),
+        });
+        let service = service_with_signer(beacon, pk, signer, config.clone()).await;
+        service
+            .maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), ample_slot_end())
+            .await;
+        assert_eq!(
+            selection_calls.load(Ordering::SeqCst),
+            1,
+            "selection proof runs before the fetch"
+        );
+        assert_eq!(
+            contribution_calls.load(Ordering::SeqCst),
+            0,
+            "removing the pre-sign fence check enters sign_contribution_and_proof"
+        );
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
+
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let submits = Arc::new(AtomicUsize::new(0));
+        let beacon = MockBeaconNodeClient::new();
+        let _generation = beacon.track_admission();
+        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+            beacon
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution(move |requested, subcommittee, _| {
+                    Ok(DataResponse { data: contribution_body(requested, head, subcommittee) })
+                })
+                .with_submit_contribution_and_proofs({
+                    let submits = Arc::clone(&submits);
+                    move |batch| {
+                        submits.fetch_add(batch.len(), Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+        );
+        let service = service_with_config(beacon, pk, sk, config).await;
+        signer::require_beacon_admission_scope(async {
+            service
+                .maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), ample_slot_end())
+                .await;
+        })
+        .await;
+        assert_eq!(
+            submits.load(Ordering::SeqCst),
+            1,
+            "a holding fence signs the contribution only inside the admission scope"
+        );
     }
 }

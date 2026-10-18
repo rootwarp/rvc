@@ -3,6 +3,8 @@
 use super::*;
 use beacon::WireBody;
 use eth_types::BeaconBlock;
+use signer::SignerError;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Duration;
 use timing::{DeadlineBps, DeadlineSchedule};
@@ -366,4 +368,90 @@ fn test_v4_envelope_deadline_is_injected_schedule_not_literal() {
     let body = &rest[..end];
     assert!(body.contains("first_overrun_stage"), "{body}");
     assert!(!body.contains("5000"), "{body}");
+}
+
+fn signer_service_for(secret: crypto::SecretKey) -> Arc<signer::SignerService> {
+    let mut keys = crypto::KeyManager::new();
+    keys.insert(secret);
+    let composite = Arc::new(crypto::CompositeSigner::new(crypto::LocalSigner::new(keys)));
+    let db = Arc::new(slashing::SlashingDb::open_in_memory().expect("memory slashing db"));
+    Arc::new(signer::SignerService::new(composite, db).with_enablement(signer::always_enabled()))
+}
+
+/// The envelope signs under the produce fence. A capture fence that no longer
+/// holds is discarded before that sign, so dropping `capture_fence` from the
+/// re-check (or deleting the re-check) publishes the envelope. A call with no
+/// scope is `BeaconAdmissionRevoked`.
+#[tokio::test]
+async fn gloas_envelope_signs_under_its_scope_and_is_refused_without_one() {
+    let secret = crypto::SecretKey::generate();
+    let pubkey = secret.public_key();
+    let signer = signer_service_for(secret);
+    let slot = test_gloas_slot();
+    let beacon = Arc::new(MockBeaconClient::from_response(self_build_json_response(slot)));
+    let schedule = Arc::new(test_fork_schedule_with_near_gloas());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        schedule.clone(),
+        [0xaa; 32],
+    );
+    let response = self_build_json_response(slot);
+    let envelope = WireBody::Json(serde_json::json!("0x01"));
+    let blobs = WireBody::Json(serde_json::json!([]));
+    let proofs = WireBody::Json(serde_json::json!([]));
+    let root = [0x11; 32];
+    let fork = eth_types::ForkName::Gloas;
+    let generation = Arc::new(AtomicU64::new(0));
+    let fence = beacon::DutyFence::at(0, Arc::clone(&generation));
+    let capture = beacon::DutyFence::at(0, generation);
+
+    let published = signer::require_beacon_admission_scope(service.sign_and_publish_envelope(
+        &response,
+        &envelope,
+        &blobs,
+        &proofs,
+        root,
+        slot,
+        &pubkey,
+        fork,
+        &mut PayloadDeadline::for_test(60_000),
+        &fence,
+        &capture,
+    ))
+    .await;
+    assert!(published.is_ok(), "{published:?}");
+    assert_eq!(beacon.envelope_publish_calls.lock().unwrap().len(), 1);
+
+    let refused =
+        signer::require_beacon_admission_scope(signer.sign_execution_payload_envelope_root(
+            &root,
+            slot + 2,
+            &pubkey,
+            schedule.as_ref(),
+            &[0xaa; 32],
+        ))
+        .await;
+    assert!(matches!(refused, Err(SignerError::BeaconAdmissionRevoked)), "{refused:?}");
+
+    let held = beacon::DutyFence::at(0, Arc::new(AtomicU64::new(0)));
+    let closed = beacon::DutyFence::closed();
+    let blocked = signer::require_beacon_admission_scope(service.sign_and_publish_envelope(
+        &response,
+        &envelope,
+        &blobs,
+        &proofs,
+        root,
+        slot + 1,
+        &pubkey,
+        fork,
+        &mut PayloadDeadline::for_test(60_000),
+        &held,
+        &closed,
+    ))
+    .await;
+    let err = blocked.expect_err("revoked capture fence");
+    assert!(err.to_string().contains("admission revoked in flight"), "{err}");
+    assert_eq!(beacon.envelope_publish_calls.lock().unwrap().len(), 1);
 }

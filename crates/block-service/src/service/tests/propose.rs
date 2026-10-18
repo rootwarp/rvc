@@ -1937,3 +1937,48 @@ async fn test_ranked_skipped_fee_match_signs_the_mismatch() {
         "signing the mismatch must increment the penalty counter"
     );
 }
+
+#[tokio::test]
+async fn fresh_block_duty_with_no_admitted_node_signs_no_randao() {
+    let pubkey = test_pubkey();
+    let slot = 64;
+    let mut beacon = MockBeaconClient::unblinded(test_block(slot));
+    beacon.refuse_admission = true;
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        Arc::new(beacon),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("halted");
+    assert!(err.to_string().contains("no admitted beacon node"), "{err}");
+    assert!(signer.randao_calls.lock().unwrap().is_empty());
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn block_candidate_captured_before_revocation_is_not_signed() {
+    use std::sync::atomic::Ordering;
+    let pubkey = test_pubkey();
+    let slot = 64;
+    let beacon = MockBeaconClient::unblinded(test_block(slot));
+    let revocation = Arc::clone(&beacon.revocation);
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        Arc::new(beacon),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    service.set_after_produce(move || {
+        revocation.fetch_add(1, Ordering::Release);
+    });
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("revoked");
+    assert!(err.to_string().contains("admission revoked"), "{err}");
+    assert_eq!(signer.randao_calls.lock().unwrap().len(), 1, "RANDAO at duty start is kept");
+    assert!(signer.header_calls.lock().unwrap().is_empty(), "the candidate is not signed");
+    assert!(signer.block_calls.lock().unwrap().is_empty());
+}

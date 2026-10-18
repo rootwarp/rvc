@@ -307,6 +307,7 @@ async fn snapshot_ctx_returns_while_the_head_fetch_is_pending() {
         parent_root: Some(parent),
         expected_parents: None,
         head_root: None,
+        fence: beacon::DutyFence::open(),
     });
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let gate = Phase2Head::new();

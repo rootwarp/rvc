@@ -553,7 +553,9 @@ pub(crate) async fn best_of<T: Send + 'static>(
     wait_for_best(round_started, window.soft, &mut pending, &mut finished, filter).await;
 
     for done in &finished {
-        queue_health_sample(health, op_name, done.index, tracker_outcome(op_name, done));
+        if let Some(outcome) = tracker_outcome(op_name, done) {
+            queue_health_sample(health, op_name, done.index, outcome);
+        }
         log_best_failure(op_name, done);
         log_hard_reject(filter, done);
     }
@@ -577,10 +579,11 @@ struct Done<T> {
     latency: Duration,
 }
 
-fn tracker_outcome<T>(op_name: &str, done: &Done<T>) -> TrackerOutcome {
+fn tracker_outcome<T>(op_name: &str, done: &Done<T>) -> Option<TrackerOutcome> {
     match &done.result {
-        Ok(_) => TrackerOutcome::Success(done.latency),
-        Err(err) => error_outcome(op_name, err),
+        Ok(_) => Some(TrackerOutcome::Success(done.latency)),
+        Err(BeaconError::RevokedInFlight) => None,
+        Err(err) => Some(error_outcome(op_name, err)),
     }
 }
 
@@ -750,7 +753,9 @@ async fn drain_best_of<T: Send>(
     while let Some(done) = next_open(&mut pending).await {
         log_best_failure(&op_name, &done);
         log_hard_reject(&filter, &done);
-        let outcome = tracker_outcome(&op_name, &done);
+        let Some(outcome) = tracker_outcome(&op_name, &done) else {
+            continue;
+        };
         if matches!(outcome, TrackerOutcome::Success(_)) && !record_success {
             crate::metrics::RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL.inc();
             continue;

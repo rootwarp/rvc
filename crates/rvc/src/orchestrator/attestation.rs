@@ -274,6 +274,21 @@ where
         }
 
         info!(slot = slot, duty_count = duties.len(), "Found attestation duties");
+
+        let attestation_fence = match self.beacon.duty_fence() {
+            Ok(fence)
+                if !super::slot_context::admission_blocks(
+                    signer::SigningDuty::Attestation,
+                    &[&fence],
+                ) =>
+            {
+                fence
+            }
+            _ => {
+                warn!(slot, "skipping attestations: beacon node admission revoked");
+                return Ok(Vec::new());
+            }
+        };
         RVC_ORCHESTRATOR_ACTIVE_ATTESTATIONS.set(duties.len() as f64);
 
         let memo = self.load_attestation_data_memo(slot, &duties, slot_end).await;
@@ -283,7 +298,7 @@ where
         let publish_concurrency = self.config.dispatch_limits.publish_concurrency as usize;
         let waves = stream::iter(duties)
             .take_until(tokio::time::sleep_until(slot_end))
-            .map(|duty| self.sign_one(duty, &memo))
+            .map(|duty| self.sign_one(duty, &memo, &attestation_fence))
             .buffer_unordered(concurrency)
             .ready_chunks(concurrency)
             .map(|wave| self.publish_wave(slot, slot_end, wave))
@@ -476,6 +491,7 @@ where
         &self,
         duty: TypedAttesterDuty,
         memo: &AttestationDataMemo,
+        fence: &beacon::DutyFence,
     ) -> Result<WaveEntry, AttestationResult> {
         let validator_index = duty.raw.validator_index.clone();
         let pubkey = duty.pubkey.clone();
@@ -483,7 +499,7 @@ where
         // only when `attest` has not yet copied it.
         let mut slot: Slot = 0;
 
-        match self.attest(&duty, &validator_index, &mut slot, memo).await {
+        match self.attest(&duty, &validator_index, &mut slot, memo, fence).await {
             Ok(attestation) => Ok(WaveEntry {
                 attribution: WaveAttribution { validator_index, pubkey, slot },
                 attestation,
@@ -717,6 +733,7 @@ where
         validator_index: &str,
         slot: &mut Slot,
         memo: &AttestationDataMemo,
+        fence: &beacon::DutyFence,
     ) -> Result<VersionedAttestation, String> {
         *slot = duty.slot;
         debug_assert_eq!(memo.slot, *slot);
@@ -822,16 +839,26 @@ where
             return Err(format!("AttestationData sanity check failed: {e}"));
         }
 
-        let signature = match self
-            .signer
-            .sign_attestation(
-                &crypto_attestation_data,
-                &pubkey,
-                &self.config.fork_schedule,
-                &self.config.genesis_validators_root,
-            )
-            .instrument(att_span.clone())
-            .await
+        if !fence.holds() {
+            warn!(
+                slot = *slot,
+                validator_index = %validator_index,
+                "skipping attestation: beacon node admission revoked before sign"
+            );
+            return Err("beacon node admission revoked".to_string());
+        }
+        let signature = match super::slot_context::under_admission(
+            fence,
+            self.signer
+                .sign_attestation(
+                    &crypto_attestation_data,
+                    &pubkey,
+                    &self.config.fork_schedule,
+                    &self.config.genesis_validators_root,
+                )
+                .instrument(att_span.clone()),
+        )
+        .await
         {
             Ok(sig) => {
                 let sig_bytes = sig.to_bytes();
@@ -1563,6 +1590,20 @@ mod dispatch_pipeline {
             window <= Duration::from_millis(50),
             "the shared fetch must be issued within one 50 ms RTT, spread was {window:?}"
         );
+    }
+
+    /// Attestation data is fetched, then the source admission generation moves.
+    /// The fence taken before the fetch must fail before `sign_attestation`.
+    #[tokio::test]
+    async fn attestation_data_fetched_before_revocation_is_not_signed() {
+        let fixture = open_fixture(1, FixtureOpts::default());
+        fixture.beacon.revoke_after_attestation_data();
+        let results = fixture.service.process_slot(SLOT).await.expect("process_slot");
+        assert!(
+            results.iter().all(|result| !result.outcome.is_published()),
+            "a body fetched before revocation must not be signed: {results:?}"
+        );
+        assert!(!results.is_empty(), "the duty is attempted and then skipped: {results:?}");
     }
 
     /// `slot_end` already passed: nothing is signed, the drop counter matches

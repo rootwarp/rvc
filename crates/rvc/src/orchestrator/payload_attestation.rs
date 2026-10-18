@@ -131,6 +131,13 @@ impl PayloadAttestationService {
             return;
         }
 
+        let payload_fence = match self.beacon.duty_fence() {
+            Ok(fence) if fence.holds() => fence,
+            _ => {
+                warn!(slot, "skipping payload attestations: beacon node admission revoked");
+                return;
+            }
+        };
         // VC is the single observer: one fetch, identical bytes to every signer.
         let deadline = ptc_hard_deadline(slot_end, submit_timeout);
         let data =
@@ -196,7 +203,15 @@ impl PayloadAttestationService {
         let waves = stream::iter(pairs)
             .take_until(stop_pulling)
             .map(|(idx, duty, pubkey)| {
-                self.sign_payload_attestation_one(slot, &data, duty, pubkey, idx, &outcomes)
+                self.sign_payload_attestation_one(
+                    slot,
+                    &data,
+                    duty,
+                    pubkey,
+                    idx,
+                    &outcomes,
+                    &payload_fence,
+                )
             })
             .buffer_unordered(concurrency)
             .ready_chunks(concurrency)
@@ -245,6 +260,7 @@ impl PayloadAttestationService {
     ///
     /// H6: a signer error is `Err` for this duty only. The outcome is recorded
     /// here once; a later phase-deadline cancel must not count it again.
+    #[allow(clippy::too_many_arguments)]
     async fn sign_payload_attestation_one(
         &self,
         slot: Slot,
@@ -253,17 +269,23 @@ impl PayloadAttestationService {
         pubkey: PublicKey,
         duty_idx: usize,
         outcomes: &PtcDutyOutcomes,
+        fence: &beacon::DutyFence,
     ) -> (usize, Result<PayloadAttestationMessage, ()>) {
         let validator_index = duty.validator_index;
-        match self
-            .signer
-            .sign_payload_attestation(
+        if !fence.holds() {
+            warn!(slot, "skipping payload attestation: beacon node admission revoked before sign");
+            return (duty_idx, Err(()));
+        }
+        match super::slot_context::under_admission(
+            fence,
+            self.signer.sign_payload_attestation(
                 data,
                 &pubkey,
                 &self.config.fork_schedule,
                 &self.config.genesis_validators_root,
-            )
-            .await
+            ),
+        )
+        .await
         {
             Ok(sig) => {
                 outcomes.mark_signed(duty_idx);
@@ -860,6 +882,86 @@ mod tests {
 
     fn ptc_attestation_count(status: &str) -> u64 {
         RVC_PTC_ATTESTATIONS_TOTAL.with_label_values(&[status]).get()
+    }
+
+    /// Payload data is fetched, then admission is revoked. The pre-sign fence
+    /// skips the signer. A holding fence still signs, inside the admission scope.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn payload_attestation_fetched_before_revocation_is_not_signed() {
+        let k = test_key(10);
+        let submitted: Arc<Mutex<Vec<PayloadAttestationMessage>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let data = ptc_data(0);
+        let mock = MockBeaconNodeClient::new();
+        let generation = mock.track_admission();
+        let mock = Arc::new(
+            mock.with_post_ptc_duties({
+                let duty = ptc_duty(0, 10, &k.pk);
+                move |_epoch, _indices| Ok(ptc_response(vec![duty.clone()]))
+            })
+            .with_get_payload_attestation_data({
+                let generation = Arc::clone(&generation);
+                let data = data.clone();
+                move |_slot| {
+                    generation.fetch_add(1, Ordering::Release);
+                    Ok(Some(PayloadAttestationDataResponse { data: data.clone() }))
+                }
+            })
+            .with_submit_payload_attestations({
+                let submitted = Arc::clone(&submitted);
+                move |msgs| {
+                    submitted.lock().unwrap().extend(msgs);
+                    Ok(())
+                }
+            }),
+        );
+        let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
+        let service = setup_service(beacon, vec![k], &[]).await;
+        service.maybe_produce_payload_attestations(0, 0, ample_slot_end()).await;
+        assert!(
+            logs_contain("skipping payload attestation: beacon node admission revoked before sign"),
+            "removing the pre-sign fence check does not emit this skip"
+        );
+        assert!(
+            submitted.lock().unwrap().is_empty(),
+            "payload data fetched before revocation must not be submitted"
+        );
+
+        let k = test_key(11);
+        let submitted: Arc<Mutex<Vec<PayloadAttestationMessage>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let data = ptc_data(0);
+        let mock = MockBeaconNodeClient::new();
+        let _generation = mock.track_admission();
+        let mock = Arc::new(
+            mock.with_post_ptc_duties({
+                let duty = ptc_duty(0, 11, &k.pk);
+                move |_epoch, _indices| Ok(ptc_response(vec![duty.clone()]))
+            })
+            .with_get_payload_attestation_data({
+                let data = data.clone();
+                move |_slot| Ok(Some(PayloadAttestationDataResponse { data: data.clone() }))
+            })
+            .with_submit_payload_attestations({
+                let submitted = Arc::clone(&submitted);
+                move |msgs| {
+                    submitted.lock().unwrap().extend(msgs);
+                    Ok(())
+                }
+            }),
+        );
+        let beacon: Arc<dyn BeaconNodeClient> = mock;
+        let service = setup_service(beacon, vec![k], &[]).await;
+        signer::require_beacon_admission_scope(async {
+            service.maybe_produce_payload_attestations(0, 0, ample_slot_end()).await;
+        })
+        .await;
+        assert_eq!(
+            submitted.lock().unwrap().len(),
+            1,
+            "a holding fence signs the payload attestation only inside the admission scope"
+        );
     }
 
     #[tokio::test]
