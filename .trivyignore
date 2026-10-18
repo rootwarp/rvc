@@ -1,0 +1,4 @@
+# zlib1g CVE-2023-45853 is in minizip. The zlib1g binary package does not ship minizip.
+# Debian marks the bug will_not_fix: https://security-tracker.debian.org/tracker/CVE-2023-45853
+# Review by 2027-01-18.
+CVE-2023-45853

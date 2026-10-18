@@ -91,20 +91,26 @@ def test_jobs_are_build_then_soak():
     assert "continue-on-error" not in text
 
 
+def _sha_pin(body: str, action: str) -> str:
+    match = re.search(rf"{re.escape(action)}@[0-9a-f]{{40}}\s+#\s+v\S+", body)
+    assert match, f"missing sha pin for {action}"
+    return match.group(0)
+
+
 def test_build_matches_ci_check_cache_and_pins():
     nightly = NIGHTLY.read_text(encoding="utf-8")
     ci = CI_YML.read_text(encoding="utf-8")
     build = _jobs(nightly)["build"]
     check = _jobs(ci)["check"]
     # Nightly build shares the Check job's rust-cache key (not a full target/ dump).
-    assert "Swatinem/rust-cache@v2" in check
-    assert "Swatinem/rust-cache@v2" in build
+    assert _sha_pin(check, "Swatinem/rust-cache") == _sha_pin(build, "Swatinem/rust-cache")
     assert 'shared-key: check' in check
     assert 'shared-key: check' in build
     assert 'cache-all-crates: "false"' in check
     assert 'cache-all-crates: "false"' in build
-    assert "dtolnay/rust-toolchain@stable" in build
-    assert "arduino/setup-protoc@v3" in build
+    assert _sha_pin(check, "dtolnay/rust-toolchain") == _sha_pin(build, "dtolnay/rust-toolchain")
+    assert "toolchain: stable" in build
+    assert _sha_pin(check, "arduino/setup-protoc") == _sha_pin(build, "arduino/setup-protoc")
     assert 'version: "27.x"' in build
     assert "cargo build --release --locked -p rvc-bin" in build
     assert "actions/upload-artifact@v4" in build

@@ -23,3 +23,10 @@ Guidance for coding agents (Cursor, Claude Code, Codex) working in rvc. `CLAUDE.
 
 ## Coding
 Follow `.cursor/rules/rust-code.mdc` (TDD, idiomatic Rust, conventions) and `CLAUDE.md`.
+
+## CI action pins
+Third-party `uses:` in `.github/workflows` are full commit SHAs with a `# vX.Y.Z` comment on the same line. First-party `actions/*` and `github/*` stay on major tags.
+Tagging and releases are lead-only. Do not retag or re-run a release whose workflow still names a missing action ref. Publish images from a tag that contains the corrected workflow.
+Resolve a pin with `gh api repos/<owner>/<repo>/git/ref/tags/<tag>`. If `object.type` is `tag`, dereference `git/tags/<object.sha>` and pin the commit, not the tag object. Confirm the ref exists before pushing. Confirm the commit is on the upstream default branch: `gh api repos/<owner>/<repo>/compare/<default>...<sha>` must report `status` `behind` or `identical`. Reject an annotated tag whose `tagger.date` is within 7 days, and treat a lightweight tag whose commit is only a few days old as not yet reviewed.
+`dtolnay/rust-toolchain` SHAs must be in `master` history (tag `v1` today); set `with: toolchain: stable`. `taiki-e/install-action` is the `v2` release commit; set `with: tool:`.
+`aquasecurity/trivy-action` is pinned in both `docker.yml` and `docker-scan.yml`. Keep those `uses:` lines identical. SARIF output ignores `severity` unless `limit-severities-for-sarif: true`; both workflows set that flag, so `exit-code: '1'` applies to CRITICAL only. `.trivyignore` allows only CVE-2023-45853 (Debian `will_not_fix`: the bug is in minizip, which `zlib1g` does not ship; review by 2027-01-18). Do not set `ignore-unfixed`.
