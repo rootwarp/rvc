@@ -269,6 +269,12 @@ pub struct SignerService {
     /// Release `rvc-bin` does not enable that feature.
     #[cfg(any(test, feature = "test-utils"))]
     pre_reserve_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
+    /// Test-only park before [`Self::ensure_signing_enabled`].
+    #[cfg(any(test, feature = "test-utils"))]
+    admission_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
+    /// Test-only park after the non-slashable enablement check, before the backend.
+    #[cfg(any(test, feature = "test-utils"))]
+    nonslashable_barrier: parking_lot::Mutex<Option<Arc<dyn core::PreReserveBarrier>>>,
 }
 
 /// Per-slot envelope reservation. In-flight is refused the same as signed so
@@ -343,6 +349,10 @@ impl SigningEnablement for FailClosedEnablement {
     fn voluntary_exit_only(&self) -> bool {
         false
     }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
+    }
 }
 
 /// Offline CLI exit enablement. Permits exactly one pubkey, and only a
@@ -376,6 +386,10 @@ impl SigningEnablement for OfflineExitEnablement {
 
     fn voluntary_exit_only(&self) -> bool {
         true
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
     }
 }
 
@@ -500,6 +514,10 @@ impl SigningEnablement for AlwaysEnabled {
     }
 
     fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
         false
     }
 }
@@ -632,6 +650,10 @@ impl SignerService {
             envelope_slots: parking_lot::Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-utils"))]
             pre_reserve_barrier: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            admission_barrier: parking_lot::Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            nonslashable_barrier: parking_lot::Mutex::new(None),
         }
     }
 
@@ -648,6 +670,33 @@ impl SignerService {
     #[cfg(any(test, feature = "test-utils"))]
     fn pre_reserve_barrier(&self) -> Option<Arc<dyn core::PreReserveBarrier>> {
         self.pre_reserve_barrier.lock().clone()
+    }
+
+    /// Park before the outer enablement check. `None` clears it.
+    ///
+    /// The barrier must not call back into the enablement gate.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_admission_barrier(&self, barrier: Option<Arc<dyn core::PreReserveBarrier>>) {
+        *self.admission_barrier.lock() = barrier;
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn admission_barrier(&self) -> Option<Arc<dyn core::PreReserveBarrier>> {
+        self.admission_barrier.lock().clone()
+    }
+
+    /// Park after the non-slashable enablement check and before the backend.
+    ///
+    /// That is the accepted window: the check has admitted the sign, and the
+    /// backend has not run. `None` clears it.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_nonslashable_barrier(&self, barrier: Option<Arc<dyn core::PreReserveBarrier>>) {
+        *self.nonslashable_barrier.lock() = barrier;
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn nonslashable_barrier(&self) -> Option<Arc<dyn core::PreReserveBarrier>> {
+        self.nonslashable_barrier.lock().clone()
     }
 
     /// Replace the signing enablement gate (builder style).
@@ -741,9 +790,19 @@ impl SignerService {
     /// Refuse signing when the doppelganger enablement gate is closed.
     ///
     /// Called **before** any slashing stage or BLS sign so a closed gate never
-    /// stages a row or produces a signature.  On slashable paths the shared
+    /// stages a row or produces a signature. On slashable paths the shared
     /// core re-checks enablement **under** the per-validator lock (closes
-    /// Safe→Detected TOCTOU vs concurrent liveness).
+    /// Safe→Detected TOCTOU vs concurrent liveness) and again after the
+    /// slashing reservation, before BLS.
+    ///
+    /// The process detection latch is read inside `signing_allowed`. Once that
+    /// latch is stored, this check and every later admission check return
+    /// [`SignerError::BlockedByDoppelganger`]. A slashable sign that has not
+    /// called BLS is refused and keeps its reserved row. The post-reserve
+    /// check is the admission boundary, not an atomic pair with the backend:
+    /// a BLS call already started, including a remote request, and a
+    /// non-slashable sign that already passed its check, run to the sign
+    /// timeout.
     fn ensure_signing_enabled(
         &self,
         pubkey: &PublicKey,
@@ -768,6 +827,17 @@ impl SignerService {
             "SignerService: signing blocked by doppelganger enablement gate"
         );
         Err(SignerError::BlockedByDoppelganger)
+    }
+
+    /// Outer admission check, after an optional test rendezvous.
+    async fn admit(&self, pubkey: &PublicKey, duty: SigningDuty) -> Result<(), SignerError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(barrier) = self.admission_barrier() {
+            barrier.wait().await;
+        }
+        #[cfg(not(any(test, feature = "test-utils")))]
+        std::future::ready(()).await;
+        self.ensure_signing_enabled(pubkey, duty)
     }
 
     /// Raw-root [`Self::sign_backend`] for local/HTTP keys; typed adapter for gRPC.
@@ -829,6 +899,40 @@ impl SignerService {
     //   2. `ensure_signing_enabled` (Result) then `sign_nonslashable_core`
     // No per-validator lock, no slashing-DB staging. VC `debug!`/timing stay here.
 
+    async fn sign_nonslashable_checked(
+        &self,
+        backend: &dyn Signer,
+        pubkey: &PublicKey,
+        signing_root: Root,
+        duty: SigningDuty,
+    ) -> Result<Signature, NonSlashableFailure> {
+        #[cfg(any(test, feature = "test-utils"))]
+        {
+            return core::sign_nonslashable_core_paused(
+                self.enablement.as_ref(),
+                backend,
+                pubkey,
+                signing_root,
+                self.sign_timeout,
+                duty,
+                self.nonslashable_barrier(),
+            )
+            .await;
+        }
+        #[cfg(not(any(test, feature = "test-utils")))]
+        {
+            sign_nonslashable_core(
+                self.enablement.as_ref(),
+                backend,
+                pubkey,
+                signing_root,
+                self.sign_timeout,
+                duty,
+            )
+            .await
+        }
+    }
+
     /// Facade wrapper: `ensure_signing_enabled` then [`sign_nonslashable_core`].
     ///
     /// VC-specific `debug!` / elapsed timing stay here (operator output, not
@@ -845,8 +949,9 @@ impl SignerService {
     ) -> Result<Signature, SignerError> {
         // Same gate point as the slashable early check. `op_name` is only the
         // log and metrics label. The exit unlock is `duty`, matched exhaustively
-        // inside `signing_allowed`.
-        self.ensure_duty_enabled(pubkey, duty)?;
+        // inside `signing_allowed`. The admission barrier, when set, parks
+        // before that check.
+        self.admit(pubkey, duty).await?;
 
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let start = Instant::now();
@@ -857,16 +962,7 @@ impl SignerService {
             "Signing non-slashable duty"
         );
 
-        match sign_nonslashable_core(
-            self.enablement.as_ref(),
-            backend.as_ref(),
-            pubkey,
-            signing_root,
-            self.sign_timeout,
-            duty,
-        )
-        .await
-        {
+        match self.sign_nonslashable_checked(backend.as_ref(), pubkey, signing_root, duty).await {
             Ok(sig) => {
                 debug!(
                     duration_ms = start.elapsed().as_millis() as u64,
@@ -978,7 +1074,7 @@ impl ValidatorSigner for SignerService {
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
         // Cheap outer enablement check (core re-checks under the lock).
-        self.ensure_signing_enabled(pubkey, SigningDuty::Attestation)?;
+        self.admit(pubkey, SigningDuty::Attestation).await?;
 
         let start = Instant::now();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -1030,7 +1126,7 @@ impl ValidatorSigner for SignerService {
         let result = sign_slashable(SignSlashableRequest {
             locks: &self.validator_locks,
             pubkey,
-            enablement: self.enablement.as_ref(),
+            enablement: Arc::clone(&self.enablement),
             signer,
             signing_root,
             sign_timeout: self.sign_timeout,
@@ -1087,7 +1183,7 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        self.ensure_signing_enabled(pubkey, SigningDuty::Block)?;
+        self.admit(pubkey, SigningDuty::Block).await?;
 
         let start = Instant::now();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -1112,7 +1208,7 @@ impl ValidatorSigner for SignerService {
         let result = sign_slashable(SignSlashableRequest {
             locks: &self.validator_locks,
             pubkey,
-            enablement: self.enablement.as_ref(),
+            enablement: Arc::clone(&self.enablement),
             signer,
             signing_root,
             sign_timeout: self.sign_timeout,
@@ -1169,7 +1265,7 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        self.ensure_signing_enabled(pubkey, SigningDuty::Block)?;
+        self.admit(pubkey, SigningDuty::Block).await?;
 
         let start = Instant::now();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -1226,7 +1322,7 @@ impl ValidatorSigner for SignerService {
         let result = sign_slashable(SignSlashableRequest {
             locks: &self.validator_locks,
             pubkey,
-            enablement: self.enablement.as_ref(),
+            enablement: Arc::clone(&self.enablement),
             signer,
             signing_root,
             sign_timeout: self.sign_timeout,
@@ -3317,6 +3413,10 @@ mod tests {
             fn voluntary_exit_only(&self) -> bool {
                 false
             }
+
+            fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+                false
+            }
         }
         let service = SignerService::new(signer, slashing_db)
             .with_enablement(Arc::new(FlipEnablement(Arc::clone(&gate))));
@@ -4186,6 +4286,10 @@ mod tests {
         fn voluntary_exit_only(&self) -> bool {
             false
         }
+
+        fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+            false
+        }
     }
 
     #[tokio::test]
@@ -4334,6 +4438,10 @@ mod tests {
         }
 
         fn voluntary_exit_only(&self) -> bool {
+            false
+        }
+
+        fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
             false
         }
     }

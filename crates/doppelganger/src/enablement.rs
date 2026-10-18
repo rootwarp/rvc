@@ -33,6 +33,23 @@ pub trait SigningEnablement: Send + Sync {
     /// [`is_signing_enabled`]: SigningEnablement::is_signing_enabled
     #[must_use]
     fn voluntary_exit_only(&self) -> bool;
+
+    /// `true` only when doppelganger detection has closed signing for `pubkey`.
+    ///
+    /// There is no default. A wrapper that omits this method does not compile,
+    /// so it cannot silently skip the post-reserve check. Wrappers forward the
+    /// inner value. Delete quiesce is not detection: a wrapper that closes
+    /// signing for another reason still returns the inner value, which is
+    /// `false` unless detection itself closed signing.
+    ///
+    /// The slashable path calls this after the slashing reservation and before
+    /// BLS. That call is the admission boundary for a sign that has not yet
+    /// contacted the backend. It is not atomic with the BLS call. Detection can
+    /// land after this returns `false`, and a BLS call that has already started,
+    /// including a request already sent to a remote signer, still finishes
+    /// inside the sign timeout.
+    #[must_use]
+    fn blocked_by_doppelganger(&self, pubkey: &crypto::PublicKey) -> bool;
 }
 
 /// Duty presented to [`signing_allowed`].
@@ -112,6 +129,10 @@ impl SigningEnablement for DoppelgangerDisabledByOperator {
     }
 
     fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &crypto::PublicKey) -> bool {
         false
     }
 }

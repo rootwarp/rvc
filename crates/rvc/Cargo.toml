@@ -73,6 +73,8 @@ secrecy.workspace = true
 serde_json.workspace = true
 # test-utils: AlwaysEnabled for orchestrator unit/integration tests (SEC-2a).
 signer = { workspace = true, features = ["test-utils"] }
+# test-utils: detection-latch rendezvous hooks (FU-A2a). Not a production feature.
+doppelganger = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true

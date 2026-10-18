@@ -132,6 +132,40 @@ pub enum Commands {
         #[command(subcommand)]
         command: SlashingCommands,
     },
+
+    /// Doppelganger detection maintenance.
+    Doppelganger {
+        #[command(subcommand)]
+        command: DoppelgangerCommands,
+    },
+}
+
+/// Subcommands under `rvc doppelganger`.
+#[derive(Subcommand)]
+pub enum DoppelgangerCommands {
+    /// Remove the detection marker so the validator client can start.
+    ///
+    /// Requires `--confirm`. Takes the keystore lock and refuses while a
+    /// process holds it. A validator client started with
+    /// `--disable-keystore-locking` holds no lock, so stop that process
+    /// first. The next start runs a full forward window for every key loaded
+    /// on that boot. Deleting only `.rvc.doppelganger_detected` by hand does
+    /// not force that window. Do this only after the other instance is no
+    /// longer signing these keys.
+    ClearDetection {
+        /// Validator data directory (the keystore directory).
+        #[arg(long)]
+        datadir: PathBuf,
+
+        /// Slashing protection database. When its directory is not `datadir`,
+        /// also remove a fallback detection marker written there during shutdown.
+        #[arg(long)]
+        slashing_db_path: Option<PathBuf>,
+
+        /// Confirm removal of the detection marker.
+        #[arg(long, default_value_t = false)]
+        confirm: bool,
+    },
 }
 
 /// Subcommands under `rvc slashing` (RF2-13 / B5). Kept as a small nested enum so
@@ -332,6 +366,15 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 
             commands::submit_exit::execute(args).await?;
         }
+        Commands::Doppelganger { command } => match command {
+            DoppelgangerCommands::ClearDetection { datadir, slashing_db_path, confirm } => {
+                commands::doppelganger::execute_clear_detection(
+                    &datadir,
+                    slashing_db_path.as_deref(),
+                    confirm,
+                )?;
+            }
+        },
         Commands::Slashing { command } => match command {
             SlashingCommands::Prune { slashing_db_path, dry_run, yes, log_level } => {
                 init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);

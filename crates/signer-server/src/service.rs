@@ -111,6 +111,10 @@ impl signer::SigningEnablement for AlwaysEnabled {
     fn voluntary_exit_only(&self) -> bool {
         false
     }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

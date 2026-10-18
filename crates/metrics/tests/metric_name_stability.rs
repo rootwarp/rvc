@@ -109,6 +109,16 @@
 //! does not allow that shape. Labels are `mode` and `shape`. A Gloas response
 //! flagged blinded is not counted. Dashboards that watch mode mismatches
 //! should bind this name.
+//! #705 adds `rvc_doppelganger_detection_latch` (family delta +1): 0 when the
+//! liveness loop starts, 1 after this process stores the doppelganger latch.
+//! A boot that exits 12 because the marker file is already present can exit
+//! before the loop is scraped. It has no labels. Dashboards that watch an
+//! in-process detection should bind this gauge; the marker file is the
+//! durable signal.
+//! #705 also adds `rvc_doppelganger_marker_write_failures_total` (family delta
+//! +1): one increment each time the detection marker write fails. The process
+//! stays up and retries. It has no labels. Dashboards that watch a latched
+//! process that has not yet exited should bind this counter.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -163,6 +173,8 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_builder_circuit_breaker_trips_total",
     "rvc_builder_consecutive_misses",
     "rvc_builder_epoch_misses",
+    "rvc_doppelganger_detection_latch", // operator-facing: 1 after this process stores the detection latch (#705)
+    "rvc_doppelganger_marker_write_failures_total", // operator-facing: failed durable marker writes while the latch stays set (#705)
     "rvc_duties_fetched_total",
     "rvc_duty_index_set_size", // operator-facing: pubkey-index registry size (RR-2.2)
     "rvc_duty_rejected_total", // operator-facing: per-duty malformed numeric field (RR3-04 / #533)
@@ -317,8 +329,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        64,
-        "#647 adds rvc_block_shape_rejections_total; count is the list length"
+        66,
+        "#705 adds the detection latch gauge and the marker-write failure counter"
     );
 }
 

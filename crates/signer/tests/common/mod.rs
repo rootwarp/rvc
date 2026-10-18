@@ -36,6 +36,10 @@ impl SigningEnablement for AlwaysAllowed {
     fn voluntary_exit_only(&self) -> bool {
         false
     }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
+        false
+    }
 }
 
 /// Denies every pubkey (active doppelganger window or fail-closed unknown key).
@@ -47,6 +51,10 @@ impl SigningEnablement for AlwaysDenied {
     }
 
     fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+
+    fn blocked_by_doppelganger(&self, _pubkey: &PublicKey) -> bool {
         false
     }
 }

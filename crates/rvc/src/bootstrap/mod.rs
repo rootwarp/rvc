@@ -23,6 +23,8 @@ pub use beacon::{connect_beacon, BeaconHandles};
 pub use enablement::{wire_signing_enablement, EnablementHandles};
 pub use executor::{ShutdownOutcome, ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
 pub use keys::{load_signing_keys, LoadedKeys};
+#[cfg(test)]
+pub(crate) use run::{await_shutdown_and_drain_with_signal, DetectionShutdown, ShutdownInputs};
 pub use run::{run, RunOptions};
 pub use services::{build_services, ServiceHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
@@ -117,6 +119,10 @@ pub enum BootstrapError {
     /// A registered task panicked. The executor drain has already finished.
     #[error("critical task '{task}' failed; process exiting")]
     CriticalTaskFailed { task: &'static str },
+
+    /// Doppelganger detection requested a drain. Exit 12.
+    #[error("doppelganger detected; process exiting")]
+    DoppelgangerDetected,
 }
 
 impl BootstrapError {
@@ -126,6 +132,7 @@ impl BootstrapError {
             Self::Startup(e) => e.exit_code(),
             Self::CriticalTaskFailed { .. } => EXIT_CRITICAL_TASK_FAILED,
             Self::ListenerBind { .. } => EXIT_LISTENER_BIND,
+            Self::DoppelgangerDetected => crate::startup::EXIT_DOPPELGANGER_DETECTED,
             _ => 1,
         }
     }

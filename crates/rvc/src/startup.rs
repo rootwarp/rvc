@@ -26,8 +26,10 @@ use crate::config::ConfigError;
 /// Distinct exit codes for startup failures.
 pub const EXIT_INTEGRITY_CHECK_FAILED: i32 = 10;
 pub const EXIT_GENESIS_ROOT_MISMATCH: i32 = 11;
-// EXIT 12 reserved historically for one-shot doppelganger detection (retired with
-// run_doppelganger_detection; production uses ForwardWindowMachine + Detected gate).
+/// Doppelganger detected. The liveness loop requests this through the executor
+/// drain after `.rvc.doppelganger_detected` is durable. The next start reads
+/// that file and exits 12 again.
+pub const EXIT_DOPPELGANGER_DETECTED: i32 = 12;
 pub const EXIT_UNSUPPORTED_FORK_VERSION: i32 = 13;
 pub const EXIT_KEYSTORE_LOCKED: i32 = 14;
 /// Required metrics or keymanager listener failed to bind.

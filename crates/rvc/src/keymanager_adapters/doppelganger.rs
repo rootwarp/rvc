@@ -148,7 +148,7 @@ impl DoppelgangerMonitor for DoppelgangerDisabledMonitor {
 /// |------|----------------|
 /// | `start_monitoring` | [`ForwardWindowMachine::register_for_import`] (always Pending) |
 /// | `stop_monitoring` | **no-op** — M-12 wall-clock elapsed must not cancel machine state |
-/// | `cancel_monitoring` | [`ForwardWindowMachine::cancel`] — DELETE / re-import fresh window |
+/// | `cancel_monitoring` | [`ForwardWindowMachine::cancel`] — DELETE drops `Pending`/`Safe`; `Detected` stays |
 ///
 /// Safety is the machine's `SigningEnablement` status (fail-closed for
 /// Pending/Detected/Unmonitored).
@@ -243,6 +243,21 @@ impl DoppelgangerMonitor for ForwardWindowMonitor {
         match PublicKey::from_bytes(pubkey) {
             Ok(pk) => self.machine.is_signing_enabled(&pk),
             // Invalid encoding → fail closed.
+            Err(_) => false,
+        }
+    }
+
+    fn signing_closed_by_detection(&self, pubkey: &Pubkey) -> bool {
+        match PublicKey::from_bytes(pubkey) {
+            Ok(pk) => self.machine.signing_closed_by_detection(&pk),
+            // Invalid encoding → treat as closed so an enable write is rolled back.
+            Err(_) => true,
+        }
+    }
+
+    fn is_detected_key(&self, pubkey: &Pubkey) -> bool {
+        match PublicKey::from_bytes(pubkey) {
+            Ok(pk) => self.machine.is_detected(&pk),
             Err(_) => false,
         }
     }

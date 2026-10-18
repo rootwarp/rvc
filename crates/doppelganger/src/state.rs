@@ -20,7 +20,15 @@ pub enum ValidatorState {
     /// `remaining` reached 0 with no live answer → safe to sign.
     Safe,
     /// An unexplained `is_live` was observed at an epoch `>= next_check_epoch`.
-    /// This state is TERMINAL: nothing transitions out of `Detected`.
+    ///
+    /// `Detected` is terminal in the machine. `cancel`, `register`,
+    /// `register_for_import`, `start_monitoring`, and `cancel_monitoring` do not
+    /// remove or replace it, so a DELETE then re-import in this process stays
+    /// `Detected`. The first transition also sets the process-wide detection
+    /// latch under the same states lock. While that latch is set,
+    /// [`crate::SigningEnablement::is_signing_enabled`] is false for every key.
+    /// The latch is not cleared in this process. The durable marker in the
+    /// validator data directory is what makes the next start exit 12.
     Detected,
 }
 

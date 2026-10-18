@@ -12,12 +12,18 @@ categories = ["cryptography::cryptocurrencies"]
 [lints]
 workspace = true
 
+[features]
+default = []
+# Rendezvous hooks for the detection latch. Production binaries do not enable it.
+test-utils = []
+
 [dependencies]
 crypto = { workspace = true }
 observability = { workspace = true }
 eth-types = { workspace = true }
 slashing = { workspace = true }
 hex = { workspace = true }
+libc = { workspace = true }
 parking_lot = { workspace = true }
 tracing = { workspace = true }
 
