@@ -5,6 +5,7 @@
 //! are captured for assertions.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -277,6 +278,10 @@ pub struct MockBeaconNodeClient {
     aggregate_completions: Mutex<Vec<tokio::time::Instant>>,
     /// When this returns `Some`, `get_attestation_data` fails that call and skips the handler.
     get_attestation_data_error: Option<AttestationDataErrorInject>,
+    /// When set, duty fences track this generation instead of staying open.
+    tracked_admission: Mutex<Option<Arc<AtomicU64>>>,
+    revoke_after_attestation_data: AtomicBool,
+    revoke_after_aggregate: AtomicBool,
 }
 
 /// Arrival of one role-trait call, before the injected request delay.
@@ -292,6 +297,40 @@ pub struct MockCallStamp {
 impl MockBeaconNodeClient {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// `duty_fence` and `admission_duty_fence` follow this generation.
+    pub fn track_admission(&self) -> Arc<AtomicU64> {
+        let mut slot = self.tracked_admission.lock().unwrap_or_else(|err| err.into_inner());
+        slot.get_or_insert_with(|| Arc::new(AtomicU64::new(0))).clone()
+    }
+
+    /// After a successful attestation-data fetch, bump the tracked generation.
+    pub fn revoke_after_attestation_data(&self) {
+        let _ = self.track_admission();
+        self.revoke_after_attestation_data.store(true, Ordering::Release);
+    }
+
+    /// After a successful aggregate fetch, bump the tracked generation.
+    pub fn revoke_after_aggregate(&self) {
+        let _ = self.track_admission();
+        self.revoke_after_aggregate.store(true, Ordering::Release);
+    }
+
+    fn fence_now(&self) -> beacon::DutyFence {
+        let slot = self.tracked_admission.lock().unwrap_or_else(|err| err.into_inner());
+        match slot.as_ref() {
+            Some(epoch) => beacon::DutyFence::at(epoch.load(Ordering::Acquire), Arc::clone(epoch)),
+            None => beacon::DutyFence::open(),
+        }
+    }
+
+    fn bump_tracked_admission(&self) {
+        if let Some(epoch) =
+            self.tracked_admission.lock().unwrap_or_else(|err| err.into_inner()).as_ref()
+        {
+            epoch.fetch_add(1, Ordering::Release);
+        }
     }
 
     /// Sleep `delay` before every async role-trait method.
@@ -1142,6 +1181,10 @@ impl BlockProducer for MockBeaconNodeClient {
 
 #[async_trait]
 impl AttestationApi for MockBeaconNodeClient {
+    fn admission_duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
+        Ok(self.fence_now())
+    }
+
     async fn get_attestation_data(
         &self,
         slot: u64,
@@ -1156,7 +1199,12 @@ impl AttestationApi for MockBeaconNodeClient {
             self.get_attestation_data.record((slot, committee_index));
             return Err(err);
         }
-        self.get_attestation_data.invoke("get_attestation_data", (slot, committee_index))
+        let result =
+            self.get_attestation_data.invoke("get_attestation_data", (slot, committee_index));
+        if result.is_ok() && self.revoke_after_attestation_data.load(Ordering::Acquire) {
+            self.bump_tracked_admission();
+        }
+        result
     }
 
     async fn submit_attestation(
@@ -1175,10 +1223,14 @@ impl AttestationApi for MockBeaconNodeClient {
         fork: ForkName,
     ) -> Result<VersionedAggregateAttestation, BeaconError> {
         self.charge(MockMethod::GetAggregateAttestation).await;
-        self.get_aggregate_attestation.invoke(
+        let result = self.get_aggregate_attestation.invoke(
             "get_aggregate_attestation",
             (slot, attestation_data_root.to_string(), committee_index, fork),
-        )
+        );
+        if result.is_ok() && self.revoke_after_aggregate.load(Ordering::Acquire) {
+            self.bump_tracked_admission();
+        }
+        result
     }
 
     async fn submit_aggregate_and_proofs(
@@ -1284,7 +1336,11 @@ impl LivenessApi for MockBeaconNodeClient {
     }
 }
 
-impl BeaconNodeClient for MockBeaconNodeClient {}
+impl BeaconNodeClient for MockBeaconNodeClient {
+    fn duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
+        Ok(self.fence_now())
+    }
+}
 
 #[cfg(test)]
 mod tests {

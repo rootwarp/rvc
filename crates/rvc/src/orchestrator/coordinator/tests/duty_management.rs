@@ -1139,6 +1139,7 @@ async fn drive_prepare_and_register(
     use validator_store::ValidatorConfig;
 
     let mock = Arc::new(mock);
+    mock.track_admission();
     let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
     let slot = epoch * ::timing::SLOTS_PER_EPOCH;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), slot));
@@ -1366,6 +1367,7 @@ async fn test_proposer_root_change_rebroadcasts_preferences() {
     let local_pk = local.public_key().to_bytes();
     let local_hex = pubkey_hex(&local_pk);
     let mock = Arc::new(retirement_beacon());
+    mock.track_admission();
     let beacon: Arc<dyn BeaconNodeClient> = mock.clone();
     let slot = gloas_epoch * ::timing::SLOTS_PER_EPOCH;
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), slot));

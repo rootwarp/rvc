@@ -303,7 +303,11 @@ pub async fn run(
     let head_gate = spawn_sse_subscriber(Some(Arc::clone(&bn_manager)), &executor)
         .unwrap_or_else(|| crate::orchestrator::HeadEventGate::pair().1);
     // DSR-2.1 / FR-P1-3: register bn.sync_monitor (Background).
-    spawn_sync_monitor(Some(Arc::clone(&bn_manager)), &executor, None);
+    let sync_check = bn_manager::sync_check_interval_for(
+        slot_clock.slot_duration(),
+        slot_clock.slots_per_epoch(),
+    );
+    spawn_sync_monitor(Some(Arc::clone(&bn_manager)), &executor, Some(sync_check));
     let slot_duration_ms = slot_clock.slot_duration().as_millis() as u64;
     let (mut orchestrator, orchestrator_handle) =
         crate::orchestrator::DutyOrchestrator::new(crate::orchestrator::OrchestratorDeps {

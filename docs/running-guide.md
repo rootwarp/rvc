@@ -65,6 +65,12 @@ rvc start [OPTIONS]
 | `--init-slashing-db` | false | Allow creating a **fresh empty** slashing DB if the path is missing (SEC-3). Dangerous on a previously-active validator (zero history → double-sign risk). Use only for genuine first deploy; 0-byte/corrupt files always abort. Config equivalent: `allow_fresh_db = true` |
 | `--network <NETWORK>` | `mainnet` | Network preset: `mainnet`, `sepolia`, `holesky`, `goerli`, `custom` |
 
+If every configured beacon node disagrees with the chain identity agreed at
+startup — genesis validators root, genesis time, genesis fork version, slot
+duration, or slots per epoch — duties stop and the process stays up. The log
+line is `no admitted beacon node; duties halted`. A timeout or an HTTP 5xx
+does not revoke a node. Duties resume when a node matches that identity again.
+
 #### Server Options
 
 | Flag | Default | Description |

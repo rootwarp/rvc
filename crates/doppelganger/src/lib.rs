@@ -13,7 +13,8 @@ mod state;
 mod traits;
 
 pub use enablement::{
-    signing_allowed, DoppelgangerDisabledByOperator, SigningDuty, SigningEnablement,
+    duty_requires_beacon_admission, signing_allowed, DoppelgangerDisabledByOperator, SigningDuty,
+    SigningEnablement,
 };
 pub use epoch_clock::MonotonicEpochClock;
 pub use forward_window::{EpochLiveness, ForwardWindowMachine};

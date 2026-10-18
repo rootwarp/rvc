@@ -10,7 +10,9 @@ use beacon::{block_value, GloasBlockContents, ProduceBlockV4Body, RankedBlock, W
 use crypto::PublicKey;
 use eth_types::{ForkName, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
-use signer::{BeaconBlockHeaderFields, CircuitBreakerState, ValidatorSigner};
+use signer::{
+    BeaconAdmission, BeaconBlockHeaderFields, CircuitBreakerState, SigningDuty, ValidatorSigner,
+};
 use timing::{due_ms, DeadlineBps, DeadlineSchedule};
 use validator_store::ValidatorStore;
 
@@ -51,6 +53,8 @@ pub struct BlockService<S: ValidatorSigner, B: BeaconBlockClient> {
     slot_duration_ms: u64,
     #[cfg(test)]
     envelope_deadline_note: Mutex<Option<EnvelopeDeadlineNote>>,
+    #[cfg(test)]
+    after_produce: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[cfg(test)]
@@ -144,6 +148,43 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             slot_duration_ms: SLOT_DURATION_MS,
             #[cfg(test)]
             envelope_deadline_note: Mutex::new(None),
+            #[cfg(test)]
+            after_produce: Mutex::new(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_produce(&self, hook: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.after_produce.lock() {
+            *slot = Some(Arc::new(hook));
+        }
+    }
+
+    fn admission_blocks(duty: SigningDuty, fence: &beacon::DutyFence) -> bool {
+        signer::duty_requires_beacon_admission(duty) && !fence.holds()
+    }
+
+    async fn under_admission<T>(
+        fence: &beacon::DutyFence,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        match fence.generation() {
+            Some(current) => {
+                signer::with_beacon_admission(BeaconAdmission::new(fence.seen(), current), fut)
+                    .await
+            }
+            None => fut.await,
+        }
+    }
+
+    fn discard_revoked_fences(fences: &[&beacon::DutyFence]) -> Result<(), BlockServiceError> {
+        if fences.iter().any(|fence| Self::admission_blocks(SigningDuty::Block, fence)) {
+            warn!("beacon node admission revoked; block candidate discarded");
+            Err(BlockServiceError::Beacon(
+                "beacon node response dropped: admission revoked in flight".into(),
+            ))
+        } else {
+            Ok(())
         }
     }
 
@@ -225,8 +266,15 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         expected_proposer_index: u64,
         expected_parents: Option<ExpectedParents>,
     ) -> Result<BlockProposalResult, BlockServiceError> {
-        self.propose_block_until(slot, pubkey, expected_proposer_index, expected_parents, None)
-            .await
+        self.propose_block_until(
+            slot,
+            pubkey,
+            expected_proposer_index,
+            expected_parents,
+            None,
+            &beacon::DutyFence::open(),
+        )
+        .await
     }
 
     /// [`Self::propose_block`] with a per-call block-production deadline.
@@ -251,10 +299,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         expected_proposer_index: u64,
         expected_parents: Option<ExpectedParents>,
         deadline: Option<tokio::time::Instant>,
+        capture_fence: &beacon::DutyFence,
     ) -> Result<BlockProposalResult, BlockServiceError> {
         let mode = self.validator_store.effective_block_selection_mode(&pubkey.to_bytes());
         let validator = BlockResponseValidator { expected_proposer_index, expected_parents };
-        self.propose_block_impl(slot, pubkey, mode, Some(&validator), deadline).await
+        self.propose_block_impl(slot, pubkey, mode, Some(&validator), deadline, capture_fence).await
     }
 
     /// Mode-override entry point for tests. Not part of the public API —
@@ -268,7 +317,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         mode: BlockSelectionMode,
     ) -> Result<BlockProposalResult, BlockServiceError> {
-        self.propose_block_impl(slot, pubkey, mode, None, None).await
+        self.propose_block_impl(slot, pubkey, mode, None, None, &beacon::DutyFence::open()).await
     }
 
     async fn propose_block_impl(
@@ -278,6 +327,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         mode: BlockSelectionMode,
         validator: Option<&BlockResponseValidator>,
         deadline: Option<tokio::time::Instant>,
+        capture_fence: &beacon::DutyFence,
     ) -> Result<BlockProposalResult, BlockServiceError> {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let proposal_start = Instant::now();
@@ -288,11 +338,23 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let fork = ForkName::from_epoch(epoch, &self.fork_schedule);
         let mut payload_deadline = self.payload_deadline(fork, proposal_start);
 
+        let fence = self.beacon.duty_fence()?;
+        if Self::admission_blocks(SigningDuty::RandaoReveal, &fence) {
+            warn!(slot, "no admitted beacon node; duties halted");
+            return Err(BlockServiceError::Beacon("no admitted beacon node; duties halted".into()));
+        }
+
         // 1. Sign RANDAO reveal
         let randao_start = std::time::Instant::now();
-        let randao_sig = self
-            .signer
-            .sign_randao_reveal(epoch, pubkey, &self.fork_schedule, &self.genesis_validators_root)
+        let randao_sig = Self::under_admission(
+                &fence,
+                self.signer.sign_randao_reveal(
+                    epoch,
+                    pubkey,
+                    &self.fork_schedule,
+                    &self.genesis_validators_root,
+                ),
+            )
             .instrument(tracing::info_span!("sign.randao"))
             .await
             .map_err(|e| {
@@ -428,6 +490,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         };
 
         payload_deadline.mark("produce");
+        #[cfg(test)]
+        if let Some(hook) = self.after_produce.lock().ok().and_then(|guard| guard.clone()) {
+            hook();
+        }
+        Self::discard_revoked_fences(&[&fence, capture_fence])?;
 
         // Sign and publish. The slot fork picks V4 or the ranked V3 list.
         // V4 rejects a blinded flag before signing; the shape is the bid
@@ -449,6 +516,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 fork,
                 mode,
                 &mut payload_deadline,
+                &fence,
+                capture_fence,
             )
             .await
             .map(|(block_root, is_blinded)| SignedProposal {
@@ -463,7 +532,17 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     "pre-Gloas slot produced a V4 block".to_string(),
                 ));
             };
-            self.sign_first_v3_candidate(candidates, slot, pubkey, validator, fork, mode).await
+            self.sign_first_v3_candidate(
+                candidates,
+                slot,
+                pubkey,
+                validator,
+                fork,
+                mode,
+                &fence,
+                capture_fence,
+            )
+                .await
         }
         .map_err(|e| {
             if matches!(e, BlockServiceError::EnvelopeAfterPublish(_)) {
@@ -519,6 +598,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         fork: ForkName,
         mode: BlockSelectionMode,
         payload_deadline: &mut PayloadDeadline,
+        fence: &beacon::DutyFence,
+        capture_fence: &beacon::DutyFence,
     ) -> Result<(Root, bool), BlockServiceError> {
         cross_check_consensus_version(&response.consensus_version, fork)?;
         reject_blinded_at_gloas(
@@ -607,12 +688,19 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         } else {
             None
         };
-        let sig = self
-            .signer
-            .sign_block_header(&header, pubkey, &self.fork_schedule, &self.genesis_validators_root)
-            .instrument(tracing::info_span!("sign.block"))
-            .await
-            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        Self::discard_revoked_fences(&[fence, capture_fence])?;
+        let sig = Self::under_admission(
+            fence,
+            self.signer.sign_block_header(
+                &header,
+                pubkey,
+                &self.fork_schedule,
+                &self.genesis_validators_root,
+            ),
+        )
+        .instrument(tracing::info_span!("sign.block"))
+        .await
+        .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
         payload_deadline.mark("sign_block");
         let published = async {
             let builder_url =
@@ -652,6 +740,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                         pubkey,
                         fork,
                         payload_deadline,
+                        fence,
+                        capture_fence,
                     )
                     .await
                 {
@@ -677,6 +767,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         fork: ForkName,
         payload_deadline: &mut PayloadDeadline,
+        fence: &beacon::DutyFence,
+        capture_fence: &beacon::DutyFence,
     ) -> Result<(), BlockServiceError> {
         if !response.payload_included {
             return Err(BlockServiceError::Parse(
@@ -684,18 +776,22 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     .to_string(),
             ));
         }
-        let sig = self
-            .signer
-            .sign_execution_payload_envelope_root(
+        // The header scope ended when that future completed. Re-enter it, and
+        // re-check the capture fence taken before produce.
+        Self::discard_revoked_fences(&[fence, capture_fence])?;
+        let sig = Self::under_admission(
+            fence,
+            self.signer.sign_execution_payload_envelope_root(
                 &object_root,
                 slot,
                 pubkey,
                 &self.fork_schedule,
                 &self.genesis_validators_root,
-            )
-            .instrument(tracing::info_span!("sign.envelope"))
-            .await
-            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+            ),
+        )
+        .instrument(tracing::info_span!("sign.envelope"))
+        .await
+        .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
         payload_deadline.mark("sign_envelope");
         let signed = signed_envelope_wire(envelope_body, &sig.to_bytes())?;
         let publish = self
@@ -728,6 +824,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     /// Walk pre-Gloas candidates. A prepare failure is logged once and skipped.
     /// The first candidate that prepares is signed and published. A signer or
     /// publish error returns immediately and does not try the next candidate.
+    #[allow(clippy::too_many_arguments)]
     async fn sign_first_v3_candidate(
         &self,
         candidates: Vec<RankedBlock>,
@@ -736,6 +833,8 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         validator: Option<&BlockResponseValidator>,
         fork: ForkName,
         mode: BlockSelectionMode,
+        fence: &beacon::DutyFence,
+        capture_fence: &beacon::DutyFence,
     ) -> Result<SignedProposal, BlockServiceError> {
         if candidates.is_empty() {
             return Err(BlockServiceError::Beacon(
@@ -758,7 +857,9 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                         is_blinded = response.is_blinded,
                         "Blinded/unblinded path chosen"
                     );
-                    return self.sign_and_publish_prepared(prepared, slot, pubkey).await;
+                    return self
+                        .sign_and_publish_prepared(prepared, slot, pubkey, fence, capture_fence)
+                        .await;
                 }
                 Err(err) => {
                     warn!(
@@ -1014,19 +1115,23 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         prepared: PreparedProposal,
         slot: Slot,
         pubkey: &PublicKey,
+        fence: &beacon::DutyFence,
+        capture_fence: &beacon::DutyFence,
     ) -> Result<SignedProposal, BlockServiceError> {
         let sign_start = std::time::Instant::now();
-        let sig = self
-            .signer
-            .sign_block_header(
+        Self::discard_revoked_fences(&[fence, capture_fence])?;
+        let sig = Self::under_admission(
+            fence,
+            self.signer.sign_block_header(
                 &prepared.header,
                 pubkey,
                 &self.fork_schedule,
                 &self.genesis_validators_root,
-            )
-            .instrument(tracing::info_span!("sign.block"))
-            .await
-            .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+            ),
+        )
+        .instrument(tracing::info_span!("sign.block"))
+        .await
+        .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
         debug!(
             slot = slot,
             duration_ms = sign_start.elapsed().as_millis() as u64,

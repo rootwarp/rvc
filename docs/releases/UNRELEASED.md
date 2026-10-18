@@ -313,12 +313,31 @@ least one must respond. Custom still requires every configured beacon node.
 A beacon node whose genesis validators root is not the configured root is
 rejected. It is not admitted, it is not the chain identity, and it is not a
 source of liveness or head and reorg events. A skipped node stays out of
-duties and liveness until its slot duration, slots per epoch, genesis time,
-and genesis validators root match the boot agreement. Recovering `/eth/v1/node/syncing` does not admit it. A spec that
-arrives before a genesis timeout is still compared. HTTP 502, 503, 504, and
+duties and liveness until its slot duration, `SLOTS_PER_EPOCH`, genesis time,
+`genesis_fork_version`, and genesis validators root match the boot agreement.
+Recovering `/eth/v1/node/syncing` does not admit it. A spec that arrives
+before a genesis timeout is still compared. A genesis timeout before any
+node has seeded still merges that spec's slot duration and `SLOTS_PER_EPOCH`.
+It does not seed genesis time or `genesis_fork_version`. If no node returns
+genesis, boot fails and chain identity stays unset. HTTP 502, 503, 504, and
 429 count as not responding. HTTP 500 does not.
-The client does not assume 12 seconds. Slot boundaries use that duration in
-milliseconds, including lengths that are not a whole number of seconds.
+
+The monitor re-checks identity once per epoch. A parsed mismatch revokes the
+node, including a pass that would otherwise be Unreachable or Unknown when
+one side has already parsed a disagreement. When the last admitted node is
+revoked, duties halt in place and the process stays up. `rvc_bn_admitted`
+for that endpoint is 0. The proposer pool does not apply this check yet
+(#708).
+
+The sync monitor waits one epoch of the beacon-node slot duration (6 000 ms
+and 32 slots is 192 s). The head-event fallback poll waits one slot of that
+duration. The subscriber samples the admission generation before it connects.
+A silent stream wakes every 200 ms and leaves when that generation moved.
+When the duration is not known yet the poll backs off 200 ms and retries the
+stream; it does not wait for shutdown. Block production's default slot length
+and the keystore admission clock still use 12 seconds. Slot boundaries use
+the beacon-node duration in milliseconds, including lengths that are not a
+whole number of seconds.
 
 The keymanager voluntary exit uses the duration and genesis time checked at
 startup. It does not read the spec or genesis again from whichever pool node

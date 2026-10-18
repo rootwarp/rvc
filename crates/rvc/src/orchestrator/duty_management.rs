@@ -483,16 +483,33 @@ impl DutyManagementService {
                 let committee_length = duty.committee_length;
                 let wire = &duty.raw;
 
-                // Compute selection proof and determine if aggregator
-                let selection_proof = match self
-                    .signer
-                    .sign_selection_proof(
+                let fence = match self.beacon.duty_fence() {
+                    Ok(fence)
+                        if !super::slot_context::admission_blocks(
+                            signer::SigningDuty::SelectionProof,
+                            &[&fence],
+                        ) =>
+                    {
+                        fence
+                    }
+                    _ => {
+                        warn!(
+                            slot,
+                            "skipping committee subscription: beacon node admission revoked"
+                        );
+                        continue;
+                    }
+                };
+                let selection_proof = match super::slot_context::under_admission(
+                    &fence,
+                    self.signer.sign_selection_proof(
                         slot,
                         &pubkey,
                         &self.config.fork_schedule,
                         &self.config.genesis_validators_root,
-                    )
-                    .await
+                    ),
+                )
+                .await
                 {
                     Ok(sig) => sig,
                     Err(e) => {

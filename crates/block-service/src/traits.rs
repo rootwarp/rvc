@@ -41,6 +41,10 @@ pub struct ProduceDuty {
 /// can be adapted to implement this trait.
 #[async_trait]
 pub trait BeaconBlockClient: Send + Sync {
+    fn duty_fence(&self) -> Result<beacon::DutyFence, BlockServiceError> {
+        Ok(beacon::DutyFence::open())
+    }
+
     async fn produce_block_v3(
         &self,
         slot: Slot,

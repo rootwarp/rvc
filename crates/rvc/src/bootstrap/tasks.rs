@@ -984,6 +984,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sync_monitor_interval_is_one_epoch_of_the_bn_slot_duration() {
+        let interval = bn_manager::sync_check_interval_for(Duration::from_millis(6_000), 32);
+        assert_eq!(interval, Duration::from_secs(192));
+        let src = include_str!("run.rs");
+        assert!(
+            src.contains("sync_check_interval_for("),
+            "the sync monitor must use one epoch of the beacon-node slot duration"
+        );
+    }
+
     // -- DSR-2.1: sync monitor bootstrap wiring --
 
     #[tokio::test]

@@ -35,6 +35,14 @@ pub enum BeaconError {
     /// The beacon node returned a genesis validators root other than the configured one.
     #[error("genesis validators root {root} does not match configured root")]
     GenesisValidatorsRootMismatch { root: String },
+
+    /// No beacon node is admitted, so a duty must not be sent or signed.
+    #[error("no admitted beacon node; duties halted")]
+    NoAdmittedNode,
+
+    /// A response arrived after the node's admission generation changed.
+    #[error("beacon node response dropped: admission revoked in flight")]
+    RevokedInFlight,
 }
 
 #[cfg(test)]
@@ -78,6 +86,18 @@ mod tests {
             timeout: Duration::from_secs(3),
         };
         assert_eq!(err.to_string(), "produce_block_v3 timed out after 3s");
+    }
+
+    #[test]
+    fn test_no_admitted_node_error_display() {
+        let err = BeaconError::NoAdmittedNode;
+        assert_eq!(err.to_string(), "no admitted beacon node; duties halted");
+    }
+
+    #[test]
+    fn test_revoked_in_flight_error_display() {
+        let err = BeaconError::RevokedInFlight;
+        assert_eq!(err.to_string(), "beacon node response dropped: admission revoked in flight");
     }
 
     #[test]

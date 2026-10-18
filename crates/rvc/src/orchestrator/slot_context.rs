@@ -49,6 +49,7 @@ pub(crate) struct SlotContext {
     /// messages. `None` after that fallback means no parent was verified
     /// either, and sync duties skip.
     pub head_root: Option<Root>,
+    pub fence: beacon::DutyFence,
 }
 
 impl SlotContext {
@@ -63,6 +64,7 @@ impl SlotContext {
         slot: Slot,
         epoch: Epoch,
     ) -> Self {
+        let fence = beacon.duty_fence().unwrap_or_else(|_| beacon::DutyFence::closed());
         let (parent_root, expected_parents) = match walk_back_parent(beacon, slot).await {
             ParentCapture::Header(header) => {
                 (Some(header.root), Some(expected_parents_for(slot, &header)))
@@ -70,10 +72,22 @@ impl SlotContext {
             ParentCapture::Unchecked => (None, None),
             ParentCapture::Closed => (None, Some(ExpectedParents::closed())),
         };
-        Self { slot, epoch, parent_root, expected_parents, head_root: None }
+        Self { slot, epoch, parent_root, expected_parents, head_root: None, fence }
     }
 
     /// Records the phase-2 head. The first root wins; a later call leaves it.
+    #[cfg(test)]
+    pub(crate) fn bare(slot: Slot, epoch: Epoch) -> Self {
+        Self {
+            slot,
+            epoch,
+            parent_root: None,
+            expected_parents: None,
+            head_root: None,
+            fence: beacon::DutyFence::open(),
+        }
+    }
+
     pub(crate) fn set_head(&mut self, root: Root) {
         if self.head_root.is_none() {
             self.head_root = Some(root);
@@ -94,6 +108,36 @@ impl SlotContext {
         if let Some(root) = fetched.or(self.parent_root) {
             self.set_head(root);
         }
+    }
+}
+
+/// Fence for a slot whose parent capture timed out.
+///
+/// An open fence would let a later phase sign after a revoke. The beacon
+/// fence still fails `holds` when a later revoke lands. No admitted node is
+/// [`beacon::DutyFence::closed`].
+pub(crate) fn fence_when_parent_capture_times_out(
+    result: Result<beacon::DutyFence, beacon::BeaconError>,
+) -> beacon::DutyFence {
+    result.unwrap_or_else(|_| beacon::DutyFence::closed())
+}
+
+/// `true` when `duty` signs admitted chain data and any fence no longer holds.
+pub(crate) fn admission_blocks(duty: signer::SigningDuty, fences: &[&beacon::DutyFence]) -> bool {
+    signer::duty_requires_beacon_admission(duty) && fences.iter().any(|fence| !fence.holds())
+}
+
+/// Run `fut` inside the signer's admission scope when the fence tracks a generation.
+pub(crate) async fn under_admission<T>(
+    fence: &beacon::DutyFence,
+    fut: impl std::future::Future<Output = T>,
+) -> T {
+    match fence.generation() {
+        Some(current) => {
+            signer::with_beacon_admission(signer::BeaconAdmission::new(fence.seen(), current), fut)
+                .await
+        }
+        None => fut.await,
     }
 }
 
@@ -254,8 +298,24 @@ async fn fetch_slot_qualified_root(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
     use super::super::utils::parse_hex_root;
     use super::*;
+
+    #[test]
+    fn parent_capture_timeout_does_not_use_an_open_fence() {
+        let closed = fence_when_parent_capture_times_out(Err(beacon::BeaconError::NoAdmittedNode));
+        assert!(!closed.holds());
+        let current = Arc::new(AtomicU64::new(3));
+        let held =
+            fence_when_parent_capture_times_out(Ok(beacon::DutyFence::at(3, Arc::clone(&current))));
+        assert!(held.holds());
+        current.fetch_add(1, Ordering::Release);
+        assert!(!held.holds());
+    }
+
     use beacon::{BlockRootData, DataResponse};
     use bn_manager::MockBeaconNodeClient;
     use metrics::definitions::{
@@ -956,6 +1016,7 @@ mod tests {
             parent_root: Some(parent_root()),
             expected_parents: None,
             head_root: None,
+            fence: beacon::DutyFence::open(),
         }
     }
 

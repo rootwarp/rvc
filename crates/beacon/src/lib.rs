@@ -2,8 +2,11 @@
 //!
 //! Provides async HTTP client with retry logic for beacon node communication.
 
+mod admission;
 mod client;
 mod error;
+
+pub use admission::DutyFence;
 pub(crate) mod http_caps;
 mod retry;
 pub mod ssz_deser;

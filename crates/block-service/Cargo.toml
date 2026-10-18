@@ -32,6 +32,10 @@ rvc-gloas.workspace = true
 crypto.workspace = true
 eth-types = { workspace = true, features = ["test-fixtures"] }
 rvc-gloas = { workspace = true, features = ["test-fixtures"] }
+# `always_enabled` and `require_beacon_admission_scope` for admission tests.
+# Production dependency lines do not enable this feature.
+signer = { workspace = true, features = ["test-utils"] }
+slashing.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "time"] }
 toml.workspace = true
 tracing-test.workspace = true

@@ -26,8 +26,8 @@ That command prints 14 lines, one per row below.
 | File | Line | Task | Call | Bucket | Reason |
 |---|---:|---|---|---|---|
 | `bin/rvc/src/logging.rs` | 312 | `log_reload` | spawn | detached | SIGHUP log-reload handler; process-lifetime signal loop, no caller trace to inherit. |
-| `crates/rvc/src/bootstrap/run.rs` | 371 | `duty_orchestrator` | spawn | detached | Already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B. `executor.spawn_result`. |
-| `crates/rvc/src/bootstrap/run.rs` | 854 | `secret_provider_refresh` | spawn | detached | `secret_provider::RefreshService::run`; loop body is `crates/secret-provider/src/refresh.rs:185`, out of scope. |
+| `crates/rvc/src/bootstrap/run.rs` | 375 | `duty_orchestrator` | spawn | detached | Already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B. `executor.spawn_result`. |
+| `crates/rvc/src/bootstrap/run.rs` | 858 | `secret_provider_refresh` | spawn | detached | `secret_provider::RefreshService::run`; loop body is `crates/secret-provider/src/refresh.rs:185`, out of scope. |
 | `crates/rvc/src/bootstrap/tasks.rs` | 120 | `metrics_server` | spawn | detached | Metrics server; serve loop is `crates/metrics/src/server.rs:96` (`serve_metrics_with_health`), out of P1-1 scope. |
 | `crates/rvc/src/bootstrap/tasks.rs` | 142 | `monitoring_push` | spawn | B | Iteration loop. Loop site `crates/rvc/src/background_tasks/monitoring.rs:161`. TRC-6b owns the per-iteration root. |
 | `crates/rvc/src/bootstrap/tasks.rs` | 171 | `proposer_config_refresh` | spawn | B | Iteration loop. Loop site `crates/rvc/src/background_tasks/config_url.rs:965`. TRC-6b owns the per-iteration root. |
@@ -95,7 +95,7 @@ These calls are outside the executor scan (`crates/rvc` + `bin/rvc`) and outside
 
 | File | Line | Call |
 |---|---:|---|
-| `crates/bn-manager/src/fan_out.rs` | 862 | `tokio::spawn` in `wait_for_complete_detached` |
-| `crates/bn-manager/src/fan_out.rs` | 1075 | `tokio::spawn` in `spawn_detached` |
-| `crates/bn-manager/src/fan_out.rs` | 1130 | `tokio::spawn` in `health_sender` |
-| `crates/bn-manager/src/manager.rs` | 714 | `tokio::spawn` in `start_sse` |
+| `crates/bn-manager/src/fan_out.rs` | 867 | `tokio::spawn` in `wait_for_complete_detached` |
+| `crates/bn-manager/src/fan_out.rs` | 1080 | `tokio::spawn` in `spawn_detached` |
+| `crates/bn-manager/src/fan_out.rs` | 1135 | `tokio::spawn` in `health_sender` |
+| `crates/bn-manager/src/manager.rs` | 780 | `tokio::spawn` in `start_sse` |

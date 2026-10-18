@@ -85,6 +85,16 @@ lazy_static! {
         )
     };
 
+    /// 1 when the beacon node is admitted for duties, 0 when it is not.
+    /// Labels: endpoint
+    pub static ref RVC_BN_ADMITTED: prometheus::IntGaugeVec = {
+        define_int_gauge_vec(
+            "rvc_bn_admitted",
+            "1 when the beacon node is admitted for duties, 0 when admission is revoked or not yet granted",
+            &["endpoint"],
+        )
+    };
+
     /// Compatibility handle for `rvc_signer_slashing_tx_hold_duration_ms`.
     ///
     /// The owning declaration is `signer::metrics`. This rust identifier is
@@ -201,6 +211,7 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_MONITORING_PUSH_SUCCESS_TOTAL);
     lazy_static::initialize(&RVC_MONITORING_PUSH_FAILURES_TOTAL);
     lazy_static::initialize(&RVC_BN_HEALTH_TIER);
+    lazy_static::initialize(&RVC_BN_ADMITTED);
     lazy_static::initialize(&RVC_TX_HOLD_DURATION_MS);
     lazy_static::initialize(&RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS);
     lazy_static::initialize(&RVC_SLOT_PHASE_OFFSET_MS);
@@ -210,7 +221,9 @@ pub fn init_metrics() {
     lazy_static::initialize(&RVC_TASK_EXITS_TOTAL);
     lazy_static::initialize(&RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL);
     lazy_static::initialize(&RVC_SLOT_REPLAY_SKIPPED_TOTAL);
-    // DSR-2.4: force-register S5A zero children so scrapes see numeric samples.
+    // DSR-2.4: the health-tier gauge keeps one placeholder child so a scrape
+    // before the first beacon node still has a numeric sample. `rvc_bn_admitted`
+    // does not: an `endpoint="unknown"` child would look like a real node.
     let _ = RVC_BN_HEALTH_TIER.with_label_values(&[bn_health_tier::UNCONFIGURED_ENDPOINT]);
     for task in task_exit_tasks::ALL {
         for outcome in task_exit_outcome::ALL {
@@ -333,6 +346,7 @@ pub mod sync_committee_skip_phase {
 /// `reason` label values for `rvc_sync_committee_skipped_total`.
 pub mod sync_committee_skip_reason {
     pub const NO_HEAD_ROOT: &str = "no_head_root";
+    pub const BN_REVOKED: &str = "bn_revoked";
 }
 
 /// `reason` label values for `rvc_payload_attestation_skipped_total`.
@@ -451,6 +465,20 @@ mod tests {
         assert!(
             endpoints.contains(bn_health_tier::UNCONFIGURED_ENDPOINT),
             "bn_health_tier unknown endpoint must be force-registered, got {endpoints:?}"
+        );
+
+        let admitted = gathered.iter().find(|metric| metric.name() == "rvc_bn_admitted");
+        let unknown_admitted = admitted.is_some_and(|metric| {
+            metric.get_metric().iter().any(|sample| {
+                sample.get_label().iter().any(|label| {
+                    label.name() == "endpoint"
+                        && label.value() == bn_health_tier::UNCONFIGURED_ENDPOINT
+                })
+            })
+        });
+        assert!(
+            !unknown_admitted,
+            "rvc_bn_admitted must not publish an endpoint=unknown placeholder"
         );
     }
 

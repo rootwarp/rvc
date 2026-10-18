@@ -1,6 +1,6 @@
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use metrics::{define_int_gauge_vec, IntGaugeVec};
@@ -234,6 +234,8 @@ pub struct BeaconClient {
     config: BeaconClientConfig,
     /// Logs the node-version v1 fallback once per BN (D25).
     node_version_v1_fallback_logged: Arc<AtomicBool>,
+    /// Set by [`Self::hold_admission`]. Unset means `duty_fence` stays open.
+    admission_generation: Arc<Mutex<Option<Arc<AtomicU64>>>>,
 }
 
 impl BeaconClient {
@@ -262,7 +264,24 @@ impl BeaconClient {
             client,
             config,
             node_version_v1_fallback_logged: Arc::new(AtomicBool::new(false)),
+            admission_generation: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Install a holding duty-fence generation on this client.
+    ///
+    /// `BnManager` owns admission. A raw client stays open until a test calls
+    /// this, so builder preferences do not sign against an open fence.
+    #[doc(hidden)]
+    pub fn hold_admission(&self) -> Arc<AtomicU64> {
+        let mut slot = self.admission_generation.lock().unwrap_or_else(|err| err.into_inner());
+        slot.get_or_insert_with(|| Arc::new(AtomicU64::new(0))).clone()
+    }
+
+    /// Generation installed by [`Self::hold_admission`], if any.
+    #[doc(hidden)]
+    pub fn admission_generation(&self) -> Option<Arc<AtomicU64>> {
+        self.admission_generation.lock().unwrap_or_else(|err| err.into_inner()).clone()
     }
 
     /// Returns the configured endpoint URL.

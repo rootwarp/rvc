@@ -181,6 +181,7 @@ async fn test_sync_runs_with_attesting_disabled() {
         parent_root: None,
         expected_parents: None,
         head_root: Some(r_captured),
+        fence: beacon::DutyFence::open(),
     };
 
     // Exercise the guarded sync-messages phase directly.
@@ -230,6 +231,7 @@ async fn test_sync_messages_skipped_when_sync_disabled() {
         parent_root: None,
         expected_parents: None,
         head_root: Some(r_captured),
+        fence: beacon::DutyFence::open(),
     };
 
     orchestrator
@@ -268,6 +270,7 @@ async fn test_sync_contributions_skipped_when_sync_disabled() {
         parent_root: None,
         expected_parents: None,
         head_root: Some(r_captured),
+        fence: beacon::DutyFence::open(),
     };
     // With sync_enabled=false the phase guard returns early before any
     // signer or BN call. The test just verifies no panic and no submission.

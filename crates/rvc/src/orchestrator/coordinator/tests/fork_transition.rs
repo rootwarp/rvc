@@ -93,7 +93,11 @@ async fn build_fork_transition_orchestrator_with(
     clock.set_slot(slot);
 
     let beacon_config = BeaconClientConfig::new(mock_server_uri);
-    let beacon: Arc<dyn BeaconNodeClient> = Arc::new(BeaconClient::new(beacon_config).unwrap());
+    let client = BeaconClient::new(beacon_config).unwrap();
+    if attach_builder {
+        client.hold_admission();
+    }
+    let beacon: Arc<dyn BeaconNodeClient> = Arc::new(client);
 
     let secret_key = SecretKey::generate();
     let pubkey_hex = format!("0x{}", hex::encode(secret_key.public_key().to_bytes()));
@@ -2241,6 +2245,7 @@ fn proposal_ctx(slot: Slot) -> SlotContext {
         parent_root: None,
         expected_parents: None,
         head_root: None,
+        fence: beacon::DutyFence::open(),
     }
 }
 

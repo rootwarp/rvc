@@ -770,6 +770,9 @@ where
                         parent_root: None,
                         expected_parents: None,
                         head_root: None,
+                        fence: super::slot_context::fence_when_parent_capture_times_out(
+                            self.beacon.duty_fence(),
+                        ),
                     }
                 }
             };

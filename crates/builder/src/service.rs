@@ -122,6 +122,20 @@ impl BuilderService {
         }
     }
 
+    /// Duty fence for preferences and builder-request auth.
+    ///
+    /// Those messages carry `dependent_root` and `proposal_slot` from beacon
+    /// duties. No admitted node skips the sign.
+    fn preference_admission(&self) -> Option<signer::BeaconAdmission> {
+        match self.bn.beacon_admission() {
+            Ok(admission) if admission.holds() => Some(admission),
+            _ => {
+                warn!("skipping builder preference sign: beacon node admission revoked");
+                None
+            }
+        }
+    }
+
     /// Drop cached registrations so the next [`Self::register_validators`] re-submits.
     ///
     /// Preference caches are left intact. Used by boundary tests so a missing
@@ -191,10 +205,19 @@ impl BuilderService {
                 }
             };
 
-            match self
-                .signer
-                .sign_builder_registration(&registration, &pk, self.genesis_fork_version)
-                .await
+            // Fee recipient, gas limit, timestamp, and pubkey are local
+            // config under the configured genesis fork version, not a
+            // beacon-node body. The scope is `BeaconAdmission::unbound`.
+            // A missing scope still fails closed.
+            match signer::with_beacon_admission(
+                signer::BeaconAdmission::unbound(),
+                self.signer.sign_builder_registration(
+                    &registration,
+                    &pk,
+                    self.genesis_fork_version,
+                ),
+            )
+            .await
             {
                 Ok(signature) => {
                     // Wire boundary: eth_types::Signature is Vec<u8> for JSON serde.
@@ -393,6 +416,9 @@ impl BuilderService {
         let mut signed = Vec::new();
         let mut signed_keys = Vec::new();
         for proposal in &candidates {
+            let Some(admission) = self.preference_admission() else {
+                continue;
+            };
             let fee_recipient = self.validator_store.effective_fee_recipient(&proposal.pubkey);
             let gas_limit = self.validator_store.effective_gas_limit(&proposal.pubkey);
             let prefs = ProposerPreferences {
@@ -413,15 +439,16 @@ impl BuilderService {
                     continue;
                 }
             };
-            match self
-                .signer
-                .sign_proposer_preferences(
+            match signer::with_beacon_admission(
+                admission,
+                self.signer.sign_proposer_preferences(
                     &prefs,
                     &pk,
                     &self.fork_schedule,
                     genesis_validators_root,
-                )
-                .await
+                ),
+            )
+            .await
             {
                 Ok(signature) => {
                     signed.push(SignedProposerPreferences {
@@ -535,6 +562,9 @@ impl BuilderService {
         }
 
         for (proposal, url) in &to_sign {
+            let Some(admission) = self.preference_admission() else {
+                continue;
+            };
             // No out-of-band override is configured; default to URL UTF-8 bytes.
             let auth =
                 match BuilderRequestAuth::new(url.as_bytes().to_vec(), proposal.proposal_slot) {
@@ -560,7 +590,11 @@ impl BuilderService {
                     continue;
                 }
             };
-            match self.signer.sign_builder_request_auth(&auth, &pk, self.genesis_fork_version).await
+            match signer::with_beacon_admission(
+                admission,
+                self.signer.sign_builder_request_auth(&auth, &pk, self.genesis_fork_version),
+            )
+            .await
             {
                 Ok(signature) => {
                     let signed = eth_types::SignedBuilderRequestAuth {
@@ -720,7 +754,8 @@ mod tests {
 
     use async_trait::async_trait;
     use crypto::PublicKey;
-    use eth_types::{ProposerPreferences, ValidatorRegistrationV1};
+    use eth_types::{BuilderRequestAuth, ProposerPreferences, ValidatorRegistrationV1};
+    use signer::ValidatorSigner;
     use validator_store::ValidatorConfig;
 
     use bn_manager::SubmitBuilderPreferencesResult;
@@ -840,6 +875,10 @@ mod tests {
                 });
             }
             Ok(SubmitBuilderPreferencesResult::Success)
+        }
+
+        fn beacon_admission(&self) -> Result<signer::BeaconAdmission, BeaconError> {
+            Ok(signer::BeaconAdmission::unbound())
         }
     }
 
@@ -2347,5 +2386,145 @@ mod tests {
             capped_unique_builder_urls(urls),
             vec!["https://a.example".to_string(), "https://b.example".to_string()]
         );
+    }
+
+    fn production_signer() -> (Arc<signer::SignerService>, PublicKey, Arc<dyn RegistrationSigner>) {
+        let secret = crypto::SecretKey::generate();
+        let pubkey = secret.public_key();
+        let mut keys = crypto::KeyManager::new();
+        keys.insert(secret);
+        let composite = Arc::new(crypto::CompositeSigner::new(crypto::LocalSigner::new(keys)));
+        let db = Arc::new(slashing::SlashingDb::open_in_memory().expect("memory slashing db"));
+        let service = Arc::new(
+            signer::SignerService::new(composite, db).with_enablement(signer::always_enabled()),
+        );
+        let validator: Arc<dyn signer::ValidatorSigner> = service.clone();
+        (service, pubkey, Arc::new(validator))
+    }
+
+    /// Registration installs `BeaconAdmission::unbound`. Removing that scope
+    /// makes the submit empty, because `require_beacon_admission_scope` runs
+    /// the production missing-scope branch.
+    #[tokio::test]
+    async fn registration_signs_under_unbound_scope_and_is_refused_without_one() {
+        let (service, pubkey, signer) = production_signer();
+        let pk = pubkey.to_bytes();
+        let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
+        let bn = Arc::new(MockBn::new());
+        let builder =
+            BuilderService::new(signer, bn.clone(), Arc::new(store), GENESIS_FORK, unscheduled());
+        signer::require_beacon_admission_scope(builder.register_validators(PRE_GLOAS_EPOCH))
+            .await
+            .unwrap();
+        {
+            let calls = bn.register_calls.lock();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].len(), 1);
+            assert_eq!(calls[0][0].signature.len(), 96);
+        }
+
+        let registration = ValidatorRegistrationV1 {
+            fee_recipient: [0; 20],
+            gas_limit: 1,
+            timestamp: 1,
+            pubkey: pk,
+        };
+        let err = signer::require_beacon_admission_scope(service.sign_builder_registration(
+            &registration,
+            &pubkey,
+            GENESIS_FORK,
+        ))
+        .await
+        .expect_err("missing admission scope");
+        assert!(matches!(err, SignerError::BeaconAdmissionRevoked));
+    }
+
+    /// The preferences gate installs the beacon scope before the sign.
+    /// Removing `preference_admission` leaves the production branch with no
+    /// scope, so nothing is submitted.
+    #[tokio::test]
+    async fn proposer_preferences_sign_under_the_gate_and_are_refused_without_a_scope() {
+        let (service, pubkey, signer) = production_signer();
+        let pk = pubkey.to_bytes();
+        let store = test_store_with_builder_validators(&[(pk, true, None, None)]);
+        let bn = Arc::new(MockBn::new());
+        let gloas_epoch = 10;
+        let builder = BuilderService::new(
+            signer,
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let proposal = upcoming_for(pk, gloas_epoch, 1);
+        signer::require_beacon_admission_scope(builder.broadcast_proposer_preferences(
+            gloas_epoch,
+            std::slice::from_ref(&proposal),
+            &TEST_GVR,
+        ))
+        .await
+        .unwrap();
+        {
+            let calls = bn.preference_calls.lock();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].len(), 1);
+            assert_eq!(calls[0][0].signature.len(), 96);
+        }
+
+        let prefs = ProposerPreferences {
+            dependent_root: proposal.dependent_root,
+            proposal_slot: proposal.proposal_slot,
+            validator_index: proposal.validator_index,
+            fee_recipient: [0; 20],
+            target_gas_limit: 1,
+        };
+        let err = signer::require_beacon_admission_scope(service.sign_proposer_preferences(
+            &prefs,
+            &pubkey,
+            &gloas_at(gloas_epoch),
+            &TEST_GVR,
+        ))
+        .await
+        .expect_err("missing admission scope");
+        assert!(matches!(err, SignerError::BeaconAdmissionRevoked));
+    }
+
+    /// Builder-request auth uses the same gate. A missing scope is refused.
+    #[tokio::test]
+    async fn builder_request_auth_signs_under_the_gate_and_is_refused_without_a_scope() {
+        let (service, pubkey, signer) = production_signer();
+        let pk = pubkey.to_bytes();
+        let store = store_with_builders(pk, &["https://a.example"]);
+        let bn = Arc::new(MockBn::new());
+        let gloas_epoch = 10;
+        let builder = BuilderService::new(
+            signer,
+            bn.clone(),
+            Arc::new(store),
+            GENESIS_FORK,
+            gloas_at(gloas_epoch),
+        );
+        let proposal = upcoming_for(pk, gloas_epoch, 1);
+        signer::require_beacon_admission_scope(
+            builder.broadcast_builder_preferences(gloas_epoch, std::slice::from_ref(&proposal)),
+        )
+        .await
+        .unwrap();
+        {
+            let calls = bn.builder_pref_calls.lock();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].len(), 1);
+        }
+
+        let auth = BuilderRequestAuth::new(b"https://a.example".to_vec(), proposal.proposal_slot)
+            .expect("auth");
+        let err = signer::require_beacon_admission_scope(service.sign_builder_request_auth(
+            &auth,
+            &pubkey,
+            GENESIS_FORK,
+        ))
+        .await
+        .expect_err("missing admission scope");
+        assert!(matches!(err, SignerError::BeaconAdmissionRevoked));
     }
 }

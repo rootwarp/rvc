@@ -136,6 +136,21 @@ where
         // H-4: validator_index was parsed when the proposer duty entered the cache.
         let expected_proposer_index = proposer_duty.validator_index;
 
+        let proposal_closed = self
+            .beacon
+            .duty_fence()
+            .map(|fence| {
+                super::slot_context::admission_blocks(
+                    signer::SigningDuty::RandaoReveal,
+                    &[&fence, &ctx.fence],
+                )
+            })
+            .unwrap_or(true);
+        if proposal_closed {
+            warn!(slot, "skipping block proposal: beacon node admission revoked");
+            return;
+        }
+
         info!(slot, validator_index = %proposer_duty.validator_index, "Proposing block");
 
         // The outer timeout is the block-production allowance, and also the
@@ -156,6 +171,7 @@ where
                 expected_proposer_index,
                 ctx.expected_parents,
                 proposal_deadline,
+                &ctx.fence,
             ),
         )
         .await

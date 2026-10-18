@@ -15,7 +15,7 @@ use eth_types::{
     BuilderRequestAuth, ForkSchedule, ProposerPreferences, Root, SignedProposerPreferences,
     ValidatorRegistrationV1,
 };
-use signer::{SignerError, ValidatorSigner};
+use signer::{BeaconAdmission, SignerError, ValidatorSigner};
 
 /// Beacon methods used by [`crate::BuilderService`].
 #[async_trait]
@@ -39,6 +39,14 @@ pub trait BuilderBeaconClient: Send + Sync {
         &self,
         entries: &[BuilderPreferencesEntry],
     ) -> Result<SubmitBuilderPreferencesResult, BeaconError>;
+
+    /// Admission scope for preferences and builder-request auth.
+    ///
+    /// No admitted node is [`BeaconError::NoAdmittedNode`]. A test double that
+    /// should still sign overrides this with [`BeaconAdmission::unbound`].
+    fn beacon_admission(&self) -> Result<BeaconAdmission, BeaconError> {
+        Err(BeaconError::NoAdmittedNode)
+    }
 }
 
 /// Production bridge: full BN trait object satisfies the narrow builder surface.
@@ -72,6 +80,14 @@ impl BuilderBeaconClient for Arc<dyn BeaconNodeClient> {
         entries: &[BuilderPreferencesEntry],
     ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
         (**self).submit_builder_preferences(entries).await
+    }
+
+    fn beacon_admission(&self) -> Result<BeaconAdmission, BeaconError> {
+        let fence = BeaconNodeClient::duty_fence(&**self)?;
+        match fence.generation() {
+            Some(current) => Ok(BeaconAdmission::new(fence.seen(), current)),
+            None => Err(BeaconError::NoAdmittedNode),
+        }
     }
 }
 

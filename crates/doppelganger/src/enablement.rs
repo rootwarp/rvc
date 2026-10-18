@@ -79,6 +79,33 @@ pub enum SigningDuty {
     VoluntaryExit,
 }
 
+/// `true` except [`SigningDuty::VoluntaryExit`].
+///
+/// The signed exit is the epoch and the validator index, so that duty does not
+/// require a beacon admission scope. The keymanager may still read the index
+/// from a beacon node. That read is not an admission fence.
+#[must_use]
+pub fn duty_requires_beacon_admission(duty: SigningDuty) -> bool {
+    match duty {
+        SigningDuty::VoluntaryExit => false,
+        SigningDuty::Attestation
+        | SigningDuty::Block
+        | SigningDuty::RandaoReveal
+        | SigningDuty::SyncCommitteeMessage
+        | SigningDuty::SelectionProof
+        | SigningDuty::AggregateAndProof
+        | SigningDuty::ElectraAggregateAndProof
+        | SigningDuty::AggregateAndProofRoot
+        | SigningDuty::SyncCommitteeSelectionProof
+        | SigningDuty::ContributionAndProof
+        | SigningDuty::PayloadAttestation
+        | SigningDuty::ProposerPreferences
+        | SigningDuty::BuilderRegistration
+        | SigningDuty::BuilderRequestAuth
+        | SigningDuty::ExecutionPayloadEnvelope => true,
+    }
+}
+
 /// Whether `enablement` permits `pubkey` for `duty`.
 ///
 /// The match is exhaustive and has no wildcard. Only a voluntary exit stays

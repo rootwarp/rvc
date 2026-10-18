@@ -268,6 +268,13 @@ pub trait BlockProducer: Send + Sync {
 /// Attestation data, submission, aggregation, and committee subscriptions.
 #[async_trait]
 pub trait AttestationApi: Send + Sync {
+    /// Admission fence for selection proofs. Default stays open for role-only doubles.
+    ///
+    /// Named apart from [`BeaconNodeClient::duty_fence`] so a full client is not ambiguous.
+    fn admission_duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
+        Ok(beacon::DutyFence::open())
+    }
+
     async fn get_attestation_data(
         &self,
         slot: u64,
@@ -448,6 +455,9 @@ pub trait BeaconNodeClient:
     + Send
     + Sync
 {
+    fn duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
+        Ok(beacon::DutyFence::open())
+    }
 }
 
 /// Per-operation timeout configuration for beacon node API calls.
@@ -604,6 +614,9 @@ pub struct BnHealthScore {
     pub error_rate: f64,
     /// Composite health score (0.0 = worst, 1.0 = best).
     pub score: f64,
+    /// Whether the node is admitted for duties. Unadmitted nodes stay in this
+    /// report so operators can see them, and they do not publish a health tier.
+    pub admitted: bool,
 }
 
 #[cfg(test)]
@@ -762,6 +775,7 @@ mod tests {
             latency_ms: 50.0,
             error_rate: 0.0,
             score: 1.0,
+            admitted: true,
         };
         assert_eq!(score.endpoint, "http://localhost:5052");
         assert!(score.is_reachable);
@@ -784,6 +798,7 @@ mod tests {
             latency_ms: 0.0,
             error_rate: 1.0,
             score: 0.0,
+            admitted: false,
         };
         let cloned = score.clone();
         assert_eq!(cloned, score);
@@ -801,6 +816,7 @@ mod tests {
             latency_ms: 10.0,
             error_rate: 0.0,
             score: 0.9,
+            admitted: true,
         };
         let b = a.clone();
         assert_eq!(a, b);

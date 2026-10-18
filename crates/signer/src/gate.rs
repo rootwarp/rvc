@@ -207,6 +207,10 @@ impl SigningGate {
     /// check is the admission boundary: it is not atomic with the backend
     /// call. A BLS call already started finishes or hits the sign timeout.
     fn gate_decision(&self, pubkey: &PublicKey, duty: SigningDuty) -> bool {
+        if crate::beacon_admission_revoked(duty) {
+            warn!("SigningGate: beacon node admission revoked");
+            return false;
+        }
         let enabled = doppelganger::signing_allowed(self.enablement.as_ref(), pubkey, duty);
         // Codify PRD §6.3: when the enablement returns false (unknown or blocked),
         // the gate decision must equal the fail-closed default.  This assert fires
