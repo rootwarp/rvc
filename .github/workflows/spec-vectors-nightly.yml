@@ -6,6 +6,9 @@ on:
     - cron: "0 5 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   # Nightly mainnet spec-vectors (#240 / 3.10b).
   #
@@ -31,9 +34,13 @@ jobs:
       PRESET: mainnet
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -46,7 +53,9 @@ jobs:
             ${{ runner.os }}-cargo-spec-vectors-deps-
 
       - name: Install cargo-nextest
-        uses: taiki-e/install-action@nextest
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: nextest
 
       # Archives only: the pin is the tarball digest, not a restored tests/ tree.
       # No restore-keys: a lock change must miss, not restore a stale archive.
