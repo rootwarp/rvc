@@ -245,6 +245,11 @@ jobs:
       - name: Gitleaks — source tree
         run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
 
+      # A line that contains the word false must still surface a synthetic key.
+      # The running-guide allow is path-and-value, so the same value elsewhere fails too.
+      - name: Gitleaks — verify=false canary is detected
+        run: ./scripts/gitleaks_verify_false_canary.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:

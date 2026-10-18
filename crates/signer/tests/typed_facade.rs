@@ -639,6 +639,10 @@ impl doppelganger::SigningEnablement for Denied {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
         false
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
 }
 
 struct HangingTyped {

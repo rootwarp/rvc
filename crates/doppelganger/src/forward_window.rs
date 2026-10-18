@@ -423,4 +423,8 @@ impl SigningEnablement for ForwardWindowMachine {
     fn is_signing_enabled(&self, pubkey: &crypto::PublicKey) -> bool {
         matches!(self.status(pubkey), ForwardWindowStatus::Safe)
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
 }

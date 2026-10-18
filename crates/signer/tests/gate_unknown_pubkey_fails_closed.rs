@@ -35,6 +35,10 @@ impl SigningEnablement for KnownOnlyEnablement {
         // Unknown pubkey → false (fail-closed per FailClosedDefault::default_when_unknown).
         self.known.contains(pubkey.to_bytes().as_slice())
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
 }
 
 const GVR: Root = [0xd3; 32];

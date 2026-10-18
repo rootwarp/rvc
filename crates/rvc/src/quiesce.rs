@@ -166,6 +166,10 @@ impl SigningEnablement for QuiescingEnablement {
         }
         self.inner.is_signing_enabled(pubkey)
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        self.inner.voluntary_exit_only()
+    }
 }
 
 /// [`SigningQuiesce`] for the VC: insert into the registry the signer's
@@ -287,6 +291,10 @@ struct AllowOne([u8; 48]);
 impl SigningEnablement for AllowOne {
     fn is_signing_enabled(&self, pubkey: &PublicKey) -> bool {
         pubkey.to_bytes() == self.0
+    }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
     }
 }
 
@@ -518,4 +526,19 @@ async fn non_quiesced_pubkeys_are_unaffected() {
         !matches!(result, Err(signer::SignerError::BlockedByDoppelganger)),
         "non-quiesced pubkey must pass ensure_signing_enabled, got {result:?}"
     );
+}
+
+/// The quiesce wrapper must not drop an exit-only inner back to every duty.
+#[test]
+fn quiescing_enablement_forwards_voluntary_exit_only() {
+    let pubkey = crypto::SecretKey::generate().public_key();
+    let registry = Arc::new(QuiesceRegistry::new());
+    let exit_only = QuiescingEnablement::new(
+        Arc::new(signer::OfflineExitEnablement::new(&pubkey)),
+        Arc::clone(&registry),
+    );
+    let every_duty =
+        QuiescingEnablement::new(Arc::new(doppelganger::DoppelgangerDisabledByOperator), registry);
+    assert!(exit_only.voluntary_exit_only());
+    assert!(!every_duty.voluntary_exit_only());
 }

@@ -107,6 +107,10 @@ impl signer::SigningEnablement for AlwaysEnabled {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
         true
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -901,7 +905,7 @@ impl SignerServiceV2 for SignerServiceImpl {
                 &self.backend_name,
                 &ctx,
                 &plan,
-                NonSlashableOp::SelectionProof,
+                NonSlashableOp::SyncCommitteeSelectionProof,
             )
             .await
             .map_err(dispatch_err_to_status)?;

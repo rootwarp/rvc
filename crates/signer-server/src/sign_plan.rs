@@ -152,7 +152,6 @@ pub fn plan_sign(input: &PlanInput) -> SignPlan {
         PlanInput::AggregationSlot { slot, fork_version, gvr } => {
             let domain = compute_domain(DOMAIN_SELECTION_PROOF, *fork_version, *gvr);
             let root = compute_signing_root(slot, domain);
-            // Same gate method as sync selection; domain is already in the root.
             (root, Slashing::NonSlashable, Some(NonSlashableOp::SelectionProof))
         }
         PlanInput::AggregateAndProof { object_root, fork_version, gvr } => {
@@ -170,7 +169,7 @@ pub fn plan_sign(input: &PlanInput) -> SignPlan {
         PlanInput::SyncCommitteeSelection { data, fork_version, gvr } => {
             let domain = compute_domain(DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, *fork_version, *gvr);
             let root = compute_signing_root(data, domain);
-            (root, Slashing::NonSlashable, Some(NonSlashableOp::SelectionProof))
+            (root, Slashing::NonSlashable, Some(NonSlashableOp::SyncCommitteeSelectionProof))
         }
         PlanInput::ContributionAndProof { object_root, fork_version, gvr } => {
             let domain = compute_domain(DOMAIN_CONTRIBUTION_AND_PROOF, *fork_version, *gvr);
@@ -257,6 +256,7 @@ pub struct RequestCtx {
 pub enum NonSlashableOp {
     RandaoReveal,
     SelectionProof,
+    SyncCommitteeSelectionProof,
     AggregateAndProof,
     SyncCommitteeMessage,
     ContributionAndProof,
@@ -340,6 +340,9 @@ pub async fn dispatch_non_slashable(
         let result = match op {
             NonSlashableOp::RandaoReveal => gate.sign_randao_reveal(&ctx.pubkey, root).await,
             NonSlashableOp::SelectionProof => gate.sign_selection_proof(&ctx.pubkey, root).await,
+            NonSlashableOp::SyncCommitteeSelectionProof => {
+                gate.sign_sync_committee_selection_proof(&ctx.pubkey, root).await
+            }
             NonSlashableOp::AggregateAndProof => {
                 gate.sign_aggregate_and_proof(&ctx.pubkey, root).await
             }
@@ -716,6 +719,19 @@ mod tests {
         assert_eq!(sync_plan, plan_sign(&http_sync));
         assert_eq!(sync_plan, plan_sign(&dvt_sync));
         assert_eq!(sync_plan.non_slashable_op, Some(NonSlashableOp::SyncCommitteeMessage));
+
+        let sync_selection = plan_sign(&PlanInput::SyncCommitteeSelection {
+            data: SyncAggregatorSelectionData { slot: 1, subcommittee_index: 2 },
+            fork_version: FORK,
+            gvr: GVR,
+        });
+        assert_eq!(
+            sync_selection.non_slashable_op,
+            Some(NonSlashableOp::SyncCommitteeSelectionProof)
+        );
+        let aggregation =
+            plan_sign(&PlanInput::AggregationSlot { slot: 77, fork_version: FORK, gvr: GVR });
+        assert_eq!(aggregation.non_slashable_op, Some(NonSlashableOp::SelectionProof));
 
         // Block: when the HTTP header's body_root equals the body HTR of the full
         // gRPC/DVT block, object roots (and therefore SignPlans) match.

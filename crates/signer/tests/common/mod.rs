@@ -32,6 +32,10 @@ impl SigningEnablement for AlwaysAllowed {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
         true
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
 }
 
 /// Denies every pubkey (active doppelganger window or fail-closed unknown key).
@@ -39,6 +43,10 @@ pub struct AlwaysDenied;
 
 impl SigningEnablement for AlwaysDenied {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
+        false
+    }
+
+    fn voluntary_exit_only(&self) -> bool {
         false
     }
 }

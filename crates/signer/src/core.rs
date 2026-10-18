@@ -126,8 +126,11 @@ pub async fn sign_nonslashable_core(
     pubkey: &PublicKey,
     signing_root: Root,
     sign_timeout: Duration,
+    duty: doppelganger::SigningDuty,
 ) -> Result<Signature, NonSlashableFailure> {
-    if !enablement.is_signing_enabled(pubkey) {
+    // `duty` is matched exhaustively in `signing_allowed`. Only
+    // `SigningDuty::VoluntaryExit` unlocks an exit-only enablement.
+    if !doppelganger::signing_allowed(enablement, pubkey, duty) {
         return Err(NonSlashableFailure::Blocked);
     }
 
@@ -844,6 +847,13 @@ impl SlashableKind {
             Self::Attestation { .. } => "attestation",
         }
     }
+
+    fn signing_duty(self) -> doppelganger::SigningDuty {
+        match self {
+            Self::Block { .. } => doppelganger::SigningDuty::Block,
+            Self::Attestation { .. } => doppelganger::SigningDuty::Attestation,
+        }
+    }
 }
 
 /// 1-in-N rate for the attestation-stage trace (issue 5.3).
@@ -1067,7 +1077,7 @@ where
     let guard = req.locks.lock(&pubkey_bytes).await;
 
     // Step 2: re-check enablement under the lock (SigningGate / SignerService parity).
-    if !req.enablement.is_signing_enabled(req.pubkey) {
+    if !doppelganger::signing_allowed(req.enablement, req.pubkey, req.kind.signing_duty()) {
         warn!(
             pubkey = %TruncatedPubkey::new(&pubkey_hex),
             op = op_name,
@@ -1156,6 +1166,10 @@ mod tests {
     impl SigningEnablement for FlipEnablement {
         fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
             self.enabled.load(Ordering::SeqCst)
+        }
+
+        fn voluntary_exit_only(&self) -> bool {
+            false
         }
     }
 

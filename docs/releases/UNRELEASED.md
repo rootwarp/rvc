@@ -33,6 +33,19 @@ The response body is capped at 4 MiB. A `Content-Length` above the cap is
 rejected before the body is buffered. A chunked body with no
 `Content-Length` is rejected as soon as the bytes read pass the cap.
 
+## CLI voluntary exit signs again
+
+`rvc voluntary-exit` and `rvc prepare-exit` sign with the local keystore again.
+They are offline tools and are not doppelganger-gated: a voluntary exit is not
+a slashable duty, and the command logs a warning when it signs. `prepare-exit`
+writes the signed message and does not broadcast it. `voluntary-exit` submits
+it to the beacon node after `--confirm`. `rvc-keygen exit` stays an offline
+ungated tool.
+
+The keymanager exit path stays doppelganger-gated. `Pending` and `Detected`
+keys are refused. The exit adapter takes the beacon slot duration as a
+required argument and no longer defaults it to 12 s.
+
 ## Head capture deadline and concurrent sync contributions
 
 Phase-2 head capture calls Beacon API `GET /eth/v1/beacon/blocks/{slot}/root`

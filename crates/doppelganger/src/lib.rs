@@ -11,7 +11,9 @@ mod restart_skip;
 mod state;
 mod traits;
 
-pub use enablement::{DoppelgangerDisabledByOperator, SigningEnablement};
+pub use enablement::{
+    signing_allowed, DoppelgangerDisabledByOperator, SigningDuty, SigningEnablement,
+};
 pub use epoch_clock::MonotonicEpochClock;
 pub use forward_window::{EpochLiveness, ForwardWindowMachine};
 pub use restart_skip::should_skip_restart_monitoring;

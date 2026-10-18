@@ -37,7 +37,7 @@ pub use core::{
     SignSlashableRequest, SlashableKind, SlashableSignSession, StandardSlashableHooks,
     TimeoutPolicy, TimeoutPolicySource, DEFAULT_SIGN_TIMEOUT,
 };
-pub use doppelganger::SigningEnablement;
+pub use doppelganger::{SigningDuty, SigningEnablement};
 pub use error::{classify, GateErrClass, SigningGateError};
 pub use fail_closed::FailClosedDefault;
 pub use gate::{SigningGate, AUDIT_CN_DEFAULT};
@@ -339,6 +339,147 @@ impl SigningEnablement for FailClosedEnablement {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
         <bool as FailClosedDefault>::default_when_unknown()
     }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
+    }
+}
+
+/// Offline CLI exit enablement. Permits exactly one pubkey, and only a
+/// voluntary exit.
+///
+/// `rvc voluntary-exit` and `rvc prepare-exit` are offline tools. A voluntary
+/// exit is not slashable, so that path is not doppelganger-gated. The type is
+/// named so it cannot be confused with the test-only always-enabled helper
+/// or with `DoppelgangerDisabledByOperator` (every pubkey). Installing it does
+/// not unlock attestations, blocks, or other duties: [`voluntary_exit_only`]
+/// is true, and [`signing_allowed`] refuses those paths.
+///
+/// [`voluntary_exit_only`]: SigningEnablement::voluntary_exit_only
+/// [`signing_allowed`]: doppelganger::signing_allowed
+pub struct OfflineExitEnablement {
+    pubkey: PublicKey,
+}
+
+impl OfflineExitEnablement {
+    /// Permit a voluntary exit only for `pubkey`.
+    #[must_use]
+    pub fn new(pubkey: &PublicKey) -> Self {
+        Self { pubkey: pubkey.clone() }
+    }
+}
+
+impl SigningEnablement for OfflineExitEnablement {
+    fn is_signing_enabled(&self, pubkey: &PublicKey) -> bool {
+        pubkey == &self.pubkey
+    }
+
+    fn voluntary_exit_only(&self) -> bool {
+        true
+    }
+}
+
+#[cfg(test)]
+mod offline_exit_enablement_tests {
+    use super::{OfflineExitEnablement, SigningEnablement};
+    use crypto::SecretKey;
+
+    #[test]
+    fn test_offline_exit_enablement_refuses_other_pubkeys() {
+        let allowed = SecretKey::generate().public_key();
+        let other = SecretKey::generate().public_key();
+        let third = SecretKey::generate().public_key();
+        let gate = OfflineExitEnablement::new(&allowed);
+
+        assert!(gate.is_signing_enabled(&allowed));
+        assert!(!gate.is_signing_enabled(&other));
+        assert!(!gate.is_signing_enabled(&third));
+        assert!(gate.voluntary_exit_only());
+        assert!(doppelganger::signing_allowed(
+            &gate,
+            &allowed,
+            doppelganger::SigningDuty::VoluntaryExit
+        ));
+        assert!(!doppelganger::signing_allowed(
+            &gate,
+            &allowed,
+            doppelganger::SigningDuty::RandaoReveal
+        ));
+        assert!(!doppelganger::signing_allowed(
+            &gate,
+            &other,
+            doppelganger::SigningDuty::VoluntaryExit
+        ));
+    }
+
+    /// The pubkey match must not open a slashable duty or another non-slashable duty.
+    #[tokio::test]
+    async fn test_offline_exit_enablement_signs_only_a_voluntary_exit() {
+        use crypto::{CompositeSigner, KeyManager, LocalSigner};
+        use eth_types::{AttestationData, Checkpoint, ForkSchedule, VoluntaryExit};
+        use slashing::SlashingDb;
+
+        use super::{OfflineExitEnablement, SignerError, SignerService, ValidatorSigner};
+
+        let secret_key = crypto::SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let mut manager = KeyManager::new();
+        manager.insert(secret_key);
+        let composite = std::sync::Arc::new(CompositeSigner::new(LocalSigner::new(manager)));
+        let slashing_db = std::sync::Arc::new(SlashingDb::open_in_memory().expect("memory db"));
+        let service = SignerService::new(composite, slashing_db)
+            .with_enablement(std::sync::Arc::new(OfflineExitEnablement::new(&pubkey)));
+
+        let schedule = ForkSchedule {
+            genesis_fork_version: [0x10, 0, 0, 0],
+            altair_fork_epoch: 10,
+            altair_fork_version: [0x11, 0, 0, 0],
+            bellatrix_fork_epoch: 20,
+            bellatrix_fork_version: [0x12, 0, 0, 0],
+            capella_fork_epoch: 30,
+            capella_fork_version: [0x13, 0, 0, 0],
+            deneb_fork_epoch: 40,
+            deneb_fork_version: [0x14, 0, 0, 0],
+            electra_fork_epoch: 50,
+            electra_fork_version: [0x15, 0, 0, 0],
+            fulu_fork_epoch: 60,
+            fulu_fork_version: [0x16, 0, 0, 0],
+            gloas_fork_epoch: u64::MAX,
+            gloas_fork_version: [0x17, 0, 0, 0],
+        };
+        let gvr = [0xbb_u8; 32];
+
+        let attestation = service
+            .sign_attestation(
+                &AttestationData {
+                    slot: 1,
+                    index: 0,
+                    beacon_block_root: [0; 32],
+                    source: Checkpoint { epoch: 0, root: [0; 32] },
+                    target: Checkpoint { epoch: 1, root: [0; 32] },
+                },
+                &pubkey,
+                &schedule,
+                &gvr,
+            )
+            .await;
+        assert!(
+            matches!(attestation, Err(SignerError::BlockedByDoppelganger)),
+            "attestation must stay gated, got {attestation:?}"
+        );
+
+        let randao = service.sign_randao_reveal(1, &pubkey, &schedule, &gvr).await;
+        assert!(
+            matches!(randao, Err(SignerError::BlockedByDoppelganger)),
+            "randao must stay gated, got {randao:?}"
+        );
+
+        let exit = VoluntaryExit { epoch: 55, validator_index: 1 };
+        service
+            .sign_voluntary_exit(&exit, &pubkey, &schedule, &gvr)
+            .await
+            .expect("voluntary exit is the only duty this enablement unlocks");
+    }
 }
 
 /// Enablement that permits every pubkey.
@@ -356,6 +497,10 @@ pub struct AlwaysEnabled;
 impl SigningEnablement for AlwaysEnabled {
     fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
         true
+    }
+
+    fn voluntary_exit_only(&self) -> bool {
+        false
     }
 }
 
@@ -599,8 +744,22 @@ impl SignerService {
     /// stages a row or produces a signature.  On slashable paths the shared
     /// core re-checks enablement **under** the per-validator lock (closes
     /// Safe→Detected TOCTOU vs concurrent liveness).
-    fn ensure_signing_enabled(&self, pubkey: &PublicKey) -> Result<(), SignerError> {
-        if self.enablement.is_signing_enabled(pubkey) {
+    fn ensure_signing_enabled(
+        &self,
+        pubkey: &PublicKey,
+        duty: SigningDuty,
+    ) -> Result<(), SignerError> {
+        self.ensure_duty_enabled(pubkey, duty)
+    }
+
+    /// `duty` is the typed operation. An exit-only enablement stays closed
+    /// for every variant except [`SigningDuty::VoluntaryExit`].
+    fn ensure_duty_enabled(
+        &self,
+        pubkey: &PublicKey,
+        duty: SigningDuty,
+    ) -> Result<(), SignerError> {
+        if doppelganger::signing_allowed(self.enablement.as_ref(), pubkey, duty) {
             return Ok(());
         }
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -679,12 +838,15 @@ impl SignerService {
         &self,
         pubkey: &PublicKey,
         signing_root: Root,
+        duty: SigningDuty,
         op_name: &str,
         backend: Arc<dyn Signer>,
         fork_name: Option<ForkName>,
     ) -> Result<Signature, SignerError> {
-        // Same gate point as slashable early check (Result, not a bool).
-        self.ensure_signing_enabled(pubkey)?;
+        // Same gate point as the slashable early check. `op_name` is only the
+        // log and metrics label. The exit unlock is `duty`, matched exhaustively
+        // inside `signing_allowed`.
+        self.ensure_duty_enabled(pubkey, duty)?;
 
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let start = Instant::now();
@@ -701,6 +863,7 @@ impl SignerService {
             pubkey,
             signing_root,
             self.sign_timeout,
+            duty,
         )
         .await
         {
@@ -748,6 +911,10 @@ impl SignerService {
     }
 
     /// Returns a reference to the underlying composite signer.
+    ///
+    /// Test-only. Production signing goes through [`ValidatorSigner`], which
+    /// consults the doppelganger gate. A raw accessor would skip that gate.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn signer(&self) -> &CompositeSigner {
         &self.signer
     }
@@ -811,7 +978,7 @@ impl ValidatorSigner for SignerService {
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
         // Cheap outer enablement check (core re-checks under the lock).
-        self.ensure_signing_enabled(pubkey)?;
+        self.ensure_signing_enabled(pubkey, SigningDuty::Attestation)?;
 
         let start = Instant::now();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -920,7 +1087,7 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        self.ensure_signing_enabled(pubkey)?;
+        self.ensure_signing_enabled(pubkey, SigningDuty::Block)?;
 
         let start = Instant::now();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -1002,7 +1169,7 @@ impl ValidatorSigner for SignerService {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<Signature, SignerError> {
-        self.ensure_signing_enabled(pubkey)?;
+        self.ensure_signing_enabled(pubkey, SigningDuty::Block)?;
 
         let start = Instant::now();
         let pubkey_hex = hex::encode(pubkey.to_bytes());
@@ -1122,7 +1289,15 @@ impl ValidatorSigner for SignerService {
             grpc.sign_randao_reveal(epoch_c, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "randao", backend, Some(fork_name)).await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::RandaoReveal,
+            "randao",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs a sync committee message for the given beacon block root and slot.
@@ -1150,6 +1325,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::SyncCommitteeMessage,
             "sync_committee_message",
             backend,
             Some(fork_name),
@@ -1183,6 +1359,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::PayloadAttestation,
             "payload_attestation",
             backend,
             Some(fork_name),
@@ -1224,6 +1401,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::ProposerPreferences,
             "proposer_preferences",
             backend,
             Some(fork_name),
@@ -1267,6 +1445,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::BuilderRequestAuth,
             "builder_request_auth",
             backend,
             Some(ForkName::Phase0),
@@ -1309,6 +1488,7 @@ impl ValidatorSigner for SignerService {
             .sign_nonslashable(
                 pubkey,
                 signing_root,
+                SigningDuty::ExecutionPayloadEnvelope,
                 "execution_payload_envelope",
                 backend,
                 Some(fork_name),
@@ -1337,6 +1517,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::SelectionProof,
             "selection_proof",
             backend,
             Some(ForkName::from_epoch(slot / SLOTS_PER_EPOCH, fork_schedule)),
@@ -1378,6 +1559,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::AggregateAndProof,
             "aggregate_and_proof",
             backend,
             Some(fork_name),
@@ -1413,6 +1595,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::AggregateAndProofRoot,
             "aggregate_and_proof_root",
             backend,
             Some(fork_name),
@@ -1456,6 +1639,7 @@ impl ValidatorSigner for SignerService {
             self.sign_nonslashable(
                 pubkey,
                 signing_root,
+                SigningDuty::ElectraAggregateAndProof,
                 "electra_aggregate_and_proof",
                 backend,
                 Some(fork_name),
@@ -1468,6 +1652,7 @@ impl ValidatorSigner for SignerService {
             self.sign_nonslashable(
                 pubkey,
                 signing_root,
+                SigningDuty::ElectraAggregateAndProof,
                 "electra_aggregate_and_proof",
                 backend,
                 Some(fork_name),
@@ -1508,8 +1693,15 @@ impl ValidatorSigner for SignerService {
             grpc.sign_voluntary_exit(&exit, &sign_ctx).await
         });
         let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-        self.sign_nonslashable(pubkey, signing_root, "voluntary_exit", backend, Some(fork_name))
-            .await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::VoluntaryExit,
+            "voluntary_exit",
+            backend,
+            Some(fork_name),
+        )
+        .await
     }
 
     /// Signs a builder registration with DOMAIN_APPLICATION_BUILDER.
@@ -1548,6 +1740,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::BuilderRegistration,
             "builder_registration",
             backend,
             Some(ForkName::Phase0),
@@ -1579,6 +1772,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::SyncCommitteeSelectionProof,
             "sync_committee_selection_proof",
             backend,
             Some(fork_name),
@@ -1610,6 +1804,7 @@ impl ValidatorSigner for SignerService {
         self.sign_nonslashable(
             pubkey,
             signing_root,
+            SigningDuty::ContributionAndProof,
             "contribution_and_proof",
             backend,
             Some(fork_name),
@@ -3118,6 +3313,10 @@ mod tests {
             fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
                 self.0.load(std::sync::atomic::Ordering::SeqCst)
             }
+
+            fn voluntary_exit_only(&self) -> bool {
+                false
+            }
         }
         let service = SignerService::new(signer, slashing_db)
             .with_enablement(Arc::new(FlipEnablement(Arc::clone(&gate))));
@@ -3983,6 +4182,10 @@ mod tests {
         fn is_signing_enabled(&self, _pubkey: &PublicKey) -> bool {
             false
         }
+
+        fn voluntary_exit_only(&self) -> bool {
+            false
+        }
     }
 
     #[tokio::test]
@@ -4128,6 +4331,10 @@ mod tests {
                 )
                 .map(|prev| prev > 0)
                 .unwrap_or(false)
+        }
+
+        fn voluntary_exit_only(&self) -> bool {
+            false
         }
     }
 

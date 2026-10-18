@@ -290,6 +290,56 @@ impl MockBn {
             .mount(&self.server)
             .await;
     }
+
+    /// Serve one validator on the GET index lookup. Higher priority than the
+    /// empty startup stub so a CLI exit test can resolve an index.
+    ///
+    /// The CLI unit test includes this file. Integration tests do not call it.
+    #[allow(dead_code)]
+    pub async fn mount_validator(&self, pubkey_hex: &str, index: &str) {
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/eth/v1/beacon/states/head/validators.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "execution_optimistic": false,
+                "finalized": false,
+                "data": [{
+                    "index": index,
+                    "status": "active_ongoing",
+                    "validator": { "pubkey": pubkey_hex }
+                }]
+            })))
+            .with_priority(1)
+            .mount(&self.server)
+            .await;
+    }
+
+    /// Serve an ordered validator list on the GET index lookup.
+    ///
+    /// Same priority as [`Self::mount_validator`]. A test calls one of them.
+    /// The CLI must select by pubkey, not by list position.
+    #[allow(dead_code)]
+    pub async fn mount_validators(&self, records: &[(&str, &str)]) {
+        let data: Vec<_> = records
+            .iter()
+            .map(|(pubkey, index)| {
+                serde_json::json!({
+                    "index": index,
+                    "status": "active_ongoing",
+                    "validator": { "pubkey": pubkey }
+                })
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/eth/v1/beacon/states/head/validators.*"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "execution_optimistic": false,
+                "finalized": false,
+                "data": data
+            })))
+            .with_priority(1)
+            .mount(&self.server)
+            .await;
+    }
 }
 
 fn fork_version_hex(fork: ForkName) -> String {

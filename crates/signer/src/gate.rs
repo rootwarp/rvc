@@ -30,7 +30,8 @@
 //! `sign_aggregate_and_proof`, `sign_payload_attestation`,
 //! `sign_proposer_preferences`, `sign_builder_request_auth`,
 //! `sign_execution_payload_envelope`, `sign_contribution_and_proof`,
-//! `sign_selection_proof`, `sign_randao_reveal`, `sign_voluntary_exit`,
+//! `sign_selection_proof`, `sign_sync_committee_selection_proof`,
+//! `sign_randao_reveal`, `sign_voluntary_exit`,
 //! `sign_builder_registration`):
 //!
 //! 1. Check `gate_decision` — if false, return
@@ -58,8 +59,8 @@
 //! # Cancellation safety and the sign-span lock
 //!
 //! [`crate::core::sign_slashable`] acquires the per-pubkey `OwnedMutexGuard` and moves it into
-//! `tokio::task::spawn_blocking`.  The acquire is `core.rs:1067` (`req.locks.lock`); the closure
-//! that keeps the guard (`let _guard = guard`) is `core.rs:1116`.  That blocking task owns the
+//! `tokio::task::spawn_blocking`.  The acquire is `core.rs:1077` (`req.locks.lock`); the closure
+//! that keeps the guard (`let _guard = guard`) is `core.rs:1126`.  That blocking task owns the
 //! guard for the whole reserve → sign → reconcile body.  Dropping the caller future while it
 //! waits on `spawn_blocking(...).await` leaves the guard on the blocking task until the body
 //! returns, so the same pubkey stays serialized for the in-flight sign.
@@ -90,7 +91,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crypto::{CompositeSigner, PublicKey, Signer};
-use doppelganger::SigningEnablement;
+use doppelganger::{SigningDuty, SigningEnablement};
 use eth_types::Root;
 use observability::logging::TruncatedPubkey;
 use slashing::SlashingDb;
@@ -199,8 +200,8 @@ impl SigningGate {
     /// This helper is the single gate-decision point for BOTH slashable and
     /// non-slashable signing paths, ensuring the fail-closed semantics are
     /// applied uniformly.
-    fn gate_decision(&self, pubkey: &PublicKey) -> bool {
-        let enabled = self.enablement.is_signing_enabled(pubkey);
+    fn gate_decision(&self, pubkey: &PublicKey, duty: SigningDuty) -> bool {
+        let enabled = doppelganger::signing_allowed(self.enablement.as_ref(), pubkey, duty);
         // Codify PRD §6.3: when the enablement returns false (unknown or blocked),
         // the gate decision must equal the fail-closed default.  This assert fires
         // in debug/test builds if `FailClosedDefault::default_when_unknown()` is
@@ -250,7 +251,7 @@ impl SigningGate {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
 
         // Cheap outer enablement check (no lock). Core re-checks under the lock.
-        if !self.gate_decision(pubkey) {
+        if !self.gate_decision(pubkey, SigningDuty::Block) {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
                 slot,
@@ -322,7 +323,7 @@ impl SigningGate {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
 
         // Cheap outer enablement check (no lock). Core re-checks under the lock.
-        if !self.gate_decision(pubkey) {
+        if !self.gate_decision(pubkey, SigningDuty::Attestation) {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
                 source_epoch,
@@ -370,12 +371,14 @@ impl SigningGate {
         &self,
         pubkey: &PublicKey,
         signing_root: Root,
+        duty: SigningDuty,
         op_name: &str,
     ) -> Result<Vec<u8>, SigningGateError> {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
 
-        // Same gate_decision point as slashable paths (bool, fail-closed).
-        if !self.gate_decision(pubkey) {
+        // Same gate_decision point as slashable paths. `op_name` is the log
+        // and metrics label. The exit unlock is `duty`.
+        if !self.gate_decision(pubkey, duty) {
             warn!(
                 pubkey = %TruncatedPubkey::new(&pubkey_hex),
                 op = op_name,
@@ -390,6 +393,7 @@ impl SigningGate {
             pubkey,
             signing_root,
             self.sign_timeout,
+            duty,
         )
         .await
         {
@@ -452,7 +456,13 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_sync_committee_message").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::SyncCommitteeMessage,
+            "sign_sync_committee_message",
+        )
+        .await
     }
 
     /// Sign an aggregate-and-proof.
@@ -486,7 +496,13 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_aggregate_and_proof").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::AggregateAndProof,
+            "sign_aggregate_and_proof",
+        )
+        .await
     }
 
     /// Sign a payload attestation (PTC).
@@ -503,7 +519,13 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_payload_attestation").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::PayloadAttestation,
+            "sign_payload_attestation",
+        )
+        .await
     }
 
     /// Sign proposer preferences.
@@ -520,7 +542,13 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_proposer_preferences").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::ProposerPreferences,
+            "sign_proposer_preferences",
+        )
+        .await
     }
 
     /// Sign a contribution-and-proof.
@@ -537,24 +565,60 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_contribution_and_proof").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::ContributionAndProof,
+            "sign_contribution_and_proof",
+        )
+        .await
     }
 
-    /// Sign a sync committee selection proof.
+    /// Sign an attester selection proof (`DOMAIN_SELECTION_PROOF` over the slot).
     ///
-    /// Non-slashable: gate check → BLS sign, NO slashing-DB staging.
+    /// Non-slashable: gate check → BLS sign, no slashing-DB staging.
+    /// Sync-committee selection proofs use [`Self::sign_sync_committee_selection_proof`].
     ///
     /// # Parameters
     ///
     /// - `pubkey`: The validator's BLS public key.
     /// - `signing_root`: The pre-computed signing root (caller applies
-    ///   `DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF` domain).
+    ///   `DOMAIN_SELECTION_PROOF` over the slot).
     pub async fn sign_selection_proof(
         &self,
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_selection_proof").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::SelectionProof,
+            "sign_selection_proof",
+        )
+        .await
+    }
+
+    /// Sign a sync committee selection proof.
+    ///
+    /// Non-slashable: gate check → BLS sign, no slashing-DB staging.
+    ///
+    /// # Parameters
+    ///
+    /// - `pubkey`: The validator's BLS public key.
+    /// - `signing_root`: The pre-computed signing root (caller applies
+    ///   `DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF`).
+    pub async fn sign_sync_committee_selection_proof(
+        &self,
+        pubkey: &PublicKey,
+        signing_root: Root,
+    ) -> Result<Vec<u8>, SigningGateError> {
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::SyncCommitteeSelectionProof,
+            "sign_sync_committee_selection_proof",
+        )
+        .await
     }
 
     /// Sign a RANDAO reveal.
@@ -571,7 +635,13 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_randao_reveal").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::RandaoReveal,
+            "sign_randao_reveal",
+        )
+        .await
     }
 
     /// Sign a voluntary exit.
@@ -588,7 +658,13 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_voluntary_exit").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::VoluntaryExit,
+            "sign_voluntary_exit",
+        )
+        .await
     }
 
     /// Sign a builder registration.
@@ -605,7 +681,13 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_builder_registration").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::BuilderRegistration,
+            "sign_builder_registration",
+        )
+        .await
     }
 
     /// Sign a builder request auth (`DOMAIN_BUILDER_REQUEST_AUTH`).
@@ -616,7 +698,13 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_builder_request_auth").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::BuilderRequestAuth,
+            "sign_builder_request_auth",
+        )
+        .await
     }
 
     /// Sign a self-build execution payload envelope (`DOMAIN_BEACON_BUILDER`).
@@ -627,6 +715,12 @@ impl SigningGate {
         pubkey: &PublicKey,
         signing_root: Root,
     ) -> Result<Vec<u8>, SigningGateError> {
-        self.sign_nonslashable(pubkey, signing_root, "sign_execution_payload_envelope").await
+        self.sign_nonslashable(
+            pubkey,
+            signing_root,
+            SigningDuty::ExecutionPayloadEnvelope,
+            "sign_execution_payload_envelope",
+        )
+        .await
     }
 }

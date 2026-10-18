@@ -178,7 +178,10 @@ pub fn sign_type_from_op_name(op_name: &str) -> &'static str {
         "sign_block" | "sign_block_header" => rejection_sign_type::BEACON_BLOCK,
         "sign_attestation" => rejection_sign_type::ATTESTATION_DATA,
         "randao" | "sign_randao_reveal" => rejection_sign_type::RANDAO_REVEAL,
-        "selection_proof" | "sign_selection_proof" | "sync_committee_selection_proof" => {
+        "selection_proof"
+        | "sign_selection_proof"
+        | "sync_committee_selection_proof"
+        | "sign_sync_committee_selection_proof" => {
             rejection_sign_type::SYNC_AGGREGATOR_SELECTION_DATA
         }
         "aggregate_and_proof"

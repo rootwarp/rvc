@@ -9,7 +9,7 @@ use crypto::KeyManager;
 use eth_types::{SignedVoluntaryExit, VoluntaryExit, SLOTS_PER_EPOCH};
 use rvc::config::{Config, ServiceBuilder};
 use signer::{SignerService, ValidatorSigner};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Common inputs for building a signed voluntary exit (shared by both CLI commands).
 pub struct ExitCommonArgs {
@@ -169,8 +169,11 @@ pub async fn build_signed_exit(args: ExitCommonArgs) -> anyhow::Result<BuiltSign
 
     let validator = validators_response
         .data
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("Validator not found for pubkey: {}", pubkey_with_prefix))?;
+        .iter()
+        .find(|v| beacon::hex_ids_equal(&v.validator.pubkey, &pubkey_with_prefix))
+        .ok_or_else(|| {
+            anyhow::anyhow!("validator {pubkey_with_prefix} not found on beacon node")
+        })?;
 
     let validator_index: u64 =
         validator.index.parse().context("Failed to parse validator index")?;
@@ -232,14 +235,16 @@ pub async fn build_signed_exit(args: ExitCommonArgs) -> anyhow::Result<BuiltSign
 
     let slashing_db = builder.build_slashing_db().context("Failed to open slashing database")?;
 
-    let composite_signer =
-        Arc::new(crypto::CompositeSigner::new(crypto::LocalSigner::new(key_manager)));
-    let signer = SignerService::new(composite_signer, slashing_db);
-
     let pk = eth_types::canonical::pubkey_hex::parse_pubkey_hex(&pubkey_with_prefix)
         .map_err(|e| anyhow::anyhow!("invalid validator pubkey: {e}"))?;
     let pubkey = crypto::PublicKey::from_bytes(pk.as_bytes())
         .map_err(|e| anyhow::anyhow!("Invalid public key: {:?}", e))?;
+
+    let composite_signer =
+        Arc::new(crypto::CompositeSigner::new(crypto::LocalSigner::new(key_manager)));
+    // Offline CLI: permit only this pubkey. Not the test-only always-enabled helper.
+    let signer = SignerService::new(composite_signer, slashing_db)
+        .with_enablement(Arc::new(signer::OfflineExitEnablement::new(&pubkey)));
 
     let fork_schedule = builder
         .build_fork_schedule(&beacon_client)
@@ -257,11 +262,22 @@ pub async fn build_signed_exit(args: ExitCommonArgs) -> anyhow::Result<BuiltSign
         .await
         .map_err(|e| anyhow::anyhow!("Failed to sign voluntary exit: {}", e))?;
 
+    warn!(
+        validator_index,
+        epoch,
+        "voluntary exit signed without a doppelganger window (offline CLI; not doppelganger-gated)"
+    );
+
     let signed_exit =
         SignedVoluntaryExit { message: voluntary_exit, signature: signature.to_bytes().to_vec() };
 
     Ok(BuiltSignedExit { signed_exit, validator_index, epoch, pubkey_with_prefix, beacon_client })
 }
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../tests/common/mock_bn.rs"]
+mod mock_bn;
 
 #[cfg(test)]
 mod tests {
@@ -443,6 +459,167 @@ mod tests {
             .expect_err("genesis");
         assert!(err.to_string().contains("genesis_time"), "{err}");
         assert!(err.to_string().contains("preset"), "{err}");
+    }
+
+    /// Electra-era epoch on the mock mainnet schedule (Capella is active,
+    /// Fulu is not). A future epoch relative to a clock near epoch ~400k.
+    const FUTURE_ELECTRA_EPOCH: u64 = 1_000_000;
+
+    /// Local keystore, mock beacon (genesis, spec, fork schedule), and a
+    /// tempfile slashing DB. The signature must verify under the EIP-7044
+    /// Capella exit domain.
+    #[tokio::test]
+    async fn test_build_signed_exit_signs_with_a_local_keystore() {
+        let sk = crypto::SecretKey::generate();
+        let pubkey = sk.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+
+        let keystore_dir = tempfile::tempdir().expect("keystore dir");
+        let password = "exit-test-password";
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt keystore");
+        keystore.to_file(keystore_dir.path().join("keystore-0.json")).expect("write keystore");
+        let password_file = keystore_dir.path().join("passwords.txt");
+        std::fs::write(&password_file, format!("*={password}\n")).expect("password file");
+
+        let db_dir = tempfile::tempdir().expect("slashing dir");
+        let db_path = db_dir.path().join("slashing.sqlite");
+        {
+            let (_db, created) =
+                slashing::SlashingDb::open_with_create_info(&db_path).expect("create slashing db");
+            assert!(created, "tempfile slashing DB must be a fresh file");
+        }
+
+        let bn = super::mock_bn::MockBn::start().await;
+        bn.mount_validator(&pubkey_hex, "42").await;
+
+        let built = build_signed_exit(ExitCommonArgs {
+            pubkey: pubkey_hex,
+            epoch: Some(FUTURE_ELECTRA_EPOCH),
+            beacon_url: bn.uri(),
+            keystore_path: keystore_dir.path().to_path_buf(),
+            password_file,
+            slashing_db_path: Some(db_path),
+            network: Some("mainnet".to_string()),
+            genesis_validators_root: None,
+            confirm: Some(true),
+        })
+        .await
+        .expect("local keystore signs a voluntary exit");
+
+        assert_eq!(built.validator_index, 42);
+        assert_eq!(built.epoch, FUTURE_ELECTRA_EPOCH);
+        assert_eq!(built.signed_exit.message.epoch, FUTURE_ELECTRA_EPOCH);
+        assert_eq!(built.signed_exit.message.validator_index, 42);
+
+        let gvr = eth_types::NetworkPreset::MAINNET.genesis_validators_root;
+        let capella = eth_types::NetworkPreset::MAINNET.capella_fork_version;
+        let exit = &built.signed_exit.message;
+        let capella_root = crypto::compute_signing_root(
+            exit,
+            crypto::compute_domain(eth_types::DOMAIN_VOLUNTARY_EXIT, capella, gvr),
+        );
+        let signature =
+            crypto::Signature::from_bytes(&built.signed_exit.signature).expect("96-byte signature");
+        signature.verify(&pubkey, &capella_root).expect("signature verifies under the exit domain");
+
+        // Head fork at this epoch is Electra (mock ELECTRA_FORK_VERSION).
+        // EIP-7044 must not sign the exit under that domain.
+        let electra = [0x05, 0x00, 0x00, 0x00];
+        let electra_root = crypto::compute_signing_root(
+            exit,
+            crypto::compute_domain(eth_types::DOMAIN_VOLUNTARY_EXIT, electra, gvr),
+        );
+        assert_ne!(capella_root, electra_root, "Capella and Electra exit domains differ");
+        assert!(
+            signature.verify(&pubkey, &electra_root).is_err(),
+            "exit signature must not verify under the Electra domain"
+        );
+    }
+
+    /// The beacon list can lead with a different validator. The index must be
+    /// the requested pubkey, including when that pubkey's case differs.
+    #[tokio::test]
+    async fn test_build_signed_exit_matches_the_requested_pubkey() {
+        let sk = crypto::SecretKey::generate();
+        let pubkey = sk.public_key();
+        let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+        let decoy = format!("0x{}", "ab".repeat(48));
+
+        let keystore_dir = tempfile::tempdir().expect("keystore dir");
+        let password = "exit-test-password";
+        let keystore = crypto::Keystore::encrypt(
+            &sk,
+            password.as_bytes(),
+            "m/12381/3600/0/0/0",
+            crypto::EncryptionKdf::scrypt_cheap_for_tests(),
+        )
+        .expect("encrypt keystore");
+        keystore.to_file(keystore_dir.path().join("keystore-0.json")).expect("write keystore");
+        let password_file = keystore_dir.path().join("passwords.txt");
+        std::fs::write(&password_file, format!("*={password}\n")).expect("password file");
+
+        let db_dir = tempfile::tempdir().expect("slashing dir");
+        let db_path = db_dir.path().join("slashing.sqlite");
+        {
+            slashing::SlashingDb::open_with_create_info(&db_path).expect("create slashing db");
+        }
+
+        let bn = super::mock_bn::MockBn::start().await;
+        bn.mount_validators(&[(&decoy, "7"), (&pubkey_hex.to_ascii_uppercase(), "42")]).await;
+
+        let built = build_signed_exit(ExitCommonArgs {
+            pubkey: pubkey_hex,
+            epoch: Some(FUTURE_ELECTRA_EPOCH),
+            beacon_url: bn.uri(),
+            keystore_path: keystore_dir.path().to_path_buf(),
+            password_file,
+            slashing_db_path: Some(db_path),
+            network: Some("mainnet".to_string()),
+            genesis_validators_root: None,
+            confirm: Some(true),
+        })
+        .await
+        .expect("matching pubkey signs even when it is not the first record");
+
+        assert_eq!(built.validator_index, 42);
+        assert_ne!(built.validator_index, 7);
+    }
+
+    /// A list that does not contain the requested pubkey fails before signing.
+    #[tokio::test]
+    async fn test_build_signed_exit_rejects_when_no_record_matches_the_pubkey() {
+        let bn = super::mock_bn::MockBn::start().await;
+        let requested = format!("0x{}", "cd".repeat(48));
+        let other = format!("0x{}", "ab".repeat(48));
+        bn.mount_validators(&[(&other, "7")]).await;
+
+        let err = match build_signed_exit(ExitCommonArgs {
+            pubkey: requested.clone(),
+            epoch: Some(1),
+            beacon_url: bn.uri(),
+            keystore_path: std::path::PathBuf::from("/no/such/keystore"),
+            password_file: std::path::PathBuf::from("/no/such/passwords"),
+            slashing_db_path: None,
+            network: Some("mainnet".to_string()),
+            genesis_validators_root: None,
+            confirm: None,
+        })
+        .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("a validator list that omits the pubkey must not sign"),
+        };
+
+        let text = err.to_string();
+        assert!(text.contains("not found"), "{text}");
+        assert!(text.contains(&requested), "{text}");
+        assert!(!text.contains("Failed to sign"), "{text}");
     }
 
     #[tokio::test]

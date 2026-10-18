@@ -5,7 +5,7 @@
 //! a default library build. `new_unchecked` is the `pub(crate)` alias of
 //! `new_for_tests`. Before the gate it was already `#[cfg(test)]` (this crate's
 //! unit tests only); it did not compile into a default build. The named check
-//! still requires the same attribute on all four, and requires the alias to
+//! still requires the same attribute on all five, and requires the alias to
 //! stay `pub(crate)`:
 //!
 //! - `RemoteSigner::new_for_tests` in `crates/remote-signer-client/src/client.rs`
@@ -14,8 +14,10 @@
 //! - `OrchestratorDeps::for_test` in `crates/rvc/src/orchestrator/coordinator/mod.rs`
 //! - `LivenessObservationLoop::refresh_indices_for_test` in
 //!   `crates/rvc/src/liveness_loop.rs` (writes the shared pubkey↔index registry)
+//! - `SignerService::signer` in `crates/signer/src/lib.rs` (raw signer, skips
+//!   the doppelganger gate)
 //!
-//! `#[cfg(test)]` alone is not enough for those four. Integration tests are a
+//! `#[cfg(test)]` alone is not enough for those five. Integration tests are a
 //! separate crate, so `cfg(test)` is false on the library they link. The
 //! attribute is exactly `#[cfg(any(test, feature = "test-utils"))]`. Downstream
 //! integration tests see the items through the self dev-dependency feature
@@ -65,6 +67,7 @@ const CLIENT_REL: &str = "crates/remote-signer-client/src/client.rs";
 const COORD_REL: &str = "crates/rvc/src/orchestrator/coordinator/mod.rs";
 const LIVENESS_REL: &str = "crates/rvc/src/liveness_loop.rs";
 const BUILDER_REL: &str = "crates/rvc/src/config/builder.rs";
+const SIGNER_REL: &str = "crates/signer/src/lib.rs";
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap().to_path_buf()
@@ -216,6 +219,9 @@ fn test_only_constructors_are_feature_gated() {
         "LivenessObservationLoop::refresh_indices_for_test",
     )
     .unwrap_or_else(|e| panic!("{e}"));
+    let signer_src = read_lines(SIGNER_REL);
+    let raw_signer = find_decl(&signer_src, |t| is_fn_item(t, "signer"), "SignerService::signer")
+        .unwrap_or_else(|e| panic!("{e}"));
     let mut impl_ok = false;
     for line in coord[..=for_test].iter().rev() {
         let t = line.trim();
@@ -237,6 +243,7 @@ fn test_only_constructors_are_feature_gated() {
         (client.as_slice(), new_unchecked, format!("{CLIENT_REL} new_unchecked")),
         (coord.as_slice(), for_test, format!("{COORD_REL} OrchestratorDeps::for_test")),
         (liveness.as_slice(), refresh_indices, format!("{LIVENESS_REL} refresh_indices_for_test")),
+        (signer_src.as_slice(), raw_signer, format!("{SIGNER_REL} SignerService::signer")),
     ] {
         if let Err(e) = predecessor_gate(lines, idx) {
             failures.push(format!("{what}: {e}"));
