@@ -233,6 +233,8 @@ impl ProduceBlockResponse {
     /// bodies are unchanged. Gloas and pre-Deneb object bodies fail closed.
     /// `BeaconBlock`'s `hex_vec` serde is not used on the object itself.
     pub fn parse_full_block(&self) -> Result<BlockContents, BeaconError> {
+        eth_types::block_object(&self.data)
+            .map_err(|err| BeaconError::ParseError(err.to_string()))?;
         let mut data = self.data.clone();
         replace_json_body_with_ssz(&mut data, &self.consensus_version, false)?;
         serde_json::from_value(data)
@@ -246,8 +248,10 @@ impl ProduceBlockResponse {
     /// A hex body is kept as SSZ only when it decodes as that same layout.
     /// Gloas and pre-Deneb object bodies fail closed.
     /// `BlindedBeaconBlock`'s `hex_vec` serde is not used on the object itself.
-    /// A decode error leaves `data` unchanged.
+    /// A hybrid document is rejected. A decode error leaves `data` unchanged.
     pub fn parse_blinded_block(&self) -> Result<BlindedBeaconBlock, BeaconError> {
+        eth_types::block_object(&self.data)
+            .map_err(|err| BeaconError::ParseError(err.to_string()))?;
         let mut data = self.data.clone();
         eth_types::block_body_json::reject_beacon_api_lenient_spellings(&data)
             .map_err(|err| BeaconError::ParseError(err.to_string()))?;
@@ -1810,6 +1814,20 @@ mod tests {
         }
         assert_eq!(response.data, original);
         assert!(response.data["body"].is_object());
+    }
+
+    #[test]
+    fn blinded_hybrid_document_is_rejected() {
+        let nested = kat_blinded_block(blinded_body_fixture(ELECTRA_BLINDED_BODY_JSON));
+        let mut hybrid = nested.clone();
+        hybrid["block"] = nested;
+        let response = blinded_produce(hybrid, "electra");
+        match response.parse_blinded_block() {
+            Err(BeaconError::ParseError(msg)) => {
+                assert!(msg.contains("both top-level block fields and a nested block"), "{msg}");
+            }
+            other => panic!("expected hybrid ParseError, got {other:?}"),
+        }
     }
 
     #[test]

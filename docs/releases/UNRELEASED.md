@@ -3,6 +3,14 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Full blocks and one JSON block shape
+
+A full block whose body does not decode under its consensus version is rejected before signing; a JSON block document with both top-level and nested block fields is rejected.
+
+That hybrid rejection also covers a blinded JSON document, and a document that is not a JSON object. A bare Deneb, Electra, or Fulu JSON block is published as `{message, signature}` with the object body that was hashed.
+
+The fork layout is the header's `Eth-Consensus-Version`, which is already checked against the slot's fork. A Deneb body under an Electra or Fulu header is a parse error, and nothing is signed. Pre-Deneb full blocks stay unsupported. A produce document that carries block fields at the top level and a nested `block` is rejected, so the fee check and the signed block cannot be different objects.
+
 ## Proposer-config URL refresh
 
 Shutdown cancels an in-flight proposer-config fetch. Dropping the fetch

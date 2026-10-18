@@ -5,9 +5,11 @@
 # when BlockHeaderSummary landed in types.rs (#641), then 978 → 1009 and
 # 1464 → 1495 when RankedBlock landed (#646), then 1009 → 1012 and
 # 1495 → 1498 when the V4 decode comment landed (#647), then 1012 → 1062
-# and 1498 → 1548 when the blinded hex-body fork check landed.
-crates/beacon/src/types.rs:generic-api-key:1548
-crates/beacon/src/types.rs:generic-api-key:1062
+# and 1498 → 1548 when the blinded hex-body fork check landed, then
+# 1062 → 1066 and 1548 → 1552 when the full-block layout check and the
+# blinded hybrid reject landed (#709).
+crates/beacon/src/types.rs:generic-api-key:1552
+crates/beacon/src/types.rs:generic-api-key:1066
 crates/crypto/examples/log_sample.rs:generic-api-key:27
 # Same test keystore pubkeys. Lines moved 452 → 522, 704 → 774, and 994 → 1064
 # when the password-map key and load report were added (#644).

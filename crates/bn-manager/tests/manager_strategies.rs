@@ -3902,13 +3902,7 @@ async fn test_broadcast_partial_failure_records_health() {
 
 fn sample_signed_block() -> SignedBeaconBlock {
     SignedBeaconBlock {
-        message: eth_types::BeaconBlock {
-            slot: 100,
-            proposer_index: 42,
-            parent_root: [1u8; 32],
-            state_root: [2u8; 32],
-            body: vec![0xde, 0xad],
-        },
+        message: eth_types::external_vector_deneb_block(),
         signature: vec![0xaa; 96],
     }
 }
@@ -4233,6 +4227,27 @@ async fn test_submit_helper_respects_each_broadcast_topic_flag() {
 
     // -- blocks (publish_block) --
     let signed = sample_signed_block();
+    {
+        let bn = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v2/beacon/blocks"))
+            .and(MessageBodyObject)
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&bn)
+            .await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![bn.uri()])).unwrap();
+        assert!(manager.publish_block(&signed, "deneb", None).await.is_ok());
+        let requests = bn.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body["message"]["body"].is_object(),
+            "bare Deneb publish body is an object: {body}"
+        );
+        assert!(body.get("signed_block").is_none(), "bare block is not block contents");
+        let hex_body = serde_json::to_value(&signed).unwrap();
+        assert!(hex_body["message"]["body"].is_string(), "in-memory body stays hex");
+    }
     {
         let bn1 = MockServer::start().await;
         let bn2 = MockServer::start().await;

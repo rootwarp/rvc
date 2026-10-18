@@ -54,6 +54,31 @@ pub struct SignedBlockContentsJson {
     pub blobs: Vec<Vec<u8>>,
 }
 
+impl SignedBeaconBlockJson {
+    /// Build `{message, signature}` from a signed block whose body is canonical SSZ.
+    ///
+    /// Encodes that body with [`crate::block_body_json::encode`] for `layout`.
+    /// [`BodyForkLayout::Gloas`] returns [`BodySszError::GloasUnsupported`].
+    /// This is the bare Deneb+ publish body: the object that was hashed, not hex.
+    pub fn from_signed(
+        signed: &SignedBeaconBlock,
+        layout: BodyForkLayout,
+    ) -> Result<Self, BodySszError> {
+        let body = crate::block_body_json::encode(&signed.message.body, layout)?;
+        require_json_object(&body, "encode")?;
+        Ok(Self {
+            message: BeaconBlockJson {
+                slot: signed.message.slot,
+                proposer_index: signed.message.proposer_index,
+                parent_root: signed.message.parent_root,
+                state_root: signed.message.state_root,
+                body,
+            },
+            signature: signed.signature.clone(),
+        })
+    }
+}
+
 impl SignedBlockContentsJson {
     /// Build contents from a signed block whose `message.body` is canonical SSZ.
     ///
@@ -65,19 +90,8 @@ impl SignedBlockContentsJson {
         blobs: Vec<Vec<u8>>,
         layout: BodyForkLayout,
     ) -> Result<Self, BodySszError> {
-        let body = crate::block_body_json::encode(&signed_block.message.body, layout)?;
-        require_json_object(&body, "encode")?;
         Ok(Self {
-            signed_block: SignedBeaconBlockJson {
-                message: BeaconBlockJson {
-                    slot: signed_block.message.slot,
-                    proposer_index: signed_block.message.proposer_index,
-                    parent_root: signed_block.message.parent_root,
-                    state_root: signed_block.message.state_root,
-                    body,
-                },
-                signature: signed_block.signature.clone(),
-            },
+            signed_block: SignedBeaconBlockJson::from_signed(signed_block, layout)?,
             kzg_proofs,
             blobs,
         })
