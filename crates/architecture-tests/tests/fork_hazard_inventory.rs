@@ -114,7 +114,7 @@ const fn inv(
 
 /// Exact per-class counts. Update together with [`INVENTORY`] and the audit doc.
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
-    (Class::GeForkName, 26),
+    (Class::GeForkName, 27),
     (Class::IndexZero, 8),
     (Class::MatchForkName, 8),
     (Class::StringDispatch, 10),
@@ -243,7 +243,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/grpc-signer/src/client.rs",
-        277,
+        279,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -261,7 +261,16 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/aggregation.rs",
-        403,
+        172,
+        Class::GeForkName,
+        false,
+        ">= ForkName::Gloas",
+        Verdict::InheritIntentionally,
+        "—",
+    ),
+    inv(
+        "crates/rvc/src/orchestrator/aggregation.rs",
+        651,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -270,7 +279,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/rvc/src/orchestrator/coordinator/mod.rs",
-        1764,
+        1779,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -324,7 +333,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1377,
+        1365,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -333,7 +342,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1718,
+        1706,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -342,7 +351,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/signer/src/lib.rs",
-        1795,
+        1788,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",

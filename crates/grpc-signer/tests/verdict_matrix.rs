@@ -1035,6 +1035,60 @@ async fn test_new_client_old_server_gloas_is_typed_no_retry() {
     assert_eq!(root_calls, 0, "container aggregates must not hit SignRoot: {names:?}");
 }
 
+fn bitlist(bit_length: usize) -> Vec<u8> {
+    let len = bit_length / 8 + 1;
+    let sentinel_bit = bit_length % 8;
+    let mut bytes = vec![0xff; len];
+    bytes[len - 1] = ((1u8 << sentinel_bit) - 1) | (1u8 << sentinel_bit);
+    bytes
+}
+
+#[tokio::test]
+async fn electra_aggregate_on_fulu_is_refused_without_legacy_rpc() {
+    let sk = SecretKey::generate();
+    let pk = sk.public_key();
+    let (addr, calls, _h) = start_recording_server(sk, false).await;
+    let signer = connect(addr).await;
+    let ctx = fulu_ctx(pk);
+    let mut electra = electra_aggregate();
+    electra.aggregate.aggregation_bits = bitlist(2049);
+    match TypedSigner::sign_electra_aggregate_and_proof(&signer, &electra, &ctx).await {
+        Err(crypto::SigningError::LocalRejected(msg)) => {
+            assert!(msg.contains("drops committee_bits"), "{msg}");
+        }
+        other => panic!("Electra aggregate on Fulu must fail closed, got {other:?}"),
+    }
+    let names = RecordingV2::names(&calls);
+    assert!(
+        !names.iter().any(|name| name == "sign_aggregate_and_proof" || name == "sign_root"),
+        "a refused Electra aggregate must not be sent: {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn overlong_legacy_aggregate_is_rejected_before_rpc() {
+    let sk = SecretKey::generate();
+    let pk = sk.public_key();
+    let (addr, calls, _h) = start_recording_server(sk, false).await;
+    let signer = connect(addr).await;
+    let ctx = fulu_ctx(pk);
+    let mut agg = aggregate();
+    // Past Bitlist[2048]'s 257-byte encoding. A shorter 2049-bit list still fits
+    // that byte cap; 258 bytes is what makes the legacy hasher return an error.
+    agg.aggregate.aggregation_bits = vec![0xff; 258];
+    match TypedSigner::sign_aggregate_and_proof(&signer, &agg, &ctx).await {
+        Err(crypto::SigningError::LocalRejected(msg)) => {
+            assert!(msg.contains("invalid aggregate"), "{msg}");
+        }
+        other => panic!("an over-long bitlist must not panic, got {other:?}"),
+    }
+    let names = RecordingV2::names(&calls);
+    assert!(
+        !names.iter().any(|name| name == "sign_aggregate_and_proof"),
+        "invalid bits must not be sent: {names:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_unknown_duty_and_fork_id_fail_closed() {
     let sk = SecretKey::generate();

@@ -3,6 +3,12 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Aggregate responses are checked before signing
+
+An aggregate is signed only when its slot, attestation-data root, committee, attester-bit length, and fork match the request. The root is the unmodified attestation data. At Electra and Fulu the data index must be zero. Before Electra it must be the duty's committee index. At Gloas the index stays in that root. A beacon node without aggregate v2 returns an Electra body on Fulu and Gloas; that body is accepted. The duty's committee length must be 1 through 2048 on every fork. The attester bitlist must be exactly that length, and still inside the fork's spec maximum. A mismatch increments `rvc_aggregations_total{status="failed"}` and is not signed.
+
+Aggregation and sync contributions share one phase-2 cap of `duty_dispatch_concurrency`. Selection proofs and the following aggregate-and-proof or contribution-and-proof signatures take permits from that same cap, and only while the signer call runs. A permit is not kept once the phase deadline has passed. When that wait expires on the aggregate-and-proof signature, `rvc_aggregations_total{status="failed"}` increments. That expiry is not a slot-end intake drop. A cancelled selection-proof wait does not increment the counter. Time spent waiting for a permit counts against the sync contribution timeout. Attestations and sync messages at the 1/3 offset are not on this cap.
+
 ## Full blocks and one JSON block shape
 
 A full block whose body does not decode under its consensus version is rejected before signing; a JSON block document with both top-level and nested block fields is rejected.

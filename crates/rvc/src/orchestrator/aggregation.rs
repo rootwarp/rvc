@@ -11,7 +11,7 @@ use crypto::PublicKey;
 use duty_tracker::{DutyTracker, TypedAttesterDuty};
 use eth_types::{
     AggregateAndProof, ElectraAggregateAndProof, ForkName, SignedAggregateAndProof,
-    SignedElectraAggregateAndProof, Slot, MAX_COMMITTEES_PER_SLOT,
+    SignedElectraAggregateAndProof, Slot, MAX_COMMITTEES_PER_SLOT, MAX_VALIDATORS_PER_COMMITTEE,
 };
 use observability::logging::TruncatedPubkey;
 use signer::{is_aggregator, ValidatorSigner};
@@ -20,7 +20,10 @@ use tree_hash::TreeHash;
 use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
-use super::dispatch::{SlotEndDropCounter, SLOT_END_PUBLISH_OVERHANG};
+use super::dispatch::{
+    sign_with_phase2_permit, Phase2SignError, Phase2SignerPermits, SlotEndDropCounter,
+    SLOT_END_PUBLISH_OVERHANG,
+};
 use super::utils::{self, TimedOutcome};
 
 pub(crate) struct AggregationService {
@@ -65,6 +68,189 @@ struct AggregateDutyOutcome {
     proof: Option<ProducedAggregate>,
 }
 
+/// Why an aggregate body was not the one this duty requested.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateMismatch {
+    Slot,
+    DataRoot,
+    DataIndex,
+    CommitteeIndex,
+    AttesterBits,
+    Fork,
+    Oversized,
+}
+
+impl AggregateMismatch {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Slot => "slot",
+            Self::DataRoot => "data_root",
+            Self::DataIndex => "data_index",
+            Self::CommitteeIndex => "committee_index",
+            Self::AttesterBits => "attester_bits",
+            Self::Fork => "fork",
+            Self::Oversized => "oversized",
+        }
+    }
+}
+
+/// The aggregate body is the one `get_aggregate_attestation` was asked for.
+///
+/// The root is `AttestationData::tree_hash_root` of the body that would be
+/// signed. Electra and Fulu also require `data.index == 0` (EIP-7549). Before
+/// Electra, `data.index` must be the duty's committee index. At Gloas the
+/// index stays in the root (payload empty or full). The duty's
+/// `committee_length` must be `1..=MAX_VALIDATORS_PER_COMMITTEE` on every
+/// fork. A mismatch is returned before any `sign_*aggregate_and_proof*` call.
+fn aggregate_matches(
+    aggregate: &VersionedAggregateAttestation,
+    slot: Slot,
+    att_data_root: tree_hash::Hash256,
+    committee_index: u64,
+    committee_length: u64,
+    fork: ForkName,
+) -> Result<(), AggregateMismatch> {
+    if !aggregate_fork_matches(aggregate, fork) {
+        return Err(AggregateMismatch::Fork);
+    }
+    let (data, aggregation_bits, signature, committee_bits) = match aggregate {
+        VersionedAggregateAttestation::PreElectra(body) => {
+            (&body.data, body.aggregation_bits.as_slice(), body.signature.as_slice(), None)
+        }
+        VersionedAggregateAttestation::Electra(body)
+        | VersionedAggregateAttestation::Fulu(body)
+        | VersionedAggregateAttestation::Gloas(body) => (
+            &body.data,
+            body.aggregation_bits.as_slice(),
+            body.signature.as_slice(),
+            Some(body.committee_bits.as_slice()),
+        ),
+    };
+    if signature.len() != 96 {
+        return Err(AggregateMismatch::Oversized);
+    }
+    // `committee_length` is an unbounded duty field. The Electra bitlist limit
+    // is larger than 2048, so a matching over-long list would otherwise be signed.
+    if !(1..=MAX_VALIDATORS_PER_COMMITTEE).contains(&committee_length) {
+        return Err(AggregateMismatch::AttesterBits);
+    }
+    let max_bits = if utils::uses_electra_attestation_wire(fork) {
+        MAX_VALIDATORS_PER_COMMITTEE * MAX_COMMITTEES_PER_SLOT
+    } else {
+        MAX_VALIDATORS_PER_COMMITTEE
+    };
+    attester_bits_ok(aggregation_bits, max_bits, committee_length)?;
+    if data.slot != slot {
+        return Err(AggregateMismatch::Slot);
+    }
+    if let Some(bits) = committee_bits {
+        committee_index_ok(bits, committee_index)?;
+    }
+    if utils::zeroes_committee_index(fork) {
+        if data.index != 0 {
+            return Err(AggregateMismatch::DataIndex);
+        }
+    } else if !utils::uses_electra_attestation_wire(fork) && data.index != committee_index {
+        return Err(AggregateMismatch::DataIndex);
+    }
+    if data.tree_hash_root() != att_data_root {
+        return Err(AggregateMismatch::DataRoot);
+    }
+    Ok(())
+}
+
+/// Fork variant accepted for `fork`.
+///
+/// An Electra body is accepted on every fork that uses the Electra wire,
+/// including Fulu and Gloas. A beacon node without aggregate v2 returns that
+/// variant from the v1 fallback. Fulu stays exact. Gloas stays open-ended.
+fn aggregate_fork_matches(aggregate: &VersionedAggregateAttestation, fork: ForkName) -> bool {
+    match aggregate {
+        VersionedAggregateAttestation::PreElectra(_) => fork < ForkName::Electra,
+        VersionedAggregateAttestation::Electra(_) => utils::uses_electra_attestation_wire(fork),
+        VersionedAggregateAttestation::Fulu(_) => fork == ForkName::Fulu,
+        VersionedAggregateAttestation::Gloas(_) => fork >= ForkName::Gloas,
+    }
+}
+
+/// SSZ `Bitlist` bytes for this duty.
+///
+/// The byte cap and the bit cap each reject an oversized buffer before the
+/// committee-length compare. A buffer inside the spec whose bit length
+/// is not `committee_length` is [`AggregateMismatch::AttesterBits`].
+/// `committee_length` must be `1..=MAX_VALIDATORS_PER_COMMITTEE` on every fork.
+fn attester_bits_ok(
+    bytes: &[u8],
+    max_bits: u64,
+    committee_length: u64,
+) -> Result<(), AggregateMismatch> {
+    let max_len = (max_bits / 8 + 1) as usize;
+    if bytes.len() > max_len {
+        return Err(AggregateMismatch::Oversized);
+    }
+    if bytes.is_empty() {
+        return Err(AggregateMismatch::AttesterBits);
+    }
+    let last = *bytes.last().expect("length checked");
+    if last == 0 {
+        return Err(AggregateMismatch::AttesterBits);
+    }
+    let sentinel_bit = 7 - last.leading_zeros() as usize;
+    let bit_length = (bytes.len() - 1) * 8 + sentinel_bit;
+    if bit_length as u64 > max_bits {
+        return Err(AggregateMismatch::Oversized);
+    }
+    if !(1..=MAX_VALIDATORS_PER_COMMITTEE).contains(&committee_length)
+        || bit_length as u64 != committee_length
+    {
+        return Err(AggregateMismatch::AttesterBits);
+    }
+    let mut saw_participant = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        let bits = if index + 1 == bytes.len() { byte & !(1 << sentinel_bit) } else { byte };
+        if bits != 0 {
+            saw_participant = true;
+            break;
+        }
+    }
+    if saw_participant {
+        Ok(())
+    } else {
+        Err(AggregateMismatch::AttesterBits)
+    }
+}
+
+/// Electra+ `committee_bits` is `Bitvector[MAX_COMMITTEES_PER_SLOT]` with
+/// exactly the requested committee set.
+fn committee_index_ok(bits: &[u8], committee_index: u64) -> Result<(), AggregateMismatch> {
+    if bits.len() > (MAX_COMMITTEES_PER_SLOT as usize).div_ceil(8) {
+        return Err(AggregateMismatch::Oversized);
+    }
+    if bits.len() != (MAX_COMMITTEES_PER_SLOT as usize).div_ceil(8)
+        || committee_index >= MAX_COMMITTEES_PER_SLOT
+    {
+        return Err(AggregateMismatch::CommitteeIndex);
+    }
+    let mut matched = false;
+    for (index, byte) in bits.iter().copied().enumerate() {
+        for bit in 0..8 {
+            if byte & (1 << bit) == 0 {
+                continue;
+            }
+            let set = (index * 8 + bit) as u64;
+            if matched || set != committee_index {
+                return Err(AggregateMismatch::CommitteeIndex);
+            }
+            matched = true;
+        }
+    }
+    if matched {
+        Ok(())
+    } else {
+        Err(AggregateMismatch::CommitteeIndex)
+    }
+}
+
 impl AggregationService {
     pub(crate) fn new(
         signer: Arc<dyn ValidatorSigner>,
@@ -98,13 +284,33 @@ impl AggregationService {
     /// admitted only until `slot_end` plus [`SLOT_END_PUBLISH_OVERHANG`].
     /// Aggregates are non-slashable: this path does not touch SQLite.
     /// `source_validators` is sorted before recording because wave completion
-    /// order is not the duty order.
-    #[tracing::instrument(name = "orchestrator.produce_aggregations", level = "debug", skip_all, fields(slot = slot, epoch = epoch))]
+    /// order is not the duty order. The span is on [`Self::produce_aggregations`].
+    ///
+    /// Tests call this so a pipeline keeps its own cap. The coordinator calls
+    /// [`Self::produce_aggregations`] with the shared phase-2 permits.
+    #[cfg(test)]
     pub(crate) async fn maybe_produce_aggregations(
         &self,
         slot: Slot,
         epoch: u64,
         slot_end: tokio::time::Instant,
+    ) {
+        let permits = Phase2SignerPermits::new(self.config.dispatch_limits.concurrency as usize);
+        self.produce_aggregations(slot, epoch, slot_end, &permits).await
+    }
+
+    /// Produce aggregate-and-proofs under a caller-owned phase-2 cap.
+    ///
+    /// The coordinator passes one [`Phase2SignerPermits`] shared with sync
+    /// contributions. A caller outside that phase builds its own, sized to
+    /// the same knob.
+    #[tracing::instrument(name = "orchestrator.produce_aggregations", level = "debug", skip_all, fields(slot = slot, epoch = epoch))]
+    pub(crate) async fn produce_aggregations(
+        &self,
+        slot: Slot,
+        epoch: u64,
+        slot_end: tokio::time::Instant,
+        permits: &Phase2SignerPermits,
     ) {
         let duties =
             match utils::get_duties_for_slot(&self.pubkey_map, &self.duty_tracker, slot).await {
@@ -133,6 +339,7 @@ impl AggregationService {
         let duty_count = duties.len();
         let concurrency = self.config.dispatch_limits.concurrency as usize;
         let publish_concurrency = self.config.dispatch_limits.publish_concurrency as usize;
+        let sign_deadline = slot_end.checked_add(SLOT_END_PUBLISH_OVERHANG).unwrap_or(slot_end);
         let waves = stream::iter(duties)
             .take_until(tokio::time::sleep_until(slot_end))
             .map(|duty| {
@@ -143,7 +350,7 @@ impl AggregationService {
                     pubkey = %TruncatedPubkey::new(&duty.pubkey),
                     aggregation.fork = fork_label,
                 );
-                self.produce_one_aggregate(duty, slot, fork_name, agg_span)
+                self.produce_one_aggregate(duty, slot, fork_name, agg_span, permits, sign_deadline)
             })
             .buffer_unordered(concurrency)
             .ready_chunks(concurrency)
@@ -177,6 +384,8 @@ impl AggregationService {
         slot: Slot,
         fork_name: ForkName,
         agg_span: Span,
+        permits: &Phase2SignerPermits,
+        sign_deadline: tokio::time::Instant,
     ) -> Option<AggregateDutyOutcome> {
         let committee_length = duty.committee_length;
 
@@ -212,21 +421,38 @@ impl AggregationService {
                 return None;
             }
         };
-        let selection_proof = match super::slot_context::under_admission(
+        let selection_proof = match sign_with_phase2_permit(
+            permits,
+            sign_deadline,
             &fence,
-            self.signer
-                .sign_selection_proof(
-                    slot,
-                    &pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                )
-                .instrument(agg_span.clone()),
+            super::slot_context::under_admission(
+                &fence,
+                self.signer
+                    .sign_selection_proof(
+                        slot,
+                        &pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .instrument(agg_span.clone()),
+            ),
         )
         .await
         {
             Ok(sig) => sig,
-            Err(e) => {
+            Err(Phase2SignError::Cancelled) => {
+                warn!(
+                    slot,
+                    validator_index = %duty.validator_index,
+                    "phase-2 signer permit wait cancelled before selection proof"
+                );
+                return None;
+            }
+            Err(Phase2SignError::Revoked) => {
+                warn!(slot, "skipping aggregation: beacon node admission revoked");
+                return None;
+            }
+            Err(Phase2SignError::Failed(e)) => {
                 warn!(
                     slot,
                     validator_index = %duty.validator_index,
@@ -261,6 +487,8 @@ impl AggregationService {
                 selection_proof.to_bytes().to_vec(),
                 agg_span,
                 &fence,
+                permits,
+                sign_deadline,
             )
             .await;
 
@@ -282,6 +510,8 @@ impl AggregationService {
         selection_proof: Vec<u8>,
         agg_span: Span,
         fence: &beacon::DutyFence,
+        permits: &Phase2SignerPermits,
+        sign_deadline: tokio::time::Instant,
     ) -> Option<ProducedAggregate> {
         let uses_electra_wire = utils::uses_electra_attestation_wire(fork_name);
         let committee_index = duty.committee_index;
@@ -377,6 +607,24 @@ impl AggregationService {
             }
         };
 
+        if let Err(mismatch) = aggregate_matches(
+            &aggregate,
+            slot,
+            att_data_root,
+            committee_index,
+            duty.committee_length,
+            fork_name,
+        ) {
+            warn!(
+                slot,
+                validator_index = %duty.validator_index,
+                mismatch = mismatch.as_str(),
+                "aggregate response does not match the request; not signing"
+            );
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+            return None;
+        }
+
         let aggregator_index = duty.validator_index;
 
         if uses_electra_wire {
@@ -409,6 +657,8 @@ impl AggregationService {
                         message,
                         agg_span,
                         fence,
+                        permits,
+                        sign_deadline,
                     )
                     .await?;
                 Some(ProducedAggregate::Gloas(signed))
@@ -421,6 +671,8 @@ impl AggregationService {
                         message,
                         agg_span,
                         fence,
+                        permits,
+                        sign_deadline,
                     )
                     .await?;
                 Some(ProducedAggregate::Electra(signed))
@@ -450,6 +702,8 @@ impl AggregationService {
                     message,
                     agg_span,
                     fence,
+                    permits,
+                    sign_deadline,
                 )
                 .await?;
             Some(ProducedAggregate::PreElectra(signed))
@@ -461,6 +715,7 @@ impl AggregationService {
     /// Explicit (non-generic) twin of [`Self::sign_and_wrap_electra`]: the two
     /// signer methods and log strings differ; a generic over proof type would
     /// contort more than it saves.
+    #[allow(clippy::too_many_arguments)]
     async fn sign_and_wrap_pre_electra(
         &self,
         slot: Slot,
@@ -469,6 +724,8 @@ impl AggregationService {
         message: AggregateAndProof,
         agg_span: Span,
         fence: &beacon::DutyFence,
+        permits: &Phase2SignerPermits,
+        sign_deadline: tokio::time::Instant,
     ) -> Option<SignedAggregateAndProof> {
         if let Err(e) = message.try_tree_hash_root() {
             warn!(
@@ -480,30 +737,44 @@ impl AggregationService {
             RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
             return None;
         }
-        if !fence.holds() {
-            warn!(
-                slot,
-                validator_index = %validator_index,
-                "skipping aggregate: beacon node admission revoked before sign"
-            );
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-            return None;
-        }
-        let signature = match super::slot_context::under_admission(
+        let signature = match sign_with_phase2_permit(
+            permits,
+            sign_deadline,
             fence,
-            self.signer
-                .sign_aggregate_and_proof(
-                    &message,
-                    pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                )
-                .instrument(agg_span),
+            super::slot_context::under_admission(
+                fence,
+                self.signer
+                    .sign_aggregate_and_proof(
+                        &message,
+                        pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .instrument(agg_span),
+            ),
         )
         .await
         {
             Ok(sig) => sig,
-            Err(e) => {
+            Err(Phase2SignError::Cancelled) => {
+                warn!(
+                    slot,
+                    validator_index = %validator_index,
+                    "phase-2 signer permit wait cancelled before aggregate and proof"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+            Err(Phase2SignError::Revoked) => {
+                warn!(
+                    slot,
+                    validator_index = %validator_index,
+                    "skipping aggregate: beacon node admission revoked before sign"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+            Err(Phase2SignError::Failed(e)) => {
                 warn!(
                     slot,
                     validator_index = %validator_index,
@@ -518,6 +789,7 @@ impl AggregationService {
     }
 
     /// Tree-hash guard + sign + wrap for Electra/Fulu aggregate-and-proof.
+    #[allow(clippy::too_many_arguments)]
     async fn sign_and_wrap_electra(
         &self,
         slot: Slot,
@@ -526,6 +798,8 @@ impl AggregationService {
         message: ElectraAggregateAndProof,
         agg_span: Span,
         fence: &beacon::DutyFence,
+        permits: &Phase2SignerPermits,
+        sign_deadline: tokio::time::Instant,
     ) -> Option<SignedElectraAggregateAndProof> {
         if let Err(e) = message.try_tree_hash_root() {
             warn!(
@@ -537,30 +811,44 @@ impl AggregationService {
             RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
             return None;
         }
-        if !fence.holds() {
-            warn!(
-                slot,
-                validator_index = %validator_index,
-                "skipping aggregate: beacon node admission revoked before sign"
-            );
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-            return None;
-        }
-        let signature = match super::slot_context::under_admission(
+        let signature = match sign_with_phase2_permit(
+            permits,
+            sign_deadline,
             fence,
-            self.signer
-                .sign_electra_aggregate_and_proof(
-                    &message,
-                    pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                )
-                .instrument(agg_span),
+            super::slot_context::under_admission(
+                fence,
+                self.signer
+                    .sign_electra_aggregate_and_proof(
+                        &message,
+                        pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .instrument(agg_span),
+            ),
         )
         .await
         {
             Ok(sig) => sig,
-            Err(e) => {
+            Err(Phase2SignError::Cancelled) => {
+                warn!(
+                    slot,
+                    validator_index = %validator_index,
+                    "phase-2 signer permit wait cancelled before Electra aggregate and proof"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+            Err(Phase2SignError::Revoked) => {
+                warn!(
+                    slot,
+                    validator_index = %validator_index,
+                    "skipping aggregate: beacon node admission revoked before sign"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+            Err(Phase2SignError::Failed(e)) => {
                 warn!(
                     slot,
                     validator_index = %validator_index,
@@ -579,6 +867,7 @@ impl AggregationService {
     /// Pre-Gloas `try_tree_hash_root` is intentionally not used: the island
     /// decode is the validity gate. A [`rvc_gloas::GloasError`] skips the
     /// duty with a failure increment and no signer call.
+    #[allow(clippy::too_many_arguments)]
     async fn sign_and_wrap_gloas(
         &self,
         slot: Slot,
@@ -587,6 +876,8 @@ impl AggregationService {
         message: ElectraAggregateAndProof,
         agg_span: Span,
         fence: &beacon::DutyFence,
+        permits: &Phase2SignerPermits,
+        sign_deadline: tokio::time::Instant,
     ) -> Option<SignedElectraAggregateAndProof> {
         let ssz = match encode_electra_aggregate_and_proof(&message) {
             Ok(ssz) => ssz,
@@ -603,31 +894,45 @@ impl AggregationService {
             }
         };
         let sign_slot = message.aggregate.data.slot;
-        if !fence.holds() {
-            warn!(
-                slot,
-                validator_index = %validator_index,
-                "skipping aggregate: beacon node admission revoked before sign"
-            );
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
-            return None;
-        }
-        let signature = match super::slot_context::under_admission(
+        let signature = match sign_with_phase2_permit(
+            permits,
+            sign_deadline,
             fence,
-            self.signer
-                .sign_aggregate_and_proof_root(
-                    &object_root,
-                    sign_slot,
-                    pubkey,
-                    &self.config.fork_schedule,
-                    &self.config.genesis_validators_root,
-                )
-                .instrument(agg_span),
+            super::slot_context::under_admission(
+                fence,
+                self.signer
+                    .sign_aggregate_and_proof_root(
+                        &object_root,
+                        sign_slot,
+                        pubkey,
+                        &self.config.fork_schedule,
+                        &self.config.genesis_validators_root,
+                    )
+                    .instrument(agg_span),
+            ),
         )
         .await
         {
             Ok(sig) => sig,
-            Err(e) => {
+            Err(Phase2SignError::Cancelled) => {
+                warn!(
+                    slot,
+                    validator_index = %validator_index,
+                    "phase-2 signer permit wait cancelled before Gloas aggregate and proof"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+            Err(Phase2SignError::Revoked) => {
+                warn!(
+                    slot,
+                    validator_index = %validator_index,
+                    "skipping aggregate: beacon node admission revoked before sign"
+                );
+                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                return None;
+            }
+            Err(Phase2SignError::Failed(e)) => {
                 warn!(
                     slot,
                     validator_index = %validator_index,
@@ -973,7 +1278,8 @@ mod tests {
     use duty_tracker::DutyTracker;
     use eth_types::{
         Attestation as EthAttestation, AttestationData, Checkpoint, ElectraAggregateAndProof,
-        ElectraAttestation, Epoch, ForkName, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH,
+        ElectraAttestation, Epoch, ForkName, ForkSchedule, Root, Slot, MAX_COMMITTEES_PER_SLOT,
+        MAX_VALIDATORS_PER_COMMITTEE, SLOTS_PER_EPOCH,
     };
     use signer::{
         always_enabled, SignerError, SignerService, StubValidatorSigner, ValidatorSigner,
@@ -982,6 +1288,8 @@ mod tests {
     use ssz08::{Decode, Encode};
     use tree_hash::TreeHash;
     use validator_store::{ValidatorConfig, ValidatorStore};
+
+    use tracing_subscriber::layer::SubscriberExt;
 
     use super::utils;
     use super::{AggregationService, OrchestratorConfig};
@@ -1118,11 +1426,12 @@ mod tests {
             .with_get_aggregate_attestation(move |slot, _root, _idx, fork| {
                 fetched_forks.lock().unwrap().push(fork);
                 let mut agg = aggregate.clone();
+                let data = request_shaped_data(slot);
                 match &mut agg {
-                    VersionedAggregateAttestation::PreElectra(a) => a.data.slot = slot,
+                    VersionedAggregateAttestation::PreElectra(a) => a.data = data,
                     VersionedAggregateAttestation::Electra(a)
                     | VersionedAggregateAttestation::Fulu(a)
-                    | VersionedAggregateAttestation::Gloas(a) => a.data.slot = slot,
+                    | VersionedAggregateAttestation::Gloas(a) => a.data = data,
                 }
                 Ok(agg)
             })
@@ -1190,11 +1499,16 @@ mod tests {
     struct RecordingSigner {
         inner: StubValidatorSigner,
         calls: Mutex<Vec<&'static str>>,
+        selection_proof: Option<Signature>,
     }
 
     impl RecordingSigner {
         fn new() -> Self {
-            Self { inner: StubValidatorSigner::new(), calls: Mutex::new(Vec::new()) }
+            Self {
+                inner: StubValidatorSigner::new(),
+                calls: Mutex::new(Vec::new()),
+                selection_proof: None,
+            }
         }
 
         fn record(&self, name: &'static str) {
@@ -1216,6 +1530,11 @@ mod tests {
                         $($arg: $ty),*
                     ) -> Result<Signature, SignerError> {
                         self.record(stringify!($name));
+                        if stringify!($name) == "sign_selection_proof" {
+                            if let Some(proof) = &self.selection_proof {
+                                return Ok(proof.clone());
+                            }
+                        }
                         self.inner.$name($($arg),*).await
                     }
                 )*
@@ -1651,8 +1970,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_gloas_error_skips_aggregate_without_signer() {
+    /// A short `committee_bits` vector is rejected by the request check.
+    /// The island encode is a different reject; a short selection proof is.
+    #[tokio::test(flavor = "current_thread")]
+    async fn short_committee_bits_fail_the_request_check() {
         let _guard = agg_fail_metric_lock().await;
         let sk = SecretKey::generate();
         let pk = sk.public_key();
@@ -1681,34 +2002,51 @@ mod tests {
         )
         .await;
 
+        let logs = Arc::new(Mutex::new(String::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(MismatchLog { buf: Arc::clone(&logs) });
+        let _log = tracing::subscriber::set_default(subscriber);
         service.maybe_produce_aggregations(slot, gloas_epoch, super::ample_slot_end()).await;
+        drop(_log);
+        let text = logs.lock().expect("mismatch log").clone();
+        assert!(
+            text.contains("mismatch=committee_index"),
+            "short committee bits must fail the request check; log={text}"
+        );
 
         let calls = rec.calls();
         assert!(
             !calls.contains(&"sign_aggregate_and_proof_root"),
-            "GloasError must not call the signer; calls={calls:?}"
+            "short committee bits must not reach the island signer; calls={calls:?}"
         );
         assert!(
             !calls.contains(&"sign_electra_aggregate_and_proof"),
-            "GloasError must not fall back to Electra signing; calls={calls:?}"
+            "a request-check reject must not fall back to Electra signing; calls={calls:?}"
         );
         let failed_after =
             RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
         assert_eq!(
             failed_after.saturating_sub(failed_before),
             1,
-            "GloasError must increment RVC_AGGREGATIONS_TOTAL failed"
+            "a request-check reject must increment RVC_AGGREGATIONS_TOTAL failed"
         );
-        assert_eq!(submit_calls.load(Ordering::SeqCst), 0, "GloasError must not submit");
+        assert_eq!(
+            submit_calls.load(Ordering::SeqCst),
+            0,
+            "a request-check reject must not submit"
+        );
     }
 
-    #[tokio::test]
-    async fn test_gloas_invalid_aggregation_bits_skip_without_signer() {
+    /// Empty, sentinel-less, and over-long bitlists fail the request check.
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_aggregation_bits_fail_the_request_check() {
         let _guard = agg_fail_metric_lock().await;
         const OVER_LEN: usize = 16_386;
-        for (label, bits) in
-            [("empty", vec![]), ("no-sentinel", vec![0x00]), ("over-length", vec![0xff; OVER_LEN])]
-        {
+        for (label, bits, mismatch) in [
+            ("empty", vec![], "attester_bits"),
+            ("no-sentinel", vec![0x00], "attester_bits"),
+            ("over-length", vec![0xff; OVER_LEN], "oversized"),
+        ] {
             let sk = SecretKey::generate();
             let pk = sk.public_key();
             let pk_bytes = pk.to_bytes();
@@ -1736,12 +2074,22 @@ mod tests {
             )
             .await;
 
+            let logs = Arc::new(Mutex::new(String::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(MismatchLog { buf: Arc::clone(&logs) });
+            let _log = tracing::subscriber::set_default(subscriber);
             service.maybe_produce_aggregations(slot, gloas_epoch, super::ample_slot_end()).await;
+            drop(_log);
+            let text = logs.lock().expect("mismatch log").clone();
+            assert!(
+                text.contains(&format!("mismatch={mismatch}")),
+                "{label}: expected mismatch={mismatch}; log={text}"
+            );
 
             let calls = rec.calls();
             assert!(
                 !calls.contains(&"sign_aggregate_and_proof_root"),
-                "{label}: must not call signer; calls={calls:?}"
+                "{label}: must not reach the island signer; calls={calls:?}"
             );
             assert!(
                 !calls.contains(&"sign_electra_aggregate_and_proof"),
@@ -2173,5 +2521,822 @@ mod tests {
         sign_payload_attestation(data: &eth_types::PayloadAttestationData, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
         sign_execution_payload_envelope_root(object_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
         sign_aggregate_and_proof_root(object_root: &Root, slot: Slot, pubkey: &PublicKey, fork_schedule: &ForkSchedule, genesis_validators_root: &Root);
+    }
+
+    fn request_shaped_data(slot: Slot) -> AttestationData {
+        AttestationData {
+            slot,
+            index: 0,
+            beacon_block_root: [0x11; 32],
+            source: Checkpoint { epoch: 0, root: [0u8; 32] },
+            target: Checkpoint { epoch: 0, root: [0u8; 32] },
+        }
+    }
+
+    fn matching_electra_body(slot: Slot) -> ElectraAttestation {
+        let mut body = electra_attestation(slot);
+        body.data = request_shaped_data(slot);
+        body.aggregation_bits = vec![0xff, 0x01];
+        body.committee_bits = vec![0x01, 0, 0, 0, 0, 0, 0, 0];
+        body.signature = vec![0xab; 96];
+        body
+    }
+
+    fn beacon_request_data(slot: Slot) -> beacon::AttestationData {
+        beacon::AttestationData {
+            slot: slot.to_string(),
+            index: "0".to_string(),
+            beacon_block_root: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            source: beacon::Checkpoint {
+                epoch: "0".to_string(),
+                root: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            },
+            target: beacon::Checkpoint {
+                epoch: "0".to_string(),
+                root: "0x0000000000000000000000000000000000000000000000000000000000000000"
+                    .to_string(),
+            },
+        }
+    }
+
+    struct SignCase {
+        epoch: u64,
+        committee_index: &'static str,
+        committee_length: &'static str,
+        aggregate: VersionedAggregateAttestation,
+        config: OrchestratorConfig,
+        /// When set, `sign_selection_proof` returns this signature so a long
+        /// committee can still be selected as aggregator.
+        selection_proof: Option<Signature>,
+    }
+
+    async fn sign_electra_aggregate(
+        aggregate: VersionedAggregateAttestation,
+    ) -> (Vec<&'static str>, usize) {
+        sign_case(SignCase {
+            epoch: 50,
+            committee_index: "0",
+            committee_length: "8",
+            aggregate,
+            config: create_test_config(),
+            selection_proof: None,
+        })
+        .await
+    }
+
+    async fn sign_case(case: SignCase) -> (Vec<&'static str>, usize) {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let mut recorder = RecordingSigner::new();
+        recorder.selection_proof = case.selection_proof.clone();
+        let rec = Arc::new(recorder);
+        let submits = Arc::new(AtomicUsize::new(0));
+        let slot = case.epoch * SLOTS_PER_EPOCH;
+        let epoch = case.epoch;
+        let committee_index = case.committee_index.to_string();
+        let committee_length = case.committee_length.to_string();
+        let aggregate = case.aggregate;
+        let config = case.config;
+        let submit_count = Arc::clone(&submits);
+        let beacon = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_get_attester_duties(move |_epoch, _indices| {
+                    Ok(DependentRootResponse {
+                        dependent_root: "0xaabb".to_string(),
+                        execution_optimistic: false,
+                        data: vec![beacon::AttesterDuty {
+                            pubkey: pk_hex.clone(),
+                            validator_index: "1".to_string(),
+                            committee_index: committee_index.clone(),
+                            committee_length: committee_length.clone(),
+                            committees_at_slot: "1".to_string(),
+                            validator_committee_index: "0".to_string(),
+                            slot: slot.to_string(),
+                        }],
+                    })
+                })
+                .with_get_attestation_data(move |queried, _committee| {
+                    Ok(DataResponse { data: beacon_request_data(queried) })
+                })
+                .with_get_aggregate_attestation(move |_slot, _root, _idx, _fork| {
+                    Ok(aggregate.clone())
+                })
+                .with_submit_aggregate_and_proofs(move |_proofs| {
+                    submit_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+        );
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(epoch).await.unwrap();
+        let mut map = HashMap::new();
+        map.insert(pk_bytes, pk);
+        let service = AggregationService::new(
+            rec.clone(),
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            config,
+            enabled_store(pk_bytes),
+        );
+        service.maybe_produce_aggregations(slot, epoch, super::ample_slot_end()).await;
+        (rec.calls(), submits.load(Ordering::SeqCst))
+    }
+
+    struct MismatchLog {
+        buf: Arc<Mutex<String>>,
+    }
+
+    struct MismatchVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for MismatchVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={value}", field.name());
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for MismatchLog
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut line = String::new();
+            event.record(&mut MismatchVisitor(&mut line));
+            let mut buf = self.buf.lock().expect("mismatch log");
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+    }
+
+    fn aggregate_sign_count(calls: &[&str]) -> usize {
+        calls.iter().filter(|name| name.contains("aggregate_and_proof")).count()
+    }
+
+    /// A real selection proof that `is_aggregator` accepts for this committee.
+    fn aggregator_proof(committee_length: u64) -> Signature {
+        let mut n = 0u32;
+        loop {
+            let signature = signer::mock_sig(&n.to_le_bytes());
+            if signer::is_aggregator(committee_length, &signature.to_bytes()) {
+                return signature;
+            }
+            n += 1;
+            assert!(n < 10_000, "no aggregator proof for committee {committee_length}");
+        }
+    }
+
+    /// SSZ bitlist with `bit_length` participant bits and a trailing sentinel.
+    fn bitlist(bit_length: usize) -> Vec<u8> {
+        assert!(bit_length > 0);
+        let len = bit_length / 8 + 1;
+        let sentinel_bit = bit_length % 8;
+        let mut bytes = vec![0xff; len];
+        let low = if sentinel_bit == 0 { 0 } else { (1u8 << sentinel_bit) - 1 };
+        bytes[len - 1] = low | (1u8 << sentinel_bit);
+        bytes
+    }
+
+    async fn expect_mismatch(label: &str, case: SignCase, mismatch: &str) {
+        let logs = Arc::new(Mutex::new(String::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(MismatchLog { buf: Arc::clone(&logs) });
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (calls, submits) = sign_case(case).await;
+        drop(_guard);
+        assert_eq!(
+            aggregate_sign_count(&calls),
+            0,
+            "{label}: aggregate must not be signed; calls={calls:?}"
+        );
+        assert_eq!(submits, 0, "{label}: aggregate must not be published");
+        let text = logs.lock().expect("mismatch log").clone();
+        assert!(
+            text.contains(&format!("mismatch={mismatch}")),
+            "{label}: expected mismatch={mismatch}; log={text}"
+        );
+    }
+
+    #[test]
+    fn aggregate_fork_matches_rejects_each_loosened_arm() {
+        let slot = 0;
+        let pre = VersionedAggregateAttestation::PreElectra(pre_electra_attestation(slot));
+        let electra = VersionedAggregateAttestation::Electra(electra_attestation(slot));
+        let fulu = VersionedAggregateAttestation::Fulu(electra_attestation(slot));
+        let gloas = VersionedAggregateAttestation::Gloas(electra_attestation(slot));
+        assert!(super::aggregate_fork_matches(&pre, ForkName::Deneb));
+        assert!(!super::aggregate_fork_matches(&pre, ForkName::Electra));
+        assert!(!super::aggregate_fork_matches(&electra, ForkName::Deneb));
+        assert!(super::aggregate_fork_matches(&electra, ForkName::Electra));
+        assert!(super::aggregate_fork_matches(&electra, ForkName::Fulu));
+        assert!(super::aggregate_fork_matches(&electra, ForkName::Gloas));
+        assert!(!super::aggregate_fork_matches(&fulu, ForkName::Electra));
+        assert!(super::aggregate_fork_matches(&fulu, ForkName::Fulu));
+        assert!(!super::aggregate_fork_matches(&fulu, ForkName::Gloas));
+        assert!(!super::aggregate_fork_matches(&gloas, ForkName::Electra));
+        assert!(!super::aggregate_fork_matches(&gloas, ForkName::Fulu));
+        assert!(super::aggregate_fork_matches(&gloas, ForkName::Gloas));
+    }
+
+    #[test]
+    fn gloas_island_encode_rejects_a_short_selection_proof() {
+        let message = ElectraAggregateAndProof {
+            aggregator_index: 1,
+            aggregate: matching_electra_body(0),
+            selection_proof: vec![0x11; 95],
+        };
+        let err = super::encode_electra_aggregate_and_proof(&message).expect_err("95-byte proof");
+        assert!(err.to_string().contains("96"), "{err}");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_mismatched_aggregate_is_not_signed() {
+        let _guard = agg_fail_metric_lock().await;
+        let electra_epoch = 50u64;
+        let slot = electra_epoch * SLOTS_PER_EPOCH;
+        let cases: &[(&str, VersionedAggregateAttestation)] = &[
+            ("slot", {
+                let mut body = matching_electra_body(slot);
+                body.data.slot = slot + 1;
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            ("data_root", {
+                let mut body = matching_electra_body(slot);
+                body.data.beacon_block_root = [0x22; 32];
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            ("committee_index", {
+                let mut body = matching_electra_body(slot);
+                body.committee_bits = vec![0x02, 0, 0, 0, 0, 0, 0, 0];
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            ("multiple_committee_bits", {
+                let mut body = matching_electra_body(slot);
+                body.committee_bits = vec![0x03, 0, 0, 0, 0, 0, 0, 0];
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            ("attester_bits", {
+                let mut body = matching_electra_body(slot);
+                body.aggregation_bits = vec![0x01];
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            ("fork", {
+                let body = matching_electra_body(slot);
+                VersionedAggregateAttestation::Fulu(body)
+            }),
+            ("signature_95", {
+                let mut body = matching_electra_body(slot);
+                body.signature = vec![0xab; 95];
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            ("signature_97", {
+                let mut body = matching_electra_body(slot);
+                body.signature = vec![0xab; 97];
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            ("short_committee_bits", {
+                let mut body = matching_electra_body(slot);
+                body.committee_bits = vec![0x01];
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            ("oversized", {
+                let mut body = matching_electra_body(slot);
+                body.aggregation_bits = vec![0xff; 16_386];
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            // 31 participant bits (`0xffffffff`) against a committee of 8.
+            ("committee_length", {
+                let mut body = matching_electra_body(slot);
+                body.aggregation_bits = vec![0xff, 0xff, 0xff, 0xff];
+                VersionedAggregateAttestation::Electra(body)
+            }),
+            // EIP-7549: a non-zero index must not be signed on a zeroed copy's root.
+            ("data_index", {
+                let mut body = matching_electra_body(slot);
+                body.data.index = 1;
+                VersionedAggregateAttestation::Electra(body)
+            }),
+        ];
+        for (label, aggregate) in cases {
+            let logs = Arc::new(Mutex::new(String::new()));
+            let subscriber =
+                tracing_subscriber::registry().with(MismatchLog { buf: Arc::clone(&logs) });
+            let _guard = tracing::subscriber::set_default(subscriber);
+            let (calls, submits) = sign_electra_aggregate(aggregate.clone()).await;
+            drop(_guard);
+            assert_eq!(
+                aggregate_sign_count(&calls),
+                0,
+                "{label}: aggregate must not be signed; calls={calls:?}"
+            );
+            assert_eq!(submits, 0, "{label}: aggregate must not be published");
+            let expected = match *label {
+                "committee_length" => "attester_bits",
+                "multiple_committee_bits" | "short_committee_bits" => "committee_index",
+                "signature_95" | "signature_97" => "oversized",
+                other => other,
+            };
+            let text = logs.lock().expect("mismatch log").clone();
+            assert!(
+                text.contains(&format!("mismatch={expected}")),
+                "{label}: expected mismatch={expected}; log={text}"
+            );
+        }
+    }
+
+    /// Fulu and Gloas accept the Electra body a v1 aggregate fallback returns.
+    #[tokio::test]
+    async fn electra_variant_from_v1_fallback_is_signed_on_fulu_and_gloas() {
+        let fulu_epoch = 60u64;
+        let fulu_slot = fulu_epoch * SLOTS_PER_EPOCH;
+        let (fulu_calls, fulu_submits) = sign_case(SignCase {
+            epoch: fulu_epoch,
+            committee_index: "0",
+            committee_length: "8",
+            aggregate: VersionedAggregateAttestation::Electra(matching_electra_body(fulu_slot)),
+            config: create_test_config(),
+            selection_proof: None,
+        })
+        .await;
+        assert_eq!(
+            fulu_calls.iter().filter(|name| **name == "sign_electra_aggregate_and_proof").count(),
+            1,
+            "Fulu v1 Electra body must be signed; calls={fulu_calls:?}"
+        );
+        assert_eq!(fulu_submits, 1);
+
+        let gloas_epoch = 70u64;
+        let gloas_slot = gloas_epoch * SLOTS_PER_EPOCH;
+        let (gloas_calls, gloas_submits) = sign_case(SignCase {
+            epoch: gloas_epoch,
+            committee_index: "0",
+            committee_length: "8",
+            aggregate: VersionedAggregateAttestation::Electra(matching_electra_body(gloas_slot)),
+            config: gloas_config(gloas_epoch),
+            selection_proof: None,
+        })
+        .await;
+        assert_eq!(
+            gloas_calls.iter().filter(|name| **name == "sign_aggregate_and_proof_root").count(),
+            1,
+            "Gloas v1 Electra body must be signed on the island path; calls={gloas_calls:?}"
+        );
+        assert_eq!(gloas_submits, 1);
+    }
+
+    /// Pre-Electra roots can match on the wrong committee. The duty index binds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn pre_electra_data_index_must_match_the_duty_committee() {
+        let _metrics = agg_fail_metric_lock().await;
+        let logs = Arc::new(Mutex::new(String::new()));
+        let subscriber =
+            tracing_subscriber::registry().with(MismatchLog { buf: Arc::clone(&logs) });
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let slot = 0u64;
+        let mut body = pre_electra_attestation(slot);
+        body.data = request_shaped_data(slot);
+        let (calls, submits) = sign_case(SignCase {
+            epoch: 0,
+            committee_index: "1",
+            committee_length: "8",
+            aggregate: VersionedAggregateAttestation::PreElectra(body),
+            config: create_test_config(),
+            selection_proof: None,
+        })
+        .await;
+        drop(_guard);
+        assert_eq!(
+            aggregate_sign_count(&calls),
+            0,
+            "index 0 must not be signed for committee 1; calls={calls:?}"
+        );
+        assert_eq!(submits, 0);
+        let text = logs.lock().expect("mismatch log").clone();
+        assert!(
+            text.contains("mismatch=data_index"),
+            "pre-Electra index check must be the one that fired; log={text}"
+        );
+    }
+
+    /// Variants the later wrap would still sign. Only `aggregate_fork_matches` rejects them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cross_fork_aggregates_fail_the_early_fork_check() {
+        let _guard = agg_fail_metric_lock().await;
+        let electra_epoch = 50u64;
+        let electra_slot = electra_epoch * SLOTS_PER_EPOCH;
+        let fulu_epoch = 60u64;
+        let fulu_slot = fulu_epoch * SLOTS_PER_EPOCH;
+        let gloas_epoch = 70u64;
+        let gloas_slot = gloas_epoch * SLOTS_PER_EPOCH;
+        let cases = [
+            (
+                "fulu_on_electra",
+                electra_epoch,
+                create_test_config(),
+                VersionedAggregateAttestation::Fulu(matching_electra_body(electra_slot)),
+            ),
+            (
+                "gloas_on_electra",
+                electra_epoch,
+                create_test_config(),
+                VersionedAggregateAttestation::Gloas(matching_electra_body(electra_slot)),
+            ),
+            (
+                "gloas_on_fulu",
+                fulu_epoch,
+                create_test_config(),
+                VersionedAggregateAttestation::Gloas(matching_electra_body(fulu_slot)),
+            ),
+            (
+                "fulu_on_gloas",
+                gloas_epoch,
+                gloas_config(gloas_epoch),
+                VersionedAggregateAttestation::Fulu(matching_electra_body(gloas_slot)),
+            ),
+        ];
+        for (label, epoch, config, aggregate) in cases {
+            expect_mismatch(
+                label,
+                SignCase {
+                    epoch,
+                    committee_index: "0",
+                    committee_length: "8",
+                    aggregate,
+                    config,
+                    selection_proof: None,
+                },
+                "fork",
+            )
+            .await;
+        }
+    }
+
+    /// Byte cap and bit cap each fire on their own boundary. Electra's limit is
+    /// above the pre-Electra maximum, so a 2049-bit list is not oversized there.
+    #[tokio::test(flavor = "current_thread")]
+    async fn attester_bit_caps_reject_each_boundary() {
+        let _guard = agg_fail_metric_lock().await;
+        let pre_max = MAX_VALIDATORS_PER_COMMITTEE as usize;
+        let electra_max = pre_max * MAX_COMMITTEES_PER_SLOT as usize;
+
+        let mut at_pre_limit = pre_electra_attestation(0);
+        at_pre_limit.data = request_shaped_data(0);
+        at_pre_limit.aggregation_bits = bitlist(pre_max);
+        expect_mismatch(
+            "pre_at_bit_limit",
+            SignCase {
+                epoch: 0,
+                committee_index: "0",
+                committee_length: "8",
+                aggregate: VersionedAggregateAttestation::PreElectra(at_pre_limit),
+                config: create_test_config(),
+                selection_proof: None,
+            },
+            "attester_bits",
+        )
+        .await;
+
+        let mut over_pre_bits = pre_electra_attestation(0);
+        over_pre_bits.data = request_shaped_data(0);
+        over_pre_bits.aggregation_bits = bitlist(pre_max + 1);
+        expect_mismatch(
+            "pre_bit_cap",
+            SignCase {
+                epoch: 0,
+                committee_index: "0",
+                committee_length: "8",
+                aggregate: VersionedAggregateAttestation::PreElectra(over_pre_bits),
+                config: create_test_config(),
+                selection_proof: None,
+            },
+            "oversized",
+        )
+        .await;
+
+        let mut over_pre_bytes = pre_electra_attestation(0);
+        over_pre_bytes.data = request_shaped_data(0);
+        over_pre_bytes.aggregation_bits = vec![0u8; pre_max / 8 + 2];
+        expect_mismatch(
+            "pre_byte_cap",
+            SignCase {
+                epoch: 0,
+                committee_index: "0",
+                committee_length: "8",
+                aggregate: VersionedAggregateAttestation::PreElectra(over_pre_bytes),
+                config: create_test_config(),
+                selection_proof: None,
+            },
+            "oversized",
+        )
+        .await;
+
+        let electra_epoch = 50u64;
+        let electra_slot = electra_epoch * SLOTS_PER_EPOCH;
+        let mut electra_above_pre = matching_electra_body(electra_slot);
+        electra_above_pre.aggregation_bits = bitlist(pre_max + 1);
+        expect_mismatch(
+            "electra_above_pre_electra_max",
+            SignCase {
+                epoch: electra_epoch,
+                committee_index: "0",
+                committee_length: "8",
+                aggregate: VersionedAggregateAttestation::Electra(electra_above_pre),
+                config: create_test_config(),
+                selection_proof: None,
+            },
+            "attester_bits",
+        )
+        .await;
+
+        let mut electra_over_bits = matching_electra_body(electra_slot);
+        electra_over_bits.aggregation_bits = bitlist(electra_max + 1);
+        expect_mismatch(
+            "electra_bit_cap",
+            SignCase {
+                epoch: electra_epoch,
+                committee_index: "0",
+                committee_length: "8",
+                aggregate: VersionedAggregateAttestation::Electra(electra_over_bits),
+                config: create_test_config(),
+                selection_proof: None,
+            },
+            "oversized",
+        )
+        .await;
+
+        let mut electra_over_bytes = matching_electra_body(electra_slot);
+        electra_over_bytes.aggregation_bits = vec![0u8; electra_max / 8 + 2];
+        expect_mismatch(
+            "electra_byte_cap",
+            SignCase {
+                epoch: electra_epoch,
+                committee_index: "0",
+                committee_length: "8",
+                aggregate: VersionedAggregateAttestation::Electra(electra_over_bytes),
+                config: create_test_config(),
+                selection_proof: None,
+            },
+            "oversized",
+        )
+        .await;
+    }
+
+    /// The only phase-2 permit is already held. The selection-proof wait hits
+    /// its deadline and the signer is not called.
+    #[tokio::test(start_paused = true)]
+    async fn cancel_during_phase2_permit_wait_does_not_sign() {
+        use std::time::Duration;
+
+        use crate::orchestrator::dispatch::Phase2SignerPermits;
+
+        let permits = Phase2SignerPermits::new(1);
+        let held = permits
+            .acquire_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("the test holds the only permit");
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let pk_hex = format!("0x{}", hex::encode(pk_bytes));
+        let rec = Arc::new(RecordingSigner::new());
+        let submits = Arc::new(AtomicUsize::new(0));
+        let slot = 50 * SLOTS_PER_EPOCH;
+        let submit_count = Arc::clone(&submits);
+        let beacon = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_get_attester_duties(move |_epoch, _indices| {
+                    Ok(DependentRootResponse {
+                        dependent_root: "0xaabb".to_string(),
+                        execution_optimistic: false,
+                        data: vec![beacon::AttesterDuty {
+                            pubkey: pk_hex.clone(),
+                            validator_index: "1".to_string(),
+                            committee_index: "0".to_string(),
+                            committee_length: "8".to_string(),
+                            committees_at_slot: "1".to_string(),
+                            validator_committee_index: "0".to_string(),
+                            slot: slot.to_string(),
+                        }],
+                    })
+                })
+                .with_get_attestation_data(move |queried, _committee| {
+                    Ok(DataResponse { data: beacon_request_data(queried) })
+                })
+                .with_get_aggregate_attestation(move |_slot, _root, _idx, _fork| {
+                    Ok(VersionedAggregateAttestation::Electra(matching_electra_body(slot)))
+                })
+                .with_submit_aggregate_and_proofs(move |_proofs| {
+                    submit_count.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }),
+        );
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        duty_tracker.fetch_duties_for_epoch(50).await.unwrap();
+        let mut map = HashMap::new();
+        map.insert(pk_bytes, pk);
+        let service = AggregationService::new(
+            rec.clone(),
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            create_test_config(),
+            enabled_store(pk_bytes),
+        );
+        let slot_end = tokio::time::Instant::now() + Duration::from_millis(20);
+        let run = service.produce_aggregations(slot, 50, slot_end, &permits);
+        tokio::pin!(run);
+        // Park on the permit before slot end, so intake does not drop the duty.
+        for _ in 0..32 {
+            tokio::select! {
+                biased;
+                _ = &mut run => panic!("phase finished while the only permit is held"),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        let mut advanced = Duration::ZERO;
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut run => {
+                    assert!(
+                        advanced >= Duration::from_millis(520),
+                        "the permit wait returned before its deadline ({advanced:?})"
+                    );
+                    break;
+                }
+                _ = tokio::task::yield_now() => {
+                    if advanced < Duration::from_millis(600) {
+                        tokio::time::advance(Duration::from_millis(10)).await;
+                        advanced += Duration::from_millis(10);
+                    } else {
+                        panic!("permit wait did not cancel after the deadline");
+                    }
+                }
+            }
+        }
+        drop(held);
+        let calls = rec.calls();
+        assert_eq!(calls, Vec::<&str>::new(), "a cancelled permit wait must not sign: {calls:?}");
+        assert_eq!(submits.load(Ordering::SeqCst), 0);
+    }
+
+    /// A duty committee length outside `1..=2048` is rejected before signing,
+    /// including when the bitlist matches that length and fits the Electra spec max.
+    #[tokio::test(flavor = "current_thread")]
+    async fn committee_length_above_2048_is_not_signed_on_electra_or_fulu() {
+        let _metrics = agg_fail_metric_lock().await;
+        for (label, epoch) in [("electra", 50u64), ("fulu", 60u64)] {
+            let slot = epoch * SLOTS_PER_EPOCH;
+            let mut body = matching_electra_body(slot);
+            body.aggregation_bits = bitlist(2049);
+            let aggregate = if epoch == 50 {
+                VersionedAggregateAttestation::Electra(body)
+            } else {
+                VersionedAggregateAttestation::Fulu(body)
+            };
+            expect_mismatch(
+                label,
+                SignCase {
+                    epoch,
+                    committee_index: "0",
+                    committee_length: "2049",
+                    aggregate,
+                    config: create_test_config(),
+                    selection_proof: Some(aggregator_proof(2049)),
+                },
+                "attester_bits",
+            )
+            .await;
+        }
+    }
+
+    /// Fulu zeroes `data.index`. A non-zero index is `data_index`, not a root miss.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fulu_data_index_must_be_zero() {
+        let _metrics = agg_fail_metric_lock().await;
+        let fulu_epoch = 60u64;
+        let slot = fulu_epoch * SLOTS_PER_EPOCH;
+        let mut body = matching_electra_body(slot);
+        body.data.index = 1;
+        expect_mismatch(
+            "fulu_data_index",
+            SignCase {
+                epoch: fulu_epoch,
+                committee_index: "0",
+                committee_length: "8",
+                aggregate: VersionedAggregateAttestation::Fulu(body),
+                config: create_test_config(),
+                selection_proof: None,
+            },
+            "data_index",
+        )
+        .await;
+    }
+
+    /// The final Electra sign's permit wait expires. That counts as failed,
+    /// and it is not a slot-end intake drop.
+    #[tokio::test(start_paused = true)]
+    async fn expired_final_sign_permit_wait_counts_as_failed() {
+        use std::time::Duration;
+
+        use crate::orchestrator::dispatch::Phase2SignerPermits;
+
+        let _metrics = agg_fail_metric_lock().await;
+        let permits = Phase2SignerPermits::new(1);
+        let held = permits
+            .acquire_until(tokio::time::Instant::now() + Duration::from_secs(30))
+            .await
+            .expect("the test holds the only permit");
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let pk_bytes = pk.to_bytes();
+        let rec = Arc::new(RecordingSigner::new());
+        let beacon = Arc::new(MockBeaconNodeClient::new());
+        let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+        let mut map = HashMap::new();
+        map.insert(pk_bytes, pk.clone());
+        let service = AggregationService::new(
+            rec.clone(),
+            beacon,
+            duty_tracker,
+            Arc::new(parking_lot::RwLock::new(map)),
+            create_test_config(),
+            enabled_store(pk_bytes),
+        );
+        let slot = 50 * SLOTS_PER_EPOCH;
+        let message = ElectraAggregateAndProof {
+            aggregator_index: 1,
+            aggregate: matching_electra_body(slot),
+            selection_proof: vec![0xcd; 96],
+        };
+        let failed_before =
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+        let drops_before = service.slot_end_drops.get();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
+        let fence = beacon::DutyFence::open();
+        let run = service.sign_and_wrap_electra(
+            slot,
+            "1",
+            &pk,
+            message,
+            tracing::Span::none(),
+            &fence,
+            &permits,
+            deadline,
+        );
+        tokio::pin!(run);
+        tokio::select! {
+            biased;
+            _ = &mut run => panic!("the final sign finished while the only permit is held"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tokio::time::advance(Duration::from_millis(40)).await;
+        let signed = (&mut run).await;
+        drop(held);
+        assert!(signed.is_none(), "an expired final-sign wait must not return a signature");
+        let calls = rec.calls();
+        assert!(
+            !calls.contains(&"sign_electra_aggregate_and_proof"),
+            "an expired final-sign wait must not sign; calls={calls:?}"
+        );
+        let failed_after =
+            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+        assert_eq!(
+            failed_after.saturating_sub(failed_before),
+            1,
+            "an expired final-sign wait must increment RVC_AGGREGATIONS_TOTAL failed"
+        );
+        assert_eq!(
+            service.slot_end_drops.get(),
+            drops_before,
+            "an expired final-sign wait is not a slot-end intake drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matching_electra_aggregate_is_signed_once() {
+        let slot = 50 * SLOTS_PER_EPOCH;
+        let (calls, submits) = sign_electra_aggregate(VersionedAggregateAttestation::Electra(
+            matching_electra_body(slot),
+        ))
+        .await;
+        assert_eq!(
+            calls.iter().filter(|name| **name == "sign_electra_aggregate_and_proof").count(),
+            1,
+            "a matching Electra aggregate is signed once; calls={calls:?}"
+        );
+        assert_eq!(submits, 1, "a matching Electra aggregate is published once");
     }
 }
