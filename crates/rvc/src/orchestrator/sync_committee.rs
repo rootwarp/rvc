@@ -22,7 +22,10 @@ use signer::ValidatorSigner;
 use validator_store::ValidatorStore;
 
 use super::coordinator::{OrchestratorConfig, PubkeyMap};
-use super::dispatch::{SlotEndDropCounter, SLOT_END_PUBLISH_OVERHANG};
+use super::dispatch::{
+    sign_with_phase2_permit, Phase2SignError, Phase2SignerPermits, SlotEndDropCounter,
+    SLOT_END_PUBLISH_OVERHANG,
+};
 use super::slot_context::SlotContext;
 use super::utils;
 
@@ -257,13 +260,33 @@ impl SyncCommitteeService {
         attempted
     }
 
-    #[tracing::instrument(name = "orchestrator.produce_sync_contributions", level = "debug", skip_all, fields(slot = slot))]
+    /// Tests call this so a pipeline keeps its own cap. The coordinator calls
+    /// [`Self::produce_sync_contributions`] with the shared phase-2 permits.
+    #[cfg(test)]
     pub(crate) async fn maybe_produce_sync_contributions(
+        &self,
+        slot: Slot,
+        epoch: u64,
+        ctx: &SlotContext,
+        slot_end: tokio::time::Instant,
+    ) {
+        let permits = Phase2SignerPermits::new(self.config.dispatch_limits.concurrency as usize);
+        self.produce_sync_contributions(slot, epoch, ctx, slot_end, &permits).await
+    }
+
+    /// Produce sync contributions under a caller-owned phase-2 cap.
+    ///
+    /// The coordinator passes one [`Phase2SignerPermits`] shared with aggregation.
+    /// Selection proofs and contribution-and-proof signatures each take one
+    /// permit for the signer call. The contribution fetch does not hold one.
+    #[tracing::instrument(name = "orchestrator.produce_sync_contributions", level = "debug", skip_all, fields(slot = slot))]
+    pub(crate) async fn produce_sync_contributions(
         &self,
         slot: Slot,
         _epoch: u64,
         ctx: &SlotContext,
         slot_end: tokio::time::Instant,
+        permits: &Phase2SignerPermits,
     ) {
         let duties = self.duty_tracker.get_sync_committee_duties(slot).await;
         if duties.is_empty() {
@@ -328,6 +351,7 @@ impl SyncCommitteeService {
                     pubkey,
                     subcommittee,
                     ctx,
+                    permits,
                 )
             })
             .buffer_unordered(concurrency)
@@ -358,9 +382,10 @@ impl SyncCommitteeService {
     ///
     /// A subcommittee index outside `0..4` returns before any signature.
     /// The selection proof and the contribution-and-proof signature both stop
-    /// at [`contribution_deadline`]. The contribution body is checked before
-    /// `sign_contribution_and_proof`. A deadline that has already passed does
-    /// not call the signer or the beacon node.
+    /// at [`contribution_deadline`]. Each sign acquires one phase-2 permit
+    /// inside that deadline and inside the admission scope. The contribution
+    /// body is checked before `sign_contribution_and_proof`. A deadline that
+    /// has already passed does not call the signer or the beacon node.
     #[allow(clippy::too_many_arguments)]
     async fn produce_one_contribution(
         &self,
@@ -371,6 +396,7 @@ impl SyncCommitteeService {
         pubkey: PublicKey,
         subcommittee_index: u64,
         ctx: &SlotContext,
+        permits: &Phase2SignerPermits,
     ) -> Option<SignedContributionAndProof> {
         if subcommittee_index >= SYNC_COMMITTEE_SUBNET_COUNT {
             debug!(
@@ -386,9 +412,11 @@ impl SyncCommitteeService {
         }
         let fence = self.beacon.duty_fence().unwrap_or_else(|_| beacon::DutyFence::closed());
 
-        let selection_proof = match sign_before_deadline(
+        let selection_proof = match sign_contribution_phase2(
+            permits,
             slot_end,
             self.config.timeouts.sync_contribution,
+            &fence,
             super::slot_context::under_admission(
                 &fence,
                 self.signer.sign_sync_committee_selection_proof(
@@ -403,7 +431,7 @@ impl SyncCommitteeService {
         .await
         {
             Ok(sig) => sig,
-            Err(SignStop::Stopped { bounded_by_overhang }) => {
+            Err(ContributionSignStop::Stopped { bounded_by_overhang }) => {
                 warn_contribution_stopped(
                     slot,
                     bounded_by_overhang,
@@ -411,7 +439,14 @@ impl SyncCommitteeService {
                 );
                 return None;
             }
-            Err(SignStop::Failed(e)) => {
+            Err(ContributionSignStop::Revoked) => {
+                warn!(
+                    slot,
+                    "skipping sync contribution: beacon node admission revoked before sign"
+                );
+                return None;
+            }
+            Err(ContributionSignStop::Failed(e)) => {
                 warn!(
                     slot,
                     subcommittee_index,
@@ -497,9 +532,11 @@ impl SyncCommitteeService {
             warn!(slot, "skipping sync contribution: beacon node admission revoked before sign");
             return None;
         }
-        let sig = match sign_before_deadline(
+        let sig = match sign_contribution_phase2(
+            permits,
             slot_end,
             self.config.timeouts.sync_contribution,
+            &fence,
             super::slot_context::under_admission(
                 &fence,
                 self.signer.sign_contribution_and_proof(
@@ -513,7 +550,7 @@ impl SyncCommitteeService {
         .await
         {
             Ok(sig) => sig,
-            Err(SignStop::Stopped { bounded_by_overhang }) => {
+            Err(ContributionSignStop::Stopped { bounded_by_overhang }) => {
                 warn_contribution_stopped(
                     slot,
                     bounded_by_overhang,
@@ -521,7 +558,14 @@ impl SyncCommitteeService {
                 );
                 return None;
             }
-            Err(SignStop::Failed(e)) => {
+            Err(ContributionSignStop::Revoked) => {
+                warn!(
+                    slot,
+                    "skipping sync contribution: beacon node admission revoked before sign"
+                );
+                return None;
+            }
+            Err(ContributionSignStop::Failed(e)) => {
                 warn!(
                     slot,
                     subcommittee_index,
@@ -627,6 +671,51 @@ pub(crate) fn contribution_deadline(
 enum SignStop<E> {
     Stopped { bounded_by_overhang: bool },
     Failed(E),
+}
+
+enum ContributionSignStop<E> {
+    Stopped { bounded_by_overhang: bool },
+    Revoked,
+    Failed(E),
+}
+
+/// Sign inside the contribution deadline and the shared phase-2 cap.
+///
+/// The permit wait sits inside [`sign_before_deadline`], so time spent queued
+/// for a phase-2 permit counts against the sync contribution timeout. That
+/// timeout still drops a slow signer. A cancelled wait is the same stop as a
+/// deadline that has already passed. The signer future is polled only after a
+/// permit is held and the fence still holds. The caller installs admission.
+async fn sign_contribution_phase2<E, Fut>(
+    permits: &Phase2SignerPermits,
+    slot_end: tokio::time::Instant,
+    timeout: Duration,
+    fence: &beacon::DutyFence,
+    sign: Fut,
+) -> Result<crypto::Signature, ContributionSignStop<E>>
+where
+    Fut: Future<Output = Result<crypto::Signature, E>>,
+{
+    let (deadline, bounded_by_overhang) = contribution_deadline(slot_end, timeout);
+    match sign_before_deadline(
+        slot_end,
+        timeout,
+        sign_with_phase2_permit(permits, deadline, fence, sign),
+    )
+    .await
+    {
+        Ok(signature) => Ok(signature),
+        Err(SignStop::Stopped { bounded_by_overhang }) => {
+            Err(ContributionSignStop::Stopped { bounded_by_overhang })
+        }
+        Err(SignStop::Failed(Phase2SignError::Cancelled)) => {
+            Err(ContributionSignStop::Stopped { bounded_by_overhang })
+        }
+        Err(SignStop::Failed(Phase2SignError::Revoked)) => Err(ContributionSignStop::Revoked),
+        Err(SignStop::Failed(Phase2SignError::Failed(error))) => {
+            Err(ContributionSignStop::Failed(error))
+        }
+    }
 }
 
 /// Signs `sign` only when [`contribution_deadline`] is still ahead.

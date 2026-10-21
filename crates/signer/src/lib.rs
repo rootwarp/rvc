@@ -138,9 +138,9 @@ use crypto::{
     DutyRef, PublicKey, SignContext, Signature, Signer, SigningCtx, SigningError, TypedSigner,
 };
 use eth_types::{
-    AggregateAndProof, Attestation, AttestationData, BeaconBlock, BlindedBeaconBlock,
-    BuilderRequestAuth, ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, ForkName,
-    ForkSchedule, PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
+    AggregateAndProof, AttestationData, BeaconBlock, BlindedBeaconBlock, BuilderRequestAuth,
+    ContributionAndProof, ElectraAggregateAndProof, Epoch, ForkInfo, ForkName, ForkSchedule,
+    PayloadAttestationData, ProposerPreferences, Root, Slot, ValidatorRegistrationV1,
     VoluntaryExit, SLOTS_PER_EPOCH,
 };
 use observability::logging::fields::Duty;
@@ -675,18 +675,6 @@ fn sign_context_at_epoch(
         ForkInfo { previous_version, current_version, genesis_validators_root },
         fork_name,
     )
-}
-
-fn electra_aggregate_as_legacy(e: &ElectraAggregateAndProof) -> AggregateAndProof {
-    AggregateAndProof {
-        aggregator_index: e.aggregator_index,
-        aggregate: Attestation {
-            aggregation_bits: e.aggregate.aggregation_bits.clone(),
-            data: e.aggregate.data.clone(),
-            signature: e.aggregate.signature.clone(),
-        },
-        selection_proof: e.selection_proof.clone(),
-    }
 }
 
 fn sign_context_for_exit(
@@ -1723,6 +1711,11 @@ impl ValidatorSigner for SignerService {
             );
             return Err(SignerError::UnsupportedDuty { duty: "aggregate_and_proof" });
         }
+        if let Err(error) = aggregate_and_proof.try_tree_hash_root() {
+            return Err(SignerError::SigningFailed(format!(
+                "invalid aggregate and proof: {error}"
+            )));
+        }
         let ctx = SigningCtx { fork_schedule, genesis_validators_root: *genesis_validators_root };
         let signing_root = signing_root_for(&DutyRef::AggregateAndProof(aggregate_and_proof), &ctx);
         let gvr = *genesis_validators_root;
@@ -1806,22 +1799,17 @@ impl ValidatorSigner for SignerService {
         let fork_name = sign_ctx.fork_name;
         let pk = pubkey.to_bytes();
         if self.signer.has_grpc_remote(&pk) {
-            // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
-            let legacy = electra_aggregate_as_legacy(aggregate_and_proof);
-            let signing_root = signing_root_for(&DutyRef::AggregateAndProof(&legacy), &ctx);
-            let typed = self.grpc_typed_factory(pubkey, move |grpc| async move {
-                grpc.sign_aggregate_and_proof(&legacy, &sign_ctx).await
-            });
-            let backend = self.bls_backend_for_duty(pubkey, signing_root, typed);
-            self.sign_nonslashable(
-                pubkey,
-                signing_root,
-                SigningDuty::ElectraAggregateAndProof,
-                "electra_aggregate_and_proof",
-                backend,
-                Some(fork_name),
-            )
-            .await
+            // SignAggregateAndProof is pre-Electra attestation SSZ and drops
+            // committee_bits. SignRoot would change the RPC a pre-Gloas remote
+            // signer receives. Fail closed before any legacy hash.
+            crate::metrics::record_rejection(
+                crate::metrics::rejection_reason::UNSUPPORTED_TYPE,
+                crate::metrics::rejection_sign_type::AGGREGATE_AND_PROOF,
+                crate::metrics::version_label(Some(fork_name)),
+            );
+            return Err(SignerError::SigningFailed(
+                "legacy SignAggregateAndProof drops committee_bits; this client does not send Electra aggregates on SignRoot".to_string(),
+            ));
         } else {
             let signing_root =
                 signing_root_for(&DutyRef::ElectraAggregateAndProof(aggregate_and_proof), &ctx);
@@ -4102,6 +4090,30 @@ mod tests {
             compute_domain(eth_types::DOMAIN_AGGREGATE_AND_PROOF, fork_version, genesis_root);
         let signing_root = compute_signing_root(&agg_and_proof, domain);
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    #[tokio::test]
+    async fn overlong_aggregate_bits_are_rejected_without_panic() {
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+        let schedule = create_test_fork_schedule();
+        let mut agg = create_test_aggregate_and_proof(100);
+        // 258 bytes is past Bitlist[2048] (257). `try_tree_hash_root` fails;
+        // the panicking `tree_hash_root` wrapper must not run.
+        agg.aggregate.aggregation_bits = vec![0xff; 258];
+        let err = service
+            .sign_aggregate_and_proof(&agg, &pubkey, &schedule, &[0xaa; 32])
+            .await
+            .expect_err("an over-long bitlist must not reach the legacy hasher");
+        match err {
+            SignerError::SigningFailed(msg) => {
+                assert!(msg.contains("invalid aggregate"), "{msg}");
+            }
+            other => panic!("expected SigningFailed, got {other:?}"),
+        }
     }
 
     #[test]

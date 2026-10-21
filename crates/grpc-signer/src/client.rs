@@ -20,7 +20,9 @@
 //! | Sync-committee message / selection | supported, unchanged | legacy typed RPC |
 //! | RANDAO, voluntary exit, builder registration | supported, unchanged | legacy typed RPC |
 //! | Block / blinded block | supported via the header RPC | 4.20a `SignBlockHeader`; Gloas `body_root` from `gloas_body_root` (P5 5.11b) through 4.21's `sign_block_header`. `sign_block` / `sign_blinded_block` refuse at Gloas (no Electra/Deneb body hash). |
-//! | Aggregate-and-proof, Electra aggregate-and-proof, contribution-and-proof | supported via the root RPC | 4.20a `SignRoot`; Electra keeps `committee_bits` in the object root |
+//! | Aggregate-and-proof | pre-Gloas legacy RPC; Gloas refused | `SignAggregateAndProof` before Gloas. An over-long bitlist returns an error instead of hashing. At Gloas the caller uses `sign_aggregate_and_proof_root`. |
+//! | Electra aggregate-and-proof | refused | Legacy `SignAggregateAndProof` drops `committee_bits`. This client does not send Electra aggregates on `SignRoot`. At Gloas the error still names `sign_aggregate_and_proof_root`. |
+//! | contribution-and-proof | supported via the root RPC at Gloas | 4.20a `SignRoot` at Gloas; legacy `SignContributionAndProof` before Gloas |
 //! | PTC payload attestation | supported via the root RPC | 4.20a `SignRoot` |
 //! | Proposer preferences | supported via the root RPC | 4.20a `SignRoot` |
 //! | Self-build execution payload envelope | supported via the root RPC (`EXECUTION_PAYLOAD_ENVELOPE`) | root from P5 5.16; served in P6 6.19 |
@@ -45,8 +47,8 @@ use crypto::{InsecureGate, InsecureMode};
 use crypto::{PublicKey, Signature, PUBLIC_KEY_BYTES_LEN};
 use eth_types::{
     encode_attestation_ssz, encode_beacon_block_ssz, encode_blinded_beacon_block_ssz,
-    encode_sync_committee_contribution_ssz, AggregateAndProof, Attestation, AttestationData,
-    BeaconBlock, BeaconBlockHeader, BlindedBeaconBlock, BuilderRequestAuth, ContributionAndProof,
+    encode_sync_committee_contribution_ssz, AggregateAndProof, AttestationData, BeaconBlock,
+    BeaconBlockHeader, BlindedBeaconBlock, BuilderRequestAuth, ContributionAndProof,
     ElectraAggregateAndProof, Epoch, ForkName, PayloadAttestationData, ProposerPreferences, Root,
     Slot, SyncAggregatorSelectionData, ValidatorRegistrationV1, VoluntaryExit,
     DOMAIN_AGGREGATE_AND_PROOF, DOMAIN_APPLICATION_BUILDER, DOMAIN_BEACON_ATTESTER,
@@ -692,6 +694,11 @@ impl TypedSigner for GrpcRemoteSigner {
             let _ = agg;
             return Err(Self::gloas_aggregate_requires_root());
         }
+        if let Err(error) = agg.try_tree_hash_root() {
+            return Err(SigningError::LocalRejected(format!(
+                "invalid aggregate and proof: {error}"
+            )));
+        }
         let fork_id = Self::fork_id(ctx);
         let aggregate_ssz = encode_attestation_ssz(&agg.aggregate, fork_id);
         let req = SignAggregateAndProofRequest {
@@ -720,21 +727,15 @@ impl TypedSigner for GrpcRemoteSigner {
         agg: &ElectraAggregateAndProof,
         ctx: &SignContext,
     ) -> Result<Signature, SigningError> {
+        let _ = agg;
         if Self::uses_gloas_rpc(ctx) {
-            let _ = agg;
             return Err(Self::gloas_aggregate_requires_root());
         }
-        // Pre-Gloas SignAggregateAndProof is pre-Electra attestation SSZ.
-        let legacy = AggregateAndProof {
-            aggregator_index: agg.aggregator_index,
-            aggregate: Attestation {
-                aggregation_bits: agg.aggregate.aggregation_bits.clone(),
-                data: agg.aggregate.data.clone(),
-                signature: agg.aggregate.signature.clone(),
-            },
-            selection_proof: agg.selection_proof.clone(),
-        };
-        self.sign_aggregate_and_proof(&legacy, ctx).await
+        // SignAggregateAndProof cannot carry committee_bits. Putting this
+        // object on SignRoot would change the RPC pre-Gloas signers receive.
+        Err(SigningError::LocalRejected(
+            "legacy SignAggregateAndProof drops committee_bits; this client does not send Electra aggregates on SignRoot".to_string(),
+        ))
     }
 
     async fn sign_sync_committee_message(
@@ -1386,20 +1387,18 @@ mod tests {
         let plain = build_endpoint("http://localhost:50051", None);
         assert!(plain.is_ok(), "plaintext endpoint must build: {plain:?}");
 
-        // TLS config application is the only branch difference; invalid PEM is
-        // accepted at endpoint construction (tonic validates on connect).
+        // TLS config application is the only branch difference. These bytes are
+        // not a PEM document: `from_pem` only stores them, and `tls_config` may
+        // accept or reject them. The result is discarded; this only checks that
+        // both paths share `build_endpoint` (no second `Channel::from_shared`).
         let tls = build_endpoint(
             "https://localhost:50051",
             Some((
-                b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".to_vec(),
-                Zeroizing::new(
-                    b"-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n".to_vec(),
-                ),
-                b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".to_vec(),
+                b"stub-client-cert".to_vec(),
+                Zeroizing::new(b"stub-client-key".to_vec()),
+                b"stub-ca-cert".to_vec(),
             )),
         );
-        // tls_config may accept or reject the stub PEM depending on tonic/rustls;
-        // either way the call is on the shared builder (no second Channel::from_shared).
         let _ = tls;
 
         let bad_plain = build_endpoint("not a url", None);

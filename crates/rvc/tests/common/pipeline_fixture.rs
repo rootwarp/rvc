@@ -653,9 +653,15 @@ impl PipelineBeacon {
             });
         }
         if self.aggregators {
+            let att_map = Arc::clone(&self.attestation_data_by_slot);
             client = client
-                .with_get_aggregate_attestation(|slot, _root, _committee_index, _fork| {
-                    Ok(VersionedAggregateAttestation::PreElectra(pre_electra_aggregate(slot)))
+                .with_get_aggregate_attestation(move |slot, _root, _committee_index, _fork| {
+                    let configured = att_map.lock().expect("attestation data").get(&slot).cloned();
+                    let body = match configured {
+                        Some(data) => pre_electra_aggregate_for(&data),
+                        None => pre_electra_aggregate(slot),
+                    };
+                    Ok(VersionedAggregateAttestation::PreElectra(body))
                 })
                 .with_submit_aggregate_and_proofs(|_proofs| Ok(()));
         }
@@ -716,11 +722,13 @@ fn proposer_duties_for(
 /// Pre-Electra aggregate returned when aggregators are on.
 ///
 /// The fixture fork schedule puts Electra at epoch 50. Slots 100 and 101 are
-/// epoch 3, so `AggregationService` expects this variant. The bitlist and
-/// signature match the aggregation unit-test body that tree-hashes.
+/// epoch 3, so `AggregationService` expects this variant. Aggregators are
+/// forced with committee length 1, so the bitlist is one participant bit.
+/// When the fixture has attestation data for the slot, the aggregate copies
+/// that data so the response is the one the duty requested.
 fn pre_electra_aggregate(slot: Slot) -> EthAttestation {
     EthAttestation {
-        aggregation_bits: vec![0xff, 0x01],
+        aggregation_bits: vec![0x03],
         data: EthAttestationData {
             slot,
             index: 0,
@@ -730,6 +738,34 @@ fn pre_electra_aggregate(slot: Slot) -> EthAttestation {
         },
         signature: vec![0xab; 96],
     }
+}
+
+fn pre_electra_aggregate_for(data: &BeaconAttestationData) -> EthAttestation {
+    EthAttestation {
+        aggregation_bits: vec![0x03],
+        data: EthAttestationData {
+            slot: data.slot.parse().expect("attestation slot"),
+            index: data.index.parse().expect("committee index"),
+            beacon_block_root: decode_root(&data.beacon_block_root),
+            source: EthCheckpoint {
+                epoch: data.source.epoch.parse().expect("source epoch"),
+                root: decode_root(&data.source.root),
+            },
+            target: EthCheckpoint {
+                epoch: data.target.epoch.parse().expect("target epoch"),
+                root: decode_root(&data.target.root),
+            },
+        },
+        signature: vec![0xab; 96],
+    }
+}
+
+fn decode_root(hex_str: &str) -> [u8; 32] {
+    let hex_str = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = hex::decode(hex_str).expect("root hex");
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&bytes);
+    root
 }
 
 // ── fixture options + fixture ────────────────────────────────────────────────

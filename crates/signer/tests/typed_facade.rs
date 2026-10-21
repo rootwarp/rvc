@@ -1081,7 +1081,16 @@ async fn test_every_typed_signer_method_reached_from_validator_signer() {
     svc.sign_randao_reveal(3, &pk, &schedule, &gvr).await.unwrap();
     svc.sign_sync_committee_message(&[0x88; 32], 100, &pk, &schedule, &gvr).await.unwrap();
     svc.sign_aggregate_and_proof(&aggregate(), &pk, &schedule, &gvr).await.unwrap();
-    svc.sign_electra_aggregate_and_proof(&electra_aggregate(), &pk, &schedule, &gvr).await.unwrap();
+    let electra_err = svc
+        .sign_electra_aggregate_and_proof(&electra_aggregate(), &pk, &schedule, &gvr)
+        .await
+        .expect_err("Electra aggregate over gRPC must fail closed");
+    match electra_err {
+        SignerError::SigningFailed(msg) => {
+            assert!(msg.contains("drops committee_bits"), "{msg}");
+        }
+        other => panic!("expected SigningFailed, got {other:?}"),
+    }
     svc.sign_voluntary_exit(&VoluntaryExit { epoch: 1, validator_index: 0 }, &pk, &schedule, &gvr)
         .await
         .unwrap();
@@ -1115,6 +1124,42 @@ async fn test_every_typed_signer_method_reached_from_validator_signer() {
     ] {
         assert!(seen.contains(name), "TypedSigner::{name} was not reached; seen={seen:?}");
     }
+    assert!(
+        !seen.contains("sign_electra_aggregate_and_proof"),
+        "Electra gRPC aggregate must not be sent; seen={seen:?}"
+    );
+}
+
+#[tokio::test]
+async fn electra_grpc_aggregate_with_2049_bits_is_refused() {
+    let sk = SecretKey::generate();
+    let pk = sk.public_key();
+    let rec = Arc::new(RecordingTyped::new(&sk));
+    let svc = grpc_service(sk, rec.clone());
+    let mut electra = electra_aggregate();
+    electra.aggregate.data.slot = 60 * SLOTS_PER_EPOCH;
+    let bit_length = 2049usize;
+    let len = bit_length / 8 + 1;
+    let sentinel_bit = bit_length % 8;
+    let mut bytes = vec![0xff; len];
+    bytes[len - 1] = ((1u8 << sentinel_bit) - 1) | (1u8 << sentinel_bit);
+    electra.aggregate.aggregation_bits = bytes;
+    let err = svc
+        .sign_electra_aggregate_and_proof(&electra, &pk, &fulu_schedule(), &GVR)
+        .await
+        .expect_err("a 2049-bit Electra aggregate must not be hashed");
+    match err {
+        SignerError::SigningFailed(msg) => {
+            assert!(msg.contains("drops committee_bits"), "{msg}");
+        }
+        other => panic!("expected SigningFailed, got {other:?}"),
+    }
+    let seen = rec.seen.lock().unwrap().clone();
+    assert!(
+        !seen.contains("sign_aggregate_and_proof")
+            && !seen.contains("sign_electra_aggregate_and_proof"),
+        "the legacy RPC must not be called; seen={seen:?}"
+    );
 }
 
 fn local_bls_backend(sk_bytes: [u8; 32]) -> Arc<dyn Signer> {

@@ -21,9 +21,6 @@ crates/crypto/src/key_manager.rs:generic-api-key:1064
 # when `Keystore::validate` was made public (#644).
 crates/crypto/src/keystore.rs:generic-api-key:594
 crates/crypto/src/keystore.rs:generic-api-key:628
-# Same private-key stub as the 2026-09-29 baseline; the line moved 1356 → 1392,
-# then 1392 → 1396 when build_endpoint installed the rustls ring provider (#612).
-crates/grpc-signer/src/client.rs:private-key:1396
 crates/keymanager-api/src/auth.rs:generic-api-key:339
 crates/keymanager-api/src/auth.rs:generic-api-key:353
 crates/observability/src/logging.rs:generic-api-key:363

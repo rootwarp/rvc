@@ -259,7 +259,7 @@ async fn test_aggregation_creates_produce_span() {
         .and(path("/eth/v1/validator/aggregate_attestation"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "data": {
-                "aggregation_bits": "0xffffffff",
+                "aggregation_bits": "0xff01",
                 "data": {
                     "slot": slot.to_string(),
                     "index": "1",

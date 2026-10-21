@@ -31,7 +31,7 @@ use timing::{due_ms, DeadlineBps, DeadlineSchedule, SlotClock, TimingError, SLOT
 
 use super::aggregation::AggregationService;
 use super::attestation::AttestationService;
-use super::dispatch::DispatchLimits;
+use super::dispatch::{DispatchLimits, Phase2SignerPermits};
 use super::duty_management::DutyManagementService;
 use super::error::OrchestratorError;
 use super::head_events::HeadEventGate;
@@ -1415,10 +1415,11 @@ where
         current_epoch: u64,
         agg_phase_span: tracing::Span,
         slot_end: tokio::time::Instant,
+        phase2_signer_permits: &Phase2SignerPermits,
     ) {
         if self.attesting_enabled.load(Ordering::Relaxed) {
             self.aggregation_service
-                .maybe_produce_aggregations(current_slot, current_epoch, slot_end)
+                .produce_aggregations(current_slot, current_epoch, slot_end, phase2_signer_permits)
                 .instrument(agg_phase_span)
                 .await;
         } else {
@@ -1566,6 +1567,10 @@ where
         anchor: &SlotAnchor,
         gate: &Phase2Head,
     ) -> WaitOutcome {
+        // One cap for every phase-2 signer call in this slot: aggregation and
+        // sync contributions both acquire `phase2_signer_permits`.
+        let phase2_signer_permits =
+            Phase2SignerPermits::new(self.config.dispatch_limits.concurrency as usize);
         if deadlines.contribution == deadlines.aggregate {
             if matches!(
                 self.wait_until_bps(
@@ -1602,11 +1607,18 @@ where
                         current_epoch,
                         &snapshot,
                         slot_end,
+                        &phase2_signer_permits,
                     )
                     .instrument(contribution_span)
                     .await;
                 },
-                self.run_aggregation_phase(current_slot, current_epoch, agg_phase_span, slot_end,),
+                self.run_aggregation_phase(
+                    current_slot,
+                    current_epoch,
+                    agg_phase_span,
+                    slot_end,
+                    &phase2_signer_permits,
+                ),
             );
             return WaitOutcome::Continue;
         }
@@ -1642,6 +1654,7 @@ where
                     current_epoch,
                     &snapshot,
                     anchor.slot_end(),
+                    &phase2_signer_permits,
                 )
                 .instrument(agg_phase_span.clone())
                 .await;
@@ -1669,6 +1682,7 @@ where
                     current_epoch,
                     agg_phase_span.clone(),
                     anchor.slot_end(),
+                    &phase2_signer_permits,
                 )
                 .await;
                 WaitOutcome::Continue
@@ -1742,10 +1756,11 @@ where
         epoch: u64,
         ctx: &SlotContext,
         slot_end: tokio::time::Instant,
+        phase2_signer_permits: &Phase2SignerPermits,
     ) {
         if self.sync_enabled.load(Ordering::Acquire) {
             self.sync_committee_service
-                .maybe_produce_sync_contributions(slot, epoch, ctx, slot_end)
+                .produce_sync_contributions(slot, epoch, ctx, slot_end, phase2_signer_permits)
                 .await;
         }
     }

@@ -274,12 +274,14 @@ async fn test_sync_contributions_skipped_when_sync_disabled() {
     };
     // With sync_enabled=false the phase guard returns early before any
     // signer or BN call. The test just verifies no panic and no submission.
+    let phase2_signer_permits = Phase2SignerPermits::new(1);
     orchestrator
         .run_sync_contributions_phase(
             0,
             0,
             &ctx,
             tokio::time::Instant::now() + Duration::from_secs(60),
+            &phase2_signer_permits,
         )
         .await;
 
