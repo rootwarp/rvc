@@ -26,6 +26,9 @@ use beacon::{
 };
 use eth_types::{
     BodyForkLayout, ForkName, ForkSchedule, SignedBlindedBeaconBlock, SignedBlindedBeaconBlockJson,
+    EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX, EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX,
+    EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX, EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+    EXTERNAL_BEACON_BLOCK_HEADER_SLOT, EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX,
 };
 use timing::{SlotClock, SystemSlotClock};
 
@@ -6624,32 +6627,42 @@ async fn aggregate_fetch_retries_503_then_succeeds() {
 #[tokio::test]
 async fn test_get_block_header_parses_root_slot_proposer_and_parent() {
     let mock_server = MockServer::start().await;
-    let root = "0x1111111111111111111111111111111111111111111111111111111111111111";
-    let parent = "0x2222222222222222222222222222222222222222222222222222222222222222";
-    let header_body = |slot: &str, root: &str, parent: &str| {
-        json!({
-            "execution_optimistic": false,
-            "finalized": false,
-            "data": {
-                "root": root,
-                "canonical": true,
-                "header": {
-                    "message": {
-                        "slot": slot,
-                        "proposer_index": "7",
-                        "parent_root": parent,
-                        "state_root": root,
-                        "body_root": root
-                    },
-                    "signature": "0x00"
+    // Hash-consistent with the consensus-spec ssz_static BeaconBlockHeader case.
+    let root = format!("0x{EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX}");
+    let parent = format!("0x{EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX}");
+    let state = format!("0x{EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX}");
+    let body_root = format!("0x{EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX}");
+    let slot = EXTERNAL_BEACON_BLOCK_HEADER_SLOT.to_string();
+    let proposer = EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX.to_string();
+    let header_body = {
+        let state = state.clone();
+        let body_root = body_root.clone();
+        let proposer = proposer.clone();
+        move |slot: &str, root: &str, parent: &str| {
+            json!({
+                "execution_optimistic": false,
+                "finalized": false,
+                "data": {
+                    "root": root,
+                    "canonical": true,
+                    "header": {
+                        "message": {
+                            "slot": slot,
+                            "proposer_index": proposer,
+                            "parent_root": parent,
+                            "state_root": state,
+                            "body_root": body_root
+                        },
+                        "signature": "0x00"
+                    }
                 }
-            }
-        })
+            })
+        }
     };
 
     Mock::given(method("GET"))
-        .and(path("/eth/v1/beacon/headers/99"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(header_body("99", root, parent)))
+        .and(path(format!("/eth/v1/beacon/headers/{slot}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(header_body(&slot, &root, &parent)))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -6663,13 +6676,13 @@ async fn test_get_block_header_parses_root_slot_proposer_and_parent() {
         .await;
     Mock::given(method("GET"))
         .and(path("/eth/v1/beacon/headers/bad-slot"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(header_body("nope", root, parent)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(header_body("nope", &root, &parent)))
         .expect(1)
         .mount(&mock_server)
         .await;
     Mock::given(method("GET"))
         .and(path("/eth/v1/beacon/headers/short-root"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(header_body("1", "0xabcd", parent)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(header_body("1", "0xabcd", &parent)))
         .expect(1)
         .mount(&mock_server)
         .await;
@@ -6677,11 +6690,11 @@ async fn test_get_block_header_parses_root_slot_proposer_and_parent() {
     let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri()).with_max_retries(0))
         .expect("client");
 
-    let header = client.get_block_header("99").await.expect("header");
-    assert_eq!(header.slot, 99);
-    assert_eq!(header.proposer_index, 7);
-    assert_eq!(header.root, [0x11; 32]);
-    assert_eq!(header.parent_root, [0x22; 32]);
+    let header = client.get_block_header(&slot).await.expect("header");
+    assert_eq!(header.slot, EXTERNAL_BEACON_BLOCK_HEADER_SLOT);
+    assert_eq!(header.proposer_index, EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX);
+    assert_eq!(hex::encode(header.root), EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX);
+    assert_eq!(hex::encode(header.parent_root), EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX);
 
     let missing = client.get_block_header("missing").await;
     assert!(matches!(missing, Err(BeaconError::ApiError { status: 404, .. })), "{missing:?}");

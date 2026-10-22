@@ -44,8 +44,11 @@ url.workspace = true
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring"] }
 
 [dev-dependencies]
+# Tests call `BeaconBlockHeader::hash_tree_root_bytes`, which is compiled only
+# with `test-fixtures`. Production `cargo build -p rvc-bin` leaves the feature off.
+eth-types = { workspace = true, features = ["test-fixtures"] }
 # eth-types / hex / serde_json are production deps above; integration tests reuse
-# them via normal dependency inheritance (no duplicate dev-dep lines).
+# them via normal dependency inheritance except for the feature line above.
 # test-utils: EncryptionKdf cheap-KDF helpers in integration tests (#602).
 # Dev-edge only — production `cargo build -p rvc-bin` does not enable it.
 crypto = { workspace = true, features = ["test-utils"] }

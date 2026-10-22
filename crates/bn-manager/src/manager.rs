@@ -112,6 +112,22 @@ fn no_eligible_bn(op_name: &str, role: BnRole) -> BeaconError {
     BeaconError::NoEligibleBn { operation: op_name.to_string(), role: role.to_string() }
 }
 
+fn is_api_not_found(err: &BeaconError) -> bool {
+    matches!(err, BeaconError::ApiError { status: 404, .. })
+}
+
+/// Keep the first error that is not a 404. A stored 404 is replaced. A later
+/// 404 is not. On `produce_block_v4`, a 405 or 501 ranks like a 404: a later
+/// 500 or timeout replaces it, and it does not replace a 500.
+fn note_attempt_error(op_name: &str, stored: &mut Option<BeaconError>, err: BeaconError) {
+    let soft = stored
+        .as_ref()
+        .is_none_or(|kept| is_api_not_found(kept) || is_v4_capability_gap(op_name, kept));
+    if soft {
+        *stored = Some(err);
+    }
+}
+
 fn publish_capability(endpoint: &str, capability: &str, capable: bool) {
     #[cfg(not(test))]
     debug_assert!(
@@ -1156,6 +1172,11 @@ impl BnManager {
     /// Each attempt is bounded by [`attempt_timeout`]; an exhausted deadline
     /// returns [`BeaconError::OperationTimeout`] without starting that attempt.
     /// `None` leaves attempts unbounded (the caller has no operation budget).
+    ///
+    /// A 404 is the result only when every attempted beacon node returned 404
+    /// (all_not_found). Any other error stays, in attempt order, and a later
+    /// 404 does not replace it. On `produce_block_v4`, a 405 or 501 ranks like
+    /// a 404. [`BeaconError::RevokedInFlight`] is not a 404.
     async fn query_first_inner<'s, T, F>(
         &'s self,
         op_name: &str,
@@ -1188,7 +1209,8 @@ impl BnManager {
             let client = &self.clients[i];
             let stamp = self.admission_stamp(i);
             if !self.stamp_holds(stamp) {
-                last_err = Some(BeaconError::RevokedInFlight);
+                // all_not_found: a revoke is not "the slot is empty".
+                note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
                 continue;
             }
             tried += 1;
@@ -1203,7 +1225,7 @@ impl BnManager {
             match await_attempt(op_name, bound, fut).await {
                 Ok(result) => {
                     if !self.stamp_holds(stamp) {
-                        last_err = Some(BeaconError::RevokedInFlight);
+                        note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
                         continue;
                     }
                     let elapsed = start.elapsed();
@@ -1248,7 +1270,8 @@ impl BnManager {
                             "BN query failed, no more BNs to try"
                         );
                     }
-                    last_err = Some(e);
+                    // all_not_found: the first non-404 stays.
+                    note_attempt_error(op_name, &mut last_err, e);
                 }
             }
         }
@@ -1291,12 +1314,16 @@ impl BnManager {
     /// `None` leaves attempts unbounded (the caller has no operation budget).
     ///
     /// `Ok(None)` (HTTP 204) is not a health outcome and is not a cluster answer.
+    /// It still wins over a 404 and over any other error except
+    /// [`BeaconError::OperationTimeout`]. [`BeaconError::Timeout`] does not beat
+    /// a 204. An `OperationTimeout` from any attempt in the round beats a 204.
+    /// The 404 rule from [`Self::query_first_inner`] applies when no node
+    /// returned data and none returned 204.
     ///
     /// A per-attempt [`BeaconError::OperationTimeout`] fails over while a later
     /// beacon node remains and [`attempt_limit`] still yields a bound. It is
-    /// returned only when that deadline is already exhausted or the timed-out
-    /// attempt is the last one. A stored `OperationTimeout` wins over
-    /// `Ok(None)`, so an earlier HTTP 204 cannot hide a hang.
+    /// returned immediately when that deadline is already exhausted or the
+    /// timed-out attempt is the last one.
     async fn query_first_prefer_some_inner<'s, T, F>(
         &'s self,
         op_name: &str,
@@ -1315,6 +1342,7 @@ impl BnManager {
             return Err(no_eligible_bn(op_name, role));
         }
         let mut last_err = None;
+        let mut timeout_over_empty: Option<BeaconError> = None;
         let mut saw_none = false;
         let mut tried: usize = 0;
 
@@ -1330,7 +1358,7 @@ impl BnManager {
             let client = &self.clients[i];
             let stamp = self.admission_stamp(i);
             if !self.stamp_holds(stamp) {
-                last_err = Some(BeaconError::RevokedInFlight);
+                note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
                 continue;
             }
             tried += 1;
@@ -1345,7 +1373,7 @@ impl BnManager {
             match await_attempt(op_name, bound, fut).await {
                 Ok(Some(result)) => {
                     if !self.stamp_holds(stamp) {
-                        last_err = Some(BeaconError::RevokedInFlight);
+                        note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
                         continue;
                     }
                     let elapsed = start.elapsed();
@@ -1368,7 +1396,7 @@ impl BnManager {
                 }
                 Ok(None) => {
                     if !self.stamp_holds(stamp) {
-                        last_err = Some(BeaconError::RevokedInFlight);
+                        note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
                         continue;
                     }
                     saw_none = true;
@@ -1386,7 +1414,13 @@ impl BnManager {
                         &[(i, error_outcome(op_name, &e))],
                     )
                     .await;
-                    if matches!(e, BeaconError::OperationTimeout { .. }) {
+                    if let BeaconError::OperationTimeout { operation, timeout } = &e {
+                        if timeout_over_empty.is_none() {
+                            timeout_over_empty = Some(BeaconError::OperationTimeout {
+                                operation: operation.clone(),
+                                timeout: *timeout,
+                            });
+                        }
                         let has_next = pos + 1 < indices.len();
                         if !has_next {
                             tracing::Span::current().record("tried", tried);
@@ -1415,24 +1449,21 @@ impl BnManager {
                             "BN query failed, no more BNs to try"
                         );
                     }
-                    last_err = Some(e);
+                    note_attempt_error(op_name, &mut last_err, e);
                 }
             }
         }
 
         tracing::Span::current().record("tried", tried);
 
-        // A hang is not "no data". An earlier 204 must not hide it.
-        match last_err {
-            Some(err @ BeaconError::OperationTimeout { .. }) => Err(err),
-            other => {
-                if saw_none {
-                    Ok(None)
-                } else {
-                    Err(other.unwrap_or_else(|| no_eligible_bn(op_name, role)))
-                }
+        // A hang anywhere in the round is not "no data".
+        if saw_none {
+            if let Some(err) = timeout_over_empty {
+                return Err(err);
             }
+            return Ok(None);
         }
+        Err(last_err.unwrap_or_else(|| no_eligible_bn(op_name, role)))
     }
 
     /// Sequential production failover (D29): one in-flight request, health-score
@@ -1447,6 +1478,14 @@ impl BnManager {
     /// One-in-flight is the client future this method polls. A per-attempt
     /// timeout drops that future before the next POST; a cancelled reqwest
     /// may still be aborting on the wire.
+    ///
+    /// A 404 is returned only when every attempted node returned 404. Otherwise
+    /// the first non-404, in attempt order, is kept. On `produce_block_v4`, a
+    /// 405 or 501 ranks like a 404: a later 500 or timeout replaces it, and it
+    /// does not replace a 500. An exhausted budget still replaces the stored
+    /// error with [`BeaconError::OperationTimeout`], because the round has
+    /// stopped. All-incapable v4 (every failure is 404, 405, or 501, or an
+    /// unrecognised fork) is still [`BeaconError::NoEligibleBn`].
     async fn query_failover<'s, T, F>(
         &'s self,
         op_name: &str,
@@ -1503,6 +1542,7 @@ impl BnManager {
                 match attempt_timeout(remaining, remaining_bns) {
                     Some(d) => Some(d),
                     None => {
+                        // The round stopped. This replaces a stored BN error.
                         last_err = Some(BeaconError::OperationTimeout {
                             operation: op_name.to_string(),
                             timeout: total,
@@ -1517,7 +1557,7 @@ impl BnManager {
             let client = &self.clients[i];
             let stamp = self.admission_stamp(i);
             if !self.stamp_holds(stamp) {
-                last_err = Some(BeaconError::RevokedInFlight);
+                note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
                 continue;
             }
             tried += 1;
@@ -1535,7 +1575,7 @@ impl BnManager {
             match result {
                 Ok(value) => {
                     if !self.stamp_holds(stamp) {
-                        last_err = Some(BeaconError::RevokedInFlight);
+                        note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
                         continue;
                     }
                     let elapsed = start.elapsed();
@@ -1558,7 +1598,7 @@ impl BnManager {
                 }
                 Err(e) => {
                     if matches!(e, BeaconError::RevokedInFlight) {
-                        last_err = Some(e);
+                        note_attempt_error(op_name, &mut last_err, e);
                         continue;
                     }
                     let outcome = error_outcome(op_name, &e);
@@ -1584,7 +1624,7 @@ impl BnManager {
                                 "BN query failed, no more BNs to try"
                             );
                         }
-                        last_err = Some(e);
+                        note_attempt_error(op_name, &mut last_err, e);
                     } else {
                         warn!(
                             op = op_name,
@@ -1593,7 +1633,7 @@ impl BnManager {
                             error = %e,
                             "BN production error is not failover-retryable"
                         );
-                        last_err = Some(e);
+                        note_attempt_error(op_name, &mut last_err, e);
                         break;
                     }
                 }
@@ -3601,7 +3641,12 @@ impl NodeStatusApi for BnManager {
     }
 
     async fn get_block_header(&self, block_id: &str) -> Result<BlockHeaderSummary, BeaconError> {
-        // no budget: header lookup; OperationTimeouts has no field for it
+        // no budget: header lookup; OperationTimeouts has no field for it.
+        // A root that is not hash_tree_root(message), a missing
+        // execution_optimistic flag, or true, is a parse error and a health
+        // error for that beacon node on every slot this header is fetched.
+        // It is not a 404. A later node that returns a valid header still
+        // supplies it. When every attempt fails, the parent filter stays off.
         self.query_first("get_block_header", BnRole::All, HealthTier::SmallLag, None, |c| {
             Box::pin(c.get_block_header(block_id))
         })
@@ -6844,9 +6889,8 @@ mod tests {
         assert!(!higher_block_value(&a, &b));
     }
 
-    /// BN-1 fails fast, BN-2 hangs past the outer operation budget. The fast
-    /// failure must already be on BN-1's tracker when `with_op_timeout` cancels
-    /// the rest of the round (the batched `failed` vec used to be dropped).
+    /// BN-1 fails fast, BN-2 hangs. The 500 is the result: a later attempt
+    /// timeout does not replace it. BN-1's tracker already holds that failure.
     #[tokio::test]
     async fn outer_timeout_no_longer_drops_a_recorded_failure() {
         use wiremock::matchers::{method, path};
@@ -6883,8 +6927,8 @@ mod tests {
 
         let err = manager.get_attester_duties(1, &["1".to_string()]).await.unwrap_err();
         assert!(
-            matches!(err, BeaconError::OperationTimeout { ref operation, .. } if operation == "get_attester_duties"),
-            "outer with_op_timeout must still fire, got {err:?}"
+            matches!(err, BeaconError::ApiError { status: 500, .. }),
+            "BN-1's 500 stays when BN-2's attempt times out, got {err:?}"
         );
 
         let trackers = manager.health_trackers().read().await;
@@ -7383,8 +7427,8 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(
-            matches!(err, BeaconError::OperationTimeout { .. }),
-            "last BN must end at the deadline, got {err:?}"
+            matches!(err, BeaconError::ApiError { status: 500, .. }),
+            "the earlier 500 stays after the last attempt hits the deadline, got {err:?}"
         );
         assert!(secondary_started.load(Ordering::SeqCst), "BN-2's attempt must start");
         assert!(
@@ -9325,5 +9369,455 @@ mod tests {
         let count = manager.admit_against_identity(identity).await;
         assert!(!manager.is_admitted(0), "a boot read with no identity evidence stays out");
         assert_eq!(count, 0);
+    }
+
+    const GENESIS_OK: &str = r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0xabc","genesis_fork_version":"0x00000000"}}"#;
+
+    #[derive(Clone, Copy, Debug)]
+    enum BnReply {
+        NotFound,
+        ServerError,
+        BadRequest,
+        Timeout,
+        Ready,
+        MethodNotAllowed,
+        NotImplemented,
+    }
+
+    #[derive(Clone, Copy)]
+    enum Chosen {
+        Status(u16),
+        Timeout,
+        Ready,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Strategy {
+        First,
+        PreferSome,
+        Failover,
+    }
+
+    async fn mount_genesis(server: &wiremock::MockServer, reply: BnReply) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let template = match reply {
+            BnReply::NotFound => {
+                ResponseTemplate::new(404).set_body_string(r#"{"message":"NOT_FOUND"}"#)
+            }
+            BnReply::ServerError | BnReply::Timeout => {
+                ResponseTemplate::new(500).set_body_string("down")
+            }
+            BnReply::BadRequest => ResponseTemplate::new(400).set_body_string("bad"),
+            BnReply::MethodNotAllowed => ResponseTemplate::new(405).set_body_string("no v4"),
+            BnReply::NotImplemented => ResponseTemplate::new(501).set_body_string("no v4"),
+            BnReply::Ready => ResponseTemplate::new(200).set_body_string(GENESIS_OK),
+        };
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(template)
+            .mount(server)
+            .await;
+    }
+
+    fn genesis_op<'a>(
+        timeouts: &'a std::collections::HashSet<String>,
+    ) -> impl Fn(&BeaconClient) -> BoxFut<'_, String> + 'a {
+        move |client| {
+            let timeout = timeouts.contains(client.endpoint());
+            Box::pin(async move {
+                if timeout {
+                    Err(BeaconError::Timeout)
+                } else {
+                    client.get_genesis().await.map(|genesis| genesis.data.genesis_time)
+                }
+            })
+        }
+    }
+
+    async fn run_strategy(
+        manager: &BnManager,
+        strategy: Strategy,
+        timeouts: &std::collections::HashSet<String>,
+        op_name: &str,
+    ) -> Result<Option<String>, BeaconError> {
+        match strategy {
+            Strategy::First => manager
+                .query_first_inner(
+                    op_name,
+                    BnRole::All,
+                    HealthTier::SmallLag,
+                    None,
+                    &genesis_op(timeouts),
+                )
+                .await
+                .map(|(_, value)| Some(value)),
+            Strategy::PreferSome => {
+                manager
+                    .query_first_prefer_some_inner(
+                        op_name,
+                        BnRole::All,
+                        HealthTier::SmallLag,
+                        None,
+                        &|client| {
+                            let timeout = timeouts.contains(client.endpoint());
+                            Box::pin(async move {
+                                if timeout {
+                                    Err(BeaconError::Timeout)
+                                } else {
+                                    client
+                                        .get_genesis()
+                                        .await
+                                        .map(|genesis| Some(genesis.data.genesis_time))
+                                }
+                            })
+                        },
+                    )
+                    .await
+            }
+            Strategy::Failover => manager
+                .query_failover_inner(
+                    op_name,
+                    BnRole::All,
+                    HealthTier::SmallLag,
+                    None,
+                    &genesis_op(timeouts),
+                )
+                .await
+                .map(Some),
+        }
+    }
+
+    fn assert_chosen(result: Result<Option<String>, BeaconError>, chosen: Chosen, ctx: &str) {
+        match (result, chosen) {
+            (Err(BeaconError::ApiError { status, .. }), Chosen::Status(expected)) => {
+                assert_eq!(status, expected, "{ctx}");
+            }
+            (Err(BeaconError::Timeout), Chosen::Timeout) => {}
+            (Ok(Some(time)), Chosen::Ready) => assert_eq!(time, "1606824023", "{ctx}"),
+            (other, _) => panic!("{ctx}: {other:?}"),
+        }
+    }
+
+    async fn assert_reply_mix(replies: &[BnReply], chosen: Chosen) {
+        let mut servers = Vec::new();
+        let mut timeouts = std::collections::HashSet::new();
+        for reply in replies {
+            let server = wiremock::MockServer::start().await;
+            mount_genesis(&server, *reply).await;
+            if matches!(reply, BnReply::Timeout) {
+                timeouts.insert(server.uri());
+            }
+            servers.push(server);
+        }
+        let endpoints: Vec<String> = servers.iter().map(|server| server.uri()).collect();
+        for strategy in [Strategy::First, Strategy::PreferSome, Strategy::Failover] {
+            let manager = BnManager::new(BnManagerConfig::new(endpoints.clone())).unwrap();
+            let result = run_strategy(&manager, strategy, &timeouts, "get_genesis").await;
+            assert_chosen(result, chosen, &format!("{strategy:?} {replies:?}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn query_first_does_not_let_a_404_mask_another_bns_500() {
+        assert_reply_mix(&[BnReply::ServerError, BnReply::NotFound], Chosen::Status(500)).await;
+    }
+
+    #[tokio::test]
+    async fn query_first_variants_apply_the_404_rule_to_each_outcome_mix() {
+        let mixes = [
+            (&[BnReply::NotFound, BnReply::NotFound][..], Chosen::Status(404)),
+            (&[BnReply::NotFound, BnReply::ServerError], Chosen::Status(500)),
+            (&[BnReply::ServerError, BnReply::NotFound], Chosen::Status(500)),
+            (&[BnReply::NotFound, BnReply::Timeout], Chosen::Timeout),
+            (&[BnReply::NotFound, BnReply::Ready], Chosen::Ready),
+            (&[BnReply::NotFound], Chosen::Status(404)),
+            (&[BnReply::NotFound, BnReply::ServerError, BnReply::BadRequest], Chosen::Status(500)),
+            (&[BnReply::Timeout, BnReply::NotFound], Chosen::Timeout),
+        ];
+        for (replies, chosen) in mixes {
+            assert_reply_mix(replies, chosen).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn query_with_zero_attempted_bns_is_not_a_404() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&server)
+            .await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).unwrap();
+        manager.revoke_admission(0);
+        let timeouts = std::collections::HashSet::new();
+        for strategy in [Strategy::First, Strategy::PreferSome, Strategy::Failover] {
+            let err = run_strategy(&manager, strategy, &timeouts, "get_genesis").await.unwrap_err();
+            assert!(matches!(err, BeaconError::NoAdmittedNode), "{strategy:?} {err:?}");
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(GENESIS_OK))
+            .mount(&server)
+            .await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).unwrap();
+        let past = tokio::time::Instant::now().checked_sub(Duration::from_secs(5)).unwrap();
+        let err = manager
+            .query_first_inner("get_genesis", BnRole::All, HealthTier::SmallLag, Some(past), &|c| {
+                Box::pin(c.get_genesis())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BeaconError::OperationTimeout { .. }), "{err:?}");
+        let err = manager
+            .query_first_prefer_some_inner(
+                "get_genesis",
+                BnRole::All,
+                HealthTier::SmallLag,
+                Some(past),
+                &|c| Box::pin(async move { c.get_genesis().await.map(Some) }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BeaconError::OperationTimeout { .. }), "{err:?}");
+        let err = manager
+            .query_failover_inner(
+                "get_genesis",
+                BnRole::All,
+                HealthTier::SmallLag,
+                Some(Duration::ZERO),
+                &|c| Box::pin(c.get_genesis()),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BeaconError::OperationTimeout { .. }), "{err:?}");
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn query_first_follows_a_bn_that_flips_between_500_and_404() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let primary = MockServer::start().await;
+        let secondary = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("down"))
+            .up_to_n_times(1)
+            .mount(&primary)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("later"))
+            .mount(&primary)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("missing"))
+            .mount(&secondary)
+            .await;
+
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![primary.uri(), secondary.uri()])).unwrap();
+        let timeouts = std::collections::HashSet::new();
+        let first = run_strategy(&manager, Strategy::First, &timeouts, "get_genesis").await;
+        assert_chosen(first, Chosen::Status(500), "first round keeps the 500");
+        let second = run_strategy(&manager, Strategy::First, &timeouts, "get_genesis").await;
+        assert_chosen(second, Chosen::Status(404), "second round is all 404");
+    }
+
+    #[tokio::test]
+    async fn query_failover_v4_all_404_stays_no_eligible_and_a_500_is_not_masked() {
+        assert_reply_mix_named(
+            &[BnReply::NotFound, BnReply::NotFound],
+            ErrKind::NoEligible,
+            bn_capability::PRODUCE_BLOCK_V4,
+            Strategy::Failover,
+        )
+        .await;
+        assert_reply_mix_named(
+            &[BnReply::ServerError, BnReply::NotFound],
+            ErrKind::Status(500),
+            bn_capability::PRODUCE_BLOCK_V4,
+            Strategy::Failover,
+        )
+        .await;
+        assert_reply_mix_named(
+            &[BnReply::NotFound, BnReply::ServerError],
+            ErrKind::Status(500),
+            bn_capability::PRODUCE_BLOCK_V4,
+            Strategy::Failover,
+        )
+        .await;
+    }
+
+    enum ErrKind {
+        NoEligible,
+        Status(u16),
+        Timeout,
+    }
+
+    async fn assert_reply_mix_named(
+        replies: &[BnReply],
+        expect: ErrKind,
+        op_name: &str,
+        strategy: Strategy,
+    ) {
+        let mut servers = Vec::new();
+        let mut timeouts = std::collections::HashSet::new();
+        for reply in replies {
+            let server = wiremock::MockServer::start().await;
+            mount_genesis(&server, *reply).await;
+            if matches!(reply, BnReply::Timeout) {
+                timeouts.insert(server.uri());
+            }
+            servers.push(server);
+        }
+        let endpoints: Vec<String> = servers.iter().map(|server| server.uri()).collect();
+        let manager = BnManager::new(BnManagerConfig::new(endpoints)).unwrap();
+        let result = run_strategy(&manager, strategy, &timeouts, op_name).await;
+        match (result, expect) {
+            (Err(BeaconError::NoEligibleBn { .. }), ErrKind::NoEligible) => {}
+            (Err(BeaconError::ApiError { status, .. }), ErrKind::Status(expected)) => {
+                assert_eq!(status, expected, "{op_name} {replies:?}");
+            }
+            (Err(BeaconError::Timeout), ErrKind::Timeout) => {}
+            (other, _) => panic!("{op_name} {replies:?}: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn query_failover_does_not_let_a_404_mask_a_500() {
+        assert_reply_mix_named(
+            &[BnReply::ServerError, BnReply::NotFound],
+            ErrKind::Status(500),
+            "get_genesis",
+            Strategy::Failover,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn query_failover_v4_ranks_405_and_501_like_a_404() {
+        let op = bn_capability::PRODUCE_BLOCK_V4;
+        let cases = [
+            (&[BnReply::MethodNotAllowed, BnReply::ServerError][..], ErrKind::Status(500)),
+            (&[BnReply::NotImplemented, BnReply::ServerError], ErrKind::Status(500)),
+            (&[BnReply::MethodNotAllowed, BnReply::Timeout], ErrKind::Timeout),
+            (&[BnReply::ServerError, BnReply::MethodNotAllowed], ErrKind::Status(500)),
+        ];
+        for (replies, expect) in cases {
+            assert_reply_mix_named(replies, expect, op, Strategy::Failover).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn query_first_prefer_some_204_still_beats_404_and_server_error_but_not_a_hang() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn mount_payload(server: &MockServer, status: u16) {
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/validator/payload_attestation_data"))
+                .respond_with(ResponseTemplate::new(status).set_body_string("x"))
+                .mount(server)
+                .await;
+        }
+
+        let empty = MockServer::start().await;
+        let missing = MockServer::start().await;
+        mount_payload(&missing, 404).await;
+        mount_payload(&empty, 204).await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![missing.uri(), empty.uri()])).unwrap();
+        let result = manager
+            .query_first_prefer_some_inner(
+                "get_payload_attestation_data",
+                BnRole::All,
+                HealthTier::SmallLag,
+                None,
+                &|client| Box::pin(client.get_payload_attestation_data(7)),
+            )
+            .await
+            .expect("404 then 204");
+        assert!(result.is_none());
+
+        let down = MockServer::start().await;
+        let empty = MockServer::start().await;
+        mount_payload(&down, 500).await;
+        mount_payload(&empty, 204).await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![down.uri(), empty.uri()])).unwrap();
+        let result = manager
+            .query_first_prefer_some_inner(
+                "get_payload_attestation_data",
+                BnRole::All,
+                HealthTier::SmallLag,
+                None,
+                &|client| Box::pin(client.get_payload_attestation_data(7)),
+            )
+            .await
+            .expect("500 then 204");
+        assert!(result.is_none());
+
+        let urls = [
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:8".to_string(),
+            "http://127.0.0.1:7".to_string(),
+        ];
+        let manager = BnManager::new(BnManagerConfig::new(urls.to_vec())).unwrap();
+        let err = manager
+            .query_first_prefer_some_inner(
+                "get_payload_attestation_data",
+                BnRole::All,
+                HealthTier::SmallLag,
+                None,
+                &|client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.ends_with(":9") {
+                            Err(BeaconError::ApiError { status: 500, message: "down".into() })
+                        } else if endpoint.ends_with(":8") {
+                            Err(BeaconError::OperationTimeout {
+                                operation: "get_payload_attestation_data".into(),
+                                timeout: Duration::from_millis(1),
+                            })
+                        } else {
+                            Ok(None::<String>)
+                        }
+                    })
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BeaconError::OperationTimeout { .. }), "{err:?}");
+
+        let manager = BnManager::new(BnManagerConfig::new(urls.to_vec())).unwrap();
+        let result = manager
+            .query_first_prefer_some_inner(
+                "get_payload_attestation_data",
+                BnRole::All,
+                HealthTier::SmallLag,
+                None,
+                &|client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.ends_with(":9") {
+                            Err(BeaconError::Timeout)
+                        } else {
+                            Ok(None::<String>)
+                        }
+                    })
+                },
+            )
+            .await
+            .expect("http timeout then 204");
+        assert!(result.is_none());
     }
 }

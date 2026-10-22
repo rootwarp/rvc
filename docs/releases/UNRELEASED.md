@@ -3,6 +3,18 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Parent lookup does not treat a mixed beacon-node failure as an empty slot
+
+`query_first`, `query_first_prefer_some`, and `query_failover` return a 404 only when every beacon node that was attempted returned 404. Otherwise the result is the first non-404 error, in attempt order. A later 404 does not replace that error. Parent lookup therefore stops when one node returns 500 and another returns 404, in either order. It does not walk back and bind an older block. Stopping leaves `expected_parents` unset, which turns the parent filter off.
+
+On `produce_block_v4`, HTTP 405 and 501 are a capability gap and rank like a 404 when the round chooses which error to keep. A 500 or a timeout replaces a 405 or 501 seen earlier. A 405 or 501 does not replace an earlier 500. A v4 produce round in which every attempted node returns 404, 405, or 501 is still "no eligible beacon node".
+
+A header is used only when `execution_optimistic` is false and `data.root` equals `hash_tree_root` of the header message. A missing flag, `true`, a non-boolean flag, or a root that does not match is a parse error. Each of those responses is a health error for the beacon node that returned it, on every slot whose header is fetched. A later beacon node that returns a valid header still supplies that header. The header signature is not checked. The header container is the same from phase0 through Gloas. The known-answer vector is `ethereum/consensus-specs` tag `v1.7.0-beta.2`, `tests/minimal/gloas/ssz_static/BeaconBlockHeader/ssz_random/case_0`.
+
+Two returned-error labels changed. A fast 500 followed by a hung peer on `query_first` is reported as that 500, not as an operation timeout. The same 500 stays when the last remaining attempt hits the deadline.
+
+An HTTP 204 is still "no data" when the other attempts are 404s or other errors that are not an operation timeout. `BeaconError::Timeout` does not beat a 204. An operation timeout anywhere in that round does. If the attempt budget is already exhausted, the round returns that timeout without starting the next request.
+
 ## Selection shape is applied when the block is collected
 
 Builder-only drops a local block while candidates are collected. That block does not end the wait, and the fallback does not return it. Execution-only drops a blinded block the same way. Max-profit and builder-always still accept either shape while the builder circuit breaker is clear.

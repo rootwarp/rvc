@@ -26,6 +26,7 @@ telemetry = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+tree_hash = { workspace = true }
 url = { workspace = true }
 rand = { workspace = true }
 
@@ -38,7 +39,6 @@ crypto = { workspace = true }
 metrics = { workspace = true }
 eth-types = { workspace = true, features = ["test-fixtures"] }
 timing = { workspace = true }
-tree_hash = { workspace = true }
 wiremock = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }
