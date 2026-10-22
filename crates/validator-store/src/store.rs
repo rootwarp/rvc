@@ -1,5 +1,5 @@
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -198,6 +198,30 @@ struct StoreState {
     /// Per-field proposer-URL overlay. Lives in this lock with the row and
     /// `validator_gen`, so a claim, a keymanager write, and a restore each
     /// finish under one write guard.
+    ///
+    /// URL ownership invariants, kept for RV-4.5 (`commit_then_publish`) and
+    /// RV-5.1 (strict `reload_config`):
+    ///
+    /// * A validators-file write uses [`ValidatorStore::disk_toml`], which
+    ///   reverts this overlay on a clone. [`snapshot_toml`] of live state is
+    ///   not a file write: it still contains URL-owned values.
+    /// * The URL owns a field only while the latest successful document sets
+    ///   it. Omission releases that field. The local baseline is written back
+    ///   only when the live value still equals the remote value. One document
+    ///   is one `save_lock` and one state write: rows are claimed, omitted
+    ///   pubkeys are released, then defaults are applied and omitted default
+    ///   fields are released. A reader does not observe the local default fee
+    ///   for a row that same document still sets.
+    /// * [`ValidatorStore::reload_config`] keeps entries whose pubkey is
+    ///   absent from the parsed file and drops entries the file replaces.
+    ///   `remote_defaults` is cleared there because live defaults are replaced
+    ///   from the file. A parse error returns before either change. Reload
+    ///   does not restore a URL-owned value onto a row the file replaces.
+    /// * `set_enabled` does not take `save_lock` and does not change this
+    ///   overlay. Non-durable [`ValidatorStore::update_config`] and
+    ///   [`ValidatorStore::apply_default_update`] do not take `save_lock` and
+    ///   do not write the file. Each holds the state write guard across its
+    ///   ownership change and its value write.
     url_owned: HashMap<[u8; 48], UrlOwned>,
     /// Live `default_config` overlay. Disk snapshots write `durable`, never
     /// the remote value.
@@ -248,20 +272,50 @@ struct RemoteDefaults {
     graffiti: Option<OwnedValue<Option<[u8; 32]>>>,
 }
 
+/// Remote `default_config` fields the latest successful document does not set.
+///
+/// [`ValidatorStore::release_remote_defaults`] restores each `true` field
+/// when the live value is still the remote one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RemoteDefaultRelease {
+    pub fee_recipient: bool,
+    pub gas_limit: bool,
+    pub graffiti: bool,
+}
+
+impl RemoteDefaultRelease {
+    /// Release every remote default field.
+    pub fn all() -> Self {
+        Self { fee_recipient: true, gas_limit: true, graffiti: true }
+    }
+
+    /// Fields `update` leaves unset.
+    pub fn omitted(update: &crate::config::DefaultUpdate) -> Self {
+        Self {
+            fee_recipient: update.fee_recipient.is_none(),
+            gas_limit: update.gas_limit.is_none(),
+            graffiti: update.graffiti.is_none(),
+        }
+    }
+}
+
 pub struct ValidatorStore {
     state: RwLock<StoreState>,
     config_path: Option<PathBuf>,
-    // Serializes durable mutation (`update_config_durable`, `save_config`,
-    // `reload_config`, import, delete, and signing-safety disables).
+    // Serializes durable mutation and the proposer-URL refresher
+    // (`update_config_durable`, `save_config`, `reload_config`, import, delete,
+    // signing-safety disables, `apply_remote_proposer`,
+    // `release_remote_proposer`, `apply_remote_defaults`, and
+    // `release_remote_defaults`).
     // Snapshot → tempfile write → atomic rename, and the matching in-memory
     // publish, run as one critical section. A safer disable publishes before
     // the write; a less-safe change publishes only after it. Without this, a
     // thread holding a stale snapshot can `persist` AFTER a thread with newer
     // data and silently clobber committed updates.
     // Lock order is always `save_lock` then `state`, never the reverse.
-    // Intentionally separate from `state`: `set_enabled` and the proposer-URL
-    // refresher mutate memory without taking it, so a durable update re-applies
-    // its delta and must not replace the map. Keymanager import and delete go
+    // `set_enabled` mutates memory without taking this lock, so a durable
+    // update re-applies its delta and must not replace the map. The
+    // proposer-URL refresher takes this lock. Keymanager import and delete go
     // through `add_validator_durable` / `remove_validator_durable`, which take
     // this lock and persist. `add_validator` / `remove_validator` stay
     // memory-only for startup registration and tests.
@@ -888,8 +942,9 @@ impl ValidatorStore {
     /// is taken. If `pubkey` is absent from the cloned state this returns
     /// [`ValidatorStoreError::NotFound`] and does not write or publish. A write
     /// error also publishes nothing. On success the same delta is applied to
-    /// the live map — the map is not replaced — so `set_enabled` and the
-    /// proposer-URL refresher survive.
+    /// the live map — the map is not replaced — so `set_enabled`, which does
+    /// not take `save_lock`, survives. The proposer-URL refresher takes
+    /// `save_lock` and cannot run during this write.
     ///
     /// Keymanager import and delete take `save_lock` and persist, so they
     /// cannot land between this snapshot and its publish. If that pubkey's
@@ -925,8 +980,9 @@ impl ValidatorStore {
 
         commit_less_safe(config_path, &self.disk_toml(&candidate), &previous)?;
 
-        // `set_enabled` and the proposer-URL refresher do not bump
-        // `validator_gen`, so the same identity still takes the delta.
+        // `set_enabled` does not take `save_lock` and does not bump
+        // `validator_gen`, so the same identity still takes the delta. The
+        // proposer-URL refresher takes `save_lock` and does not bump it either.
         // Import and delete take `save_lock` and cannot run here. A caller
         // that still mutates identity without the lock leaves a file that
         // describes a validator that is gone or was replaced. Re-snapshot the
@@ -1020,7 +1076,10 @@ impl ValidatorStore {
     ///
     /// A field the URL does not already own takes its baseline from the live
     /// value in this same critical section. A field it already owns keeps that
-    /// baseline. A pubkey the store does not contain is left alone.
+    /// baseline. A field this update does not set is released: the local
+    /// baseline is written back only when the live value still equals the
+    /// remote value, and ownership of that field ends. A pubkey the store
+    /// does not contain is left alone.
     pub fn apply_remote_proposer(
         &self,
         pubkey: &[u8; 48],
@@ -1029,31 +1088,7 @@ impl ValidatorStore {
         validate_update_ingress(&update)?;
         let _save_guard = self.save_lock.lock();
         let mut state = self.state.write();
-        let Some(generation) = state.validator_gen.get(pubkey).copied() else {
-            return Ok(());
-        };
-        let (current_fee, current_gas, current_builder) = {
-            let Some(config) = state.validators.get(pubkey) else {
-                return Ok(());
-            };
-            (config.fee_recipient, config.gas_limit, config.builder_proposals)
-        };
-        {
-            let entry = state.url_owned.entry(*pubkey).or_default();
-            if entry.generation != generation {
-                *entry = UrlOwned { generation, ..UrlOwned::default() };
-            }
-            if let Some(fee) = update.fee_recipient {
-                claim_field(&mut entry.fee_recipient, current_fee, fee);
-            }
-            if let Some(gas) = update.gas_limit {
-                claim_field(&mut entry.gas_limit, current_gas, gas);
-            }
-            if let Some(builder) = update.builder_proposals {
-                claim_field(&mut entry.builder_proposals, current_builder, builder);
-            }
-        }
-        apply_update_locked(&mut state, pubkey, &update);
+        apply_remote_proposer_locked(&mut state, pubkey, &update);
         Ok(())
     }
 
@@ -1064,34 +1099,19 @@ impl ValidatorStore {
     pub fn release_remote_proposer(&self, pubkey: &[u8; 48]) {
         let _save_guard = self.save_lock.lock();
         let mut state = self.state.write();
-        let Some(owned) = state.url_owned.get(pubkey).copied() else {
-            return;
-        };
-        let generation = state.validator_gen.get(pubkey).copied();
-        #[cfg(test)]
-        invoke_release_hook();
-        if generation != Some(owned.generation) {
-            state.url_owned.remove(pubkey);
-            return;
-        }
-        if let Some(config) = state.validators.get_mut(pubkey) {
-            if let Some(fee) = owned.fee_recipient {
-                if config.fee_recipient == fee.applied {
-                    config.fee_recipient = fee.durable;
-                }
-            }
-            if let Some(gas) = owned.gas_limit {
-                if config.gas_limit == gas.applied {
-                    config.gas_limit = gas.durable;
-                }
-            }
-            if let Some(builder) = owned.builder_proposals {
-                if config.builder_proposals == builder.applied {
-                    config.builder_proposals = builder.durable;
-                }
-            }
-        }
-        state.url_owned.remove(pubkey);
+        release_remote_proposer_locked(&mut state, pubkey);
+    }
+
+    /// Release remote defaults the latest successful document no longer sets.
+    ///
+    /// A field in `fields` that the URL owns is restored to its local baseline
+    /// only when the live value still equals the remote value. Ownership of
+    /// each released field ends either way. Fields not named in `fields` stay
+    /// owned. Holds `save_lock` and then one state write.
+    pub fn release_remote_defaults(&self, fields: RemoteDefaultRelease) {
+        let _save_guard = self.save_lock.lock();
+        let mut state = self.state.write();
+        release_remote_defaults_locked(&mut state, fields);
     }
 
     /// Apply a remote `default_config` to the live defaults.
@@ -1105,24 +1125,62 @@ impl ValidatorStore {
         }
         let _save_guard = self.save_lock.lock();
         let mut state = self.state.write();
-        if let Some(fee) = update.fee_recipient {
-            let current = state.defaults.fee_recipient;
-            claim_field(&mut state.remote_defaults.fee_recipient, current, fee);
-            state.defaults.fee_recipient = fee;
+        apply_remote_defaults_locked(&mut state, &update);
+        Ok(())
+    }
+
+    /// Apply one successful proposer-config document.
+    ///
+    /// Holds `save_lock` and then one state write for the rows, the omitted
+    /// pubkeys, and the defaults. Rows are claimed before defaults are
+    /// released, so a reader does not observe the local default fee for a
+    /// row this document still sets. Validation `Err` returns before any write.
+    /// Two or more omitted pubkeys are logged at warn. Claims and releases
+    /// are logged at info.
+    pub fn apply_remote_document(
+        &self,
+        rows: Vec<([u8; 48], ValidatorConfigUpdate)>,
+        missing: Vec<[u8; 48]>,
+        defaults: Option<DefaultUpdate>,
+    ) -> Result<(), ValidatorStoreError> {
+        for (_, update) in &rows {
+            validate_update_ingress(update)?;
         }
-        if let Some(gas) = update.gas_limit {
-            let current = state.defaults.gas_limit;
-            claim_field(&mut state.remote_defaults.gas_limit, current, gas);
-            state.defaults.gas_limit = gas;
+        if let Some(gl) = defaults.as_ref().and_then(|update| update.gas_limit) {
+            ensure_toml_u64("gas_limit", gl)?;
         }
-        if let Some(graffiti) = update.graffiti {
-            let current = state.defaults.graffiti;
-            claim_field(&mut state.remote_defaults.graffiti, current, graffiti);
-            state.defaults.graffiti = graffiti;
+        let row_count = rows.len();
+        let released = missing.len();
+        {
+            let _save_guard = self.save_lock.lock();
+            let mut state = self.state.write();
+            for (pubkey, update) in rows {
+                apply_remote_proposer_locked(&mut state, &pubkey, &update);
+            }
+            for pubkey in &missing {
+                release_remote_proposer_locked(&mut state, pubkey);
+            }
+            publish_remote_defaults_locked(&mut state, defaults);
+        }
+        info!(
+            rows = row_count,
+            released_pubkeys = released,
+            "proposer config url document applied"
+        );
+        if released > 1 {
+            warn!(
+                released_pubkeys = released,
+                "proposer config url released multiple tracked validators"
+            );
         }
         Ok(())
     }
 
+    /// Validators-file document for `state`.
+    ///
+    /// Reverts the proposer-URL overlay on a clone, then snapshots. RV-4.5's
+    /// `commit_then_publish` must persist this document. [`snapshot_toml`] of
+    /// the live state still contains URL-owned values and is not a file write.
     fn disk_toml(&self, state: &StoreState) -> TomlConfig {
         let mut durable = state.clone();
         revert_remote_overlay(&mut durable);
@@ -1147,6 +1205,14 @@ impl ValidatorStore {
         commit_snapshot(config_path, &toml_config)
     }
 
+    /// Re-read the validators file and merge it into the live store.
+    ///
+    /// Parse errors return before any write, which is the path RV-5.1 uses
+    /// for an unknown key. On success, pubkeys absent from the file keep
+    /// their URL ownership and their live URL values. Pubkeys the file
+    /// contains are replaced from the file and lose URL ownership. Remote
+    /// defaults are cleared because live defaults are replaced from the file.
+    /// Nothing in the shipped binary calls this.
     #[tracing::instrument(name = "validator_store.reload_config", skip_all)]
     pub fn reload_config(&self) -> Result<(), ValidatorStoreError> {
         let path = self.config_path.as_ref().ok_or_else(|| {
@@ -1177,10 +1243,12 @@ impl ValidatorStore {
         // visible to concurrent readers as a single atomic transition. Merge
         // (insert/overwrite) preserves programmatic validators not present in
         // the file; global_block_selection_mode is left untouched.
+        let in_file: HashSet<[u8; 48]> =
+            parsed_validators.iter().map(|config| config.pubkey).collect();
         let mut state = self.state.write();
         state.defaults = new_defaults;
-        state.url_owned.clear();
         state.remote_defaults = RemoteDefaults::default();
+        state.url_owned.retain(|pubkey, _| !in_file.contains(pubkey));
         let existing_count = state.validators.len();
         for config in parsed_validators {
             state.insert_validator(config);
@@ -1401,10 +1469,10 @@ fn sync_parent_dir(parent: &Path) -> Result<(), ValidatorStoreError> {
     Ok(())
 }
 
-/// Apply `update` to `pubkey` under the caller's state guard.
+/// Record `remote` as the URL value of one field.
 ///
-/// Returns the changed field names when that validator is present, or an empty
-/// vec when it is not (unknown pubkeys stay a no-op).
+/// The first claim stores `current` as the local baseline. A later claim
+/// keeps that baseline and replaces only the remote value.
 fn claim_field<T: Copy>(slot: &mut Option<OwnedValue<T>>, current: T, remote: T) {
     match slot {
         Some(owned) => owned.applied = remote,
@@ -1441,6 +1509,155 @@ fn drop_url_owned_fields(
     }
 }
 
+fn apply_remote_proposer_locked(
+    state: &mut StoreState,
+    pubkey: &[u8; 48],
+    update: &ValidatorConfigUpdate,
+) {
+    let Some(generation) = state.validator_gen.get(pubkey).copied() else {
+        return;
+    };
+    let Some(config) = state.validators.get(pubkey) else {
+        return;
+    };
+    let (current_fee, current_gas, current_builder) =
+        (config.fee_recipient, config.gas_limit, config.builder_proposals);
+    let mut entry = state.url_owned.get(pubkey).copied().unwrap_or_default();
+    if entry.generation != generation {
+        entry = UrlOwned { generation, ..UrlOwned::default() };
+    }
+    if let Some(config) = state.validators.get_mut(pubkey) {
+        release_absent_fields(config, &mut entry, update);
+    }
+    if let Some(fee) = update.fee_recipient {
+        claim_field(&mut entry.fee_recipient, current_fee, fee);
+    }
+    if let Some(gas) = update.gas_limit {
+        claim_field(&mut entry.gas_limit, current_gas, gas);
+    }
+    if let Some(builder) = update.builder_proposals {
+        claim_field(&mut entry.builder_proposals, current_builder, builder);
+    }
+    if entry.fee_recipient.is_none()
+        && entry.gas_limit.is_none()
+        && entry.builder_proposals.is_none()
+    {
+        state.url_owned.remove(pubkey);
+    } else {
+        state.url_owned.insert(*pubkey, entry);
+    }
+    apply_update_locked(state, pubkey, update);
+}
+
+fn release_remote_proposer_locked(state: &mut StoreState, pubkey: &[u8; 48]) {
+    let Some(owned) = state.url_owned.get(pubkey).copied() else {
+        return;
+    };
+    let generation = state.validator_gen.get(pubkey).copied();
+    #[cfg(test)]
+    invoke_release_hook();
+    if generation != Some(owned.generation) {
+        state.url_owned.remove(pubkey);
+        return;
+    }
+    if let Some(config) = state.validators.get_mut(pubkey) {
+        if let Some(fee) = owned.fee_recipient {
+            restore_url_value(&mut config.fee_recipient, fee);
+        }
+        if let Some(gas) = owned.gas_limit {
+            restore_url_value(&mut config.gas_limit, gas);
+        }
+        if let Some(builder) = owned.builder_proposals {
+            restore_url_value(&mut config.builder_proposals, builder);
+        }
+    }
+    state.url_owned.remove(pubkey);
+}
+
+fn apply_remote_defaults_locked(state: &mut StoreState, update: &DefaultUpdate) {
+    if let Some(fee) = update.fee_recipient {
+        let current = state.defaults.fee_recipient;
+        claim_field(&mut state.remote_defaults.fee_recipient, current, fee);
+        state.defaults.fee_recipient = fee;
+    }
+    if let Some(gas) = update.gas_limit {
+        let current = state.defaults.gas_limit;
+        claim_field(&mut state.remote_defaults.gas_limit, current, gas);
+        state.defaults.gas_limit = gas;
+    }
+    if let Some(graffiti) = update.graffiti {
+        let current = state.defaults.graffiti;
+        claim_field(&mut state.remote_defaults.graffiti, current, graffiti);
+        state.defaults.graffiti = graffiti;
+    }
+}
+
+fn release_remote_defaults_locked(state: &mut StoreState, fields: RemoteDefaultRelease) {
+    if fields.fee_recipient {
+        if let Some(owned) = state.remote_defaults.fee_recipient.take() {
+            restore_url_value(&mut state.defaults.fee_recipient, owned);
+        }
+    }
+    if fields.gas_limit {
+        if let Some(owned) = state.remote_defaults.gas_limit.take() {
+            restore_url_value(&mut state.defaults.gas_limit, owned);
+        }
+    }
+    if fields.graffiti {
+        if let Some(owned) = state.remote_defaults.graffiti.take() {
+            restore_url_value(&mut state.defaults.graffiti, owned);
+        }
+    }
+}
+
+/// Defaults are published after rows. The test hook runs at the end of that
+/// publish, so it observes the post-default state. A call moved ahead of the
+/// row claims runs the hook before those claims.
+fn publish_remote_defaults_locked(state: &mut StoreState, defaults: Option<DefaultUpdate>) {
+    match defaults {
+        None => release_remote_defaults_locked(state, RemoteDefaultRelease::all()),
+        Some(update) => {
+            let release = RemoteDefaultRelease::omitted(&update);
+            apply_remote_defaults_locked(state, &update);
+            release_remote_defaults_locked(state, release);
+        }
+    }
+    #[cfg(test)]
+    invoke_document_hook(state);
+}
+
+/// Write `owned.durable` back when `live` is still the remote value.
+fn restore_url_value<T: Copy + PartialEq>(live: &mut T, owned: OwnedValue<T>) {
+    if *live == owned.applied {
+        *live = owned.durable;
+    }
+}
+
+/// Release row fields this update does not set. Shared with
+/// [`release_remote_proposer`] and [`revert_remote_overlay`] through
+/// [`restore_url_value`].
+fn release_absent_fields(
+    config: &mut ValidatorConfig,
+    entry: &mut UrlOwned,
+    update: &ValidatorConfigUpdate,
+) {
+    if update.fee_recipient.is_none() {
+        if let Some(owned) = entry.fee_recipient.take() {
+            restore_url_value(&mut config.fee_recipient, owned);
+        }
+    }
+    if update.gas_limit.is_none() {
+        if let Some(owned) = entry.gas_limit.take() {
+            restore_url_value(&mut config.gas_limit, owned);
+        }
+    }
+    if update.builder_proposals.is_none() {
+        if let Some(owned) = entry.builder_proposals.take() {
+            restore_url_value(&mut config.builder_proposals, owned);
+        }
+    }
+}
+
 fn revert_remote_overlay(state: &mut StoreState) {
     let owned = std::mem::take(&mut state.url_owned);
     for (pubkey, fields) in owned {
@@ -1454,39 +1671,31 @@ fn revert_remote_overlay(state: &mut StoreState) {
             continue;
         };
         if let Some(fee) = fields.fee_recipient {
-            if config.fee_recipient == fee.applied {
-                config.fee_recipient = fee.durable;
-            }
+            restore_url_value(&mut config.fee_recipient, fee);
         }
         if let Some(gas) = fields.gas_limit {
-            if config.gas_limit == gas.applied {
-                config.gas_limit = gas.durable;
-            }
+            restore_url_value(&mut config.gas_limit, gas);
         }
         if let Some(builder) = fields.builder_proposals {
-            if config.builder_proposals == builder.applied {
-                config.builder_proposals = builder.durable;
-            }
+            restore_url_value(&mut config.builder_proposals, builder);
         }
     }
-    if let Some(fee) = state.remote_defaults.fee_recipient {
-        if state.defaults.fee_recipient == fee.applied {
-            state.defaults.fee_recipient = fee.durable;
-        }
+    if let Some(fee) = state.remote_defaults.fee_recipient.take() {
+        restore_url_value(&mut state.defaults.fee_recipient, fee);
     }
-    if let Some(gas) = state.remote_defaults.gas_limit {
-        if state.defaults.gas_limit == gas.applied {
-            state.defaults.gas_limit = gas.durable;
-        }
+    if let Some(gas) = state.remote_defaults.gas_limit.take() {
+        restore_url_value(&mut state.defaults.gas_limit, gas);
     }
-    if let Some(graffiti) = state.remote_defaults.graffiti {
-        if state.defaults.graffiti == graffiti.applied {
-            state.defaults.graffiti = graffiti.durable;
-        }
+    if let Some(graffiti) = state.remote_defaults.graffiti.take() {
+        restore_url_value(&mut state.defaults.graffiti, graffiti);
     }
     state.remote_defaults = RemoteDefaults::default();
 }
 
+/// Apply `update` to `pubkey` under the caller's state guard.
+///
+/// Returns the changed field names when that validator is present, or an empty
+/// vec when it is not (unknown pubkeys stay a no-op).
 fn apply_update_locked(
     state: &mut StoreState,
     pubkey: &[u8; 48],
@@ -1747,6 +1956,15 @@ thread_local! {
     static RELEASE_PROBE_STORE: std::cell::RefCell<Option<std::sync::Arc<ValidatorStore>>> =
         const { std::cell::RefCell::new(None) };
     static RELEASE_LOCKS_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DOCUMENT_HOOK: std::cell::Cell<Option<fn(&StoreState)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn invoke_document_hook(state: &StoreState) {
+    if let Some(hook) = DOCUMENT_HOOK.with(|slot| slot.get()) {
+        hook(state);
+    }
 }
 
 #[cfg(test)]
@@ -5364,5 +5582,617 @@ builder_boost_factor = 175
         super::RELEASE_PROBE_STORE.with(|slot| *slot.borrow_mut() = None);
         assert!(super::RELEASE_LOCKS_HELD.with(|slot| slot.get()));
         assert_eq!(store.get_config(&pk).unwrap().fee_recipient, Some(test_fee_recipient(2)));
+    }
+
+    /// A reload leaves URL ownership on rows the file does not replace.
+    /// A later save writes their local baseline. Rows the file replaces take
+    /// the file values, and remote defaults are cleared with that replace.
+    #[test]
+    fn a_reload_keeps_url_ownership_for_rows_absent_from_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let file_pk = test_pubkey(1);
+        let mem_pk = test_pubkey(2);
+        let file_fee = test_fee_recipient(0x11);
+        let mem_fee = test_fee_recipient(0x22);
+        let remote_fee = test_fee_recipient(0x33);
+        let local_default = test_fee_recipient(0x01);
+        let body = format!(
+            "[defaults]\nfee_recipient = \"0x{}\"\ngas_limit = 30000000\n\n[[validators]]\npubkey = \"0x{}\"\nfee_recipient = \"0x{}\"\ngas_limit = 21000000\nbuilder_proposals = false\n",
+            hex::encode(local_default),
+            hex::encode(file_pk),
+            hex::encode(file_fee),
+        );
+        std::fs::write(&path, &body).unwrap();
+        let store = ValidatorStore::load_from_config(&path).unwrap();
+        let mut mem = ValidatorConfig::new(mem_pk);
+        mem.fee_recipient = Some(mem_fee);
+        mem.gas_limit = Some(21_000_000);
+        store.add_validator(mem).unwrap();
+
+        let remote = ValidatorConfigUpdate {
+            fee_recipient: Some(Some(remote_fee)),
+            gas_limit: Some(Some(36_000_000)),
+            builder_proposals: Some(true),
+            ..ValidatorConfigUpdate::default()
+        };
+        store.apply_remote_proposer(&mem_pk, remote).unwrap();
+        store
+            .apply_remote_proposer(
+                &file_pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(remote_fee)),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        store
+            .apply_remote_defaults(DefaultUpdate {
+                fee_recipient: Some(remote_fee),
+                gas_limit: Some(40_000_000),
+                ..DefaultUpdate::default()
+            })
+            .unwrap();
+
+        store.reload_config().unwrap();
+        {
+            let state = store.state.read();
+            assert!(state.url_owned.contains_key(&mem_pk));
+            assert!(!state.url_owned.contains_key(&file_pk));
+            assert!(state.remote_defaults.fee_recipient.is_none());
+            assert!(state.remote_defaults.gas_limit.is_none());
+            assert!(state.remote_defaults.graffiti.is_none());
+        }
+
+        let mem_row = store.get_config(&mem_pk).unwrap();
+        assert_eq!(mem_row.fee_recipient, Some(remote_fee));
+        assert_eq!(mem_row.gas_limit, Some(36_000_000));
+        assert!(mem_row.builder_proposals);
+        let file_row = store.get_config(&file_pk).unwrap();
+        assert_eq!(file_row.fee_recipient, Some(file_fee));
+        assert_eq!(file_row.gas_limit, Some(21_000_000));
+        assert!(!file_row.builder_proposals);
+
+        store.save_config().unwrap();
+        let fresh = ValidatorStore::load_from_config(&path).unwrap();
+        let saved = fresh.get_config(&mem_pk).expect("absent row is still durable as its baseline");
+        assert_eq!(saved.fee_recipient, Some(mem_fee));
+        assert_eq!(saved.gas_limit, Some(21_000_000));
+        assert!(!saved.builder_proposals);
+
+        store.release_remote_proposer(&mem_pk);
+        let restored = store.get_config(&mem_pk).unwrap();
+        assert_eq!(restored.fee_recipient, Some(mem_fee));
+        assert_eq!(restored.gas_limit, Some(21_000_000));
+        assert!(!restored.builder_proposals);
+
+        store.release_remote_proposer(&file_pk);
+        assert_eq!(store.get_config(&file_pk).unwrap().fee_recipient, Some(file_fee));
+        assert_eq!(store.default_fee_recipient(), local_default);
+        assert_eq!(store.default_gas_limit(), 30_000_000);
+    }
+
+    /// An equal in-memory write drops URL ownership, so omission keeps it.
+    #[test]
+    fn a_non_durable_update_equal_to_the_url_value_becomes_the_baseline() {
+        let store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let pk = test_pubkey(1);
+        let baseline = test_fee_recipient(1);
+        let remote = test_fee_recipient(2);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(baseline);
+        cfg.gas_limit = Some(21_000_000);
+        store.add_validator(cfg).unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(remote)),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        store
+            .update_config(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(remote)),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        store.release_remote_proposer(&pk);
+        let live = store.get_config(&pk).unwrap();
+        assert_eq!(live.fee_recipient, Some(remote));
+        assert_eq!(live.gas_limit, Some(36_000_000));
+        assert!(live.builder_proposals);
+    }
+
+    /// Restore writes the baseline only when live still equals the URL value.
+    #[test]
+    fn release_keeps_a_live_fee_that_no_longer_matches_the_url_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let pk = test_pubkey(1);
+        let baseline = test_fee_recipient(1);
+        let remote = test_fee_recipient(2);
+        let diverged = test_fee_recipient(3);
+        let mut store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(baseline);
+        cfg.gas_limit = Some(21_000_000);
+        store.add_validator(cfg).unwrap();
+        store.config_path = Some(path.clone());
+        store.save_config().unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(remote)),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        {
+            let mut state = store.state.write();
+            let row = state.validators.get_mut(&pk).unwrap();
+            row.fee_recipient = Some(diverged);
+            row.gas_limit = Some(40_000_000);
+            row.builder_proposals = false;
+        }
+        store.save_config().unwrap();
+        let disk = ValidatorStore::load_from_config(&path).unwrap();
+        let saved = disk.get_config(&pk).unwrap();
+        assert_eq!(saved.fee_recipient, Some(diverged));
+        assert_eq!(saved.gas_limit, Some(40_000_000));
+        assert!(!saved.builder_proposals);
+
+        store.release_remote_proposer(&pk);
+        let live = store.get_config(&pk).unwrap();
+        assert_eq!(live.fee_recipient, Some(diverged));
+        assert_eq!(live.gas_limit, Some(40_000_000));
+        assert!(!live.builder_proposals);
+    }
+
+    /// Durable C then release, and release then durable C. The release hook
+    /// sees both store locks held. Neither order leaves the URL value live.
+    #[test]
+    fn deterministic_release_vs_durable_write_interleavings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let pk = test_pubkey(1);
+        let mut store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(test_fee_recipient(1));
+        cfg.gas_limit = Some(21_000_000);
+        store.add_validator(cfg).unwrap();
+        store.config_path = Some(path.clone());
+        store.save_config().unwrap();
+        let store = std::sync::Arc::new(store);
+        fn remote_update() -> ValidatorConfigUpdate {
+            ValidatorConfigUpdate {
+                fee_recipient: Some(Some(test_fee_recipient(2))),
+                gas_limit: Some(Some(36_000_000)),
+                builder_proposals: Some(true),
+                ..ValidatorConfigUpdate::default()
+            }
+        }
+        fn local_update() -> ValidatorConfigUpdate {
+            ValidatorConfigUpdate {
+                fee_recipient: Some(Some(test_fee_recipient(3))),
+                gas_limit: Some(Some(40_000_000)),
+                builder_proposals: Some(false),
+                ..ValidatorConfigUpdate::default()
+            }
+        }
+
+        // Durable fee C while gas and builder stay URL-owned, then release.
+        // The hook runs because ownership remains. Fee stays C.
+        store.apply_remote_proposer(&pk, remote_update()).unwrap();
+        store
+            .update_config_durable(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(test_fee_recipient(3))),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        super::RELEASE_LOCKS_HELD.with(|slot| slot.set(false));
+        super::RELEASE_PROBE_STORE
+            .with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(&store)));
+        super::RELEASE_HOOK.with(|slot| slot.set(Some(super::probe_release_locks)));
+        store.release_remote_proposer(&pk);
+        super::RELEASE_HOOK.with(|slot| slot.set(None));
+        assert!(super::RELEASE_LOCKS_HELD.with(|slot| slot.get()));
+        let after_release = store.get_config(&pk).unwrap();
+        assert_eq!(after_release.fee_recipient, Some(test_fee_recipient(3)));
+        assert_eq!(after_release.gas_limit, Some(21_000_000));
+        assert!(!after_release.builder_proposals);
+        let disk = ValidatorStore::load_from_config(&path).unwrap().get_config(&pk).unwrap();
+        assert_eq!(disk.fee_recipient, Some(test_fee_recipient(3)));
+        assert_eq!(disk.gas_limit, Some(21_000_000));
+        assert!(!disk.builder_proposals);
+
+        store.apply_remote_proposer(&pk, remote_update()).unwrap();
+        super::RELEASE_LOCKS_HELD.with(|slot| slot.set(false));
+        super::RELEASE_HOOK.with(|slot| slot.set(Some(super::probe_release_locks)));
+        store.release_remote_proposer(&pk);
+        super::RELEASE_HOOK.with(|slot| slot.set(None));
+        super::RELEASE_PROBE_STORE.with(|slot| *slot.borrow_mut() = None);
+        assert!(super::RELEASE_LOCKS_HELD.with(|slot| slot.get()));
+        assert_eq!(store.get_config(&pk).unwrap().fee_recipient, Some(test_fee_recipient(3)));
+        assert_eq!(store.get_config(&pk).unwrap().gas_limit, Some(21_000_000));
+        store.update_config_durable(&pk, local_update()).unwrap();
+        let live = store.get_config(&pk).unwrap();
+        assert_eq!(live.fee_recipient, Some(test_fee_recipient(3)));
+        assert_eq!(live.gas_limit, Some(40_000_000));
+        assert!(!live.builder_proposals);
+        let disk = ValidatorStore::load_from_config(&path).unwrap().get_config(&pk).unwrap();
+        assert_eq!(disk.fee_recipient, Some(test_fee_recipient(3)));
+        assert_eq!(disk.gas_limit, Some(40_000_000));
+        assert!(!disk.builder_proposals);
+    }
+
+    /// A local default write of the remote value becomes the baseline.
+    /// Omission must not restore the pre-URL default. Covers fee, gas, and
+    /// graffiti, including a write equal to the remote value.
+    #[test]
+    fn a_local_default_write_drops_remote_default_ownership() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let remote_fee = test_fee_recipient(2);
+        let graffiti = [0x11u8; 32];
+        store
+            .apply_remote_defaults(DefaultUpdate {
+                fee_recipient: Some(remote_fee),
+                gas_limit: Some(40_000_000),
+                graffiti: Some(Some(graffiti)),
+            })
+            .unwrap();
+        store
+            .apply_default_update(DefaultUpdate {
+                fee_recipient: Some(remote_fee),
+                gas_limit: Some(40_000_000),
+                graffiti: Some(Some(graffiti)),
+            })
+            .unwrap();
+        store.release_remote_defaults(RemoteDefaultRelease::all());
+        assert_eq!(store.default_fee_recipient(), remote_fee);
+        assert_eq!(store.default_gas_limit(), 40_000_000);
+        assert_eq!(store.state.read().defaults.graffiti, Some(graffiti));
+    }
+
+    /// Reload replaces defaults from the file. A file that repeats the remote
+    /// value must not snap back to the pre-URL baseline on a later release.
+    #[test]
+    fn a_reload_clears_remote_defaults_when_the_file_repeats_the_remote_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let pk = test_pubkey(1);
+        let local = test_fee_recipient(1);
+        let remote = test_fee_recipient(2);
+        let graffiti = super::parse_graffiti("x");
+        let body = format!(
+            "[defaults]\nfee_recipient = \"0x{}\"\ngas_limit = 30000000\n\n[[validators]]\npubkey = \"0x{}\"\n",
+            hex::encode(local),
+            hex::encode(pk),
+        );
+        std::fs::write(&path, body).unwrap();
+        let store = ValidatorStore::load_from_config(&path).unwrap();
+        store
+            .apply_remote_defaults(DefaultUpdate {
+                fee_recipient: Some(remote),
+                gas_limit: Some(40_000_000),
+                graffiti: Some(Some(graffiti)),
+            })
+            .unwrap();
+        let edited = format!(
+            "[defaults]\nfee_recipient = \"0x{}\"\ngas_limit = 40000000\ngraffiti = \"x\"\n\n[[validators]]\npubkey = \"0x{}\"\n",
+            hex::encode(remote),
+            hex::encode(pk),
+        );
+        std::fs::write(&path, edited).unwrap();
+        store.reload_config().unwrap();
+        assert_eq!(store.default_fee_recipient(), remote);
+        assert_eq!(store.default_gas_limit(), 40_000_000);
+        assert_eq!(store.state.read().defaults.graffiti, Some(graffiti));
+        store.release_remote_defaults(RemoteDefaultRelease::all());
+        assert_eq!(store.default_fee_recipient(), remote);
+        assert_eq!(store.default_gas_limit(), 40_000_000);
+        assert_eq!(store.state.read().defaults.graffiti, Some(graffiti));
+    }
+
+    /// Re-insert bumps generation and leaves the old overlay in place.
+    /// An omission must not write that overlay's baseline onto the new row
+    /// when the new row still equals the remote value.
+    #[test]
+    fn a_reinsert_then_omission_does_not_restore_the_previous_baseline() {
+        let store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let pk = test_pubkey(1);
+        let baseline = test_fee_recipient(1);
+        let remote = test_fee_recipient(2);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(baseline);
+        cfg.gas_limit = Some(21_000_000);
+        store.add_validator(cfg).unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(remote)),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        let mut again = ValidatorConfig::new(pk);
+        again.fee_recipient = Some(remote);
+        again.gas_limit = Some(36_000_000);
+        again.builder_proposals = true;
+        store.add_validator(again).unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    gas_limit: Some(Some(40_000_000)),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        let live = store.get_config(&pk).unwrap();
+        assert_eq!(live.fee_recipient, Some(remote));
+        assert_eq!(live.gas_limit, Some(40_000_000));
+        assert!(live.builder_proposals);
+    }
+
+    /// A later document that omits one field restores that field and keeps
+    /// the fields it still sets. A later value does not replace the baseline.
+    #[test]
+    fn an_omitted_field_restores_only_that_field() {
+        let store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let pk = test_pubkey(1);
+        let baseline = test_fee_recipient(1);
+        let remote = test_fee_recipient(2);
+        let later = test_fee_recipient(3);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(baseline);
+        cfg.gas_limit = Some(21_000_000);
+        store.add_validator(cfg).unwrap();
+        let full = ValidatorConfigUpdate {
+            fee_recipient: Some(Some(remote)),
+            gas_limit: Some(Some(36_000_000)),
+            builder_proposals: Some(true),
+            ..ValidatorConfigUpdate::default()
+        };
+        store.apply_remote_proposer(&pk, full).unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(later)),
+                    gas_limit: Some(Some(40_000_000)),
+                    builder_proposals: Some(false),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        store.release_remote_proposer(&pk);
+        let kept = store.get_config(&pk).unwrap();
+        assert_eq!(kept.fee_recipient, Some(baseline));
+        assert_eq!(kept.gas_limit, Some(21_000_000));
+        assert!(!kept.builder_proposals);
+
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(remote)),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    gas_limit: Some(Some(36_000_000)),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        let fee_and_builder_back = store.get_config(&pk).unwrap();
+        assert_eq!(fee_and_builder_back.fee_recipient, Some(baseline));
+        assert_eq!(fee_and_builder_back.gas_limit, Some(36_000_000));
+        assert!(!fee_and_builder_back.builder_proposals);
+
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(remote)),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        let gas_back = store.get_config(&pk).unwrap();
+        assert_eq!(gas_back.fee_recipient, Some(remote));
+        assert_eq!(gas_back.gas_limit, Some(21_000_000));
+        assert!(!gas_back.builder_proposals);
+    }
+
+    #[test]
+    fn release_remote_defaults_restores_only_named_fields() {
+        let store = ValidatorStore::new(test_fee_recipient(1), 30_000_000);
+        let remote = test_fee_recipient(2);
+        let graffiti = [0x11u8; 32];
+        store
+            .apply_remote_defaults(DefaultUpdate {
+                fee_recipient: Some(remote),
+                gas_limit: Some(40_000_000),
+                graffiti: Some(Some(graffiti)),
+            })
+            .unwrap();
+        store.release_remote_defaults(RemoteDefaultRelease {
+            fee_recipient: true,
+            gas_limit: false,
+            graffiti: false,
+        });
+        assert_eq!(store.default_fee_recipient(), test_fee_recipient(1));
+        assert_eq!(store.default_gas_limit(), 40_000_000);
+        assert_eq!(store.state.read().defaults.graffiti, Some(graffiti));
+        store.release_remote_defaults(RemoteDefaultRelease {
+            fee_recipient: false,
+            gas_limit: true,
+            graffiti: true,
+        });
+        assert_eq!(store.default_gas_limit(), 30_000_000);
+        assert_eq!(store.state.read().defaults.graffiti, None);
+    }
+
+    #[test]
+    fn omitted_names_only_unset_default_fields() {
+        let partial = RemoteDefaultRelease::omitted(&DefaultUpdate {
+            fee_recipient: Some(test_fee_recipient(1)),
+            gas_limit: None,
+            graffiti: None,
+        });
+        assert!(!partial.fee_recipient);
+        assert!(partial.gas_limit);
+        assert!(partial.graffiti);
+        let fee_unset = RemoteDefaultRelease::omitted(&DefaultUpdate {
+            fee_recipient: None,
+            gas_limit: Some(1),
+            graffiti: Some(None),
+        });
+        assert!(fee_unset.fee_recipient);
+        assert!(!fee_unset.gas_limit);
+        assert!(!fee_unset.graffiti);
+        let all_set = RemoteDefaultRelease::omitted(&DefaultUpdate {
+            fee_recipient: Some(test_fee_recipient(1)),
+            gas_limit: Some(1),
+            graffiti: Some(None),
+        });
+        assert!(!all_set.fee_recipient);
+        assert!(!all_set.gas_limit);
+        assert!(!all_set.graffiti);
+    }
+
+    thread_local! {
+        static DOCUMENT_FEE: std::cell::Cell<Option<[u8; 20]>> = const { std::cell::Cell::new(None) };
+    }
+
+    fn record_document_fee(state: &super::StoreState) {
+        let pk = test_pubkey(1);
+        let fee = state
+            .validators
+            .get(&pk)
+            .and_then(|row| row.fee_recipient)
+            .unwrap_or(state.defaults.fee_recipient);
+        DOCUMENT_FEE.with(|slot| slot.set(Some(fee)));
+    }
+
+    /// A row that inherits the URL default fee must already show the document's
+    /// per-validator fee when that default is released. Releasing the default
+    /// first would show the local default inside the same document.
+    #[test]
+    fn a_document_claims_rows_before_releasing_defaults() {
+        let local = test_fee_recipient(1);
+        let remote_default = test_fee_recipient(2);
+        let row_fee = test_fee_recipient(3);
+        let store = ValidatorStore::new(local, 30_000_000);
+        let pk = test_pubkey(1);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = None;
+        cfg.gas_limit = Some(21_000_000);
+        store.add_validator(cfg).unwrap();
+        store
+            .apply_remote_defaults(DefaultUpdate {
+                fee_recipient: Some(remote_default),
+                gas_limit: None,
+                graffiti: None,
+            })
+            .unwrap();
+        assert_eq!(store.effective_fee_recipient(&pk), remote_default);
+
+        DOCUMENT_FEE.with(|slot| slot.set(None));
+        super::DOCUMENT_HOOK.with(|slot| slot.set(Some(record_document_fee)));
+        store
+            .apply_remote_document(
+                vec![(
+                    pk,
+                    ValidatorConfigUpdate {
+                        fee_recipient: Some(Some(row_fee)),
+                        ..ValidatorConfigUpdate::default()
+                    },
+                )],
+                Vec::new(),
+                None,
+            )
+            .unwrap();
+        super::DOCUMENT_HOOK.with(|slot| slot.set(None));
+
+        assert_eq!(DOCUMENT_FEE.with(|slot| slot.get()), Some(row_fee));
+        assert_eq!(store.effective_fee_recipient(&pk), row_fee);
+        assert_eq!(store.default_fee_recipient(), local);
+    }
+
+    /// Re-insert bumps generation and leaves the overlay while live still
+    /// equals the remote value. Release must not write the old baseline, and
+    /// the overlay must be gone. A disk snapshot must keep the reinserted row.
+    #[test]
+    fn a_generation_mismatch_skips_restore_on_release_and_on_revert() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("validators.toml");
+        let pk = test_pubkey(1);
+        let baseline = test_fee_recipient(1);
+        let remote = test_fee_recipient(2);
+        let mut store = ValidatorStore::new(test_fee_recipient(9), 30_000_000);
+        let mut cfg = ValidatorConfig::new(pk);
+        cfg.fee_recipient = Some(baseline);
+        cfg.gas_limit = Some(21_000_000);
+        store.add_validator(cfg).unwrap();
+        store.config_path = Some(path.clone());
+        store.save_config().unwrap();
+        store
+            .apply_remote_proposer(
+                &pk,
+                ValidatorConfigUpdate {
+                    fee_recipient: Some(Some(remote)),
+                    gas_limit: Some(Some(36_000_000)),
+                    builder_proposals: Some(true),
+                    ..ValidatorConfigUpdate::default()
+                },
+            )
+            .unwrap();
+        let mut again = ValidatorConfig::new(pk);
+        again.fee_recipient = Some(remote);
+        again.gas_limit = Some(36_000_000);
+        again.builder_proposals = true;
+        store.add_validator(again).unwrap();
+        assert!(store.state.read().url_owned.contains_key(&pk));
+
+        store.save_config().unwrap();
+        let saved = ValidatorStore::load_from_config(&path).unwrap().get_config(&pk).unwrap();
+        assert_eq!(saved.fee_recipient, Some(remote));
+        assert_eq!(saved.gas_limit, Some(36_000_000));
+        assert!(saved.builder_proposals);
+
+        store.release_remote_proposer(&pk);
+        let live = store.get_config(&pk).unwrap();
+        assert_eq!(live.fee_recipient, Some(remote));
+        assert_eq!(live.gas_limit, Some(36_000_000));
+        assert!(live.builder_proposals);
+        assert!(store.state.read().url_owned.is_empty());
     }
 }
