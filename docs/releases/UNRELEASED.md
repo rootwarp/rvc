@@ -3,6 +3,18 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Selection shape is applied when the block is collected
+
+Builder-only drops a local block while candidates are collected. That block does not end the wait, and the fallback does not return it. Execution-only drops a blinded block the same way. Max-profit and builder-always still accept either shape while the builder circuit breaker is clear.
+
+While the breaker is tripped, max-profit and builder-always use the execution-only shape check. A pre-Gloas blinded block and a Gloas external bid are not signed. The produce request uses boost 0, and on Gloas the builder list stays empty. Builder-only still misses the slot when the breaker is tripped.
+
+A failed publish of a pre-Gloas blinded block, or of a Gloas external bid, counts toward the breaker. A local publish does not. Only a successful publish on that builder path resets the consecutive miss count: a blinded block the beacon node accepted, or a Gloas external bid. A later local block does not reset it. The proposal timeout still does not count a miss.
+
+The breaker is clear or tripped. Misses below the limit leave it clear. There is no half-open state.
+
+The per-validator builder flag is unchanged.
+
 ## Aggregate responses are checked before signing
 
 An aggregate is signed only when its slot, attestation-data root, committee, attester-bit length, and fork match the request. The root is the unmodified attestation data. At Electra and Fulu the data index must be zero. Before Electra it must be the duty's committee index. At Gloas the index stays in that root. A beacon node without aggregate v2 returns an Electra body on Fulu and Gloas; that body is accepted. The duty's committee length must be 1 through 2048 on every fork. The attester bitlist must be exactly that length, and still inside the fork's spec maximum. A mismatch increments `rvc_aggregations_total{status="failed"}` and is not signed.
@@ -464,7 +476,7 @@ wrong shape, the proposal still returns a builder-only error and names that
 shape, even if a later candidate fails for another reason. A lone wrong-slot
 blinded block stays a slot mismatch. Execution-only returns a mode mismatch, which does not trip
 the builder circuit breaker. Max-profit and builder-always still accept
-either shape.
+either shape while the builder circuit breaker is clear.
 
 On `produceBlockV4`, a boost of 0 clears `builders`. That is execution-only,
 and max-profit or builder-always while the circuit breaker is tripped. A

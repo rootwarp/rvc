@@ -358,15 +358,16 @@ async fn produce_hits(server: &MockServer) -> usize {
 async fn proposer_candidate_captured_before_revocation_is_not_signed() {
     let main = MockServer::start().await;
     let proposer = MockServer::start().await;
-    let body = blinded_block();
+    // Execution-only collection rejects a blinded body. This candidate has to
+    // survive that gate so the post-produce fence is what drops it.
     Mock::given(method("GET"))
         .and(path(format!("/eth/v3/validator/blocks/{SLOT}")))
-        .respond_with(produce_template(body.clone()))
+        .respond_with(full_deneb_template())
         .mount(&proposer)
         .await;
     Mock::given(method("GET"))
         .and(path(format!("/eth/v3/validator/blocks/{}", SLOT + 1)))
-        .respond_with(produce_template(body))
+        .respond_with(full_deneb_template())
         .mount(&main)
         .await;
     let main_mgr = manager(main.uri());

@@ -427,6 +427,8 @@ pub(crate) struct MockBeaconClient {
     pub(crate) revocation: Arc<AtomicU64>,
     pub(crate) also_revocation: Option<Arc<AtomicU64>>,
     pub(crate) third_revocation: Option<Arc<AtomicU64>>,
+    /// Duty passed to the last `produce_block_v3_ranked` call.
+    pub(crate) last_duty: Mutex<Option<crate::ProduceDuty>>,
 }
 
 impl MockBeaconClient {
@@ -454,6 +456,7 @@ impl MockBeaconClient {
             revocation: Arc::new(AtomicU64::new(0)),
             also_revocation: None,
             third_revocation: None,
+            last_duty: Mutex::new(None),
         }
     }
 
@@ -755,8 +758,9 @@ impl BeaconBlockClient for MockBeaconClient {
         randao_reveal: &str,
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
-        _duty: Option<crate::ProduceDuty>,
+        duty: Option<crate::ProduceDuty>,
     ) -> Result<Vec<RankedBlock>, BlockServiceError> {
+        *self.last_duty.lock().unwrap() = duty;
         if let Some(list) = self.ranked_candidates.lock().unwrap().clone() {
             let call = CapturedProduceCall {
                 slot,

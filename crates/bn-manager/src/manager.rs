@@ -11,12 +11,12 @@ use beacon::{
     BeaconCommitteeSubscription, BeaconError, BlockHeaderSummary, BlockRootResponse, BuilderConfig,
     BuilderPreferencesEntry, ConfigSpecResponse, DutyFence, GenesisResponse, IndexedFailure,
     PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
-    ProposerPreparation, PtcDutiesResponse, RankedBlock, SignedContributionAndProof,
-    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
-    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
-    SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
-    VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    WireBody,
+    ProposerPreparation, PtcDutiesResponse, RankedBlock, ShapeConstraint,
+    SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
+    SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
+    SyncCommitteeMessage, SyncingResponse, ValidatorLiveness, ValidatorLivenessResponse,
+    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
+    VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -2376,6 +2376,7 @@ struct BlockDutyChecks {
     parent_closed: bool,
     fee_recipient: Option<[u8; 20]>,
     consensus_version: ForkName,
+    shape: ShapeConstraint,
 }
 
 fn checks_from_duty(slot: u64, duty: ProduceDuty) -> BlockDutyChecks {
@@ -2387,6 +2388,7 @@ fn checks_from_duty(slot: u64, duty: ProduceDuty) -> BlockDutyChecks {
         parent_closed: duty.parent_closed,
         fee_recipient: duty.expected_fee_recipient,
         consensus_version: duty.expected_consensus_version,
+        shape: duty.shape,
     }
 }
 
@@ -2429,6 +2431,8 @@ enum HardReject {
     /// Unreadable fee, missing fee on a full Bellatrix+ block, header-only
     /// full block, or a readable mismatch under [`FeeRecipientPolicy::Reject`].
     Fee,
+    /// [`ShapeConstraint`] rejects this blinded flag.
+    Shape,
 }
 
 fn hard_reject_label(reason: HardReject) -> &'static str {
@@ -2439,6 +2443,7 @@ fn hard_reject_label(reason: HardReject) -> &'static str {
         HardReject::Proposer => "proposer",
         HardReject::Parent => "parent",
         HardReject::Fee => "fee",
+        HardReject::Shape => "shape",
     }
 }
 
@@ -2463,6 +2468,11 @@ fn hard_reject_reason(
 ) -> Option<HardReject> {
     if block.consensus_version.parse::<ForkName>().ok() != Some(checks.consensus_version) {
         return Some(HardReject::Fork);
+    }
+    // The blinded flag is a header. A wrong shape is rejected before the body
+    // is read, so an unreadable body cannot hide it.
+    if !checks.shape.allows_blinded_flag(block.is_blinded) {
+        return Some(HardReject::Shape);
     }
     let Some(fields) = duty_fields(block) else {
         return Some(HardReject::Unreadable);
@@ -4669,6 +4679,92 @@ mod tests {
         block_passes_duty(block, checks, FeeRecipientPolicy::Sign)
     }
 
+    /// A shape mismatch is false for accept, in-hand, and fallback together.
+    ///
+    /// Dropping `block_passes_duty` from only one of those closures would still
+    /// rank or return the wrong shape.
+    #[test]
+    fn shape_mismatch_fails_accept_in_hand_and_fallback() {
+        let parent = [0xabu8; 32];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
+            fee_recipient: None,
+            consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::BlindedOnly,
+        };
+        let select = produce_best_select(Some(checks), FeeRecipientPolicy::Sign);
+        let local = duty_response("9000", 1, 7, parent, None);
+        assert!(!(select.accept)(&local), "a local block is not accepted under blinded-only");
+        assert!(!(select.in_hand)(&local), "a local block must not close the soft window");
+        assert!(
+            !(select.fallback_accept)(&local),
+            "fallback must not return a local block under blinded-only"
+        );
+
+        let mut blinded = duty_response("1000", 1, 7, parent, None);
+        blinded.is_blinded = true;
+        assert!((select.accept)(&blinded));
+        assert!((select.in_hand)(&blinded));
+        assert!((select.fallback_accept)(&blinded));
+
+        let local_only = BlockDutyChecks { shape: ShapeConstraint::LocalOnly, ..checks };
+        let local_select = produce_best_select(Some(local_only), FeeRecipientPolicy::Sign);
+        assert!(!(local_select.accept)(&blinded));
+        assert!(!(local_select.in_hand)(&blinded));
+        assert!(!(local_select.fallback_accept)(&blinded));
+        assert!((local_select.accept)(&local));
+        assert!((local_select.in_hand)(&local));
+        assert!((local_select.fallback_accept)(&local));
+    }
+
+    /// The blinded flag is a header. An unreadable body cannot hide a wrong shape.
+    #[test]
+    fn shape_reject_precedes_an_unreadable_body_on_every_pre_gloas_fork() {
+        let forks = [
+            (ForkName::Phase0, "phase0"),
+            (ForkName::Altair, "altair"),
+            (ForkName::Bellatrix, "bellatrix"),
+            (ForkName::Capella, "capella"),
+            (ForkName::Deneb, "deneb"),
+            (ForkName::Electra, "electra"),
+            (ForkName::Fulu, "fulu"),
+        ];
+        for (fork, name) in forks {
+            let checks = BlockDutyChecks {
+                slot: 1,
+                proposer_index: 0,
+                parent_root: None,
+                alternate_parent_root: None,
+                parent_closed: false,
+                fee_recipient: None,
+                consensus_version: fork,
+                shape: ShapeConstraint::LocalOnly,
+            };
+            let block = ProduceBlockResponse {
+                data: serde_json::json!("not-a-block"),
+                is_blinded: true,
+                consensus_version: name.to_string(),
+                execution_payload_value: Some("1".to_string()),
+                is_ssz: false,
+                ssz_bytes: None,
+                payload_included: false,
+                builder_url: None,
+                consensus_block_value: None,
+            };
+            assert!(
+                matches!(
+                    hard_reject_reason(&block, &checks, FeeRecipientPolicy::Sign),
+                    Some(HardReject::Shape)
+                ),
+                "{name} must reject the blinded flag before the body"
+            );
+        }
+    }
+
     /// Guard: the passthrough macro list must name every role-trait method.
     /// Primary enforcement is compile-time (missing method → trait not satisfied).
     /// This test documents the expected surface and catches accidental list drift.
@@ -5304,6 +5400,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: None,
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let start = tokio::time::Instant::now();
         let result = manager
@@ -5369,6 +5466,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: None,
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let start = tokio::time::Instant::now();
         let result = manager
@@ -5531,6 +5629,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let result = manager
             .query_best_filtered(
@@ -5578,6 +5677,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some([0x11; 20]),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let result = manager
             .query_best_filtered(
@@ -5625,6 +5725,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let start = tokio::time::Instant::now();
         let result = manager
@@ -5681,6 +5782,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let start = tokio::time::Instant::now();
         let result = manager
@@ -5745,6 +5847,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let result = manager
             .query_best_filtered(
@@ -5826,6 +5929,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some([0x11; 20]),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         assert!(passes_sign(&block, &checks));
         let wrong_parent = BlockDutyChecks { parent_root: Some([0xcd; 32]), ..checks };
@@ -5844,6 +5948,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let matching = duty_response("1", 1, 7, parent, Some(fee));
         assert!(passes_sign(&matching, &checks));
@@ -5884,6 +5989,7 @@ mod tests {
                 parent_closed: false,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
             },
         );
         assert_eq!(checks.parent_root, Some(primary));
@@ -5910,6 +6016,7 @@ mod tests {
                 parent_closed: true,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
             },
         );
         assert!(matches!(
@@ -5934,6 +6041,7 @@ mod tests {
                 parent_closed: false,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
             },
         );
         let start = tokio::time::Instant::now();
@@ -5981,6 +6089,7 @@ mod tests {
                 parent_closed: false,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
             },
         );
 
@@ -6049,6 +6158,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let result = manager
             .query_best_filtered(
@@ -6125,6 +6235,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some(expected),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let mut blinded = duty_response("1", 1, 7, parent, None);
         blinded.is_blinded = true;
@@ -6181,6 +6292,7 @@ mod tests {
             parent_closed: false,
             expected_fee_recipient: Some([0x11; 20]),
             expected_consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
 
         async fn ranked(body: &str, duty: ProduceDuty) -> Result<Vec<RankedBlock>, BeaconError> {
@@ -6232,6 +6344,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some(expected),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         for (fork, version, preferred) in [
             (ForkName::Phase0, "phase0", true),
@@ -6316,6 +6429,7 @@ mod tests {
             parent_closed: false,
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
         };
         let matching = ssz_contents(7, 42, parent, &deneb.as_ssz_bytes(), "deneb");
         assert!(passes_sign(&matching, &checks));
@@ -6380,6 +6494,7 @@ mod tests {
                 parent_closed: false,
                 fee_recipient: Some(fee),
                 consensus_version: fork,
+                shape: ShapeConstraint::Any,
             };
             let block = |body: Vec<u8>| ProduceBlockResponse {
                 data: serde_json::Value::Null,

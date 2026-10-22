@@ -5,6 +5,7 @@
 mod admission;
 mod client;
 mod error;
+mod shape;
 
 pub use admission::DutyFence;
 pub(crate) mod http_caps;
@@ -17,6 +18,7 @@ pub use client::{ensure_genesis_validators_root, hex_ids_equal, BeaconClient, Be
 pub use error::BeaconError;
 pub use http_caps::ResponseCaps;
 pub use retry::RetryPolicy;
+pub use shape::{ShapeConstraint, GLOAS_SELF_BUILD_BUILDER_INDEX};
 pub use types::{
     block_value, parse_fork_schedule, parse_slot_duration_ms, parse_slots_per_epoch,
     AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,

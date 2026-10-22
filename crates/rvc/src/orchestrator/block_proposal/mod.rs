@@ -177,11 +177,16 @@ where
         .await
         {
             Ok(Ok(result)) => {
-                let was_tripped = self.circuit_breaker.is_tripped();
-                self.circuit_breaker.record_success();
-                self.update_circuit_breaker_metrics();
-                if was_tripped && !self.circuit_breaker.is_tripped() {
-                    info!(slot, "Builder circuit breaker reset after successful proposal");
+                // Only a builder-path publish resets the breaker. A local
+                // success, including a fallback after a blinded failure, says
+                // nothing about the relay.
+                if result.builder_path {
+                    let was_tripped = self.circuit_breaker.is_tripped();
+                    self.circuit_breaker.record_success();
+                    self.update_circuit_breaker_metrics();
+                    if was_tripped && !self.circuit_breaker.is_tripped() {
+                        info!(slot, "Builder circuit breaker reset after successful proposal");
+                    }
                 }
                 inc_proposal_outcome(proposal_outcome::SUCCESS);
                 info!(

@@ -515,12 +515,27 @@ async fn test_blinded_block_publish_failure() {
     let slot = 200;
     let block = test_blinded_block(slot);
     let beacon = MockBeaconClient::blinded(block).with_publish_error();
-    let signer = MockSigner::new();
-    let service = build_service(signer, beacon, &pubkey);
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        Arc::new(beacon),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
 
     let result = service.propose_block(slot, &pubkey, 42, None).await;
     assert!(result.is_err());
-    assert!(matches!(result.unwrap_err(), BlockServiceError::Beacon(_)));
+    // A blinded publish error is a builder miss, including when the beacon node fails.
+    assert!(
+        matches!(result.unwrap_err(), BlockServiceError::BuilderFailure(_)),
+        "blinded publish failure must be BuilderFailure"
+    );
+    assert_eq!(
+        signer.header_calls.lock().unwrap().len(),
+        1,
+        "one signature, then the publish fails"
+    );
 }
 
 #[tokio::test]

@@ -26,8 +26,8 @@ use rvc_bn_manager::{
     AttestationApi, AttestationData, BeaconError, BeaconNodeClient, BlockProducer, BnManager,
     BnManagerConfig, BnRole, BnSyncDetail, BnSyncStatus, BuilderConfig, Checkpoint, DutiesProvider,
     FeeRecipientPolicy, LivenessApi, NodeStatusApi, OperationTimeouts, PayloadAttestationApi,
-    ProduceDuty, Propagator, SignedBeaconBlock, SignedBlindedBeaconBlock, SingleAttestation,
-    SubmitAttestationResult, SyncCommitteeApi, VersionedAttestation,
+    ProduceDuty, Propagator, ShapeConstraint, SignedBeaconBlock, SignedBlindedBeaconBlock,
+    SingleAttestation, SubmitAttestationResult, SyncCommitteeApi, VersionedAttestation,
     VersionedSignedAggregateAndProof,
 };
 
@@ -1360,6 +1360,7 @@ async fn test_best_of_falls_back_to_unsynced_when_every_synced_bn_times_out() {
                 parent_closed: false,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
             },
         )
         .await;
@@ -1396,6 +1397,7 @@ fn deneb_fee_duty(fee: [u8; 20]) -> ProduceDuty {
         parent_closed: false,
         expected_fee_recipient: Some(fee),
         expected_consensus_version: ForkName::Deneb,
+        shape: ShapeConstraint::Any,
     }
 }
 
@@ -2972,6 +2974,7 @@ async fn test_sync_query_best_falls_back_to_unsynced_when_synced_fail() {
                 parent_closed: false,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
             },
         )
         .await;
@@ -4058,6 +4061,7 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
                 parent_closed: false,
                 expected_fee_recipient: None,
                 expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
             },
         )
         .await;
@@ -4879,4 +4883,236 @@ async fn test_get_genesis_does_not_observe_proposer_bn_latency_ms() {
         count_before,
         "non-proposer BN RPCs must not observe rvc_proposer_bn_latency_ms"
     );
+}
+
+fn shape_duty(shape: ShapeConstraint, parent: Option<[u8; 32]>) -> ProduceDuty {
+    ProduceDuty {
+        expected_proposer_index: 0,
+        expected_parent_root: parent,
+        alternate_parent_root: None,
+        parent_closed: false,
+        expected_fee_recipient: None,
+        expected_consensus_version: ForkName::Deneb,
+        shape,
+    }
+}
+
+fn block_document(parent_hex: &str) -> String {
+    let state = "00".repeat(32);
+    format!(
+        r#"{{"data":{{"slot":"1","proposer_index":"0","parent_root":"0x{parent_hex}","state_root":"0x{state}","body":{{}}}}}}"#
+    )
+}
+
+fn http_message(extra_headers: &str, body: &str) -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn block_headers(value: &str, blinded: bool) -> String {
+    let flag = if blinded { "true" } else { "false" };
+    format!(
+        "Eth-Consensus-Version: deneb\r\nEth-Execution-Payload-Blinded: {flag}\r\nEth-Execution-Payload-Value: {value}\r\n"
+    )
+}
+
+/// One beacon node on the test runtime.
+///
+/// Wiremock's delay sleeps on a private runtime, so a paused test clock cannot
+/// release it. This server's sleep is the test clock. The receiver fires once
+/// that sleep is registered, which is still at virtual t = 0 when the caller
+/// is waiting on a blocking thread. Stepping before that signal would arm the
+/// delay in the future and miss the soft deadline.
+async fn paused_bn(
+    sync_body: String,
+    block_delay: Duration,
+    block_value: &'static str,
+    blinded: bool,
+    parent_hex: String,
+) -> (String, std::sync::mpsc::Receiver<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let (armed_tx, armed_rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            let sync_body = sync_body.clone();
+            let parent_hex = parent_hex.clone();
+            let armed_tx = armed_tx.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                let mut got = 0usize;
+                loop {
+                    let n = sock.read(&mut buf[got..]).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    got += n;
+                    if buf[..got].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf[..got]);
+                let message = if head.contains("/eth/v1/node/syncing") {
+                    http_message("", &sync_body)
+                } else {
+                    if !block_delay.is_zero() {
+                        let sleep = tokio::time::sleep(block_delay);
+                        tokio::pin!(sleep);
+                        let mut signal = Some(armed_tx);
+                        std::future::poll_fn(|cx| {
+                            match std::future::Future::poll(sleep.as_mut(), cx) {
+                                std::task::Poll::Ready(()) => std::task::Poll::Ready(()),
+                                std::task::Poll::Pending => {
+                                    if let Some(tx) = signal.take() {
+                                        let _ = tx.send(());
+                                    }
+                                    std::task::Poll::Pending
+                                }
+                            }
+                        })
+                        .await;
+                    }
+                    let body = block_document(&parent_hex);
+                    http_message(&block_headers(block_value, blinded), &body)
+                };
+                let _ = sock.write_all(&message).await;
+            });
+        }
+    });
+    (format!("http://{addr}"), armed_rx)
+}
+
+/// Block sleeps are already registered. Step the two arrivals, then the rest
+/// of a 3s budget's soft deadline (1.5s). Auto-advance stays off until both
+/// receivers fire, so the sleeps are armed at virtual t = 0.
+async fn drive_to_soft_deadline(armed: Vec<std::sync::mpsc::Receiver<()>>) {
+    tokio::task::spawn_blocking(move || {
+        for rx in armed {
+            rx.recv().expect("block response armed on the paused clock");
+        }
+    })
+    .await
+    .expect("arm wait");
+    step_paused(50).await;
+    step_paused(1_150).await;
+    step_paused(300).await;
+}
+
+/// Virtual steps. `sleep` under a paused clock fires each earlier timer first.
+/// One `advance` across both arrivals would deliver them together.
+async fn step_paused(ms: u64) {
+    tokio::time::sleep(Duration::from_millis(ms)).await;
+}
+
+/// Builder-only: a fast local block does not end the wait. The later blinded
+/// block is the only candidate, even though the local value is higher.
+///
+/// Budget 3s, so the soft deadline is 1.5s. The local block is released at
+/// 50ms and the blinded block at 1.2s, both before that deadline.
+#[tokio::test(flavor = "current_thread")]
+async fn builder_only_local_block_does_not_close_the_soft_window() {
+    let parent = "00".repeat(32);
+    let (local, local_armed) =
+        paused_bn("{}".to_string(), Duration::from_millis(50), "9000", false, parent.clone()).await;
+    let (blinded, blinded_armed) =
+        paused_bn("{}".to_string(), Duration::from_millis(1_200), "1000", true, parent).await;
+    tokio::time::pause();
+    let manager = manager_with_block_budget(&[&local, &blinded], Duration::from_secs(3));
+    let started = tokio::time::Instant::now();
+    let duty = shape_duty(ShapeConstraint::BlindedOnly, None);
+    let produce = tokio::spawn(async move {
+        manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await
+    });
+    drive_to_soft_deadline(vec![local_armed, blinded_armed]).await;
+    let ranked = produce.await.expect("produce task").expect("ranked blocks");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1_400) && elapsed <= Duration::from_millis(1_600),
+        "soft deadline is 1.5s, returned at {elapsed:?}"
+    );
+    assert_eq!(ranked.len(), 1, "the local block must not be a candidate");
+    assert!(ranked[0].response.is_blinded);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+/// Execution-only: a fast blinded block is a hard reject. The later local
+/// block is the only candidate.
+#[tokio::test(flavor = "current_thread")]
+async fn execution_only_blinded_block_is_a_hard_reject() {
+    let parent = "00".repeat(32);
+    let (blinded, blinded_armed) =
+        paused_bn("{}".to_string(), Duration::from_millis(50), "9000", true, parent.clone()).await;
+    let (local, local_armed) =
+        paused_bn("{}".to_string(), Duration::from_millis(1_200), "1000", false, parent).await;
+    tokio::time::pause();
+    let manager = manager_with_block_budget(&[&blinded, &local], Duration::from_secs(3));
+    let started = tokio::time::Instant::now();
+    let duty = shape_duty(ShapeConstraint::LocalOnly, None);
+    let produce = tokio::spawn(async move {
+        manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await
+    });
+    drive_to_soft_deadline(vec![blinded_armed, local_armed]).await;
+    let ranked = produce.await.expect("produce task").expect("ranked blocks");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(1_400) && elapsed <= Duration::from_millis(1_600),
+        "soft deadline is 1.5s, returned at {elapsed:?}"
+    );
+    assert_eq!(ranked.len(), 1, "the blinded block must not be a candidate");
+    assert!(!ranked[0].response.is_blinded);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+/// Synced nodes miss the budget. The first fallback is the wrong shape and is
+/// not returned. The next fallback, which matches, is.
+#[tokio::test(flavor = "current_thread")]
+async fn fallback_respects_the_shape_constraint() {
+    let parent = "ab".repeat(32);
+    let (synced, _) = paused_bn(
+        SYNCED_RESPONSE.to_string(),
+        Duration::from_secs(30),
+        "1111",
+        true,
+        parent.clone(),
+    )
+    .await;
+    const SMALL_LAG: &str = r#"{"data":{"head_slot":"991","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#;
+    let (wrong, _) =
+        paused_bn(SMALL_LAG.to_string(), Duration::ZERO, "9000", false, parent.clone()).await;
+    let (right, _) = paused_bn(SMALL_LAG.to_string(), Duration::ZERO, "1000", true, parent).await;
+    let manager = manager_with_block_budget(&[&synced, &wrong, &right], Duration::from_millis(400));
+    manager.check_sync_status().await;
+    let details = manager.sync_statuses().read().await.clone();
+    let summary: Vec<_> = details.iter().map(|d| (d.status, d.sync_distance)).collect();
+    assert!(matches!(details[0].status, BnSyncStatus::Synced), "sync {summary:?}");
+    assert_eq!(details[1].sync_distance, Some(9), "sync {summary:?}");
+    assert_eq!(details[2].sync_distance, Some(9), "sync {summary:?}");
+    tokio::time::pause();
+    let duty = shape_duty(ShapeConstraint::BlindedOnly, Some([0xab; 32]));
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let result = manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await;
+        let _ = done_tx.send(result);
+    });
+    // 400 ms expires the synced attempt. After that, auto-advance would skip
+    // the fallback sockets and jump to the next timer. Waiting on the result
+    // from a blocking thread holds auto-advance off, so those accepts finish
+    // while the backstop is still open.
+    step_paused(400).await;
+    let ranked = tokio::task::spawn_blocking(move || done_rx.recv().expect("produce finished"))
+        .await
+        .expect("blocking wait")
+        .expect("fallback block");
+    assert_eq!(ranked.len(), 1, "the wrong-shape fallback must not be returned");
+    assert!(ranked[0].response.is_blinded);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
 }

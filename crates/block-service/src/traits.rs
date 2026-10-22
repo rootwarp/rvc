@@ -6,7 +6,7 @@ use eth_types::{
 
 use crate::BlockServiceError;
 
-pub use beacon::{BuilderConfig, ProduceBlockResponse, RankedBlock, WireBody};
+pub use beacon::{BuilderConfig, ProduceBlockResponse, RankedBlock, ShapeConstraint, WireBody};
 
 /// Cached V4 `BuilderConfig` (6.17 signed auth). Implemented in `rvc`, not here:
 /// `rvc-block-service → rvc-builder` is a forbidden edge.
@@ -33,6 +33,9 @@ pub struct ProduceDuty {
     /// Slot fork. A candidate whose `consensus_version` is not this fork is
     /// not ranked and does not close the soft deadline.
     pub expected_consensus_version: ForkName,
+    /// Shapes that may be ranked. A mismatch is a hard reject: it does not
+    /// close the soft deadline, and the fallback does not return it.
+    pub shape: ShapeConstraint,
 }
 
 /// Minimal beacon client trait for block production and publication.

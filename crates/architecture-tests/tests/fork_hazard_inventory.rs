@@ -144,7 +144,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        457,
+        470,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -153,7 +153,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        537,
+        550,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -162,7 +162,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1349,
+        1404,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -171,7 +171,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1870,
+        1925,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -180,7 +180,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1882,
+        1937,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -189,7 +189,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1886,
+        1941,
         Class::GeForkName,
         false,
         ">= ForkName::Gloas",
@@ -470,7 +470,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
-        1848,
+        1903,
         Class::MatchForkName,
         false,
         "match fork {",
@@ -516,7 +516,7 @@ const INVENTORY: &[Inv] = &[
     // Class 4
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        1166,
+        1170,
         Class::StringDispatch,
         false,
         "match consensus_version {",
@@ -525,7 +525,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        1187,
+        1191,
         Class::StringDispatch,
         true,
         "match consensus_version {",
@@ -534,7 +534,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/block-service/src/service/tests/mocks.rs",
-        1280,
+        1284,
         Class::StringDispatch,
         false,
         "matches!(consensus_version",
@@ -588,7 +588,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/bn-manager/src/manager.rs",
-        2775,
+        2785,
         Class::StringDispatch,
         true,
         "match consensus_version {",
