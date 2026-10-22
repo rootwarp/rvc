@@ -15,6 +15,9 @@ Guidance for coding agents (Cursor, Claude Code, Codex) working in rvc. `CLAUDE.
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
 - `cargo test` (workspace, or `-p` for touched crates plus dependents)
+- `gitleaks detect --no-git --source . --config .gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --exit-code 1`
+- History scan: `gitleaks detect --source . --config .gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --exit-code 1`
+- `git diff --shortstat develop...HEAD` = N gross lines; cap 2,000 including tests and generated content; stop at 1,800 and report.
 - Self-check (paste into PR body):
   - [ ] Red check: each new acceptance test shown failing on base or with the fix removed.
   - [ ] Measurement claims ("no regression") come from a scenario where unfixed code scores worse.

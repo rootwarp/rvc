@@ -13,13 +13,33 @@ fn workspace_root() -> PathBuf {
 fn test_gitleaks_allow_is_path_scoped_and_false_lines_stay_scanned() {
     let root = workspace_root();
     let config = std::fs::read_to_string(root.join(".gitleaks.toml")).expect("gitleaks config");
+    // Case-fold: viper matches these keys either way. This string scan does
+    // not load the allowlists useDefault merges in from the default rules.
+    let folded = config.to_ascii_lowercase();
     assert!(
-        !config.contains("regexTarget"),
+        !folded.contains("regextarget"),
         "the source-tree config must leave the regex target on the secret"
     );
     assert!(
-        !config.contains("gitleaks:allow"),
+        !folded.contains("gitleaks:allow"),
         "the config prose must not embed the inline allow token"
+    );
+    assert!(
+        !folded.contains("condition = \"or\""),
+        "OR allows the whole file when the path matches"
+    );
+    assert_eq!(
+        folded.lines().filter(|line| line.trim() == "[allowlist]").count(),
+        1,
+        "a second allowlist table is merged by gitleaks"
+    );
+    assert!(
+        folded.lines().all(|line| line.trim() != "[[allowlists]]"),
+        "a top-level allowlists array is not a second baseline"
+    );
+    assert!(
+        folded.lines().all(|line| line.trim() != "[rules.allowlist]"),
+        "the singular rule allowlist overrides the per-rule array"
     );
     assert!(config.contains("condition = \"AND\""));
     assert!(config.contains("docs/running-guide"));

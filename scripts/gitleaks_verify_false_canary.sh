@@ -2,6 +2,10 @@
 # Prove the source-tree gitleaks config still reports a secret on a line that
 # contains the word false, and that the running-guide exception is one path
 # plus one exact secret.
+#
+# Scans use --source . from inside the tree. Gitleaks then reports paths
+# relative to that directory, which is what the anchored allowlist matches.
+# An absolute --source would report absolute paths and miss ^docs/...$.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -19,10 +23,15 @@ trap 'rm -rf "$tmp"' EXIT
 scan() {
   local src=$1
   local report=$2
+  local code
   set +e
-  "$gitleaks" detect --no-git --source "$src" --config "$config" \
-    --report-format json --report-path "$report" --no-banner --exit-code 1 >/dev/null
-  local code=$?
+  (
+    cd "$src" || exit 2
+    "$gitleaks" detect --no-git --source . --config "$config" \
+      --ignore-gitleaks-allow \
+      --report-format json --report-path "$report" --no-banner --exit-code 1 >/dev/null
+  )
+  code=$?
   set -e
   printf '%s' "$code"
 }
