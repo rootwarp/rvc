@@ -142,7 +142,7 @@ async fn test_self_build_publishes_block_and_envelope_through_second_bn() {
 
     let manager = BnManager::new(BnManagerConfig::new(vec![producer.uri(), publisher.uri()]))
         .expect("BnManager");
-    let beacon = Arc::new(BeaconBlockAdapter(Arc::new(manager)));
+    let beacon = Arc::new(BeaconBlockAdapter::new(Arc::new(manager)));
     let pubkey = SecretKey::generate().public_key();
     let store = ValidatorStore::new([0u8; 20], 30_000_000);
     store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();

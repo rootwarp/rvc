@@ -20,7 +20,8 @@ use tracing::{error, info, warn};
 
 use super::executor::{ShutdownOutcome, ShutdownReason, ShutdownTier, TaskExecutor, TierBudget};
 use super::tasks::{
-    bind_required_listeners, spawn_background_tasks, spawn_sse_subscriber, spawn_sync_monitor,
+    bind_required_listeners, spawn_background_tasks, spawn_proposer_sync_monitor,
+    spawn_sse_subscriber, spawn_sync_monitor,
 };
 use super::{
     build_services, connect_beacon, load_signing_keys, open_slashing_db, wire_signing_enablement,
@@ -213,7 +214,7 @@ pub async fn run(
         duty_tracker,
         slot_clock,
         orchestrator_config,
-        proposer_bn_manager: _,
+        proposer_bn_manager,
         block_beacon,
         builder_service,
         attesting_enabled,
@@ -308,6 +309,7 @@ pub async fn run(
         slot_clock.slots_per_epoch(),
     );
     spawn_sync_monitor(Some(Arc::clone(&bn_manager)), &executor, Some(sync_check));
+    spawn_proposer_sync_monitor(proposer_bn_manager, &executor, Some(sync_check));
     let slot_duration_ms = slot_clock.slot_duration().as_millis() as u64;
     let (mut orchestrator, orchestrator_handle) =
         crate::orchestrator::DutyOrchestrator::new(crate::orchestrator::OrchestratorDeps {
@@ -1399,6 +1401,10 @@ mod tests {
         assert!(
             body.contains("bn.sync_monitor"),
             "DSR-2.1 must name the registered sync-monitor task bn.sync_monitor"
+        );
+        assert!(
+            body.contains("spawn_proposer_sync_monitor"),
+            "FU-A6 must start the proposer sync monitor from production run()"
         );
     }
 

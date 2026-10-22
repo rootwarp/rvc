@@ -564,6 +564,7 @@ impl ServiceBuilder {
             .map_err(|e| {
                 ConfigError::InvalidBeaconUrl(format!("failed to create proposer BnManager: {}", e))
             })?
+            .with_metric_pool(bn_manager::METRIC_POOL_PROPOSER)
             .with_operation_timeouts(self.config.operation_timeouts());
         info!(
             endpoints = ?endpoints,

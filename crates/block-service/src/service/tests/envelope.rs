@@ -455,3 +455,66 @@ async fn gloas_envelope_signs_under_its_scope_and_is_refused_without_one() {
     assert!(err.to_string().contains("admission revoked in flight"), "{err}");
     assert_eq!(beacon.envelope_publish_calls.lock().unwrap().len(), 1);
 }
+
+/// The discard inside `sign_and_publish_v4` must refuse the header.
+///
+/// An external bid has no envelope, so the second `discard_revoked_fences`
+/// call is that header check. Removing it leaves the generation unmoved and
+/// the mock signer completes the header.
+#[tokio::test]
+async fn v4_header_discard_refuses_the_header_when_admission_moves() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let pubkey = test_pubkey();
+    let slot = test_gloas_slot();
+    let beacon = Arc::new(
+        MockBeaconClient::unblinded(external_bid_block(slot)).with_consensus_version("gloas"),
+    );
+    let signer = Arc::new(MockSigner::new());
+    let service = gloas_service(signer.clone(), beacon.clone(), &pubkey);
+    let revocation = Arc::clone(&beacon.revocation);
+    let calls = AtomicUsize::new(0);
+    service.set_before_discard(move || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            revocation.fetch_add(1, Ordering::Release);
+        }
+    });
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("discarded");
+    assert!(err.to_string().contains("admission revoked"), "{err}");
+    assert!(
+        signer.header_calls.lock().unwrap().is_empty(),
+        "sign_and_publish_v4 must drop the candidate before the header"
+    );
+    assert!(signer.envelope_calls.lock().unwrap().is_empty());
+}
+
+/// The discard inside `sign_and_publish_envelope` must refuse the envelope
+/// after the header was signed.
+///
+/// Self-build calls discard after produce, before the header, and before the
+/// envelope. The third call is the envelope check. Removing it leaves the
+/// generation unmoved and the mock signer completes the envelope.
+#[tokio::test]
+async fn envelope_discard_refuses_the_envelope_when_admission_moves() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let pubkey = test_pubkey();
+    let slot = test_gloas_slot();
+    let beacon = Arc::new(MockBeaconClient::from_response(self_build_json_response(slot)));
+    let signer = Arc::new(MockSigner::new());
+    let service = gloas_service(signer.clone(), beacon.clone(), &pubkey);
+    let revocation = Arc::clone(&beacon.revocation);
+    let calls = AtomicUsize::new(0);
+    service.set_before_discard(move || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+            revocation.fetch_add(1, Ordering::Release);
+        }
+    });
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("discarded");
+    assert!(err.to_string().contains("admission revoked"), "{err}");
+    assert_eq!(signer.header_calls.lock().unwrap().len(), 1, "the header was already signed");
+    assert!(
+        signer.envelope_calls.lock().unwrap().is_empty(),
+        "sign_and_publish_envelope must drop the envelope before it is signed"
+    );
+}

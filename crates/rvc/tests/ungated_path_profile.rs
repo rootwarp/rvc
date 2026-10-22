@@ -255,7 +255,7 @@ async fn measure_propose(
         .await;
 
     let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
-    let beacon = Arc::new(BeaconBlockAdapter(Arc::new(manager)));
+    let beacon = Arc::new(BeaconBlockAdapter::new(Arc::new(manager)));
     let store = ValidatorStore::new([0u8; 20], 30_000_000);
     store.add_validator(ValidatorConfig::new(pk.to_bytes())).unwrap();
     let service = BlockService::new(

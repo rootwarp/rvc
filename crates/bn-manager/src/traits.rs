@@ -462,6 +462,16 @@ pub trait BeaconNodeClient:
     fn duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
         Ok(beacon::DutyFence::open())
     }
+
+    /// Revocation generation, including when no node is admitted.
+    ///
+    /// [`Self::duty_fence`] returns [`BeaconError::NoAdmittedNode`] for an
+    /// empty pool and drops the generation it loaded. This watch keeps that
+    /// generation so a later grant and revoke still drops a fence taken
+    /// while the pool was empty.
+    fn revocation_watch(&self) -> beacon::DutyFence {
+        beacon::DutyFence::open()
+    }
 }
 
 /// Per-operation timeout configuration for beacon node API calls.

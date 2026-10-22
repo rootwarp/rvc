@@ -356,7 +356,7 @@ async fn test_higher_value_stale_parent_is_not_signed() {
     let mut config = BnManagerConfig::new(vec![bn_a.uri(), bn_b.uri()]);
     config.broadcast_topics.blocks = false;
     let manager = BnManager::new(config).expect("BnManager");
-    let beacon = Arc::new(BeaconBlockAdapter(Arc::new(manager)));
+    let beacon = Arc::new(BeaconBlockAdapter::new(Arc::new(manager)));
     let pubkey = SecretKey::generate().public_key();
     let store = ValidatorStore::new([0u8; 20], 30_000_000);
     store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
@@ -410,7 +410,7 @@ fn builder_only_service(
     let mut config = BnManagerConfig::new(endpoints);
     config.broadcast_topics.blocks = false;
     let manager = BnManager::new(config).expect("BnManager");
-    let beacon = Arc::new(BeaconBlockAdapter(Arc::new(manager)));
+    let beacon = Arc::new(BeaconBlockAdapter::new(Arc::new(manager)));
     let pubkey = SecretKey::generate().public_key();
     let fee = eth_types::external_vector_deneb_body().execution_payload.fee_recipient;
     let store = ValidatorStore::new(fee, 30_000_000);

@@ -27,14 +27,19 @@ const BUDGET: Duration = Duration::from_millis(80);
 /// Row budget. Tens of ms and well below [`ATTEMPT_TIMEOUT_FLOOR`].
 const ROW_BUDGET: Duration = Duration::from_millis(40);
 
-/// Scheduling slack. Several times smaller than `FLOOR - ROW_BUDGET`.
-const ROW_EPSILON: Duration = Duration::from_millis(50);
+/// Scheduling slack. Smaller than `FLOOR - ROW_BUDGET` by more than one budget.
+///
+/// A loaded `cargo nextest --workspace --all-features` run slipped a 40 ms
+/// `get_payload_attestation_data` budget to 100 ms (Actions run 39740511987).
+/// 120 ms of slack keeps that row under the ceiling. The ceiling stays under
+/// the attempt floor and the hang, so a missing inner deadline still fails.
+const ROW_EPSILON: Duration = Duration::from_millis(120);
 
 /// Elapsed ceiling for one budgeted row.
 ///
-/// llvm-cov stretched a 40 ms budget to 111 ms, past the 90 ms ceiling.
-/// Coverage keeps a wider ceiling that is still below the attempt floor and
-/// the hang, so a missing inner deadline still fails.
+/// llvm-cov stretched a 40 ms budget to 111 ms. Coverage keeps a wider
+/// ceiling that is still below the attempt floor and the hang, so a missing
+/// inner deadline still fails.
 fn row_elapsed_limit() -> Duration {
     let slack = if std::env::var_os("CARGO_LLVM_COV").is_some()
         || std::env::var_os("LLVM_PROFILE_FILE").is_some()
@@ -278,8 +283,9 @@ async fn every_converted_site_still_returns_operation_timeout() {
         ]
     );
     assert!(
-        ATTEMPT_TIMEOUT_FLOOR.saturating_sub(ROW_BUDGET) > ROW_EPSILON * 3,
-        "FLOOR ({ATTEMPT_TIMEOUT_FLOOR:?}) - budget ({ROW_BUDGET:?}) must be several times ε ({ROW_EPSILON:?})"
+        ATTEMPT_TIMEOUT_FLOOR.saturating_sub(ROW_BUDGET + ROW_EPSILON) > ROW_BUDGET,
+        "FLOOR ({ATTEMPT_TIMEOUT_FLOOR:?}) must stay more than a budget ({ROW_BUDGET:?}) above the elapsed ceiling ({:?})",
+        ROW_BUDGET + ROW_EPSILON
     );
     assert!(ROW_BUDGET < ATTEMPT_TIMEOUT_FLOOR);
     assert!(HANG > ATTEMPT_TIMEOUT_FLOOR, "a missing deadline must outlast the floor");

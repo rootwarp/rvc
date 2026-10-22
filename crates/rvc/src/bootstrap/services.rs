@@ -87,6 +87,22 @@ fn apply_fork_compatibility_result(
     }
 }
 
+/// Admit proposer nodes against the identity the main pool already agreed.
+///
+/// Seeded from [`BnManager::agreed_chain_identity`], which
+/// [`BnManager::agreed_spec_and_genesis`] stored. This does not call
+/// `agreed_spec_and_genesis` or `confirm_genesis_validators_root` on the
+/// proposer pool: both fail the process when every node disagrees, and both
+/// would seed an identity independent of the main pool. Zero admitted nodes
+/// is not a boot error. The caller logs that once.
+async fn admit_proposer_pool(main: &BnManager, proposer: &BnManager) -> usize {
+    let Some(identity) = main.agreed_chain_identity().await else {
+        proposer.revoke_unidentified();
+        return 0;
+    };
+    proposer.admit_against_identity(identity).await
+}
+
 /// Build signer, validator store (with D-3 registration), duty path, fork gate,
 /// proposer/main block adapters, builder service, and the shared attesting toggle.
 ///
@@ -214,13 +230,29 @@ pub async fn build_services(
         }
     };
 
-    // Block production goes through BnManager so multi-node failover applies.
-    // Prefer the dedicated proposer pool when configured; otherwise the main pool.
-    let block_beacon = match &proposer_bn_manager {
-        Some(proposer_mgr) => {
-            Arc::new(BeaconBlockAdapter(proposer_mgr.clone() as Arc<dyn BeaconNodeClient>))
+    let admitted_proposers = match &proposer_bn_manager {
+        Some(proposer) => Some(admit_proposer_pool(&beacon.bn_manager, proposer).await),
+        None => None,
+    };
+    match admitted_proposers {
+        Some(0) => {
+            warn!("no admitted proposer node; block production uses the main pool");
         }
-        None => Arc::new(BeaconBlockAdapter(main_beacon.clone())),
+        Some(admitted) => {
+            info!(admitted, "proposer pool admitted against the main pool identity");
+        }
+        None => {}
+    }
+
+    // Block production goes through BnManager so multi-node failover applies.
+    // The proposer pool is preferred while it has an admitted node. An empty
+    // proposer pool stays installed and routes to the main pool.
+    let block_beacon = match &proposer_bn_manager {
+        Some(proposer_mgr) => Arc::new(BeaconBlockAdapter::with_proposer(
+            main_beacon.clone(),
+            proposer_mgr.clone() as Arc<dyn BeaconNodeClient>,
+        )),
+        None => Arc::new(BeaconBlockAdapter::new(main_beacon.clone())),
     };
 
     let builder_service = Some(builder.build_builder_service(
@@ -276,6 +308,7 @@ mod tests {
     use crate::config::{Config, ForkScheduleConfig};
     use crate::orchestrator::PubkeyMap;
     use beacon::BeaconClient;
+    use block_service::BeaconBlockClient;
     use crypto::{CompositeSigner, KeyManager, LocalSigner, PublicKey, SecretKey};
     use doppelganger::{DoppelgangerDisabledByOperator, MonotonicEpochClock};
     use eth_types::{ForkName, Root};
@@ -538,10 +571,17 @@ mod tests {
         // Separate mock for proposer pool so the dedicated BnManager is distinct.
         let main_server = mock_bn_server("0x05000000").await;
         let proposer_server = mock_bn_server("0x05000000").await;
+        mount_genesis(&main_server, "0xabc").await;
+        mount_genesis(&proposer_server, "0xabc").await;
 
         let mut config = base_config(&dir, &main_server.uri());
         config.proposer_nodes = vec![proposer_server.uri()];
         let beacon = beacon_handles(&main_server.uri()).await;
+        beacon
+            .bn_manager
+            .agreed_spec_and_genesis(bn_manager::SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("main pool agrees");
         let keys = loaded_keys(pubkey_map_with(&[]));
 
         let handles = run_phase(&config, &keys, &beacon).await.expect("proposer path builds");
@@ -549,14 +589,15 @@ mod tests {
         let proposer =
             handles.proposer_bn_manager.as_ref().expect("proposer_nodes set → dedicated BnManager");
         let proposer_as_client: Arc<dyn BeaconNodeClient> = Arc::clone(proposer) as _;
+        let production = handles.block_beacon.production();
         assert!(
-            Arc::ptr_eq(&proposer_as_client, &handles.block_beacon.0),
+            Arc::ptr_eq(&proposer_as_client, &production),
             "block_beacon must wrap the proposer BnManager (E7), not a hand-built client"
         );
-        // Main pool must not be the block path when proposer is configured.
+        // Main pool must not be the block path when a proposer node is admitted.
         let main_as_client: Arc<dyn BeaconNodeClient> = Arc::clone(&beacon.bn_manager) as _;
         assert!(
-            !Arc::ptr_eq(&main_as_client, &handles.block_beacon.0),
+            !Arc::ptr_eq(&main_as_client, &production),
             "block_beacon must not use main pool when proposer nodes are set"
         );
     }
@@ -667,5 +708,255 @@ mod tests {
         assert!(apply_fork_compatibility_result(Err(err), true).is_ok());
         assert!(apply_fork_compatibility_result(Ok(()), false).is_ok());
         assert!(apply_fork_compatibility_result(Ok(()), true).is_ok());
+    }
+
+    fn identity_genesis(root: &str) -> String {
+        format!(
+            r#"{{"data":{{"genesis_time":"1606824023","genesis_validators_root":"{root}","genesis_fork_version":"0x00000000"}}}}"#
+        )
+    }
+
+    async fn mount_genesis(server: &MockServer, root: &str) {
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(identity_genesis(root)))
+            .mount(server)
+            .await;
+    }
+
+    async fn produce_hits(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .iter()
+            .filter(|request| request.url.path().starts_with("/eth/v3/validator/blocks/"))
+            .count()
+    }
+
+    /// Two proposer nodes, one with a different genesis validators root.
+    /// Production asks only the node that matches the main pool's identity.
+    #[tokio::test]
+    async fn proposer_pool_wrong_root_node_is_not_admitted() {
+        let dir = TempDir::new().unwrap();
+        let main = mock_bn_server("0x05000000").await;
+        let good = mock_bn_server("0x05000000").await;
+        let bad = mock_bn_server("0x05000000").await;
+        mount_genesis(&main, "0xabc").await;
+        mount_genesis(&good, "0xabc").await;
+        mount_genesis(&bad, "0xdef").await;
+
+        let mut config = base_config(&dir, &main.uri());
+        config.proposer_nodes = vec![good.uri(), bad.uri()];
+        let beacon = beacon_handles(&main.uri()).await;
+        beacon
+            .bn_manager
+            .agreed_spec_and_genesis(bn_manager::SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("main pool agrees");
+        let keys = loaded_keys(pubkey_map_with(&[]));
+        let handles = run_phase(&config, &keys, &beacon).await.expect("proposer boot is not fatal");
+
+        let _ = handles.block_beacon.produce_block_v3(42, "0xrandao", None, None).await;
+        assert_eq!(
+            produce_hits(&bad).await,
+            0,
+            "a proposer node on the wrong genesis root is not asked for a block"
+        );
+        assert!(produce_hits(&good).await > 0, "the matching proposer node is asked for a block");
+        assert_eq!(
+            produce_hits(&main).await,
+            0,
+            "the main pool is not used while a proposer node is admitted"
+        );
+    }
+
+    fn proposer_spec(slot_ms: &str, slots: &str) -> String {
+        format!(r#"{{"data":{{"SLOT_DURATION_MS":"{slot_ms}","SLOTS_PER_EPOCH":"{slots}"}}}}"#)
+    }
+
+    async fn mount_identity_body(server: &MockServer, spec: &str, genesis_root: &str) {
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(spec))
+            .mount(server)
+            .await;
+        mount_genesis(server, genesis_root).await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#,
+            ))
+            .mount(server)
+            .await;
+    }
+
+    async fn path_hits(server: &MockServer, route: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("requests")
+            .iter()
+            .filter(|request| request.url.path() == route)
+            .count()
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn proposer_pool_with_no_admitted_node_falls_back_to_the_main_pool() {
+        let dir = TempDir::new().unwrap();
+        let main = mock_bn_server("0x05000000").await;
+        let bad = mock_bn_server("0x05000000").await;
+        mount_genesis(&main, "0xabc").await;
+        mount_genesis(&bad, "0xdef").await;
+        let mut config = base_config(&dir, &main.uri());
+        config.proposer_nodes = vec![bad.uri()];
+        let beacon = beacon_handles(&main.uri()).await;
+        beacon
+            .bn_manager
+            .agreed_spec_and_genesis(bn_manager::SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("main pool agrees");
+        let keys = loaded_keys(pubkey_map_with(&[]));
+        let handles = run_phase(&config, &keys, &beacon).await.expect("boot is not fatal");
+        logs_assert(|lines: &[&str]| {
+            let n = lines
+                .iter()
+                .filter(|line| {
+                    line.contains("no admitted proposer node; block production uses the main pool")
+                })
+                .count();
+            if n == 1 {
+                Ok(())
+            } else {
+                Err(format!("fallback warning count {n}"))
+            }
+        });
+        assert!(!logs_contain("no admitted beacon node; duties halted"));
+        let _ = handles.block_beacon.produce_block_v3(42, "0xrandao", None, None).await;
+        assert_eq!(produce_hits(&bad).await, 0, "the unadmitted proposer is not asked");
+        assert!(produce_hits(&main).await > 0, "production uses the main pool");
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn proposer_pool_node_revoked_at_runtime_on_an_identity_change_is_never_asked_for_a_block(
+    ) {
+        let dir = TempDir::new().unwrap();
+        let main = mock_bn_server("0x05000000").await;
+        let proposer = mock_bn_server("0x05000000").await;
+        mount_genesis(&main, "0xabc").await;
+        mount_genesis(&proposer, "0xabc").await;
+        let mut config = base_config(&dir, &main.uri());
+        config.proposer_nodes = vec![proposer.uri()];
+        let beacon = beacon_handles(&main.uri()).await;
+        beacon
+            .bn_manager
+            .agreed_spec_and_genesis(bn_manager::SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("main pool agrees");
+        let keys = loaded_keys(pubkey_map_with(&[]));
+        let handles = run_phase(&config, &keys, &beacon).await.expect("boot");
+        let pool = handles.proposer_bn_manager.as_ref().expect("proposer pool");
+
+        let _ = handles.block_beacon.produce_block_v3(42, "0xrandao", None, None).await;
+        assert!(produce_hits(&proposer).await > 0, "the matching proposer is asked");
+        assert_eq!(produce_hits(&main).await, 0);
+
+        // reset() drops the request log, so later counts start again at zero.
+        proposer.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&proposer)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&proposer)
+            .await;
+        pool.check_sync_status().await;
+        let before_transient = produce_hits(&proposer).await;
+        let _ = handles.block_beacon.produce_block_v3(43, "0xrandao", None, None).await;
+        let after_transient = produce_hits(&proposer).await;
+        assert!(
+            after_transient > before_transient,
+            "a transient error does not revoke the proposer"
+        );
+        assert_eq!(produce_hits(&main).await, 0, "the main pool stays unused");
+
+        proposer.reset().await;
+        mount_identity_body(&proposer, &proposer_spec("12000", "32"), "0xdef").await;
+        pool.check_sync_status().await;
+        assert!(logs_contain("no admitted proposer node; block production uses the main pool"));
+        assert!(!logs_contain("no admitted beacon node; duties halted"));
+        let before_revoke = produce_hits(&proposer).await;
+        let _ = handles.block_beacon.produce_block_v3(44, "0xrandao", None, None).await;
+        assert_eq!(
+            produce_hits(&proposer).await,
+            before_revoke,
+            "the revoked proposer is not asked for a block"
+        );
+        assert!(produce_hits(&main).await > 0, "production falls back to the main pool");
+    }
+
+    #[tokio::test]
+    async fn revoked_proposer_node_still_receives_identity_probes() {
+        let dir = TempDir::new().unwrap();
+        let main = mock_bn_server("0x05000000").await;
+        let proposer = mock_bn_server("0x05000000").await;
+        mount_genesis(&main, "0xabc").await;
+        mount_genesis(&proposer, "0xabc").await;
+        let mut config = base_config(&dir, &main.uri());
+        config.proposer_nodes = vec![proposer.uri()];
+        let beacon = beacon_handles(&main.uri()).await;
+        beacon
+            .bn_manager
+            .agreed_spec_and_genesis(bn_manager::SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("main pool agrees");
+        let keys = loaded_keys(pubkey_map_with(&[]));
+        let handles = run_phase(&config, &keys, &beacon).await.expect("boot");
+        let pool = handles.proposer_bn_manager.as_ref().expect("proposer pool");
+
+        proposer.reset().await;
+        mount_identity_body(&proposer, &proposer_spec("12000", "32"), "0xdef").await;
+        pool.check_sync_status().await;
+        let spec_before = path_hits(&proposer, "/eth/v1/config/spec").await;
+        let genesis_before = path_hits(&proposer, "/eth/v1/beacon/genesis").await;
+        let sync_before = path_hits(&proposer, "/eth/v1/node/syncing").await;
+        pool.check_sync_status().await;
+        assert!(path_hits(&proposer, "/eth/v1/config/spec").await > spec_before);
+        assert!(path_hits(&proposer, "/eth/v1/beacon/genesis").await > genesis_before);
+        assert!(path_hits(&proposer, "/eth/v1/node/syncing").await > sync_before);
+
+        proposer.reset().await;
+        mount_identity_body(&proposer, &proposer_spec("12000", "32"), "0xabc").await;
+        pool.check_sync_status().await;
+        let before = produce_hits(&proposer).await;
+        let _ = handles.block_beacon.produce_block_v3(42, "0xrandao", None, None).await;
+        assert!(produce_hits(&proposer).await > before, "a matching identity re-admits the node");
+        assert_eq!(produce_hits(&main).await, 0, "the main pool is not used after re-admission");
+    }
+
+    /// No main-pool identity must revoke the proposer pool. Deleting
+    /// `revoke_unidentified` leaves the nodes admitted, which is how a
+    /// manager starts.
+    #[tokio::test]
+    async fn admit_proposer_pool_revokes_when_the_main_identity_is_missing() {
+        let endpoint = "http://127.0.0.1:9".to_string();
+        let main =
+            BnManager::new(bn_manager::BnManagerConfig::new(vec![endpoint.clone()])).expect("main");
+        let proposer =
+            BnManager::new(bn_manager::BnManagerConfig::new(vec![endpoint])).expect("proposer");
+        assert!(BeaconNodeClient::duty_fence(&proposer).is_ok(), "a new manager starts admitted");
+        let admitted = admit_proposer_pool(&main, &proposer).await;
+        assert_eq!(admitted, 0);
+        let err = BeaconNodeClient::duty_fence(&proposer)
+            .expect_err("missing main identity must revoke the proposer pool");
+        assert!(
+            matches!(err, bn_manager::BeaconError::NoAdmittedNode),
+            "revoke_unidentified must clear admission, got {err:?}"
+        );
     }
 }

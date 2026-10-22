@@ -29,9 +29,11 @@ pub use run::{run, RunOptions};
 pub use services::{build_services, ServiceHandles};
 pub use slashing::{open_slashing_db, KeystoreLockGuard, SlashingDbHandles};
 pub use tasks::{
-    bind_required_listeners, check_metrics_bind_gate, spawn_background_tasks, spawn_sse_subscriber,
-    spawn_sync_monitor, RequiredListeners, METRICS_ALLOW_NON_LOOPBACK_ENV, SSE_CANCEL_TASK_NAME,
-    SSE_TASK_NAME, SYNC_MONITOR_CANCEL_TASK_NAME, SYNC_MONITOR_TASK_NAME,
+    bind_required_listeners, check_metrics_bind_gate, spawn_background_tasks,
+    spawn_proposer_sync_monitor, spawn_sse_subscriber, spawn_sync_monitor, RequiredListeners,
+    METRICS_ALLOW_NON_LOOPBACK_ENV, PROPOSER_SYNC_MONITOR_CANCEL_TASK_NAME,
+    PROPOSER_SYNC_MONITOR_TASK_NAME, SSE_CANCEL_TASK_NAME, SSE_TASK_NAME,
+    SYNC_MONITOR_CANCEL_TASK_NAME, SYNC_MONITOR_TASK_NAME,
 };
 
 use std::sync::Arc;

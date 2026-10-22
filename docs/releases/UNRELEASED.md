@@ -342,8 +342,35 @@ The monitor re-checks identity once per epoch. A parsed mismatch revokes the
 node, including a pass that would otherwise be Unreachable or Unknown when
 one side has already parsed a disagreement. When the last admitted node is
 revoked, duties halt in place and the process stays up. `rvc_bn_admitted`
-for that endpoint is 0. The proposer pool does not apply this check yet
-(#708).
+for that endpoint is 0.
+
+The proposer pool is admitted against that same main-pool identity. A
+proposer node whose spec or genesis disagrees, or that does not answer at
+boot, is left unadmitted. Startup still succeeds. When that boot pass admits
+nobody, block production uses the main pool and startup logs one warning:
+`no admitted proposer node; block production uses the main pool`. The same
+monitor interval re-checks proposer identity. A parsed mismatch revokes the
+node, including the last admitted proposer node, and production uses the
+main pool. A monitor pass that finds no admitted proposer node logs that
+same sentence. It does not log `no admitted beacon node; duties halted`.
+A timeout or an HTTP 5xx leaves admission unchanged when neither response
+parses a disagreement. A parsed disagreement still revokes, including when
+the other response is a timeout or a 5xx. A revoked proposer node is still
+probed and is admitted again when it matches. The block duty fails closed
+when the main pool has no admitted node, including when a proposer node is
+still admitted. When a proposer pool is configured, the block fence watches
+the main pool's revocation generation and the proposer pool's revocation
+generation, including when the proposer pool has no admitted node. Produce
+still asks whichever pool is admitted when the block is requested, so a
+proposer node granted after that fence can be asked. If either watched
+generation moves before the header is signed, the candidate is dropped and
+the header is not signed. Combining fences keeps every generation.
+`rvc_bn_admitted` and `rvc_bn_health_tier` carry a `pool` label (`main` or
+`proposer`), so one URL configured in both pools does not share a series.
+The proposer sync monitor publishes health tiers for admitted proposer
+endpoints. An empty `proposer_nodes` list still builds no proposer pool. A
+parent-capture fence that no longer holds signs no RANDAO. With no proposer
+pool, the fence watches only the main generation.
 
 The sync monitor waits one epoch of the beacon-node slot duration (6 000 ms
 and 32 slots is 192 s). The head-event fallback poll waits one slot of that

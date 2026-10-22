@@ -59,6 +59,9 @@ zeroize.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+# test-utils: produce-return hook for the proposer fence tests. The production
+# dependency line above does not enable this feature.
+block-service = { workspace = true, features = ["test-utils"] }
 # test-utils: shared MockBeaconNodeClient for unit/integration tests (RF4-24).
 bn-manager = { workspace = true, features = ["test-utils"] }
 crypto = { workspace = true, features = ["test-utils"] }

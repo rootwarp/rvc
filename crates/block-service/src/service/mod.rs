@@ -1,6 +1,6 @@
 use std::str::FromStr;
 use std::sync::Arc;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-utils"))]
 use std::sync::Mutex;
 use std::time::Instant;
 
@@ -53,8 +53,17 @@ pub struct BlockService<S: ValidatorSigner, B: BeaconBlockClient> {
     slot_duration_ms: u64,
     #[cfg(test)]
     envelope_deadline_note: Mutex<Option<EnvelopeDeadlineNote>>,
-    #[cfg(test)]
+    /// Runs after produce returns and before the fence is checked again.
+    /// Integration tests revoke a pool here. Not compiled into production.
+    #[cfg(any(test, feature = "test-utils"))]
     after_produce: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// Runs at the start of each `discard_revoked_fences` call.
+    ///
+    /// A test bumps one generation on a chosen call so a later discard can be
+    /// removed without the earlier discard hiding that. Not compiled into
+    /// production.
+    #[cfg(any(test, feature = "test-utils"))]
+    before_discard: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[cfg(test)]
@@ -148,14 +157,23 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             slot_duration_ms: SLOT_DURATION_MS,
             #[cfg(test)]
             envelope_deadline_note: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-utils"))]
             after_produce: Mutex::new(None),
+            #[cfg(any(test, feature = "test-utils"))]
+            before_discard: Mutex::new(None),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_after_produce(&self, hook: impl Fn() + Send + Sync + 'static) {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_after_produce(&self, hook: impl Fn() + Send + Sync + 'static) {
         if let Ok(mut slot) = self.after_produce.lock() {
+            *slot = Some(Arc::new(hook));
+        }
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn set_before_discard(&self, hook: impl Fn() + Send + Sync + 'static) {
+        if let Ok(mut slot) = self.before_discard.lock() {
             *slot = Some(Arc::new(hook));
         }
     }
@@ -168,16 +186,25 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         fence: &beacon::DutyFence,
         fut: impl std::future::Future<Output = T>,
     ) -> T {
-        match fence.generation() {
-            Some(current) => {
-                signer::with_beacon_admission(BeaconAdmission::new(fence.seen(), current), fut)
-                    .await
-            }
-            None => fut.await,
+        let mut generations = fence.generations();
+        let Some((seen, current)) = generations.next() else {
+            return fut.await;
+        };
+        let mut admission = BeaconAdmission::new(seen, current);
+        for (seen, current) in generations {
+            admission = admission.and_generation(seen, current);
         }
+        signer::with_beacon_admission(admission, fut).await
     }
 
-    fn discard_revoked_fences(fences: &[&beacon::DutyFence]) -> Result<(), BlockServiceError> {
+    fn discard_revoked_fences(
+        &self,
+        fences: &[&beacon::DutyFence],
+    ) -> Result<(), BlockServiceError> {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(hook) = self.before_discard.lock().ok().and_then(|guard| guard.clone()) {
+            hook();
+        }
         if fences.iter().any(|fence| Self::admission_blocks(SigningDuty::Block, fence)) {
             warn!("beacon node admission revoked; block candidate discarded");
             Err(BlockServiceError::Beacon(
@@ -343,6 +370,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             warn!(slot, "no admitted beacon node; duties halted");
             return Err(BlockServiceError::Beacon("no admitted beacon node; duties halted".into()));
         }
+        if Self::admission_blocks(SigningDuty::RandaoReveal, capture_fence) {
+            warn!(slot, "beacon node admission revoked; block candidate discarded");
+            return Err(BlockServiceError::Beacon(
+                "beacon node response dropped: admission revoked in flight".into(),
+            ));
+        }
 
         // 1. Sign RANDAO reveal
         let randao_start = std::time::Instant::now();
@@ -490,11 +523,11 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         };
 
         payload_deadline.mark("produce");
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-utils"))]
         if let Some(hook) = self.after_produce.lock().ok().and_then(|guard| guard.clone()) {
             hook();
         }
-        Self::discard_revoked_fences(&[&fence, capture_fence])?;
+        self.discard_revoked_fences(&[&fence, capture_fence])?;
 
         // Sign and publish. The slot fork picks V4 or the ranked V3 list.
         // V4 rejects a blinded flag before signing; the shape is the bid
@@ -688,7 +721,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         } else {
             None
         };
-        Self::discard_revoked_fences(&[fence, capture_fence])?;
+        self.discard_revoked_fences(&[fence, capture_fence])?;
         let sig = Self::under_admission(
             fence,
             self.signer.sign_block_header(
@@ -778,7 +811,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         }
         // The header scope ended when that future completed. Re-enter it, and
         // re-check the capture fence taken before produce.
-        Self::discard_revoked_fences(&[fence, capture_fence])?;
+        self.discard_revoked_fences(&[fence, capture_fence])?;
         let sig = Self::under_admission(
             fence,
             self.signer.sign_execution_payload_envelope_root(
@@ -1119,7 +1152,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         capture_fence: &beacon::DutyFence,
     ) -> Result<SignedProposal, BlockServiceError> {
         let sign_start = std::time::Instant::now();
-        Self::discard_revoked_fences(&[fence, capture_fence])?;
+        self.discard_revoked_fences(&[fence, capture_fence])?;
         let sig = Self::under_admission(
             fence,
             self.signer.sign_block_header(
