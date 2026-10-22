@@ -859,6 +859,15 @@ async fn test_merged_liveness_ignores_a_failing_bn() {
         .await;
 
     let manager = make_multi_manager(&[&primary.uri(), &secondary.uri()]);
+    // Not-live counts only from a synced witness. The secondary is the sole
+    // success, so it has to be that witness. The assertion is unchanged.
+    manager.sync_statuses().write().await[1] = BnSyncDetail {
+        status: BnSyncStatus::Synced,
+        sync_distance: Some(0),
+        head_slot: Some(32),
+        is_optimistic: false,
+        el_offline: false,
+    };
     let indices = vec!["1".to_string()];
     let result = manager.post_validator_liveness_merged(42, &indices).await;
     assert!(result.is_ok(), "partial failure must not fail the merge: {result:?}");

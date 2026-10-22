@@ -715,6 +715,82 @@ fn test_opening_tick_live_current_epoch_wins_in_reverse_answer_order() {
     assert!(!machine.is_signing_enabled(&pubkey));
 }
 
+/// A failed or omitted duplicate cancels that epoch's not-live, for the
+/// previous epoch and for the current epoch. A live duplicate still detects.
+#[test]
+fn test_duplicate_failed_and_not_live_does_not_decrement() {
+    let omitted = Some(vec![ValidatorLivenessData { index: "other".to_string(), is_live: false }]);
+    let cases = [
+        "previous-failed-after",
+        "previous-failed-before",
+        "previous-omitted",
+        "current-failed",
+        "current-omitted",
+    ];
+    for label in cases {
+        let machine = machine_n(1);
+        let pubkey = new_pubkey();
+        let hex = hex::encode(pubkey.to_bytes());
+        let start = 50u64;
+        machine.register(&pubkey, start);
+        close_once(&machine, &hex, start);
+        assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Pending, "{label}");
+
+        let current = start + 2;
+        let previous = start + 1;
+        let answers = match label {
+            "previous-failed-after" => vec![
+                EpochLiveness { epoch: previous, samples: not_live(&hex) },
+                EpochLiveness { epoch: previous, samples: None },
+                EpochLiveness { epoch: current, samples: not_live(&hex) },
+            ],
+            "previous-failed-before" => vec![
+                EpochLiveness { epoch: previous, samples: None },
+                EpochLiveness { epoch: previous, samples: not_live(&hex) },
+                EpochLiveness { epoch: current, samples: not_live(&hex) },
+            ],
+            "previous-omitted" => vec![
+                EpochLiveness { epoch: previous, samples: not_live(&hex) },
+                EpochLiveness { epoch: previous, samples: omitted.clone() },
+                EpochLiveness { epoch: current, samples: not_live(&hex) },
+            ],
+            "current-failed" => vec![
+                EpochLiveness { epoch: previous, samples: not_live(&hex) },
+                EpochLiveness { epoch: current, samples: not_live(&hex) },
+                EpochLiveness { epoch: current, samples: None },
+            ],
+            "current-omitted" => vec![
+                EpochLiveness { epoch: previous, samples: not_live(&hex) },
+                EpochLiveness { epoch: current, samples: not_live(&hex) },
+                EpochLiveness { epoch: current, samples: omitted.clone() },
+            ],
+            _ => unreachable!(),
+        };
+        let _ = machine.apply_liveness_tick(&answers, current, CLOSED_EPOCH_SLOT);
+        assert_eq!(
+            machine.status(&pubkey),
+            ForwardWindowStatus::Pending,
+            "{label}: a failed or omitted duplicate must not decrement"
+        );
+        assert!(!machine.is_signing_enabled(&pubkey), "{label}");
+    }
+
+    let machine = machine_n(1);
+    let pubkey = new_pubkey();
+    let hex = hex::encode(pubkey.to_bytes());
+    let start = 80u64;
+    machine.register(&pubkey, start);
+    let current = start + 1;
+    let answers = [
+        EpochLiveness { epoch: current, samples: live(&hex) },
+        EpochLiveness { epoch: current, samples: None },
+    ];
+    let missing = machine.apply_liveness_tick(&answers, current, CLOSED_EPOCH_SLOT);
+    assert!(missing.is_empty(), "a live answer is not an unobserved epoch");
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Detected);
+    assert!(!machine.is_signing_enabled(&pubkey), "a live answer still closes signing");
+}
+
 #[test]
 fn test_opening_tick_failed_current_epoch_stays_pending() {
     let machine = machine_n(1);

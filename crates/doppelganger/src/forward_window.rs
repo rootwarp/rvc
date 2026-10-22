@@ -487,6 +487,10 @@ impl ForwardWindowMachine {
     /// previous epoch and the current epoch first and applies both through
     /// [`Self::apply_liveness_tick`], so a live current epoch is not dropped
     /// on the tick that would otherwise reach `Safe`.
+    ///
+    /// Test and `test-utils` only. Production applies ticks through
+    /// [`Self::apply_liveness_tick`].
+    #[cfg(any(test, feature = "test-utils"))]
     #[must_use = "unobserved keys stay Pending; log or retry them"]
     pub fn observe_liveness(
         &self,
@@ -567,6 +571,10 @@ impl ForwardWindowMachine {
     /// omits the key, or a missing current-epoch answer leaves the key
     /// `Pending`.
     ///
+    /// A second answer for the same epoch that failed, or that omits the key,
+    /// cancels that epoch's not-live. A live sample in either answer still
+    /// detects.
+    ///
     /// Returned pairs are `(epoch, pubkey-hex)` for a due key with no sample,
     /// sorted by epoch then pubkey. Signing stays at its previous value until
     /// this function returns.
@@ -576,6 +584,26 @@ impl ForwardWindowMachine {
         answers: &[EpochLiveness],
         current_epoch: Epoch,
         slot_in_epoch: u64,
+    ) -> Vec<(Epoch, String)> {
+        self.apply_liveness(answers, current_epoch, slot_in_epoch, false)
+    }
+
+    /// Apply live samples and skip every not-live decrement.
+    ///
+    /// The liveness loop uses this when the epoch changes while the queries
+    /// are in flight. A live answer still moves the key to `Detected`. A
+    /// not-live answer does not decrement.
+    #[must_use = "unobserved keys stay Pending; log or retry them"]
+    pub fn apply_live_answers_only(&self, answers: &[EpochLiveness]) -> Vec<(Epoch, String)> {
+        self.apply_liveness(answers, 0, 0, true)
+    }
+
+    fn apply_liveness(
+        &self,
+        answers: &[EpochLiveness],
+        current_epoch: Epoch,
+        slot_in_epoch: u64,
+        skip_decrement: bool,
     ) -> Vec<(Epoch, String)> {
         let folded: Vec<(Epoch, Option<HashMap<&str, bool>>)> = answers
             .iter()
@@ -599,12 +627,16 @@ impl ForwardWindowMachine {
             let mut saw_live = false;
             let mut closed_not_live_epoch: Option<Epoch> = None;
             let mut current_not_live = false;
+            let mut blocked: HashSet<Epoch> = HashSet::new();
             for (epoch, response) in &folded {
                 if *epoch < next_check_epoch {
                     continue;
                 }
                 match response {
-                    None => unobserved.push((*epoch, key.clone())),
+                    None => {
+                        unobserved.push((*epoch, key.clone()));
+                        blocked.insert(*epoch);
+                    }
                     Some(samples) => match samples.get(key.as_str()).copied() {
                         Some(true) => saw_live = true,
                         Some(false) => {
@@ -617,17 +649,30 @@ impl ForwardWindowMachine {
                                 current_not_live = true;
                             }
                         }
-                        None => unobserved.push((*epoch, key.clone())),
+                        None => {
+                            unobserved.push((*epoch, key.clone()));
+                            blocked.insert(*epoch);
+                        }
                     },
                 }
             }
 
             if saw_live {
+                unobserved.retain(|(_, pubkey)| pubkey != &key);
                 *state = ValidatorState::Detected;
                 arm_latch = true;
                 continue;
             }
+            if skip_decrement {
+                continue;
+            }
             let Some(epoch) = closed_not_live_epoch else { continue };
+            if blocked.contains(&epoch) {
+                continue;
+            }
+            if blocked.contains(&current_epoch) {
+                current_not_live = false;
+            }
             // The last count would open the gate. It needs a successful
             // not-live answer for the epoch being entered.
             if remaining == 1 && !current_not_live {
@@ -753,6 +798,17 @@ impl SigningEnablement for ForwardWindowMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observe_liveness_is_gated_to_test_utils() {
+        let src = include_str!("forward_window.rs");
+        let at = src.find("pub fn observe_liveness").expect("observe_liveness");
+        let mut near = src[..at].lines().rev().take(8);
+        assert!(
+            near.any(|line| line.contains("cfg(any(test, feature = \"test-utils\"))")),
+            "observe_liveness must not compile outside test or test-utils"
+        );
+    }
 
     fn machine() -> ForwardWindowMachine {
         let db: Arc<dyn slashing::SlashingDbReader> =

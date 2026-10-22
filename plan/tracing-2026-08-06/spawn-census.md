@@ -37,7 +37,7 @@ That command prints 14 lines, one per row below.
 | `crates/rvc/src/bootstrap/tasks.rs` | 261 | `bn.sync_monitor.cancel` | spawn | detached | Cancel-forwarder for `bn.sync_monitor`; not an iteration loop. |
 | `crates/rvc/src/index_resolver.rs` | 86 | `index.resolve` | spawn | B | Iteration loop. Loop site `crates/rvc/src/index_resolver.rs:114` (`IndexResolver::run`). TRC-6b owns the per-iteration root. |
 | `crates/rvc/src/keymanager_adapters/spawn.rs` | 341 | `keymanager_api` | spawn | detached | Keymanager API server; serve loop is `KeymanagerServer::serve_on` in `crates/keymanager-api/src/server.rs:203`, out of scope. |
-| `crates/rvc/src/liveness_loop.rs` | 608 | `liveness_loop` | spawn | B | Iteration loop. Loop site `crates/rvc/src/liveness_loop.rs:256` (`LivenessObservationLoop::run` loop body). TRC-6b owns the per-iteration root. |
+| `crates/rvc/src/liveness_loop.rs` | 695 | `liveness_loop` | spawn | B | Iteration loop. Loop site `crates/rvc/src/liveness_loop.rs:315` (`LivenessObservationLoop::run` loop body). TRC-6b owns the per-iteration root. |
 | `crates/rvc/src/slashing_monitor.rs` | 145 | `slashing_monitor` | spawn | B | Iteration loop. Loop site `crates/rvc/src/slashing_monitor.rs:148`. TRC-6b owns the per-iteration root. |
 
 Shape A = 0 at this HEAD. None of the 14 inherit a caller trace as a shape A root.
@@ -48,7 +48,7 @@ Shape A = 0 at this HEAD. None of the 14 inherit a caller trace as a shape A roo
 |---|---|---|
 | `monitoring_push` | `crates/rvc/src/bootstrap/tasks.rs:142` | `crates/rvc/src/background_tasks/monitoring.rs:161` |
 | `proposer_config_refresh` | `crates/rvc/src/bootstrap/tasks.rs:171` | `crates/rvc/src/background_tasks/config_url.rs:965` |
-| `liveness_loop` | `crates/rvc/src/liveness_loop.rs:608` | `crates/rvc/src/liveness_loop.rs:256` |
+| `liveness_loop` | `crates/rvc/src/liveness_loop.rs:695` | `crates/rvc/src/liveness_loop.rs:315` |
 | `slashing_monitor` | `crates/rvc/src/slashing_monitor.rs:145` | `crates/rvc/src/slashing_monitor.rs:148` |
 | `index.resolve` | `crates/rvc/src/index_resolver.rs:86` | `crates/rvc/src/index_resolver.rs:114` |
 
@@ -75,9 +75,9 @@ The slashing-monitor `None` call is the old no-op detached site. It left the cen
 
 ## `liveness_loop.rs` `#[cfg(test)]` trap
 
-`crates/rvc/src/liveness_loop.rs` has a method-level `#[cfg(test)]` at `:382` and an inner `#[cfg(test)]` at `:556`. The column-0 module attribute is at `:614`. The production spawn is `:608`, above that module attribute.
+`crates/rvc/src/liveness_loop.rs` has a method-level `#[cfg(test)]` at `:445` and an inner `#[cfg(test)]` at `:643`. The column-0 module attribute is at `:701`. The production spawn is `:695`, above that module attribute.
 
-Truncating the file at the first `#[cfg(test)]` (the method-level attribute at `:382`) hides `:608` and drops a real production site. The command above keeps `:608` because it only treats a column-0 `#[cfg(test)]` as the end of the production region.
+Truncating the file at the first `#[cfg(test)]` (the method-level attribute at `:445`) hides `:695` and drops a real production site. The command above keeps `:695` because it only treats a column-0 `#[cfg(test)]` as the end of the production region.
 
 `crates/architecture-tests/tests/spawn_span_continuity.rs` pins this census at 14 under tracing ADR-009. The gate ends the production region at the first column-0 `#[cfg(test)]` followed by `mod` (not the first bare `#[cfg(test)]`), skips `///` and `//!` lines, and does not count `register_opt(..., None)`. A site passes only when the preceding non-empty line is a `// detached:` comment, or it is one of the five shape-B rows and the loop file in the table above contains `parent: None` and `follows_from` for that task. The allow-list is empty.
 
@@ -98,4 +98,4 @@ These calls are outside the executor scan (`crates/rvc` + `bin/rvc`) and outside
 | `crates/bn-manager/src/fan_out.rs` | 867 | `tokio::spawn` in `wait_for_complete_detached` |
 | `crates/bn-manager/src/fan_out.rs` | 1080 | `tokio::spawn` in `spawn_detached` |
 | `crates/bn-manager/src/fan_out.rs` | 1135 | `tokio::spawn` in `health_sender` |
-| `crates/bn-manager/src/manager.rs` | 780 | `tokio::spawn` in `start_sse` |
+| `crates/bn-manager/src/manager.rs` | 785 | `tokio::spawn` in `start_sse` |

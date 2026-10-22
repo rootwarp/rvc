@@ -335,6 +335,9 @@ pub struct BnManager {
     slot_duration_ms: AtomicU64,
     /// Identity from the beacon nodes that completed spec and genesis.
     chain_identity: Arc<tokio::sync::RwLock<Option<ChainIdentity>>>,
+    /// Fires after the liveness stamp re-check and before the witness read.
+    #[cfg(test)]
+    after_stamp_recheck: tokio::sync::Notify,
 }
 
 /// Apply health-tracker updates. Each call takes the write lock once.
@@ -549,6 +552,8 @@ impl BnManager {
             revocation_generation: Arc::new(AtomicU64::new(0)),
             slot_duration_ms: AtomicU64::new(0),
             chain_identity: Arc::new(tokio::sync::RwLock::new(None)),
+            #[cfg(test)]
+            after_stamp_recheck: tokio::sync::Notify::new(),
         })
     }
 
@@ -2085,6 +2090,52 @@ impl BnManager {
         tracing::Span::current().record("tried", attempts.len());
         fan_out::all(op_name, &role.to_string(), attempts, budget, &self.health_trackers).await
     }
+
+    /// Endpoints that may witness a not-live liveness answer.
+    ///
+    /// Read after the admission fence. A node that is no longer admitted is
+    /// not a witness. Unknown, unreachable, optimistic, execution-offline, and
+    /// a missing or unreadable sync distance are not witnesses. Synced and
+    /// SmallLag are.
+    async fn synced_witness_endpoints(&self) -> HashSet<String> {
+        let details = self.sync_statuses.read().await;
+        let mut synced_witness = HashSet::new();
+        for (index, detail) in details.iter().enumerate() {
+            if !self.is_admitted(index) || !detail_is_synced_witness(detail, &self.tier_thresholds)
+            {
+                continue;
+            }
+            if let Some(client) = self.clients.get(index) {
+                synced_witness.insert(client.endpoint().to_string());
+            }
+        }
+        synced_witness
+    }
+
+    /// Head slot from every admitted node in the All role ([`BnRole::matches`]).
+    ///
+    /// [`Self::broadcast_all`] takes the duty fence before the calls. A node
+    /// revoked while the call is in flight, a missing `head_slot`, or a value
+    /// that is not a base-10 slot number fails the call.
+    pub async fn admitted_head_slots(&self) -> Result<Vec<u64>, BeaconError> {
+        let broadcast = self
+            .broadcast_all("admitted_head_slots", BnRole::All, None, |client| {
+                let client = client.clone();
+                Box::pin(async move {
+                    let syncing = client.get_node_syncing().await?;
+                    parse_head_slot(&syncing.data.head_slot)
+                })
+            })
+            .await?;
+        if broadcast.outcomes.is_empty() {
+            return Err(BeaconError::NoAdmittedNode);
+        }
+        let mut head_slots = Vec::with_capacity(broadcast.outcomes.len());
+        for outcome in broadcast.outcomes {
+            head_slots.push(outcome.result?);
+        }
+        Ok(head_slots)
+    }
 }
 
 /// Deneb, Electra, and Fulu publish `{message, signature}` with an object body.
@@ -2727,29 +2778,76 @@ fn json_fixed_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     Some(out)
 }
 
+/// `true` when this node's last sync sample can witness a not-live answer.
+///
+/// A missing distance is not a witness: an unreadable sync sample must not
+/// open the gate.
+fn detail_is_synced_witness(detail: &BnSyncDetail, thresholds: &TierThresholds) -> bool {
+    if detail.is_optimistic || detail.el_offline {
+        return false;
+    }
+    if matches!(
+        detail.status,
+        BnSyncStatus::Unknown | BnSyncStatus::Unreachable | BnSyncStatus::ElOffline
+    ) {
+        return false;
+    }
+    let Some(distance) = detail.sync_distance else {
+        return false;
+    };
+    matches!(thresholds.tier_for_distance(distance), HealthTier::Synced | HealthTier::SmallLag)
+}
+
+fn parse_head_slot(text: &str) -> Result<u64, BeaconError> {
+    if text.is_empty() || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(BeaconError::ParseError("head_slot is not a slot number".into()));
+    }
+    text.parse::<u64>()
+        .map_err(|_| BeaconError::ParseError("head_slot is not a slot number".into()))
+}
+
 /// OR-merge `is_live` per validator index across broadcast outcomes.
 ///
-/// Fail-safe: any BN reporting live wins. Errors contribute nothing. All-fail
+/// Live from any admitted node wins. Not-live counts only when `synced_witness`
+/// contains that outcome's endpoint. Anything else is omitted, so the epoch
+/// stays unobserved for that index. Errors contribute nothing. All-fail
 /// returns `Err` so the observation loop stays fail-closed.
 fn merge_liveness_broadcast(
     broadcast: BroadcastResult<ValidatorLivenessResponse>,
+    synced_witness: &HashSet<String>,
 ) -> Result<ValidatorLivenessResponse, BeaconError> {
     if !broadcast.any_success() {
         return broadcast.into_result();
     }
 
-    let mut live_by_index: HashMap<String, bool> = HashMap::new();
+    struct Fold {
+        live: bool,
+        not_live_witnessed: bool,
+    }
+
+    let mut by_index: HashMap<String, Fold> = HashMap::new();
     let mut order: Vec<String> = Vec::new();
     for outcome in broadcast.outcomes {
         let Ok(resp) = outcome.result else {
             continue;
         };
+        let witness = synced_witness.contains(&outcome.endpoint);
         for entry in resp.data {
-            match live_by_index.get_mut(&entry.index) {
-                Some(live) => *live |= entry.is_live,
-                None => {
-                    live_by_index.insert(entry.index.clone(), entry.is_live);
-                    order.push(entry.index);
+            match by_index.entry(entry.index) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    order.push(slot.key().clone());
+                    slot.insert(Fold {
+                        live: entry.is_live,
+                        not_live_witnessed: !entry.is_live && witness,
+                    });
+                }
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let fold = slot.get_mut();
+                    if entry.is_live {
+                        fold.live = true;
+                    } else if witness {
+                        fold.not_live_witnessed = true;
+                    }
                 }
             }
         }
@@ -2759,7 +2857,15 @@ fn merge_liveness_broadcast(
         data: order
             .into_iter()
             .filter_map(|index| {
-                live_by_index.remove(&index).map(|is_live| ValidatorLiveness { index, is_live })
+                let fold = by_index.remove(&index)?;
+                let is_live = if fold.live {
+                    true
+                } else if fold.not_live_witnessed {
+                    false
+                } else {
+                    return None;
+                };
+                Some(ValidatorLiveness { index, is_live })
             })
             .collect(),
     })
@@ -4135,8 +4241,11 @@ impl LivenessApi for BnManager {
                     .await),
             )
             .await?;
+        #[cfg(test)]
+        self.after_stamp_recheck.notify_one();
         Self::log_partial_failure("post_validator_liveness_merged", &broadcast);
-        merge_liveness_broadcast(broadcast)
+        let synced_witness = self.synced_witness_endpoints().await;
+        merge_liveness_broadcast(broadcast, &synced_witness)
     }
 }
 
@@ -7828,6 +7937,160 @@ mod tests {
             .iter()
             .filter(|request| request.url.path().contains("/eth/v1/validator/liveness/"))
             .count()
+    }
+
+    async fn mount_sync_body(server: &wiremock::MockServer, body: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_liveness_body(server: &wiremock::MockServer, body: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/validator/liveness/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn merged_liveness_after_sync(
+        sync_body: &str,
+        liveness_body: &str,
+    ) -> ValidatorLivenessResponse {
+        use crate::traits::LivenessApi;
+        let server = wiremock::MockServer::start().await;
+        mount_sync_body(&server, sync_body).await;
+        mount_liveness_body(&server, liveness_body).await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("manager");
+        manager.check_sync_status().await;
+        manager
+            .post_validator_liveness_merged(1, &["1".to_string()])
+            .await
+            .expect("admitted node answered")
+    }
+
+    fn counts_not_live(response: &ValidatorLivenessResponse) -> bool {
+        response.data.iter().any(|entry| entry.index == "1" && !entry.is_live)
+    }
+
+    fn counts_live(response: &ValidatorLivenessResponse) -> bool {
+        response.data.iter().any(|entry| entry.index == "1" && entry.is_live)
+    }
+
+    /// An unsynced, optimistic, execution-offline, large-lag, or unreadable
+    /// distance must not contribute `is_live = false`.
+    #[tokio::test]
+    async fn merged_liveness_ignores_not_live_from_unsynced_nodes() {
+        let not_live = r#"{"data":[{"index":"1","is_live":false}]}"#;
+        let cases = [
+            (
+                "unsynced",
+                r#"{"data":{"head_slot":"10","sync_distance":"1000","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#,
+            ),
+            (
+                "optimistic",
+                r#"{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false,"is_optimistic":true,"el_offline":false}}"#,
+            ),
+            (
+                "el_offline",
+                r#"{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":true}}"#,
+            ),
+            (
+                "large_lag",
+                r#"{"data":{"head_slot":"100","sync_distance":"64","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#,
+            ),
+            (
+                "garbled_distance",
+                r#"{"data":{"head_slot":"100","sync_distance":"nope","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#,
+            ),
+        ];
+        for (label, sync_body) in cases {
+            let response = merged_liveness_after_sync(sync_body, not_live).await;
+            assert!(
+                !counts_not_live(&response),
+                "{label}: not-live without a synced witness must not count: {response:?}"
+            );
+        }
+    }
+
+    /// `is_live = true` from an unsynced or optimistic admitted node still counts.
+    #[tokio::test]
+    async fn merged_liveness_keeps_live_from_an_unsynced_node() {
+        let live = r#"{"data":[{"index":"1","is_live":true}]}"#;
+        let cases = [
+            (
+                "unsynced",
+                r#"{"data":{"head_slot":"10","sync_distance":"1000","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#,
+            ),
+            (
+                "optimistic",
+                r#"{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false,"is_optimistic":true,"el_offline":false}}"#,
+            ),
+        ];
+        for (label, sync_body) in cases {
+            let response = merged_liveness_after_sync(sync_body, live).await;
+            assert!(
+                counts_live(&response),
+                "{label}: live from an admitted node must be kept: {response:?}"
+            );
+        }
+    }
+
+    /// SmallLag is a synced witness. Its not-live answer counts.
+    #[tokio::test]
+    async fn merged_liveness_counts_not_live_from_a_small_lag_witness() {
+        let response = merged_liveness_after_sync(
+            r#"{"data":{"head_slot":"100","sync_distance":"9","is_syncing":true,"is_optimistic":false,"el_offline":false}}"#,
+            r#"{"data":[{"index":"1","is_live":false}]}"#,
+        )
+        .await;
+        assert!(counts_not_live(&response), "SmallLag is a synced witness: {response:?}");
+    }
+
+    /// The liveness body is accepted, then the node is revoked before the
+    /// witness read. That not-live answer must be omitted. Dropping the
+    /// admission check in `synced_witness_endpoints` lets it count.
+    #[tokio::test(flavor = "current_thread")]
+    async fn merged_liveness_omits_not_live_when_revoked_before_the_witness_read() {
+        let server = wiremock::MockServer::start().await;
+        mount_liveness_body(&server, r#"{"data":[{"index":"1","is_live":false}]}"#).await;
+        let manager =
+            Arc::new(BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("manager"));
+        let mut guard = manager.sync_statuses().write().await;
+        guard[0] = BnSyncDetail {
+            status: BnSyncStatus::Synced,
+            sync_distance: Some(0),
+            head_slot: Some(1000),
+            is_optimistic: false,
+            el_offline: false,
+        };
+        // Register the waiter before the call. The permit is raised only after
+        // the stamp re-check, and the write lock keeps the witness read parked.
+        let cleared = manager.after_stamp_recheck.notified();
+        let task_manager = Arc::clone(&manager);
+        let task = tokio::spawn(async move {
+            task_manager.post_validator_liveness_merged(1, &["1".to_string()]).await
+        });
+        cleared.await;
+        assert!(
+            !task.is_finished(),
+            "the witness read must still be waiting on the sync-status lock"
+        );
+        manager.revoke_admission(0);
+        assert!(!manager.is_admitted(0));
+        assert!(!task.is_finished(), "revoke must land before the witness read");
+        drop(guard);
+        let response = task.await.expect("task").expect("the body was accepted before revoke");
+        assert!(
+            !counts_not_live(&response),
+            "a node revoked before the witness read must not count as not-live: {response:?}"
+        );
     }
 
     #[test]

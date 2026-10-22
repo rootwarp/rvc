@@ -383,15 +383,19 @@ pub trait LivenessApi: Send + Sync {
         validator_indices: &[String],
     ) -> Result<ValidatorLivenessResponse, BeaconError>;
 
-    /// Query liveness on every configured BN and OR-merge `is_live` per index.
+    /// Query liveness and OR-merge `is_live` per index.
     ///
-    /// Any BN reporting live wins (fail-safe). Errors and non-responses
-    /// contribute nothing — they are not treated as "not live". Returns `Err`
-    /// only when every BN fails, so callers can stay fail-closed.
+    /// Any admitted success reporting live wins (fail-safe). A not-live answer
+    /// counts only under the witness rule, and that rule is enforced in
+    /// [`crate::BnManager`]: only an admitted node whose last sync sample is
+    /// Synced or SmallLag, not optimistic, and not execution-offline can
+    /// contribute `is_live = false`. Errors and non-responses contribute
+    /// nothing. Returns `Err` only when every BN fails, so callers can stay
+    /// fail-closed.
     ///
     /// No default body: an unimplemented method is a compile error, not a
     /// silent runtime failure. Single-BN clients (`BeaconClient`) self-delegate
-    /// to [`Self::post_validator_liveness`].
+    /// to [`Self::post_validator_liveness`] and do not apply the witness rule.
     async fn post_validator_liveness_merged(
         &self,
         epoch: u64,
