@@ -13,7 +13,7 @@ use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visit
 use serde::Deserialize;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn, Instrument};
-use validator_store::{DefaultUpdate, ValidatorStore};
+use validator_store::{DefaultUpdate, RemoteDefaultRelease, ValidatorStore};
 
 /// One successful proposer-config fetch.
 ///
@@ -744,11 +744,17 @@ fn entry_to_update(
 /// write of a field the URL owns drops that ownership, even when the written
 /// value equals the URL value. A later document owns the field again only by
 /// setting a value, and the baseline is the live value at that moment.
-/// Omitting a pubkey restores each field the URL still owns. A fetch with no
-/// `proposer_config` object applies `default_config` only and does not restore.
+/// Omitting a pubkey restores each field the URL still owns. Naming the
+/// pubkey but omitting a field releases that field the same way. One
+/// successful document is one state write: rows are claimed, omitted pubkeys
+/// are released, then defaults are applied and omitted default fields are
+/// released. A fetch with no `proposer_config` object applies `default_config`
+/// only and does not restore omitted pubkeys.
 ///
 /// `default_config` changes the live defaults. The store does not write it
-/// into `[defaults]`. No block is signed or published.
+/// into `[defaults]`. A successful document that omits `default_config`, or
+/// omits one of its fields, releases that remote default. A failed fetch does
+/// not. No block is signed or published.
 #[derive(Default)]
 pub struct ProposerConfigApplier {
     seen: HashSet<[u8; 48]>,
@@ -765,7 +771,9 @@ impl ProposerConfigApplier {
     /// `updates == None` means the document had no `proposer_config` object.
     /// Every entry is checked before any store write. One bad pubkey, fee, or
     /// gas limit leaves the previous URL values in place and does not restore
-    /// omitted keys. No block is signed or published.
+    /// omitted keys. Rows are claimed before defaults are released, so a
+    /// reader does not observe the local default fee for a row this document
+    /// still sets. No block is signed or published.
     pub fn apply(
         &mut self,
         store: &ValidatorStore,
@@ -773,49 +781,52 @@ impl ProposerConfigApplier {
         default_update: Option<ValidatorConfigUpdate>,
     ) {
         let Some(updates) = updates else {
-            let default_update = match default_update.as_ref() {
-                None => None,
-                Some(update) => match update.to_default_update() {
-                    Ok(update) => Some(update),
-                    Err(e) => {
-                        warn!(error = %e, "proposer config rejected; previous values stay");
-                        return;
-                    }
-                },
+            let Some(update) = default_update else {
+                return;
             };
-            if let Some(update) = default_update {
-                if let Err(e) = store.apply_remote_defaults(update) {
-                    warn!(error = %e, "proposer config default entry ignored");
+            let default_update = match update.to_default_update() {
+                Ok(update) => update,
+                Err(e) => {
+                    warn!(error = %e, "proposer config rejected; previous values stay");
+                    return;
                 }
-            }
+            };
+            publish_remote_defaults(store, Some(default_update));
             return;
         };
         let Ok(prepared) = prepare_fetch(&updates, default_update.as_ref()) else {
             return;
         };
-        if let Some(update) = prepared.default_update {
-            if let Err(e) = store.apply_remote_defaults(update) {
-                warn!(error = %e, "proposer config default entry ignored");
-            }
-        }
         let mut present = HashSet::new();
-        for (pk, store_update) in prepared.rows {
-            present.insert(pk);
-            if let Err(e) = store.apply_remote_proposer(&pk, store_update) {
-                warn!(
-                    error = %e,
-                    pubkey_prefix = %pubkey_prefix(&pk),
-                    "proposer config entry ignored"
-                );
-            }
+        for (pk, _) in &prepared.rows {
+            present.insert(*pk);
         }
         let missing: Vec<[u8; 48]> =
             self.seen.iter().copied().filter(|pk| !present.contains(pk)).collect();
-        for pk in missing {
-            store.release_remote_proposer(&pk);
+        if let Err(e) = store.apply_remote_document(prepared.rows, missing, prepared.default_update)
+        {
+            warn!(error = %e, "proposer config document rejected; previous values stay");
+            return;
         }
         self.seen = present;
     }
+}
+
+/// Apply `default_config` fields the document sets, then release the ones it omits.
+///
+/// `None` means the document had no `default_config`. Every remote default is
+/// released. An apply error leaves the previous remote defaults in place.
+fn publish_remote_defaults(store: &ValidatorStore, update: Option<DefaultUpdate>) {
+    let Some(update) = update else {
+        store.release_remote_defaults(RemoteDefaultRelease::all());
+        return;
+    };
+    let release = RemoteDefaultRelease::omitted(&update);
+    if let Err(e) = store.apply_remote_defaults(update) {
+        warn!(error = %e, "proposer config default entry ignored");
+        return;
+    }
+    store.release_remote_defaults(release);
 }
 
 struct PreparedFetch {
@@ -860,10 +871,6 @@ fn warn_ignored_entry(pubkey: &str, error: &impl std::fmt::Display) {
     warn!(error = %error, pubkey = %pubkey, "proposer config entry ignored");
 }
 
-fn pubkey_prefix(pk: &[u8; 48]) -> String {
-    hex::encode(&pk[..4])
-}
-
 /// Starts the background proposer config refresh task.
 ///
 /// Fetches proposer config from URL at the configured interval and
@@ -879,8 +886,10 @@ fn pubkey_prefix(pk: &[u8; 48]) -> String {
 /// `apply_fn` runs on the blocking pool because it waits on the store save
 /// lock while durable writers hold that lock across `write_toml_atomic`.
 /// Shutdown observed before `spawn_blocking` does not start apply and is
-/// not a success. An apply that has started is awaited. A cancelled or
-/// failed join is not logged or counted as success.
+/// not a success. An apply that has started is awaited and still runs to
+/// completion, including a release of omitted fields. Shutdown does not roll
+/// that release back. A cancelled or failed join is not logged or counted
+/// as success.
 pub async fn start_proposer_config_refresh<A>(
     settings: ProposerConfigUrlSettings,
     shutdown: CancellationToken,
@@ -1850,7 +1859,13 @@ mod tests {
             Some(row("default", Some(&default_fee), None, Some(40_000_000))),
         );
         assert_eq!(store.default_fee_recipient(), [0xccu8; 20]);
-        applier.apply(&store, Some(Vec::new()), None);
+        // Repeat `default_config` so the restored row inherits the remote
+        // default. A document that omits it restores the local defaults.
+        applier.apply(
+            &store,
+            Some(Vec::new()),
+            Some(row("default", Some(&default_fee), None, Some(40_000_000))),
+        );
         assert_eq!(store.get_config(&pk).expect("row").fee_recipient, None);
         assert_eq!(store.get_config(&pk).expect("row").gas_limit, None);
         assert!(!store.is_builder_enabled(&pk));
@@ -2021,6 +2036,64 @@ mod tests {
             fetched.default_update.expect("default").fee_recipient.as_deref(),
             Some(fee.as_str())
         );
+    }
+
+    #[test]
+    fn apply_without_a_document_does_not_release_defaults() {
+        let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
+        store
+            .apply_remote_defaults(validator_store::DefaultUpdate {
+                fee_recipient: Some([0xbbu8; 20]),
+                gas_limit: Some(40_000_000),
+                ..validator_store::DefaultUpdate::default()
+            })
+            .unwrap();
+        ProposerConfigApplier::new().apply(&store, None, None);
+        assert_eq!(store.default_fee_recipient(), [0xbbu8; 20]);
+        assert_eq!(store.default_gas_limit(), 40_000_000);
+    }
+
+    /// A rejected default update does not release fields the URL still owns.
+    #[test]
+    fn a_rejected_default_update_does_not_release_owned_defaults() {
+        let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
+        let graffiti = [0x11u8; 32];
+        store
+            .apply_remote_defaults(validator_store::DefaultUpdate {
+                graffiti: Some(Some(graffiti)),
+                ..validator_store::DefaultUpdate::default()
+            })
+            .unwrap();
+        let huge = (i64::MAX as u64).saturating_add(1);
+        publish_remote_defaults(
+            &store,
+            Some(validator_store::DefaultUpdate {
+                gas_limit: Some(huge),
+                ..validator_store::DefaultUpdate::default()
+            }),
+        );
+        assert_eq!(store.effective_graffiti(&[0u8; 48]), Some(graffiti));
+        assert_eq!(store.default_gas_limit(), 30_000_000);
+    }
+
+    /// A default-only document that fails validation is not a release.
+    #[test]
+    fn a_rejected_default_only_document_does_not_release_owned_defaults() {
+        let store = ValidatorStore::new([0x01u8; 20], 30_000_000);
+        let graffiti = [0x11u8; 32];
+        store
+            .apply_remote_defaults(validator_store::DefaultUpdate {
+                graffiti: Some(Some(graffiti)),
+                ..validator_store::DefaultUpdate::default()
+            })
+            .unwrap();
+        let huge = (i64::MAX as u64).saturating_add(1);
+        ProposerConfigApplier::new().apply(
+            &store,
+            None,
+            Some(row("default", None, None, Some(huge))),
+        );
+        assert_eq!(store.effective_graffiti(&[0u8; 48]), Some(graffiti));
     }
 
     #[test]

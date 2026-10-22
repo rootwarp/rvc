@@ -429,6 +429,58 @@ async fn omitting_a_pubkey_restores_its_pre_url_fee_gas_and_builder_flag() {
     assert_pre_url_triple(&store, &pk);
 }
 
+/// Tick 1 sets fee, gas, and builder. Tick 2 names the same pubkey with gas
+/// only. Fee and builder return to the baseline. Gas stays remote.
+#[tokio::test]
+async fn a_field_the_url_stops_setting_is_restored_while_the_pubkey_stays_named() {
+    let mock_server = MockServer::start().await;
+    let pk = test_pubkey();
+    let pk_hex = format!("0x{}", hex::encode(pk));
+    let fee_b_hex = format!("0x{}", hex::encode(fee_b()));
+    let store = explicit_baseline_store();
+    let tick1 = one_pubkey_body(&pk_hex, &entry_body(&fee_b_hex, 36_000_000, true));
+    let tick2 = one_pubkey_body(&pk_hex, r#"{"builder":{"gas_limit":"36000000"}}"#);
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tick1))
+        .up_to_n_times(1)
+        .mount(&mock_server)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(tick2))
+        .mount(&mock_server)
+        .await;
+
+    let mut applier = ProposerConfigApplier::new();
+    let first = fetch_proposer_config(&mock_server.uri(), None, true).await.expect("tick 1");
+    applier.apply(&store, first.updates, first.default_update);
+    assert_url_triple(&store, &pk);
+
+    let second = fetch_proposer_config(&mock_server.uri(), None, true).await.expect("tick 2");
+    applier.apply(&store, second.updates, second.default_update);
+    let row = store.get_config(&pk).expect("row");
+    assert_eq!(row.fee_recipient, Some(fee_a()));
+    assert_eq!(row.gas_limit, Some(36_000_000));
+    assert!(!row.builder_proposals);
+    assert_eq!(row.graffiti, Some([0x47u8; 32]));
+    assert!(row.enabled);
+
+    applier.apply(
+        &store,
+        Some(vec![UrlUpdate {
+            pubkey: pk_hex,
+            fee_recipient: Some(fee_b_hex),
+            builder_enabled: None,
+            gas_limit: None,
+        }]),
+        None,
+    );
+    let row = store.get_config(&pk).expect("row");
+    assert_eq!(row.fee_recipient, Some(fee_b()));
+    assert_eq!(row.gas_limit, Some(21_000_000));
+    assert!(!row.builder_proposals);
+}
+
 #[tokio::test]
 async fn a_401_after_a_url_set_keeps_the_url_values_until_a_successful_omission() {
     let mock_server = MockServer::start().await;
@@ -832,6 +884,85 @@ fn remote_default_config_is_not_the_local_defaults_after_restart() {
     assert_eq!(restarted.get_config(&row.pk).expect("row").fee_recipient, Some(fee_a()));
 }
 
+/// A later successful body that omits a default field restores that field.
+/// Omitting `default_config` entirely restores every remote default. The
+/// named pubkey is left on its URL values.
+#[test]
+fn a_body_without_default_config_restores_the_local_defaults() {
+    let row = persisted_row(fee_a(), 21_000_000, false);
+    row.store
+        .apply_remote_defaults(validator_store::DefaultUpdate {
+            graffiti: Some(Some([0x11u8; 32])),
+            ..validator_store::DefaultUpdate::default()
+        })
+        .expect("remote graffiti");
+    assert_eq!(row.store.effective_graffiti(&row.pk), Some([0x11u8; 32]));
+    let mut applier = ProposerConfigApplier::new();
+    applier.apply(
+        &row.store,
+        Some(vec![url_entry(&row.pk, fee_b(), 36_000_000, true)]),
+        Some(UrlUpdate {
+            pubkey: "default".to_string(),
+            fee_recipient: Some(format!("0x{}", hex::encode(fee_b()))),
+            builder_enabled: None,
+            gas_limit: Some(40_000_000),
+        }),
+    );
+    assert_eq!(row.store.default_fee_recipient(), fee_b());
+    assert_eq!(row.store.default_gas_limit(), 40_000_000);
+    assert_eq!(row.store.effective_graffiti(&row.pk), None);
+
+    applier.apply(
+        &row.store,
+        Some(vec![url_entry(&row.pk, fee_b(), 36_000_000, true)]),
+        Some(UrlUpdate {
+            pubkey: "default".to_string(),
+            fee_recipient: None,
+            builder_enabled: None,
+            gas_limit: Some(40_000_000),
+        }),
+    );
+    assert_eq!(row.store.default_fee_recipient(), [0x01u8; 20]);
+    assert_eq!(row.store.default_gas_limit(), 40_000_000);
+    assert_eq!(row.store.effective_fee_recipient(&row.pk), fee_b());
+
+    applier.apply(&row.store, Some(vec![url_entry(&row.pk, fee_b(), 36_000_000, true)]), None);
+    assert_eq!(row.store.default_fee_recipient(), [0x01u8; 20]);
+    assert_eq!(row.store.default_gas_limit(), 30_000_000);
+    assert_eq!(row.store.effective_fee_recipient(&row.pk), fee_b());
+    assert_eq!(row.store.effective_gas_limit(&row.pk), 36_000_000);
+}
+
+/// A local defaults write drops remote ownership. A later omission keeps the
+/// local value.
+#[test]
+fn a_local_default_write_drops_remote_default_ownership() {
+    use validator_store::DefaultUpdate;
+
+    let row = persisted_row(fee_a(), 21_000_000, false);
+    let mut applier = ProposerConfigApplier::new();
+    applier.apply(
+        &row.store,
+        Some(vec![]),
+        Some(UrlUpdate {
+            pubkey: "default".to_string(),
+            fee_recipient: Some(format!("0x{}", hex::encode(fee_b()))),
+            builder_enabled: None,
+            gas_limit: Some(40_000_000),
+        }),
+    );
+    row.store
+        .apply_default_update(DefaultUpdate {
+            fee_recipient: Some(fee_b()),
+            gas_limit: Some(40_000_000),
+            graffiti: None,
+        })
+        .expect("local defaults");
+    applier.apply(&row.store, Some(vec![]), None);
+    assert_eq!(row.store.default_fee_recipient(), fee_b());
+    assert_eq!(row.store.default_gas_limit(), 40_000_000);
+}
+
 #[test]
 fn remote_and_keymanager_writes_stay_atomic_across_omission() {
     let row = persisted_row(fee_a(), 21_000_000, false);
@@ -883,29 +1014,5 @@ fn remote_and_keymanager_writes_stay_atomic_across_omission() {
     barrier.wait();
     writer.join().expect("writer");
     refresher.join().expect("refresher");
-
-    store
-        .update_config_durable(
-            &pk,
-            ValidatorConfigUpdate {
-                fee_recipient: Some(Some(fee_c())),
-                gas_limit: Some(Some(40_000_000)),
-                builder_proposals: Some(false),
-                ..ValidatorConfigUpdate::default()
-            },
-        )
-        .expect("final C");
-    store
-        .apply_remote_proposer(
-            &pk,
-            ValidatorConfigUpdate {
-                fee_recipient: Some(Some(fee_b())),
-                gas_limit: Some(Some(36_000_000)),
-                builder_proposals: Some(true),
-                ..ValidatorConfigUpdate::default()
-            },
-        )
-        .expect("final B");
-    store.release_remote_proposer(&pk);
     assert_live_and_disk(&row, Some(fee_c()), Some(40_000_000), false);
 }

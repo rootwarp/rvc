@@ -20,7 +20,9 @@ The fork layout is the header's `Eth-Consensus-Version`, which is already checke
 ## Proposer-config URL refresh
 
 Shutdown cancels an in-flight proposer-config fetch. Dropping the fetch
-stops this task from waiting on it. A DNS lookup or a connect already
+stops this task from waiting on it. An apply that has already started still
+runs to completion, including a release of omitted fields. Shutdown does not
+roll that release back. A DNS lookup or a connect already
 spawned inside the HTTP stack can outlive that drop until the connect
 timeout or the request deadline. The client uses a 10 second connect
 timeout and a 30 second total deadline. The connect timeout covers DNS,
@@ -250,7 +252,13 @@ memory and in the validators file. The URL owns the field again only when a
 later document sets it, and the baseline is the live value at that moment.
 A later successful fetch that omits the pubkey restores each field the URL
 still owns. A field the URL does not own is left as it is. Naming the
-pubkey again after that restore starts ownership from the restored row.
+pubkey but omitting one field restores that field when the live value is
+still the remote one, and leaves the fields the document still sets.
+Naming the pubkey again after that restore starts ownership from the
+restored row.
+
+Operators whose URL publishes a partial document now see omitted fields
+snap back to the local baseline. A failed fetch does not snap them back.
 
 Deleting a key removes its ownership record. Importing it again starts from
 the imported row. An omission after that delete does not write the old
@@ -266,8 +274,15 @@ still owns on disk.
 `default_config` changes the live defaults only. It is not written as
 `[defaults]`. After a restart with the remote document gone, a validator
 with no per-validator override uses the local `[defaults]` from the file.
-A later body that omits `default_config` does not restore the previous
-remote defaults.
+A later successful body that omits `default_config`, or omits one of its
+fields, restores that field's local value when the live value is still the
+remote one. A failed fetch does not.
+
+`reload_config` keeps URL ownership for a validator that is not in the
+file, so a later save still writes that validator's local baseline. A
+validator the file replaces takes the file values, and that URL ownership
+is dropped. Remote defaults are cleared because the file replaces them.
+Nothing in the shipped binary calls `reload_config`.
 
 A 401, a body that is not JSON, a 200 whose JSON has neither
 `proposer_config` nor `default_config`, or one invalid entry leaves every

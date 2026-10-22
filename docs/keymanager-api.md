@@ -438,7 +438,7 @@ All numeric fields (`epoch`, `validator_index`) are string-encoded per spec. The
 
 ## Config Persistence
 
-All POST and DELETE operations on fee recipient, gas limit, and graffiti endpoints persist changes to the TOML config file atomically (temp file + rename). Changes survive process restarts without re-applying.
+All POST and DELETE operations on fee recipient, gas limit, and graffiti endpoints persist changes to the TOML config file atomically (temp file + rename). Changes survive process restarts without re-applying. A later proposer-config URL document that names fee recipient or gas limit takes that field back from the value set here.
 
 Concurrent API requests are safe — writes are serialized through a lock, and atomic file operations prevent corruption on crash.
 
