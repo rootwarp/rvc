@@ -14,7 +14,7 @@ workspace = true
 
 [features]
 default = []
-# Rendezvous hooks for the detection latch. Production binaries do not enable it.
+# Test-only surface: latch hooks and `observe_liveness`. Production binaries do not enable it.
 test-utils = []
 
 [dependencies]
@@ -28,6 +28,8 @@ parking_lot = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Integration tests call `observe_liveness`, which is test-utils only.
+rvc-doppelganger = { path = ".", features = ["test-utils"] }
 crypto = { workspace = true }
 slashing = { workspace = true }
 hex = { workspace = true }

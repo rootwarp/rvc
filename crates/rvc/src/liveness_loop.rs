@@ -19,11 +19,14 @@
 //!
 //! Liveness fans out to every configured BN via
 //! [`LivenessApi::post_validator_liveness_merged`]. Per validator index,
-//! `is_live` is OR-merged — any BN reporting live wins (fail-safe: a lagging
-//! primary that answers all-not-live cannot suppress a secondary that saw
-//! activity). Errors and non-responses contribute nothing (they are not treated
-//! as "not live"). If every BN fails the call returns `Err` and this loop still
-//! fail-closes on errors/incomplete samples.
+//! `is_live` is OR-merged — any admitted BN reporting live wins (fail-safe: a
+//! lagging primary that answers all-not-live cannot suppress a secondary that
+//! saw activity). A not-live answer counts only when a synced witness reported
+//! it. Errors and non-responses contribute nothing (they are not treated as
+//! "not live"). If every BN fails the call returns `Err` and this loop still
+//! fail-closes on errors/incomplete samples. The epoch is read again after the
+//! queries; if it moved, live answers still detect and the decrement is skipped.
+//! A closed epoch older than the previous one is not queried again.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -47,6 +50,34 @@ use crate::pubkey_index::SharedPubkeyIndexRegistry;
 use crate::pubkey_index::{parse_pubkey_bytes, pubkey_bytes_to_0x};
 use crate::quiesce::TrackedKeys;
 use crate::startup::EXIT_DOPPELGANGER_DETECTED;
+
+/// Test clock. Production reads [`MonotonicEpochClock`].
+#[cfg(any(test, feature = "test-utils"))]
+pub struct ClockSeam {
+    epoch: std::sync::atomic::AtomicU64,
+    slot_in_epoch: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl ClockSeam {
+    /// Epoch and slot the liveness loop reads while this seam is installed.
+    pub fn new(epoch: u64, slot_in_epoch: u64) -> Arc<Self> {
+        Arc::new(Self {
+            epoch: std::sync::atomic::AtomicU64::new(epoch),
+            slot_in_epoch: std::sync::atomic::AtomicU64::new(slot_in_epoch),
+        })
+    }
+
+    /// Move the epoch the next clock read returns.
+    pub fn set_epoch(&self, epoch: u64) {
+        self.epoch.store(epoch, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Epoch stored by [`Self::set_epoch`].
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 /// Merge `pubkey-hex → numeric index` entries into the shared registry.
 ///
@@ -104,6 +135,9 @@ pub struct LivenessObservationLoop {
     /// Validator data directory for the detection marker. Production sets this
     /// to the keystore directory.
     detection_marker_dir: Option<std::path::PathBuf>,
+    /// Replaces the monotonic clock in tests. Production leaves this unset.
+    #[cfg(any(test, feature = "test-utils"))]
+    clock_seam: Option<Arc<ClockSeam>>,
 }
 
 /// Body of the retained liveness index refresh. Expanded only from the test helper
@@ -184,7 +218,32 @@ impl LivenessObservationLoop {
             unobserved_warned: parking_lot::Mutex::new(HashSet::new()),
             exit_request: None,
             detection_marker_dir: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            clock_seam: None,
         }
+    }
+
+    /// Read epochs from `seam` instead of the monotonic clock.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_clock_seam(mut self, seam: Arc<ClockSeam>) -> Self {
+        self.clock_seam = Some(seam);
+        self
+    }
+
+    fn clock_epoch(&self) -> Epoch {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(seam) = &self.clock_seam {
+            return seam.epoch.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        self.epoch_clock.current_epoch()
+    }
+
+    fn clock_slot(&self) -> u64 {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(seam) = &self.clock_seam {
+            return seam.slot_in_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        }
+        self.epoch_clock.slot_in_epoch()
     }
 
     /// Install the process-exit request used on the first detection.
@@ -263,12 +322,16 @@ impl LivenessObservationLoop {
                 }
 
                 let latched_before = self.machine.detected_latch();
-                let current_epoch = self.epoch_clock.current_epoch();
-                let slot_in_epoch = self.epoch_clock.slot_in_epoch();
+                let epoch_at_query = self.clock_epoch();
+                let slot_at_query = self.clock_slot();
                 // Network observation may store the latch. The marker write is
                 // the only disk step before the exit request, and that request
                 // waits until the write succeeds. Sidecar file I/O stays after it.
-                self.observe_adjacent(current_epoch, slot_in_epoch).await;
+                let answers = self.observe_adjacent(epoch_at_query, slot_at_query).await;
+                let current_epoch = self.clock_epoch();
+                let slot_in_epoch = self.clock_slot();
+                let skip_decrement = current_epoch != epoch_at_query;
+                self.record_liveness(&answers, epoch_at_query, slot_at_query, skip_decrement);
                 let statuses = self.machine.tick(current_epoch, slot_in_epoch);
                 let detected =
                     statuses.iter().filter(|s| **s == ForwardWindowStatus::Detected).count();
@@ -393,23 +456,32 @@ impl LivenessObservationLoop {
         current_epoch: Epoch,
         slot_in_epoch: u64,
     ) -> Vec<ForwardWindowStatus> {
-        self.observe_adjacent(current_epoch, slot_in_epoch).await;
+        let answers = self.observe_adjacent(current_epoch, slot_in_epoch).await;
+        self.record_liveness(&answers, current_epoch, slot_in_epoch, false);
         let statuses = self.machine.tick(current_epoch, slot_in_epoch);
         self.record_completed_imports();
         statuses
     }
 
-    /// Fetch epochs `current - 1` and `current`, then apply them together.
+    /// Fetch epochs `current - 1` and `current`.
     ///
-    /// Queries run to completion before the machine changes. A live answer at
-    /// or after `next_check_epoch` is `Detected` before any decrement, so
-    /// signing stays closed until both answers of this tick are applied. A
-    /// failed or partial current-epoch query does not let the previous
-    /// epoch's decrement open the gate.
-    async fn observe_adjacent(&self, current_epoch: Epoch, slot_in_epoch: u64) {
+    /// A closed epoch older than `current - 1` is not queried again. A missed
+    /// closed window is not queried again, and the remaining decrements are
+    /// still required, so a miss never closes the window early.
+    ///
+    /// The caller applies the answers after reading the epoch again. A live
+    /// answer at or after `next_check_epoch` is `Detected` before any
+    /// decrement, so signing stays closed until both answers of this tick are
+    /// applied. A failed or partial current-epoch query does not let the
+    /// previous epoch's decrement open the gate.
+    async fn observe_adjacent(
+        &self,
+        current_epoch: Epoch,
+        _slot_in_epoch: u64,
+    ) -> Vec<EpochLiveness> {
         let pending = self.machine.pending_keys();
         if pending.is_empty() {
-            return;
+            return Vec::new();
         }
         let index_to_bare = self.pubkey_index.read().index_to_bare_hex().clone();
         let mut bare_to_index: HashMap<&str, &str> = HashMap::with_capacity(index_to_bare.len());
@@ -471,7 +543,22 @@ impl LivenessObservationLoop {
             }
         }
 
-        let unobserved = self.machine.apply_liveness_tick(&answers, current_epoch, slot_in_epoch);
+        answers
+    }
+
+    /// Apply one tick's answers and warn once per unobserved key.
+    fn record_liveness(
+        &self,
+        answers: &[EpochLiveness],
+        current_epoch: Epoch,
+        slot_in_epoch: u64,
+        skip_decrement: bool,
+    ) {
+        let unobserved = if skip_decrement {
+            self.machine.apply_live_answers_only(answers)
+        } else {
+            self.machine.apply_liveness_tick(answers, current_epoch, slot_in_epoch)
+        };
         let mut by_epoch: HashMap<Epoch, Vec<String>> = HashMap::new();
         for (epoch, key) in unobserved {
             by_epoch.entry(epoch).or_default().push(key);
@@ -1589,6 +1676,168 @@ mod tests {
             }
             other => panic!("expected a readable marker, got {other:?}"),
         }
+        cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        task.await.expect("liveness loop");
+    }
+
+    /// The epoch moves while the two liveness queries are in flight. The final
+    /// not-live decrement is skipped. A live answer on the same tick still detects.
+    #[tokio::test(start_paused = true)]
+    async fn epoch_change_during_queries_skips_final_decrement() {
+        let m = machine();
+        let pending_pk = new_pk();
+        let live_pk = new_pk();
+        let start = 10u64;
+        m.register(&pending_pk, start);
+
+        let seam = ClockSeam::new(13, CLOSED_EPOCH_SLOT);
+        let advance = Arc::new(AtomicBool::new(false));
+        let advance_flag = Arc::clone(&advance);
+        let seam_for_mock = Arc::clone(&seam);
+        let beacon = Arc::new(MockBeaconNodeClient::new().with_post_validator_liveness(
+            move |_epoch, indices| {
+                if advance_flag.swap(false, Ordering::SeqCst) {
+                    seam_for_mock.set_epoch(seam_for_mock.epoch().saturating_add(1));
+                }
+                let data = indices
+                    .iter()
+                    .map(|idx| ValidatorLiveness { index: idx.clone(), is_live: idx == "2" })
+                    .collect();
+                Ok(ValidatorLivenessResponse { data })
+            },
+        ));
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(pending_pk.to_bytes(), "1".to_string());
+        reg.write().insert(live_pk.to_bytes(), "2".to_string());
+        let cancel = CancellationToken::new();
+        let loop_ = LivenessObservationLoop::new(
+            Arc::clone(&m),
+            beacon,
+            reg,
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
+            cancel.clone(),
+        )
+        .with_slot_duration(Duration::from_secs(12))
+        .with_clock_seam(Arc::clone(&seam));
+
+        loop_.drive_once_for_test(start + 1, CLOSED_EPOCH_SLOT).await;
+        loop_.drive_once_for_test(start + 2, CLOSED_EPOCH_SLOT).await;
+        assert_eq!(m.status(&pending_pk), ForwardWindowStatus::Pending);
+        m.register(&live_pk, 13);
+        advance.store(true, Ordering::SeqCst);
+
+        let task = tokio::spawn(loop_.run());
+        for _ in 0..256 {
+            if m.status(&live_pk) == ForwardWindowStatus::Detected {
+                break;
+            }
+            if task.is_finished() {
+                panic!("liveness loop ended before the live answer was applied");
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(seam.epoch(), 14, "the clock seam must move between the two queries");
+        assert_eq!(
+            m.status(&pending_pk),
+            ForwardWindowStatus::Pending,
+            "an epoch change must skip the final not-live decrement"
+        );
+        assert_eq!(m.status(&live_pk), ForwardWindowStatus::Detected);
+        assert!(m.detected_latch());
+        assert!(!m.is_signing_enabled(&pending_pk));
+        assert!(!m.is_signing_enabled(&live_pk));
+
+        cancel.cancel();
+        tokio::time::advance(Duration::from_secs(12)).await;
+        task.await.expect("liveness loop");
+    }
+
+    /// The epoch stays put, and the slot crosses the closed boundary while the
+    /// queries are in flight. The decrement uses the slot from before the
+    /// queries. Passing the post-query slot would open the gate.
+    #[tokio::test(start_paused = true)]
+    async fn same_epoch_uses_the_pre_query_slot_for_the_closed_check() {
+        let m = machine();
+        let pk = new_pk();
+        let start = 10u64;
+        m.register(&pk, start);
+
+        let seam = ClockSeam::new(13, CLOSED_EPOCH_SLOT - 1);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let arm = Arc::new(AtomicBool::new(false));
+        let calls_for_mock = Arc::clone(&calls);
+        let arm_for_mock = Arc::clone(&arm);
+        let seam_for_mock = Arc::clone(&seam);
+        let beacon = Arc::new(MockBeaconNodeClient::new().with_post_validator_liveness(
+            move |_epoch, indices| {
+                calls_for_mock.fetch_add(1, Ordering::SeqCst);
+                if arm_for_mock.load(Ordering::SeqCst) {
+                    seam_for_mock.slot_in_epoch.store(CLOSED_EPOCH_SLOT, Ordering::SeqCst);
+                }
+                let data = indices
+                    .iter()
+                    .map(|idx| ValidatorLiveness { index: idx.clone(), is_live: false })
+                    .collect();
+                Ok(ValidatorLivenessResponse { data })
+            },
+        ));
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(pk.to_bytes(), "1".to_string());
+        let cancel = CancellationToken::new();
+        let loop_ = LivenessObservationLoop::new(
+            Arc::clone(&m),
+            beacon,
+            reg,
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
+            cancel.clone(),
+        )
+        .with_slot_duration(Duration::from_secs(12))
+        .with_clock_seam(Arc::clone(&seam));
+
+        loop_.drive_once_for_test(start + 1, CLOSED_EPOCH_SLOT).await;
+        loop_.drive_once_for_test(start + 2, CLOSED_EPOCH_SLOT).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 4, "the two closed epochs are applied before run");
+        assert_eq!(m.status(&pk), ForwardWindowStatus::Pending);
+        assert!(!m.is_signing_enabled(&pk));
+        arm.store(true, Ordering::SeqCst);
+
+        let task = tokio::spawn(loop_.run());
+        for _ in 0..256 {
+            if calls.load(Ordering::SeqCst) >= 6 {
+                break;
+            }
+            if task.is_finished() {
+                panic!("liveness loop ended before both queries of the open slot");
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            6,
+            "run queries the previous epoch and the current one"
+        );
+        for _ in 0..32 {
+            if task.is_finished() {
+                panic!("liveness loop ended before the pre-query slot was applied");
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert_eq!(seam.epoch(), 13, "the epoch must stay on the value read before the queries");
+        assert_eq!(
+            seam.slot_in_epoch.load(Ordering::SeqCst),
+            CLOSED_EPOCH_SLOT,
+            "the slot must close during the queries"
+        );
+        assert_eq!(
+            m.status(&pk),
+            ForwardWindowStatus::Pending,
+            "a same-epoch slot that closes during the queries must not decrement"
+        );
+        assert!(!m.is_signing_enabled(&pk));
+
         cancel.cancel();
         tokio::time::advance(Duration::from_secs(12)).await;
         task.await.expect("liveness loop");

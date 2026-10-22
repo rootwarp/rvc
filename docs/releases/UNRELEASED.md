@@ -297,6 +297,16 @@ gate. A clock reading before genesis does not mark boot keys Safe. There is
 no timeout that opens the gate. An imported key starts counting at the epoch
 after import. A live answer at or after that epoch closes the gate for good.
 
+A not-live answer counts only when at least one admitted beacon node that is
+Synced or SmallLag, not optimistic, and not execution-offline reported it.
+A missing or unreadable sync distance is not that witness. A live answer
+from any admitted node still counts. The loop reads the epoch again after
+those queries. If the epoch changed, a live answer still detects and a
+not-live answer does not decrement. A closed epoch older than the previous
+one is not queried again. A missed closed window is not queried again, and
+the remaining decrements are still required, so a miss never closes the
+window early.
+
 ## Slot duration comes from the beacon node
 
 Doppelganger epoch, liveness sleep, the index-resolver tick, the import hold,
@@ -347,9 +357,15 @@ out-of-range, or non-preset duration, a `SLOTS_PER_EPOCH` that is not the
 preset, and a genesis time that is not the named-network preset.
 
 Epoch 0 marks normally registered keys Safe only on a named network, after
-the responding beacon nodes match that preset genesis. Custom does not open
-the bypass: the same nodes choose the slot duration, and a long duration can
-hold the clock at epoch 0. A duration outside the bound cannot produce epoch 0.
+the responding beacon nodes match that preset genesis, and only when every
+admitted beacon node in the All role reports a head slot below
+`SLOTS_PER_EPOCH`. That is an admitted node whose role set contains `All`
+(`BnRole::matches` in `crates/bn-manager/src/types.rs`). A query
+error, a missing head slot, or a head slot that is not a number leaves the
+bypass closed, and those boot keys stay Pending for the forward window.
+Custom does not open the bypass: the same nodes choose the slot duration,
+and a long duration can hold the clock at epoch 0. A duration outside the
+bound cannot produce epoch 0.
 
 `BlockService::new` still stores the 12 s constant until the coordinator
 passes the beacon-node duration. `KeystoreManagerAdapter::new` builds its

@@ -579,7 +579,7 @@ const INVENTORY: &[Inv] = &[
     ),
     inv(
         "crates/bn-manager/src/manager.rs",
-        2645,
+        2696,
         Class::StringDispatch,
         true,
         "match consensus_version {",

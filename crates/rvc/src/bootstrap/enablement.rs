@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use bn_manager::{BeaconNodeClient, LivenessApi};
+use bn_manager::{BeaconNodeClient, BnManager, LivenessApi};
 use doppelganger::{ForwardWindowMachine, MonotonicEpochClock, SigningEnablement};
 use slashing::SlashingDb;
 use tracing::{error, info, warn};
@@ -92,8 +92,17 @@ pub async fn wire_signing_enablement(
         Arc::new(MonotonicEpochClock::new(beacon.genesis_time, beacon.slot_duration_ms));
     let enablement_epoch = epoch_clock.current_epoch();
     // Named-network confirmation is not enough: a clock still before genesis
-    // saturates to epoch 0 and must not take the Safe bypass.
-    let epoch0_bypass = beacon.genesis_confirmed && !epoch_clock.before_genesis();
+    // saturates to epoch 0 and must not take the Safe bypass. A head outside
+    // epoch 0, or a head that cannot be read, closes it too.
+    let epoch0_bypass = if doppelganger_enabled
+        && beacon.genesis_confirmed
+        && !epoch_clock.before_genesis()
+        && enablement_epoch == 0
+    {
+        admitted_heads_in_epoch_zero(beacon.bn_manager.as_ref()).await
+    } else {
+        false
+    };
 
     // Resolve validator indices into the shared registry (duty tracker + liveness
     // + prepare_proposers all share this handle).
@@ -185,6 +194,37 @@ pub async fn wire_signing_enablement(
         pubkey_index,
         tracked_keys,
     })
+}
+
+/// `true` when every admitted beacon node in the All role reports a head in epoch 0.
+///
+/// All means a role set that contains [`bn_manager::BnRole::All`]
+/// ([`bn_manager::BnRole::matches`]). An error, an empty set, a missing slot,
+/// or a slot that does not parse closes the bypass. `head_slot` is the decimal
+/// slot from `/eth/v1/node/syncing`.
+async fn admitted_heads_in_epoch_zero(manager: &BnManager) -> bool {
+    match manager.admitted_head_slots().await {
+        Ok(slots)
+            if !slots.is_empty()
+                && slots.iter().all(|head_slot| *head_slot < eth_types::SLOTS_PER_EPOCH) =>
+        {
+            true
+        }
+        Ok(slots) => {
+            info!(
+                head_slots = ?slots,
+                "epoch-0 doppelganger bypass closed: a beacon head is missing or outside epoch 0"
+            );
+            false
+        }
+        Err(err) => {
+            warn!(
+                error = %err,
+                "epoch-0 doppelganger bypass closed: beacon head could not be read"
+            );
+            false
+        }
+    }
 }
 
 /// Resolve validator public keys to numeric beacon indices.
@@ -281,6 +321,13 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "data": []
             })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"0","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#,
+            ))
             .mount(&server)
             .await;
 
@@ -436,6 +483,162 @@ mod tests {
         let machine = handles.forward_window_machine.expect("machine present");
         assert_eq!(machine.status(&pk), ForwardWindowStatus::Safe);
         executor.token().cancel();
+    }
+
+    fn syncing_body(head_slot: &str) -> String {
+        format!(
+            r#"{{"data":{{"head_slot":"{head_slot}","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}}}"#
+        )
+    }
+
+    async fn mount_validators(server: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/states/head/validators"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .mount(server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/eth/v1/beacon/states/head/validators"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})))
+            .mount(server)
+            .await;
+    }
+
+    async fn beacon_with_syncing(
+        genesis_time: u64,
+        servers: &[(MockServer, Option<String>)],
+    ) -> BeaconHandles {
+        for (server, body) in servers {
+            mount_validators(server).await;
+            if let Some(body) = body {
+                Mock::given(method("GET"))
+                    .and(path("/eth/v1/node/syncing"))
+                    .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                    .mount(server)
+                    .await;
+            } else {
+                Mock::given(method("GET"))
+                    .and(path("/eth/v1/node/syncing"))
+                    .respond_with(ResponseTemplate::new(500).set_body_string("down"))
+                    .mount(server)
+                    .await;
+            }
+        }
+        let nodes: Vec<String> = servers.iter().map(|(server, _)| server.uri()).collect();
+        let config = Config {
+            beacon_url: nodes[0].clone(),
+            beacon_nodes: nodes,
+            disable_keystore_locking: true,
+            allow_fresh_db: true,
+            ..Default::default()
+        };
+        let builder = ServiceBuilder::new(config);
+        let beacon_client = builder.build_beacon().expect("beacon client");
+        let bn_manager = builder
+            .build_bn_manager_with_timeouts(OperationTimeouts::default())
+            .expect("bn manager");
+        BeaconHandles {
+            beacon_client,
+            bn_manager,
+            genesis_validators_root: GVR,
+            genesis_validators_root_hex: format!("0x{}", hex::encode(GVR)),
+            genesis_time,
+            slot_duration_ms: 12_000,
+            genesis_confirmed: true,
+        }
+    }
+
+    async fn epoch0_enabled(beacon: &BeaconHandles) -> bool {
+        let sk = SecretKey::generate();
+        let pk = sk.public_key();
+        let keys = loaded_keys_with_pubkey(pk.clone());
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().unwrap());
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let handles =
+            wire_signing_enablement(&base_config(true), &keys, beacon, slashing_db, &executor)
+                .await
+                .expect("epoch-0 phase");
+        let enabled = handles.signing_enablement.is_signing_enabled(&pk);
+        let status = handles.forward_window_machine.expect("machine").status(&pk);
+        executor.token().cancel();
+        assert_eq!(enabled, status == ForwardWindowStatus::Safe);
+        enabled
+    }
+
+    /// A beacon head outside epoch 0, or a head query that fails, closes the bypass.
+    #[tokio::test]
+    async fn test_epoch0_bypass_requires_beacon_head_in_epoch_zero() {
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let genesis = now.saturating_sub(30);
+
+        let late = MockServer::start().await;
+        let late_beacon = beacon_with_syncing(genesis, &[(late, Some(syncing_body("40")))]).await;
+        assert!(!epoch0_enabled(&late_beacon).await, "a head at slot 40 is outside epoch 0");
+
+        let boundary = MockServer::start().await;
+        let boundary_beacon =
+            beacon_with_syncing(genesis, &[(boundary, Some(syncing_body("32")))]).await;
+        assert!(!epoch0_enabled(&boundary_beacon).await, "slot SLOTS_PER_EPOCH is epoch 1");
+
+        let inside = MockServer::start().await;
+        let inside_beacon =
+            beacon_with_syncing(genesis, &[(inside, Some(syncing_body("31")))]).await;
+        assert!(epoch0_enabled(&inside_beacon).await, "slot 31 is still epoch 0");
+
+        let broken = MockServer::start().await;
+        let broken_beacon = beacon_with_syncing(genesis, &[(broken, None)]).await;
+        assert!(!epoch0_enabled(&broken_beacon).await, "a head-query error means no bypass");
+
+        let garbled = MockServer::start().await;
+        mount_validators(&garbled).await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"nope","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#,
+            ))
+            .mount(&garbled)
+            .await;
+        let garbled_beacon = {
+            let config = Config {
+                beacon_url: garbled.uri(),
+                beacon_nodes: vec![garbled.uri()],
+                disable_keystore_locking: true,
+                allow_fresh_db: true,
+                ..Default::default()
+            };
+            let builder = ServiceBuilder::new(config);
+            BeaconHandles {
+                beacon_client: builder.build_beacon().expect("beacon"),
+                bn_manager: builder
+                    .build_bn_manager_with_timeouts(OperationTimeouts::default())
+                    .expect("manager"),
+                genesis_validators_root: GVR,
+                genesis_validators_root_hex: format!("0x{}", hex::encode(GVR)),
+                genesis_time: genesis,
+                slot_duration_ms: 12_000,
+                genesis_confirmed: true,
+            }
+        };
+        assert!(!epoch0_enabled(&garbled_beacon).await, "a non-numeric head_slot means no bypass");
+
+        let early = MockServer::start().await;
+        let far = MockServer::start().await;
+        let split = beacon_with_syncing(
+            genesis,
+            &[(early, Some(syncing_body("0"))), (far, Some(syncing_body("40")))],
+        )
+        .await;
+        assert!(!epoch0_enabled(&split).await, "every admitted All-role head must be in epoch 0");
+
+        let head_zero = MockServer::start().await;
+        let head_error = MockServer::start().await;
+        let mixed = beacon_with_syncing(
+            genesis,
+            &[(head_zero, Some(syncing_body("0"))), (head_error, None)],
+        )
+        .await;
+        assert!(!epoch0_enabled(&mixed).await, "one head error closes the epoch-0 bypass");
     }
 
     /// Restart safe-skip requires local slashing history under this GVR.

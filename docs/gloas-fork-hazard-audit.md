@@ -99,7 +99,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/block-service/src/service/tests/v4.rs` 144 | 4 | exhaustive | test-only | Fulu slot with a gloas JSON version must fail closed. | — |
 | `crates/block-service/src/service/tests/v4.rs` 176 | 4 | exhaustive | test-only | Fulu slot with a gloas SSZ version must fail closed. | — |
 | `crates/block-service/src/service/tests/v4.rs` 209 | 4 | exhaustive | test-only | Gloas slot with a fulu version must fail closed. | — |
-| `crates/bn-manager/src/manager.rs` 2645 | 4 | _ | must-bound | V3 SSZ duty check picks `BlockContents` or `BeaconBlock` from the consensus version string. `_ => None` rejects an unknown version instead of inheriting either format. | — |
+| `crates/bn-manager/src/manager.rs` 2696 | 4 | _ | must-bound | V3 SSZ duty check picks `BlockContents` or `BeaconBlock` from the consensus version string. `_ => None` rejects an unknown version instead of inheriting either format. | — |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 2487 | 4 | exhaustive | test-only | Envelope publish assert names consensus version `gloas`. Not a production dispatch. | — |
 | `crates/crypto/src/typed_signer.rs` 61 | 5 | — | must-bound | `SignContext::resolve` first-matches `fork_info.current_version` over `entries()`. Two `[0xFF;4]` rows (unscheduled Fulu+Gloas after 2.6) resolve Fulu, so `Gloas.fork_version()` does not round-trip. 2.6 pins the collision; 2.10 confines it to both-unscheduled. | 2.6 |
 | `crates/eth-types/src/fork.rs` 118 | 5 | — | inherit-intentionally | `next_activation` scans `entries()` and skips `u64::MAX`. A new row participates by construction. | — |
