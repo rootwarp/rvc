@@ -6,26 +6,57 @@
 # secret, which is the gitleaks default. Setting the target to the whole line
 # would make the extended default pattern for the words true, false, and null
 # skip any line that contains those words, including a real secret.
-# Every intentional in-src test finding is baselined by EXACT fingerprint
-# (`file:rule:line`) in `.gitleaksignore`. A new secret — even a 64-hex key
-# in one of those same files on a new line — is a new fingerprint and FAILS the gate.
-# An inline allow signature on the finding's own line is a built-in skip.
-# A comment on a neighboring line does not suppress the finding, so prose
-# around a sample stays scanned. Do not put that signature inside a fenced
-# sample that is shown as program output.
-# The fenced log line in docs/running-guide.md is allowed only by a
-# generic-api-key rule allowlist with condition AND: that path, and the exact
-# captured truncated pubkey. The same value in any other file FAILS the gate.
-# A different secret on that path also FAILS the gate.
 #
-# Path allow-lists:
+# Intentional fixture findings are allow-listed per rule, per file, and per
+# exact captured value. Each [[rules.allowlists]] entry uses condition AND,
+# one anchored path, and anchored regexes. A regex equals one captured
+# value. One fixture in crates/slashing/src/db/interchange.rs straddles a
+# 10000-byte read, so that file lists every prefix of that value from length
+# 35 through 98. A captured prefix in that range is allowed there, including
+# when a different token is cut down to one of those prefixes by a chunk
+# boundary. The same prefix in any other file is not. Every other file lists
+# only the full value. Splitting one of those across a chunk boundary fails
+# closed when the captured prefix is one the rule still reports. For
+# crates/beacon/src/types.rs that is every prefix of length 34 or more.
+# Paths no longer in the tree keep an exact entry so a history scan stays
+# clean. Four entries are history findings on files that are still in the
+# tree, not retired paths: bin/rvc/src/commands/voluntary_exit.rs,
+# crates/beacon/src/client.rs, crates/eth-types/src/duties.rs, and
+# crates/grpc-signer/src/client.rs. That text is not in the current files.
+# crates/duty-tracker/src/tracker.rs is a current file and its allowlisted
+# text is in that file.
+# A line move does not retune an entry whose captured text stays the same.
+# Gitleaks reads the working tree in 10000-byte chunks with no overlap, so an
+# insertion that pushes some other value across a chunk boundary changes the
+# captured prefix. That new prefix is a finding until it is added here.
+# crates/crypto/src/key_manager.rs is the next value close to a boundary
+# (63 bytes of slack).
+#
+# Adding a fixture: from the repo root, run
+#   gitleaks detect --no-git --source . --config .gitleaks.toml \
+#     --ignore-gitleaks-allow --no-banner --report-format json --report-path -
+# without --redact. Escape the captured value as a fully anchored literal
+# (escape regex punctuation, and escape '-' so the text has no private-key
+# begin marker) and add it under that file's block. Gitleaks skips the file
+# named by --config, so a clean scan of this file is not evidence about that
+# text. Do not add a path-wide or repo-wide value allow. Do not set a regex
+# target on these blocks: the default target is the captured secret.
+# scripts/tests/test_gitleaks_allowlist.py compares keys without regard to
+# case, rejects unknown keys and case-only duplicates, and requires condition
+# AND. line and match targets are rejected in any case because the key is
+# unknown. That guard reads only this file. It does not inspect allowlists
+# that useDefault merges in from the default rules. The architecture gate
+# that reads this file also rejects a regex-target key in any case.
+#
+# Inline allow comments are not a baseline. CI passes --ignore-gitleaks-allow
+# so a comment cannot suppress a finding. Do not put an inline allow token
+# in this file.
+#
+# Path allow-lists (global):
 #   - `target/`: build artifacts, never source.
 #   - `tests/`: whole integration-test trees (published Eth2 slashing-interchange vectors, mock
 #     beacon responses, etc.). RISK-ACCEPT: a real secret committed under `tests/` would be
 #     ignored; mitigated by the fact these are fixtures, by Gate 1/Gate 3, and by review.
-#   (The single non-secret hex test input in crates/crypto/examples/log_sample.rs is baselined by
-#   fingerprint in .gitleaksignore — NOT a directory-wide path allow — so a NEW file added under
-#   crates/crypto/examples/ with a real secret is still scanned and caught.)
 #
 # What this gate does and does NOT catch: it catches keyworded secrets (PEM private keys, cloud
 # creds, PATs, `key/secret/token = <high-entropy>`). It does NOT catch a *bare* 64-hex literal
@@ -46,9 +77,8 @@ paths = [
   '''(^|/)tests/''',
 ]
 
-# Exact captured secret from the running-guide log sample. AND with the path:
-# the same value anywhere else is still a finding. Default regex target (the
-# secret), not the line.
+# Captured fixture secrets. AND with one exact path: the same value anywhere
+# else is still a finding. Default regex target (the captured secret).
 [[rules]]
 id = "generic-api-key"
 
@@ -56,8 +86,435 @@ id = "generic-api-key"
 description = "Truncated pubkey on the docs/running-guide.md trace sample line"
 condition = "AND"
 paths = [
-  '''(^|/)docs/running-guide\.md$''',
+  '''^docs/running\-guide\.md$''',
 ]
 regexes = [
   '''^0x97f1d3a731\.\.\.db22c6bb$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^bin/rvc/src/commands/prepare_exit\.rs$''',
+]
+regexes = [
+  '''^abcdef1234567890$''',
+  '''^0xabcdef1234567890$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^bin/rvc/src/commands/voluntary_exit\.rs$''',
+]
+regexes = [
+  '''^abcdef1234567890$''',
+  '''^0xabcdef1234567890$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/beacon\-client/src/types\.rs$''',
+]
+regexes = [
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/beacon/src/client\.rs$''',
+]
+regexes = [
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+  '''^0xa1234f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74b$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/beacon/src/types\.rs$''',
+]
+regexes = [
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/crypto/examples/log_sample\.rs$''',
+]
+regexes = [
+  '''^93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/crypto/src/key_manager\.rs$''',
+]
+regexes = [
+  '''^9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07$''',
+  '''^a99a76ed7796f7be22d5b7e85deeb7c5677e88e511e0b337618f8c4eb61349b4bf2d153f649f7b53359fe8b94a38e44c$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/crypto/src/keystore\.rs$''',
+]
+regexes = [
+  '''^9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/crypto/src/logging\.rs$''',
+]
+regexes = [
+  '''^0x0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a$''',
+  '''^93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/duty\-tracker/src/tracker\.rs$''',
+]
+regexes = [
+  '''^0xpubkey_1234$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/eth\-types/src/duties\.rs$''',
+]
+regexes = [
+  '''^0xabcdef1234567890$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/keymanager\-api/src/auth\.rs$''',
+]
+regexes = [
+  '''^abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/observability/src/logging\.rs$''',
+]
+regexes = [
+  '''^0x0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a$''',
+  '''^93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/rvc\-spec\-vectors/src/builder_request_auth_kat\.rs$''',
+]
+regexes = [
+  '''^0x1234567890abcdef$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/rvc/src/beacon/client\.rs$''',
+]
+regexes = [
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+  '''^0xa1234f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74b$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/rvc/src/beacon/types\.rs$''',
+]
+regexes = [
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/rvc/src/crypto/key_manager\.rs$''',
+]
+regexes = [
+  '''^9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07$''',
+  '''^a99a76ed7796f7be22d5b7e85deeb7c5677e88e511e0b337618f8c4eb61349b4bf2d153f649f7b53359fe8b94a38e44c$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/rvc/src/crypto/keystore\.rs$''',
+]
+regexes = [
+  '''^9612d7a727c9d0a22e185a1c768478dfe919cada9266988cb32359c11f2b7b27f4ae4040902382ae2910c15e2b420d07$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/rvc/src/orchestrator/service\.rs$''',
+]
+regexes = [
+  '''^93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/rvc/src/slashing/db\.rs$''',
+]
+regexes = [
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/rvc/src/slashing/types\.rs$''',
+]
+regexes = [
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/slashing/src/db\.rs$''',
+]
+regexes = [
+  '''^0xabcdef1234567890$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed$''',
+]
+
+# gitleaks 8.21.2 reads the working tree in 10000-byte chunks with no overlap.
+# One fixture here straddles a boundary, so the captured text is a prefix whose
+# length depends on the bytes above it. Each prefix the rule still reports is
+# listed exactly. There is no wildcard.
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/slashing/src/db/interchange\.rs$''',
+]
+regexes = [
+  '''^0xb845089a1457f811bfc000588fbb4e713$''',
+  '''^0xb845089a1457f811bfc000588fbb4e7136$''',
+  '''^0xb845089a1457f811bfc000588fbb4e71366$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669b$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8c$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce0$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce06$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060e$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6b$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6e$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ec$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece0$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09a$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09af$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc37$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc379$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc37941$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc379410$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c9$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91c$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca7$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73a$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73ac$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acd$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e54$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e545$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e54571$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e545712$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d5$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d587$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d5872$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723b$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723be$''',
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/slashing/src/db/open\.rs$''',
+]
+regexes = [
+  '''^0xabcdef1234567890$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/slashing/src/types\.rs$''',
+]
+regexes = [
+  '''^0xb845089a1457f811bfc000588fbb4e713669be8ce060ea6be3c6ece09afc3794106c91ca73acda5e5457122d58723bed$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/telemetry/src/format\.rs$''',
+]
+regexes = [
+  '''^0x93247f2209\.\.\.611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^docs/researches/mev\-boost\.md$''',
+]
+regexes = [
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc\.\.\.$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^docs/researches/slashing\-protection\.md$''',
+]
+regexes = [
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc\.\.\.$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^docs/validators\-config\.md$''',
+]
+regexes = [
+  '''^0xabc123\.\.\.48\-byte\-BLS\-pubkey\.\.\.$''',
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^plan/logging/OPERATOR_GUIDE\.md$''',
+]
+regexes = [
+  '''^0x93247f2209\.\.\.611df74a$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^validators\.example\.toml$''',
+]
+regexes = [
+  '''^0x93247f2209abcacf57b75a51dafae777f9dd38bc7053d1af526f220a7489a6d3a2753e5f3e8b1cfe39b56f43611df74a$''',
+  '''^0xa1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6$''',
+]
+[[rules]]
+id = "private-key"
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^bin/rvc\-signer/src/http_api/tls\.rs$''',
+]
+regexes = [
+  '''^\-\-\-\-\-BEGIN EC PRIVATE KEY\-\-\-\-\-\\nS0xNTk9QUVJT\\n\-\-\-\-\-END EC PRIVATE KEY\-\-\-\-\-$''',
+  '''^\-\-\-\-\-BEGIN RSA PRIVATE KEY\-\-\-\-\-\\nQUJDRUZHSElK\\n\-\-\-\-\-END RSA PRIVATE KEY\-\-\-\-\-$''',
+  '''^\-\-\-\-\-BEGIN ENCRYPTED PRIVATE KEY\-\-\-\-\-\\nMIIB\.\.\.\\n\-\-\-\-\-END ENCRYPTED PRIVATE KEY\-\-\-\-\-$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/grpc\-signer/src/client\.rs$''',
+]
+regexes = [
+  '''^\-\-\-\-\-BEGIN PRIVATE KEY\-\-\-\-\-\\nMIIB\\n\-\-\-\-\-END PRIVATE KEY\-\-\-\-\-$''',
+]
+
+[[rules.allowlists]]
+description = "Exact fixture values"
+condition = "AND"
+paths = [
+  '''^crates/signer\-server/src/http_api/tls_config/tests\.rs$''',
+]
+regexes = [
+  '''^\-\-\-\-\-BEGIN EC PRIVATE KEY\-\-\-\-\-\\nS0xNTk9QUVJT\\n\-\-\-\-\-END EC PRIVATE KEY\-\-\-\-\-$''',
+  '''^\-\-\-\-\-BEGIN RSA PRIVATE KEY\-\-\-\-\-\\nQUJDRUZHSElK\\n\-\-\-\-\-END RSA PRIVATE KEY\-\-\-\-\-$''',
+  '''^\-\-\-\-\-BEGIN ENCRYPTED PRIVATE KEY\-\-\-\-\-\\nMIIB\.\.\.\\n\-\-\-\-\-END ENCRYPTED PRIVATE KEY\-\-\-\-\-$''',
 ]

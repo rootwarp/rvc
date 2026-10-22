@@ -242,13 +242,20 @@ jobs:
           gitleaks version
 
       # Gate 2a: scan the source tree (working files); fail closed on any finding.
+      # --ignore-gitleaks-allow: an inline allow comment is not a baseline.
       - name: Gitleaks — source tree
-        run: gitleaks detect --no-git --source . --config .gitleaks.toml --redact --no-banner --exit-code 1
+        run: gitleaks detect --no-git --source . --config .gitleaks.toml --ignore-gitleaks-allow --redact --no-banner --exit-code 1
 
       # A line that contains the word false must still surface a synthetic key.
       # The running-guide allow is path-and-value, so the same value elsewhere fails too.
       - name: Gitleaks — verify=false canary is detected
         run: ./scripts/gitleaks_verify_false_canary.sh
+
+      # Prepend blank lines to every allowlisted file, then append a fresh key,
+      # the same value on a non-allowlisted path, and prefix/suffix grafts.
+      # Each of those must still fail. Removing any one allowlist entry must fail too.
+      - name: Gitleaks — line-shift canary
+        run: python3 scripts/gitleaks_line_shift_canary.py
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
