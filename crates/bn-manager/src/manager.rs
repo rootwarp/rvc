@@ -335,9 +335,17 @@ pub struct BnManager {
     slot_duration_ms: AtomicU64,
     /// Identity from the beacon nodes that completed spec and genesis.
     chain_identity: Arc<tokio::sync::RwLock<Option<ChainIdentity>>>,
+    /// When true, an empty admitted set logs that duties halted.
+    /// The proposer pool sets this false and falls back to the main pool.
+    halt_when_empty: AtomicBool,
+    /// `pool` label on `rvc_bn_admitted` and `rvc_bn_health_tier`.
+    metric_pool: &'static str,
     /// Fires after the liveness stamp re-check and before the witness read.
     #[cfg(test)]
     after_stamp_recheck: tokio::sync::Notify,
+    /// Fires after each sync-monitor admission re-check.
+    #[cfg(any(test, feature = "test-utils"))]
+    sync_polled: Arc<tokio::sync::Notify>,
 }
 
 /// Apply health-tracker updates. Each call takes the write lock once.
@@ -552,8 +560,12 @@ impl BnManager {
             revocation_generation: Arc::new(AtomicU64::new(0)),
             slot_duration_ms: AtomicU64::new(0),
             chain_identity: Arc::new(tokio::sync::RwLock::new(None)),
+            halt_when_empty: AtomicBool::new(true),
+            metric_pool: crate::metrics::METRIC_POOL_MAIN,
             #[cfg(test)]
             after_stamp_recheck: tokio::sync::Notify::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            sync_polled: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -561,6 +573,12 @@ impl BnManager {
     /// after [`Self::new`].
     pub fn with_fee_recipient_policy(mut self, policy: FeeRecipientPolicy) -> Self {
         self.fee_recipient_policy = policy;
+        self
+    }
+
+    /// Label that separates this manager's gauges from another pool's.
+    pub fn with_metric_pool(mut self, pool: &'static str) -> Self {
+        self.metric_pool = pool;
         self
     }
 
@@ -721,6 +739,7 @@ impl BnManager {
             &self.sync_statuses,
             &self.tier_thresholds,
             false,
+            self.metric_pool,
         )
         .await;
         self.recheck_admission().await;
@@ -737,10 +756,16 @@ impl BnManager {
     ) -> tokio::task::JoinHandle<()> {
         let interval = interval.unwrap_or(DEFAULT_SYNC_CHECK_INTERVAL);
         let watch = self.admission_watch();
+        #[cfg(any(test, feature = "test-utils"))]
+        let sync_polled = Arc::clone(&self.sync_polled);
         let after_poll: AfterSyncPoll = Arc::new(move || {
             let watch = watch.clone();
+            #[cfg(any(test, feature = "test-utils"))]
+            let sync_polled = Arc::clone(&sync_polled);
             Box::pin(async move {
                 watch.recheck().await;
+                #[cfg(any(test, feature = "test-utils"))]
+                sync_polled.notify_one();
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         });
         start_sync_monitor_publishing(
@@ -820,7 +845,6 @@ impl BnManager {
                 .is_some_and(|generation| generation.load(Ordering::Acquire) == stamp.generation)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
     fn revoke_admission(&self, index: usize) {
         revoke_at(
             &self.admitted,
@@ -841,6 +865,61 @@ impl BnManager {
             revocation_generation: Arc::clone(&self.revocation_generation),
             chain_identity: Arc::clone(&self.chain_identity),
             tier_thresholds: self.tier_thresholds.clone(),
+            halt_when_empty: self.halt_when_empty.load(Ordering::Acquire),
+            metric_pool: self.metric_pool,
+        }
+    }
+
+    /// Revoke one node. Test and `test-utils` callers use this to move the
+    /// fence without waiting for a monitor pass.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn testing_revoke_admission(&self, index: usize) {
+        self.revoke_admission(index);
+    }
+
+    /// Admit one node without moving the process revocation generation.
+    ///
+    /// A real grant bumps the per-node epoch and not `revocation_generation`.
+    /// This seam only sets the bit, which is what `duty_fence` checks.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn testing_grant_admission(&self, index: usize) {
+        let Some(gate) = self.admission_gate.get(index) else {
+            return;
+        };
+        let _guard = gate.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(flag) = self.admitted.get(index) {
+            flag.store(true, Ordering::Release);
+        }
+    }
+
+    /// Notified once each sync-monitor pass finishes its admission re-check.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn testing_sync_polled(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.sync_polled)
+    }
+
+    /// `true` when fallback selection would accept this admitted node.
+    ///
+    /// Uses the same tier floor as [`Self::fallback_unsynced`]. Unknown and
+    /// unsynced nodes are false. A synced, healthy, admitted proposal node
+    /// is true.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub async fn testing_fallback_would_select(&self, index: usize) -> bool {
+        if !self.is_admitted(index) {
+            return false;
+        }
+        let role_ok =
+            self.roles.get(index).is_some_and(|roles| BnRole::matches(roles, BnRole::Proposal));
+        if !role_ok {
+            return false;
+        }
+        let sync = self.sync_statuses.read().await;
+        let health = self.health_trackers.read().await;
+        match (sync.get(index), health.get(index)) {
+            (Some(detail), Some(tracker)) => {
+                above_fallback_floor(detail, tracker, &self.tier_thresholds)
+            }
+            _ => false,
         }
     }
 
@@ -3034,6 +3113,61 @@ impl BnManager {
         )
         .await
     }
+
+    /// Chain identity stored by [`Self::agreed_spec_and_genesis`].
+    pub async fn agreed_chain_identity(&self) -> Option<ChainIdentity> {
+        self.chain_identity.read().await.clone()
+    }
+
+    /// Admit this pool against an identity another pool already agreed.
+    ///
+    /// A match leaves the node admitted. A parsed mismatch, or a boot read
+    /// that produced no identity evidence, revokes it. The caller does not
+    /// fail when the admitted count is zero. Runtime re-checks keep a node
+    /// admitted on a transient error; this boot pass does not, because the
+    /// node has not yet shown the seeded identity.
+    ///
+    /// Does not call [`Self::agreed_spec_and_genesis`] or
+    /// [`Self::confirm_genesis_validators_root`]. Those fail the caller when
+    /// nobody matches, and they would seed an identity from this pool.
+    pub async fn admit_against_identity(&self, identity: ChainIdentity) -> usize {
+        self.halt_when_empty.store(false, Ordering::Release);
+        self.slot_duration_ms.store(identity.slot_duration_ms, Ordering::Release);
+        *self.chain_identity.write().await = Some(identity.clone());
+        for (index, client) in self.clients.iter().enumerate() {
+            let spec = client.get_config_spec().await;
+            let genesis = client.get_genesis().await;
+            match classify_identity(&spec, &genesis, &identity) {
+                IdentityClass::Match => {}
+                IdentityClass::Mismatch => {
+                    warn!(
+                        bn_index = index,
+                        "proposer beacon node chain identity mismatch; left unadmitted"
+                    );
+                    self.revoke_admission(index);
+                }
+                IdentityClass::Transient => {
+                    warn!(
+                        bn_index = index,
+                        "proposer beacon node identity unavailable at boot; left unadmitted"
+                    );
+                    self.revoke_admission(index);
+                }
+            }
+        }
+        self.admitted.iter().filter(|flag| flag.load(Ordering::Acquire)).count()
+    }
+
+    /// Leave every node unadmitted when the main pool has no chain identity.
+    ///
+    /// The stored identity stays unset, so a later re-check cannot grant.
+    /// Production always agrees the main pool before this runs.
+    pub fn revoke_unidentified(&self) {
+        self.halt_when_empty.store(false, Ordering::Release);
+        for index in 0..self.clients.len() {
+            self.revoke_admission(index);
+        }
+    }
 }
 
 fn is_unreachable(err: &BeaconError) -> bool {
@@ -3145,6 +3279,8 @@ struct AdmissionWatch {
     revocation_generation: Arc<AtomicU64>,
     chain_identity: Arc<tokio::sync::RwLock<Option<ChainIdentity>>>,
     tier_thresholds: TierThresholds,
+    halt_when_empty: bool,
+    metric_pool: &'static str,
 }
 
 impl AdmissionWatch {
@@ -3205,7 +3341,11 @@ impl AdmissionWatch {
             publish_admission(self, index, admitted, detail);
         }
         if identity.is_some() && !any_admitted {
-            error!("no admitted beacon node; duties halted");
+            if self.halt_when_empty {
+                error!("no admitted beacon node; duties halted");
+            } else {
+                warn!("no admitted proposer node; block production uses the main pool");
+            }
         }
     }
 }
@@ -3216,10 +3356,11 @@ fn publish_admission(watch: &AdmissionWatch, index: usize, admitted: bool, detai
     };
     let endpoint = crate::metrics::endpoint_label(client.endpoint());
     metrics::definitions::RVC_BN_ADMITTED
-        .with_label_values(&[endpoint.as_str()])
+        .with_label_values(&[endpoint.as_str(), watch.metric_pool])
         .set(i64::from(admitted));
     if !admitted {
-        let _ = metrics::definitions::RVC_BN_HEALTH_TIER.remove_label_values(&[endpoint.as_str()]);
+        let _ = metrics::definitions::RVC_BN_HEALTH_TIER
+            .remove_label_values(&[endpoint.as_str(), watch.metric_pool]);
         return;
     }
     if matches!(detail.status, BnSyncStatus::Synced) {
@@ -3227,7 +3368,7 @@ fn publish_admission(watch: &AdmissionWatch, index: usize, admitted: bool, detai
     }
     let tier = detail.tier(&watch.tier_thresholds);
     metrics::definitions::RVC_BN_HEALTH_TIER
-        .with_label_values(&[endpoint.as_str()])
+        .with_label_values(&[endpoint.as_str(), watch.metric_pool])
         .set(tier.as_metric_value());
 }
 
@@ -4252,6 +4393,11 @@ impl LivenessApi for BnManager {
 impl BeaconNodeClient for BnManager {
     fn duty_fence(&self) -> Result<DutyFence, BeaconError> {
         self.duty_fence_now()
+    }
+
+    fn revocation_watch(&self) -> DutyFence {
+        let seen = self.revocation_generation.load(Ordering::Acquire);
+        DutyFence::at(seen, Arc::clone(&self.revocation_generation))
     }
 }
 
@@ -8525,6 +8671,34 @@ mod tests {
         manager
     }
 
+    fn gauge_series_for(family_name: &str, endpoint: &str) -> Vec<(String, i64)> {
+        metrics::REGISTRY
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == family_name)
+            .map(|family| {
+                family
+                    .get_metric()
+                    .iter()
+                    .filter_map(|metric| {
+                        let mut found_endpoint = None;
+                        let mut pool = None;
+                        for label in metric.get_label() {
+                            match label.name() {
+                                "endpoint" => found_endpoint = Some(label.value().to_string()),
+                                "pool" => pool = Some(label.value().to_string()),
+                                _ => {}
+                            }
+                        }
+                        (found_endpoint? == endpoint).then(|| {
+                            (pool.unwrap_or_default(), metric.get_gauge().get_value() as i64)
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     async fn path_hits(server: &wiremock::MockServer, route: &str) -> usize {
         server
             .received_requests()
@@ -8566,6 +8740,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn same_endpoint_in_two_pools_keeps_separate_admission_series() {
+        let server = wiremock::MockServer::start().await;
+        mount_synced(&server).await;
+        let main_pool = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("main");
+        let proposer_pool = BnManager::new(BnManagerConfig::new(vec![server.uri()]))
+            .expect("proposer")
+            .with_metric_pool(crate::metrics::METRIC_POOL_PROPOSER);
+        main_pool.check_sync_status().await;
+        proposer_pool.check_sync_status().await;
+        proposer_pool.testing_revoke_admission(0);
+        proposer_pool.check_sync_status().await;
+        let endpoint = crate::metrics::endpoint_label(&server.uri());
+        let series = gauge_series_for("rvc_bn_admitted", &endpoint);
+        let main_value = series
+            .iter()
+            .find(|(pool, _)| pool == crate::metrics::METRIC_POOL_MAIN)
+            .map(|(_, value)| *value);
+        let proposer_value = series
+            .iter()
+            .find(|(pool, _)| pool == crate::metrics::METRIC_POOL_PROPOSER)
+            .map(|(_, value)| *value);
+        assert_eq!(main_value, Some(1), "main pool stays admitted, got {series:?}");
+        assert_eq!(proposer_value, Some(0), "proposer pool is revoked, got {series:?}");
+        let tiers = gauge_series_for("rvc_bn_health_tier", &endpoint);
+        let main_tier = tiers
+            .iter()
+            .find(|(pool, _)| pool == crate::metrics::METRIC_POOL_MAIN)
+            .map(|(_, value)| *value);
+        let proposer_tier =
+            tiers.iter().any(|(pool, _)| pool == crate::metrics::METRIC_POOL_PROPOSER);
+        assert_eq!(
+            main_tier,
+            Some(crate::types::HealthTier::Synced.as_metric_value()),
+            "main pool keeps its tier, got {tiers:?}"
+        );
+        assert!(!proposer_tier, "revoked proposer tier is removed, got {tiers:?}");
+    }
+
+    #[tokio::test]
     #[tracing_test::traced_test]
     async fn last_admitted_bn_is_revoked_on_a_chain_identity_mismatch_and_duties_fail_closed() {
         let server = wiremock::MockServer::start().await;
@@ -8575,7 +8788,9 @@ mod tests {
         assert!(!manager.is_admitted(0));
         let label = crate::metrics::endpoint_label(&server.uri());
         assert_eq!(
-            metrics::definitions::RVC_BN_ADMITTED.with_label_values(&[label.as_str()]).get(),
+            metrics::definitions::RVC_BN_ADMITTED
+                .with_label_values(&[label.as_str(), crate::metrics::METRIC_POOL_MAIN])
+                .get(),
             0
         );
         assert!(logs_contain("no admitted beacon node; duties halted"));
@@ -8918,5 +9133,82 @@ mod tests {
         assert!(late.holds(), "sampling the generation after the revoke would hold");
         let early = duty_fence_from_samples(3, true, Arc::clone(&current)).expect("still admitted");
         assert!(!early.holds(), "the pre-revoke generation does not hold");
+    }
+
+    #[tokio::test]
+    async fn admit_against_identity_unadmits_disagreement_and_boot_transient() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let identity = ChainIdentity {
+            slot_duration_ms: 12_000,
+            slots_per_epoch: 32,
+            genesis_time: 1_606_824_023,
+            genesis_validators_root: "0xabc".to_string(),
+            genesis_fork_version: "0x00000000".to_string(),
+        };
+        let cases = [
+            (
+                "match",
+                identity_spec("12000", "32"),
+                identity_genesis("1606824023", "0xabc", "0x00000000"),
+                true,
+            ),
+            (
+                "root",
+                identity_spec("12000", "32"),
+                identity_genesis("1606824023", "0xdef", "0x00000000"),
+                false,
+            ),
+            (
+                "genesis time",
+                identity_spec("12000", "32"),
+                identity_genesis("1", "0xabc", "0x00000000"),
+                false,
+            ),
+            (
+                "fork",
+                identity_spec("12000", "32"),
+                identity_genesis("1606824023", "0xabc", "0x01000000"),
+                false,
+            ),
+            (
+                "duration",
+                identity_spec("6000", "32"),
+                identity_genesis("1606824023", "0xabc", "0x00000000"),
+                false,
+            ),
+            (
+                "slots",
+                identity_spec("12000", "16"),
+                identity_genesis("1606824023", "0xabc", "0x00000000"),
+                false,
+            ),
+        ];
+        for (label, spec, genesis, admitted) in cases {
+            let server = MockServer::start().await;
+            mount_identity(&server, &spec, &genesis).await;
+            let manager =
+                BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("manager");
+            let count = manager.admit_against_identity(identity.clone()).await;
+            assert_eq!(manager.is_admitted(0), admitted, "{label}");
+            assert_eq!(count, usize::from(admitted), "{label}");
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(503).set_body_string("unavailable"))
+            .mount(&server)
+            .await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("manager");
+        let count = manager.admit_against_identity(identity).await;
+        assert!(!manager.is_admitted(0), "a boot read with no identity evidence stays out");
+        assert_eq!(count, 0);
     }
 }

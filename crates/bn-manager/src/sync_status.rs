@@ -106,7 +106,14 @@ pub async fn check_all_sync_statuses(
     statuses: &SharedSyncStatuses,
     thresholds: &TierThresholds,
 ) {
-    check_all_sync_statuses_publishing(clients, statuses, thresholds, true).await;
+    check_all_sync_statuses_publishing(
+        clients,
+        statuses,
+        thresholds,
+        true,
+        crate::metrics::METRIC_POOL_MAIN,
+    )
+    .await;
 }
 
 /// [`check_all_sync_statuses`]. `publish` writes the tier gauge and the synced log.
@@ -117,6 +124,7 @@ pub async fn check_all_sync_statuses_publishing(
     statuses: &SharedSyncStatuses,
     thresholds: &TierThresholds,
     publish: bool,
+    pool: &str,
 ) {
     let futs: Vec<_> = clients
         .iter()
@@ -172,7 +180,7 @@ pub async fn check_all_sync_statuses_publishing(
             // Issue 8.3 label hygiene — never put userinfo/path/query on /metrics.
             let endpoint_label = crate::metrics::endpoint_label(&endpoint);
             metrics::definitions::RVC_BN_HEALTH_TIER
-                .with_label_values(&[endpoint_label.as_str()])
+                .with_label_values(&[endpoint_label.as_str(), pool])
                 .set(tier.as_metric_value());
         }
         new_statuses[i] = detail;
@@ -248,7 +256,16 @@ pub fn start_sync_monitor_publishing(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            check_all_sync_statuses_publishing(&clients, &statuses, &thresholds, publish).await;
+            // `publish` is the free-function path. `BnManager` passes false and
+            // writes `pool` from its own re-check.
+            check_all_sync_statuses_publishing(
+                &clients,
+                &statuses,
+                &thresholds,
+                publish,
+                crate::metrics::METRIC_POOL_MAIN,
+            )
+            .await;
             if let Some(after_poll) = &after_poll {
                 after_poll().await;
             }
@@ -1015,7 +1032,9 @@ mod tests {
 
     fn health_tier_gauge(endpoint: &str) -> i64 {
         let label = crate::metrics::endpoint_label(endpoint);
-        metrics::definitions::RVC_BN_HEALTH_TIER.with_label_values(&[label.as_str()]).get()
+        metrics::definitions::RVC_BN_HEALTH_TIER
+            .with_label_values(&[label.as_str(), crate::metrics::METRIC_POOL_MAIN])
+            .get()
     }
 
     #[tokio::test]

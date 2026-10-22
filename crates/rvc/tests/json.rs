@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use block_service::BlockService;
-use bn_manager::{BeaconNodeClient, BnManager, BnManagerConfig};
+use bn_manager::{BnManager, BnManagerConfig};
 use crypto::SecretKey;
 use eth_types::ForkSchedule;
 use rvc::beacon_adapter::BeaconBlockAdapter;
@@ -80,7 +80,7 @@ async fn contents_publish_through_the_production_adapter_uses_the_bn_pool() {
     let mut config = BnManagerConfig::new(vec![primary.uri(), secondary.uri()]);
     config.broadcast_topics.blocks = false;
     let manager = Arc::new(BnManager::new(config).expect("BnManager"));
-    let beacon = Arc::new(BeaconBlockAdapter(manager.clone() as Arc<dyn BeaconNodeClient>));
+    let beacon = Arc::new(BeaconBlockAdapter::new(manager.clone()));
     // Fixture payload fee recipient is 0x66…66. The store default is what
     // `propose_block` sends as the expected fee for an unknown pubkey.
     let store = ValidatorStore::new([0x66; 20], 30_000_000);
@@ -183,7 +183,7 @@ async fn blinded_electra_json_publishes_once_and_skips_the_full_block_endpoint()
     let mut config = BnManagerConfig::new(vec![bn.uri()]);
     config.broadcast_topics.blocks = false;
     let manager = Arc::new(BnManager::new(config).expect("BnManager"));
-    let beacon = Arc::new(BeaconBlockAdapter(manager.clone() as Arc<dyn BeaconNodeClient>));
+    let beacon = Arc::new(BeaconBlockAdapter::new(manager.clone()));
     let store = ValidatorStore::new([0x66; 20], 30_000_000);
     store.set_global_block_selection_mode(BlockSelectionMode::BuilderOnly);
     let mut schedule = ForkSchedule::unscheduled_gloas();

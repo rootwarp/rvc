@@ -815,3 +815,163 @@ async fn parent_and_slot_mismatch_drop_the_duty_before_signing() {
     assert_eq!(err.to_string(), "slot mismatch: requested 3000001, got 3000000");
     assert_nothing_signed_or_published(&slot_harness);
 }
+
+/// A revoke of the second fence generation during `sign_block_header` is visible
+/// in the admission scope. Forgetting `and_generation` leaves `holds` true.
+#[tokio::test]
+async fn sign_block_header_sees_the_second_admission_generation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let pubkey = test_pubkey();
+    let response = contents_response(DENEB_CONTENTS_JSON);
+    let doc = fixture_doc(DENEB_CONTENTS_JSON);
+    let slot = quoted_u64(&doc["data"]["block"]["slot"]);
+    let proposer = quoted_u64(&doc["data"]["block"]["proposer_index"]);
+    let version = response.consensus_version.clone();
+    let primary = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let also = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut beacon = MockBeaconClient::from_response(response);
+    beacon.revocation = Arc::clone(&primary);
+    beacon.also_revocation = Some(Arc::clone(&also));
+    let beacon = Arc::new(beacon);
+    let signer = Arc::new(MockSigner::new());
+    let saw_both = Arc::new(AtomicBool::new(false));
+    {
+        let primary = Arc::clone(&primary);
+        let also = Arc::clone(&also);
+        let saw_both = Arc::clone(&saw_both);
+        *signer.before_header.lock().unwrap() = Some(Arc::new(move || {
+            primary.fetch_add(1, Ordering::Release);
+            let primary_drops = signer::testing_beacon_admission_holds() == Some(false);
+            primary.fetch_sub(1, Ordering::Release);
+            also.fetch_add(1, Ordering::Release);
+            let also_drops = signer::testing_beacon_admission_holds() == Some(false);
+            saw_both.store(primary_drops && also_drops, Ordering::Release);
+            false
+        }));
+    }
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_for(&version)),
+        [0xaa; 32],
+    );
+    let err = service.propose_block(slot, &pubkey, proposer, None).await.expect_err("refused");
+    assert!(saw_both.load(Ordering::Acquire), "both generations must be installed, got {err}");
+    assert!(signer.header_calls.lock().unwrap().is_empty(), "no signature is completed");
+    assert!(beacon.publish_contents_calls.lock().unwrap().is_empty());
+}
+
+/// A parent-capture fence that is already stale must refuse before RANDAO.
+#[tokio::test]
+async fn stale_parent_capture_fence_signs_no_randao() {
+    let pubkey = test_pubkey();
+    let response = contents_response(DENEB_CONTENTS_JSON);
+    let doc = fixture_doc(DENEB_CONTENTS_JSON);
+    let slot = quoted_u64(&doc["data"]["block"]["slot"]);
+    let proposer = quoted_u64(&doc["data"]["block"]["proposer_index"]);
+    let version = response.consensus_version.clone();
+    let beacon = Arc::new(MockBeaconClient::from_response(response));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon,
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_for(&version)),
+        [0xaa; 32],
+    );
+    let err = service
+        .propose_block_until(slot, &pubkey, proposer, None, None, &beacon::DutyFence::closed())
+        .await
+        .expect_err("stale parent capture");
+    assert!(err.to_string().contains("admission revoked"), "{err}");
+    assert!(
+        signer.randao_calls.lock().unwrap().is_empty(),
+        "a stale parent-capture fence signs no RANDAO"
+    );
+}
+
+/// A revoke of the third fence generation during `sign_block_header` is visible
+/// in the admission scope. Copying only `also_generation` leaves `holds` true.
+#[tokio::test]
+async fn sign_block_header_sees_the_third_admission_generation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let pubkey = test_pubkey();
+    let response = contents_response(DENEB_CONTENTS_JSON);
+    let doc = fixture_doc(DENEB_CONTENTS_JSON);
+    let slot = quoted_u64(&doc["data"]["block"]["slot"]);
+    let proposer = quoted_u64(&doc["data"]["block"]["proposer_index"]);
+    let version = response.consensus_version.clone();
+    let primary = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let also = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let third = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let mut beacon = MockBeaconClient::from_response(response);
+    beacon.revocation = Arc::clone(&primary);
+    beacon.also_revocation = Some(Arc::clone(&also));
+    beacon.third_revocation = Some(Arc::clone(&third));
+    let beacon = Arc::new(beacon);
+    let signer = Arc::new(MockSigner::new());
+    let saw_third = Arc::new(AtomicBool::new(false));
+    {
+        let third = Arc::clone(&third);
+        let saw_third = Arc::clone(&saw_third);
+        *signer.before_header.lock().unwrap() = Some(Arc::new(move || {
+            third.fetch_add(1, Ordering::Release);
+            let drops = signer::testing_beacon_admission_holds() == Some(false);
+            third.fetch_sub(1, Ordering::Release);
+            saw_third.store(drops, Ordering::Release);
+            false
+        }));
+    }
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_for(&version)),
+        [0xaa; 32],
+    );
+    let err = service.propose_block(slot, &pubkey, proposer, None).await.expect_err("refused");
+    assert!(saw_third.load(Ordering::Acquire), "the third generation must be installed, got {err}");
+    assert!(signer.header_calls.lock().unwrap().is_empty(), "no signature is completed");
+}
+
+/// The discard inside `sign_and_publish_prepared` must refuse the header.
+///
+/// The call after produce is index 0. Index 1 is the prepared-candidate
+/// discard. Removing that call leaves the generation unmoved and the mock
+/// signer completes the header.
+#[tokio::test]
+async fn prepared_discard_refuses_the_header_when_admission_moves() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let pubkey = test_pubkey();
+    let response = contents_response(DENEB_CONTENTS_JSON);
+    let doc = fixture_doc(DENEB_CONTENTS_JSON);
+    let slot = quoted_u64(&doc["data"]["block"]["slot"]);
+    let proposer = quoted_u64(&doc["data"]["block"]["proposer_index"]);
+    let version = response.consensus_version.clone();
+    let beacon = Arc::new(MockBeaconClient::from_response(response));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_for(&version)),
+        [0xaa; 32],
+    );
+    let revocation = Arc::clone(&beacon.revocation);
+    let calls = AtomicUsize::new(0);
+    service.set_before_discard(move || {
+        if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            revocation.fetch_add(1, Ordering::Release);
+        }
+    });
+    let err = service.propose_block(slot, &pubkey, proposer, None).await.expect_err("discarded");
+    assert!(err.to_string().contains("admission revoked"), "{err}");
+    assert!(
+        signer.header_calls.lock().unwrap().is_empty(),
+        "sign_and_publish_prepared must drop the candidate before the header"
+    );
+}

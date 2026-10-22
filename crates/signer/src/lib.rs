@@ -40,19 +40,34 @@ pub use core::{
 pub use doppelganger::{duty_requires_beacon_admission, SigningDuty, SigningEnablement};
 
 /// Revocation generation for [`with_beacon_admission`]. A missing scope fails closed.
+///
+/// [`Self::and_generation`] keeps every generation already attached.
+/// [`Self::holds`] is false when any of them has moved, so one block duty
+/// can fail closed on the main pool or the proposer pool.
 #[derive(Clone, Debug)]
 pub struct BeaconAdmission {
-    seen: u64,
-    current: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    watches: Vec<(u64, std::sync::Arc<std::sync::atomic::AtomicU64>)>,
 }
 
 impl BeaconAdmission {
     pub fn new(seen: u64, current: std::sync::Arc<std::sync::atomic::AtomicU64>) -> Self {
-        Self { seen, current }
+        Self { watches: vec![(seen, current)] }
+    }
+
+    /// Attach another pool's generation. Generations already stored stay.
+    pub fn and_generation(
+        mut self,
+        seen: u64,
+        current: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        self.watches.push((seen, current));
+        self
     }
 
     pub fn holds(&self) -> bool {
-        self.current.load(std::sync::atomic::Ordering::Acquire) == self.seen
+        self.watches
+            .iter()
+            .all(|(seen, current)| current.load(std::sync::atomic::Ordering::Acquire) == *seen)
     }
 
     /// Scope for a process that has no beacon node. Stays public so
@@ -62,7 +77,53 @@ impl BeaconAdmission {
     /// The atomic is private to this value, so `holds` stays true. A missing
     /// scope still fails closed.
     pub fn unbound() -> Self {
-        Self { seen: 0, current: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)) }
+        Self { watches: vec![(0, std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)))] }
+    }
+}
+
+/// `Some` when this task installed an admission scope.
+///
+/// Tests read it from inside `sign_block_header` to prove both generations
+/// were installed. Production builds do not compile this.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn testing_beacon_admission_holds() -> Option<bool> {
+    BEACON_ADMISSION.try_with(|admission| admission.holds()).ok()
+}
+
+#[cfg(test)]
+mod beacon_admission_combined {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    use super::BeaconAdmission;
+
+    #[test]
+    fn combined_admission_fails_when_either_generation_moves() {
+        let primary = Arc::new(AtomicU64::new(0));
+        let also = Arc::new(AtomicU64::new(2));
+        let admission =
+            BeaconAdmission::new(0, Arc::clone(&primary)).and_generation(2, Arc::clone(&also));
+        assert!(admission.holds());
+        also.fetch_add(1, Ordering::Release);
+        assert!(!admission.holds(), "the second generation must drop the scope");
+        also.store(2, Ordering::Release);
+        primary.fetch_add(1, Ordering::Release);
+        assert!(!admission.holds(), "the primary generation must drop the scope");
+    }
+
+    #[test]
+    fn and_generation_keeps_a_generation_attached_before_the_last() {
+        let primary = Arc::new(AtomicU64::new(0));
+        let middle = Arc::new(AtomicU64::new(1));
+        let third = Arc::new(AtomicU64::new(2));
+        let admission = BeaconAdmission::new(0, Arc::clone(&primary))
+            .and_generation(1, Arc::clone(&middle))
+            .and_generation(2, Arc::clone(&third));
+        middle.fetch_add(1, Ordering::Release);
+        assert!(
+            !admission.holds(),
+            "combining must keep a generation attached before the last one"
+        );
     }
 }
 
@@ -3356,6 +3417,36 @@ mod tests {
             compute_domain(eth_types::DOMAIN_RANDAO, schedule.genesis_fork_version, genesis_root);
         let signing_root = compute_signing_root(&epoch, domain);
         assert!(signature.verify(&pubkey, &signing_root).is_ok());
+    }
+
+    /// The real signer refuses when a generation attached after the primary moves.
+    ///
+    /// A mock that returns false from its own hook does not exercise
+    /// [`SignerService::ensure_duty_enabled`].
+    #[tokio::test]
+    async fn signer_refuses_randao_when_the_second_generation_moves() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let signer = create_test_composite_signer_with_key(secret_key);
+        let slashing_db = Arc::new(SlashingDb::open_in_memory().expect("failed to open db"));
+        let service = SignerService::new(signer, slashing_db).with_enablement(always_enabled());
+        let schedule = create_test_fork_schedule();
+        let genesis_root = [0xaa; 32];
+        let primary = Arc::new(AtomicU64::new(0));
+        let second = Arc::new(AtomicU64::new(4));
+        let admission =
+            BeaconAdmission::new(0, Arc::clone(&primary)).and_generation(4, Arc::clone(&second));
+        second.fetch_add(1, Ordering::Release);
+
+        let err = with_beacon_admission(
+            admission,
+            service.sign_randao_reveal(5, &pubkey, &schedule, &genesis_root),
+        )
+        .await
+        .expect_err("the second generation must refuse the real signer");
+        assert!(matches!(err, SignerError::BeaconAdmissionRevoked), "{err:?}");
     }
 
     #[tokio::test]

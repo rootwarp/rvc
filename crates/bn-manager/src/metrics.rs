@@ -8,6 +8,12 @@ use metrics::{
 };
 use url::Url;
 
+/// `pool` label for the main beacon-node manager.
+pub const METRIC_POOL_MAIN: &str = "main";
+
+/// `pool` label for the proposer beacon-node manager.
+pub const METRIC_POOL_PROPOSER: &str = "proposer";
+
 /// `scheme://host:port` with userinfo and path stripped — dashboards key on host,
 /// not credentials or request path (issue 8.3 label hygiene).
 ///

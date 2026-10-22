@@ -265,6 +265,48 @@ pub fn spawn_sync_monitor(
     });
 }
 
+/// Executor name for the proposer-pool sync monitor.
+pub const PROPOSER_SYNC_MONITOR_TASK_NAME: &str = "bn.proposer_sync_monitor";
+
+/// Cancel-forwarder for [`PROPOSER_SYNC_MONITOR_TASK_NAME`].
+pub const PROPOSER_SYNC_MONITOR_CANCEL_TASK_NAME: &str = "bn.proposer_sync_monitor.cancel";
+
+/// Register the proposer-pool sync monitor at [`ShutdownTier::Background`].
+///
+/// Same shape as [`spawn_sync_monitor`]. `None` uses
+/// [`TaskExecutor::register_opt`] and is not a census site. The poll loop
+/// lives in bn-manager. The caller passes the interval from
+/// [`bn_manager::sync_check_interval_for`].
+pub fn spawn_proposer_sync_monitor(
+    bn_manager: Option<Arc<BnManager>>,
+    executor: &TaskExecutor,
+    interval: Option<Duration>,
+) {
+    let Some(bn_manager) = bn_manager else {
+        executor.register_opt::<()>(
+            PROPOSER_SYNC_MONITOR_TASK_NAME,
+            ShutdownTier::Background,
+            None,
+        );
+        return;
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    info!("Starting proposer beacon-node sync monitor");
+    let sync_handle = bn_manager.start_sync_monitor(interval, shutdown_rx);
+    let sync_abort = sync_handle.abort_handle();
+    // detached: proposer BN sync monitor; process-lifetime Infra handle, loop lives in bn-manager, out of P1-1 scope.
+    executor.register(PROPOSER_SYNC_MONITOR_TASK_NAME, ShutdownTier::Background, sync_handle);
+
+    let token = executor.token();
+    // detached: cancel-forwarder for bn.proposer_sync_monitor; not an iteration loop.
+    executor.spawn(PROPOSER_SYNC_MONITOR_CANCEL_TASK_NAME, ShutdownTier::Background, async move {
+        token.cancelled().await;
+        let _ = shutdown_tx.send(true);
+        sync_abort.abort();
+    });
+}
+
 /// Listeners bound before keystore load so a port clash aborts startup.
 ///
 /// `metrics` is always bound. `keymanager` is bound only when
@@ -1161,6 +1203,147 @@ mod tests {
         assert!(
             body.contains("bn_manager.start_sync_monitor"),
             "bootstrap must call BnManager::start_sync_monitor"
+        );
+    }
+
+    /// One monitor pass marks a matching proposer node Synced.
+    ///
+    /// The first poll runs before the interval sleep. The test waits on
+    /// [`BnManager::testing_sync_polled`] and then shuts the executor down, so
+    /// it does not sleep for the epoch. Pausing time here advances the client
+    /// timeout before wiremock answers and records the node as unreachable.
+    /// The fallback floor is the same predicate `fallback_unsynced` uses.
+    #[tokio::test]
+    async fn proposer_pool_sync_monitor_publishes_tiers() {
+        use bn_manager::ChainIdentity;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"data":{"SLOT_DURATION_MS":"12000","SLOTS_PER_EPOCH":"32"}}"#,
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0xabc","genesis_fork_version":"0x00000000"}}"#,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/node/syncing"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"head_slot":"100","sync_distance":"0","is_syncing":false,"is_optimistic":false,"el_offline":false}}"#,
+            ))
+            .mount(&server)
+            .await;
+
+        let manager = Arc::new(
+            BnManager::new(bn_manager::BnManagerConfig::new(vec![server.uri()]))
+                .expect("proposer manager"),
+        );
+        let admitted = manager
+            .admit_against_identity(ChainIdentity {
+                slot_duration_ms: 12_000,
+                slots_per_epoch: 32,
+                genesis_time: 1_606_824_023,
+                genesis_validators_root: "0xabc".to_string(),
+                genesis_fork_version: "0x00000000".to_string(),
+            })
+            .await;
+        assert_eq!(admitted, 1);
+        assert!(
+            !manager.testing_fallback_would_select(0).await,
+            "an unknown tier is below the fallback floor"
+        );
+        // Identity is stored and the bit is set. Revoke before the monitor
+        // starts so only `recheck` can admit the node again. Dropping
+        // `notify_one` still hangs on `polled`; dropping `recheck` leaves
+        // the bit clear and fails the fallback assertion below.
+        manager.testing_revoke_admission(0);
+        assert!(
+            bn_manager::BeaconNodeClient::duty_fence(manager.as_ref()).is_err(),
+            "the proposer node stays unadmitted until recheck"
+        );
+
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let polled = manager.testing_sync_polled();
+        spawn_proposer_sync_monitor(
+            Some(Arc::clone(&manager)),
+            &executor,
+            Some(Duration::from_secs(192)),
+        );
+        polled.notified().await;
+        let status = manager.sync_statuses().read().await;
+        assert_eq!(
+            status.first().map(|detail| detail.status),
+            Some(bn_manager::BnSyncStatus::Synced)
+        );
+        drop(status);
+        assert!(
+            manager.testing_fallback_would_select(0).await,
+            "recheck must admit the matching proposer node again"
+        );
+        assert!(
+            bn_manager::BeaconNodeClient::duty_fence(manager.as_ref()).is_ok(),
+            "recheck must grant the matching proposer node again"
+        );
+        let entries = executor.registry_entries();
+        assert!(
+            entries.contains(&(PROPOSER_SYNC_MONITOR_TASK_NAME, ShutdownTier::Background)),
+            "{entries:?}"
+        );
+        assert!(
+            entries.contains(&(PROPOSER_SYNC_MONITOR_CANCEL_TASK_NAME, ShutdownTier::Background)),
+            "{entries:?}"
+        );
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    /// Cancelling the process token must abort the registered proposer monitor.
+    ///
+    /// The first sync poll is held open, so closing the shutdown watch does
+    /// not finish the task. `executor.shutdown` aborts registered work on its
+    /// own, so this test only cancels the token. Removing the forwarder body
+    /// leaves `rvc_tasks_running` up.
+    #[tokio::test]
+    async fn proposer_sync_monitor_cancel_forwarder_stops_the_registered_task() {
+        use metrics::definitions::RVC_TASKS_RUNNING;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+        let manager = Arc::new(
+            BnManager::new(bn_manager::BnManagerConfig::new(vec![server.uri()]))
+                .expect("proposer manager"),
+        );
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let before = RVC_TASKS_RUNNING.with_label_values(&[PROPOSER_SYNC_MONITOR_TASK_NAME]).get();
+        spawn_proposer_sync_monitor(Some(manager), &executor, Some(Duration::from_secs(192)));
+        assert!(
+            RVC_TASKS_RUNNING.with_label_values(&[PROPOSER_SYNC_MONITOR_TASK_NAME]).get() > before,
+            "the proposer sync monitor must be registered before cancel"
+        );
+        executor.token().cancel();
+        let dropped = async {
+            while RVC_TASKS_RUNNING.with_label_values(&[PROPOSER_SYNC_MONITOR_TASK_NAME]).get()
+                != before
+            {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), dropped).await.expect(
+            "the cancel forwarder must abort bn.proposer_sync_monitor without executor.shutdown",
         );
     }
 }

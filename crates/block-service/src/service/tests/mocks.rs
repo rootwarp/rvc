@@ -97,6 +97,8 @@ pub(crate) struct MockSigner {
     pub(crate) header_calls: Mutex<Vec<CapturedSignBlockHeaderCall>>,
     pub(crate) envelope_calls: Mutex<Vec<CapturedSignEnvelopeCall>>,
     pub(crate) call_trace: Arc<Mutex<Vec<&'static str>>>,
+    /// Return `false` to refuse the signature before it is produced.
+    pub(crate) before_header: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
 }
 
 impl MockSigner {
@@ -110,6 +112,7 @@ impl MockSigner {
             header_calls: Mutex::new(Vec::new()),
             envelope_calls: Mutex::new(Vec::new()),
             call_trace: Arc::new(Mutex::new(Vec::new())),
+            before_header: Mutex::new(None),
         }
     }
 
@@ -234,6 +237,11 @@ impl ValidatorSigner for MockSigner {
         fork_schedule: &ForkSchedule,
         genesis_validators_root: &Root,
     ) -> Result<crypto::Signature, SignerError> {
+        if let Some(hook) = self.before_header.lock().unwrap().clone() {
+            if !hook() {
+                return Err(SignerError::KeyNotFound("admission revoked".to_string()));
+            }
+        }
         self.header_calls.lock().unwrap().push(CapturedSignBlockHeaderCall {
             header: header.clone(),
             pubkey: pubkey.clone(),
@@ -417,6 +425,8 @@ pub(crate) struct MockBeaconClient {
     pub(crate) call_trace: Arc<Mutex<Vec<&'static str>>>,
     pub(crate) refuse_admission: bool,
     pub(crate) revocation: Arc<AtomicU64>,
+    pub(crate) also_revocation: Option<Arc<AtomicU64>>,
+    pub(crate) third_revocation: Option<Arc<AtomicU64>>,
 }
 
 impl MockBeaconClient {
@@ -442,6 +452,8 @@ impl MockBeaconClient {
             call_trace: Arc::new(Mutex::new(Vec::new())),
             refuse_admission: false,
             revocation: Arc::new(AtomicU64::new(0)),
+            also_revocation: None,
+            third_revocation: None,
         }
     }
 
@@ -706,7 +718,14 @@ impl BeaconBlockClient for MockBeaconClient {
         if self.refuse_admission {
             return Err(BlockServiceError::Beacon("no admitted beacon node; duties halted".into()));
         }
-        Ok(beacon::DutyFence::at(0, Arc::clone(&self.revocation)))
+        let mut fence = beacon::DutyFence::at(0, Arc::clone(&self.revocation));
+        if let Some(also) = &self.also_revocation {
+            fence = fence.and_fence(beacon::DutyFence::at(0, Arc::clone(also)));
+        }
+        if let Some(third) = &self.third_revocation {
+            fence = fence.and_fence(beacon::DutyFence::at(0, Arc::clone(third)));
+        }
+        Ok(fence)
     }
 
     async fn produce_block_v3(

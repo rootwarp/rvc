@@ -134,7 +134,7 @@ async fn top_level_graffiti_reaches_a_produced_block() {
     let beacon: Arc<dyn BeaconNodeClient> = Arc::new(client);
     let service = block_service::BlockService::new(
         Arc::new(StubValidatorSigner::new()),
-        Arc::new(BeaconBlockAdapter(beacon)),
+        Arc::new(BeaconBlockAdapter::new(beacon)),
         store,
         Arc::new(ForkSchedule::unscheduled_gloas()),
         [0xaa; 32],

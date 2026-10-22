@@ -28,7 +28,7 @@
 //!
 //! A window around the spawn line is not classification (2). `monitoring_push` and
 //! `proposer_config_refresh` are spawned in `bootstrap/tasks.rs`; their loops live
-//! in other files. The allow-list is empty. The pin is 14 (5 shape B, 9 detached,
+//! in other files. The allow-list is empty. The pin is 16 (5 shape B, 11 detached,
 //! shape A = 0).
 //!
 //! No external dependency: hand-rolled scan, same style as `raw_spawn.rs`.
@@ -36,10 +36,10 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Production-site pin. 5 shape B + 9 detached + shape A = 0.
-const PIN: usize = 14;
+/// Production-site pin. 5 shape B + 11 detached + shape A = 0.
+const PIN: usize = 16;
 const SHAPE_B_PIN: usize = 5;
-const DETACHED_PIN: usize = 9;
+const DETACHED_PIN: usize = 11;
 const SHAPE_A_PIN: usize = 0;
 
 const CENSUS: &str = "plan/tracing-2026-08-06/spawn-census.md";

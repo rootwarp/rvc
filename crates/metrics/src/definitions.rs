@@ -76,22 +76,22 @@ lazy_static! {
     };
 
     /// Gauge for per-BN health tier (1=Synced, 2=SmallLag, 3=LargeLag, 4=Unsynced).
-    /// Labels: endpoint
+    /// Labels: endpoint, pool (`main` or `proposer`)
     pub static ref RVC_BN_HEALTH_TIER: prometheus::IntGaugeVec = {
         define_int_gauge_vec(
             "rvc_bn_health_tier",
             "Health tier of each beacon node (1=synced, 2=small-lag, 3=large-lag, 4=unsynced)",
-            &["endpoint"],
+            &["endpoint", "pool"],
         )
     };
 
     /// 1 when the beacon node is admitted for duties, 0 when it is not.
-    /// Labels: endpoint
+    /// Labels: endpoint, pool (`main` or `proposer`)
     pub static ref RVC_BN_ADMITTED: prometheus::IntGaugeVec = {
         define_int_gauge_vec(
             "rvc_bn_admitted",
             "1 when the beacon node is admitted for duties, 0 when admission is revoked or not yet granted",
-            &["endpoint"],
+            &["endpoint", "pool"],
         )
     };
 
@@ -224,7 +224,7 @@ pub fn init_metrics() {
     // DSR-2.4: the health-tier gauge keeps one placeholder child so a scrape
     // before the first beacon node still has a numeric sample. `rvc_bn_admitted`
     // does not: an `endpoint="unknown"` child would look like a real node.
-    let _ = RVC_BN_HEALTH_TIER.with_label_values(&[bn_health_tier::UNCONFIGURED_ENDPOINT]);
+    let _ = RVC_BN_HEALTH_TIER.with_label_values(&[bn_health_tier::UNCONFIGURED_ENDPOINT, "main"]);
     for task in task_exit_tasks::ALL {
         for outcome in task_exit_outcome::ALL {
             let _ = RVC_TASK_EXITS_TOTAL.with_label_values(&[task, outcome]);

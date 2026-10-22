@@ -14,14 +14,61 @@ use block_service::{
 use bn_manager::{BeaconNodeClient, ProduceDuty as BnProduceDuty};
 use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContentsJson, Slot};
 
-/// Newtype adapter that implements [`BeaconBlockClient`] for any
-/// [`BeaconNodeClient`] (typically a proposer or main-pool `BnManager`).
-pub struct BeaconBlockAdapter(pub Arc<dyn BeaconNodeClient>);
+/// Block client over the main pool, with an optional proposer pool.
+///
+/// Produce and publish go to the proposer pool while it has an admitted
+/// node. The duty fence watches the main pool and the proposer pool's
+/// revocation generation, including when that pool is empty. A node granted
+/// after the fence and revoked before the signature is dropped. No admitted
+/// main node fails the fence even when a proposer node is admitted.
+pub struct BeaconBlockAdapter {
+    main: Arc<dyn BeaconNodeClient>,
+    proposer: Option<Arc<dyn BeaconNodeClient>>,
+}
+
+impl BeaconBlockAdapter {
+    /// Main pool only. An empty `proposer_nodes` list uses this.
+    pub fn new(main: Arc<dyn BeaconNodeClient>) -> Self {
+        Self { main, proposer: None }
+    }
+
+    /// Main pool plus a proposer pool. Both stay installed when the proposer
+    /// pool has nobody admitted, so a later monitor pass can route back.
+    pub fn with_proposer(
+        main: Arc<dyn BeaconNodeClient>,
+        proposer: Arc<dyn BeaconNodeClient>,
+    ) -> Self {
+        Self { main, proposer: Some(proposer) }
+    }
+
+    /// Pool that would serve the next produce call.
+    pub fn production(&self) -> Arc<dyn BeaconNodeClient> {
+        Arc::clone(self.route())
+    }
+
+    fn route(&self) -> &Arc<dyn BeaconNodeClient> {
+        match &self.proposer {
+            Some(proposer) if proposer.duty_fence().is_ok() => proposer,
+            _ => &self.main,
+        }
+    }
+}
 
 #[async_trait]
 impl BeaconBlockClient for BeaconBlockAdapter {
     fn duty_fence(&self) -> Result<beacon::DutyFence, BlockServiceError> {
-        self.0.duty_fence().map_err(Into::into)
+        let main = self.main.duty_fence().map_err(BlockServiceError::from)?;
+        let Some(proposer) = &self.proposer else {
+            return Ok(main);
+        };
+        // Sample before `duty_fence`. A revoke between the two attaches the
+        // pre-revoke generation, so `holds` is false. A sample taken after
+        // `NoAdmittedNode` can observe the post-revoke generation and stay open.
+        let proposer_watch = proposer.revocation_watch();
+        match proposer.duty_fence() {
+            Ok(_) | Err(beacon::BeaconError::NoAdmittedNode) => Ok(main.and_fence(proposer_watch)),
+            Err(other) => Err(BlockServiceError::from(other)),
+        }
     }
 
     async fn produce_block_v3(
@@ -31,7 +78,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        self.0
+        self.route()
             .produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor)
             .await
             .map_err(Into::into)
@@ -45,7 +92,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         builder_boost_factor: Option<u64>,
         duty: ProduceDuty,
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        self.0
+        self.route()
             .produce_block_v3_for_duty(
                 slot,
                 randao_reveal,
@@ -80,7 +127,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
             expected_fee_recipient: duty.expected_fee_recipient,
             expected_consensus_version: duty.expected_consensus_version,
         });
-        self.0
+        self.route()
             .produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
             .await
             .map_err(Into::into)
@@ -103,7 +150,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
             expected_fee_recipient: duty.expected_fee_recipient,
             expected_consensus_version: duty.expected_consensus_version,
         });
-        self.0
+        self.route()
             .produce_block_v3_ranked_by(
                 slot,
                 randao_reveal,
@@ -123,7 +170,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         graffiti: Option<&str>,
         builder_config: &BuilderConfig,
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        self.0
+        self.route()
             .produce_block_v4(slot, randao_reveal, graffiti, builder_config)
             .await
             .map_err(Into::into)
@@ -137,7 +184,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         builder_config: &BuilderConfig,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        self.0
+        self.route()
             .produce_block_v4_by(slot, randao_reveal, graffiti, builder_config, deadline)
             .await
             .map_err(Into::into)
@@ -149,7 +196,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         consensus_version: &str,
         builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
-        self.0
+        self.route()
             .publish_block(signed_block, consensus_version, builder_url)
             .await
             .map_err(|e| BlockServiceError::Beacon(e.to_string()))
@@ -161,7 +208,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         consensus_version: &str,
         builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
-        self.0
+        self.route()
             .publish_block_contents(contents, consensus_version, builder_url)
             .await
             .map_err(|e| BlockServiceError::Beacon(e.to_string()))
@@ -172,7 +219,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         signed_block: &SignedBlindedBeaconBlock,
         consensus_version: &str,
     ) -> Result<(), BlockServiceError> {
-        self.0
+        self.route()
             .publish_blinded_block(signed_block, consensus_version)
             .await
             .map_err(|e| BlockServiceError::Beacon(e.to_string()))
@@ -185,7 +232,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         is_blinded: bool,
         builder_url: Option<&str>,
     ) -> Result<(), BlockServiceError> {
-        self.0
+        self.route()
             .publish_block_ssz(ssz_bytes, consensus_version, is_blinded, builder_url)
             .await
             .map_err(|e| BlockServiceError::Beacon(e.to_string()))
@@ -199,7 +246,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         consensus_version: &str,
         broadcast_validation: Option<&str>,
     ) -> Result<(), BlockServiceError> {
-        self.0
+        self.route()
             .publish_execution_payload_envelope(
                 signed_envelope,
                 blobs,
@@ -263,7 +310,7 @@ mod tests {
 
         let manager = BnManager::new(BnManagerConfig::new(vec![primary.uri(), secondary.uri()]))
             .expect("proposer BnManager");
-        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        let adapter = BeaconBlockAdapter::new(Arc::new(manager));
 
         let produced = adapter
             .produce_block_v3(42, "0xrandao", None, None)
@@ -288,7 +335,7 @@ mod tests {
         let main_mgr =
             BnManager::new(BnManagerConfig::new(vec![main.uri()])).expect("main BnManager");
         // Mirrors main.rs: no proposer pool → wrap the main pool.
-        let adapter = BeaconBlockAdapter(Arc::new(main_mgr) as Arc<dyn BeaconNodeClient>);
+        let adapter = BeaconBlockAdapter::new(Arc::new(main_mgr));
 
         let produced = adapter
             .produce_block_v3(7, "0xrandao", None, None)
@@ -330,7 +377,7 @@ mod tests {
             .await;
 
         let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
-        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        let adapter = BeaconBlockAdapter::new(Arc::new(manager));
 
         let produced = adapter
             .produce_block_v4(slot, "0xrandao", None, &builder_config)
@@ -356,7 +403,7 @@ mod tests {
             .await;
 
         let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
-        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        let adapter = BeaconBlockAdapter::new(Arc::new(manager));
         adapter
             .publish_block(&sample_signed_block(), "deneb", Some(builder))
             .await
@@ -384,7 +431,7 @@ mod tests {
             .await;
 
         let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
-        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        let adapter = BeaconBlockAdapter::new(Arc::new(manager));
         adapter.publish_block(&sample_signed_block(), "deneb", None).await.expect("publish_block");
 
         let requests = server.received_requests().await.unwrap();
@@ -411,7 +458,7 @@ mod tests {
             .await;
 
         let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
-        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        let adapter = BeaconBlockAdapter::new(Arc::new(manager));
         adapter
             .publish_block_ssz(&ssz_bytes, "deneb", false, Some(builder))
             .await
@@ -440,7 +487,7 @@ mod tests {
             .await;
 
         let manager = BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("BnManager");
-        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        let adapter = BeaconBlockAdapter::new(Arc::new(manager));
         adapter
             .publish_block_ssz(&ssz_bytes, "deneb", false, None)
             .await
@@ -484,7 +531,7 @@ mod tests {
 
         let manager = BnManager::new(BnManagerConfig::new(vec![primary.uri(), secondary.uri()]))
             .expect("BnManager");
-        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        let adapter = BeaconBlockAdapter::new(Arc::new(manager));
         adapter
             .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
             .await
@@ -527,12 +574,11 @@ mod tests {
             .mount(&proposer)
             .await;
 
-        let _main_mgr =
+        let main_mgr =
             BnManager::new(BnManagerConfig::new(vec![main.uri()])).expect("main BnManager");
         let proposer_mgr =
             BnManager::new(BnManagerConfig::new(vec![proposer.uri()])).expect("proposer BnManager");
-        // Mirrors main.rs: proposer pool configured → wrap proposer BnManager.
-        let adapter = BeaconBlockAdapter(Arc::new(proposer_mgr) as Arc<dyn BeaconNodeClient>);
+        let adapter = BeaconBlockAdapter::with_proposer(Arc::new(main_mgr), Arc::new(proposer_mgr));
 
         let produced = adapter
             .produce_block_v3(9, "0xrandao", None, None)
@@ -564,7 +610,7 @@ mod tests {
 
         let manager =
             BnManager::new(BnManagerConfig::new(vec![server.uri()])).expect("ssz BnManager");
-        let adapter = BeaconBlockAdapter(Arc::new(manager));
+        let adapter = BeaconBlockAdapter::new(Arc::new(manager));
 
         let produced = adapter
             .produce_block_v3(500, "0xrandao", None, None)
@@ -619,7 +665,7 @@ mod tests {
         let mut config = BnManagerConfig::new(vec![primary.uri(), secondary.uri()]);
         config.broadcast_topics.blocks = false;
         let manager = Arc::new(BnManager::new(config).expect("BnManager"));
-        let adapter = BeaconBlockAdapter(manager.clone() as Arc<dyn BeaconNodeClient>);
+        let adapter = BeaconBlockAdapter::new(manager.clone());
 
         adapter
             .publish_block_contents(&contents, "electra", None)

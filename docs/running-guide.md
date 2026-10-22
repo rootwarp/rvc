@@ -71,6 +71,29 @@ duration, or slots per epoch — duties stop and the process stays up. The log
 line is `no admitted beacon node; duties halted`. A timeout or an HTTP 5xx
 does not revoke a node. Duties resume when a node matches that identity again.
 
+`proposer_nodes` is an optional block-production pool. Each proposer node is
+admitted only when its spec and genesis match the main pool's agreed
+identity. A mismatch, or a failed read at boot, leaves that node unadmitted
+and does not fail startup. If that boot pass admits nobody, proposals use
+the main pool and startup logs one warning: `no admitted proposer node;
+block production uses the main pool`. A later parsed mismatch revokes the
+node, including the last one, and proposals use the main pool. A monitor
+pass that finds no admitted proposer node logs that same sentence, and does
+not log `no admitted beacon node; duties halted`. A timeout or an HTTP 5xx
+leaves admission unchanged when neither response parses a disagreement. A
+revoked node is still probed and is admitted again when it matches. Block
+duties fail closed when the main pool has no admitted node, even if a
+proposer node is admitted. When a proposer pool is configured, the block
+fence watches both revocation generations, including when that pool has no
+admitted node. Produce still asks whichever pool is admitted when the block
+is requested, so a proposer node granted after that fence can be asked. If
+either watched generation moves before the header is signed, the candidate
+is dropped and the header is not signed. A parent-capture fence that no
+longer holds signs no RANDAO. With no proposer pool, the fence watches only
+the main generation. The proposer sync monitor publishes health tiers for
+admitted proposer endpoints on the same one-epoch interval. An empty list
+builds no proposer pool.
+
 #### Server Options
 
 | Flag | Default | Description |
@@ -213,6 +236,13 @@ log_level = "info"
 
 # Multi-BN failover
 # beacon_nodes = ["http://bn1:5052", "http://bn2:5052"]
+
+# Optional proposer pool. Admitted only when spec and genesis match the main
+# pool. Empty builds no pool. No admitted proposer node uses beacon_nodes.
+# The block fence watches that pool's revocation generation even when it is
+# empty. Produce may still ask a node granted later. If either watched
+# generation moves before the header is signed, the candidate is dropped.
+# proposer_nodes = ["http://proposer:5052"]
 
 # Keymanager API
 # keymanager_enabled = true
