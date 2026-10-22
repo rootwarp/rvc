@@ -50,7 +50,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | Site | Class | Kind | Verdict | Rationale | Issue |
 |---|---|---|---|---|---|
 | `bin/rvc-keygen/src/exit.rs` 107 | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 301. | — |
-| `crates/beacon/src/client.rs` 577 | 1 | — | inherit-intentionally | Proposer-duties v1/v2 routing (4.5). Open-ended `>= Gloas` keeps later forks on v2 rather than silently falling back to deprecated v1. | 4.5 |
+| `crates/beacon/src/client.rs` 582 | 1 | — | inherit-intentionally | Proposer-duties v1/v2 routing (4.5). Open-ended `>= Gloas` keeps later forks on v2 rather than silently falling back to deprecated v1. | 4.5 |
 | `crates/block-service/src/service/mod.rs` 470 | 1 | — | inherit-intentionally | Produce dispatch: open-ended `>= Gloas` stays on V4 so a later fork does not fall back to V3. | — |
 | `crates/block-service/src/service/mod.rs` 550 | 1 | — | inherit-intentionally | Sign/publish dispatch: open-ended `>= Gloas` stays on `sign_and_publish_v4`. | — |
 | `crates/block-service/src/service/mod.rs` 1404 | 1 | — | inherit-intentionally | Response log omits the pre-Gloas blinded field once `>= Gloas`. Later forks keep that shape. | — |
@@ -84,9 +84,9 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/rvc/src/orchestrator/utils.rs` 146 | 2 | — | must-bound | The assignment gated by `zeroes_committee_index`. Bound together with the half-open `Electra..Gloas` predicate (2.3 / 2.8). | 2.3 |
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 363 | 2 | — | test-only | Gloas round-trip builds a zeroed index to prove the signing path did not zero it. | — |
 | `crates/rvc/tests/gloas_data_index_round_trip.rs` 390 | 2 | — | test-only | Electra/Fulu round-trip expects the submitted index to be zeroed. | — |
-| `bin/rvc/tests/common/mock_bn.rs` 346 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
-| `crates/beacon/src/client.rs` 1280 | 3 | exhaustive | inherit-intentionally | Aggregate fetch v2 request table. Exhaustive `match fork` so a new variant is a compile error, not a silent v1 or v2 inherit. | RR-3.2 |
-| `crates/beacon/src/client.rs` 2157 | 3 | exhaustive | inherit-intentionally | v2 200 is accepted only when the response header, body `version`, and the requested fork agree. Pre-Electra is not decoded on this path. | RR-3.2 |
+| `bin/rvc/tests/common/mock_bn.rs` 353 | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
+| `crates/beacon/src/client.rs` 1285 | 3 | exhaustive | inherit-intentionally | Aggregate fetch v2 request table. Exhaustive `match fork` so a new variant is a compile error, not a silent v1 or v2 inherit. | RR-3.2 |
+| `crates/beacon/src/client.rs` 2162 | 3 | exhaustive | inherit-intentionally | v2 200 is accepted only when the response header, body `version`, and the requested fork agree. Pre-Electra is not decoded on this path. | RR-3.2 |
 | `crates/block-service/src/service/mod.rs` 1903 | 3 | exhaustive | inherit-intentionally | `ssz_block_format` named Gloas `BeaconBlock` arm; exhaustive `match fork` so a new variant is a compile error, not a silent `BlockContents`/`BeaconBlock` inherit. Unknown version strings fail closed before the match. | 6.4 |
 | `crates/eth-types/src/block.rs` 42 | 3 | exhaustive | inherit-intentionally | `expected_kzg_proof_count` is keyed on `ForkName`, not `BodyForkLayout` (Fulu must not inherit Electra's one-proof rule). Deneb/Electra are one proof per blob, Fulu is `CELLS_PER_EXT_BLOB` cell proofs, Gloas and pre-Deneb error. A new variant is a compile error. | RR-3.9 |
 | `crates/eth-types/src/fork.rs` 190 | 3 | exhaustive | inherit-intentionally | `ForkName::id` exhaustive `match self` with no `_ =>`. Deliberate fork-addition tripwire (2.1). 2.5b adds the Gloas arm. | 2.5b |
@@ -100,7 +100,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/block-service/src/service/tests/v4.rs` 144 | 4 | exhaustive | test-only | Fulu slot with a gloas JSON version must fail closed. | — |
 | `crates/block-service/src/service/tests/v4.rs` 176 | 4 | exhaustive | test-only | Fulu slot with a gloas SSZ version must fail closed. | — |
 | `crates/block-service/src/service/tests/v4.rs` 209 | 4 | exhaustive | test-only | Gloas slot with a fulu version must fail closed. | — |
-| `crates/bn-manager/src/manager.rs` 2785 | 4 | _ | must-bound | V3 SSZ duty check picks `BlockContents` or `BeaconBlock` from the consensus version string. `_ => None` rejects an unknown version instead of inheriting either format. | — |
+| `crates/bn-manager/src/manager.rs` 2825 | 4 | _ | must-bound | V3 SSZ duty check picks `BlockContents` or `BeaconBlock` from the consensus version string. `_ => None` rejects an unknown version instead of inheriting either format. | — |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` 2487 | 4 | exhaustive | test-only | Envelope publish assert names consensus version `gloas`. Not a production dispatch. | — |
 | `crates/crypto/src/typed_signer.rs` 61 | 5 | — | must-bound | `SignContext::resolve` first-matches `fork_info.current_version` over `entries()`. Two `[0xFF;4]` rows (unscheduled Fulu+Gloas after 2.6) resolve Fulu, so `Gloas.fork_version()` does not round-trip. 2.6 pins the collision; 2.10 confines it to both-unscheduled. | 2.6 |
 | `crates/eth-types/src/fork.rs` 118 | 5 | — | inherit-intentionally | `next_activation` scans `entries()` and skips `u64::MAX`. A new row participates by construction. | — |

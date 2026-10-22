@@ -205,6 +205,64 @@ pub struct BeaconBlockHeader {
     pub body_root: Root,
 }
 
+impl BeaconBlockHeader {
+    /// SSZ `hash_tree_root` of this header, as 32 bytes.
+    ///
+    /// The container is the same from phase0 through Gloas. This does not
+    /// check a signature. Tests only.
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn hash_tree_root_bytes(&self) -> [u8; 32] {
+        use tree_hash::TreeHash;
+        let hashed = self.tree_hash_root();
+        let mut root = [0u8; 32];
+        root.copy_from_slice(hashed.as_slice());
+        root
+    }
+}
+
+/// Official consensus-spec `ssz_static` `BeaconBlockHeader` root.
+///
+/// `ethereum/consensus-specs` tag `v1.7.0-beta.2`,
+/// `tests/minimal/gloas/ssz_static/BeaconBlockHeader/ssz_random/case_0`
+/// (`roots.yaml` in that release's `minimal.tar.gz`). `consensus-spec-tests`
+/// is archived and does not publish this Gloas case. The header container is
+/// the same from phase0 through Gloas.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX: &str =
+    "5b18ad5300570f50558dece01042d7dcc597946fc4ba0598f2f9b3f30bc1f072";
+
+/// Decoded `serialized.ssz_snappy` for that same `BeaconBlockHeader` case.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX: &str = concat!(
+    "dae48901d19e4ebdcf3f1d9d938d1352ae70c0ffe5f6258d04c55ea694c117da",
+    "da19468c4821c40496efc662fd36de4c7e088265842a34eb2edad5e17d353b36",
+    "5fe48afb51fb906e5c7d2e91681e56ffb2c3c345a8a774e83fe0298a24d84e05",
+    "65509084256a9b3c9676048da1899bc1",
+);
+
+/// Slot field of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`].
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_SLOT: u64 = 13_641_014_941_862_978_778;
+
+/// Proposer index of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`].
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX: u64 = 5_914_226_400_803_241_935;
+
+/// `parent_root` of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`], lowercase hex, no `0x`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX: &str =
+    "ae70c0ffe5f6258d04c55ea694c117dada19468c4821c40496efc662fd36de4c";
+
+/// `state_root` of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`], lowercase hex, no `0x`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX: &str =
+    "7e088265842a34eb2edad5e17d353b365fe48afb51fb906e5c7d2e91681e56ff";
+
+/// `body_root` of [`EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX`], lowercase hex, no `0x`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX: &str =
+    "b2c3c345a8a774e83fe0298a24d84e0565509084256a9b3c9676048da1899bc1";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlindedBeaconBlock {
     #[serde(with = "serde_utils::quoted_u64")]
@@ -1234,6 +1292,34 @@ mod tests {
         );
         // The independent oracle must reproduce the published constant too.
         assert_eq!(independent_header_root(&zero), ZERO_HASH_3);
+    }
+
+    /// The published `ssz_static` header decodes to the `EXTERNAL_*` fields and root.
+    #[test]
+    fn external_beacon_block_header_matches_ssz_static_case() {
+        use ssz::Decode;
+        use tree_hash::TreeHash;
+
+        let bytes = hex::decode(super::EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX).unwrap();
+        let decoded = BeaconBlockHeader::from_ssz_bytes(&bytes).unwrap();
+        assert_eq!(decoded.slot, super::EXTERNAL_BEACON_BLOCK_HEADER_SLOT);
+        assert_eq!(decoded.proposer_index, super::EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX);
+        assert_eq!(
+            hex::encode(decoded.parent_root),
+            super::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX
+        );
+        assert_eq!(
+            hex::encode(decoded.state_root),
+            super::EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX
+        );
+        assert_eq!(
+            hex::encode(decoded.body_root),
+            super::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX
+        );
+        assert_eq!(
+            hex::encode(decoded.tree_hash_root().as_slice()),
+            super::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX
+        );
     }
 
     /// KAT: the derived `tree_hash_root` matches an independent raw-sha256

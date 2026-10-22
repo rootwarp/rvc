@@ -11,6 +11,27 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Mainnet GVR used by default config (`network = "mainnet"`).
 pub const MAINNET_GVR: &str = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95";
 
+fn consistent_stub_header(slot: &str) -> String {
+    let slot_n = slot.parse::<u64>().unwrap_or(1);
+    let parent = [2u8; 32];
+    let state = [3u8; 32];
+    let body = [4u8; 32];
+    let header = eth_types::BeaconBlockHeader {
+        slot: slot_n,
+        proposer_index: 1,
+        parent_root: parent,
+        state_root: state,
+        body_root: body,
+    };
+    let root = hex::encode(header.hash_tree_root_bytes());
+    format!(
+        r#"{{"execution_optimistic":false,"finalized":false,"data":{{"root":"0x{root}","canonical":true,"header":{{"message":{{"slot":"{slot_n}","proposer_index":"1","parent_root":"0x{}","state_root":"0x{}","body_root":"0x{}"}},"signature":"0x00"}}}}}}"#,
+        hex::encode(parent),
+        hex::encode(state),
+        hex::encode(body),
+    )
+}
+
 /// A running mock beacon node. Drop to tear down the HTTP server.
 pub struct MockBn {
     server: MockServer,
@@ -242,21 +263,7 @@ impl MockBn {
                 } else {
                     "1"
                 };
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                    "execution_optimistic": false,
-                    "finalized": false,
-                    "data": {
-                        "root": "0x0000000000000000000000000000000000000000000000000000000000000001",
-                        "header": {
-                            "message": {
-                                "slot": slot,
-                                "proposer_index": "1",
-                                "parent_root": "0x0000000000000000000000000000000000000000000000000000000000000002"
-                            },
-                            "signature": "0x00"
-                        }
-                    }
-                }))
+                ResponseTemplate::new(200).set_body_string(consistent_stub_header(slot))
             })
             .mount(&self.server)
             .await;

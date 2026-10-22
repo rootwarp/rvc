@@ -17,6 +17,38 @@ fn empty_duty_body() -> serde_json::Value {
     })
 }
 
+fn slot_from_block_id(slot: &str) -> u64 {
+    if slot.is_empty() || !slot.bytes().all(|byte| byte.is_ascii_digit()) {
+        return 1;
+    }
+    let mut value = 0u64;
+    for byte in slot.bytes() {
+        value = value.saturating_mul(10).saturating_add(u64::from(byte - b'0'));
+    }
+    value
+}
+
+fn consistent_stub_header(slot: &str) -> String {
+    let slot_n = slot_from_block_id(slot);
+    let parent = [2u8; 32];
+    let state = [3u8; 32];
+    let body = [4u8; 32];
+    let header = eth_types::BeaconBlockHeader {
+        slot: slot_n,
+        proposer_index: 1,
+        parent_root: parent,
+        state_root: state,
+        body_root: body,
+    };
+    let root = hex::encode(header.hash_tree_root_bytes());
+    format!(
+        r#"{{"execution_optimistic":false,"finalized":false,"data":{{"root":"0x{root}","canonical":true,"header":{{"message":{{"slot":"{slot_n}","proposer_index":"1","parent_root":"0x{}","state_root":"0x{}","body_root":"0x{}"}},"signature":"0x00"}}}}}}"#,
+        hex::encode(parent),
+        hex::encode(state),
+        hex::encode(body),
+    )
+}
+
 fn block_root_body() -> serde_json::Value {
     serde_json::json!({
         "execution_optimistic": false,
@@ -76,21 +108,8 @@ async fn mount_slot_loop_mocks(
             } else {
                 "1"
             };
-            let mut header = ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "execution_optimistic": false,
-                "finalized": false,
-                "data": {
-                    "root": "0x0000000000000000000000000000000000000000000000000000000000000001",
-                    "header": {
-                        "message": {
-                            "slot": slot,
-                            "proposer_index": "1",
-                            "parent_root": "0x0000000000000000000000000000000000000000000000000000000000000002"
-                        },
-                        "signature": "0x00"
-                    }
-                }
-            }));
+            let mut header =
+                ResponseTemplate::new(200).set_body_string(consistent_stub_header(slot));
             if let Some(delay) = header_delay {
                 header = header.set_delay(delay);
             }

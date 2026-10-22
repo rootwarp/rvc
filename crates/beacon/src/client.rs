@@ -9,6 +9,7 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tracing::{debug, error, trace, warn, Instrument};
 
 use observability::logging::RedactedUrl;
+use tree_hash::TreeHash;
 
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBlockContentsJson,
@@ -553,10 +554,14 @@ impl BeaconClient {
 
     /// Fetches one beacon header (`GET /eth/v1/beacon/headers/{block_id}`).
     ///
-    /// Returns the block root, slot, proposer index, and parent root. Slot and
-    /// proposer index must be decimal integers. Roots must be 32 bytes. The
-    /// header message carries no fork; callers check the produced block's
-    /// consensus version against the duty fork.
+    /// The returned root is `hash_tree_root` of the header message. A root that
+    /// does not match is a parse error. `execution_optimistic` must be `false`.
+    /// A missing flag, `true`, or a non-boolean flag is a parse error. That
+    /// parse error is a health error for the beacon node on every slot whose
+    /// header is fetched. A non-boolean flag is not copied into the error.
+    /// The signature is not checked. The header container is the same from
+    /// phase0 through Gloas. Slot and proposer index must be decimal integers.
+    /// Roots must be 32 bytes.
     #[tracing::instrument(name = "beacon.get_block_header", skip_all)]
     pub async fn get_block_header(
         &self,
@@ -2210,8 +2215,43 @@ fn decode_aggregate_data<T: DeserializeOwned>(data: serde_json::Value) -> Result
         .map_err(|e| BeaconError::ParseError(format!("error decoding response body: {e}")))
 }
 
+fn deserialize_execution_optimistic<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Flag;
+
+    impl serde::de::Visitor<'_> for Flag {
+        type Value = Option<bool>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a boolean")
+        }
+
+        fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+            Ok(Some(value))
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_str<E: serde::de::Error>(self, _value: &str) -> Result<Self::Value, E> {
+            Err(E::custom("execution_optimistic must be a boolean"))
+        }
+
+        fn visit_string<E: serde::de::Error>(self, _value: String) -> Result<Self::Value, E> {
+            Err(E::custom("execution_optimistic must be a boolean"))
+        }
+    }
+
+    deserializer.deserialize_any(Flag)
+}
+
 #[derive(Debug, Deserialize)]
 struct BlockHeaderWire {
+    #[serde(default, deserialize_with = "deserialize_execution_optimistic")]
+    execution_optimistic: Option<bool>,
     data: BlockHeaderDataWire,
 }
 
@@ -2231,15 +2271,34 @@ struct BeaconHeaderMessageWire {
     slot: String,
     proposer_index: String,
     parent_root: String,
+    state_root: String,
+    body_root: String,
 }
 
 fn parse_block_header(wire: BlockHeaderWire) -> Result<BlockHeaderSummary, BeaconError> {
+    if wire.execution_optimistic != Some(false) {
+        return Err(BeaconError::ParseError("execution_optimistic header is unchecked".into()));
+    }
     let message = wire.data.header.message;
-    Ok(BlockHeaderSummary {
-        root: parse_root_hex(&wire.data.root, "root")?,
+    let header = eth_types::BeaconBlockHeader {
         slot: parse_u64_decimal(&message.slot, "slot")?,
         proposer_index: parse_u64_decimal(&message.proposer_index, "proposer_index")?,
         parent_root: parse_root_hex(&message.parent_root, "parent_root")?,
+        state_root: parse_root_hex(&message.state_root, "state_root")?,
+        body_root: parse_root_hex(&message.body_root, "body_root")?,
+    };
+    let root = parse_root_hex(&wire.data.root, "root")?;
+    let computed = header.tree_hash_root();
+    if computed.as_slice() != root {
+        return Err(BeaconError::ParseError(
+            "beacon header root does not match hash_tree_root(message)".into(),
+        ));
+    }
+    Ok(BlockHeaderSummary {
+        root,
+        slot: header.slot,
+        proposer_index: header.proposer_index,
+        parent_root: header.parent_root,
     })
 }
 
@@ -2920,5 +2979,164 @@ mod tests {
             "encoded segment must stay on configured origin: {abs}"
         );
         assert!(!abs.starts_with("http://evil.com"), "must not takeover origin: {abs}");
+    }
+
+    fn external_slot() -> String {
+        eth_types::EXTERNAL_BEACON_BLOCK_HEADER_SLOT.to_string()
+    }
+
+    /// JSON header. `optimistic == None` omits the flag. `body_root` is omitted
+    /// when `include_body_root` is false.
+    fn external_header_json(
+        optimistic: Option<bool>,
+        root_hex: &str,
+        slot: &str,
+        include_body_root: bool,
+    ) -> String {
+        let flag = match optimistic {
+            Some(value) => format!(r#""execution_optimistic":{value},"#),
+            None => String::new(),
+        };
+        let body_field = if include_body_root {
+            format!(r#","body_root":"0x{}""#, eth_types::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX)
+        } else {
+            String::new()
+        };
+        format!(
+            r#"{{{flag}"finalized":false,"data":{{"root":"0x{root_hex}","canonical":true,"header":{{"message":{{"slot":"{slot}","proposer_index":"{}","parent_root":"0x{}","state_root":"0x{}"{body_field}}},"signature":"0x00"}}}}}}"#,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX,
+        )
+    }
+
+    async fn fetch_header(body: &str, block_id: &str) -> Result<BlockHeaderSummary, BeaconError> {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/beacon/headers/{block_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let client = BeaconClient::new(BeaconClientConfig::new(server.uri()).with_max_retries(0))
+            .expect("client");
+        client.get_block_header(block_id).await
+    }
+
+    #[tokio::test]
+    async fn get_block_header_rejects_a_header_whose_hash_differs() {
+        let slot = external_slot();
+        let mut wrong = eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX.to_string();
+        let last = wrong.pop().expect("root hex");
+        wrong.push(if last == '2' { '3' } else { '2' });
+        assert_ne!(wrong, eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX);
+        let body = external_header_json(Some(false), &wrong, &slot, true);
+        let err = fetch_header(&body, &slot).await.expect_err("root must be hash_tree_root");
+        match err {
+            BeaconError::ParseError(message) => {
+                assert!(message.contains("hash_tree_root"), "{message}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_block_header_treats_an_optimistic_header_as_unchecked() {
+        let slot = external_slot();
+        let body = external_header_json(
+            Some(true),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            &slot,
+            true,
+        );
+        let err = fetch_header(&body, &slot).await.expect_err("optimistic header is unchecked");
+        match err {
+            BeaconError::ParseError(message) => {
+                assert!(message.contains("execution_optimistic"), "{message}");
+                assert!(message.contains("unchecked"), "{message}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_block_header_accepts_the_external_vector_when_the_flag_is_false() {
+        let slot = external_slot();
+        let body = external_header_json(
+            Some(false),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            &slot,
+            true,
+        );
+        let header = fetch_header(&body, &slot).await.expect("consistent header");
+        assert_eq!(hex::encode(header.root), eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX);
+        assert_eq!(header.slot, eth_types::EXTERNAL_BEACON_BLOCK_HEADER_SLOT);
+        assert_eq!(header.proposer_index, eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX);
+        assert_eq!(
+            hex::encode(header.parent_root),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX
+        );
+    }
+
+    #[tokio::test]
+    async fn get_block_header_rejects_an_absent_optimistic_flag_and_a_malformed_message() {
+        let slot = external_slot();
+        let absent = external_header_json(
+            None,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            &slot,
+            true,
+        );
+        let absent_err = fetch_header(&absent, &slot).await.expect_err("missing flag");
+        match absent_err {
+            BeaconError::ParseError(message) => {
+                assert!(message.contains("execution_optimistic"), "{message}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
+
+        let malformed = external_header_json(
+            Some(false),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            &slot,
+            false,
+        );
+        let malformed_err = fetch_header(&malformed, &slot).await.expect_err("missing body_root");
+        assert!(matches!(malformed_err, BeaconError::ParseError(_)), "{malformed_err:?}");
+
+        let bad_slot = external_header_json(
+            Some(false),
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            "nope",
+            true,
+        );
+        let bad_slot_err = fetch_header(&bad_slot, "nope").await.expect_err("slot");
+        assert!(matches!(bad_slot_err, BeaconError::ParseError(_)), "{bad_slot_err:?}");
+    }
+
+    #[tokio::test]
+    async fn get_block_header_drops_a_string_optimistic_flag_from_the_error() {
+        let slot = external_slot();
+        let marker = "SENTINEL_OPTIMISTIC_VALUE_MUST_NOT_LEAK";
+        let leaked = marker.repeat(40);
+        let body = format!(
+            r#"{{"execution_optimistic":"{leaked}","finalized":false,"data":{{"root":"0x{}","canonical":true,"header":{{"message":{{"slot":"{slot}","proposer_index":"{}","parent_root":"0x{}","state_root":"0x{}","body_root":"0x{}"}},"signature":"0x00"}}}}}}"#,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX,
+        );
+        let err = fetch_header(&body, &slot).await.expect_err("string flag");
+        match err {
+            BeaconError::ParseError(message) => {
+                assert!(!message.contains(marker), "{message}");
+                assert!(message.len() < 240, "{message}");
+                assert!(message.contains("execution_optimistic"), "{message}");
+            }
+            other => panic!("expected parse error, got {other:?}"),
+        }
     }
 }

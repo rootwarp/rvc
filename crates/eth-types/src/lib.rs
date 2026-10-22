@@ -59,6 +59,10 @@ pub mod fixtures {
     pub use crate::block::{
         external_vector_deneb_blinded_block, external_vector_deneb_block,
         external_vector_electra_blinded_block, external_vector_electra_block,
+        EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX, EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX,
+        EXTERNAL_BEACON_BLOCK_HEADER_PROPOSER_INDEX, EXTERNAL_BEACON_BLOCK_HEADER_ROOT_HEX,
+        EXTERNAL_BEACON_BLOCK_HEADER_SLOT, EXTERNAL_BEACON_BLOCK_HEADER_SSZ_HEX,
+        EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX,
     };
     pub use crate::block_body::{
         external_vector_blinded_deneb_body, external_vector_blinded_electra_body,

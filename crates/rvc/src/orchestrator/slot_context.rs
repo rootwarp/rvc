@@ -56,9 +56,10 @@ impl SlotContext {
     /// Captures `parent_root` at t=0 by walking back `slot-1` … `slot-4`.
     ///
     /// First 200 wins. Four misses fall back to `"head"` (warn + metric).
-    /// Only a spec 404 continues the walk. A non-404 error stops with no
-    /// parent check. A header slot that disagrees with the requested id, or a
-    /// head at slot N or later, rejects every parent. `head_root` stays `None`.
+    /// Only a spec 404 continues the walk. A non-404 error stops and leaves
+    /// the parent filter off (`expected_parents` is `None`). A header slot
+    /// that disagrees with the requested id, or a head at slot N or later,
+    /// rejects every parent. `head_root` stays `None`.
     pub(crate) async fn capture_parent(
         beacon: &dyn BeaconNodeClient,
         slot: Slot,
@@ -246,6 +247,10 @@ async fn lookup_header(beacon: &dyn BeaconNodeClient, block_id: &str, slot: Slot
         Err(BeaconError::ApiError { status: 404, .. }) => ParentLookup::Miss,
         // 5xx/429/transport/parse/body-too-large: stop so we do not bind
         // root(N-2) while N-1 still exists (H-4 ParentRootMismatch).
+        // A root mismatch, a missing execution_optimistic flag, or true is
+        // that parse error. expected_parents stays unset, so the parent
+        // filter is off. An optimistic or flagless header is also a health
+        // error for the beacon node that returned it, on every slot fetched.
         Err(e) => {
             warn!(slot, error = %e, "Failed to fetch block header for slot context");
             ParentLookup::Unchecked
@@ -508,24 +513,12 @@ mod tests {
             .await;
 
         let parent_slot = slot - 1;
-        let parent_hex = format!("0x{}", "11".repeat(32));
         Mock::given(method("GET"))
             .and(path(format!("/eth/v1/beacon/headers/{parent_slot}")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "execution_optimistic": false,
-                "finalized": false,
-                "data": {
-                    "root": parent_hex,
-                    "header": {
-                        "message": {
-                            "slot": parent_slot.to_string(),
-                            "proposer_index": "1",
-                            "parent_root": format!("0x{}", "22".repeat(32))
-                        },
-                        "signature": format!("0x{}", "33".repeat(96))
-                    }
-                }
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(consistent_header_json(parent_slot, Some(false))),
+            )
             .expect(1)
             .mount(&mock_server)
             .await;
@@ -1093,5 +1086,231 @@ mod tests {
         let second = SlotContext::capture_parent(&beacon, 40, 1).await;
         assert!(second.head_root.is_none());
         assert_eq!(first.head_root, Some([0x01; 32]));
+    }
+
+    fn consistent_header_json(slot: u64, optimistic: Option<bool>) -> String {
+        use tree_hash::TreeHash;
+        let parent = parse_hex_root(&format!(
+            "0x{}",
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX
+        ))
+        .unwrap();
+        let state = parse_hex_root(&format!(
+            "0x{}",
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX
+        ))
+        .unwrap();
+        let body =
+            parse_hex_root(&format!("0x{}", eth_types::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX))
+                .unwrap();
+        let header = eth_types::BeaconBlockHeader {
+            slot,
+            proposer_index: 7,
+            parent_root: parent,
+            state_root: state,
+            body_root: body,
+        };
+        let root = hex::encode(header.tree_hash_root().as_slice());
+        let flag = match optimistic {
+            Some(true) => r#""execution_optimistic":true,"#,
+            Some(false) => r#""execution_optimistic":false,"#,
+            None => "",
+        };
+        format!(
+            r#"{{{flag}"finalized":false,"data":{{"root":"0x{root}","canonical":true,"header":{{"message":{{"slot":"{slot}","proposer_index":"7","parent_root":"0x{}","state_root":"0x{}","body_root":"0x{}"}},"signature":"0x00"}}}}}}"#,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX,
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX,
+        )
+    }
+
+    async fn mount_header(server: &wiremock::MockServer, block_id: &str, status: u16, body: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path(format!("/eth/v1/beacon/headers/{block_id}")))
+            .respond_with(ResponseTemplate::new(status).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    fn manager_for(endpoints: Vec<String>) -> bn_manager::BnManager {
+        bn_manager::BnManager::new(bn_manager::BnManagerConfig::new(endpoints)).unwrap()
+    }
+
+    async fn header_paths(server: &wiremock::MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|request| request.url.path().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn parent_lookup_is_unchecked_when_one_bn_404s_and_another_errors() {
+        let primary = wiremock::MockServer::start().await;
+        let secondary = wiremock::MockServer::start().await;
+        let slot: Slot = 100;
+        mount_header(&primary, "99", 500, "down").await;
+        mount_header(&secondary, "99", 404, r#"{"message":"NOT_FOUND"}"#).await;
+        let bait = consistent_header_json(98, Some(false));
+        mount_header(&primary, "98", 200, &bait).await;
+        mount_header(&secondary, "98", 200, &bait).await;
+
+        let manager = manager_for(vec![primary.uri(), secondary.uri()]);
+        let ctx = SlotContext::capture_parent(&manager, slot, slot / 32).await;
+        assert!(ctx.parent_root.is_none(), "a mixed 500/404 must not bind slot 98");
+        assert!(ctx.expected_parents.is_none(), "the parent check stays unchecked");
+        let paths = header_paths(&primary).await;
+        let secondary_paths = header_paths(&secondary).await;
+        assert!(
+            paths.iter().chain(secondary_paths.iter()).all(|path| !path.ends_with("/98")),
+            "walk must not reach slot 98: {paths:?} {secondary_paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_lookup_is_unchecked_when_a_404_precedes_a_500() {
+        let primary = wiremock::MockServer::start().await;
+        let secondary = wiremock::MockServer::start().await;
+        let slot: Slot = 100;
+        mount_header(&primary, "99", 404, r#"{"message":"NOT_FOUND"}"#).await;
+        mount_header(&secondary, "99", 500, "down").await;
+        let bait = consistent_header_json(98, Some(false));
+        mount_header(&primary, "98", 200, &bait).await;
+        mount_header(&secondary, "98", 200, &bait).await;
+
+        let manager = manager_for(vec![primary.uri(), secondary.uri()]);
+        let ctx = SlotContext::capture_parent(&manager, slot, slot / 32).await;
+        assert!(ctx.parent_root.is_none(), "a 404 then a 500 must not bind slot 98");
+        assert!(ctx.expected_parents.is_none(), "the parent filter stays off");
+        let paths = header_paths(&primary).await;
+        let secondary_paths = header_paths(&secondary).await;
+        assert!(
+            paths.iter().chain(secondary_paths.iter()).all(|path| !path.ends_with("/98")),
+            "walk must not reach slot 98: {paths:?} {secondary_paths:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_lookup_uses_a_valid_peer_when_the_first_header_is_optimistic() {
+        let primary = wiremock::MockServer::start().await;
+        let secondary = wiremock::MockServer::start().await;
+        let slot: Slot = 100;
+        mount_header(&primary, "99", 200, &consistent_header_json(99, Some(true))).await;
+        mount_header(&secondary, "99", 200, &consistent_header_json(99, Some(false))).await;
+
+        let manager = manager_for(vec![primary.uri(), secondary.uri()]);
+        let ctx = SlotContext::capture_parent(&manager, slot, slot / 32).await;
+        let root = header_root_for_slot(99);
+        assert_eq!(ctx.parent_root, Some(root));
+        assert!(ctx.expected_parents.is_some(), "the valid peer keeps the parent filter on");
+        let trackers = manager.health_trackers().read().await;
+        assert!(
+            trackers[0].error_rate() > 0.0,
+            "an optimistic header is a health error for that beacon node"
+        );
+        assert_eq!(trackers[1].error_rate(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn parent_lookup_walks_back_when_every_attempted_bn_returns_404() {
+        let primary = wiremock::MockServer::start().await;
+        let secondary = wiremock::MockServer::start().await;
+        let slot: Slot = 100;
+        for server in [&primary, &secondary] {
+            for id in ["99", "98", "97", "96"] {
+                mount_header(server, id, 404, r#"{"message":"NOT_FOUND"}"#).await;
+            }
+            mount_header(server, "head", 200, &consistent_header_json(90, Some(false))).await;
+        }
+        let manager = manager_for(vec![primary.uri(), secondary.uri()]);
+        let ctx = SlotContext::capture_parent(&manager, slot, slot / 32).await;
+        let root = header_root_for_slot(90);
+        assert_eq!(ctx.parent_root, Some(root));
+        assert_eq!(
+            ctx.expected_parents,
+            Some(block_service::ExpectedParents { root, parent: None, closed: false })
+        );
+    }
+
+    fn header_root_for_slot(slot: u64) -> [u8; 32] {
+        use tree_hash::TreeHash;
+        eth_types::BeaconBlockHeader {
+            slot,
+            proposer_index: 7,
+            parent_root: parse_hex_root(&format!(
+                "0x{}",
+                eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX
+            ))
+            .unwrap(),
+            state_root: parse_hex_root(&format!(
+                "0x{}",
+                eth_types::EXTERNAL_BEACON_BLOCK_HEADER_STATE_ROOT_HEX
+            ))
+            .unwrap(),
+            body_root: parse_hex_root(&format!(
+                "0x{}",
+                eth_types::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX
+            ))
+            .unwrap(),
+        }
+        .tree_hash_root()
+        .as_slice()
+        .try_into()
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn parent_lookup_keeps_a_verified_header_and_rejects_bad_ones() {
+        let slot: Slot = 100;
+        let good = wiremock::MockServer::start().await;
+        mount_header(&good, "99", 200, &consistent_header_json(99, Some(false))).await;
+        let manager = manager_for(vec![good.uri()]);
+        let ctx = SlotContext::capture_parent(&manager, slot, slot / 32).await;
+        let root = header_root_for_slot(99);
+        let parent = parse_hex_root(&format!(
+            "0x{}",
+            eth_types::EXTERNAL_BEACON_BLOCK_HEADER_PARENT_ROOT_HEX
+        ))
+        .unwrap();
+        assert_eq!(ctx.parent_root, Some(root));
+        assert_eq!(
+            ctx.expected_parents,
+            Some(block_service::ExpectedParents { root, parent: Some(parent), closed: false })
+        );
+
+        let good_body = consistent_header_json(99, Some(false));
+        let advertised = hex::encode(root);
+        let mut flipped = advertised.clone();
+        let last = flipped.pop().unwrap();
+        flipped.push(if last == 'a' { 'b' } else { 'a' });
+        let mismatch = good_body
+            .replace(&format!("\"root\":\"0x{advertised}\""), &format!("\"root\":\"0x{flipped}\""));
+        let malformed = good_body.replacen(
+            &format!(
+                ",\"body_root\":\"0x{}\"",
+                eth_types::EXTERNAL_BEACON_BLOCK_HEADER_BODY_ROOT_HEX
+            ),
+            "",
+            1,
+        );
+        for body in [
+            consistent_header_json(99, Some(true)),
+            consistent_header_json(99, None),
+            mismatch,
+            malformed,
+        ] {
+            let server = wiremock::MockServer::start().await;
+            mount_header(&server, "99", 200, &body).await;
+            let manager = manager_for(vec![server.uri()]);
+            let ctx = SlotContext::capture_parent(&manager, slot, slot / 32).await;
+            assert!(ctx.parent_root.is_none(), "{body}");
+            assert!(ctx.expected_parents.is_none(), "{body}");
+            let paths = header_paths(&server).await;
+            assert!(paths.iter().all(|path| path.ends_with("/99")), "{paths:?}");
+        }
     }
 }
