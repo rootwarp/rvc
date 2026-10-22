@@ -752,3 +752,328 @@ async fn test_failed_proposal_increments_failed_outcome() {
     })
     .await;
 }
+
+/// One produce step, then the publish outcome for that step.
+#[derive(Clone, Copy)]
+enum PublishStep {
+    BlindedFail,
+    BlindedOk,
+    LocalOk,
+    LocalFail,
+    BlindedHang,
+}
+
+struct ScriptedBeacon {
+    steps: std::sync::Mutex<std::collections::VecDeque<PublishStep>>,
+    current: std::sync::Mutex<Option<PublishStep>>,
+    index: u64,
+}
+
+impl ScriptedBeacon {
+    fn new(index: u64, steps: Vec<PublishStep>) -> Self {
+        Self {
+            steps: std::sync::Mutex::new(steps.into()),
+            current: std::sync::Mutex::new(None),
+            index,
+        }
+    }
+
+    fn take(&self) -> PublishStep {
+        let step = self.steps.lock().expect("steps").pop_front().expect("a step");
+        *self.current.lock().expect("current") = Some(step);
+        step
+    }
+
+    fn block(
+        &self,
+        slot: Slot,
+        blinded: bool,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        let data = if blinded {
+            let mut block = eth_types::external_vector_deneb_blinded_block();
+            block.slot = slot;
+            block.proposer_index = self.index;
+            serde_json::to_value(&block)
+        } else {
+            let mut block = eth_types::external_vector_deneb_block();
+            block.slot = slot;
+            block.proposer_index = self.index;
+            serde_json::to_value(&block)
+        }
+        .map_err(|err| block_service::BlockServiceError::Parse(err.to_string()))?;
+        Ok(block_service::ProduceBlockResponse {
+            data,
+            is_blinded: blinded,
+            consensus_version: "deneb".to_string(),
+            execution_payload_value: Some("1".to_string()),
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+        })
+    }
+
+    async fn finish(&self) -> Result<(), block_service::BlockServiceError> {
+        let step = *self.current.lock().expect("current");
+        match step {
+            Some(PublishStep::BlindedOk | PublishStep::LocalOk) => Ok(()),
+            Some(PublishStep::BlindedHang) => std::future::pending().await,
+            Some(PublishStep::BlindedFail | PublishStep::LocalFail) | None => {
+                Err(block_service::BlockServiceError::Beacon("publish failed".to_string()))
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl block_service::BeaconBlockClient for ScriptedBeacon {
+    async fn produce_block_v3(
+        &self,
+        slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_boost_factor: Option<u64>,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        let blinded = matches!(
+            self.take(),
+            PublishStep::BlindedFail | PublishStep::BlindedOk | PublishStep::BlindedHang
+        );
+        self.block(slot, blinded)
+    }
+
+    async fn produce_block_v4(
+        &self,
+        _slot: Slot,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_config: &block_service::BuilderConfig,
+    ) -> Result<block_service::ProduceBlockResponse, block_service::BlockServiceError> {
+        Err(block_service::BlockServiceError::Beacon("v4 unused".to_string()))
+    }
+
+    async fn publish_block(
+        &self,
+        _signed_block: &eth_types::SignedBeaconBlock,
+        _consensus_version: &str,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        _signed_block: &eth_types::SignedBlindedBeaconBlock,
+        _consensus_version: &str,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        _ssz_bytes: &[u8],
+        _consensus_version: &str,
+        _is_blinded: bool,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+
+    async fn publish_block_contents(
+        &self,
+        _contents: &eth_types::SignedBlockContentsJson,
+        _consensus_version: &str,
+        _builder_url: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        _signed_envelope: &block_service::WireBody,
+        _blobs: &block_service::WireBody,
+        _kzg_proofs: &block_service::WireBody,
+        _consensus_version: &str,
+        _broadcast_validation: Option<&str>,
+    ) -> Result<(), block_service::BlockServiceError> {
+        self.finish().await
+    }
+}
+
+struct ProposalRig {
+    orchestrator: DutyOrchestrator<MockSlotClock, MockSubmitter, ScriptedBeacon>,
+    breaker: Arc<signer::CircuitBreakerState>,
+    clock: Arc<MockSlotClock>,
+    epoch: u64,
+}
+
+async fn proposal_rig(limit: u32, steps: Vec<PublishStep>, slots: &[u64]) -> ProposalRig {
+    use bn_manager::MockBeaconNodeClient;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let secret = SecretKey::generate();
+    let pubkey = secret.public_key();
+    let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+    let index = 1u64;
+    let epoch = slots[0] / SLOTS_PER_EPOCH;
+    let data = slots
+        .iter()
+        .map(|slot| {
+            serde_json::json!({
+                "pubkey": pubkey_hex,
+                "validator_index": index.to_string(),
+                "slot": slot.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Mock::given(method("GET"))
+        .and(path(format!("/eth/v1/validator/duties/proposer/{epoch}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "dependent_root": "0x0000000000000000000000000000000000000000000000000000000000000000",
+            "execution_optimistic": false,
+            "data": data,
+        })))
+        .mount(&server)
+        .await;
+
+    let beacon = Arc::new(BeaconClient::new(BeaconClientConfig::new(server.uri())).unwrap());
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec![pubkey_hex]));
+    duty_tracker.fetch_proposer_duties(epoch).await.unwrap();
+
+    let mut keys = KeyManager::new();
+    keys.insert(secret);
+    let signer = Arc::new(
+        SignerService::new(
+            Arc::new(CompositeSigner::new(LocalSigner::new(keys))),
+            Arc::new(SlashingDb::open_in_memory().unwrap()),
+        )
+        .with_enablement(always_enabled()),
+    );
+    let store = Arc::new(ValidatorStore::new([0xaa; 20], 30_000_000));
+    store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes())).unwrap();
+    store.set_global_block_selection_mode(validator_store::BlockSelectionMode::MaxProfit);
+    let mut map = HashMap::new();
+    map.insert(pubkey.to_bytes(), pubkey);
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    let breaker = Arc::new(signer::CircuitBreakerState::new(limit, 0));
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps {
+        circuit_breaker: Arc::clone(&breaker),
+        attesting_enabled: Arc::new(AtomicBool::new(true)),
+        ..OrchestratorDeps::for_test(
+            Arc::clone(&clock),
+            duty_tracker,
+            signer,
+            Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+            Arc::new(MockBeaconNodeClient::new()),
+            Arc::new(ScriptedBeacon::new(index, steps)),
+            None,
+            store,
+            create_test_config(),
+            Arc::new(parking_lot::RwLock::new(map)),
+        )
+    });
+    ProposalRig { orchestrator, breaker, clock, epoch }
+}
+
+async fn propose_at(rig: &ProposalRig, slot: u64) {
+    rig.clock.set_slot(slot);
+    let ctx = SlotContext::bare(slot, rig.epoch);
+    rig.orchestrator.maybe_propose_block(slot, rig.epoch, &ctx, None).await;
+}
+
+/// N consecutive blinded publish failures trip the breaker.
+#[tokio::test]
+async fn test_blinded_publish_failure_trips_breaker() {
+    let slots = [100u64, 101, 102];
+    let rig = proposal_rig(
+        3,
+        vec![PublishStep::BlindedFail, PublishStep::BlindedFail, PublishStep::BlindedFail],
+        &slots,
+    )
+    .await;
+    for slot in slots {
+        propose_at(&rig, slot).await;
+    }
+    assert_eq!(rig.breaker.consecutive_misses(), 3);
+    assert_eq!(rig.breaker.epoch_misses(), 3);
+    assert!(rig.breaker.is_tripped());
+}
+
+/// A local block after a blinded failure does not reset the miss count.
+///
+/// Blinded failure, local success, repeated. The breaker trips on the blinded
+/// failures alone.
+#[tokio::test]
+async fn test_local_fallback_after_blinded_failure_does_not_reset_the_breaker() {
+    let slots = [100u64, 101, 102, 103, 104];
+    let rig = proposal_rig(
+        3,
+        vec![
+            PublishStep::BlindedFail,
+            PublishStep::LocalOk,
+            PublishStep::BlindedFail,
+            PublishStep::LocalOk,
+            PublishStep::BlindedFail,
+        ],
+        &slots,
+    )
+    .await;
+    for slot in slots {
+        propose_at(&rig, slot).await;
+    }
+    assert_eq!(rig.breaker.consecutive_misses(), 3);
+    assert!(rig.breaker.is_tripped());
+}
+
+/// A blinded publish the beacon node accepted clears the consecutive count
+/// and leaves the epoch count.
+#[tokio::test]
+async fn test_successful_blinded_publish_resets_the_miss_count() {
+    let slots = [110u64, 111, 112];
+    let rig = proposal_rig(
+        3,
+        vec![PublishStep::BlindedFail, PublishStep::BlindedFail, PublishStep::BlindedOk],
+        &slots,
+    )
+    .await;
+    for slot in slots {
+        propose_at(&rig, slot).await;
+    }
+    assert_eq!(rig.breaker.consecutive_misses(), 0);
+    assert_eq!(rig.breaker.epoch_misses(), 2);
+    assert!(!rig.breaker.is_tripped());
+}
+
+/// A local publish failure is not a builder miss.
+#[tokio::test]
+async fn test_local_publish_failure_does_not_move_the_breaker() {
+    let rig = proposal_rig(3, vec![PublishStep::LocalFail], &[120]).await;
+    propose_at(&rig, 120).await;
+    assert_eq!(rig.breaker.consecutive_misses(), 0);
+    assert_eq!(rig.breaker.epoch_misses(), 0);
+    assert!(!rig.breaker.is_tripped());
+}
+
+/// The outer proposal timeout cannot classify the publish, so it records nothing.
+#[tokio::test(flavor = "current_thread")]
+async fn test_proposal_timeout_does_not_record_a_miss() {
+    let rig = proposal_rig(3, vec![PublishStep::BlindedHang], &[121]).await;
+    tokio::time::pause();
+    rig.clock.set_slot(121);
+    let allowance = super::block_proposal_allowance(&rig.orchestrator.config.timeouts);
+    let epoch = rig.epoch;
+    let orch = rig.orchestrator;
+    let task = tokio::spawn(async move {
+        let ctx = SlotContext::bare(121, epoch);
+        orch.maybe_propose_block(121, epoch, &ctx, None).await;
+    });
+    tokio::time::sleep(allowance).await;
+    tokio::time::timeout(Duration::from_millis(1), task)
+        .await
+        .expect("the outer timeout ends the proposal")
+        .expect("proposal task");
+    assert_eq!(rig.breaker.consecutive_misses(), 0);
+    assert!(!rig.breaker.is_tripped());
+}

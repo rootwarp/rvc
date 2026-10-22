@@ -53,7 +53,7 @@ fn provider_with(entries: Vec<BuilderEntry>) -> BuilderConfig {
     BuilderConfig { min_bid: 7, builder_boost_factor: 1, builders: entries }
 }
 
-fn response_of(client: MockBeaconClient) -> ProduceBlockResponse {
+pub(super) fn response_of(client: MockBeaconClient) -> ProduceBlockResponse {
     client.produce_response.expect("configured produce response")
 }
 
@@ -66,7 +66,7 @@ fn pre_gloas(
     BlockService::new(signer, beacon, Arc::new(store), Arc::new(test_fork_schedule()), [0xaa; 32])
 }
 
-fn gloas(
+pub(super) fn gloas(
     signer: Arc<MockSigner>,
     beacon: Arc<MockBeaconClient>,
     _pubkey: &PublicKey,
@@ -97,7 +97,7 @@ fn store_with(pubkey: &PublicKey, boost: Option<u64>, min_bid: u64) -> Validator
     store
 }
 
-fn header_signs(signer: &MockSigner) -> usize {
+pub(super) fn header_signs(signer: &MockSigner) -> usize {
     signer.header_calls.lock().expect("header calls").len()
 }
 
@@ -105,7 +105,7 @@ fn envelope_signs(signer: &MockSigner) -> usize {
     signer.envelope_calls.lock().expect("envelope calls").len()
 }
 
-fn assert_unsigned(signer: &MockSigner, beacon: &MockBeaconClient) {
+pub(super) fn assert_unsigned(signer: &MockSigner, beacon: &MockBeaconClient) {
     assert_eq!(header_signs(signer), 0);
     assert_eq!(signer.block_calls.lock().expect("block calls").len(), 0);
     assert_eq!(envelope_signs(signer), 0);
@@ -530,7 +530,7 @@ async fn test_mode_shape_gloas_rejections_sign_nothing() {
     }
 }
 
-fn gloas_beacon(slot: Slot) -> MockBeaconClient {
+pub(super) fn gloas_beacon(slot: Slot) -> MockBeaconClient {
     MockBeaconClient::unblinded(external_bid_block(slot)).with_consensus_version("gloas")
 }
 
@@ -574,6 +574,9 @@ async fn test_mode_shape_gloas_allowed_shapes_sign_once() {
         let (service, signer, beacon, pubkey) = gloas_pair(response);
         let result = service.propose_block_with_mode(slot, &pubkey, mode).await;
         assert!(result.is_ok(), "{mode} self-build: {result:?}");
+        let result = result.expect("self-build");
+        assert!(!result.is_blinded, "{mode} self-build stays unblinded");
+        assert!(!result.builder_path, "{mode} self-build is not a builder path");
         assert_eq!(header_signs(&signer), 1);
         assert_eq!(envelope_signs(&signer), 1);
         assert_eq!(beacon.envelope_publish_calls.lock().expect("envelope").len(), 1);
@@ -589,10 +592,55 @@ async fn test_mode_shape_gloas_allowed_shapes_sign_once() {
         let (service, signer, beacon, pubkey) = gloas_pair(response);
         let result = service.propose_block_with_mode(slot, &pubkey, mode).await;
         assert!(result.is_ok(), "{mode} builder-win: {result:?}");
+        let result = result.expect("builder-win");
+        assert!(!result.is_blinded, "{mode} builder-win stays unblinded");
+        assert!(result.builder_path, "{mode} external bid is the builder path");
         assert_eq!(header_signs(&signer), 1);
         assert_eq!(envelope_signs(&signer), 0);
         assert!(beacon.envelope_publish_calls.lock().expect("envelope").is_empty());
     }
+}
+
+/// A Gloas external-bid publish error is a builder miss. A self-build publish error is not.
+#[tokio::test]
+async fn test_gloas_publish_failure_counts_only_for_an_external_bid() {
+    let slot = test_gloas_slot();
+    let pubkey = test_pubkey();
+    let external = Arc::new(gloas_beacon(slot).with_publish_error());
+    let signer = Arc::new(MockSigner::new());
+    let service = gloas(
+        Arc::clone(&signer),
+        Arc::clone(&external),
+        &pubkey,
+        test_validator_store(&pubkey),
+        Arc::new(CircuitBreakerState::new(0, 0)),
+        None,
+    );
+    let err = service
+        .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly)
+        .await
+        .expect_err("external publish");
+    assert!(matches!(err, BlockServiceError::BuilderFailure(_)), "{err:?}");
+    assert_eq!(header_signs(&signer), 1, "the header is signed once, then publish fails");
+
+    let local = Arc::new(
+        MockBeaconClient::from_response(self_build_json_response(slot)).with_publish_error(),
+    );
+    let signer = Arc::new(MockSigner::new());
+    let service = gloas(
+        Arc::clone(&signer),
+        Arc::clone(&local),
+        &pubkey,
+        test_validator_store(&pubkey),
+        Arc::new(CircuitBreakerState::new(0, 0)),
+        None,
+    );
+    let err = service
+        .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::ExecutionOnly)
+        .await
+        .expect_err("self-build publish");
+    assert!(matches!(err, BlockServiceError::Beacon(_)), "{err:?}");
+    assert_eq!(header_signs(&signer), 1, "the header is signed once, then publish fails");
 }
 
 /// `payload_included` that contradicts the body is a parse error and is not signed.

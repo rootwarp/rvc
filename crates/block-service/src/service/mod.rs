@@ -6,7 +6,9 @@ use std::time::Instant;
 
 use tracing::{debug, error, info, warn, Instrument};
 
-use beacon::{block_value, GloasBlockContents, ProduceBlockV4Body, RankedBlock, WireBody};
+use beacon::{
+    block_value, GloasBlockContents, ProduceBlockV4Body, RankedBlock, ShapeConstraint, WireBody,
+};
 use crypto::PublicKey;
 use eth_types::{ForkName, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
 use observability::logging::{TruncatedPubkey, TruncatedRoot};
@@ -24,7 +26,9 @@ use crate::traits::{
     BeaconBlockClient, BuilderConfig, BuilderConfigProvider, ProduceBlockResponse, ProduceDuty,
 };
 use crate::types::{BlockSelectionMode, CandidateShape};
-use crate::validation::{check_mode_shape, BlockResponseValidator, ExpectedParents};
+use crate::validation::{
+    check_mode_shape, constraint_for_mode, BlockResponseValidator, ExpectedParents,
+};
 use crate::BlockServiceError;
 
 /// Result of a successful block proposal.
@@ -33,6 +37,12 @@ pub struct BlockProposalResult {
     pub slot: Slot,
     pub block_root: Root,
     pub is_blinded: bool,
+    /// The beacon node accepted a builder-path block.
+    ///
+    /// Pre-Gloas this is a blinded block. On Gloas it is an external bid.
+    /// A local block, including a self-build, is false. The breaker resets
+    /// only when this is true.
+    pub builder_path: bool,
     pub consensus_version: String,
     pub value_wei: Option<String>,
 }
@@ -408,36 +418,22 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let graffiti = self.validator_store.effective_graffiti(&pubkey_bytes);
         let graffiti_hex = graffiti.map(|g| format!("0x{}", hex::encode(g)));
 
-        // Check circuit breaker for builder modes first
-        let circuit_breaker_tripped = self.circuit_breaker.is_tripped();
-
-        let boost = match mode {
-            BlockSelectionMode::ExecutionOnly => {
-                debug!(slot = slot, "ExecutionOnly: builder_boost_factor=0");
-                0
-            }
-            BlockSelectionMode::MaxProfit => {
-                if circuit_breaker_tripped {
+        // One sample. Boost, the duty shape, and the sign-time mode all use it.
+        // A later trip does not change this proposal.
+        let breaker_tripped = self.circuit_breaker.is_tripped();
+        if breaker_tripped {
+            match mode {
+                BlockSelectionMode::ExecutionOnly => {}
+                BlockSelectionMode::MaxProfit => {
                     warn!(slot = slot, "Builder circuit breaker tripped, using local block only");
-                    0
-                } else {
-                    self.validator_store.builder_boost_factor(&pubkey_bytes)
                 }
-            }
-            BlockSelectionMode::BuilderAlways => {
-                if circuit_breaker_tripped {
+                BlockSelectionMode::BuilderAlways => {
                     warn!(
                         slot = slot,
                         "BuilderAlways: circuit breaker tripped, falling back to local"
                     );
-                    0
-                } else {
-                    debug!(slot = slot, "BuilderAlways: builder_boost_factor=u64::MAX");
-                    u64::MAX
                 }
-            }
-            BlockSelectionMode::BuilderOnly => {
-                if circuit_breaker_tripped {
+                BlockSelectionMode::BuilderOnly => {
                     error!(
                         slot = slot,
                         pubkey = %TruncatedPubkey::new(&pubkey_hex),
@@ -447,6 +443,23 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                         "circuit breaker tripped — proposal missed".to_string(),
                     ));
                 }
+            }
+        }
+        let effective_mode = selection_effective_mode(mode, breaker_tripped);
+        let shape = constraint_for_mode(effective_mode);
+        let boost = match effective_mode {
+            BlockSelectionMode::ExecutionOnly => {
+                debug!(slot = slot, "ExecutionOnly: builder_boost_factor=0");
+                0
+            }
+            BlockSelectionMode::MaxProfit => {
+                self.validator_store.builder_boost_factor(&pubkey_bytes)
+            }
+            BlockSelectionMode::BuilderAlways => {
+                debug!(slot = slot, "BuilderAlways: builder_boost_factor=u64::MAX");
+                u64::MAX
+            }
+            BlockSelectionMode::BuilderOnly => {
                 debug!(slot = slot, "BuilderOnly: builder_boost_factor=u64::MAX");
                 u64::MAX
             }
@@ -470,7 +483,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         } else {
             let duty = validator.map(|checks| {
                 let fee_recipient = self.validator_store.effective_fee_recipient(&pubkey_bytes);
-                duty_from_validator(checks, fee_recipient, fork)
+                duty_from_validator(checks, fee_recipient, fork, shape)
             });
             self.beacon
                 .produce_block_v3_ranked_by(
@@ -547,15 +560,16 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 pubkey,
                 validator,
                 fork,
-                mode,
+                effective_mode,
                 &mut payload_deadline,
                 &fence,
                 capture_fence,
             )
             .await
-            .map(|(block_root, is_blinded)| SignedProposal {
+            .map(|(block_root, is_blinded, builder_path)| SignedProposal {
                 block_root,
                 is_blinded,
+                builder_path,
                 consensus_version: response.consensus_version,
                 value_wei: response.execution_payload_value,
             })
@@ -571,7 +585,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 pubkey,
                 validator,
                 fork,
-                mode,
+                effective_mode,
                 &fence,
                 capture_fence,
             )
@@ -611,6 +625,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             slot,
             block_root: signed.block_root,
             is_blinded: signed.is_blinded,
+            builder_path: signed.builder_path,
             consensus_version: signed.consensus_version,
             value_wei: signed.value_wei,
         })
@@ -633,7 +648,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         payload_deadline: &mut PayloadDeadline,
         fence: &beacon::DutyFence,
         capture_fence: &beacon::DutyFence,
-    ) -> Result<(Root, bool), BlockServiceError> {
+    ) -> Result<(Root, bool, bool), BlockServiceError> {
         cross_check_consensus_version(&response.consensus_version, fork)?;
         reject_blinded_at_gloas(
             response.is_blinded,
@@ -781,10 +796,13 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                     return Err(BlockServiceError::EnvelopeAfterPublish(e.to_string()));
                 }
             }
-            Ok((block_root, false))
+            Ok((block_root, false, !self_build))
         }
         .await;
-        published.map_err(demote_post_sign)
+        let builder_path = !self_build;
+        published
+            .map_err(demote_post_sign)
+            .map_err(|err| builder_publish_failure(err, builder_path))
     }
 
     /// Self-build envelope: never before the block publish; same produce body.
@@ -1171,6 +1189,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             "Block signing duration"
         );
         let signature = sig.to_bytes();
+        let builder_path = prepared.is_blinded;
         let published = async {
             match prepared.payload {
                 PreparedPayload::SszWhole(bytes) => {
@@ -1269,12 +1288,15 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             Ok(SignedProposal {
                 block_root: prepared.block_root,
                 is_blinded: prepared.is_blinded,
+                builder_path,
                 consensus_version: prepared.consensus_version,
                 value_wei: prepared.execution_payload_value,
             })
         }
         .await;
-        published.map_err(demote_post_sign)
+        published
+            .map_err(demote_post_sign)
+            .map_err(|err| builder_publish_failure(err, builder_path))
     }
 }
 
@@ -1315,6 +1337,7 @@ enum Produced {
 struct SignedProposal {
     block_root: Root,
     is_blinded: bool,
+    builder_path: bool,
     consensus_version: String,
     value_wei: Option<String>,
 }
@@ -1323,6 +1346,7 @@ fn duty_from_validator(
     checks: &BlockResponseValidator,
     fee_recipient: [u8; 20],
     fork: ForkName,
+    shape: ShapeConstraint,
 ) -> ProduceDuty {
     ProduceDuty {
         expected_proposer_index: checks.expected_proposer_index,
@@ -1337,6 +1361,37 @@ fn duty_from_validator(
         parent_closed: checks.expected_parents.is_some_and(|parents| parents.closed),
         expected_fee_recipient: Some(fee_recipient),
         expected_consensus_version: fork,
+        shape,
+    }
+}
+
+/// Max-profit and builder-always behave as execution-only while the breaker is tripped.
+///
+/// Builder-only is unchanged: the caller misses the slot before this runs.
+fn selection_effective_mode(mode: BlockSelectionMode, breaker_tripped: bool) -> BlockSelectionMode {
+    match mode {
+        BlockSelectionMode::MaxProfit | BlockSelectionMode::BuilderAlways if breaker_tripped => {
+            BlockSelectionMode::ExecutionOnly
+        }
+        other => other,
+    }
+}
+
+/// A builder-path publish failure counts as a builder miss.
+///
+/// A local publish, a signer error, and an envelope failure after a self-build
+/// stay on their own variants. Over-counting a beacon-node error on a blinded
+/// publish is the safe direction: the breaker falls back to local blocks.
+fn builder_publish_failure(err: BlockServiceError, builder_path: bool) -> BlockServiceError {
+    if !builder_path {
+        return err;
+    }
+    match err {
+        BlockServiceError::BuilderFailure(_)
+        | BlockServiceError::BuilderOnly(_)
+        | BlockServiceError::Signer(_)
+        | BlockServiceError::EnvelopeAfterPublish(_) => err,
+        other => BlockServiceError::BuilderFailure(other.to_string()),
     }
 }
 

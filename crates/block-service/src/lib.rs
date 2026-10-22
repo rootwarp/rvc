@@ -13,6 +13,6 @@ mod validation;
 pub use beacon::{BuilderConfig, ProduceBlockResponse, RankedBlock, WireBody};
 pub use error::BlockServiceError;
 pub use service::{BlockProposalResult, BlockService};
-pub use traits::{BeaconBlockClient, BuilderConfigProvider, ProduceDuty};
+pub use traits::{BeaconBlockClient, BuilderConfigProvider, ProduceDuty, ShapeConstraint};
 pub use types::{BlockSelectionMode, CandidateShape};
 pub use validation::ExpectedParents;

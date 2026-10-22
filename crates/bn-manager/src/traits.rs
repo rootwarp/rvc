@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+pub use beacon::ShapeConstraint;
 use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
     BlockHeaderSummary, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry,
@@ -13,6 +14,7 @@ use beacon::{
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
     WireBody,
 };
+
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
     SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration,
@@ -72,6 +74,9 @@ pub struct ProduceDuty {
     /// Slot fork. A candidate whose `consensus_version` is not this fork is
     /// not ranked and does not close the soft deadline.
     pub expected_consensus_version: ForkName,
+    /// Shapes that may be ranked. A mismatch is a hard reject: it does not
+    /// close the soft deadline, and the fallback does not return it.
+    pub shape: ShapeConstraint,
 }
 
 /// Block production, publication, proposer preparation, and builder registration.
@@ -125,7 +130,8 @@ pub trait BlockProducer: Send + Sync {
 
     /// [`Self::produce_block_v3`] with the duty's slot, proposer, parent,
     /// and consensus version applied before a block is ranked or returned.
-    /// Those four checks, plus an unreadable or missing fee on a full
+    /// Those checks, plus the [`ProduceDuty::shape`] constraint and an
+    /// unreadable or missing fee on a full
     /// Bellatrix-or-later block, are hard rejects. A readable fee that does
     /// not match is a soft penalty under [`FeeRecipientPolicy::Sign`]: it
     /// ranks below a matching candidate and does not close the soft window.

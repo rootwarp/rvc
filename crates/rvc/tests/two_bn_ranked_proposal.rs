@@ -512,9 +512,10 @@ async fn test_builder_only_local_alone_signs_nothing() {
         .await
         .expect_err("local fallback is not signed");
     assert_eq!(signer.header_signs(), 0);
+    // Collection drops the local block before the sign-time shape error.
     assert_eq!(
         err.to_string(),
-        "builder-only mode: response shape unblinded contradicts builder-only"
+        "builder-only mode: builder block production failed: beacon error: HTTP request failed: produce_block_v3: all BNs failed in best-selection"
     );
     assert!(matches!(err, BlockServiceError::BuilderOnly(_)));
     let reqs = bn.received_requests().await.expect("recorded requests");

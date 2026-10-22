@@ -12,6 +12,18 @@ use block_service::{
     RankedBlock, WireBody,
 };
 use bn_manager::{BeaconNodeClient, ProduceDuty as BnProduceDuty};
+
+fn bn_duty(duty: ProduceDuty) -> BnProduceDuty {
+    BnProduceDuty {
+        expected_proposer_index: duty.expected_proposer_index,
+        expected_parent_root: duty.expected_parent_root,
+        alternate_parent_root: duty.alternate_parent_root,
+        parent_closed: duty.parent_closed,
+        expected_fee_recipient: duty.expected_fee_recipient,
+        expected_consensus_version: duty.expected_consensus_version,
+        shape: duty.shape,
+    }
+}
 use eth_types::{SignedBeaconBlock, SignedBlindedBeaconBlock, SignedBlockContentsJson, Slot};
 
 /// Block client over the main pool, with an optional proposer pool.
@@ -98,14 +110,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
                 randao_reveal,
                 graffiti,
                 builder_boost_factor,
-                BnProduceDuty {
-                    expected_proposer_index: duty.expected_proposer_index,
-                    expected_parent_root: duty.expected_parent_root,
-                    alternate_parent_root: duty.alternate_parent_root,
-                    parent_closed: duty.parent_closed,
-                    expected_fee_recipient: duty.expected_fee_recipient,
-                    expected_consensus_version: duty.expected_consensus_version,
-                },
+                bn_duty(duty),
             )
             .await
             .map_err(Into::into)
@@ -119,14 +124,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         builder_boost_factor: Option<u64>,
         duty: Option<ProduceDuty>,
     ) -> Result<Vec<RankedBlock>, BlockServiceError> {
-        let duty = duty.map(|duty| BnProduceDuty {
-            expected_proposer_index: duty.expected_proposer_index,
-            expected_parent_root: duty.expected_parent_root,
-            alternate_parent_root: duty.alternate_parent_root,
-            parent_closed: duty.parent_closed,
-            expected_fee_recipient: duty.expected_fee_recipient,
-            expected_consensus_version: duty.expected_consensus_version,
-        });
+        let duty = duty.map(bn_duty);
         self.route()
             .produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
             .await
@@ -142,14 +140,7 @@ impl BeaconBlockClient for BeaconBlockAdapter {
         duty: Option<ProduceDuty>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<Vec<RankedBlock>, BlockServiceError> {
-        let duty = duty.map(|duty| BnProduceDuty {
-            expected_proposer_index: duty.expected_proposer_index,
-            expected_parent_root: duty.expected_parent_root,
-            alternate_parent_root: duty.alternate_parent_root,
-            parent_closed: duty.parent_closed,
-            expected_fee_recipient: duty.expected_fee_recipient,
-            expected_consensus_version: duty.expected_consensus_version,
-        });
+        let duty = duty.map(bn_duty);
         self.route()
             .produce_block_v3_ranked_by(
                 slot,

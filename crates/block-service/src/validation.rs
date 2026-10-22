@@ -1,7 +1,21 @@
+use beacon::{ShapeConstraint, GLOAS_SELF_BUILD_BUILDER_INDEX};
 use eth_types::Root;
 
 use crate::types::{BlockSelectionMode, CandidateShape};
 use crate::BlockServiceError;
+
+/// Selection mode as a [`ShapeConstraint`], ignoring the breaker.
+///
+/// A tripped breaker is applied by the caller, which passes execution-only
+/// for max-profit and builder-always. This function is the only mode-to-shape
+/// table.
+pub(crate) fn constraint_for_mode(mode: BlockSelectionMode) -> ShapeConstraint {
+    match mode {
+        BlockSelectionMode::MaxProfit | BlockSelectionMode::BuilderAlways => ShapeConstraint::Any,
+        BlockSelectionMode::BuilderOnly => ShapeConstraint::BlindedOnly,
+        BlockSelectionMode::ExecutionOnly => ShapeConstraint::LocalOnly,
+    }
+}
 
 /// Reject a produced shape that the selection mode must not sign.
 ///
@@ -13,11 +27,14 @@ pub(crate) fn check_mode_shape(
     mode: BlockSelectionMode,
     shape: CandidateShape,
 ) -> Result<(), BlockServiceError> {
-    let builder_shape = matches!(shape, CandidateShape::Blinded | CandidateShape::BuilderWin);
-    let allowed = match mode {
-        BlockSelectionMode::MaxProfit | BlockSelectionMode::BuilderAlways => true,
-        BlockSelectionMode::BuilderOnly => builder_shape,
-        BlockSelectionMode::ExecutionOnly => !builder_shape,
+    let constraint = constraint_for_mode(mode);
+    let allowed = match shape {
+        CandidateShape::Unblinded => constraint.allows_blinded_flag(false),
+        CandidateShape::Blinded => constraint.allows_blinded_flag(true),
+        CandidateShape::SelfBuild => {
+            constraint.allows_builder_index(GLOAS_SELF_BUILD_BUILDER_INDEX)
+        }
+        CandidateShape::BuilderWin => constraint.allows_builder_index(0),
     };
     if allowed {
         Ok(())
