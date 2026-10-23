@@ -282,6 +282,31 @@ pub fn self_signed_leaf_der(cn: &str) -> Vec<u8> {
     params.self_signed(&key).expect("self-sign").der().as_ref().to_vec()
 }
 
+/// Wiremock responder that notifies a channel when a request is recorded.
+///
+/// The send happens in [`Respond::respond`], after wiremock has stored the
+/// request. Waiting on the receiver is the publish, not a clock.
+#[derive(Clone)]
+pub struct SignalOnReceipt {
+    body: wiremock::ResponseTemplate,
+    tx: std::sync::mpsc::Sender<()>,
+}
+
+impl SignalOnReceipt {
+    /// Pair `body` with a sender. Clone the sender to share one receiver.
+    #[must_use]
+    pub fn new(body: wiremock::ResponseTemplate, tx: std::sync::mpsc::Sender<()>) -> Self {
+        Self { body, tx }
+    }
+}
+
+impl wiremock::Respond for SignalOnReceipt {
+    fn respond(&self, _request: &wiremock::Request) -> wiremock::ResponseTemplate {
+        let _ = self.tx.send(());
+        self.body.clone()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

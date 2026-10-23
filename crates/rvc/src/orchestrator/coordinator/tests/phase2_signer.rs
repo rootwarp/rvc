@@ -194,18 +194,18 @@ fn electra_body(data: eth_types::AttestationData) -> eth_types::ElectraAttestati
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn phase2_signer_concurrency_is_capped_across_aggregation_and_contributions() {
     run_capped_phase(0, 0, AggregateShape::PreElectra).await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn electra_aggregate_and_proof_signs_under_the_phase2_cap() {
     let epoch = 50u64;
     run_capped_phase(epoch * eth_types::SLOTS_PER_EPOCH, epoch, AggregateShape::Electra).await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn gloas_aggregate_and_proof_root_signs_under_the_phase2_cap() {
     let epoch = 70u64;
     run_capped_phase(epoch * eth_types::SLOTS_PER_EPOCH, epoch, AggregateShape::Gloas).await;
@@ -489,7 +489,7 @@ async fn wait_for_rendezvous(
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn in_flight_returns_to_zero_when_a_blocked_sign_is_dropped() {
     let (release_tx, release_rx) = watch::channel(0u8);
     let (arrived_tx, mut arrived) = watch::channel(0u64);

@@ -532,7 +532,7 @@ impl AggregationService {
                     error = %e,
                     "Failed to get attestation data for aggregation"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
             TimedOutcome::Timeout => {
@@ -541,7 +541,7 @@ impl AggregationService {
                     validator_index = %duty.validator_index,
                     "Attestation data fetch timed out for aggregation"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
         };
@@ -561,7 +561,7 @@ impl AggregationService {
                     error = %e,
                     "Failed to convert attestation data for aggregation"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
         };
@@ -593,7 +593,7 @@ impl AggregationService {
                     error = %e,
                     "Failed to get aggregate attestation"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
             TimedOutcome::Timeout => {
@@ -602,7 +602,7 @@ impl AggregationService {
                     validator_index = %duty.validator_index,
                     "Aggregate attestation fetch timed out"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
         };
@@ -621,7 +621,7 @@ impl AggregationService {
                 mismatch = mismatch.as_str(),
                 "aggregate response does not match the request; not signing"
             );
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+            note_aggregations_failed(1);
             return None;
         }
 
@@ -638,7 +638,7 @@ impl AggregationService {
                         validator_index = %duty.validator_index,
                         "Expected Electra aggregate but got pre-Electra"
                     );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    note_aggregations_failed(1);
                     return None;
                 }
             };
@@ -688,7 +688,7 @@ impl AggregationService {
                         validator_index = %duty.validator_index,
                         "Expected pre-Electra aggregate but got Electra"
                     );
-                    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                    note_aggregations_failed(1);
                     return None;
                 }
             };
@@ -734,7 +734,7 @@ impl AggregationService {
                 error = %e,
                 "Skipping aggregate with invalid aggregation bits"
             );
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+            note_aggregations_failed(1);
             return None;
         }
         let signature = match sign_with_phase2_permit(
@@ -762,7 +762,7 @@ impl AggregationService {
                     validator_index = %validator_index,
                     "phase-2 signer permit wait cancelled before aggregate and proof"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
             Err(Phase2SignError::Revoked) => {
@@ -771,7 +771,7 @@ impl AggregationService {
                     validator_index = %validator_index,
                     "skipping aggregate: beacon node admission revoked before sign"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
             Err(Phase2SignError::Failed(e)) => {
@@ -781,7 +781,7 @@ impl AggregationService {
                     error = %e,
                     "Failed to sign aggregate and proof"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
         };
@@ -808,7 +808,7 @@ impl AggregationService {
                 error = %e,
                 "Skipping aggregate with invalid aggregation bits"
             );
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+            note_aggregations_failed(1);
             return None;
         }
         let signature = match sign_with_phase2_permit(
@@ -836,7 +836,7 @@ impl AggregationService {
                     validator_index = %validator_index,
                     "phase-2 signer permit wait cancelled before Electra aggregate and proof"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
             Err(Phase2SignError::Revoked) => {
@@ -845,7 +845,7 @@ impl AggregationService {
                     validator_index = %validator_index,
                     "skipping aggregate: beacon node admission revoked before sign"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
             Err(Phase2SignError::Failed(e)) => {
@@ -855,7 +855,7 @@ impl AggregationService {
                     error = %e,
                     "Failed to sign Electra aggregate and proof"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
         };
@@ -920,7 +920,7 @@ impl AggregationService {
                     validator_index = %validator_index,
                     "phase-2 signer permit wait cancelled before Gloas aggregate and proof"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
             Err(Phase2SignError::Revoked) => {
@@ -929,7 +929,7 @@ impl AggregationService {
                     validator_index = %validator_index,
                     "skipping aggregate: beacon node admission revoked before sign"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
             Err(Phase2SignError::Failed(e)) => {
@@ -939,7 +939,7 @@ impl AggregationService {
                     error = %e,
                     "Failed to sign Gloas aggregate and proof"
                 );
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+                note_aggregations_failed(1);
                 return None;
             }
         };
@@ -1067,9 +1067,7 @@ impl AggregationService {
                 bounded_by_overhang,
                 self.config.timeouts.aggregate_submit,
             );
-            RVC_AGGREGATIONS_TOTAL
-                .with_label_values(&[attestation_status::FAILED])
-                .inc_by(count as u64);
+            note_aggregations_failed(count as u64);
             return;
         }
 
@@ -1107,9 +1105,7 @@ impl AggregationService {
                         warn!(slot, error = %e, "Failed to submit Gloas aggregate and proofs");
                     }
                 }
-                RVC_AGGREGATIONS_TOTAL
-                    .with_label_values(&[attestation_status::FAILED])
-                    .inc_by(count as u64);
+                note_aggregations_failed(count as u64);
             }
             Err(_) => {
                 warn_aggregate_publish_stopped(
@@ -1118,9 +1114,7 @@ impl AggregationService {
                     bounded_by_overhang,
                     self.config.timeouts.aggregate_submit,
                 );
-                RVC_AGGREGATIONS_TOTAL
-                    .with_label_values(&[attestation_status::FAILED])
-                    .inc_by(count as u64);
+                note_aggregations_failed(count as u64);
             }
         }
     }
@@ -1193,6 +1187,12 @@ fn warn_aggregate_publish_stopped(
     }
 }
 
+fn note_aggregations_failed(by: u64) {
+    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc_by(by);
+    #[cfg(any(test, feature = "test-utils"))]
+    crate::test_metrics::add_agg_failed(by);
+}
+
 fn skip_gloas_aggregate(
     slot: Slot,
     validator_index: &str,
@@ -1206,7 +1206,7 @@ fn skip_gloas_aggregate(
         error = %error,
         "Skipping Gloas aggregate"
     );
-    RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).inc();
+    note_aggregations_failed(1);
 }
 
 fn encode_electra_aggregate_and_proof(
@@ -1293,12 +1293,10 @@ mod tests {
 
     use super::utils;
     use super::{AggregationService, OrchestratorConfig};
-    use crate::metrics::{attestation_status, RVC_AGGREGATIONS_TOTAL};
 
     /// Process-wide aggregations-failed counter; serialize exact-delta assertions.
-    async fn agg_fail_metric_lock() -> tokio::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await
+    async fn agg_fail_metric_lock() {
+        // The failed-count readers use a thread-local delta. Nothing to hold.
     }
 
     fn create_test_fork_schedule() -> Arc<ForkSchedule> {
@@ -1985,8 +1983,7 @@ mod tests {
         let slot = gloas_epoch * SLOTS_PER_EPOCH;
         let mut bad = electra_attestation(slot);
         bad.committee_bits = vec![0x01, 0x00, 0x00];
-        let failed_before =
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+        let failed_before = crate::test_metrics::agg_failed();
 
         let service = setup_agg_service(
             pk_hex,
@@ -2023,8 +2020,7 @@ mod tests {
             !calls.contains(&"sign_electra_aggregate_and_proof"),
             "a request-check reject must not fall back to Electra signing; calls={calls:?}"
         );
-        let failed_after =
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+        let failed_after = crate::test_metrics::agg_failed();
         assert_eq!(
             failed_after.saturating_sub(failed_before),
             1,
@@ -2057,8 +2053,7 @@ mod tests {
             let slot = gloas_epoch * SLOTS_PER_EPOCH;
             let mut bad = electra_attestation(slot);
             bad.aggregation_bits = bits;
-            let failed_before =
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+            let failed_before = crate::test_metrics::agg_failed();
 
             let service = setup_agg_service(
                 pk_hex,
@@ -2095,8 +2090,7 @@ mod tests {
                 !calls.contains(&"sign_electra_aggregate_and_proof"),
                 "{label}: must not fall back to Electra signing; calls={calls:?}"
             );
-            let failed_after =
-                RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+            let failed_after = crate::test_metrics::agg_failed();
             assert_eq!(
                 failed_after.saturating_sub(failed_before),
                 1,
@@ -3095,7 +3089,7 @@ mod tests {
 
     /// The only phase-2 permit is already held. The selection-proof wait hits
     /// its deadline and the signer is not called.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn cancel_during_phase2_permit_wait_does_not_sign() {
         use std::time::Duration;
 
@@ -3247,7 +3241,7 @@ mod tests {
 
     /// The final Electra sign's permit wait expires. That counts as failed,
     /// and it is not a slot-end intake drop.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn expired_final_sign_permit_wait_counts_as_failed() {
         use std::time::Duration;
 
@@ -3281,8 +3275,7 @@ mod tests {
             aggregate: matching_electra_body(slot),
             selection_proof: vec![0xcd; 96],
         };
-        let failed_before =
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+        let failed_before = crate::test_metrics::agg_failed();
         let drops_before = service.slot_end_drops.get();
         let deadline = tokio::time::Instant::now() + Duration::from_millis(40);
         let fence = beacon::DutyFence::open();
@@ -3311,8 +3304,7 @@ mod tests {
             !calls.contains(&"sign_electra_aggregate_and_proof"),
             "an expired final-sign wait must not sign; calls={calls:?}"
         );
-        let failed_after =
-            RVC_AGGREGATIONS_TOTAL.with_label_values(&[attestation_status::FAILED]).get();
+        let failed_after = crate::test_metrics::agg_failed();
         assert_eq!(
             failed_after.saturating_sub(failed_before),
             1,

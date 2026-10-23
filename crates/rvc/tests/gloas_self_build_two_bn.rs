@@ -106,15 +106,23 @@ async fn test_self_build_publishes_block_and_envelope_through_second_bn() {
         .expect(1)
         .mount(&producer)
         .await;
+    let (block_tx, block_rx) = std::sync::mpsc::channel();
+    let (envelope_tx, envelope_rx) = std::sync::mpsc::channel();
     Mock::given(method("POST"))
         .and(path("/eth/v2/beacon/blocks"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("producer has no cache"))
+        .respond_with(rvc_test_support::SignalOnReceipt::new(
+            ResponseTemplate::new(500).set_body_string("producer has no cache"),
+            block_tx,
+        ))
         .expect(1..)
         .mount(&producer)
         .await;
     Mock::given(method("POST"))
         .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
-        .respond_with(ResponseTemplate::new(500).set_body_string("producer has no cache"))
+        .respond_with(rvc_test_support::SignalOnReceipt::new(
+            ResponseTemplate::new(500).set_body_string("producer has no cache"),
+            envelope_tx,
+        ))
         .expect(1..)
         .mount(&producer)
         .await;
@@ -158,23 +166,17 @@ async fn test_self_build_publishes_block_and_envelope_through_second_bn() {
     assert!(result.is_ok(), "second-BN self-build must succeed: {result:?}");
 
     // Broadcast returns on the first 200 and drains the other BN off the
-    // caller. Wait until that drain is recorded so wiremock's expect() check
-    // on drop does not race the in-flight publish.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-    loop {
-        let reqs = producer.received_requests().await.unwrap();
-        let saw_block = reqs.iter().any(|r| r.url.path() == "/eth/v2/beacon/blocks");
-        let saw_envelope =
-            reqs.iter().any(|r| r.url.path() == PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH);
-        if saw_block && saw_envelope {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "producer publish was not recorded before the mock server dropped"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
+    // caller. Both producer publishes notify before wiremock's expect() check.
+    tokio::time::timeout(
+        std::time::Duration::from_secs(12),
+        tokio::task::spawn_blocking(move || {
+            block_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("producer block");
+            envelope_rx.recv_timeout(std::time::Duration::from_secs(5)).expect("producer envelope");
+        }),
+    )
+    .await
+    .expect("producer publish wait hung")
+    .expect("producer publish wait");
 
     let publisher_reqs = publisher.received_requests().await.unwrap();
     assert!(

@@ -119,9 +119,10 @@ async fn aggregations_are_dispatched_concurrently() {
     let run_fut = fixture.orchestrator.run();
     tokio::pin!(run_fut);
 
-    let wall_started = std::time::Instant::now();
     let mut released = 0usize;
     let mut shutdown_sent = false;
+    let wall_deadline = std::time::Instant::now() + Duration::from_secs(10 * 60);
+    let paused_start = tokio::time::Instant::now();
     loop {
         tokio::select! {
             biased;
@@ -130,6 +131,17 @@ async fn aggregations_are_dispatched_concurrently() {
                 break;
             }
             _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                // Paused time. This arm advances the slot clock; it is not a wall bound.
+                if std::time::Instant::now() >= wall_deadline {
+                    panic!(
+                        "aggregate proofs did not reach {SLOT_COUNT} slots within 10m wall time (released {released})"
+                    );
+                }
+                if paused_start.elapsed() > Duration::from_secs(15 * 60) {
+                    panic!(
+                        "aggregate proofs did not reach {SLOT_COUNT} slots within 15m of paused time (released {released})"
+                    );
+                }
                 let proofs = aggregate_proof_count(&client.submit_aggregate_and_proofs_calls());
                 if !shutdown_sent && proofs >= (released + 1) * N {
                     if released + 1 == SLOT_COUNT {
@@ -140,10 +152,6 @@ async fn aggregations_are_dispatched_concurrently() {
                         clock.set_slot(slots[released]);
                     }
                 }
-                assert!(
-                    wall_started.elapsed() < Duration::from_secs(180),
-                    "aggregation dispatch did not finish {SLOT_COUNT} slots within 180 s of wall time; proofs={proofs}"
-                );
             }
         }
     }

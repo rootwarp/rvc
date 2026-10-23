@@ -1022,7 +1022,10 @@ where
                 return false;
             }
             let count = fetched.updates.as_ref().map_or(0, Vec::len);
-            if invoke_apply(apply_fn, fetched, meters).await.is_err() {
+            let applied = invoke_apply(apply_fn, fetched, meters).await;
+            #[cfg(any(test, feature = "test-utils"))]
+            note_proposer_refresh_settled();
+            if applied.is_err() {
                 warn!("proposer config apply did not finish; not counting success");
                 meters.failure.inc();
                 return true;
@@ -1046,9 +1049,40 @@ where
             if !fetch_error_already_counted(&e) {
                 meters.failure.inc();
             }
+            #[cfg(any(test, feature = "test-utils"))]
+            note_proposer_refresh_settled();
         }
     }
     true
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn proposer_refresh_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+static PROPOSER_REFRESH_SETTLED: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Serialize refresh tasks in one test binary so they share one settle sender.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn testing_lock_proposer_refresh() -> tokio::sync::MutexGuard<'static, ()> {
+    proposer_refresh_lock().lock().await
+}
+
+/// Install the sender notified after a fetch applies or fails. `None` clears it.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn testing_set_proposer_refresh_settled(tx: Option<std::sync::mpsc::Sender<()>>) {
+    *PROPOSER_REFRESH_SETTLED.lock().expect("proposer refresh settled") = tx;
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn note_proposer_refresh_settled() {
+    if let Some(tx) = PROPOSER_REFRESH_SETTLED.lock().expect("proposer refresh settled").as_ref() {
+        let _ = tx.send(());
+    }
 }
 
 fn refresh_interval_is_usable(interval: Duration) -> bool {

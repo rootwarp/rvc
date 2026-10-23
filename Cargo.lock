@@ -4249,6 +4249,7 @@ dependencies = [
  "rvc-secret-provider",
  "rvc-signer",
  "rvc-slashing",
+ "rvc-test-support",
  "rvc-timing",
  "rvc-validator-store",
  "secrecy",
@@ -4349,6 +4350,7 @@ dependencies = [
  "beacon",
  "futures",
  "reqwest 0.12.28",
+ "rvc-bn-manager",
  "rvc-eth-types",
  "rvc-metrics",
  "rvc-observability",
@@ -4859,6 +4861,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
+ "wiremock",
 ]
 
 [[package]]

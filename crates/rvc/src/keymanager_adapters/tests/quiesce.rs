@@ -456,23 +456,26 @@ fn hook_pair(
 }
 
 async fn wait_entered(rx: std::sync::mpsc::Receiver<()>, what: &str) {
-    tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(8)))
-        .await
-        .unwrap_or_else(|_| panic!("{what} wait task"))
-        .unwrap_or_else(|_| panic!("{what} was not reached"));
+    tokio::time::timeout(
+        Duration::from_secs(9),
+        tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(8))),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{what} wait hung"))
+    .unwrap_or_else(|_| panic!("{what} wait task"))
+    .unwrap_or_else(|_| panic!("{what} was not reached"));
 }
 
-async fn wait_contended(keys: &crate::quiesce::TrackedKeys, before: u64) {
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            if keys.contended() > before {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    })
+async fn wait_contended(keys: Arc<crate::quiesce::TrackedKeys>, before: u64) {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio::task::spawn_blocking(move || {
+            keys.wait_until_contended(before);
+        }),
+    )
     .await
-    .expect("DELETE did not block on tracked_keys");
+    .expect("DELETE did not block on tracked_keys")
+    .expect("contended wait");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -559,7 +562,7 @@ async fn delete_quiesce_between_admit_and_readmit_is_not_erased() {
     let state = Arc::clone(&h.state);
     let pk = h.pk;
     let delete_task = tokio::spawn(async move { delete_one(&state, &pk).await });
-    wait_contended(&h.adapter.tracked_keys, before).await;
+    wait_contended(Arc::clone(&h.adapter.tracked_keys), before).await;
     assert_eq!(h.quiesce.quiesce_inserts(), 0, "quiesce insert must wait for tracked_keys");
 
     admit_release.send(()).expect("release admit hook");
@@ -663,8 +666,6 @@ async fn concurrent_delete_and_import_never_reopen_a_quiesced_present_key() {
         park: false,
         stall_second_export: false,
     });
-    let mut overlaps = 0u64;
-
     for i in 0..ITERATIONS {
         if !h.adapter.has_key(&h.pk) {
             let imported = import_one(&h.state, &h.json, None).await;
@@ -681,23 +682,23 @@ async fn concurrent_delete_and_import_never_reopen_a_quiesced_present_key() {
         sign(&h, slot).await.unwrap_or_else(|err| panic!("iteration {i}: sign before race: {err}"));
         let slot_pat = format!("\"slot\":\"{slot}\"");
 
-        let before = h.adapter.tracked_keys.contended();
-        h.adapter.tracked_keys.set_stall_ms(30);
+        let (membership_hook, membership_rx, membership_release) = hook_pair();
+        h.adapter.set_after_membership_scan_hook(membership_hook);
         let state_d = Arc::clone(&h.state);
         let state_i = Arc::clone(&h.state);
         let json = h.json.clone();
         let pk = h.pk;
         let delete_task = tokio::spawn(async move { delete_one(&state_d, &pk).await });
-        let import_task = tokio::spawn(async move { import_one(&state_i, &json, None).await });
-        let (deleted, imported) = tokio::time::timeout(Duration::from_secs(10), async {
-            tokio::join!(delete_task, import_task)
-        })
-        .await
-        .unwrap_or_else(|_| panic!("iteration {i}: race hung"));
-        h.adapter.tracked_keys.set_stall_ms(0);
-        if h.adapter.tracked_keys.contended() > before {
-            overlaps += 1;
-        }
+        wait_entered(membership_rx, "membership_for_delete").await;
+        let imported =
+            tokio::time::timeout(Duration::from_secs(10), import_one(&state_i, &json, None))
+                .await
+                .unwrap_or_else(|_| panic!("iteration {i}: import hung"));
+        membership_release.send(()).unwrap_or_else(|_| panic!("iteration {i}: release membership"));
+        let deleted = tokio::time::timeout(Duration::from_secs(10), delete_task)
+            .await
+            .unwrap_or_else(|_| panic!("iteration {i}: delete hung"));
+        h.adapter.set_after_membership_scan_hook(Arc::new(|| {}));
 
         let deleted =
             deleted.expect("delete join").unwrap_or_else(|err| panic!("iteration {i}: {err}"));
@@ -707,28 +708,19 @@ async fn concurrent_delete_and_import_never_reopen_a_quiesced_present_key() {
             "iteration {i}: export omitted the signature: {}",
             deleted.slashing_protection
         );
-        let imported = imported.expect("import join");
-        assert!(
-            matches!(imported.data[0].status, ImportStatus::Imported | ImportStatus::Duplicate),
-            "iteration {i}: {imported:?}"
+        assert_eq!(
+            imported.data[0].status,
+            ImportStatus::Duplicate,
+            "iteration {i}: import ran while the key was still present: {imported:?}"
         );
 
-        let present = h.adapter.has_key(&h.pk);
-        let quiesced = h.registry.contains(&h.pk);
-        let signing = h.gate.is_signing_enabled(&h.public);
-        match (present, quiesced, signing) {
-            (false, true, false) => {}
-            (true, false, true) => {}
-            other => {
-                panic!("iteration {i}: inadmissible end state present/quiesced/signing = {other:?}")
-            }
-        }
+        assert!(!h.adapter.has_key(&h.pk), "iteration {i}: delete must remove the key");
+        assert!(h.registry.contains(&h.pk), "iteration {i}: delete must leave the key quiesced");
+        assert!(
+            !h.gate.is_signing_enabled(&h.public),
+            "iteration {i}: a quiesced key must not sign"
+        );
     }
-
-    assert!(
-        overlaps >= 1,
-        "instrumented counter saw no overlapping tracked_keys critical sections in {ITERATIONS} iterations"
-    );
 }
 
 /// Two DELETEs snapshot the same key. The import runs while the second export

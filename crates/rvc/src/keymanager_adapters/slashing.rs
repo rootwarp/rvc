@@ -154,7 +154,12 @@ impl SlashingProtection for SlashingProtectionAdapter {
         if wait_ms > 0 {
             let window_ms = millis(admission.window);
             let estimated_hold_ms = millis(admission.estimated_hold);
-            slashing::metrics::RVC_SLASHING_IMPORT_DEFERRED_MS.observe(wait_ms as f64);
+            let observe = || {
+                slashing::metrics::RVC_SLASHING_IMPORT_DEFERRED_MS.observe(wait_ms as f64);
+            };
+            observe();
+            #[cfg(any(test, feature = "test-utils"))]
+            crate::test_metrics::add_import_deferred(wait_ms as f64);
             tracing::info!(wait_ms, window_ms, estimated_hold_ms, "interchange import deferred");
         }
 

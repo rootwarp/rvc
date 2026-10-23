@@ -86,6 +86,9 @@ async fn run_one_refresh_tick(
     store: Arc<ValidatorStore>,
     applier: Arc<Mutex<ProposerConfigApplier>>,
 ) {
+    let _lock = rvc::background_tasks::config_url::testing_lock_proposer_refresh().await;
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    rvc::background_tasks::config_url::testing_set_proposer_refresh_settled(Some(settled_tx));
     let settings = ProposerConfigUrlSettings {
         url,
         refresh_interval: Duration::from_secs(3600),
@@ -101,14 +104,22 @@ async fn run_one_refresh_tick(
         })
         .await;
     });
-    // Initial fetch runs immediately at task start.
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    tokio::time::timeout(
+        Duration::from_secs(6),
+        tokio::task::spawn_blocking(move || settled_rx.recv_timeout(Duration::from_secs(5))),
+    )
+    .await
+    .expect("refresh settle wait hung")
+    .expect("refresh settle wait")
+    .expect("refresh did not settle");
     shutdown.cancel();
     handle.await.expect("refresh task joined");
+    rvc::background_tasks::config_url::testing_set_proposer_refresh_settled(None);
 }
 
 #[tokio::test]
 async fn a_rotated_fee_recipient_reaches_the_store() {
+    let _lock = rvc::background_tasks::config_url::testing_lock_proposer_refresh().await;
     let mock_server = MockServer::start().await;
     let pk = test_pubkey();
     let pk_hex = format!("0x{}", hex::encode(pk));
@@ -271,6 +282,7 @@ async fn a_malformed_fee_recipient_leaves_the_previous_value_intact_and_warns() 
 
 #[tokio::test]
 async fn an_http_401_leaves_all_previous_values_intact() {
+    let _lock = rvc::background_tasks::config_url::testing_lock_proposer_refresh().await;
     let mock_server = MockServer::start().await;
     let pk = test_pubkey();
     let pk_hex = format!("0x{}", hex::encode(pk));

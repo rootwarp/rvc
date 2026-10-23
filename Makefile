@@ -36,9 +36,16 @@ clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 	cargo clippy -p rvc-signer-bin --all-targets --features dvt -- -D warnings
 
-# Test
+# Test. `cargo nextest` is the default. Plain `cargo test` still runs the
+# same suite; it shares one process per test binary.
 test:
-	cargo test --workspace
+	@if command -v cargo-nextest >/dev/null 2>&1; then \
+		cargo nextest run --workspace --all-features ; \
+	else \
+		echo "cargo-nextest not installed; falling back to cargo test --workspace --all-features" ; \
+		echo "Install with: cargo install cargo-nextest --locked" ; \
+		cargo test --workspace --all-features ; \
+	fi
 
 test-verbose:
 	cargo test -- --nocapture

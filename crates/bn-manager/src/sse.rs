@@ -2,6 +2,24 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(any(test, feature = "test-utils"))]
+static SSE_DROP_TX: std::sync::Mutex<Vec<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Register for one notification each time the callback channel drops an event.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn testing_subscribe_sse_drops() -> std::sync::mpsc::Receiver<()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    SSE_DROP_TX.lock().expect("sse drops").push(tx);
+    rx
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn note_sse_callback_drop() {
+    let mut txs = SSE_DROP_TX.lock().expect("sse drops");
+    txs.retain(|tx| tx.send(()).is_ok());
+}
+
 use serde::Deserialize;
 
 mod frame;
@@ -217,6 +235,8 @@ fn forward_sse_message(
                 Ok(()) => true,
                 Err(TrySendError::Full(_)) => {
                     warn!("SSE callback channel full; dropping event");
+                    #[cfg(any(test, feature = "test-utils"))]
+                    note_sse_callback_drop();
                     true
                 }
                 Err(TrySendError::Closed(_)) => {

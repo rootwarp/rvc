@@ -15,8 +15,8 @@ mod common;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -42,6 +42,42 @@ const STARTUP_SEQUENCE: &[&str] = &[
 
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(35);
+/// First process plus respawns. The last attempt is not respawned.
+const READY_ATTEMPTS: u32 = 5;
+
+/// Exit 15 before the orchestrator log is the only startup failure that is retried.
+fn is_port_bind_race(code: Option<i32>, saw_orchestrator: bool) -> bool {
+    !saw_orchestrator && code == Some(rvc::startup::EXIT_LISTENER_BIND)
+}
+
+fn child_status(child: &mut Child) -> Option<ExitStatus> {
+    match child.try_wait() {
+        Ok(status) => status,
+        Err(err) => panic!("error waiting for process: {err}"),
+    }
+}
+
+#[test]
+fn non_bind_exit_is_not_retried() {
+    let exit = |code: i32| {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("exit {code}"))
+            .status()
+            .expect("spawn sh")
+            .code()
+    };
+    let bind = rvc::startup::EXIT_LISTENER_BIND;
+    assert!(is_port_bind_race(exit(bind), false), "exit {bind} before the log is a port race");
+    assert!(!is_port_bind_race(exit(bind), true), "exit {bind} after the log is not retried");
+    assert!(!is_port_bind_race(exit(1), false), "exit 1 is not retried");
+    assert!(!is_port_bind_race(exit(0), false), "exit 0 is not retried");
+    let signal =
+        std::process::Command::new("sh").arg("-c").arg("kill -TERM $$").status().expect("spawn sh");
+    assert!(signal.code().is_none(), "signal death has no code, got {signal}");
+    assert!(!is_port_bind_race(signal.code(), false), "signal death is not retried");
+}
+
 const TEST_KEYSTORE_PASSWORD: &str = "rf5-01-smoke-password";
 
 fn get_binary_path() -> std::path::PathBuf {
@@ -161,40 +197,75 @@ fn spawn_validator(config_path: &std::path::Path, ports: &TestPorts) -> Child {
         .env_remove("OTEL_TRACES_SAMPLER_ARG")
         // Console fmt layer writes to stdout (see `console_fmt_layer(..., stdout)`).
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("Failed to spawn validator process")
 }
 
-/// Drain child stdout on a background thread so the process cannot block on a full pipe.
+/// Drain child stdout and stderr so the process cannot block on a full pipe.
 ///
-/// Console logs go to stdout; stderr is only used for a few `eprintln!` warnings.
+/// The orchestrator flag is set only from stdout. Stderr is appended so a
+/// failed attempt's panic includes both streams.
 struct LogCapture {
     buffer: Arc<Mutex<String>>,
-    handle: Option<JoinHandle<()>>,
+    handles: Vec<JoinHandle<()>>,
+    orchestrator: Arc<(Mutex<bool>, Condvar)>,
+}
+
+fn spawn_log_reader(
+    mut reader: impl Read + Send + 'static,
+    buf: Arc<Mutex<String>>,
+    orchestrator: Option<Arc<(Mutex<bool>, Condvar)>>,
+) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut chunk = [0u8; 4096];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let text = String::from_utf8_lossy(&chunk[..n]);
+                    let mut saw = false;
+                    if let Ok(mut guard) = buf.lock() {
+                        guard.push_str(&text);
+                        saw =
+                            orchestrator.is_some() && guard.contains("Starting duty orchestrator");
+                    }
+                    if let Some(ready) = orchestrator.as_ref().filter(|_| saw) {
+                        let (lock, cv) = &**ready;
+                        if let Ok(mut flag) = lock.lock() {
+                            *flag = true;
+                            cv.notify_all();
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    })
 }
 
 impl LogCapture {
-    fn start(stdout: ChildStdout) -> Self {
+    fn start(stdout: ChildStdout, stderr: ChildStderr) -> Self {
         let buffer = Arc::new(Mutex::new(String::new()));
-        let buf = Arc::clone(&buffer);
-        let handle = thread::spawn(move || {
-            let mut reader = stdout;
-            let mut chunk = [0u8; 4096];
-            loop {
-                match reader.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let text = String::from_utf8_lossy(&chunk[..n]);
-                        if let Ok(mut guard) = buf.lock() {
-                            guard.push_str(&text);
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-        Self { buffer, handle: Some(handle) }
+        let orchestrator = Arc::new((Mutex::new(false), Condvar::new()));
+        let handles = vec![
+            spawn_log_reader(stdout, Arc::clone(&buffer), Some(Arc::clone(&orchestrator))),
+            spawn_log_reader(stderr, Arc::clone(&buffer), None),
+        ];
+        Self { buffer, handles, orchestrator }
+    }
+
+    fn saw_orchestrator(&self) -> bool {
+        let (lock, _) = &*self.orchestrator;
+        *lock.lock().expect("orchestrator log")
+    }
+
+    fn wait_for_orchestrator(&self, timeout: Duration) -> bool {
+        let (lock, cv) = &*self.orchestrator;
+        let guard = lock.lock().expect("orchestrator log");
+        let (guard, _) =
+            cv.wait_timeout_while(guard, timeout, |flag| !*flag).expect("orchestrator log");
+        *guard
     }
 
     fn snapshot(&self) -> String {
@@ -202,7 +273,7 @@ impl LogCapture {
     }
 
     fn finish(&mut self) -> String {
-        if let Some(handle) = self.handle.take() {
+        for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
         self.snapshot()
@@ -211,7 +282,7 @@ impl LogCapture {
 
 impl Drop for LogCapture {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
     }
@@ -303,6 +374,7 @@ struct SmokeHarness {
     _keystore_dir: TempDir,
     _slashing_db_dir: TempDir,
     _config_file: NamedTempFile,
+    beacon_url: String,
     ports: TestPorts,
     child: Child,
     logs: LogCapture,
@@ -331,9 +403,11 @@ impl SmokeHarness {
 
         let mut child = spawn_validator(config_file.path(), &ports);
         let stdout = child.stdout.take().expect("stdout piped");
-        let logs = LogCapture::start(stdout);
+        let stderr = child.stderr.take().expect("stderr piped");
+        let logs = LogCapture::start(stdout, stderr);
 
         Self {
+            beacon_url: mock_bn.uri(),
             _mock_bn: mock_bn,
             _keystore_dir: keystore_dir,
             _slashing_db_dir: slashing_db_dir,
@@ -342,6 +416,31 @@ impl SmokeHarness {
             child,
             logs,
         }
+    }
+
+    fn respawn(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = self.logs.finish();
+        self.ports = TestPorts::allocate();
+        let slashing = self._slashing_db_dir.path().join("slashing.db");
+        let _ = std::fs::remove_file(&slashing);
+        let _ = std::fs::remove_file(self._slashing_db_dir.path().join("slashing.db-wal"));
+        let _ = std::fs::remove_file(self._slashing_db_dir.path().join("slashing.db-shm"));
+        let config_file = create_test_config(
+            &self._keystore_dir,
+            &slashing,
+            &self._keystore_dir.path().join("validators.toml"),
+            &self._keystore_dir.path().join("passwords.txt"),
+            &self.beacon_url,
+            &self.ports,
+        );
+        let mut child = spawn_validator(config_file.path(), &self.ports);
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+        self.logs = LogCapture::start(stdout, stderr);
+        self._config_file = config_file;
+        self.child = child;
     }
 
     fn health_url(&self) -> String {
@@ -360,16 +459,60 @@ impl SmokeHarness {
         format!("http://127.0.0.1:{}/livez", self.ports.metrics)
     }
 
-    /// Wait until `/health` is HTTP 200 (healthy=true). 503 is not ready.
-    async fn wait_until_ready(&self) {
-        let health = self.health_url();
-        assert!(
-            wait_for_http_ok(&health, READY_TIMEOUT).await,
-            "health endpoint not HTTP 200 within {:?}.\n--- stdout ---\n{}",
-            READY_TIMEOUT,
+    /// Wait until `/health` is HTTP 200 on this child, after the orchestrator starts.
+    ///
+    /// A 200 from a process that already exited is another test's listener
+    /// (`free_port` releases the port before the child binds). Respawn only
+    /// when this child exited [`rvc::startup::EXIT_LISTENER_BIND`] before the
+    /// orchestrator log. Any other exit panics with the status and the log.
+    async fn wait_until_ready(&mut self) {
+        for attempt in 1..=READY_ATTEMPTS {
+            if self.retry_port_bind_race(attempt) {
+                continue;
+            }
+            let health = self.health_url();
+            let healthy = wait_for_http_ok(&health, READY_TIMEOUT).await;
+            if self.retry_port_bind_race(attempt) {
+                continue;
+            }
+            assert!(
+                healthy,
+                "health endpoint not HTTP 200 within {:?}.\n--- log ---\n{}",
+                READY_TIMEOUT,
+                self.logs.snapshot()
+            );
+            let saw = self.logs.wait_for_orchestrator(READY_TIMEOUT);
+            if self.retry_port_bind_race(attempt) {
+                continue;
+            }
+            if saw {
+                assert_health_json_healthy(&self.health_url()).await;
+                return;
+            }
+        }
+        panic!(
+            "duty orchestrator did not start within {READY_ATTEMPTS} attempts.\n--- log ---\n{}",
             self.logs.snapshot()
         );
-        assert_health_json_healthy(&health).await;
+    }
+
+    /// Respawn after exit 15 before the orchestrator log. Every other exit panics.
+    fn retry_port_bind_race(&mut self, attempt: u32) -> bool {
+        let Some(status) = child_status(&mut self.child) else {
+            return false;
+        };
+        let saw = self.logs.saw_orchestrator();
+        let logs = self.logs.snapshot();
+        if is_port_bind_race(status.code(), saw) && attempt < READY_ATTEMPTS {
+            self.respawn();
+            return true;
+        }
+        panic!(
+            "startup exited {status} on attempt {attempt}/{READY_ATTEMPTS} \
+             (orchestrator log seen: {saw}); respawn is only for exit {} before that log\n\
+             --- log ---\n{logs}",
+            rvc::startup::EXIT_LISTENER_BIND,
+        );
     }
 
     #[cfg(unix)]
@@ -561,7 +704,8 @@ async fn test_startup_fails_closed_on_genesis_root_mismatch() {
 
     let mut child = spawn_validator(config_file.path(), &ports);
     let stdout = child.stdout.take().expect("stdout piped");
-    let mut capture = LogCapture::start(stdout);
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut capture = LogCapture::start(stdout, stderr);
 
     let status = wait_for_exit(&mut child, READY_TIMEOUT);
     let logs = capture.finish();
@@ -601,7 +745,8 @@ async fn test_startup_fails_closed_on_unsupported_fork() {
 
     let mut child = spawn_validator(config_file.path(), &ports);
     let stdout = child.stdout.take().expect("stdout piped");
-    let mut capture = LogCapture::start(stdout);
+    let stderr = child.stderr.take().expect("stderr piped");
+    let mut capture = LogCapture::start(stdout, stderr);
 
     let status = wait_for_exit(&mut child, READY_TIMEOUT);
     let logs = capture.finish();

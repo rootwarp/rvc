@@ -193,6 +193,14 @@ fn expected_parents_for(proposal_slot: Slot, header: &BlockHeaderSummary) -> Exp
     ExpectedParents::open(header.root, at_previous.then_some(header.parent_root))
 }
 
+fn note_parent_fallback() {
+    RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL
+        .with_label_values(&[slot_context_parent_fallback::WALK_BACK_EXHAUSTED])
+        .inc();
+    #[cfg(any(test, feature = "test-utils"))]
+    crate::test_metrics::add_parent_fallback();
+}
+
 async fn walk_back_parent(beacon: &dyn BeaconNodeClient, slot: Slot) -> ParentCapture {
     let mut attempts = 0u32;
     for offset in 1..=PARENT_WALKBACK_ATTEMPTS {
@@ -209,9 +217,7 @@ async fn walk_back_parent(beacon: &dyn BeaconNodeClient, slot: Slot) -> ParentCa
     }
 
     warn!(slot, attempts, "parent_root walk-back exhausted; falling back to head");
-    RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL
-        .with_label_values(&[slot_context_parent_fallback::WALK_BACK_EXHAUSTED])
-        .inc();
+    note_parent_fallback();
     match lookup_header(beacon, "head", slot).await {
         ParentLookup::Found(header) if header.slot >= slot => {
             warn!(
@@ -323,9 +329,6 @@ mod tests {
 
     use beacon::{BlockRootData, DataResponse};
     use bn_manager::MockBeaconNodeClient;
-    use metrics::definitions::{
-        slot_context_parent_fallback, RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL,
-    };
     use tracing_test::traced_test;
 
     fn slot_vs_head_beacon(
@@ -356,9 +359,7 @@ mod tests {
     }
 
     fn fallback_count() -> u64 {
-        RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL
-            .with_label_values(&[slot_context_parent_fallback::WALK_BACK_EXHAUSTED])
-            .get()
+        crate::test_metrics::parent_fallback()
     }
 
     /// ARCH-3b stub: 404 on `head_slot` and every `skipped` slot; `"head"` uses
@@ -687,7 +688,7 @@ mod tests {
     }
 
     /// ARCH-3d: a single skipped predecessor is not `parent_root = None`.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_capture_parent_walks_back_over_a_skipped_slot() {
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;
@@ -717,7 +718,7 @@ mod tests {
     }
 
     /// ARCH-3d: three consecutive skips still resolve inside the four-attempt budget.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_capture_parent_walks_back_over_three_consecutive_skips() {
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;
@@ -750,7 +751,7 @@ mod tests {
     }
 
     /// ARCH-3d: four misses take the counted, warn-logged `"head"` last resort.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     #[traced_test]
     async fn test_capture_parent_falls_back_to_head_after_four_misses() {
         let slot: Slot = 100;
@@ -790,7 +791,7 @@ mod tests {
     }
 
     /// ARCH-3d: a down BN must not burn the remaining walk-back attempts.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_capture_parent_stops_walking_on_transport_error() {
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;
@@ -811,7 +812,7 @@ mod tests {
     }
 
     /// Slot-1 503 is not a skip. Walking to N-2 would arm H-4 with a stale ancestor.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_capture_parent_stops_walking_on_non_404_api_error() {
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;
@@ -848,7 +849,7 @@ mod tests {
     }
 
     /// Unusable 200 on slot-1 is not a skip — the block may still exist.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_capture_parent_stops_walking_on_unparseable_response() {
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;
@@ -877,7 +878,7 @@ mod tests {
     }
 
     /// A numeric id whose header slot disagrees is not a miss. The walk stops.
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_capture_parent_stops_when_header_slot_disagrees() {
         let slot: Slot = 100;
         let epoch: Epoch = slot / 32;

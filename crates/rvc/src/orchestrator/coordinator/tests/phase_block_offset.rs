@@ -131,10 +131,6 @@ fn phase_offset_count(phase: &str) -> u64 {
     RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).get_sample_count()
 }
 
-fn phase_offset_sum(phase: &str) -> f64 {
-    RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).get_sample_sum()
-}
-
 /// Drive one slot through `run()` and assert the M2 histogram records a sample.
 #[tokio::test(flavor = "current_thread")]
 async fn test_slot_phase_block_start_offset_is_recorded_each_slot() {
@@ -401,24 +397,41 @@ async fn phase_block_start_offset_reports_the_true_offset() {
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
     ));
 
-    let cold_count_before = histogram_count(slot_phase_cache::COLD);
-    let cold_sum_before = histogram_sum(slot_phase_cache::COLD);
-    let block_count_before = phase_offset_count(slot_phase_offset::BLOCK);
-    let block_sum_before = phase_offset_sum(slot_phase_offset::BLOCK);
+    let (cold_count_before, cold_sum_before) = crate::test_metrics::block_start_cold();
+    let (block_count_before, block_sum_before) = crate::test_metrics::phase_block();
 
+    let (recorded_tx, recorded_rx) = std::sync::mpsc::channel();
+    testing_set_phase_block_recorded(Some(recorded_tx));
     tokio::select! {
         biased;
         _ = orchestrator.run() => {}
         () = async {
-            // Phase 0 records before the bps waits. Shut down once that sample exists.
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            // `start_paused` does not wake `spawn_blocking`. Poll the signal.
+            // Wall time only: a paused sleep here would move the slot clock.
+            let wall_deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                match recorded_rx.try_recv() {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                        if std::time::Instant::now() >= wall_deadline {
+                            panic!("phase=block was not recorded within 30s");
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        panic!("phase=block was not recorded");
+                    }
+                }
+            }
             handle.shutdown();
             std::future::pending::<()>().await;
         } => {}
     }
+    testing_set_phase_block_recorded(None);
 
-    let cold_added = histogram_count(slot_phase_cache::COLD) - cold_count_before;
-    let sum_delta = histogram_sum(slot_phase_cache::COLD) - cold_sum_before;
+    let (cold_after, cold_sum_after) = crate::test_metrics::block_start_cold();
+    let cold_added = cold_after - cold_count_before;
+    let sum_delta = cold_sum_after - cold_sum_before;
     assert!(cold_added >= 1, "post-boot slot must record cache=cold, added {cold_added}");
     let observed = sum_delta / cold_added as f64;
     assert!(
@@ -427,8 +440,9 @@ async fn phase_block_start_offset_reports_the_true_offset() {
          (sum_delta={sum_delta}, cold_added={cold_added})"
     );
 
-    let block_added = phase_offset_count(slot_phase_offset::BLOCK) - block_count_before;
-    let block_sum = phase_offset_sum(slot_phase_offset::BLOCK) - block_sum_before;
+    let (block_after, block_sum_after) = crate::test_metrics::phase_block();
+    let block_added = block_after - block_count_before;
+    let block_sum = block_sum_after - block_sum_before;
     assert!(block_added >= 1, "phase=block must be recorded, added {block_added}");
     let block_observed = block_sum / block_added as f64;
     assert!(

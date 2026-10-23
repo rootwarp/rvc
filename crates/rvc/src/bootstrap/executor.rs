@@ -164,6 +164,11 @@ pub struct TaskExecutor {
     /// Exit classifications (`ok` / `error` / `panic` / `cancelled`) in completion order.
     /// Written by every monitor; read by unit tests (ARCH-2f will also drive metrics).
     exits: Arc<Mutex<Vec<(&'static str, &'static str)>>>,
+    /// Bumps after a monitor records an exit. Tests wait on this instead of the
+    /// process-global running gauge. The counter is always updated: a
+    /// `#[cfg(test)]` above the production `tokio::spawn` sites would hide
+    /// those sites from the raw-spawn scan.
+    finished: tokio::sync::watch::Sender<u64>,
 }
 
 impl TaskExecutor {
@@ -182,6 +187,7 @@ impl TaskExecutor {
             doppelganger_exit: Arc::new(AtomicBool::new(false)),
             registry: Arc::new(Mutex::new(Vec::new())),
             exits: Arc::new(Mutex::new(Vec::new())),
+            finished: tokio::sync::watch::channel(0).0,
         };
         (executor, shutdown_rx)
     }
@@ -250,6 +256,7 @@ impl TaskExecutor {
         let work = handle.abort_handle();
         let tx = self.shutdown_tx.clone();
         let exits = Arc::clone(&self.exits);
+        let finished = self.finished.clone();
         RVC_TASKS_RUNNING.with_label_values(&[name]).inc();
         let monitor = tokio::spawn(async move {
             let outcome = match handle.await {
@@ -263,6 +270,7 @@ impl TaskExecutor {
             RVC_TASKS_RUNNING.with_label_values(&[name]).dec();
             RVC_TASK_EXITS_TOTAL.with_label_values(&[name, outcome]).inc();
             exits.lock().push((name, outcome));
+            finished.send_modify(|count| *count = count.saturating_add(1));
         });
         self.registry.lock().push(Registered { name, tier, work, monitor });
     }
@@ -303,6 +311,7 @@ impl TaskExecutor {
         let work = handle.abort_handle();
         let tx = self.shutdown_tx.clone();
         let exits = Arc::clone(&self.exits);
+        let finished = self.finished.clone();
         RVC_TASKS_RUNNING.with_label_values(&[name]).inc();
         let monitor = tokio::spawn(async move {
             let outcome = match handle.await {
@@ -321,6 +330,7 @@ impl TaskExecutor {
             RVC_TASKS_RUNNING.with_label_values(&[name]).dec();
             RVC_TASK_EXITS_TOTAL.with_label_values(&[name, outcome]).inc();
             exits.lock().push((name, outcome));
+            finished.send_modify(|count| *count = count.saturating_add(1));
         });
         self.registry.lock().push(Registered { name, tier, work, monitor });
     }
@@ -493,6 +503,29 @@ impl TaskExecutor {
     #[cfg(test)]
     fn recorded_outcomes(&self) -> Vec<(&'static str, &'static str)> {
         self.exits.lock().clone()
+    }
+
+    /// Whether the registered work task named `name` has finished.
+    #[cfg(test)]
+    pub(crate) fn work_finished(&self, name: &str) -> bool {
+        self.registry.lock().iter().any(|entry| entry.name == name && entry.work.is_finished())
+    }
+
+    /// Resolves when `name`'s work abort handle is finished.
+    ///
+    /// Subscribes before the check so a completion that lands between the
+    /// check and the wait is still observed.
+    #[cfg(test)]
+    pub(crate) async fn wait_until_work_finished(&self, name: &'static str) {
+        let mut finished = self.finished.subscribe();
+        loop {
+            if self.work_finished(name) {
+                return;
+            }
+            if finished.changed().await.is_err() {
+                return;
+            }
+        }
     }
 }
 

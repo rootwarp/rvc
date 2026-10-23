@@ -67,6 +67,10 @@ pub struct KeystoreManagerAdapter {
     after_readmit: TestHookSlot,
     #[cfg(test)]
     after_delete_unlock: TestHookSlot,
+    /// Runs after `membership_for_delete` drops `tracked_keys`, before it returns.
+    /// The delete task is paused here, so the key is still present and the lock is free.
+    #[cfg(test)]
+    after_membership_scan: TestHookSlot,
     /// Runs inside the import `spawn_blocking` body, after the permit is moved
     /// in and before `decrypt`.
     #[cfg(test)]
@@ -155,6 +159,8 @@ impl KeystoreManagerAdapter {
             #[cfg(test)]
             after_delete_unlock: Arc::new(Mutex::new(None)),
             #[cfg(test)]
+            after_membership_scan: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
             during_blocking: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             after_secret_before_keystore: Arc::new(Mutex::new(None)),
@@ -240,6 +246,11 @@ impl KeystoreManagerAdapter {
     #[cfg(test)]
     pub(crate) fn set_after_delete_unlock_hook(&self, hook: TestHook) {
         *self.after_delete_unlock.lock() = Some(hook);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_after_membership_scan_hook(&self, hook: TestHook) {
+        *self.after_membership_scan.lock() = Some(hook);
     }
 
     #[cfg(test)]
@@ -1236,6 +1247,10 @@ impl KeystoreManager for KeystoreManagerAdapter {
             let count = inflight.per_key.entry(*pubkey).or_insert(0);
             *count = count.saturating_add(1);
         }
+        drop(inflight);
+        drop(_keys);
+        #[cfg(test)]
+        run_hook(&self.after_membership_scan);
         members
     }
 

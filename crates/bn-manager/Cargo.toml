@@ -37,6 +37,8 @@ tracing = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
+# Feature-unify `test-utils` so integration tests see SSE drop notifications.
+rvc-bn-manager = { path = ".", features = ["test-utils"] }
 eth-types = { workspace = true, features = ["test-fixtures"] }
 serde_json = { workspace = true }
 wiremock = { workspace = true }

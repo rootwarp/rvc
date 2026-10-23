@@ -1135,7 +1135,7 @@ where
         } else {
             slot_phase_cache::WARM
         };
-        RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS.with_label_values(&[cache]).observe(offset_ms);
+        observe_block_start_offset(cache, offset_ms);
         self.phase_block_cache_cold = false;
     }
 
@@ -1369,7 +1369,7 @@ where
 
     /// Records `rvc_slot_phase_offset_ms{phase}` at the moment a phase fires.
     fn record_phase_offset(phase: &'static str, anchor: &SlotAnchor) {
-        RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).observe(anchor.elapsed_ms() as f64);
+        observe_phase_offset(phase, anchor.elapsed_ms() as f64);
     }
 
     async fn run_attestation_phase(
@@ -1860,6 +1860,41 @@ impl BuilderConfigProvider for BuilderConfigAdapter {
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+#[cfg(test)]
+static PHASE_BLOCK_RECORDED: std::sync::Mutex<Option<std::sync::mpsc::Sender<()>>> =
+    std::sync::Mutex::new(None);
+
+/// Install the sender `observe_phase_offset` notifies for `phase=block`.
+/// `None` clears it. The caller holds the metric gate across the install.
+///
+/// Defined after the fork-hazard sites so those line pins do not move.
+#[cfg(test)]
+pub(crate) fn testing_set_phase_block_recorded(tx: Option<std::sync::mpsc::Sender<()>>) {
+    *PHASE_BLOCK_RECORDED.lock().expect("phase recorded") = tx;
+}
+
+fn observe_block_start_offset(cache: &str, offset_ms: f64) {
+    RVC_SLOT_PHASE_BLOCK_START_OFFSET_MS.with_label_values(&[cache]).observe(offset_ms);
+    #[cfg(any(test, feature = "test-utils"))]
+    if cache == slot_phase_cache::COLD {
+        crate::test_metrics::add_block_start_cold(offset_ms);
+    }
+}
+
+fn observe_phase_offset(phase: &'static str, elapsed_ms: f64) {
+    RVC_SLOT_PHASE_OFFSET_MS.with_label_values(&[phase]).observe(elapsed_ms);
+    #[cfg(any(test, feature = "test-utils"))]
+    if phase == slot_phase_offset::BLOCK {
+        crate::test_metrics::add_phase_block(elapsed_ms);
+    }
+    #[cfg(test)]
+    if phase == slot_phase_offset::BLOCK {
+        if let Some(tx) = PHASE_BLOCK_RECORDED.lock().expect("phase recorded").as_ref() {
+            let _ = tx.send(());
+        }
+    }
+}
 
 /// Watch sender with no live slot loop.
 ///

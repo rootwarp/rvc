@@ -19,3 +19,6 @@ pub mod pubkey_index;
 pub mod quiesce;
 pub mod slashing_monitor;
 pub mod startup;
+
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_metrics;
