@@ -96,9 +96,11 @@ Empty on this commit. `crates/slashing/src/stage.rs` is not edited. Blob sha `20
 
 These calls are outside the executor scan (`crates/rvc` + `bin/rvc`) and outside `raw_spawn` `ALLOW_LIST` (that list stays empty). #646 shifted them. They are not rows in the production-sites table above.
 
-| File | Line | Call |
-|---|---:|---|
-| `crates/bn-manager/src/fan_out.rs` | 867 | `tokio::spawn` in `wait_for_complete_detached` |
-| `crates/bn-manager/src/fan_out.rs` | 1080 | `tokio::spawn` in `spawn_detached` |
-| `crates/bn-manager/src/fan_out.rs` | 1135 | `tokio::spawn` in `health_sender` |
-| `crates/bn-manager/src/manager.rs` | 785 | `tokio::spawn` in `start_sse` |
+| File | Item | Call |
+|---|---|---|
+| `crates/bn-manager/src/fan_out.rs` | `wait_for_complete_detached` | `tokio::spawn` |
+| `crates/bn-manager/src/fan_out.rs` | `spawn_detached` | `tokio::spawn` |
+| `crates/bn-manager/src/fan_out.rs` | `health_sender` | `tokio::spawn` |
+| `crates/bn-manager/src/manager.rs` | `BnManager::start_sse` | `tokio::spawn` |
+| `crates/bn-manager/src/sse.rs` | `subscribe_events_admitted_inner` | `tokio::spawn` |
+| `crates/bn-manager/src/sync_status.rs` | `start_sync_monitor_publishing` | `tokio::spawn` |
