@@ -3,21 +3,35 @@
 //! Scans **tracked** sources only:
 //!
 //! ```text
-//! git ls-files 'crates/rvc/**/*.rs' 'bin/rvc/**/*.rs'
+//! git -c core.quotePath=false ls-files -z -- 'crates/rvc/**/*.rs' 'bin/rvc/**/*.rs'
 //! ```
 //!
-//! Paths containing `/tests/` are dropped. A site is `executor.spawn(`,
-//! `executor.spawn_result(`, `executor.register(`, `executor.register_result(`,
-//! or `executor.register_opt(` whose handle argument is
-//! `Some` (any non-`None` handle expression counts, so a future `Some(_)` cannot
-//! hide). `register_opt(..., None)` is not a site. `spawn_blocking` is not scanned.
+//! Paths are NUL-delimited. A non-UTF-8 path, or a file that cannot be read,
+//! is an error. A path is kept when it ends in `.rs` and does not contain
+//! `/tests/`. A site is a call whose receiver ident ends in `executor` and
+//! whose method is `spawn`, `spawn_result`, `register`, `register_result`, or
+//! `register_opt`. `register_opt` is a site unless its last argument is `None`,
+//! or `None::<...>` whose `>` closes inside that argument and nothing follows
+//! it. `None::<fn() -> u8>` is a site, because `->` supplies that `>`. A last
+//! argument wrapped in `{}`, `()`, or `[]` is still that argument. Commas split
+//! the list on `()` `[]` `{}` depth only; `<` and `>` do not nest.
+//! `spawn_blocking` is not a site. `RawIdent` on a receiver or a method is that
+//! ident with `r#` removed. `r#None` is not the `None` sentinel. Comments and
+//! strings are not idents. The scan keeps reading inside a call's arguments, so
+//! a nested call is visited too. A `::<` with no `>` inside the enclosing call
+//! does not consume tokens past that call.
 //!
-//! The production region ends at the first column-0 `#[cfg(test)]` followed by
-//! `mod` (visibility and a `//` / attribute gap are allowed). A bare `#[cfg(test)]`
-//! does not end the region: `liveness_loop.rs` has method-level attributes above
-//! the production spawn, and truncating there drops that site. Lines whose trimmed
-//! form starts with `///` or `//!` are skipped, so the `run` doc comment in
-//! `liveness_loop.rs` ("Spawns no tasks") is not a spawn.
+//! The production cut is the first token `#[cfg(test)]` followed by `mod`
+//! (`bn_test_cut`). A bare `#[cfg(test)]` does not end the region.
+//! `liveness_loop.rs` has method-level attributes above the production spawn.
+//! A call at or after the attribute is not a site. `bn_test_cut` errors when a
+//! non-gap token follows the module. This scan returns that error when a call
+//! it recognizes starts at or after the module end, including one nested in an
+//! earlier call's arguments. A tail with no such call still uses the cut. The
+//! production prefix is checked with the lexer mask, so a multibyte
+//! char literal there fails the file. One inside the test module is outside
+//! that prefix. A `///` or `//!` line is a comment, not a call, so the `run`
+//! doc comment in `liveness_loop.rs` ("Spawns no tasks") is not a spawn.
 //!
 //! A site passes only when:
 //!
@@ -31,11 +45,16 @@
 //! in other files. The allow-list is empty. The pin is 16 (5 shape B, 11 detached,
 //! shape A = 0).
 //!
-//! The executor pin is a hand-rolled text scan, same style as `raw_spawn.rs`.
-//! Its `production_region_end` line cut is unchanged. The bn-manager section
-//! is separate: `tokio::spawn` and the `#[cfg(test)] mod` cut come from
-//! `ra_ap_rustc_lexer` tokens, and the row names the enclosing item. An
-//! untrusted token stream fails that file.
+//! The bn-manager section is separate. Its rows name the enclosing item.
+//! An untrusted token stream fails that file. The production site list comes
+//! from `find_production_sites`. `register_opt_none_sites` calls the same
+//! `executor_calls` scan for the not-site table and does not build that list.
+//! `census_line_pins_match_sources` still calls
+//! `code_portion` (through `line_is_loop`, and on the prose-cited spawn line),
+//! `is_column0_cfg_test`, `cfg_test_followed_by_mod`, `next_code_line`, and
+//! `first_bare_cfg_test_line`. `bare_cfg_test_does_not_hide_the_liveness_loop_spawn`
+//! still calls `production_region_end` and `code_portion`. Those walks do not
+//! decide a hit.
 
 use ra_ap_rustc_lexer::{tokenize, FrontmatterAllowed, LiteralKind, TokenKind};
 use rvc_architecture_tests::{non_code_spans, SourceItems};
@@ -110,25 +129,8 @@ fn workspace_root() -> PathBuf {
 // Tracked-file scan
 // ---------------------------------------------------------------------------
 
-fn tracked_rs_files(root: &Path) -> Vec<String> {
-    let output = Command::new("git")
-        .args(["ls-files", "--", "crates/rvc/**/*.rs", "bin/rvc/**/*.rs"])
-        .current_dir(root)
-        .output()
-        .expect("git ls-files");
-    assert!(
-        output.status.success(),
-        "git ls-files failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8(output.stdout)
-        .expect("git ls-files utf-8")
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && l.ends_with(".rs"))
-        .filter(|l| !l.contains("/tests/"))
-        .map(|l| l.replace('\\', "/"))
-        .collect()
+fn tracked_rs_files(root: &Path) -> Result<Vec<String>, String> {
+    tracked_nul(root, "executor", &["crates/rvc/**/*.rs", "bin/rvc/**/*.rs"])
 }
 
 // ---------------------------------------------------------------------------
@@ -232,232 +234,203 @@ fn code_portion(line: &str) -> &str {
     line
 }
 
-/// Production code with comment-only lines blanked, cut at the module attribute.
-///
-/// Line numbers match the original file. Doc comments (`///`, `//!`) and other
-/// `//` lines contribute no tokens.
-fn production_code(src: &str) -> String {
-    let lines: Vec<&str> = src.lines().collect();
-    let end = production_region_end(&lines).unwrap_or(lines.len() + 1);
-    let mut out = String::new();
-    for (i, line) in lines.iter().enumerate() {
-        if i + 1 >= end {
-            break;
-        }
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("///") || trimmed.starts_with("//!") || trimmed.starts_with("//") {
-            out.push('\n');
-        } else {
-            out.push_str(code_portion(line));
-            out.push('\n');
-        }
-    }
-    out
-}
-
-struct CallHit {
+struct ExecHit {
+    at: usize,
     kind: Kind,
-    line: usize,
     is_site: bool,
-    close_paren: usize,
 }
 
-fn find_calls(code: &str) -> Vec<CallHit> {
-    let bytes = code.as_bytes();
-    let mut i = 0;
-    let mut in_str = false;
-    let mut hits = Vec::new();
-    while i < bytes.len() {
-        if in_str {
-            if bytes[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if bytes[i] == b'"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'"' {
-            in_str = true;
-            i += 1;
-            continue;
-        }
-        if code[i..].starts_with("executor.") {
-            if let Some(hit) = parse_call(code, i) {
-                let next = hit.close_paren + 1;
-                hits.push(hit);
-                i = next;
-                continue;
-            }
-        }
-        i += 1;
+fn exec_method(name: &str) -> Option<Kind> {
+    match name {
+        "spawn" | "spawn_result" => Some(Kind::Spawn),
+        "register" | "register_result" => Some(Kind::Register),
+        "register_opt" => Some(Kind::RegisterOpt),
+        _ => None,
     }
-    hits
 }
 
-fn parse_call(code: &str, at: usize) -> Option<CallHit> {
-    let rest_at = at + "executor.".len();
-    let rest = &code[rest_at..];
-    let (kind, name_len) = method_kind(rest)?;
-    let mut j = name_len;
-    j += ws_len(&rest[j..]);
-    if rest[j..].starts_with("::") {
-        j = skip_turbofish(rest, j)?;
-        j += ws_len(&rest[j..]);
+/// `None` or `None::<...>`, and nothing else, from `start` up to `end`.
+fn none_sentinel(src: &str, toks: &[(usize, usize, TokenKind)], start: usize, end: usize) -> bool {
+    let i = next_solid(toks, start);
+    if i >= end || !word_is(src, toks, i, "None") {
+        return false;
     }
-    if rest.as_bytes().get(j) != Some(&b'(') {
-        return None;
+    let mut j = next_solid(toks, i + 1);
+    if j >= end {
+        return true;
     }
-    let paren = rest_at + j;
-    let close = matching_paren(code, paren)?;
-    let args = &code[paren + 1..close];
-    let is_site = match kind {
-        Kind::RegisterOpt => !last_arg_is_none(args),
-        Kind::Spawn | Kind::Register => true,
-    };
-    let line = code[..at].bytes().filter(|&c| c == b'\n').count() + 1;
-    Some(CallHit { kind, line, is_site, close_paren: close })
-}
-
-fn method_kind(rest: &str) -> Option<(Kind, usize)> {
-    const CANDIDATES: &[(&str, Kind)] = &[
-        ("register_opt", Kind::RegisterOpt),
-        ("register_result", Kind::Register),
-        ("register", Kind::Register),
-        ("spawn_result", Kind::Spawn),
-        ("spawn", Kind::Spawn),
-    ];
-    for &(name, kind) in CANDIDATES {
-        if let Some(after) = rest.strip_prefix(name) {
-            let continues = after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_');
-            if !continues {
-                return Some((kind, name.len()));
-            }
-        }
+    if !matches!(toks[j].2, TokenKind::Colon) {
+        return false;
     }
-    None
-}
-
-fn ws_len(s: &str) -> usize {
-    s.chars().take_while(|c| c.is_whitespace()).map(char::len_utf8).sum()
-}
-
-fn skip_turbofish(rest: &str, mut j: usize) -> Option<usize> {
-    if !rest[j..].starts_with("::") {
-        return Some(j);
+    j = next_solid(toks, j + 1);
+    if j >= end || !matches!(toks[j].2, TokenKind::Colon) {
+        return false;
     }
-    j += 2;
-    j += ws_len(&rest[j..]);
-    let bytes = rest.as_bytes();
-    if bytes.get(j) != Some(&b'<') {
-        return None;
+    j = next_solid(toks, j + 1);
+    if j >= end || !matches!(toks[j].2, TokenKind::Lt) {
+        return false;
     }
-    let mut depth = 0i32;
-    while j < bytes.len() {
-        match bytes[j] {
-            b'<' => depth += 1,
-            b'>' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(j + 1);
-                }
-            }
-            _ => {}
-        }
-        j += 1;
-    }
-    None
-}
-
-fn matching_paren(src: &str, open: usize) -> Option<usize> {
-    let bytes = src.as_bytes();
-    if bytes.get(open) != Some(&b'(') {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut in_str = false;
-    let mut i = open;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == b'"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
-}
-
-/// Top-level comma-separated arguments. A trailing comma does not invent an empty last arg.
-fn top_level_args(args: &str) -> Vec<&str> {
-    let bytes = args.as_bytes();
-    let mut depth_paren = 0i32;
-    let mut depth_brack = 0i32;
-    let mut depth_brace = 0i32;
-    let mut in_str = false;
-    let mut parts = Vec::new();
-    let mut start = 0;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str {
-            if b == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b == b'"' {
-                in_str = false;
-            }
-            i += 1;
-            continue;
-        }
-        match b {
-            b'"' => in_str = true,
-            b'(' => depth_paren += 1,
-            b')' => depth_paren -= 1,
-            b'[' => depth_brack += 1,
-            b']' => depth_brack -= 1,
-            b'{' => depth_brace += 1,
-            b'}' => depth_brace -= 1,
-            b',' if depth_paren == 0 && depth_brack == 0 && depth_brace == 0 => {
-                parts.push(&args[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    parts.push(&args[start..]);
-    parts
-}
-
-/// `None` or `None::<...>`. `Some(...)` is not `None`. A trailing comma is ignored.
-fn last_arg_is_none(args: &str) -> bool {
-    let last = top_level_args(args).into_iter().rev().find(|p| !p.trim().is_empty()).unwrap_or("");
-    let Some(rest) = last.trim().strip_prefix("None") else {
+    // The closing `>` has to sit inside this argument. `->` inside it still closes early.
+    let Some(after) = skip_until_before(toks, j, end, TokenKind::Lt, TokenKind::Gt) else {
         return false;
     };
-    rest.is_empty() || !rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+    next_solid(toks, after) >= end
+}
+
+/// Last argument, found from the end. `()` `[]` `{}` nest. `<` and `>` do not.
+fn last_arg_is_none(
+    src: &str,
+    toks: &[(usize, usize, TokenKind)],
+    open: usize,
+    close: usize,
+) -> bool {
+    let mut paren = 0i32;
+    let mut brack = 0i32;
+    let mut brace = 0i32;
+    let mut end = close;
+    let mut saw = false;
+    let mut i = close;
+    while i > open {
+        i -= 1;
+        let kind = toks[i].2;
+        let flat = paren == 0 && brack == 0 && brace == 0;
+        // A closer at flat depth is part of the last argument (`{ Some(h) }`).
+        if flat && !matches!(kind, TokenKind::Comma) && !is_gap(kind) {
+            saw = true;
+        }
+        match kind {
+            TokenKind::CloseParen => paren += 1,
+            TokenKind::OpenParen => paren -= 1,
+            TokenKind::CloseBracket => brack += 1,
+            TokenKind::OpenBracket => brack -= 1,
+            TokenKind::CloseBrace => brace += 1,
+            TokenKind::OpenBrace => brace -= 1,
+            TokenKind::Comma if flat => {
+                if saw {
+                    return none_sentinel(src, toks, i + 1, end);
+                }
+                end = i;
+            }
+            _ => {}
+        }
+    }
+    saw && none_sentinel(src, toks, open + 1, end)
+}
+
+fn executor_calls(src: &str, toks: &[(usize, usize, TokenKind)]) -> Result<Vec<ExecHit>, String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    // Exclusive token index of the call whose arguments we are inside.
+    let mut limit = vec![toks.len()];
+    while i < toks.len() {
+        while limit.len() > 1 && i >= *limit.last().unwrap() {
+            limit.pop();
+        }
+        if !call_word(src, &toks[i]).is_some_and(|word| word.ends_with("executor")) {
+            i += 1;
+            continue;
+        }
+        let dot = next_solid(toks, i + 1);
+        let name = next_solid(toks, dot + 1);
+        let kind = toks.get(name).and_then(|tok| call_word(src, tok)).and_then(exec_method);
+        if !matches!(toks.get(dot).map(|tok| tok.2), Some(TokenKind::Dot)) || kind.is_none() {
+            i += 1;
+            continue;
+        }
+        let mut open = next_solid(toks, name + 1);
+        if matches!(toks.get(open).map(|tok| tok.2), Some(TokenKind::Colon)) {
+            let colon2 = next_solid(toks, open + 1);
+            let lt = next_solid(toks, colon2 + 1);
+            if !matches!(toks.get(colon2).map(|tok| tok.2), Some(TokenKind::Colon))
+                || !matches!(toks.get(lt).map(|tok| tok.2), Some(TokenKind::Lt))
+            {
+                i += 1;
+                continue;
+            }
+            let end = *limit.last().unwrap();
+            let Some(after) = skip_until_before(toks, lt, end, TokenKind::Lt, TokenKind::Gt) else {
+                // No closer inside this call. At end of file that is an error.
+                // Inside a call, keep scanning so a later spawn is not dropped.
+                if end == toks.len() {
+                    return Err("unclosed turbofish".to_string());
+                }
+                i += 1;
+                continue;
+            };
+            open = next_solid(toks, after);
+            if open >= end {
+                i += 1;
+                continue;
+            }
+        }
+        if !matches!(toks.get(open).map(|tok| tok.2), Some(TokenKind::OpenParen)) {
+            i += 1;
+            continue;
+        }
+        let Some(after_close) = skip_until(toks, open, TokenKind::OpenParen, TokenKind::CloseParen)
+        else {
+            return Err("unclosed call".to_string());
+        };
+        let close = after_close - 1;
+        let is_site = match kind.unwrap() {
+            Kind::RegisterOpt => !last_arg_is_none(src, toks, open, close),
+            Kind::Spawn | Kind::Register => true,
+        };
+        out.push(ExecHit { at: toks[i].0, kind: kind.unwrap(), is_site });
+        // Keep scanning the argument list so a nested call is not skipped.
+        // The turbofish skip above cannot run past this call.
+        limit.push(after_close);
+        i = open + 1;
+    }
+    Ok(out)
+}
+
+/// Attribute byte of the first `#[cfg(test)] mod`, and the byte after that module.
+fn test_mod_span(src: &str, toks: &[(usize, usize, TokenKind)]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i < toks.len() {
+        if matches!(toks[i].2, TokenKind::Pound) {
+            if let Some(after) = cfg_test_attr_end(src, toks, i) {
+                if let Some(mod_i) = mod_after(src, toks, after) {
+                    if let Some(end) = module_end(toks, mod_i) {
+                        return Some((toks[i].0, end));
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `bn_test_cut`, except a non-gap token after the module is an error only
+/// when a recognized call starts at or after the module end.
+fn executor_cut(src: &str, toks: &[(usize, usize, TokenKind)]) -> Result<Option<usize>, String> {
+    match bn_test_cut(src, toks) {
+        Ok(cut) => Ok(cut),
+        Err(msg) if msg == "production code follows the test module" => {
+            let Some((cut, end)) = test_mod_span(src, toks) else {
+                return Err(msg);
+            };
+            let calls = executor_calls(src, toks)?;
+            if calls.iter().any(|hit| hit.at >= end) {
+                Err(msg)
+            } else {
+                Ok(Some(cut))
+            }
+        }
+        Err(msg) => Err(msg),
+    }
+}
+
+type Lexed = Vec<(usize, usize, TokenKind)>;
+
+/// Tokens for the whole file. The production prefix is checked with the mask.
+fn executor_lex(src: &str) -> Result<(Lexed, Option<usize>), String> {
+    let toks = lex_file(src, false)?;
+    let cut = executor_cut(src, &toks)?;
+    lex_file(&src[..cut.unwrap_or(src.len())], true)?;
+    Ok((toks, cut))
 }
 
 fn is_detached_comment(line: &str) -> bool {
@@ -476,19 +449,22 @@ fn preceding_nonempty<'a>(lines: &[&'a str], line_1based: usize) -> Option<&'a s
     None
 }
 
-fn find_production_sites(path: &str, src: &str) -> Vec<Site> {
+fn find_production_sites(path: &str, src: &str) -> Result<Vec<Site>, String> {
+    let (toks, cut) = executor_lex(src).map_err(|err| format!("row {path}: {err}"))?;
+    let prefix = cut.unwrap_or(src.len());
     let lines: Vec<&str> = src.lines().collect();
-    let code = production_code(src);
+    let starts = line_starts(src);
     let mut sites = Vec::new();
-    for hit in find_calls(&code) {
-        if !hit.is_site {
+    for hit in executor_calls(src, &toks).map_err(|err| format!("row {path}: {err}"))? {
+        if hit.at >= prefix || !hit.is_site {
             continue;
         }
-        let text = lines.get(hit.line - 1).map(|l| l.trim().to_string()).unwrap_or_default();
-        let detached = preceding_nonempty(&lines, hit.line).is_some_and(is_detached_comment);
-        sites.push(Site { path: path.to_string(), line: hit.line, kind: hit.kind, detached, text });
+        let line = starts.partition_point(|start| *start <= hit.at);
+        let text = lines[line - 1].trim().to_string();
+        let detached = preceding_nonempty(&lines, line).is_some_and(is_detached_comment);
+        sites.push(Site { path: path.to_string(), line, kind: hit.kind, detached, text });
     }
-    sites
+    Ok(sites)
 }
 
 // ---------------------------------------------------------------------------
@@ -536,31 +512,60 @@ fn split_path_line(spec: &str) -> Option<(String, usize)> {
     Some((path.to_string(), line))
 }
 
-/// The loop file contains `parent: None` on the task's span and a `follows_from`.
+/// The loop file contains `parent: None` and the task string on one line, plus `follows_from`.
 ///
-/// The task quote is exact (`"index.resolve"` does not match `"index.resolve.tick"`).
-/// Comments are ignored. This reads the census loop file, not a window around the spawn.
-fn loop_file_has_shape_b(loop_src: &str, task: &str) -> bool {
-    let quoted = format!("\"{task}\"");
+/// Tokens only. The string is the task itself, so `"index.resolve"` is not
+/// `"index.resolve.tick"`. Comment tokens are not idents. This reads the census
+/// loop file, not a window around the spawn. The mask check stays on the site scan.
+fn loop_file_has_shape_b(loop_src: &str, task: &str) -> Result<bool, String> {
+    let toks = lex_file(loop_src, false)?;
+    let starts = line_starts(loop_src);
     let mut parent_for_task = false;
     let mut follows = false;
-    for line in loop_src.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("//") {
-            continue;
+    let mut line = 0usize;
+    let mut saw_pair = false;
+    let mut saw_task = false;
+    for i in 0..toks.len() {
+        let this = starts.partition_point(|at| *at <= toks[i].0);
+        if this != line {
+            if saw_pair && saw_task {
+                parent_for_task = true;
+            }
+            line = this;
+            saw_pair = false;
+            saw_task = false;
         }
-        let code = code_portion(line);
-        if code.contains("parent: None") && code.contains(&quoted) {
-            parent_for_task = true;
+        if word_is(loop_src, &toks, i, "parent") {
+            let colon = next_solid(&toks, i + 1);
+            let none = next_solid(&toks, colon + 1);
+            let colon_line = toks.get(colon).map(|tok| starts.partition_point(|at| *at <= tok.0));
+            let none_line = toks.get(none).map(|tok| starts.partition_point(|at| *at <= tok.0));
+            if matches!(toks.get(colon).map(|tok| tok.2), Some(TokenKind::Colon))
+                && word_is(loop_src, &toks, none, "None")
+                && colon_line == Some(this)
+                && none_line == Some(this)
+            {
+                saw_pair = true;
+            }
         }
-        if code.contains("follows_from") {
+        if let TokenKind::Literal { kind: LiteralKind::Str { terminated: true }, .. } = toks[i].2 {
+            let text = loop_src.get(toks[i].0..toks[i].1).unwrap_or("");
+            let plain = text.strip_prefix('"').and_then(|rest| rest.strip_suffix('"'));
+            if !text.contains('\\') && plain == Some(task) {
+                saw_task = true;
+            }
+        }
+        if word_is(loop_src, &toks, i, "follows_from") {
             follows = true;
         }
     }
-    parent_for_task && follows
+    if saw_pair && saw_task {
+        parent_for_task = true;
+    }
+    Ok(parent_for_task && follows)
 }
 
-fn classify(site: &Site, rows: &[ShapeBRow], loop_ok: impl Fn(&ShapeBRow) -> bool) -> Class {
+fn classify(site: &Site, rows: &[ShapeBRow], mut loop_ok: impl FnMut(&ShapeBRow) -> bool) -> Class {
     if let Some(row) = rows.iter().find(|r| r.spawn_path == site.path && r.spawn_line == site.line)
     {
         if site.detached {
@@ -586,9 +591,9 @@ fn pin_failure(found: usize, detail: &str) -> String {
     format!(
         "production executor site count is {found}, pin is {PIN} \
          ({SHAPE_B_PIN} shape B, {DETACHED_PIN} detached, shape A = {SHAPE_A_PIN}).\n\
-         Exclusion rule: end each file's production region at the first column-0 \
+         Exclusion rule: end each file's production region at the first token \
          `#[cfg(test)]` followed by `mod` (do not truncate at the first bare \
-         `#[cfg(test)]`); skip lines whose trimmed form starts with `///` or `//!`; \
+         `#[cfg(test)]`); a `///` or `//!` line is a comment, not a call; \
          `register_opt(..., None)` is not a site; drop paths containing `/tests/`.\n\
          A site passes only when (1) the immediately preceding non-empty line is a \
          `// detached:` comment, or (2) it is one of the five census shape-B spawns \
@@ -599,27 +604,39 @@ fn pin_failure(found: usize, detail: &str) -> String {
     )
 }
 
-fn scan_workspace(root: &Path) -> (Vec<Site>, Vec<ShapeBRow>) {
-    let files = tracked_rs_files(root);
-    assert!(
-        files.len() > 40,
-        "scanned only {} tracked files under crates/rvc and bin/rvc; git ls-files likely broke",
-        files.len()
-    );
-    let census = std::fs::read_to_string(root.join(CENSUS)).unwrap_or_default();
-    let rows = parse_shape_b(&census);
-    let mut sites = Vec::new();
-    for rel in &files {
-        let src = std::fs::read_to_string(root.join(rel)).unwrap_or_default();
-        sites.extend(find_production_sites(rel, &src));
+fn load_executor(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for rel in tracked_rs_files(root)? {
+        let src =
+            std::fs::read_to_string(root.join(&rel)).map_err(|err| format!("row {rel}: {err}"))?;
+        out.push((rel, src));
     }
-    sites.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
-    (sites, rows)
+    Ok(out)
 }
 
-fn loop_ok_for<'a>(root: &'a Path) -> impl Fn(&ShapeBRow) -> bool + 'a {
+fn scan_workspace(root: &Path) -> Result<(Vec<Site>, Vec<ShapeBRow>), String> {
+    let files = load_executor(root)?;
+    if files.len() <= 40 {
+        return Err(format!(
+            "scanned only {} tracked files under crates/rvc and bin/rvc; git ls-files likely broke",
+            files.len()
+        ));
+    }
+    let census =
+        std::fs::read_to_string(root.join(CENSUS)).map_err(|err| format!("row {CENSUS}: {err}"))?;
+    let rows = parse_shape_b(&census);
+    let mut sites = Vec::new();
+    for (rel, src) in &files {
+        sites.extend(find_production_sites(rel, src)?);
+    }
+    sites.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
+    Ok((sites, rows))
+}
+
+fn loop_ok_for<'a>(root: &'a Path) -> impl Fn(&ShapeBRow) -> Result<bool, String> + 'a {
     move |row: &ShapeBRow| {
-        let src = std::fs::read_to_string(root.join(&row.loop_path)).unwrap_or_default();
+        let src = std::fs::read_to_string(root.join(&row.loop_path))
+            .map_err(|err| format!("row {}: {err}", row.loop_path))?;
         loop_file_has_shape_b(&src, &row.task)
     }
 }
@@ -629,14 +646,14 @@ fn loop_ok_for<'a>(root: &'a Path) -> impl Fn(&ShapeBRow) -> bool + 'a {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn production_executor_sites_pin_fourteen() {
+fn production_executor_sites_pin_sixteen() {
     assert!(
         ALLOW_LIST.is_empty(),
         "allow-list stays empty; classify with a // detached: comment or a census shape-B row"
     );
 
     let root = workspace_root();
-    let (sites, rows) = scan_workspace(&root);
+    let (sites, rows) = scan_workspace(&root).unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(
         rows.len(),
         SHAPE_B_PIN,
@@ -652,7 +669,13 @@ fn production_executor_sites_pin_fourteen() {
     let mut rendered: Vec<String> = Vec::new();
 
     for site in &sites {
-        let class = classify(site, &rows, &loop_ok);
+        let class = classify(site, &rows, |row| match loop_ok(row) {
+            Ok(ok) => ok,
+            Err(err) => {
+                problems.push(err);
+                false
+            }
+        });
         let label = match class {
             Class::Detached => {
                 detached += 1;
@@ -763,7 +786,7 @@ fn bare_cfg_test_does_not_hide_the_liveness_loop_spawn() {
         lines.iter().any(|l| l.trim_start().starts_with("///") && l.contains("Spawns no tasks")),
         "re-locate the run() doc comment; it must not be scanned as a spawn"
     );
-    let sites = find_production_sites("crates/rvc/src/liveness_loop.rs", &src);
+    let sites = find_production_sites("crates/rvc/src/liveness_loop.rs", &src).unwrap();
     assert_eq!(sites.len(), 1, "doc comment and test-module spawns must not count: {sites:?}");
     assert_eq!(sites[0].line, spawn);
     assert!(!sites[0].detached, "the shape-B spawn line has no // detached: comment");
@@ -777,7 +800,7 @@ fn doc_comment_mentioning_a_spawn_is_not_a_site() {
 //! module doc executor.register(\n\
 pub async fn run(self) {}\n\
 ";
-    let sites = find_production_sites("crates/rvc/src/liveness_loop.rs", src);
+    let sites = find_production_sites("crates/rvc/src/liveness_loop.rs", src).unwrap();
     assert!(sites.is_empty(), "doc comments are not spawns: {sites:?}");
 }
 
@@ -797,8 +820,9 @@ fn register_opt_none_is_not_a_site_and_some_is() {
             Some(handle),\n\
         );\n\
         executor.spawn_blocking(\"not-a-site\", || {});\n\
+        executor.register_opt::<()>(\"typed\", tier, None::<()>);\n\
 ";
-    let sites = find_production_sites("crates/rvc/src/bootstrap/tasks.rs", src);
+    let sites = find_production_sites("crates/rvc/src/bootstrap/tasks.rs", src).unwrap();
     assert_eq!(
         sites.len(),
         2,
@@ -818,7 +842,7 @@ fn spawn_result_and_register_result_are_sites() {
         executor.register_result(\"metrics_like\", ShutdownTier::Telemetry, handle);\n\
         executor.spawn_blocking(\"not-a-site\", || {});\n\
 ";
-    let sites = find_production_sites("crates/rvc/src/bootstrap/run.rs", src);
+    let sites = find_production_sites("crates/rvc/src/bootstrap/run.rs", src).unwrap();
     assert_eq!(
         sites.len(),
         2,
@@ -847,7 +871,7 @@ mod tests {\n\
     }\n\
 }\n\
 ";
-    let sites = find_production_sites("crates/rvc/src/liveness_loop.rs", src);
+    let sites = find_production_sites("crates/rvc/src/liveness_loop.rs", src).unwrap();
     assert_eq!(sites.len(), 1, "{sites:?}");
     assert_eq!(sites[0].line, 4);
     assert!(sites[0].text.contains("liveness_loop"));
@@ -880,29 +904,29 @@ fn shape_b_reads_the_census_loop_file_not_a_spawn_window() {
         spawn_line: 1,
         loop_path: "crates/rvc/src/background_tasks/monitoring.rs".to_string(),
     };
-    let site = find_production_sites(&row.spawn_path, spawn_file).pop().unwrap();
+    let site = find_production_sites(&row.spawn_path, spawn_file).unwrap().pop().unwrap();
     assert!(!site.detached);
     assert_eq!(
         classify(&site, std::slice::from_ref(&row), |_| {
-            loop_file_has_shape_b(loop_file, "monitoring_push")
+            loop_file_has_shape_b(loop_file, "monitoring_push").unwrap()
         }),
         Class::ShapeB
     );
     assert_eq!(
         classify(&site, std::slice::from_ref(&row), |_| {
-            loop_file_has_shape_b(other_task, "monitoring_push")
+            loop_file_has_shape_b(other_task, "monitoring_push").unwrap()
         }),
         Class::ShapeBLoopMissing,
         "parent: None for a different task is not shape B"
     );
-    let window_site = find_production_sites(&row.spawn_path, window_only).pop().unwrap();
+    let window_site = find_production_sites(&row.spawn_path, window_only).unwrap().pop().unwrap();
     assert_eq!(
         classify(&window_site, std::slice::from_ref(&row), |_| false),
         Class::ShapeBLoopMissing,
         "a same-file window is not enough when the census loop file does not carry the spans"
     );
-    assert!(loop_file_has_shape_b(loop_file, "monitoring_push"));
-    assert!(!loop_file_has_shape_b(other_task, "monitoring_push"));
+    assert!(loop_file_has_shape_b(loop_file, "monitoring_push").unwrap());
+    assert!(!loop_file_has_shape_b(other_task, "monitoring_push").unwrap());
 }
 
 #[test]
@@ -913,7 +937,7 @@ fn detached_comment_is_the_preceding_nonempty_line() {
     executor.spawn(\"metrics_server\", ShutdownTier::Telemetry, async move {});\n\
     executor.spawn(\"bare\", ShutdownTier::Background, async move {});\n\
 ";
-    let sites = find_production_sites("crates/rvc/src/bootstrap/tasks.rs", src);
+    let sites = find_production_sites("crates/rvc/src/bootstrap/tasks.rs", src).unwrap();
     assert_eq!(sites.len(), 2, "{sites:?}");
     assert!(sites[0].detached);
     assert!(!sites[1].detached);
@@ -933,9 +957,343 @@ fn shape_b_spawn_must_not_carry_a_detached_comment() {
         spawn_line: 2,
         loop_path: "crates/rvc/src/liveness_loop.rs".to_string(),
     };
-    let site = find_production_sites(&row.spawn_path, src).pop().unwrap();
+    let site = find_production_sites(&row.spawn_path, src).unwrap().pop().unwrap();
     assert!(site.detached);
     assert_eq!(classify(&site, &[row], |_| true), Class::ShapeBWithDetached);
+}
+
+#[test]
+fn executor_keeps_a_spawn_after_a_raw_string_cfg_decoy() {
+    let src = "\
+fn item() {\n\
+    let _ = r#\"\n\
+#[cfg(test)]\n\
+mod x\n\
+\"#;\n\
+    executor.spawn(\"kept\", tier, async {});\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert!(sites[0].text.contains("kept"), "{sites:?}");
+}
+
+#[test]
+fn executor_keeps_a_spawn_after_a_block_comment_cfg_decoy() {
+    let src = "\
+fn item() {\n\
+    /*\n\
+#[cfg(test)]\n\
+mod x\n\
+*/\n\
+    executor.spawn(\"kept\", tier, async {});\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert!(sites[0].text.contains("kept"), "{sites:?}");
+}
+
+#[test]
+fn executor_accepts_r_hash_spawn_inside_a_macro() {
+    let src = "macro_rules! m { () => { r#executor.r#spawn(\"t\", tier, async {}); }; }\n";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    let one = "macro_rules! m { () => { executor.r#spawn(\"t\", tier, async {}); }; }\n";
+    let sites = find_production_sites("a.rs", one).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+}
+
+#[test]
+fn executor_rejects_production_code_after_the_test_module() {
+    let src = "\
+fn item() { executor.spawn(\"before\", tier, async {}); }\n\
+#[cfg(test)]\n\
+mod tests {}\n\
+fn after() { executor.spawn(\"after\", tier, async {}); }\n\
+";
+    let err = find_production_sites("a.rs", src).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("follows the test module"), "{err}");
+    let semi = "fn item() { executor.spawn(\"before\", tier, async {}); }\n#[cfg(test)] mod tests;\nfn after() { executor.spawn(\"after\", tier, async {}); }\n";
+    let err = find_production_sites("a.rs", semi).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("follows the test module"), "{err}");
+}
+
+#[test]
+fn executor_rejects_a_production_multibyte_char_literal() {
+    let src = "fn item() {\n    let _ = '€';\n    executor.spawn(\"t\", tier, async {});\n}\n";
+    let err = find_production_sites("a.rs", src).unwrap_err();
+    assert!(err.contains("a.rs"), "{err}");
+    assert!(err.contains("lexer mask disagreed"), "{err}");
+}
+
+#[test]
+fn executor_keeps_a_multibyte_char_literal_inside_the_test_module() {
+    let src = "\
+fn item() { executor.spawn(\"kept\", tier, async {}); }\n\
+#[cfg(test)]\n\
+mod tests {\n\
+    fn t() { let _ = '€'; }\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert!(sites[0].text.contains("kept"), "{sites:?}");
+}
+
+#[test]
+fn executor_keeps_a_spawn_inside_a_non_test_cfg_module() {
+    let unix = "\
+fn item() { executor.spawn(\"outer\", tier, async {}); }\n\
+#[cfg(unix)]\n\
+mod p {\n\
+    pub fn g() { executor.spawn(\"inner\", tier, async {}); }\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", unix).unwrap();
+    assert_eq!(sites.len(), 2, "{sites:?}");
+    let not_test = "\
+fn item() { executor.spawn(\"outer\", tier, async {}); }\n\
+#[cfg(not(test))]\n\
+mod p {\n\
+    pub fn g() { executor.spawn(\"inner\", tier, async {}); }\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", not_test).unwrap();
+    assert_eq!(sites.len(), 2, "{sites:?}");
+}
+
+#[test]
+fn executor_counts_a_receiver_whose_name_ends_in_executor() {
+    let src = "\
+fn item() {\n\
+    task_executor.spawn(\"task\", tier, async {});\n\
+    self.bg_executor.register(\"reg\", tier, handle);\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 2, "{sites:?}");
+    assert_eq!(sites[0].kind, Kind::Spawn);
+    assert_eq!(sites[1].kind, Kind::Register);
+}
+
+#[test]
+fn executor_rejects_a_nested_call_after_the_test_module() {
+    let src = "\
+fn f() {\n\
+    executor.spawn(\"a\", tier, async move {\n\
+        #[cfg(test)] mod t {}\n\
+        executor.spawn(\"b\", tier, async {});\n\
+    });\n\
+}\n\
+";
+    let err = find_production_sites("a.rs", src).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("follows the test module"), "{err}");
+}
+
+#[test]
+fn executor_counts_a_spawn_nested_in_register_opt_none() {
+    let src = "\
+fn item() {\n\
+    executor.r#register_opt::<()>(\"n\", { executor.spawn(\"inner\", tier, async {}); tier }, None);\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert_eq!(sites[0].kind, Kind::Spawn);
+    assert!(sites[0].text.contains("inner"), "{sites:?}");
+}
+
+#[test]
+fn executor_counts_register_opt_past_a_comparison_in_an_earlier_arg() {
+    let src = "\
+fn item() {\n\
+    executor.register_opt(\"t\", None.unwrap_or(if 0 < 1 { tier } else { tier }), Some(h));\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert_eq!(sites[0].kind, Kind::RegisterOpt);
+}
+
+#[test]
+fn executor_counts_register_opt_when_none_is_not_the_whole_last_arg() {
+    let src = "\
+fn item() {\n\
+    executor.register_opt(\"t\", tier, None.or(Some(h)));\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert_eq!(sites[0].kind, Kind::RegisterOpt);
+}
+
+#[test]
+fn executor_does_not_nest_angles_when_splitting_arguments() {
+    let src = "fn item() { executor.register_opt(\"t\", tier, None::<A, B>); }\n";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert_eq!(sites[0].kind, Kind::RegisterOpt);
+}
+
+#[test]
+fn executor_counts_a_grouped_last_argument() {
+    let src = "\
+fn item() {\n\
+    executor.register_opt(\"t\", None, { Some(h) });\n\
+    executor.register_opt(\"t\", None, (Some(h)),);\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 2, "{sites:?}");
+    assert!(sites.iter().all(|s| s.kind == Kind::RegisterOpt), "{sites:?}");
+}
+
+#[test]
+fn executor_counts_none_turbofish_when_the_closer_is_outside_the_argument() {
+    let src = "\
+fn item() {\n\
+    executor.register_opt(\"t\", tier, None::<JoinHandle<[u8; (0 < 1) as usize]>>.or(Some(h)));\n\
+    fn ret() -> u8 { 0 }\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert_eq!(sites[0].kind, Kind::RegisterOpt);
+}
+
+#[test]
+fn executor_counts_none_turbofish_closed_by_an_arrow() {
+    let src = "fn item() { executor.register_opt(\"t\", tier, None::<fn() -> u8>); }\n";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert_eq!(sites[0].kind, Kind::RegisterOpt);
+}
+
+#[test]
+fn executor_keeps_a_spawn_after_an_unclosed_turbofish_in_an_argument() {
+    let src = "\
+fn f() {\n\
+    executor.spawn(\"outer\", tier, async { stringify!(executor.register_opt::<); });\n\
+    executor.spawn(\"real\", tier, async {});\n\
+    let _ = Some(()) > (None);\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 2, "{sites:?}");
+    assert!(sites.iter().any(|s| s.text.contains("\"real\"")), "{sites:?}");
+}
+
+#[test]
+fn executor_rejects_a_post_module_spawn_past_an_unclosed_turbofish() {
+    let src = "\
+fn f() {\n\
+    executor.spawn(\"outer\", tier, async { stringify!(executor.register_opt::<); });\n\
+    #[cfg(test)]\n\
+    mod t {}\n\
+    executor.spawn(\"real\", tier, async {});\n\
+    let _ = Some(()) > (None);\n\
+}\n\
+";
+    let err = find_production_sites("a.rs", src).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("follows the test module"), "{err}");
+}
+
+#[test]
+fn executor_keeps_a_none_turbofish_that_contains_a_nested_comma() {
+    let src = "\
+fn item() {\n\
+    executor.register_opt(\"t\", tier, None::<u8>.or(Some(h)));\n\
+    executor.register_opt(\"t\", tier, None::<JoinHandle<(u8, u8)>>);\n\
+    executor.register_opt(\"t\", tier, None::<[A, B]>);\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert!(sites[0].text.contains(".or("), "{sites:?}");
+}
+
+#[test]
+fn executor_rejects_a_call_that_starts_on_the_module_end_byte() {
+    let src = "fn f() {\n    #[cfg(test)] mod t {}executor.spawn(\"after\", tier, async {});\n}\n";
+    let err = find_production_sites("a.rs", src).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("follows the test module"), "{err}");
+}
+
+#[test]
+fn executor_keeps_a_call_inside_the_test_module_when_the_tail_has_none() {
+    let src = "\
+fn item() { executor.spawn(\"before\", tier, async {}); }\n\
+#[cfg(test)]\n\
+mod tests {\n\
+    fn t() { executor.spawn(\"inside\", tier, async {}); }\n\
+}\n\
+fn after() {}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert!(sites[0].text.contains("before"), "{sites:?}");
+}
+
+#[test]
+fn shape_b_requires_follows_from() {
+    let src = "let loop_span = tracing::info_span!(parent: None, \"monitoring_push\");\n";
+    assert!(!loop_file_has_shape_b(src, "monitoring_push").unwrap());
+}
+
+#[test]
+fn executor_requires_a_dot_before_the_method() {
+    let src = "\
+fn item() {\n\
+    executor.spawn(\"kept\", tier, async {});\n\
+    executor x spawn(\"no-dot\", tier, async {});\n\
+}\n\
+";
+    let sites = find_production_sites("a.rs", src).unwrap();
+    assert_eq!(sites.len(), 1, "{sites:?}");
+    assert!(sites[0].text.contains("kept"), "{sites:?}");
+}
+
+#[test]
+fn executor_reads_non_ascii_and_quoted_tracked_paths() {
+    let cafe = "crates/rvc/src/café.rs";
+    let messy = "crates/rvc/src/q\"b\\c\td.rs";
+    let body = "fn h() { executor.spawn(\"t\", tier, async {}); }\n";
+    let root = init_bn_repo(&[(cafe, body), (messy, body)]);
+    let files = tracked_rs_files(&root).unwrap();
+    assert!(files.iter().any(|path| path.contains("café")), "{files:?}");
+    assert!(
+        files.iter().any(|path| path.contains('"') && path.contains('\\') && path.contains('\t')),
+        "{files:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn executor_names_a_non_utf8_tracked_path() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = init_bn_repo(&[]);
+    let mut name = b"bad".to_vec();
+    name.push(0xff);
+    name.extend(b".rs");
+    let path = root.join("crates/rvc/src").join(std::ffi::OsString::from_vec(name));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "fn h() { executor.spawn(\"t\", tier, async {}); }\n").unwrap();
+    let out = Command::new("git").args(["add", "-A"]).current_dir(&root).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = tracked_rs_files(&root).unwrap_err();
+    assert!(err.contains("non-utf8") && err.contains("executor") && err.contains("bad"), "{err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn executor_names_an_unreadable_tracked_file() {
+    let rel = "crates/rvc/src/gone.rs";
+    let root = init_bn_repo(&[(rel, "fn h() { executor.spawn(\"t\", tier, async {}); }\n")]);
+    std::fs::remove_file(root.join(rel)).unwrap();
+    let err = load_executor(&root).unwrap_err();
+    assert!(err.contains(rel), "{err}");
+    let _ = std::fs::remove_dir_all(root);
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,19 +1368,20 @@ fn next_code_line<'a>(lines: &[&'a str], after_1based: usize) -> &'a str {
     ""
 }
 
-fn register_opt_none_sites(root: &std::path::Path) -> Vec<(String, usize)> {
+fn register_opt_none_sites(root: &std::path::Path) -> Result<Vec<(String, usize)>, String> {
     let mut out = Vec::new();
-    for rel in tracked_rs_files(root) {
-        let src = std::fs::read_to_string(root.join(&rel)).unwrap_or_default();
-        let code = production_code(&src);
-        for hit in find_calls(&code) {
-            if hit.kind == Kind::RegisterOpt && !hit.is_site {
-                out.push((rel.clone(), hit.line));
+    for (rel, src) in load_executor(root)? {
+        let (toks, cut) = executor_lex(&src).map_err(|err| format!("row {rel}: {err}"))?;
+        let prefix = cut.unwrap_or(src.len());
+        let starts = line_starts(&src);
+        for hit in executor_calls(&src, &toks).map_err(|err| format!("row {rel}: {err}"))? {
+            if hit.at < prefix && hit.kind == Kind::RegisterOpt && !hit.is_site {
+                out.push((rel.clone(), starts.partition_point(|start| *start <= hit.at)));
             }
         }
     }
     out.sort();
-    out
+    Ok(out)
 }
 
 /// The census's first table, shape-B loop lines, not-site rows, and the
@@ -1031,13 +1390,14 @@ fn register_opt_none_sites(root: &std::path::Path) -> Vec<(String, usize)> {
 #[test]
 fn census_line_pins_match_sources() {
     let root = workspace_root();
-    let census = std::fs::read_to_string(root.join(CENSUS)).unwrap_or_default();
+    let census = std::fs::read_to_string(root.join(CENSUS))
+        .unwrap_or_else(|err| panic!("row {CENSUS}: {err}"));
     assert!(
         census.contains(&format!("## Production sites ({PIN})")),
         "production-sites heading must name the pin {PIN}"
     );
 
-    let (sites, _) = scan_workspace(&root);
+    let (sites, _) = scan_workspace(&root).unwrap_or_else(|err| panic!("{err}"));
     let mut scanned: Vec<(String, usize, String)> =
         sites.iter().map(|s| (s.path.clone(), s.line, s.kind.as_str().to_string())).collect();
     scanned.sort();
@@ -1065,7 +1425,8 @@ fn census_line_pins_match_sources() {
         assert!(cells.len() >= 3, "shape-B row {cells:?}");
         let (path, line) =
             split_path_line(&cells[2]).unwrap_or_else(|| panic!("loop spec {:?}", cells[2]));
-        let src = std::fs::read_to_string(root.join(&path)).unwrap_or_default();
+        let src = std::fs::read_to_string(root.join(&path))
+            .unwrap_or_else(|err| panic!("row {path}: {err}"));
         let text = src.lines().nth(line - 1).unwrap_or("");
         assert!(
             line_is_loop(text),
@@ -1082,7 +1443,7 @@ fn census_line_pins_match_sources() {
         })
         .collect();
     not_sites.sort();
-    let scanned_none = register_opt_none_sites(&root);
+    let scanned_none = register_opt_none_sites(&root).unwrap_or_else(|err| panic!("{err}"));
     assert_eq!(
         not_sites, scanned_none,
         "not-site table must match production register_opt(..., None) calls.\n\
@@ -1143,9 +1504,11 @@ fn census_line_pins_match_sources() {
 // bn-manager census: (file, enclosing item), lexer tokens only
 // ---------------------------------------------------------------------------
 
-fn tracked_bn_files(root: &Path) -> Result<Vec<String>, String> {
+fn tracked_nul(root: &Path, label: &str, specs: &[&str]) -> Result<Vec<String>, String> {
+    let mut args = vec!["-c", "core.quotePath=false", "ls-files", "-z", "--"];
+    args.extend(specs.iter().copied());
     let output = Command::new("git")
-        .args(["-c", "core.quotePath=false", "ls-files", "-z", "--", "crates/bn-manager/**/*.rs"])
+        .args(&args)
         .current_dir(root)
         .output()
         .map_err(|err| format!("git ls-files: {err}"))?;
@@ -1158,12 +1521,16 @@ fn tracked_bn_files(root: &Path) -> Result<Vec<String>, String> {
             continue;
         }
         let path = String::from_utf8(raw.to_vec())
-            .map_err(|_| format!("non-utf8 bn-manager path: {}", String::from_utf8_lossy(raw)))?;
+            .map_err(|_| format!("non-utf8 {label} path: {}", String::from_utf8_lossy(raw)))?;
         if path.ends_with(".rs") && !path.contains("/tests/") {
             files.push(path);
         }
     }
     Ok(files)
+}
+
+fn tracked_bn_files(root: &Path) -> Result<Vec<String>, String> {
+    tracked_nul(root, "bn-manager", &["crates/bn-manager/**/*.rs"])
 }
 
 fn lit_unterminated(kind: LiteralKind) -> Option<bool> {
@@ -1185,7 +1552,7 @@ fn lit_unterminated(kind: LiteralKind) -> Option<bool> {
 /// Spans come from the lexer. A length that is not a char boundary is an
 /// error, not a slice. Comment and string tokens are masked; a disagreement
 /// with [`non_code_spans`] fails the file.
-fn lex_file(src: &str) -> Result<Vec<(usize, usize, TokenKind)>, String> {
+fn lex_file(src: &str, check_mask: bool) -> Result<Vec<(usize, usize, TokenKind)>, String> {
     let first = src.lines().next().unwrap_or("");
     if first.starts_with("#!") && !first.starts_with("#![") {
         return Err("shebang".to_string());
@@ -1225,7 +1592,7 @@ fn lex_file(src: &str) -> Result<Vec<(usize, usize, TokenKind)>, String> {
     if pos != src.len() {
         return Err("token stream did not cover the file".to_string());
     }
-    if masked != non_code_spans(src) {
+    if check_mask && masked != non_code_spans(src) {
         return Err("lexer mask disagreed".to_string());
     }
     Ok(toks)
@@ -1338,8 +1705,22 @@ fn skip_until(
     open: TokenKind,
     close: TokenKind,
 ) -> Option<usize> {
+    skip_until_before(toks, from, toks.len(), open, close)
+}
+
+/// Like [`skip_until`], but a closer at index `end` or later does not count.
+fn skip_until_before(
+    toks: &[(usize, usize, TokenKind)],
+    from: usize,
+    end: usize,
+    open: TokenKind,
+    close: TokenKind,
+) -> Option<usize> {
+    if end <= from {
+        return None;
+    }
     let mut depth = 0usize;
-    for (n, tok) in toks.iter().enumerate().skip(from) {
+    for (n, tok) in toks.iter().enumerate().take(end).skip(from) {
         if tok.2 == open {
             depth += 1;
         } else if tok.2 == close {
@@ -1432,7 +1813,7 @@ fn bn_hits(files: &[(String, String)]) -> Result<Vec<BnHit>, String> {
     let mut hits = Vec::new();
     let mut errors = Vec::new();
     for (path, src) in files {
-        let toks = match lex_file(src) {
+        let toks = match lex_file(src, true) {
             Ok(toks) => toks,
             Err(err) => {
                 errors.push(format!("row {path}: {err}"));
