@@ -24,6 +24,9 @@ Guidance for coding agents (Cursor, Claude Code, Codex) working in rvc. `CLAUDE.
   - [ ] Repo-wide grep for every changed symbol/pattern the issue targets.
   - [ ] Signing-root / `hash_tree_root` tests are KAT-anchored or `kat_exempt` with a reason.
 
+## Tests
+`cargo nextest run --workspace --all-features` is the default. `cargo test` still runs the suite and is what the pre-PR line below names; it shares one process per test binary, so process-global metrics can race. Timing tests use paused tokio time. Do not synchronize a test on a wall-clock sleep.
+
 ## Coding
 Follow `.cursor/rules/rust-code.mdc` (TDD, idiomatic Rust, conventions) and `CLAUDE.md`.
 

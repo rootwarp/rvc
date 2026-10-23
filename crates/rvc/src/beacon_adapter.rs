@@ -501,15 +501,23 @@ mod tests {
         let blobs = WireBody::Json(serde_json::json!(["0xbb"]));
         let proofs = WireBody::Json(serde_json::json!(["0xaa"]));
 
+        let (primary_tx, primary_rx) = std::sync::mpsc::channel();
+        let (secondary_tx, secondary_rx) = std::sync::mpsc::channel();
         Mock::given(method("POST"))
             .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
-            .respond_with(ResponseTemplate::new(400).set_body_string("bad envelope"))
+            .respond_with(rvc_test_support::SignalOnReceipt::new(
+                ResponseTemplate::new(400).set_body_string("bad envelope"),
+                primary_tx,
+            ))
             .expect(1)
             .mount(&primary)
             .await;
         Mock::given(method("POST"))
             .and(path(PUBLISH_EXECUTION_PAYLOAD_ENVELOPES_PATH))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(rvc_test_support::SignalOnReceipt::new(
+                ResponseTemplate::new(200),
+                secondary_tx,
+            ))
             .expect(1)
             .mount(&secondary)
             .await;
@@ -527,6 +535,20 @@ mod tests {
             .publish_execution_payload_envelope(&envelope, &blobs, &proofs, "gloas", None)
             .await
             .expect("broadcast/submit succeeds if any BN accepts");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            tokio::task::spawn_blocking(move || {
+                primary_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("primary envelope");
+                secondary_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("secondary envelope");
+            }),
+        )
+        .await
+        .expect("envelope publish wait hung")
+        .expect("envelope publish wait");
 
         let primary_reqs = primary.received_requests().await.unwrap();
         let secondary_reqs = secondary.received_requests().await.unwrap();

@@ -382,15 +382,15 @@ mod tests {
         );
     }
 
-    /// ARCH-2g P1-8: disabled slashing monitor registers no task and creates no series.
+    /// ARCH-2g P1-8: disabled slashing monitor registers no task.
+    ///
+    /// The registry is the claim. `rvc_tasks_running` is process-global, so a
+    /// sibling test that spawns the same name can move the gauge.
     #[tokio::test]
     async fn test_disabled_slashing_monitor_registers_no_task() {
-        use metrics::definitions::RVC_TASKS_RUNNING;
         use tokio_util::sync::CancellationToken;
 
-        const NAME: &str = "slashing_monitor";
         let (exec, _rx) = TaskExecutor::new(CancellationToken::new());
-        let before = RVC_TASKS_RUNNING.with_label_values(&[NAME]).get();
 
         spawn(
             Arc::new(mock_failing()),
@@ -401,11 +401,6 @@ mod tests {
         );
 
         assert!(exec.registered_names().is_empty(), "SlashedAction::None must register no task");
-        assert_eq!(
-            RVC_TASKS_RUNNING.with_label_values(&[NAME]).get(),
-            before,
-            "disabled slashing must not touch rvc_tasks_running{{task={NAME}}}"
-        );
     }
 
     /// ARCH-2g P1-9: enabled monitor is registered by name.

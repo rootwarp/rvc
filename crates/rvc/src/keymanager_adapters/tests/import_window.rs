@@ -8,7 +8,7 @@ use axum::response::IntoResponse;
 use http_body_util::BodyExt;
 use keymanager_api::error::map_slashing_protection_error;
 use keymanager_api::traits::{SlashingProtection, SlashingProtectionError};
-use slashing::metrics::{RVC_SLASHING_IMPORT_CONN_HOLD_MS, RVC_SLASHING_IMPORT_DEFERRED_MS};
+use slashing::metrics::RVC_SLASHING_IMPORT_CONN_HOLD_MS;
 use timing::{due_ms, MockSlotClock, SlotClock, ATTESTATION_DUE_BPS};
 use tokio::time::Instant;
 use tracing::field::{Field, Visit};
@@ -110,6 +110,7 @@ impl<S: tracing::Subscriber> Layer<S> for DeferralLog {
 /// one `info!`.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn interchange_import_waits_for_a_free_window_and_reports_the_wait() {
+    let (deferred_before, deferred_sum_before) = crate::test_metrics::import_deferred();
     let open_ms = due_ms(ATTESTATION_DUE_BPS, SLOT_MS) + 500;
     assert_eq!(open_ms, 4_499, "attestation due 3999 ms plus the 500 ms reserve");
     let wait_ms = open_ms - 1_000;
@@ -134,8 +135,6 @@ async fn interchange_import_waits_for_a_free_window_and_reports_the_wait() {
     let subscriber = tracing_subscriber::registry().with(DeferralLog(Arc::clone(&logs)));
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    let deferred_before = RVC_SLASHING_IMPORT_DEFERRED_MS.get_sample_count();
-    let deferred_sum_before = RVC_SLASHING_IMPORT_DEFERRED_MS.get_sample_sum();
     let started = Instant::now();
     let import = adapter.import_interchange(&json);
     tokio::pin!(import);
@@ -170,12 +169,9 @@ async fn interchange_import_waits_for_a_free_window_and_reports_the_wait() {
     assert_eq!(recorded[0].window_ms, Some(window_ms));
     assert_eq!(recorded[0].estimated_hold_ms, Some(estimated_hold_ms));
 
-    assert_eq!(
-        RVC_SLASHING_IMPORT_DEFERRED_MS.get_sample_count() - deferred_before,
-        1,
-        "one deferred-ms sample"
-    );
-    let sum_delta = RVC_SLASHING_IMPORT_DEFERRED_MS.get_sample_sum() - deferred_sum_before;
+    let (deferred_after, deferred_sum_after) = crate::test_metrics::import_deferred();
+    assert_eq!(deferred_after - deferred_before, 1, "one deferred-ms sample");
+    let sum_delta = deferred_sum_after - deferred_sum_before;
     assert!(
         (sum_delta - wait_ms as f64).abs() < f64::EPSILON,
         "deferred-ms sample is the wait, got {sum_delta}"

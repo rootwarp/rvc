@@ -35,22 +35,6 @@ const ROW_BUDGET: Duration = Duration::from_millis(40);
 /// the attempt floor and the hang, so a missing inner deadline still fails.
 const ROW_EPSILON: Duration = Duration::from_millis(120);
 
-/// Elapsed ceiling for one budgeted row.
-///
-/// llvm-cov stretched a 40 ms budget to 111 ms. Coverage keeps a wider
-/// ceiling that is still below the attempt floor and the hang, so a missing
-/// inner deadline still fails.
-fn row_elapsed_limit() -> Duration {
-    let slack = if std::env::var_os("CARGO_LLVM_COV").is_some()
-        || std::env::var_os("LLVM_PROFILE_FILE").is_some()
-    {
-        Duration::from_millis(200)
-    } else {
-        ROW_EPSILON
-    };
-    ROW_BUDGET + slack
-}
-
 type OpFut<'a> = Pin<Box<dyn Future<Output = Result<(), BeaconError>> + Send + 'a>>;
 
 /// One budgeted operation. One row per converted site.
@@ -260,7 +244,7 @@ async fn harness_actually_hangs_past_the_budget() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn every_converted_site_still_returns_operation_timeout() {
     assert_eq!(BUDGETED_OPERATIONS.len(), 13, "one row per converted operation");
     let names: Vec<&str> = BUDGETED_OPERATIONS.iter().map(|op| op.op_name).collect();
@@ -292,7 +276,7 @@ async fn every_converted_site_still_returns_operation_timeout() {
 
     let fleet = HangingFleet::start(1, ROW_BUDGET, HANG, false).await;
     for op in BUDGETED_OPERATIONS {
-        let started = Instant::now();
+        let started = tokio::time::Instant::now();
         let err = (op.invoke)(&fleet.manager).await.expect_err(op.op_name);
         let elapsed = started.elapsed();
         assert!(
@@ -300,16 +284,10 @@ async fn every_converted_site_still_returns_operation_timeout() {
             "{} returned {err:?}",
             op.op_name
         );
-        let limit = row_elapsed_limit();
         assert!(
-            limit < HANG && limit < ATTEMPT_TIMEOUT_FLOOR,
-            "the elapsed limit {limit:?} must stay under the hang ({HANG:?}) and the floor ({ATTEMPT_TIMEOUT_FLOOR:?})"
-        );
-        assert!(
-            elapsed <= limit,
-            "{} elapsed {elapsed:?} exceeded {limit:?} (floor {:?}); a site with no inner deadline would wait for the hang",
-            op.op_name,
-            ATTEMPT_TIMEOUT_FLOOR
+            elapsed >= ROW_BUDGET && elapsed < ATTEMPT_TIMEOUT_FLOOR && elapsed < HANG,
+            "{} elapsed {elapsed:?}; a missing inner deadline waits for the hang ({HANG:?}) and an immediate error is under the budget ({ROW_BUDGET:?})",
+            op.op_name
         );
     }
 }

@@ -1882,32 +1882,6 @@ mod dispatch_pipeline {
         );
     }
 
-    /// Slot budget for [`short_overhang_keeps_a_known_partial`].
-    ///
-    /// The paused clock keeps this at 50 ms. llvm-cov can spend that budget
-    /// during signing when instrumentation is not absorbed by the pause, so
-    /// coverage uses a wider slot that is still far under the 30 s submit timeout.
-    fn overhang_slot_budget() -> Duration {
-        if std::env::var_os("CARGO_LLVM_COV").is_some()
-            || std::env::var_os("LLVM_PROFILE_FILE").is_some()
-        {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_millis(50)
-        }
-    }
-
-    /// Extra room on the overhang ceiling under llvm-cov.
-    fn overhang_finish_slack() -> Duration {
-        if std::env::var_os("CARGO_LLVM_COV").is_some()
-            || std::env::var_os("LLVM_PROFILE_FILE").is_some()
-        {
-            Duration::from_millis(500)
-        } else {
-            Duration::ZERO
-        }
-    }
-
     /// Two already-signed attestations for one `publish_wave`.
     ///
     /// The paused clock decides which partial is kept. Building the wave here
@@ -1957,13 +1931,13 @@ mod dispatch_pipeline {
             submitter,
         );
         let started = tokio::time::Instant::now();
-        let slot_end = started + overhang_slot_budget();
+        let slot_end = started + Duration::from_millis(50);
         let results = fixture.service.publish_wave(SLOT, slot_end, signed_pair()).await;
         let finished = tokio::time::Instant::now();
         let overhang_at = slot_end + Duration::from_millis(500);
         assert_eq!(results.len(), 2, "{results:?}");
         assert!(
-            finished <= overhang_at + overhang_finish_slack(),
+            finished <= overhang_at,
             "the wait ran until {finished:?}, past overhang {overhang_at:?}"
         );
         let rejected = results

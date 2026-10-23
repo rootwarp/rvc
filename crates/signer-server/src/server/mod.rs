@@ -230,6 +230,8 @@ pub async fn run(
         let joined = match tokio::time::timeout(deadline, children.shutdown()).await {
             Ok(joined) => joined,
             Err(_elapsed) => {
+                #[cfg(test)]
+                tests::note_deadline_expired();
                 warn!(
                     deadline_ms = deadline.as_millis() as u64,
                     "signer shutdown deadline exceeded; aborting remaining signer child tasks"
@@ -249,6 +251,8 @@ pub async fn run(
             match tokio::time::timeout(deadline, &mut work).await {
                 Ok(result) => result,
                 Err(_elapsed) => {
+                    #[cfg(test)]
+                    tests::note_deadline_expired();
                     warn!(
                         deadline_ms = deadline.as_millis() as u64,
                         "signer shutdown deadline exceeded; dropping gRPC serve and aborting owned children"
@@ -562,10 +566,16 @@ async fn serve_until_shutdown(
         _ = shutdown.cancelled() => {
             if let Some(token) = &http_shutdown {
                 token.cancel();
+                #[cfg(test)]
+                if token.is_cancelled() {
+                    tests::note_http_accepts_stopped();
+                }
             }
-            #[cfg(test)]
-            tests::note_http_accepts_stopped();
             grpc_stop.cancel();
+            #[cfg(test)]
+            tests::note_grpc_drain_started(
+                http_shutdown.as_ref().is_some_and(|token| token.is_cancelled()),
+            );
             #[cfg(test)]
             if tests::wedge_grpc_drain() {
                 // Reach serve.await so the real drain path runs, then hang as if
@@ -612,6 +622,9 @@ mod tests {
         joined_http: bool,
         drop_guard_ran: bool,
         http_accepts_stopped: bool,
+        /// `http_shutdown.is_cancelled()` at `GrpcDrainStarted`, before Drop.
+        http_accepts_cancelled_before_drain: bool,
+        events: Vec<ProbeEvent>,
         wedge_reloader: bool,
         wedge_grpc_drain: bool,
         panic_child: Option<&'static str>,
@@ -619,8 +632,21 @@ mod tests {
         deadline: Option<Duration>,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ProbeEvent {
+        HttpAcceptsStopped,
+        GrpcDrainStarted,
+        DeadlineExpired,
+    }
+
     tokio::task_local! {
         static CHILD_PROBE: Arc<Mutex<ChildProbe>>;
+    }
+
+    fn push_probe_event(event: ProbeEvent) {
+        let _ = CHILD_PROBE.try_with(|probe| {
+            probe.lock().unwrap_or_else(|e| e.into_inner()).events.push(event);
+        });
     }
 
     fn probe_snapshot(probe: &Arc<Mutex<ChildProbe>>) -> ChildProbe {
@@ -676,6 +702,19 @@ mod tests {
         let _ = CHILD_PROBE.try_with(|probe| {
             probe.lock().unwrap_or_else(|e| e.into_inner()).http_accepts_stopped = true;
         });
+        push_probe_event(ProbeEvent::HttpAcceptsStopped);
+    }
+
+    pub(super) fn note_grpc_drain_started(http_accepts_cancelled: bool) {
+        let _ = CHILD_PROBE.try_with(|probe| {
+            probe.lock().unwrap_or_else(|e| e.into_inner()).http_accepts_cancelled_before_drain =
+                http_accepts_cancelled;
+        });
+        push_probe_event(ProbeEvent::GrpcDrainStarted);
+    }
+
+    pub(super) fn note_deadline_expired() {
+        push_probe_event(ProbeEvent::DeadlineExpired);
     }
 
     pub(super) fn deadline_override() -> Option<Duration> {
@@ -1422,37 +1461,12 @@ mod tests {
                 )
                 .await;
                 shutdown.cancel();
-                let started = Instant::now();
-                loop {
-                    let snap = probe_snapshot(&probe_for_wait);
-                    let http_stopped = snap.http_accepts_stopped
-                        && snap.http_shutdown.as_ref().is_some_and(|token| token.is_cancelled());
-                    if http_stopped {
-                        break;
-                    }
-                    if started.elapsed() > Duration::from_millis(150) {
-                        panic!(
-                            "HTTP accepts must stop before a hung gRPC drain hits the deadline \
-                             (stopped={}, cancelled={})",
-                            snap.http_accepts_stopped,
-                            snap.http_shutdown.as_ref().is_some_and(|token| token.is_cancelled()),
-                        );
-                    }
-                    tokio::select! {
-                        result = &mut run_fut => {
-                            panic!("run returned before HTTP accepts stopped: {result:?}");
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(10)) => {}
-                    }
-                }
-                let result = tokio::time::timeout(Duration::from_secs(2), run_fut).await;
-                (result, started.elapsed())
+                let result = tokio::time::timeout(Duration::from_secs(5), run_fut).await;
+                result
             })
             .await;
 
-        let (result, elapsed) = outcome;
-        assert!(elapsed < Duration::from_secs(2), "hung gRPC drain stalled shutdown: {elapsed:?}");
-        let result = result.expect("shutdown deadline must bound a hung gRPC drain");
+        let result = outcome.expect("shutdown deadline must bound a hung gRPC drain");
         let err = result.expect_err("aborting a hung gRPC drain is a runtime error");
         assert!(
             err.to_string().contains("shutdown deadline"),
@@ -1460,6 +1474,19 @@ mod tests {
         );
         assert!(logs_contain("shutdown deadline exceeded"));
         let snap = probe_snapshot(&probe);
+        assert_eq!(
+            snap.events,
+            vec![
+                ProbeEvent::HttpAcceptsStopped,
+                ProbeEvent::GrpcDrainStarted,
+                ProbeEvent::DeadlineExpired,
+            ],
+            "HTTP accepts stop, then the gRPC drain starts, then the deadline fires"
+        );
+        assert!(
+            snap.http_accepts_cancelled_before_drain,
+            "http_shutdown must already be cancelled when the gRPC drain starts"
+        );
         expect_abort_finished("reloader", &snap.reloader).await;
         expect_abort_finished("metrics", &snap.metrics).await;
         expect_abort_finished("http", &snap.http).await;

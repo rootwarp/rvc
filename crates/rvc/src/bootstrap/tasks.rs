@@ -1311,10 +1311,9 @@ mod tests {
     /// The first sync poll is held open, so closing the shutdown watch does
     /// not finish the task. `executor.shutdown` aborts registered work on its
     /// own, so this test only cancels the token. Removing the forwarder body
-    /// leaves `rvc_tasks_running` up.
+    /// leaves the registered work running.
     #[tokio::test]
     async fn proposer_sync_monitor_cancel_forwarder_stops_the_registered_task() {
-        use metrics::definitions::RVC_TASKS_RUNNING;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1328,22 +1327,20 @@ mod tests {
                 .expect("proposer manager"),
         );
         let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
-        let before = RVC_TASKS_RUNNING.with_label_values(&[PROPOSER_SYNC_MONITOR_TASK_NAME]).get();
         spawn_proposer_sync_monitor(Some(manager), &executor, Some(Duration::from_secs(192)));
         assert!(
-            RVC_TASKS_RUNNING.with_label_values(&[PROPOSER_SYNC_MONITOR_TASK_NAME]).get() > before,
+            executor.registered_names().contains(&PROPOSER_SYNC_MONITOR_TASK_NAME),
             "the proposer sync monitor must be registered before cancel"
         );
         executor.token().cancel();
-        let dropped = async {
-            while RVC_TASKS_RUNNING.with_label_values(&[PROPOSER_SYNC_MONITOR_TASK_NAME]).get()
-                != before
-            {
-                tokio::task::yield_now().await;
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(2), dropped).await.expect(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.wait_until_work_finished(PROPOSER_SYNC_MONITOR_TASK_NAME),
+        )
+        .await
+        .expect(
             "the cancel forwarder must abort bn.proposer_sync_monitor without executor.shutdown",
         );
+        assert!(executor.work_finished(PROPOSER_SYNC_MONITOR_TASK_NAME));
     }
 }

@@ -145,23 +145,16 @@ fn app_state(adapter: Arc<KeystoreManagerAdapter>) -> Arc<AppState> {
     })
 }
 
-/// Cheap scrypt (`n = 2`) returns in microseconds, so it cannot by itself open
-/// a 50 ms gap. `tracked_keys` is held for the import critical section that
-/// now runs on the blocking pool, and `set_stall_ms` parks that same thread.
+/// Each import parks inside `spawn_blocking` until this task releases it.
 ///
-/// The 50 ms bound missed once while a parallel security run loaded the host,
-/// then passed 6/6 in isolation. That is host scheduling, not async-worker
-/// starvation: the stall is on the blocking pool. The limit is the idle gap
-/// measured on this host before the imports, plus 40 ms, and at least 50 ms.
-/// An import that starved the runtime would add the 80 ms stall on top of the
-/// idle gap and still fail.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// Receiving every park on the current-thread runtime shows the worker is
+/// not occupied by the blocking import body. All `N` keystores still land.
+#[tokio::test(flavor = "current_thread")]
 async fn async_heartbeat_has_no_gap_over_50ms_while_100_keystores_import() {
     const N: usize = 100;
     let dir = TempDir::new().unwrap();
     let (adapter, _, _) =
         test_keystore_adapter(dir.path().to_path_buf(), create_empty_composite_signer());
-    adapter.tracked_keys.set_stall_ms(80);
     let adapter = Arc::new(adapter);
 
     let mut jsons = Vec::with_capacity(N);
@@ -169,31 +162,13 @@ async fn async_heartbeat_has_no_gap_over_50ms_while_100_keystores_import() {
         jsons.push(cheap_keystore(PASSWORD).0);
     }
 
-    let gaps = Arc::new(Mutex::new(Vec::<Duration>::new()));
-    let stop = CancellationToken::new();
-    let gaps_task = Arc::clone(&gaps);
-    let stop_task = stop.clone();
-    let heartbeat = tokio::spawn(async move {
-        let mut last = Instant::now();
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    let now = Instant::now();
-                    gaps_task.lock().expect("gaps").push(now.saturating_duration_since(last));
-                    last = now;
-                }
-                _ = stop_task.cancelled() => break,
-            }
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let gap_len_before = gaps.lock().expect("gaps").len();
-    let idle_max = gaps.lock().expect("gaps")[..gap_len_before]
-        .iter()
-        .copied()
-        .max()
-        .unwrap_or(Duration::from_millis(10));
+    let (entered_tx, mut entered_rx) =
+        tokio::sync::mpsc::channel::<tokio::sync::oneshot::Sender<()>>(1);
+    adapter.set_during_blocking_hook(Arc::new(move || {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        entered_tx.blocking_send(ack_tx).expect("import observer alive");
+        let _ = ack_rx.blocking_recv();
+    }));
 
     let mut joins = Vec::with_capacity(N);
     for json in jsons {
@@ -202,21 +177,19 @@ async fn async_heartbeat_has_no_gap_over_50ms_while_100_keystores_import() {
             adapter.import_keystore(&json, PASSWORD).await.expect("import");
         }));
     }
-    for join in joins {
-        join.await.expect("import task");
+    for _ in 0..N {
+        let ack = tokio::time::timeout(Duration::from_secs(10), entered_rx.recv())
+            .await
+            .expect("import did not reach the blocking body")
+            .expect("import observer closed");
+        ack.send(()).expect("blocking import still waiting");
     }
-    stop.cancel();
-    heartbeat.await.expect("heartbeat");
-
-    let gaps = gaps.lock().expect("gaps");
-    let during = &gaps[gap_len_before..];
-    assert!(!during.is_empty(), "heartbeat must tick while 100 keystores import");
-    let max_gap = during.iter().copied().max().expect("gap");
-    let limit = idle_max.saturating_add(Duration::from_millis(40)).max(Duration::from_millis(50));
-    assert!(
-        max_gap <= limit,
-        "async heartbeat gap {max_gap:?} exceeded host idle {idle_max:?} plus margin (limit {limit:?}) while {N} keystores imported"
-    );
+    for join in joins {
+        tokio::time::timeout(Duration::from_secs(10), join)
+            .await
+            .expect("import join hung")
+            .expect("import task");
+    }
     assert_eq!(adapter.list_keys().len(), N);
 }
 

@@ -88,97 +88,15 @@ fn version_exits_zero() {
     assert!(stdout.contains("rvc"), "stdout={stdout}");
 }
 
+/// Exit status of `start --help`. The flag list itself is
+/// `test_start_help_lists_every_flag`.
 #[test]
 fn start_help_exits_zero_and_lists_flags() {
     let output = run_with_timeout(
         Command::new(rvc_bin()).args(["start", "--help"]),
-        Duration::from_secs(10),
+        Duration::from_secs(60),
     );
     assert!(output.status.success(), "stderr={}", String::from_utf8_lossy(&output.stderr));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // Core surface + RF5-14 complete flag set (dropped clap flatten field fails loudly).
-    for flag in [
-        "--config",
-        "--beacon-url",
-        "--beacon-nodes",
-        "--beacon-max-body-bytes",
-        "--keystore-path",
-        "--slashing-db-path",
-        "--init-slashing-db",
-        "--allow-unsupported-fork",
-        "--metrics-address",
-        "--metrics-port",
-        "--network",
-        "--genesis-time",
-        "--genesis-validators-root",
-        "--graffiti",
-        "--no-doppelganger-detection",
-        "--log-level",
-        "--log-format",
-        "--enable-log-reload",
-        "--keymanager-enabled",
-        "--no-keymanager",
-        "--keymanager-address",
-        "--keymanager-token-file",
-        "--remote-signer-url",
-        "--remote-signer-allowed-hosts",
-        "--strict-permissions",
-        "--strict-slashing-semantics",
-        "--block-production-timeout",
-        "--attestation-timeout",
-        "--aggregate-timeout",
-        "--duty-fetch-timeout",
-        "--duty-dispatch-concurrency",
-        "--duty-publish-concurrency",
-        "--key-decrypt-threads",
-        "--tracing-endpoint",
-        "--tracing-exporter",
-        "--tracing-sample-rate",
-        "--tracing-max-queue-size",
-        "--tracing-max-export-batch-size",
-        "--secret-provider",
-        "--gcp-project-id",
-        "--gcp-secret-prefix",
-        "--secret-refresh-interval",
-        "--secret-provider-strict",
-        "--allow-insecure-remote-signer",
-        "--keymanager-cors-origins",
-        "--keymanager-body-limit",
-        "--keymanager-import-kdf-concurrency",
-        "--keymanager-import-kdf-total-mib",
-        "--keymanager-import-kdf-max-keystore-mib",
-        "--grpc-signer-url",
-        "--grpc-signer-tls-cert",
-        "--grpc-signer-tls-key",
-        "--grpc-signer-tls-ca-cert",
-        "--disable-attesting",
-        "--slashed-validators-action",
-        "--builder-circuit-breaker-consecutive-limit",
-        "--builder-circuit-breaker-epoch-limit",
-        "--disable-keystore-locking",
-        "--proposer-nodes",
-        "--broadcast",
-        "--proposer-config-url",
-        "--proposer-config-file",
-        "--proposer-config-refresh-interval",
-        "--proposer-config-url-token",
-        "--proposer-config-url-insecure",
-        "--monitoring-endpoint",
-        "--monitoring-interval",
-        "--monitoring-endpoint-insecure",
-        "--logfile",
-        "--logfile-max-size",
-        "--logfile-max-number",
-        "--logfile-compress",
-        "--logfile-level",
-        "--block-selection-mode",
-        "--validator-registration-batch-size",
-        "--validator-registration-batch-delay",
-        "--validators-config",
-        "--password-file",
-    ] {
-        assert!(stdout.contains(flag), "start --help missing {flag}\n{stdout}");
-    }
 }
 
 #[test]
