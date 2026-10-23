@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use beacon::{BuilderEntry, BuilderRequestAuth, SignedBuilderRequestAuth};
 use eth_types::body_tree_hash_root;
 use std::sync::Arc;
+use std::time::Duration;
 
 fn gloas_unblinded(slot: Slot) -> MockBeaconClient {
     MockBeaconClient::unblinded(gloas_block(slot)).with_consensus_version("gloas")
@@ -92,6 +93,44 @@ async fn test_gloas_epoch_calls_produce_block_v4() {
     assert_eq!(v4[0].builder_config.builder_boost_factor, 150);
     assert_eq!(v4[0].builder_config.min_bid, 0);
     assert!(v4[0].builder_config.builders.is_empty());
+}
+
+/// `propose_block_until` passes its deadline into V4 produce. Each call keeps
+/// its own instant. `propose_block` passes `None`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn propose_block_until_forwards_the_deadline_to_produce_v4() {
+    let pubkey = test_pubkey();
+    let slot = test_gloas_slot();
+    let beacon = Arc::new(gloas_unblinded(slot).with_produce_error());
+    let service = BlockService::new(
+        Arc::new(MockSigner::new()),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_with_near_gloas()),
+        [0xaa; 32],
+    );
+    let first = tokio::time::Instant::now() + Duration::from_millis(40);
+    let second = tokio::time::Instant::now() + Duration::from_millis(400);
+    let fence = beacon::DutyFence::open();
+    assert!(service
+        .propose_block_until(slot, &pubkey, 42, None, Some(first), &fence)
+        .await
+        .is_err());
+    assert!(service
+        .propose_block_until(slot, &pubkey, 42, None, Some(second), &fence)
+        .await
+        .is_err());
+    assert!(service.propose_block(slot, &pubkey, 42, None).await.is_err());
+    let recorded = beacon.recorded_deadline();
+    assert!(
+        recorded.iter().all(|(kind, _)| *kind == super::mocks::RecordedProduce::V4),
+        "V4 produce must not record a V3 call: {recorded:?}"
+    );
+    assert_eq!(
+        recorded.into_iter().map(|(_, deadline)| deadline).collect::<Vec<_>>(),
+        vec![Some(first), Some(second), None]
+    );
+    assert!(beacon.produce_v3_calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

@@ -155,11 +155,16 @@ where
 
         // The outer timeout is the block-production allowance, and also the
         // time left in the slot when that is shorter. `proposal_deadline` is
-        // that slot end. It is passed only into proposer-pool block production.
-        // Publication inside the proposal uses its own budget. Attestation,
-        // sync, and aggregate publication are not capped here; they keep
-        // slot end plus 500 ms. Produce may also run the 250 ms backstop
-        // (`bn_manager::BACKSTOP_MARGIN`) inside its own budget.
+        // forwarded only into proposer-pool block production. The coordinator
+        // arms it at the slot end before parent capture; this function does
+        // not recompute it. Publication inside the proposal uses its own
+        // budget. Attestation, sync, and aggregate publication are not capped
+        // here; they keep slot end plus 500 ms. When `proposal_deadline` is
+        // set, V3 produce arms its 250 ms backstop at that instant. The cap
+        // is a tokio timeout, with the same poll order as the timeout below:
+        // when the runtime is responsive the wait ends at that instant, and
+        // under scheduler lag a result that is already ready can still be
+        // returned.
         let remaining =
             self.clock.time_until_slot(slot.saturating_add(1)).unwrap_or(std::time::Duration::ZERO);
         let allowance = block_proposal_allowance(&self.config.timeouts).min(remaining);

@@ -15,11 +15,11 @@ use beacon::{
     AttestationDataResponse, AttesterDutiesResponse, BeaconCommitteeSubscription, BeaconError,
     BlockRootData, BlockRootResponse, BuilderConfig, BuilderPreferencesEntry, ConfigSpecResponse,
     GenesisResponse, PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
-    ProposerPreparation, PtcDutiesResponse, SignedContributionAndProof, StateForkResponse,
-    SubmitAttestationResult, SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse,
-    SyncCommitteeDutiesResponse, SyncCommitteeMessage, SyncingResponse, ValidatorLivenessResponse,
-    ValidatorsResponse, VersionedAggregateAttestation, VersionedAttestation,
-    VersionedSignedAggregateAndProof, WireBody,
+    ProposerPreparation, PtcDutiesResponse, RankedBlock, SignedContributionAndProof,
+    StateForkResponse, SubmitAttestationResult, SubmitBuilderPreferencesResult,
+    SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse, SyncCommitteeMessage,
+    SyncingResponse, ValidatorLivenessResponse, ValidatorsResponse, VersionedAggregateAttestation,
+    VersionedAttestation, VersionedSignedAggregateAndProof, WireBody,
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
@@ -28,10 +28,17 @@ use eth_types::{
 
 use crate::traits::{
     AttestationApi, BeaconNodeClient, BlockProducer, DutiesProvider, LivenessApi, NodeStatusApi,
-    PayloadAttestationApi, SyncCommitteeApi,
+    PayloadAttestationApi, ProduceDuty, SyncCommitteeApi,
 };
 
 type Handler<A, R> = Arc<dyn Fn(A) -> Result<R, BeaconError> + Send + Sync>;
+
+/// Which `_by` produce method recorded a deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordedProduce {
+    V3,
+    V4,
+}
 
 /// Same variant `BeaconClient` surfaces for HTTP 404 (`GET .../blocks/{block_id}/root`).
 fn block_root_not_found() -> BeaconError {
@@ -236,6 +243,10 @@ pub struct MockBeaconNodeClient {
     produce_block_v3: MethodHook<(u64, String, Option<String>, Option<u64>), ProduceBlockResponse>,
     produce_block_v4:
         MethodHook<(u64, String, Option<String>, BuilderConfig), ProduceBlockResponse>,
+    /// Deadline of each `produce_block_v3_ranked_by` / `produce_block_v4_by` call,
+    /// in call order, tagged with which method recorded it. Stored on this
+    /// client, not in a process-global.
+    recorded_deadline: Mutex<Vec<(RecordedProduce, Option<tokio::time::Instant>)>>,
     publish_block: MethodHook<(SignedBeaconBlock, String, Option<String>), ()>,
     publish_block_contents: MethodHook<(SignedBlockContentsJson, String, Option<String>), ()>,
     publish_blinded_block: MethodHook<(SignedBlindedBeaconBlock, String), ()>,
@@ -897,6 +908,20 @@ impl MockBeaconNodeClient {
         self.produce_block_v4.calls()
     }
 
+    /// Deadlines passed to the `_by` produce methods, in call order, with the
+    /// method that recorded each one.
+    pub fn recorded_deadline(&self) -> Vec<(RecordedProduce, Option<tokio::time::Instant>)> {
+        self.recorded_deadline.lock().unwrap_or_else(|err| err.into_inner()).clone()
+    }
+
+    fn push_recorded_deadline(
+        &self,
+        kind: RecordedProduce,
+        deadline: Option<tokio::time::Instant>,
+    ) {
+        self.recorded_deadline.lock().unwrap_or_else(|err| err.into_inner()).push((kind, deadline));
+    }
+
     pub fn publish_block_contents_calls(
         &self,
     ) -> Vec<(SignedBlockContentsJson, String, Option<String>)> {
@@ -1066,6 +1091,32 @@ impl BlockProducer for MockBeaconNodeClient {
             "produce_block_v4",
             (slot, randao_reveal.to_string(), graffiti.map(str::to_string), builder_config.clone()),
         )
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<RankedBlock>, BeaconError> {
+        self.push_recorded_deadline(RecordedProduce::V3, deadline);
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        self.push_recorded_deadline(RecordedProduce::V4, deadline);
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
     }
 
     async fn publish_block(

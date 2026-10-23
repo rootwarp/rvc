@@ -29,7 +29,7 @@ pub use error::BnManagerError;
 pub use manager::{BnManager, SpecAgreement, ATTEMPT_TIMEOUT_FLOOR};
 pub use metrics::{METRIC_POOL_MAIN, METRIC_POOL_PROPOSER};
 #[cfg(any(test, feature = "test-utils"))]
-pub use mock::{MockBeaconNodeClient, MockCallStamp, MockMethod};
+pub use mock::{MockBeaconNodeClient, MockCallStamp, MockMethod, RecordedProduce};
 pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,

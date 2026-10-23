@@ -335,6 +335,62 @@ mod tests {
         assert_eq!(produced.execution_payload_value.as_deref(), Some("111"));
     }
 
+    fn recording_pool() -> (
+        Arc<bn_manager::MockBeaconNodeClient>,
+        BeaconBlockAdapter,
+        Arc<bn_manager::MockBeaconNodeClient>,
+    ) {
+        let main = Arc::new(bn_manager::MockBeaconNodeClient::new());
+        let proposer = Arc::new(bn_manager::MockBeaconNodeClient::new());
+        let adapter = BeaconBlockAdapter::with_proposer(
+            main.clone() as Arc<dyn bn_manager::BeaconNodeClient>,
+            proposer.clone() as Arc<dyn bn_manager::BeaconNodeClient>,
+        );
+        (main, adapter, proposer)
+    }
+
+    /// The V3 deadline is stored on the routed proposer pool, per call.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_adapter_forwards_the_v3_deadline_to_the_pool() {
+        let (main, adapter, proposer) = recording_pool();
+        let first = tokio::time::Instant::now() + std::time::Duration::from_millis(25);
+        let second = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+        let _ = adapter.produce_block_v3_ranked_by(1, "0x", None, None, None, Some(first)).await;
+        let _ = adapter.produce_block_v3_ranked_by(2, "0x", None, None, None, Some(second)).await;
+        let _ = adapter.produce_block_v3_ranked_by(3, "0x", None, None, None, None).await;
+        assert_eq!(
+            proposer.recorded_deadline(),
+            vec![
+                (bn_manager::RecordedProduce::V3, Some(first)),
+                (bn_manager::RecordedProduce::V3, Some(second)),
+                (bn_manager::RecordedProduce::V3, None),
+            ]
+        );
+        assert!(main.recorded_deadline().is_empty());
+    }
+
+    /// The V4 deadline is stored on the routed proposer pool, per call.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn test_adapter_forwards_the_v4_deadline_to_the_pool() {
+        let (main, adapter, proposer) = recording_pool();
+        let config = BuilderConfig::default();
+        let first = tokio::time::Instant::now() + std::time::Duration::from_millis(25);
+        let second = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+        let _ = adapter.produce_block_v4_by(1, "0x", None, &config, Some(first)).await;
+        let _ = adapter.produce_block_v4_by(2, "0x", None, &config, Some(second)).await;
+        let _ = adapter.produce_block_v4_by(3, "0x", None, &config, None).await;
+        let recorded = proposer.recorded_deadline();
+        assert!(
+            recorded.iter().all(|(kind, _)| *kind == bn_manager::RecordedProduce::V4),
+            "V4 produce must not record a V3 call: {recorded:?}"
+        );
+        assert_eq!(
+            recorded.into_iter().map(|(_, deadline)| deadline).collect::<Vec<_>>(),
+            vec![Some(first), Some(second), None]
+        );
+        assert!(main.recorded_deadline().is_empty());
+    }
+
     /// Production path: adapter forwards `produce_block_v4` onto BnManager (POST /eth/v4/...).
     #[tokio::test]
     async fn test_produce_block_v4_forwards_to_bn_manager() {
