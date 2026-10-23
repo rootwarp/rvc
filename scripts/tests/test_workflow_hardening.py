@@ -37,7 +37,10 @@ SCAN_PATHS = {
     "scripts/docker-cargo-features.sh",
 }
 
-ALLOWED_IGNORED_CVE = "CVE-2023-45853"
+ALLOWED_IGNORED_CVES = [
+    "CVE-2023-45853",
+    "CVE-2026-111497 exp:2026-12-31",
+]
 
 
 class WorkflowLoader(yaml.SafeLoader):
@@ -203,7 +206,7 @@ def ignore_file_problems(files: dict[str, str]) -> list[str]:
     problems: list[str] = []
     if sorted(files) != [".trivyignore"]:
         problems.append(f"unexpected ignore files: {sorted(files)}")
-    if trivyignore_entries(files.get(".trivyignore", "")) != [ALLOWED_IGNORED_CVE]:
+    if trivyignore_entries(files.get(".trivyignore", "")) != ALLOWED_IGNORED_CVES:
         problems.append("ignore entries")
     return problems
 
@@ -307,13 +310,18 @@ jobs:
 
 
 def test_ignore_file_problems_reject_extra_entries_and_files():
-    assert ignore_file_problems({".trivyignore": "# note\nCVE-2023-45853\n"}) == []
-    extra = ignore_file_problems({".trivyignore": "CVE-2023-45853\nCVE-2099-0001\n"})
+    reviewed = "# note\n" + "\n".join(ALLOWED_IGNORED_CVES) + "\n"
+    assert ignore_file_problems({".trivyignore": reviewed}) == []
+    extra = ignore_file_problems({".trivyignore": reviewed + "CVE-2099-0001\n"})
     assert extra == ["ignore entries"]
+    dropped_expiry = ignore_file_problems(
+        {".trivyignore": "CVE-2023-45853\nCVE-2026-111497\n"}
+    )
+    assert dropped_expiry == ["ignore entries"]
     other = ignore_file_problems(
         {
-            ".trivyignore": "CVE-2023-45853\n",
-            "nested/extra.trivyignore": "CVE-2023-45853\n",
+            ".trivyignore": reviewed,
+            "nested/extra.trivyignore": reviewed,
         }
     )
     assert any("unexpected ignore files" in item for item in other)
@@ -447,6 +455,8 @@ def test_reviewed_trivyignore_is_the_only_ignore_file():
     assert "2027-01-18" in text
     assert "minizip" in text
     assert "will_not_fix" in text
+    assert "https://security-tracker.debian.org/tracker/CVE-2026-111497" in text
+    assert "CVE-2026-111497 exp:2026-12-31" in text
 
 
 def test_dependabot_tracks_github_actions():
