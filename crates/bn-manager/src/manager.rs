@@ -281,8 +281,12 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 ///   failed, falls back only to untried proposal-role BNs above the health
 ///   floor, and only when the expected parent root is known, inside the time
 ///   left in the backstop (budget plus 250 ms). The outer timeout is that
-///   backstop. A zero budget is no budget. With no budget, the round waits
-///   for every BN.
+///   backstop. `produce_block_v3` with a slot deadline arms both at the
+///   earlier of that backstop and the deadline. When the runtime is
+///   responsive the wait ends there. If the runtime polls late, a result
+///   that is already ready can still be returned: tokio polls the inner
+///   future before the timer. A zero budget is no budget. With no budget
+///   and no deadline, the round waits for every BN.
 /// - **Failover**: sequential, one in-flight; retry connect / timeout / 5xx only —
 ///   `produce_block_v4` (D29). Never after a 2xx, never in parallel. 404/405/501
 ///   are a capability gap (missing `/eth/v4`) and do fail over; a later success
@@ -489,6 +493,44 @@ fn checked_deadline(start: tokio::time::Instant, budget: Duration) -> tokio::tim
     start.checked_add(budget).unwrap_or(start)
 }
 
+/// Outer wait for one `produce_block_v3` call.
+///
+/// This is the budget plus [`fan_out::BACKSTOP_MARGIN`], and also the time
+/// left until `hard_end` when that is sooner. A `hard_end` in the past is
+/// zero. The subtraction is [`tokio::time::Instant::saturating_duration_since`],
+/// so a past instant does not panic. `None` for both stays unbounded.
+///
+/// The result is the duration passed to [`tokio::time::timeout`]. A busy
+/// runtime can poll the task after that timer fires.
+fn outer_produce_timeout(
+    budget: Option<Duration>,
+    hard_end: Option<tokio::time::Instant>,
+) -> Option<Duration> {
+    let backstop = fan_out::broadcast_backstop(budget);
+    let Some(end) = hard_end else {
+        return backstop;
+    };
+    let remaining = end.saturating_duration_since(tokio::time::Instant::now());
+    Some(backstop.unwrap_or(remaining).min(remaining))
+}
+
+/// Fallback deadline: `started + budget + 250 ms`, and `hard_end` when that
+/// instant is earlier. `None` for both leaves the fallback unbounded.
+fn fallback_backstop(
+    started: tokio::time::Instant,
+    budget: Option<Duration>,
+    hard_end: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    let from_budget = budget
+        .map(|budget| checked_deadline(started, budget.saturating_add(fan_out::BACKSTOP_MARGIN)));
+    match (from_budget, hard_end) {
+        (Some(from_budget), Some(end)) => Some(from_budget.min(end)),
+        (Some(from_budget), None) => Some(from_budget),
+        (None, Some(end)) => Some(end),
+        (None, None) => None,
+    }
+}
+
 impl BnManager {
     /// Creates a new `BnManager` from the given configuration.
     ///
@@ -616,7 +658,8 @@ impl BnManager {
     /// the outer timeout is a backstop at that budget plus 250 ms. Best-of
     /// block production uses the same backstop: each attempt is bounded by the
     /// budget, blocks in hand return at half that budget, and a miss falls
-    /// back inside the remaining margin. With no budget configured, attempts
+    /// back inside the remaining margin. A per-call slot deadline cuts that
+    /// margin when it is earlier. With no budget configured, attempts
     /// stay unbounded. `produce_block_v4` keeps an outer `tokio::time::timeout`
     /// at the budget. Exceeding the budget returns `BeaconError::OperationTimeout`.
     pub fn with_operation_timeouts(mut self, timeouts: OperationTimeouts) -> Self {
@@ -1660,7 +1703,7 @@ impl BnManager {
     /// for every selected BN. Every candidate is accepted, and fallback is on.
     /// That fallback is untried proposal-role BNs above [`FALLBACK_TIER_FLOOR`].
     /// After a hard-deadline miss it is bounded by the time left before the
-    /// budget plus 250 ms.
+    /// budget plus 250 ms. This helper does not pass a slot deadline.
     #[cfg(test)]
     async fn query_best<T, F>(
         &self,
@@ -1724,7 +1767,7 @@ impl BnManager {
             tried = tracing::field::Empty,
         );
         let ranked = self
-            .query_best_inner(op_name, role, min_tier, budget, &op, select)
+            .query_best_inner(op_name, role, min_tier, budget, None, &op, select)
             .instrument(strategy_span)
             .await?;
         ranked.into_iter().next().map(|(_, value)| value).ok_or_else(|| {
@@ -1732,12 +1775,14 @@ impl BnManager {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn query_best_inner<T, F>(
         &self,
         op_name: &str,
         role: BnRole,
         min_tier: HealthTier,
         budget: Option<Duration>,
+        hard_end: Option<tokio::time::Instant>,
         op: &F,
         select: BestSelect<T>,
     ) -> Result<Vec<(usize, T)>, BeaconError>
@@ -1753,9 +1798,7 @@ impl BnManager {
         }
 
         let started = tokio::time::Instant::now();
-        let backstop = budget.map(|budget| {
-            checked_deadline(started, budget.saturating_add(fan_out::BACKSTOP_MARGIN))
-        });
+        let backstop = fallback_backstop(started, budget, hard_end);
         let admitted = Arc::clone(&self.admitted);
         let generations = Arc::clone(&self.admission_generation);
         let mut stamps = HashMap::new();
@@ -1999,6 +2042,17 @@ impl BnManager {
     /// candidate that is signed, not for the head of this list.
     /// Fallback runs only when the expected parent root is known, and only
     /// against untried proposal-role BNs above the health floor.
+    ///
+    /// `deadline` bounds how long this call waits when the runtime is
+    /// responsive. The fallback deadline is the earlier of `start + budget +
+    /// 250 ms` and `deadline`. The outer timeout is the earlier of `budget +
+    /// 250 ms` and the time left until `deadline`. A deadline already in the
+    /// past arms a zero timeout. A deadline later than the budget plus 250 ms
+    /// does not shorten that budget. The subtraction saturates, so a past
+    /// deadline does not panic. The bound is a tokio timeout, the same poll
+    /// order as the orchestrator's proposal timeout: the inner future is
+    /// polled before the timer, so under scheduler lag a result that is
+    /// already ready can still be returned.
     async fn produce_block_v3_checked(
         &self,
         slot: u64,
@@ -2017,15 +2071,18 @@ impl BnManager {
             strategy = "best",
             tried = tracing::field::Empty,
         );
+        // `deadline` caps the 250 ms backstop. The armed duration is
+        // `outer_produce_timeout`: a busy runtime can poll after it fires.
         let ranked = self
             .with_op_timeout(
                 "produce_block_v3",
-                fan_out::broadcast_backstop(budget),
+                outer_produce_timeout(budget, deadline),
                 self.query_best_inner(
                     "produce_block_v3",
                     BnRole::Proposal,
                     HealthTier::Synced,
                     budget,
+                    deadline,
                     &move |client: &BeaconClient| {
                         let client = client.clone();
                         let randao_reveal = randao_reveal.clone();
@@ -5381,6 +5438,520 @@ mod tests {
             .await;
         assert!(result.is_err(), "fallback past the backstop must not return a block: {result:?}");
         assert_eq!(start.elapsed(), Duration::from_millis(450));
+    }
+
+    fn fallback_on() -> BestSelect<ProduceBlockResponse> {
+        testing_select(|_| true, |_| true, higher_block_value, |_, _, _| {}, true)
+    }
+
+    async fn two_bn_pool() -> BnManager {
+        let manager = manager_with_endpoints(&["synced", "fallback"])
+            .with_operation_timeouts(huge_pool_timeouts());
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        manager
+    }
+
+    fn answer_at(
+        when: tokio::time::Instant,
+        synced_hangs: bool,
+    ) -> impl Fn(&BeaconClient) -> BoxFut<'static, ProduceBlockResponse> {
+        move |client: &BeaconClient| {
+            let endpoint = client.endpoint().to_string();
+            Box::pin(async move {
+                if endpoint.contains("synced") {
+                    if synced_hangs {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Ok(block_with_value("1"))
+                    } else {
+                        Err(BeaconError::ApiError { status: 500, message: "down".to_string() })
+                    }
+                } else {
+                    let wait = when.saturating_duration_since(tokio::time::Instant::now());
+                    if !wait.is_zero() {
+                        tokio::time::sleep(wait).await;
+                    }
+                    Ok(block_with_value("9"))
+                }
+            })
+        }
+    }
+
+    async fn best_until(
+        manager: &BnManager,
+        budget: Option<Duration>,
+        hard_end: Option<tokio::time::Instant>,
+        op: &impl Fn(&BeaconClient) -> BoxFut<'static, ProduceBlockResponse>,
+    ) -> Result<Vec<(usize, ProduceBlockResponse)>, BeaconError> {
+        manager
+            .with_op_timeout(
+                "produce_block_v3",
+                outer_produce_timeout(budget, hard_end),
+                manager.query_best_inner(
+                    "produce_block_v3",
+                    BnRole::Proposal,
+                    HealthTier::Synced,
+                    budget,
+                    hard_end,
+                    op,
+                    fallback_on(),
+                ),
+            )
+            .await
+    }
+
+    async fn best_inner(
+        manager: &BnManager,
+        budget: Option<Duration>,
+        hard_end: Option<tokio::time::Instant>,
+        op: &impl Fn(&BeaconClient) -> BoxFut<'static, ProduceBlockResponse>,
+    ) -> Result<Vec<(usize, ProduceBlockResponse)>, BeaconError> {
+        manager
+            .query_best_inner(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                budget,
+                hard_end,
+                op,
+                fallback_on(),
+            )
+            .await
+    }
+
+    /// Synced BN hangs. Pool timeouts are [`huge_pool_timeouts`]. The budget
+    /// passed in is `production_budget(Some(hard_end))`, so the effective
+    /// budget is 200 ms, the same as the cap. The fallback would answer 100 ms
+    /// after the cap. On this paused runtime the call ends at the cap and
+    /// does not keep that block.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_v3_fallback_does_not_run_past_the_per_call_deadline() {
+        let manager = two_bn_pool().await;
+        let cap = Duration::from_millis(200);
+        let start = tokio::time::Instant::now();
+        let hard_end = start + cap;
+        let op = answer_at(hard_end + Duration::from_millis(100), true);
+        let budget = manager.production_budget(Some(hard_end));
+        let result = best_until(&manager, budget, Some(hard_end), &op).await;
+        assert!(result.is_err(), "fallback at deadline+100ms must not win: {result:?}");
+        assert_eq!(start.elapsed(), cap);
+    }
+
+    /// Synced BN errors at once, so the fallback runs. An answer before or at
+    /// `hard_end` is kept. An answer after it is not, and the call ends at
+    /// `hard_end` rather than at budget + 250 ms.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_v3_fallback_answer_is_kept_before_and_at_hard_end_and_dropped_after() {
+        let cap = Duration::from_millis(200);
+        let budget = Some(Duration::from_secs(1));
+
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let hard_end = start + cap;
+        let early = best_inner(
+            &manager,
+            budget,
+            Some(hard_end),
+            &answer_at(start + Duration::from_millis(50), false),
+        )
+        .await
+        .expect("answer before hard_end");
+        assert_eq!(early[0].1.execution_payload_value.as_deref(), Some("9"));
+        assert_eq!(start.elapsed(), Duration::from_millis(50));
+
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let hard_end = start + cap;
+        let on_time = best_inner(&manager, budget, Some(hard_end), &answer_at(hard_end, false))
+            .await
+            .expect("answer at hard_end");
+        assert_eq!(on_time[0].1.execution_payload_value.as_deref(), Some("9"));
+        assert_eq!(start.elapsed(), cap);
+
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let hard_end = start + cap;
+        let late = best_inner(
+            &manager,
+            budget,
+            Some(hard_end),
+            &answer_at(hard_end + Duration::from_millis(100), false),
+        )
+        .await;
+        assert!(late.is_err(), "answer after hard_end must not win: {late:?}");
+        assert_eq!(start.elapsed(), cap);
+    }
+
+    /// `hard_end` later than start + budget + 250 ms does not shrink the
+    /// backstop, and it does not extend it either. `None` keeps the same
+    /// budget backstop.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_later_hard_end_does_not_extend_or_shrink_the_budget_backstop() {
+        let budget = Some(Duration::from_millis(200));
+        let backstop = Duration::from_millis(450);
+
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let inside = best_inner(
+            &manager,
+            budget,
+            None,
+            &answer_at(start + Duration::from_millis(300), false),
+        )
+        .await
+        .expect("no hard_end, inside the backstop");
+        assert_eq!(inside[0].1.execution_payload_value.as_deref(), Some("9"));
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let late = best_inner(
+            &manager,
+            budget,
+            None,
+            &answer_at(start + backstop + Duration::from_millis(100), false),
+        )
+        .await;
+        assert!(late.is_err(), "no hard_end, past the backstop: {late:?}");
+        assert_eq!(start.elapsed(), backstop);
+
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let hard_end = start + Duration::from_secs(2);
+        let inside = best_inner(
+            &manager,
+            budget,
+            Some(hard_end),
+            &answer_at(start + Duration::from_millis(300), false),
+        )
+        .await
+        .expect("later hard_end still allows the budget backstop");
+        assert_eq!(inside[0].1.execution_payload_value.as_deref(), Some("9"));
+        assert_eq!(start.elapsed(), Duration::from_millis(300));
+
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let hard_end = start + Duration::from_secs(2);
+        let late = best_inner(
+            &manager,
+            budget,
+            Some(hard_end),
+            &answer_at(start + backstop + Duration::from_millis(100), false),
+        )
+        .await;
+        assert!(late.is_err(), "past the budget backstop: {late:?}");
+        assert_eq!(start.elapsed(), backstop);
+    }
+
+    /// No configured budget, and a `hard_end`. The fallback bound is that
+    /// instant (`fallback_backstop`'s `(None, Some)` arm). An answer after it
+    /// is dropped on this paused runtime, and the call ends at `hard_end`.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_missing_budget_stops_the_fallback_at_hard_end() {
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let hard_end = start + Duration::from_millis(200);
+        let early = best_inner(
+            &manager,
+            None,
+            Some(hard_end),
+            &answer_at(start + Duration::from_millis(50), false),
+        )
+        .await
+        .expect("answer before hard_end");
+        assert_eq!(early[0].1.execution_payload_value.as_deref(), Some("9"));
+        assert_eq!(start.elapsed(), Duration::from_millis(50));
+
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let hard_end = start + Duration::from_millis(200);
+        let late = best_inner(
+            &manager,
+            None,
+            Some(hard_end),
+            &answer_at(hard_end + Duration::from_millis(100), false),
+        )
+        .await;
+        assert!(late.is_err(), "answer after hard_end must not win: {late:?}");
+        assert_eq!(start.elapsed(), Duration::from_millis(200));
+    }
+
+    /// HTTP/1.1 stub on this runtime, so `tokio::time::sleep` follows pause.
+    /// The counter increments once the request headers have arrived, before
+    /// the response delay.
+    async fn paused_produce_server(
+        status: u16,
+        body: String,
+        delay: Duration,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_task = Arc::clone(&hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let body = body.clone();
+                let hits_task = Arc::clone(&hits_task);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 1024];
+                    loop {
+                        let n = match sock.read(&mut tmp).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => n,
+                        };
+                        buf.extend_from_slice(&tmp[..n]);
+                        if buf.windows(4).any(|window| window == b"\r\n\r\n") || buf.len() > 16_384
+                        {
+                            break;
+                        }
+                    }
+                    if !buf.windows(4).any(|window| window == b"\r\n\r\n") {
+                        return;
+                    }
+                    hits_task.fetch_add(1, Ordering::SeqCst);
+                    if !delay.is_zero() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let header = format!(
+                        "HTTP/1.1 {status} x\r\nContent-Type: application/json\r\n\
+                         Eth-Consensus-Version: phase0\r\n\
+                         Eth-Execution-Payload-Blinded: false\r\n\
+                         Eth-Execution-Payload-Value: 9\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = sock.write_all(header.as_bytes()).await;
+                    let _ = sock.write_all(body.as_bytes()).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// `produce_block_v3_ranked_by` → `produce_block_v3_checked`. Synced BN
+    /// returns 400 at once. The fallback answers 300 ms after its request
+    /// headers arrive. The configured budget is 5 s and the deadline is 150 ms,
+    /// so the effective budget is 150 ms.
+    ///
+    /// Time is paused with auto-advance off. The call is polled until both
+    /// stubs have counted a request, which happens only after the headers
+    /// arrive, and the clock is still at the start. The test then advances
+    /// 150 ms, and one more millisecond if the call is still pending. Elapsed
+    /// is then 150 ms or 151 ms, because tokio rounds a paused advance up to
+    /// the next millisecond tick. The call has returned and does not keep the
+    /// fallback block.
+    #[tokio::test(flavor = "current_thread")]
+    async fn produce_block_v3_checked_stops_the_fallback_at_the_deadline() {
+        use std::sync::atomic::Ordering;
+        tokio::time::pause();
+        let parent = [0xabu8; 32];
+        let (synced, synced_hits) =
+            paused_produce_server(400, "{}".to_string(), Duration::ZERO).await;
+        let block = format!(
+            r#"{{"data":{{"slot":"1","proposer_index":"7","parent_root":"{}","state_root":"{}","body":{{}}}}}}"#,
+            parent_hex(&parent),
+            parent_hex(&[0u8; 32]),
+        );
+        let (fallback, fallback_hits) =
+            paused_produce_server(200, block, Duration::from_millis(300)).await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![synced, fallback]))
+            .expect("manager")
+            .with_operation_timeouts(OperationTimeouts {
+                block_production: Duration::from_secs(5),
+                ..OperationTimeouts::default()
+            });
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        let duty = ProduceDuty {
+            expected_proposer_index: 7,
+            expected_parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
+            expected_fee_recipient: None,
+            expected_consensus_version: ForkName::Phase0,
+            shape: ShapeConstraint::Any,
+        };
+        let start = tokio::time::Instant::now();
+        let deadline = start + Duration::from_millis(150);
+        let produce = manager.produce_block_v3_ranked_by(
+            1,
+            "0xrandao",
+            None,
+            None,
+            Some(duty),
+            Some(deadline),
+        );
+        tokio::pin!(produce);
+        let mut both_received = false;
+        for _ in 0..10_000 {
+            if synced_hits.load(Ordering::SeqCst) >= 1 && fallback_hits.load(Ordering::SeqCst) >= 1
+            {
+                both_received = true;
+                break;
+            }
+            tokio::select! {
+                biased;
+                result = &mut produce => panic!(
+                    "produce finished before both requests were recorded: {result:?}"
+                ),
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+        assert!(both_received, "stubs did not receive both requests before the deadline");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        let mut result = None;
+        for step in [Duration::from_millis(150), Duration::from_millis(1)] {
+            tokio::time::advance(step).await;
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            if let std::task::Poll::Ready(ready) = produce.as_mut().poll(&mut cx) {
+                result = Some(ready);
+                break;
+            }
+        }
+        let result = result.unwrap_or_else(|| {
+            panic!(
+                "produce still pending after the deadline advance, elapsed {:?}",
+                start.elapsed()
+            )
+        });
+        assert!(result.is_err(), "fallback at 300 ms must not win: {result:?}");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed == Duration::from_millis(150) || elapsed == Duration::from_millis(151),
+            "elapsed {elapsed:?}"
+        );
+        assert!(synced_hits.load(Ordering::SeqCst) >= 1, "synced stub did not receive a request");
+        assert!(
+            fallback_hits.load(Ordering::SeqCst) >= 1,
+            "fallback stub did not receive a request"
+        );
+    }
+
+    /// A deadline already in the past is zero. It does not panic, and it does
+    /// not wait out the 250 ms backstop.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_past_hard_end_does_not_panic_or_wait_out_the_backstop() {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let hard_end = tokio::time::Instant::now() - Duration::from_millis(500);
+        assert_eq!(
+            outer_produce_timeout(Some(Duration::from_millis(200)), Some(hard_end)),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            fallback_backstop(
+                tokio::time::Instant::now(),
+                Some(Duration::from_millis(200)),
+                Some(hard_end),
+            ),
+            Some(hard_end)
+        );
+
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let budget = manager.production_budget(Some(hard_end));
+        assert_eq!(budget, Some(Duration::ZERO));
+        let result = best_until(
+            &manager,
+            budget,
+            Some(hard_end),
+            &answer_at(start + Duration::from_millis(100), true),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// The budget passed to `best_until` is 2 s, longer than the time left
+    /// until `hard_end`. That helper feeds the 2 s value to
+    /// `outer_produce_timeout` and `query_best_inner` directly.
+    /// `produce_block_v3_checked` would call `production_budget` first, and
+    /// that caps the budget at the time left, so this 2 s value is not the
+    /// budget that function passes. On this call the outer timeout is the
+    /// time left, not budget + 250 ms.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_earlier_hard_end_cuts_a_longer_production_budget() {
+        let manager = two_bn_pool().await;
+        let cap = Duration::from_millis(200);
+        let start = tokio::time::Instant::now();
+        let hard_end = start + cap;
+        let result = best_until(
+            &manager,
+            Some(Duration::from_secs(2)),
+            Some(hard_end),
+            &answer_at(hard_end + Duration::from_millis(100), true),
+        )
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(start.elapsed(), cap);
+    }
+
+    /// A deadline from the previous call on the same manager does not shorten
+    /// the next one. The budget is longer than either deadline, and the synced
+    /// BN errors so the fallback starts at once. The first call drops a late
+    /// fallback. The second call keeps one that arrives inside its own deadline.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_stale_hard_end_does_not_clamp_the_next_call() {
+        let manager = two_bn_pool().await;
+        let budget = Some(Duration::from_secs(2));
+
+        let start = tokio::time::Instant::now();
+        let first = start + Duration::from_millis(40);
+        let early = best_until(
+            &manager,
+            budget,
+            Some(first),
+            &answer_at(first + Duration::from_millis(100), false),
+        )
+        .await;
+        assert!(early.is_err(), "first deadline must drop the late fallback: {early:?}");
+        assert_eq!(start.elapsed(), Duration::from_millis(40));
+
+        let start = tokio::time::Instant::now();
+        let second = start + Duration::from_millis(300);
+        let later = best_until(
+            &manager,
+            budget,
+            Some(second),
+            &answer_at(start + Duration::from_millis(200), false),
+        )
+        .await
+        .expect("the next call uses its own deadline");
+        assert_eq!(later[0].1.execution_payload_value.as_deref(), Some("9"));
+        assert_eq!(start.elapsed(), Duration::from_millis(200));
+    }
+
+    /// V4 has no 250 ms backstop. A hang ends at the budget.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_v4_hang_stops_at_the_budget_without_adding_the_backstop() {
+        let manager = manager_with_endpoints(&["synced"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        let budget = Duration::from_millis(200);
+        let start = tokio::time::Instant::now();
+        let err = manager
+            .query_failover_inner(
+                "produce_block_v4",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(budget),
+                &|_client| {
+                    Box::pin(async {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Ok(block_with_value("1"))
+                    })
+                },
+            )
+            .await
+            .expect_err("v4 hang");
+        assert!(
+            matches!(err, BeaconError::OperationTimeout { .. } | BeaconError::Timeout),
+            "{err:?}"
+        );
+        assert_eq!(start.elapsed(), budget);
     }
 
     fn parent_hex(parent: &[u8; 32]) -> String {
@@ -9226,6 +9797,7 @@ mod tests {
                 "held_candidate",
                 BnRole::All,
                 HealthTier::Unsynced,
+                None,
                 None,
                 &op,
                 select,

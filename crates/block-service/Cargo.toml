@@ -40,6 +40,8 @@ rvc-gloas = { workspace = true, features = ["test-fixtures"] }
 # Production dependency lines do not enable this feature.
 signer = { workspace = true, features = ["test-utils"] }
 slashing.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+# `test-util` is not part of tokio's `full` feature. The deadline-forwarding
+# tests use `start_paused` so Instant values come from the paused clock.
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
 toml.workspace = true
 tracing-test.workspace = true

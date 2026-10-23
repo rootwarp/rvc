@@ -3,6 +3,20 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## V3 block production arms the fallback at the slot deadline
+
+`produce_block_v3` on the proposer pool takes the slot end as a per-call deadline. The production budget was already the shorter of the configured budget and the time left. The 250 ms backstop and the unsynced fallback used to be armed past that deadline. Both are now armed at the earlier of (call start + budget + 250 ms) and the deadline.
+
+The outer wait is the earlier of (budget + 250 ms) and the time left until the deadline. A deadline that is already past arms a zero timeout, so the call is not asked to wait out the 250 ms. A deadline later than the budget plus 250 ms leaves that budget and its backstop unchanged. The subtraction saturates, so a deadline in the past does not panic.
+
+`produce_block_v4` has no 250 ms backstop. Its wait stays the production budget capped at the time left. This note does not change that path.
+
+The deadline is an argument of that produce call. The next produce call, and attestation, aggregate, and publication, do not keep it.
+
+The bound is a tokio timeout, the same poll order as the orchestrator's proposal timeout. When the runtime is responsive, the call is not asked to wait past it. Under scheduler lag the runtime can poll the task after the timer has fired, and a result that is already ready on that poll can still be returned. That wake-up is best-effort.
+
+With builder boost greater than 0, a V3 produce timeout at slot end can now count as a builder circuit-breaker miss. Counting that timeout as a miss biases toward local blocks. The outer proposal timeout still does not count a miss.
+
 ## Parent lookup does not treat a mixed beacon-node failure as an empty slot
 
 `query_first`, `query_first_prefer_some`, and `query_failover` return a 404 only when every beacon node that was attempted returned 404. Otherwise the result is the first non-404 error, in attempt order. A later 404 does not replace that error. Parent lookup therefore stops when one node returns 500 and another returns 404, in either order. It does not walk back and bind an older block. Stopping leaves `expected_parents` unset, which turns the parent filter off.

@@ -3,6 +3,7 @@
 use super::*;
 use eth_types::{BeaconBlock, BlindedBeaconBlock};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn test_compute_block_root_matches_tree_hash() {
@@ -139,6 +140,42 @@ async fn test_propose_block_unblinded() {
     beacon_arc.assert_last_published_block(slot, 42);
     signer_arc.assert_last_sign_block_domain(&fork, &gvr);
     signer_arc.assert_last_sign_block_header(&fork, &gvr);
+}
+
+/// `propose_block_until` passes its deadline into V3 produce. Each call keeps
+/// its own instant. `propose_block` passes `None`.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn propose_block_until_forwards_the_deadline_to_produce_v3() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let beacon = Arc::new(MockBeaconClient::unblinded(test_block(slot)).with_produce_error());
+    let service = BlockService::new(
+        Arc::new(MockSigner::new()),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let first = tokio::time::Instant::now() + Duration::from_millis(40);
+    let second = tokio::time::Instant::now() + Duration::from_millis(400);
+    let fence = beacon::DutyFence::open();
+    assert!(service
+        .propose_block_until(slot, &pubkey, 42, None, Some(first), &fence)
+        .await
+        .is_err());
+    assert!(service
+        .propose_block_until(slot, &pubkey, 42, None, Some(second), &fence)
+        .await
+        .is_err());
+    assert!(service.propose_block(slot, &pubkey, 42, None).await.is_err());
+    assert_eq!(
+        beacon.recorded_deadline(),
+        vec![
+            (super::mocks::RecordedProduce::V3, Some(first)),
+            (super::mocks::RecordedProduce::V3, Some(second)),
+            (super::mocks::RecordedProduce::V3, None),
+        ]
+    );
 }
 
 /// D29: two distinct produce answers exist, but sign + publish is single-flight.

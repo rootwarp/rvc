@@ -767,6 +767,8 @@ struct ScriptedBeacon {
     steps: std::sync::Mutex<std::collections::VecDeque<PublishStep>>,
     current: std::sync::Mutex<Option<PublishStep>>,
     index: u64,
+    /// Deadline of each `produce_block_v3_ranked_by` call, in order.
+    recorded_deadline: std::sync::Mutex<Vec<Option<tokio::time::Instant>>>,
 }
 
 impl ScriptedBeacon {
@@ -775,7 +777,12 @@ impl ScriptedBeacon {
             steps: std::sync::Mutex::new(steps.into()),
             current: std::sync::Mutex::new(None),
             index,
+            recorded_deadline: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn recorded_deadline(&self) -> Vec<Option<tokio::time::Instant>> {
+        self.recorded_deadline.lock().expect("deadline").clone()
     }
 
     fn take(&self) -> PublishStep {
@@ -842,6 +849,21 @@ impl block_service::BeaconBlockClient for ScriptedBeacon {
         self.block(slot, blinded)
     }
 
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<block_service::ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<block_service::RankedBlock>, block_service::BlockServiceError> {
+        self.recorded_deadline.lock().expect("deadline").push(deadline);
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![block_service::RankedBlock { bn_index: 0, response }])
+    }
+
     async fn produce_block_v4(
         &self,
         _slot: Slot,
@@ -905,6 +927,7 @@ struct ProposalRig {
     breaker: Arc<signer::CircuitBreakerState>,
     clock: Arc<MockSlotClock>,
     epoch: u64,
+    beacon: Arc<ScriptedBeacon>,
 }
 
 async fn proposal_rig(limit: u32, steps: Vec<PublishStep>, slots: &[u64]) -> ProposalRig {
@@ -958,6 +981,7 @@ async fn proposal_rig(limit: u32, steps: Vec<PublishStep>, slots: &[u64]) -> Pro
     map.insert(pubkey.to_bytes(), pubkey);
     let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
     let breaker = Arc::new(signer::CircuitBreakerState::new(limit, 0));
+    let beacon = Arc::new(ScriptedBeacon::new(index, steps));
     let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps {
         circuit_breaker: Arc::clone(&breaker),
         attesting_enabled: Arc::new(AtomicBool::new(true)),
@@ -967,14 +991,14 @@ async fn proposal_rig(limit: u32, steps: Vec<PublishStep>, slots: &[u64]) -> Pro
             signer,
             Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
             Arc::new(MockBeaconNodeClient::new()),
-            Arc::new(ScriptedBeacon::new(index, steps)),
+            Arc::clone(&beacon),
             None,
             store,
             create_test_config(),
             Arc::new(parking_lot::RwLock::new(map)),
         )
     });
-    ProposalRig { orchestrator, breaker, clock, epoch }
+    ProposalRig { orchestrator, breaker, clock, epoch, beacon }
 }
 
 async fn propose_at(rig: &ProposalRig, slot: u64) {
@@ -1076,4 +1100,85 @@ async fn test_proposal_timeout_does_not_record_a_miss() {
         .expect("proposal task");
     assert_eq!(rig.breaker.consecutive_misses(), 0);
     assert!(!rig.breaker.is_tripped());
+}
+
+/// The outer allowance is `min(block proposal allowance, time left in the slot)`.
+///
+/// A hang returns at the shorter of those two. Tokio's timer wheel rounds a
+/// deadline up by at most one millisecond, so under pause the measured elapsed
+/// is that shorter duration or one millisecond more. A slot that is already
+/// over does not wait out the allowance.
+#[tokio::test(flavor = "current_thread")]
+async fn test_proposal_outer_timeout_is_clamped_to_slot_end() {
+    let rig = proposal_rig(
+        3,
+        vec![PublishStep::BlindedHang, PublishStep::BlindedHang, PublishStep::BlindedHang],
+        &[121, 122, 123],
+    )
+    .await;
+    tokio::time::pause();
+    let allowance = super::block_proposal_allowance(&rig.orchestrator.config.timeouts);
+    let slot_ms = 12_000u64;
+    assert!(Duration::from_millis(slot_ms) > allowance);
+    let epoch = rig.epoch;
+    // `deadline_to_tick` adds 999_999 ns. Elapsed is the armed duration, or
+    // one millisecond more when the paused instant is not on a millisecond.
+    let within_one_tick = |actual: Duration, armed: Duration| {
+        let tick = Duration::from_millis(1);
+        assert!(
+            actual == armed || actual == armed.saturating_add(tick),
+            "elapsed {actual:?}, armed {armed:?}"
+        );
+    };
+
+    // Slot already over: remaining is zero, shorter than the allowance.
+    rig.clock.set_slot_with_offset_ms(121, slot_ms);
+    let start = tokio::time::Instant::now();
+    let ctx = SlotContext::bare(121, epoch);
+    rig.orchestrator.maybe_propose_block(121, epoch, &ctx, None).await;
+    within_one_tick(start.elapsed(), Duration::ZERO);
+
+    // 40 ms left in the slot, shorter than the allowance.
+    rig.clock.set_slot_with_offset_ms(122, slot_ms - 40);
+    let start = tokio::time::Instant::now();
+    let ctx = SlotContext::bare(122, epoch);
+    rig.orchestrator.maybe_propose_block(122, epoch, &ctx, None).await;
+    within_one_tick(start.elapsed(), Duration::from_millis(40));
+
+    // A full slot remains, longer than the allowance. The allowance wins.
+    rig.clock.set_slot(123);
+    let start = tokio::time::Instant::now();
+    let ctx = SlotContext::bare(123, epoch);
+    rig.orchestrator.maybe_propose_block(123, epoch, &ctx, None).await;
+    within_one_tick(start.elapsed(), allowance);
+}
+
+/// `maybe_propose_block` passes the slot-end deadline into block production.
+/// Each call stores its own instant. `None` stays `None` on the next call.
+#[tokio::test(flavor = "current_thread")]
+async fn test_maybe_propose_block_forwards_the_slot_end_deadline() {
+    let rig = proposal_rig(
+        3,
+        vec![PublishStep::LocalOk, PublishStep::LocalOk, PublishStep::LocalOk],
+        &[130, 131, 132],
+    )
+    .await;
+    tokio::time::pause();
+    let epoch = rig.epoch;
+
+    rig.clock.set_slot(130);
+    let first = tokio::time::Instant::now() + Duration::from_millis(800);
+    let ctx = SlotContext::bare(130, epoch);
+    rig.orchestrator.maybe_propose_block(130, epoch, &ctx, Some(first)).await;
+
+    rig.clock.set_slot(131);
+    let second = tokio::time::Instant::now() + Duration::from_secs(2);
+    let ctx = SlotContext::bare(131, epoch);
+    rig.orchestrator.maybe_propose_block(131, epoch, &ctx, Some(second)).await;
+
+    rig.clock.set_slot(132);
+    let ctx = SlotContext::bare(132, epoch);
+    rig.orchestrator.maybe_propose_block(132, epoch, &ctx, None).await;
+
+    assert_eq!(rig.beacon.recorded_deadline(), vec![Some(first), Some(second), None]);
 }

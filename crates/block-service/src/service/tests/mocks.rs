@@ -401,6 +401,13 @@ pub(crate) fn mock_envelope_sig() -> crypto::Signature {
 
 // --- Mock Beacon Client ---
 
+/// Which `_by` produce method recorded a deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordedProduce {
+    V3,
+    V4,
+}
+
 pub(crate) struct MockBeaconClient {
     pub(crate) produce_response: Option<ProduceBlockResponse>,
     /// Extra produce answers, consumed in order before `produce_response`.
@@ -429,6 +436,10 @@ pub(crate) struct MockBeaconClient {
     pub(crate) third_revocation: Option<Arc<AtomicU64>>,
     /// Duty passed to the last `produce_block_v3_ranked` call.
     pub(crate) last_duty: Mutex<Option<crate::ProduceDuty>>,
+    /// Deadline of each `produce_block_v3_ranked_by` / `produce_block_v4_by` call,
+    /// in call order, tagged with which method recorded it. Stored on this
+    /// client, not in a process-global.
+    recorded_deadline: Mutex<Vec<(RecordedProduce, Option<tokio::time::Instant>)>>,
 }
 
 impl MockBeaconClient {
@@ -457,7 +468,12 @@ impl MockBeaconClient {
             also_revocation: None,
             third_revocation: None,
             last_duty: Mutex::new(None),
+            recorded_deadline: Mutex::new(Vec::new()),
         }
+    }
+
+    pub(crate) fn recorded_deadline(&self) -> Vec<(RecordedProduce, Option<tokio::time::Instant>)> {
+        self.recorded_deadline.lock().unwrap().clone()
     }
 
     pub(crate) fn with_trace(mut self, trace: Arc<Mutex<Vec<&'static str>>>) -> Self {
@@ -784,6 +800,20 @@ impl BeaconBlockClient for MockBeaconClient {
         Ok(vec![RankedBlock { bn_index: 0, response }])
     }
 
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<crate::ProduceDuty>,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
+        self.recorded_deadline.lock().unwrap().push((RecordedProduce::V3, deadline));
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
     async fn produce_block_v4(
         &self,
         slot: Slot,
@@ -808,6 +838,18 @@ impl BeaconBlockClient for MockBeaconClient {
         }
         self.take_produce_response()
             .ok_or_else(|| BlockServiceError::Beacon("produce_block_v4 not configured".to_string()))
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: Slot,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<ProduceBlockResponse, BlockServiceError> {
+        self.recorded_deadline.lock().unwrap().push((RecordedProduce::V4, deadline));
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
     }
 
     async fn publish_block(
