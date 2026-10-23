@@ -31,8 +31,16 @@
 //! in other files. The allow-list is empty. The pin is 16 (5 shape B, 11 detached,
 //! shape A = 0).
 //!
-//! No external dependency: hand-rolled scan, same style as `raw_spawn.rs`.
+//! The executor pin is a hand-rolled text scan, same style as `raw_spawn.rs`.
+//! Its `production_region_end` line cut is unchanged. The bn-manager section
+//! is separate: `tokio::spawn` and the `#[cfg(test)] mod` cut come from
+//! `ra_ap_rustc_lexer` tokens, and the row names the enclosing item. An
+//! untrusted token stream fails that file.
 
+use ra_ap_rustc_lexer::{tokenize, FrontmatterAllowed, LiteralKind, TokenKind};
+use rvc_architecture_tests::{non_code_spans, SourceItems};
+
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -1129,4 +1137,730 @@ fn census_line_pins_match_sources() {
         Some(method_line),
         "the first bare #[cfg(test)] is the method-level pin"
     );
+}
+
+// ---------------------------------------------------------------------------
+// bn-manager census: (file, enclosing item), lexer tokens only
+// ---------------------------------------------------------------------------
+
+fn tracked_bn_files(root: &Path) -> Result<Vec<String>, String> {
+    let output = Command::new("git")
+        .args(["-c", "core.quotePath=false", "ls-files", "-z", "--", "crates/bn-manager/**/*.rs"])
+        .current_dir(root)
+        .output()
+        .map_err(|err| format!("git ls-files: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("git ls-files failed: {}", String::from_utf8_lossy(&output.stderr)));
+    }
+    let mut files = Vec::new();
+    for raw in output.stdout.split(|b| *b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let path = String::from_utf8(raw.to_vec())
+            .map_err(|_| format!("non-utf8 bn-manager path: {}", String::from_utf8_lossy(raw)))?;
+        if path.ends_with(".rs") && !path.contains("/tests/") {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn lit_unterminated(kind: LiteralKind) -> Option<bool> {
+    match kind {
+        LiteralKind::Char { terminated }
+        | LiteralKind::Byte { terminated }
+        | LiteralKind::Str { terminated }
+        | LiteralKind::ByteStr { terminated }
+        | LiteralKind::CStr { terminated } => Some(!terminated),
+        LiteralKind::RawStr { n_hashes }
+        | LiteralKind::RawByteStr { n_hashes }
+        | LiteralKind::RawCStr { n_hashes } => Some(n_hashes.is_none()),
+        LiteralKind::Int { .. } | LiteralKind::Float { .. } => None,
+    }
+}
+
+/// Lexer tokens, or why the file cannot be trusted.
+///
+/// Spans come from the lexer. A length that is not a char boundary is an
+/// error, not a slice. Comment and string tokens are masked; a disagreement
+/// with [`non_code_spans`] fails the file.
+fn lex_file(src: &str) -> Result<Vec<(usize, usize, TokenKind)>, String> {
+    let first = src.lines().next().unwrap_or("");
+    if first.starts_with("#!") && !first.starts_with("#![") {
+        return Err("shebang".to_string());
+    }
+    let mut pos = 0usize;
+    let mut toks = Vec::new();
+    let mut masked = Vec::new();
+    for tok in tokenize(src, FrontmatterAllowed::No) {
+        let len = tok.len as usize;
+        let end = pos.saturating_add(len);
+        if len == 0 || end > src.len() || !src.is_char_boundary(end) {
+            return Err("token stream broke".to_string());
+        }
+        let (mask, bad) = match tok.kind {
+            TokenKind::LineComment { .. } => (true, false),
+            TokenKind::BlockComment { terminated, .. } => (true, !terminated),
+            TokenKind::Unknown
+            | TokenKind::InvalidIdent
+            | TokenKind::GuardedStrPrefix
+            | TokenKind::UnknownPrefix
+            | TokenKind::UnknownPrefixLifetime => (false, true),
+            TokenKind::Literal { kind, .. } => match lit_unterminated(kind) {
+                Some(bad) => (true, bad),
+                None => (false, false),
+            },
+            _ => (false, false),
+        };
+        if bad {
+            return Err("unterminated or unknown token".to_string());
+        }
+        if mask {
+            masked.push((pos, end));
+        }
+        toks.push((pos, end, tok.kind));
+        pos = end;
+    }
+    if pos != src.len() {
+        return Err("token stream did not cover the file".to_string());
+    }
+    if masked != non_code_spans(src) {
+        return Err("lexer mask disagreed".to_string());
+    }
+    Ok(toks)
+}
+
+fn is_gap(kind: TokenKind) -> bool {
+    matches!(
+        kind,
+        TokenKind::Whitespace | TokenKind::LineComment { .. } | TokenKind::BlockComment { .. }
+    )
+}
+
+fn next_solid(toks: &[(usize, usize, TokenKind)], mut i: usize) -> usize {
+    while i < toks.len() && is_gap(toks[i].2) {
+        i += 1;
+    }
+    i
+}
+
+fn word_is(src: &str, toks: &[(usize, usize, TokenKind)], i: usize, want: &str) -> bool {
+    toks.get(i)
+        .is_some_and(|tok| matches!(tok.2, TokenKind::Ident) && src.get(tok.0..tok.1) == Some(want))
+}
+
+/// `Ident` or `RawIdent` with the `r#` prefix removed. Keywords stay `Ident` only.
+fn call_word<'a>(src: &'a str, tok: &(usize, usize, TokenKind)) -> Option<&'a str> {
+    let text = src.get(tok.0..tok.1)?;
+    match tok.2 {
+        TokenKind::Ident => Some(text),
+        TokenKind::RawIdent => text.strip_prefix("r#").filter(|rest| !rest.is_empty()),
+        _ => None,
+    }
+}
+
+/// Byte offset of each `tokio::spawn(` call. Comments and strings are not idents.
+fn tokio_spawn_calls(src: &str, toks: &[(usize, usize, TokenKind)]) -> Vec<usize> {
+    let mut out = Vec::new();
+    for i in 0..toks.len() {
+        if call_word(src, &toks[i]) != Some("tokio") {
+            continue;
+        }
+        let colon = next_solid(toks, i + 1);
+        let colon2 = next_solid(toks, colon + 1);
+        let name = next_solid(toks, colon2 + 1);
+        let open = next_solid(toks, name + 1);
+        if open < toks.len()
+            && matches!(toks[colon].2, TokenKind::Colon)
+            && matches!(toks[colon2].2, TokenKind::Colon)
+            && toks.get(name).is_some_and(|tok| call_word(src, tok) == Some("spawn"))
+            && matches!(toks[open].2, TokenKind::OpenParen)
+        {
+            out.push(toks[i].0);
+        }
+    }
+    out
+}
+
+fn line_starts(src: &str) -> Vec<usize> {
+    let mut starts = Vec::new();
+    starts.push(0);
+    for (i, b) in src.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    starts
+}
+
+fn line_text_at(src: &str, starts: &[usize], at: usize) -> String {
+    let line = starts.partition_point(|start| *start <= at);
+    let from = starts[line - 1];
+    let to = starts.get(line).copied().unwrap_or(src.len());
+    src[from..to].trim().to_string()
+}
+
+fn cfg_test_attr_end(src: &str, toks: &[(usize, usize, TokenKind)], i: usize) -> Option<usize> {
+    if !matches!(toks.get(i)?.2, TokenKind::Pound) {
+        return None;
+    }
+    let bracket = next_solid(toks, i + 1);
+    if !matches!(toks.get(bracket)?.2, TokenKind::OpenBracket) {
+        return None;
+    }
+    let cfg = next_solid(toks, bracket + 1);
+    if !word_is(src, toks, cfg, "cfg") {
+        return None;
+    }
+    let open = next_solid(toks, cfg + 1);
+    if !matches!(toks.get(open)?.2, TokenKind::OpenParen) {
+        return None;
+    }
+    let test = next_solid(toks, open + 1);
+    if !word_is(src, toks, test, "test") {
+        return None;
+    }
+    let close = next_solid(toks, test + 1);
+    if !matches!(toks.get(close)?.2, TokenKind::CloseParen) {
+        return None;
+    }
+    let end = next_solid(toks, close + 1);
+    if !matches!(toks.get(end)?.2, TokenKind::CloseBracket) {
+        return None;
+    }
+    Some(end + 1)
+}
+
+fn skip_until(
+    toks: &[(usize, usize, TokenKind)],
+    from: usize,
+    open: TokenKind,
+    close: TokenKind,
+) -> Option<usize> {
+    let mut depth = 0usize;
+    for (n, tok) in toks.iter().enumerate().skip(from) {
+        if tok.2 == open {
+            depth += 1;
+        } else if tok.2 == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(n + 1);
+            }
+        }
+    }
+    None
+}
+
+fn mod_after(src: &str, toks: &[(usize, usize, TokenKind)], mut i: usize) -> Option<usize> {
+    loop {
+        i = next_solid(toks, i);
+        if matches!(toks.get(i)?.2, TokenKind::Pound) {
+            let bracket = next_solid(toks, i + 1);
+            if !matches!(toks.get(bracket)?.2, TokenKind::OpenBracket) {
+                return None;
+            }
+            i = skip_until(toks, bracket, TokenKind::OpenBracket, TokenKind::CloseBracket)?;
+            continue;
+        }
+        break;
+    }
+    if word_is(src, toks, i, "pub") {
+        let next = next_solid(toks, i + 1);
+        if matches!(toks.get(next).map(|tok| tok.2), Some(TokenKind::OpenParen)) {
+            i = next_solid(
+                toks,
+                skip_until(toks, next, TokenKind::OpenParen, TokenKind::CloseParen)?,
+            );
+        } else {
+            i = next;
+        }
+    }
+    word_is(src, toks, i, "mod").then_some(i)
+}
+
+fn module_end(toks: &[(usize, usize, TokenKind)], mod_i: usize) -> Option<usize> {
+    let name = next_solid(toks, mod_i + 1);
+    toks.get(name)?;
+    let after = next_solid(toks, name + 1);
+    match toks.get(after).map(|tok| tok.2) {
+        Some(TokenKind::Semi) => Some(toks[after].1),
+        Some(TokenKind::OpenBrace) => {
+            skip_until(toks, after, TokenKind::OpenBrace, TokenKind::CloseBrace)
+                .map(|idx| toks[idx - 1].1)
+        }
+        _ => None,
+    }
+}
+
+/// Byte where the test module's `#[cfg(test)]` starts, or an error when code follows it.
+fn bn_test_cut(src: &str, toks: &[(usize, usize, TokenKind)]) -> Result<Option<usize>, String> {
+    let mut i = 0;
+    while i < toks.len() {
+        if matches!(toks[i].2, TokenKind::Pound) {
+            if let Some(after) = cfg_test_attr_end(src, toks, i) {
+                if let Some(mod_i) = mod_after(src, toks, after) {
+                    let end = module_end(toks, mod_i).ok_or("unclosed test module")?;
+                    let follows = toks.iter().any(|tok| tok.0 >= end && !is_gap(tok.2));
+                    if follows {
+                        return Err("production code follows the test module".to_string());
+                    }
+                    return Ok(Some(toks[i].0));
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(None)
+}
+
+#[derive(Debug)]
+struct BnHit {
+    file: String,
+    item: String,
+    fp: String,
+}
+
+#[derive(Debug)]
+struct BnRow {
+    file: String,
+    item: String,
+    raw: String,
+}
+
+fn bn_hits(files: &[(String, String)]) -> Result<Vec<BnHit>, String> {
+    let mut hits = Vec::new();
+    let mut errors = Vec::new();
+    for (path, src) in files {
+        let toks = match lex_file(src) {
+            Ok(toks) => toks,
+            Err(err) => {
+                errors.push(format!("row {path}: {err}"));
+                continue;
+            }
+        };
+        let items = match SourceItems::parse(src) {
+            Ok(items) => items,
+            Err(err) => {
+                errors.push(format!("row {path}: {err}"));
+                continue;
+            }
+        };
+        let starts = line_starts(src);
+        let cut = match bn_test_cut(src, &toks) {
+            Ok(cut) => cut,
+            Err(err) => {
+                errors.push(format!("row {path}: {err}"));
+                continue;
+            }
+        };
+        for at in tokio_spawn_calls(src, &toks) {
+            if cut.is_some_and(|cut| at >= cut) {
+                continue;
+            }
+            let fp = line_text_at(src, &starts, at);
+            match items.enclosing(at) {
+                Err(err) => errors.push(format!("row {path} fingerprint {fp:?}: {err}")),
+                Ok(id) if id.as_str().is_empty() || id.as_str() == "<module>" => {
+                    errors.push(format!("row {path} fingerprint {fp:?}: refusing <module>"));
+                }
+                Ok(id) => {
+                    hits.push(BnHit { file: path.clone(), item: id.as_str().to_string(), fp })
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(hits)
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn is_line_number(cell: &str) -> bool {
+    !cell.is_empty() && cell.chars().all(|c| c.is_ascii_digit())
+}
+
+fn parse_bn_rows(section: &str) -> Result<Vec<BnRow>, String> {
+    let mut rows = Vec::new();
+    let mut errors = Vec::new();
+    for cells in markdown_table(section) {
+        let raw = cells.join(" | ");
+        if cells.len() < 3 {
+            errors.push(format!("bn-manager row needs file, item, call: {raw}"));
+            continue;
+        }
+        if is_line_number(&cells[1]) {
+            errors.push(format!("bn-manager row uses a line number as the item: {raw}"));
+            continue;
+        }
+        if cells[2] != "tokio::spawn" {
+            errors.push(format!("bn-manager row call must be tokio::spawn: {raw}"));
+            continue;
+        }
+        rows.push(BnRow { file: cells[0].clone(), item: cells[1].clone(), raw });
+    }
+    if errors.is_empty() {
+        Ok(rows)
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn reconcile_bn(rows: &[BnRow], hits: &[BnHit]) -> Result<(), String> {
+    let mut errors = Vec::new();
+    let mut expected: HashMap<String, String> = HashMap::new();
+    for row in rows {
+        let detail = format!("bn-manager {} item `{}` ({})", row.file, row.item, row.raw);
+        let key = format!("{}\n{}", row.file, row.item);
+        if expected.insert(key, detail.clone()).is_some() {
+            errors.push(format!("duplicate {detail}"));
+        }
+    }
+    let mut seen: HashMap<String, String> = HashMap::new();
+    for hit in hits {
+        let detail =
+            format!("bn-manager {} item `{}` fingerprint {:?}", hit.file, hit.item, hit.fp);
+        let key = format!("{}\n{}", hit.file, hit.item);
+        if let Some(prev) = seen.insert(key.clone(), detail.clone()) {
+            errors.push(format!("duplicate hit {detail}; also {prev}"));
+            continue;
+        }
+        if !expected.contains_key(&key) {
+            errors.push(format!("extra {detail}"));
+        }
+    }
+    for (key, detail) in &expected {
+        if !seen.contains_key(key) {
+            errors.push(format!("missing {detail}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+fn bn_section_matches(census: &str, files: &[(String, String)]) -> Result<(), String> {
+    let rows = parse_bn_rows(&section_body(census, "bn-manager raw"))?;
+    reconcile_bn(&rows, &bn_hits(files)?)
+}
+
+fn check_bn(rows: &[(&str, &str)], files: &[(&str, &str)]) -> Result<(), String> {
+    let owned: Vec<(String, String)> =
+        files.iter().map(|(path, src)| ((*path).to_string(), (*src).to_string())).collect();
+    let content: Vec<BnRow> = rows
+        .iter()
+        .map(|(file, item)| BnRow {
+            file: (*file).to_string(),
+            item: (*item).to_string(),
+            raw: format!("{file} {item}"),
+        })
+        .collect();
+    reconcile_bn(&content, &bn_hits(&owned)?)
+}
+
+fn load_bn(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for rel in tracked_bn_files(root)? {
+        let src =
+            std::fs::read_to_string(root.join(&rel)).map_err(|err| format!("row {rel}: {err}"))?;
+        out.push((rel, src));
+    }
+    Ok(out)
+}
+
+#[test]
+fn census_bn_manager_rows_match_sources() {
+    let root = workspace_root();
+    let census = std::fs::read_to_string(root.join(CENSUS)).unwrap();
+    let files = load_bn(&root).unwrap_or_else(|err| panic!("{err}"));
+    bn_section_matches(&census, &files).unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+fn census_accepts_a_spawn_inside_a_closure() {
+    let src = "fn outer() {\n    let _ = || { tokio::spawn(async {}); };\n}\n";
+    check_bn(&[("a.rs", "outer")], &[("a.rs", src)]).unwrap();
+    let err = check_bn(&[("a.rs", "<closure>")], &[("a.rs", src)]).unwrap_err();
+    assert!(err.contains("<closure>") && err.contains("outer"), "{err}");
+}
+
+#[test]
+fn census_accepts_a_spawn_inside_a_macro() {
+    let src = "macro_rules! m {\n    () => { tokio::spawn(async {}); };\n}\n";
+    check_bn(&[("a.rs", "macro_rules!m")], &[("a.rs", src)]).unwrap();
+}
+
+#[test]
+fn census_accepts_a_spawn_inside_a_nested_mod() {
+    let src = "mod outer {\n    fn inner() {\n        tokio::spawn(async {});\n    }\n}\n";
+    check_bn(&[("a.rs", "outer::inner")], &[("a.rs", src)]).unwrap();
+    let err = check_bn(&[("a.rs", "inner")], &[("a.rs", src)]).unwrap_err();
+    assert!(err.contains("inner") && err.contains("outer::inner"), "{err}");
+}
+
+#[test]
+fn census_accepts_spaced_tokio_spawn_tokens() {
+    let src = "fn item() {\n    tokio /* gap */ :: spawn(async {});\n}\n";
+    check_bn(&[("a.rs", "item")], &[("a.rs", src)]).unwrap();
+}
+
+#[test]
+fn census_ignores_tokio_spawn_in_a_comment_or_string() {
+    let src = "fn item() {\n    // tokio::spawn(async {});\n    let _ = \"tokio::spawn\";\n    tokio::spawn(async {});\n}\n";
+    check_bn(&[("a.rs", "item")], &[("a.rs", src)]).unwrap();
+}
+
+#[test]
+fn census_ignores_a_spawn_inside_a_cfg_test_module() {
+    let src = "\
+fn item() {\n\
+    tokio::spawn(async {});\n\
+}\n\
+#[cfg(test)]\n\
+mod tests {\n\
+    fn hidden() { tokio::spawn(async {}); }\n\
+}\n\
+";
+    check_bn(&[("a.rs", "item")], &[("a.rs", src)]).unwrap();
+}
+
+#[test]
+fn census_ignores_a_use_of_tokio_spawn() {
+    let src = "use tokio::spawn;\nfn item() {\n    tokio::spawn(async {});\n}\n";
+    check_bn(&[("a.rs", "item")], &[("a.rs", src)]).unwrap();
+}
+
+#[test]
+fn census_rejects_a_row_whose_item_is_gone() {
+    let src = "fn now() {\n    tokio::spawn(async {});\n}\n";
+    let err = check_bn(&[("a.rs", "gone")], &[("a.rs", src)]).unwrap_err();
+    assert!(err.contains("gone") && err.contains("now"), "{err}");
+}
+
+#[test]
+fn census_rejects_a_duplicated_row() {
+    let src = "fn item() {\n    tokio::spawn(async {});\n}\n";
+    let err = check_bn(&[("a.rs", "item"), ("a.rs", "item")], &[("a.rs", src)]).unwrap_err();
+    assert!(err.contains("duplicate"), "{err}");
+    let twin = "fn item() {\n    tokio::spawn(async {});\n    tokio::spawn(async {});\n}\n";
+    let err = check_bn(&[("a.rs", "item")], &[("a.rs", twin)]).unwrap_err();
+    assert!(err.contains("duplicate hit"), "{err}");
+}
+
+#[test]
+fn census_rejects_a_row_moved_to_another_file() {
+    let src = "fn item() {\n    tokio::spawn(async {});\n}\n";
+    let err = check_bn(&[("a.rs", "item")], &[("b.rs", src)]).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("b.rs"), "{err}");
+}
+
+#[test]
+fn census_rejects_an_ambiguous_item() {
+    let src = "fn f() {\n    tokio::spawn(async {});\n}\nfn f() {}\n";
+    let err = check_bn(&[("a.rs", "f")], &[("a.rs", src)]).unwrap_err();
+    assert!(err.contains("ambiguous"), "{err}");
+    assert!(!err.contains("<module>"), "{err}");
+}
+
+#[test]
+fn census_rejects_an_untrusted_file() {
+    let src = "fn f() {\n    tokio::spawn(async {});\n    let _ = \"unterminated;\n}\n";
+    let err = check_bn(&[("a.rs", "f")], &[("a.rs", src)]).unwrap_err();
+    assert!(err.contains("a.rs"), "{err}");
+    assert!(err.contains("unclosed") || err.contains("unterminated"), "{err}");
+    assert!(!err.contains("<module>"), "{err}");
+}
+
+#[test]
+fn census_rejects_a_shebang_file() {
+    let src = "#!/usr/bin/env rust\nfn item() { tokio::spawn(async {}); }\n";
+    let err = check_bn(&[("a.rs", "item")], &[("a.rs", src)]).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("shebang"), "{err}");
+}
+
+#[test]
+fn census_rejects_a_module_level_spawn() {
+    let src = "tokio::spawn(async {});\n";
+    let err = check_bn(&[("a.rs", "<module>")], &[("a.rs", src)]).unwrap_err();
+    assert!(err.contains("refusing <module>"), "{err}");
+}
+
+#[test]
+fn census_rejects_a_line_numbered_item() {
+    let section = "\
+| File | Item | Call |\n\
+|---|---|---|\n\
+| `crates/bn-manager/src/manager.rs` | 785 | `tokio::spawn` in `start_sse` |\n\
+";
+    let err = parse_bn_rows(section).unwrap_err();
+    assert!(
+        err.contains("line number") && err.contains("785") && err.contains("start_sse"),
+        "{err}"
+    );
+}
+
+#[test]
+fn census_rejects_a_production_multibyte_char_literal() {
+    let src = "fn item() {\n    let _ = '€';\n    tokio::spawn(async {});\n}\n";
+    let err = check_bn(&[("a.rs", "item")], &[("a.rs", src)]).unwrap_err();
+    assert!(err.contains("a.rs"), "{err}");
+    assert!(err.contains("lexer mask disagreed"), "{err}");
+    assert!(!err.contains("<module>"), "{err}");
+}
+
+#[test]
+fn census_accepts_a_multibyte_char_inside_a_string() {
+    let src = "fn item() {\n    let _ = \"€\";\n    tokio::spawn(async {});\n}\n";
+    check_bn(&[("a.rs", "item")], &[("a.rs", src)]).unwrap();
+}
+
+fn init_bn_repo(files: &[(&str, &str)]) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    let root = std::env::temp_dir().join(format!(
+        "bn-census-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("crates/bn-manager/src")).unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git").args(args).current_dir(&root).output().expect("git");
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    for (rel, src) in files {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, src).unwrap();
+    }
+    git(&["add", "-A"]);
+    root
+}
+
+#[test]
+fn census_reads_non_ascii_and_quoted_tracked_paths() {
+    let cafe = "crates/bn-manager/src/café.rs";
+    let messy = "crates/bn-manager/src/q\"b\\c\td.rs";
+    let body = "fn h() { tokio::spawn(async {}); }\n";
+    let root = init_bn_repo(&[(cafe, body), (messy, body)]);
+    let hits = bn_hits(&load_bn(&root).unwrap()).unwrap();
+    assert!(hits.iter().any(|hit| hit.file.contains("café")), "dropped non-ascii: {hits:?}");
+    assert!(
+        hits.iter().any(|hit| hit.file.contains('"')
+            && hit.file.contains('\\')
+            && hit.file.contains('\t')),
+        "dropped quoted path: {hits:?}"
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn census_names_a_non_utf8_tracked_path() {
+    use std::os::unix::ffi::OsStringExt;
+    let root = init_bn_repo(&[]);
+    let mut name = b"bad".to_vec();
+    name.push(0xff);
+    name.extend(b".rs");
+    let path = root.join("crates/bn-manager/src").join(std::ffi::OsString::from_vec(name));
+    std::fs::write(&path, "fn h() { tokio::spawn(async {}); }\n").unwrap();
+    let out = Command::new("git").args(["add", "-A"]).current_dir(&root).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let err = tracked_bn_files(&root).unwrap_err();
+    assert!(err.contains("non-utf8") && err.contains("bad"), "{err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn census_names_an_unreadable_tracked_file() {
+    let rel = "crates/bn-manager/src/gone.rs";
+    let root = init_bn_repo(&[(rel, "fn h() { tokio::spawn(async {}); }\n")]);
+    std::fs::remove_file(root.join(rel)).unwrap();
+    let err = load_bn(&root).unwrap_err();
+    assert!(err.contains(rel), "{err}");
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn census_accepts_r_hash_tokio_spawn_inside_a_macro() {
+    let src = "macro_rules! m { () => { r#tokio::spawn(async {}); }; }\n";
+    check_bn(&[("a.rs", "macro_rules!m")], &[("a.rs", src)]).unwrap();
+    let both = "macro_rules! m { () => { r#tokio::r#spawn(async {}); }; }\n";
+    check_bn(&[("a.rs", "macro_rules!m")], &[("a.rs", both)]).unwrap();
+}
+
+#[test]
+fn census_accepts_r_hash_spawn_inside_a_macro() {
+    let src = "macro_rules! m { () => { tokio::r#spawn(async {}); }; }\n";
+    check_bn(&[("a.rs", "macro_rules!m")], &[("a.rs", src)]).unwrap();
+}
+
+#[test]
+fn census_keeps_a_spawn_after_a_raw_string_cfg_decoy() {
+    let src = "\
+fn item() {\n\
+    let _ = r#\"\n\
+#[cfg(test)]\n\
+mod x\n\
+\"#;\n\
+    tokio::spawn(async {});\n\
+}\n\
+";
+    check_bn(&[("a.rs", "item")], &[("a.rs", src)]).unwrap();
+}
+
+#[test]
+fn census_keeps_a_spawn_after_a_block_comment_cfg_decoy() {
+    let src = "\
+fn item() {\n\
+    /*\n\
+#[cfg(test)]\n\
+mod x\n\
+*/\n\
+    tokio::spawn(async {});\n\
+}\n\
+";
+    check_bn(&[("a.rs", "item")], &[("a.rs", src)]).unwrap();
+}
+
+#[test]
+fn census_rejects_production_code_after_the_test_module() {
+    let braced = "\
+fn item() {\n\
+    tokio::spawn(async {});\n\
+}\n\
+#[cfg(test)]\n\
+mod tests {\n\
+    fn hidden() { tokio::spawn(async {}); }\n\
+}\n\
+fn after() {}\n\
+";
+    let err = check_bn(&[("a.rs", "item")], &[("a.rs", braced)]).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("follows the test module"), "{err}");
+    let semi = "fn item() { tokio::spawn(async {}); }\n#[cfg(test)] mod tests;\nfn after() {}\n";
+    let err = check_bn(&[("a.rs", "item")], &[("a.rs", semi)]).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("follows the test module"), "{err}");
+}
+
+#[test]
+fn census_keeps_a_spawn_inside_a_non_test_cfg_module() {
+    let unix = "\
+fn item() { tokio::spawn(async {}); }\n\
+#[cfg(unix)]\n\
+mod p {\n\
+    pub fn g() { tokio::spawn(async {}); }\n\
+}\n\
+";
+    check_bn(&[("a.rs", "item"), ("a.rs", "p::g")], &[("a.rs", unix)]).unwrap();
+    let not_test = "\
+fn item() { tokio::spawn(async {}); }\n\
+#[cfg(not(test))]\n\
+mod p {\n\
+    pub fn g() { tokio::spawn(async {}); }\n\
+}\n\
+";
+    check_bn(&[("a.rs", "item"), ("a.rs", "p::g")], &[("a.rs", not_test)]).unwrap();
 }
