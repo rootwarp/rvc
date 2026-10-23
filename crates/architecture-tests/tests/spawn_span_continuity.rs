@@ -45,16 +45,27 @@
 //! in other files. The allow-list is empty. The pin is 16 (5 shape B, 11 detached,
 //! shape A = 0).
 //!
+//! Census rows are content anchors. A production site is `(file, enclosing
+//! item, task, call)`. A shape-B loop is `(loop file, item containing the
+//! loop)`. A not-site is `(file, enclosing item, task)`. The task is the whole
+//! first argument: a plain string literal, or the only `const` of that name in
+//! the production prefix whose initializer is a plain string followed by `;`.
+//! The next token after that argument is a comma. `enclosing_item` resolves
+//! the item on that prefix. A hit inside an item whose name is declared twice,
+//! an untrusted token stream, a raw ident the resolver refuses, or a hit
+//! outside every fn and `macro_rules!` fails the file. The call scan still sees a call in that file; the anchor does not
+//! return a successful list that omitted it. A blank line does not change an
+//! anchor. A census path cell is repo-relative.
+//!
+//! `census_anchors_match_sources` checks those rows, the liveness content
+//! shape, and the bn-manager section. The liveness shape is token order: the
+//! first bare `#[cfg(test)]` sits on a function, a later bare `#[cfg(test)]`
+//! does not, and a column-0 `#[cfg(test)]` is followed by `mod`. The production
+//! spawn is after that first attribute and before the module attribute.
+//!
 //! The bn-manager section is separate. Its rows name the enclosing item.
 //! An untrusted token stream fails that file. The production site list comes
-//! from `find_production_sites`. `register_opt_none_sites` calls the same
-//! `executor_calls` scan for the not-site table and does not build that list.
-//! `census_line_pins_match_sources` still calls
-//! `code_portion` (through `line_is_loop`, and on the prose-cited spawn line),
-//! `is_column0_cfg_test`, `cfg_test_followed_by_mod`, `next_code_line`, and
-//! `first_bare_cfg_test_line`. `bare_cfg_test_does_not_hide_the_liveness_loop_spawn`
-//! still calls `production_region_end` and `code_portion`. Those walks do not
-//! decide a hit.
+//! from `find_production_sites`. Not-sites use the same `executor_calls` scan.
 
 use ra_ap_rustc_lexer::{tokenize, FrontmatterAllowed, LiteralKind, TokenKind};
 use rvc_architecture_tests::{non_code_spans, SourceItems};
@@ -95,7 +106,10 @@ impl Kind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Site {
     path: String,
+    /// Diagnostic only. Census keys do not use it.
     line: usize,
+    item: String,
+    task: String,
     kind: Kind,
     /// Immediately preceding non-empty line is a `// detached:` comment.
     detached: bool,
@@ -103,11 +117,19 @@ struct Site {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct NotSite {
+    path: String,
+    item: String,
+    task: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ShapeBRow {
     task: String,
     spawn_path: String,
-    spawn_line: usize,
+    spawn_item: String,
     loop_path: String,
+    loop_item: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,109 +155,14 @@ fn tracked_rs_files(root: &Path) -> Result<Vec<String>, String> {
     tracked_nul(root, "executor", &["crates/rvc/**/*.rs", "bin/rvc/**/*.rs"])
 }
 
-// ---------------------------------------------------------------------------
-// Production region: #[cfg(test)] followed by mod
-// ---------------------------------------------------------------------------
+// The production cut is `executor_cut`: the first `#[cfg(test)]` followed by `mod`.
+// A bare attribute does not end the region.
 
-/// 1-based line of the first column-0 `#[cfg(test)]` followed by `mod`.
-///
-/// Lines at and after this line are outside the production region. Returns
-/// `None` when the file has no such module attribute (the whole file is
-/// production for this gate).
-fn production_region_end(lines: &[&str]) -> Option<usize> {
-    for (i, line) in lines.iter().enumerate() {
-        if is_column0_cfg_test(line) && cfg_test_followed_by_mod(lines, i) {
-            return Some(i + 1);
-        }
-    }
-    None
-}
-
-/// Column-0 `#[cfg(test)]`, not `#[cfg(test, ...)]` or `#[cfg(testing)]`.
-fn is_column0_cfg_test(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("#[cfg(test)]") else {
-        return false;
-    };
-    rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace())
-}
-
-/// `#[cfg(test)]` then `mod`, skipping blank lines, `//` comments, and attributes.
-///
-/// Same-line `#[cfg(test)] mod tests` counts. `pub` / `pub(crate)` / `pub(super)`
-/// may precede `mod`. An indented method attribute is not column-0, so it never
-/// reaches this check.
-fn cfg_test_followed_by_mod(lines: &[&str], idx: usize) -> bool {
-    let rest = lines[idx].trim().strip_prefix("#[cfg(test)]").unwrap_or("").trim_start();
-    if !rest.is_empty() && !rest.starts_with("//") {
-        return is_mod_item(rest);
-    }
-    for line in lines.iter().skip(idx + 1) {
-        let n = line.trim();
-        if n.is_empty() || n.starts_with("//") || n.starts_with('#') {
-            continue;
-        }
-        return is_mod_item(n);
-    }
-    false
-}
-
-fn is_mod_item(trimmed: &str) -> bool {
-    let rest = if let Some(after_pub) = trimmed.strip_prefix("pub") {
-        let after_pub = after_pub.trim_start();
-        if let Some(inside) = after_pub.strip_prefix('(') {
-            let Some(end) = inside.find(')') else {
-                return false;
-            };
-            inside[end + 1..].trim_start()
-        } else {
-            after_pub
-        }
-    } else {
-        trimmed
-    };
-    let Some(after_mod) = rest.strip_prefix("mod") else {
-        return false;
-    };
-    after_mod.is_empty() || after_mod.starts_with(|c: char| c.is_whitespace() || c == '{')
-}
-
-/// First 1-based line whose trim is exactly `#[cfg(test)]`, indented or not.
-///
-/// This is the truncation this gate refuses: it hides `liveness_loop.rs`'s
-/// production spawn, which sits above the column-0 module attribute.
-fn first_bare_cfg_test_line(lines: &[&str]) -> Option<usize> {
-    lines.iter().position(|l| l.trim() == "#[cfg(test)]").map(|i| i + 1)
-}
-
-// ---------------------------------------------------------------------------
-// Call scan
-// ---------------------------------------------------------------------------
-
-fn code_portion(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut in_str = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if in_str && b == b'\\' {
-            i += 2;
-            continue;
-        }
-        if b == b'"' {
-            in_str = !in_str;
-            i += 1;
-            continue;
-        }
-        if !in_str && b == b'/' && bytes.get(i + 1) == Some(&b'/') {
-            return &line[..i];
-        }
-        i += 1;
-    }
-    line
-}
-
+#[derive(Debug)]
 struct ExecHit {
     at: usize,
+    /// Token index of the call's `(`.
+    open: usize,
     kind: Kind,
     is_site: bool,
 }
@@ -376,7 +303,7 @@ fn executor_calls(src: &str, toks: &[(usize, usize, TokenKind)]) -> Result<Vec<E
             Kind::RegisterOpt => !last_arg_is_none(src, toks, open, close),
             Kind::Spawn | Kind::Register => true,
         };
-        out.push(ExecHit { at: toks[i].0, kind: kind.unwrap(), is_site });
+        out.push(ExecHit { at: toks[i].0, open, kind: kind.unwrap(), is_site });
         // Keep scanning the argument list so a nested call is not skipped.
         // The turbofish skip above cannot run past this call.
         limit.push(after_close);
@@ -449,87 +376,263 @@ fn preceding_nonempty<'a>(lines: &[&'a str], line_1based: usize) -> Option<&'a s
     None
 }
 
-fn find_production_sites(path: &str, src: &str) -> Result<Vec<Site>, String> {
+enum TaskConst {
+    Plain(String),
+    Other,
+}
+
+/// A plain `"..."` literal. Escapes, raw strings, and byte strings are `Err`
+/// so a caller can fail closed instead of treating them as a different token.
+fn plain_task_string(src: &str, tok: &(usize, usize, TokenKind)) -> Result<Option<String>, String> {
+    match tok.2 {
+        TokenKind::Literal { kind: LiteralKind::Str { terminated: true }, .. } => {
+            let text = src.get(tok.0..tok.1).ok_or("task string is not a char boundary")?;
+            if text.contains('\\') {
+                return Err("escaped task string".to_string());
+            }
+            text.strip_prefix('"')
+                .and_then(|rest| rest.strip_suffix('"'))
+                .map(|inner| Some(inner.to_string()))
+                .ok_or_else(|| "task string is not a plain literal".to_string())
+        }
+        TokenKind::Literal { kind: LiteralKind::RawStr { .. }, .. }
+        | TokenKind::Literal { kind: LiteralKind::ByteStr { .. }, .. }
+        | TokenKind::Literal { kind: LiteralKind::RawByteStr { .. }, .. }
+        | TokenKind::Literal { kind: LiteralKind::CStr { .. }, .. }
+        | TokenKind::Literal { kind: LiteralKind::RawCStr { .. }, .. } => {
+            Err("task string is not a plain literal".to_string())
+        }
+        TokenKind::Literal { kind: LiteralKind::Str { terminated: false }, .. } => {
+            Err("unterminated task string".to_string())
+        }
+        _ => Ok(None),
+    }
+}
+
+/// `const NAME = "...";` in the production prefix. Two consts of one name fail.
+/// The initializer counts only when the next token is `;`. Anything else is
+/// other and rejected at the call that uses it, so an unused const does not
+/// hide a later spawn.
+fn const_strings(
+    src: &str,
+    toks: &[(usize, usize, TokenKind)],
+    prefix: usize,
+) -> Result<HashMap<String, TaskConst>, String> {
+    let mut out = HashMap::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if toks[i].0 >= prefix || !word_is(src, toks, i, "const") {
+            i += 1;
+            continue;
+        }
+        let name_i = next_solid(toks, i + 1);
+        let Some(name) = toks.get(name_i).and_then(|tok| call_word(src, tok)) else {
+            i += 1;
+            continue;
+        };
+        let colon = next_solid(toks, name_i + 1);
+        if toks.get(colon).map(|tok| tok.2) != Some(TokenKind::Colon) || toks[colon].0 >= prefix {
+            i += 1;
+            continue;
+        }
+        let mut value_at = None;
+        let mut j = colon + 1;
+        while j < toks.len() && toks[j].0 < prefix {
+            match toks[j].2 {
+                TokenKind::Eq => {
+                    value_at = Some(next_solid(toks, j + 1));
+                    break;
+                }
+                TokenKind::Semi | TokenKind::OpenBrace => break,
+                _ => j += 1,
+            }
+        }
+        let kind = match value_at {
+            Some(at) => {
+                let Some(tok) = toks.get(at).filter(|tok| tok.0 < prefix) else {
+                    i += 1;
+                    continue;
+                };
+                match plain_task_string(src, tok) {
+                    Ok(Some(text)) => {
+                        let semi = next_solid(toks, at + 1);
+                        if toks
+                            .get(semi)
+                            .is_some_and(|tok| tok.2 == TokenKind::Semi && tok.0 < prefix)
+                        {
+                            TaskConst::Plain(text)
+                        } else {
+                            TaskConst::Other
+                        }
+                    }
+                    Ok(None) | Err(_) => TaskConst::Other,
+                }
+            }
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        let name = name.to_string();
+        if out.insert(name.clone(), kind).is_some() {
+            return Err(format!("ambiguous task const `{name}`"));
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn task_of(
+    src: &str,
+    toks: &[(usize, usize, TokenKind)],
+    open: usize,
+    consts: &HashMap<String, TaskConst>,
+) -> Result<String, String> {
+    let i = next_solid(toks, open + 1);
+    let Some(tok) = toks.get(i) else {
+        return Err("call has no task argument".to_string());
+    };
+    let next = next_solid(toks, i + 1);
+    let bare = matches!(toks.get(next).map(|tok| tok.2), Some(TokenKind::Comma));
+    if let Some(text) = plain_task_string(src, tok)? {
+        if !bare {
+            return Err("task argument is not a bare string or ident".to_string());
+        }
+        return Ok(text);
+    }
+    let Some(name) = call_word(src, tok) else {
+        return Err("unrecognised task argument".to_string());
+    };
+    if toks.get(next).map(|tok| tok.2) == Some(TokenKind::Bang) {
+        return Err(format!("task macro `{name}`"));
+    }
+    if toks.get(next).map(|tok| tok.2) == Some(TokenKind::Colon) {
+        let colon2 = next_solid(toks, next + 1);
+        if toks.get(colon2).map(|tok| tok.2) == Some(TokenKind::Colon) {
+            return Err(format!("task path `{name}`"));
+        }
+    }
+    if !bare {
+        return Err("task argument is not a bare string or ident".to_string());
+    }
+    match consts.get(name) {
+        Some(TaskConst::Plain(text)) => Ok(text.clone()),
+        Some(TaskConst::Other) => Err(format!("task const `{name}` is not a plain string")),
+        None => Err(format!("unresolved task const `{name}`")),
+    }
+}
+
+fn item_name(items: &SourceItems, path: &str, at: usize) -> Result<String, String> {
+    match items.enclosing(at) {
+        Ok(id) => Ok(id.as_str().to_string()),
+        Err(err) => Err(format!("row {path}: {err}")),
+    }
+}
+
+struct Prepared {
+    toks: Lexed,
+    prefix: usize,
+    items: SourceItems,
+    consts: HashMap<String, TaskConst>,
+    calls: Vec<ExecHit>,
+}
+
+fn prepare_file(path: &str, src: &str) -> Result<Prepared, String> {
     let (toks, cut) = executor_lex(src).map_err(|err| format!("row {path}: {err}"))?;
     let prefix = cut.unwrap_or(src.len());
+    let calls = executor_calls(src, &toks).map_err(|err| format!("row {path}: {err}"))?;
+    let items = SourceItems::parse(&src[..prefix]).map_err(|err| format!("row {path}: {err}"))?;
+    let consts = const_strings(src, &toks, prefix).map_err(|err| format!("row {path}: {err}"))?;
+    Ok(Prepared { toks, prefix, items, consts, calls })
+}
+
+fn find_production_sites(path: &str, src: &str) -> Result<Vec<Site>, String> {
+    let prepared = prepare_file(path, src)?;
     let lines: Vec<&str> = src.lines().collect();
     let starts = line_starts(src);
     let mut sites = Vec::new();
-    for hit in executor_calls(src, &toks).map_err(|err| format!("row {path}: {err}"))? {
-        if hit.at >= prefix || !hit.is_site {
+    for hit in &prepared.calls {
+        if hit.at >= prepared.prefix || !hit.is_site {
             continue;
         }
         let line = starts.partition_point(|start| *start <= hit.at);
         let text = lines[line - 1].trim().to_string();
         let detached = preceding_nonempty(&lines, line).is_some_and(is_detached_comment);
-        sites.push(Site { path: path.to_string(), line, kind: hit.kind, detached, text });
+        let item = item_name(&prepared.items, path, hit.at)?;
+        let task = task_of(src, &prepared.toks, hit.open, &prepared.consts)
+            .map_err(|err| format!("row {path}: {err}"))?;
+        sites.push(Site {
+            path: path.to_string(),
+            line,
+            item,
+            task,
+            kind: hit.kind,
+            detached,
+            text,
+        });
     }
     Ok(sites)
+}
+
+fn not_site_anchors(path: &str, src: &str) -> Result<Vec<NotSite>, String> {
+    let prepared = prepare_file(path, src)?;
+    let mut out = Vec::new();
+    for hit in &prepared.calls {
+        if hit.at >= prepared.prefix || hit.is_site || hit.kind != Kind::RegisterOpt {
+            continue;
+        }
+        let item = item_name(&prepared.items, path, hit.at)?;
+        if item == "<module>" {
+            return Err(format!("row {path}: refusing <module>"));
+        }
+        let task = task_of(src, &prepared.toks, hit.open, &prepared.consts)
+            .map_err(|err| format!("row {path}: {err}"))?;
+        out.push(NotSite { path: path.to_string(), item, task });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
 // Census shape B
 // ---------------------------------------------------------------------------
 
-fn parse_shape_b(census: &str) -> Vec<ShapeBRow> {
+fn parse_shape_b(census: &str) -> Result<Vec<ShapeBRow>, String> {
     let mut rows = Vec::new();
-    let mut in_section = false;
-    for line in census.lines() {
-        if let Some(heading) = line.strip_prefix("## ") {
-            if in_section {
-                break;
-            }
-            if heading.trim() == "Shape B loop sites" {
-                in_section = true;
-            }
-            continue;
+    for cells in census_rows(&section_body(census, "Shape B loop sites"), 5)? {
+        repo_rel(&cells[1])?;
+        repo_rel(&cells[3])?;
+        if rows.iter().any(|row: &ShapeBRow| {
+            row.task == cells[0] && row.spawn_path == cells[1] && row.spawn_item == cells[2]
+        }) {
+            return Err(format!("duplicate shape-B row {}", cells.join(" | ")));
         }
-        if !in_section || !line.starts_with('|') || line.contains("---") {
-            continue;
-        }
-        let cells: Vec<&str> =
-            line.trim().trim_matches('|').split('|').map(|c| c.trim().trim_matches('`')).collect();
-        if cells.len() < 3 || cells[0] == "Task" || cells[0].is_empty() {
-            continue;
-        }
-        let Some((spawn_path, spawn_line)) = split_path_line(cells[1]) else {
-            continue;
-        };
-        let Some((loop_path, _)) = split_path_line(cells[2]) else {
-            continue;
-        };
-        rows.push(ShapeBRow { task: cells[0].to_string(), spawn_path, spawn_line, loop_path });
+        rows.push(ShapeBRow {
+            task: cells[0].clone(),
+            spawn_path: cells[1].clone(),
+            spawn_item: cells[2].clone(),
+            loop_path: cells[3].clone(),
+            loop_item: cells[4].clone(),
+        });
     }
-    rows
+    Ok(rows)
 }
 
-fn split_path_line(spec: &str) -> Option<(String, usize)> {
-    let (path, line) = spec.rsplit_once(':')?;
-    let line = line.parse().ok()?;
-    if path.is_empty() {
-        return None;
-    }
-    Some((path.to_string(), line))
-}
-
-/// The loop file contains `parent: None` and the task string on one line, plus `follows_from`.
-///
-/// Tokens only. The string is the task itself, so `"index.resolve"` is not
-/// `"index.resolve.tick"`. Comment tokens are not idents. This reads the census
-/// loop file, not a window around the spawn. The mask check stays on the site scan.
-fn loop_file_has_shape_b(loop_src: &str, task: &str) -> Result<bool, String> {
+/// `parent: None` on the same line as the task string. `follows_from` anywhere.
+/// Two such lines, or a string span that is not a char boundary, fail the file.
+fn shape_b_parents(loop_src: &str, task: &str) -> Result<Vec<usize>, String> {
     let toks = lex_file(loop_src, false)?;
     let starts = line_starts(loop_src);
-    let mut parent_for_task = false;
+    let mut parents = Vec::new();
     let mut follows = false;
     let mut line = 0usize;
     let mut saw_pair = false;
     let mut saw_task = false;
+    let mut pair_at = 0usize;
     for i in 0..toks.len() {
         let this = starts.partition_point(|at| *at <= toks[i].0);
         if this != line {
             if saw_pair && saw_task {
-                parent_for_task = true;
+                parents.push(pair_at);
             }
             line = this;
             saw_pair = false;
@@ -546,10 +649,13 @@ fn loop_file_has_shape_b(loop_src: &str, task: &str) -> Result<bool, String> {
                 && none_line == Some(this)
             {
                 saw_pair = true;
+                pair_at = toks[i].0;
             }
         }
         if let TokenKind::Literal { kind: LiteralKind::Str { terminated: true }, .. } = toks[i].2 {
-            let text = loop_src.get(toks[i].0..toks[i].1).unwrap_or("");
+            let text = loop_src.get(toks[i].0..toks[i].1).ok_or_else(|| {
+                format!("shape-B task string is not a char boundary at {}", toks[i].0)
+            })?;
             let plain = text.strip_prefix('"').and_then(|rest| rest.strip_suffix('"'));
             if !text.contains('\\') && plain == Some(task) {
                 saw_task = true;
@@ -560,14 +666,68 @@ fn loop_file_has_shape_b(loop_src: &str, task: &str) -> Result<bool, String> {
         }
     }
     if saw_pair && saw_task {
-        parent_for_task = true;
+        parents.push(pair_at);
     }
-    Ok(parent_for_task && follows)
+    if !follows {
+        return Ok(Vec::new());
+    }
+    if parents.len() > 1 {
+        return Err(format!("ambiguous shape-B parent for task `{task}`"));
+    }
+    Ok(parents)
+}
+
+fn loop_file_has_shape_b(loop_src: &str, task: &str) -> Result<bool, String> {
+    Ok(!shape_b_parents(loop_src, task)?.is_empty())
+}
+
+/// Item containing the `loop` for this task. The `parent: None` line and the
+/// `loop` keyword share that item. `<module>` is refused.
+fn loop_item(path: &str, src: &str, task: &str) -> Result<String, String> {
+    let parents = shape_b_parents(src, task)?;
+    if parents.len() != 1 {
+        return Err(format!("shape-B parent count for `{task}` is {}", parents.len()));
+    }
+    let at = parents[0];
+    let prepared = prepare_file(path, src)?;
+    if at >= prepared.prefix {
+        return Err(format!(
+            "row {path}: shape-B parent for `{task}` is outside the production prefix"
+        ));
+    }
+    let item = item_name(&prepared.items, path, at)?;
+    if item == "<module>" {
+        return Err(format!("row {path}: refusing <module> for shape-B task `{task}`"));
+    }
+    let mut has_loop = false;
+    let mut resolve_err = None;
+    for (i, tok) in prepared.toks.iter().enumerate() {
+        if tok.0 >= prepared.prefix || !word_is(src, &prepared.toks, i, "loop") {
+            continue;
+        }
+        let brace = next_solid(&prepared.toks, i + 1);
+        if prepared.toks.get(brace).map(|tok| tok.2) != Some(TokenKind::OpenBrace) {
+            continue;
+        }
+        match prepared.items.enclosing(tok.0) {
+            Ok(id) if id.as_str() == item => has_loop = true,
+            Ok(_) => {}
+            Err(err) => resolve_err = Some(format!("row {path}: {err}")),
+        }
+    }
+    if !has_loop {
+        if let Some(err) = resolve_err {
+            return Err(err);
+        }
+        return Err(format!("row {path}: item `{item}` has no `loop` for task `{task}`"));
+    }
+    Ok(item)
 }
 
 fn classify(site: &Site, rows: &[ShapeBRow], mut loop_ok: impl FnMut(&ShapeBRow) -> bool) -> Class {
-    if let Some(row) = rows.iter().find(|r| r.spawn_path == site.path && r.spawn_line == site.line)
-    {
+    if let Some(row) = rows.iter().find(|row| {
+        row.spawn_path == site.path && row.spawn_item == site.item && row.task == site.task
+    }) {
         if site.detached {
             return Class::ShapeBWithDetached;
         }
@@ -624,20 +784,39 @@ fn scan_workspace(root: &Path) -> Result<(Vec<Site>, Vec<ShapeBRow>), String> {
     }
     let census =
         std::fs::read_to_string(root.join(CENSUS)).map_err(|err| format!("row {CENSUS}: {err}"))?;
-    let rows = parse_shape_b(&census);
-    let mut sites = Vec::new();
-    for (rel, src) in &files {
-        sites.extend(find_production_sites(rel, src)?);
-    }
+    let rows = parse_shape_b(&census)?;
+    let mut sites = collect_anchored_sites(&files)?;
     sites.sort_by(|a, b| (&a.path, a.line).cmp(&(&b.path, b.line)));
     Ok((sites, rows))
 }
 
+fn collect_anchored_sites(files: &[(String, String)]) -> Result<Vec<Site>, String> {
+    let mut sites = Vec::new();
+    for (rel, src) in files {
+        for site in find_production_sites(rel, src)? {
+            if site.item == "<module>" {
+                return Err(format!("row {rel}: refusing <module> for task {}", site.task));
+            }
+            sites.push(site);
+        }
+    }
+    Ok(sites)
+}
+
 fn loop_ok_for<'a>(root: &'a Path) -> impl Fn(&ShapeBRow) -> Result<bool, String> + 'a {
     move |row: &ShapeBRow| {
-        let src = std::fs::read_to_string(root.join(&row.loop_path))
-            .map_err(|err| format!("row {}: {err}", row.loop_path))?;
-        loop_file_has_shape_b(&src, &row.task)
+        let src = read_repo_file(root, &row.loop_path)?;
+        if !loop_file_has_shape_b(&src, &row.task)? {
+            return Ok(false);
+        }
+        let item = loop_item(&row.loop_path, &src, &row.task)?;
+        if item != row.loop_item {
+            return Err(format!(
+                "row {}: shape-B task `{}` loop item is `{item}`, census says `{}`",
+                row.loop_path, row.task, row.loop_item
+            ));
+        }
+        Ok(true)
     }
 }
 
@@ -690,23 +869,29 @@ fn production_executor_sites_pin_sixteen() {
             Class::Unclassified => "unclassified",
         };
         rendered.push(format!(
-            "{}:{}: {} {label} {}",
+            "{} {} `{}` {} {label} (line {})",
             site.path,
-            site.line,
+            site.item,
+            site.task,
             site.kind.as_str(),
-            site.text
+            site.line
         ));
         if !matches!(class, Class::Detached | Class::ShapeB) {
-            problems.push(format!("{}:{}: {label}", site.path, site.line));
+            problems.push(format!(
+                "{} {} `{}`: {label} (line {})",
+                site.path, site.item, site.task, site.line
+            ));
         }
     }
 
     for row in &rows {
-        let seen = sites.iter().any(|s| s.path == row.spawn_path && s.line == row.spawn_line);
+        let seen = sites.iter().any(|site| {
+            site.path == row.spawn_path && site.item == row.spawn_item && site.task == row.task
+        });
         if !seen {
             problems.push(format!(
-                "census shape-B row {}:{} ({}) is not a production site",
-                row.spawn_path, row.spawn_line, row.task
+                "census shape-B row {} {} ({}) is not a production site",
+                row.spawn_path, row.spawn_item, row.task
             ));
         }
     }
@@ -761,35 +946,21 @@ fn failure_names_the_exclusion_rule_and_tracing_adr_009() {
 fn bare_cfg_test_does_not_hide_the_liveness_loop_spawn() {
     let root = workspace_root();
     let src = std::fs::read_to_string(root.join("crates/rvc/src/liveness_loop.rs")).unwrap();
-    let lines: Vec<&str> = src.lines().collect();
-    let bare = first_bare_cfg_test_line(&lines).expect("method-level #[cfg(test)]");
-    let end = production_region_end(&lines).expect("column-0 module attribute");
-    let spawn = lines
-        .iter()
-        .position(|l| code_portion(l).contains("executor.spawn("))
-        .map(|i| i + 1)
-        .expect("production liveness spawn");
+    liveness_shape(&src).unwrap();
     assert!(
-        bare < spawn,
-        "first bare #[cfg(test)] at {bare} must sit above the spawn at {spawn} \
-         (truncating there drops the production site)"
-    );
-    assert!(spawn < end, "spawn at {spawn} must stay in the production region that ends at {end}");
-    assert_eq!(lines[end - 1].trim(), "#[cfg(test)]");
-    assert!(
-        lines[end].trim().starts_with("mod"),
-        "module line after the attribute: {}",
-        lines[end]
-    );
-    // The doc comment is still in the production region and is not a site.
-    assert!(
-        lines.iter().any(|l| l.trim_start().starts_with("///") && l.contains("Spawns no tasks")),
+        src.contains("Spawns no tasks"),
         "re-locate the run() doc comment; it must not be scanned as a spawn"
     );
     let sites = find_production_sites("crates/rvc/src/liveness_loop.rs", &src).unwrap();
     assert_eq!(sites.len(), 1, "doc comment and test-module spawns must not count: {sites:?}");
-    assert_eq!(sites[0].line, spawn);
-    assert!(!sites[0].detached, "the shape-B spawn line has no // detached: comment");
+    assert_eq!(sites[0].item, "spawn_liveness_loop");
+    assert_eq!(sites[0].task, "liveness_loop");
+    assert!(!sites[0].detached, "the shape-B spawn has no // detached: comment");
+    let shifted = format!("\n{src}");
+    liveness_shape(&shifted).unwrap();
+    let again = find_production_sites("crates/rvc/src/liveness_loop.rs", &shifted).unwrap();
+    assert_eq!(again[0].item, sites[0].item);
+    assert_eq!(again[0].task, sites[0].task);
 }
 
 #[test]
@@ -901,8 +1072,9 @@ fn shape_b_reads_the_census_loop_file_not_a_spawn_window() {
     let row = ShapeBRow {
         task: "monitoring_push".to_string(),
         spawn_path: "crates/rvc/src/bootstrap/tasks.rs".to_string(),
-        spawn_line: 1,
+        spawn_item: "<module>".to_string(),
         loop_path: "crates/rvc/src/background_tasks/monitoring.rs".to_string(),
+        loop_item: "start_monitoring_push".to_string(),
     };
     let site = find_production_sites(&row.spawn_path, spawn_file).unwrap().pop().unwrap();
     assert!(!site.detached);
@@ -954,8 +1126,9 @@ fn shape_b_spawn_must_not_carry_a_detached_comment() {
     let row = ShapeBRow {
         task: "liveness_loop".to_string(),
         spawn_path: "crates/rvc/src/liveness_loop.rs".to_string(),
-        spawn_line: 2,
+        spawn_item: "<module>".to_string(),
         loop_path: "crates/rvc/src/liveness_loop.rs".to_string(),
+        loop_item: "LivenessObservationLoop::run".to_string(),
     };
     let site = find_production_sites(&row.spawn_path, src).unwrap().pop().unwrap();
     assert!(site.detached);
@@ -1098,10 +1271,15 @@ fn item() {\n\
     executor.r#register_opt::<()>(\"n\", { executor.spawn(\"inner\", tier, async {}); tier }, None);\n\
 }\n\
 ";
-    let sites = find_production_sites("a.rs", src).unwrap();
-    assert_eq!(sites.len(), 1, "{sites:?}");
-    assert_eq!(sites[0].kind, Kind::Spawn);
-    assert!(sites[0].text.contains("inner"), "{sites:?}");
+    let (toks, cut) = executor_lex(src).unwrap();
+    assert!(cut.is_none());
+    let calls = executor_calls(src, &toks).unwrap();
+    let sites: Vec<_> = calls.iter().filter(|hit| hit.is_site).collect();
+    assert_eq!(sites.len(), 1, "{calls:?}");
+    // `enclosing_item` refuses a raw ident, so the anchor errors instead of
+    // guessing an item or returning a successful list that dropped the spawn.
+    let err = find_production_sites("a.rs", src).unwrap_err();
+    assert!(err.contains("a.rs") && err.contains("raw identifier"), "{err}");
 }
 
 #[test]
@@ -1344,160 +1522,497 @@ fn markdown_table(section: &str) -> Vec<Vec<String>> {
     rows
 }
 
-fn cite_after(section: &str, phrase: &str) -> usize {
-    let idx = section.find(phrase).unwrap_or_else(|| panic!("census prose missing {phrase:?}"));
-    let rest = section[idx + phrase.len()..].trim_start_matches('`');
-    assert!(rest.starts_with(':'), "expected :LINE after {phrase:?}, rest starts {rest:?}");
-    let digits: String = rest[1..].chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().unwrap_or_else(|_| panic!("line number after {phrase:?}"))
+/// A census path is repo-relative. Empty, absolute, `.`, and `..` fail before `join`.
+fn repo_rel(cell: &str) -> Result<(), String> {
+    if cell.is_empty()
+        || Path::new(cell).is_absolute()
+        || cell.split(['/', '\\']).any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return Err(format!("census path is not repo-relative: {cell}"));
+    }
+    Ok(())
 }
 
-fn line_is_loop(line: &str) -> bool {
-    let code = code_portion(line).trim();
-    code == "loop" || code.starts_with("loop ") || code.starts_with("loop{")
+fn read_repo_file(root: &Path, rel: &str) -> Result<String, String> {
+    repo_rel(rel)?;
+    std::fs::read_to_string(root.join(rel)).map_err(|err| format!("row {rel}: {err}"))
 }
 
-fn next_code_line<'a>(lines: &[&'a str], after_1based: usize) -> &'a str {
-    for line in lines.iter().skip(after_1based) {
-        let t = line.trim();
-        if t.is_empty() || t.starts_with("//") || t.starts_with("#[") || t.starts_with("///") {
+fn line_cell(cell: &str) -> bool {
+    if is_line_number(cell) {
+        return true;
+    }
+    match cell.rsplit_once(':') {
+        Some((_, tail)) => is_line_number(tail),
+        None => false,
+    }
+}
+
+fn cites_line(text: &str) -> bool {
+    text.split(':').skip(1).any(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
+
+/// Data rows of one markdown table. The header is skipped. A short row, an
+/// empty cell, or a line pin is an error, not a skipped row.
+fn census_rows(section: &str, columns: usize) -> Result<Vec<Vec<String>>, String> {
+    let mut rows = Vec::new();
+    let mut header = false;
+    for line in section.lines() {
+        if !line.starts_with('|') || line.contains("---") {
             continue;
         }
-        return t;
+        let cells: Vec<String> = line
+            .trim()
+            .trim_matches('|')
+            .split('|')
+            .map(|cell| cell.trim().trim_matches('`').to_string())
+            .collect();
+        if !header {
+            header = true;
+            if cells.iter().any(|cell| cell == "Line") {
+                return Err(format!("census table still has a Line column: {line}"));
+            }
+            continue;
+        }
+        if cells.len() != columns || cells.iter().any(|cell| cell.is_empty()) {
+            return Err(format!("unrecognised census row: {line}"));
+        }
+        if cells.iter().any(|cell| line_cell(cell)) {
+            return Err(format!("census row uses a line pin: {line}"));
+        }
+        rows.push(cells);
     }
-    ""
+    if !header {
+        return Err("census table missing".to_string());
+    }
+    Ok(rows)
 }
 
-fn register_opt_none_sites(root: &std::path::Path) -> Result<Vec<(String, usize)>, String> {
-    let mut out = Vec::new();
-    for (rel, src) in load_executor(root)? {
-        let (toks, cut) = executor_lex(&src).map_err(|err| format!("row {rel}: {err}"))?;
-        let prefix = cut.unwrap_or(src.len());
-        let starts = line_starts(&src);
-        for hit in executor_calls(&src, &toks).map_err(|err| format!("row {rel}: {err}"))? {
-            if hit.at < prefix && hit.kind == Kind::RegisterOpt && !hit.is_site {
-                out.push((rel.clone(), starts.partition_point(|start| *start <= hit.at)));
-            }
+fn attr_on_fn(src: &str, toks: &[(usize, usize, TokenKind)], mut i: usize) -> bool {
+    loop {
+        let n = next_solid(toks, i);
+        if !matches!(toks.get(n).map(|tok| tok.2), Some(TokenKind::Pound)) {
+            i = n;
+            break;
+        }
+        let bracket = next_solid(toks, n + 1);
+        if !matches!(toks.get(bracket).map(|tok| tok.2), Some(TokenKind::OpenBracket)) {
+            return false;
+        }
+        let Some(after) =
+            skip_until(toks, bracket, TokenKind::OpenBracket, TokenKind::CloseBracket)
+        else {
+            return false;
+        };
+        i = after;
+    }
+    if word_is(src, toks, i, "pub") {
+        let next = next_solid(toks, i + 1);
+        if matches!(toks.get(next).map(|tok| tok.2), Some(TokenKind::OpenParen)) {
+            let Some(after) = skip_until(toks, next, TokenKind::OpenParen, TokenKind::CloseParen)
+            else {
+                return false;
+            };
+            i = next_solid(toks, after);
+        } else {
+            i = next;
         }
     }
-    out.sort();
-    Ok(out)
+    if word_is(src, toks, i, "async")
+        || word_is(src, toks, i, "unsafe")
+        || word_is(src, toks, i, "const")
+    {
+        i = next_solid(toks, i + 1);
+    }
+    word_is(src, toks, i, "fn")
 }
 
-/// The census's first table, shape-B loop lines, not-site rows, and the
-/// `liveness_loop.rs` prose pins must match the sources. Reverting a table
-/// line while leaving the shape-B spawn row alone used to stay green.
+struct CfgAttr {
+    at: usize,
+    column0: bool,
+    is_mod: bool,
+    on_fn: bool,
+}
+
+/// First bare `#[cfg(test)]` on a function, a later one that is not, and a
+/// column-0 `#[cfg(test)]` followed by `mod`, with the one production spawn
+/// between the first attribute and that module attribute.
+fn liveness_shape(src: &str) -> Result<(), String> {
+    let (toks, cut) = executor_lex(src)?;
+    let prefix = cut.unwrap_or(src.len());
+    let starts = line_starts(src);
+    let mut attrs = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        if let Some(after) = cfg_test_attr_end(src, &toks, i) {
+            let column0 = starts.binary_search(&toks[i].0).is_ok();
+            let is_mod = mod_after(src, &toks, after).is_some();
+            let on_fn = !is_mod && attr_on_fn(src, &toks, after);
+            attrs.push(CfgAttr { at: toks[i].0, column0, is_mod, on_fn });
+            i = after;
+            continue;
+        }
+        i += 1;
+    }
+    let Some(first) = attrs.first() else {
+        return Err("no bare #[cfg(test)]".to_string());
+    };
+    if first.column0 || first.is_mod || !first.on_fn {
+        return Err(
+            "first bare #[cfg(test)] is not an indented attribute on a function".to_string()
+        );
+    }
+    let Some(mod_at) = attrs.iter().find(|attr| attr.column0 && attr.is_mod).map(|attr| attr.at)
+    else {
+        return Err("no column-0 #[cfg(test)] followed by mod".to_string());
+    };
+    if !attrs.iter().any(|attr| {
+        attr.at > first.at && attr.at < mod_at && !attr.column0 && !attr.is_mod && !attr.on_fn
+    }) {
+        return Err("no later bare #[cfg(test)] off a function before the module".to_string());
+    }
+    let hits: Vec<_> = executor_calls(src, &toks)?
+        .into_iter()
+        .filter(|hit| hit.is_site && hit.at < prefix)
+        .collect();
+    if hits.len() != 1 {
+        return Err(format!("liveness production site count is {}", hits.len()));
+    }
+    if !(first.at < hits[0].at && hits[0].at < mod_at) {
+        return Err(
+            "production spawn is not between the first bare attribute and the module attribute"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn push_unique(
+    keys: &mut Vec<(String, String, String, String)>,
+    key: (String, String, String, String),
+) -> Result<(), String> {
+    if keys.iter().any(|have| have == &key) {
+        return Err(format!("duplicate anchor {key:?}"));
+    }
+    keys.push(key);
+    Ok(())
+}
+
+fn census_anchors_match(census: &str, root: &Path) -> Result<(), String> {
+    if census.contains("| Line |") {
+        return Err("census still has a Line column".to_string());
+    }
+    if !census.contains(&format!("## Production sites ({PIN})")) {
+        return Err(format!("production-sites heading must name the pin {PIN}"));
+    }
+    let (sites, _) = scan_workspace(root)?;
+    let rows = parse_shape_b(census)?;
+    if rows.len() != SHAPE_B_PIN {
+        return Err(format!("shape-B table has {} rows, pin is {SHAPE_B_PIN}", rows.len()));
+    }
+    let mut scanned = Vec::new();
+    for site in &sites {
+        push_unique(
+            &mut scanned,
+            (
+                site.path.clone(),
+                site.item.clone(),
+                site.task.clone(),
+                site.kind.as_str().to_string(),
+            ),
+        )?;
+    }
+    let mut table = Vec::new();
+    let mut buckets = Vec::new();
+    for cells in census_rows(&section_body(census, "Production sites"), 6)? {
+        repo_rel(&cells[0])?;
+        let call = cells[3].as_str();
+        if call != "spawn" && call != "register" {
+            return Err(format!("unrecognised production call `{call}`"));
+        }
+        let bucket = cells[4].as_str();
+        if bucket != "detached" && bucket != "B" {
+            return Err(format!("unrecognised bucket `{bucket}`"));
+        }
+        let key = (cells[0].clone(), cells[1].clone(), cells[2].clone(), cells[3].clone());
+        push_unique(&mut table, key)?;
+        buckets.push(bucket.to_string());
+    }
+    let mut left = scanned.clone();
+    let mut right = table.clone();
+    left.sort();
+    right.sort();
+    if left != right {
+        return Err(format!("production anchors differ\nscanned: {left:?}\ntable: {right:?}"));
+    }
+    for site in &sites {
+        let shape_b = rows.iter().any(|row| {
+            row.spawn_path == site.path && row.spawn_item == site.item && row.task == site.task
+        });
+        let expect = match (site.detached, shape_b) {
+            (true, false) => "detached",
+            (false, true) => "B",
+            (true, true) => {
+                return Err(format!(
+                    "{} {} `{}` is shape B and also detached",
+                    site.path, site.item, site.task
+                ));
+            }
+            (false, false) => {
+                return Err(format!(
+                    "{} {} `{}` is not detached and has no shape-B row",
+                    site.path, site.item, site.task
+                ));
+            }
+        };
+        let found = table.iter().zip(&buckets).find(|(key, _)| {
+            key.0 == site.path
+                && key.1 == site.item
+                && key.2 == site.task
+                && key.3 == site.kind.as_str()
+        });
+        match found {
+            Some((_, bucket)) if bucket == expect => {}
+            Some((_, bucket)) => {
+                return Err(format!(
+                    "{} {} `{}` bucket is `{bucket}`, classification is `{expect}`",
+                    site.path, site.item, site.task
+                ));
+            }
+            None => return Err(format!("missing bucket for {} {}", site.path, site.task)),
+        }
+    }
+    for row in &rows {
+        let src = read_repo_file(root, &row.loop_path)?;
+        let item = loop_item(&row.loop_path, &src, &row.task)?;
+        if item != row.loop_item {
+            return Err(format!(
+                "row {}: loop item is `{item}`, census says `{}`",
+                row.loop_path, row.loop_item
+            ));
+        }
+    }
+    let mut not_scanned = Vec::new();
+    for (rel, src) in load_executor(root)? {
+        for site in not_site_anchors(&rel, &src)? {
+            push_unique(
+                &mut not_scanned,
+                (site.path, site.item, site.task, "register_opt".to_string()),
+            )?;
+        }
+    }
+    let mut not_table = Vec::new();
+    for cells in census_rows(&section_body(census, "Not sites"), 4)? {
+        repo_rel(&cells[0])?;
+        if cells[3] != "register_opt" {
+            return Err(format!("not-site call must be register_opt: {}", cells.join(" | ")));
+        }
+        push_unique(
+            &mut not_table,
+            (cells[0].clone(), cells[1].clone(), cells[2].clone(), cells[3].clone()),
+        )?;
+    }
+    not_scanned.sort();
+    not_table.sort();
+    if not_scanned != not_table {
+        return Err(format!(
+            "not-site anchors differ\nscanned: {not_scanned:?}\ntable: {not_table:?}"
+        ));
+    }
+    let live_path = "crates/rvc/src/liveness_loop.rs";
+    let live = read_repo_file(root, live_path)?;
+    liveness_shape(&live).map_err(|err| format!("row {live_path}: {err}"))?;
+    let prose = section_body(census, "liveness_loop.rs");
+    if cites_line(&prose) {
+        return Err("liveness prose still cites a line number".to_string());
+    }
+    let bn = load_bn(root)?;
+    bn_section_matches(census, &bn)?;
+    Ok(())
+}
+
+fn anchor_keys(
+    files: &[(String, String)],
+) -> Result<Vec<(String, String, String, String)>, String> {
+    let mut keys = Vec::new();
+    for site in collect_anchored_sites(files)? {
+        push_unique(&mut keys, (site.path, site.item, site.task, site.kind.as_str().to_string()))?;
+    }
+    for (path, src) in files {
+        for site in not_site_anchors(path, src)? {
+            push_unique(&mut keys, (site.path, site.item, site.task, "register_opt".to_string()))?;
+        }
+    }
+    keys.sort();
+    Ok(keys)
+}
+
 #[test]
-fn census_line_pins_match_sources() {
+fn census_anchors_match_sources() {
     let root = workspace_root();
     let census = std::fs::read_to_string(root.join(CENSUS))
         .unwrap_or_else(|err| panic!("row {CENSUS}: {err}"));
-    assert!(
-        census.contains(&format!("## Production sites ({PIN})")),
-        "production-sites heading must name the pin {PIN}"
-    );
+    census_anchors_match(&census, &root).unwrap_or_else(|err| panic!("{err}"));
+}
 
-    let (sites, _) = scan_workspace(&root).unwrap_or_else(|err| panic!("{err}"));
-    let mut scanned: Vec<(String, usize, String)> =
-        sites.iter().map(|s| (s.path.clone(), s.line, s.kind.as_str().to_string())).collect();
-    scanned.sort();
-    let mut table: Vec<(String, usize, String)> =
-        markdown_table(&section_body(&census, "Production sites"))
-            .into_iter()
-            .map(|cells| {
-                assert!(cells.len() >= 4, "production row {cells:?}");
-                let line: usize =
-                    cells[1].parse().unwrap_or_else(|_| panic!("line {:?}", cells[1]));
-                (cells[0].clone(), line, cells[3].clone())
-            })
-            .collect();
-    table.sort();
-    assert_eq!(
-        table,
-        scanned,
-        "production-sites table (file, line, call) must match scanned executor sites.\n\
-         table:\n  {}\nscanned:\n  {}",
-        table.iter().map(|r| format!("{}:{} {}", r.0, r.1, r.2)).collect::<Vec<_>>().join("\n  "),
-        scanned.iter().map(|r| format!("{}:{} {}", r.0, r.1, r.2)).collect::<Vec<_>>().join("\n  ")
-    );
-
-    for cells in markdown_table(&section_body(&census, "Shape B loop sites")) {
-        assert!(cells.len() >= 3, "shape-B row {cells:?}");
-        let (path, line) =
-            split_path_line(&cells[2]).unwrap_or_else(|| panic!("loop spec {:?}", cells[2]));
-        let src = std::fs::read_to_string(root.join(&path))
-            .unwrap_or_else(|err| panic!("row {path}: {err}"));
-        let text = src.lines().nth(line - 1).unwrap_or("");
-        assert!(
-            line_is_loop(text),
-            "{path}:{line} is not a `loop` (shape-B loop column): {text:?}"
-        );
+#[test]
+fn census_anchor_survives_a_blank_line_insert() {
+    let root = workspace_root();
+    let files = load_executor(&root).unwrap_or_else(|err| panic!("{err}"));
+    let before = anchor_keys(&files).unwrap_or_else(|err| panic!("{err}"));
+    let mut shifted = files.clone();
+    for (path, src) in &mut shifted {
+        if path.ends_with("bootstrap/tasks.rs") || path.ends_with("liveness_loop.rs") {
+            src.insert(0, '\n');
+        }
     }
+    let after = anchor_keys(&shifted).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(before, after, "a leading blank line changed an anchor");
+    let live = shifted.iter().find(|(path, _)| path.ends_with("liveness_loop.rs")).unwrap();
+    liveness_shape(&live.1).unwrap();
+}
 
-    let mut not_sites: Vec<(String, usize)> = markdown_table(&section_body(&census, "Not sites"))
-        .into_iter()
-        .map(|cells| {
-            assert!(cells.len() >= 2, "not-site row {cells:?}");
-            let line: usize = cells[1].parse().unwrap_or_else(|_| panic!("line {:?}", cells[1]));
-            (cells[0].clone(), line)
-        })
-        .collect();
-    not_sites.sort();
-    let scanned_none = register_opt_none_sites(&root).unwrap_or_else(|err| panic!("{err}"));
-    assert_eq!(
-        not_sites, scanned_none,
-        "not-site table must match production register_opt(..., None) calls.\n\
-         table: {not_sites:?}\nscanned: {scanned_none:?}"
-    );
+#[test]
+fn liveness_content_shape_fails_closed() {
+    let ok = "fn prod() {\n    #[cfg(test)]\n    async fn helper() {}\n    #[cfg(test)]\n    let _x = 1;\n    executor.spawn(\"liveness_loop\", tier, async {});\n}\n#[cfg(test)]\nmod tests {}\n";
+    liveness_shape(ok).unwrap();
+    let no_inner = "fn prod() {\n    #[cfg(test)]\n    async fn helper() {}\n    executor.spawn(\"liveness_loop\", tier, async {});\n}\n#[cfg(test)]\nmod tests {}\n";
+    let err = liveness_shape(no_inner).unwrap_err();
+    assert!(err.contains("off a function"), "{err}");
+    let indented_mod = "fn prod() {\n    #[cfg(test)]\n    async fn helper() {}\n    #[cfg(test)]\n    let _x = 1;\n    executor.spawn(\"liveness_loop\", tier, async {});\n    #[cfg(test)]\n    mod tests {}\n}\n";
+    let err = liveness_shape(indented_mod).unwrap_err();
+    assert!(err.contains("column-0"), "{err}");
+    let first_not_fn = "fn prod() {\n    #[cfg(test)]\n    let _x = 1;\n    #[cfg(test)]\n    async fn helper() {}\n    executor.spawn(\"liveness_loop\", tier, async {});\n}\n#[cfg(test)]\nmod tests {}\n";
+    let err = liveness_shape(first_not_fn).unwrap_err();
+    assert!(err.contains("not an indented attribute on a function"), "{err}");
+    let column0 = "fn prod() {\n#[cfg(test)]\nasync fn helper() {}\n    #[cfg(test)]\n    let _x = 1;\n    executor.spawn(\"liveness_loop\", tier, async {});\n}\n#[cfg(test)]\nmod tests {}\n";
+    let err = liveness_shape(column0).unwrap_err();
+    assert!(err.contains("not an indented attribute on a function"), "{err}");
+    let early = "fn prod() {\n    executor.spawn(\"liveness_loop\", tier, async {});\n    #[cfg(test)]\n    async fn helper() {}\n    #[cfg(test)]\n    let _x = 1;\n}\n#[cfg(test)]\nmod tests {}\n";
+    let err = liveness_shape(early).unwrap_err();
+    assert!(err.contains("not between"), "{err}");
+    let two = "fn prod() {\n    #[cfg(test)]\n    async fn helper() {}\n    #[cfg(test)]\n    let _x = 1;\n    executor.spawn(\"liveness_loop\", tier, async {});\n    executor.spawn(\"other\", tier, async {});\n}\n#[cfg(test)]\nmod tests {}\n";
+    let err = liveness_shape(two).unwrap_err();
+    assert!(err.contains("site count"), "{err}");
+}
 
-    let prose = section_body(&census, "liveness_loop.rs");
-    let method_line = cite_after(&prose, "method-level `#[cfg(test)]` at ");
-    let inner_line = cite_after(&prose, "inner `#[cfg(test)]` at ");
-    let module_line = cite_after(&prose, "column-0 module attribute is at ");
-    let spawn_line = cite_after(&prose, "production spawn is ");
-    assert_eq!(
-        cite_after(&prose, "method-level attribute at "),
-        method_line,
-        "truncate sentence must cite the same method-level attribute"
+#[test]
+fn task_argument_fails_closed() {
+    let resolved = "\
+const NAME: &str = \"bn.sse\";\n\
+fn f() { executor.spawn(NAME, tier, async {}); }\n\
+";
+    let sites = find_production_sites("a.rs", resolved).unwrap();
+    assert_eq!(sites.len(), 1);
+    assert_eq!(sites[0].item, "f");
+    assert_eq!(sites[0].task, "bn.sse");
+    let missing = "fn f() { executor.spawn(MISSING, tier, async {}); }\n";
+    let err = find_production_sites("a.rs", missing).unwrap_err();
+    assert!(
+        err.contains("unresolved task const") && err.contains("MISSING") && err.contains("a.rs"),
+        "{err}"
     );
-    assert_eq!(
-        cite_after(&prose, "hides "),
-        spawn_line,
-        "truncate sentence must cite the production spawn"
-    );
+    let path = "fn f() { executor.spawn(crate::NAME, tier, async {}); }\n";
+    let err = find_production_sites("a.rs", path).unwrap_err();
+    assert!(err.contains("task path") && err.contains("crate"), "{err}");
+    let raw = "fn f() { executor.spawn(r#\"bn.sse\"#, tier, async {}); }\n";
+    let err = find_production_sites("a.rs", raw).unwrap_err();
+    assert!(err.contains("not a plain literal"), "{err}");
+    let mac = "fn f() { executor.spawn(name!(), tier, async {}); }\n";
+    let err = find_production_sites("a.rs", mac).unwrap_err();
+    assert!(err.contains("task macro"), "{err}");
+    let trimmed =
+        "const NAME: &str = \"bn.sse\".trim();\nfn f() { executor.spawn(NAME, tier, async {}); }\n";
+    let err = find_production_sites("a.rs", trimmed).unwrap_err();
+    assert!(err.contains("not a plain string") && err.contains("NAME"), "{err}");
+    let expr = "fn f() { executor.spawn(\"bn.sse\".trim(), tier, async {}); }\n";
+    let err = find_production_sites("a.rs", expr).unwrap_err();
+    assert!(err.contains("not a bare string or ident"), "{err}");
+    let method =
+        "const NAME: &str = \"bn.sse\";\nfn f() { executor.spawn(NAME.trim(), tier, async {}); }\n";
+    let err = find_production_sites("a.rs", method).unwrap_err();
+    assert!(err.contains("not a bare string or ident"), "{err}");
+    let escaped = "fn f() { executor.spawn(\"a\\nb\", tier, async {}); }\n";
+    let err = find_production_sites("a.rs", escaped).unwrap_err();
+    assert!(err.contains("escaped task string"), "{err}");
+    let dup = "const NAME: &str = \"a\";\nconst NAME: &str = \"b\";\nfn f() { executor.spawn(NAME, tier, async {}); }\n";
+    let err = find_production_sites("a.rs", dup).unwrap_err();
+    assert!(err.contains("ambiguous task const") && err.contains("NAME"), "{err}");
+}
 
-    let src = std::fs::read_to_string(root.join("crates/rvc/src/liveness_loop.rs")).unwrap();
-    let lines: Vec<&str> = src.lines().collect();
-    assert_eq!(lines[method_line - 1].trim(), "#[cfg(test)]", "method-level pin");
-    assert!(!is_column0_cfg_test(lines[method_line - 1]), "method-level attribute is indented");
-    let method_next = next_code_line(&lines, method_line);
-    assert!(
-        method_next.contains("fn "),
-        "method-level #[cfg(test)] at {method_line} must sit on a function, next is {method_next:?}"
+#[test]
+fn loop_item_surfaces_a_resolve_error() {
+    let src = "fn parent_ok() {\n    let loop_span = tracing::info_span!(parent: None, \"t\");\n    follows_from();\n}\nfn f() { loop {} }\nfn f() { let _ = 1; }\n";
+    let err = loop_item("a.rs", src, "t").unwrap_err();
+    assert!(err.contains("ambiguous") && !err.contains("has no `loop`"), "{err}");
+}
+
+#[test]
+fn shape_b_path_stays_inside_the_repo() {
+    let header = "## Shape B loop sites\n\n| Task | Spawn file | Spawn item | Loop file | Loop item |\n|---|---|---|---|---|\n";
+    let err = parse_shape_b(&format!("{header}| `t` | `../outside.rs` | `f` | `a.rs` | `g` |\n"))
+        .unwrap_err();
+    assert!(err.contains("not repo-relative") && err.contains(".."), "{err}");
+    let err = parse_shape_b(&format!("{header}| `t` | `/etc/passwd` | `f` | `a.rs` | `g` |\n"))
+        .unwrap_err();
+    assert!(err.contains("not repo-relative") && err.contains("/etc/passwd"), "{err}");
+}
+
+#[test]
+fn census_bucket_follows_the_shape_b_row() {
+    let root = workspace_root();
+    let census = std::fs::read_to_string(root.join(CENSUS)).unwrap();
+    let line = "| `index.resolve` | `crates/rvc/src/index_resolver.rs` | `spawn_index_resolver` | `crates/rvc/src/index_resolver.rs` | `IndexResolver::run` |";
+    let missing = census.replace(
+        line,
+        "| `index.resolve` | `crates/rvc/src/index_resolver.rs` | `other_item` | `crates/rvc/src/index_resolver.rs` | `IndexResolver::run` |",
     );
-    assert_eq!(lines[inner_line - 1].trim(), "#[cfg(test)]", "inner pin");
-    assert!(!is_column0_cfg_test(lines[inner_line - 1]), "inner attribute is indented");
-    let inner_next = next_code_line(&lines, inner_line);
-    assert!(
-        !inner_next.contains("fn "),
-        "inner #[cfg(test)] at {inner_line} is not a method attribute, next is {inner_next:?}"
+    let err = census_anchors_match(&missing, &root).unwrap_err();
+    assert!(err.contains("no shape-B row") && err.contains("index.resolve"), "{err}");
+    let both = census.replace(
+        line,
+        "| `metrics_server` | `crates/rvc/src/bootstrap/tasks.rs` | `spawn_background_tasks` | `crates/rvc/src/index_resolver.rs` | `IndexResolver::run` |",
     );
-    assert!(is_column0_cfg_test(lines[module_line - 1]), "column-0 module attribute");
-    assert!(
-        cfg_test_followed_by_mod(&lines, module_line - 1),
-        "column-0 attribute must be followed by mod"
-    );
-    assert!(
-        code_portion(lines[spawn_line - 1]).contains("executor.spawn"),
-        "production spawn line {spawn_line}: {:?}",
-        lines[spawn_line - 1]
-    );
-    assert!(method_line < spawn_line && inner_line < spawn_line && spawn_line < module_line);
-    assert_eq!(
-        first_bare_cfg_test_line(&lines),
-        Some(method_line),
-        "the first bare #[cfg(test)] is the method-level pin"
-    );
+    let err = census_anchors_match(&both, &root).unwrap_err();
+    assert!(err.contains("shape B and also detached") && err.contains("metrics_server"), "{err}");
+}
+
+#[test]
+fn push_unique_rejects_a_duplicate_anchor() {
+    let mut keys = Vec::new();
+    let key = ("a".into(), "b".into(), "c".into(), "spawn".into());
+    push_unique(&mut keys, key.clone()).unwrap();
+    let err = push_unique(&mut keys, key).unwrap_err();
+    assert!(err.contains("duplicate anchor"), "{err}");
+}
+
+#[test]
+fn executor_anchor_rejects_an_ambiguous_item_and_module_level() {
+    let ambiguous = "\
+fn f() { executor.spawn(\"t\", tier, async {}); }\n\
+fn f() { let _ = 1; }\n\
+";
+    let err = find_production_sites("a.rs", ambiguous).unwrap_err();
+    assert!(err.contains("ambiguous") && err.contains("a.rs"), "{err}");
+    let module = "executor.spawn(\"t\", tier, async {});\n";
+    let sites = find_production_sites("a.rs", module).unwrap();
+    assert_eq!(sites[0].item, "<module>");
+    let err = collect_anchored_sites(&[("a.rs".to_string(), module.to_string())]).unwrap_err();
+    assert!(err.contains("refusing <module>") && err.contains("a.rs"), "{err}");
+    let good = "fn f() { executor.spawn(\"kept\", tier, async {}); }\n";
+    let bad = "fn g() { executor.spawn(\"u\", tier, async {}); let _ = \"open; }\n";
+    let err = collect_anchored_sites(&[
+        ("good.rs".to_string(), good.to_string()),
+        ("bad.rs".to_string(), bad.to_string()),
+    ])
+    .unwrap_err();
+    assert!(err.contains("bad.rs"), "{err}");
+    let none = "executor.register_opt::<()>(\"t\", tier, None);\n";
+    let err = not_site_anchors("a.rs", none).unwrap_err();
+    assert!(err.contains("refusing <module>"), "{err}");
+    let unterminated = "fn f() { executor.spawn(\"t\", tier, async {}); let _ = \"open; }\n";
+    let err = not_site_anchors("bad.rs", unterminated).unwrap_err();
+    assert!(err.contains("bad.rs"), "{err}");
 }
 
 // ---------------------------------------------------------------------------
