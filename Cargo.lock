@@ -3654,6 +3654,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
+name = "ra-ap-rustc_lexer"
+version = "0.178.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9ca24dbcae9cafa44593b72888c3bfa7f2ddd62820a0f3a346fa3ffdf2b882"
+dependencies = [
+ "memchr",
+ "unicode-ident",
+ "unicode-properties",
+]
+
+[[package]]
 name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4266,6 +4277,7 @@ dependencies = [
 name = "rvc-architecture-tests"
 version = "0.8.0"
 dependencies = [
+ "ra-ap-rustc_lexer",
  "rvc-observability",
  "rvc-telemetry",
  "serde_json",
@@ -6096,6 +6108,12 @@ checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
 dependencies = [
  "tinyvec",
 ]
+
+[[package]]
+name = "unicode-properties"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
 
 [[package]]
 name = "unicode-segmentation"

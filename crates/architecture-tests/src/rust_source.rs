@@ -13,6 +13,12 @@ const MAX_NESTING: usize = 256;
 const MAX_ITEMS: usize = 20_000;
 const MAX_ANGLE_SCAN: usize = 100_000;
 
+/// Whitespace rustc accepts between tokens: space, tab, LF, VT (`0x0B`), FF, CR.
+/// `u8::is_ascii_whitespace` omits VT. A byte `>= 0x80` is not whitespace.
+pub fn is_rust_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0B | 0x0C | b'\r')
+}
+
 fn push_masked(out: &mut Vec<u8>, byte: u8) {
     out.push(if byte == b'\n' { b'\n' } else { b' ' });
 }
@@ -151,21 +157,46 @@ pub fn mask_comments_and_strings(src: &str) -> String {
     mask_source(src).0
 }
 
-/// Mask, and report whether every string and block comment is closed.
-fn mask_source(src: &str) -> (String, bool) {
+/// Half-open ranges the masker treated as a comment or a string or char literal.
+/// Sorted, non-overlapping. The hazard scanner drops hits inside these ranges.
+pub fn non_code_spans(src: &str) -> Vec<(usize, usize)> {
+    mask_source(src).2
+}
+
+/// `at` is code when it sits in no span from [`non_code_spans`].
+pub fn byte_in_code(non_code: &[(usize, usize)], at: usize) -> bool {
+    non_code
+        .binary_search_by(|&(start, end)| {
+            if at < start {
+                std::cmp::Ordering::Greater
+            } else if at >= end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_err()
+}
+
+/// Mask, whether every string and block comment is closed, and the non-code spans.
+fn mask_source(src: &str) -> (String, bool, Vec<(usize, usize)>) {
     let bytes = src.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
+    let mut non_code = Vec::new();
     let mut i = 0;
     let mut closed = true;
     while i < bytes.len() {
         if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'/') {
+            let start = i;
             while i < bytes.len() && bytes[i] != b'\n' {
                 out.push(b' ');
                 i += 1;
             }
+            non_code.push((start, i));
             continue;
         }
         if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let start = i;
             out.push(b' ');
             out.push(b' ');
             i += 2;
@@ -187,9 +218,12 @@ fn mask_source(src: &str) -> (String, bool) {
                 }
             }
             closed &= depth == 0;
+            non_code.push((start, i));
             continue;
         }
+        let start = i;
         if let Some(ok) = try_mask_raw_string_closed(bytes, &mut out, &mut i) {
+            non_code.push((start, i));
             closed &= ok;
             continue;
         }
@@ -198,20 +232,23 @@ fn mask_source(src: &str) -> (String, bool) {
             && ident_boundary_before(bytes, i)
         {
             closed &= mask_cooked_string(bytes, &mut out, &mut i);
+            non_code.push((start, i));
             continue;
         }
         if bytes[i] == b'"' {
             closed &= mask_cooked_string(bytes, &mut out, &mut i);
+            non_code.push((start, i));
             continue;
         }
         if try_mask_char_literal(bytes, &mut out, &mut i) {
+            non_code.push((start, i));
             continue;
         }
         out.push(bytes[i]);
         i += 1;
     }
     debug_assert_eq!(out.len(), bytes.len());
-    (String::from_utf8(out).expect("masking preserves UTF-8"), closed)
+    (String::from_utf8(out).expect("masking preserves UTF-8"), closed, non_code)
 }
 
 /// Qualified enclosing item. See the module docs for the name shapes.
@@ -264,8 +301,9 @@ pub enum ResolveError {
         limit: usize,
     },
     /// `r#` plus an ASCII ident start, on a word this scanner reads (a name or
-    /// a body ident). A raw ident inside a header is not read. Non-ASCII
-    /// (`r#é`) is not detected.
+    /// a body ident). A raw ident inside a header is not read. `r#é` is
+    /// [`ResolveError::NonAscii`]: the non-ASCII byte is rejected in
+    /// [`SourceItems::parse`] before this arm runs.
     RawIdent,
     /// The file declared more items than [`MAX_ITEMS`].
     TooManyItems {
@@ -288,6 +326,8 @@ pub enum ResolveError {
     Stalled {
         offset: usize,
     },
+    /// Non-ASCII outside a comment or string. Not read as a name.
+    NonAscii,
 }
 
 impl std::fmt::Display for ResolveError {
@@ -314,6 +354,7 @@ impl std::fmt::Display for ResolveError {
                 write!(f, "masked length {masked} != source length {source}")
             }
             Self::Stalled { offset } => write!(f, "item scanner stalled at byte {offset}"),
+            Self::NonAscii => write!(f, "non-ascii byte"),
         }
     }
 }
@@ -332,12 +373,17 @@ pub struct SourceItems {
 
 impl SourceItems {
     pub fn parse(src: &str) -> Result<Self, ResolveError> {
-        let (masked, closed) = mask_source(src);
+        let (masked, closed, _) = mask_source(src);
         if !closed {
             return Err(ResolveError::Unterminated);
         }
         if masked.len() != src.len() {
             return Err(ResolveError::MaskLength { masked: masked.len(), source: src.len() });
+        }
+        // One check, after comments and strings are blanked. Macro bodies and
+        // attributes are included; they are not special-cased below.
+        if masked.bytes().any(|b| b >= 0x80) {
+            return Err(ResolveError::NonAscii);
         }
         let mut parser = Parser { src: &masked, i: 0, depth: 0, items: Vec::new() };
         parser.parse_until(&Ctx::default(), false)?;
@@ -475,7 +521,7 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        while self.peek().is_some_and(is_rust_ws) {
             self.i += 1;
         }
     }
@@ -483,11 +529,11 @@ impl<'a> Parser<'a> {
     fn read_ident(&mut self) -> Result<Option<String>, ResolveError> {
         self.skip_ws();
         let bytes = self.bytes();
-        if bytes.get(self.i) == Some(&b'r')
-            && bytes.get(self.i + 1) == Some(&b'#')
-            && bytes.get(self.i + 2).is_some_and(|b| is_ident_start(*b))
-        {
-            return Err(ResolveError::RawIdent);
+        if bytes.get(self.i) == Some(&b'r') && bytes.get(self.i + 1) == Some(&b'#') {
+            let next = bytes.get(self.i + 2).copied();
+            if next.is_some_and(is_ident_start) {
+                return Err(ResolveError::RawIdent);
+            }
         }
         let start = self.i;
         if !self.peek().is_some_and(is_ident_start) {
@@ -506,12 +552,12 @@ impl<'a> Parser<'a> {
         }
         let bytes = self.bytes();
         let mut j = self.i + 1;
-        while bytes.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+        while bytes.get(j).is_some_and(|b| is_rust_ws(*b)) {
             j += 1;
         }
         if bytes.get(j) == Some(&b'!') {
             j += 1;
-            while bytes.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+            while bytes.get(j).is_some_and(|b| is_rust_ws(*b)) {
                 j += 1;
             }
         }
@@ -803,7 +849,7 @@ impl<'a> Parser<'a> {
                 } else if word == "for" && where_at.is_none() && for_at.is_none() {
                     let mut j = self.i;
                     let bytes = self.bytes();
-                    while bytes.get(j).is_some_and(|c| c.is_ascii_whitespace()) {
+                    while bytes.get(j).is_some_and(|c| is_rust_ws(*c)) {
                         j += 1;
                     }
                     if bytes.get(j) != Some(&b'<') {
@@ -851,7 +897,7 @@ impl<'a> Parser<'a> {
         };
         let bytes = self.bytes();
         let mut j = end;
-        while bytes.get(j).is_some_and(|b| b.is_ascii_whitespace()) {
+        while bytes.get(j).is_some_and(|b| is_rust_ws(*b)) {
             j += 1;
         }
         if bytes.get(j) == Some(&b':') && bytes.get(j + 1) == Some(&b':') {
@@ -1035,7 +1081,7 @@ fn const_param(bytes: &[u8], i: usize) -> bool {
     while j > 0 {
         j -= 1;
         match bytes[j] {
-            b if b.is_ascii_whitespace() => {}
+            b if is_rust_ws(b) => {}
             b'<' | b',' if depth == 0 => return true,
             b']' => depth += 1,
             b'[' => {
@@ -1061,7 +1107,7 @@ fn prev_non_ws_at(bytes: &[u8], index: usize) -> Option<u8> {
     let mut j = index;
     while j > 0 {
         j -= 1;
-        if !bytes[j].is_ascii_whitespace() {
+        if !is_rust_ws(bytes[j]) {
             return Some(bytes[j]);
         }
     }
@@ -1080,7 +1126,7 @@ fn normalize_type(raw: &str) -> String {
     let mut collapsed = String::new();
     let mut prev_space = false;
     for c in raw.chars() {
-        if c.is_whitespace() {
+        if c.is_ascii() && is_rust_ws(c as u8) {
             if !prev_space && !collapsed.is_empty() {
                 collapsed.push(' ');
                 prev_space = true;
@@ -1275,6 +1321,15 @@ mod tests {
             "trait T<# /* c */ [cfg(any())] const B: dyn Iterator<Item = Vec<u8>>, const C: usize = { 1 }>",
             "trait T<#/*c*/[cfg(all())] const C: char = 'x'>",
             "trait T<U, const C: char = 'x'>",
+            "trait T<'a, const P1: u8, P2 = fn(char)->char, const P3: bool = { 2 > 1 }>",
+            "trait T<const P: bool = true, Q = Vec<u8>, const R: bool = { 2 > 1 }>",
+            "#[cfg(any())] trait T<A, const B: dyn Iterator<Item = Vec<u8>>, const C: usize = { 1 }>",
+            "trait T<#[cfg(any())] const B: dyn Iterator<Item = Vec<u8>>, const C: usize = { 1 }>",
+            "trait T<A, #[cfg(any())] const B: dyn Iterator<Item = Vec<u8>>, const C: usize = { 1 }>",
+            "trait T<#[cfg(any())] const B: dyn Iterator<Item = [u8; 1]>, const C: char = 'x'>",
+            "trait T<#[cfg(any())] const B: u8 = b'>', const C: bool = { 2 > 1 }>",
+            "trait T<#[a] # [b] const C: char = 'x'>",
+            "type Char<const N: usize> = char;\ntype Byte<const N: usize> = u8;\ntrait T<const C: Char<0> = 'a', const D: Byte<0> = 1>",
             "trait T<const A: bool = { 2 > 1 }, const B: usize = { 3 }>",
         ];
         let body = " { fn m() { let HIT = 1; } }";
@@ -1508,6 +1563,271 @@ mod tests {
         assert!(!err.to_string().contains("256"), "{err}");
         let short = SourceItems::parse("impl<T").unwrap_err();
         assert!(matches!(short, ResolveError::Unclosed { .. }), "{short}");
+    }
+
+    #[test]
+    fn non_ascii_names_and_char_literals_fail_closed() {
+        let raw = "fn r#é() { let ANCHOR = 1; }\n";
+        let err = enclosing_item(raw, at(raw, "ANCHOR")).unwrap_err();
+        assert!(matches!(err, ResolveError::NonAscii), "{err}");
+        let name = "fn é() { let ANCHOR = 1; }\n";
+        let err = enclosing_item(name, at(name, "ANCHOR")).unwrap_err();
+        assert!(matches!(err, ResolveError::NonAscii), "{err}");
+        let ch = "fn f() { let _ = ('é','}'); let ANCHOR = 1; }\n";
+        let err = enclosing_item(ch, at(ch, "ANCHOR")).unwrap_err();
+        assert!(matches!(err, ResolveError::NonAscii), "{err}");
+        for src in [
+            "fn f(é: u8) { let ANCHOR = 1; }\n",
+            "impl é { fn m() { let ANCHOR = 1; } }\n",
+            "struct Foo<T>(T);\nimpl<é> Foo<T> { fn m() { let ANCHOR = 1; } }\n",
+        ] {
+            let err = enclosing_item(src, at(src, "ANCHOR")).unwrap_err();
+            assert!(matches!(err, ResolveError::NonAscii), "{src} -> {err}");
+        }
+        let leak = "macro_rules! a {()=>{('é','{')};}\nfn f(){let HAZ = 1;}\nmacro_rules! b {()=>{('é','}')};}\n";
+        let err = enclosing_item(leak, at(leak, "HAZ")).unwrap_err();
+        assert!(matches!(err, ResolveError::NonAscii), "{err}");
+        assert_ne!(err.to_string(), "macro_rules!a");
+        for src in [
+            "#[doc = 'é']\nfn f() { let ANCHOR = 1; }\n",
+            "#[cfg(é)]\nfn f() { let ANCHOR = 1; }\n",
+        ] {
+            let err = enclosing_item(src, at(src, "ANCHOR")).unwrap_err();
+            assert!(matches!(err, ResolveError::NonAscii), "{src} -> {err}");
+        }
+        let kept = "#[doc = \"é\"]\nfn f() { let ANCHOR = 1; }\n";
+        assert_eq!(enclosing_item(kept, at(kept, "ANCHOR")).unwrap().as_str(), "f");
+    }
+
+    #[test]
+    fn vertical_tab_keeps_the_owner() {
+        let cases = [
+            ("fn\x0Bf() { let ANCHOR = 1; }\n", "ANCHOR", "f"),
+            ("mod\x0Btests { fn f() { let ANCHOR = 1; } }\n", "ANCHOR", "tests::f"),
+            (
+                "struct Foo<T>(std::marker::PhantomData<T>);\nimpl\x0B<T> Foo<T> { fn m() { let ANCHOR = 1; } }\n",
+                "ANCHOR",
+                "Foo<T>::m",
+            ),
+            ("trait\x0BT { fn m() { let ANCHOR = 1; } }\n", "ANCHOR", "T::m"),
+            ("macro_rules!\x0Bm { () => { let ANCHOR = 1; }; }\n", "ANCHOR", "macro_rules!m"),
+            ("macro_rules! m { () =>\x0B{ let ANCHOR = 1; }; }\n", "ANCHOR", "macro_rules!m"),
+            (
+                "fn reject_gloas_version_pre_gloas() {\n    let slot_fork = 1;\n    if\x0Bslot_fork >= 1 { let ANCHOR = 1; }\n}\n",
+                "ANCHOR",
+                "reject_gloas_version_pre_gloas",
+            ),
+        ];
+        for (src, needle, expect) in cases {
+            let got =
+                enclosing_item(src, at(src, needle)).unwrap_or_else(|e| panic!("{e} in {src:?}"));
+            assert_eq!(got.as_str(), expect, "{src:?}");
+            assert_ne!(got.as_str(), "<module>", "{src:?}");
+            rustc_lib(src).unwrap_or_else(|e| panic!("rustc rejected\n{src:?}\n{e}"));
+        }
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../block-service/src/service/mod.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let fn_at = src.find("fn reject_gloas_version_pre_gloas").expect("fn");
+        // Split so this test file is not itself a `>= ForkName::` hazard hit.
+        let needle = format!("if slot_fork {} {}", ">=", "ForkName::Gloas");
+        let rel = src[fn_at..].find(&needle).expect("slot_fork line");
+        let space = fn_at + rel + 2;
+        assert_eq!(src.as_bytes()[space], b' ', "space between if and slot_fork");
+        let mut edited = src.into_bytes();
+        edited[space] = 0x0B;
+        let edited = String::from_utf8(edited).unwrap();
+        let item = enclosing_item(&edited, space + 1).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(item.as_str(), "reject_gloas_version_pre_gloas");
+        assert_ne!(item.as_str(), "<module>");
+    }
+
+    #[test]
+    fn keyword_form_feed_keeps_the_name() {
+        let cases = [
+            ("fn\x0Cf() { let ANCHOR = 1; }\n", "ANCHOR", "f"),
+            ("mod\x0Ctests { fn f() { let ANCHOR = 1; } }\n", "ANCHOR", "tests::f"),
+            (
+                "struct Foo<T>(std::marker::PhantomData<T>);\nimpl\x0C<T> Foo<T> { fn m() { let ANCHOR = 1; } }\n",
+                "ANCHOR",
+                "Foo<T>::m",
+            ),
+        ];
+        for (src, needle, expect) in cases {
+            let got =
+                enclosing_item(src, at(src, needle)).unwrap_or_else(|e| panic!("{e} in {src}"));
+            assert_eq!(got.as_str(), expect, "{src}");
+        }
+    }
+
+    fn rustc_lib(src: &str) -> Result<(), String> {
+        let dir = std::env::temp_dir().join(format!("rvc-hdr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rs = dir.join("case.rs");
+        std::fs::write(&rs, src).unwrap();
+        let out = std::process::Command::new("rustc")
+            .args(["--edition", "2021", "--crate-type", "lib", "--error-format", "short"])
+            .arg(&rs)
+            .arg("-o")
+            .arg(dir.join("case.rlib"))
+            .output()
+            .expect("spawn rustc");
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).to_string())
+        }
+    }
+
+    /// Headers this resolver claims, checked against `rustc --edition 2021`.
+    /// `compile` is whether rustc must accept the program. The resolver result
+    /// is checked either way. `#[a]` is a token shape rustc rejects.
+    #[test]
+    fn rustc_differential_on_claimed_headers() {
+        let cases: &[(&str, &str, &str, bool)] = &[
+            ("fn\x0Cf() { let ANCHOR = 1; }\n", "ANCHOR", "f", true),
+            ("mod\x0Ctests { fn f() { let ANCHOR = 1; } }\n", "ANCHOR", "tests::f", true),
+            (
+                "struct Foo<T>(std::marker::PhantomData<T>);\nimpl\x0C<T> Foo<T> { fn m() { let ANCHOR = 1; } }\n",
+                "ANCHOR",
+                "Foo<T>::m",
+                true,
+            ),
+            (
+                "trait T<'a, const P1: u8, P2 = fn(char)->char, const P3: bool = { 2 > 1 }> { fn m() { let HIT = 1; } }\nconst OK: bool = 2 > 1;\n",
+                "HIT",
+                "T::m",
+                true,
+            ),
+            (
+                "trait T<const P: bool = true, Q = Vec<u8>, const R: bool = { 2 > 1 }> { fn m() { let HIT = 1; } }\nconst OK: bool = 2 > 1;\n",
+                "HIT",
+                "T::m",
+                true,
+            ),
+            (
+                "#[cfg(any())] trait T<A, const B: dyn Iterator<Item = Vec<u8>>, const C: usize = { 1 }> { fn m() { let HIT = 1; } }\n",
+                "HIT",
+                "T::m",
+                true,
+            ),
+            (
+                "trait T<#[cfg(any())] const B: dyn Iterator<Item = Vec<u8>>, const C: usize = { 1 }> { fn m() { let HIT = 1; } }\n",
+                "HIT",
+                "T::m",
+                true,
+            ),
+            (
+                "trait T<A, #[cfg(any())] const B: dyn Iterator<Item = Vec<u8>>, const C: usize = { 1 }> { fn m() { let HIT = 1; } }\n",
+                "HIT",
+                "T::m",
+                true,
+            ),
+            (
+                "trait T<#[cfg(any())] const B: dyn Iterator<Item = [u8; 1]>, const C: char = 'x'> { fn m() { let HIT = 1; } }\n",
+                "HIT",
+                "T::m",
+                true,
+            ),
+            (
+                "trait T<#[cfg(any())] const B: u8 = b'>', const C: bool = { 2 > 1 }> { fn m() { let HIT = 1; } }\n",
+                "HIT",
+                "T::m",
+                true,
+            ),
+            (
+                "trait T<#[a] # [b] const C: char = 'x'> { fn m() { let HIT = 1; } }\n",
+                "HIT",
+                "T::m",
+                false,
+            ),
+            (
+                "type Char<const N: usize> = char;\ntype Byte<const N: usize> = u8;\ntrait T<const C: Char<0> = 'a', const D: Byte<0> = 1> { fn m() { let HIT = 1; } }\n",
+                "HIT",
+                "T::m",
+                true,
+            ),
+            ("#[doc = \"é\"]\nfn f() { let ANCHOR = 1; }\n", "ANCHOR", "f", true),
+        ];
+        for (src, needle, expect, compile) in cases {
+            let got =
+                enclosing_item(src, at(src, needle)).unwrap_or_else(|e| panic!("{e} in {src}"));
+            assert_eq!(got.as_str(), *expect, "{src}");
+            let rustc = rustc_lib(src);
+            let detail = rustc.as_ref().err().map(String::as_str).unwrap_or("");
+            assert_eq!(rustc.is_ok(), *compile, "{src}\n{detail}");
+        }
+        // rustc accepts these. The resolver fails closed instead of guessing
+        // `r`, `<module>`, or a function that swallowed the char literal.
+        for src in [
+            "fn r#é() { let ANCHOR = 1; }\n",
+            "fn é() { let ANCHOR = 1; }\n",
+            "fn f() { let _ = ('é','}'); let ANCHOR = 1; }\n",
+            "macro_rules! a {()=>{('é','{')};}\nfn f(){let HAZ = 1;}\nmacro_rules! b {()=>{('é','}')};}\n",
+            "#[doc = 'é']\nfn f() { let ANCHOR = 1; }\n",
+            "#[cfg(é)]\nfn f() { let ANCHOR = 1; }\n",
+        ] {
+            let needle = if src.contains("HAZ") { "HAZ" } else { "ANCHOR" };
+            assert!(enclosing_item(src, at(src, needle)).is_err(), "{src}");
+            rustc_lib(src).unwrap_or_else(|e| panic!("rustc rejected\n{src}\n{e}"));
+        }
+    }
+
+    /// Seeded grammar of trait heads. Every program must compile and keep `m`.
+    #[test]
+    fn seeded_trait_grammar_matches_rustc() {
+        let choices = [
+            "const P{i}: u8 = 1",
+            "const P{i}: bool = true",
+            "const P{i}: bool = { 2 > 1 }",
+            "const P{i}: char = 'x'",
+            "const P{i}: char = '>'",
+            "P{i} = Vec<u8>",
+            "P{i} = fn(char)->char",
+            "#[cfg(any())] const P{i}: u8 = b'>'",
+            "#[cfg(any())] const P{i}: dyn Iterator<Item = Vec<u8>>",
+        ];
+        let pasted = [
+            "#[cfg(any())] trait T<A, const B: dyn Iterator<Item = Vec<u8>>, const C: usize = { 1 }>",
+            "trait T<A, #[cfg(any())] const B: dyn Iterator<Item = Vec<u8>>, const C: usize = { 1 }>",
+        ];
+        for head in pasted {
+            let src = format!(
+                "{head} {{ fn m() {{ let HIT = 1; }} }}\nconst OK: bool = 2 > 1;\nfn later() {{ let NEXT = 1; }}\n"
+            );
+            let hit =
+                enclosing_item(&src, at(&src, "HIT")).unwrap_or_else(|e| panic!("{e}\n{src}"));
+            assert_eq!(hit.as_str(), "T::m", "{src}");
+            assert_eq!(enclosing_item(&src, at(&src, "const OK")).unwrap().as_str(), "<module>");
+            assert_eq!(enclosing_item(&src, at(&src, "NEXT")).unwrap().as_str(), "later");
+            rustc_lib(&src).unwrap_or_else(|e| panic!("rustc rejected\n{src}\n{e}"));
+        }
+        let mut state = 0x714u64;
+        for _ in 0..24 {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let count = 1 + (state % 3) as usize;
+            let mut params = Vec::new();
+            for i in 0..count {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                params
+                    .push(choices[(state as usize) % choices.len()].replace("{i}", &i.to_string()));
+            }
+            let src = format!(
+                "trait T<\x0B{}> {{ fn m() {{ let HIT = 1; }} }}\nconst OK: bool = 2 > 1;\nfn later() {{ let NEXT = 1; }}\n",
+                params.join(", ")
+            );
+            let hit =
+                enclosing_item(&src, at(&src, "HIT")).unwrap_or_else(|e| panic!("{e}\n{src}"));
+            assert_eq!(hit.as_str(), "T::m", "{src}");
+            assert_eq!(
+                enclosing_item(&src, at(&src, "const OK")).unwrap().as_str(),
+                "<module>",
+                "{src}"
+            );
+            assert_eq!(enclosing_item(&src, at(&src, "NEXT")).unwrap().as_str(), "later", "{src}");
+            rustc_lib(&src).unwrap_or_else(|e| panic!("rustc rejected\n{src}\n{e}"));
+        }
     }
 
     #[test]

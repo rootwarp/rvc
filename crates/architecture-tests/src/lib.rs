@@ -14,8 +14,9 @@
 mod rust_source;
 
 pub use rust_source::{
-    enclosing_item, ident_boundary_before, mask_comments_and_strings, mask_cooked_string,
-    try_mask_char_literal, try_mask_raw_string, ItemId, ItemSpan, ResolveError, SourceItems,
+    byte_in_code, enclosing_item, ident_boundary_before, is_rust_ws, mask_comments_and_strings,
+    mask_cooked_string, non_code_spans, try_mask_char_literal, try_mask_raw_string, ItemId,
+    ItemSpan, ResolveError, SourceItems,
 };
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
