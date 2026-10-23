@@ -30,6 +30,9 @@ Guidance for coding agents (Cursor, Claude Code, Codex) working in rvc. `CLAUDE.
 ## Coding
 Follow `.cursor/rules/rust-code.mdc` (TDD, idiomatic Rust, conventions) and `CLAUDE.md`.
 
+## Spawn census
+`plan/tracing-2026-08-06/spawn-census.md` is checked by `census_anchors_match_sources`. Classify new spawn sites; anchors follow the code. A new executor or bn-manager spawn needs a content row (file, enclosing item, and task or call). A line number is not a key.
+
 ## CI action pins
 Third-party `uses:` in `.github/workflows` are full commit SHAs with a `# vX.Y.Z` comment on the same line. First-party `actions/*` and `github/*` stay on major tags.
 Tagging and releases are lead-only. Do not retag or re-run a release whose workflow still names a missing action ref. Publish images from a tag that contains the corrected workflow.
