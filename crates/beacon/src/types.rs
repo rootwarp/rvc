@@ -234,8 +234,13 @@ impl ProduceBlockResponse {
     /// `consensus_version` through [`eth_types::block_body_json::decode`]. Hex
     /// bodies are unchanged. Gloas and pre-Deneb object bodies fail closed.
     /// `BeaconBlock`'s `hex_vec` serde is not used on the object itself.
+    ///
+    /// A `0X` hex prefix and a `+`-prefixed integer string are rejected on this
+    /// value, including inside the body, before that decode.
     pub fn parse_full_block(&self) -> Result<BlockContents, BeaconError> {
         eth_types::block_object(&self.data)
+            .map_err(|err| BeaconError::ParseError(err.to_string()))?;
+        eth_types::block_body_json::reject_beacon_api_lenient_spellings(&self.data)
             .map_err(|err| BeaconError::ParseError(err.to_string()))?;
         let mut data = self.data.clone();
         replace_json_body_with_ssz(&mut data, &self.consensus_version, false)?;
@@ -251,9 +256,14 @@ impl ProduceBlockResponse {
     /// Gloas and pre-Deneb object bodies fail closed.
     /// `BlindedBeaconBlock`'s `hex_vec` serde is not used on the object itself.
     /// A hybrid document is rejected. A decode error leaves `data` unchanged.
+    ///
+    /// The block object may only contain `slot`, `proposer_index`,
+    /// `parent_root`, `state_root`, and `body`. Nested keys the re-encoded body
+    /// does not contain are rejected inside `decode_blinded`.
     pub fn parse_blinded_block(&self) -> Result<BlindedBeaconBlock, BeaconError> {
-        eth_types::block_object(&self.data)
+        let block = eth_types::block_object(&self.data)
             .map_err(|err| BeaconError::ParseError(err.to_string()))?;
+        reject_unknown_blinded_block_keys(block)?;
         let mut data = self.data.clone();
         eth_types::block_body_json::reject_beacon_api_lenient_spellings(&data)
             .map_err(|err| BeaconError::ParseError(err.to_string()))?;
@@ -397,6 +407,43 @@ fn check_blinded_hex_body(text: &str, consensus_version: &str) -> Result<(), Bea
         BeaconError::ParseError(format!("invalid JSON blinded block body: {err}"))
     })?;
     Ok(())
+}
+
+const BLINDED_BLOCK_JSON_KEYS: &[&str] =
+    &["slot", "proposer_index", "parent_root", "state_root", "body"];
+
+/// The blinded block object has five fields. Any other key is dropped by
+/// serde, so reject it before the body is decoded. The shown name is at most
+/// 64 Unicode scalars, with control characters and line separators replaced,
+/// so a long or hostile key cannot fill or split the error string.
+fn reject_unknown_blinded_block_keys(block: &serde_json::Value) -> Result<(), BeaconError> {
+    let Some(map) = block.as_object() else {
+        return Ok(());
+    };
+    for key in map.keys() {
+        if !BLINDED_BLOCK_JSON_KEYS.contains(&key.as_str()) {
+            return Err(BeaconError::ParseError(format!(
+                "unknown JSON field `{}`",
+                shown_json_field(key)
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn shown_json_field(key: &str) -> String {
+    key.chars()
+        .take(64)
+        .map(
+            |ch| {
+                if ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}' {
+                    '\u{fffd}'
+                } else {
+                    ch
+                }
+            },
+        )
+        .collect()
 }
 
 fn json_body_field(data: &mut serde_json::Value) -> Option<&mut serde_json::Value> {
@@ -1759,6 +1806,107 @@ mod tests {
             eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX
         );
         assert!(response.data["body"].is_string());
+    }
+
+    #[test]
+    fn json_blinded_deneb_hex_body_under_electra_is_a_parse_error() {
+        let ssz = eth_types::external_vector_blinded_deneb_body().as_ssz_bytes();
+        let body = serde_json::Value::String(format!("0x{}", hex::encode(ssz)));
+        for version in ["electra", "fulu"] {
+            let response = blinded_produce(kat_blinded_block(body.clone()), version);
+            let original = response.data.clone();
+            match response.parse_blinded_block() {
+                Err(BeaconError::ParseError(msg)) => {
+                    assert!(
+                        msg.contains("invalid JSON blinded block body")
+                            && msg.contains("invalid SSZ body encoding"),
+                        "{version}: {msg}"
+                    );
+                }
+                other => panic!("{version}: expected ParseError, got {other:?}"),
+            }
+            assert_eq!(response.data, original, "{version}");
+        }
+    }
+
+    #[test]
+    fn parse_blinded_block_rejects_an_unknown_block_field() {
+        let mut data = kat_blinded_block(blinded_body_fixture(ELECTRA_BLINDED_BODY_JSON));
+        data["not_a_block_field"] = serde_json::json!(1);
+        let response = blinded_produce(data, "electra");
+        match response.parse_blinded_block() {
+            Err(BeaconError::ParseError(msg)) => {
+                assert!(msg.contains("not_a_block_field"), "{msg}");
+            }
+            other => panic!("expected ParseError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_blinded_block_unknown_field_error_caps_and_replaces_control_characters() {
+        let mut data = kat_blinded_block(blinded_body_fixture(ELECTRA_BLINDED_BODY_JSON));
+        let key = format!("bad\n\u{2028}{}", "k".repeat(80));
+        data[&key] = serde_json::json!(1);
+        let err = blinded_produce(data, "electra").parse_blinded_block().expect_err("hostile key");
+        let text = err.to_string();
+        let expected = format!("bad\u{fffd}\u{fffd}{}", "k".repeat(59));
+        assert!(text.contains(&expected), "{text}");
+        assert!(!text.contains('\n') && !text.contains('\u{2028}'), "{text}");
+        assert!(!text.contains(&"k".repeat(60)), "{text}");
+    }
+
+    #[test]
+    fn parse_full_block_rejects_lenient_spellings() {
+        let parent = format!("0x{}", "01".repeat(32));
+        let state = format!("0x{}", "02".repeat(32));
+        let mut uppercase = serde_json::json!({
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": parent.replacen("0x", "0X", 1),
+            "state_root": state,
+            "body": "0xdead"
+        });
+        let err = full_produce(uppercase.clone(), "deneb").parse_full_block().expect_err("0X");
+        assert!(err.to_string().contains("lowercase 0x"), "{err}");
+
+        uppercase["parent_root"] = serde_json::json!(parent);
+        uppercase["slot"] = serde_json::json!("+100");
+        let err = full_produce(uppercase, "deneb").parse_full_block().expect_err("plus slot");
+        assert!(err.to_string().contains("leading +"), "{err}");
+
+        let mut body: serde_json::Value =
+            serde_json::from_str(ELECTRA_FULL_BODY_JSON).expect("body");
+        let randao = body["randao_reveal"].as_str().expect("randao").to_string();
+        body["randao_reveal"] = serde_json::Value::String(randao.replacen("0x", "0X", 1));
+        let err = full_produce(kat_blinded_block(body.clone()), "electra")
+            .parse_full_block()
+            .expect_err("0X inside body");
+        assert!(err.to_string().contains("lowercase 0x"), "{err}");
+
+        body["randao_reveal"] = serde_json::Value::String(randao);
+        body["execution_payload"]["block_number"] = serde_json::json!("+1");
+        let err = full_produce(kat_blinded_block(body), "electra")
+            .parse_full_block()
+            .expect_err("plus inside body");
+        assert!(err.to_string().contains("leading +"), "{err}");
+    }
+
+    const ELECTRA_FULL_BODY_JSON: &str =
+        include_str!("../../eth-types/tests/fixtures/beacon_api/electra_block_body.json");
+
+    fn full_produce(data: serde_json::Value, consensus_version: &str) -> ProduceBlockResponse {
+        ProduceBlockResponse {
+            data,
+            is_blinded: false,
+            consensus_version: consensus_version.to_string(),
+            execution_payload_value: None,
+            is_ssz: false,
+            ssz_bytes: None,
+            payload_included: false,
+            builder_url: None,
+            consensus_block_value: None,
+            candidate_memo: crate::prepare_check::CandidateMemo::arc(),
+        }
     }
 
     #[test]

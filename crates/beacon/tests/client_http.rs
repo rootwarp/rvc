@@ -1884,6 +1884,68 @@ async fn test_produce_block_v3_full_block() {
 }
 
 #[tokio::test]
+async fn produce_block_v3_json_with_a_duplicate_key_is_a_parse_error() {
+    let mock_server = MockServer::start().await;
+    let body = r#"{"version":"deneb","data":{"slot":"1","slot":"2"}}"#;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(body)
+                .insert_header("Content-Type", "application/json")
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    match client.produce_block_v3(1, "0xrandao", None, None).await {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("duplicate JSON key"), "{msg}");
+        }
+        other => panic!("expected a duplicate-key parse error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn produce_block_v3_full_json_with_a_0x_prefix_is_a_parse_error() {
+    let mock_server = MockServer::start().await;
+    let envelope = serde_json::json!({
+        "version": "deneb",
+        "data": {
+            "slot": "100",
+            "proposer_index": "42",
+            "parent_root": format!("0X{}", "01".repeat(32)),
+            "state_root": format!("0x{}", "02".repeat(32)),
+            "body": "0xdead"
+        }
+    });
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/100"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(&envelope)
+                .insert_header("Content-Type", "application/json")
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false"),
+        )
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let client = BeaconClient::new(BeaconClientConfig::new(mock_server.uri())).unwrap();
+    let result = client.produce_block_v3(100, "0xrandao", None, None).await.expect("JSON value");
+    match result.parse_full_block() {
+        Err(BeaconError::ParseError(msg)) => {
+            assert!(msg.contains("lowercase 0x"), "{msg}");
+        }
+        other => panic!("expected a 0X parse error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_produce_block_missing_consensus_version_is_rejected() {
     let mock_server = MockServer::start().await;
 

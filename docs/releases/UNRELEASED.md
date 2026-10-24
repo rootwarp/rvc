@@ -336,12 +336,28 @@ JSON object. The object is built once, before the publish is fanned out.
 `Eth-Consensus-Version` must name the slot's fork before the body is decoded
 or signed. A hex `body` is kept as SSZ only when that SSZ is the blinded
 container for the same fork; a Deneb body under an Electra or Fulu header is
-rejected before any signature. Unknown JSON fields are rejected, including
-`execution_requests` on a Deneb body and `execution_payload` beside
-`execution_payload_header`. Duplicate JSON keys are a parse error. A hex
-prefix must be lowercase `0x` (digits may be `A-F`). A quoted integer must
-not start with `+`. A `uint256` decimal longer than 78 significant digits is
-rejected. Gloas and pre-Deneb object bodies fail with a parse error in
+rejected before any signature. On the blinded path, a key that the
+re-encoded SSZ does not contain at the same path is rejected. That includes
+a nested key on `execution_payload_header`, on `eth1_data`, on
+`sync_aggregate`, and on an element of `execution_requests.withdrawals`, and
+a key on the blinded block object other than `slot`, `proposer_index`,
+`parent_root`, `state_root`, and `body`. A positional JSON array is rejected
+when the re-encoded SSZ at that path is an object, including
+`execution_requests` written as `[deposits, withdrawals, consolidations]`, so
+a nested key inside that array is not dropped. `execution_requests` on a Deneb body
+and `execution_payload` beside `execution_payload_header` are rejected. Those
+container types stay lenient on other beacon-node responses, so an unknown
+nested field there does not fail the duty. A full (unblinded) JSON body
+rejects an unknown field of the body object. A nested field inside that body
+is not a parse error, and it is not part of the signed SSZ. Duplicate JSON
+keys are a parse error. The key is the UTF-8 string JSON defines, so a raw
+non-ASCII key and the same key written with `\u` escapes are one key, and two
+different surrogate-pair keys are not. A hex prefix must be lowercase `0x`
+(digits may be `A-F`). A quoted integer must not start with `+`. The full
+JSON produce path uses those same two spelling rules, on the block object and
+inside the body, before the body is decoded. A `uint256` decimal longer than
+78 significant digits is rejected. Gloas and pre-Deneb object bodies fail with
+a parse error in
 `parse_blinded_block`. On the proposal path a Gloas blinded response is still
 dropped as blinded-not-supported before that parse, and a pre-Deneb object
 body fails with a parse error before the block is signed. A blinded publish
