@@ -124,7 +124,7 @@ const EXPECTED_COUNTS: [(Class, usize); 5] = [
     (Class::GeForkName, 28),
     (Class::IndexZero, 8),
     (Class::MatchForkName, 10),
-    (Class::StringDispatch, 10),
+    (Class::StringDispatch, 11),
     (Class::Entries, 8),
 ];
 
@@ -635,6 +635,15 @@ const INVENTORY: &[Inv] = &[
         Class::StringDispatch,
         false,
         "match &envelopes[0] {",
+        Verdict::TestOnly,
+        "—",
+    ),
+    inv(
+        "crates/rvc/src/orchestrator/sync_committee.rs",
+        "tests::contribution_kat",
+        Class::StringDispatch,
+        false,
+        "match name {",
         Verdict::TestOnly,
         "—",
     ),

@@ -582,3 +582,56 @@ fn test_gloas_v4_helpers_do_not_read_is_blinded_or_electra_htr() {
         assert!(!body.contains("parse_full_block"), "{name} must not call parse_full_block");
     }
 }
+
+/// A Gloas parent mismatch is dropped before the header signer.
+#[tokio::test]
+async fn test_gloas_parent_mismatch_drops_duty_before_signer() {
+    let pubkey = test_pubkey();
+    let slot = test_gloas_slot();
+    let signer = Arc::new(MockSigner::new());
+    let beacon = Arc::new(gloas_unblinded(slot));
+    let service = BlockService::new(
+        signer.clone(),
+        beacon,
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_with_near_gloas()),
+        [0xaa; 32],
+    );
+    let err = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: [0xee; 32], parent: None, closed: false }),
+        )
+        .await
+        .expect_err("parent mismatch");
+    assert!(matches!(err, BlockServiceError::ParentRootMismatch { .. }), "{err:?}");
+    assert!(signer.header_calls.lock().unwrap().is_empty());
+    assert!(signer.block_calls.lock().unwrap().is_empty());
+}
+
+/// A V4 publish parse error after the header is signed is a publication failure.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_v4_post_sign_parse_is_logged_as_publication_failure() {
+    let pubkey = test_pubkey();
+    let slot = test_gloas_slot();
+    let beacon = Arc::new(
+        MockBeaconClient::from_response(self_build_json_response(slot)).with_publish_parse_error(),
+    );
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon,
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_with_near_gloas()),
+        [0xaa; 32],
+    );
+    let err = service.propose_block(slot, &pubkey, 42, None).await.expect_err("publish parse");
+    assert_eq!(signer.header_calls.lock().unwrap().len(), 1);
+    assert_eq!(err.to_string(), "beacon error: parse error: publish body");
+    assert!(matches!(err, BlockServiceError::Beacon(_)));
+    assert!(logs_contain("Block publication failed"));
+    assert!(!logs_contain("Block response rejected before publication"));
+}

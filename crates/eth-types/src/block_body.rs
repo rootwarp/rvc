@@ -1685,6 +1685,20 @@ pub const EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX: &str =
 pub const EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX: &str =
     "6bf364098fe8b865ffecc0b1d88c5b6edada937e5c9c3c69726d1d46cf2e1d24";
 
+/// Same blinded body as [`EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX`] plus one
+/// `WithdrawalRequest` (`source` `0xab` × 20, pubkey `0xcd` × 48, amount
+/// 32_000_000_000). `remerkleable==0.1.27` via `scripts/gen_blinded_electra_roots.py`.
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BLINDED_ELECTRA_WITHDRAWAL_BODY_ROOT_HEX: &str =
+    "852758253b54e21fb36a8d15ca0232b57b533f3bb30ace1a1989fd6f0fa03839";
+
+/// Withdrawal body plus one attestation (8 aggregation bits, committee bit 0),
+/// one blob KZG commitment `0xab` × 48. Same generator and preset as
+/// [`EXTERNAL_BLINDED_ELECTRA_WITHDRAWAL_BODY_ROOT_HEX`].
+#[cfg(any(test, feature = "test-fixtures"))]
+pub const EXTERNAL_BLINDED_ELECTRA_NONEMPTY_BODY_ROOT_HEX: &str =
+    "e760f138a084fe0ac063f0776aa5caca22ba5c996c328bc37e63a0bdbe2cdcdd";
+
 /// Deneb full body root (`remerkleable`; graffiti `"rvc-sec6d-deneb-body!!!!!!!!!"`).
 #[cfg(any(test, feature = "test-fixtures"))]
 pub const EXTERNAL_DENEB_BODY_ROOT_HEX: &str =
@@ -2299,6 +2313,55 @@ mod tests {
         );
         // Distinct from the full Electra empty-ops vector (different graffiti).
         assert_ne!(body.tree_hash_root(), hex32(EXTERNAL_ELECTRA_BODY_ROOT_HEX));
+    }
+
+    fn withdrawal_request() -> WithdrawalRequest {
+        WithdrawalRequest {
+            source_address: [0xab; 20],
+            validator_pubkey: [0xcd; 48],
+            amount: 32_000_000_000,
+        }
+    }
+
+    fn blinded_electra_with_withdrawal() -> BlindedBeaconBlockBodyElectra {
+        let mut body = external_vector_blinded_electra_body();
+        body.execution_requests.withdrawals = VariableList::from(vec![withdrawal_request()]);
+        body
+    }
+
+    /// 8 aggregation bits set, sentinel in the next byte: `Bitlist` encoding `0xff01`.
+    fn nonempty_blinded_electra() -> BlindedBeaconBlockBodyElectra {
+        let mut body = blinded_electra_with_withdrawal();
+        body.attestations = VariableList::from(vec![crate::ElectraAttestation {
+            aggregation_bits: vec![0xff, 0x01],
+            data: crate::AttestationData {
+                slot: 500,
+                index: 0,
+                beacon_block_root: [0xaa; 32],
+                source: crate::Checkpoint { epoch: 15, root: [0xbb; 32] },
+                target: crate::Checkpoint { epoch: 16, root: [0xcc; 32] },
+            },
+            signature: vec![0xaa; 96],
+            committee_bits: vec![0x01, 0, 0, 0, 0, 0, 0, 0],
+        }]);
+        body.blob_kzg_commitments = VariableList::from(vec![[0xab; 48]]);
+        body
+    }
+
+    #[test]
+    fn test_blinded_electra_withdrawal_body_root() {
+        assert_eq!(
+            blinded_electra_with_withdrawal().tree_hash_root(),
+            hex32(EXTERNAL_BLINDED_ELECTRA_WITHDRAWAL_BODY_ROOT_HEX),
+        );
+    }
+
+    #[test]
+    fn test_blinded_electra_nonempty_ops_body_root() {
+        assert_eq!(
+            nonempty_blinded_electra().tree_hash_root(),
+            hex32(EXTERNAL_BLINDED_ELECTRA_NONEMPTY_BODY_ROOT_HEX),
+        );
     }
 
     #[test]

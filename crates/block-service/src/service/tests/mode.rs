@@ -951,6 +951,7 @@ async fn test_mode_shape_self_build_sent_bare_is_rejected() {
 /// Envelope `builder_index` and `beacon_block_root` must match the signed block.
 #[tokio::test]
 async fn test_mode_shape_self_build_envelope_mismatch_is_unsigned() {
+    // kat_exempt: error-string only.
     let slot = test_gloas_slot();
     let block = self_build_block(slot);
     let block_root = rvc_gloas::gloas_block_root(
@@ -1069,6 +1070,7 @@ fn ssz_self_build_with_envelope(slot: Slot, envelope: &[u8]) -> ProduceBlockResp
 /// SSZ envelope index and block root are checked before signing, same as JSON.
 #[tokio::test]
 async fn test_mode_shape_self_build_envelope_mismatch_ssz_is_unsigned() {
+    // kat_exempt: error-string only.
     let slot = test_gloas_slot();
     let parent_root = [0x11; 32];
     let block = eth_types::BeaconBlock {
@@ -1131,6 +1133,7 @@ async fn test_mode_shape_self_build_envelope_mismatch_ssz_is_unsigned() {
 /// Envelope parent must match the block parent before signing.
 #[tokio::test]
 async fn test_mode_shape_envelope_parent_mismatch_is_unsigned() {
+    // kat_exempt: error-string only.
     let slot = test_gloas_slot();
     let block = self_build_block(slot);
     let block_root = rvc_gloas::gloas_block_root(
@@ -1168,6 +1171,147 @@ async fn test_mode_shape_envelope_parent_mismatch_is_unsigned() {
             hex::encode(block.parent_root)
         )
     );
+}
+
+fn ssz_produce(bytes: Vec<u8>, payload_included: bool) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data: serde_json::Value::Null,
+        is_blinded: false,
+        consensus_version: "gloas".to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: true,
+        ssz_bytes: Some(bytes),
+        payload_included,
+        builder_url: None,
+        consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
+    }
+}
+
+/// Bare self-build SSZ (`payload_included` false) is rejected before signing.
+#[tokio::test]
+async fn test_mode_shape_bare_self_build_ssz_requires_envelope() {
+    // kat_exempt: error-string only.
+    let slot = test_gloas_slot();
+    let block = self_build_block(slot);
+    let bytes = build_gloas_beacon_block_ssz(
+        block.slot,
+        block.proposer_index,
+        block.parent_root,
+        block.state_root,
+        &block.body,
+    );
+    let modes = [
+        BlockSelectionMode::ExecutionOnly,
+        BlockSelectionMode::MaxProfit,
+        BlockSelectionMode::BuilderAlways,
+    ];
+    for mode in modes {
+        let (service, signer, beacon, pubkey) = gloas_pair(ssz_produce(bytes.clone(), false));
+        let err = service.propose_block_with_mode(slot, &pubkey, mode).await.expect_err("bare ssz");
+        assert_unsigned(&signer, &beacon);
+        assert_eq!(
+            err.to_string(),
+            "parse error: self-build bid requires an execution payload envelope",
+            "{mode}"
+        );
+    }
+}
+
+/// External-bid SSZ wrapped as `BlockContents` is rejected before signing.
+#[tokio::test]
+async fn test_mode_shape_external_bid_ssz_contents_is_rejected() {
+    // kat_exempt: error-string only.
+    let slot = test_gloas_slot();
+    let block = external_bid_block(slot);
+    let block_ssz = build_gloas_beacon_block_ssz(
+        block.slot,
+        block.proposer_index,
+        block.parent_root,
+        block.state_root,
+        &block.body,
+    );
+    let contents =
+        build_gloas_block_contents_ssz(&block_ssz, &gloas_envelope_ssz(), &[0xaa], &[0xbb]);
+    let modes = [
+        BlockSelectionMode::BuilderOnly,
+        BlockSelectionMode::MaxProfit,
+        BlockSelectionMode::BuilderAlways,
+    ];
+    for mode in modes {
+        let (service, signer, beacon, pubkey) = gloas_pair(ssz_produce(contents.clone(), true));
+        let err =
+            service.propose_block_with_mode(slot, &pubkey, mode).await.expect_err("external ssz");
+        assert_unsigned(&signer, &beacon);
+        assert_eq!(
+            err.to_string(),
+            "parse error: execution payload envelope requires a self-build bid",
+            "{mode}"
+        );
+    }
+}
+
+/// SSZ envelope parent must match the block parent before signing.
+#[tokio::test]
+async fn test_mode_shape_envelope_parent_mismatch_ssz_is_unsigned() {
+    // kat_exempt: error-string only.
+    let slot = test_gloas_slot();
+    let parent_root = [0x11; 32];
+    let block = eth_types::BeaconBlock {
+        slot,
+        proposer_index: 42,
+        parent_root,
+        state_root: [0x22; 32],
+        body: self_build_body(slot, parent_root),
+    };
+    let block_root = rvc_gloas::gloas_block_root(
+        &rvc_gloas::HeaderFields {
+            slot: block.slot,
+            proposer_index: block.proposer_index,
+            parent_root: block.parent_root,
+            state_root: block.state_root,
+        },
+        &block.body,
+    )
+    .expect("block root");
+    let bound = bound_self_build_envelope(&block);
+    let wrong_parent = rvc_gloas::envelope_with_binding(
+        &bound,
+        rvc_gloas::BUILDER_INDEX_SELF_BUILD,
+        block_root,
+        [0xab; 32],
+    )
+    .expect("parent rewrite");
+    let block_ssz = build_gloas_beacon_block_ssz(
+        block.slot,
+        block.proposer_index,
+        block.parent_root,
+        block.state_root,
+        &block.body,
+    );
+    let contents = build_gloas_block_contents_ssz(&block_ssz, &wrong_parent, &[0xaa], &[0xbb]);
+    let modes = [
+        BlockSelectionMode::ExecutionOnly,
+        BlockSelectionMode::MaxProfit,
+        BlockSelectionMode::BuilderAlways,
+    ];
+    for mode in modes {
+        let (service, signer, beacon, pubkey) = gloas_pair(ssz_produce(contents.clone(), true));
+        let err = service
+            .propose_block_with_mode(slot, &pubkey, mode)
+            .await
+            .expect_err("ssz envelope parent");
+        assert_unsigned(&signer, &beacon);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "parse error: self-build envelope parent_beacon_block_root 0x{} does not match block parent root 0x{}",
+                hex::encode([0xab; 32]),
+                hex::encode(parent_root)
+            ),
+            "{mode}"
+        );
+    }
 }
 
 /// Bid slot and beacon parent are checked on a bare external block, before signing.

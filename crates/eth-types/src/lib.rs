@@ -68,7 +68,8 @@ pub mod fixtures {
         external_vector_blinded_deneb_body, external_vector_blinded_electra_body,
         external_vector_deneb_body, external_vector_electra_body,
         external_vector_execution_payload_header, EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX,
-        EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX, EXTERNAL_DENEB_BLOCK_ROOT_HEX,
+        EXTERNAL_BLINDED_ELECTRA_BODY_ROOT_HEX, EXTERNAL_BLINDED_ELECTRA_NONEMPTY_BODY_ROOT_HEX,
+        EXTERNAL_BLINDED_ELECTRA_WITHDRAWAL_BODY_ROOT_HEX, EXTERNAL_DENEB_BLOCK_ROOT_HEX,
         EXTERNAL_DENEB_BODY_ROOT_HEX, EXTERNAL_ELECTRA_BLOCK_ROOT_HEX,
         EXTERNAL_ELECTRA_BODY_ROOT_HEX,
     };
