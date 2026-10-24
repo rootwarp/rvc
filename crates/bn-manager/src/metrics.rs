@@ -201,6 +201,21 @@ pub static RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL: LazyLock<IntCounter> = LazyL
     )
 });
 
+/// Broadcast attempts that waited because the beacon node was already at
+/// [`crate::MAX_INFLIGHT_PER_BN`].
+///
+/// One increment per wait, labelled by [`endpoint_label`]. A free permit
+/// does not increment this. The send still runs once a permit is free, or
+/// the attempt times out at its budget without starting the HTTP call.
+/// The overflow gauge stays [`RVC_BN_BROADCAST_OVERFLOW_DRAINS`].
+pub static RVC_BN_BROADCAST_INFLIGHT_WAITS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    define_int_counter_vec(
+        "rvc_bn_broadcast_inflight_waits_total",
+        "Broadcast attempts that waited for a per-beacon-node in-flight permit. Label endpoint is the redacted beacon endpoint. The cap is 2 times the default publish concurrency (4). A wait is not a skip. The HTTP call starts after a permit is acquired, or the attempt times out at its budget without starting",
+        &["endpoint"],
+    )
+});
+
 /// In-flight overflow publishes, one series per redacted beacon endpoint.
 ///
 /// The 16-permit health-sample cap limits health recording, not sends. A
@@ -209,7 +224,7 @@ pub static RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL: LazyLock<IntCounter> = LazyL
 /// [`endpoint_label`] (`scheme://host:port`, userinfo and path stripped) so
 /// a slow beacon node's backlog is visible. Each publish ends at that
 /// attempt's budget, or at the beacon client's HTTP timeout when no budget
-/// is set.
+/// is set. Sends are also capped by [`crate::MAX_INFLIGHT_PER_BN`].
 pub static RVC_BN_BROADCAST_OVERFLOW_DRAINS: LazyLock<IntGaugeVec> = LazyLock::new(|| {
     define_int_gauge_vec(
         "rvc_bn_broadcast_overflow_drains",
@@ -228,6 +243,7 @@ pub fn init() {
     LazyLock::force(&RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL);
     LazyLock::force(&RVC_BN_PRODUCE_SOFT_DEADLINE_RETURNS_TOTAL);
     LazyLock::force(&RVC_BN_PRODUCE_FALLBACK_TOTAL);
+    LazyLock::force(&RVC_BN_BROADCAST_INFLIGHT_WAITS_TOTAL);
     LazyLock::force(&RVC_BN_BROADCAST_OVERFLOW_DRAINS);
     LazyLock::force(&RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL);
 }

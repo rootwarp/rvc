@@ -3,6 +3,42 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Broadcast drains are bounded per beacon node and joined on shutdown
+
+Each beacon node accepts at most 4 in-flight broadcast sends. That cap is
+`MAX_INFLIGHT_PER_BN` in `fan_out`: 2 × the default publish concurrency of 2.
+It does not follow a live change of `duty_publish_concurrency`. A node that
+is already at the cap waits up to one attempt budget for a permit
+(`rvc_bn_broadcast_inflight_waits_total`, labelled by the redacted endpoint).
+The HTTP call starts only after the permit is held. The wait does not shrink
+that call's budget, and it does not skip the node. If the permit does not
+arrive, the attempt times out and the HTTP call is not started. A send that
+already holds a permit runs to its own attempt budget and is not cancelled
+to free the slot. The caller's backstop, 250 ms past that budget, does not
+cancel it either. The overflow gauge is unchanged: it still counts publishes
+past the 16-permit health-sample cap, and it still drops when that HTTP call
+finishes.
+
+Detached drains are joined on shutdown after the duty orchestrator stops,
+for up to the block-publication budget (2 s by default). A configured zero
+is no budget, the same rule as the publication timeout itself: shutdown
+waits until those drains finish. A hung send still ends at the HTTP client
+timeout. The join does not cancel a send that is still running when a
+positive budget elapses. The health recorder is still not joined, so a
+sample that is only queued at process exit is not kept.
+
+Drains keep the attempt budget. They do not use the caller's slot deadline.
+A background send is already bounded by one budget after it starts. Cutting
+it at the slot deadline would cancel late gossip, and an attestation can
+still be included for 32 slots.
+
+The execution-payload envelope is sent to every role-matching beacon node as
+soon as the first block acceptance returns. A slower node may not have
+imported the block yet. It can answer "unknown block", and that answer
+counts as a health error until the node imports the block. Sending the
+envelope only to the nodes that accepted the block stays parked until Gloas
+is scheduled.
+
 ## A hard-rejected block does not improve beacon-node health
 
 A produce candidate that fails a hard check no longer counts as a successful health sample. The beacon node's score, error rate, and latency stay where they were. A readable fee-recipient mismatch under `fee_recipient_policy = sign` is still a success. The fallback records that sample only after the fallback accept check, so a rejected fallback body does not improve the node either.
@@ -652,9 +688,12 @@ background finishes record health at once. That cap limits health recording,
 not sends. If 16 are already running, further nodes still receive the
 publish. Those overflow drains are not dropped to make room. Each one ends
 at that attempt's budget, or at the beacon client's HTTP timeout when no
-budget is set, so how many are in flight follows publish rate times that
-timeout (`rvc_bn_broadcast_overflow_drains`, labelled by the redacted
-endpoint). The gauge drops when that beacon node's HTTP call finishes. A
+budget is set, so how many used to be in flight followed publish rate times that
+timeout. Sends are now capped at 4 per beacon node (2 × the default publish
+concurrency of 2). A saturated node waits up to one attempt budget
+(`rvc_bn_broadcast_inflight_waits_total`, labelled by the redacted
+endpoint). The overflow gauge is still `rvc_bn_broadcast_overflow_drains`.
+The gauge drops when that beacon node's HTTP call finishes. A
 success health sample is skipped when that 16-permit pool is full
 (`rvc_bn_broadcast_drain_health_skipped_total`). An error or a timeout is
 still recorded then, when the recorder queue has room. When that queue is
@@ -662,5 +701,9 @@ full, an error or a timeout sample can be dropped. The drop is counted on
 the same counter, and the attempt does not wait. Liveness
 and builder-preference merges still wait for every matching beacon node.
 When no budget is configured, the publish itself stays unbounded up to the
-HTTP client timeout. Shutdown drops the unregistered recorder and any
-overflow publish, so a queued health sample is not kept.
+HTTP client timeout, and so does the permit wait. Drains keep that attempt
+budget. They do not use the caller's slot deadline. Shutdown joins detached
+drains after the orchestrator tier, for up to the block-publication budget.
+A zero budget waits until the drains finish. A positive budget does not
+cancel a send that is still running. The recorder stays
+unregistered, so a sample that is only queued at process exit is not kept.

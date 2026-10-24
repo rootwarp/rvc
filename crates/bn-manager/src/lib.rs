@@ -13,6 +13,7 @@ pub use fan_out::{
 };
 pub use fan_out::{
     AttestationPublishContext, KnownAttestationPublish, ATTESTATION_PUBLISH, BACKSTOP_MARGIN,
+    MAX_INFLIGHT_PER_BN,
 };
 mod health;
 mod manager;

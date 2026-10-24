@@ -22,8 +22,22 @@
 //!
 //! [`HEALTH_SAMPLE_CAP`] limits how many of those drains record health at
 //! once. It does not limit sends. A full pool still runs every remaining
-//! publish and does not cancel it. Those overflow drains end at the attempt
-//! budget, or at the HTTP client timeout when no budget is set (ADR-001).
+//! publish and does not cancel it. Sends are limited separately by
+//! [`MAX_INFLIGHT_PER_BN`]: each beacon node has that many broadcast permits.
+//! The HTTP call is polled only after a permit is held. A saturated node
+//! waits up to one attempt budget. That wait does not skip the node and does
+//! not shrink the HTTP budget. If the permit does not arrive, the attempt is
+//! [`BeaconError::OperationTimeout`] and the HTTP call is not started. A
+//! permit that arrives is an accepted send. It runs to its own attempt
+//! budget and is not cancelled to admit another send. It is also not
+//! cancelled by the caller's outer backstop, which is only 250 ms past that
+//! budget. Those drains, including
+//! ones past the health-sample cap, end at the attempt budget, or at the HTTP
+//! client timeout when no budget is set (ADR-001). They do not end at the
+//! caller's slot deadline. A background send is already bounded by one budget
+//! after it starts, and cutting it at the slot deadline would cancel late
+//! gossip. Attestations stay includable for 32 slots. That is the decision
+//! for the slot-deadline follow-up.
 //! A full pool still offers an error or a timeout to the recorder. Only a
 //! success health sample may be skipped for that reason, and that skip is
 //! counted. A broadcast skip increments
@@ -38,14 +52,19 @@
 //! [`crate::manager::TrackerOutcome::Rejected`]: the health score does not
 //! move. A fee-only penalty is a success.
 //! Cancelling the caller does not drop a sample that was already queued.
-//! Process shutdown drops that unregistered recorder and any overflow drain,
-//! so a queued sample or an in-flight overflow publish is not kept. The
-//! overflow gauge drops when the HTTP call finishes, before the health sample
-//! is queued.
+//! Detached drains are counted on this runtime and joined by
+//! [`wait_for_broadcast_drains`], which bootstrap runs after the orchestrator
+//! tier for up to the block-publication budget. That wait does not cancel a
+//! send that is still running when the budget elapses. The health recorder
+//! stays unregistered. Process shutdown can still drop it, so a sample that
+//! is only queued is not kept. The overflow gauge drops when the HTTP call
+//! finishes, or when that attempt is cancelled or panics, before the health
+//! sample is queued. The in-flight permit drops at that same point.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Poll;
 use std::time::Duration;
@@ -53,7 +72,7 @@ use std::time::Duration;
 use beacon::BeaconError;
 use futures::stream::{FuturesUnordered, StreamExt};
 use observability::logging::RedactedUrl;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tracing::{trace, warn, Instrument};
 
 use crate::broadcast::{BnOutcome, BroadcastResult};
@@ -69,6 +88,17 @@ use crate::manager::{
 /// publish. Only a success sample is skipped. An error or a timeout is still
 /// recorded when the recorder queue accepts it.
 pub(crate) const HEALTH_SAMPLE_CAP: usize = 16;
+
+/// Broadcast sends that may be in flight to one beacon node.
+///
+/// Two waves of the default publish concurrency. That default is
+/// `DEFAULT_DUTY_PUBLISH_CONCURRENCY` in `rvc-config`, which is 2. This crate
+/// does not depend on `rvc-config`, so the product is written out: `2 × 2 = 4`.
+/// The cap does not follow a live change of the knob. A node that is already
+/// at the cap waits up to one attempt budget (`rvc_bn_broadcast_inflight_waits_total`).
+/// The wait is backpressure. It is not a skip, and it does not cancel a send
+/// that already holds a permit.
+pub const MAX_INFLIGHT_PER_BN: usize = 2 * 2;
 
 /// Added to the operation budget for the outer `with_op_timeout` backstop.
 pub const BACKSTOP_MARGIN: Duration = Duration::from_millis(250);
@@ -196,6 +226,49 @@ pub(crate) fn global_drain_pool() -> &'static DrainPool {
     POOL.get_or_init(|| DrainPool::new(HEALTH_SAMPLE_CAP))
 }
 
+/// Per-endpoint broadcast permits. Missing endpoints are unbounded.
+///
+/// [`BnManager`](crate::BnManager) owns one gate built from its endpoints.
+/// Fan-out looks up the attempt's endpoint and does not poll the HTTP future
+/// until that permit is held.
+#[derive(Clone, Default)]
+pub(crate) struct InflightGate {
+    permits: HashMap<String, Arc<Semaphore>>,
+}
+
+impl InflightGate {
+    pub(crate) fn unbounded() -> Self {
+        Self { permits: HashMap::new() }
+    }
+
+    /// One [`MAX_INFLIGHT_PER_BN`] semaphore per endpoint.
+    pub(crate) fn for_endpoints<'a>(endpoints: impl IntoIterator<Item = &'a str>) -> Self {
+        let permits = endpoints
+            .into_iter()
+            .map(|endpoint| (endpoint.to_string(), Arc::new(Semaphore::new(MAX_INFLIGHT_PER_BN))))
+            .collect();
+        Self { permits }
+    }
+
+    fn semaphore(&self, endpoint: &str) -> Option<Arc<Semaphore>> {
+        self.permits.get(endpoint).cloned()
+    }
+
+    #[cfg(test)]
+    fn for_test(pairs: &[(&str, usize)]) -> Self {
+        let permits = pairs
+            .iter()
+            .map(|(endpoint, cap)| ((*endpoint).to_string(), Arc::new(Semaphore::new(*cap))))
+            .collect();
+        Self { permits }
+    }
+
+    #[cfg(test)]
+    fn available(&self, endpoint: &str) -> usize {
+        self.permits.get(endpoint).map(|sem| sem.available_permits()).unwrap_or(0)
+    }
+}
+
 /// Which `Ok` may return early, and which partial to keep otherwise.
 #[derive(Clone, Copy)]
 pub(crate) struct PublishPolicy<T> {
@@ -288,7 +361,17 @@ pub(crate) async fn first_ok<T: Clone + Send + 'static>(
     health: &SharedHealthTrackers,
     pool: &DrainPool,
 ) -> Result<(String, T), BeaconError> {
-    first_ok_with(op_name, role, attempts, budget, health, pool, PublishPolicy::any_ok()).await
+    first_ok_bounded(
+        op_name,
+        role,
+        attempts,
+        budget,
+        health,
+        pool,
+        PublishPolicy::any_ok(),
+        &InflightGate::unbounded(),
+    )
+    .await
 }
 
 /// Return the first complete `Ok`. Later attempts keep running on the drain.
@@ -308,6 +391,34 @@ pub(crate) async fn first_ok_with<T: Clone + Send + 'static>(
     pool: &DrainPool,
     policy: PublishPolicy<T>,
 ) -> Result<(String, T), BeaconError> {
+    first_ok_bounded(
+        op_name,
+        role,
+        attempts,
+        budget,
+        health,
+        pool,
+        policy,
+        &InflightGate::unbounded(),
+    )
+    .await
+}
+
+/// [`first_ok_with`] with a per-endpoint in-flight gate.
+///
+/// An empty gate does not wait. A gate with no entry for an endpoint does
+/// not wait. The HTTP future is not polled until the permit is held.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn first_ok_bounded<T: Clone + Send + 'static>(
+    op_name: &str,
+    role: &str,
+    attempts: Vec<BnAttempt<T>>,
+    budget: Option<Duration>,
+    health: &SharedHealthTrackers,
+    pool: &DrainPool,
+    policy: PublishPolicy<T>,
+    inflight: &InflightGate,
+) -> Result<(String, T), BeaconError> {
     if attempts.is_empty() {
         return Err(no_eligible(op_name, role));
     }
@@ -320,6 +431,7 @@ pub(crate) async fn first_ok_with<T: Clone + Send + 'static>(
     let mut slots: Vec<Option<Tracked<T>>> = attempts
         .into_iter()
         .map(|attempt| {
+            let permit = inflight.semaphore(&attempt.endpoint);
             Some(attempt_fut(
                 op_name,
                 budget,
@@ -327,6 +439,7 @@ pub(crate) async fn first_ok_with<T: Clone + Send + 'static>(
                 health,
                 Arc::clone(&record),
                 Arc::clone(&skipped),
+                permit,
             ))
         })
         .collect();
@@ -392,9 +505,10 @@ type AttemptFut<T> = Pin<Box<dyn Future<Output = Finished<T>> + Send>>;
 struct Tracked<T> {
     endpoint: String,
     fut: AttemptFut<T>,
-    /// Set when this publish is past the health-sample cap. Dropped when the
-    /// HTTP call finishes, before the health sample is queued.
-    overflow: Arc<Mutex<Option<OverflowGuard>>>,
+    /// Overflow gauge and the in-flight permit. Both drop when the HTTP call
+    /// finishes, or when this attempt is cancelled or panics, before the
+    /// health sample is queued.
+    lease: Arc<Mutex<AttemptLease>>,
 }
 
 fn is_complete_ok<T>(finished: &Finished<T>, policy: &PublishPolicy<T>) -> bool {
@@ -445,13 +559,27 @@ fn note_finished<T>(
 /// Wait for every attempt. Each one is still bounded by `budget`.
 ///
 /// Health is spawned from each attempt as it finishes, so this loop does not
-/// take the health write lock between polls.
+/// take the health write lock between polls. Production broadcasts use
+/// [`all_bounded`]. This entry point stays for callers with no in-flight gate.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn all<T: Send + 'static>(
     op_name: &str,
     role: &str,
     attempts: Vec<BnAttempt<T>>,
     budget: Option<Duration>,
     health: &SharedHealthTrackers,
+) -> Result<BroadcastResult<T>, BeaconError> {
+    all_bounded(op_name, role, attempts, budget, health, &InflightGate::unbounded()).await
+}
+
+/// [`all`] with a per-endpoint in-flight gate. See [`first_ok_bounded`].
+pub(crate) async fn all_bounded<T: Send + 'static>(
+    op_name: &str,
+    role: &str,
+    attempts: Vec<BnAttempt<T>>,
+    budget: Option<Duration>,
+    health: &SharedHealthTrackers,
+    inflight: &InflightGate,
 ) -> Result<BroadcastResult<T>, BeaconError> {
     if attempts.is_empty() {
         return Err(no_eligible(op_name, role));
@@ -461,6 +589,7 @@ pub(crate) async fn all<T: Send + 'static>(
     let skipped = Arc::new(AtomicU64::new(0));
     let mut pending = FuturesUnordered::new();
     for attempt in attempts {
+        let permit = inflight.semaphore(&attempt.endpoint);
         pending.push(
             attempt_fut(
                 op_name,
@@ -469,6 +598,7 @@ pub(crate) async fn all<T: Send + 'static>(
                 health,
                 Arc::clone(&record),
                 Arc::clone(&skipped),
+                permit,
             )
             .fut,
         );
@@ -885,8 +1015,9 @@ fn attempt_fut<T: Send + 'static>(
     health: &SharedHealthTrackers,
     record: Arc<AtomicBool>,
     skipped: Arc<AtomicU64>,
+    inflight: Option<Arc<Semaphore>>,
 ) -> Tracked<T> {
-    let overflow = Arc::new(Mutex::new(None));
+    let lease = Arc::new(Mutex::new(AttemptLease::empty()));
     let endpoint = attempt.endpoint.clone();
     let fut = Box::pin(run_attempt(
         AttemptEnv {
@@ -896,11 +1027,12 @@ fn attempt_fut<T: Send + 'static>(
             record,
             skipped,
             health_tx: health_sender(),
-            overflow: Arc::clone(&overflow),
+            lease: Arc::clone(&lease),
+            inflight,
         },
         attempt,
     ));
-    Tracked { endpoint, fut, overflow }
+    Tracked { endpoint, fut, lease }
 }
 
 /// After a partial acceptance, finish the other publishes off the caller.
@@ -945,7 +1077,9 @@ async fn wait_for_complete_detached<T: Clone + Send + 'static>(
     // so a later, better partial replaces the shared slot.
     let publish = ATTESTATION_PUBLISH.try_with(Clone::clone).ok();
     let drive_policy = policy.clone();
+    let guard = begin_detached();
     tokio::spawn(async move {
+        let _guard = guard;
         let drive = drive_after_partial(Some(partial), earlier, pending, op_name, drive_policy, tx);
         if let Some(ctx) = publish {
             ATTESTATION_PUBLISH.scope(ctx, drive).await;
@@ -1153,19 +1287,116 @@ async fn drain_pending<T: Send>(
 
 /// Run `fut` to completion. `permit` is held until it finishes. `None` still
 /// runs `fut`: a full pool skips success samples, it does not cancel the publish.
-/// The task is not registered with the executor (ADR-001). Shutdown drops it.
+///
+/// The task is not an executor task (ADR-001). It is counted by
+/// [`begin_detached`]. [`wait_for_broadcast_drains`] joins it. Dropping the
+/// runtime still drops it.
 fn spawn_detached<F>(permit: Option<OwnedSemaphorePermit>, fut: F)
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    let guard = begin_detached();
     tokio::spawn(async move {
+        let _guard = guard;
         fut.await;
         drop(permit);
     });
 }
 
+/// In-flight detached drains on one Tokio runtime.
+struct DrainTracker {
+    inflight: AtomicUsize,
+    idle: Notify,
+}
+
+impl DrainTracker {
+    fn new() -> Self {
+        Self { inflight: AtomicUsize::new(0), idle: Notify::new() }
+    }
+
+    fn enter(&self) {
+        self.inflight.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Decrements the tracker when the detached task ends, including cancel and panic.
+struct DetachedGuard(Arc<DrainTracker>);
+
+impl Drop for DetachedGuard {
+    fn drop(&mut self) {
+        if self.0.inflight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+fn drain_trackers() -> &'static Mutex<HashMap<tokio::runtime::Id, Arc<DrainTracker>>> {
+    static TRACKERS: std::sync::OnceLock<Mutex<HashMap<tokio::runtime::Id, Arc<DrainTracker>>>> =
+        std::sync::OnceLock::new();
+    TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Count one detached task before it is spawned, and release that count when
+/// the returned guard drops.
+fn begin_detached() -> DetachedGuard {
+    let id = tokio::runtime::Handle::current().id();
+    let tracker = {
+        let mut trackers = drain_trackers().lock().expect("broadcast drain trackers");
+        Arc::clone(trackers.entry(id).or_insert_with(|| Arc::new(DrainTracker::new())))
+    };
+    tracker.enter();
+    DetachedGuard(tracker)
+}
+
+/// Wait until detached drains on this runtime have finished, or until
+/// `deadline` elapses.
+///
+/// `deadline` is relative to this call. It is not a slot deadline. A send
+/// that is still running when the bound elapses keeps running. A zero
+/// deadline is no budget, the same rule as operation timeouts: the wait
+/// ends when the drains do. A hung send still ends at the HTTP client
+/// timeout, which drops the task.
+pub(crate) async fn wait_for_broadcast_drains(deadline: Duration) {
+    let id = tokio::runtime::Handle::current().id();
+    let tracker = {
+        let mut trackers = drain_trackers().lock().expect("broadcast drain trackers");
+        Arc::clone(trackers.entry(id).or_insert_with(|| Arc::new(DrainTracker::new())))
+    };
+    // Zero matches `op_timeout`: no budget, not an already-elapsed bound.
+    let bounded = !deadline.is_zero();
+    let deadline_at = tokio::time::Instant::now() + deadline;
+    loop {
+        // Subscribe before the load so a completion between the load and the
+        // wait is not lost.
+        let notified = tracker.idle.notified();
+        tokio::pin!(notified);
+        let inflight = tracker.inflight.load(Ordering::Acquire);
+        if inflight == 0 {
+            return;
+        }
+        if bounded && tokio::time::Instant::now() >= deadline_at {
+            warn!(inflight, "broadcast drains still running at the shutdown bound");
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = &mut notified => {}
+            _ = tokio::time::sleep_until(deadline_at), if bounded => {
+                let inflight = tracker.inflight.load(Ordering::Acquire);
+                if inflight > 0 {
+                    warn!(
+                        inflight,
+                        "broadcast drains still running at the shutdown bound"
+                    );
+                }
+                return;
+            }
+        }
+    }
+}
+
 /// Counts one in-flight overflow publish for a redacted endpoint. Drop
-/// (completion, cancel, or shutdown) removes that count. The publish itself
+/// (completion, cancel, or panic) removes that count. The publish itself
 /// is not cancelled by the health-sample cap.
 struct OverflowGuard(String);
 
@@ -1177,11 +1408,74 @@ impl Drop for OverflowGuard {
     }
 }
 
+/// Permit and overflow gauge for one attempt. Both drop together, at the
+/// same point: when the HTTP call returns, or when the attempt is cancelled
+/// or panics.
+struct AttemptLease {
+    overflow: Option<OverflowGuard>,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl AttemptLease {
+    fn empty() -> Self {
+        Self { overflow: None, permit: None }
+    }
+}
+
+fn release_attempt_lease(lease: &Mutex<AttemptLease>) {
+    let held = std::mem::replace(&mut *lease.lock().expect("attempt lease"), AttemptLease::empty());
+    drop(held);
+}
+
 fn arm_overflow<T>(tracked: Tracked<T>) -> Tracked<T> {
     let label = crate::metrics::endpoint_label(&tracked.endpoint);
     crate::metrics::RVC_BN_BROADCAST_OVERFLOW_DRAINS.with_label_values(&[label.as_str()]).inc();
-    *tracked.overflow.lock().expect("overflow guard") = Some(OverflowGuard(label));
+    tracked.lease.lock().expect("overflow guard").overflow = Some(OverflowGuard(label));
     tracked
+}
+
+/// Take a broadcast permit. A free permit does not increment the wait counter.
+/// A full semaphore waits up to `budget` (`None` waits without a timeout).
+/// The HTTP future is not polled by this function.
+fn acquire_inflight_permit(
+    op_name: &str,
+    endpoint: &str,
+    sem: &Arc<Semaphore>,
+    budget: Option<Duration>,
+) -> impl Future<Output = Result<OwnedSemaphorePermit, BeaconError>> {
+    let op_name = op_name.to_string();
+    let endpoint = endpoint.to_string();
+    let sem = Arc::clone(sem);
+    async move {
+        match Arc::clone(&sem).try_acquire_owned() {
+            Ok(permit) => Ok(permit),
+            Err(TryAcquireError::Closed) => {
+                Err(BeaconError::HttpError("broadcast in-flight semaphore closed".to_string()))
+            }
+            Err(TryAcquireError::NoPermits) => {
+                let label = crate::metrics::endpoint_label(&endpoint);
+                crate::metrics::RVC_BN_BROADCAST_INFLIGHT_WAITS_TOTAL
+                    .with_label_values(&[label.as_str()])
+                    .inc();
+                let acquire = Arc::clone(&sem).acquire_owned();
+                match budget {
+                    None => acquire.await.map_err(|_| {
+                        BeaconError::HttpError("broadcast in-flight semaphore closed".to_string())
+                    }),
+                    Some(budget) => match tokio::time::timeout(budget, acquire).await {
+                        Ok(Ok(permit)) => Ok(permit),
+                        Ok(Err(_)) => Err(BeaconError::HttpError(
+                            "broadcast in-flight semaphore closed".to_string(),
+                        )),
+                        Err(_) => Err(BeaconError::OperationTimeout {
+                            operation: op_name,
+                            timeout: budget,
+                        }),
+                    },
+                }
+            }
+        }
+    }
 }
 
 struct HealthSample {
@@ -1232,7 +1526,9 @@ struct AttemptEnv {
     record: Arc<AtomicBool>,
     skipped: Arc<AtomicU64>,
     health_tx: tokio::sync::mpsc::Sender<HealthSample>,
-    overflow: Arc<Mutex<Option<OverflowGuard>>>,
+    lease: Arc<Mutex<AttemptLease>>,
+    /// `None` does not wait. Production passes the endpoint's semaphore.
+    inflight: Option<Arc<Semaphore>>,
 }
 
 /// Queue one sample without waiting. A full or closed queue drops the sample,
@@ -1273,7 +1569,73 @@ fn enqueue_health(
 /// and before the health sample is queued. Health uses [`enqueue_health`], so
 /// a full queue cannot block this result. A full health-sample pool skips a
 /// success. An error or a timeout is still offered to the recorder.
-async fn run_attempt<T: Send>(env: AttemptEnv, attempt: BnAttempt<T>) -> Finished<T> {
+///
+/// Once a per-node permit is held, the HTTP call moves to [`spawn_detached`].
+/// The caller's outer backstop is only 250 ms past the attempt budget, so a
+/// permit that arrives late would otherwise be cancelled while its own budget
+/// is still running. A wait that never gets a permit stays on this task.
+async fn run_attempt<T: Send + 'static>(env: AttemptEnv, attempt: BnAttempt<T>) -> Finished<T> {
+    if let Some(sem) = env.inflight.clone() {
+        let waited = tokio::time::Instant::now();
+        match acquire_inflight_permit(&env.op_name, &attempt.endpoint, &sem, env.budget).await {
+            Ok(permit) => {
+                env.lease.lock().expect("attempt lease").permit = Some(permit);
+            }
+            Err(err) => {
+                // The HTTP future was never polled. Drop an overflow gauge
+                // that was armed when this attempt moved to a full drain.
+                release_attempt_lease(&env.lease);
+                let elapsed = waited.elapsed();
+                let index = attempt.index;
+                let endpoint = attempt.endpoint;
+                warn!(
+                    op = %env.op_name,
+                    bn_index = index,
+                    endpoint = %RedactedUrl(&endpoint),
+                    error = %err,
+                    "broadcast waited for an in-flight permit until the attempt budget"
+                );
+                let outcome = error_outcome(&env.op_name, &err);
+                enqueue_health(
+                    &env.health_tx,
+                    env.health,
+                    env.op_name,
+                    index,
+                    outcome,
+                    SkipFamily::Broadcast,
+                );
+                return Finished {
+                    index,
+                    outcome: BnOutcome { endpoint, result: Err(err), latency: elapsed },
+                };
+            }
+        }
+        let index = attempt.index;
+        let endpoint = attempt.endpoint.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        spawn_detached(None, async move {
+            let _ = tx.send(finish_accepted(env, attempt).await);
+        });
+        return match rx.await {
+            Ok(finished) => finished,
+            Err(_) => Finished {
+                index,
+                outcome: BnOutcome {
+                    endpoint,
+                    result: Err(BeaconError::HttpError(
+                        "broadcast lost the detached attempt".to_string(),
+                    )),
+                    latency: Duration::ZERO,
+                },
+            },
+        };
+    }
+    finish_accepted(env, attempt).await
+}
+
+/// HTTP call, then the health sample. The permit and the overflow gauge drop
+/// before that sample is queued.
+async fn finish_accepted<T: Send>(env: AttemptEnv, attempt: BnAttempt<T>) -> Finished<T> {
     let span = tracing::info_span!(
         "bn.attempt",
         bn_url = %RedactedUrl(&attempt.endpoint),
@@ -1283,10 +1645,9 @@ async fn run_attempt<T: Send>(env: AttemptEnv, attempt: BnAttempt<T>) -> Finishe
     let start = tokio::time::Instant::now();
     let result =
         Instrument::instrument(await_attempt(&env.op_name, env.budget, attempt.fut), span).await;
-    // The HTTP call is finished. Drop the gauge before the queue, and do not
-    // hold the mutex across that enqueue.
-    let overflow = env.overflow.lock().expect("overflow guard").take();
-    drop(overflow);
+    // The HTTP call is finished. Drop the permit and the overflow gauge
+    // before the queue, and do not hold the mutex across that enqueue.
+    release_attempt_lease(&env.lease);
     let elapsed = start.elapsed();
     let tracker = match &result {
         Ok(_) => {
@@ -2698,7 +3059,8 @@ mod tests {
                     record: Arc::new(AtomicBool::new(true)),
                     skipped: Arc::new(AtomicU64::new(0)),
                     health_tx: tx,
-                    overflow: Arc::new(Mutex::new(None)),
+                    lease: Arc::new(Mutex::new(AttemptLease::empty())),
+                    inflight: None,
                 },
                 BnAttempt {
                     index: 0,
@@ -2730,21 +3092,18 @@ mod tests {
         );
     }
 
-    fn arm_gauge(endpoint: &str) -> (String, Arc<Mutex<Option<OverflowGuard>>>) {
+    fn arm_gauge(endpoint: &str) -> (String, Arc<Mutex<AttemptLease>>) {
         let label = crate::metrics::endpoint_label(endpoint);
         crate::metrics::RVC_BN_BROADCAST_OVERFLOW_DRAINS.with_label_values(&[label.as_str()]).inc();
         let guard = OverflowGuard(label.clone());
-        (label, Arc::new(Mutex::new(Some(guard))))
+        (label, Arc::new(Mutex::new(AttemptLease { overflow: Some(guard), permit: None })))
     }
 
     fn gauge_of(label: &str) -> i64 {
         crate::metrics::RVC_BN_BROADCAST_OVERFLOW_DRAINS.with_label_values(&[label]).get()
     }
 
-    fn pending_attempt(
-        overflow: Arc<Mutex<Option<OverflowGuard>>>,
-        budget: Option<Duration>,
-    ) -> AttemptEnv {
+    fn pending_attempt(lease: Arc<Mutex<AttemptLease>>, budget: Option<Duration>) -> AttemptEnv {
         AttemptEnv {
             op_name: "submit_attestation".to_string(),
             budget,
@@ -2752,7 +3111,8 @@ mod tests {
             record: Arc::new(AtomicBool::new(true)),
             skipped: Arc::new(AtomicU64::new(0)),
             health_tx: health_sender(),
-            overflow,
+            lease,
+            inflight: None,
         }
     }
 
@@ -2824,5 +3184,446 @@ mod tests {
             Ok(_) => panic!("the attempt finished instead of panicking"),
         }
         assert_eq!(gauge_of(&label), 0, "the gauge drops when the attempt panics");
+    }
+
+    fn gate_for(endpoints: &[(&str, usize)]) -> InflightGate {
+        InflightGate::for_test(endpoints)
+    }
+
+    /// Paused clock. BN-B hangs. Three times the cap are broadcast. BN-A
+    /// returns first-OK while BN-B is still at the cap. Releasing the hang
+    /// lets every accepted send finish. Nothing in flight is cancelled.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn per_bn_inflight_bound_waits_for_a_permit_and_never_cancels_an_inflight_send() {
+        let cap = MAX_INFLIGHT_PER_BN;
+        assert_eq!(cap, 4, "2 × the publish-concurrency default of 2");
+        let waves = 3 * cap;
+        let endpoint_a = "http://bn-a.example:5052";
+        let endpoint_b = "http://bn-b.example:5052";
+        let gate = gate_for(&[(endpoint_a, cap), (endpoint_b, cap)]);
+        let label_b = crate::metrics::endpoint_label(endpoint_b);
+        let waits_before = crate::metrics::RVC_BN_BROADCAST_INFLIGHT_WAITS_TOTAL
+            .with_label_values(&[label_b.as_str()])
+            .get();
+
+        let inflight_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let started_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished_b = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let a_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let mut joins = tokio::task::JoinSet::new();
+        for _ in 0..waves {
+            let gate = gate.clone();
+            let inflight_b = Arc::clone(&inflight_b);
+            let peak_b = Arc::clone(&peak_b);
+            let started_b = Arc::clone(&started_b);
+            let finished_b = Arc::clone(&finished_b);
+            let release = Arc::clone(&release);
+            let wake = Arc::clone(&wake);
+            let a_done = Arc::clone(&a_done);
+            joins.spawn(async move {
+                let attempts = vec![
+                    BnAttempt {
+                        index: 0,
+                        endpoint: endpoint_a.to_string(),
+                        fut: Box::pin(async { Ok::<(), BeaconError>(()) }),
+                    },
+                    BnAttempt {
+                        index: 1,
+                        endpoint: endpoint_b.to_string(),
+                        fut: Box::pin(async move {
+                            let now = inflight_b.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak_b.fetch_max(now, Ordering::SeqCst);
+                            started_b.fetch_add(1, Ordering::SeqCst);
+                            loop {
+                                let notified = wake.notified();
+                                tokio::pin!(notified);
+                                if release.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                notified.await;
+                            }
+                            inflight_b.fetch_sub(1, Ordering::SeqCst);
+                            finished_b.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        }),
+                    },
+                ];
+                let health = health_for(2);
+                let pool = DrainPool::new(HEALTH_SAMPLE_CAP);
+                let (endpoint, _) = first_ok_bounded(
+                    "submit_attestation",
+                    "attestation",
+                    attempts,
+                    Some(Duration::from_secs(2)),
+                    &health,
+                    &pool,
+                    PublishPolicy::any_ok(),
+                    &gate,
+                )
+                .await
+                .expect("bn-a returns first-ok");
+                assert_eq!(endpoint, endpoint_a, "a saturated bn-b must not delay bn-a");
+                a_done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+
+        let wall = std::time::Instant::now() + Duration::from_secs(5);
+        while a_done.load(Ordering::SeqCst) < waves || started_b.load(Ordering::SeqCst) < cap {
+            assert!(
+                std::time::Instant::now() < wall,
+                "first-ok or the in-flight cap did not settle: a_done={} started={} peak={}",
+                a_done.load(Ordering::SeqCst),
+                started_b.load(Ordering::SeqCst),
+                peak_b.load(Ordering::SeqCst),
+            );
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            peak_b.load(Ordering::SeqCst) <= cap,
+            "peak in-flight to bn-b was {}",
+            peak_b.load(Ordering::SeqCst)
+        );
+        assert_eq!(started_b.load(Ordering::SeqCst), cap, "only one cap of sends has started");
+        assert_eq!(inflight_b.load(Ordering::SeqCst), cap);
+        let waits = crate::metrics::RVC_BN_BROADCAST_INFLIGHT_WAITS_TOTAL
+            .with_label_values(&[label_b.as_str()])
+            .get()
+            - waits_before;
+        assert!(
+            waits >= (waves - cap) as u64,
+            "the sends past the cap must wait for a permit, waited {waits}"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        wake.notify_waiters();
+        while finished_b.load(Ordering::SeqCst) < waves {
+            assert!(
+                std::time::Instant::now() < wall,
+                "an accepted send was cancelled: finished {} of {waves}",
+                finished_b.load(Ordering::SeqCst)
+            );
+            wake.notify_waiters();
+            tokio::task::yield_now().await;
+        }
+        assert!(peak_b.load(Ordering::SeqCst) <= cap);
+        assert_eq!(gate.available(endpoint_b), cap, "every permit was released");
+        while let Some(joined) = joins.join_next().await {
+            joined.expect("broadcast task");
+        }
+    }
+
+    /// A detached publish is still running when the caller has returned.
+    /// `wait_for_broadcast_drains` stays pending until that publish finishes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn detached_drain_is_awaited_by_wait_for_broadcast_drains() {
+        let release = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let release_flag = Arc::clone(&release);
+        let wake_flag = Arc::clone(&wake);
+        let finished_flag = Arc::clone(&finished);
+        let health = health_for(2);
+        let pool = DrainPool::new(4);
+        let attempts = vec![
+            BnAttempt {
+                index: 0,
+                endpoint: "http://bn-a-drain.example:9".to_string(),
+                fut: Box::pin(async { Ok::<(), BeaconError>(()) }),
+            },
+            BnAttempt {
+                index: 1,
+                endpoint: "http://bn-b-drain.example:9".to_string(),
+                fut: Box::pin(async move {
+                    loop {
+                        let notified = wake_flag.notified();
+                        tokio::pin!(notified);
+                        if release_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        notified.await;
+                    }
+                    finished_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                }),
+            },
+        ];
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            first_ok("submit_attestation", "attestation", attempts, None, &health, &pool),
+        )
+        .await
+        .expect("first-ok must return while bn-b is still in flight");
+        assert!(result.is_ok(), "{result:?}");
+        assert!(!finished.load(Ordering::SeqCst));
+
+        let waiting =
+            tokio::spawn(async { wait_for_broadcast_drains(Duration::from_secs(5)).await });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished(), "the drain is still in flight");
+        assert!(!finished.load(Ordering::SeqCst));
+
+        release.store(true, Ordering::SeqCst);
+        wake.notify_waiters();
+        let wall = std::time::Instant::now() + Duration::from_secs(2);
+        while !finished.load(Ordering::SeqCst) || !waiting.is_finished() {
+            assert!(std::time::Instant::now() < wall, "the drain wait did not join the send");
+            wake.notify_waiters();
+            tokio::task::yield_now().await;
+        }
+        waiting.await.expect("drain wait");
+    }
+
+    /// A zero deadline is no budget. The wait stays pending while a drain runs.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn zero_broadcast_drain_deadline_waits_until_the_send_finishes() {
+        let release = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let release_flag = Arc::clone(&release);
+        let wake_flag = Arc::clone(&wake);
+        let finished_flag = Arc::clone(&finished);
+        let health = health_for(2);
+        let pool = DrainPool::new(4);
+        let attempts = vec![
+            BnAttempt {
+                index: 0,
+                endpoint: "http://bn-a-zero.example:9".to_string(),
+                fut: Box::pin(async { Ok::<(), BeaconError>(()) }),
+            },
+            BnAttempt {
+                index: 1,
+                endpoint: "http://bn-b-zero.example:9".to_string(),
+                fut: Box::pin(async move {
+                    loop {
+                        let notified = wake_flag.notified();
+                        tokio::pin!(notified);
+                        if release_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        notified.await;
+                    }
+                    finished_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                }),
+            },
+        ];
+        first_ok("submit_attestation", "attestation", attempts, None, &health, &pool)
+            .await
+            .expect("first-ok");
+        let waiting = tokio::spawn(async { wait_for_broadcast_drains(Duration::ZERO).await });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!waiting.is_finished(), "a zero budget must not skip an in-flight drain");
+        assert!(!finished.load(Ordering::SeqCst));
+
+        release.store(true, Ordering::SeqCst);
+        wake.notify_waiters();
+        let wall = std::time::Instant::now() + Duration::from_secs(2);
+        while !finished.load(Ordering::SeqCst) || !waiting.is_finished() {
+            assert!(std::time::Instant::now() < wall, "the zero-budget wait did not join the send");
+            wake.notify_waiters();
+            tokio::task::yield_now().await;
+        }
+        waiting.await.expect("zero-budget drain wait");
+    }
+
+    /// The shutdown bound returns while a send is still in flight, and that
+    /// send still runs to completion after the wait has returned.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn broadcast_drain_wait_returns_at_the_deadline_without_cancelling_the_send() {
+        let release = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let release_flag = Arc::clone(&release);
+        let wake_flag = Arc::clone(&wake);
+        let finished_flag = Arc::clone(&finished);
+        let health = health_for(2);
+        let pool = DrainPool::new(4);
+        let attempts = vec![
+            BnAttempt {
+                index: 0,
+                endpoint: "http://bn-a-deadline.example:9".to_string(),
+                fut: Box::pin(async { Ok::<(), BeaconError>(()) }),
+            },
+            BnAttempt {
+                index: 1,
+                endpoint: "http://bn-b-deadline.example:9".to_string(),
+                fut: Box::pin(async move {
+                    loop {
+                        let notified = wake_flag.notified();
+                        tokio::pin!(notified);
+                        if release_flag.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        notified.await;
+                    }
+                    finished_flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                }),
+            },
+        ];
+        first_ok("submit_attestation", "attestation", attempts, None, &health, &pool)
+            .await
+            .expect("first-ok");
+        let waiting =
+            tokio::spawn(async { wait_for_broadcast_drains(Duration::from_secs(1)).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let wall = std::time::Instant::now() + Duration::from_secs(2);
+        while !waiting.is_finished() {
+            assert!(std::time::Instant::now() < wall, "the deadline did not release the wait");
+            tokio::task::yield_now().await;
+        }
+        waiting.await.expect("deadline wait");
+        assert!(!finished.load(Ordering::SeqCst), "the deadline must not cancel the send");
+
+        release.store(true, Ordering::SeqCst);
+        wake.notify_waiters();
+        while !finished.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < wall, "the send did not finish after the deadline");
+            wake.notify_waiters();
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A permit that does not arrive inside the attempt budget does not poll
+    /// the HTTP future.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn inflight_wait_that_exceeds_the_budget_does_not_start_the_send() {
+        let endpoint = "http://bn-b-budget.example:9";
+        let gate = gate_for(&[(endpoint, 1)]);
+        let sem = gate.semaphore(endpoint).expect("semaphore");
+        let _held = Arc::clone(&sem).try_acquire_owned().expect("the only permit");
+        let started = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+        let health = health_for(1);
+        let pool = DrainPool::new(4);
+        let attempts = vec![BnAttempt {
+            index: 0,
+            endpoint: endpoint.to_string(),
+            fut: Box::pin(async move {
+                started_flag.store(true, Ordering::SeqCst);
+                Ok::<(), BeaconError>(())
+            }),
+        }];
+        let task = tokio::spawn(async move {
+            first_ok_bounded(
+                "submit_attestation",
+                "attestation",
+                attempts,
+                Some(Duration::from_secs(1)),
+                &health,
+                &pool,
+                PublishPolicy::any_ok(),
+                &gate,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let wall = std::time::Instant::now() + Duration::from_secs(2);
+        while !task.is_finished() {
+            assert!(std::time::Instant::now() < wall, "the permit wait did not time out");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        let result = task.await.expect("join");
+        assert!(
+            matches!(result, Err(BeaconError::OperationTimeout { .. })),
+            "the attempt must time out instead of being skipped: {result:?}"
+        );
+        assert!(!started.load(Ordering::SeqCst), "the HTTP future must not be polled");
+    }
+
+    /// A permit that arrives inside the attempt budget is an accepted send.
+    /// The caller's backstop is that budget plus [`BACKSTOP_MARGIN`]. It
+    /// returns while the send is still running, and the send still finishes.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn outer_backstop_does_not_cancel_a_send_that_already_holds_a_permit() {
+        let endpoint = "http://bn-b-backstop.example:9";
+        let gate = gate_for(&[(endpoint, 1)]);
+        let sem = gate.semaphore(endpoint).expect("semaphore");
+        let held = Arc::clone(&sem).try_acquire_owned().expect("the only permit");
+        let started = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let finished = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+        let release_flag = Arc::clone(&release);
+        let wake_flag = Arc::clone(&wake);
+        let finished_flag = Arc::clone(&finished);
+        let health = health_for(1);
+        let pool = DrainPool::new(4);
+        let attempts = vec![BnAttempt {
+            index: 0,
+            endpoint: endpoint.to_string(),
+            fut: Box::pin(async move {
+                started_flag.store(true, Ordering::SeqCst);
+                loop {
+                    let notified = wake_flag.notified();
+                    tokio::pin!(notified);
+                    if release_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
+                }
+                finished_flag.store(true, Ordering::SeqCst);
+                Ok::<(), BeaconError>(())
+            }),
+        }];
+        let budget = Duration::from_secs(1);
+        let origin = tokio::time::Instant::now();
+        let task = tokio::spawn(async move {
+            tokio::time::timeout(
+                budget + BACKSTOP_MARGIN,
+                first_ok_bounded(
+                    "submit_attestation",
+                    "attestation",
+                    attempts,
+                    Some(budget),
+                    &health,
+                    &pool,
+                    PublishPolicy::any_ok(),
+                    &gate,
+                ),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        drop(held);
+        let wall = std::time::Instant::now() + Duration::from_secs(2);
+        while !started.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < wall, "the accepted send did not start");
+            tokio::task::yield_now().await;
+        }
+        let remaining = (budget + BACKSTOP_MARGIN).saturating_sub(origin.elapsed());
+        tokio::time::advance(remaining).await;
+        while !task.is_finished() {
+            assert!(std::time::Instant::now() < wall, "the outer backstop did not fire");
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        let result = task.await.expect("join");
+        assert!(result.is_err(), "the caller backstop returns, got {result:?}");
+        assert!(!finished.load(Ordering::SeqCst), "the backstop must not cancel the accepted send");
+
+        release.store(true, Ordering::SeqCst);
+        wake.notify_waiters();
+        while !finished.load(Ordering::SeqCst) {
+            assert!(std::time::Instant::now() < wall, "the accepted send did not finish");
+            wake.notify_waiters();
+            tokio::task::yield_now().await;
+        }
     }
 }

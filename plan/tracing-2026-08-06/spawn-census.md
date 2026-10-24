@@ -84,3 +84,5 @@ These calls are outside the executor scan (`crates/rvc` + `bin/rvc`) and outside
 | `crates/bn-manager/src/manager.rs` | `BnManager::start_sse` | `tokio::spawn` |
 | `crates/bn-manager/src/sse.rs` | `subscribe_events_admitted_inner` | `tokio::spawn` |
 | `crates/bn-manager/src/sync_status.rs` | `start_sync_monitor_publishing` | `tokio::spawn` |
+
+`spawn_detached` and `wait_for_complete_detached` stay raw `tokio::spawn` calls. They are not executor tasks. Each one is counted, and `BnManager::wait_for_broadcast_drains` joins them after the Orchestrator tier for up to `block_publication`. A zero budget waits until the drains finish. A positive budget does not cancel a send that is still running. `health_sender` is not counted. Process shutdown can still drop the recorder, so a sample that is only queued is not kept. The drain does not use the caller's slot deadline. It ends at the attempt budget.
