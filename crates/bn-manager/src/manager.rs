@@ -372,19 +372,31 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 ///   so that result wins the race against the outer timeout; if the timeout
 ///   still wins, its error path keeps the same partial. Once any node has
 ///   accepted, the remaining publishes run on a detached task, so cancelling
-///   the caller does not cancel them. Each attempt is bounded by that operation's
-///   budget; attempts still running are drained. At most 16 drains record
-///   health at once. That cap limits health recording, not sends. A full pool
-///   still finishes every remaining publish. Those overflow drains end at the
-///   attempt budget, or at the HTTP client timeout when no budget is set.
-///   The overflow gauge drops when the HTTP call finishes. Only a success
+///   the caller does not cancel them. Each beacon node accepts at most
+///   [`fan_out::MAX_INFLIGHT_PER_BN`] broadcast sends at once (2 × the default
+///   publish concurrency of 2). A saturated node waits up to one attempt
+///   budget for a permit. The HTTP call starts only after that permit is
+///   held, and the wait does not shrink the HTTP budget. The wait is counted
+///   on `rvc_bn_broadcast_inflight_waits_total`. A permit that does not arrive
+///   is an attempt timeout. The HTTP call is not started. A send that holds a
+///   permit is not cancelled to free the slot. Each attempt is bounded by that
+///   operation's budget; attempts still running are drained. The drain keeps
+///   that attempt budget. It does not use the caller's slot deadline. At most
+///   16 drains record health at once. That cap limits health recording, not
+///   sends. A full pool still finishes every remaining publish. Those overflow
+///   drains end at the attempt budget, or at the HTTP client timeout when no
+///   budget is set. The overflow gauge and the in-flight permit drop when the
+///   HTTP call finishes. Only a success
 ///   health sample is skipped when the pool is full; an error or a timeout
 ///   is still recorded when the recorder queue has room. A sample that does
 ///   not fit on that queue is counted and dropped, including an error or a
 ///   timeout, and the attempt does not wait. The skip is logged and counted.
 ///   With no budget configured, attempts stay unbounded up to that HTTP
-///   timeout. The
-///   outer timeout is only a backstop at the budget plus 250 ms. Role filter
+///   timeout, and the permit wait is unbounded too. The
+///   outer timeout is only a backstop at the budget plus 250 ms. Detached
+///   drains are joined on shutdown by [`Self::wait_for_broadcast_drains`] for
+///   up to the block-publication budget. That wait does not cancel a send
+///   that is still running. The health recorder is not joined. Role filter
 ///   only; health **tier is not applied** and unhealthy role-matching peers
 ///   are not dropped (a lagging / previously-erroring BN still gossips).
 ///   `All`-role fallback is shared with the query path. An empty role+All
@@ -419,6 +431,8 @@ pub struct BnManager {
     clients: Vec<BeaconClient>,
     sync_statuses: SharedSyncStatuses,
     health_trackers: SharedHealthTrackers,
+    /// Per-endpoint broadcast permits. See [`fan_out::MAX_INFLIGHT_PER_BN`].
+    inflight: fan_out::InflightGate,
     operation_timeouts: Option<OperationTimeouts>,
     broadcast_topics: crate::traits::BroadcastTopics,
     roles: Vec<HashSet<BnRole>>,
@@ -679,6 +693,7 @@ impl BnManager {
         let sync_statuses = new_shared_sync_statuses(clients.len());
         let endpoints: Vec<String> = clients.iter().map(|c| c.endpoint().to_string()).collect();
         let health_trackers = new_shared_health_trackers(&endpoints);
+        let inflight = fan_out::InflightGate::for_endpoints(endpoints.iter().map(String::as_str));
         for ep in &endpoints {
             for capability in bn_capability::ALL {
                 publish_capability(ep, capability, true);
@@ -692,6 +707,7 @@ impl BnManager {
             clients,
             sync_statuses,
             health_trackers,
+            inflight,
             operation_timeouts: None,
             broadcast_topics,
             roles,
@@ -759,6 +775,22 @@ impl BnManager {
     /// still treat zero as no budget.
     pub fn operation_timeouts(&self) -> Option<&OperationTimeouts> {
         self.operation_timeouts.as_ref()
+    }
+
+    /// Wait until detached broadcast drains on this runtime have finished, or
+    /// until `deadline` elapses.
+    ///
+    /// `deadline` is a relative bound from this call. Bootstrap passes
+    /// `block_publication` and runs this after the orchestrator tier. A zero
+    /// duration is no budget, the same rule as [`Self::operation_timeouts`]
+    /// call sites: the wait ends when the drains do. The wait does not cancel
+    /// a send that is still running, and it is not a slot deadline. Drains
+    /// keep their attempt budget. Every pool on the runtime shares one
+    /// tracker, so one call joins the main pool and the proposer pool. The
+    /// health recorder is not joined.
+    pub async fn wait_for_broadcast_drains(&self, deadline: Duration) {
+        let _ = &self.clients;
+        fan_out::wait_for_broadcast_drains(deadline).await;
     }
 
     /// Wraps a future with an optional per-operation timeout.
@@ -2375,7 +2407,7 @@ impl BnManager {
             self.ensure_duty_admission()?;
             let attempts = self.fan_attempts(role, &op);
             tracing::Span::current().record("tried", attempts.len());
-            fan_out::first_ok_with(
+            fan_out::first_ok_bounded(
                 op_name,
                 &role.to_string(),
                 attempts,
@@ -2383,6 +2415,7 @@ impl BnManager {
                 &self.health_trackers,
                 fan_out::global_drain_pool(),
                 policy,
+                &self.inflight,
             )
             .await
         }
@@ -2406,7 +2439,15 @@ impl BnManager {
         self.ensure_duty_admission()?;
         let attempts = self.fan_attempts(role, &op);
         tracing::Span::current().record("tried", attempts.len());
-        fan_out::all(op_name, &role.to_string(), attempts, budget, &self.health_trackers).await
+        fan_out::all_bounded(
+            op_name,
+            &role.to_string(),
+            attempts,
+            budget,
+            &self.health_trackers,
+            &self.inflight,
+        )
+        .await
     }
 
     /// Endpoints that may witness a not-live liveness answer.
@@ -4319,6 +4360,12 @@ impl BlockProducer for BnManager {
         }
     }
 
+    /// The envelope goes to every role-matching beacon node as soon as the
+    /// first block acceptance returns. A slower node may not have imported
+    /// the block yet. It can answer "unknown block", and that answer counts
+    /// as a health error until the node imports the block. Sending the
+    /// envelope only to the nodes that accepted the block stays parked until
+    /// Gloas is scheduled (FU-D6).
     async fn publish_execution_payload_envelope(
         &self,
         signed_envelope: &WireBody,

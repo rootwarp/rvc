@@ -12,6 +12,7 @@
 
 use std::fmt::Display;
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -169,6 +170,12 @@ pub struct TaskExecutor {
     /// `#[cfg(test)]` above the production `tokio::spawn` sites would hide
     /// those sites from the raw-spawn scan.
     finished: tokio::sync::watch::Sender<u64>,
+    /// Polled after the Orchestrator tier and before Background.
+    ///
+    /// Bootstrap registers [`bn_manager::BnManager::wait_for_broadcast_drains`]
+    /// here. The future is not started until that point. It is not an
+    /// executor task, so it is not in the spawn census.
+    after_orchestrator: Mutex<Option<Pin<Box<dyn Future<Output = ()> + Send>>>>,
 }
 
 impl TaskExecutor {
@@ -188,8 +195,23 @@ impl TaskExecutor {
             registry: Arc::new(Mutex::new(Vec::new())),
             exits: Arc::new(Mutex::new(Vec::new())),
             finished: tokio::sync::watch::channel(0).0,
+            after_orchestrator: Mutex::new(None),
         };
         (executor, shutdown_rx)
+    }
+
+    /// Run `fut` after the Orchestrator tier has drained and before Background.
+    ///
+    /// The future is polled only then, so its deadline starts after in-flight
+    /// duties have stopped spawning drains. A second call replaces a waiter
+    /// that has not run. The waiter is awaited in full. It is not cut by the
+    /// Background tier budget. [`bn_manager::BnManager::wait_for_broadcast_drains`]
+    /// bounds itself by `block_publication`.
+    pub fn set_after_orchestrator_waiter<F>(&self, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        *self.after_orchestrator.lock() = Some(Box::pin(fut));
     }
 
     /// Handle the liveness loop uses to request exit 12.
@@ -360,6 +382,7 @@ impl TaskExecutor {
     pub async fn shutdown(self, budget: TierBudget) -> ShutdownOutcome {
         // Exactly once — cooperative tasks across all tiers observe the same cancel.
         self.token.cancel();
+        let mut after_orchestrator = self.after_orchestrator.lock().take();
 
         let registered = {
             let mut guard = self.registry.lock();
@@ -383,10 +406,14 @@ impl TaskExecutor {
 
         for tier in TIERS {
             let tasks = std::mem::take(&mut by_tier[tier as usize]);
-            if tasks.is_empty() {
-                continue;
+            if !tasks.is_empty() {
+                Self::drain_tier(tasks, budget.for_tier(tier), &mut joined, &mut aborted).await;
             }
-            Self::drain_tier(tasks, budget.for_tier(tier), &mut joined, &mut aborted).await;
+            if tier == ShutdownTier::Orchestrator {
+                if let Some(waiter) = after_orchestrator.take() {
+                    waiter.await;
+                }
+            }
         }
 
         ShutdownOutcome { joined, aborted }
@@ -705,6 +732,59 @@ mod tests {
         assert!(ShutdownTier::Ingress < ShutdownTier::Orchestrator);
         assert!(ShutdownTier::Orchestrator < ShutdownTier::Background);
         assert!(ShutdownTier::Background < ShutdownTier::Telemetry);
+    }
+
+    /// The broadcast-drain waiter runs after Orchestrator has joined and
+    /// before the Background budget starts. A pending background task is
+    /// aborted only after the waiter returns, so the elapsed time is the
+    /// orchestrator sleep plus the waiter plus the background budget.
+    #[tokio::test]
+    async fn after_orchestrator_waiter_runs_before_background() {
+        let token = CancellationToken::new();
+        let (executor, _rx) = TaskExecutor::new(token);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let orch_order = Arc::clone(&order);
+        executor.spawn("orch_before_drains", ShutdownTier::Orchestrator, async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            orch_order.lock().push("orch");
+        });
+        executor.spawn("bg_after_drains", ShutdownTier::Background, std::future::pending::<()>());
+        let waiter_order = Arc::clone(&order);
+        executor.set_after_orchestrator_waiter(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            waiter_order.lock().push("waiter");
+        });
+        let started = std::time::Instant::now();
+        let outcome = executor
+            .shutdown(TierBudget::new([
+                Duration::from_millis(50),
+                Duration::from_millis(500),
+                Duration::from_millis(80),
+                Duration::from_millis(50),
+            ]))
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(360),
+            "waiter must run after orchestrator and before background, elapsed {elapsed:?}"
+        );
+        assert!(
+            outcome.joined.contains(&"orch_before_drains"),
+            "orchestrator task must join before the waiter: joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted
+        );
+        assert!(
+            outcome.aborted.contains(&"bg_after_drains"),
+            "background straggler is aborted only after the waiter: joined={:?} aborted={:?}",
+            outcome.joined,
+            outcome.aborted
+        );
+        assert_eq!(
+            order.lock().as_slice(),
+            ["orch", "waiter"],
+            "the waiter starts only after the orchestrator tier has joined"
+        );
     }
 
     /// Drop-guard records task name when the work future is dropped (abort or exit).

@@ -90,6 +90,13 @@
 //! error or a timeout when the queue has room. The cap limits health
 //! recording, not sends. The publish still runs. It has no labels. Dashboards
 //! that watch missed beacon-node health samples should bind this name.
+//! #721 adds `rvc_bn_broadcast_inflight_waits_total` (family delta +1): one
+//! increment when a broadcast waits for a per-beacon-node in-flight permit.
+//! Label `endpoint` is the redacted beacon endpoint. A free permit does not
+//! increment it. The cap is 4 (2 × the default publish concurrency of 2).
+//! The HTTP call starts after the permit is acquired. Dashboards that watch
+//! a saturated beacon node should bind this counter. The overflow gauge is
+//! unchanged.
 //! RV-1.1 / #639 adds `rvc_bn_broadcast_overflow_drains` (family delta +1):
 //! in-flight broadcast publishes past the health-sample cap. Label `endpoint`
 //! is the redacted beacon endpoint (`scheme://host:port`, userinfo and path
@@ -189,6 +196,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_bn_admitted", // operator-facing: 1 while the beacon node may serve duties (#707)
     "rvc_bn_best_of_drain_health_skipped_total", // operator-facing: best-of drain health samples not recorded; broadcast skips stay on the broadcast counter (#719)
     "rvc_bn_broadcast_drain_health_skipped_total", // operator-facing: success skipped at the cap, or any sample when the recorder queue is full; the publish still runs (#639)
+    "rvc_bn_broadcast_inflight_waits_total", // operator-facing: waits for a per-beacon-node in-flight permit; the send is not skipped (#721)
     "rvc_bn_broadcast_overflow_drains", // operator-facing: in-flight overflow publishes by redacted endpoint; drops when the HTTP call finishes (#639)
     "rvc_bn_capability_state",
     "rvc_bn_health_tier",
@@ -352,11 +360,7 @@ fn expected_metric_names_is_sorted_and_unique() {
         sorted.as_slice(),
         "EXPECTED_METRIC_NAMES must be sorted and unique (edit-only list)"
     );
-    assert_eq!(
-        EXPECTED_METRIC_NAMES.len(),
-        71,
-        "#719 adds the produce reject, soft-deadline, fallback, and best-of drain-skip families"
-    );
+    assert_eq!(EXPECTED_METRIC_NAMES.len(), 72, "#721 adds rvc_bn_broadcast_inflight_waits_total");
 }
 
 #[test]

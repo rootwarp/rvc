@@ -166,6 +166,7 @@ pub async fn run(
     .await?;
 
     // Step 7: remaining services (signer, D-3, fork gate, proposer, toggle).
+    let block_publication = options.timeouts.block_publication;
     let services = build_services(
         &config,
         &loaded_keys,
@@ -371,6 +372,16 @@ pub async fn run(
 
     startup::log_orchestrator_started(validator_count, bn_count);
     info!("Starting duty orchestrator");
+
+    // After the orchestrator tier, join detached broadcast drains for up to
+    // the block-publication budget. Zero is no budget: the wait ends when
+    // the drains do. The future starts only then, so drains spawned while
+    // duties are stopping are included. One runtime tracker covers the main
+    // pool and the proposer pool. The waiter is not an executor spawn.
+    let broadcast_drains = Arc::clone(&bn_manager);
+    executor.set_after_orchestrator_waiter(async move {
+        broadcast_drains.wait_for_broadcast_drains(block_publication).await;
+    });
 
     // Spawn (not poll inline): in-flight publish survives the shutdown signal (M10).
     // detached: already a per-slot root inside the task (`DutyOrchestrator::run`, span `slot.process`); not shape B.
@@ -1384,6 +1395,14 @@ mod tests {
         assert!(
             body.contains("executor.shutdown"),
             "production shutdown must drain via TaskExecutor::shutdown"
+        );
+        assert!(
+            body.contains("wait_for_broadcast_drains"),
+            "broadcast drains must be joined from production run()"
+        );
+        assert!(
+            body.contains("set_after_orchestrator_waiter"),
+            "the drain join must run after the orchestrator tier"
         );
         assert!(
             body.contains("duty_orchestrator"),
