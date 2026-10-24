@@ -14,4 +14,10 @@ ignore = [
     # cargo-audit treats unmaintained as a non-fatal warning by default; this
     # ignore documents the accepted residual for CI/policy clarity.
     "RUSTSEC-2025-0134",
+
+    # crypto-bigint timing variability (RUSTSEC-2026-0387, 2026-10-23).
+    # The lockfile has 0.5.5 via elliptic-curve 0.13.8 and 0.6.1 via vsss-rs 5.3.0.
+    # The advisory's fix is >=0.7.6. Those parents do not depend on that release.
+    # Cargo.lock is unchanged.
+    "RUSTSEC-2026-0387",
 ]
