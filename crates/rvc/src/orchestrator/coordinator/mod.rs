@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::FutureExt;
+
 use tokio::sync::watch;
 use tracing::{debug, error, field, info, info_span, warn, Instrument};
 
@@ -675,15 +677,35 @@ where
     ///   in-flight phase-2 head, bounded by the contribution signing deadline.
     /// - payload attestation due (Gloas+): payload attestations
     /// - post-duty: epoch duty fetches, epoch-boundary prep, builder registration
+    ///
+    /// Startup proposer preparation is polled beside the slot loop and dropped
+    /// when this function returns, including on shutdown.
     pub async fn run(&mut self) -> Result<(), OrchestratorError> {
         info!("Starting duty orchestrator");
-        // Epoch-boundary prep runs after that slot's proposal. Send the fee
-        // recipient on its own task so epoch 0–1 proposals are not built
+        // Epoch-boundary prep runs after that slot's proposal. Poll the fee
+        // recipient beside the slot loop so epoch 0–1 proposals are not built
         // against a junk address, and so a slow beacon node cannot hold the
-        // slot loop. Before genesis the epoch is 0. A failure retries once
-        // per slot.
-        self.spawn_startup_proposer_preparation();
+        // slot loop. Dropping this function drops that future. Before genesis
+        // the epoch is 0. A failure retries once per slot until both calls
+        // succeed or this function returns.
+        let duty = Arc::clone(&self.duty_management);
+        let builder = self.builder_service.clone();
+        let clock = Arc::clone(&self.clock);
+        let mut shutdown = self.shutdown_rx.clone();
+        let startup = run_startup_proposer_preparation(duty, builder, clock, &mut shutdown).fuse();
+        tokio::pin!(startup);
+        let slots = self.run_slot_loop().fuse();
+        tokio::pin!(slots);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut slots => return result,
+                _ = &mut startup => {}
+            }
+        }
+    }
 
+    async fn run_slot_loop(&mut self) -> Result<(), OrchestratorError> {
         // Defence-in-depth behind the wall-based inter-slot wait. A backward
         // clock step must not re-run a slot whose phases already finished.
         let mut last_processed_slot: Option<Slot> = None;
@@ -943,22 +965,6 @@ where
         let remaining =
             self.clock.time_until_slot(slot.saturating_add(1)).unwrap_or(Duration::ZERO);
         tokio::time::Instant::now().checked_add(remaining).unwrap_or_else(tokio::time::Instant::now)
-    }
-
-    /// `prepare_beacon_proposer` and `register_validator` off the slot loop.
-    ///
-    /// No builder jitter. Before genesis the epoch is 0, so the beacon node
-    /// learns the fee recipient without waiting for slot 0. A failure retries
-    /// once per slot until both calls succeed. Both helpers no-op at Gloas.
-    /// A beacon-node error does not stop the duty loop.
-    fn spawn_startup_proposer_preparation(&self) {
-        let duty = Arc::clone(&self.duty_management);
-        let builder = self.builder_service.clone();
-        let clock = Arc::clone(&self.clock);
-        let mut shutdown = self.shutdown_rx.clone();
-        tokio::spawn(async move {
-            run_startup_proposer_preparation(duty, builder, clock, &mut shutdown).await;
-        });
     }
 
     /// Legacy register (pre-Gloas) and preferences for Gloas+ proposal slots.

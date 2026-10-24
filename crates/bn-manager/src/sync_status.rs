@@ -254,6 +254,7 @@ pub fn start_sync_monitor_publishing(
     after_poll: Option<AfterSyncPoll>,
     publish: bool,
 ) -> tokio::task::JoinHandle<()> {
+    // detached: sync monitor; bootstrap registers the JoinHandle.
     tokio::spawn(async move {
         loop {
             // `publish` is the free-function path. `BnManager` passes false and

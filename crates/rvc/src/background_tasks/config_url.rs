@@ -1100,6 +1100,17 @@ fn fetch_error_already_counted(err: &str) -> bool {
     err.contains("cross-origin redirect") || err.contains("scheme is not allowed")
 }
 
+/// Test double for a join that is aborted before `apply_fn` runs.
+#[cfg(test)]
+async fn aborted_apply_join_for_test(meters: &RefreshMeters) -> Option<Result<(), ()>> {
+    if !meters.cancel_apply_join {
+        return None;
+    }
+    let handle = tokio::spawn(std::future::pending::<()>());
+    handle.abort();
+    Some(settle_apply_join(handle).await)
+}
+
 /// Run `apply_fn` off the async worker.
 ///
 /// File I/O under the store save lock happens on the writer that holds the
@@ -1118,10 +1129,8 @@ where
     A: Fn(FetchedProposerConfig) + Send + Sync + 'static,
 {
     #[cfg(test)]
-    if meters.cancel_apply_join {
-        let handle = tokio::spawn(std::future::pending::<()>());
-        handle.abort();
-        return settle_apply_join(handle).await;
+    if let Some(result) = aborted_apply_join_for_test(meters).await {
+        return result;
     }
     let apply_fn = Arc::clone(apply_fn);
     settle_apply_join(tokio::task::spawn_blocking(move || apply_fn(fetched))).await

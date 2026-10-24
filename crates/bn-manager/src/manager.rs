@@ -986,6 +986,7 @@ impl BnManager {
             .collect();
         let admitted = Arc::clone(&self.admitted);
         let generations = Arc::clone(&self.admission_generation);
+        // detached: SSE subscription; bootstrap registers the JoinHandle.
         tokio::spawn(async move {
             sse::subscribe_events_admitted(configs, admitted, generations, callback, shutdown)
                 .await;

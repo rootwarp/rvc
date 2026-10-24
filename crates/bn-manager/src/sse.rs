@@ -359,6 +359,7 @@ async fn subscribe_events_admitted_inner<F>(
         tokio::sync::mpsc::channel::<AdmittedSseEvent>(SSE_CALLBACK_CHANNEL_CAPACITY);
     let consumer_admitted = Arc::clone(&admitted);
     let consumer_generations = Arc::clone(&generations);
+    // detached: SSE callback consumer; the event loop drops the channel on exit.
     tokio::spawn(async move {
         while let Some(tagged) = rx.recv().await {
             let still = consumer_admitted
