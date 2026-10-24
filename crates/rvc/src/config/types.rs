@@ -1225,9 +1225,11 @@ impl Config {
     /// Fail startup when a non-denylisted secret did not load its keystore.
     ///
     /// A checksum failure says the password did not decrypt the keystore. A
-    /// keystore that does not parse says it is corrupt. A secret with no
-    /// matching keystore is a warning. Denylisted keystores are skipped. The
-    /// error names the secret file and does not include the password.
+    /// canonical `0x<pk>.json` that is empty, truncated, unreadable, or not a
+    /// valid keystore for that pubkey is corrupt. A non-canonical file counts
+    /// only when it validates or its `crypto` field is present. A secret with
+    /// no matching keystore is a warning. Denylisted keystores are skipped.
+    /// The error names the secret file and does not include the password.
     pub(crate) fn reject_undecrypted_import_secrets(
         &self,
         loaded: &crypto::KeyManager,
@@ -1675,6 +1677,9 @@ thread_local! {
     /// When set, the next directory fsync after a boot sweep fails.
     static IMPORT_SECRET_SWEEP_SYNC_FAILS: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// When set, the next sweep entry after a successful unlink is unreadable.
+    static IMPORT_SECRET_SWEEP_ENTRY_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 fn read_import_secret_bytes(path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>, &'static str> {
@@ -1913,38 +1918,92 @@ pub(crate) fn is_staged_import_secret_name(name: &str) -> bool {
         && nanos.bytes().all(|b| b.is_ascii_digit())
 }
 
+const SWEEP_UNLINK_FAILED: &str = "staged import secret could not be removed";
+const SWEEP_SYNC_FAILED: &str = "sync import secret directory failed";
+const SWEEP_UNLINK_AND_SYNC_FAILED: &str =
+    "staged import secret could not be removed; sync import secret directory failed";
+const SWEEP_UNREADABLE_AND_SYNC_FAILED: &str = "unreadable; sync import secret directory failed";
+
 fn sync_import_secret_dir(dir: &Path) -> Result<(), ConfigError> {
     #[cfg(test)]
     if IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.replace(false)) {
         return Err(ConfigError::ImportSecret {
             path: dir.to_path_buf(),
-            reason: "sync import secret directory failed",
+            reason: SWEEP_SYNC_FAILED,
         });
     }
     let file = fs::File::open(dir).map_err(|_| ConfigError::ImportSecret {
         path: dir.to_path_buf(),
-        reason: "sync import secret directory failed",
+        reason: SWEEP_SYNC_FAILED,
     })?;
     file.sync_all().map_err(|_| ConfigError::ImportSecret {
         path: dir.to_path_buf(),
-        reason: "sync import secret directory failed",
+        reason: SWEEP_SYNC_FAILED,
     })
+}
+
+fn sweep_dir_unreadable(dir: &Path) -> ConfigError {
+    ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" }
+}
+
+fn sweep_entry(
+    entry: Result<fs::DirEntry, std::io::Error>,
+    removed: bool,
+) -> Result<fs::DirEntry, std::io::Error> {
+    let entry = entry?;
+    #[cfg(test)]
+    if removed && IMPORT_SECRET_SWEEP_ENTRY_FAILS.with(|flag| flag.get()) {
+        let staged = entry.file_name().to_str().is_some_and(is_staged_import_secret_name);
+        if staged {
+            IMPORT_SECRET_SWEEP_ENTRY_FAILS.with(|flag| flag.set(false));
+            return Err(std::io::Error::other("unreadable"));
+        }
+    }
+    let _ = removed;
+    Ok(entry)
+}
+
+fn remember_sweep(first_err: &mut Option<ConfigError>, err: ConfigError) {
+    if first_err.is_none() {
+        *first_err = Some(err);
+    }
+}
+
+/// Keep the first sweep error and name the directory fsync when that also fails.
+fn attach_sweep_sync(first_err: Option<ConfigError>, sync_err: ConfigError) -> ConfigError {
+    let ConfigError::ImportSecret { path, reason } = sync_err else {
+        return sync_err;
+    };
+    if reason != SWEEP_SYNC_FAILED {
+        return ConfigError::ImportSecret { path, reason };
+    }
+    let Some(ConfigError::ImportSecret { path, reason }) = first_err else {
+        return ConfigError::ImportSecret { path, reason: SWEEP_SYNC_FAILED };
+    };
+    let reason = match reason {
+        SWEEP_UNLINK_FAILED => SWEEP_UNLINK_AND_SYNC_FAILED,
+        "unreadable" => SWEEP_UNREADABLE_AND_SYNC_FAILED,
+        other => other,
+    };
+    ConfigError::ImportSecret { path, reason }
 }
 
 fn sweep_import_secret_partials(dir: &Path) -> Result<(), ConfigError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(_) => {
-            return Err(ConfigError::ImportSecret { path: dir.to_path_buf(), reason: "unreadable" })
-        }
+        Err(_) => return Err(sweep_dir_unreadable(dir)),
     };
     let mut removed = false;
+    let mut first_err = None;
     for entry in entries {
-        let entry = entry.map_err(|_| ConfigError::ImportSecret {
-            path: dir.to_path_buf(),
-            reason: "unreadable",
-        })?;
+        let entry = match sweep_entry(entry, removed) {
+            Ok(entry) => entry,
+            Err(_) => {
+                remember_sweep(&mut first_err, sweep_dir_unreadable(dir));
+                continue;
+            }
+        };
         let file_name = entry.file_name();
         let Some(name) = file_name.to_str() else {
             continue;
@@ -1957,30 +2016,71 @@ fn sweep_import_secret_partials(dir: &Path) -> Result<(), ConfigError> {
             Ok(()) => removed = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => {
-                if removed {
-                    sync_import_secret_dir(dir)?;
-                }
-                return Err(ConfigError::ImportSecret {
-                    path,
-                    reason: "staged import secret could not be removed",
-                });
+                remember_sweep(
+                    &mut first_err,
+                    ConfigError::ImportSecret { path, reason: SWEEP_UNLINK_FAILED },
+                );
             }
         }
     }
     if removed {
-        sync_import_secret_dir(dir)?;
+        if let Err(sync_err) = sync_import_secret_dir(dir) {
+            first_err = Some(attach_sweep_sync(first_err, sync_err));
+        }
     }
-    Ok(())
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 struct DeclaredKeystore {
     valid: bool,
 }
 
-/// One pass over `*.json` files. A file that parses and validates is valid.
-/// A pubkey plus a `crypto` or `version` field that fails validation is
-/// corrupt, including a missing `version` or a `crypto` value that is not an
-/// object. Deposit data and slashing interchange do not have that shape.
+fn note_declared(
+    declared: &mut HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>,
+    pubkey: [u8; crypto::PUBLIC_KEY_BYTES_LEN],
+    valid: bool,
+) {
+    let entry = declared.entry(pubkey).or_insert(DeclaredKeystore { valid: false });
+    if valid {
+        entry.valid = true;
+    }
+}
+
+/// File name import writes: `0x` + lowercase bare pubkey hex + `.json`.
+fn canonical_keystore_name(name: &str) -> Option<[u8; crypto::PUBLIC_KEY_BYTES_LEN]> {
+    let stem = name.strip_suffix(".json")?;
+    parse_import_secret_name(stem)
+}
+
+/// Read a keystore candidate that stays inside `base`.
+///
+/// A symlink is followed only when its target is a regular file inside
+/// `base`. `None` means the entry cannot be read that way.
+fn read_declared_keystore(base: &Path, path: &Path) -> Option<String> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    let target = if meta.file_type().is_symlink() || meta.is_file() {
+        let target = path.canonicalize().ok()?;
+        if !target.starts_with(base) || !target.is_file() {
+            return None;
+        }
+        target
+    } else {
+        return None;
+    };
+    fs::read_to_string(target).ok()
+}
+
+/// One pass over `*.json` files.
+///
+/// [`canonical_keystore_name`] is that pubkey's keystore. An empty, truncated,
+/// or unreadable file at that name is corrupt, as is a document that does not
+/// validate as the same pubkey. Any other name counts only when the document
+/// validates or its `crypto` field is present. A valid file wins over a
+/// corrupt file for the same pubkey. Deposit data and slashing interchange do
+/// not have a keystore shape.
 fn index_declared_keystores(
     keystore_dir: &Path,
 ) -> Result<HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>, ConfigError> {
@@ -2005,33 +2105,72 @@ fn index_declared_keystores(
         if !name.ends_with(".json") || name.ends_with(".import_meta.json") {
             continue;
         }
-        let canonical = match path.canonicalize() {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        if !canonical.starts_with(&base) {
-            continue;
-        }
-        let content = match fs::read_to_string(&canonical) {
-            Ok(content) => content,
-            Err(_) => continue,
-        };
-        if let Some((pubkey, valid)) = keystore_declaration(&content) {
-            let entry = declared.entry(pubkey).or_insert(DeclaredKeystore { valid: false });
-            if valid {
-                entry.valid = true;
+        let named = canonical_keystore_name(name);
+        match read_declared_keystore(&base, &path) {
+            Some(content) => record_keystore_file(&mut declared, name, &content),
+            None => {
+                if let Some(pk) = named {
+                    note_declared(&mut declared, pk, false);
+                }
             }
         }
     }
     Ok(declared)
 }
 
-/// `(pubkey, valid)` for a keystore-shaped file.
+fn record_keystore_file(
+    declared: &mut HashMap<[u8; crypto::PUBLIC_KEY_BYTES_LEN], DeclaredKeystore>,
+    name: &str,
+    content: &str,
+) {
+    if let Some(named) = canonical_keystore_name(name) {
+        match keystore_declaration(content) {
+            Some((body, valid)) => {
+                note_declared(declared, body, valid);
+                if body != named {
+                    note_declared(declared, named, false);
+                }
+            }
+            None => note_declared(declared, named, false),
+        }
+        return;
+    }
+    if let Some((body, valid)) = noncanonical_keystore_declaration(content) {
+        note_declared(declared, body, valid);
+    }
+}
+
+/// `(pubkey, valid)` for a non-canonical `*.json` file.
+///
+/// Valid means [`crypto::Keystore::from_json`] accepted it. Corrupt means a
+/// `crypto` field is present and validation failed. A pubkey plus only a
+/// `version` field is not a keystore.
+fn noncanonical_keystore_declaration(
+    content: &str,
+) -> Option<([u8; crypto::PUBLIC_KEY_BYTES_LEN], bool)> {
+    if let Some((pubkey, true)) = keystore_declaration(content) {
+        return Some((pubkey, true));
+    }
+    let value: serde_json::Value = serde_json::from_str(content).ok()?;
+    let obj = value.as_object()?;
+    if !obj.contains_key("crypto") {
+        return None;
+    }
+    let pubkey = obj
+        .get("pubkey")
+        .and_then(|field| field.as_str())
+        .and_then(crypto::decode_password_map_key)?;
+    Some((pubkey, false))
+}
+
+/// `(pubkey, valid)` for a keystore-shaped document.
 ///
 /// Valid means [`crypto::Keystore::from_json`] accepted it. Corrupt means the
 /// JSON has a pubkey and a `crypto` or `version` field, and validation
 /// failed. A missing `version` or a `crypto` value that is not an object is
-/// still that keystore. JSON with neither field is not a keystore.
+/// still that shape. JSON with neither field is not a keystore.
+/// [`index_declared_keystores`] applies the corrupt result to
+/// [`canonical_keystore_name`] only.
 fn keystore_declaration(content: &str) -> Option<([u8; crypto::PUBLIC_KEY_BYTES_LEN], bool)> {
     if let Ok(keystore) = crypto::Keystore::from_json(content) {
         let pubkey = keystore.pubkey.as_deref().and_then(crypto::decode_password_map_key)?;
@@ -3175,6 +3314,75 @@ payload_attestation_due_bps = 4000
         let err = config_at(dir.path(), None).load_passwords().unwrap_err();
         assert_import_secret_err(&err, "sync import secret directory failed", secret);
         assert!(!partial.exists(), "the partial is unlinked before the directory fsync");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_sweep_keeps_the_unlink_error_when_the_sync_also_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x8a; 48];
+        let secret = "kept-when-unlink-and-sync-fail";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        let removed = secrets.join(format!(".0x{}.1.2.keymanager-secret.partial", "11".repeat(48)));
+        let blocked = secrets.join(format!(".0x{}.3.4.keymanager-secret.partial", "22".repeat(48)));
+        std::fs::write(&removed, b"stale-partial-body").unwrap();
+        std::fs::create_dir(&blocked).unwrap();
+        struct ClearSweep;
+        impl Drop for ClearSweep {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(false));
+            }
+        }
+        super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(true));
+        let _guard = ClearSweep;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("staged import secret could not be removed"), "{msg}");
+        assert!(msg.contains("sync import secret directory failed"), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        assert!(!removed.exists(), "a removable partial is unlinked before the fsync");
+        assert!(blocked.is_dir(), "the partial that could not be removed is still there");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_passwords_sweep_keeps_an_entry_error_when_the_sync_also_fails() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pubkey = [0x8b; 48];
+        let secret = "kept-when-entry-and-sync-fail";
+        write_import_secret(dir.path(), &secret_name(&pubkey), secret.as_bytes(), 0o600);
+        let secrets = dir.path().join(Config::IMPORT_SECRETS_DIR);
+        let first = secrets.join(format!(".0x{}.1.2.keymanager-secret.partial", "33".repeat(48)));
+        let second = secrets.join(format!(".0x{}.3.4.keymanager-secret.partial", "44".repeat(48)));
+        std::fs::write(&first, b"first-partial").unwrap();
+        std::fs::write(&second, b"second-partial").unwrap();
+        struct ClearSweep;
+        impl Drop for ClearSweep {
+            fn drop(&mut self) {
+                super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(false));
+                super::IMPORT_SECRET_SWEEP_ENTRY_FAILS.with(|flag| flag.set(false));
+            }
+        }
+        super::IMPORT_SECRET_SWEEP_SYNC_FAILS.with(|flag| flag.set(true));
+        super::IMPORT_SECRET_SWEEP_ENTRY_FAILS.with(|flag| flag.set(true));
+        let _guard = ClearSweep;
+        let err = config_at(dir.path(), None).load_passwords().unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unreadable"), "{msg}");
+        assert!(msg.contains("sync import secret directory failed"), "{msg}");
+        assert!(!msg.contains(secret), "{msg}");
+        let left = [first.exists(), second.exists()];
+        assert_eq!(left.iter().filter(|exists| **exists).count(), 1, "{left:?}");
+    }
+
+    #[test]
+    fn note_declared_keeps_a_valid_keystore_after_a_corrupt_file() {
+        let mut declared = std::collections::HashMap::new();
+        let pubkey = [0xab; 48];
+        note_declared(&mut declared, pubkey, true);
+        note_declared(&mut declared, pubkey, false);
+        assert!(declared.get(&pubkey).expect("recorded").valid);
     }
 
     #[cfg(unix)]

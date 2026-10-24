@@ -411,6 +411,60 @@ mod tests {
         assert!(!msg.contains(secret), "{msg}");
     }
 
+    /// Canonical symlink or FIFO alone, plus a secret and no other json, fails boot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_load_signing_keys_aborts_on_a_lone_canonical_symlink() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        for kind in ["outside", "dangling", "directory", "fifo"] {
+            let dir = TempDir::new().unwrap();
+            let ks = dir.path().join("k");
+            std::fs::create_dir(&ks).unwrap();
+            let outside_pk = kind == "outside";
+            let pk = if outside_pk {
+                write_keystore(dir.path(), &SecretKey::generate())
+            } else {
+                [0xcd; 48]
+            };
+            let secret = if outside_pk { PASSWORD } else { "lone-symlink-secret" };
+            let name = format!("0x{}", hex::encode(pk));
+            let link = ks.join(format!("{name}.json"));
+            let target = if outside_pk {
+                dir.path().join(format!("keystore-0x{}.json", hex::encode(pk)))
+            } else {
+                dir.path().join(kind)
+            };
+            if kind == "directory" {
+                std::fs::create_dir(&target).unwrap();
+            } else if kind == "fifo" {
+                let c_path = std::ffi::CString::new(target.to_str().unwrap()).unwrap();
+                // SAFETY: mkfifo only creates a named pipe at this temp path.
+                assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            }
+            let dest = if kind == "dangling" { "missing" } else { target.to_str().unwrap() };
+            std::os::unix::fs::symlink(dest, &link).unwrap();
+            let secrets = ks.join(Config::IMPORT_SECRETS_DIR);
+            std::fs::create_dir(&secrets).unwrap();
+            std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true).mode(0o600);
+            write!(opts.open(secrets.join(&name)).unwrap(), "{secret}").unwrap();
+            let msg = load_signing_keys(
+                &base_config(ks, write_password_file(&dir)),
+                &DeletionDenylist::empty_at(dir.path().join("d")),
+            )
+            .await
+            .map(|_| ())
+            .expect_err(kind)
+            .to_string();
+            assert!(msg.contains("keystore is corrupt") && msg.contains(&name), "{kind}: {msg}");
+            assert!(!msg.contains(secret), "{kind}: {msg}");
+            assert!(!msg.contains("No keystore files"), "{kind}: {msg}");
+            assert!(!msg.contains("has no keystore"), "{kind}: {msg}");
+        }
+    }
+
     #[tokio::test]
     async fn test_load_signing_keys_initializes_secret_provider_metrics_eagerly() {
         let dir = TempDir::new().unwrap();

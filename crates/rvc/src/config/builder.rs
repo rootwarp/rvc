@@ -595,13 +595,21 @@ impl ServiceBuilder {
         }
 
         let mut report = crypto::KeystoreLoadReport::default();
-        let key_manager = KeyManager::load_from_directory_with_threads_filtered_reporting(
+        let key_manager = match KeyManager::load_from_directory_with_threads_filtered_reporting(
             &self.config.keystore_path,
             &passwords,
             self.config.key_decrypt_threads,
             denylist,
             &mut report,
-        )?;
+        ) {
+            Ok(manager) => manager,
+            Err(err @ crypto::KeyManagerError::NoKeystoreFiles) => {
+                let empty = KeyManager::new();
+                self.config.reject_undecrypted_import_secrets(&empty, denylist, &report)?;
+                return Err(err.into());
+            }
+            Err(err) => return Err(err.into()),
+        };
         self.config.reject_undecrypted_import_secrets(&key_manager, denylist, &report)?;
         info!(
             key_count = key_manager.len(),
@@ -1705,20 +1713,24 @@ mod tests {
     }
 
     /// A missing `version` or a `crypto` value that is not an object is corrupt.
+    ///
+    /// A pubkey plus only `version` is corrupt on the canonical name. The same
+    /// document under another name is not a keystore.
     #[cfg(unix)]
     #[test]
     fn build_key_manager_errors_when_version_is_missing_or_crypto_is_not_an_object() {
         let secret = "malformed-keystore-secret";
         let cases = [
-            r#"{"crypto":{"kdf":{"function":"scrypt"}},"pubkey":"{bare}"}"#,
-            r#"{"crypto":"not-an-object","pubkey":"{bare}","version":4}"#,
-            r#"{"pubkey":"{bare}","path":"m/12381/3600/0/0/0","version":4}"#,
+            (r#"{"crypto":{"kdf":{"function":"scrypt"}},"pubkey":"{bare}"}"#, false),
+            (r#"{"crypto":"not-an-object","pubkey":"{bare}","version":4}"#, false),
+            (r#"{"pubkey":"{bare}","path":"m/12381/3600/0/0/0","version":4}"#, true),
         ];
-        for body in cases {
+        for (body, canonical) in cases {
             let dir = TempDir::new().unwrap();
             let pk = [0xabu8; 48];
             let bare = hex::encode(pk);
-            std::fs::write(dir.path().join("bad.json"), body.replace("{bare}", &bare)).unwrap();
+            let name = if canonical { format!("0x{bare}.json") } else { "bad.json".to_string() };
+            std::fs::write(dir.path().join(name), body.replace("{bare}", &bare)).unwrap();
             write_import_secret(dir.path(), &pk, secret);
             let config =
                 Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
@@ -1731,6 +1743,119 @@ mod tests {
             assert!(!msg.contains("has no keystore"), "{msg}");
             assert!(!msg.contains(secret), "{msg}");
         }
+    }
+
+    /// A non-canonical file that only names the secret's pubkey does not abort.
+    #[cfg(unix)]
+    #[tracing_test::traced_test]
+    #[test]
+    fn build_key_manager_warns_when_only_an_unrelated_json_names_the_secret_pubkey() {
+        let dir = TempDir::new().unwrap();
+        let kept_pw = "kept-keystore-password";
+        let unrelated_pw = "unrelated-json-secret";
+        let pk = write_encrypted_keystore(dir.path(), kept_pw);
+        write_import_secret(dir.path(), &pk, kept_pw);
+        let unrelated = [0xabu8; 48];
+        let bare = hex::encode(unrelated);
+        write_import_secret(dir.path(), &unrelated, unrelated_pw);
+        let names = [
+            format!("0x{}.json", bare.to_ascii_uppercase()),
+            format!("0X{bare}.json"),
+            format!("0x{bare}\u{200d}.json"),
+            format!("0x{bare}Z.json"),
+            "notes.json".to_string(),
+        ];
+        let body = format!(r#"{{"pubkey":"{bare}","path":"m/12381/3600/0/0/0","version":4}}"#);
+        for name in &names {
+            std::fs::write(dir.path().join(name), &body).unwrap();
+        }
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager()
+            .expect("a non-canonical version field is not a corrupt keystore");
+        assert!(loaded.contains(&pk), "a renamed keystore still loads");
+        assert!(!loaded.contains(&unrelated));
+        assert!(logs_contain("import password secret has no keystore"));
+        assert!(!logs_contain("keystore is corrupt"));
+        assert!(!logs_contain(kept_pw));
+        assert!(!logs_contain(unrelated_pw));
+    }
+
+    /// A valid keystore under another name still loads when `0x<pk>.json` is empty.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_loads_a_renamed_keystore_when_the_canonical_file_is_empty() {
+        let dir = TempDir::new().unwrap();
+        let password = "renamed-keystore-password";
+        let pk = write_encrypted_keystore(dir.path(), password);
+        write_import_secret(dir.path(), &pk, password);
+        std::fs::write(dir.path().join(format!("0x{}.json", hex::encode(pk))), b"").unwrap();
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let loaded = ServiceBuilder::new(config)
+            .build_key_manager()
+            .expect("a valid non-canonical keystore still loads");
+        assert!(loaded.contains(&pk));
+    }
+
+    /// An empty, truncated, or unreadable canonical keystore fails boot.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_errors_on_an_empty_truncated_or_unreadable_canonical_keystore_with_a_secret(
+    ) {
+        let secret = "canonical-keystore-secret";
+        let cases: &[(&str, Option<&[u8]>)] =
+            &[("empty", Some(b"")), ("truncated", Some(br#"{"pubkey":"#)), ("unreadable", None)];
+        for (label, body) in cases {
+            let dir = TempDir::new().unwrap();
+            let pk = [0xabu8; 48];
+            let bare = hex::encode(pk);
+            let name = format!("0x{bare}.json");
+            let path = dir.path().join(&name);
+            match body {
+                Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+                None => std::os::unix::fs::symlink("/no/such/keystore.json", &path).unwrap(),
+            }
+            write_import_secret(dir.path(), &pk, secret);
+            let config =
+                Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+            let err = match ServiceBuilder::new(config).build_key_manager() {
+                Err(err) => err,
+                Ok(_) => panic!("{label} canonical keystore must not be an orphan warning"),
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("keystore is corrupt"), "{label}: {msg}");
+            assert!(msg.contains(&format!("0x{bare}")), "{label}: {msg}");
+            assert!(!msg.contains("has no keystore"), "{label}: {msg}");
+            assert!(!msg.contains(secret), "{label}: {msg}");
+        }
+    }
+
+    /// `0x<other>.json` whose body validates as a different pubkey is corrupt.
+    #[cfg(unix)]
+    #[test]
+    fn build_key_manager_errors_when_a_canonical_file_validates_as_another_pubkey() {
+        let dir = TempDir::new().unwrap();
+        let password = "mismatched-canonical-name";
+        let body = write_encrypted_keystore(dir.path(), password);
+        let named = [0xcdu8; 48];
+        assert_ne!(body, named);
+        let json = std::fs::read_to_string(
+            dir.path().join(format!("keystore-{}.json", hex::encode(body))),
+        )
+        .unwrap();
+        let named_hex = hex::encode(named);
+        std::fs::write(dir.path().join(format!("0x{named_hex}.json")), json).unwrap();
+        write_import_secret(dir.path(), &named, password);
+        let config = Config { keystore_path: dir.path().to_path_buf(), ..create_minimal_config() };
+        let err = match ServiceBuilder::new(config).build_key_manager() {
+            Err(err) => err,
+            Ok(_) => panic!("a mismatched canonical name must not be an orphan warning"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("keystore is corrupt"), "{msg}");
+        assert!(msg.contains(&format!("0x{named_hex}")), "{msg}");
+        assert!(!msg.contains("has no keystore"), "{msg}");
+        assert!(!msg.contains(password), "{msg}");
     }
 
     /// Deposit data and an interchange file that contain the pubkey do not abort.

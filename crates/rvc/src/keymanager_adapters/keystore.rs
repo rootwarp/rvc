@@ -42,9 +42,10 @@ use super::notifier::{pubkey_hex, KeyChangeNotifier};
 ///
 /// # Deletion denylist (SEC-1b)
 ///
-/// On successful `delete_keystore`, the pubkey is recorded in
-/// [`DeletionDenylist`] so keystore-dir / secret-provider loaders skip it on
-/// the next boot. Intentional re-import via `import_keystore` clears the entry.
+/// `delete_keystore` records the pubkey in [`DeletionDenylist`] even when
+/// import-secret removal fails, so the next boot skips the key. The signing
+/// registry is updated only after secret removal and the denylist write both
+/// succeed. Intentional re-import via `import_keystore` clears the entry.
 pub struct KeystoreManagerAdapter {
     keystore_dir: PathBuf,
     composite_signer: Arc<CompositeSigner>,
@@ -355,18 +356,57 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), ImportKeystoreErr
 thread_local! {
     pub(super) static IMPORT_SECRET_DIR_SYNC_FAILS: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    /// Fail the Nth `sync_keystore_dir` call on this thread. `0` is off.
+    /// [`IMPORT_SECRET_DIR_SYNC_CALLS`] is 1-based and must be reset by the test.
+    pub(super) static IMPORT_SECRET_DIR_SYNC_FAIL_ON_CALL: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+    pub(super) static IMPORT_SECRET_DIR_SYNC_CALLS: std::cell::Cell<u32> =
+        const { std::cell::Cell::new(0) };
+    /// The next import-secret unlink fails with `PermissionDenied`.
+    pub(super) static IMPORT_SECRET_REMOVE_FAILS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 fn sync_keystore_dir(dir: &Path) -> Result<(), ImportKeystoreError> {
     #[cfg(test)]
-    if IMPORT_SECRET_DIR_SYNC_FAILS.with(|flag| flag.replace(false)) {
-        return Err(ImportKeystoreError::Io(format!(
-            "sync import secret directory {} failed",
-            dir.display()
-        )));
+    {
+        let call = IMPORT_SECRET_DIR_SYNC_CALLS.with(|slot| {
+            let next = slot.get().saturating_add(1);
+            slot.set(next);
+            next
+        });
+        let one_shot = IMPORT_SECRET_DIR_SYNC_FAILS.with(|flag| flag.replace(false));
+        let nth = IMPORT_SECRET_DIR_SYNC_FAIL_ON_CALL.with(|slot| slot.get());
+        if one_shot || (nth != 0 && call == nth) {
+            if nth != 0 && call == nth {
+                IMPORT_SECRET_DIR_SYNC_FAIL_ON_CALL.with(|slot| slot.set(0));
+            }
+            return Err(ImportKeystoreError::Io(format!(
+                "sync import secret directory {} failed",
+                dir.display()
+            )));
+        }
     }
     let file = std::fs::File::open(dir).map_err(|e| ImportKeystoreError::Io(e.to_string()))?;
     file.sync_all().map_err(|e| ImportKeystoreError::Io(e.to_string()))
+}
+
+fn unlink_import_path(path: &Path) -> std::io::Result<()> {
+    #[cfg(test)]
+    if IMPORT_SECRET_REMOVE_FAILS.with(|flag| flag.replace(false)) {
+        return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"));
+    }
+    std::fs::remove_file(path)
+}
+
+fn attach_import_sync(
+    first_err: Option<ImportKeystoreError>,
+    sync_err: ImportKeystoreError,
+) -> ImportKeystoreError {
+    match first_err {
+        Some(err) => ImportKeystoreError::Io(format!("{err}; {sync_err}")),
+        None => sync_err,
+    }
 }
 
 fn io_import(action: &str, path: &Path, err: std::io::Error) -> ImportKeystoreError {
@@ -538,8 +578,18 @@ fn remove_staged_secret_partials(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(io_import("read import secret directory", secrets_dir, e)),
     };
+    let mut removed = false;
+    let mut first_err = None;
     for entry in entries {
-        let entry = entry.map_err(|e| io_import("read import secret directory", secrets_dir, e))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(io_import("read import secret directory", secrets_dir, e));
+                }
+                continue;
+            }
+        };
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
             continue;
@@ -547,13 +597,26 @@ fn remove_staged_secret_partials(
         if !name.starts_with(&prefix) || !crate::config::is_staged_import_secret_name(name) {
             continue;
         }
-        match std::fs::remove_file(entry.path()) {
-            Ok(()) => {}
+        let path = entry.path();
+        match unlink_import_path(&path) {
+            Ok(()) => removed = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io_import("remove staged import secret", &entry.path(), e)),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(io_import("remove staged import secret", &path, e));
+                }
+            }
         }
     }
-    sync_keystore_dir(secrets_dir)
+    if removed {
+        if let Err(sync_err) = sync_keystore_dir(secrets_dir) {
+            first_err = Some(attach_import_sync(first_err, sync_err));
+        }
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 /// `create_new` a mode `0600` file, fsync it, then rename into the secrets dir.
@@ -594,8 +657,11 @@ fn persist_import_secret(
 /// still registered.
 fn remove_import_secret(keystore_dir: &Path, pubkey: &Pubkey) -> Result<(), ImportKeystoreError> {
     let path = import_secret_path(keystore_dir, pubkey);
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
+    let secrets_dir = import_secrets_dir(keystore_dir);
+    let mut removed = false;
+    let mut first_err = None;
+    match unlink_import_path(&path) {
+        Ok(()) => removed = true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => {
             warn!(
@@ -603,13 +669,49 @@ fn remove_import_secret(keystore_dir: &Path, pubkey: &Pubkey) -> Result<(), Impo
                 error = %e,
                 "failed to remove an import password secret"
             );
-            return Err(io_import("remove import password secret", &path, e));
+            first_err = Some(io_import("remove import password secret", &path, e));
         }
     }
-    let secrets_dir = import_secrets_dir(keystore_dir);
-    // Partials are removed before the directory fsync, so a failed import or
-    // DELETE does not leave plaintext durable in the directory.
-    remove_staged_secret_partials(&secrets_dir, pubkey)
+    // Partials are attempted even when the final secret could not be removed.
+    // A later partial or fsync error is attached to that first error. A failed
+    // partial unlink does not skip the directory fsync after the final secret
+    // was removed.
+    if let Err(e) = remove_staged_secret_partials(&secrets_dir, pubkey) {
+        first_err = Some(match first_err {
+            Some(first) => attach_import_sync(Some(first), e),
+            None => e,
+        });
+    }
+    if removed {
+        if let Err(sync_err) = sync_keystore_dir(&secrets_dir) {
+            first_err = Some(attach_import_sync(first_err, sync_err));
+        }
+    }
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// Write the denylist after the secret-removal attempt.
+///
+/// A failed secret removal still denylists the key. Registry updates stay
+/// with the caller and run only when this returns `Ok`.
+fn insert_denylist_after_secret(
+    denylist: Option<&Arc<DeletionDenylist>>,
+    pubkey: &Pubkey,
+    secret_removed: Result<(), ImportKeystoreError>,
+) -> Result<(), DeleteKeystoreError> {
+    if let Some(denylist) = denylist {
+        if let Err(e) = denylist.insert(pubkey) {
+            let deny = e.to_string();
+            return Err(match secret_removed {
+                Ok(()) => DeleteKeystoreError::Io(deny),
+                Err(secret) => DeleteKeystoreError::Io(format!("{secret}; {deny}")),
+            });
+        }
+    }
+    secret_removed.map_err(|e| DeleteKeystoreError::Io(e.to_string()))
 }
 
 /// Unlink staged and final names, then fsync the directory.
@@ -1356,52 +1458,43 @@ impl KeystoreManager for KeystoreManagerAdapter {
             }
         }
         if !self.composite_signer.has_local_key(pubkey) {
-            // The key is already absent. A leftover import secret is still
-            // removed, and a failed removal is returned so DELETE does not
-            // report the plaintext as gone. This path does not register the key.
-            // The denylist insert is the break-glass retry for a prior DELETE
-            // that removed the key before denylist durability failed.
-            remove_import_secret(&self.keystore_dir, pubkey)
-                .map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
-            if let Some(ref denylist) = self.denylist {
-                denylist.insert(pubkey).map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
-            }
+            // Already absent from the signer. Still remove a leftover secret
+            // and write the denylist. A failed secret removal does not skip
+            // the denylist and does not register the key.
+            insert_denylist_after_secret(
+                self.denylist.as_ref(),
+                pubkey,
+                remove_import_secret(&self.keystore_dir, pubkey),
+            )?;
             return Ok(false);
         }
 
-        // Order (SEC-1b fail-closed for durability):
-        //   1. Unlink keystore files (IO failure leaves memory intact)
-        //   2. Remove the import secret, including the secrets-dir fsync
-        //      (failure leaves the key local so DELETE can retry)
-        //   3. Durable denylist.insert (IO failure leaves key still local → retryable)
-        //   4. Remove from signing registry
+        // Order:
+        //   1. Unlink keystore files. Failure leaves memory and the denylist
+        //      unchanged. The keystore directory is not fsynced.
+        //   2. Remove the import secret, including the secrets-dir fsync.
+        //   3. Durable denylist.insert, including when step 2 fails.
+        //   4. Remove from the signing registry only when 2 and 3 both succeed.
         //
-        // Writing the denylist *before* remove_local_key ensures a failed
-        // insert does not leave a non-signable key that cannot be re-deleted.
-        // The secret is gone before that insert, so a failed secret removal
-        // does not denylist a key whose plaintext is still on disk.
+        // A failed secret removal still denylists the key so a restart does
+        // not load it. The registry stays so DELETE can be retried.
 
         // Matches any `*.json` whose EIP-2335 pubkey field equals this key
         // (API-import `0x{hex}.json` and boot-loaded names like `validator1.json`).
         // No matching file is OK (secret-provider / already removed).
         remove_matching_keystore_files(&self.keystore_dir, pubkey)?;
-        remove_import_secret(&self.keystore_dir, pubkey)
-            .map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
-
-        // M-12 (Critical #2): remove the import-time sidecar so a
-        // subsequent re-import starts with a clean timestamp. A leftover
-        // staged partial or `.removing.*` set-aside is the same unfinished
-        // marker (older cleanups used rename-aside; boot still fails closed).
-        let meta_path = import_meta_path(&self.keystore_dir, pubkey);
-        let _ = std::fs::remove_file(&meta_path);
-        let _ = std::fs::remove_file(staged_meta_path(&self.keystore_dir, pubkey));
-        remove_leftover_removing_sidecars(&self.keystore_dir, pubkey);
-
-        // SEC-1b: persist deletion *before* registry removal so durability
-        // failure leaves the key still present for DELETE retry.
-        if let Some(ref denylist) = self.denylist {
-            denylist.insert(pubkey).map_err(|e| DeleteKeystoreError::Io(e.to_string()))?;
+        let secret_removed = remove_import_secret(&self.keystore_dir, pubkey);
+        if secret_removed.is_ok() {
+            // M-12: remove the import-time sidecar so a re-import starts clean.
+            // A leftover staged partial or `.removing.*` set-aside is the same
+            // unfinished marker (older cleanups used rename-aside; boot still
+            // fails closed). Skipped when the secret is still on disk.
+            let meta_path = import_meta_path(&self.keystore_dir, pubkey);
+            let _ = std::fs::remove_file(&meta_path);
+            let _ = std::fs::remove_file(staged_meta_path(&self.keystore_dir, pubkey));
+            remove_leftover_removing_sidecars(&self.keystore_dir, pubkey);
         }
+        insert_denylist_after_secret(self.denylist.as_ref(), pubkey, secret_removed)?;
 
         // Drop bookkeeping after denylist succeeds (lock still held for
         // remove_local_key + map update so concurrent deletes/imports serialize).
