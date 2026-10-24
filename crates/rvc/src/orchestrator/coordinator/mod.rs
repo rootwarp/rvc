@@ -1325,14 +1325,39 @@ where
         slot_end.min(budget_at)
     }
 
+    /// Deadline for a phase-2 head fetch started by the contribution phase.
+    ///
+    /// The earliest of slot end, `now` plus `attestation_fetch`, and the
+    /// contribution signing deadline. The signing deadline is a fresh
+    /// `now` plus `sync_contribution`, capped at slot end plus 500 ms, and
+    /// can therefore sit past slot end. This fetch does not use that
+    /// overhang. A budget `Instant` cannot add, or a slot that has already
+    /// ended, yields a deadline at or before now so [`fetch_head_root`] does
+    /// not call the beacon node.
+    fn contribution_head_deadline(
+        slot_end: tokio::time::Instant,
+        timeouts: &OperationTimeouts,
+    ) -> tokio::time::Instant {
+        let fetch_at = Self::head_fetch_deadline(slot_end, timeouts.attestation_fetch);
+        let (sign_at, _) =
+            super::sync_committee::contribution_deadline(slot_end, timeouts.sync_contribution);
+        fetch_at.min(sign_at)
+    }
+
     /// Phase-2 head, when it is still unset.
     ///
     /// One capture runs per slot. A second caller waits until that capture
     /// finishes or `deadline`, whichever is earlier, and does not start
     /// another fetch. The slot-context lock is not held across the beacon
-    /// fetch. The first root written wins. A timeout or invalid body keeps
-    /// the parent captured at t=0: that parent is the last head this client
-    /// verified, and signing it is valid and non-slashable for sync messages.
+    /// fetch. The first root written wins. No root is stored when the
+    /// deadline has already passed, the fetch times out, the slot is empty
+    /// (HTTP 404), the beacon node returns any other error, or the body is
+    /// not `0x` plus 64 hex digits. The parent captured at t=0 is kept in
+    /// each of those cases. That parent is not always a head this client
+    /// verified. After four misses the t=0 walk uses the beacon node's
+    /// `"head"` header and keeps it when that header's slot is below this
+    /// slot. Signing the kept root is valid and non-slashable for sync
+    /// messages.
     async fn capture_head_if_needed(
         &self,
         ctx: &tokio::sync::Mutex<SlotContext>,
@@ -1559,9 +1584,13 @@ where
     /// each duty waits from slot start to its own offset.
     ///
     /// Aggregation starts at that wait. Contributions then wait for an
-    /// in-flight phase-2 capture, bounded by the contribution signing
-    /// deadline. That wait does not delay aggregation, and it does not start
-    /// a second head fetch while the first capture is running.
+    /// in-flight phase-2 capture, or run it when they win `try_begin`. The
+    /// bound is [`Self::contribution_head_deadline`]: slot end, `now` plus
+    /// `attestation_fetch`, or the contribution signing deadline, whichever
+    /// is earliest. The signing deadline can be slot end plus 500 ms. The
+    /// head fetch does not use that overhang. The wait does not delay
+    /// aggregation, and it does not start a second head fetch while the first
+    /// capture is running.
     #[allow(clippy::too_many_arguments)]
     async fn run_aggregation_and_contribution_phases(
         &self,
@@ -1602,10 +1631,8 @@ where
             let contribution_span = agg_phase_span.clone();
             tokio::join!(
                 async {
-                    let (deadline, _) = super::sync_committee::contribution_deadline(
-                        slot_end,
-                        self.config.timeouts.sync_contribution,
-                    );
+                    let deadline =
+                        Self::contribution_head_deadline(slot_end, &self.config.timeouts);
                     self.capture_head_if_needed(ctx, deadline, gate).await;
                     let snapshot = self.snapshot_ctx(ctx).await;
                     self.run_sync_contributions_phase(
@@ -1648,12 +1675,8 @@ where
                 Self::record_phase_offset(slot_phase_offset::CONTRIBUTION, anchor);
                 let slot_end = anchor.slot_end();
                 let head_deadline =
-                    Self::head_fetch_deadline(slot_end, self.config.timeouts.attestation_fetch);
-                let (sign_deadline, _) = super::sync_committee::contribution_deadline(
-                    slot_end,
-                    self.config.timeouts.sync_contribution,
-                );
-                self.capture_head_if_needed(ctx, head_deadline.min(sign_deadline), gate).await;
+                    Self::contribution_head_deadline(slot_end, &self.config.timeouts);
+                self.capture_head_if_needed(ctx, head_deadline, gate).await;
                 let snapshot = self.snapshot_ctx(ctx).await;
                 self.run_sync_contributions_phase(
                     current_slot,

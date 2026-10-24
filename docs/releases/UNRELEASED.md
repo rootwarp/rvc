@@ -257,35 +257,55 @@ latch. Do not stop the node while
 ## Head capture deadline and concurrent sync contributions
 
 Phase-2 head capture calls Beacon API `GET /eth/v1/beacon/blocks/{slot}/root`
-with the decimal slot. The request stops at the earlier of slot end and the
-`attestation_fetch` budget. A deadline that has already passed does not call
-the beacon node. The slot-context lock is not held across that fetch. One
-capture runs per slot. A second caller waits until that capture finishes or
-its own deadline, and does not start another fetch. The first root written
-is kept. A timeout or a body that is not `0x` plus 64 hex digits (`A-F`
-allowed) falls back to the parent captured at t=0. That fallback is a
-liveness choice: the parent is the last head this client verified, and
-signing it is valid and non-slashable for sync messages. Attestations do
-not wait for the fetch. When the attestation and sync-message deadlines
-match, the fetch runs beside attestations. When they differ, the attestation
-arm does not capture the head.
+with the decimal slot. The slot-context lock is not held across that fetch.
+One capture runs per slot. A second caller waits until that capture finishes
+or its own deadline, and does not start another fetch. The first root written
+is kept.
+
+When the attestation or sync-message phase owns the fetch, the request stops
+at the earlier of slot end and `now` plus the `attestation_fetch` budget.
+When the contribution phase owns the fetch, the deadline is the earliest of
+those two and the contribution signing deadline. The signing deadline is
+recomputed as a fresh `now` plus `sync_contribution`, capped at slot end plus
+500 ms, so it can sit past slot end. The head fetch does not use that 500 ms
+overhang. When the contribution and aggregate deadlines match and the
+contribution arm owns the fetch, the deadline is slot end when slot end is
+at or before both `now` plus `attestation_fetch` and the signing deadline.
+It is the earlier of those two when either one is before slot end. A
+deadline at or before `now` does not call the beacon node.
+
+When the fetch returns no root, the stored head is the parent captured at
+t=0. If that parent was not stored, the head stays unset. The fetch returns
+no root when the deadline has already passed, the fetch times out, the slot
+is empty (HTTP 404), the beacon node returns any other error, or the body is
+not `0x` plus 64 hex digits (`A-F` allowed). The parent is not always a head
+this client verified. The t=0 walk tries slot-1 through slot-4. After four
+misses it uses the beacon node's `head` header and keeps that header's root
+when `header.slot` is below the proposal slot. Signing the fallback root is
+valid and non-slashable for sync messages. Attestations do not wait for the
+fetch. When the attestation and sync-message deadlines match, the fetch runs
+beside attestations. When they differ, the attestation arm does not capture
+the head.
 
 `BnManager::get_block_root` uses the same `attestation_fetch` budget, so a
 hung beacon node fails over inside that budget.
 
 Sync contributions use the phase-2 head. They do not start a second fetch
 while that capture is running. When the contribution and aggregate deadlines
-match, aggregation starts at that shared wait. Contributions wait for the
-in-flight phase-2 capture, bounded by the contribution signing deadline, and
-that wait does not delay aggregation. Contribution intake stops at slot end.
-Subcommittees not pulled onto the pipeline before slot end increment the
-slot-end drop counter. The counter is cumulative for the sync-committee
-service. An in-flight fetch or signature is not a drop; only items
-`take_until(slot_end)` did not yield are counted. A fetch, a signature, or
-a publish already running stops at the earlier of the `sync_contribution`
-timeout and slot end plus 500 ms. Selection proofs and contribution
-signatures stop at that same instant, so a slow remote signer cannot stretch
-the phase. A subcommittee index outside `0..4` is skipped before any
+match, aggregation starts at that shared wait. Contributions run the head
+fetch when they win it, and otherwise wait for the in-flight capture. That
+wait uses the contribution head deadline above. It does not delay
+aggregation. Contribution intake stops at slot end. Items not pulled onto
+the pipeline before slot end increment the slot-end drop counter.
+Sync-message drops are duties. Contribution drops are one item per duty and
+subcommittee. The counter adds those counts, so one increment is not always
+one subcommittee. It is cumulative for the sync-committee service, and it is
+a log field, not a Prometheus metric. An in-flight fetch or signature is not
+a drop. A fetch, a signature, or a publish already running stops at the
+earlier of a fresh `now` plus the `sync_contribution` timeout and slot end
+plus 500 ms. Each step computes that deadline again. Only the slot end plus
+500 ms cap is shared. A slow remote signer cannot stretch one step past its
+own deadline. A subcommittee index outside `0..4` is skipped before any
 signature. Duplicate subcommittee indices are one fetch and one
 contribution-and-proof. The contribution body must match the duty slot, the
 phase-2 head, and the requested subcommittee, with a 16-byte aggregation

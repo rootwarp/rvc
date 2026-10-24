@@ -663,3 +663,421 @@ async fn gloas_timings_publish_a_head_that_returns_inside_the_fetch_budget() {
     head_delay_publishes(Duration::from_millis(3_500), [0xab; 32], 6_500).await;
     head_delay_publishes(Duration::from_secs(5), [0x11; 32], 7_000).await;
 }
+
+/// Contribution and aggregate share 6_000 ms. Attestation and sync messages
+/// wait until 9_000 ms, so the contribution arm calls `try_begin` first.
+/// `attestation_fetch` and `sync_contribution` are both 30 s, longer than the
+/// 6 s left in the slot, so the only instant before slot end + 500 ms is
+/// slot end itself.
+fn contribution_owns_head_deadlines() -> DeadlineBps {
+    DeadlineBps {
+        attestation: 7_500,
+        sync_message: 7_500,
+        aggregate: 5_000,
+        contribution: 5_000,
+        payload: 5_000,
+        payload_attestation: 7_500,
+    }
+}
+
+#[derive(Clone)]
+struct HeadPublish {
+    root: [u8; 32],
+    at: tokio::time::Instant,
+}
+
+struct HungHeadRun {
+    origin: tokio::time::Instant,
+    root_arrivals: Vec<tokio::time::Instant>,
+    publishes: Vec<HeadPublish>,
+}
+
+/// Hung `get_block_root`. The contribution phase owns the capture. A timeout
+/// publishes the t=0 parent.
+async fn run_hung_contribution_head(
+    deadlines: DeadlineBps,
+    attestation_fetch: Duration,
+    sync_contribution: Duration,
+    shutdown_ms: u64,
+) -> HungHeadRun {
+    let origin = tokio::time::Instant::now();
+    let slot: Slot = 33;
+    let config = create_test_config()
+        .with_timeouts(OperationTimeouts {
+            attestation_fetch,
+            sync_contribution,
+            ..OperationTimeouts::default()
+        })
+        .with_deadline_schedule(DeadlineSchedule { pre_gloas: deadlines, gloas: deadlines });
+    let (secret, pubkey) =
+        find_aggregator(slot, &[0], &config.fork_schedule, config.genesis_validators_root);
+    let pubkey_hex = format!("0x{}", hex::encode(pubkey.to_bytes()));
+    let published = Arc::new(StdMutex::new(Vec::new()));
+    let beacon = Arc::new(
+        MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::GetBlockRoot, Duration::from_secs(30))
+            .with_slot_aware_block_root(slot + 1, &[], move |queried| match queried {
+                Some(queried_slot) if queried_slot == slot => hex_root(0xab),
+                _ => hex_root(0x11),
+            })
+            .with_get_attester_duties({
+                let pubkey_hex = pubkey_hex.clone();
+                move |epoch, _| {
+                    let data = if epoch == 1 {
+                        vec![attester_duty(&pubkey_hex, slot)]
+                    } else {
+                        Vec::new()
+                    };
+                    Ok(DependentRootResponse {
+                        dependent_root: hex_root(0),
+                        execution_optimistic: false,
+                        data,
+                    })
+                }
+            })
+            .with_get_attestation_data(|requested, _| {
+                Ok(DataResponse { data: attestation_data(requested) })
+            })
+            .with_post_sync_committee_duties({
+                let duty_pk = pubkey.to_bytes();
+                move |_epoch, _| {
+                    Ok(ExecutionOptimisticResponse {
+                        execution_optimistic: false,
+                        data: vec![SyncCommitteeDuty {
+                            pubkey: duty_pk,
+                            validator_index: 1,
+                            validator_sync_committee_indices: vec![0],
+                        }],
+                    })
+                }
+            })
+            .with_get_sync_committee_contribution(move |requested, subcommittee, root| {
+                Ok(DataResponse {
+                    data: eth_types::SyncCommitteeContribution {
+                        slot: requested,
+                        beacon_block_root: decode_root(&root),
+                        subcommittee_index: subcommittee,
+                        aggregation_bits: vec![0xff; 16],
+                        signature: vec![1u8; 96],
+                    },
+                })
+            })
+            .with_submit_contribution_and_proofs({
+                let published = Arc::clone(&published);
+                move |proofs| {
+                    let at = tokio::time::Instant::now();
+                    published.lock().expect("proofs").extend(proofs.iter().map(|proof| {
+                        HeadPublish { root: proof.message.contribution.beacon_block_root, at }
+                    }));
+                    Ok(())
+                }
+            }),
+    );
+    let duty_tracker = Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()]));
+    duty_tracker.fetch_duties_for_epoch(1).await.expect("attester duties");
+    duty_tracker.fetch_sync_committee_duties(1).await.expect("sync duties");
+    let mut key_manager = KeyManager::new();
+    key_manager.insert(secret);
+    let signer = Arc::new(
+        SignerService::new(
+            Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+            Arc::new(SlashingDb::open_in_memory().expect("memory slashing db")),
+        )
+        .with_enablement(always_enabled()),
+    );
+    let store = Arc::new(ValidatorStore::new([0xaa; 20], 30_000_000));
+    store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).expect("add validator");
+    let mut map = HashMap::new();
+    map.insert(pubkey.to_bytes(), pubkey);
+    let clock = Arc::new(MockSlotClock::new(0, Duration::from_millis(SLOT_MS), 32));
+    clock.set_slot(slot);
+    let (mut orchestrator, handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        duty_tracker,
+        signer,
+        Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+        beacon.clone(),
+        create_mock_block_beacon(),
+        None,
+        store,
+        config,
+        Arc::new(parking_lot::RwLock::new(map)),
+    ));
+    tokio::spawn(async move {
+        tokio::time::sleep_until(origin + Duration::from_millis(shutdown_ms)).await;
+        handle.shutdown();
+    });
+    orchestrator.run().await.expect("run");
+    let root_arrivals = beacon
+        .call_stamps()
+        .into_iter()
+        .filter(|stamp| stamp.method == MockMethod::GetBlockRoot)
+        .map(|stamp| stamp.at)
+        .collect();
+    let publishes = published.lock().expect("proofs").clone();
+    HungHeadRun { origin, root_arrivals, publishes }
+}
+
+/// Equal contribution and aggregate deadlines, contribution phase only, so
+/// that arm owns `try_begin`. A 30 s hang is longer than the 6 s left in the
+/// slot and longer than the 500 ms overhang. The phase returns at slot end
+/// and stores the t=0 parent. Contribution intake is already closed then, so
+/// this slot does not sign that parent.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shared_contribution_head_fetch_stops_at_slot_end() {
+    let origin = tokio::time::Instant::now();
+    let slot: Slot = 33;
+    let deadlines = contribution_owns_head_deadlines();
+    let config = create_test_config()
+        .with_timeouts(OperationTimeouts {
+            attestation_fetch: Duration::from_secs(30),
+            sync_contribution: Duration::from_secs(30),
+            ..OperationTimeouts::default()
+        })
+        .with_deadline_schedule(DeadlineSchedule { pre_gloas: deadlines, gloas: deadlines });
+    let beacon = Arc::new(
+        MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::GetBlockRoot, Duration::from_secs(30))
+            .with_slot_aware_block_root(slot + 1, &[], move |queried| match queried {
+                Some(queried_slot) if queried_slot == slot => hex_root(0xab),
+                _ => hex_root(0x11),
+            }),
+    );
+    let clock = Arc::new(MockSlotClock::new(0, Duration::from_millis(SLOT_MS), 32));
+    clock.set_slot(slot);
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock.clone(),
+        Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()])),
+        Arc::new(SignerService::new(
+            Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new()))),
+            Arc::new(SlashingDb::open_in_memory().expect("memory slashing db")),
+        )),
+        Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+        beacon.clone(),
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        config,
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+    ));
+    let anchor = SlotAnchor::capture(clock.as_ref(), slot);
+    let parent = [0x11; 32];
+    let ctx = tokio::sync::Mutex::new(SlotContext {
+        slot,
+        epoch: 1,
+        parent_root: Some(parent),
+        expected_parents: None,
+        head_root: None,
+        fence: beacon::DutyFence::open(),
+    });
+    let gate = Phase2Head::new();
+    let outcome = orchestrator
+        .run_aggregation_and_contribution_phases(
+            slot,
+            1,
+            &ctx,
+            deadlines,
+            tracing::info_span!("agg"),
+            &anchor,
+            &gate,
+        )
+        .await;
+    assert!(matches!(outcome, WaitOutcome::Continue));
+    let elapsed = tokio::time::Instant::now().saturating_duration_since(origin);
+    assert!(
+        elapsed + Duration::from_millis(50) >= Duration::from_millis(SLOT_MS)
+            && elapsed <= Duration::from_millis(SLOT_MS + 50),
+        "phase returned after {elapsed:?}, not at slot end"
+    );
+    let arrivals: Vec<_> = beacon
+        .call_stamps()
+        .into_iter()
+        .filter(|stamp| stamp.method == MockMethod::GetBlockRoot)
+        .collect();
+    assert_eq!(arrivals.len(), 1, "the contribution phase starts one fetch");
+    within(arrivals[0].at, origin, 6_000);
+    assert_eq!(ctx.lock().await.head_root, Some(parent));
+}
+
+/// Same arm as the slot-end test. `attestation_fetch` is 1 s and
+/// `sync_contribution` is 30 s, so the fetch stops one second after it
+/// starts rather than at slot end.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn shared_contribution_head_fetch_stops_at_the_attestation_fetch_budget() {
+    let run = run_hung_contribution_head(
+        contribution_owns_head_deadlines(),
+        Duration::from_secs(1),
+        Duration::from_secs(30),
+        13_000,
+    )
+    .await;
+    assert_eq!(run.root_arrivals.len(), 1);
+    within(run.root_arrivals[0], run.origin, 6_000);
+    assert_eq!(run.publishes.len(), 1);
+    assert_eq!(run.publishes[0].root, [0x11; 32]);
+    within(run.publishes[0].at, run.origin, 7_000);
+}
+
+/// Contribution at 2_000 ms, aggregate at 8_000 ms. The contribution arm owns
+/// the fetch. `sync_contribution` is 1 s, so the signing deadline is earlier
+/// than both slot end and the 30 s attestation-fetch budget.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn split_contribution_head_deadline_is_capped_by_sign_deadline() {
+    let deadlines = DeadlineBps {
+        attestation: 7_500,
+        sync_message: 7_500,
+        aggregate: 6_667,
+        contribution: 1_667,
+        payload: 6_667,
+        payload_attestation: 7_500,
+    };
+    let run = run_hung_contribution_head(
+        deadlines,
+        Duration::from_secs(30),
+        Duration::from_secs(1),
+        13_000,
+    )
+    .await;
+    assert_eq!(run.root_arrivals.len(), 1, "the contribution arm starts the only fetch");
+    within(run.root_arrivals[0], run.origin, 2_000);
+    assert_eq!(run.publishes.len(), 1);
+    assert_eq!(run.publishes[0].root, [0x11; 32]);
+    within(run.publishes[0].at, run.origin, 3_000);
+}
+
+type HeadOrch = DutyOrchestrator<MockSlotClock, MockSubmitter, MockBlockBeacon>;
+
+/// A budget longer than the time left in the slot stops at slot end. A shorter
+/// budget stops at `now + budget`. A slot end already behind `now` stays there.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn head_fetch_deadline_is_capped_at_slot_end() {
+    let now = tokio::time::Instant::now();
+    let slot_end = now + Duration::from_secs(12);
+    assert_eq!(HeadOrch::head_fetch_deadline(slot_end, Duration::from_secs(30)), slot_end);
+    assert_eq!(
+        HeadOrch::head_fetch_deadline(slot_end, Duration::from_secs(4)),
+        now + Duration::from_secs(4)
+    );
+    let passed = now;
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let late = HeadOrch::head_fetch_deadline(passed, Duration::from_secs(4));
+    assert_eq!(late, passed);
+    assert!(late < tokio::time::Instant::now());
+}
+
+/// Slot end, the attestation-fetch budget, and the contribution signing
+/// deadline. The earliest one wins, including when slot end is already past.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn contribution_head_deadline_is_the_earliest_bound() {
+    let now = tokio::time::Instant::now();
+    let slot_end = now + Duration::from_secs(12);
+    let long = OperationTimeouts {
+        attestation_fetch: Duration::from_secs(30),
+        sync_contribution: Duration::from_secs(30),
+        ..OperationTimeouts::default()
+    };
+    assert_eq!(HeadOrch::contribution_head_deadline(slot_end, &long), slot_end);
+    let fetch_bound = OperationTimeouts {
+        attestation_fetch: Duration::from_secs(1),
+        sync_contribution: Duration::from_secs(30),
+        ..OperationTimeouts::default()
+    };
+    assert_eq!(
+        HeadOrch::contribution_head_deadline(slot_end, &fetch_bound),
+        now + Duration::from_secs(1)
+    );
+    let sign_bound = OperationTimeouts {
+        attestation_fetch: Duration::from_secs(30),
+        sync_contribution: Duration::from_millis(500),
+        ..OperationTimeouts::default()
+    };
+    assert_eq!(
+        HeadOrch::contribution_head_deadline(slot_end, &sign_bound),
+        now + Duration::from_millis(500)
+    );
+
+    let passed = now;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let late = HeadOrch::contribution_head_deadline(passed, &long);
+    assert_eq!(late, passed);
+    assert!(late < tokio::time::Instant::now());
+}
+
+/// The owner is still inside the fetch. The waiter returns at its own
+/// deadline and does not wait for the owner to finish.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn phase2_waiter_returns_at_its_deadline_while_capture_is_fetching() {
+    let gate = Phase2Head::new();
+    assert!(gate.try_begin(), "the owner must win try_begin");
+    let finish = gate.finish_on_drop();
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_millis(700);
+    tokio::select! {
+        biased;
+        _ = gate.wait_until(deadline) => {}
+        _ = tokio::time::sleep(Duration::from_millis(701)) => {
+            panic!("waiter ignored its deadline");
+        }
+    }
+    assert_eq!(
+        tokio::time::Instant::now().saturating_duration_since(started),
+        Duration::from_millis(700)
+    );
+    let later = tokio::time::Instant::now() + Duration::from_millis(500);
+    tokio::select! {
+        biased;
+        _ = gate.wait_until(later) => panic!("waiter returned while the owner was still fetching"),
+        _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+    }
+    drop(finish);
+    let before = tokio::time::Instant::now();
+    gate.wait_until(before + Duration::from_secs(30)).await;
+    assert_eq!(tokio::time::Instant::now(), before, "a finished capture wakes the waiter");
+}
+
+/// Slot end is already past when the contribution arm asks for a head. The
+/// beacon node is not called, and the stored head is the t=0 parent.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn slot_end_already_passed_does_not_fetch_a_contribution_head() {
+    let beacon = Arc::new(
+        MockBeaconNodeClient::new().with_slot_aware_block_root(34, &[], |_| hex_root(0xab)),
+    );
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    let (orchestrator, _handle) = DutyOrchestrator::new(OrchestratorDeps::for_test(
+        clock,
+        Arc::new(DutyTracker::new(beacon.clone(), vec!["1".to_string()])),
+        Arc::new(SignerService::new(
+            Arc::new(CompositeSigner::new(LocalSigner::new(KeyManager::new()))),
+            Arc::new(SlashingDb::open_in_memory().expect("memory slashing db")),
+        )),
+        Arc::new(Propagator::new(Arc::new(MockSubmitter::new()))),
+        beacon.clone(),
+        create_mock_block_beacon(),
+        None,
+        create_mock_validator_store(),
+        create_test_config(),
+        Arc::new(parking_lot::RwLock::new(HashMap::new())),
+    ));
+    let parent = [0x11; 32];
+    let ctx = tokio::sync::Mutex::new(SlotContext {
+        slot: 33,
+        epoch: 1,
+        parent_root: Some(parent),
+        expected_parents: None,
+        head_root: None,
+        fence: beacon::DutyFence::open(),
+    });
+    let slot_end = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let timeouts = OperationTimeouts {
+        attestation_fetch: Duration::from_secs(30),
+        sync_contribution: Duration::from_secs(30),
+        ..OperationTimeouts::default()
+    };
+    let deadline = HeadOrch::contribution_head_deadline(slot_end, &timeouts);
+    assert!(deadline <= tokio::time::Instant::now());
+    let gate = Phase2Head::new();
+    orchestrator.capture_head_if_needed(&ctx, deadline, &gate).await;
+    assert!(beacon.get_block_root_calls().is_empty());
+    assert_eq!(ctx.lock().await.head_root, Some(parent));
+}
