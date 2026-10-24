@@ -11,8 +11,9 @@ use eth_types::{Epoch, SLOTS_PER_EPOCH};
 /// Epoch provider immune to post-start NTP steps.
 ///
 /// ```text
-/// now_unix       = start_unix_time + start_instant.elapsed()
-/// current_epoch  = (now_unix - genesis_time) * 1000 / slot_duration_ms / SLOTS_PER_EPOCH
+/// now_unix_ms    = start_unix_time_ms + elapsed milliseconds
+/// current_slot   = (now_unix_ms - genesis_time * 1000) / slot_duration_ms
+/// current_epoch  = current_slot / SLOTS_PER_EPOCH
 /// ```
 ///
 /// `slot_duration_ms` is the beacon node's resolved slot length. A zero
@@ -26,7 +27,8 @@ use eth_types::{Epoch, SLOTS_PER_EPOCH};
 pub struct MonotonicEpochClock {
     genesis_time: u64,
     start_instant: Instant,
-    start_unix_time: u64,
+    /// Unix time at `start_instant`, in milliseconds.
+    start_unix_time_ms: u64,
     slot_duration_ms: u64,
 }
 
@@ -35,8 +37,11 @@ impl MonotonicEpochClock {
     ///
     /// `slot_duration_ms` is the value resolved from the beacon node spec.
     pub fn new(genesis_time: u64, slot_duration_ms: u64) -> Self {
-        let start_unix_time =
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let start_unix_time_ms = u64::try_from(
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let start_unix_time = start_unix_time_ms / 1000;
         let one_epoch_secs = slot_duration_ms.saturating_mul(SLOTS_PER_EPOCH) / 1000;
         if genesis_time > start_unix_time.saturating_add(one_epoch_secs) {
             // Genesis more than one epoch in the future → every call yields 0
@@ -49,20 +54,37 @@ impl MonotonicEpochClock {
                  until genesis (import path must not treat that as Safe)"
             );
         }
-        Self { genesis_time, start_instant: Instant::now(), start_unix_time, slot_duration_ms }
+        Self { genesis_time, start_instant: Instant::now(), start_unix_time_ms, slot_duration_ms }
     }
 
-    /// Test/helper constructor with explicit anchors.
+    /// Test/helper constructor with explicit anchors, in whole seconds.
     ///
     /// Production paths use [`Self::new`]; tests use this to drive
-    /// deterministic epoch values.
+    /// deterministic epoch values. Sub-second anchors use
+    /// [`Self::with_start_time_ms`].
     pub fn with_start_time(
         genesis_time: u64,
         start_instant: Instant,
         start_unix_time: u64,
         slot_duration_ms: u64,
     ) -> Self {
-        Self { genesis_time, start_instant, start_unix_time, slot_duration_ms }
+        Self::with_start_time_ms(
+            genesis_time,
+            start_instant,
+            start_unix_time.saturating_mul(1000),
+            slot_duration_ms,
+        )
+    }
+
+    /// Test/helper constructor. `start_unix_time_ms` is milliseconds since
+    /// the Unix epoch.
+    pub fn with_start_time_ms(
+        genesis_time: u64,
+        start_instant: Instant,
+        start_unix_time_ms: u64,
+        slot_duration_ms: u64,
+    ) -> Self {
+        Self { genesis_time, start_instant, start_unix_time_ms, slot_duration_ms }
     }
 
     /// Beacon-node slot length in milliseconds used by this clock.
@@ -75,8 +97,7 @@ impl MonotonicEpochClock {
     /// Slot math then saturates to epoch 0. That epoch has not started, so it
     /// must not count and must not take the epoch-0 Safe bypass.
     pub fn before_genesis(&self) -> bool {
-        Self::now_unix(self.start_unix_time, self.start_instant.elapsed().as_secs())
-            < self.genesis_time
+        self.now_unix_ms() < self.genesis_time.saturating_mul(1000)
     }
 
     /// Epoch-0 Safe bypass for a named network whose clock has reached genesis.
@@ -87,8 +108,10 @@ impl MonotonicEpochClock {
         named_network && now_unix >= genesis_time
     }
 
-    fn now_unix(start_unix_time: u64, elapsed_secs: u64) -> u64 {
-        start_unix_time.saturating_add(elapsed_secs)
+    fn now_unix_ms(&self) -> u64 {
+        let elapsed_ms =
+            u64::try_from(self.start_instant.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.start_unix_time_ms.saturating_add(elapsed_ms)
     }
 
     /// Current epoch from the monotonic clock.
@@ -111,12 +134,11 @@ impl MonotonicEpochClock {
         {
             return u64::MAX;
         }
-        let elapsed_secs = self.start_instant.elapsed().as_secs();
-        let now_unix = Self::now_unix(self.start_unix_time, elapsed_secs);
+        let now_ms = self.now_unix_ms();
+        let genesis_ms = self.genesis_time.saturating_mul(1000);
         // Before genesis this saturates to 0. That is not slot 0 of epoch 0;
         // `before_genesis` is how boot refuses the Safe bypass.
-        let secs_since_genesis = now_unix.saturating_sub(self.genesis_time);
-        let elapsed_ms = secs_since_genesis.saturating_mul(1000);
+        let elapsed_ms = now_ms.saturating_sub(genesis_ms);
         elapsed_ms.checked_div(self.slot_duration_ms).unwrap_or(u64::MAX)
     }
 

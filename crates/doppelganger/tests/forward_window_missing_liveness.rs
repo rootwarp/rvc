@@ -156,7 +156,7 @@ fn test_missing_entry_epoch_keeps_validator_pending_through_boundary() {
     assert_eq!(missing, vec![hex::encode(pubkey.to_bytes())], "empty samples return the key");
 
     // Tick to the satisfaction boundary.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
 
     assert!(
         !machine.is_signing_enabled(&pubkey),
@@ -180,7 +180,7 @@ fn test_missing_entry_keeps_pending_even_far_past_boundary() {
     for epoch in start_epoch..start_epoch + 5 {
         let missing = machine.observe_liveness(epoch, &[], epoch + 1, CLOSED_EPOCH_SLOT);
         assert_eq!(missing, vec![pubkey_hex.clone()], "epoch {epoch} has no index");
-        machine.tick(epoch + 50, 0);
+        machine.statuses(epoch + 50, 0);
         assert!(
             !machine.is_signing_enabled(&pubkey),
             "no index and a far tick must not open the gate at epoch {epoch}"
@@ -230,7 +230,7 @@ fn test_start_epoch_absent_end_epoch_present_stays_pending() {
     );
 
     // Tick to boundary — start_epoch was never recorded → window incomplete → stays Pending.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "start_epoch absent + end_epoch present must NOT satisfy the window (fail-closed)"
@@ -255,7 +255,7 @@ fn test_complete_observation_yields_safe_at_boundary() {
 
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
 
     assert!(
         machine.is_signing_enabled(&pubkey),
@@ -276,7 +276,7 @@ fn test_complete_observation_monitoring_epochs_2_yields_safe() {
 
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
         "monitoring_epochs=2: all 3 epochs observed completely → Safe at boundary"
@@ -304,7 +304,7 @@ fn test_partial_observation_only_start_epoch_stays_pending() {
         "start_epoch must succeed"
     );
 
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "only start_epoch observed (missing middle and end_epoch) → must stay Pending"
@@ -364,7 +364,7 @@ fn test_detected_is_terminal_tick_past_boundary_still_denied() {
     assert!(!machine.is_signing_enabled(&pubkey), "Detected → signing denied");
 
     // Tick far past end_epoch.
-    machine.tick(end_epoch + 10, 0);
+    machine.statuses(end_epoch + 10, 0);
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "Detected is terminal: tick past end_epoch must NOT resurrect to Safe"
@@ -419,6 +419,11 @@ fn test_duplicate_sample_or_semantics_true_wins() {
         !machine.is_signing_enabled(&pubkey),
         "OR-fold: (false, true) → is_live=true must win → Detected"
     );
+    assert_eq!(
+        machine.status(&pubkey),
+        ForwardWindowStatus::Detected,
+        "OR-fold: (false, true) is Detected, not a Pending key that also cannot sign"
+    );
 }
 
 /// (true, false): a last-wins fold keeps false and misses the detection.
@@ -445,6 +450,35 @@ fn test_duplicate_sample_reverse_order_true_then_false_detects() {
         !machine.is_signing_enabled(&pubkey),
         "OR-fold: (true, false) → is_live=true must win → Detected"
     );
+}
+
+/// Tick path: `(false, true)` in one epoch answer is Detected.
+///
+/// A first-wins fold keeps false. `!is_signing_enabled` is also true for
+/// `Pending`, so the status is the assertion that kills that fold.
+#[test]
+fn test_duplicate_sample_tick_true_wins_is_detected() {
+    let machine = machine();
+    let pubkey = new_pubkey();
+    let pubkey_hex = hex::encode(pubkey.to_bytes());
+    let start_epoch: Epoch = 85;
+    machine.register(&pubkey, start_epoch);
+
+    let samples = vec![
+        ValidatorLivenessData { index: pubkey_hex.clone(), is_live: false },
+        ValidatorLivenessData { index: pubkey_hex, is_live: true },
+    ];
+    let current = start_epoch + 1;
+    let _ = machine.apply_liveness_tick(
+        &[
+            EpochLiveness { epoch: start_epoch, samples: Some(samples.clone()) },
+            EpochLiveness { epoch: current, samples: Some(samples) },
+        ],
+        current,
+        24,
+    );
+    assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Detected);
+    assert!(!machine.is_signing_enabled(&pubkey));
 }
 
 /// If a pubkey appears twice both not-live, OR-fold keeps false → stays Pending.
@@ -478,7 +512,7 @@ fn test_duplicate_sample_or_semantics_both_false_stays_pending() {
         "end_epoch must succeed"
     );
 
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
         "OR-fold: (false, false) → is_live=false → Safe after complete window"
@@ -518,7 +552,7 @@ fn test_out_of_window_before_start_ignored_completely() {
 
     // Now provide complete observation for in-window epochs and confirm Safe.
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
         "complete in-window observation after out-of-window ignore → Safe"
@@ -539,7 +573,7 @@ fn test_observe_liveness_returns_ok_when_no_pending_in_window_validators() {
 
     // Observe completely to reach Safe.
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pubkey), "must be Safe");
 
     // Now call observe_liveness for another epoch with empty samples.
@@ -611,7 +645,7 @@ fn test_multi_validator_partial_response_a_present_b_absent() {
     );
 
     // Tick to boundary — both should now be Safe.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pk_a), "A must be Safe after complete observation");
     assert!(machine.is_signing_enabled(&pk_b), "B must be Safe after retry + complete observation");
 }
@@ -647,7 +681,7 @@ fn test_multi_validator_b_never_retried_stays_pending() {
     assert_eq!(missing_end, vec![hex::encode(pk_b.to_bytes())]);
 
     // Tick to boundary.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
 
     // A has both start_epoch and end_epoch recorded → Safe.
     assert!(machine.is_signing_enabled(&pk_a), "A (fully observed) must be Safe");

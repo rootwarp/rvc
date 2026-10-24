@@ -32,7 +32,7 @@ pub enum ValidatorState {
     Detected,
 }
 
-/// Observable status returned by [`crate::ForwardWindowMachine::tick`] and
+/// Observable status returned by [`crate::ForwardWindowMachine::statuses`] and
 /// [`crate::ForwardWindowMachine::status`].
 ///
 /// `Copy` so callers can cheaply pass it around without cloning.

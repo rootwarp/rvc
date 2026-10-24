@@ -171,3 +171,14 @@ fn test_huge_slot_duration_is_not_epoch_zero() {
     );
     assert_ne!(day.current_epoch(), 0);
 }
+
+/// A start 4.5 s after genesis, with 1500 ms slots, is slot 3.
+#[test]
+fn test_epoch_clock_keeps_sub_second_precision() {
+    let genesis = 1_700_000_000_u64;
+    let start_ms = genesis.saturating_mul(1000).saturating_add(4_500);
+    let clock = MonotonicEpochClock::with_start_time_ms(genesis, Instant::now(), start_ms, 1_500);
+    assert!(!clock.before_genesis());
+    assert_eq!(clock.current_slot(), 3);
+    assert_eq!(clock.current_epoch(), 0);
+}

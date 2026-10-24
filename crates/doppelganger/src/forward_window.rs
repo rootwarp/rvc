@@ -327,8 +327,7 @@ impl ForwardWindowMachine {
     /// target epoch that is RECENT (within the monitoring window), the validator
     /// transitions straight to `Safe` without waiting for the full window.
     /// A stale attestation (outside the window) does NOT trigger the skip.
-    /// Uses the shared [`crate::should_skip_restart_monitoring`] predicate
-    /// (same rule as the legacy service).
+    /// Uses [`crate::should_skip_restart_monitoring`].
     pub fn register(&self, pubkey: &crypto::PublicKey, current_epoch: Epoch) {
         let pubkey_hex = hex::encode(pubkey.to_bytes());
         let force_blocks = self.force_window_path.as_deref().is_some_and(path_blocks_skip);
@@ -427,12 +426,13 @@ impl ForwardWindowMachine {
         );
     }
 
-    /// Report status. Does not open the gate.
+    /// Snapshot every registered validator's status. Does not open the gate.
     ///
-    /// Safe happens only inside [`Self::observe_liveness`] or
-    /// [`Self::apply_liveness_tick`] when `remaining` hits 0. A tick past any
-    /// epoch, including one far ahead, leaves `Pending` keys `Pending`.
-    pub fn tick(&self, _current_epoch: Epoch, _slot_in_epoch: u64) -> Vec<ForwardWindowStatus> {
+    /// Both arguments are ignored. Safe happens only inside
+    /// [`Self::observe_liveness`] or [`Self::apply_liveness_tick`] when
+    /// `remaining` hits 0. A call past any epoch, including one far ahead,
+    /// leaves `Pending` keys `Pending`.
+    pub fn statuses(&self, _current_epoch: Epoch, _slot_in_epoch: u64) -> Vec<ForwardWindowStatus> {
         let states = self.states.lock();
         let mut statuses = Vec::with_capacity(states.by_pubkey.len());
         for state in states.by_pubkey.values() {
@@ -508,13 +508,11 @@ impl ForwardWindowMachine {
 
         let latch_hook = self.latch_hook_snapshot();
         let mut states = self.states.lock();
-        let keys: Vec<String> = states.by_pubkey.keys().cloned().collect();
         let mut unobserved = Vec::new();
         let mut arm_latch = false;
         let mut window_completed = false;
         let mut finished = Vec::new();
-        for key in keys {
-            let Some(state) = states.by_pubkey.get_mut(&key) else { continue };
+        for (key, state) in states.by_pubkey.iter_mut() {
             let ValidatorState::Pending { next_check_epoch, remaining } = *state else {
                 continue;
             };
@@ -543,7 +541,7 @@ impl ForwardWindowMachine {
                     }
                 }
                 Some(false) => {}
-                None => unobserved.push(key),
+                None => unobserved.push(key.clone()),
             }
         }
         if arm_latch && !states.detected_latch {
@@ -613,13 +611,11 @@ impl ForwardWindowMachine {
 
         let latch_hook = self.latch_hook_snapshot();
         let mut states = self.states.lock();
-        let keys: Vec<String> = states.by_pubkey.keys().cloned().collect();
         let mut unobserved = Vec::new();
         let mut arm_latch = false;
         let mut window_completed = false;
         let mut finished = Vec::new();
-        for key in keys {
-            let Some(state) = states.by_pubkey.get_mut(&key) else { continue };
+        for (key, state) in states.by_pubkey.iter_mut() {
             let ValidatorState::Pending { next_check_epoch, remaining } = *state else {
                 continue;
             };
@@ -658,7 +654,7 @@ impl ForwardWindowMachine {
             }
 
             if saw_live {
-                unobserved.retain(|(_, pubkey)| pubkey != &key);
+                unobserved.retain(|(_, pubkey)| pubkey != key);
                 *state = ValidatorState::Detected;
                 arm_latch = true;
                 continue;

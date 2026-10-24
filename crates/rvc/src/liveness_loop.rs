@@ -6,7 +6,7 @@
 //! Each cycle (once per slot):
 //! 1. Fetch liveness for the previous epoch and the current epoch
 //! 2. Translate numeric validator indices → bare pubkey-hex (SEC-001)
-//! 3. Apply both answers in one step, then `tick`
+//! 3. Apply both answers in one step, then read [`ForwardWindowMachine::statuses`]
 //!
 //! Index refresh is not done here. [`crate::index_resolver::IndexResolver`] is the
 //! single production writer (ADR-R05).
@@ -130,6 +130,8 @@ pub struct LivenessObservationLoop {
     tracked_keys: Option<Arc<TrackedKeys>>,
     /// `(pubkey hex, epoch)` pairs already logged as unobserved.
     unobserved_warned: parking_lot::Mutex<HashSet<(String, Epoch)>>,
+    /// Pubkeys already logged once because they have no validator index.
+    no_index_noted: parking_lot::Mutex<HashSet<String>>,
     /// Drain request. Production [`spawn_liveness_loop`] always sets this.
     exit_request: Option<Arc<dyn ExitRequest>>,
     /// Validator data directory for the detection marker. Production sets this
@@ -216,6 +218,7 @@ impl LivenessObservationLoop {
             import_sidecar_dir: None,
             tracked_keys: None,
             unobserved_warned: parking_lot::Mutex::new(HashSet::new()),
+            no_index_noted: parking_lot::Mutex::new(HashSet::new()),
             exit_request: None,
             detection_marker_dir: None,
             #[cfg(any(test, feature = "test-utils"))]
@@ -332,7 +335,7 @@ impl LivenessObservationLoop {
                 let slot_in_epoch = self.clock_slot();
                 let skip_decrement = current_epoch != epoch_at_query;
                 self.record_liveness(&answers, epoch_at_query, slot_at_query, skip_decrement);
-                let statuses = self.machine.tick(current_epoch, slot_in_epoch);
+                let statuses = self.machine.statuses(current_epoch, slot_in_epoch);
                 let detected =
                     statuses.iter().filter(|s| **s == ForwardWindowStatus::Detected).count();
                 let pending =
@@ -458,7 +461,7 @@ impl LivenessObservationLoop {
     ) -> Vec<ForwardWindowStatus> {
         let answers = self.observe_adjacent(current_epoch, slot_in_epoch).await;
         self.record_liveness(&answers, current_epoch, slot_in_epoch, false);
-        let statuses = self.machine.tick(current_epoch, slot_in_epoch);
+        let statuses = self.machine.statuses(current_epoch, slot_in_epoch);
         self.record_completed_imports();
         statuses
     }
@@ -546,7 +549,11 @@ impl LivenessObservationLoop {
         answers
     }
 
-    /// Apply one tick's answers and warn once per unobserved key.
+    /// Apply one tick's answers.
+    ///
+    /// A key with no validator index is logged once at info. An omitted or
+    /// failed answer for a key that has an index is warned once per
+    /// `(pubkey, epoch)`.
     fn record_liveness(
         &self,
         answers: &[EpochLiveness],
@@ -559,17 +566,55 @@ impl LivenessObservationLoop {
         } else {
             self.machine.apply_liveness_tick(answers, current_epoch, slot_in_epoch)
         };
+        let indexed = self.indexed_bare_hexes();
         let mut by_epoch: HashMap<Epoch, Vec<String>> = HashMap::new();
+        let mut no_index = Vec::new();
         for (epoch, key) in unobserved {
-            by_epoch.entry(epoch).or_default().push(key);
+            if indexed.contains(&key) {
+                by_epoch.entry(epoch).or_default().push(key);
+            } else {
+                no_index.push(key);
+            }
         }
+        self.note_no_index(&no_index);
         for (epoch, keys) in by_epoch {
             self.warn_unobserved(current_epoch, epoch, &keys);
         }
     }
 
-    /// One warning per `(pubkey, epoch)`. Entries older than the previous
-    /// epoch are dropped; those epochs are no longer queried.
+    fn indexed_bare_hexes(&self) -> HashSet<String> {
+        self.pubkey_index.read().index_to_bare_hex().values().cloned().collect()
+    }
+
+    /// Log once per pubkey that has no beacon index yet.
+    ///
+    /// An omitted or failed answer for a key that already has an index still
+    /// goes through [`Self::warn_unobserved`].
+    fn note_no_index(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        let mut noted = self.no_index_noted.lock();
+        let mut fresh = Vec::new();
+        for key in keys {
+            if noted.insert(key.clone()) {
+                fresh.push(key.clone());
+            }
+        }
+        drop(noted);
+        for key in fresh {
+            info!(
+                pubkey = %observability::logging::TruncatedPubkey::new(&key),
+                "doppelganger liveness: no index yet; Safe stays closed until an index is known"
+            );
+        }
+    }
+
+    /// One warning per `(pubkey, epoch)` when a queried key is omitted or the
+    /// query fails.
+    ///
+    /// Pairs with `epoch < current_epoch.saturating_sub(2)` are dropped
+    /// (`retain_from`). A key with no validator index is not warned here.
     fn warn_unobserved(&self, current_epoch: Epoch, epoch: Epoch, keys: &[String]) {
         if keys.is_empty() {
             return;
@@ -704,6 +749,7 @@ mod tests {
     use crate::pubkey_index::PubkeyIndexRegistry;
     use bn_manager::MockBeaconNodeClient;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
 
     use beacon::{
         BeaconError, ValidatorData, ValidatorInfo, ValidatorLiveness, ValidatorLivenessResponse,
@@ -952,7 +998,7 @@ mod tests {
         assert_eq!(m.status(&pk), ForwardWindowStatus::Detected);
         assert!(!m.is_signing_enabled(&pk), "Detected must keep gate closed");
 
-        m.tick(start + DEFAULT_MONITORING_EPOCHS + 5, 0);
+        m.statuses(start + DEFAULT_MONITORING_EPOCHS + 5, 0);
         assert!(!m.is_signing_enabled(&pk));
         assert!(!m.is_signing_enabled(&pk), "no signing when Detected (enablement false)");
     }
@@ -975,6 +1021,85 @@ mod tests {
         );
         assert!(m.is_signing_enabled(&pk), "signing must proceed after clean window");
         assert_eq!(m.status(&pk), ForwardWindowStatus::Safe);
+    }
+
+    struct LoopLog(Arc<std::sync::Mutex<String>>);
+
+    struct LoopLogVisitor<'a>(&'a mut String);
+
+    impl tracing::field::Visit for LoopLogVisitor<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={:?}", field.name(), value);
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            use std::fmt::Write;
+            let _ = write!(self.0, " {}={}", field.name(), value);
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for LoopLog
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut line = String::new();
+            event.record(&mut LoopLogVisitor(&mut line));
+            let mut buf = self.0.lock().expect("logs");
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+    }
+
+    /// A key with no beacon index logs once at info across epochs.
+    ///
+    /// The same loop then warns when that key has an index and the answer
+    /// omits it. The info line does not repeat.
+    #[tokio::test(flavor = "current_thread")]
+    async fn no_index_key_logs_once_not_per_epoch() {
+        let logs = Arc::new(std::sync::Mutex::new(String::new()));
+        let subscriber = tracing_subscriber::registry().with(LoopLog(Arc::clone(&logs)));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let m = machine();
+        let pk = new_pk();
+        let start = 10u64;
+        m.register(&pk, start);
+        let reg = PubkeyIndexRegistry::shared();
+        let loop_ = LivenessObservationLoop::new(
+            Arc::clone(&m),
+            Arc::new(all_not_live(&[]).0),
+            reg,
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
+            CancellationToken::new(),
+        )
+        .with_slot_duration(Duration::from_millis(1));
+        loop_.drive_once_for_test(start + 1, CLOSED_EPOCH_SLOT).await;
+        loop_.drive_once_for_test(start + 2, CLOSED_EPOCH_SLOT).await;
+        let text = logs.lock().expect("logs").clone();
+        assert_eq!(text.matches("no index yet").count(), 1, "{text}");
+        assert_eq!(text.matches("doppelganger liveness unobserved").count(), 0, "{text}");
+        assert!(!m.is_signing_enabled(&pk));
+
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(pk.to_bytes(), "7".to_string());
+        let loop_ = LivenessObservationLoop::new(
+            Arc::clone(&m),
+            Arc::new(all_not_live(&[]).0),
+            reg,
+            Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
+            CancellationToken::new(),
+        )
+        .with_slot_duration(Duration::from_millis(1));
+        loop_.drive_once_for_test(start + 3, CLOSED_EPOCH_SLOT).await;
+        let text = logs.lock().expect("logs").clone();
+        assert_eq!(text.matches("no index yet").count(), 1, "{text}");
+        assert!(text.matches("doppelganger liveness unobserved").count() >= 1, "{text}");
     }
 
     /// A completed forward window removes the import sidecar. Pending and
@@ -1477,21 +1602,25 @@ mod tests {
         m.register(&pk, start);
         let prefix = hex::encode(pk.to_bytes());
         let prefix = &prefix[..10];
+        let reg = PubkeyIndexRegistry::shared();
+        reg.write().insert(pk.to_bytes(), "7".to_string());
+        // Index 7 is known and the answer omits it, so this is the per-epoch warn.
         let loop_ = LivenessObservationLoop::new(
             Arc::clone(&m),
-            Arc::new(MockBeaconNodeClient::new()),
-            PubkeyIndexRegistry::shared(),
+            Arc::new(all_not_live(&[]).0),
+            reg,
             Arc::new(MonotonicEpochClock::with_start_time(0, std::time::Instant::now(), 0, 12_000)),
             CancellationToken::new(),
         );
         loop_.drive_once_for_test(start, CLOSED_EPOCH_SLOT).await;
         loop_.drive_once_for_test(start, CLOSED_EPOCH_SLOT).await;
         let epoch_10 = format!("epoch={start}");
+        let warn = "doppelganger liveness unobserved";
         logs_assert(|lines| {
             let hits = lines
                 .iter()
                 .filter(|line| {
-                    line.contains("unobserved") && line.contains(&epoch_10) && line.contains(prefix)
+                    line.contains(warn) && line.contains(&epoch_10) && line.contains(prefix)
                 })
                 .count();
             if hits == 1 {
@@ -1505,12 +1634,14 @@ mod tests {
         logs_assert(|lines| {
             let first = lines
                 .iter()
-                .filter(|line| line.contains("unobserved") && line.contains(&epoch_10))
+                .filter(|line| {
+                    line.contains(warn) && line.contains(&epoch_10) && line.contains(prefix)
+                })
                 .count();
             let second = lines
                 .iter()
                 .filter(|line| {
-                    line.contains("unobserved") && line.contains(&epoch_11) && line.contains(prefix)
+                    line.contains(warn) && line.contains(&epoch_11) && line.contains(prefix)
                 })
                 .count();
             if first == 1 && second == 1 {

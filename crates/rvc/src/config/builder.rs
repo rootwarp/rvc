@@ -910,11 +910,11 @@ impl ServiceBuilder {
             import_strict,
             "ForwardWindowMachine constructed (SEC-2b/2c). Keys stay closed until \
              {closed_epochs} closed not-live epochs are observed (a gap delays \
-             Safe; there is no timeout). The liveness loop (SEC-2c) feeds \
-             observe_liveness via bn-manager failover. Epoch-0 bypass and \
-             restart-aware safe-skip apply only to keys that are not an unfinished \
-             import (open hold, any import sidecar, staged sidecar, \
-             or an unreadable keystore directory or validators file)."
+             Safe; there is no timeout). The liveness loop (SEC-2c) applies both \
+             epoch answers with apply_liveness_tick via bn-manager failover. \
+             Epoch-0 bypass and restart-aware safe-skip apply only to keys that \
+             are not an unfinished import (open hold, any import sidecar, staged \
+             sidecar, or an unreadable keystore directory or validators file)."
         );
 
         (Arc::clone(&machine) as Arc<dyn SigningEnablement>, Some(machine))
@@ -2915,7 +2915,7 @@ mod tests {
 
         // Tick well past the boundary WITHOUT observe_liveness → still closed.
         let end_epoch = 50 + DEFAULT_MONITORING_EPOCHS;
-        machine.tick(end_epoch + 5, 0);
+        machine.statuses(end_epoch + 5, 0);
         assert!(
             !enablement.is_signing_enabled(&pk),
             "without complete liveness observation the gate must stay closed (D-2 fail-closed)"
