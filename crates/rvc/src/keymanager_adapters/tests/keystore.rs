@@ -1599,6 +1599,9 @@ fn delete_retry_removes_a_leftover_secret() {
     );
     assert!(!secret.exists(), "the retry removes the leftover plaintext");
     assert!(!adapter.has_key(&pk));
+    let denylist = crate::deletion_denylist::DeletionDenylist::load(keystore_dir.path())
+        .expect("denylist reloads");
+    assert!(denylist.contains(&pk), "a successful retry of an absent key is denylisted");
 }
 
 #[test]
@@ -1636,24 +1639,20 @@ fn import_rejects_a_password_over_the_boot_limit() {
     assert!(names.is_empty(), "an oversized password must write nothing, found {names:?}");
 }
 
-/// Root can unlink a file in a mode `0500` directory, so a DAC denial is not
-/// observable and must not be asserted.
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn root_ignores_directory_mode() -> bool {
-    // SAFETY: geteuid only reads this process's effective user id.
-    unsafe { libc::geteuid() == 0 }
+struct ClearRemoveFail;
+impl Drop for ClearRemoveFail {
+    fn drop(&mut self) {
+        super::super::keystore::IMPORT_SECRET_REMOVE_FAILS.with(|flag| flag.set(false));
+    }
 }
 
-#[cfg(unix)]
+fn arm_remove_fail() -> ClearRemoveFail {
+    super::super::keystore::IMPORT_SECRET_REMOVE_FAILS.with(|flag| flag.set(true));
+    ClearRemoveFail
+}
+
 #[test]
 fn delete_reports_a_secret_removal_failure_and_keeps_the_key() {
-    use std::os::unix::fs::PermissionsExt;
-
-    if root_ignores_directory_mode() {
-        return;
-    }
-
     let password = "import-only-testpass";
     let keystore_dir = TempDir::new().unwrap();
     let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
@@ -1661,26 +1660,12 @@ fn delete_reports_a_secret_removal_failure_and_keeps_the_key() {
     let pk = sk.public_key().to_bytes();
     block_on(adapter.import_keystore(&encrypt_json(&sk, password), password)).expect("import");
     let secret = secret_file(keystore_dir.path(), &pk);
-    let secrets_dir = secret.parent().unwrap().to_path_buf();
     let json_path = keystore_dir.path().join(format!("{}.json", pubkey_hex(pk)));
-    struct RestoreMode(std::path::PathBuf);
-    impl Drop for RestoreMode {
-        fn drop(&mut self) {
-            let Ok(meta) = std::fs::metadata(&self.0) else {
-                return;
-            };
-            let mut perms = meta.permissions();
-            perms.set_mode(0o700);
-            let _ = std::fs::set_permissions(&self.0, perms);
-        }
-    }
-    let _restore = RestoreMode(secrets_dir.clone());
-    let mut perms = std::fs::metadata(&secrets_dir).unwrap().permissions();
-    perms.set_mode(0o500);
-    std::fs::set_permissions(&secrets_dir, perms).unwrap();
+    let _guard = arm_remove_fail();
     let err = adapter.delete_keystore(&pk).expect_err("secret removal must be reported");
     let msg = err.to_string();
     assert!(msg.contains("import password secret"), "{msg}");
+    assert!(msg.contains("permission denied"), "{msg}");
     assert!(!msg.contains(password), "{msg}");
     assert!(adapter.has_key(&pk), "the key stays registered so DELETE can be retried");
     assert!(secret.exists(), "the plaintext remains when removal fails");
@@ -1712,15 +1697,8 @@ fn delete_reports_a_staged_secret_removal_failure_and_keeps_the_key() {
     assert!(!json_path.exists(), "the keystore was already removed");
 }
 
-#[cfg(unix)]
 #[test]
 fn delete_reports_a_secret_removal_failure_when_the_key_is_not_registered() {
-    use std::os::unix::fs::PermissionsExt;
-
-    if root_ignores_directory_mode() {
-        return;
-    }
-
     let password = "import-only-testpass";
     let keystore_dir = TempDir::new().unwrap();
     let (adapter, composite, _validators) = validators_backed_adapter(keystore_dir.path());
@@ -1731,28 +1709,232 @@ fn delete_reports_a_secret_removal_failure_when_the_key_is_not_registered() {
     let secret = secret_file(keystore_dir.path(), &pk);
     let json_path = keystore_dir.path().join(format!("{}.json", pubkey_hex(pk)));
     std::fs::remove_file(&json_path).unwrap();
-    let secrets_dir = secret.parent().unwrap().to_path_buf();
-    struct RestoreMode(std::path::PathBuf);
-    impl Drop for RestoreMode {
-        fn drop(&mut self) {
-            let Ok(meta) = std::fs::metadata(&self.0) else {
-                return;
-            };
-            let mut perms = meta.permissions();
-            perms.set_mode(0o700);
-            let _ = std::fs::set_permissions(&self.0, perms);
-        }
-    }
-    let _restore = RestoreMode(secrets_dir.clone());
-    let mut perms = std::fs::metadata(&secrets_dir).unwrap().permissions();
-    perms.set_mode(0o500);
-    std::fs::set_permissions(&secrets_dir, perms).unwrap();
+    let _guard = arm_remove_fail();
     let err = adapter.delete_keystore(&pk).expect_err("secret removal must be reported");
     let msg = err.to_string();
     assert!(msg.contains("import password secret"), "{msg}");
+    assert!(msg.contains("permission denied"), "{msg}");
     assert!(!msg.contains(password), "{msg}");
     assert!(!adapter.has_key(&pk), "an unregistered key is not added back");
     assert!(secret.exists(), "the plaintext remains when removal fails");
+}
+
+#[test]
+fn delete_fsyncs_the_secret_dir_when_a_staged_partial_cannot_be_removed() {
+    let password = "import-only-testpass";
+    let keystore_dir = TempDir::new().unwrap();
+    let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    block_on(adapter.import_keystore(&encrypt_json(&sk, password), password)).expect("import");
+    let secret = secret_file(keystore_dir.path(), &pk);
+    let partial =
+        secret.parent().unwrap().join(format!(".{}.1.2.keymanager-secret.partial", pubkey_hex(pk)));
+    std::fs::create_dir(&partial).unwrap();
+    struct ClearSyncFail;
+    impl Drop for ClearSyncFail {
+        fn drop(&mut self) {
+            super::super::keystore::IMPORT_SECRET_DIR_SYNC_FAILS.with(|flag| flag.set(false));
+        }
+    }
+    let _guard = ClearSyncFail;
+    super::super::keystore::IMPORT_SECRET_DIR_SYNC_FAILS.with(|flag| flag.set(true));
+    let err = adapter.delete_keystore(&pk).expect_err("partial removal and fsync must be reported");
+    let msg = err.to_string();
+    assert!(msg.contains("staged import secret"), "{msg}");
+    assert!(msg.contains("sync import secret directory"), "{msg}");
+    assert!(!msg.contains(password), "{msg}");
+    assert!(adapter.has_key(&pk), "the key stays registered so DELETE can be retried");
+    assert!(!secret.exists(), "the final secret is unlinked before the directory fsync");
+    assert!(partial.is_dir(), "the staged partial remains");
+}
+
+#[test]
+fn delete_denylists_even_when_secret_removal_fails() {
+    let password = "import-only-testpass";
+    // Loaded key, final unlink fails. Not-registered key, final unlink fails.
+    // Loaded key, staged partial cannot be removed. Loaded key, directory
+    // fsync fails after the secret is unlinked. Final unlink fails and the
+    // partial cleanup's fsync also fails. Denylist IO fails alone, and
+    // together with the unlink.
+    for case in [
+        "loaded-unlink",
+        "absent-unlink",
+        "loaded-partial",
+        "loaded-sync",
+        "loaded-unlink-sync",
+        "denylist-io",
+        "both-io",
+    ] {
+        let keystore_dir = TempDir::new().unwrap();
+        let (adapter, composite, _validators) = validators_backed_adapter(keystore_dir.path());
+        let sk = SecretKey::generate();
+        let pk = sk.public_key().to_bytes();
+        block_on(adapter.import_keystore(&encrypt_json(&sk, password), password)).expect("import");
+        let loaded = !case.starts_with("absent");
+        if !loaded {
+            assert!(composite.remove_local_key(&pk));
+            let json_path = keystore_dir.path().join(format!("{}.json", pubkey_hex(pk)));
+            std::fs::remove_file(&json_path).unwrap();
+        }
+        let secret = secret_file(keystore_dir.path(), &pk);
+        struct ClearHooks;
+        impl Drop for ClearHooks {
+            fn drop(&mut self) {
+                super::super::keystore::IMPORT_SECRET_REMOVE_FAILS.with(|flag| flag.set(false));
+                super::super::keystore::IMPORT_SECRET_DIR_SYNC_FAILS.with(|flag| flag.set(false));
+            }
+        }
+        let _guard = ClearHooks;
+        let deny_path = keystore_dir.path().join(".rvc.deleted_keys");
+        if case == "loaded-partial" {
+            let partial = secret
+                .parent()
+                .unwrap()
+                .join(format!(".{}.1.2.keymanager-secret.partial", pubkey_hex(pk)));
+            std::fs::create_dir(&partial).unwrap();
+        } else if case == "loaded-sync" {
+            super::super::keystore::IMPORT_SECRET_DIR_SYNC_FAILS.with(|flag| flag.set(true));
+        } else if case == "loaded-unlink-sync" {
+            std::fs::write(
+                secret
+                    .parent()
+                    .unwrap()
+                    .join(format!(".{}.1.2.keymanager-secret.partial", pubkey_hex(pk))),
+                b"leftover",
+            )
+            .unwrap();
+            super::super::keystore::IMPORT_SECRET_REMOVE_FAILS.with(|flag| flag.set(true));
+            super::super::keystore::IMPORT_SECRET_DIR_SYNC_FAILS.with(|flag| flag.set(true));
+        } else if case == "denylist-io" || case == "both-io" {
+            std::fs::create_dir(&deny_path).unwrap();
+            if case == "both-io" {
+                super::super::keystore::IMPORT_SECRET_REMOVE_FAILS.with(|flag| flag.set(true));
+            }
+        } else {
+            super::super::keystore::IMPORT_SECRET_REMOVE_FAILS.with(|flag| flag.set(true));
+        }
+        let err = adapter.delete_keystore(&pk).expect_err(case);
+        let msg = err.to_string();
+        assert!(!msg.contains(password), "{case}: {msg}");
+        assert_eq!(adapter.has_key(&pk), loaded, "{case}");
+        if case == "denylist-io" || case == "both-io" {
+            assert!(msg.contains("deletion denylist"), "{case}: {msg}");
+            assert_eq!(secret.exists(), case == "both-io", "{case}");
+            if case == "both-io" {
+                assert!(msg.contains("import password secret"), "{case}: {msg}");
+            }
+            continue;
+        }
+        let denylist = crate::deletion_denylist::DeletionDenylist::load(keystore_dir.path())
+            .unwrap_or_else(|e| panic!("{case}: denylist reload: {e}"));
+        assert!(denylist.contains(&pk), "{case}: denylist missing");
+        if case == "loaded-unlink-sync" {
+            assert!(msg.contains("permission denied"), "{case}: {msg}");
+            assert!(msg.contains("sync import secret directory"), "{case}: {msg}");
+            assert!(secret.exists(), "{case}");
+            let partial = secret
+                .parent()
+                .unwrap()
+                .join(format!(".{}.1.2.keymanager-secret.partial", pubkey_hex(pk)));
+            assert!(!partial.exists(), "{case}: the partial was removed before the fsync");
+        }
+        if case == "loaded-unlink" {
+            assert!(secret.exists(), "{case}");
+            std::fs::write(keystore_dir.path().join("notes.json"), b"{}").unwrap();
+            let config = crate::config::Config {
+                keystore_path: keystore_dir.path().to_path_buf(),
+                ..Default::default()
+            };
+            let booted = crate::config::ServiceBuilder::new(config)
+                .build_key_manager_owned_filtered(Some(&denylist.snapshot()))
+                .unwrap_or_else(|e| panic!("{case}: boot: {e}"));
+            assert!(!booted.contains(&pk), "{case}: restart must skip the denylisted secret");
+        }
+    }
+}
+
+#[test]
+fn import_reports_a_secret_dir_sync_failure_after_abandoning_the_staged_secret() {
+    let password = "import-only-testpass";
+    let keystore_dir = TempDir::new().unwrap();
+    let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    let secrets = keystore_dir.path().join(".rvc.keymanager-secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::create_dir(secrets.join(pubkey_hex(pk))).unwrap();
+    // Import runs on the blocking pool, so the counter has to be armed there.
+    // No partial exists yet, so this path's first directory sync is
+    // `abandon_staged` after the rename onto the occupied final path fails.
+    adapter.set_during_blocking_hook(Arc::new(|| {
+        super::super::keystore::IMPORT_SECRET_DIR_SYNC_CALLS.with(|slot| slot.set(0));
+        super::super::keystore::IMPORT_SECRET_DIR_SYNC_FAIL_ON_CALL.with(|slot| slot.set(1));
+    }));
+    let err = block_on(adapter.import_keystore(&encrypt_json(&sk, password), password))
+        .expect_err("rename and directory sync fail");
+    let msg = err.to_string();
+    assert!(msg.contains("rename import secret"), "{msg}");
+    assert!(msg.contains("sync import secret directory"), "{msg}");
+    assert!(!msg.contains(password), "{msg}");
+    let staged: Vec<_> = std::fs::read_dir(&secrets)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains("keymanager-secret.partial"))
+        .collect();
+    assert!(staged.is_empty(), "abandon removes the staged secret before the fsync: {staged:?}");
+    assert!(secrets.join(pubkey_hex(pk)).is_dir());
+    assert!(!adapter.has_key(&pk));
+}
+
+#[test]
+fn boot_during_import_sees_the_secret_before_the_keystore() {
+    let password = "import-only-testpass";
+    let keystore_dir = TempDir::new().unwrap();
+    let (adapter, _composite, _validators) = validators_backed_adapter(keystore_dir.path());
+    let sk = SecretKey::generate();
+    let pk = sk.public_key().to_bytes();
+    let json = encrypt_json(&sk, password);
+    std::fs::write(keystore_dir.path().join("notes.json"), b"{}").unwrap();
+    let secret = secret_file(keystore_dir.path(), &pk);
+    let json_path = keystore_dir.path().join(format!("{}.json", pubkey_hex(pk)));
+    let (boot_go_tx, boot_go_rx) = std::sync::mpsc::channel::<()>();
+    let (boot_done_tx, boot_done_rx) = std::sync::mpsc::channel::<()>();
+    let boot_go_tx = Arc::new(std::sync::Mutex::new(Some(boot_go_tx)));
+    let boot_done_rx = Arc::new(std::sync::Mutex::new(boot_done_rx));
+    let secret_hook = secret.clone();
+    let json_hook = json_path.clone();
+    adapter.set_after_secret_before_keystore_hook(Arc::new(move || {
+        assert!(secret_hook.is_file(), "the secret is durable before the keystore");
+        assert!(!json_hook.exists(), "the keystore is not renamed yet");
+        let tx = boot_go_tx.lock().expect("boot gate").take().expect("boot gate once");
+        tx.send(()).expect("boot thread is waiting");
+        boot_done_rx.lock().expect("boot gate").recv().expect("boot finished");
+    }));
+    let boot_dir = keystore_dir.path().to_path_buf();
+    let booted = std::thread::spawn(move || {
+        boot_go_rx.recv().expect("import reached the secret");
+        let config = crate::config::Config { keystore_path: boot_dir, ..Default::default() };
+        let loaded = crate::config::ServiceBuilder::new(config)
+            .build_key_manager()
+            .expect("boot during import");
+        boot_done_tx.send(()).expect("import is waiting");
+        loaded
+    });
+    block_on(adapter.import_keystore(&json, password)).expect("import");
+    let during = booted.join().expect("boot thread");
+    assert!(
+        !during.contains(&pk),
+        "boot in the secret-before-keystore window does not load the key"
+    );
+    assert!(adapter.has_key(&pk));
+    let config = crate::config::Config {
+        keystore_path: keystore_dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let after =
+        crate::config::ServiceBuilder::new(config).build_key_manager().expect("boot after import");
+    assert!(after.contains(&pk));
 }
 
 #[test]

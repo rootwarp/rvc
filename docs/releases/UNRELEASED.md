@@ -13,6 +13,16 @@ When every finished candidate is dropped and no transport error was stored, `pro
 
 `health_scores` takes the sync lock and then the health lock, the same order as synced selection and the proposal fallback.
 
+## Keystore boot names and delete durability
+
+Import writes a keystore as `0x` plus the lowercase pubkey hex plus `.json`. Startup treats that exact name as the key's keystore. An empty file, a truncated file, or a file that cannot be read at that name fails startup when an import secret for the same pubkey is present and the key did not load. The error names the secret and says the keystore is corrupt. A symlink at that name whose target is outside the keystore directory, or that does not resolve to a regular file inside it, is the same failure.
+
+A `*.json` file with any other name is a keystore only when it validates, or when it has a pubkey and a `crypto` field and validation fails. A file that only carries the pubkey and a `version` does not block startup. That secret is a warning, the same as a secret with no keystore file. A valid keystore under another name, such as `keystore-<hex>.json`, still loads. If that file loads the key, an empty `0x<pk>.json` for the same pubkey does not fail startup. An unreadable canonical file is recorded with the same invalid mark, and a valid file for that pubkey is kept. A canonical file whose body validates as a different pubkey is corrupt for the name in the filename.
+
+DELETE writes the deletion denylist after it tries to remove the import secret, including when that removal fails. A loaded key stays in the signing registry until secret removal and the denylist write both succeed, so the DELETE can be retried. A restart skips a key that is on the denylist. A failure to remove the keystore JSON returns before the denylist write. The keystore directory is not fsynced on DELETE.
+
+After an import-secret file or a staged partial is removed, boot and DELETE fsync that secret directory. A later directory-entry error or a failed unlink does not skip that fsync when something was already removed. If the fsync also fails, the error keeps the first removal error and includes the fsync failure. A partial-cleanup error is attached to an earlier final-secret unlink error.
+
 ## V3 block production arms the fallback at the slot deadline
 
 `produce_block_v3` on the proposer pool takes the slot end as a per-call deadline. The production budget was already the shorter of the configured budget and the time left. The 250 ms backstop and the unsynced fallback used to be armed past that deadline. Both are now armed at the earlier of (call start + budget + 250 ms) and the deadline.

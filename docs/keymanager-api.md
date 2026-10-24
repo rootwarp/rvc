@@ -112,7 +112,7 @@ Import one or more keystores. Slashing protection data is imported first, before
 
 | Status | Meaning |
 |--------|---------|
-| `imported` | Key successfully imported and activated. The password is stored mode `0600` in `<keystore_dir>/.rvc.keymanager-secrets/` (directory mode `0700`) and is loaded on the next start, ahead of `--password-file`. |
+| `imported` | Key successfully imported and activated. The password is stored mode `0600` in `<keystore_dir>/.rvc.keymanager-secrets/` (directory mode `0700`) and is loaded on the next start, ahead of `--password-file`. The keystore file is `0x` plus the lowercase pubkey hex plus `.json`. |
 | `duplicate` | Key already exists |
 | `error` | Import failed. A missing, non-lowercase, `0x`-prefixed, or mismatched `pubkey` field is reported by name and writes nothing. |
 
@@ -145,10 +145,12 @@ Delete one or more local keystores. Slashing protection is exported before delet
 
 | Status | Meaning |
 |--------|---------|
-| `deleted` | Key deleted and deactivated. The persisted import password is removed with the keystore. |
+| `deleted` | Key deleted and deactivated. The persisted import password is removed with the keystore, and the pubkey is written to the deletion denylist. A restart skips a denylisted key. |
 | `not_active` | Key exists but is not active |
 | `not_found` | Key not found |
-| `error` | Deletion failed |
+| `error` | Deletion failed. A loaded key stays in the signing registry until secret removal and the denylist write both succeed, so the DELETE can be retried. The denylist may already contain the pubkey when import-secret removal failed. A failure to remove the keystore JSON returns before the denylist write. |
+
+On startup, only `0x<lowercase pubkey>.json` is that key's keystore. An empty, truncated, or unreadable file at that name fails startup when its import secret is present and the key did not load. Any other `*.json` name counts as a keystore only when it validates, or when it has a pubkey and a `crypto` field and validation fails. A document that only shares the pubkey and a `version` does not.
 
 ---
 
