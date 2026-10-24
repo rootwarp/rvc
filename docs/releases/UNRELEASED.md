@@ -652,9 +652,9 @@ another candidate matches.
 
 `produce_block_v3` treats a block as in hand only when it passes the hard
 checks and carries the expected fee recipient. The hard checks are the duty's
-slot, proposer, parent, and consensus version. A full block from Bellatrix on
-is also rejected when its fee is missing, invalid, or present only on a
-builder header. A blinded block is not: the builder header's fee is the
+slot, proposer, parent, and consensus version. When the duty names an
+expected fee, a full block from Bellatrix on is also rejected when its fee
+is missing, invalid, or present only on a builder header. A blinded block is not: the builder header's fee is the
 builder's. Before Bellatrix a missing fee is still accepted. A block that
 fails a hard check does not close the soft window (half the block-production
 budget). The rejection is logged with the beacon-node index and the expected
@@ -665,23 +665,38 @@ way.
 After slot, proposer, parent, and fee pass, a body that still cannot be signed is reason `prepare`. That covers a blinded body whose layout is not the slot fork, a block root that cannot be computed, and a KZG proof count that is not the count that fork signs for its blobs. The candidate is not held and it does not close the soft window. A document that names two block objects, or a body that cannot be read at all, stays `unreadable`. A full SSZ block with a proof-byte length that is not a multiple of 48, a blob-byte length that is not a multiple of 131072, or the wrong proof count for the fork is rejected before the header is signed. A Gloas slot on this pre-Gloas path is rejected. `produce_block_v4` does not use this check. Blinded blocks at Gloas stay a blinded-at-Gloas drop.
 
 A readable fee that does not match is a penalty when `fee_recipient_policy`
-is `sign` (the default). It does not close the soft window and it does not
-stop the unsynced fallback. It is signed only after every selected beacon
+is `sign` (the default) and the duty's expected fee recipient is set.
+Production always sets it, from the validator's effective fee recipient at
+the moment the duty is built. A duty with no expected fee does not fee-reject
+a missing, invalid, or different fee. There is no production caller that
+omits it. The penalty does not close the soft window and it does not stop
+the unsynced fallback. The block is signed only after every selected beacon
 node has answered or the hard deadline (the budget) passes, and only when no
-fee-matching block is in hand. The warning names the beacon-node index and is
-emitted for the candidate that is signed. A fee-matching candidate that fails
+fee-matching block is in hand. The warning is emitted for the candidate
+whose header signature succeeded, before that block is published. A signer
+refusal does not warn and does not increment the counter. The warning names
+the beacon-node index, proposer, parent, fork, expected fee, fee on the
+block, and the per-header value parse. A fee-matching candidate that fails
 the proposal checks is skipped and does not take the penalty. That signed
 mismatch increments `rvc_produce_block_fee_recipient_penalty_total`.
-`fee_recipient_policy =
-"reject"` drops a readable mismatch instead, and that drop is not counted.
+`fee_recipient_policy = "reject"` drops a readable mismatch instead, and
+that drop is not counted. A missing or invalid fee on a full Bellatrix-or-later
+block is a hard reject only when the duty names an expected fee.
 
 Ranking within a fee class adds the execution payload value and the consensus
 block value. Each header is a whole decimal. A missing, empty, signed, or
 non-digit header, or a digit string that does not fit in `u128`, contributes
 0. A non-UTF-8 `Eth-Consensus-Block-Value` on a V3 response is ignored the
 same way: the block is still returned and that header contributes 0. One bad
-header does not zero the other. The sum saturates at `u128::MAX`. An unparsed
-header is logged as `unparsed`, not as `ok:0`.
+header does not zero the other. The sum saturates at `u128::MAX`. A total
+above 1,000 ETH (`MAX_PLAUSIBLE_BLOCK_VALUE_WEI`, 10^21 wei) ranks as 0 and
+is logged as implausible. The block is not rejected for that claim. CoinDesk
+on 31 July 2023 reported that slot 6,992,273 paid 584 ETH on 30 July 2023.
+That figure is below the cap. Each header is logged on its
+own: `exec=ok:<wei>` or `exec=unparsed:"<raw>"`, and the same for
+`consensus`. A missing header is `missing`. The raw text copied into the log
+is at most 64 bytes. A quote, backslash, or control byte in that raw text is
+`?`. An unparsed header is not logged as `ok:0`.
 Equal totals keep the lower beacon-node index. `produce_block_v3` returns the
 head of that list. `produce_block_v3_ranked` returns every accepted candidate,
 best first, including a fee-penalized block behind a fee-matching one. Block

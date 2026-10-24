@@ -229,7 +229,11 @@ pub trait BlockProducer: Send + Sync {
     /// ranks below a matching candidate and does not close the soft window.
     /// It is returned only after every beacon node has answered or the hard
     /// deadline passes, and only when no matching block is available.
-    /// [`FeeRecipientPolicy::Reject`] drops that mismatch. A blinded block
+    /// [`FeeRecipientPolicy::Reject`] drops that mismatch. Those fee checks
+    /// run only when [`ProduceDuty::expected_fee_recipient`] is `Some`.
+    /// `None` does not fee-reject a missing, invalid, or different fee.
+    /// Production always passes `Some`: the block service copies the
+    /// validator's effective fee recipient onto the duty. A blinded block
     /// keeps its builder-header fee recipient and is not penalized.
     ///
     /// Fallback runs only for untried proposal-role beacon nodes above the

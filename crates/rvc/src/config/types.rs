@@ -4977,6 +4977,14 @@ builders = ["not a url"]
         assert!(reject.validate().is_ok());
     }
 
+    /// An unknown policy name is rejected, and the error names that name.
+    #[test]
+    fn unknown_fee_recipient_policy_is_rejected_naming_the_value() {
+        let err = toml::from_str::<Config>("fee_recipient_policy = \"sometimes\"").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sometimes"), "{msg}");
+    }
+
     // -- RF5-13: nested call sites; flat shims deleted --
 
     /// Source-level guard: flat field shims must not reappear on `Config`.

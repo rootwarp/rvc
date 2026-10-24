@@ -22,11 +22,11 @@ pub use prepare_check::{check_preparable, CandidateMemo, PrepareReject, Prepared
 pub use retry::RetryPolicy;
 pub use shape::{ShapeConstraint, GLOAS_SELF_BUILD_BUILDER_INDEX};
 pub use types::{
-    block_value, parse_fork_schedule, parse_slot_duration_ms, parse_slots_per_epoch,
-    AttestationData, AttestationDataResponse, AttesterDutiesResponse, AttesterDuty,
-    BeaconBlockHeader, BeaconCommitteeSubscription, BlockHeaderSummary, BlockRootData,
-    BlockRootResponse, Checkpoint, ClientVersionV1, ConfigSpecResponse, DataResponse,
-    DependentRootResponse, ExecutionOptimisticResponse, GenesisData, GenesisResponse,
+    block_value, display_value_parse, parse_fork_schedule, parse_slot_duration_ms,
+    parse_slots_per_epoch, AttestationData, AttestationDataResponse, AttesterDutiesResponse,
+    AttesterDuty, BeaconBlockHeader, BeaconCommitteeSubscription, BlockHeaderSummary,
+    BlockRootData, BlockRootResponse, Checkpoint, ClientVersionV1, ConfigSpecResponse,
+    DataResponse, DependentRootResponse, ExecutionOptimisticResponse, GenesisData, GenesisResponse,
     GloasBlockContents, IndexedAttestationError, IndexedErrorMessage, IndexedFailure,
     LegacyAttestation, NodeVersionData, NodeVersionResponse, NodeVersionV2Data,
     NodeVersionV2Response, PayloadAttestationDataResponse, ProduceBlockResponse,
@@ -37,7 +37,7 @@ pub use types::{
     SyncCommitteeMessage, SyncingData, SyncingResponse, ValidatorData, ValidatorInfo,
     ValidatorLiveness, ValidatorLivenessResponse, ValidatorsResponse,
     VersionedAggregateAttestation, VersionedAttestation, VersionedSignedAggregateAndProof,
-    WireBody,
+    WireBody, MAX_PLAUSIBLE_BLOCK_VALUE_WEI,
 };
 pub use v4_wire::{
     BuilderConfig, BuilderEntry, BuilderPreferencesEntry, BuilderRequestAuth,

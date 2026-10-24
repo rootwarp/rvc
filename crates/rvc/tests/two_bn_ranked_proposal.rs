@@ -1,8 +1,7 @@
-//! Issue #646: a higher-value block on a stale parent is not signed.
+//! Two beacon nodes, one proposal.
 //!
-//! BN-A builds on root(N-3) at 0.07 ETH. BN-B builds on root(N-1) at 0.05 ETH.
-//! Expected parents are root(N-1) and root(N-2). BN-B is signed and published.
-//! BN-A never reaches the signer.
+//! A higher-value block on root(N-3) is dropped by BnManager before the
+//! candidate walk. The block on an accepted parent is what gets signed.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -324,8 +323,11 @@ fn produce_ssz(bytes: Vec<u8>, execution_value: &str) -> ResponseTemplate {
         .set_body_bytes(bytes)
 }
 
+/// BN-A's parent is root(N-3). BnManager rejects that parent before the
+/// candidate walk, so this test does not show the walk skipping a candidate.
+/// BN-B, on root(N-1), is signed and published.
 #[tokio::test]
-async fn test_higher_value_stale_parent_is_not_signed() {
+async fn test_higher_value_stale_parent_is_dropped_before_the_walk() {
     let bn_a = MockServer::start().await;
     let bn_b = MockServer::start().await;
     let produce_path = format!("/eth/v3/validator/blocks/{SLOT}");
@@ -522,4 +524,138 @@ async fn test_builder_only_local_alone_signs_nothing() {
     assert!(matches!(err, BlockServiceError::BuilderOnly(_)));
     let reqs = bn.received_requests().await.expect("recorded requests");
     assert!(reqs.iter().all(|req| req.method.as_str() != "POST"), "nothing published");
+}
+
+async fn mount_blinded_publish(server: &MockServer) {
+    Mock::given(method("POST"))
+        .and(path("/eth/v1/beacon/blinded_blocks"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(server)
+        .await;
+}
+
+/// The only acceptable block uses the re-org parent. BnManager must have
+/// received that parent on the duty, and the signed publish carries it.
+#[tokio::test]
+async fn test_reorg_parent_block_is_signed_through_bn_manager() {
+    let bn_stale = MockServer::start().await;
+    let bn_reorg = MockServer::start().await;
+    let produce_path = format!("/eth/v3/validator/blocks/{SLOT}");
+    Mock::given(method("GET"))
+        .and(path(produce_path.as_str()))
+        .respond_with(produce_ssz(blinded_on(ROOT_N3), VALUE_A))
+        .expect(1)
+        .mount(&bn_stale)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(produce_path.as_str()))
+        .respond_with(produce_ssz(blinded_on(ROOT_N2), VALUE_B))
+        .expect(1)
+        .mount(&bn_reorg)
+        .await;
+    mount_blinded_publish(&bn_stale).await;
+    mount_blinded_publish(&bn_reorg).await;
+
+    let mut config = BnManagerConfig::new(vec![bn_stale.uri(), bn_reorg.uri()]);
+    config.broadcast_topics.blocks = false;
+    let manager = BnManager::new(config).expect("BnManager");
+    let beacon = Arc::new(BeaconBlockAdapter::new(Arc::new(manager)));
+    let pubkey = SecretKey::generate().public_key();
+    let store = ValidatorStore::new([0u8; 20], 30_000_000);
+    let mut validator = ValidatorConfig::new(pubkey.to_bytes());
+    validator.builder_proposals = true;
+    store.add_validator(validator).unwrap();
+    let signer = Arc::new(CountingSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon,
+        Arc::new(store),
+        Arc::new(deneb_schedule()),
+        [0xaa; 32],
+    );
+    let result = service.propose_block(SLOT, &pubkey, PROPOSER, parents()).await;
+    assert!(result.is_ok(), "the re-org parent must be signed: {result:?}");
+    assert_eq!(signer.header_signs(), 1);
+
+    let mut publishes = Vec::new();
+    for server in [&bn_stale, &bn_reorg] {
+        let reqs = server.received_requests().await.expect("recorded requests");
+        publishes.extend(
+            reqs.into_iter().filter(|req| req.url.path() == "/eth/v1/beacon/blinded_blocks"),
+        );
+    }
+    assert_eq!(publishes.len(), 1, "one blinded publish");
+    assert_eq!(&publishes[0].body[PARENT_OFFSET..PARENT_OFFSET + 32], &ROOT_N2);
+}
+
+/// A higher-value body that cannot be prepared is not signed.
+///
+/// The lower blinded block on the primary parent is the one published.
+/// This does not isolate BnManager's prepare reject from the later walk:
+/// the walk-skip of a candidate the mock still returns is
+/// `test_higher_value_unpreparable_candidate_is_skipped_by_the_walk`.
+#[tokio::test]
+async fn test_higher_value_unpreparable_body_is_not_signed() {
+    let bn_bad = MockServer::start().await;
+    let bn_good = MockServer::start().await;
+    let produce_path = format!("/eth/v3/validator/blocks/{SLOT}");
+    let parent = format!("0x{}", hex::encode(ROOT_N1));
+    let stub = format!(
+        r#"{{"slot":"{SLOT}","proposer_index":"{PROPOSER}","parent_root":"{parent}","state_root":"0x{}","body":{{"execution_payload":{{"fee_recipient":"0x{}"}}}}}}"#,
+        "55".repeat(32),
+        "00".repeat(20),
+    );
+    Mock::given(method("GET"))
+        .and(path(produce_path.as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", "application/json")
+                .insert_header("Eth-Consensus-Version", "deneb")
+                .insert_header("Eth-Execution-Payload-Blinded", "false")
+                .insert_header("Eth-Execution-Payload-Value", VALUE_A)
+                .insert_header(HEADER_ETH_CONSENSUS_BLOCK_VALUE, "0")
+                .set_body_string(stub),
+        )
+        .expect(1)
+        .mount(&bn_bad)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(produce_path.as_str()))
+        .respond_with(produce_ssz(blinded_on(ROOT_N1), VALUE_B))
+        .expect(1)
+        .mount(&bn_good)
+        .await;
+    mount_blinded_publish(&bn_bad).await;
+    mount_blinded_publish(&bn_good).await;
+
+    let mut config = BnManagerConfig::new(vec![bn_bad.uri(), bn_good.uri()]);
+    config.broadcast_topics.blocks = false;
+    let manager = BnManager::new(config).expect("BnManager");
+    let beacon = Arc::new(BeaconBlockAdapter::new(Arc::new(manager)));
+    let pubkey = SecretKey::generate().public_key();
+    let store = ValidatorStore::new([0u8; 20], 30_000_000);
+    let mut validator = ValidatorConfig::new(pubkey.to_bytes());
+    validator.builder_proposals = true;
+    store.add_validator(validator).unwrap();
+    let signer = Arc::new(CountingSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon,
+        Arc::new(store),
+        Arc::new(deneb_schedule()),
+        [0xaa; 32],
+    );
+    let result = service.propose_block(SLOT, &pubkey, PROPOSER, parents()).await;
+    assert!(result.is_ok(), "the preparable block must be signed: {result:?}");
+    assert_eq!(signer.header_signs(), 1, "the unpreparable body must not reach the signer");
+    // Publish is not pinned to the producing beacon node.
+    let mut publishes = Vec::new();
+    for server in [&bn_bad, &bn_good] {
+        let reqs = server.received_requests().await.expect("recorded requests");
+        publishes.extend(
+            reqs.into_iter().filter(|req| req.url.path() == "/eth/v1/beacon/blinded_blocks"),
+        );
+    }
+    assert_eq!(publishes.len(), 1, "the blinded block on the primary parent is published");
+    assert_eq!(&publishes[0].body[PARENT_OFFSET..PARENT_OFFSET + 32], &ROOT_N1);
 }

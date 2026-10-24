@@ -5377,6 +5377,41 @@ async fn initial_round_without_a_synced_node_skips_large_lag_optimistic_and_offl
     assert_eq!(block.execution_payload_value.as_deref(), Some("7000"));
 }
 
+/// A synced node fails. The small-lag peer is fallback-only, and an unknown
+/// parent does not open fallback, so that peer is not asked.
+#[tokio::test]
+async fn produce_block_v3_ranked_by_with_an_unknown_parent_does_not_ask_a_small_lag_bn() {
+    let synced = MockServer::start().await;
+    let small = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(SYNCED_RESPONSE))
+        .mount(&synced)
+        .await;
+    mount_syncing(&small, 9, false, false).await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("no"))
+        .expect(1)
+        .mount(&synced)
+        .await;
+    mount_produce_times(&small, "7000", 0).await;
+
+    let manager = manager_with_block_budget(&[&synced.uri(), &small.uri()], Duration::from_secs(3));
+    manager.check_sync_status().await;
+    let err = manager
+        .produce_block_v3_ranked_by(1, "0xrandao", None, None, Some(unknown_parent_duty()), None)
+        .await
+        .expect_err("unknown parent must not fall back onto the small-lag block");
+    assert!(
+        err.to_string().contains("500"),
+        "the result is the synced node's failure, not a small-lag block: {err}"
+    );
+    // `expect(0)` on the small-lag produce is the pin: asking that node fails here.
+    synced.verify().await;
+    small.verify().await;
+}
+
 /// No node meets the floor. A known parent relaxes to the wider set, so the
 /// large-lag block is still produced.
 #[tokio::test]
