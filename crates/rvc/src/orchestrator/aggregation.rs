@@ -1631,65 +1631,46 @@ mod tests {
         }
     }
 
+    /// AttestationData HTR, slot 500, index 0, block `0xaa`×32, source epoch 15
+    /// root `0xbb`×32, target epoch 16 root `0xcc`×32.
+    /// `remerkleable==0.1.27` via `scripts/gen_blinded_electra_roots.py`.
+    const KAT_AGGREGATOR_ATTESTATION_DATA_INDEX_0_ROOT: &str =
+        "99fd45ee92ab37455d07a9cfacbfb15932e57d77e15b5d6810e485bec2c507eb";
+    /// Same fixture with committee index 5.
+    const KAT_AGGREGATOR_ATTESTATION_DATA_INDEX_5_ROOT: &str =
+        "272bc05089f136c17e5af597df0cfdadec849cb02689eec58e209a8e5363d043";
+
     /// H-2 regression test: Electra aggregator must zero `index` before
     /// computing `tree_hash_root` (EIP-7549).
-    ///
-    /// Pre-fix: `aggregation.rs` called `tree_hash_root()` with the BN-supplied
-    /// committee index intact, producing a root the BN doesn't recognise (→ 404).
-    /// Post-fix: `convert_and_normalize_attestation_data` zeros the index first.
     #[test]
-    fn test_electra_aggregator_root_zero_index() {
+    fn test_electra_aggregator_data_root() {
         let beacon_data = make_beacon_attestation_data("5");
-
-        // Simulate the aggregation path: convert + normalize for Electra
         let normalized =
             utils::convert_and_normalize_attestation_data(&beacon_data, ForkName::Electra)
                 .expect("conversion must succeed");
-
-        let agg_root = normalized.tree_hash_root();
-
-        // Expected: root computed with index explicitly set to 0
-        let expected = make_crypto_attestation_data(0).tree_hash_root();
-
+        let agg_root = normalized.tree_hash_root().0;
+        assert_eq!(agg_root, parse_root(KAT_AGGREGATOR_ATTESTATION_DATA_INDEX_0_ROOT));
         assert_eq!(
-            agg_root, expected,
-            "Electra aggregator root must equal the root with index=0 (EIP-7549)"
+            make_crypto_attestation_data(0).tree_hash_root().0,
+            parse_root(KAT_AGGREGATOR_ATTESTATION_DATA_INDEX_0_ROOT)
         );
-
-        // Guard: root with the original index differs (validates the test is meaningful)
-        let wrong_root = make_crypto_attestation_data(5).tree_hash_root();
-        assert_ne!(
-            agg_root, wrong_root,
-            "Root with original index must differ (test fixture must use non-zero index)"
-        );
+        assert_ne!(agg_root, parse_root(KAT_AGGREGATOR_ATTESTATION_DATA_INDEX_5_ROOT));
     }
 
-    /// Regression guard: pre-Electra forks must NOT zero the committee index.
-    ///
-    /// Zeroing the index for Phase0..Deneb would change the attestation data
-    /// root and break all pre-Electra aggregator duties.
+    /// Pre-Electra forks keep the committee index in the attestation-data root.
     #[test]
-    fn test_pre_electra_aggregator_root_keeps_index() {
+    fn test_pre_electra_aggregator_data_root() {
         let beacon_data = make_beacon_attestation_data("5");
-
-        // Simulate the aggregation path for Deneb (last pre-Electra fork)
         let normalized =
             utils::convert_and_normalize_attestation_data(&beacon_data, ForkName::Deneb)
                 .expect("conversion must succeed");
-
-        let agg_root = normalized.tree_hash_root();
-
-        // Expected: root computed with the original index (5), NOT zeroed
-        let expected = make_crypto_attestation_data(5).tree_hash_root();
-
+        let agg_root = normalized.tree_hash_root().0;
+        assert_eq!(agg_root, parse_root(KAT_AGGREGATOR_ATTESTATION_DATA_INDEX_5_ROOT));
         assert_eq!(
-            agg_root, expected,
-            "Pre-Electra aggregator root must be computed with original index (no EIP-7549 zeroing)"
+            make_crypto_attestation_data(5).tree_hash_root().0,
+            parse_root(KAT_AGGREGATOR_ATTESTATION_DATA_INDEX_5_ROOT)
         );
-
-        // Guard: zero-index root differs from the preserved-index root
-        let zero_root = make_crypto_attestation_data(0).tree_hash_root();
-        assert_ne!(agg_root, zero_root, "Pre-Electra root must differ from the zero-index root");
+        assert_ne!(agg_root, parse_root(KAT_AGGREGATOR_ATTESTATION_DATA_INDEX_0_ROOT));
     }
 
     fn parse_hex(hex: &str) -> Vec<u8> {

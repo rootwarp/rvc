@@ -1945,6 +1945,40 @@ mod tests {
         drop(held);
     }
 
+    // ContributionAndProof signing roots for a fixed container.
+    // eth-ssz-specs==0.1.0, consensus-specs v1.7.0-beta.2,
+    // scripts/gen_signing_roots.py --contribution-out. Domain bytes are parsed
+    // from altair beacon-chain.md (0x09000000). Fork versions match
+    // create_test_fork_schedule with gloas_fork_epoch = 70. GVR is zero.
+    // Aggregator 1, block root 0xcd*32, subcommittee 0, aggregation bits
+    // 0xff*16, contribution signature 0x01*96, selection proof 0x22*96.
+    const KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_DENEB: &str =
+        "ddd35a153f5dd348cbdd029415b8008c6221f3f6bbdc767414d40dd4b671b589";
+    const KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_ELECTRA: &str =
+        "ab397acee848a543560c83257138e54ac18922d8de86cdb20e2ac7c5fe26ce04";
+    const KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_FULU: &str =
+        "08ba8ee46f0256737998aa09f04e3cbe0733d43f21ecfda18fa1c0caf9dcb3ac";
+    const KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_GLOAS: &str =
+        "b8a7f216721d67ec098c3dec0027fed747ef77ba5d4df8f5a7e76a6f29ed99c9";
+
+    fn contribution_kat(name: &str) -> &'static str {
+        match name {
+            "deneb" => KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_DENEB,
+            "electra" => KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_ELECTRA,
+            "fulu" => KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_FULU,
+            "gloas" => KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_GLOAS,
+            other => panic!("no contribution KAT for {other}"),
+        }
+    }
+
+    fn fixed_contribution_and_proof(slot: Slot) -> eth_types::ContributionAndProof {
+        eth_types::ContributionAndProof {
+            aggregator_index: 1,
+            contribution: contribution_body(slot, [0xcd; 32], 0),
+            selection_proof: vec![0x22; 96],
+        }
+    }
+
     fn contribution_body(
         slot: Slot,
         head: Root,
@@ -2451,6 +2485,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_contribution_and_proof_signing_root() {
+        let mut schedule = (*create_test_fork_schedule()).clone();
+        schedule.gloas_fork_epoch = 70;
+        let ctx =
+            crypto::SigningCtx { fork_schedule: &schedule, genesis_validators_root: [0u8; 32] };
+        let cases = [
+            (1280u64, "deneb", KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_DENEB),
+            (1600, "electra", KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_ELECTRA),
+            (1920, "fulu", KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_FULU),
+            (2240, "gloas", KAT_CONTRIBUTION_AND_PROOF_SIGNING_ROOT_GLOAS),
+        ];
+        for (slot, name, kat) in cases {
+            let fixture = fixed_contribution_and_proof(slot);
+            let got =
+                crypto::signing_root_for(&crypto::DutyRef::ContributionAndProof(&fixture), &ctx);
+            assert_eq!(hex::encode(got), kat, "{name}");
+            assert_eq!(kat, contribution_kat(name), "{name}");
+        }
+    }
+
     #[tokio::test]
     async fn each_fork_publishes_the_slot_and_rejects_a_mismatched_slot() {
         let epochs = [(40u64, "deneb"), (50, "electra"), (60, "fulu"), (70, "gloas")];
@@ -2508,12 +2563,20 @@ mod tests {
             assert_eq!(published[0].signature.len(), 96, "{name}");
             assert!(published[0].signature.iter().any(|byte| *byte != 0), "{name}");
             assert_eq!(eth_types::ForkName::from_epoch(epoch, &schedule).as_ref(), name);
+            let ctx = crypto::SigningCtx {
+                fork_schedule: schedule.as_ref(),
+                genesis_validators_root: [0u8; 32],
+            };
+            let fixture = fixed_contribution_and_proof(slot);
+            let anchored =
+                crypto::signing_root_for(&crypto::DutyRef::ContributionAndProof(&fixture), &ctx);
+            assert_eq!(hex::encode(anchored), contribution_kat(name), "{name}");
+            // The published selection proof is a fresh key, so its signing root
+            // is not the fixed KAT. This only checks the signature matches that
+            // message; the root oracle is `contribution_kat`.
             let expected = crypto::signing_root_for(
                 &crypto::DutyRef::ContributionAndProof(&published[0].message),
-                &crypto::SigningCtx {
-                    fork_schedule: schedule.as_ref(),
-                    genesis_validators_root: [0u8; 32],
-                },
+                &ctx,
             );
             let signature =
                 crypto::Signature::from_bytes(&published[0].signature).expect("signature bytes");

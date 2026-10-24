@@ -56,8 +56,12 @@ async fn test_self_build_json_signs_block_then_envelope() {
     assert!(result.is_ok(), "self-build JSON must succeed: {result:?}");
 
     assert_eq!(signer.header_calls.lock().unwrap().len(), 1);
+    let header = signer.header_calls.lock().unwrap()[0].header.clone();
+    assert_eq!(hex::encode(header.body_root), rvc_gloas::KAT_GLOAS_SELF_BUILD_BODY_ROOT);
+    assert_eq!(hex::encode(header.object_root()), rvc_gloas::KAT_GLOAS_SELF_BUILD_BLOCK_ROOT);
     assert_eq!(signer.envelope_calls.lock().unwrap().len(), 1);
     assert_eq!(signer.envelope_calls.lock().unwrap()[0].object_root, expected_root);
+    assert_eq!(hex::encode(expected_root), rvc_gloas::KAT_GLOAS_BOUND_ENVELOPE_ROOT);
     assert_eq!(signer.envelope_calls.lock().unwrap()[0].slot, slot);
     assert_eq!(beacon.publish_full_calls.lock().unwrap().len(), 1);
     assert!(beacon.publish_full_calls.lock().unwrap()[0].builder_url.is_none());
