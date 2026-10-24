@@ -4979,70 +4979,6 @@ impl_beacon_client_passthrough! {
             validator_indices: &[String],
         ) -> Result<PtcDutiesResponse, BeaconError>;
     }
-    BlockProducer {
-        async fn produce_block_v3(
-            &self,
-            slot: u64,
-            randao_reveal: &str,
-            graffiti: Option<&str>,
-            builder_boost_factor: Option<u64>,
-        ) -> Result<ProduceBlockResponse, BeaconError>;
-        async fn produce_block_v4(
-            &self,
-            slot: u64,
-            randao_reveal: &str,
-            graffiti: Option<&str>,
-            builder_config: &BuilderConfig,
-        ) -> Result<ProduceBlockResponse, BeaconError>;
-        async fn publish_block(
-            &self,
-            signed_block: &SignedBeaconBlock,
-            consensus_version: &str,
-            builder_url: Option<&str>,
-        ) -> Result<(), BeaconError>;
-        async fn publish_block_contents(
-            &self,
-            contents: &SignedBlockContentsJson,
-            consensus_version: &str,
-            builder_url: Option<&str>,
-        ) -> Result<(), BeaconError>;
-        async fn publish_blinded_block(
-            &self,
-            signed_blinded_block: &SignedBlindedBeaconBlock,
-            consensus_version: &str,
-        ) -> Result<(), BeaconError>;
-        async fn publish_block_ssz(
-            &self,
-            ssz_bytes: &[u8],
-            consensus_version: &str,
-            is_blinded: bool,
-            builder_url: Option<&str>,
-        ) -> Result<(), BeaconError>;
-        async fn publish_execution_payload_envelope(
-            &self,
-            signed_envelope: &WireBody,
-            blobs: &WireBody,
-            kzg_proofs: &WireBody,
-            consensus_version: &str,
-            broadcast_validation: Option<&str>,
-        ) -> Result<(), BeaconError>;
-        async fn prepare_beacon_proposer(
-            &self,
-            preparations: &[ProposerPreparation],
-        ) -> Result<(), BeaconError>;
-        async fn register_validators(
-            &self,
-            registrations: &[SignedValidatorRegistration],
-        ) -> Result<(), BeaconError>;
-        async fn submit_proposer_preferences(
-            &self,
-            preferences: &[SignedProposerPreferences],
-        ) -> Result<(), BeaconError>;
-        async fn submit_builder_preferences(
-            &self,
-            entries: &[BuilderPreferencesEntry],
-        ) -> Result<SubmitBuilderPreferencesResult, BeaconError>;
-    }
     AttestationApi {
         async fn get_attestation_data(
             &self,
@@ -5108,6 +5044,189 @@ impl_beacon_client_passthrough! {
         ) -> Result<ValidatorLivenessResponse, BeaconError>;
     }
 }
+
+/// `BlockProducer` for the raw client. Duty-carrying methods are not in the
+/// passthrough macro: a duty is an error, and `async_trait` cannot rewrite
+/// `self` inside a `macro_rules` body.
+#[async_trait]
+impl BlockProducer for BeaconClient {
+    async fn produce_block_v3(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        BeaconClient::produce_block_v3(self, slot, randao_reveal, graffiti, builder_boost_factor)
+            .await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+    ) -> Result<Vec<RankedBlock>, BeaconError> {
+        if duty.is_some() {
+            return Err(BeaconClient::unsupported_duty_aware_production());
+        }
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<ProduceDuty>,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<RankedBlock>, BeaconError> {
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        _slot: u64,
+        _randao_reveal: &str,
+        _graffiti: Option<&str>,
+        _builder_boost_factor: Option<u64>,
+        _duty: ProduceDuty,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        Err(BeaconClient::unsupported_duty_aware_production())
+    }
+
+    async fn produce_block_v4(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        BeaconClient::produce_block_v4(self, slot, randao_reveal, graffiti, builder_config).await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &BuilderConfig,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<ProduceBlockResponse, BeaconError> {
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
+    }
+
+    async fn publish_block(
+        &self,
+        signed_block: &SignedBeaconBlock,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        BeaconClient::publish_block(self, signed_block, consensus_version, builder_url).await
+    }
+
+    async fn publish_block_contents(
+        &self,
+        contents: &SignedBlockContentsJson,
+        consensus_version: &str,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        BeaconClient::publish_block_contents(self, contents, consensus_version, builder_url).await
+    }
+
+    async fn publish_blinded_block(
+        &self,
+        signed_blinded_block: &SignedBlindedBeaconBlock,
+        consensus_version: &str,
+    ) -> Result<(), BeaconError> {
+        BeaconClient::publish_blinded_block(self, signed_blinded_block, consensus_version).await
+    }
+
+    async fn publish_block_ssz(
+        &self,
+        ssz_bytes: &[u8],
+        consensus_version: &str,
+        is_blinded: bool,
+        builder_url: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        BeaconClient::publish_block_ssz(self, ssz_bytes, consensus_version, is_blinded, builder_url)
+            .await
+    }
+
+    async fn publish_execution_payload_envelope(
+        &self,
+        signed_envelope: &WireBody,
+        blobs: &WireBody,
+        kzg_proofs: &WireBody,
+        consensus_version: &str,
+        broadcast_validation: Option<&str>,
+    ) -> Result<(), BeaconError> {
+        BeaconClient::publish_execution_payload_envelope(
+            self,
+            signed_envelope,
+            blobs,
+            kzg_proofs,
+            consensus_version,
+            broadcast_validation,
+        )
+        .await
+    }
+
+    async fn prepare_beacon_proposer(
+        &self,
+        preparations: &[ProposerPreparation],
+    ) -> Result<(), BeaconError> {
+        BeaconClient::prepare_beacon_proposer(self, preparations).await
+    }
+
+    async fn register_validators(
+        &self,
+        registrations: &[SignedValidatorRegistration],
+    ) -> Result<(), BeaconError> {
+        BeaconClient::register_validators(self, registrations).await
+    }
+
+    async fn submit_proposer_preferences(
+        &self,
+        preferences: &[SignedProposerPreferences],
+    ) -> Result<(), BeaconError> {
+        BeaconClient::submit_proposer_preferences(self, preferences).await
+    }
+
+    async fn submit_builder_preferences(
+        &self,
+        entries: &[BuilderPreferencesEntry],
+    ) -> Result<SubmitBuilderPreferencesResult, BeaconError> {
+        BeaconClient::submit_builder_preferences(self, entries).await
+    }
+}
+
+/// `BlockProducer` methods on `BeaconClient`. Kept beside the passthrough list
+/// because the duty methods cannot live in that macro.
+#[cfg(test)]
+pub(crate) const BEACON_CLIENT_BLOCK_PRODUCER_METHODS: &[&str] = &[
+    "produce_block_v3",
+    "produce_block_v3_ranked",
+    "produce_block_v3_ranked_by",
+    "produce_block_v3_for_duty",
+    "produce_block_v4",
+    "produce_block_v4_by",
+    "publish_block",
+    "publish_block_contents",
+    "publish_blinded_block",
+    "publish_block_ssz",
+    "publish_execution_payload_envelope",
+    "prepare_beacon_proposer",
+    "register_validators",
+    "submit_proposer_preferences",
+    "submit_builder_preferences",
+];
 
 impl BeaconNodeClient for BeaconClient {
     fn duty_fence(&self) -> Result<beacon::DutyFence, BeaconError> {
@@ -5256,20 +5375,23 @@ mod tests {
         fn _assert_full_client<T: BeaconNodeClient>() {}
         _assert_full_client::<BeaconClient>();
 
-        // 38 methods across the seven role traits (see impl_beacon_client_passthrough!).
+        // 27 passthrough methods, plus 15 hand-written BlockProducer methods.
+        // Duty-carrying produce methods cannot sit in the macro (async_trait).
+        let mut surface: Vec<&str> = BEACON_CLIENT_PASSTHROUGH_METHODS.to_vec();
+        surface.extend_from_slice(BEACON_CLIENT_BLOCK_PRODUCER_METHODS);
         assert_eq!(
-            BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            38,
-            "update impl_beacon_client_passthrough! when adding a role-trait method"
+            surface.len(),
+            42,
+            "update the passthrough macro or BEACON_CLIENT_BLOCK_PRODUCER_METHODS"
         );
 
-        let mut sorted: Vec<&str> = BEACON_CLIENT_PASSTHROUGH_METHODS.to_vec();
+        let mut sorted = surface.clone();
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(
             sorted.len(),
-            BEACON_CLIENT_PASSTHROUGH_METHODS.len(),
-            "passthrough method list must not contain duplicates: {sorted:?}"
+            surface.len(),
+            "method list must not contain duplicates: {sorted:?}"
         );
 
         // Spot-check that each role trait is represented.
@@ -5280,7 +5402,11 @@ mod tests {
             "get_attester_duties",
             "post_ptc_duties",
             "produce_block_v3",
+            "produce_block_v3_ranked",
+            "produce_block_v3_ranked_by",
+            "produce_block_v3_for_duty",
             "produce_block_v4",
+            "produce_block_v4_by",
             "publish_block",
             "publish_block_contents",
             "publish_block_ssz",
@@ -5294,10 +5420,7 @@ mod tests {
             "post_validator_liveness",
             "post_validator_liveness_merged",
         ] {
-            assert!(
-                BEACON_CLIENT_PASSTHROUGH_METHODS.contains(&required),
-                "passthrough list missing {required}"
-            );
+            assert!(surface.contains(&required), "client surface missing {required}");
         }
     }
 

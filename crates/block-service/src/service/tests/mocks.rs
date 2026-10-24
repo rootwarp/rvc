@@ -943,6 +943,17 @@ impl BeaconBlockClient for MockBeaconClient {
         }
         self.publish_failure()
     }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: crate::ProduceDuty,
+    ) -> Result<crate::ProduceBlockResponse, crate::BlockServiceError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
 }
 // --- Helpers ---
 

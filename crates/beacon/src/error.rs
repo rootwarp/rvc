@@ -44,6 +44,14 @@ pub enum BeaconError {
     #[error("beacon node response dropped: admission revoked in flight")]
     RevokedInFlight,
 
+    /// This client does not implement the named operation.
+    ///
+    /// A raw [`crate::BeaconClient`] returns this when produce is asked to
+    /// apply a duty. Ranking and the fee, fork, and parent checks belong to
+    /// the beacon-node pool.
+    #[error("{0}")]
+    Unsupported(&'static str),
+
     /// Produce round failed for a reason other than a transport error.
     #[error(transparent)]
     Produce(#[from] ProduceError),
@@ -126,6 +134,12 @@ mod tests {
             err.to_string(),
             "produce_block_v3: all candidates rejected: bn 0 parent, bn 1 slot"
         );
+    }
+
+    #[test]
+    fn test_unsupported_error_display() {
+        let err = BeaconError::Unsupported("duty-aware production requires BnManager");
+        assert_eq!(err.to_string(), "duty-aware production requires BnManager");
     }
 
     #[test]

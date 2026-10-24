@@ -80,6 +80,108 @@ pub struct ProduceDuty {
 }
 
 /// Block production, publication, proposer preparation, and builder registration.
+///
+/// The duty-carrying methods have no body. A wrapper that leaves them out does
+/// not compile, so a missed override cannot drop the fee and fork checks.
+///
+/// ```compile_fail
+/// struct Wrapper;
+/// impl rvc_bn_manager::BlockProducer for Wrapper {}
+/// ```
+///
+/// ```compile_fail
+/// use async_trait::async_trait;
+///
+/// struct Wrapper;
+///
+/// #[async_trait]
+/// impl rvc_bn_manager::BlockProducer for Wrapper {
+///     async fn produce_block_v3(
+///         &self,
+///         _: u64,
+///         _: &str,
+///         _: Option<&str>,
+///         _: Option<u64>,
+///     ) -> Result<beacon::ProduceBlockResponse, beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn produce_block_v4(
+///         &self,
+///         _: u64,
+///         _: &str,
+///         _: Option<&str>,
+///         _: &beacon::BuilderConfig,
+///     ) -> Result<beacon::ProduceBlockResponse, beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn publish_block(
+///         &self,
+///         _: &eth_types::SignedBeaconBlock,
+///         _: &str,
+///         _: Option<&str>,
+///     ) -> Result<(), beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn publish_block_contents(
+///         &self,
+///         _: &eth_types::SignedBlockContentsJson,
+///         _: &str,
+///         _: Option<&str>,
+///     ) -> Result<(), beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn publish_blinded_block(
+///         &self,
+///         _: &eth_types::SignedBlindedBeaconBlock,
+///         _: &str,
+///     ) -> Result<(), beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn publish_block_ssz(
+///         &self,
+///         _: &[u8],
+///         _: &str,
+///         _: bool,
+///         _: Option<&str>,
+///     ) -> Result<(), beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn publish_execution_payload_envelope(
+///         &self,
+///         _: &beacon::WireBody,
+///         _: &beacon::WireBody,
+///         _: &beacon::WireBody,
+///         _: &str,
+///         _: Option<&str>,
+///     ) -> Result<(), beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn prepare_beacon_proposer(
+///         &self,
+///         _: &[rvc_bn_manager::ProposerPreparation],
+///     ) -> Result<(), beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn register_validators(
+///         &self,
+///         _: &[eth_types::SignedValidatorRegistration],
+///     ) -> Result<(), beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn submit_proposer_preferences(
+///         &self,
+///         _: &[eth_types::SignedProposerPreferences],
+///     ) -> Result<(), beacon::BeaconError> {
+///         unimplemented!()
+///     }
+///     async fn submit_builder_preferences(
+///         &self,
+///         _: &[beacon::BuilderPreferencesEntry],
+///     ) -> Result<beacon::SubmitBuilderPreferencesResult, beacon::BeaconError> {
+///         unimplemented!()
+///     }
+/// }
+/// ```
 #[async_trait]
 pub trait BlockProducer: Send + Sync {
     async fn produce_block_v3(
@@ -92,10 +194,9 @@ pub trait BlockProducer: Send + Sync {
 
     /// Every arrived produce-block candidate, best first.
     ///
-    /// The default is one candidate from [`Self::produce_block_v3`] and ignores
-    /// `duty`. `BnManager` returns the value-ranked list and applies `duty`
-    /// before a candidate can be signed. [`Self::produce_block_v3`] is the
-    /// head of that list.
+    /// No default body. `BnManager` returns the value-ranked list and applies
+    /// `duty` before a candidate can be signed. A raw client returns one
+    /// candidate from [`Self::produce_block_v3`] only when `duty` is `None`.
     async fn produce_block_v3_ranked(
         &self,
         slot: u64,
@@ -103,17 +204,12 @@ pub trait BlockProducer: Send + Sync {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
         duty: Option<ProduceDuty>,
-    ) -> Result<Vec<RankedBlock>, BeaconError> {
-        let _ = duty;
-        let response =
-            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
-        Ok(vec![RankedBlock { bn_index: 0, response }])
-    }
+    ) -> Result<Vec<RankedBlock>, BeaconError>;
 
     /// [`Self::produce_block_v3_ranked`] capped at `deadline` when it is set.
     ///
-    /// The default ignores `deadline`. [`crate::BnManager`] uses it only for
-    /// this produce call. Other pool operations are not capped by it.
+    /// No default body. [`crate::BnManager`] uses `deadline` only for this
+    /// produce call. Other pool operations are not capped by it.
     async fn produce_block_v3_ranked_by(
         &self,
         slot: u64,
@@ -122,11 +218,7 @@ pub trait BlockProducer: Send + Sync {
         builder_boost_factor: Option<u64>,
         duty: Option<ProduceDuty>,
         deadline: Option<tokio::time::Instant>,
-    ) -> Result<Vec<RankedBlock>, BeaconError> {
-        let _ = deadline;
-        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
-            .await
-    }
+    ) -> Result<Vec<RankedBlock>, BeaconError>;
 
     /// [`Self::produce_block_v3`] with the duty's slot, proposer, parent,
     /// and consensus version applied before a block is ranked or returned.
@@ -144,7 +236,9 @@ pub trait BlockProducer: Send + Sync {
     /// health floor, and only when [`ProduceDuty::expected_parent_root`] is
     /// `Some` and [`ProduceDuty::parent_closed`] is false. A fallback block
     /// must use that primary parent; the re-org parent is not accepted there.
-    /// The default ignores the duty and calls [`Self::produce_block_v3`].
+    ///
+    /// No default body. The argument is a duty, so a client that cannot apply
+    /// it must return an error rather than call [`Self::produce_block_v3`].
     async fn produce_block_v3_for_duty(
         &self,
         slot: u64,
@@ -152,10 +246,7 @@ pub trait BlockProducer: Send + Sync {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
         duty: ProduceDuty,
-    ) -> Result<ProduceBlockResponse, BeaconError> {
-        let _ = duty;
-        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
-    }
+    ) -> Result<ProduceBlockResponse, BeaconError>;
 
     /// Produce a block via `POST /eth/v4/validator/blocks/{slot}`.
     ///
@@ -171,8 +262,8 @@ pub trait BlockProducer: Send + Sync {
 
     /// [`Self::produce_block_v4`] capped at `deadline` when it is set.
     ///
-    /// The default ignores `deadline`. [`crate::BnManager`] applies it only
-    /// to this produce call.
+    /// No default body. [`crate::BnManager`] applies `deadline` only to this
+    /// produce call. A raw client has one node and calls [`Self::produce_block_v4`].
     async fn produce_block_v4_by(
         &self,
         slot: u64,
@@ -180,10 +271,7 @@ pub trait BlockProducer: Send + Sync {
         graffiti: Option<&str>,
         builder_config: &BuilderConfig,
         deadline: Option<tokio::time::Instant>,
-    ) -> Result<ProduceBlockResponse, BeaconError> {
-        let _ = deadline;
-        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
-    }
+    ) -> Result<ProduceBlockResponse, BeaconError>;
 
     /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block(
@@ -937,5 +1025,165 @@ mod tests {
     fn test_bn_manager_config_includes_broadcast_topics() {
         let config = BnManagerConfig::new(vec!["http://localhost:5052".to_string()]);
         assert_eq!(config.broadcast_topics, BroadcastTopics::default());
+    }
+
+    fn sample_duty() -> ProduceDuty {
+        ProduceDuty {
+            expected_proposer_index: 7,
+            expected_parent_root: Some([0xab; 32]),
+            alternate_parent_root: None,
+            parent_closed: false,
+            expected_fee_recipient: Some([0x11; 20]),
+            expected_consensus_version: eth_types::ForkName::Deneb,
+            shape: ShapeConstraint::Any,
+        }
+    }
+
+    fn raw_client(uri: &str) -> beacon::BeaconClient {
+        beacon::BeaconClient::new(beacon::BeaconClientConfig::new(uri).with_max_retries(0))
+            .expect("client")
+    }
+
+    async fn mount_one_block(server: &wiremock::MockServer) {
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/eth/v3/validator/blocks/1"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .insert_header("Eth-Consensus-Version", "deneb")
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Execution-Payload-Value", "1000")
+                    .set_body_string(
+                        r#"{"data":{"slot":"1","proposer_index":"0","parent_root":"0x00","state_root":"0x00","body":{}}}"#,
+                    ),
+            )
+            .mount(server)
+            .await;
+    }
+
+    fn assert_duty_unsupported(err: beacon::BeaconError) {
+        let message = err.to_string();
+        assert!(message.contains("duty-aware production requires BnManager"), "{message}");
+        assert!(format!("{err:?}").contains("Unsupported"), "{err:?}");
+    }
+
+    fn assert_no_http(server: &wiremock::MockServer, hits: &[wiremock::Request]) {
+        assert!(hits.is_empty(), "{} request(s) left {}", hits.len(), server.uri());
+    }
+
+    /// A raw client asked to rank with a duty must not return that node's block.
+    #[tokio::test]
+    async fn default_ranked_with_a_duty_fails_closed() {
+        let server = wiremock::MockServer::start().await;
+        mount_one_block(&server).await;
+        let client = raw_client(&server.uri());
+        let result =
+            client.produce_block_v3_ranked(1, "0xrandao", None, None, Some(sample_duty())).await;
+        let err = match result {
+            Ok(blocks) => panic!("duty was dropped; got {} candidate(s)", blocks.len()),
+            Err(err) => err,
+        };
+        assert_duty_unsupported(err);
+        let hits = server.received_requests().await.expect("requests");
+        assert_no_http(&server, &hits);
+    }
+
+    /// The deadline form is the same gate. A duty still does not reach the node.
+    #[tokio::test]
+    async fn default_ranked_by_with_a_duty_fails_closed() {
+        let server = wiremock::MockServer::start().await;
+        mount_one_block(&server).await;
+        let client = raw_client(&server.uri());
+        let deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .expect("past");
+        let result = client
+            .produce_block_v3_ranked_by(
+                1,
+                "0xrandao",
+                None,
+                None,
+                Some(sample_duty()),
+                Some(deadline),
+            )
+            .await;
+        let err = match result {
+            Ok(blocks) => panic!("duty was dropped; got {} candidate(s)", blocks.len()),
+            Err(err) => err,
+        };
+        assert_duty_unsupported(err);
+        let hits = server.received_requests().await.expect("requests");
+        assert_no_http(&server, &hits);
+    }
+
+    /// `for_duty` always carries a duty, so the raw client always refuses.
+    #[tokio::test]
+    async fn default_for_duty_fails_closed() {
+        let server = wiremock::MockServer::start().await;
+        mount_one_block(&server).await;
+        let client = raw_client(&server.uri());
+        let result =
+            client.produce_block_v3_for_duty(1, "0xrandao", None, None, sample_duty()).await;
+        let err = match result {
+            Ok(_) => panic!("duty was dropped; got a block"),
+            Err(err) => err,
+        };
+        assert_duty_unsupported(err);
+        let hits = server.received_requests().await.expect("requests");
+        assert_no_http(&server, &hits);
+    }
+
+    /// No duty keeps today's one-candidate produce.
+    #[tokio::test]
+    async fn ranked_without_a_duty_returns_one_candidate() {
+        let server = wiremock::MockServer::start().await;
+        mount_one_block(&server).await;
+        let client = raw_client(&server.uri());
+        let blocks = client
+            .produce_block_v3_ranked(1, "0xrandao", None, None, None)
+            .await
+            .expect("single candidate");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].bn_index, 0);
+        assert_eq!(blocks[0].response.execution_payload_value.as_deref(), Some("1000"));
+    }
+
+    /// A past deadline is not applied when no duty was supplied.
+    #[tokio::test]
+    async fn ranked_by_without_a_duty_ignores_a_past_deadline() {
+        let server = wiremock::MockServer::start().await;
+        mount_one_block(&server).await;
+        let client = raw_client(&server.uri());
+        let deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .expect("past");
+        let blocks = client
+            .produce_block_v3_ranked_by(1, "0xrandao", None, None, None, Some(deadline))
+            .await
+            .expect("deadline ignored");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].response.execution_payload_value.as_deref(), Some("1000"));
+    }
+
+    /// V4 has no duty argument. The raw client still calls the node.
+    #[tokio::test]
+    async fn produce_block_v4_by_calls_the_node() {
+        let server = wiremock::MockServer::start().await;
+        let client = raw_client(&server.uri());
+        let deadline = tokio::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(60))
+            .expect("past");
+        let err = client
+            .produce_block_v4_by(
+                1,
+                "0xrandao",
+                None,
+                &beacon::BuilderConfig::default(),
+                Some(deadline),
+            )
+            .await
+            .expect_err("unmocked v4");
+        assert!(!err.to_string().contains("duty-aware production requires BnManager"), "{err}");
+        let hits = server.received_requests().await.expect("requests");
+        assert!(!hits.is_empty(), "v4_by must reach the node");
     }
 }

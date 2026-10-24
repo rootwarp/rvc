@@ -58,11 +58,11 @@ pub trait BeaconBlockClient: Send + Sync {
 
     /// [`Self::produce_block_v3`] plus the duty checks applied before ranking.
     ///
-    /// The default ignores the duty and calls [`Self::produce_block_v3`].
-    /// `BnManager` uses the checks to drop a block that fails slot, proposer,
-    /// parent, or consensus version before it can win, and to keep fallback
-    /// on proposal-role nodes when [`ProduceDuty::expected_parent_root`] is
-    /// known.
+    /// No default body. `BnManager` uses the checks to drop a block that fails
+    /// slot, proposer, parent, or consensus version before it can win, and to
+    /// keep fallback on proposal-role nodes when
+    /// [`ProduceDuty::expected_parent_root`] is known. A client that cannot
+    /// apply the duty must return an error.
     async fn produce_block_v3_for_duty(
         &self,
         slot: Slot,
@@ -70,18 +70,14 @@ pub trait BeaconBlockClient: Send + Sync {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
         duty: ProduceDuty,
-    ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        let _ = duty;
-        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
-    }
+    ) -> Result<ProduceBlockResponse, BlockServiceError>;
 
     /// Every arrived produce-block candidate, best first.
     ///
-    /// The default ignores `duty` and returns one candidate from
-    /// [`Self::produce_block_v3`]. `BnManager` returns the value-ranked list
-    /// and applies `duty` before a candidate can be signed.
+    /// No default body. `BnManager` returns the value-ranked list and applies
+    /// `duty` before a candidate can be signed.
     /// [`Self::produce_block_v3`] and [`Self::produce_block_v3_for_duty`] are
-    /// the head of that list.
+    /// the head of that list when the client ranks.
     async fn produce_block_v3_ranked(
         &self,
         slot: Slot,
@@ -89,16 +85,11 @@ pub trait BeaconBlockClient: Send + Sync {
         graffiti: Option<&str>,
         builder_boost_factor: Option<u64>,
         duty: Option<ProduceDuty>,
-    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
-        let _ = duty;
-        let response =
-            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
-        Ok(vec![RankedBlock { bn_index: 0, response }])
-    }
+    ) -> Result<Vec<RankedBlock>, BlockServiceError>;
 
     /// [`Self::produce_block_v3_ranked`] capped at `deadline` for this call only.
     ///
-    /// The default ignores `deadline`.
+    /// No default body.
     async fn produce_block_v3_ranked_by(
         &self,
         slot: Slot,
@@ -107,11 +98,7 @@ pub trait BeaconBlockClient: Send + Sync {
         builder_boost_factor: Option<u64>,
         duty: Option<ProduceDuty>,
         deadline: Option<tokio::time::Instant>,
-    ) -> Result<Vec<RankedBlock>, BlockServiceError> {
-        let _ = deadline;
-        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
-            .await
-    }
+    ) -> Result<Vec<RankedBlock>, BlockServiceError>;
 
     async fn produce_block_v4(
         &self,
@@ -123,7 +110,7 @@ pub trait BeaconBlockClient: Send + Sync {
 
     /// [`Self::produce_block_v4`] capped at `deadline` for this call only.
     ///
-    /// The default ignores `deadline`.
+    /// No default body.
     async fn produce_block_v4_by(
         &self,
         slot: Slot,
@@ -131,10 +118,7 @@ pub trait BeaconBlockClient: Send + Sync {
         graffiti: Option<&str>,
         builder_config: &BuilderConfig,
         deadline: Option<tokio::time::Instant>,
-    ) -> Result<ProduceBlockResponse, BlockServiceError> {
-        let _ = deadline;
-        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
-    }
+    ) -> Result<ProduceBlockResponse, BlockServiceError>;
 
     /// `builder_url` is the produce-time `Eth-Builder-Url` echo; omit the header when `None`.
     async fn publish_block(
@@ -312,6 +296,54 @@ impl BeaconBlockClient for BareClient {
         _broadcast_validation: Option<&str>,
     ) -> Result<(), BlockServiceError> {
         unreachable!("unused")
+    }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: crate::ProduceDuty,
+    ) -> Result<crate::ProduceBlockResponse, crate::BlockServiceError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<crate::ProduceDuty>,
+    ) -> Result<Vec<crate::RankedBlock>, crate::BlockServiceError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![crate::RankedBlock { bn_index: 0, response }])
+    }
+
+    async fn produce_block_v3_ranked_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        duty: Option<crate::ProduceDuty>,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<Vec<crate::RankedBlock>, crate::BlockServiceError> {
+        self.produce_block_v3_ranked(slot, randao_reveal, graffiti, builder_boost_factor, duty)
+            .await
+    }
+
+    async fn produce_block_v4_by(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_config: &crate::BuilderConfig,
+        _deadline: Option<tokio::time::Instant>,
+    ) -> Result<crate::ProduceBlockResponse, crate::BlockServiceError> {
+        self.produce_block_v4(slot, randao_reveal, graffiti, builder_config).await
     }
 }
 
