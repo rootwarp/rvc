@@ -74,6 +74,41 @@ fn paths_on_different_filesystems(a: &Path, b: &Path) -> Option<bool> {
     Some(a_id != b_id)
 }
 
+/// One warning per BuilderOnly key that cannot ask a builder.
+///
+/// A key whose effective mode is not BuilderOnly is silent. A key that is
+/// builder-enabled and has at least one Gloas builder URL is silent. Either
+/// missing piece is one warning, including when both are missing. The line
+/// names the truncated pubkey, `builder_enabled`, and `gloas_builders`. It
+/// does not name a relay URL or a fee recipient. Startup continues.
+fn warn_builder_only_without_builder(store: &ValidatorStore, pubkeys: &[[u8; 48]]) {
+    for pubkey in pubkeys {
+        if store.effective_block_selection_mode(pubkey)
+            != validator_store::BlockSelectionMode::BuilderOnly
+        {
+            continue;
+        }
+        let builder_enabled = store.is_builder_enabled(pubkey);
+        let gloas_builders = store.builders(pubkey).len();
+        if builder_enabled && gloas_builders > 0 {
+            continue;
+        }
+        let pk_hex = hex::encode(pubkey);
+        let message = match (builder_enabled, gloas_builders) {
+            (false, 0) => "builder-only key is not builder-enabled and has no Gloas builders",
+            (false, _) => "builder-only key is not builder-enabled",
+            (true, _) => "builder-only key has no Gloas builders",
+        };
+        warn!(
+            reason = "builder_only_without_builder",
+            pubkey = %observability::logging::TruncatedPubkey::new(&pk_hex),
+            builder_enabled,
+            gloas_builders,
+            "{message}"
+        );
+    }
+}
+
 /// SEC-3 post-open gate: a fresh create without opt-in must never proceed to sign.
 ///
 /// Closes the TOCTOU between the builder's pre-open `path.exists()` check and
@@ -1102,6 +1137,8 @@ impl ServiceBuilder {
 
         crate::startup::apply_builder_settings(&store, &self.config.builder)?;
         store.set_global_block_selection_mode(self.config.block_selection_mode);
+        let tracked = store.tracked_pubkeys();
+        warn_builder_only_without_builder(&store, &tracked);
 
         if let Some(raw) = self.config.graffiti.as_deref() {
             let applied = validator_store::parse_graffiti(raw);
@@ -1132,12 +1169,14 @@ impl ServiceBuilder {
     /// keep a freshly-imported key disabled is preserved.
     pub fn register_loaded_validators(&self, store: &ValidatorStore, pubkey_map: &PubkeyMap) {
         let mut registered = 0usize;
+        let mut added = Vec::new();
         for pubkey in pubkey_map.read().values() {
             let pk_bytes = pubkey.to_bytes();
             if !store.has_validator(&pk_bytes) {
                 store
                     .add_validator(validator_store::ValidatorConfig::new(pk_bytes))
                     .expect("ValidatorConfig::new has no builder URLs");
+                added.push(pk_bytes);
                 registered += 1;
             }
         }
@@ -1146,6 +1185,7 @@ impl ServiceBuilder {
             enabled_total = store.list_enabled_pubkeys().len(),
             "Registered loaded validators in the validator store (D-3 fail-closed)"
         );
+        warn_builder_only_without_builder(store, &added);
     }
 
     pub fn build_builder_service(

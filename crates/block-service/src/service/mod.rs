@@ -445,7 +445,19 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 }
             }
         }
-        let effective_mode = selection_effective_mode(mode, breaker_tripped);
+        let mut effective_mode = selection_effective_mode(mode, breaker_tripped);
+        if local_only_because_builder_flag_off(
+            fork,
+            effective_mode,
+            self.validator_store.is_builder_enabled(&pubkey_bytes),
+        ) {
+            debug!(
+                slot = slot,
+                mode = %mode,
+                "builder_proposals is off; pre-Gloas produce is local-only"
+            );
+            effective_mode = BlockSelectionMode::ExecutionOnly;
+        }
         let shape = constraint_for_mode(effective_mode);
         let boost = match effective_mode {
             BlockSelectionMode::ExecutionOnly => {
@@ -1373,6 +1385,21 @@ fn duty_from_validator(
         expected_consensus_version: fork,
         shape,
     }
+}
+
+/// Pre-Gloas, a key that is not builder-enabled does not ask for a builder bid.
+///
+/// Max-profit and builder-always become execution-only: boost 0 and
+/// [`ShapeConstraint::LocalOnly`]. Builder-only stays on the builder walk and
+/// fails closed there. Gloas is unchanged: V4 `builders` already follow the store.
+fn local_only_because_builder_flag_off(
+    fork: ForkName,
+    mode: BlockSelectionMode,
+    builder_enabled: bool,
+) -> bool {
+    fork < ForkName::Gloas
+        && !builder_enabled
+        && matches!(mode, BlockSelectionMode::MaxProfit | BlockSelectionMode::BuilderAlways)
 }
 
 /// Max-profit and builder-always behave as execution-only while the breaker is tripped.

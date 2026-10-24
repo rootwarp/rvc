@@ -3,6 +3,16 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Builder policy follows the flag, and the boost ranks across beacon nodes
+
+A key whose effective block-selection mode is `builder-only` warns once at startup when `builder_proposals` is off, or when that key's Gloas builder list is empty. Both missing is still one warning. The line is `builder_only_without_builder`. It names the truncated pubkey, `builder_enabled`, and `gloas_builders`. It does not name a relay URL or a fee recipient. Startup continues. Keys already in the validators file are checked when the store is built. A keystore key that was not in the file is checked when it is registered, so each key warns once.
+
+Before Gloas, `max-profit` and `builder-always` with `builder_proposals` off do not request a builder bid. The produce call uses boost 0 and accepts only a local block. A blinded response is rejected before it is signed, and a produce error on that path is not a builder-circuit miss. `builder-only` is not downgraded: it still asks with boost `u64::MAX`, still refuses a local block, and still warns at startup. Gloas is unchanged. V4 keeps the configured boost and the configured builder list.
+
+When more than one beacon node returns a block, a blinded block is ranked at `value * builder_boost_factor / 100` and a local block at its raw value. The scale is a checked multiply. When that product does not fit in `u128`, a divide-first path runs, and the quotient is capped at `u128::MAX`. Overflow does not always yield `u128::MAX`: `u128::MAX` at boost 50 is `u128::MAX / 2`. Saturating the product and then dividing would turn `u128::MAX / 2 * 1000` into `u128::MAX / 100`. Boost `u64::MAX` ranks any blinded block above any local block. Boost 0 ranks any local block above any blinded block, including a local value of 0 against a blinded value of `u128::MAX`. No boost on the duty compares raw values. The primary parent still outranks the re-org parent before the boost.
+
+Turning `builder_proposals` off does not tell the relay to forget the validator, and it does not drop a registration the builder service already cached. The relay keeps the last registration until a later registration update.
+
 ## Broadcast drains are bounded per beacon node and joined on shutdown
 
 Each beacon node accepts at most 4 in-flight broadcast sends. That cap is

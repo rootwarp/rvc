@@ -542,6 +542,11 @@ impl ValidatorStore {
         self.state.read().validators.values().filter(|c| c.enabled).map(|c| c.pubkey).collect()
     }
 
+    /// Every tracked pubkey, including rows with signing disabled.
+    pub fn tracked_pubkeys(&self) -> Vec<[u8; 48]> {
+        self.state.read().validators.keys().copied().collect()
+    }
+
     /// Returns `true` if this validator is permitted to sign.
     ///
     /// Fail-closed (D-3 / Issue 2.11): keys that are not tracked by the store

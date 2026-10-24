@@ -1281,6 +1281,7 @@ pub(crate) fn test_validator_store(pubkey: &PublicKey) -> ValidatorStore {
     let pk_bytes = pubkey.to_bytes();
     let mut config = validator_store::ValidatorConfig::new(pk_bytes);
     config.builder_boost_factor = Some(150);
+    config.builder_proposals = true;
     let mut graffiti = [0u8; 32];
     graffiti[..5].copy_from_slice(b"hello");
     config.graffiti = Some(graffiti);
