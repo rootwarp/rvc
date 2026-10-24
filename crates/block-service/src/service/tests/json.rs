@@ -47,6 +47,7 @@ fn contents_response(text: &str) -> ProduceBlockResponse {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -169,6 +170,7 @@ async fn gloas_json_body_fails_closed_and_publishes_nothing() {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     };
     let err = response.parse_full_block().expect_err("gloas JSON body must fail closed");
     let msg = err.to_string();
@@ -228,6 +230,7 @@ async fn signing_root_is_unchanged_for_the_same_block() {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     };
     let pubkey = test_pubkey();
     let harness = harness(response, &pubkey);
@@ -273,6 +276,7 @@ fn blinded_produce(data: serde_json::Value, version: &str) -> ProduceBlockRespon
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -566,6 +570,7 @@ fn full_produce(data: serde_json::Value, version: &str) -> ProduceBlockResponse 
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 

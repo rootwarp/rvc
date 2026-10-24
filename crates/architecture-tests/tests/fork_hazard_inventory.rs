@@ -121,9 +121,9 @@ const fn inv(
 
 /// Exact per-class counts. Update together with [`INVENTORY`] and the audit doc.
 const EXPECTED_COUNTS: [(Class, usize); 5] = [
-    (Class::GeForkName, 26),
+    (Class::GeForkName, 28),
     (Class::IndexZero, 8),
-    (Class::MatchForkName, 8),
+    (Class::MatchForkName, 10),
     (Class::StringDispatch, 10),
     (Class::Entries, 8),
 ];
@@ -148,6 +148,24 @@ const INVENTORY: &[Inv] = &[
         "if ForkName::from_epoch(epoch, schedule) >= ForkName::Gloas { \"v2\" } else { \"v1\" };",
         Verdict::InheritIntentionally,
         "4.5",
+    ),
+    inv(
+        "crates/beacon/src/prepare_check.rs",
+        "compute_preparable",
+        Class::GeForkName,
+        false,
+        "&& (slot_fork >= ForkName::Gloas || response.consensus_version == \"gloas\")",
+        Verdict::InheritIntentionally,
+        "—",
+    ),
+    inv(
+        "crates/beacon/src/prepare_check.rs",
+        "compute_preparable",
+        Class::GeForkName,
+        false,
+        "Ok(_) if slot_fork >= ForkName::Gloas => {",
+        Verdict::InheritIntentionally,
+        "—",
     ),
     inv(
         "crates/block-service/src/service/mod.rs",
@@ -465,6 +483,24 @@ const INVENTORY: &[Inv] = &[
         "match requested {",
         Verdict::InheritIntentionally,
         "RR-3.2",
+    ),
+    inv(
+        "crates/beacon/src/prepare_check.rs",
+        "compute_preparable",
+        Class::MatchForkName,
+        false,
+        "match ForkName::from_str(&response.consensus_version) {",
+        Verdict::InheritIntentionally,
+        "—",
+    ),
+    inv(
+        "crates/beacon/src/prepare_check.rs",
+        "ssz_format",
+        Class::MatchForkName,
+        false,
+        "Ok(match fork {",
+        Verdict::InheritIntentionally,
+        "—",
     ),
     inv(
         "crates/block-service/src/service/mod.rs",

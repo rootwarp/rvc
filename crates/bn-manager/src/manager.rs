@@ -2644,6 +2644,8 @@ enum HardReject {
     Fee,
     /// [`ShapeConstraint`] rejects this blinded flag.
     Shape,
+    /// The shared prepare predicate rejected the body.
+    Prepare,
 }
 
 fn hard_reject_label(reason: HardReject) -> &'static str {
@@ -2655,6 +2657,7 @@ fn hard_reject_label(reason: HardReject) -> &'static str {
         HardReject::Parent => "parent",
         HardReject::Fee => "fee",
         HardReject::Shape => "shape",
+        HardReject::Prepare => "prepare",
     }
 }
 
@@ -2707,6 +2710,11 @@ fn hard_reject_reason(
     }
     if fee_is_hard_reject(block, checks, &fields, policy) {
         return Some(HardReject::Fee);
+    }
+    if beacon::prepare_check::check_preparable(block, checks.consensus_version, checks.shape)
+        .is_err()
+    {
+        return Some(HardReject::Prepare);
     }
     None
 }
@@ -4925,8 +4933,7 @@ mod tests {
             "fallback must not return a local block under blinded-only"
         );
 
-        let mut blinded = duty_response("1000", 1, 7, parent, None);
-        blinded.is_blinded = true;
+        let blinded = blinded_duty_response("1000", 1, 7, parent);
         assert!((select.accept)(&blinded));
         assert!((select.in_hand)(&blinded));
         assert!((select.fallback_accept)(&blinded));
@@ -4974,6 +4981,7 @@ mod tests {
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             };
             assert!(
                 matches!(
@@ -5303,6 +5311,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }
     }
 
@@ -6080,6 +6089,19 @@ mod tests {
         hex
     }
 
+    fn deneb_body_json() -> serde_json::Value {
+        serde_json::to_value(eth_types::external_vector_deneb_body()).expect("deneb body json")
+    }
+
+    fn deneb_contents_data() -> serde_json::Value {
+        let doc: serde_json::Value = serde_json::from_str(include_str!(
+            "../../eth-types/tests/fixtures/beacon_api/deneb_block_contents.json"
+        ))
+        .expect("deneb contents fixture");
+        doc["data"].clone()
+    }
+
+    /// `fee == None` keeps the vector fee, so the body stays preparable.
     fn duty_response(
         execution: &str,
         slot: u64,
@@ -6087,21 +6109,49 @@ mod tests {
         parent: [u8; 32],
         fee: Option<[u8; 20]>,
     ) -> ProduceBlockResponse {
-        let body = match fee {
-            Some(fee) => serde_json::json!({
-                "execution_payload": { "fee_recipient": parent_hex_n(&fee) }
-            }),
-            None => serde_json::json!({}),
-        };
+        let mut body = deneb_body_json();
+        if let Some(fee) = fee {
+            body["execution_payload"]["fee_recipient"] =
+                serde_json::Value::String(parent_hex_n(&fee));
+        }
+        let data = serde_json::json!({
+            "slot": slot.to_string(),
+            "proposer_index": proposer.to_string(),
+            "parent_root": parent_hex(&parent),
+            "state_root": parent_hex(&[0u8; 32]),
+            "body": body,
+        });
+        produce_from_data(execution, data, false)
+    }
+
+    fn blinded_duty_response(
+        execution: &str,
+        slot: u64,
+        proposer: u64,
+        parent: [u8; 32],
+    ) -> ProduceBlockResponse {
+        let body: serde_json::Value = serde_json::from_str(include_str!(
+            "../../eth-types/tests/fixtures/beacon_api/deneb_blinded_block_body.json"
+        ))
+        .expect("deneb blinded body");
+        let data = serde_json::json!({
+            "slot": slot.to_string(),
+            "proposer_index": proposer.to_string(),
+            "parent_root": parent_hex(&parent),
+            "state_root": parent_hex(&[0u8; 32]),
+            "body": body,
+        });
+        produce_from_data(execution, data, true)
+    }
+
+    fn produce_from_data(
+        execution: &str,
+        data: serde_json::Value,
+        is_blinded: bool,
+    ) -> ProduceBlockResponse {
         ProduceBlockResponse {
-            data: serde_json::json!({
-                "slot": slot.to_string(),
-                "proposer_index": proposer.to_string(),
-                "parent_root": parent_hex(&parent),
-                "state_root": parent_hex(&[0u8; 32]),
-                "body": body,
-            }),
-            is_blinded: false,
+            data,
+            is_blinded,
             consensus_version: "deneb".to_string(),
             execution_payload_value: Some(execution.to_string()),
             is_ssz: false,
@@ -6109,7 +6159,17 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }
+    }
+
+    /// Drop `fee_recipient` so the fee rule sees [`FeeOnBlock::Unknown`].
+    fn without_fee(mut block: ProduceBlockResponse) -> ProduceBlockResponse {
+        block.data["body"]["execution_payload"]
+            .as_object_mut()
+            .expect("execution payload")
+            .remove("fee_recipient");
+        block
     }
 
     fn parent_hex_n(bytes: &[u8]) -> String {
@@ -6423,7 +6483,7 @@ mod tests {
                     let endpoint = client.endpoint().to_string();
                     Box::pin(async move {
                         if endpoint.contains("small") {
-                            Ok(duty_response("1000", 1, 7, parent, None))
+                            Ok(without_fee(duty_response("1000", 1, 7, parent, None)))
                         } else {
                             Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
                         }
@@ -6639,11 +6699,17 @@ mod tests {
 
     #[test]
     fn ssz_block_passes_slot_proposer_and_parent() {
-        let mut bytes = vec![0u8; 84];
-        bytes[0..8].copy_from_slice(&7u64.to_le_bytes());
-        bytes[8..16].copy_from_slice(&42u64.to_le_bytes());
-        bytes[16..48].copy_from_slice(&[0xab; 32]);
-        bytes[80..84].copy_from_slice(&84u32.to_le_bytes());
+        let body = eth_types::external_vector_blinded_deneb_body().as_ssz_bytes();
+        let bytes = eth_types::encode_blinded_beacon_block_ssz(
+            &eth_types::BlindedBeaconBlock {
+                slot: 7,
+                proposer_index: 42,
+                parent_root: [0xab; 32],
+                state_root: [0u8; 32],
+                body,
+            },
+            0,
+        );
         let block = ProduceBlockResponse {
             data: serde_json::Value::Null,
             is_blinded: true,
@@ -6654,6 +6720,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         let checks = BlockDutyChecks {
             slot: 7,
@@ -6693,7 +6760,7 @@ mod tests {
         let mismatched = duty_response("1", 1, 7, parent, Some([0x22; 20]));
         assert!(passes_sign(&mismatched, &checks));
         assert!(!fee_preferred(&mismatched, &checks));
-        let missing = duty_response("1", 1, 7, parent, None);
+        let missing = without_fee(duty_response("1", 1, 7, parent, None));
         assert!(!passes_sign(&missing, &checks));
         assert!(!block_passes_duty(&mismatched, &checks, FeeRecipientPolicy::Reject));
         let mut wrong_version = duty_response("9000", 1, 7, parent, Some(fee));
@@ -7250,11 +7317,9 @@ mod tests {
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
         };
-        let mut blinded = duty_response("1", 1, 7, parent, None);
-        blinded.is_blinded = true;
-        blinded.data["body"] = serde_json::json!({
-            "execution_payload_header": { "fee_recipient": parent_hex_n(&[0x22; 20]) }
-        });
+        let mut blinded = blinded_duty_response("1", 1, 7, parent);
+        blinded.data["body"]["execution_payload_header"]["fee_recipient"] =
+            serde_json::Value::String(parent_hex_n(&[0x22; 20]));
         assert!(passes_sign(&blinded, &checks));
         assert!(
             fee_preferred(&blinded, &checks),
@@ -7274,7 +7339,10 @@ mod tests {
         let mut payload = duty_response("1", 1, 7, parent, Some(expected));
         payload.data["body"]["execution_payload_header"] =
             serde_json::json!({ "fee_recipient": parent_hex_n(&[0x22; 20]) });
-        assert!(passes_sign(&payload, &checks));
+        assert!(
+            !passes_sign(&payload, &checks),
+            "an extra header field on a full body is not preparable"
+        );
         assert!(fee_preferred(&payload, &checks));
     }
 
@@ -7287,17 +7355,22 @@ mod tests {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let parent = "ab".repeat(32);
-        let state = "00".repeat(32);
-        let fee = "11".repeat(20);
-        let nested = format!(
-            r#"{{"slot":"1","proposer_index":"7","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}}}}"#
-        );
-        let contents =
-            format!(r#"{{"data":{{"block":{nested},"kzg_proofs":["0xab"],"blobs":["0xcd"]}}}}"#);
-        let hybrid = format!(
-            r#"{{"data":{{"slot":"1","proposer_index":"7","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}},"block":{nested},"kzg_proofs":["0xab"],"blobs":["0xcd"]}}}}"#
-        );
+        let mut data = deneb_contents_data();
+        let block = data.get_mut("block").expect("block");
+        block["slot"] = serde_json::json!("1");
+        block["proposer_index"] = serde_json::json!("7");
+        block["parent_root"] = serde_json::json!(format!("0x{}", "ab".repeat(32)));
+        block["body"]["execution_payload"]["fee_recipient"] =
+            serde_json::json!(format!("0x{}", "11".repeat(20)));
+        let hybrid_block = data["block"].clone();
+        let contents = serde_json::json!({ "data": data.clone() }).to_string();
+        let mut hybrid_data = data;
+        hybrid_data["slot"] = hybrid_block["slot"].clone();
+        hybrid_data["proposer_index"] = hybrid_block["proposer_index"].clone();
+        hybrid_data["parent_root"] = hybrid_block["parent_root"].clone();
+        hybrid_data["state_root"] = hybrid_block["state_root"].clone();
+        hybrid_data["body"] = hybrid_block["body"].clone();
+        let hybrid = serde_json::json!({ "data": hybrid_data }).to_string();
         let duty = ProduceDuty {
             expected_proposer_index: 7,
             expected_parent_root: Some([0xab; 32]),
@@ -7371,22 +7444,22 @@ mod tests {
             (ForkName::Gloas, "gloas", false),
         ] {
             let checks = BlockDutyChecks { consensus_version: fork, ..base };
-            let mut block = duty_response("1", 1, 7, parent, None);
+            let mut block = without_fee(duty_response("1", 1, 7, parent, None));
             block.consensus_version = version.to_string();
-            assert_eq!(passes_sign(&block, &checks), preferred, "{version}");
+            assert!(!passes_sign(&block, &checks), "{version} is not preparable");
             assert_eq!(fee_preferred(&block, &checks), preferred, "{version}");
         }
 
         let mut present = duty_response("1", 1, 7, parent, Some(expected));
         present.consensus_version = "bellatrix".to_string();
         let bellatrix = BlockDutyChecks { consensus_version: ForkName::Bellatrix, ..base };
-        assert!(passes_sign(&present, &bellatrix));
+        assert!(!passes_sign(&present, &bellatrix), "a pre-deneb full body is not preparable");
         assert!(fee_preferred(&present, &bellatrix));
 
         let mut wrong = duty_response("1", 1, 7, parent, Some([0x22; 20]));
         wrong.consensus_version = "altair".to_string();
         let altair = BlockDutyChecks { consensus_version: ForkName::Altair, ..base };
-        assert!(passes_sign(&wrong, &altair));
+        assert!(!passes_sign(&wrong, &altair), "a pre-deneb full body is not preparable");
         assert!(!fee_preferred(&wrong, &altair));
     }
 
@@ -7424,6 +7497,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }
     }
 
@@ -7486,6 +7560,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         let gloas_checks = BlockDutyChecks { consensus_version: ForkName::Gloas, ..checks };
         assert!(!passes_sign(&gloas, &gloas_checks), "an unreadable Gloas fee is a hard reject");
@@ -7529,12 +7604,13 @@ mod tests {
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             };
             let matching = block(pre_deneb_body(fixed_len, fee));
-            assert!(passes_sign(&matching, &checks), "{version}");
+            assert!(!passes_sign(&matching, &checks), "{version} full body is not preparable");
             assert!(fee_preferred(&matching, &checks), "{version}");
             let mismatched = block(pre_deneb_body(fixed_len, [0x11; 20]));
-            assert!(passes_sign(&mismatched, &checks), "{version} mismatch stays eligible");
+            assert!(!passes_sign(&mismatched, &checks), "{version} full body is not preparable");
             assert!(!fee_preferred(&mismatched, &checks), "{version} mismatch");
             let short = block(vec![0u8; 8]);
             assert!(!passes_sign(&short, &checks), "{version} short body is a hard reject");
@@ -7565,6 +7641,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
@@ -7576,6 +7653,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         assert!(higher_block_value(&a, &b));
         assert!(!higher_block_value(&b, &a));
@@ -7593,6 +7671,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
@@ -7604,6 +7683,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         assert!(!higher_block_value(&a, &b));
         assert!(higher_block_value(&b, &a));
@@ -7621,6 +7701,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
@@ -7632,6 +7713,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         assert!(!higher_block_value(&a, &b));
     }
@@ -7650,6 +7732,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: consensus.map(str::to_string),
+            candidate_memo: beacon::CandidateMemo::arc(),
         }
     }
 
@@ -7843,6 +7926,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         let b = ProduceBlockResponse {
             data: serde_json::Value::Null,
@@ -7854,6 +7938,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         };
         assert!(!higher_block_value(&a, &b));
     }

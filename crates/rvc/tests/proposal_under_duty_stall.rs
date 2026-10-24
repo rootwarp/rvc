@@ -503,6 +503,7 @@ impl BeaconBlockClient for TrackingBlockBeacon {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         })
     }
 

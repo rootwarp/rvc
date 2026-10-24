@@ -195,6 +195,8 @@ pub struct ProduceBlockResponse {
     /// [`block_value`] adds this to the execution payload value. A missing or
     /// unparsable header contributes 0.
     pub consensus_block_value: Option<String>,
+    /// Prepare cache. Clones share one decode.
+    pub candidate_memo: std::sync::Arc<crate::prepare_check::CandidateMemo>,
 }
 
 /// One produce-block response and the beacon node that returned it.
@@ -1658,6 +1660,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: crate::prepare_check::CandidateMemo::arc(),
         };
 
         let block = response.parse_full_block().unwrap();
@@ -1685,6 +1688,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: crate::prepare_check::CandidateMemo::arc(),
         }
     }
 
@@ -1842,6 +1846,7 @@ mod tests {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: crate::prepare_check::CandidateMemo::arc(),
         };
 
         assert!(response.parse_full_block().is_err());
@@ -1877,6 +1882,7 @@ mod tests {
             payload_included,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: crate::prepare_check::CandidateMemo::arc(),
         }
     }
 
