@@ -3,8 +3,9 @@
 //! bn-manager ranks with this. block-service builds the header from the same
 //! [`Prepared`] value. A failure does not close the soft window and is not signed.
 
+use std::any::Any;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use eth_types::{
     body_fork_layout, expected_kzg_proof_count, BeaconBlock, BlindedBeaconBlock, BlockContents,
@@ -25,6 +26,18 @@ const BLOB_BYTES: usize = 131_072;
 #[derive(Debug)]
 pub struct CandidateMemo {
     prepare: Mutex<Option<PrepareSlot>>,
+    /// bn-manager stores decoded duty fields here. One type per candidate.
+    duty: DutyCache,
+}
+
+struct DutyCache {
+    value: OnceLock<Box<dyn Any + Send + Sync>>,
+}
+
+impl std::fmt::Debug for DutyCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DutyCache").field("filled", &self.value.get().is_some()).finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -37,7 +50,15 @@ struct PrepareSlot {
 impl CandidateMemo {
     /// Empty cache shared by clones of the response.
     pub fn arc() -> Arc<Self> {
-        Arc::new(Self { prepare: Mutex::new(None) })
+        Arc::new(Self { prepare: Mutex::new(None), duty: DutyCache { value: OnceLock::new() } })
+    }
+
+    /// First call runs `init`. Later calls return that value.
+    ///
+    /// The cache holds one type. A second type is a programming error.
+    pub fn cached_duty<T: Send + Sync + 'static>(&self, init: impl FnOnce() -> T) -> &T {
+        let boxed = self.duty.value.get_or_init(|| Box::new(init()));
+        boxed.downcast_ref::<T>().expect("duty cache stores one type")
     }
 }
 
