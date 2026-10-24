@@ -676,6 +676,8 @@ async fn wait_for_best<T>(
     filter: &BestFilter<T>,
 ) -> bool {
     loop {
+        // Every selected node has answered. A held re-org parent is returned
+        // now: waiting out the soft deadline cannot add a candidate.
         if pending.is_empty() {
             return false;
         }

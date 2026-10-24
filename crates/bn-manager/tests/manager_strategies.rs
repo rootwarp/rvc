@@ -5077,7 +5077,7 @@ async fn builder_only_local_block_does_not_close_the_soft_window() {
     tokio::time::pause();
     let manager = manager_with_block_budget(&[&local, &blinded], Duration::from_secs(3));
     let started = tokio::time::Instant::now();
-    let duty = shape_duty(ShapeConstraint::BlindedOnly, None);
+    let duty = shape_duty(ShapeConstraint::BlindedOnly, Some([0u8; 32]));
     let produce = tokio::spawn(async move {
         manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await
     });
@@ -5105,7 +5105,7 @@ async fn execution_only_blinded_block_is_a_hard_reject() {
     tokio::time::pause();
     let manager = manager_with_block_budget(&[&blinded, &local], Duration::from_secs(3));
     let started = tokio::time::Instant::now();
-    let duty = shape_duty(ShapeConstraint::LocalOnly, None);
+    let duty = shape_duty(ShapeConstraint::LocalOnly, Some([0u8; 32]));
     let produce = tokio::spawn(async move {
         manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await
     });
@@ -5305,4 +5305,97 @@ async fn blinded_deneb_body_under_fulu_does_not_close_the_soft_window() {
     assert_eq!(ranked.len(), 1, "the deneb body must not be held");
     assert!(ranked[0].response.is_blinded);
     assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+fn syncing_body(distance: u64, optimistic: bool, el_offline: bool) -> String {
+    format!(
+        r#"{{"data":{{"head_slot":"1000","sync_distance":"{distance}","is_syncing":true,"is_optimistic":{optimistic},"el_offline":{el_offline}}}}}"#
+    )
+}
+
+async fn mount_syncing(server: &MockServer, distance: u64, optimistic: bool, el_offline: bool) {
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/node/syncing"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(syncing_body(distance, optimistic, el_offline)),
+        )
+        .mount(server)
+        .await;
+}
+
+async fn mount_produce_times(server: &MockServer, value: &str, times: u64) {
+    let parent = "ab".repeat(32);
+    let body = produce_json(preparable_data("full", 1, 7, &parent, false));
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block(value, body))
+        .expect(times)
+        .mount(server)
+        .await;
+}
+
+fn unknown_parent_duty() -> ProduceDuty {
+    ProduceDuty {
+        expected_proposer_index: 7,
+        expected_parent_root: None,
+        alternate_parent_root: None,
+        parent_closed: false,
+        expected_fee_recipient: None,
+        expected_consensus_version: ForkName::Deneb,
+        shape: ShapeConstraint::Any,
+    }
+}
+
+/// No synced node. The first round still skips large-lag, optimistic, and
+/// execution-offline beacon nodes when the parent is unknown. Small lag stays.
+#[tokio::test]
+async fn initial_round_without_a_synced_node_skips_large_lag_optimistic_and_offline_bns_when_the_parent_is_unknown(
+) {
+    let small = MockServer::start().await;
+    let large = MockServer::start().await;
+    let optimistic = MockServer::start().await;
+    let offline = MockServer::start().await;
+    mount_syncing(&small, 9, false, false).await;
+    mount_syncing(&large, 17, false, false).await;
+    mount_syncing(&optimistic, 9, true, false).await;
+    mount_syncing(&offline, 9, false, true).await;
+    mount_produce_times(&small, "7000", 1).await;
+    mount_produce_times(&large, "1111", 0).await;
+    mount_produce_times(&optimistic, "2222", 0).await;
+    mount_produce_times(&offline, "3333", 0).await;
+
+    let manager = manager_with_block_budget(
+        &[&small.uri(), &large.uri(), &optimistic.uri(), &offline.uri()],
+        Duration::from_secs(3),
+    );
+    manager.check_sync_status().await;
+    let block = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, unknown_parent_duty())
+        .await
+        .expect("the small-lag block");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("7000"));
+}
+
+/// No node meets the floor. A known parent relaxes to the wider set, so the
+/// large-lag block is still produced.
+#[tokio::test]
+async fn initial_round_relaxes_when_the_parent_is_known_and_no_floor_node_exists() {
+    let large = MockServer::start().await;
+    mount_syncing(&large, 17, false, false).await;
+    mount_produce_times(&large, "7000", 1).await;
+    let manager = manager_with_block_budget(&[&large.uri()], Duration::from_secs(3));
+    manager.check_sync_status().await;
+    let parent = [0xabu8; 32];
+    let block = manager
+        .produce_block_v3_for_duty(
+            1,
+            "0xrandao",
+            None,
+            None,
+            any_duty(ForkName::Deneb, Some(parent), None),
+        )
+        .await
+        .expect("known parent relaxes onto the large-lag node");
+    assert_eq!(block.execution_payload_value.as_deref(), Some("7000"));
 }

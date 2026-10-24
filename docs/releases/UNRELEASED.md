@@ -536,8 +536,11 @@ process starts with the breaker clear, so those entries are sent again.
 At proposal slot N, the parent walk reads `GET /eth/v1/beacon/headers/{block_id}`.
 The first header found is the canonical parent. When that header is exactly at
 slot N-1, a block whose parent is that header's own parent is also signed and
-published, but only after the soft deadline and only when no block on the
-header root is in hand. That covers a single-slot proposer re-org. The header
+published when no block on the header root is in hand. If every selected
+beacon node has already answered, that re-org parent is returned then, before
+the soft deadline, because waiting cannot bring a better block. While a
+selected node is still in flight, the re-org parent does not close the soft
+window. That covers a single-slot proposer re-org. The header
 root ranks ahead of that re-org parent. A header below N-1 accepts only that
 header's root. A non-404 error skips the parent check rather than binding an
 older block. A header whose slot does not match the requested id, or a head
@@ -601,12 +604,24 @@ failure retries once per slot until both succeed. A slow beacon node on that
 task does not hold the slot loop. The epoch-boundary send still runs after
 that slot's proposal.
 
+The first round of a duty keeps the usual tier selection, then drops any
+beacon node below small lag, any optimistic node, and any node whose
+execution client is offline. A healthy node whose sync status has not been
+read yet stays in that round, including when the expected parent was not
+supplied. A synced node still leaves a small-lag peer for the fallback
+round. When that filter leaves nobody and the expected parent is known, the
+round uses the wider set, so a measured node below the floor can still
+propose. When the parent is unknown, that wider set is not used: a large-lag,
+optimistic, or execution-offline node is not asked for the block.
+
 If every synced proposal node fails or misses the budget, another
 proposal-role node is tried only when it is still above the health floor
 (small lag or better, healthy, not optimistic, and execution online) and the
 expected parent root is known. Its block has to match that primary parent.
 The re-org parent is not accepted on this path. A readable
-fee mismatch is kept only when no fee-matching block is available. A blinded
+fee mismatch is kept only when no fee-matching block is available. Every
+penalized block from that fallback is kept and ranked; the higher value is
+first. A blinded
 block keeps the builder header's fee recipient. The attempt stays inside the
 time left in the backstop, and ends 50 ms early once a block is held. The
 block-proposal deadline includes that same 250 ms, so publishing is not

@@ -164,6 +164,64 @@ fn skip_capability(tracker: &BnHealthTracker, op_name: &str) -> bool {
     }
 }
 
+/// Capability skip, health cut, and health-score order. Same tail as
+/// [`BnManager::synced_indices`].
+fn order_selected(
+    tier_filtered: Vec<usize>,
+    op_name: &str,
+    health_guard: &[BnHealthTracker],
+) -> Vec<usize> {
+    let capable: Vec<usize> =
+        tier_filtered.iter().copied().filter(|&i| capable_of(&health_guard[i], op_name)).collect();
+
+    if capable.is_empty() {
+        if !tier_filtered.is_empty() {
+            warn!(
+                op = op_name,
+                bn_count = tier_filtered.len(),
+                "all eligible BNs incapable of operation, re-probing"
+            );
+        }
+        let healthy: Vec<usize> =
+            tier_filtered.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
+        let mut result = if healthy.is_empty() {
+            error!(
+                bn_count = tier_filtered.len(),
+                "All BNs unhealthy, using all tier-matching BNs"
+            );
+            tier_filtered
+        } else {
+            healthy
+        };
+        sort_indices_by_health(&mut result, health_guard);
+        return result;
+    }
+
+    let mut reprobe = Vec::new();
+    for &i in &tier_filtered {
+        if capable_of(&health_guard[i], op_name) {
+            continue;
+        }
+        if skip_capability(&health_guard[i], op_name) {
+            continue;
+        }
+        reprobe.push(i);
+    }
+
+    let healthy_capable: Vec<usize> =
+        capable.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
+    let mut capable_pool = if healthy_capable.is_empty() {
+        error!(bn_count = capable.len(), "All BNs unhealthy, using all tier-matching BNs");
+        capable
+    } else {
+        healthy_capable
+    };
+    sort_indices_by_health(&mut reprobe, health_guard);
+    sort_indices_by_health(&mut capable_pool, health_guard);
+    reprobe.extend(capable_pool);
+    reprobe
+}
+
 fn sort_indices_by_health(indices: &mut [usize], health_guard: &[BnHealthTracker]) {
     indices.sort_by(|&a, &b| {
         health_guard[b]
@@ -278,6 +336,10 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 ///   value — `produce_block_v3`. With a block-production budget, accepted
 ///   blocks in hand are returned at the soft deadline (half the budget). A
 ///   block that fails the slot, proposer, or parent check is not in hand. A
+///   known duty's first round keeps that tier selection and then stays on
+///   small lag or better, and is not optimistic or execution-offline. A
+///   healthy node that has not been polled stays in. The filter is lifted
+///   when it is empty and the parent is known. A
 ///   hard reject does not change that beacon node's health score. A fee-only
 ///   penalty still counts as a success. When the finished candidates were all
 ///   dropped and no transport error was stored, the error names each reason.
@@ -1077,16 +1139,7 @@ impl BnManager {
         let healthy_count = health_guard.iter().filter(|t| t.is_healthy()).count();
         debug!(bn_count = self.clients.len(), healthy_count = healthy_count, "Health check cycle");
 
-        let role_indices = self.role_matching_indices(role);
-
-        // If still empty after role fallback, use every admitted BN.
-        // Unadmitted nodes stay out: a syncing recovery is not chain identity.
-        let role_indices = if role_indices.is_empty() {
-            warn!("no admitted BNs with All role either, falling back to all admitted BNs");
-            (0..self.clients.len()).filter(|&i| self.is_admitted(i)).collect()
-        } else {
-            role_indices
-        };
+        let role_indices = self.admitted_role_indices(role);
 
         // Step 2: Filter by tier
         let mut tier_filtered: Vec<usize> = role_indices
@@ -1136,60 +1189,73 @@ impl BnManager {
             tier_filtered = role_indices;
         }
 
-        let capable: Vec<usize> = tier_filtered
-            .iter()
-            .copied()
-            .filter(|&i| capable_of(&health_guard[i], op_name))
-            .collect();
-
-        if capable.is_empty() {
-            if !tier_filtered.is_empty() {
-                warn!(
-                    op = op_name,
-                    bn_count = tier_filtered.len(),
-                    "all eligible BNs incapable of operation, re-probing"
-                );
-            }
-            let healthy: Vec<usize> =
-                tier_filtered.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
-            let mut result = if healthy.is_empty() {
-                error!(
-                    bn_count = tier_filtered.len(),
-                    "All BNs unhealthy, using all tier-matching BNs"
-                );
-                tier_filtered
-            } else {
-                healthy
-            };
-            sort_indices_by_health(&mut result, &health_guard);
-            return result;
-        }
-
         // Mixed fleet: skip flagged BNs for one selection, then re-probe them
         // first so a recovered BN is contacted while a capable peer stays healthy.
-        let mut reprobe = Vec::new();
-        for &i in &tier_filtered {
-            if capable_of(&health_guard[i], op_name) {
-                continue;
-            }
-            if skip_capability(&health_guard[i], op_name) {
-                continue;
-            }
-            reprobe.push(i);
-        }
+        order_selected(tier_filtered, op_name, &health_guard)
+    }
 
-        let healthy_capable: Vec<usize> =
-            capable.iter().copied().filter(|&i| health_guard[i].is_healthy()).collect();
-        let mut capable_pool = if healthy_capable.is_empty() {
-            error!(bn_count = capable.len(), "All BNs unhealthy, using all tier-matching BNs");
-            capable
-        } else {
-            healthy_capable
-        };
-        sort_indices_by_health(&mut reprobe, &health_guard);
-        sort_indices_by_health(&mut capable_pool, &health_guard);
-        reprobe.extend(capable_pool);
-        reprobe
+    /// Role match, then `All`, then every admitted node.
+    ///
+    /// Unadmitted nodes stay out: a syncing recovery is not chain identity.
+    fn admitted_role_indices(&self, role: BnRole) -> Vec<usize> {
+        let role_indices = self.role_matching_indices(role);
+        if !role_indices.is_empty() {
+            return role_indices;
+        }
+        warn!("no admitted BNs with All role either, falling back to all admitted BNs");
+        (0..self.clients.len()).filter(|&i| self.is_admitted(i)).collect()
+    }
+
+    /// First-round indices for a produce duty.
+    ///
+    /// `None` is no duty: the caller keeps [`Self::synced_indices`]. `Some` is
+    /// that same selection filtered by [`passes_first_round`], so a synced
+    /// node still leaves small-lag peers for fallback. A healthy node whose
+    /// sync status has not been polled stays in. An empty filter with a known
+    /// parent returns the unfiltered selection. An empty filter with an
+    /// unknown parent asks a not-yet-polled healthy node that tier relaxation
+    /// skipped, and otherwise asks nobody: large-lag, optimistic, and
+    /// execution-offline nodes are not asked.
+    async fn first_round_floor(&self, checks: Option<&BlockDutyChecks>) -> Option<Vec<usize>> {
+        let checks = checks?;
+        let relaxed =
+            self.synced_indices(BnRole::Proposal, HealthTier::Synced, "produce_block_v3").await;
+        let sync_guard = self.sync_statuses.read().await;
+        let health_guard = self.health_trackers.read().await;
+        let floor: Vec<usize> = relaxed
+            .iter()
+            .copied()
+            .filter(|&index| {
+                passes_first_round(&sync_guard[index], &health_guard[index], &self.tier_thresholds)
+            })
+            .collect();
+        if !floor.is_empty() {
+            return Some(floor);
+        }
+        if known_parent(checks) {
+            debug!(
+                op = "produce_block_v3",
+                "no beacon node above the sync floor; relaxing because the parent is known"
+            );
+            return Some(relaxed);
+        }
+        let unmeasured: Vec<usize> = self
+            .admitted_role_indices(BnRole::Proposal)
+            .into_iter()
+            .filter(|index| !relaxed.contains(index))
+            .filter(|&index| {
+                sync_guard[index].status == crate::sync_status::BnSyncStatus::Unknown
+                    && passes_first_round(
+                        &sync_guard[index],
+                        &health_guard[index],
+                        &self.tier_thresholds,
+                    )
+            })
+            .collect();
+        if unmeasured.is_empty() {
+            return Some(Vec::new());
+        }
+        Some(order_selected(unmeasured, "produce_block_v3", &health_guard))
     }
 
     /// Query using the `First` strategy: try synced BNs in order, fail over on error.
@@ -1794,7 +1860,7 @@ impl BnManager {
             tried = tracing::field::Empty,
         );
         let ranked = self
-            .query_best_inner(op_name, role, min_tier, budget, None, &op, select)
+            .query_best_inner(op_name, role, min_tier, budget, None, &op, select, None)
             .instrument(strategy_span)
             .await?;
         ranked
@@ -1814,13 +1880,17 @@ impl BnManager {
         hard_end: Option<tokio::time::Instant>,
         op: &F,
         select: BestSelect<T>,
+        preset_indices: Option<Vec<usize>>,
     ) -> Result<Vec<(usize, T)>, BeaconError>
     where
         T: Send + 'static,
         F: Fn(&BeaconClient) -> BoxFut<'static, T>,
     {
         self.ensure_duty_admission()?;
-        let indices = self.synced_indices(role, min_tier, op_name).await;
+        let indices = match preset_indices {
+            Some(indices) => indices,
+            None => self.synced_indices(role, min_tier, op_name).await,
+        };
         tracing::Span::current().record("tried", indices.len());
         if indices.is_empty() {
             return Err(no_eligible_bn(op_name, role));
@@ -1944,11 +2014,11 @@ impl BnManager {
     /// `window.deadline` bounds each attempt by the time still left. `None`
     /// leaves the attempts unbounded, matching a round with no budget configured. An `Ok`
     /// that fails `fallback_accept` is not returned. A candidate that is not in hand is
-    /// held so a later matching candidate can win. Once a block is held, a
+    /// held. Every hold is returned so the caller can rank them; a later block
+    /// that is in hand still stops the search. Once a block is held, a
     /// later attempt stops [`HELD_RETURN_MARGIN`] before `deadline`, so the
-    /// outer backstop cannot drop that block. The best held candidate is
-    /// returned when none match. Health samples are queued per attempt and
-    /// this function does not wait on the health write lock.
+    /// outer backstop cannot drop that block. Health samples are queued per
+    /// attempt and this function does not wait on the health write lock.
     #[allow(clippy::too_many_arguments)]
     async fn fallback_unsynced<T, F>(
         &self,
@@ -2040,7 +2110,7 @@ impl BnManager {
                         TrackerOutcome::Success(elapsed),
                     );
                     if !(select.in_hand)(&result) {
-                        keep_better(&mut held, i, result, select.pick_best.as_ref());
+                        held.push((i, result));
                         holding = true;
                         continue;
                     }
@@ -2051,11 +2121,16 @@ impl BnManager {
                         latency_ms = elapsed.as_millis() as u64,
                         "query succeeded on a proposal-role fallback BN"
                     );
-                    return FallbackRound {
-                        pick: Some(FallbackPick::Ready(i, result)),
-                        transport_error,
-                        rejections,
+                    // The in-hand block stops the search. Holds already taken
+                    // stay on the list so the walk can use them.
+                    held.push((i, result));
+                    let pick = if held.len() == 1 {
+                        let (index, value) = held.pop().expect("the in-hand block was just pushed");
+                        FallbackPick::Ready(index, value)
+                    } else {
+                        FallbackPick::Held(held)
                     };
+                    return FallbackRound { pick: Some(pick), transport_error, rejections };
                 }
                 Err(e) => {
                     if matches!(e, BeaconError::RevokedInFlight) {
@@ -2097,7 +2172,16 @@ impl BnManager {
     /// `rvc_produce_block_fee_recipient_penalty_total` are emitted for the
     /// candidate that is signed, not for the head of this list.
     /// Fallback runs only when the expected parent root is known, and only
-    /// against untried proposal-role BNs above the health floor.
+    /// against untried proposal-role BNs above the health floor. Every
+    /// penalized fallback block is kept.
+    ///
+    /// With a duty, [`Self::first_round_floor`] keeps the usual tier selection
+    /// and then drops nodes below the fallback floor (small lag or better, not
+    /// optimistic, execution online). A healthy node that has not been polled
+    /// stays eligible. A synced node therefore still leaves small-lag peers
+    /// for fallback. When the filter is empty and the parent root is known,
+    /// the round uses the unfiltered selection. An unknown parent does not
+    /// relax onto a measured node below the floor.
     ///
     /// `deadline` bounds how long this call waits when the runtime is
     /// responsive. The fallback deadline is the earlier of `start + budget +
@@ -2121,6 +2205,7 @@ impl BnManager {
         let budget = self.production_budget(deadline);
         let randao_reveal = randao_reveal.to_owned();
         let graffiti = graffiti.map(str::to_owned);
+        let preset = self.first_round_floor(checks.as_ref()).await;
         let select = produce_best_select(checks, self.fee_recipient_policy);
         let strategy_span = tracing::info_span!(
             "bn.strategy.best",
@@ -2155,6 +2240,7 @@ impl BnManager {
                         })
                     },
                     select,
+                    preset,
                 )
                 .instrument(strategy_span),
             )
@@ -2462,35 +2548,45 @@ fn all_candidates_rejected(operation: &str, rejections: &[(usize, &'static str)]
 }
 
 /// Better candidates first. Ties keep the lower beacon-node index.
-fn sort_by_pick<T>(
-    mut items: Vec<(usize, T)>,
-    pick_best: &dyn Fn(&T, &T) -> bool,
-) -> Vec<(usize, T)> {
-    items.sort_by(|left, right| {
-        if pick_best(&left.1, &right.1) {
-            std::cmp::Ordering::Less
-        } else if pick_best(&right.1, &left.1) {
-            std::cmp::Ordering::Greater
-        } else {
-            left.0.cmp(&right.0)
-        }
-    });
-    items
+///
+/// The rank key is computed once per candidate in [`sort_by_cached_key`].
+fn sort_by_pick<T>(items: Vec<(usize, T)>, pick_best: &dyn Fn(&T, &T) -> bool) -> Vec<(usize, T)> {
+    sort_by_cached_key(items, pick_best)
 }
 
-fn keep_better<T>(
-    held: &mut Vec<(usize, T)>,
-    index: usize,
-    result: T,
+/// One rank key per candidate, then a sort on those keys.
+///
+/// The key is how many peers this candidate outranks, then the beacon-node
+/// index. Duty fields are cached on the candidate, so the comparisons that
+/// build the key decode each produce body once.
+fn sort_by_cached_key<T>(
+    items: Vec<(usize, T)>,
     pick_best: &dyn Fn(&T, &T) -> bool,
-) {
-    match held.pop() {
-        None => held.push((index, result)),
-        Some((_current_index, current)) if pick_best(&result, &current) => {
-            held.push((index, result));
+) -> Vec<(usize, T)> {
+    let mut wins = vec![0u32; items.len()];
+    for i in 0..items.len() {
+        for j in (i + 1)..items.len() {
+            if pick_best(&items[i].1, &items[j].1) {
+                wins[i] = wins[i].saturating_add(1);
+            } else if pick_best(&items[j].1, &items[i].1) {
+                wins[j] = wins[j].saturating_add(1);
+            }
         }
-        Some(current) => held.push(current),
     }
+    let mut keyed: Vec<(CachedRank, T)> = wins
+        .into_iter()
+        .zip(items)
+        .map(|(won, (index, value))| (CachedRank { wins_inv: u32::MAX - won, index }, value))
+        .collect();
+    keyed.sort_by_key(|left| left.0);
+    keyed.into_iter().map(|(key, value)| (key.index, value)).collect()
+}
+
+/// Best first: more peers beaten, then the lower beacon-node index.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct CachedRank {
+    wins_inv: u32,
+    index: usize,
 }
 
 /// Bound for one fallback attempt.
@@ -2603,6 +2699,10 @@ fn checks_from_duty(slot: u64, duty: ProduceDuty) -> BlockDutyChecks {
     }
 }
 
+fn known_parent(checks: &BlockDutyChecks) -> bool {
+    !checks.parent_closed && checks.parent_root.is_some()
+}
+
 fn above_fallback_floor(
     sync: &crate::sync_status::BnSyncDetail,
     health: &BnHealthTracker,
@@ -2617,6 +2717,28 @@ fn above_fallback_floor(
     sync.tier(thresholds) <= FALLBACK_TIER_FLOOR
 }
 
+/// First-round membership. Same health and flag checks as
+/// [`above_fallback_floor`], plus a node whose sync status has not been polled.
+///
+/// [`BnSyncDetail::tier`] maps that status to unsynced. The fallback floor
+/// still does: a measured unsynced node is not a fallback candidate. The first
+/// round does not, or a healthy beacon node cannot propose before the first
+/// sync check.
+fn passes_first_round(
+    sync: &crate::sync_status::BnSyncDetail,
+    health: &BnHealthTracker,
+    thresholds: &TierThresholds,
+) -> bool {
+    if sync.is_optimistic || sync.el_offline || !health.is_healthy() {
+        return false;
+    }
+    if sync.status == crate::sync_status::BnSyncStatus::Unknown {
+        return true;
+    }
+    sync.tier(thresholds) <= FALLBACK_TIER_FLOOR
+}
+
+#[derive(Clone, Copy)]
 enum FeeOnBlock {
     /// No full-payload fee recipient (blinded, or JSON without one).
     Unknown,
@@ -2625,6 +2747,7 @@ enum FeeOnBlock {
     Invalid,
 }
 
+#[derive(Clone, Copy)]
 struct DutyFields {
     slot: u64,
     proposer_index: u64,
@@ -2943,7 +3066,24 @@ fn hex_prefixed(bytes: &[u8]) -> String {
     out
 }
 
+#[cfg(test)]
+thread_local! {
+    static DUTY_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn note_duty_decode() {
+    #[cfg(test)]
+    DUTY_DECODES.with(|slot| slot.set(slot.get().saturating_add(1)));
+}
+
 fn duty_fields(block: &ProduceBlockResponse) -> Option<DutyFields> {
+    *block.candidate_memo.cached_duty(|| {
+        note_duty_decode();
+        decode_duty_fields(block)
+    })
+}
+
+fn decode_duty_fields(block: &ProduceBlockResponse) -> Option<DutyFields> {
     if block.is_ssz {
         let bytes = block.ssz_bytes.as_deref()?;
         let format = ssz_produce_format(block.is_blinded, &block.consensus_version)?;
@@ -5622,6 +5762,7 @@ mod tests {
                     hard_end,
                     op,
                     fallback_on(),
+                    None,
                 ),
             )
             .await
@@ -5642,6 +5783,7 @@ mod tests {
                 hard_end,
                 op,
                 fallback_on(),
+                None,
             )
             .await
     }
@@ -6674,6 +6816,247 @@ mod tests {
         assert_eq!(result.execution_payload_value.as_deref(), Some("9000"));
     }
 
+    /// Two penalised fallback blocks both stay on the ranked list. The walk
+    /// signs the higher one and can still see the other.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fallback_keeps_every_held_candidate_for_the_walk() {
+        let manager = manager_with_endpoints(&["synced", "low", "high"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        set_sync(&manager, 2, BnSyncStatus::Syncing, 9).await;
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
+        };
+        let ranked = manager
+            .query_best_inner(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                None,
+                &|client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("low") {
+                            Ok(duty_response("1000", 1, 7, parent, Some([0x22; 20])))
+                        } else if endpoint.contains("high") {
+                            Ok(duty_response("9000", 1, 7, parent, Some([0x33; 20])))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+                None,
+            )
+            .await
+            .expect("both penalised fallback blocks");
+        let values: Vec<_> =
+            ranked.iter().map(|(_, block)| block.execution_payload_value.clone()).collect();
+        assert_eq!(
+            values,
+            vec![Some("9000".to_string()), Some("1000".to_string())],
+            "every penalised hold stays on the walk, best first: {values:?}"
+        );
+    }
+
+    /// A fee match stops the fallback search and keeps the penalized hold
+    /// already taken. The node after the match is not asked.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn fallback_keeps_a_penalized_hold_when_a_later_match_stops_the_search() {
+        let manager = manager_with_endpoints(&["synced", "penalty", "match", "later"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        set_sync(&manager, 2, BnSyncStatus::Syncing, 9).await;
+        set_sync(&manager, 3, BnSyncStatus::Syncing, 9).await;
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
+        };
+        let ranked = manager
+            .query_best_inner(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                None,
+                &|client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("penalty") {
+                            Ok(duty_response("1000", 1, 7, parent, Some([0x22; 20])))
+                        } else if endpoint.contains("match") {
+                            Ok(duty_response("500", 1, 7, parent, Some(fee)))
+                        } else if endpoint.contains("later") {
+                            Ok(duty_response("99999", 1, 7, parent, Some(fee)))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+                None,
+            )
+            .await
+            .expect("the match and the earlier penalty");
+        let values: Vec<_> =
+            ranked.iter().map(|(_, block)| block.execution_payload_value.clone()).collect();
+        assert_eq!(
+            values,
+            vec![Some("500".to_string()), Some("1000".to_string())],
+            "the match stays ahead of the hold, and the node after it is not used: {values:?}"
+        );
+    }
+
+    /// Every selected node has answered with a re-org parent. The block comes
+    /// back then, before the soft deadline.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn reorg_parent_returns_early_when_every_bn_has_answered() {
+        let manager = manager_with_endpoints(&["bn-a", "bn-b"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Synced, 0).await;
+        let primary = [0x11u8; 32];
+        let reorg = [0x22u8; 32];
+        let checks = checks_from_duty(
+            1,
+            ProduceDuty {
+                expected_proposer_index: 7,
+                expected_parent_root: Some(primary),
+                alternate_parent_root: Some(reorg),
+                parent_closed: false,
+                expected_fee_recipient: None,
+                expected_consensus_version: ForkName::Deneb,
+                shape: ShapeConstraint::Any,
+            },
+        );
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-a") {
+                            tokio::time::sleep(Duration::from_millis(40)).await;
+                            Ok(duty_response("1000", 1, 7, reorg, None))
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(80)).await;
+                            Ok(duty_response("9000", 1, 7, reorg, None))
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+            )
+            .await
+            .expect("reorg parent once every node has answered");
+        assert_eq!(result.execution_payload_value.as_deref(), Some("9000"));
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(80),
+            "a finished round must not wait for the 1.5s soft deadline"
+        );
+    }
+
+    #[test]
+    fn sort_by_pick_decodes_each_candidate_once() {
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            alternate_parent_root: Some([0x22; 32]),
+            parent_closed: false,
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
+        };
+        let items = vec![
+            (2, duty_response("1000", 1, 7, parent, Some([0x22; 20]))),
+            (0, duty_response("5000", 1, 7, parent, Some(fee))),
+            (1, duty_response("9000", 1, 7, [0x22; 32], Some(fee))),
+            (3, duty_response("7000", 1, 7, parent, Some(fee))),
+        ];
+        DUTY_DECODES.with(|slot| slot.set(0));
+        let ranked =
+            sort_by_pick(items, &|left, right| candidate_ranks_above(left, right, Some(&checks)));
+        let decodes = DUTY_DECODES.with(|slot| slot.get());
+        assert_eq!(decodes, ranked.len() as u64, "each candidate is decoded once, got {decodes}");
+        let values: Vec<_> =
+            ranked.iter().map(|(_, block)| block.execution_payload_value.clone()).collect();
+        assert_eq!(
+            values,
+            vec![
+                Some("7000".to_string()),
+                Some("5000".to_string()),
+                Some("1000".to_string()),
+                Some("9000".to_string()),
+            ],
+            "primary fee match, then the primary penalty, then the re-org: {values:?}"
+        );
+    }
+
+    fn duty_without_parent() -> BlockDutyChecks {
+        BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: None,
+            alternate_parent_root: None,
+            parent_closed: false,
+            fee_recipient: None,
+            consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
+        }
+    }
+
+    /// A healthy beacon node is eligible before the first sync poll, including
+    /// when the proposal did not name a parent.
+    #[tokio::test]
+    async fn first_round_keeps_a_healthy_node_whose_sync_has_not_been_polled() {
+        let manager = manager_with_endpoints(&["only"]);
+        let floor = manager.first_round_floor(Some(&duty_without_parent())).await;
+        assert_eq!(floor, Some(vec![0]));
+    }
+
+    /// Tier relaxation stops on the large-lag node. The not-yet-polled peer
+    /// is still the first round when the parent is unknown.
+    #[tokio::test]
+    async fn first_round_asks_an_unpolled_node_when_every_measured_peer_is_below_the_floor() {
+        let manager = manager_with_endpoints(&["large", "fresh"]);
+        set_sync(&manager, 0, BnSyncStatus::Syncing, 17).await;
+        let floor = manager.first_round_floor(Some(&duty_without_parent())).await;
+        assert_eq!(floor, Some(vec![1]));
+    }
+
+    /// A measured node below the floor stays out when the parent is unknown.
+    #[tokio::test]
+    async fn first_round_skips_a_measured_large_lag_node_when_the_parent_is_unknown() {
+        let manager = manager_with_endpoints(&["large"]);
+        set_sync(&manager, 0, BnSyncStatus::Syncing, 17).await;
+        let floor = manager.first_round_floor(Some(&duty_without_parent())).await;
+        assert_eq!(floor, Some(Vec::new()));
+    }
+
     #[test]
     fn zero_operation_budget_is_no_budget() {
         let manager = manager_with_endpoints(&["bn"]).with_operation_timeouts(OperationTimeouts {
@@ -7138,6 +7521,7 @@ mod tests {
                     })
                 },
                 fallback_on(),
+                None,
             )
             .await;
         assert!(late.is_err(), "a fallback past the per-call deadline must not win: {late:?}");
@@ -10285,6 +10669,7 @@ mod tests {
                 None,
                 &op,
                 select,
+                None,
             )
             .await
             .expect_err("held candidate is dropped");
