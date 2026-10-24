@@ -10,7 +10,7 @@
 //!
 //! Assertions are on emitted signatures (via [`RecordingSubmitter`]), not logs.
 //! Epoch advancement uses the machine's injectable `register_for_import` /
-//! `observe_liveness` / `tick` API — no wall-clock sleep.
+//! `observe_liveness` / `statuses` API — no wall-clock sleep.
 
 mod common;
 

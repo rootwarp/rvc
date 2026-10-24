@@ -141,9 +141,12 @@ pub fn signing_allowed(
 
 /// Production opt-out of doppelganger protection (`--no-doppelganger-detection`).
 ///
-/// Enables signing for every pubkey. This deliberately forgoes the forward-window
-/// safety cost of roughly **2–3 epochs** of monitoring (~12.8–19.2 minutes on
-/// mainnet with 12 s slots). Prefer leaving doppelganger on (the default).
+/// Enables signing for every pubkey. This forgoes the forward window.
+/// With the default [`crate::DEFAULT_MONITORING_EPOCHS`] of 2, a key stays
+/// closed until 3 closed not-live epochs are counted. On mainnet (12 s slots,
+/// 32 slots per epoch) that is 19.2 minutes when every one of those epochs is
+/// closed on time. A gap delays `Safe`; two epochs are not enough. Prefer
+/// leaving doppelganger on (the default).
 ///
 /// Distinct from the test-only `AlwaysEnabled` helper in `rvc-signer`: this type
 /// is the **documented operator opt-out** and is safe to wire on the production

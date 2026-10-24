@@ -439,7 +439,7 @@ fn satisfy_window(machine: &ForwardWindowMachine, clock: &MonotonicEpochClock, p
         );
         assert!(missing.is_empty(), "observe epoch {epoch} left keys unobserved: {missing:?}");
     }
-    let _ = machine.tick(now.saturating_add(4), 0);
+    let _ = machine.statuses(now.saturating_add(4), 0);
     assert_eq!(machine.status(pk), ForwardWindowStatus::Safe, "doppelganger window must open");
 }
 

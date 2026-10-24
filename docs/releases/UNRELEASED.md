@@ -3,6 +3,14 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Doppelganger epoch clock and liveness logs
+
+The doppelganger epoch clock counts milliseconds. The slot is `(now_unix_ms - genesis_time * 1000) / slot_duration_ms`. The previous clock dropped the fractional second of the start time and of elapsed time, so a boundary could be up to almost two seconds late. The clock is not early.
+
+A validator that has no beacon index logs once, at info: `doppelganger liveness: no index yet; Safe stays closed until an index is known`. It is not warned on every epoch. A key that has an index and is omitted from the answer, or whose liveness query fails, still warns once per pubkey and epoch: `doppelganger liveness unobserved; Safe stays closed for this key`.
+
+When doppelganger protection is on, startup logs one info line. The `closed_epochs` field is 3. The message is: `ForwardWindowMachine constructed (SEC-2b/2c). Keys stay closed until 3 closed not-live epochs are observed (a gap delays Safe; there is no timeout). The liveness loop (SEC-2c) applies both epoch answers with apply_liveness_tick via bn-manager failover. Epoch-0 bypass and restart-aware safe-skip apply only to keys that are not an unfinished import (open hold, any import sidecar, staged sidecar, or an unreadable keystore directory or validators file).`
+
 ## A raw beacon client refuses a produce duty
 
 `BeaconClient` does not rank blocks and does not check the fee recipient, the fork, or the parent. `produce_block_v3_ranked` and `produce_block_v3_ranked_by` return an error when a duty is passed. `produce_block_v3_for_duty` always returns that error. The message is `duty-aware production requires BnManager`. With no duty, the raw client still returns the one block from that node, and `produce_block_v4_by` still calls that node. The validator client produces through the beacon-node pool, which already applies the duty.

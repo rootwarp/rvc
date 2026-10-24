@@ -27,9 +27,10 @@ use crate::quiesce::TrackedKeys;
 
 /// Handles produced by [`wire_signing_enablement`].
 ///
-/// Held as locals by the binary composition root until a future `run()` moves
-/// selected fields into [`super::BootstrapCtx`] (at most three named fields per
-/// the growth rule).
+/// [`super::services::build_services`] clones `signing_enablement` into the
+/// signer. [`super::run::run`] keeps the forward-window machine, the epoch
+/// clock, the pubkey index, and `tracked_keys` as locals. None of these fields
+/// are stored on [`super::BootstrapCtx`].
 pub struct EnablementHandles {
     /// Production signing gate (forward-window machine or operator opt-out).
     pub signing_enablement: Arc<dyn SigningEnablement>,
@@ -639,6 +640,60 @@ mod tests {
         )
         .await;
         assert!(!epoch0_enabled(&mixed).await, "one head error closes the epoch-0 bypass");
+    }
+
+    /// The pre-genesis log is emitted only when the clock is in epoch 0.
+    ///
+    /// A beacon head still inside epoch 0 is not enough once the clock has
+    /// left epoch 0: `epoch0_bypass` stays false, the key stays Pending, and
+    /// the startup line is absent.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn test_epoch0_bypass_log_only_at_epoch_zero() {
+        let now =
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let late_genesis = now.saturating_sub(10_000);
+        let (_late_server, late_beacon) = mock_beacon(late_genesis).await;
+        let pk = SecretKey::generate().public_key();
+        let keys = loaded_keys_with_pubkey(pk.clone());
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        let late = wire_signing_enablement(
+            &base_config(true),
+            &keys,
+            &late_beacon,
+            Arc::new(SlashingDb::open_in_memory().unwrap()),
+            &executor,
+        )
+        .await
+        .expect("clock past epoch 0");
+        assert_ne!(late.epoch_clock.current_epoch(), 0);
+        assert!(!late.epoch_clock.before_genesis());
+        assert!(
+            !logs_contain("pre-genesis (epoch 0) startup"),
+            "past epoch 0 the startup line is absent"
+        );
+        assert!(!late.signing_enablement.is_signing_enabled(&pk));
+        executor.token().cancel();
+
+        let genesis = now.saturating_sub(30);
+        let (_server, beacon) = mock_beacon(genesis).await;
+        let pk0 = SecretKey::generate().public_key();
+        let keys0 = loaded_keys_with_pubkey(pk0.clone());
+        let (executor0, _rx0) = TaskExecutor::new(CancellationToken::new());
+        let early = wire_signing_enablement(
+            &base_config(true),
+            &keys0,
+            &beacon,
+            Arc::new(SlashingDb::open_in_memory().unwrap()),
+            &executor0,
+        )
+        .await
+        .expect("epoch 0");
+        assert_eq!(early.epoch_clock.current_epoch(), 0);
+        assert!(!early.epoch_clock.before_genesis());
+        assert!(logs_contain("pre-genesis (epoch 0) startup"));
+        assert!(early.signing_enablement.is_signing_enabled(&pk0));
+        executor0.token().cancel();
     }
 
     /// Restart safe-skip requires local slashing history under this GVR.

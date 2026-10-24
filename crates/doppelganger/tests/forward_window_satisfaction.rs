@@ -139,7 +139,7 @@ fn test_safe_transition_fires_only_on_last_slot_of_satisfaction_epoch() {
 
     // All slots of start_epoch (epoch 5) — still Pending.
     for slot in 0..SLOTS_PER_EPOCH {
-        machine.tick(start_epoch, slot);
+        machine.statuses(start_epoch, slot);
         assert!(
             !machine.is_signing_enabled(&pubkey),
             "slot {slot} of epoch {start_epoch}: must still be false (not yet end_epoch)"
@@ -148,7 +148,7 @@ fn test_safe_transition_fires_only_on_last_slot_of_satisfaction_epoch() {
 
     // All slots of end_epoch EXCEPT the last — still Pending.
     for slot in 0..(SLOTS_PER_EPOCH - 1) {
-        machine.tick(end_epoch, slot);
+        machine.statuses(end_epoch, slot);
         assert!(
             !machine.is_signing_enabled(&pubkey),
             "slot {slot} of end_epoch {end_epoch}: must still be false (not the last slot)"
@@ -160,7 +160,7 @@ fn test_safe_transition_fires_only_on_last_slot_of_satisfaction_epoch() {
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
     // The last slot of end_epoch — transitions to Safe.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
         "must be true only after tick(end_epoch={end_epoch}, last_slot={})",
@@ -183,7 +183,7 @@ fn test_off_by_one_previous_epoch_last_slot_does_not_satisfy() {
     machine.register(&pubkey, start_epoch);
 
     // Last slot of end_epoch - 1 (epoch 11) — must NOT satisfy.
-    machine.tick(end_epoch - 1, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch - 1, SLOTS_PER_EPOCH - 1);
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "last slot of epoch {} must NOT satisfy (end_epoch is {})",
@@ -192,11 +192,11 @@ fn test_off_by_one_previous_epoch_last_slot_does_not_satisfy() {
     );
 
     // First slot of end_epoch — must NOT satisfy.
-    machine.tick(end_epoch, 0);
+    machine.statuses(end_epoch, 0);
     assert!(!machine.is_signing_enabled(&pubkey), "first slot of end_epoch must NOT satisfy");
 
     // Second-to-last slot of end_epoch — must NOT satisfy.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 2);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 2);
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "second-to-last slot of end_epoch must NOT satisfy"
@@ -206,7 +206,7 @@ fn test_off_by_one_previous_epoch_last_slot_does_not_satisfy() {
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
     // Last slot of end_epoch — NOW satisfies.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pubkey), "last slot of end_epoch must satisfy");
 }
 
@@ -226,7 +226,7 @@ fn test_full_slot_walk_monitoring_epochs_2() {
     // Walk every slot of epochs 100 and 101 — all must be false.
     for epoch in start_epoch..end_epoch {
         for slot in 0..SLOTS_PER_EPOCH {
-            machine.tick(epoch, slot);
+            machine.statuses(epoch, slot);
             assert!(
                 !machine.is_signing_enabled(&pubkey),
                 "epoch {epoch}, slot {slot}: must be false before end_epoch={end_epoch}"
@@ -236,7 +236,7 @@ fn test_full_slot_walk_monitoring_epochs_2() {
 
     // Walk slots 0..=SLOTS_PER_EPOCH-2 of end_epoch (102) — still false.
     for slot in 0..(SLOTS_PER_EPOCH - 1) {
-        machine.tick(end_epoch, slot);
+        machine.statuses(end_epoch, slot);
         assert!(
             !machine.is_signing_enabled(&pubkey),
             "epoch {end_epoch}, slot {slot}: must be false (not last slot)"
@@ -247,7 +247,7 @@ fn test_full_slot_walk_monitoring_epochs_2() {
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
     // Last slot of end_epoch — must flip to true.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pubkey), "must become true at last slot of end_epoch");
 }
 
@@ -270,14 +270,14 @@ fn test_missed_tick_resolves_to_safe_on_next_epoch() {
     machine.register(&pubkey, start_epoch);
 
     // Tick to one-before-last slot — still Pending.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 2);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 2);
     assert!(!machine.is_signing_enabled(&pubkey), "second-to-last slot must be Pending");
 
     // Provide complete observation before the missed-tick recovery tick.
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
     // Miss the exact boundary; tick with first slot of end_epoch+1 → must resolve Safe.
-    machine.tick(end_epoch + 1, 0);
+    machine.statuses(end_epoch + 1, 0);
     assert!(
         machine.is_signing_enabled(&pubkey),
         "missed-tick recovery: tick past end_epoch must still become Safe"
@@ -301,7 +301,7 @@ fn test_tick_far_past_end_epoch_resolves_to_safe() {
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
     // Jump many epochs ahead.
-    machine.tick(end_epoch + 100, 0);
+    machine.statuses(end_epoch + 100, 0);
     assert!(machine.is_signing_enabled(&pubkey), "tick far past end_epoch must resolve to Safe");
 }
 
@@ -474,7 +474,7 @@ fn test_imported_key_does_not_attest_until_window_clears() {
 
     // The import epoch itself is before next_check and does not count.
     observe_complete_window(&machine, &pubkey, start_epoch, start_epoch);
-    machine.tick(start_epoch + 50, 0);
+    machine.statuses(start_epoch + 50, 0);
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "imported key still Pending after the import epoch"
@@ -509,7 +509,7 @@ fn test_restarted_key_does_not_attest_until_window_clears() {
     );
 
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
         "restarted key may sign only after the window fully clears"
@@ -533,7 +533,7 @@ fn test_register_idempotent_does_not_reset_after_safe() {
 
     // Observe completely, then tick to Safe.
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pubkey));
 
     // Register again — must NOT reset to Pending.
@@ -566,7 +566,7 @@ fn test_register_idempotent_while_pending_does_not_extend_window() {
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
     // Original end_epoch (11) still applies; tick at last slot of epoch 11 → Safe.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
         "re-register while Pending must not extend end_epoch; must be Safe at original end_epoch"
@@ -654,14 +654,14 @@ fn test_detected_is_terminal_tick_does_not_resurrect() {
     assert!(!machine.is_signing_enabled(&pubkey), "Detected → signing denied");
 
     // Tick past end_epoch — must STILL be denied (Detected is terminal).
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         !machine.is_signing_enabled(&pubkey),
         "Detected is terminal: tick past end_epoch must NOT resurrect to Safe"
     );
 
     // Tick even further.
-    machine.tick(end_epoch + 10, 0);
+    machine.statuses(end_epoch + 10, 0);
     assert!(!machine.is_signing_enabled(&pubkey), "Detected is terminal even many epochs later");
 }
 
@@ -698,7 +698,7 @@ fn test_observe_liveness_not_live_does_not_detect() {
     );
 
     // Tick to end — fully observed and not Detected → Safe.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
         "not-live observation with complete window must allow Safe transition"
@@ -744,7 +744,7 @@ fn test_observe_liveness_before_window_is_ignored() {
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
 
     // Tick to Safe — confirms not Detected.
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(
         machine.is_signing_enabled(&pubkey),
         "before-window observation must not Detect; Safe at end_epoch after complete in-window observation"
@@ -776,7 +776,7 @@ fn test_observe_liveness_after_window_is_ignored() {
     for epoch in later + 1..later + 4 {
         let _ = machine.observe_liveness(epoch, &quiet, epoch + 1, CLOSED_EPOCH_SLOT);
     }
-    machine.tick(later + 20, 0);
+    machine.statuses(later + 20, 0);
     assert_eq!(machine.status(&pubkey), ForwardWindowStatus::Detected);
     assert!(!machine.is_signing_enabled(&pubkey), "Detected stays");
 }
@@ -816,7 +816,7 @@ fn test_cancel_then_reregister_starts_fresh() {
     // Observe completely and tick to Safe.
     machine.register(&pubkey, start_epoch);
     observe_complete_window(&machine, &pubkey, start_epoch, end_epoch);
-    machine.tick(end_epoch, SLOTS_PER_EPOCH - 1);
+    machine.statuses(end_epoch, SLOTS_PER_EPOCH - 1);
     assert!(machine.is_signing_enabled(&pubkey));
 
     // Cancel, then re-register → Pending again (observed_epochs reset to empty).
