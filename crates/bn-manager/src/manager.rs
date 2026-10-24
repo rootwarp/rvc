@@ -49,11 +49,16 @@ use crate::BnManagerError;
 
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = Result<T, BeaconError>> + Send + 'a>>;
 
-/// Health-tracker outcome for one BN attempt (success with latency, or error).
+/// Health-tracker outcome for one BN attempt.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TrackerOutcome {
     Success(Duration),
     Error,
+    /// An `Ok` body that is not returned. The health score does not move.
+    ///
+    /// A hard reject, or a fallback miss of the primary parent. A fee-only
+    /// penalty is [`Self::Success`].
+    Rejected,
     /// Missing `/eth/v4` (404/405/501) or an unrecognised fork — skip this BN
     /// for the operation until a later success re-probes it.
     Incapable {
@@ -272,9 +277,14 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 ///   highest strictly parsed execution payload value plus consensus block
 ///   value — `produce_block_v3`. With a block-production budget, accepted
 ///   blocks in hand are returned at the soft deadline (half the budget). A
-///   block that fails the slot, proposer, or parent check is not in hand. If
-///   none have been accepted, the first accepted block before the hard
-///   deadline (the budget) is kept. The round also returns once every
+///   block that fails the slot, proposer, or parent check is not in hand. A
+///   hard reject does not change that beacon node's health score. A fee-only
+///   penalty still counts as a success. When the finished candidates were all
+///   dropped and no transport error was stored, the error names each reason.
+///   `RevokedInFlight` is not stored. A stored transport error stays the
+///   highest-index transport error, and a higher-index hard reject does not
+///   replace it. If none have been accepted, the first accepted block before
+///   the hard deadline (the budget) is kept. The round also returns once every
 ///   selected BN has answered. Attempts still running are drained, and a
 ///   timeout is recorded as an error. Health recording is queued and does not
 ///   block the return or the drain. Nothing accepted, or every selected BN
@@ -330,6 +340,16 @@ const DEFAULT_SYNC_CHECK_INTERVAL: Duration = Duration::from_secs(384);
 /// `BeaconClient`. The keymanager exit path does not.
 /// Other call sites that need the same policy should link here rather than
 /// restate it.
+///
+/// # Lock order
+///
+/// A call that needs both locks takes `sync_statuses` and then
+/// `health_trackers`. [`Self::health_scores`], [`Self::synced_indices`], and
+/// [`Self::fallback_unsynced`] follow that order. [`record_outcomes`] writes
+/// health only. Sync polling writes sync only. Both locks are fair, so a
+/// writer queued on each lock blocks new readers. Opposite reader orders
+/// deadlock those two writers. `health_scores` has no production caller in
+/// this repository today.
 ///
 /// Tracks per-BN sync status and skips unsynced BNs for query operations.
 /// In single-BN mode, logs warnings but continues with the only available BN.
@@ -404,6 +424,7 @@ pub(crate) async fn record_outcomes(
                     publish_capability(&endpoint, bn_capability::FORK_RECOGNISED, true);
                 }
             }
+            TrackerOutcome::Rejected => {}
             TrackerOutcome::Error => trackers[idx].record_error(),
             TrackerOutcome::Incapable { unrecognised_fork } => {
                 trackers[idx].record_error();
@@ -461,6 +482,8 @@ struct BestSelect<T> {
     in_hand: Pred<T>,
     /// Called once for each `Ok` that fails [`Self::accept`], including on the drain.
     on_reject: RejectFn<T>,
+    /// Label when [`Self::accept`] or [`Self::fallback_accept`] fails. A fee-only penalty does not use this.
+    reject_label: fan_out::LabelFn<T>,
     /// Called once for the head of the ranked list.
     ///
     /// The fee-penalty warning is not emitted here. Block proposal emits it
@@ -759,10 +782,13 @@ impl BnManager {
     }
 
     /// Returns current health scores for all BNs.
+    ///
+    /// Takes `sync_statuses` before `health_trackers`. See the lock-order
+    /// note on [`BnManager`].
     #[tracing::instrument(name = "bn_manager.health_scores", skip_all)]
     pub async fn health_scores(&self) -> Vec<BnHealthScore> {
-        let health_guard = self.health_trackers.read().await;
         let sync_guard = self.sync_statuses.read().await;
+        let health_guard = self.health_trackers.read().await;
         health_guard
             .iter()
             .enumerate()
@@ -1740,6 +1766,7 @@ impl BnManager {
                 fallback_accept: Arc::clone(&accept),
                 accept,
                 on_reject,
+                reject_label: Arc::new(|_| "rejected"),
                 on_chosen: Arc::new(|_, _| {}),
                 allow_fallback: true,
             },
@@ -1770,9 +1797,11 @@ impl BnManager {
             .query_best_inner(op_name, role, min_tier, budget, None, &op, select)
             .instrument(strategy_span)
             .await?;
-        ranked.into_iter().next().map(|(_, value)| value).ok_or_else(|| {
-            BeaconError::HttpError(format!("{op_name}: all BNs failed in best-selection"))
-        })
+        ranked
+            .into_iter()
+            .next()
+            .map(|(_, value)| value)
+            .ok_or_else(|| all_candidates_rejected(op_name, &[]))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1838,14 +1867,17 @@ impl BnManager {
                 accept: Arc::clone(&select.accept),
                 in_hand: Arc::clone(&select.in_hand),
                 on_reject: Arc::clone(&select.on_reject),
+                reject_label: Arc::clone(&select.reject_label),
             },
         )
         .await?;
 
         let mut arrived = round.values;
         let mut held = round.held;
+        let mut transport = round.last_error;
+        let mut rejections = round.rejections;
         if arrived.is_empty() && select.allow_fallback {
-            match self
+            let fallback = self
                 .fallback_unsynced(
                     op_name,
                     role,
@@ -1855,12 +1887,16 @@ impl BnManager {
                     &select,
                     &mut stamps,
                 )
-                .await
-            {
+                .await;
+            match fallback.pick {
                 Some(FallbackPick::Ready(index, value)) => held.push((index, value)),
                 Some(FallbackPick::Held(more)) => held.extend(more),
                 None => {}
             }
+            if let Some((index, err)) = fallback.transport_error {
+                note_transport(&mut transport, index, err);
+            }
+            rejections.extend(fallback.rejections);
         }
         let still_held = |index: usize| {
             stamps.get(&index).is_some_and(|stamp| {
@@ -1871,7 +1907,7 @@ impl BnManager {
         held.retain(|(index, _)| still_held(*index));
         arrived.extend(held);
         if arrived.is_empty() {
-            if let Some(err) = round.last_error {
+            if let Some((_, err)) = transport {
                 return Err(err);
             }
             let revoked = stamps.iter().any(|(_, stamp)| {
@@ -1879,6 +1915,9 @@ impl BnManager {
             });
             if revoked {
                 return Err(BeaconError::RevokedInFlight);
+            }
+            if !rejections.is_empty() {
+                return Err(all_candidates_rejected(op_name, &rejections));
             }
             return Err(BeaconError::HttpError(format!(
                 "{op_name}: all BNs failed in best-selection"
@@ -1920,7 +1959,7 @@ impl BnManager {
         window: FallbackWindow,
         select: &BestSelect<T>,
         stamps: &mut HashMap<usize, AdmissionStamp>,
-    ) -> Option<FallbackPick<T>>
+    ) -> FallbackRound<T>
     where
         T: Send,
         F: Fn(&BeaconClient) -> BoxFut<'static, T>,
@@ -1943,7 +1982,7 @@ impl BnManager {
 
         if candidates.is_empty() {
             debug!(op = op_name, "no untried proposal-role BN above the health floor for fallback");
-            return None;
+            return FallbackRound::empty();
         }
 
         warn!(
@@ -1954,6 +1993,9 @@ impl BnManager {
 
         let mut held: Vec<(usize, T)> = Vec::new();
         let mut holding = window.already_held;
+        let mut started = false;
+        let mut transport_error = None;
+        let mut rejections = Vec::new();
         for i in candidates {
             let bound = fallback_attempt_bound(window.deadline, holding);
             if window.deadline.is_some() && bound.is_none() {
@@ -1963,6 +2005,10 @@ impl BnManager {
             let stamp = self.admission_stamp(i);
             if !self.stamp_holds(stamp) {
                 continue;
+            }
+            if !started {
+                crate::metrics::RVC_BN_PRODUCE_FALLBACK_TOTAL.inc();
+                started = true;
             }
             stamps.insert(i, stamp);
             let start = tokio::time::Instant::now();
@@ -1976,16 +2022,23 @@ impl BnManager {
                         continue;
                     }
                     let elapsed = start.elapsed();
+                    if !(select.fallback_accept)(&result) {
+                        (select.on_reject)(i, client.endpoint(), &result);
+                        rejections.push((i, (select.reject_label)(&result)));
+                        fan_out::queue_health_sample(
+                            &self.health_trackers,
+                            op_name,
+                            i,
+                            TrackerOutcome::Rejected,
+                        );
+                        continue;
+                    }
                     fan_out::queue_health_sample(
                         &self.health_trackers,
                         op_name,
                         i,
                         TrackerOutcome::Success(elapsed),
                     );
-                    if !(select.fallback_accept)(&result) {
-                        (select.on_reject)(i, client.endpoint(), &result);
-                        continue;
-                    }
                     if !(select.in_hand)(&result) {
                         keep_better(&mut held, i, result, select.pick_best.as_ref());
                         holding = true;
@@ -1998,7 +2051,11 @@ impl BnManager {
                         latency_ms = elapsed.as_millis() as u64,
                         "query succeeded on a proposal-role fallback BN"
                     );
-                    return Some(FallbackPick::Ready(i, result));
+                    return FallbackRound {
+                        pick: Some(FallbackPick::Ready(i, result)),
+                        transport_error,
+                        rejections,
+                    };
                 }
                 Err(e) => {
                     if matches!(e, BeaconError::RevokedInFlight) {
@@ -2010,22 +2067,21 @@ impl BnManager {
                         i,
                         error_outcome(op_name, &e),
                     );
+                    let displayed = e.to_string();
+                    note_transport(&mut transport_error, i, e);
                     warn!(
                         op = op_name,
                         bn_index = i,
                         endpoint = %RedactedUrl(client.endpoint()),
-                        error = %e,
+                        error = %displayed,
                         "proposal-role fallback BN failed"
                     );
                 }
             }
         }
 
-        if held.is_empty() {
-            None
-        } else {
-            Some(FallbackPick::Held(held))
-        }
+        let pick = if held.is_empty() { None } else { Some(FallbackPick::Held(held)) };
+        FallbackRound { pick, transport_error, rejections }
     }
 
     /// Best-of `produce_block_v3`.
@@ -2364,6 +2420,47 @@ enum FallbackPick<T> {
     Held(Vec<(usize, T)>),
 }
 
+struct FallbackRound<T> {
+    pick: Option<FallbackPick<T>>,
+    /// Highest-index transport error from this fallback.
+    transport_error: Option<(usize, BeaconError)>,
+    rejections: Vec<(usize, &'static str)>,
+}
+
+impl<T> FallbackRound<T> {
+    fn empty() -> Self {
+        Self { pick: None, transport_error: None, rejections: Vec::new() }
+    }
+}
+
+fn note_transport(stored: &mut Option<(usize, BeaconError)>, index: usize, err: BeaconError) {
+    if matches!(err, BeaconError::RevokedInFlight) {
+        return;
+    }
+    let replace = stored.as_ref().is_none_or(|(have, _)| index >= *have);
+    if replace {
+        *stored = Some((index, err));
+    }
+}
+
+fn all_candidates_rejected(operation: &str, rejections: &[(usize, &'static str)]) -> BeaconError {
+    let mut ordered = rejections.to_vec();
+    ordered.sort_by_key(|(index, _)| *index);
+    let reasons = if ordered.is_empty() {
+        "no candidate".to_string()
+    } else {
+        ordered
+            .into_iter()
+            .map(|(index, reason)| format!("bn {index} {reason}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    BeaconError::Produce(beacon::ProduceError::AllCandidatesRejected {
+        operation: operation.to_string(),
+        reasons,
+    })
+}
+
 /// Better candidates first. Ties keep the lower beacon-node index.
 fn sort_by_pick<T>(
     mut items: Vec<(usize, T)>,
@@ -2453,7 +2550,24 @@ fn produce_best_select(
         }
     });
     let on_chosen: ChosenFn<ProduceBlockResponse> = Arc::new(|_, _| {});
-    BestSelect { pick_best, accept, fallback_accept, in_hand, on_reject, on_chosen, allow_fallback }
+    let label_checks = checks;
+    let reject_label: fan_out::LabelFn<ProduceBlockResponse> =
+        Arc::new(move |block| match label_checks.as_ref() {
+            Some(checks) => hard_reject_reason(block, checks, policy)
+                .map(hard_reject_label)
+                .unwrap_or("fallback_parent"),
+            None => "fallback_parent",
+        });
+    BestSelect {
+        pick_best,
+        accept,
+        fallback_accept,
+        in_hand,
+        on_reject,
+        reject_label,
+        on_chosen,
+        allow_fallback,
+    }
 }
 
 /// Fallback may use a proposal-role BN at this tier or healthier.
@@ -2730,8 +2844,9 @@ fn log_produce_rejection(
     policy: FeeRecipientPolicy,
 ) {
     let observed = observe_duty(block);
-    let reason =
-        hard_reject_reason(block, checks, policy).map(hard_reject_label).unwrap_or("rejected");
+    let hard = hard_reject_reason(block, checks, policy);
+    let reason = hard.map(hard_reject_label).unwrap_or("fallback_parent");
+    crate::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL.with_label_values(&[reason]).inc();
     warn!(
         op = "produce_block_v3",
         bn_index = index,
@@ -4193,9 +4308,11 @@ impl BlockProducer for BnManager {
 }
 
 fn first_ranked(ranked: Vec<RankedBlock>) -> Result<ProduceBlockResponse, BeaconError> {
-    ranked.into_iter().next().map(|block| block.response).ok_or_else(|| {
-        BeaconError::HttpError("produce_block_v3: all BNs failed in best-selection".into())
-    })
+    ranked
+        .into_iter()
+        .next()
+        .map(|block| block.response)
+        .ok_or_else(|| all_candidates_rejected("produce_block_v3", &[]))
 }
 
 #[async_trait]
@@ -4772,6 +4889,7 @@ mod tests {
             accept,
             in_hand: Arc::new(in_hand),
             on_reject: Arc::new(on_reject),
+            reject_label: Arc::new(|_| "rejected"),
             on_chosen: Arc::new(|_, _| {}),
             allow_fallback,
         }
@@ -6691,6 +6809,10 @@ mod tests {
         );
     }
 
+    fn reject_total(reason: &str) -> u64 {
+        crate::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL.with_label_values(&[reason]).get()
+    }
+
     /// Fallback keeps the primary parent and drops the re-org parent.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn fallback_accepts_only_the_primary_parent() {
@@ -6712,6 +6834,7 @@ mod tests {
         let reorg_only = manager_with_endpoints(&["synced", "fallback-reorg"]);
         set_sync(&reorg_only, 0, BnSyncStatus::Synced, 0).await;
         set_sync(&reorg_only, 1, BnSyncStatus::Syncing, 9).await;
+        let parent_before = reject_total("fallback_parent");
         let rejected = reorg_only
             .query_best_filtered(
                 "produce_block_v3",
@@ -6732,6 +6855,7 @@ mod tests {
             )
             .await;
         assert!(rejected.is_err(), "fallback must not return the reorg parent: {rejected:?}");
+        assert!(reject_total("fallback_parent") > parent_before, "reorg fallback label");
 
         let primary_fallback = manager_with_endpoints(&["synced", "fallback-primary"]);
         set_sync(&primary_fallback, 0, BnSyncStatus::Synced, 0).await;
@@ -6757,6 +6881,279 @@ mod tests {
             .await
             .expect("primary parent on fallback");
         assert_eq!(accepted.execution_payload_value.as_deref(), Some("7000"));
+    }
+
+    fn parent_checks(parent: [u8; 32]) -> BlockDutyChecks {
+        BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
+            fee_recipient: Some([0x11; 20]),
+            consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
+        }
+    }
+
+    async fn health_after(
+        manager: &BnManager,
+        applied_before: u64,
+        extra: u64,
+    ) -> Vec<BnHealthScore> {
+        fan_out::wait_until_health_applied(applied_before + extra).await;
+        manager.health_scores().await
+    }
+
+    /// A fallback body that fails `fallback_accept` does not improve health.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fallback_rejected_candidate_is_not_a_health_success() {
+        let parent = [0x11u8; 32];
+        let manager = manager_with_endpoints(&["synced", "fallback-reject"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        let applied = fan_out::health_samples_applied();
+        let fallback_before = crate::metrics::RVC_BN_PRODUCE_FALLBACK_TOTAL.get();
+        let err = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("fallback-reject") {
+                            Ok(duty_response("1", 1, 8, parent, Some([0x11; 20])))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "down".into() })
+                        }
+                    })
+                },
+                produce_best_select(Some(parent_checks(parent)), FeeRecipientPolicy::Sign),
+            )
+            .await
+            .expect_err("mixed transport and reject");
+        assert!(
+            matches!(err, BeaconError::ApiError { status: 500, .. }),
+            "the transport error stays, got {err:?}"
+        );
+        let scores = health_after(&manager, applied, 2).await;
+        assert_eq!(scores[0].error_rate, 1.0, "the synced transport error is an error");
+        assert!(scores[1].latency.is_none(), "the rejected fallback is not a success: {scores:?}");
+        assert_eq!(scores[1].error_rate, 0.0, "the rejected fallback is not an error");
+        assert!(
+            crate::metrics::RVC_BN_PRODUCE_FALLBACK_TOTAL.get() > fallback_before,
+            "the fallback attempt is counted"
+        );
+    }
+
+    /// A readable wrong fee on the fallback is not a reject and stays a success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fallback_fee_penalty_is_a_health_success() {
+        let parent = [0x11u8; 32];
+        let manager = manager_with_endpoints(&["synced", "fallback-fee"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        let applied = fan_out::health_samples_applied();
+        let block = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("fallback-fee") {
+                            Ok(duty_response("50", 1, 7, parent, Some([0x22; 20])))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "down".into() })
+                        }
+                    })
+                },
+                produce_best_select(Some(parent_checks(parent)), FeeRecipientPolicy::Sign),
+            )
+            .await
+            .expect("fee penalty is held");
+        assert_eq!(block.execution_payload_value.as_deref(), Some("50"));
+        let scores = health_after(&manager, applied, 2).await;
+        assert!(scores[1].latency.is_some(), "a fee penalty on fallback is a success");
+        assert_eq!(scores[1].error_rate, 0.0);
+    }
+
+    /// Every hard reject is named. A higher-index reject does not replace a transport error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn transport_error_keeps_the_highest_index() {
+        let parent = [0x11u8; 32];
+        let checks = parent_checks(parent);
+        let manager = manager_with_endpoints(&["low", "reject"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Synced, 0).await;
+        let mixed = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                None,
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("reject") {
+                            Ok(duty_response("1", 9, 7, parent, Some([0x11; 20])))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "low".into() })
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+            )
+            .await
+            .expect_err("transport plus reject");
+        assert!(
+            matches!(mixed, BeaconError::ApiError { status: 500, .. }),
+            "a higher-index reject must not replace the transport error, got {mixed:?}"
+        );
+
+        let manager = manager_with_endpoints(&["low", "high"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Synced, 0).await;
+        let high = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                None,
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("high") {
+                            Err(BeaconError::ApiError { status: 503, message: "high".into() })
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "low".into() })
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+            )
+            .await
+            .expect_err("highest transport");
+        match high {
+            BeaconError::ApiError { status: 503, ref message } => assert_eq!(message, "high"),
+            other => panic!("highest-index transport error, got {other:?}"),
+        }
+    }
+
+    /// A fallback that answers after the per-call deadline is an error, not a success.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn v3_deadline_fallback_timeout_is_not_a_health_success() {
+        let manager = two_bn_pool().await;
+        let start = tokio::time::Instant::now();
+        let hard_end = start + Duration::from_millis(200);
+        let budget = manager.production_budget(Some(hard_end));
+        let applied = fan_out::health_samples_applied();
+        let late = manager
+            .query_best_inner(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                budget,
+                Some(hard_end),
+                &|client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("synced") {
+                            Err(BeaconError::ApiError { status: 500, message: "down".into() })
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            Ok(block_with_value("9"))
+                        }
+                    })
+                },
+                fallback_on(),
+            )
+            .await;
+        assert!(late.is_err(), "a fallback past the per-call deadline must not win: {late:?}");
+        assert_eq!(start.elapsed(), Duration::from_millis(200));
+        let scores = health_after(&manager, applied, 2).await;
+        assert_eq!(scores[0].error_rate, 1.0);
+        assert!(scores[1].latency.is_none(), "the deadline drops the late body");
+        assert_eq!(scores[1].error_rate, 1.0, "the deadline is a transport error");
+    }
+
+    /// Queued writers on both locks. `health_scores` must take sync before health.
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_scores_takes_sync_before_health() {
+        let manager = manager_with_endpoints(&["bn0"]);
+        let (sync_held_tx, sync_held_rx) = tokio::sync::oneshot::channel();
+        let (sync_release_tx, sync_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (sync_dropped_tx, sync_dropped_rx) = tokio::sync::oneshot::channel();
+        let sync = manager.sync_statuses().clone();
+        tokio::spawn(async move {
+            let guard = sync.write().await;
+            let _ = sync_held_tx.send(());
+            let _ = sync_release_rx.await;
+            drop(guard);
+            let _ = sync_dropped_tx.send(());
+        });
+        sync_held_rx.await.expect("sync writer holds the lock");
+
+        let (health_held_tx, health_held_rx) = tokio::sync::oneshot::channel();
+        let (health_release_tx, health_release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (health_dropped_tx, health_dropped_rx) = tokio::sync::oneshot::channel();
+        let health = manager.health_trackers().clone();
+        tokio::spawn(async move {
+            let guard = health.read().await;
+            let _ = health_held_tx.send(());
+            let _ = health_release_rx.await;
+            drop(guard);
+            let _ = health_dropped_tx.send(());
+        });
+        health_held_rx.await.expect("health reader holds the lock");
+
+        let health_for_writer = manager.health_trackers().clone();
+        let sync_probe = manager.sync_statuses().clone();
+        {
+            let mut health_writer = std::pin::pin!(async move {
+                let _guard = health_for_writer.write().await;
+                std::future::pending::<()>().await;
+            });
+            // The test task's waker. `Waker::noop` leaves Tokio's coop budget pending.
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(health_writer.as_mut(), cx).is_pending(),
+                    "the health writer must be queued behind the reader"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+
+            let mut scores = std::pin::pin!(manager.health_scores());
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(scores.as_mut(), cx).is_pending(),
+                    "health_scores waits while the sync writer holds the lock"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let _ = sync_release_tx.send(());
+            sync_dropped_rx.await.expect("sync writer dropped");
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(scores.as_mut(), cx).is_pending(),
+                    "health_scores still waits on the queued health writer"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert!(
+                sync_probe.try_write().is_err(),
+                "health_scores must hold the sync read before it takes health"
+            );
+        }
+        let _ = health_release_tx.send(());
+        health_dropped_rx.await.expect("health reader dropped");
     }
 
     /// A hard reject logs slot, proposer, parent, fork, fee, and the value parse.
@@ -6941,9 +7338,10 @@ mod tests {
         let err = ranked(&hybrid, duty).await.expect_err("hybrid must be a hard reject");
         let msg = err.to_string();
         assert!(
-            msg.contains("all BNs failed in best-selection"),
+            matches!(err, BeaconError::Produce(beacon::ProduceError::AllCandidatesRejected { .. })),
             "hybrid must be dropped before ranking, got {err:?}"
         );
+        assert!(msg.contains("unreadable"), "hybrid must name the reject reason, got {err:?}");
     }
 
     /// A missing fee recipient is preferred only before Bellatrix. From
@@ -9783,6 +10181,7 @@ mod tests {
             fallback_accept: Arc::new(|_: &u32| false),
             in_hand: Arc::new(|_: &u32| false),
             on_reject: Arc::new(|_: usize, _: &str, _: &u32| {}),
+            reject_label: Arc::new(|_| "rejected"),
             on_chosen: Arc::new(|_: usize, _: &u32| {}),
             allow_fallback: false,
         };

@@ -1483,6 +1483,58 @@ async fn produce_block_v3_for_duty_logs_a_hard_reject() {
     assert!(!logs_contain("signing block with fee-recipient mismatch"));
 }
 
+/// Every candidate is a hard reject. The error names each reason in index order.
+#[tokio::test]
+async fn all_rejected_round_names_the_reject_reasons() {
+    let slot_bn = MockServer::start().await;
+    let proposer_bn = MockServer::start().await;
+    let parent = "ab".repeat(32);
+    let fee = "11".repeat(20);
+    let state = "00".repeat(32);
+    let wrong_slot = format!(
+        r#"{{"data":{{"slot":"9","proposer_index":"7","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}}}}}}"#
+    );
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("9000", wrong_slot))
+        .expect(1)
+        .mount(&slot_bn)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/eth/v3/validator/blocks/1"))
+        .respond_with(mount_duty_block("8000", duty_block_body(&parent, 99, &fee)))
+        .expect(1)
+        .mount(&proposer_bn)
+        .await;
+
+    let manager = manager_with_block_budget(
+        &[&slot_bn.uri(), &proposer_bn.uri()],
+        Duration::from_millis(400),
+    );
+    let slot_before = rvc_bn_manager::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL
+        .with_label_values(&["slot"])
+        .get();
+    let proposer_before = rvc_bn_manager::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL
+        .with_label_values(&["proposer"])
+        .get();
+    let err = manager
+        .produce_block_v3_for_duty(1, "0xrandao", None, None, deneb_fee_duty([0x11; 20]))
+        .await
+        .expect_err("both candidates are hard rejects");
+    assert_eq!(
+        err.to_string(),
+        "produce_block_v3: all candidates rejected: bn 0 slot, bn 1 proposer"
+    );
+    let slot_after = rvc_bn_manager::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL
+        .with_label_values(&["slot"])
+        .get();
+    let proposer_after = rvc_bn_manager::metrics::RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL
+        .with_label_values(&["proposer"])
+        .get();
+    assert!(slot_after > slot_before, "slot rejects are counted");
+    assert!(proposer_after > proposer_before, "proposer rejects are counted");
+}
+
 /// A higher-value candidate with the wrong fee recipient ranks below a
 /// matching one. The signed block is the match, and the penalty warning is
 /// not emitted for the candidate that lost.

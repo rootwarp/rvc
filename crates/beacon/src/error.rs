@@ -43,6 +43,22 @@ pub enum BeaconError {
     /// A response arrived after the node's admission generation changed.
     #[error("beacon node response dropped: admission revoked in flight")]
     RevokedInFlight,
+
+    /// Produce round failed for a reason other than a transport error.
+    #[error(transparent)]
+    Produce(#[from] ProduceError),
+}
+
+/// A produce round that returned no block without a transport error.
+#[derive(Error, Debug, Clone, PartialEq, Eq)]
+pub enum ProduceError {
+    /// Dropped candidates, and no transport error was stored.
+    ///
+    /// `reasons` is `bn {index} {label}` in index order, joined by `, `.
+    /// Labels: `fork`, `unreadable`, `slot`, `proposer`, `parent`, `fee`,
+    /// `shape`, or `fallback_parent` (hard checks passed, primary parent missed). Fee-only is not an entry.
+    #[error("{operation}: all candidates rejected: {reasons}")]
+    AllCandidatesRejected { operation: String, reasons: String },
 }
 
 #[cfg(test)]
@@ -98,6 +114,18 @@ mod tests {
     fn test_revoked_in_flight_error_display() {
         let err = BeaconError::RevokedInFlight;
         assert_eq!(err.to_string(), "beacon node response dropped: admission revoked in flight");
+    }
+
+    #[test]
+    fn test_all_candidates_rejected_display() {
+        let err = BeaconError::from(ProduceError::AllCandidatesRejected {
+            operation: "produce_block_v3".to_string(),
+            reasons: "bn 0 parent, bn 1 slot".to_string(),
+        });
+        assert_eq!(
+            err.to_string(),
+            "produce_block_v3: all candidates rejected: bn 0 parent, bn 1 slot"
+        );
     }
 
     #[test]

@@ -3,6 +3,16 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## A hard-rejected block does not improve beacon-node health
+
+A produce candidate that fails a hard check no longer counts as a successful health sample. The beacon node's score, error rate, and latency stay where they were. A readable fee-recipient mismatch under `fee_recipient_policy = sign` is still a success. The fallback records that sample only after the fallback accept check, so a rejected fallback body does not improve the node either.
+
+When every finished candidate is dropped and no transport error was stored, `produce_block_v3` returns `all candidates rejected` and names each beacon node: `bn {index} {reason}`, in index order, joined by `, `. The reason is `fork`, `unreadable`, `slot`, `proposer`, `parent`, `fee`, `shape`, or `fallback_parent`. `fallback_parent` is a fallback body that passed the hard checks and did not use the primary parent. A stored transport error stays the highest-index transport error, and a reject does not replace it. `RevokedInFlight` is not stored as that error.
+
+`rvc_bn_produce_candidates_rejected_total` counts those drops, including `fallback_parent`. The label is `reason`. A fee-only penalty is not counted. `rvc_bn_produce_soft_deadline_returns_total` counts a best-of produce round that returns because a block is in hand at the soft deadline, or because the first in-hand block arrives after it. `rvc_bn_produce_fallback_total` counts an unsynced proposal fallback that starts an attempt. Best-of drain samples that are not recorded now increment `rvc_bn_best_of_drain_health_skipped_total`. They no longer increment `rvc_bn_broadcast_drain_health_skipped_total`. A dashboard that used the broadcast counter for best-of skips should add the new series. The 16-permit pool is still shared.
+
+`health_scores` takes the sync lock and then the health lock, the same order as synced selection and the proposal fallback.
+
 ## V3 block production arms the fallback at the slot deadline
 
 `produce_block_v3` on the proposer pool takes the slot end as a per-call deadline. The production budget was already the shorter of the configured budget and the time left. The 250 ms backstop and the unsynced fallback used to be armed past that deadline. Both are now armed at the earlier of (call start + budget + 250 ms) and the deadline.
