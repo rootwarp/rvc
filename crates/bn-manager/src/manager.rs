@@ -3127,36 +3127,17 @@ fn display_fee_got(fee: &FeeOnBlock) -> String {
     }
 }
 
-fn display_value_parse(block: &ProduceBlockResponse) -> String {
-    match parsed_display_value(block) {
-        Some(wei) => format!("ok:{wei}"),
-        None => match block.execution_payload_value.as_deref() {
-            Some("") => "unparsed:empty".to_string(),
-            Some(raw) => format!("unparsed:{raw}"),
-            None => "unparsed:missing".to_string(),
-        },
-    }
-}
-
-/// Execution wei plus consensus wei, when every present header is a whole decimal.
+/// `exec=` and `consensus=` each name one header.
 ///
-/// A missing consensus header is 0. An empty, signed, non-digit, or overflowing
-/// header is unparsed, and so is a present consensus header that does not parse.
-/// [`block_value`] still ranks those as 0; this label must not report `ok:0`.
-fn parsed_display_value(block: &ProduceBlockResponse) -> Option<u128> {
-    let execution = strict_wei(block.execution_payload_value.as_deref()?)?;
-    let consensus = match block.consensus_block_value.as_deref() {
-        Some(raw) => strict_wei(raw)?,
-        None => 0,
-    };
-    Some(execution.saturating_add(consensus))
-}
-
-fn strict_wei(raw: &str) -> Option<u128> {
-    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+/// An implausible total appends `total=implausible`. The text is
+/// [`beacon::display_value_parse`].
+fn display_value_parse(block: &ProduceBlockResponse) -> String {
+    let label = beacon::display_value_parse(block);
+    if label.contains("exec=") {
+        label
+    } else {
+        format!("exec={label}")
     }
-    raw.parse().ok()
 }
 
 fn hex_prefixed(bytes: &[u8]) -> String {
@@ -6825,13 +6806,7 @@ mod tests {
                         }
                     })
                 },
-                testing_select(
-                    move |block| passes_sign(block, &checks),
-                    move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
-                    move |left, right| candidate_ranks_above(left, right, Some(&checks)),
-                    |_, _, _| {},
-                    true,
-                ),
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
             )
             .await
             .expect("matching fallback block");
@@ -6872,13 +6847,7 @@ mod tests {
                         }
                     })
                 },
-                testing_select(
-                    move |block| passes_sign(block, &checks),
-                    move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
-                    higher_block_value,
-                    |_, _, _| {},
-                    true,
-                ),
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
             )
             .await;
         assert!(
@@ -6887,10 +6856,13 @@ mod tests {
         );
     }
 
-    /// A wrong fee at 50ms must not close the soft window. The matching fee
-    /// at 1.6s, past the 1.5s soft deadline of a 3s budget, is the block returned.
+    /// Production `in_hand` keeps the fee term. A wrong fee at 50ms must not
+    /// close the soft window. The matching fee at 1.6s is the block returned.
+    ///
+    /// Dropping `fee_preferred` from [`produce_best_select`]'s `in_hand`
+    /// returns 9000 at 50ms.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn wrong_fee_at_50ms_loses_to_a_correct_fee_at_1600ms() {
+    async fn production_select_wrong_fee_does_not_close_the_soft_window() {
         let manager = manager_with_endpoints(&["bn-wrong", "bn-right"]);
         let parent = [0xabu8; 32];
         let fee = [0x11u8; 20];
@@ -6924,17 +6896,60 @@ mod tests {
                         }
                     })
                 },
-                testing_select(
-                    move |block| passes_sign(block, &checks),
-                    move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
-                    move |left, right| candidate_ranks_above(left, right, Some(&checks)),
-                    |_, _, _| {},
-                    false,
-                ),
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
             )
             .await
             .expect("the matching fee");
         assert_eq!(result.execution_payload_value.as_deref(), Some("1000"));
+        assert_eq!(start.elapsed(), Duration::from_millis(1600));
+    }
+
+    /// A right-fee re-org parent does not close the soft window. The primary
+    /// parent, even with the wrong fee, is the block returned.
+    ///
+    /// Dropping `parent_is_primary` from [`produce_best_select`]'s `in_hand`
+    /// returns 9000 at 50ms.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn reorg_parent_does_not_close_the_soft_window() {
+        let manager = manager_with_endpoints(&["bn-reorg", "bn-primary"]);
+        let primary = [0xabu8; 32];
+        let reorg = [0x22u8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(primary),
+            alternate_parent_root: Some(reorg),
+            parent_closed: false,
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
+        };
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("bn-reorg") {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            Ok(duty_response("9000", 1, 7, reorg, Some(fee)))
+                        } else {
+                            tokio::time::sleep(Duration::from_millis(1600)).await;
+                            Ok(duty_response("1", 1, 7, primary, Some([0x22; 20])))
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+            )
+            .await
+            .expect("the primary parent");
+        assert_eq!(result.execution_payload_value.as_deref(), Some("1"));
         assert_eq!(start.elapsed(), Duration::from_millis(1600));
     }
 
@@ -6989,13 +7004,7 @@ mod tests {
                             }
                         })
                     },
-                    testing_select(
-                        move |block| passes_sign(block, &checks),
-                        move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
-                        move |left, right| candidate_ranks_above(left, right, Some(&checks)),
-                        |_, _, _| {},
-                        true,
-                    ),
+                    produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
                 ),
             )
             .await;
@@ -7006,6 +7015,160 @@ mod tests {
             elapsed < budget + fan_out::BACKSTOP_MARGIN,
             "held block returned at {elapsed:?}, which is the outer backstop"
         );
+    }
+
+    /// The synced round holds a wrong-fee block. Fallback's hang must not
+    /// eat that hold at the outer backstop.
+    ///
+    /// Forcing `already_held: false` on the fallback window returns the hold
+    /// at 450ms, which is not strictly before the outer backstop.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn synced_round_penalty_hold_beats_the_backstop_when_fallback_hangs() {
+        let budget = Duration::from_millis(200);
+        let manager = manager_with_endpoints(&["synced", "hang"]).with_operation_timeouts(
+            OperationTimeouts { block_production: budget, ..OperationTimeouts::default() },
+        );
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        let parent = [0xabu8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(parent),
+            alternate_parent_root: None,
+            parent_closed: false,
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
+        };
+        let start = tokio::time::Instant::now();
+        let result = manager
+            .with_op_timeout(
+                "produce_block_v3",
+                fan_out::broadcast_backstop(Some(budget)),
+                manager.query_best_filtered(
+                    "produce_block_v3",
+                    BnRole::Proposal,
+                    HealthTier::Synced,
+                    Some(budget),
+                    move |client| {
+                        let endpoint = client.endpoint().to_string();
+                        Box::pin(async move {
+                            if endpoint.contains("synced") {
+                                Ok(duty_response("9000", 1, 7, parent, Some([0x22; 20])))
+                            } else {
+                                tokio::time::sleep(Duration::from_secs(10)).await;
+                                Ok(duty_response("1", 1, 7, parent, Some(fee)))
+                            }
+                        })
+                    },
+                    produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+                ),
+            )
+            .await;
+        let elapsed = start.elapsed();
+        let block = result.expect("a synced-round penalty hold must beat the outer backstop");
+        assert_eq!(block.execution_payload_value.as_deref(), Some("9000"));
+        assert!(
+            elapsed < budget + fan_out::BACKSTOP_MARGIN,
+            "held block returned at {elapsed:?}, which is the outer backstop"
+        );
+    }
+
+    /// The primary parent outranks the re-org parent before fee is considered.
+    ///
+    /// Both sort orders, both synced arrival orders, and a fallback that sees
+    /// the right-fee re-org parent before the wrong-fee primary.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn primary_parent_with_wrong_fee_outranks_reorg_parent_with_right_fee() {
+        let primary = [0xabu8; 32];
+        let reorg = [0x22u8; 32];
+        let fee = [0x11u8; 20];
+        let checks = BlockDutyChecks {
+            slot: 1,
+            proposer_index: 7,
+            parent_root: Some(primary),
+            alternate_parent_root: Some(reorg),
+            parent_closed: false,
+            fee_recipient: Some(fee),
+            consensus_version: ForkName::Deneb,
+            shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
+        };
+        let primary_block = duty_response("1", 1, 7, primary, Some([0x22; 20]));
+        let reorg_block = duty_response("9000", 1, 7, reorg, Some(fee));
+        let rank = |left: &ProduceBlockResponse, right: &ProduceBlockResponse| {
+            candidate_ranks_above(left, right, Some(&checks))
+        };
+        for (first, second) in [(&primary_block, &reorg_block), (&reorg_block, &primary_block)] {
+            let ranked = sort_by_pick(vec![(0, first.clone()), (1, second.clone())], &rank);
+            assert_eq!(
+                ranked[0].1.execution_payload_value.as_deref(),
+                Some("1"),
+                "sort must keep the primary parent ahead"
+            );
+        }
+
+        for endpoints in [vec!["bn-primary", "bn-reorg"], vec!["bn-reorg", "bn-primary"]] {
+            let manager = manager_with_endpoints(&endpoints);
+            set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+            set_sync(&manager, 1, BnSyncStatus::Synced, 0).await;
+            let result = manager
+                .query_best_filtered(
+                    "produce_block_v3",
+                    BnRole::Proposal,
+                    HealthTier::Synced,
+                    Some(Duration::from_secs(3)),
+                    move |client| {
+                        let endpoint = client.endpoint().to_string();
+                        Box::pin(async move {
+                            if endpoint.contains("bn-primary") {
+                                Ok(duty_response("1", 1, 7, primary, Some([0x22; 20])))
+                            } else {
+                                Ok(duty_response("9000", 1, 7, reorg, Some(fee)))
+                            }
+                        })
+                    },
+                    produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+                )
+                .await
+                .expect("primary parent");
+            assert_eq!(
+                result.execution_payload_value.as_deref(),
+                Some("1"),
+                "synced order {endpoints:?} must keep the primary parent"
+            );
+        }
+
+        let manager = manager_with_endpoints(&["synced", "fb-reorg", "fb-primary"]);
+        set_sync(&manager, 0, BnSyncStatus::Synced, 0).await;
+        set_sync(&manager, 1, BnSyncStatus::Syncing, 9).await;
+        set_sync(&manager, 2, BnSyncStatus::Syncing, 9).await;
+        let held = manager
+            .query_best_filtered(
+                "produce_block_v3",
+                BnRole::Proposal,
+                HealthTier::Synced,
+                Some(Duration::from_secs(3)),
+                move |client| {
+                    let endpoint = client.endpoint().to_string();
+                    Box::pin(async move {
+                        if endpoint.contains("fb-reorg") {
+                            Ok(duty_response("9000", 1, 7, reorg, Some(fee)))
+                        } else if endpoint.contains("fb-primary") {
+                            Ok(duty_response("1", 1, 7, primary, Some([0x22; 20])))
+                        } else {
+                            Err(BeaconError::ApiError { status: 500, message: "no".to_string() })
+                        }
+                    })
+                },
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
+            )
+            .await
+            .expect("fallback holds the primary parent");
+        assert_eq!(held.execution_payload_value.as_deref(), Some("1"));
     }
 
     /// Two penalized fallback blocks and no match: the higher value wins.
@@ -7047,13 +7210,7 @@ mod tests {
                         }
                     })
                 },
-                testing_select(
-                    move |block| passes_sign(block, &checks),
-                    move |block| passes_sign(block, &checks) && fee_preferred(block, &checks),
-                    move |left, right| candidate_ranks_above(left, right, Some(&checks)),
-                    |_, _, _| {},
-                    true,
-                ),
+                produce_best_select(Some(checks), FeeRecipientPolicy::Sign),
             )
             .await
             .expect("the higher penalized block");
@@ -8014,28 +8171,60 @@ mod tests {
         assert!(logs_contain("fork_got=deneb") || logs_contain("fork_got=\"deneb\""));
         assert!(logs_contain("0x1111111111111111111111111111111111111111"));
         assert!(logs_contain(&hex_prefixed(&parent)));
-        assert!(logs_contain("value_parse=ok:1") || logs_contain("value_parse=\"ok:1\""));
+        assert!(
+            logs_contain("exec=ok:1, consensus=missing")
+                || logs_contain("exec=ok:1, consensus=missing\""),
+            "value_parse must label each header"
+        );
     }
 
+    /// Each header is labeled. A bad consensus header does not hide the execution value.
     #[test]
-    fn display_value_parse_names_an_unparsed_header() {
+    fn display_value_parse_labels_each_header() {
         let parent = [0xabu8; 32];
         let mut block = duty_response("12abc", 1, 7, parent, None);
-        assert_eq!(display_value_parse(&block), "unparsed:12abc");
+        assert_eq!(display_value_parse(&block), "exec=unparsed:\"12abc\", consensus=missing");
         block.execution_payload_value = Some(String::new());
-        assert_eq!(display_value_parse(&block), "unparsed:empty");
+        assert_eq!(display_value_parse(&block), "exec=unparsed:\"\", consensus=missing");
         block.execution_payload_value = None;
-        assert_eq!(display_value_parse(&block), "unparsed:missing");
+        assert_eq!(display_value_parse(&block), "exec=missing, consensus=missing");
         block.execution_payload_value = Some("5".to_string());
         block.consensus_block_value = Some("nope".to_string());
-        assert_eq!(display_value_parse(&block), "unparsed:5");
+        assert_eq!(display_value_parse(&block), "exec=ok:5, consensus=unparsed:\"nope\"");
         block.consensus_block_value = None;
-        assert_eq!(display_value_parse(&block), "ok:5");
+        assert_eq!(display_value_parse(&block), "exec=ok:5, consensus=missing");
         block.consensus_block_value = Some("10".to_string());
-        assert_eq!(display_value_parse(&block), "ok:15");
+        assert_eq!(display_value_parse(&block), "exec=ok:5, consensus=ok:10");
+        let long = "x".repeat(80);
+        block.execution_payload_value = Some(format!("12\"{long}"));
+        block.consensus_block_value = Some("nope".to_string());
+        let label = display_value_parse(&block);
+        let quoted = label.split("unparsed:\"").nth(1).and_then(|rest| rest.split('"').next());
+        assert_eq!(quoted.map(str::len), Some(64), "raw header text is capped at 64: {label}");
+        assert!(!label.contains("12\""), "a quote in the raw header is not copied: {label}");
         block.execution_payload_value = Some(u128::MAX.to_string());
         block.consensus_block_value = Some("1".to_string());
-        assert_eq!(display_value_parse(&block), format!("ok:{}", u128::MAX));
+        assert!(
+            display_value_parse(&block).ends_with(", total=implausible"),
+            "a total above the cap is labeled implausible"
+        );
+    }
+
+    /// A claim above 1,000 ETH ranks as 0. The cap itself still ranks.
+    #[test]
+    #[tracing_test::traced_test]
+    fn implausible_value_does_not_outrank_a_sane_block() {
+        let cap = beacon::MAX_PLAUSIBLE_BLOCK_VALUE_WEI;
+        let at_cap = response_with_values(Some(&cap.to_string()), Some("0"));
+        let over = response_with_values(Some(&(cap + 1).to_string()), None);
+        let sane = response_with_values(Some("1"), None);
+        assert_eq!(block_value(&at_cap), cap);
+        assert_eq!(block_value(&over), 0);
+        assert!(higher_block_value(&at_cap, &sane));
+        assert!(higher_block_value(&sane, &over));
+        assert!(!higher_block_value(&over, &sane));
+        assert!(logs_contain("claimed block value above plausibility cap"));
+        assert!(logs_contain("total=implausible"));
     }
 
     /// A builder header's fee recipient is the builder's address. It must not
@@ -8513,10 +8702,11 @@ mod tests {
         assert!(higher_block_value(&bad_consensus, &strict));
         assert!(!higher_block_value(&strict, &bad_consensus));
 
+        // u128::MAX + 1 saturates, then the plausibility cap ranks it as 0.
         let overflow = response_with_values(Some(&u128::MAX.to_string()), Some("1"));
-        assert_eq!(block_value(&overflow), u128::MAX);
-        assert!(higher_block_value(&overflow, &strict));
-        assert!(!higher_block_value(&strict, &overflow));
+        assert_eq!(block_value(&overflow), 0);
+        assert!(!higher_block_value(&overflow, &strict));
+        assert!(higher_block_value(&strict, &overflow));
 
         // 2^128 does not fit in u128.
         let too_wide = response_with_values(Some("340282366920938463463374607431768211456"), None);

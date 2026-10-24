@@ -1951,11 +1951,43 @@ fn signed_fee_penalty_counts_only_a_readable_mismatch() {
     let matching = "0x0000000000000000000000000000000000000000";
     with_signed_fee_penalty_lock(|| {
         let before = crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
-        note_signed_fee_penalty(3, &json_fee_response(wrong, false), [0u8; 20], 100);
+        note_signed_fee_penalty(
+            3,
+            &json_fee_response(wrong, false),
+            [0u8; 20],
+            100,
+            42,
+            &[0x11; 32],
+            "deneb",
+        );
         assert_eq!(crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
-        note_signed_fee_penalty(3, &json_fee_response(matching, false), [0u8; 20], 100);
-        note_signed_fee_penalty(3, &json_fee_response(wrong, true), [0u8; 20], 100);
-        note_signed_fee_penalty(3, &json_fee_response("0xzz", false), [0u8; 20], 100);
+        note_signed_fee_penalty(
+            3,
+            &json_fee_response(matching, false),
+            [0u8; 20],
+            100,
+            42,
+            &[0x11; 32],
+            "deneb",
+        );
+        note_signed_fee_penalty(
+            3,
+            &json_fee_response(wrong, true),
+            [0u8; 20],
+            100,
+            42,
+            &[0x11; 32],
+            "deneb",
+        );
+        note_signed_fee_penalty(
+            3,
+            &json_fee_response("0xzz", false),
+            [0u8; 20],
+            100,
+            42,
+            &[0x11; 32],
+            "deneb",
+        );
         assert_eq!(crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(), before + 1);
     });
 }
@@ -2164,4 +2196,276 @@ async fn block_candidate_captured_before_revocation_is_not_signed() {
     assert_eq!(signer.randao_calls.lock().unwrap().len(), 1, "RANDAO at duty start is kept");
     assert!(signer.header_calls.lock().unwrap().is_empty(), "the candidate is not signed");
     assert!(signer.block_calls.lock().unwrap().is_empty());
+}
+
+/// Holds the fee-penalty lock across a current-thread proposal so the delta
+/// is not a race with another test's increment.
+fn assert_penalty_delta(delta: u64, body: impl std::future::Future<Output = ()>) {
+    with_signed_fee_penalty_lock(|| {
+        let before = crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("penalty runtime");
+        runtime.block_on(body);
+        assert_eq!(
+            crate::metrics::RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL.get(),
+            before + delta,
+            "fee penalty delta"
+        );
+    });
+}
+
+fn service_for(
+    _pubkey: &PublicKey,
+    signer: MockSigner,
+    beacon: MockBeaconClient,
+    store: Arc<validator_store::ValidatorStore>,
+) -> BlockService<MockSigner, MockBeaconClient> {
+    BlockService::new(
+        Arc::new(signer),
+        Arc::new(beacon),
+        store,
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    )
+}
+
+/// A signer refusal is not a signed mismatch. The counter stays put and the
+/// warning is not emitted.
+#[test]
+#[tracing_test::traced_test]
+fn signer_refusal_does_not_count_a_fee_penalty() {
+    assert_penalty_delta(0, async {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let parent = [0x11u8; 32];
+        let block = block_with_fee(slot, parent, [0x44; 32], [0x22; 20]);
+        let beacon = MockBeaconClient::unblinded(block);
+        let service = service_for(
+            &pubkey,
+            MockSigner::new().with_block_error(),
+            beacon,
+            Arc::new(test_validator_store(&pubkey)),
+        );
+        let err = service
+            .propose_block(
+                slot,
+                &pubkey,
+                42,
+                Some(ExpectedParents { root: parent, parent: None, closed: false }),
+            )
+            .await
+            .expect_err("the signer refuses");
+        assert!(matches!(err, BlockServiceError::Signer(_)), "{err:?}");
+        assert!(
+            !logs_contain("signing block with fee-recipient mismatch"),
+            "a refused signature must not warn"
+        );
+    });
+}
+
+/// The duty fee is the one captured before produce. A store update after
+/// produce does not erase the mismatch.
+#[test]
+#[tracing_test::traced_test]
+fn penalty_compares_against_the_duty_fee_recipient() {
+    assert_penalty_delta(1, async {
+        let pubkey = test_pubkey();
+        let slot = 100;
+        let parent = [0x11u8; 32];
+        let block_fee = [0x22u8; 20];
+        let block = block_with_fee(slot, parent, [0x44; 32], block_fee);
+        let beacon = Arc::new(MockBeaconClient::unblinded(block));
+        let signer = Arc::new(MockSigner::new());
+        let store = Arc::new(test_validator_store(&pubkey));
+        let hook_store = Arc::clone(&store);
+        let service = BlockService::new(
+            signer.clone(),
+            beacon.clone(),
+            store,
+            Arc::new(test_fork_schedule()),
+            [0xaa; 32],
+        );
+        service.set_after_produce(move || {
+            hook_store
+                .apply_default_update(validator_store::DefaultUpdate {
+                    fee_recipient: Some(block_fee),
+                    ..validator_store::DefaultUpdate::default()
+                })
+                .expect("fee update");
+        });
+        let result = service
+            .propose_block(
+                slot,
+                &pubkey,
+                42,
+                Some(ExpectedParents { root: parent, parent: None, closed: false }),
+            )
+            .await;
+        assert!(result.is_ok(), "the mismatch is still signed: {result:?}");
+        assert_eq!(signer.header_calls.lock().unwrap().len(), 1);
+        assert_eq!(beacon.publish_calls.lock().unwrap().len(), 1);
+        assert!(logs_contain("signing block with fee-recipient mismatch"));
+        assert!(logs_contain("fee_expected=0x0000000000000000000000000000000000000000"));
+        assert!(logs_contain("fee_got=0x2222222222222222222222222222222222222222"));
+        assert!(logs_contain("proposer=42"));
+        assert!(logs_contain(&format!("parent=0x{}", hex::encode(parent))));
+        assert!(logs_contain("fork=deneb") || logs_contain("fork=\"deneb\""));
+        assert!(logs_contain("exec="));
+    });
+}
+
+/// The re-org parent and the duty fee are the values `produce_block_v3_ranked_by` sees.
+#[tokio::test]
+async fn test_propose_block_forwards_reorg_parent_into_produce_duty() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let header = [0x11u8; 32];
+    let reorg = [0x22u8; 32];
+    let mut block = test_block(slot);
+    block.parent_root = header;
+    let beacon = Arc::new(MockBeaconClient::unblinded(block));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer,
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: header, parent: Some(reorg), closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+    let duty = beacon.last_duty.lock().unwrap().expect("duty was recorded");
+    assert_eq!(duty.expected_parent_root, Some(header));
+    assert_eq!(duty.alternate_parent_root, Some(reorg));
+    assert!(!duty.parent_closed);
+    assert_eq!(duty.expected_fee_recipient, Some([0u8; 20]));
+}
+
+/// SSZ blinded block whose parent is the re-org root is signed.
+#[tokio::test]
+async fn test_propose_block_ssz_blinded_accepts_reorg_parent() {
+    let slot = 100;
+    let header = [0x11u8; 32];
+    let reorg = [0x22u8; 32];
+    let mut block = eth_types::external_vector_deneb_blinded_block();
+    block.slot = slot;
+    block.proposer_index = 42;
+    block.parent_root = reorg;
+    let response = ProduceBlockResponse {
+        data: serde_json::Value::Null,
+        is_blinded: true,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some("1".to_string()),
+        is_ssz: true,
+        ssz_bytes: Some(eth_types::encode_blinded_beacon_block_ssz(&block, 0)),
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
+    };
+    let pubkey = test_pubkey();
+    let beacon = Arc::new(MockBeaconClient::from_response(response));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: header, parent: Some(reorg), closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "SSZ blinded re-org parent must be signed: {result:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].header.parent_root, reorg);
+    drop(headers);
+    assert_eq!(beacon.publish_ssz_calls.lock().unwrap().len(), 1);
+}
+
+fn ranked_response(block: BeaconBlock, value: &str) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data: serde_json::to_value(&block).expect("block json"),
+        is_blinded: false,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some(value.to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
+    }
+}
+
+/// The mock returns both candidates. The walk skips the higher-value body
+/// that cannot be prepared and signs the next one.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn test_higher_value_unpreparable_candidate_is_skipped_by_the_walk() {
+    let slot = 100;
+    let parent = [0x11u8; 32];
+    let broken = ProduceBlockResponse {
+        data: serde_json::json!({
+            "slot": slot.to_string(),
+            "proposer_index": "42",
+            "parent_root": format!("0x{}", hex::encode(parent)),
+            "state_root": format!("0x{}", "44".repeat(32)),
+            "body": { "execution_payload": { "fee_recipient": "0x0000000000000000000000000000000000000000" } },
+        }),
+        is_blinded: false,
+        consensus_version: "deneb".to_string(),
+        execution_payload_value: Some("9000".to_string()),
+        is_ssz: false,
+        ssz_bytes: None,
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
+    };
+    let mut good = test_block(slot);
+    good.parent_root = parent;
+    good.state_root = [0x44; 32];
+    let pubkey = test_pubkey();
+    let beacon = Arc::new(
+        MockBeaconClient::unblinded(test_block(1))
+            .with_ranked_responses(vec![broken, ranked_response(good, "1")]),
+    );
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service
+        .propose_block(
+            slot,
+            &pubkey,
+            42,
+            Some(ExpectedParents { root: parent, parent: None, closed: false }),
+        )
+        .await;
+    assert!(result.is_ok(), "the preparable candidate must be signed: {result:?}");
+    let headers = signer.header_calls.lock().unwrap();
+    assert_eq!(headers.len(), 1, "the unpreparable head must not be signed");
+    assert_eq!(headers[0].header.parent_root, parent);
+    assert_eq!(headers[0].header.state_root, [0x44; 32]);
+    assert!(logs_contain("BN block response rejected"), "the walk must log the skip");
 }

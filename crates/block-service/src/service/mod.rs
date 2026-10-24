@@ -7,7 +7,8 @@ use std::time::Instant;
 use tracing::{debug, error, info, warn, Instrument};
 
 use beacon::{
-    block_value, GloasBlockContents, ProduceBlockV4Body, RankedBlock, ShapeConstraint, WireBody,
+    block_value, display_value_parse, GloasBlockContents, ProduceBlockV4Body, RankedBlock,
+    ShapeConstraint, WireBody,
 };
 use crypto::PublicKey;
 use eth_types::{ForkName, ForkSchedule, Root, Slot, SLOTS_PER_EPOCH, SLOT_DURATION_MS};
@@ -477,6 +478,12 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             }
         };
 
+        // Captured once, before produce. The penalty compares against this
+        // duty fee, not a later read of the validator store. The Gloas arm
+        // does not build a V3 duty, so it does not use this value.
+        let duty_fee =
+            validator.map(|_| self.validator_store.effective_fee_recipient(&pubkey_bytes));
+
         // 3. Request block from beacon node. Dispatch on the slot fork, never
         // on response headers: Gloas is V4, pre-Gloas stays V3 verbatim.
         let produce_result = if fork >= ForkName::Gloas {
@@ -493,8 +500,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 .await
                 .map(Produced::V4)
         } else {
-            let duty = validator.map(|checks| {
-                let fee_recipient = self.validator_store.effective_fee_recipient(&pubkey_bytes);
+            let duty = validator.zip(duty_fee).map(|(checks, fee_recipient)| {
                 duty_from_validator(checks, fee_recipient, fork, shape)
             });
             self.beacon
@@ -600,6 +606,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                 effective_mode,
                 &fence,
                 capture_fence,
+                duty_fee,
             )
                 .await
         }
@@ -898,6 +905,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         mode: BlockSelectionMode,
         fence: &beacon::DutyFence,
         capture_fence: &beacon::DutyFence,
+        expected_fee: Option<[u8; 20]>,
     ) -> Result<SignedProposal, BlockServiceError> {
         if candidates.is_empty() {
             return Err(BlockServiceError::Beacon(
@@ -911,9 +919,6 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
             match self.prepare_v3(response, slot, validator, fork, mode) {
                 Ok(prepared) => {
                     record_produced_response(slot, response, fork);
-                    let expected_fee =
-                        self.validator_store.effective_fee_recipient(&pubkey.to_bytes());
-                    note_signed_fee_penalty(candidate.bn_index, response, expected_fee, slot);
                     debug!(
                         slot = slot,
                         bn_index = candidate.bn_index,
@@ -921,7 +926,16 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
                         "Blinded/unblinded path chosen"
                     );
                     return self
-                        .sign_and_publish_prepared(prepared, slot, pubkey, fence, capture_fence)
+                        .sign_and_publish_prepared(
+                            prepared,
+                            slot,
+                            pubkey,
+                            fence,
+                            capture_fence,
+                            candidate.bn_index,
+                            response,
+                            expected_fee,
+                        )
                         .await;
                 }
                 Err(err) => {
@@ -987,16 +1001,20 @@ fn rejected_before_publish(err: &BlockServiceError) -> bool {
     )
 }
 
-/// Warn and count a readable fee mismatch on the candidate that is signed.
+/// Warn and count a readable fee mismatch after the header signature succeeds.
 ///
 /// A blinded block is skipped. An unreadable fee does not warn. A fee that
 /// matches `expected` does not warn. The head of the ranked list is not
-/// counted when a later candidate is the one that prepares.
+/// counted when a later candidate is the one that prepares. `expected` is the
+/// fee on the produce duty.
 fn note_signed_fee_penalty(
     bn_index: usize,
     response: &ProduceBlockResponse,
     expected: [u8; 20],
     slot: Slot,
+    proposer: u64,
+    parent: &[u8; 32],
+    fork: &str,
 ) {
     if response.is_blinded {
         return;
@@ -1010,11 +1028,19 @@ fn note_signed_fee_penalty(
     warn!(
         slot,
         bn_index,
+        proposer,
+        parent = %hex_root(parent),
+        fork,
         fee_expected = %hex_fee(&expected),
         fee_got = %hex_fee(&got),
+        value_parse = %display_value_parse(response),
         "signing block with fee-recipient mismatch"
     );
     inc_signed_fee_penalty();
+}
+
+fn hex_root(bytes: &[u8; 32]) -> String {
+    format!("0x{}", hex::encode(bytes))
 }
 
 fn inc_signed_fee_penalty() {
@@ -1183,6 +1209,7 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
     }
 
     /// Sign one prepared candidate and publish it. Any error is final.
+    #[allow(clippy::too_many_arguments)]
     async fn sign_and_publish_prepared(
         &self,
         prepared: PreparedProposal,
@@ -1190,6 +1217,9 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         pubkey: &PublicKey,
         fence: &beacon::DutyFence,
         capture_fence: &beacon::DutyFence,
+        bn_index: usize,
+        response: &ProduceBlockResponse,
+        expected_fee: Option<[u8; 20]>,
     ) -> Result<SignedProposal, BlockServiceError> {
         let sign_start = std::time::Instant::now();
         self.discard_revoked_fences(&[fence, capture_fence])?;
@@ -1205,6 +1235,17 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         .instrument(tracing::info_span!("sign.block"))
         .await
         .map_err(|e| BlockServiceError::Signer(e.to_string()))?;
+        if let Some(expected) = expected_fee {
+            note_signed_fee_penalty(
+                bn_index,
+                response,
+                expected,
+                slot,
+                prepared.header.proposer_index,
+                &prepared.header.parent_root,
+                &prepared.consensus_version,
+            );
+        }
         debug!(
             slot = slot,
             duration_ms = sign_start.elapsed().as_millis() as u64,

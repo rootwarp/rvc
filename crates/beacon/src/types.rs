@@ -207,24 +207,97 @@ pub struct RankedBlock {
     pub response: ProduceBlockResponse,
 }
 
+/// One ETH, in wei.
+const WEI_PER_ETH: u128 = 1_000_000_000_000_000_000;
+
+/// Ranking ignores a claimed total above this.
+///
+/// 1,000 ETH. A block at or below the cap keeps its parsed wei. A larger
+/// claim ranks as 0 and is logged. The block is not rejected for the claim.
+pub const MAX_PLAUSIBLE_BLOCK_VALUE_WEI: u128 = 1_000 * WEI_PER_ETH;
+
 /// Execution-payload wei plus consensus-block wei.
 ///
 /// Each header is a whole decimal. A missing, empty, signed, or non-digit
 /// header is 0, as is a digit string that does not fit in `u128`. The sum
-/// saturates at `u128::MAX`.
+/// saturates at `u128::MAX`, then a total above
+/// [`MAX_PLAUSIBLE_BLOCK_VALUE_WEI`] returns 0.
 pub fn block_value(resp: &ProduceBlockResponse) -> u128 {
+    let total = claimed_total(resp);
+    if total > MAX_PLAUSIBLE_BLOCK_VALUE_WEI {
+        tracing::warn!(
+            value_parse = %display_value_parse(resp),
+            cap_wei = MAX_PLAUSIBLE_BLOCK_VALUE_WEI,
+            "claimed block value above plausibility cap"
+        );
+        return 0;
+    }
+    total
+}
+
+fn claimed_total(resp: &ProduceBlockResponse) -> u128 {
     wei_or_zero(resp.execution_payload_value.as_deref())
         .saturating_add(wei_or_zero(resp.consensus_block_value.as_deref()))
 }
 
-fn wei_or_zero(raw: Option<&str>) -> u128 {
-    let Some(raw) = raw else {
-        return 0;
-    };
-    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        return 0;
+/// `exec=<label>, consensus=<label>`.
+///
+/// A parsed header is `ok:<wei>`. A missing header is `missing`. Any other
+/// header is `unparsed:"<raw>"`: the copied raw is at most 64 bytes, and a
+/// quote, backslash, or control character is `?`. A parsed total above
+/// [`MAX_PLAUSIBLE_BLOCK_VALUE_WEI`] appends `, total=implausible`.
+pub fn display_value_parse(resp: &ProduceBlockResponse) -> String {
+    let mut label = format!(
+        "exec={}, consensus={}",
+        label_wei_header(resp.execution_payload_value.as_deref()),
+        label_wei_header(resp.consensus_block_value.as_deref()),
+    );
+    if claimed_total(resp) > MAX_PLAUSIBLE_BLOCK_VALUE_WEI {
+        label.push_str(", total=implausible");
     }
-    raw.parse().unwrap_or(0)
+    label
+}
+
+fn label_wei_header(raw: Option<&str>) -> String {
+    let Some(raw) = raw else {
+        return "missing".to_string();
+    };
+    match parse_whole_wei(raw) {
+        Some(wei) => format!("ok:{wei}"),
+        None => format!("unparsed:\"{}\"", capped_header_text(raw)),
+    }
+}
+
+fn parse_whole_wei(raw: &str) -> Option<u128> {
+    if raw.is_empty() || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok()
+}
+
+/// At most 64 characters. Quotes and controls cannot break the log field.
+fn capped_header_text(raw: &str) -> String {
+    const CAP: usize = 64;
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if out.len() >= CAP {
+            break;
+        }
+        let ch = match ch {
+            '"' | '\\' | '\n' | '\r' => '?',
+            other if other.is_control() => '?',
+            other => other,
+        };
+        if out.len() + ch.len_utf8() > CAP {
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn wei_or_zero(raw: Option<&str>) -> u128 {
+    raw.and_then(parse_whole_wei).unwrap_or(0)
 }
 
 impl ProduceBlockResponse {
