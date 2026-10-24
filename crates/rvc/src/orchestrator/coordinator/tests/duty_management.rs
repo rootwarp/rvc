@@ -1777,6 +1777,110 @@ async fn test_startup_preparation_does_not_block_the_proposer_duty() {
     );
 }
 
+/// In-flight startup preparation is dropped when `run` returns.
+///
+/// The prepare call is held inside the beacon-node mock for one hour. Virtual
+/// time stays below that hold until `run` has returned, then moves past the
+/// hold and stays inside the two-hour preparation timeout. A jump past both
+/// would drop the call without recording it. A detached task records the call
+/// on this move.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn startup_preparation_ends_when_run_returns() {
+    use bn_manager::MockMethod;
+
+    let mock = retirement_beacon_base()
+        .with_method_delay(MockMethod::PrepareBeaconProposer, Duration::from_secs(3600));
+    let mut timeouts = fast_timeouts();
+    timeouts.preparation = Duration::from_secs(7200);
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    let started = spawn_startup_fee_run(mock, clock, timeouts, false).await;
+
+    let mut waited_ms = 0u64;
+    loop {
+        let entered = started
+            .mock
+            .call_stamps()
+            .iter()
+            .any(|stamp| stamp.method == MockMethod::PrepareBeaconProposer);
+        if entered {
+            break;
+        }
+        assert!(!started.run.is_finished(), "run returned before prepare_beacon_proposer");
+        waited_ms += 1;
+        assert!(waited_ms <= 5_000, "prepare_beacon_proposer did not start");
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    assert!(
+        started.mock.prepare_beacon_proposer_calls().is_empty(),
+        "the hold must still be inside the mock when run is stopped"
+    );
+
+    started.handle.shutdown();
+    let mut stop_ms = 0u64;
+    loop {
+        if started.run.is_finished() {
+            break;
+        }
+        stop_ms += 1;
+        assert!(stop_ms <= 30_000, "run did not return after shutdown");
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    let result = started.run.await.expect("run task");
+    assert!(result.is_ok(), "shutdown ends the slot loop: {result:?}");
+    assert!(
+        started.mock.prepare_beacon_proposer_calls().is_empty(),
+        "prepare must still be in flight when run returns"
+    );
+
+    // One-second steps so a still-running task is polled as the hold expires.
+    // The preparation timeout is two hours, so this move does not cancel the call.
+    let mut moved_s = 0u64;
+    while started.mock.prepare_beacon_proposer_calls().is_empty() && moved_s < 4_000 {
+        moved_s += 1;
+        tokio::time::advance(Duration::from_secs(1)).await;
+    }
+    assert!(
+        started.mock.prepare_beacon_proposer_calls().is_empty(),
+        "startup preparation must not finish after run returns; virtual seconds moved: {moved_s}"
+    );
+    let retries = started
+        .mock
+        .call_stamps()
+        .iter()
+        .filter(|stamp| stamp.method == MockMethod::PrepareBeaconProposer)
+        .count();
+    assert_eq!(retries, 1, "startup preparation must not retry after run returns");
+}
+
+/// Startup preparation is allowed to finish. `run` keeps polling the slot loop
+/// afterwards. A completed future must not be polled again.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn startup_preparation_finishes_while_the_slot_loop_continues() {
+    let mut timeouts = fast_timeouts();
+    timeouts.preparation = Duration::from_secs(7200);
+    let clock = Arc::new(MockSlotClock::new(TEST_GENESIS_TIME, Duration::from_secs(12), 32));
+    clock.set_slot(2);
+    let started = spawn_startup_fee_run(retirement_beacon_base(), clock, timeouts, false).await;
+
+    let mut waited_ms = 0u64;
+    while started.mock.prepare_beacon_proposer_calls().is_empty() && waited_ms < 5_000 {
+        waited_ms += 1;
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+    assert!(
+        !started.mock.prepare_beacon_proposer_calls().is_empty(),
+        "startup preparation did not finish; virtual ms {waited_ms}"
+    );
+    for _ in 0..8 {
+        assert!(
+            !started.run.is_finished(),
+            "a finished startup future must leave the slot loop running"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+    }
+}
+
 fn local_pk_public(bytes: &[u8; 48]) -> PublicKey {
     PublicKey::from_bytes(bytes).expect("pubkey bytes")
 }

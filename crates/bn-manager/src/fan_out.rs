@@ -1078,6 +1078,7 @@ async fn wait_for_complete_detached<T: Clone + Send + 'static>(
     let publish = ATTESTATION_PUBLISH.try_with(Clone::clone).ok();
     let drive_policy = policy.clone();
     let guard = begin_detached();
+    // detached: broadcast drain; the caller waits on the oneshot, not this task.
     tokio::spawn(async move {
         let _guard = guard;
         let drive = drive_after_partial(Some(partial), earlier, pending, op_name, drive_policy, tx);
@@ -1296,6 +1297,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let guard = begin_detached();
+    // detached: publish drain; shutdown drops the task. FU-B4 tracks the join.
     tokio::spawn(async move {
         let _guard = guard;
         fut.await;
@@ -1507,6 +1509,7 @@ fn health_sender() -> tokio::sync::mpsc::Sender<HealthSample> {
         }
     }
     let (tx, mut rx) = tokio::sync::mpsc::channel::<HealthSample>(RECORDER_QUEUE_CAP);
+    // detached: health-sample recorder; process shutdown drops the queue.
     tokio::spawn(async move {
         while let Some(sample) = rx.recv().await {
             record_outcomes(&sample.health, &sample.op_name, &[(sample.index, sample.outcome)])

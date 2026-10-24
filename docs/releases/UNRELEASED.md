@@ -39,6 +39,10 @@ counts as a health error until the node imports the block. Sending the
 envelope only to the nodes that accepted the block stays parked until Gloas
 is scheduled.
 
+## Startup proposer preparation ends when the orchestrator returns
+
+`DutyOrchestrator::run` polls startup proposer preparation beside the slot loop. That future is dropped when `run` returns, including on shutdown. A slow `prepare_beacon_proposer` still does not hold the slot loop. Before genesis the epoch is 0. A failed prepare or register retries once per slot until both succeed or `run` returns.
+
 ## A hard-rejected block does not improve beacon-node health
 
 A produce candidate that fails a hard check no longer counts as a successful health sample. The beacon node's score, error rate, and latency stay where they were. A readable fee-recipient mismatch under `fee_recipient_policy = sign` is still a success. The fallback records that sample only after the fallback accept check, so a rejected fallback body does not improve the node either.
