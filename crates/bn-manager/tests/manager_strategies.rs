@@ -5399,3 +5399,62 @@ async fn initial_round_relaxes_when_the_parent_is_known_and_no_floor_node_exists
         .expect("known parent relaxes onto the large-lag node");
     assert_eq!(block.execution_payload_value.as_deref(), Some("7000"));
 }
+
+/// Cross-BN ranking applies the operator boost to blinded blocks only.
+///
+/// BN-A returns a local block of value 10. BN-B returns a blinded block of
+/// value 9. Boost 0, 50, and 100 keep the local block (9×50/100 = 4). Boost
+/// `u64::MAX` ranks the blinded block first.
+#[tokio::test]
+async fn cross_bn_ranking_applies_the_builder_boost_factor() {
+    let cases = [(0u64, false), (50, false), (100, false), (u64::MAX, true)];
+    for (boost, blinded_wins) in cases {
+        let local = MockServer::start().await;
+        let blinded = MockServer::start().await;
+        let parent = "00".repeat(32);
+        let local_body = produce_json(preparable_data("full", 1, 7, &parent, false));
+        let blinded_body = produce_json(preparable_data("deneb-blinded", 1, 7, &parent, false));
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Eth-Consensus-Version", "deneb")
+                    .insert_header("Eth-Execution-Payload-Blinded", "false")
+                    .insert_header("Eth-Execution-Payload-Value", "10")
+                    .insert_header("Eth-Consensus-Block-Value", "0")
+                    .set_body_string(local_body),
+            )
+            .expect(1)
+            .mount(&local)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v3/validator/blocks/1"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Eth-Consensus-Version", "deneb")
+                    .insert_header("Eth-Execution-Payload-Blinded", "true")
+                    .insert_header("Eth-Execution-Payload-Value", "9")
+                    .insert_header("Eth-Consensus-Block-Value", "0")
+                    .set_body_string(blinded_body),
+            )
+            .expect(1)
+            .mount(&blinded)
+            .await;
+
+        let manager =
+            manager_with_block_budget(&[&local.uri(), &blinded.uri()], Duration::from_millis(800));
+        let duty = any_duty(ForkName::Deneb, None, None);
+        let ranked = manager
+            .produce_block_v3_ranked(1, "0xrandao", None, Some(boost), Some(duty))
+            .await
+            .unwrap_or_else(|err| panic!("boost {boost}: {err}"));
+        assert!(!ranked.is_empty(), "boost {boost}");
+        assert_eq!(
+            ranked[0].response.is_blinded, blinded_wins,
+            "boost {boost}: value {:?}",
+            ranked[0].response.execution_payload_value
+        );
+        let expected = if blinded_wins { "9" } else { "10" };
+        assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some(expected));
+    }
+}

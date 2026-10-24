@@ -2714,7 +2714,7 @@ fn produce_best_select(
 /// execution-offline nodes stay out. Healthier means `tier <=` this value.
 const FALLBACK_TIER_FLOOR: HealthTier = HealthTier::SmallLag;
 
-/// Slot, proposer, parent, consensus version, and fee recipient for one
+/// Slot, proposer, parent, consensus version, fee recipient, and boost for one
 /// `produce_block_v3` duty.
 #[derive(Clone, Copy)]
 struct BlockDutyChecks {
@@ -2726,6 +2726,9 @@ struct BlockDutyChecks {
     fee_recipient: Option<[u8; 20]>,
     consensus_version: ForkName,
     shape: ShapeConstraint,
+    /// `None` compares raw wei. `Some` scales a blinded block and leaves a local
+    /// block raw. The produce argument overwrites the `None` from [`checks_from_duty`].
+    builder_boost_factor: Option<u64>,
 }
 
 fn checks_from_duty(slot: u64, duty: ProduceDuty) -> BlockDutyChecks {
@@ -2738,6 +2741,7 @@ fn checks_from_duty(slot: u64, duty: ProduceDuty) -> BlockDutyChecks {
         fee_recipient: duty.expected_fee_recipient,
         consensus_version: duty.expected_consensus_version,
         shape: duty.shape,
+        builder_boost_factor: None,
     }
 }
 
@@ -2968,8 +2972,11 @@ fn parent_rank(block: &ProduceBlockResponse, checks: &BlockDutyChecks) -> u8 {
 ///
 /// The primary parent outranks the re-org parent. Within that class, a
 /// fee-preferred block outranks a penalized one regardless of value. Within
-/// the same fee class, [`block_value`] decides. A missing or unparsable
-/// header contributes 0, and the sum saturates.
+/// the same fee class, the boosted value decides. A local block uses its raw
+/// wei. A blinded block uses `value * boost / 100` when a boost is present.
+/// Boost `u64::MAX` ranks any blinded block above any local block. Boost 0
+/// ranks any local block above any blinded block. No boost compares raw wei.
+/// A missing or unparsable header contributes 0, and the scaled value saturates.
 fn candidate_ranks_above(
     left: &ProduceBlockResponse,
     right: &ProduceBlockResponse,
@@ -2987,7 +2994,61 @@ fn candidate_ranks_above(
             (true, true) | (false, false) => {}
         }
     }
-    block_value(left) > block_value(right)
+    let boost = checks.and_then(|checks| checks.builder_boost_factor);
+    boosted_ranks_above(boosted_rank(left, boost), boosted_rank(right, boost))
+}
+
+/// Where a block sits once the builder boost has been applied.
+///
+/// `BuilderFirst` outranks `Scaled`, which outranks `BelowLocal`. Two blocks
+/// in the same class compare the stored wei, which is raw for a local block
+/// and for the two extreme boosts, and scaled for a finite non-zero boost.
+#[derive(Clone, Copy)]
+enum BoostedRank {
+    BelowLocal(u128),
+    Scaled(u128),
+    BuilderFirst(u128),
+}
+
+fn boosted_rank(block: &ProduceBlockResponse, boost: Option<u64>) -> BoostedRank {
+    let raw = block_value(block);
+    let Some(boost) = boost.filter(|_| block.is_blinded) else {
+        return BoostedRank::Scaled(raw);
+    };
+    if boost == u64::MAX {
+        return BoostedRank::BuilderFirst(raw);
+    }
+    if boost == 0 {
+        return BoostedRank::BelowLocal(raw);
+    }
+    BoostedRank::Scaled(saturating_boosted_wei(raw, boost))
+}
+
+/// `value * boost / 100`, saturating at [`u128::MAX`].
+///
+/// Checked multiplication keeps an exact quotient when the product fits.
+/// Dividing first is the overflow path: saturating the product and then
+/// dividing would turn `u128::MAX / 2 * 1000` into `u128::MAX / 100`.
+fn saturating_boosted_wei(value: u128, boost: u64) -> u128 {
+    let factor = u128::from(boost);
+    if let Some(product) = value.checked_mul(factor) {
+        return product / 100;
+    }
+    let head = (value / 100).saturating_mul(factor);
+    let tail = (value % 100).saturating_mul(factor) / 100;
+    head.saturating_add(tail)
+}
+
+fn boosted_ranks_above(left: BoostedRank, right: BoostedRank) -> bool {
+    match (left, right) {
+        (BoostedRank::BuilderFirst(left), BoostedRank::BuilderFirst(right))
+        | (BoostedRank::Scaled(left), BoostedRank::Scaled(right))
+        | (BoostedRank::BelowLocal(left), BoostedRank::BelowLocal(right)) => left > right,
+        (BoostedRank::BuilderFirst(_), _) => true,
+        (_, BoostedRank::BuilderFirst(_)) => false,
+        (BoostedRank::Scaled(_), BoostedRank::BelowLocal(_)) => true,
+        (BoostedRank::BelowLocal(_), BoostedRank::Scaled(_)) => false,
+    }
 }
 
 struct ObservedDuty {
@@ -4158,7 +4219,10 @@ impl BlockProducer for BnManager {
         duty: Option<ProduceDuty>,
         deadline: Option<tokio::time::Instant>,
     ) -> Result<Vec<RankedBlock>, BeaconError> {
-        let checks = duty.map(|duty| checks_from_duty(slot, duty));
+        let mut checks = duty.map(|duty| checks_from_duty(slot, duty));
+        if let Some(checks) = checks.as_mut() {
+            checks.builder_boost_factor = builder_boost_factor;
+        }
         self.produce_block_v3_checked(
             slot,
             randao_reveal,
@@ -5111,6 +5175,7 @@ mod tests {
             fee_recipient: None,
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::BlindedOnly,
+            builder_boost_factor: None,
         };
         let select = produce_best_select(Some(checks), FeeRecipientPolicy::Sign);
         let local = duty_response("9000", 1, 7, parent, None);
@@ -5158,6 +5223,7 @@ mod tests {
                 fee_recipient: None,
                 consensus_version: fork,
                 shape: ShapeConstraint::LocalOnly,
+                builder_boost_factor: None,
             };
             let block = ProduceBlockResponse {
                 data: serde_json::json!("not-a-block"),
@@ -6385,6 +6451,7 @@ mod tests {
             fee_recipient: None,
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let start = tokio::time::Instant::now();
         let result = manager
@@ -6451,6 +6518,7 @@ mod tests {
             fee_recipient: None,
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let start = tokio::time::Instant::now();
         let result = manager
@@ -6614,6 +6682,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let result = manager
             .query_best_filtered(
@@ -6662,6 +6731,7 @@ mod tests {
             fee_recipient: Some([0x11; 20]),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let result = manager
             .query_best_filtered(
@@ -6710,6 +6780,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let start = tokio::time::Instant::now();
         let result = manager
@@ -6767,6 +6838,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let start = tokio::time::Instant::now();
         let result = manager
@@ -6832,6 +6904,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let result = manager
             .query_best_filtered(
@@ -6883,6 +6956,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let ranked = manager
             .query_best_inner(
@@ -6937,6 +7011,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let ranked = manager
             .query_best_inner(
@@ -7038,6 +7113,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let items = vec![
             (2, duty_response("1000", 1, 7, parent, Some([0x22; 20]))),
@@ -7074,7 +7150,109 @@ mod tests {
             fee_recipient: None,
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         }
+    }
+
+    fn value_block(execution: &str, blinded: bool) -> ProduceBlockResponse {
+        produce_from_data(execution, serde_json::json!("unused"), blinded)
+    }
+
+    #[test]
+    fn saturating_boosted_wei_divides_when_the_product_fits() {
+        assert_eq!(saturating_boosted_wei(9, 50), 4);
+        assert_eq!(saturating_boosted_wei(9, 100), 9);
+        assert_eq!(saturating_boosted_wei(150, 100), 150);
+        assert_eq!(saturating_boosted_wei(0, u64::MAX), 0);
+        assert_eq!(saturating_boosted_wei(u128::MAX, 100), u128::MAX);
+    }
+
+    /// `saturating_mul` then `/ 100` would return `u128::MAX / 100` here.
+    #[test]
+    fn saturating_boosted_wei_saturates_the_quotient() {
+        assert_eq!(saturating_boosted_wei(u128::MAX / 2, 1000), u128::MAX);
+        assert_eq!(saturating_boosted_wei(u128::MAX, 101), u128::MAX);
+    }
+
+    #[test]
+    fn builder_boost_scales_a_blinded_block_and_leaves_a_local_block_raw() {
+        let mut checks = duty_without_parent();
+        // 9 * 50 / 100 = 4, which loses to a local 5. Raw comparison would
+        // rank the blinded 9 first.
+        checks.builder_boost_factor = Some(50);
+        let local = value_block("5", false);
+        let blinded = value_block("9", true);
+        assert!(candidate_ranks_above(&local, &blinded, Some(&checks)));
+        assert!(!candidate_ranks_above(&blinded, &local, Some(&checks)));
+
+        // 9 * 200 / 100 = 18, which beats a local 10. Raw comparison would not.
+        checks.builder_boost_factor = Some(200);
+        let local = value_block("10", false);
+        let blinded = value_block("9", true);
+        assert!(candidate_ranks_above(&blinded, &local, Some(&checks)));
+        assert!(!candidate_ranks_above(&local, &blinded, Some(&checks)));
+
+        // Equal scaled values are not a strict win either way.
+        checks.builder_boost_factor = Some(100);
+        let local = value_block("9", false);
+        let blinded = value_block("9", true);
+        assert!(!candidate_ranks_above(&local, &blinded, Some(&checks)));
+        assert!(!candidate_ranks_above(&blinded, &local, Some(&checks)));
+    }
+
+    #[test]
+    fn max_boost_puts_any_blinded_block_above_any_local() {
+        let mut checks = duty_without_parent();
+        checks.builder_boost_factor = Some(u64::MAX);
+        let local = value_block(&u128::MAX.to_string(), false);
+        let blinded = value_block("1", true);
+        assert!(candidate_ranks_above(&blinded, &local, Some(&checks)));
+        assert!(!candidate_ranks_above(&local, &blinded, Some(&checks)));
+
+        let low = value_block("1", false);
+        let high = value_block("2", false);
+        assert!(candidate_ranks_above(&high, &low, Some(&checks)));
+        assert!(!candidate_ranks_above(&low, &high, Some(&checks)));
+    }
+
+    #[test]
+    fn zero_boost_puts_any_local_block_above_any_blinded() {
+        let mut checks = duty_without_parent();
+        checks.builder_boost_factor = Some(0);
+        let local = value_block("0", false);
+        let blinded = value_block(&u128::MAX.to_string(), true);
+        assert!(candidate_ranks_above(&local, &blinded, Some(&checks)));
+        assert!(!candidate_ranks_above(&blinded, &local, Some(&checks)));
+
+        let low = value_block("1", true);
+        let high = value_block("2", true);
+        assert!(candidate_ranks_above(&high, &low, Some(&checks)));
+        assert!(!candidate_ranks_above(&low, &high, Some(&checks)));
+    }
+
+    #[test]
+    fn missing_boost_compares_raw_wei() {
+        let mut checks = duty_without_parent();
+        checks.builder_boost_factor = None;
+        let local = value_block("10", false);
+        let blinded = value_block("11", true);
+        assert!(candidate_ranks_above(&blinded, &local, Some(&checks)));
+        assert!(candidate_ranks_above(&blinded, &local, None));
+        assert!(!candidate_ranks_above(&local, &blinded, None));
+    }
+
+    #[test]
+    fn primary_parent_outranks_a_max_boosted_reorg() {
+        let primary = [0xabu8; 32];
+        let reorg = [0xcd; 32];
+        let mut checks = duty_without_parent();
+        checks.parent_root = Some(primary);
+        checks.alternate_parent_root = Some(reorg);
+        checks.builder_boost_factor = Some(u64::MAX);
+        let local = duty_response("1", 1, 7, primary, None);
+        let blinded = blinded_duty_response(&u128::MAX.to_string(), 1, 7, reorg);
+        assert!(candidate_ranks_above(&local, &blinded, Some(&checks)));
+        assert!(!candidate_ranks_above(&blinded, &local, Some(&checks)));
     }
 
     /// A healthy beacon node is eligible before the first sync poll, including
@@ -7162,6 +7340,7 @@ mod tests {
             fee_recipient: Some([0x11; 20]),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         assert!(passes_sign(&block, &checks));
         let wrong_parent = BlockDutyChecks { parent_root: Some([0xcd; 32]), ..checks };
@@ -7181,6 +7360,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let matching = duty_response("1", 1, 7, parent, Some(fee));
         assert!(passes_sign(&matching, &checks));
@@ -7391,6 +7571,7 @@ mod tests {
             fee_recipient: Some([0x11; 20]),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         }
     }
 
@@ -7671,6 +7852,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let result = manager
             .query_best_filtered(
@@ -7748,6 +7930,7 @@ mod tests {
             fee_recipient: Some(expected),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let mut blinded = blinded_duty_response("1", 1, 7, parent);
         blinded.data["body"]["execution_payload_header"]["fee_recipient"] =
@@ -7864,6 +8047,7 @@ mod tests {
             fee_recipient: Some(expected),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         for (fork, version, preferred) in [
             (ForkName::Phase0, "phase0", true),
@@ -7950,6 +8134,7 @@ mod tests {
             fee_recipient: Some(fee),
             consensus_version: ForkName::Deneb,
             shape: ShapeConstraint::Any,
+            builder_boost_factor: None,
         };
         let matching = ssz_contents(7, 42, parent, &deneb.as_ssz_bytes(), "deneb");
         assert!(passes_sign(&matching, &checks));
@@ -8016,6 +8201,7 @@ mod tests {
                 fee_recipient: Some(fee),
                 consensus_version: fork,
                 shape: ShapeConstraint::Any,
+                builder_boost_factor: None,
             };
             let block = |body: Vec<u8>| ProduceBlockResponse {
                 data: serde_json::Value::Null,

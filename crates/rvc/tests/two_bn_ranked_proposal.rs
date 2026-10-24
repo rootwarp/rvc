@@ -359,7 +359,9 @@ async fn test_higher_value_stale_parent_is_not_signed() {
     let beacon = Arc::new(BeaconBlockAdapter::new(Arc::new(manager)));
     let pubkey = SecretKey::generate().public_key();
     let store = ValidatorStore::new([0u8; 20], 30_000_000);
-    store.add_validator(ValidatorConfig::new(pubkey.to_bytes())).unwrap();
+    let mut validator = ValidatorConfig::new(pubkey.to_bytes());
+    validator.builder_proposals = true;
+    store.add_validator(validator).unwrap();
     let signer = Arc::new(CountingSigner::new());
     let service = BlockService::new(
         signer.clone(),

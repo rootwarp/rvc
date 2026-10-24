@@ -978,7 +978,9 @@ async fn proposal_rig(limit: u32, steps: Vec<PublishStep>, slots: &[u64]) -> Pro
         .with_enablement(always_enabled()),
     );
     let store = Arc::new(ValidatorStore::new([0xaa; 20], 30_000_000));
-    store.add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes())).unwrap();
+    let mut validator = validator_store::ValidatorConfig::new(pubkey.to_bytes());
+    validator.builder_proposals = true;
+    store.add_validator(validator).unwrap();
     store.set_global_block_selection_mode(validator_store::BlockSelectionMode::MaxProfit);
     let mut map = HashMap::new();
     map.insert(pubkey.to_bytes(), pubkey);

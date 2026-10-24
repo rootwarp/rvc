@@ -85,8 +85,8 @@ There is no `block_selection_mode` key under `[defaults]`. The CLI flag `--block
 | `pubkey` | string | **yes** | — | 48-byte BLS pubkey hex, `0x` prefix optional. Used as the table key for lookups (all HTTP/Rust APIs address validators by this value). |
 | `fee_recipient` | string | no | inherits `[defaults].fee_recipient` | Same format/validation as above. |
 | `gas_limit` | integer | no | inherits `[defaults].gas_limit` | |
-| `builder_proposals` | bool | no | `false` | Whether this validator opts in to builder (MEV-boost) block production at all. No global default — off unless explicitly enabled per validator. |
-| `builder_boost_factor` | integer | no | `100` | Weighting used when comparing local vs. builder block value; `0` effectively disables the builder path for this validator, `u64::MAX` forces builder-always/only semantics. |
+| `builder_proposals` | bool | no | `false` | Whether this validator opts in to builder (MEV-boost) block production at all. No global default — off unless explicitly enabled per validator. See [Builder flag, boost, and what the relay keeps](#builder-flag-boost-and-what-the-relay-keeps). |
+| `builder_boost_factor` | integer | no | `100` | Weight applied to a blinded block when beacon nodes are ranked against each other. A local block keeps its raw value. `0` ranks every local block above every blinded block. `u64::MAX` ranks every blinded block above every local block. |
 | `graffiti` | string | no | inherits `[defaults].graffiti` | Same truncation behavior as above. |
 | `enabled` | bool | no | `true` | Master per-validator signing gate — `false` blocks all attesting/proposing for this key. Unknown pubkeys (not listed here and not loaded from a keystore) are treated as `enabled = false` (fail-closed). |
 | `block_selection_mode` | string | no | the global default set by `--block-selection-mode` or the top-level TOML key `block_selection_mode` (`max-profit` when both are unset) | One of `max-profit`, `execution-only`, `builder-always`, `builder-only` (kebab-case; no-hyphen spellings like `executiononly` also parse). A per-validator value wins over that global default. See below. |
@@ -97,10 +97,20 @@ There is no `block_selection_mode` key under `[defaults]`. The CLI flag `--block
 
 | Value | Effect |
 |---|---|
-| `max-profit` (default) | Request both local and builder blocks, propose whichever is worth more. |
+| `max-profit` (default) | With `builder_proposals` on, request a builder bid and propose whichever side is worth more after the boost. With the flag off, before Gloas, the proposal is local. |
 | `execution-only` | Forces `builder_boost_factor = 0` — never uses the builder. |
-| `builder-always` | Forces `builder_boost_factor = u64::MAX`; falls back to a local block if the builder fails or the circuit breaker has tripped. |
-| `builder-only` | Same weighting as `builder-always` but **never falls back** — the proposal fails outright if the builder is unavailable. Intended for DVT clusters where a local fallback would be unsafe/incorrect. |
+| `builder-always` | With the flag on, forces `builder_boost_factor = u64::MAX` and falls back to a local block if the builder fails or the circuit breaker has tripped. With the flag off, before Gloas, the proposal is local. |
+| `builder-only` | Same weighting as `builder-always` but **never falls back** — the proposal fails outright if the builder is unavailable. The flag does not turn this into a local proposal. Intended for DVT clusters where a local fallback would be unsafe/incorrect. |
+
+### Builder flag, boost, and what the relay keeps
+
+`builder_proposals` defaults to off. Startup warns, and does not exit, when a key's effective mode is `builder-only` and that flag is off, or when that key's Gloas builder URL list is empty. The warning is once per key. The log reason is `builder_only_without_builder`. It names the truncated pubkey, whether the flag is on, and how many Gloas builder URLs the key has. It does not name a relay URL or a fee recipient.
+
+Before Gloas, `max-profit` and `builder-always` with the flag off do not request a builder bid: the produce call uses boost 0 and accepts only a local block. `builder-only` still requests a builder block and fails the proposal when the only candidate is local. At Gloas the flag does not change the V4 boost or the builder list.
+
+When more than one beacon node returns a block, a blinded block is ranked at `value * builder_boost_factor / 100` and a local block at its raw value. The quotient saturates at the maximum `u128`. Boost `u64::MAX` puts every blinded block ahead of every local block. Boost `0` puts every local block ahead of every blinded block. A block on the primary parent still wins before that comparison.
+
+Setting `builder_proposals` to false does not deregister the validator at the relay and does not evict a registration this process already sent. The relay keeps that registration until a later registration update.
 
 ---
 

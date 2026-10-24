@@ -133,9 +133,10 @@ async fn test_builder_timeout_trips_breaker() {
     let validator_store = Arc::new(ValidatorStore::new([0xaau8; 20], 30_000_000));
     // D-3 fail-closed: register the loaded validator so the per-validator
     // signing gate permits this proposal (mirrors startup registration).
-    validator_store
-        .add_validator(validator_store::ValidatorConfig::new(pubkey.to_bytes()))
-        .unwrap();
+    // The flag must be on: pre-Gloas builder-always with it off is local-only.
+    let mut validator = validator_store::ValidatorConfig::new(pubkey.to_bytes());
+    validator.builder_proposals = true;
+    validator_store.add_validator(validator).unwrap();
     validator_store
         .set_global_block_selection_mode(validator_store::BlockSelectionMode::BuilderAlways);
 

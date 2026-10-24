@@ -1995,6 +1995,132 @@ async fn test_ranked_skipped_fee_match_signs_the_mismatch() {
     );
 }
 
+fn store_with_builder_flag(pubkey: &PublicKey, enabled: bool) -> validator_store::ValidatorStore {
+    let store = validator_store::ValidatorStore::new([0u8; 20], 30_000_000);
+    let mut config = validator_store::ValidatorConfig::new(pubkey.to_bytes());
+    config.builder_boost_factor = Some(150);
+    config.builder_proposals = enabled;
+    store.add_validator(config).expect("validator");
+    store
+}
+
+/// Pre-Gloas max-profit with `builder_proposals` off asks for no builder bid.
+///
+/// The produce call carries boost 0 and `LocalOnly`. A blinded response is
+/// rejected before the signer runs.
+#[tokio::test]
+async fn max_profit_requests_no_builder_bid_when_builder_proposals_is_off() {
+    assert_pre_gloas_flag_off_is_local(BlockSelectionMode::MaxProfit).await;
+}
+
+/// Builder-always follows the same flag: off means no builder bid.
+#[tokio::test]
+async fn builder_always_requests_no_builder_bid_when_builder_proposals_is_off() {
+    assert_pre_gloas_flag_off_is_local(BlockSelectionMode::BuilderAlways).await;
+}
+
+async fn assert_pre_gloas_flag_off_is_local(mode: BlockSelectionMode) {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let beacon = Arc::new(MockBeaconClient::blinded(test_blinded_block(slot)));
+    let signer = Arc::new(MockSigner::new());
+    let store = store_with_builder_flag(&pubkey, false);
+    store.set_global_block_selection_mode(mode);
+    let service = BlockService::new(
+        Arc::clone(&signer),
+        Arc::clone(&beacon),
+        Arc::new(store),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let err = service
+        .propose_block(slot, &pubkey, 42, None)
+        .await
+        .expect_err("a blinded block is not signed when builder proposals are off");
+    assert_eq!(beacon.last_produce_call().builder_boost_factor, Some(0), "{mode}");
+    let duty = beacon.last_duty.lock().expect("duty").expect("duty was sent");
+    assert_eq!(duty.shape, crate::ShapeConstraint::LocalOnly, "{mode}");
+    assert!(signer.header_calls.lock().expect("headers").is_empty(), "{mode}");
+    assert!(
+        matches!(
+            err,
+            BlockServiceError::ModeShapeMismatch {
+                mode: BlockSelectionMode::ExecutionOnly,
+                shape: crate::CandidateShape::Blinded,
+            }
+        ),
+        "{mode}: {err:?}"
+    );
+}
+
+/// Builder-only keeps the builder walk when the flag is off.
+///
+/// A local block is still a miss. A blinded block is still signed. Boost stays
+/// `u64::MAX`.
+#[tokio::test]
+async fn builder_only_with_the_flag_off_fails_closed_at_the_walk() {
+    let pubkey = test_pubkey();
+    let slot = 100;
+    let local = Arc::new(MockBeaconClient::unblinded(test_block(slot)));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        Arc::clone(&signer),
+        Arc::clone(&local),
+        Arc::new(store_with_builder_flag(&pubkey, false)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let err = service
+        .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly)
+        .await
+        .expect_err("builder-only does not sign a local block");
+    assert!(matches!(err, BlockServiceError::BuilderOnly(_)), "{err:?}");
+    assert_eq!(local.last_produce_call().builder_boost_factor, Some(u64::MAX));
+    assert!(signer.header_calls.lock().expect("headers").is_empty());
+
+    let blinded = Arc::new(MockBeaconClient::blinded(test_blinded_block(slot)));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        Arc::clone(&signer),
+        Arc::clone(&blinded),
+        Arc::new(store_with_builder_flag(&pubkey, false)),
+        Arc::new(test_fork_schedule()),
+        [0xaa; 32],
+    );
+    let result = service
+        .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::BuilderOnly)
+        .await
+        .expect("builder-only still signs a blinded block");
+    assert!(result.is_blinded);
+    assert_eq!(blinded.last_produce_call().builder_boost_factor, Some(u64::MAX));
+    assert_eq!(signer.header_calls.lock().expect("headers").len(), 1);
+}
+
+/// Gloas does not turn the flag off into boost 0. V4 still uses the store boost.
+#[tokio::test]
+async fn gloas_max_profit_keeps_builder_boost_when_builder_proposals_is_off() {
+    let slot = test_gloas_slot();
+    let pubkey = test_pubkey();
+    let beacon = Arc::new(super::mode::gloas_beacon(slot));
+    let signer = Arc::new(MockSigner::new());
+    let service = super::mode::gloas(
+        Arc::clone(&signer),
+        Arc::clone(&beacon),
+        &pubkey,
+        store_with_builder_flag(&pubkey, false),
+        Arc::new(CircuitBreakerState::new(0, 0)),
+        None,
+    );
+    let result = service
+        .propose_block_with_mode(slot, &pubkey, BlockSelectionMode::MaxProfit)
+        .await
+        .expect("Gloas max-profit still signs an external bid");
+    assert!(result.builder_path);
+    let calls = beacon.produce_v4_calls.lock().expect("v4");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].builder_config.builder_boost_factor, 150);
+}
+
 #[tokio::test]
 async fn fresh_block_duty_with_no_admitted_node_signs_no_randao() {
     let pubkey = test_pubkey();
