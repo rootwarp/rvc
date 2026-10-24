@@ -127,10 +127,67 @@ pub static RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL: LazyLock<IntCounter> = L
     || {
         define_int_counter(
         "rvc_bn_broadcast_drain_health_skipped_total",
-        "Broadcast health samples not recorded because the health-sample cap skipped a success, or because the recorder queue was full. When the queue is full, an error or a timeout sample can be dropped, and that drop is counted. The enqueue does not block the publish. A full pool still records an error or a timeout when the queue has room. The publish still runs",
+        "Broadcast health samples not recorded because the health-sample cap skipped a success, or because the recorder queue was full for a broadcast sample. When the queue is full, an error or a timeout sample can be dropped, and that drop is counted. The enqueue does not block the publish. A full pool still records an error or a timeout when the queue has room. The publish still runs. Best-of and fallback skips are rvc_bn_best_of_drain_health_skipped_total",
     )
     },
 );
+
+/// Best-of and fallback health samples that were not recorded.
+///
+/// A success is skipped when the shared 16-permit drain pool is full. A
+/// sample that does not fit on the shared recorder queue is also counted
+/// here, including an error or a hard reject. Broadcast skips stay on
+/// [`RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL`]. The pool is shared, so
+/// a full broadcast drain can cause a best-of success to land on this
+/// counter. The enqueue does not block the round.
+pub static RVC_BN_BEST_OF_DRAIN_HEALTH_SKIPPED_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_bn_best_of_drain_health_skipped_total",
+        "Best-of and fallback health samples not recorded because the shared drain pool skipped a success, or because the recorder queue was full. A hard reject is still offered to the queue. Broadcast skips stay on rvc_bn_broadcast_drain_health_skipped_total. The pool is shared. The enqueue does not block the round",
+    )
+});
+
+/// Produce candidates dropped before they are returned.
+///
+/// One increment per hard reject on best-of, its drain, and the unsynced
+/// fallback, and per fallback body that passes `accept` and misses the
+/// primary parent. A fee-only penalty is not counted. Health does not move.
+/// Label `reason` is `fork`, `unreadable`, `slot`, `proposer`, `parent`,
+/// `fee`, `shape`, or `fallback_parent`.
+pub static RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(
+    || {
+        define_int_counter_vec(
+            "rvc_bn_produce_candidates_rejected_total",
+            "Produce candidates dropped before return. A fee-only penalty is not counted. Health does not move. Label reason is fork, unreadable, slot, proposer, parent, fee, shape, or fallback_parent. fallback_parent passed the hard checks and missed the primary parent on fallback",
+            &["reason"],
+        )
+    },
+);
+
+/// Best-of produce rounds that returned at the soft deadline.
+///
+/// One increment when a block is in hand at the soft deadline, or when the
+/// first in-hand block arrives after it. A round that finishes every attempt
+/// before the soft deadline is not counted. A round with no budget is not
+/// counted.
+pub static RVC_BN_PRODUCE_SOFT_DEADLINE_RETURNS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+            "rvc_bn_produce_soft_deadline_returns_total",
+            "Best-of produce rounds that returned because a block was in hand at the soft deadline, or because the first in-hand block arrived after it. A round that finishes every attempt before the soft deadline is not counted",
+        )
+});
+
+/// Unsynced proposal fallback rounds that started an attempt.
+///
+/// One increment when the synced round left nothing in hand and the fallback
+/// starts its first attempt. No candidate above the floor does not count. A
+/// deadline that is already closed before that attempt does not count.
+pub static RVC_BN_PRODUCE_FALLBACK_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    define_int_counter(
+        "rvc_bn_produce_fallback_total",
+        "Unsynced proposal fallback rounds that started an attempt. A round with no candidate above the health floor is not counted. A deadline already closed before the first attempt is not counted",
+    )
+});
 
 /// Blocks signed even though the readable fee recipient did not match.
 ///
@@ -167,6 +224,10 @@ pub fn init() {
     LazyLock::force(&RVC_PROPOSER_BN_LATENCY_MS);
     LazyLock::force(&RVC_BN_CAPABILITY_STATE);
     LazyLock::force(&RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL);
+    LazyLock::force(&RVC_BN_BEST_OF_DRAIN_HEALTH_SKIPPED_TOTAL);
+    LazyLock::force(&RVC_BN_PRODUCE_CANDIDATES_REJECTED_TOTAL);
+    LazyLock::force(&RVC_BN_PRODUCE_SOFT_DEADLINE_RETURNS_TOTAL);
+    LazyLock::force(&RVC_BN_PRODUCE_FALLBACK_TOTAL);
     LazyLock::force(&RVC_BN_BROADCAST_OVERFLOW_DRAINS);
     LazyLock::force(&RVC_PRODUCE_FEE_RECIPIENT_PENALTY_TOTAL);
 }

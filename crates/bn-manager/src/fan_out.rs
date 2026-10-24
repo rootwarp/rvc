@@ -26,12 +26,17 @@
 //! budget, or at the HTTP client timeout when no budget is set (ADR-001).
 //! A full pool still offers an error or a timeout to the recorder. Only a
 //! success health sample may be skipped for that reason, and that skip is
-//! counted.
+//! counted. A broadcast skip increments
+//! `rvc_bn_broadcast_drain_health_skipped_total`. A best-of drain skip
+//! increments `rvc_bn_best_of_drain_health_skipped_total`. The 16-permit
+//! pool is shared.
 //!
 //! Finished samples are queued to one recorder on that runtime with
 //! `try_send`. The attempt result does not wait on that queue. When that
 //! queue is full, an error or a timeout sample can be dropped. The drop is
-//! counted.
+//! counted on that path's skip counter. A hard reject is
+//! [`crate::manager::TrackerOutcome::Rejected`]: the health score does not
+//! move. A fee-only penalty is a success.
 //! Cancelling the caller does not drop a sample that was already queued.
 //! Process shutdown drops that unregistered recorder and any overflow drain,
 //! so a queued sample or an in-flight overflow publish is not kept. The
@@ -126,9 +131,15 @@ pub(crate) struct BestRound<T> {
     ///
     /// A fee-penalized block lives here. It does not close the soft window.
     pub held: Vec<(usize, T)>,
-    /// Highest-index error when [`Self::values`] and [`Self::held`] are empty.
-    pub last_error: Option<BeaconError>,
+    /// Highest-index transport error. A hard reject does not take this slot.
+    /// [`BeaconError::RevokedInFlight`] does not take it either.
+    pub last_error: Option<(usize, BeaconError)>,
+    /// Hard rejects in arrival order. A fee-only penalty is not an entry.
+    pub rejections: Vec<(usize, &'static str)>,
 }
+
+/// Static label for one hard reject.
+pub(crate) type LabelFn<T> = std::sync::Arc<dyn Fn(&T) -> &'static str + Send + Sync>;
 
 /// One `'static` attempt. The future owns a cloned [`beacon::BeaconClient`]
 /// and the `Arc` payload the caller moved in.
@@ -485,6 +496,8 @@ pub(crate) struct BestFilter<T> {
     /// together with [`Self::accept`].
     pub in_hand: AcceptFn<T>,
     pub on_reject: RejectFn<T>,
+    /// Label for a value that fails [`Self::accept`].
+    pub reject_label: LabelFn<T>,
 }
 
 impl<T> Clone for BestFilter<T> {
@@ -493,6 +506,7 @@ impl<T> Clone for BestFilter<T> {
             accept: std::sync::Arc::clone(&self.accept),
             in_hand: std::sync::Arc::clone(&self.in_hand),
             on_reject: std::sync::Arc::clone(&self.on_reject),
+            reject_label: std::sync::Arc::clone(&self.reject_label),
         }
     }
 }
@@ -550,10 +564,14 @@ pub(crate) async fn best_of<T: Send + 'static>(
         .collect();
     let mut finished = Vec::new();
     collect_ready(&mut pending, &mut finished).await;
-    wait_for_best(round_started, window.soft, &mut pending, &mut finished, filter).await;
+    let soft_return =
+        wait_for_best(round_started, window.soft, &mut pending, &mut finished, filter).await;
+    if soft_return {
+        crate::metrics::RVC_BN_PRODUCE_SOFT_DEADLINE_RETURNS_TOTAL.inc();
+    }
 
     for done in &finished {
-        if let Some(outcome) = tracker_outcome(op_name, done) {
+        if let Some(outcome) = tracker_outcome(op_name, done, filter) {
             queue_health_sample(health, op_name, done.index, outcome);
         }
         log_best_failure(op_name, done);
@@ -579,8 +597,13 @@ struct Done<T> {
     latency: Duration,
 }
 
-fn tracker_outcome<T>(op_name: &str, done: &Done<T>) -> Option<TrackerOutcome> {
+fn tracker_outcome<T>(
+    op_name: &str,
+    done: &Done<T>,
+    filter: &BestFilter<T>,
+) -> Option<TrackerOutcome> {
     match &done.result {
+        Ok(value) if !(filter.accept)(value) => Some(TrackerOutcome::Rejected),
         Ok(_) => Some(TrackerOutcome::Success(done.latency)),
         Err(BeaconError::RevokedInFlight) => None,
         Err(err) => Some(error_outcome(op_name, err)),
@@ -608,12 +631,14 @@ fn log_hard_reject<T>(filter: &BestFilter<T>, done: &Done<T>) {
 fn best_round<T>(finished: Vec<Done<T>>, filter: &BestFilter<T>) -> BestRound<T> {
     let mut values = Vec::new();
     let mut held = Vec::new();
+    let mut rejections = Vec::new();
     let mut last_error: Option<(usize, BeaconError)> = None;
     for done in finished {
         match done.result {
             Ok(value) if closes_soft_window(&value, filter) => values.push((done.index, value)),
             Ok(value) if (filter.accept)(&value) => held.push((done.index, value)),
-            Ok(_) => {}
+            Ok(value) => rejections.push((done.index, (filter.reject_label)(&value))),
+            Err(BeaconError::RevokedInFlight) => {}
             Err(err) => {
                 let replace = last_error.as_ref().is_none_or(|(index, _)| done.index >= *index);
                 if replace {
@@ -622,7 +647,7 @@ fn best_round<T>(finished: Vec<Done<T>>, filter: &BestFilter<T>) -> BestRound<T>
             }
         }
     }
-    BestRound { values, held, last_error: last_error.map(|(_, err)| err) }
+    BestRound { values, held, last_error, rejections }
 }
 
 /// In hand and accepted. A block that fails [`BestFilter::accept`] does not
@@ -638,23 +663,28 @@ fn in_hand<T>(done: &Done<T>, filter: &BestFilter<T>) -> bool {
     }
 }
 
+/// `true` when the round returned because of the soft deadline.
+///
+/// That is a block already in hand once the soft instant has passed, or the
+/// first in-hand block after it. Every attempt finishing before that instant
+/// returns `false`.
 async fn wait_for_best<T>(
     round_started: tokio::time::Instant,
     soft: Option<Duration>,
     pending: &mut Vec<Open<T>>,
     finished: &mut Vec<Done<T>>,
     filter: &BestFilter<T>,
-) {
+) -> bool {
     loop {
         if pending.is_empty() {
-            return;
+            return false;
         }
         if finished.iter().any(|done| in_hand(done, filter)) {
             if let Some(soft) = soft {
                 let at = round_started + soft;
                 if tokio::time::Instant::now() >= at {
                     collect_ready(pending, finished).await;
-                    return;
+                    return true;
                 }
                 tokio::select! {
                     biased;
@@ -665,21 +695,21 @@ async fn wait_for_best<T>(
                     }
                     _ = tokio::time::sleep_until(at) => {
                         collect_ready(pending, finished).await;
-                        return;
+                        return true;
                     }
                 }
                 continue;
             }
         }
 
-        let Some(done) = next_open(pending).await else { return };
+        let Some(done) = next_open(pending).await else { return false };
         let past_soft =
             soft.is_some_and(|soft| tokio::time::Instant::now() >= round_started + soft);
         let first_after_soft = in_hand(&done, filter) && past_soft;
         finished.push(done);
         if first_after_soft {
             collect_ready(pending, finished).await;
-            return;
+            return true;
         }
     }
 }
@@ -753,11 +783,11 @@ async fn drain_best_of<T: Send>(
     while let Some(done) = next_open(&mut pending).await {
         log_best_failure(&op_name, &done);
         log_hard_reject(&filter, &done);
-        let Some(outcome) = tracker_outcome(&op_name, &done) else {
+        let Some(outcome) = tracker_outcome(&op_name, &done, &filter) else {
             continue;
         };
         if matches!(outcome, TrackerOutcome::Success(_)) && !record_success {
-            crate::metrics::RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL.inc();
+            crate::metrics::RVC_BN_BEST_OF_DRAIN_HEALTH_SKIPPED_TOTAL.inc();
             continue;
         }
         // Queue only. Waiting on the health write lock here stops the next
@@ -777,7 +807,56 @@ pub(crate) fn queue_health_sample(
     index: usize,
     outcome: TrackerOutcome,
 ) {
-    enqueue_health(&health_sender(), health.clone(), op_name.to_string(), index, outcome);
+    enqueue_health(
+        &health_sender(),
+        health.clone(),
+        op_name.to_string(),
+        index,
+        outcome,
+        SkipFamily::BestOf,
+    );
+}
+
+#[cfg(test)]
+static HEALTH_APPLIED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(test)]
+static HEALTH_APPLIED_WAITERS: Mutex<Vec<std::task::Waker>> = Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn note_health_applied() {
+    let waiters = {
+        let mut guard = HEALTH_APPLIED_WAITERS.lock().expect("health applied waiters");
+        HEALTH_APPLIED.fetch_add(1, Ordering::Release);
+        std::mem::take(&mut *guard)
+    };
+    for waker in waiters {
+        waker.wake();
+    }
+}
+
+/// Samples the recorder has applied on this process.
+#[cfg(test)]
+pub(crate) fn health_samples_applied() -> u64 {
+    HEALTH_APPLIED.load(Ordering::Acquire)
+}
+
+/// Wait until the recorder has applied at least `target` samples.
+///
+/// The counter is read while the waiter list is held, and the increment
+/// takes that same list, so a sample that lands during the check wakes this
+/// wait. This does not sleep.
+#[cfg(test)]
+pub(crate) async fn wait_until_health_applied(target: u64) {
+    std::future::poll_fn(|cx| {
+        let mut guard = HEALTH_APPLIED_WAITERS.lock().expect("health applied waiters");
+        if HEALTH_APPLIED.load(Ordering::Acquire) >= target {
+            return Poll::Ready(());
+        }
+        guard.push(cx.waker().clone());
+        Poll::Pending
+    })
+    .await;
 }
 
 fn no_eligible(op_name: &str, role: &str) -> BeaconError {
@@ -1136,6 +1215,8 @@ fn health_sender() -> tokio::sync::mpsc::Sender<HealthSample> {
         while let Some(sample) = rx.recv().await {
             record_outcomes(&sample.health, &sample.op_name, &[(sample.index, sample.outcome)])
                 .await;
+            #[cfg(test)]
+            note_health_applied();
         }
     });
     *slot = Some(HealthRecorder { runtime_id, tx: tx.clone() });
@@ -1154,16 +1235,33 @@ struct AttemptEnv {
 
 /// Queue one sample without waiting. A full or closed queue drops the sample,
 /// including an error or a timeout, and counts that drop.
+enum SkipFamily {
+    Broadcast,
+    BestOf,
+}
+
+fn note_queue_skip(family: SkipFamily) {
+    match family {
+        SkipFamily::Broadcast => {
+            crate::metrics::RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL.inc();
+        }
+        SkipFamily::BestOf => {
+            crate::metrics::RVC_BN_BEST_OF_DRAIN_HEALTH_SKIPPED_TOTAL.inc();
+        }
+    }
+}
+
 fn enqueue_health(
     tx: &tokio::sync::mpsc::Sender<HealthSample>,
     health: SharedHealthTrackers,
     op_name: String,
     index: usize,
     outcome: TrackerOutcome,
+    family: SkipFamily,
 ) {
     let sample = HealthSample { health, op_name, index, outcome };
     if tx.try_send(sample).is_err() {
-        crate::metrics::RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL.inc();
+        note_queue_skip(family);
     }
 }
 
@@ -1220,7 +1318,14 @@ async fn run_attempt<T: Send>(env: AttemptEnv, attempt: BnAttempt<T>) -> Finishe
         env.skipped.fetch_add(1, Ordering::Relaxed);
         crate::metrics::RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL.inc();
     } else {
-        enqueue_health(&env.health_tx, env.health, env.op_name, index, tracker);
+        enqueue_health(
+            &env.health_tx,
+            env.health,
+            env.op_name,
+            index,
+            tracker,
+            SkipFamily::Broadcast,
+        );
     }
     Finished { index, outcome: BnOutcome { endpoint, result, latency: elapsed } }
 }
@@ -1433,6 +1538,7 @@ mod tests {
                     accept: std::sync::Arc::new(|_: &()| true),
                     in_hand: std::sync::Arc::new(|_: &()| true),
                     on_reject: std::sync::Arc::new(|_: usize, _: &str, _: &()| {}),
+                    reject_label: std::sync::Arc::new(|_| "rejected"),
                 },
             ),
         )
@@ -1465,6 +1571,7 @@ mod tests {
             on_reject: std::sync::Arc::new(move |_index, _endpoint, value: &u32| {
                 record.lock().expect("reject log").push(*value);
             }),
+            reject_label: std::sync::Arc::new(|_| "rejected"),
         };
         let health = health_for(2);
         let pool = DrainPool::new(4);
@@ -1518,6 +1625,7 @@ mod tests {
             accept: std::sync::Arc::new(|value: &u32| *value != 9),
             in_hand: std::sync::Arc::new(|_: &u32| true),
             on_reject: std::sync::Arc::new(|_index, _endpoint, _value: &u32| {}),
+            reject_label: std::sync::Arc::new(|_| "rejected"),
         };
         let health = health_for(2);
         let pool = DrainPool::new(4);
@@ -1558,6 +1666,209 @@ mod tests {
             "the rejected block must not close the soft window before the later block"
         );
         assert!(round.held.is_empty(), "a hard reject is dropped, not held");
+    }
+
+    fn u32_filter(
+        accept: impl Fn(&u32) -> bool + Send + Sync + 'static,
+        in_hand: impl Fn(&u32) -> bool + Send + Sync + 'static,
+    ) -> BestFilter<u32> {
+        BestFilter {
+            accept: std::sync::Arc::new(accept),
+            in_hand: std::sync::Arc::new(in_hand),
+            on_reject: std::sync::Arc::new(|_, _, _| {}),
+            reject_label: std::sync::Arc::new(
+                |value: &u32| if *value == 7 { "parent" } else { "slot" },
+            ),
+        }
+    }
+
+    /// A hard-rejected `Ok` does not become a health success or a health error.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rejected_ok_is_not_recorded_as_health_success() {
+        let health = health_for(1);
+        let before_score = health.read().await[0].score();
+        let applied = health_samples_applied();
+        let round = best_of(
+            "produce_block_v3",
+            "proposal",
+            vec![BnAttempt {
+                index: 0,
+                endpoint: "http://bn0".to_string(),
+                fut: Box::pin(async { Ok::<_, BeaconError>(7u32) }),
+            }],
+            BestWindow { soft: None, hard: None },
+            &health,
+            &DrainPool::new(4),
+            &u32_filter(|value| *value != 7, |_| true),
+        )
+        .await
+        .expect("round");
+        assert!(round.values.is_empty());
+        assert!(round.held.is_empty());
+        assert_eq!(round.rejections, vec![(0, "parent")]);
+        wait_until_health_applied(applied + 1).await;
+        let trackers = health.read().await;
+        assert!(trackers[0].latency_ema_ms().is_none(), "a hard reject is not a success");
+        assert_eq!(trackers[0].error_rate(), 0.0, "a hard reject is not an error");
+        assert_eq!(trackers[0].score(), before_score);
+    }
+
+    /// A fee-only penalty passes `accept` and stays a health success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fee_only_penalty_is_still_a_health_success() {
+        let health = health_for(1);
+        let applied = health_samples_applied();
+        let round = best_of(
+            "produce_block_v3",
+            "proposal",
+            vec![BnAttempt {
+                index: 0,
+                endpoint: "http://bn0".to_string(),
+                fut: Box::pin(async { Ok::<_, BeaconError>(7u32) }),
+            }],
+            BestWindow { soft: None, hard: None },
+            &health,
+            &DrainPool::new(4),
+            &u32_filter(|_| true, |value| *value != 7),
+        )
+        .await
+        .expect("round");
+        assert!(round.values.is_empty(), "a fee penalty is not in hand");
+        assert_eq!(round.held, vec![(0, 7)]);
+        assert!(round.rejections.is_empty(), "a fee penalty is not a hard reject");
+        wait_until_health_applied(applied + 1).await;
+        let trackers = health.read().await;
+        assert!(trackers[0].latency_ema_ms().is_some(), "a fee penalty stays a success");
+        assert_eq!(trackers[0].error_rate(), 0.0);
+    }
+
+    /// A late hard reject on the drain is neutral for health. The in-hand block is a success.
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_hard_reject_is_not_a_health_success() {
+        let health = health_for(2);
+        let applied = health_samples_applied();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let round = best_of(
+            "produce_block_v3",
+            "proposal",
+            vec![
+                BnAttempt {
+                    index: 0,
+                    endpoint: "http://bn0".to_string(),
+                    fut: Box::pin(async { Ok::<_, BeaconError>(1u32) }),
+                },
+                BnAttempt {
+                    index: 1,
+                    endpoint: "http://bn1".to_string(),
+                    fut: Box::pin(async move { Ok(rx.await.unwrap_or(9)) }),
+                },
+            ],
+            BestWindow { soft: Some(Duration::ZERO), hard: Some(Duration::from_secs(5)) },
+            &health,
+            &DrainPool::new(4),
+            &u32_filter(|value| *value != 9, |value| *value == 1),
+        )
+        .await
+        .expect("round");
+        assert_eq!(round.values, vec![(0, 1)]);
+        let _ = tx.send(9u32);
+        wait_until_health_applied(applied + 2).await;
+        let trackers = health.read().await;
+        assert!(trackers[0].latency_ema_ms().is_some(), "the block in hand is a success");
+        assert!(trackers[1].latency_ema_ms().is_none(), "the drained hard reject is not a success");
+        assert_eq!(trackers[1].error_rate(), 0.0, "the drained hard reject is not an error");
+    }
+
+    /// The best-of drain pool skip uses its own counter.
+    #[tokio::test(flavor = "current_thread")]
+    async fn best_of_drain_skip_uses_its_own_counter() {
+        let best_before = crate::metrics::RVC_BN_BEST_OF_DRAIN_HEALTH_SKIPPED_TOTAL.get();
+        let broadcast_before = RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL.get();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let health = health_for(2);
+        let _round = best_of(
+            "produce_block_v3",
+            "proposal",
+            vec![
+                BnAttempt {
+                    index: 0,
+                    endpoint: "http://bn0".to_string(),
+                    fut: Box::pin(async { Ok::<_, BeaconError>(1u32) }),
+                },
+                BnAttempt {
+                    index: 1,
+                    endpoint: "http://bn1".to_string(),
+                    fut: Box::pin(async move {
+                        let _ = rx.await;
+                        Ok(1u32)
+                    }),
+                },
+            ],
+            BestWindow { soft: Some(Duration::ZERO), hard: Some(Duration::from_secs(5)) },
+            &health,
+            &DrainPool::new(0),
+            &u32_filter(|_| true, |_| true),
+        )
+        .await
+        .expect("round");
+        let _ = tx.send(());
+        let best_after = loop {
+            let now = crate::metrics::RVC_BN_BEST_OF_DRAIN_HEALTH_SKIPPED_TOTAL.get();
+            let broadcast_now = RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL.get();
+            if now > best_before || broadcast_now > broadcast_before {
+                break now;
+            }
+            tokio::task::yield_now().await;
+        };
+        let broadcast_after = RVC_BN_BROADCAST_DRAIN_HEALTH_SKIPPED_TOTAL.get();
+        assert!(
+            best_after > best_before,
+            "best-of drain skip must move its own counter; before={best_before} after={best_after}"
+        );
+        assert_eq!(
+            broadcast_after.saturating_sub(broadcast_before),
+            0,
+            "the best-of skip must not move the broadcast counter"
+        );
+    }
+
+    /// Returning with a block in hand at a zero soft deadline counts once.
+    #[tokio::test(flavor = "current_thread")]
+    async fn soft_deadline_return_is_counted() {
+        let before = crate::metrics::RVC_BN_PRODUCE_SOFT_DEADLINE_RETURNS_TOTAL.get();
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let round = best_of(
+            "produce_block_v3",
+            "proposal",
+            vec![
+                BnAttempt {
+                    index: 0,
+                    endpoint: "http://bn0".to_string(),
+                    fut: Box::pin(async { Ok::<_, BeaconError>(1u32) }),
+                },
+                BnAttempt {
+                    index: 1,
+                    endpoint: "http://bn1".to_string(),
+                    fut: Box::pin(async move {
+                        let _ = rx.await;
+                        Ok(1u32)
+                    }),
+                },
+            ],
+            BestWindow { soft: Some(Duration::ZERO), hard: Some(Duration::from_secs(5)) },
+            &health_for(2),
+            &DrainPool::new(4),
+            &u32_filter(|_| true, |_| true),
+        )
+        .await
+        .expect("round");
+        assert_eq!(round.values.len(), 1);
+        let after = crate::metrics::RVC_BN_PRODUCE_SOFT_DEADLINE_RETURNS_TOTAL.get();
+        assert!(
+            after > before,
+            "a soft-deadline return must be counted; before={before} after={after}"
+        );
+        let _ = tx.send(());
     }
 
     #[tokio::test]

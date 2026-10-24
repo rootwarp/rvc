@@ -515,7 +515,7 @@ async fn test_builder_only_local_alone_signs_nothing() {
     // Collection drops the local block before the sign-time shape error.
     assert_eq!(
         err.to_string(),
-        "builder-only mode: builder block production failed: beacon error: HTTP request failed: produce_block_v3: all BNs failed in best-selection"
+        "builder-only mode: builder block production failed: beacon error: produce_block_v3: all candidates rejected: bn 0 shape"
     );
     assert!(matches!(err, BlockServiceError::BuilderOnly(_)));
     let reqs = bn.received_requests().await.expect("recorded requests");

@@ -15,7 +15,7 @@ mod types;
 mod v4_wire;
 
 pub use client::{ensure_genesis_validators_root, hex_ids_equal, BeaconClient, BeaconClientConfig};
-pub use error::BeaconError;
+pub use error::{BeaconError, ProduceError};
 pub use http_caps::ResponseCaps;
 pub use retry::RetryPolicy;
 pub use shape::{ShapeConstraint, GLOAS_SELF_BUILD_BUILDER_INDEX};

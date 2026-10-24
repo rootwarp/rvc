@@ -119,6 +119,26 @@
 //! +1): one increment each time the detection marker write fails. The process
 //! stays up and retries. It has no labels. Dashboards that watch a latched
 //! process that has not yet exited should bind this counter.
+//! #719 adds `rvc_bn_produce_candidates_rejected_total` (family delta +1):
+//! one increment per hard-rejected produce candidate, and per fallback body
+//! that passes the hard checks and misses the primary parent. Label `reason`
+//! is `fork`, `unreadable`, `slot`, `proposer`, `parent`, `fee`, `shape`, or
+//! `fallback_parent`. A fee-only penalty is not counted. Health does not move.
+//! Dashboards that watch unusable produce bodies should bind this name.
+//! #719 adds `rvc_bn_produce_soft_deadline_returns_total` (family delta +1):
+//! one increment when a best-of produce round returns because a block is in
+//! hand at the soft deadline, or because the first in-hand block arrives
+//! after it. A round that finishes every attempt before that deadline is not
+//! counted. It has no labels.
+//! #719 adds `rvc_bn_produce_fallback_total` (family delta +1): one increment
+//! when an unsynced proposal fallback starts an attempt. No candidate above
+//! the health floor, and a deadline already closed before that attempt, are
+//! not counted. It has no labels.
+//! #719 splits best-of drain skips onto
+//! `rvc_bn_best_of_drain_health_skipped_total` (family delta +1). Broadcast
+//! skips stay on `rvc_bn_broadcast_drain_health_skipped_total`. A dashboard
+//! that summed the broadcast counter for best-of skips must add this series.
+//! The 16-permit pool is still shared.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -167,10 +187,14 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_blob_sidecars_published_total", // operator-facing: pre-Gloas JSON or SSZ SignedBlockContents publishes (RR-1.2)
     "rvc_block_shape_rejections_total", // operator-facing: produced blocks rejected by selection mode; labels mode, shape (#647)
     "rvc_bn_admitted", // operator-facing: 1 while the beacon node may serve duties (#707)
+    "rvc_bn_best_of_drain_health_skipped_total", // operator-facing: best-of drain health samples not recorded; broadcast skips stay on the broadcast counter (#719)
     "rvc_bn_broadcast_drain_health_skipped_total", // operator-facing: success skipped at the cap, or any sample when the recorder queue is full; the publish still runs (#639)
     "rvc_bn_broadcast_overflow_drains", // operator-facing: in-flight overflow publishes by redacted endpoint; drops when the HTTP call finishes (#639)
     "rvc_bn_capability_state",
     "rvc_bn_health_tier",
+    "rvc_bn_produce_candidates_rejected_total", // operator-facing: dropped produce candidates by reason, including fallback_parent; fee-only penalty is not counted (#719)
+    "rvc_bn_produce_fallback_total", // operator-facing: unsynced proposal fallback rounds that started an attempt (#719)
+    "rvc_bn_produce_soft_deadline_returns_total", // operator-facing: best-of produce rounds that returned at the soft deadline (#719)
     "rvc_builder_circuit_breaker_trips_total",
     "rvc_builder_consecutive_misses",
     "rvc_builder_epoch_misses",
@@ -330,8 +354,8 @@ fn expected_metric_names_is_sorted_and_unique() {
     );
     assert_eq!(
         EXPECTED_METRIC_NAMES.len(),
-        67,
-        "#705 adds the detection latch gauge and the marker-write failure counter; #707 adds rvc_bn_admitted"
+        71,
+        "#719 adds the produce reject, soft-deadline, fallback, and best-of drain-skip families"
     );
 }
 
