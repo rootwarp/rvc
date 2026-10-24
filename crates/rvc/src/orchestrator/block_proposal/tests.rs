@@ -285,6 +285,7 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             })
         }
 
@@ -517,6 +518,7 @@ async fn test_successful_proposal_increments_success_outcome() {
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             })
         }
 
@@ -818,6 +820,7 @@ impl ScriptedBeacon {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         })
     }
 

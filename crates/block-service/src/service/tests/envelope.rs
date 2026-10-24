@@ -188,6 +188,7 @@ fn gloas_ssz_builder_win(slot: Slot) -> MockBeaconClient {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     })
 }
 
@@ -231,6 +232,7 @@ async fn test_invalid_envelope_ssz_drops_duty_before_sign() {
         payload_included: true,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     };
     let signer = Arc::new(MockSigner::new());
     let beacon = Arc::new(MockBeaconClient::from_response(response));

@@ -2328,6 +2328,7 @@ fn gloas_block_contents_response_for(block: eth_types::BeaconBlock) -> ProduceBl
         payload_included: true,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -2342,6 +2343,7 @@ fn gloas_builder_win_response(slot: Slot, builder_url: &str) -> ProduceBlockResp
         payload_included: false,
         builder_url: Some(builder_url.to_string()),
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 

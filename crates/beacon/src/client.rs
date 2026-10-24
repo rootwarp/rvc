@@ -879,6 +879,7 @@ impl BeaconClient {
             payload_included: v4.payload_included,
             builder_url: v4.builder_url,
             consensus_block_value: v4.consensus_block_value,
+            candidate_memo: crate::prepare_check::CandidateMemo::arc(),
         })
     }
 
@@ -938,6 +939,7 @@ impl BeaconClient {
             payload_included: v4_headers.payload_included,
             builder_url: v4_headers.builder_url,
             consensus_block_value: v4_headers.consensus_block_value,
+            candidate_memo: crate::prepare_check::CandidateMemo::arc(),
         })
     }
 

@@ -497,6 +497,7 @@ impl MockBeaconClient {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }))
     }
 
@@ -512,6 +513,7 @@ impl MockBeaconClient {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }))
     }
 
@@ -540,6 +542,7 @@ impl MockBeaconClient {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }))
     }
 
@@ -561,6 +564,7 @@ impl MockBeaconClient {
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             })
             .collect();
         let mut client = Self::new_with_response(None);
@@ -588,6 +592,7 @@ impl MockBeaconClient {
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             })
             .collect();
         *self.ranked_candidates.lock().unwrap() = Some(responses);
@@ -1163,6 +1168,7 @@ pub(crate) fn self_build_json_response(slot: Slot) -> ProduceBlockResponse {
         payload_included: true,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -1195,6 +1201,7 @@ pub(crate) fn self_build_ssz_response(slot: Slot) -> ProduceBlockResponse {
         payload_included: true,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 

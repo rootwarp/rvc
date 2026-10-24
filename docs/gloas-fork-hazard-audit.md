@@ -38,12 +38,12 @@ token, so the path span is only the path.
 
 | Class | Count |
 |-------|------:|
-| 1 `>= ForkName::X` | 26 |
+| 1 `>= ForkName::X` | 28 |
 | 2 `.index = 0` | 8 |
-| 3 `match ForkName` | 8 |
+| 3 `match ForkName` | 10 |
 | 4 string-literal dispatch | 10 |
 | 5 `.entries()` | 8 |
-| **Total** | **60** |
+| **Total** | **64** |
 
 Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 
@@ -52,6 +52,8 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 |---|---|---|---|---|---|
 | `bin/rvc-keygen/src/exit.rs` `tests::test_exit_round_trip_encrypt_decrypt_sign` `let capped = if fork_name >= ForkName::Capella { ForkName::Capella } else { fork_name };` | 1 | — | inherit-intentionally | Test re-implements the EIP-7044 Capella cap. Open-ended `>= Capella` is correct. Production definition is `signing_root.rs` 301. | — |
 | `crates/beacon/src/client.rs` `BeaconClient::proposer_duties_path` `if ForkName::from_epoch(epoch, schedule) >= ForkName::Gloas { "v2" } else { "v1" };` | 1 | — | inherit-intentionally | Proposer-duties v1/v2 routing (4.5). Open-ended `>= Gloas` keeps later forks on v2 rather than silently falling back to deprecated v1. | 4.5 |
+| `crates/beacon/src/prepare_check.rs` `compute_preparable` `&& (slot_fork >= ForkName::Gloas || response.consensus_version == "gloas")` | 1 | — | inherit-intentionally | Blinded prepare fails closed at `>= Gloas` or consensus version `gloas`. A later fork stays a blinded drop on this pre-Gloas path. | — |
+| `crates/beacon/src/prepare_check.rs` `compute_preparable` `Ok(_) if slot_fork >= ForkName::Gloas => {` | 1 | — | inherit-intentionally | An unblinded Gloas or later slot on this pre-Gloas predicate is a parse rejection, so it is not signed through `check_preparable`. V4 does not call this function. | — |
 | `crates/block-service/src/service/mod.rs` `BlockService<S, B>::propose_block_impl` `let produce_result = if fork >= ForkName::Gloas {` | 1 | — | inherit-intentionally | Produce dispatch: open-ended `>= Gloas` stays on V4 so a later fork does not fall back to V3. | — |
 | `crates/block-service/src/service/mod.rs` `BlockService<S, B>::propose_block_impl` `let signed = if fork >= ForkName::Gloas {` | 1 | — | inherit-intentionally | Sign/publish dispatch: open-ended `>= Gloas` stays on `sign_and_publish_v4`. | — |
 | `crates/block-service/src/service/mod.rs` `record_produced_response` `if slot_fork >= ForkName::Gloas {` | 1 | — | inherit-intentionally | Response log omits the pre-Gloas blinded field once `>= Gloas`. Later forks keep that shape. | — |
@@ -87,6 +89,8 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `bin/rvc/tests/common/mock_bn.rs` `fork_version_hex` `match fork {` | 3 | exhaustive | test-only | `match fork` → version hex. Compile error on a new variant. 2.5b/2.6 add Gloas `0x07000000`. | 2.5b |
 | `crates/beacon/src/client.rs` `BeaconClient::get_aggregate_attestation` `match fork {` | 3 | exhaustive | inherit-intentionally | Aggregate fetch v2 request table. Exhaustive `match fork` so a new variant is a compile error, not a silent v1 or v2 inherit. | RR-3.2 |
 | `crates/beacon/src/client.rs` `decode_versioned_aggregate` `match requested {` | 3 | exhaustive | inherit-intentionally | v2 200 is accepted only when the response header, body `version`, and the requested fork agree. Pre-Electra is not decoded on this path. | RR-3.2 |
+| `crates/beacon/src/prepare_check.rs` `compute_preparable` `match ForkName::from_str(&response.consensus_version) {` | 3 | exhaustive | inherit-intentionally | The match is on the parse result. `ForkName::Gloas` is in a guard, so the scanner records it. A new variant does not fail compilation here. A slot at Gloas or later still takes the parse rejection in that guard. | — |
+| `crates/beacon/src/prepare_check.rs` `ssz_format` `Ok(match fork {` | 3 | exhaustive | inherit-intentionally | SSZ shape is an exhaustive `match fork`: Deneb, Electra, and Fulu are block contents; Gloas and pre-Deneb are a beacon block. A new variant is a compile error. An unknown version string fails before the match. | — |
 | `crates/block-service/src/service/mod.rs` `ssz_block_format` `let format = match fork {` | 3 | exhaustive | inherit-intentionally | `ssz_block_format` named Gloas `BeaconBlock` arm; exhaustive `match fork` so a new variant is a compile error, not a silent `BlockContents`/`BeaconBlock` inherit. Unknown version strings fail closed before the match. | 6.4 |
 | `crates/eth-types/src/block.rs` `expected_kzg_proof_count` `match fork {` | 3 | exhaustive | inherit-intentionally | `expected_kzg_proof_count` is keyed on `ForkName`, not `BodyForkLayout` (Fulu must not inherit Electra's one-proof rule). Deneb/Electra are one proof per blob, Fulu is `CELLS_PER_EXT_BLOB` cell proofs, Gloas and pre-Deneb error. A new variant is a compile error. | RR-3.9 |
 | `crates/eth-types/src/fork.rs` `ForkName::body_layout` `match self {` | 3 | exhaustive | inherit-intentionally | `body_layout()` exhaustive match. 2.7 adds `Gloas => Some(BodyForkLayout::Gloas)`. | 2.7 |

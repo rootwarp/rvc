@@ -1142,12 +1142,22 @@ impl<S: ValidatorSigner, B: BeaconBlockClient> BlockService<S, B> {
         let shape =
             if response.is_blinded { CandidateShape::Blinded } else { CandidateShape::Unblinded };
         enforce_mode_shape(mode, shape)?;
+        // JSON calls `check_preparable(` before the arm builds the header.
+        // SSZ slot-checks inside `prepare_ssz` first, then calls it there.
+        if !response.is_ssz {
+            map_prepare_reject(
+                beacon::prepare_check::check_preparable(response, fork, constraint_for_mode(mode)),
+                slot,
+                mode,
+                response,
+            )?;
+        }
         let (header, block_root, payload) = if response.is_ssz {
-            prepare_ssz(response, slot, validator)?
+            prepare_ssz(response, slot, validator, fork, mode)?
         } else if response.is_blinded {
-            prepare_blinded(response, slot, validator)?
+            prepare_blinded(response, slot, validator, fork, mode)?
         } else {
-            prepare_full(response, slot, validator)?
+            prepare_full(response, slot, validator, fork, mode)?
         };
         Ok(PreparedProposal {
             header,
@@ -1423,187 +1433,184 @@ fn prepare_ssz(
     response: &ProduceBlockResponse,
     slot: Slot,
     validator: Option<&BlockResponseValidator>,
+    fork: ForkName,
+    mode: BlockSelectionMode,
 ) -> Result<(BeaconBlockHeaderFields, Root, PreparedPayload), BlockServiceError> {
     let ssz_bytes = response
         .ssz_bytes
         .as_ref()
         .ok_or_else(|| BlockServiceError::Parse("SSZ response missing ssz_bytes".to_string()))?;
     let format = ssz_block_format(response.is_blinded, &response.consensus_version)?;
-    // Blobs-offset failures must happen before the header is signed.
-    let contents = if format == beacon::ssz_deser::SszBlockFormat::BlockContents {
-        Some(
-            beacon::ssz_deser::deserialize_block_contents_ssz(ssz_bytes, format)
-                .map_err(|e| BlockServiceError::Parse(e.to_string()))?,
-        )
-    } else {
-        None
-    };
-    if response.is_blinded {
-        let layout = blinded_body_layout(&response.consensus_version)?;
+    let (got_slot, proposer, parent) = if response.is_blinded {
         let (block, _) =
             beacon::ssz_deser::deserialize_blinded_beacon_block_from_ssz(ssz_bytes, format)
-                .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-        validate_response_block(
-            validator,
-            slot,
-            block.slot,
-            block.proposer_index,
-            block.parent_root,
-        )?;
-        let block_root = compute_blinded_block_root_for_layout(&block, layout)?;
-        let header = header_from_blinded(&block, layout)?;
-        require_block_root_matches_header(&header, block_root)?;
-        return Ok((header, block_root, PreparedPayload::SszWhole(ssz_bytes.clone())));
-    }
-    if let Some(contents) = contents.as_ref() {
-        let block = &contents.block;
-        validate_response_block(
-            validator,
-            slot,
-            block.slot,
-            block.proposer_index,
-            block.parent_root,
-        )?;
-        // The header's fork, already cross-checked against the slot. A body
-        // that only decodes under another fork is Parse before the signer.
-        let layout = full_body_layout(&response.consensus_version)?;
-        let block_root = compute_block_root_for_layout(block, layout)?;
-        let header = header_from_full(block, layout)?;
-        require_block_root_matches_header(&header, block_root)?;
-        // ISSUE-4.3 (L-3) defense-in-depth: log internal KZG commitment binding.
-        // For Deneb+ BlockContents payloads the body includes blob_kzg_commitments;
-        // this fingerprint is an rvc-internal binding (NOT spec-aligned —
-        // see kzg_commitment_list_root doc) separate from the signing scope.
-        // Fail closed: malformed body must not fingerprint as empty list.
-        let kzg_count =
-            block.blob_kzg_count(layout).map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-        let commitment_root = block
-            .kzg_commitment_root(layout)
-            .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-        debug!(
-            slot = slot,
-            kzg_count = kzg_count,
-            commitment_root = %TruncatedRoot::new(&commitment_root),
-            "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
-        );
-        return Ok((
-            header,
-            block_root,
-            PreparedPayload::SszContents {
-                block_ssz: contents.block_ssz.to_vec(),
-                kzg_proofs: contents.kzg_proofs.to_vec(),
-                blobs: contents.blobs.to_vec(),
-            },
-        ));
-    }
-    // Pre-Deneb full SSZ lands here and fails in `full_body_layout`.
-    // Blinded SSZ already returned. This arm does not publish a pre-Deneb block.
-    let (block, _) = beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
-        .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-    validate_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
-    let layout = full_body_layout(&response.consensus_version)?;
-    let block_root = compute_block_root_for_layout(&block, layout)?;
-    let header = header_from_full(&block, layout)?;
-    require_block_root_matches_header(&header, block_root)?;
-    Ok((header, block_root, PreparedPayload::SszWhole(ssz_bytes.clone())))
+                .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+        (block.slot, block.proposer_index, block.parent_root)
+    } else {
+        let (block, _) = beacon::ssz_deser::deserialize_beacon_block_from_ssz(ssz_bytes, format)
+            .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+        (block.slot, block.proposer_index, block.parent_root)
+    };
+    validate_response_block(validator, slot, got_slot, proposer, parent)?;
+    let prepared = map_prepare_reject(
+        beacon::prepare_check::check_preparable(response, fork, constraint_for_mode(mode)),
+        slot,
+        mode,
+        response,
+    )?;
+    header_from_prepared(response, prepared, slot)
 }
 
 fn prepare_full(
     response: &ProduceBlockResponse,
     slot: Slot,
     validator: Option<&BlockResponseValidator>,
+    fork: ForkName,
+    mode: BlockSelectionMode,
 ) -> Result<(BeaconBlockHeaderFields, Root, PreparedPayload), BlockServiceError> {
-    let block_contents = response.parse_full_block()?;
-    let block = block_contents.block().clone();
+    let prepared = map_prepare_reject(
+        beacon::prepare_check::check_preparable(response, fork, constraint_for_mode(mode)),
+        slot,
+        mode,
+        response,
+    )?;
+    let block = match &prepared.kind {
+        beacon::prepare_check::PreparedKind::JsonFull(contents) => contents.block().clone(),
+        _ => {
+            return Err(BlockServiceError::Parse(
+                "prepare kind was not a full JSON block".to_string(),
+            ))
+        }
+    };
     validate_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
-
-    // ISSUE-4.3 (L-3) defense-in-depth: bind blob KZG commitments canonically.
-    //
-    // The signing scope is the spec block root (`hash_tree_root` over the
-    // typed Electra body — SEC-6c). Here we additionally parse the
-    // commitments, compute an internal list fingerprint, and verify that the
-    // commitment count in the body matches the number of blobs.
-    // This does NOT change the BN-facing signing scope; it is a rvc-internal
-    // consistency check performed before the signature is created.
-    //
-    // Proof cardinality is separate and fail-closed, before the signer is
-    // called. It uses the fork name: `body_fork_layout` maps Fulu to Electra,
-    // which would apply the one-proof rule to cell proofs. The commitment-count
-    // check below stays warn-only.
-    if let eth_types::BlockContents::BlockAndBlobs { ref kzg_proofs, ref blobs, .. } =
-        block_contents
-    {
-        let proof_count = kzg_proofs.len();
-        let blob_count = blobs.len();
-        let consensus_version = &response.consensus_version;
-        let fork = ForkName::from_str(consensus_version).map_err(|_| {
-            BlockServiceError::Parse(format!(
-                "kzg proof cardinality: unknown fork {consensus_version} ({proof_count} proofs, {blob_count} blobs)"
-            ))
-        })?;
-        let expected = eth_types::expected_kzg_proof_count(fork, blob_count).map_err(|e| {
-            BlockServiceError::Parse(format!(
-                "kzg proof cardinality is not defined for fork {consensus_version} ({proof_count} proofs, {blob_count} blobs): {e}"
-            ))
-        })?;
-        if proof_count != expected {
-            return Err(BlockServiceError::Parse(format!(
-                "kzg proof cardinality mismatch for fork {consensus_version}: expected {expected} proofs, got {proof_count} proofs for {blob_count} blobs"
-            )));
-        }
-        let layout = eth_types::body_fork_layout(consensus_version).ok_or_else(|| {
-            BlockServiceError::Parse(format!(
-                "no JSON body layout for consensus version {consensus_version}"
-            ))
-        })?;
-        // Fail closed: malformed body must not fingerprint as empty list.
-        let kzg_commitments = block_contents
-            .blob_kzg_commitments(layout)
-            .map_err(|e| BlockServiceError::Parse(e.to_string()))?;
-        let commitment_root = eth_types::kzg_commitment_list_root(&kzg_commitments);
-        debug!(
-            slot = slot,
-            blobs = blob_count,
-            kzg_in_body = kzg_commitments.len(),
-            commitment_root = %TruncatedRoot::new(&commitment_root),
-            "BlockAndBlobs: internal KZG commitment binding (ISSUE-4.3)"
-        );
-        // Intentionally warn-only: the signing scope covers the typed body
-        // (self-consistent). Sidecar propagation is the BN's responsibility.
-        // Aborting here would drop proposals on legitimate BN inconsistencies
-        // during fork transitions.
-        if kzg_commitments.len() != blob_count {
-            warn!(
-                slot = slot,
-                kzg_in_body = kzg_commitments.len(),
-                blobs = blob_count,
-                "blob KZG commitment count mismatch — body inconsistent with blobs"
-            );
-        }
-    }
-
-    let layout = full_body_layout(&response.consensus_version)?;
-    let block_root = compute_block_root_for_layout(&block, layout)?;
-    let header = header_from_full(&block, layout)?;
-    require_block_root_matches_header(&header, block_root)?;
-    Ok((header, block_root, PreparedPayload::Json(block_contents)))
+    header_from_prepared(response, prepared, slot)
 }
 
 fn prepare_blinded(
     response: &ProduceBlockResponse,
     slot: Slot,
     validator: Option<&BlockResponseValidator>,
+    fork: ForkName,
+    mode: BlockSelectionMode,
 ) -> Result<(BeaconBlockHeaderFields, Root, PreparedPayload), BlockServiceError> {
-    let block = response.parse_blinded_block()?;
+    let prepared = map_prepare_reject(
+        beacon::prepare_check::check_preparable(response, fork, constraint_for_mode(mode)),
+        slot,
+        mode,
+        response,
+    )?;
+    let block = match &prepared.kind {
+        beacon::prepare_check::PreparedKind::JsonBlinded(block) => block.clone(),
+        _ => {
+            return Err(BlockServiceError::Parse(
+                "prepare kind was not a blinded JSON block".to_string(),
+            ))
+        }
+    };
     validate_response_block(validator, slot, block.slot, block.proposer_index, block.parent_root)?;
-    let layout = blinded_body_layout(&response.consensus_version)?;
-    let block_root = compute_blinded_block_root_for_layout(&block, layout)?;
-    let header = header_from_blinded(&block, layout)?;
-    require_block_root_matches_header(&header, block_root)?;
-    Ok((header, block_root, PreparedPayload::Blinded(block)))
+    header_from_prepared(response, prepared, slot)
 }
 
-/// Slot, proposer, and parent checks without a log. The caller logs once.
+fn map_prepare_reject(
+    result: Result<beacon::prepare_check::Prepared, beacon::PrepareReject>,
+    slot: Slot,
+    mode: BlockSelectionMode,
+    response: &ProduceBlockResponse,
+) -> Result<beacon::prepare_check::Prepared, BlockServiceError> {
+    result.map_err(|err| match err {
+        beacon::PrepareReject::BlindedAtGloas => {
+            error!(
+                slot = slot,
+                consensus_version = %response.consensus_version,
+                "Blinded block at Gloas — dropping duty"
+            );
+            BlockServiceError::BlindedNotSupportedAtGloas { slot }
+        }
+        beacon::PrepareReject::ConsensusVersion { expected, got } => {
+            BlockServiceError::ConsensusVersionMismatch { expected, got }
+        }
+        beacon::PrepareReject::Shape => {
+            let shape = if response.is_blinded {
+                CandidateShape::Blinded
+            } else {
+                CandidateShape::Unblinded
+            };
+            match enforce_mode_shape(mode, shape) {
+                Err(err) => err,
+                Ok(()) => BlockServiceError::Parse(
+                    "shape constraint rejected the blinded flag".to_string(),
+                ),
+            }
+        }
+        beacon::PrepareReject::UnknownSszVersion(version) => {
+            BlockServiceError::UnknownSszConsensusVersion(version)
+        }
+        beacon::PrepareReject::Parse(message) => BlockServiceError::Parse(message),
+    })
+}
+
+fn header_from_prepared(
+    response: &ProduceBlockResponse,
+    prepared: beacon::prepare_check::Prepared,
+    slot: Slot,
+) -> Result<(BeaconBlockHeaderFields, Root, PreparedPayload), BlockServiceError> {
+    let block_root = prepared.block_root;
+    match prepared.kind {
+        beacon::prepare_check::PreparedKind::JsonFull(contents) => {
+            if let eth_types::BlockContents::BlockAndBlobs { ref blobs, .. } = contents {
+                let layout = full_body_layout(&response.consensus_version)?;
+                let kzg_commitments = contents
+                    .blob_kzg_commitments(layout)
+                    .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+                let blob_count = blobs.len();
+                if kzg_commitments.len() != blob_count {
+                    warn!(
+                        slot = slot,
+                        kzg_in_body = kzg_commitments.len(),
+                        blobs = blob_count,
+                        "blob KZG commitment count mismatch — body inconsistent with blobs"
+                    );
+                }
+            }
+            let block = contents.block().clone();
+            let layout = full_body_layout(&response.consensus_version)?;
+            let header = header_from_full(&block, layout)?;
+            require_block_root_matches_header(&header, block_root)?;
+            Ok((header, block_root, PreparedPayload::Json(contents)))
+        }
+        beacon::prepare_check::PreparedKind::JsonBlinded(block) => {
+            let layout = blinded_body_layout(&response.consensus_version)?;
+            let header = header_from_blinded(&block, layout)?;
+            require_block_root_matches_header(&header, block_root)?;
+            Ok((header, block_root, PreparedPayload::Blinded(block)))
+        }
+        beacon::prepare_check::PreparedKind::SszFull { block, block_ssz, kzg_proofs, blobs } => {
+            let layout = full_body_layout(&response.consensus_version)?;
+            let kzg_count = block
+                .blob_kzg_count(layout)
+                .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+            let commitment_root = block
+                .kzg_commitment_root(layout)
+                .map_err(|err| BlockServiceError::Parse(err.to_string()))?;
+            debug!(
+                slot = slot,
+                kzg_count = kzg_count,
+                commitment_root = %TruncatedRoot::new(&commitment_root),
+                "SSZ BlockContents: internal KZG commitment binding (ISSUE-4.3)"
+            );
+            let header = header_from_full(&block, layout)?;
+            require_block_root_matches_header(&header, block_root)?;
+            Ok((header, block_root, PreparedPayload::SszContents { block_ssz, kzg_proofs, blobs }))
+        }
+        beacon::prepare_check::PreparedKind::SszBlinded { block, ssz } => {
+            let layout = blinded_body_layout(&response.consensus_version)?;
+            let header = header_from_blinded(&block, layout)?;
+            require_block_root_matches_header(&header, block_root)?;
+            Ok((header, block_root, PreparedPayload::SszWhole(ssz)))
+        }
+    }
+}
+
 fn validate_response_block(
     validator: Option<&BlockResponseValidator>,
     slot: Slot,
@@ -1835,8 +1842,9 @@ fn header_from_blinded(
 
 /// Spec `hash_tree_root(BeaconBlock)` with the header's [`eth_types::BodyForkLayout`].
 ///
-/// Production proposal path. Auto-detect would sign a Deneb body under an
-/// Electra or Fulu header. Malformed body SSZ is [`BlockServiceError::Parse`].
+/// Tests compare this root to a header. Production signing uses the root from
+/// [`beacon::prepare_check::Prepared`] and [`require_block_root_matches_header`].
+#[cfg(test)]
 fn compute_block_root_for_layout(
     block: &eth_types::BeaconBlock,
     layout: eth_types::BodyForkLayout,
@@ -1869,8 +1877,9 @@ fn compute_blinded_block_root(
 
 /// Block root for the layout `consensus_version` names.
 ///
-/// Auto-detect would sign a Deneb body under an Electra header and only fail
-/// when the publish encoder demands the header's layout.
+/// Tests compare this root to a blinded header. Production signing uses the
+/// root from [`beacon::prepare_check::Prepared`].
+#[cfg(test)]
 fn compute_blinded_block_root_for_layout(
     block: &eth_types::BlindedBeaconBlock,
     layout: eth_types::BodyForkLayout,

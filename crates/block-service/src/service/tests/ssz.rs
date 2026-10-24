@@ -324,6 +324,7 @@ async fn deneb_ssz_full_body_under_fulu_header_signs_nothing() {
             payload_included: false,
             builder_url: None,
             consensus_block_value: None,
+            candidate_memo: beacon::CandidateMemo::arc(),
         }));
         let signer = Arc::new(MockSigner::new());
         let service = BlockService::new(
@@ -720,18 +721,14 @@ fn le_u32_at(bytes: &[u8], at: usize) -> usize {
     u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize
 }
 
-/// Sidecar bytes from an RR-1.1 `BlockContents` fixture. Offsets are read here,
-/// not through `deserialize_block_contents_ssz`.
-fn fixture_sidecars(bytes: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let kzg = le_u32_at(bytes, 4);
-    let blobs = le_u32_at(bytes, 8);
-    (bytes[kzg..blobs].to_vec(), bytes[blobs..].to_vec())
+/// One blob and the proof count that fork will sign. A short blob is rejected.
+fn valid_sidecars(version: &str) -> (Vec<u8>, Vec<u8>) {
+    let proofs = if version == "fulu" { 128 } else { 1 };
+    (vec![0xab; proofs * 48], vec![0xcd; 131_072])
 }
 
-fn contents_client(version: &str, slot: Slot, fixture: &[u8]) -> (MockBeaconClient, Vec<u8>) {
-    let (proofs, blobs) = fixture_sidecars(fixture);
-    assert!(!proofs.is_empty(), "{version} kzg_proofs empty");
-    assert!(!blobs.is_empty(), "{version} blobs empty");
+fn contents_client(version: &str, slot: Slot) -> (MockBeaconClient, Vec<u8>, Vec<u8>, Vec<u8>) {
+    let (proofs, blobs) = valid_sidecars(version);
     let body = test_body_ssz_for_version(version);
     let ssz = build_ssz_bytes_with_kzg(slot, 42, &body, &proofs, &blobs);
     let client = MockBeaconClient::from_response(ProduceBlockResponse {
@@ -744,8 +741,9 @@ fn contents_client(version: &str, slot: Slot, fixture: &[u8]) -> (MockBeaconClie
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     });
-    (client, ssz)
+    (client, ssz, proofs, blobs)
 }
 
 fn service_for(
@@ -766,17 +764,11 @@ fn service_for(
 
 #[tokio::test]
 async fn published_payload_is_a_signed_block_contents_container() {
-    const DENEB: &[u8] =
-        include_bytes!("../../../../beacon/tests/fixtures/deneb_block_contents.ssz");
-    const ELECTRA: &[u8] =
-        include_bytes!("../../../../beacon/tests/fixtures/electra_block_contents.ssz");
-    const FULU: &[u8] = include_bytes!("../../../../beacon/tests/fixtures/fulu_block_contents.ssz");
     let pubkey = test_pubkey();
 
-    for (version, fixture) in [("deneb", DENEB), ("electra", ELECTRA), ("fulu", FULU)] {
+    for version in ["deneb", "electra", "fulu"] {
         let slot = 100;
-        let (client, produced) = contents_client(version, slot, fixture);
-        let (proofs, blobs) = fixture_sidecars(fixture);
+        let (client, produced, proofs, blobs) = contents_client(version, slot);
         let block_off = le_u32_at(&produced, 0);
         let kzg_off = le_u32_at(&produced, 4);
         let block_len = kzg_off - block_off;
@@ -813,17 +805,11 @@ async fn published_payload_is_a_signed_block_contents_container() {
 
 #[tokio::test]
 async fn sidecars_reach_publish_block_ssz() {
-    const DENEB: &[u8] =
-        include_bytes!("../../../../beacon/tests/fixtures/deneb_block_contents.ssz");
-    const ELECTRA: &[u8] =
-        include_bytes!("../../../../beacon/tests/fixtures/electra_block_contents.ssz");
-    const FULU: &[u8] = include_bytes!("../../../../beacon/tests/fixtures/fulu_block_contents.ssz");
     let pubkey = test_pubkey();
 
-    for (version, fixture) in [("deneb", DENEB), ("electra", ELECTRA), ("fulu", FULU)] {
+    for version in ["deneb", "electra", "fulu"] {
         let slot = 100;
-        let (client, produced) = contents_client(version, slot, fixture);
-        let (proofs, blobs) = fixture_sidecars(fixture);
+        let (client, produced, proofs, blobs) = contents_client(version, slot);
         let block_off = le_u32_at(&produced, 0);
         let kzg_off = le_u32_at(&produced, 4);
         let bn_block = &produced[block_off..kzg_off];
@@ -851,12 +837,9 @@ async fn sidecars_reach_publish_block_ssz() {
 /// `400 OffsetOutOfBounds` (blake-manual / RR-P0-3 / DSR-1.1).
 #[tokio::test]
 async fn electra_publish_avoids_offset_out_of_bounds_class() {
-    const ELECTRA: &[u8] =
-        include_bytes!("../../../../beacon/tests/fixtures/electra_block_contents.ssz");
     let pubkey = test_pubkey();
     let slot = 100;
-    let (client, produced) = contents_client("electra", slot, ELECTRA);
-    let (proofs, blobs) = fixture_sidecars(ELECTRA);
+    let (client, produced, proofs, blobs) = contents_client("electra", slot);
     let block_off = le_u32_at(&produced, 0);
     let kzg_off = le_u32_at(&produced, 4);
     let block_len = kzg_off - block_off;
@@ -917,6 +900,7 @@ async fn gloas_payload_still_routes_through_sign_and_publish_v4() {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     });
     let (service, beacon) = service_for(beacon, &pubkey, test_fork_schedule_with_near_gloas());
     let result = service.propose_block(slot, &pubkey, 42, None).await;
@@ -978,6 +962,7 @@ async fn corrupt_blobs_offset_fails_before_the_header_is_signed() {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }));
     let signer = Arc::new(MockSigner::new());
     let service = BlockService::new(

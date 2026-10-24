@@ -129,6 +129,7 @@ fn garbage(blinded: bool) -> ProduceBlockResponse {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -463,6 +464,7 @@ fn gloas_ssz_win(slot: Slot) -> ProduceBlockResponse {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -1060,6 +1062,7 @@ fn ssz_self_build_with_envelope(slot: Slot, envelope: &[u8]) -> ProduceBlockResp
         payload_included: true,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 

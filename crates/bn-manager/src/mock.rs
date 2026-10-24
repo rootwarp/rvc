@@ -1486,6 +1486,7 @@ mod tests {
                     payload_included: false,
                     builder_url: None,
                     consensus_block_value: None,
+                    candidate_memo: beacon::CandidateMemo::arc(),
                 })
             });
         let cfg = BuilderConfig::default();

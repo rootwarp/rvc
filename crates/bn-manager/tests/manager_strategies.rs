@@ -1305,12 +1305,7 @@ async fn test_best_of_falls_back_to_unsynced_when_every_synced_bn_times_out() {
     let synced = MockServer::start().await;
     let unsynced = MockServer::start().await;
     let parent = [0xabu8; 32];
-    let parent_hex =
-        format!("0x{}", parent.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
-    let state_hex = format!("0x{}", "00".repeat(32));
-    let body = format!(
-        r#"{{"data":{{"slot":"1","proposer_index":"0","parent_root":"{parent_hex}","state_root":"{state_hex}","body":{{}}}}}}"#
-    );
+    let body = produce_json(preparable_data("full", 1, 0, &"ab".repeat(32), false));
     let fallback_ok = ResponseTemplate::new(200)
         .insert_header("Eth-Consensus-Version", "deneb")
         .insert_header("Eth-Execution-Payload-Blinded", "false")
@@ -1375,10 +1370,10 @@ async fn test_best_of_falls_back_to_unsynced_when_every_synced_bn_times_out() {
 }
 
 fn duty_block_body(parent: &str, proposer: u64, fee: &str) -> String {
-    let state = "00".repeat(32);
-    format!(
-        r#"{{"data":{{"slot":"1","proposer_index":"{proposer}","parent_root":"0x{parent}","state_root":"0x{state}","body":{{"execution_payload":{{"fee_recipient":"0x{fee}"}}}}}}}}"#
-    )
+    let mut data = preparable_data("full", 1, proposer, parent, false);
+    data["body"]["execution_payload"]["fee_recipient"] =
+        serde_json::Value::String(format!("0x{fee}"));
+    produce_json(data)
 }
 
 fn mount_duty_block(value: &str, body: String) -> ResponseTemplate {
@@ -2987,12 +2982,7 @@ async fn test_sync_query_best_falls_back_to_unsynced_when_synced_fail() {
 
     // Same nodes, but BN2 is small-lag and the parent is known.
     let parent = [0xabu8; 32];
-    let parent_hex =
-        format!("0x{}", parent.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
-    let state_hex = format!("0x{}", "00".repeat(32));
-    let body = format!(
-        r#"{{"data":{{"slot":"1","proposer_index":"0","parent_root":"{parent_hex}","state_root":"{state_hex}","body":{{}}}}}}"#
-    );
+    let body = produce_json(preparable_data("full", 1, 0, &"ab".repeat(32), false));
     Mock::given(method("GET"))
         .and(path("/eth/v1/node/syncing"))
         .respond_with(ResponseTemplate::new(200).set_body_string(
@@ -4078,12 +4068,7 @@ async fn test_health_tracker_write_lock_once_on_unsynced_fallback() {
         .mount(&bn2)
         .await;
     let parent = [0xabu8; 32];
-    let parent_hex =
-        format!("0x{}", parent.iter().map(|byte| format!("{byte:02x}")).collect::<String>());
-    let state_hex = format!("0x{}", "00".repeat(32));
-    let body = format!(
-        r#"{{"data":{{"slot":"1","proposer_index":"0","parent_root":"{parent_hex}","state_root":"{state_hex}","body":{{}}}}}}"#
-    );
+    let body = produce_json(preparable_data("full", 1, 0, &"ab".repeat(32), false));
     Mock::given(method("GET"))
         .and(path("/eth/v3/validator/blocks/1"))
         .respond_with(
@@ -4949,11 +4934,9 @@ fn shape_duty(shape: ShapeConstraint, parent: Option<[u8; 32]>) -> ProduceDuty {
     }
 }
 
-fn block_document(parent_hex: &str) -> String {
-    let state = "00".repeat(32);
-    format!(
-        r#"{{"data":{{"slot":"1","proposer_index":"0","parent_root":"0x{parent_hex}","state_root":"0x{state}","body":{{}}}}}}"#
-    )
+fn block_document(parent_hex: &str, blinded: bool) -> String {
+    let kind = if blinded { "deneb-blinded" } else { "full" };
+    produce_json(preparable_data(kind, 1, 0, parent_hex, false))
 }
 
 fn http_message(extra_headers: &str, body: &str) -> Vec<u8> {
@@ -4964,10 +4947,10 @@ fn http_message(extra_headers: &str, body: &str) -> Vec<u8> {
     .into_bytes()
 }
 
-fn block_headers(value: &str, blinded: bool) -> String {
+fn block_headers(value: &str, blinded: bool, version: &str) -> String {
     let flag = if blinded { "true" } else { "false" };
     format!(
-        "Eth-Consensus-Version: deneb\r\nEth-Execution-Payload-Blinded: {flag}\r\nEth-Execution-Payload-Value: {value}\r\n"
+        "Eth-Consensus-Version: {version}\r\nEth-Execution-Payload-Blinded: {flag}\r\nEth-Execution-Payload-Value: {value}\r\n"
     )
 }
 
@@ -4985,6 +4968,19 @@ async fn paused_bn(
     blinded: bool,
     parent_hex: String,
 ) -> (String, std::sync::mpsc::Receiver<()>) {
+    paused_bn_with(sync_body, block_delay, block_value, blinded, parent_hex, "deneb", None).await
+}
+
+/// `body` replaces [`block_document`]. `version` is `Eth-Consensus-Version`.
+async fn paused_bn_with(
+    sync_body: String,
+    block_delay: Duration,
+    block_value: &'static str,
+    blinded: bool,
+    parent_hex: String,
+    version: &'static str,
+    body: Option<String>,
+) -> (String, std::sync::mpsc::Receiver<()>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -4998,6 +4994,7 @@ async fn paused_bn(
             };
             let sync_body = sync_body.clone();
             let parent_hex = parent_hex.clone();
+            let body = body.clone();
             let armed_tx = armed_tx.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 4096];
@@ -5033,8 +5030,8 @@ async fn paused_bn(
                         })
                         .await;
                     }
-                    let body = block_document(&parent_hex);
-                    http_message(&block_headers(block_value, blinded), &body)
+                    let body = body.clone().unwrap_or_else(|| block_document(&parent_hex, blinded));
+                    http_message(&block_headers(block_value, blinded, version), &body)
                 };
                 let _ = sock.write_all(&message).await;
             });
@@ -5165,6 +5162,147 @@ async fn fallback_respects_the_shape_constraint() {
         .expect("blocking wait")
         .expect("fallback block");
     assert_eq!(ranked.len(), 1, "the wrong-shape fallback must not be returned");
+    assert!(ranked[0].response.is_blinded);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+fn fixture_raw(kind: &str) -> &'static str {
+    match kind {
+        "deneb-contents" => {
+            include_str!("../../eth-types/tests/fixtures/beacon_api/deneb_block_contents.json")
+        }
+        "deneb-blinded" => {
+            include_str!("../../eth-types/tests/fixtures/beacon_api/deneb_blinded_block_body.json")
+        }
+        "electra-blinded" => {
+            include_str!(
+                "../../eth-types/tests/fixtures/beacon_api/electra_blinded_block_body.json"
+            )
+        }
+        other => panic!("unknown fixture {other}"),
+    }
+}
+
+fn patch_block(block: &mut serde_json::Value, slot: u64, proposer: u64, parent_hex: &str) {
+    for (key, value) in [
+        ("slot", slot.to_string()),
+        ("proposer_index", proposer.to_string()),
+        ("parent_root", format!("0x{parent_hex}")),
+        ("state_root", format!("0x{}", "22".repeat(32))),
+    ] {
+        block[key] = serde_json::Value::String(value);
+    }
+}
+
+/// Produce `data`. `extra_proof` appends one `kzg_proofs` entry on the Deneb contents fixture.
+fn preparable_data(
+    kind: &str,
+    slot: u64,
+    proposer: u64,
+    parent_hex: &str,
+    extra_proof: bool,
+) -> serde_json::Value {
+    if kind == "full" && !extra_proof {
+        let body =
+            serde_json::to_value(eth_types::external_vector_deneb_body()).expect("deneb body");
+        let mut block = serde_json::json!({ "body": body });
+        patch_block(&mut block, slot, proposer, parent_hex);
+        return block;
+    }
+    if kind == "full" {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(fixture_raw("deneb-contents")).expect("contents");
+        let mut data = doc["data"].take();
+        patch_block(data.get_mut("block").expect("block"), slot, proposer, parent_hex);
+        let proofs = data.get_mut("kzg_proofs").and_then(|v| v.as_array_mut()).expect("proofs");
+        let extra = proofs.first().cloned().expect("one proof");
+        proofs.push(extra);
+        return data;
+    }
+    let body: serde_json::Value = serde_json::from_str(fixture_raw(kind)).expect("blinded body");
+    let mut block = serde_json::json!({ "body": body });
+    patch_block(&mut block, slot, proposer, parent_hex);
+    block
+}
+
+fn produce_json(data: serde_json::Value) -> String {
+    serde_json::json!({ "data": data }).to_string()
+}
+
+fn any_duty(version: ForkName, parent: Option<[u8; 32]>, fee: Option<[u8; 20]>) -> ProduceDuty {
+    ProduceDuty {
+        expected_proposer_index: 7,
+        expected_parent_root: parent,
+        alternate_parent_root: None,
+        parent_closed: false,
+        expected_fee_recipient: fee,
+        expected_consensus_version: version,
+        shape: ShapeConstraint::Any,
+    }
+}
+
+/// Fast `early` is unpreparable. The 1.2s block is the only candidate.
+async fn late_preparable(
+    early: (String, bool, &'static str),
+    late: (String, bool, &'static str),
+    duty: ProduceDuty,
+) -> Vec<beacon::RankedBlock> {
+    let parent = "ab".repeat(32);
+    let (bn_a, armed_a) = paused_bn_with(
+        "{}".into(),
+        Duration::from_millis(50),
+        "9000",
+        early.1,
+        parent.clone(),
+        early.2,
+        Some(early.0),
+    )
+    .await;
+    let (bn_b, armed_b) = paused_bn_with(
+        "{}".into(),
+        Duration::from_millis(1_200),
+        "1000",
+        late.1,
+        parent,
+        late.2,
+        Some(late.0),
+    )
+    .await;
+    tokio::time::pause();
+    let manager = manager_with_block_budget(&[&bn_a, &bn_b], Duration::from_secs(3));
+    let produce = tokio::spawn(async move {
+        manager.produce_block_v3_ranked(1, "0xrandao", None, None, Some(duty)).await
+    });
+    drive_to_soft_deadline(vec![armed_a, armed_b]).await;
+    produce.await.expect("task").expect("late block")
+}
+
+/// BN-A's extra KZG proof must not close the soft window. BN-B is the block.
+#[tokio::test(flavor = "current_thread")]
+async fn unpreparable_kzg_cardinality_does_not_close_the_soft_window() {
+    let parent = "ab".repeat(32);
+    let ranked = late_preparable(
+        (produce_json(preparable_data("full", 1, 7, &parent, true)), false, "deneb"),
+        (produce_json(preparable_data("full", 1, 7, &parent, false)), false, "deneb"),
+        any_duty(ForkName::Deneb, Some([0xab; 32]), None),
+    )
+    .await;
+    assert_eq!(ranked.len(), 1, "the extra-proof block must not be held: {ranked:?}");
+    assert_eq!(ranked[0].bn_index, 1);
+    assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
+}
+
+/// A Deneb blinded body advertised as Fulu fails layout and must not win the window.
+#[tokio::test(flavor = "current_thread")]
+async fn blinded_deneb_body_under_fulu_does_not_close_the_soft_window() {
+    let parent = "ab".repeat(32);
+    let ranked = late_preparable(
+        (produce_json(preparable_data("deneb-blinded", 1, 7, &parent, false)), true, "fulu"),
+        (produce_json(preparable_data("electra-blinded", 1, 7, &parent, false)), true, "fulu"),
+        any_duty(ForkName::Fulu, Some([0xab; 32]), None),
+    )
+    .await;
+    assert_eq!(ranked.len(), 1, "the deneb body must not be held");
     assert!(ranked[0].response.is_blinded);
     assert_eq!(ranked[0].response.execution_payload_value.as_deref(), Some("1000"));
 }

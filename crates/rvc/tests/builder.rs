@@ -76,6 +76,7 @@ fn echoing_beacon() -> (MockBeaconNodeClient, Arc<Mutex<Vec<SignedBeaconBlock>>>
                 payload_included: false,
                 builder_url: None,
                 consensus_block_value: None,
+                candidate_memo: beacon::CandidateMemo::arc(),
             })
         })
         .with_publish_block(move |block, _version, _url| {

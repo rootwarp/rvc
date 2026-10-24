@@ -29,6 +29,7 @@ mod deadline;
 mod envelope;
 mod json;
 mod mode;
+mod prepare_check;
 mod propose;
 mod ssz;
 mod v4;

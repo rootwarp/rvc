@@ -5,6 +5,7 @@
 mod admission;
 mod client;
 mod error;
+pub mod prepare_check;
 mod shape;
 
 pub use admission::DutyFence;
@@ -17,6 +18,7 @@ mod v4_wire;
 pub use client::{ensure_genesis_validators_root, hex_ids_equal, BeaconClient, BeaconClientConfig};
 pub use error::{BeaconError, ProduceError};
 pub use http_caps::ResponseCaps;
+pub use prepare_check::{check_preparable, CandidateMemo, PrepareReject, Prepared, PreparedKind};
 pub use retry::RetryPolicy;
 pub use shape::{ShapeConstraint, GLOAS_SELF_BUILD_BUILDER_INDEX};
 pub use types::{

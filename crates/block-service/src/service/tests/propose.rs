@@ -860,6 +860,7 @@ fn test_block_and_blobs_json_through_produce_response() {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     };
 
     let contents = response.parse_full_block().unwrap();
@@ -1429,6 +1430,7 @@ fn block_and_blobs_response(slot: Slot, commitments: &[[u8; 48]]) -> ProduceBloc
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -1529,6 +1531,7 @@ async fn commitment_count_mismatch_still_warns_only() {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     };
 
     let signer = Arc::new(MockSigner::new());
@@ -1579,6 +1582,7 @@ fn contents_response(data: serde_json::Value, version: &str) -> ProduceBlockResp
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
@@ -1935,6 +1939,7 @@ fn json_fee_response(fee: &str, blinded: bool) -> ProduceBlockResponse {
         payload_included: false,
         builder_url: None,
         consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
     }
 }
 
