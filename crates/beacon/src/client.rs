@@ -606,6 +606,13 @@ impl BeaconClient {
     /// JSON fallback on failure) is in place.
     const SSZ_ACCEPT_HEADER: &'static str = "application/octet-stream;q=1.0,application/json;q=0.9";
 
+    /// Duty-aware production needs ranking and the fee, fork, and parent checks.
+    ///
+    /// This client has one node and does not apply a duty. The pool does.
+    pub fn unsupported_duty_aware_production() -> BeaconError {
+        BeaconError::Unsupported("duty-aware production requires BnManager")
+    }
+
     /// Produces a block for the given slot using the v3 endpoint.
     ///
     /// Requests SSZ-encoded response for reduced network latency on large blocks.

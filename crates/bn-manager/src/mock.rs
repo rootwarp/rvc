@@ -1228,6 +1228,30 @@ impl BlockProducer for MockBeaconNodeClient {
         self.charge(MockMethod::SubmitBuilderPreferences).await;
         self.submit_builder_preferences.invoke("submit_builder_preferences", entries.to_vec())
     }
+
+    async fn produce_block_v3_for_duty(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: crate::ProduceDuty,
+    ) -> Result<beacon::ProduceBlockResponse, beacon::BeaconError> {
+        self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await
+    }
+
+    async fn produce_block_v3_ranked(
+        &self,
+        slot: u64,
+        randao_reveal: &str,
+        graffiti: Option<&str>,
+        builder_boost_factor: Option<u64>,
+        _duty: Option<crate::ProduceDuty>,
+    ) -> Result<Vec<beacon::RankedBlock>, beacon::BeaconError> {
+        let response =
+            self.produce_block_v3(slot, randao_reveal, graffiti, builder_boost_factor).await?;
+        Ok(vec![beacon::RankedBlock { bn_index: 0, response }])
+    }
 }
 
 #[async_trait]

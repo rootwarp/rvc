@@ -3,6 +3,10 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## A raw beacon client refuses a produce duty
+
+`BeaconClient` does not rank blocks and does not check the fee recipient, the fork, or the parent. `produce_block_v3_ranked` and `produce_block_v3_ranked_by` return an error when a duty is passed. `produce_block_v3_for_duty` always returns that error. The message is `duty-aware production requires BnManager`. With no duty, the raw client still returns the one block from that node, and `produce_block_v4_by` still calls that node. The validator client produces through the beacon-node pool, which already applies the duty.
+
 ## Builder policy follows the flag, and the boost ranks across beacon nodes
 
 A key whose effective block-selection mode is `builder-only` warns once at startup when `builder_proposals` is off, or when that key's Gloas builder list is empty. Both missing is still one warning. The line is `builder_only_without_builder`. It names the truncated pubkey, `builder_enabled`, and `gloas_builders`. It does not name a relay URL or a fee recipient. Startup continues. Keys already in the validators file are checked when the store is built. A keystore key that was not in the file is checked when it is registered, so each key warns once.
