@@ -46,10 +46,14 @@ pub(crate) struct SyncCommitteeService {
     /// present in attestation.rs so that sync messages and contributions
     /// are also suppressed during the post-import doppelganger window.
     validator_store: Arc<ValidatorStore>,
-    /// Subcommittees not pulled onto the pipeline before slot end.
+    /// Items `take_until(slot_end)` did not yield.
     ///
-    /// Cumulative for this service. An in-flight fetch or signature is not
-    /// a drop; only items `take_until(slot_end)` did not yield are counted.
+    /// Sync-message dispatch records one per duty. Contribution dispatch
+    /// records one per duty and subcommittee. This counter adds those two
+    /// counts, so one increment is not always one subcommittee and not always
+    /// one duty. Cumulative for this service. An in-flight fetch or signature
+    /// is not a drop. This is a log field and a test accessor, not a
+    /// Prometheus metric.
     slot_end_drops: SlotEndDropCounter,
 }
 
@@ -73,7 +77,10 @@ impl SyncCommitteeService {
         }
     }
 
-    /// Duties dropped because slot end arrived before they were dispatched.
+    /// Sync-message duties plus contribution items dropped at slot end.
+    ///
+    /// The two phases share the counter and do not use the same unit. See
+    /// the `slot_end_drops` field.
     #[cfg(test)]
     pub(crate) fn slot_end_drops(&self) -> u64 {
         self.slot_end_drops.get()
@@ -323,8 +330,9 @@ impl SyncCommitteeService {
         };
 
         // One item per duty and distinct subcommittee. `take_until` stops
-        // pulling new items at slot end. A fetch already running is bounded
-        // by the same instant as the publish: slot end plus 500 ms.
+        // pulling new items at slot end. A fetch, a signature, or a publish
+        // already running gets a fresh `now` plus `sync_contribution`. Only
+        // the slot end + 500 ms cap is shared across those steps.
         let mut items = Vec::new();
         for (duty, pubkey) in matching_duties.into_iter().zip(matching_pubkeys) {
             let subcommittees: BTreeSet<u64> = duty
@@ -650,13 +658,14 @@ impl SyncCommitteeService {
     }
 }
 
-/// Earlier of the sync-contribution timeout and slot end plus 500 ms.
+/// Earlier of a fresh `now + timeout` and slot end plus 500 ms.
 ///
-/// Selection proofs, contribution signatures, fetches, and publishes all
-/// stop at this instant. `checked_add` that cannot represent slot end plus
-/// 500 ms uses `now` as that overhang instant. `checked_add` that cannot
-/// represent `now` plus the timeout uses the overhang instant. A deadline
-/// at or before `now` is already due, and the caller does not send.
+/// Each caller computes its own deadline. A step that starts later has a
+/// later `now`, so its timeout instant is later. Only the slot end + 500 ms
+/// cap is shared. `checked_add` that cannot represent slot end plus 500 ms
+/// uses `now` as that overhang instant. `checked_add` that cannot represent
+/// `now` plus the timeout uses the overhang instant. A deadline at or before
+/// `now` is already due, and the caller does not send.
 pub(crate) fn contribution_deadline(
     slot_end: tokio::time::Instant,
     timeout: Duration,
@@ -2171,7 +2180,7 @@ mod tests {
         config.timeouts.sync_contribution = Duration::from_secs(10);
         let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
         let submits = Arc::new(AtomicUsize::new(0));
-        let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
+        let beacon = Arc::new(
             MockBeaconNodeClient::new()
                 .with_method_delay(MockMethod::SubmitContributionAndProofs, Duration::from_secs(10))
                 .with_post_sync_committee_duties({
@@ -2200,13 +2209,78 @@ mod tests {
                     }
                 }),
         );
-        let service = service_with_config(beacon, pk, sk, config).await;
+        let service =
+            service_with_config(Arc::clone(&beacon) as Arc<dyn BeaconNodeClient>, pk, sk, config)
+                .await;
         let started = tokio::time::Instant::now();
         let slot_end = started + Duration::from_secs(2);
         service.maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), slot_end).await;
         let elapsed = tokio::time::Instant::now().saturating_duration_since(started);
         assert!(elapsed <= Duration::from_millis(2_600), "elapsed {elapsed:?}");
+        let arrivals: Vec<_> = beacon
+            .call_stamps()
+            .into_iter()
+            .filter(|stamp| stamp.method == MockMethod::SubmitContributionAndProofs)
+            .collect();
+        assert_eq!(arrivals.len(), 1, "the POST is started; skipping it is not this stop");
+        assert!(arrivals[0].at <= slot_end + Duration::from_millis(500));
         assert_eq!(submits.load(Ordering::SeqCst), 0, "a cancelled submit is not a publish");
+    }
+
+    /// A contribution GET that outlives slot end is cut at slot end plus 500 ms.
+    /// The 10 s `sync_contribution` timeout does not extend it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn hung_contribution_get_stops_at_the_slot_end_overhang() {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let mut config = create_test_config();
+        config.timeouts.sync_contribution = Duration::from_secs(10);
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let beacon = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_method_delay(
+                    MockMethod::GetSyncCommitteeContribution,
+                    Duration::from_secs(10),
+                )
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution(move |requested, subcommittee, _| {
+                    Ok(DataResponse { data: contribution_body(requested, head, subcommittee) })
+                })
+                .with_submit_contribution_and_proofs(|_| Ok(())),
+        );
+        let service =
+            service_with_config(Arc::clone(&beacon) as Arc<dyn BeaconNodeClient>, pk, sk, config)
+                .await;
+        let started = tokio::time::Instant::now();
+        let slot_end = started + Duration::from_secs(2);
+        service.maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), slot_end).await;
+        let elapsed = tokio::time::Instant::now().saturating_duration_since(started);
+        assert!(elapsed <= Duration::from_millis(2_500), "elapsed {elapsed:?}");
+        let arrivals: Vec<_> = beacon
+            .call_stamps()
+            .into_iter()
+            .filter(|stamp| stamp.method == MockMethod::GetSyncCommitteeContribution)
+            .collect();
+        assert_eq!(arrivals.len(), 1, "the GET starts, then the overhang cuts it");
+        assert!(arrivals[0].at < slot_end + Duration::from_millis(500));
+        let posts: Vec<_> = beacon
+            .call_stamps()
+            .into_iter()
+            .filter(|stamp| stamp.method == MockMethod::SubmitContributionAndProofs)
+            .collect();
+        assert!(posts.is_empty(), "a cancelled GET does not publish");
     }
 
     #[tokio::test]
@@ -2535,12 +2609,39 @@ mod tests {
                     }
                 }),
         );
-        let service = service_with_config(beacon, pk, sk, config).await;
+        let selection_calls = Arc::new(AtomicUsize::new(0));
+        let contribution_calls = Arc::new(AtomicUsize::new(0));
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let inner = Arc::new(
+            SignerService::new(
+                Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+                Arc::new(SlashingDb::open_in_memory().unwrap()),
+            )
+            .with_enablement(always_enabled()),
+        );
+        let signer = Arc::new(SlowSigner {
+            inner,
+            delay_selection: false,
+            delay_contribution: false,
+            delay: Duration::ZERO,
+            selection_calls: Arc::clone(&selection_calls),
+            contribution_calls: Arc::clone(&contribution_calls),
+            selection_finished: Arc::new(AtomicUsize::new(0)),
+            contribution_finished: Arc::new(AtomicUsize::new(0)),
+        });
+        let service = service_with_signer(beacon, pk, signer, config).await;
         service
             .maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), ample_slot_end())
             .await;
         assert_eq!(gets.load(Ordering::SeqCst), 1);
         assert_eq!(submits.load(Ordering::SeqCst), 0);
+        assert_eq!(selection_calls.load(Ordering::SeqCst), 1, "the selection proof still runs");
+        assert_eq!(
+            contribution_calls.load(Ordering::SeqCst),
+            0,
+            "an empty aggregation bitfield is not passed to sign_contribution_and_proof"
+        );
     }
 
     struct SlowSigner {
@@ -2550,6 +2651,10 @@ mod tests {
         delay: Duration,
         selection_calls: Arc<AtomicUsize>,
         contribution_calls: Arc<AtomicUsize>,
+        /// Incremented after the selection sleep, so a cancelled sleep stays at 0.
+        selection_finished: Arc<AtomicUsize>,
+        /// Incremented after the contribution sleep, so a cancelled sleep stays at 0.
+        contribution_finished: Arc<AtomicUsize>,
     }
 
     macro_rules! slow_fwd {
@@ -2569,12 +2674,14 @@ mod tests {
             if $self.delay_selection {
                 tokio::time::sleep($self.delay).await;
             }
+            $self.selection_finished.fetch_add(1, Ordering::SeqCst);
         };
         (@arm sign_contribution_and_proof, $self:ident, $($arg:ident),*) => {
             $self.contribution_calls.fetch_add(1, Ordering::SeqCst);
             if $self.delay_contribution {
                 tokio::time::sleep($self.delay).await;
             }
+            $self.contribution_finished.fetch_add(1, Ordering::SeqCst);
         };
         (@arm $name:ident, $self:ident, $($arg:ident),*) => {};
     }
@@ -2656,6 +2763,8 @@ mod tests {
             delay: Duration::from_secs(10),
             selection_calls: Arc::clone(&selection_calls),
             contribution_calls: Arc::clone(&contribution_calls),
+            selection_finished: Arc::new(AtomicUsize::new(0)),
+            contribution_finished: Arc::new(AtomicUsize::new(0)),
         });
         let beacon: Arc<dyn BeaconNodeClient> = Arc::new(
             MockBeaconNodeClient::new()
@@ -2699,7 +2808,8 @@ mod tests {
         };
         service.maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), slot_end).await;
         let elapsed = started.elapsed();
-        assert!(elapsed < Duration::from_secs(2), "signer stretched the phase to {elapsed:?}");
+        // Slot end is 200 ms ahead and the cap is that instant plus 500 ms.
+        assert!(elapsed <= Duration::from_millis(700), "signer stretched the phase to {elapsed:?}");
         assert_eq!(submits.load(Ordering::SeqCst), 0);
         match case {
             SlowCase::Selection => {
@@ -2786,6 +2896,8 @@ mod tests {
             delay: Duration::ZERO,
             selection_calls: Arc::clone(&selection_calls),
             contribution_calls: Arc::clone(&contribution_calls),
+            selection_finished: Arc::new(AtomicUsize::new(0)),
+            contribution_finished: Arc::new(AtomicUsize::new(0)),
         });
         let service = service_with_signer(beacon, pk, signer, config.clone()).await;
         service
@@ -2845,5 +2957,124 @@ mod tests {
             1,
             "a holding fence signs the contribution only inside the admission scope"
         );
+    }
+
+    /// Selection or contribution sign whose sleep ends on slot end + 500 ms.
+    ///
+    /// The sleep duration is that overhang. `timeout_at` polls the signer
+    /// first, so the sign returns `Ok` at the overhang instead of being
+    /// cancelled. The next step's fresh deadline is that same overhang.
+    async fn sign_finishes_on_the_overhang(
+        delay_selection: bool,
+        delay_contribution: bool,
+    ) -> (Arc<MockBeaconNodeClient>, usize, usize) {
+        let slot = 0;
+        let head = [0xAA; 32];
+        let mut config = create_test_config();
+        config.timeouts.sync_contribution = Duration::from_secs(10);
+        let (sk, pk) = find_aggregator_for(slot, &[0], &config.fork_schedule, [0u8; 32]);
+        let selection_finished = Arc::new(AtomicUsize::new(0));
+        let contribution_finished = Arc::new(AtomicUsize::new(0));
+        let mut key_manager = KeyManager::new();
+        key_manager.insert(sk);
+        let inner = Arc::new(
+            SignerService::new(
+                Arc::new(CompositeSigner::new(LocalSigner::new(key_manager))),
+                Arc::new(SlashingDb::open_in_memory().unwrap()),
+            )
+            .with_enablement(always_enabled()),
+        );
+        let signer = Arc::new(SlowSigner {
+            inner,
+            delay_selection,
+            delay_contribution,
+            delay: Duration::from_millis(700),
+            selection_calls: Arc::new(AtomicUsize::new(0)),
+            contribution_calls: Arc::new(AtomicUsize::new(0)),
+            selection_finished: Arc::clone(&selection_finished),
+            contribution_finished: Arc::clone(&contribution_finished),
+        });
+        let beacon = Arc::new(
+            MockBeaconNodeClient::new()
+                .with_post_sync_committee_duties({
+                    let duty_pk = pk.to_bytes();
+                    move |_epoch, _| {
+                        Ok(ExecutionOptimisticResponse {
+                            execution_optimistic: false,
+                            data: vec![SyncCommitteeDuty {
+                                pubkey: duty_pk,
+                                validator_index: 1,
+                                validator_sync_committee_indices: vec![0],
+                            }],
+                        })
+                    }
+                })
+                .with_get_sync_committee_contribution(move |requested, subcommittee, _| {
+                    Ok(DataResponse { data: contribution_body(requested, head, subcommittee) })
+                })
+                .with_submit_contribution_and_proofs(|_| Ok(())),
+        );
+        let service = service_with_signer(
+            Arc::clone(&beacon) as Arc<dyn BeaconNodeClient>,
+            pk,
+            signer,
+            config,
+        )
+        .await;
+        let slot_end = tokio::time::Instant::now() + Duration::from_millis(200);
+        service.maybe_produce_sync_contributions(slot, 0, &head_ctx(slot, head), slot_end).await;
+        (
+            beacon,
+            selection_finished.load(Ordering::SeqCst),
+            contribution_finished.load(Ordering::SeqCst),
+        )
+    }
+
+    fn arrivals(beacon: &MockBeaconNodeClient, method: MockMethod) -> usize {
+        beacon.call_stamps().into_iter().filter(|stamp| stamp.method == method).count()
+    }
+
+    /// The selection proof returns at slot end + 500 ms. The contribution GET
+    /// is not sent. Removing the pre-GET deadline check polls the GET once.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_produce_ready_at_the_deadline_is_not_fetched() {
+        let (beacon, selection_finished, contribution_finished) =
+            sign_finishes_on_the_overhang(true, false).await;
+        assert_eq!(selection_finished, 1, "the selection proof completed on the overhang");
+        assert_eq!(contribution_finished, 0);
+        assert_eq!(arrivals(&beacon, MockMethod::GetSyncCommitteeContribution), 0);
+        assert_eq!(arrivals(&beacon, MockMethod::SubmitContributionAndProofs), 0);
+    }
+
+    /// The contribution signature returns at slot end + 500 ms. The POST is
+    /// not sent. Removing the pre-POST deadline check polls the POST once.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_wave_ready_at_the_deadline_is_not_posted() {
+        let (beacon, selection_finished, contribution_finished) =
+            sign_finishes_on_the_overhang(false, true).await;
+        assert_eq!(selection_finished, 1);
+        assert_eq!(
+            contribution_finished, 1,
+            "the contribution signature completed on the overhang"
+        );
+        assert_eq!(arrivals(&beacon, MockMethod::GetSyncCommitteeContribution), 1);
+        assert_eq!(arrivals(&beacon, MockMethod::SubmitContributionAndProofs), 0);
+    }
+
+    /// `timeout_at` on a past instant still polls its future once. The
+    /// pre-check is what keeps an already-due sign off the signer.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn sign_before_deadline_is_not_called_when_already_due() {
+        let polled = Arc::new(AtomicUsize::new(0));
+        let flag = Arc::clone(&polled);
+        let slot_end = tokio::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let outcome = sign_before_deadline(slot_end, Duration::from_secs(10), async move {
+            flag.fetch_add(1, Ordering::SeqCst);
+            Err::<crypto::Signature, ()>(())
+        })
+        .await;
+        assert!(matches!(outcome, Err(SignStop::Stopped { bounded_by_overhang: true })));
+        assert_eq!(polled.load(Ordering::SeqCst), 0, "a past deadline does not poll the signer");
     }
 }

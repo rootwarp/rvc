@@ -40,14 +40,20 @@ pub(crate) struct SlotContext {
     /// (the walk stopped on a non-404 error, or no header was found).
     /// [`ExpectedParents::closed`] rejects every parent.
     pub expected_parents: Option<ExpectedParents>,
-    /// Canonical head as of phase 2. Captured once at t=slot/3 and reused
-    /// at phase 3 (H-5). Left `None` at t=0 — a current-slot 404 then is
-    /// the normal path, not an exception. A timeout or a body that is not
-    /// `0x` plus 64 hex digits falls back to [`Self::parent_root`]. That
-    /// fallback is a liveness choice: the parent is the last head this
-    /// client verified, and signing it is valid and non-slashable for sync
-    /// messages. `None` after that fallback means no parent was verified
-    /// either, and sync duties skip.
+    /// Canonical head as of phase 2. Captured once per slot by the phase that
+    /// wins the fetch, then reused for later duties in that slot (H-5). Left
+    /// `None` at t=0: a current-slot 404 then is the normal path, not an
+    /// exception. The phase-2 fetch falls back to
+    /// [`Self::parent_root`] when the deadline has already passed, the fetch
+    /// times out, the slot is empty (HTTP 404), the beacon node returns any
+    /// other error, or the body is not `0x` plus 64 hex digits. That fallback
+    /// is a liveness choice. The parent is not always a head this client
+    /// verified: after four misses the t=0 walk keeps the beacon node's
+    /// `"head"` header when `header.slot` is below this slot, and does not
+    /// require that this client verified that root before. Signing the
+    /// fallback root is valid and non-slashable for sync messages. `None`
+    /// after that fallback means no parent root was stored, and sync duties
+    /// skip.
     pub head_root: Option<Root>,
     pub fence: beacon::DutyFence,
 }
@@ -264,16 +270,14 @@ async fn lookup_header(beacon: &dyn BeaconNodeClient, block_id: &str, slot: Slot
     }
 }
 
-/// Phase-2 block root: lowercase `0x` and exactly 64 hex digits (`A-F` allowed).
+/// Phase-2 block root: lowercase `0x` and exactly 32 bytes (`A-F` allowed).
+///
+/// `hex::decode` rejects non-hex and odd lengths. [`TryFrom`] rejects every
+/// other length, so no input reaches a panicking copy.
 fn parse_phase2_root(hex_str: &str) -> Option<Root> {
     let rest = hex_str.strip_prefix("0x")?;
-    if rest.len() != 64 || !rest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return None;
-    }
     let bytes = hex::decode(rest).ok()?;
-    let mut root = [0u8; 32];
-    root.copy_from_slice(&bytes);
-    Some(root)
+    <[u8; 32]>::try_from(bytes.as_slice()).ok()
 }
 
 fn decimal_slot_id(block_id: &str) -> Option<Slot> {
@@ -327,8 +331,10 @@ mod tests {
         assert!(!held.holds());
     }
 
+    use std::time::Duration;
+
     use beacon::{BlockRootData, DataResponse};
-    use bn_manager::MockBeaconNodeClient;
+    use bn_manager::{MockBeaconNodeClient, MockMethod};
     use tracing_test::traced_test;
 
     fn slot_vs_head_beacon(
@@ -1012,6 +1018,125 @@ mod tests {
             head_root: None,
             fence: beacon::DutyFence::open(),
         }
+    }
+
+    /// 40, 63, and 66 hex digits, and a non-hex 64-digit body, are not a head.
+    /// The stored head is the parent. A 32-byte decode is the only length
+    /// `try_from` accepts; nothing here panics.
+    #[tokio::test]
+    async fn phase2_root_of_wrong_length_or_non_hex_falls_back() {
+        let slot: Slot = 40;
+        let bodies = [
+            format!("0x{}", "ab".repeat(20)),
+            format!("0x{}a", "ab".repeat(31)),
+            format!("0x{}", "ab".repeat(33)),
+            format!("0x{}", "gg".repeat(32)),
+        ];
+        assert_eq!(bodies[0].len(), 2 + 40);
+        assert_eq!(bodies[1].len(), 2 + 63);
+        assert_eq!(bodies[2].len(), 2 + 66);
+        assert_eq!(bodies[3].len(), 2 + 64);
+        for body in bodies {
+            let owned = body.clone();
+            let slot_id = slot.to_string();
+            let beacon = MockBeaconNodeClient::new().with_get_block_root(move |block_id| {
+                if block_id != slot_id {
+                    return Err(beacon::BeaconError::HttpError(format!(
+                        "unexpected block_id {block_id}"
+                    )));
+                }
+                Ok(DataResponse { data: BlockRootData { root: owned.clone() } })
+            });
+            let mut ctx = ctx_with_parent(slot);
+            ctx.apply_phase2_head(&beacon).await;
+            assert_eq!(ctx.head_root, Some(parent_root()), "{body}");
+        }
+    }
+
+    /// Every documented miss keeps the t=0 parent: empty-slot 404, a non-404
+    /// error, an invalid body, a fetch that outlives its deadline, and a
+    /// deadline that has already passed.
+    #[tokio::test(start_paused = true)]
+    async fn phase2_head_falls_back_to_parent_on_every_fetch_miss() {
+        let slot: Slot = 40;
+        let slot_id = slot.to_string();
+        let misses: Vec<MockBeaconNodeClient> = vec![
+            // Queried slot >= head slot is the empty-slot 404.
+            MockBeaconNodeClient::new()
+                .with_slot_aware_block_root(slot, &[], |_| format!("0x{}", "11".repeat(32))),
+            MockBeaconNodeClient::new()
+                .with_get_block_root(|_| Err(beacon::BeaconError::HttpError("down".into()))),
+            MockBeaconNodeClient::new().with_get_block_root({
+                let slot_id = slot_id.clone();
+                move |block_id| {
+                    if block_id != slot_id {
+                        return Err(beacon::BeaconError::HttpError(format!(
+                            "unexpected block_id {block_id}"
+                        )));
+                    }
+                    Err(beacon::BeaconError::ApiError {
+                        status: 503,
+                        message: "unavailable".into(),
+                    })
+                }
+            }),
+            MockBeaconNodeClient::new().with_get_block_root({
+                let slot_id = slot_id.clone();
+                move |block_id| {
+                    if block_id != slot_id {
+                        return Err(beacon::BeaconError::HttpError(format!(
+                            "unexpected block_id {block_id}"
+                        )));
+                    }
+                    Ok(DataResponse { data: BlockRootData { root: "0xabcd".to_string() } })
+                }
+            }),
+        ];
+        for beacon in misses {
+            let mut ctx = ctx_with_parent(slot);
+            ctx.apply_phase2_head(&beacon).await;
+            assert_eq!(ctx.head_root, Some(parent_root()));
+        }
+
+        let beacon = MockBeaconNodeClient::new()
+            .with_method_delay(MockMethod::GetBlockRoot, Duration::from_secs(120))
+            .with_get_block_root({
+                let slot_id = slot_id.clone();
+                move |block_id| {
+                    if block_id != slot_id {
+                        return Err(beacon::BeaconError::HttpError(format!(
+                            "unexpected block_id {block_id}"
+                        )));
+                    }
+                    Ok(DataResponse {
+                        data: BlockRootData { root: format!("0x{}", "ab".repeat(32)) },
+                    })
+                }
+            });
+        let mut ctx = ctx_with_parent(slot);
+        ctx.apply_phase2_head(&beacon).await;
+        assert_eq!(ctx.head_root, Some(parent_root()), "a 60 s deadline cuts a 120 s fetch");
+        assert!(beacon.get_block_root_calls().is_empty(), "the handler does not run after cancel");
+
+        let beacon = MockBeaconNodeClient::new().with_get_block_root({
+            let slot_id = slot_id.clone();
+            move |block_id| {
+                if block_id != slot_id {
+                    return Err(beacon::BeaconError::HttpError(format!(
+                        "unexpected block_id {block_id}"
+                    )));
+                }
+                Ok(DataResponse { data: BlockRootData { root: format!("0x{}", "cd".repeat(32)) } })
+            }
+        });
+        let fetched = fetch_head_root(&beacon, slot, tokio::time::Instant::now()).await;
+        assert!(fetched.is_none());
+        assert!(beacon.get_block_root_calls().is_empty());
+        let mut ctx = ctx_with_parent(slot);
+        if let Some(root) = fetched.or(ctx.parent_root) {
+            ctx.set_head(root);
+        }
+        assert_eq!(ctx.head_root, Some(parent_root()));
     }
 
     /// A body that is not `0x` plus 64 hex digits is rejected as a whole.
