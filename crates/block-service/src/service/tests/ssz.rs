@@ -979,3 +979,95 @@ async fn corrupt_blobs_offset_fails_before_the_header_is_signed() {
     assert!(signer.block_calls.lock().unwrap().is_empty());
     assert!(beacon.publish_ssz_calls.lock().unwrap().is_empty());
 }
+
+fn blinded_beacon_block_ssz(
+    slot: u64,
+    proposer_index: u64,
+    parent_root: [u8; 32],
+    state_root: [u8; 32],
+    body: &[u8],
+) -> Vec<u8> {
+    let body_offset: u32 = 84;
+    let mut bytes = Vec::with_capacity(84 + body.len());
+    bytes.extend_from_slice(&slot.to_le_bytes());
+    bytes.extend_from_slice(&proposer_index.to_le_bytes());
+    bytes.extend_from_slice(&parent_root);
+    bytes.extend_from_slice(&state_root);
+    bytes.extend_from_slice(&body_offset.to_le_bytes());
+    bytes.extend_from_slice(body);
+    bytes
+}
+
+fn blinded_ssz_response(ssz: Vec<u8>, consensus_version: &str) -> ProduceBlockResponse {
+    ProduceBlockResponse {
+        data: serde_json::Value::Null,
+        is_blinded: true,
+        consensus_version: consensus_version.to_string(),
+        execution_payload_value: None,
+        is_ssz: true,
+        ssz_bytes: Some(ssz),
+        payload_included: false,
+        builder_url: None,
+        consensus_block_value: None,
+        candidate_memo: beacon::CandidateMemo::arc(),
+    }
+}
+
+#[tokio::test]
+async fn ssz_blinded_deneb_body_under_electra_header_signs_nothing() {
+    let body = eth_types::external_vector_blinded_deneb_body().as_ssz_bytes();
+    let ssz = blinded_beacon_block_ssz(3_000_000, 42, [0x11; 32], [0x22; 32], &body);
+    for version in ["electra", "fulu"] {
+        let pubkey = test_pubkey();
+        let beacon =
+            Arc::new(MockBeaconClient::from_response(blinded_ssz_response(ssz.clone(), version)));
+        let signer = Arc::new(MockSigner::new());
+        let service = BlockService::new(
+            signer.clone(),
+            beacon.clone(),
+            Arc::new(test_validator_store(&pubkey)),
+            Arc::new(test_fork_schedule_for(version)),
+            [0xaa; 32],
+        );
+        let err = service.propose_block(3_000_000, &pubkey, 42, None).await.expect_err(version);
+        // `blinded_root` is the check. A later body-leaf hash must not be what
+        // rejects this block: auto-detect in `blinded_root` would still fail
+        // the leaf hash, and this assertion would not notice.
+        assert!(
+            matches!(
+                err,
+                BlockServiceError::Parse(ref msg)
+                    if msg.contains("invalid blinded block body for tree_hash_root")
+                        && msg.contains("invalid SSZ body encoding")
+            ),
+            "{version}: {err:?}"
+        );
+        assert!(signer.header_calls.lock().unwrap().is_empty(), "{version}");
+        assert!(signer.block_calls.lock().unwrap().is_empty(), "{version}");
+        assert!(beacon.publish_ssz_calls.lock().unwrap().is_empty(), "{version}");
+        assert!(beacon.publish_blinded_calls.lock().unwrap().is_empty(), "{version}");
+    }
+}
+
+#[tokio::test]
+async fn ssz_blinded_electra_block_signs_the_external_block_root() {
+    let body = eth_types::external_vector_blinded_electra_body().as_ssz_bytes();
+    let ssz = blinded_beacon_block_ssz(3_000_000, 42, [0x11; 32], [0x22; 32], &body);
+    let pubkey = test_pubkey();
+    let beacon = Arc::new(MockBeaconClient::from_response(blinded_ssz_response(ssz, "electra")));
+    let signer = Arc::new(MockSigner::new());
+    let service = BlockService::new(
+        signer.clone(),
+        beacon.clone(),
+        Arc::new(test_validator_store(&pubkey)),
+        Arc::new(test_fork_schedule_for("electra")),
+        [0xaa; 32],
+    );
+    let result = service.propose_block(3_000_000, &pubkey, 42, None).await.expect("electra ssz");
+    let expected = hex::decode(eth_types::EXTERNAL_BLINDED_ELECTRA_BLOCK_ROOT_HEX).expect("kat");
+    assert_eq!(result.block_root.as_slice(), expected.as_slice());
+    assert_eq!(signer.block_calls.lock().unwrap().len(), 1);
+    assert_eq!(signer.block_calls.lock().unwrap()[0].block_root.as_slice(), expected.as_slice());
+    assert_eq!(beacon.publish_ssz_calls.lock().unwrap().len(), 1);
+    assert!(beacon.publish_ssz_calls.lock().unwrap()[0].is_blinded);
+}

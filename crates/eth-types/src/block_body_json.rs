@@ -53,21 +53,107 @@ pub fn decode(json: &Value, layout: BodyForkLayout) -> Result<Vec<u8>, BodySszEr
 ///
 /// [`BodyForkLayout::Gloas`] returns [`BodySszError::GloasUnsupported`] without
 /// reading `json`. A full `execution_payload` object is [`BodySszError::InvalidEncoding`].
+///
+/// After the body decodes, [`reject_keys_absent_after_round_trip`] rejects an
+/// input key that the JSON re-encoded from that SSZ does not contain at the
+/// same path. Shared container types stay without `deny_unknown_fields`.
 pub fn decode_blinded(json: &Value, layout: BodyForkLayout) -> Result<Vec<u8>, BodySszError> {
-    reject_beacon_api_lenient_spellings(json)?;
-    match layout {
+    let ssz = match layout {
+        BodyForkLayout::Gloas => return Err(BodySszError::GloasUnsupported),
         BodyForkLayout::Deneb => {
+            reject_beacon_api_lenient_spellings(json)?;
             let body = BlindedBeaconBlockBodyDeneb::deserialize(json)
                 .map_err(|err| BodySszError::InvalidEncoding(err.to_string()))?;
-            Ok(body.as_ssz_bytes())
+            body.as_ssz_bytes()
         }
         BodyForkLayout::Electra => {
+            reject_beacon_api_lenient_spellings(json)?;
             let body = BlindedBeaconBlockBodyElectra::deserialize(json)
                 .map_err(|err| BodySszError::InvalidEncoding(err.to_string()))?;
-            Ok(body.as_ssz_bytes())
+            body.as_ssz_bytes()
         }
-        BodyForkLayout::Gloas => Err(BodySszError::GloasUnsupported),
+    };
+    let canonical = encode_blinded(&ssz, layout)?;
+    reject_keys_absent_after_round_trip(json, &canonical)?;
+    Ok(ssz)
+}
+
+/// Reject an input key that `canonical` does not contain at the same path.
+///
+/// Objects are compared by key. Arrays of the same length are compared by
+/// index. An input array whose canonical value is not an array is rejected,
+/// so a struct written as a positional JSON array cannot hide a nested key
+/// when the re-encoded SSZ is an object. A flat array of scalars whose
+/// canonical value is a string is kept: those elements have no keys, and a
+/// byte list re-encodes as hex. An input object whose canonical value is not
+/// an object is rejected. A scalar has no keys. The field name in the error
+/// is at most 64 Unicode scalars. A control character, U+2028, or U+2029 in
+/// that prefix is replaced with U+FFFD so the error string cannot break a
+/// log line.
+pub fn reject_keys_absent_after_round_trip(
+    input: &Value,
+    canonical: &Value,
+) -> Result<(), BodySszError> {
+    match (input, canonical) {
+        (Value::Object(input_map), Value::Object(canon_map)) => {
+            for key in input_map.keys() {
+                if !canon_map.contains_key(key) {
+                    return Err(BodySszError::InvalidEncoding(format!(
+                        "unknown JSON field `{}`",
+                        shown_json_field(key)
+                    )));
+                }
+            }
+            for (key, input_value) in input_map {
+                if let Some(canon_value) = canon_map.get(key) {
+                    reject_keys_absent_after_round_trip(input_value, canon_value)?;
+                }
+            }
+            Ok(())
+        }
+        (Value::Array(input_items), Value::Array(canon_items)) => {
+            if input_items.len() != canon_items.len() {
+                return Err(BodySszError::InvalidEncoding(
+                    "JSON array length does not match the re-encoded SSZ".into(),
+                ));
+            }
+            for (input_item, canon_item) in input_items.iter().zip(canon_items.iter()) {
+                reject_keys_absent_after_round_trip(input_item, canon_item)?;
+            }
+            Ok(())
+        }
+        (Value::Array(input_items), Value::String(_))
+            if input_items.iter().all(json_value_is_scalar) =>
+        {
+            Ok(())
+        }
+        (Value::Array(_), _) => Err(BodySszError::InvalidEncoding(
+            "JSON array was not retained by the re-encoded SSZ".into(),
+        )),
+        (Value::Object(_), _) => Err(BodySszError::InvalidEncoding(
+            "JSON object was not retained by the re-encoded SSZ".into(),
+        )),
+        _ => Ok(()),
     }
+}
+
+fn json_value_is_scalar(value: &Value) -> bool {
+    matches!(value, Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_))
+}
+
+fn shown_json_field(key: &str) -> String {
+    key.chars()
+        .take(64)
+        .map(
+            |ch| {
+                if ch.is_control() || ch == '\u{2028}' || ch == '\u{2029}' {
+                    '\u{fffd}'
+                } else {
+                    ch
+                }
+            },
+        )
+        .collect()
 }
 
 /// Canonical SSZ bytes → Beacon-API JSON object.
@@ -485,5 +571,123 @@ mod tests {
         plus["execution_payload_header"]["block_number"] = Value::String("+1".into());
         let err = decode_blinded(&plus, BodyForkLayout::Deneb).expect_err("plus");
         assert!(err.to_string().contains("leading +"), "{err}");
+    }
+
+    #[test]
+    fn blinded_decode_rejects_an_unknown_nested_field() {
+        let mut header = parse(DENEB_BLINDED_BODY_JSON);
+        header["execution_payload_header"]["not_a_header_field"] = serde_json::json!(1);
+        let err = decode_blinded(&header, BodyForkLayout::Deneb).expect_err("header");
+        assert!(err.to_string().contains("not_a_header_field"), "{err}");
+
+        let mut eth1 = parse(DENEB_BLINDED_BODY_JSON);
+        eth1["eth1_data"]["not_an_eth1_field"] = serde_json::json!(true);
+        let err = decode_blinded(&eth1, BodyForkLayout::Deneb).expect_err("eth1");
+        assert!(err.to_string().contains("not_an_eth1_field"), "{err}");
+
+        let mut sync = parse(DENEB_BLINDED_BODY_JSON);
+        sync["sync_aggregate"]["not_a_sync_field"] = serde_json::json!(1);
+        let err = decode_blinded(&sync, BodyForkLayout::Deneb).expect_err("sync");
+        assert!(err.to_string().contains("not_a_sync_field"), "{err}");
+
+        let mut body = parse(ELECTRA_BLINDED_BODY_JSON);
+        body["execution_requests"]["withdrawals"] = serde_json::json!([{
+            "source_address": format!("0x{}", "ab".repeat(20)),
+            "validator_pubkey": format!("0x{}", "cd".repeat(48)),
+            "amount": "1",
+            "not_a_withdrawal_field": "1"
+        }]);
+        let mut accepted = body.clone();
+        accepted["execution_requests"]["withdrawals"][0]
+            .as_object_mut()
+            .expect("withdrawal")
+            .remove("not_a_withdrawal_field");
+        assert!(
+            decode_blinded(&accepted, BodyForkLayout::Electra).is_ok(),
+            "the withdrawal without the extra key decodes"
+        );
+        let err = decode_blinded(&body, BodyForkLayout::Electra).expect_err("withdrawal");
+        assert!(err.to_string().contains("not_a_withdrawal_field"), "{err}");
+    }
+
+    /// `serde_json::Value` accepts a struct as a positional array. Re-encode
+    /// writes an object, so the extra key must not survive that shape change.
+    #[test]
+    fn blinded_decode_rejects_positional_execution_requests_with_an_unknown_withdrawal_field() {
+        let mut body = parse(ELECTRA_BLINDED_BODY_JSON);
+        body["execution_requests"] = serde_json::json!([
+            [],
+            [{
+                "source_address": format!("0x{}", "ab".repeat(20)),
+                "validator_pubkey": format!("0x{}", "cd".repeat(48)),
+                "amount": "1",
+                "not_a_withdrawal_field": "1"
+            }],
+            []
+        ]);
+        let err = decode_blinded(&body, BodyForkLayout::Electra)
+            .expect_err("positional execution_requests");
+        assert!(err.to_string().contains("JSON array was not retained"), "{err}");
+    }
+
+    #[test]
+    fn round_trip_keeps_a_scalar_array_encoded_as_hex_and_rejects_other_array_shapes() {
+        let scalars = serde_json::json!([1, true, "0xab"]);
+        let hex = serde_json::json!("0x010203");
+        assert!(reject_keys_absent_after_round_trip(&scalars, &hex).is_ok());
+
+        let nested = serde_json::json!([[1]]);
+        let err = reject_keys_absent_after_round_trip(&nested, &hex).expect_err("nested array");
+        assert!(err.to_string().contains("JSON array was not retained"), "{err}");
+
+        let object = serde_json::json!({"amount": "1"});
+        let err = reject_keys_absent_after_round_trip(&scalars, &object).expect_err("object");
+        assert!(err.to_string().contains("JSON array was not retained"), "{err}");
+
+        let with_key = serde_json::json!([{"not_a_field": 1}]);
+        let err = reject_keys_absent_after_round_trip(&with_key, &hex).expect_err("object element");
+        assert!(err.to_string().contains("JSON array was not retained"), "{err}");
+    }
+
+    #[test]
+    fn unknown_nested_field_error_caps_and_replaces_control_characters() {
+        let mut header = parse(DENEB_BLINDED_BODY_JSON);
+        let key = format!("bad\n\u{2028}{}", "k".repeat(80));
+        header["execution_payload_header"][&key] = serde_json::json!(1);
+        let err = decode_blinded(&header, BodyForkLayout::Deneb).expect_err("hostile key");
+        let text = err.to_string();
+        let expected = format!("bad\u{fffd}\u{fffd}{}", "k".repeat(59));
+        assert!(text.contains(&expected), "{text}");
+        assert!(!text.contains('\n') && !text.contains('\u{2028}'), "{text}");
+        assert!(!text.contains(&"k".repeat(60)), "{text}");
+    }
+
+    #[test]
+    fn full_body_decode_rejects_an_unknown_top_level_field() {
+        for (label, mut body, layout) in [
+            ("deneb", contents_body(DENEB_CONTENTS_JSON), BodyForkLayout::Deneb),
+            ("electra", parse(ELECTRA_BODY_JSON), BodyForkLayout::Electra),
+        ] {
+            assert!(decode(&body, layout).is_ok(), "{label} fixture decodes");
+            body["not_a_body_field"] = serde_json::json!(1);
+            let err = decode(&body, layout).expect_err(label);
+            assert!(err.to_string().contains("not_a_body_field"), "{label}: {err}");
+        }
+    }
+
+    #[test]
+    fn full_body_decode_drops_an_unknown_nested_field() {
+        for (label, mut body, layout) in [
+            ("deneb", contents_body(DENEB_CONTENTS_JSON), BodyForkLayout::Deneb),
+            ("electra", parse(ELECTRA_BODY_JSON), BodyForkLayout::Electra),
+        ] {
+            let clean = decode(&body, layout).expect(label);
+            body["execution_payload"]["not_a_payload_field"] = serde_json::json!(1);
+            body["eth1_data"]["not_an_eth1_field"] = serde_json::json!(1);
+            let decoded = decode(&body, layout).unwrap_or_else(|err| {
+                panic!("{label} nested unknown field is not a parse error: {err}")
+            });
+            assert_eq!(decoded, clean, "{label} nested unknown field is not in the SSZ");
+        }
     }
 }
