@@ -36,6 +36,27 @@ use secret_provider::SecretProvider;
 use super::error::ConfigError;
 use super::types::Config;
 
+fn log_fork_schedule(schedule: &ForkSchedule) {
+    info!(
+        genesis_version = %format_version(schedule.genesis_fork_version),
+        altair_epoch = schedule.altair_fork_epoch,
+        altair_version = %format_version(schedule.altair_fork_version),
+        bellatrix_epoch = schedule.bellatrix_fork_epoch,
+        bellatrix_version = %format_version(schedule.bellatrix_fork_version),
+        capella_epoch = schedule.capella_fork_epoch,
+        capella_version = %format_version(schedule.capella_fork_version),
+        deneb_epoch = schedule.deneb_fork_epoch,
+        deneb_version = %format_version(schedule.deneb_fork_version),
+        electra_epoch = schedule.electra_fork_epoch,
+        electra_version = %format_version(schedule.electra_fork_version),
+        fulu_epoch = schedule.fulu_fork_epoch,
+        fulu_version = %format_version(schedule.fulu_fork_version),
+        gloas_epoch = schedule.gloas_fork_epoch,
+        gloas_version = %format_version(schedule.gloas_fork_version),
+        "Loaded fork schedule from beacon node"
+    );
+}
+
 fn format_version(v: eth_types::Version) -> String {
     format!("0x{}", hex::encode(v))
 }
@@ -1072,30 +1093,34 @@ impl ServiceBuilder {
         Ok(root)
     }
 
+    /// Fork schedule from one beacon node. The offline exit CLI uses this.
     pub async fn build_fork_schedule(
         &self,
         beacon: &dyn BeaconNodeClient,
     ) -> Result<Arc<ForkSchedule>, ConfigError> {
         info!("Fetching fork schedule from beacon node");
         let schedule = beacon.get_fork_schedule().await?;
-        info!(
-            genesis_version = %format_version(schedule.genesis_fork_version),
-            altair_epoch = schedule.altair_fork_epoch,
-            altair_version = %format_version(schedule.altair_fork_version),
-            bellatrix_epoch = schedule.bellatrix_fork_epoch,
-            bellatrix_version = %format_version(schedule.bellatrix_fork_version),
-            capella_epoch = schedule.capella_fork_epoch,
-            capella_version = %format_version(schedule.capella_fork_version),
-            deneb_epoch = schedule.deneb_fork_epoch,
-            deneb_version = %format_version(schedule.deneb_fork_version),
-            electra_epoch = schedule.electra_fork_epoch,
-            electra_version = %format_version(schedule.electra_fork_version),
-            fulu_epoch = schedule.fulu_fork_epoch,
-            fulu_version = %format_version(schedule.fulu_fork_version),
-            gloas_epoch = schedule.gloas_fork_epoch,
-            gloas_version = %format_version(schedule.gloas_fork_version),
-            "Loaded fork schedule from beacon node"
-        );
+        log_fork_schedule(&schedule);
+        Ok(Arc::new(schedule))
+    }
+
+    /// Fork schedule that the beacon nodes agreed at boot.
+    ///
+    /// This is the value that BN admission compares against, so rvc signs
+    /// with the same schedule that each admitted node reports. Fails when
+    /// [`BnManager::agreed_spec_and_genesis`] has not stored an identity.
+    pub async fn build_agreed_fork_schedule(
+        &self,
+        beacon: &BnManager,
+    ) -> Result<Arc<ForkSchedule>, ConfigError> {
+        let schedule = beacon
+            .agreed_chain_identity()
+            .await
+            .map(|identity| identity.fork_schedule)
+            .ok_or_else(|| {
+                beacon::BeaconError::HttpError("beacon chain identity is not established".into())
+            })?;
+        log_fork_schedule(&schedule);
         Ok(Arc::new(schedule))
     }
 
@@ -2493,6 +2518,54 @@ mod tests {
             matches!(result, Err(BeaconError::BodyTooLarge { .. })),
             "proposer pool must apply beacon_max_body_bytes; got {result:?}"
         );
+    }
+
+    async fn mount_mainnet_identity(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let spec = format!(
+            r#"{{"data":{{"SLOT_DURATION_MS":"12000","SLOTS_PER_EPOCH":"32",{}}}}}"#,
+            bn_manager::MAINNET_FORK_SPEC_FIELDS
+        );
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(spec))
+            .mount(server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/beacon/genesis"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"data":{"genesis_time":"1606824023","genesis_validators_root":"0xabc","genesis_fork_version":"0x00000000"}}"#,
+            ))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_build_agreed_fork_schedule_is_the_agreed_schedule() {
+        let server = wiremock::MockServer::start().await;
+        mount_mainnet_identity(&server).await;
+        let config = Config { beacon_url: server.uri(), ..create_minimal_config() };
+        let builder = ServiceBuilder::new(config);
+        let manager = builder.build_bn_manager().expect("main BnManager");
+        manager
+            .agreed_spec_and_genesis(bn_manager::SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("boot agreement");
+        server.reset().await;
+
+        let schedule = builder.build_agreed_fork_schedule(&manager).await.expect("agreed schedule");
+        assert_eq!(*schedule, bn_manager::mainnet_fork_schedule());
+        let requests = server.received_requests().await.expect("requests");
+        assert!(requests.is_empty(), "the schedule is not read again: {requests:?}");
+    }
+
+    #[tokio::test]
+    async fn test_build_agreed_fork_schedule_without_identity_fails() {
+        let builder = ServiceBuilder::new(create_minimal_config());
+        let manager = builder.build_bn_manager().expect("main BnManager");
+        let err = builder.build_agreed_fork_schedule(&manager).await.expect_err("no identity");
+        assert!(err.to_string().contains("chain identity is not established"), "{err}");
     }
 
     #[tokio::test]

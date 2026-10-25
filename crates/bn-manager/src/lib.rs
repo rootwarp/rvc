@@ -5,7 +5,9 @@ mod broadcast;
 mod error;
 mod fan_out;
 
-pub use admission::{classify_identity, sync_check_interval_for, ChainIdentity, IdentityClass};
+pub use admission::{
+    classify_identity, sync_check_interval_for, ChainIdentity, IdentityClass, IdentityField,
+};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use fan_out::{
@@ -30,7 +32,10 @@ pub use error::BnManagerError;
 pub use manager::{BnManager, SpecAgreement, ATTEMPT_TIMEOUT_FLOOR};
 pub use metrics::{METRIC_POOL_MAIN, METRIC_POOL_PROPOSER};
 #[cfg(any(test, feature = "test-utils"))]
-pub use mock::{MockBeaconNodeClient, MockCallStamp, MockMethod, RecordedProduce};
+pub use mock::{
+    mainnet_fork_schedule, mainnet_fork_spec, MockBeaconNodeClient, MockCallStamp, MockMethod,
+    RecordedProduce, MAINNET_FORK_SPEC_FIELDS,
+};
 pub use sse::{
     parse_sse_event, BlockEvent, ChainReorgEvent, FinalizedCheckpointEvent, HeadEvent, SseConfig,
     SseConnectionState, SseError, SseEvent, DEFAULT_SSE_TOPICS,

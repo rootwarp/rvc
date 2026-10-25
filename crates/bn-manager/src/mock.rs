@@ -33,6 +33,30 @@ use crate::traits::{
 
 type Handler<A, R> = Arc<dyn Fn(A) -> Result<R, BeaconError> + Send + Sync>;
 
+/// Mainnet fork keys of `/eth/v1/config/spec` before Fulu, as JSON object
+/// members. Splice them into a spec body after the other keys.
+pub const MAINNET_FORK_SPEC_FIELDS: &str = concat!(
+    r#""GENESIS_FORK_VERSION":"0x00000000","#,
+    r#""ALTAIR_FORK_EPOCH":"74240","ALTAIR_FORK_VERSION":"0x01000000","#,
+    r#""BELLATRIX_FORK_EPOCH":"144896","BELLATRIX_FORK_VERSION":"0x02000000","#,
+    r#""CAPELLA_FORK_EPOCH":"194048","CAPELLA_FORK_VERSION":"0x03000000","#,
+    r#""DENEB_FORK_EPOCH":"269568","DENEB_FORK_VERSION":"0x04000000","#,
+    r#""ELECTRA_FORK_EPOCH":"364544","ELECTRA_FORK_VERSION":"0x05000000","#,
+    r#""FULU_FORK_EPOCH":"18446744073709551615","FULU_FORK_VERSION":"0x06000000","#,
+    r#""GLOAS_FORK_EPOCH":"18446744073709551615","GLOAS_FORK_VERSION":"0x07000000""#,
+);
+
+/// [`MAINNET_FORK_SPEC_FIELDS`] as a `/eth/v1/config/spec` data map.
+pub fn mainnet_fork_spec() -> HashMap<String, serde_json::Value> {
+    serde_json::from_str(&format!("{{{MAINNET_FORK_SPEC_FIELDS}}}"))
+        .expect("mainnet fork spec fields are a JSON object")
+}
+
+/// The fork schedule that [`MAINNET_FORK_SPEC_FIELDS`] gives.
+pub fn mainnet_fork_schedule() -> ForkSchedule {
+    beacon::parse_fork_schedule(&mainnet_fork_spec()).expect("mainnet fork spec parses")
+}
+
 /// Which `_by` produce method recorded a deadline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordedProduce {

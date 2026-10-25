@@ -955,7 +955,11 @@ builder_boost_factor = 80
     fn test_gloas_scheduled_missing_bn_version_fails() {
         let mut spec = spec_without_gloas();
         spec.insert("GLOAS_FORK_EPOCH".into(), json!("600000"));
-        let bn = parse_fork_schedule(&spec).unwrap();
+        let err = parse_fork_schedule(&spec).expect_err("a scheduled fork needs a version");
+        assert!(err.to_string().contains("GLOAS_FORK_VERSION"), "{err}");
+        // Reconciliation still rejects the sentinel version if it is given directly.
+        let mut bn = parse_fork_schedule(&spec_without_gloas()).unwrap();
+        bn.gloas_fork_epoch = 600_000;
         let local = local_gloas(Some(600_000), Some("0x07000000"));
         let msg = mismatch_msg(&local, &bn);
         assert!(msg.contains("rvc-config"), "{msg}");

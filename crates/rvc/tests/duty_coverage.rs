@@ -664,6 +664,18 @@ async fn mount_bn(server: &MockServer, state: Arc<BnState>) {
         .mount(server)
         .await;
 
+    Mock::given(method("GET"))
+        .and(path("/eth/v1/beacon/genesis"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": {
+                "genesis_time": "1606824023",
+                "genesis_validators_root": format!("0x{}", hex::encode(GVR)),
+                "genesis_fork_version": "0x00000000"
+            }
+        })))
+        .mount(server)
+        .await;
+
     let state_v = Arc::clone(&state);
     Mock::given(method("GET"))
         .and(path("/eth/v1/beacon/states/head/validators"))
@@ -737,6 +749,14 @@ async fn beacon_handles(config: &Config) -> BeaconHandles {
     let beacon_client = sb.build_beacon().expect("beacon client");
     let bn_manager =
         sb.build_bn_manager_with_timeouts(bn_manager::OperationTimeouts::default()).expect("bn");
+    // `connect_beacon` agrees the chain identity before `build_services`.
+    bn_manager
+        .agreed_spec_and_genesis(
+            bn_manager::SpecAgreement::Responding,
+            &format!("0x{}", hex::encode(GVR)),
+        )
+        .await
+        .expect("main pool agrees");
     BeaconHandles {
         beacon_client,
         bn_manager,

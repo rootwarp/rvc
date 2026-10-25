@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use beacon::{
     block_value, hex_ids_equal, AttestationDataResponse, AttesterDutiesResponse, BeaconClient,
     BeaconCommitteeSubscription, BeaconError, BlockHeaderSummary, BlockRootResponse, BuilderConfig,
-    BuilderPreferencesEntry, ConfigSpecResponse, DutyFence, GenesisResponse, IndexedFailure,
-    PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
+    BuilderPreferencesEntry, ConfigSpecResponse, DutyFence, ForkScheduleAgreement, GenesisResponse,
+    IndexedFailure, PayloadAttestationDataResponse, ProduceBlockResponse, ProposerDutiesResponse,
     ProposerPreparation, PtcDutiesResponse, RankedBlock, ShapeConstraint,
     SignedContributionAndProof, StateForkResponse, SubmitAttestationResult,
     SubmitBuilderPreferencesResult, SyncCommitteeContributionResponse, SyncCommitteeDutiesResponse,
@@ -30,7 +30,9 @@ use observability::logging::RedactedUrl;
 
 use crate::sync_status::BnSyncStatus;
 
-use crate::admission::{classify_identity, AdmissionStamp, ChainIdentity, IdentityClass};
+use crate::admission::{
+    classify_identity, AdmissionStamp, ChainIdentity, IdentityClass, IdentityField,
+};
 use crate::broadcast::BroadcastResult;
 use crate::fan_out::{self, BnAttempt};
 use crate::health::{new_shared_health_trackers, BnHealthTracker, SharedHealthTrackers};
@@ -3443,8 +3445,12 @@ pub enum SpecAgreement {
 impl BnManager {
     /// Slot duration, slots per epoch, and genesis time.
     ///
-    /// A missing key, a value outside the slot-duration bound, or any
-    /// disagreement among responders fails closed. [`SpecAgreement::All`]
+    /// Also stores the [`ChainIdentity`]: these three values, the genesis
+    /// validators root, the genesis fork version, and the fork schedule from
+    /// the spec. A missing key, a value outside the slot-duration bound, or any
+    /// disagreement among responders fails closed. The fork schedule of
+    /// each later responder is compared key by key with
+    /// [`beacon::compare_fork_schedule`]. [`SpecAgreement::All`]
     /// also fails when any configured BN does not respond.
     /// [`SpecAgreement::Responding`] skips a connect failure, a timeout, or a
     /// proxy status (429, 502, 503, 504) and fails when nobody returned both
@@ -3466,6 +3472,8 @@ impl BnManager {
         let mut slots_per_epoch = None;
         let mut genesis_time = None;
         let mut genesis_fork_version = None;
+        let mut fork_schedule = None;
+        let mut unverified_specs = Vec::new();
         let mut responded = 0u32;
         let mut saw_root_mismatch = false;
         for (index, client) in self.clients.iter().enumerate() {
@@ -3500,10 +3508,14 @@ impl BnManager {
             // A genesis timeout still compares the spec already in hand.
             duration_ms = agree(duration_ms, ms, "slot duration")?;
             slots_per_epoch = agree(slots_per_epoch, slots, "SLOTS_PER_EPOCH")?;
+            let schedule = beacon::parse_fork_schedule(&spec.data)?;
             let Some(genesis) = genesis else {
+                // No verified root: compare this schedule after the loop, never seed it.
+                unverified_specs.push(spec.data);
                 self.mark_unadmitted(index);
                 continue;
             };
+            fork_schedule = agree_fork_schedule(fork_schedule, schedule, &spec.data)?;
             let parsed_genesis = genesis
                 .data
                 .genesis_time
@@ -3527,12 +3539,18 @@ impl BnManager {
                 "no beacon node responded with spec and genesis".into(),
             ));
         }
-        match (duration_ms, slots_per_epoch, genesis_time, genesis_fork_version) {
+        if let Some(agreed) = &fork_schedule {
+            for spec in &unverified_specs {
+                check_fork_schedule(spec, agreed)?;
+            }
+        }
+        match (duration_ms, slots_per_epoch, genesis_time, genesis_fork_version, fork_schedule) {
             (
                 Some(duration_ms),
                 Some(slots_per_epoch),
                 Some(genesis_time),
                 Some(genesis_fork_version),
+                Some(fork_schedule),
             ) => {
                 self.slot_duration_ms.store(duration_ms, Ordering::Release);
                 *self.chain_identity.write().await = Some(ChainIdentity {
@@ -3541,6 +3559,7 @@ impl BnManager {
                     genesis_time,
                     genesis_validators_root: configured_root.to_string(),
                     genesis_fork_version,
+                    fork_schedule,
                 });
                 Ok((duration_ms, slots_per_epoch, genesis_time))
             }
@@ -3553,8 +3572,9 @@ impl BnManager {
     /// Admit one boot-skipped beacon node after its spec and genesis match
     /// the chain the responding nodes agreed on.
     ///
-    /// `/eth/v1/node/syncing` does not admit the node. A mismatch leaves it
-    /// unadmitted.
+    /// `/eth/v1/node/syncing` does not admit the node. A mismatch, including
+    /// one fork epoch or fork version, revokes it. A missing or unparsable
+    /// fork key with no disagreement is an error and does not revoke.
     pub async fn admit_skipped_beacon(&self, index: usize) -> Result<(), BeaconError> {
         admit_client(
             &self.clients,
@@ -3593,9 +3613,10 @@ impl BnManager {
             let genesis = client.get_genesis().await;
             match classify_identity(&spec, &genesis, &identity) {
                 IdentityClass::Match => {}
-                IdentityClass::Mismatch => {
+                IdentityClass::Mismatch(field) => {
                     warn!(
                         bn_index = index,
+                        %field,
                         "proposer beacon node chain identity mismatch; left unadmitted"
                     );
                     self.revoke_admission(index);
@@ -3643,6 +3664,35 @@ fn agree(prev: Option<u64>, next: u64, field: &str) -> Result<Option<u64>, Beaco
         ))),
         _ => Ok(Some(next)),
     }
+}
+
+/// Keeps the agreed schedule, or `next` when there is none yet.
+///
+/// `next` comes from [`beacon::parse_fork_schedule`] on the same spec. That
+/// parse is the completeness gate: a missing or malformed key fails there,
+/// so the key-by-key comparison here can only match or disagree.
+fn agree_fork_schedule(
+    prev: Option<ForkSchedule>,
+    next: ForkSchedule,
+    spec: &HashMap<String, serde_json::Value>,
+) -> Result<Option<ForkSchedule>, BeaconError> {
+    match prev {
+        Some(prev) => {
+            check_fork_schedule(spec, &prev)?;
+            Ok(Some(prev))
+        }
+        None => Ok(Some(next)),
+    }
+}
+
+fn check_fork_schedule(
+    spec: &HashMap<String, serde_json::Value>,
+    agreed: &ForkSchedule,
+) -> Result<(), BeaconError> {
+    if beacon::compare_fork_schedule(spec, agreed) == ForkScheduleAgreement::Mismatch {
+        return Err(BeaconError::ParseError("beacon nodes disagree on the fork schedule".into()));
+    }
+    Ok(())
 }
 
 fn agree_hex(prev: Option<String>, next: &str, field: &str) -> Result<Option<String>, BeaconError> {
@@ -3770,7 +3820,8 @@ impl AdmissionWatch {
                             observed,
                         );
                     }
-                    IdentityClass::Mismatch => {
+                    IdentityClass::Mismatch(field) => {
+                        log_runtime_mismatch(index, field);
                         revoke_at(
                             &self.admitted,
                             &self.admission_generation,
@@ -3801,6 +3852,21 @@ impl AdmissionWatch {
                 warn!("no admitted proposer node; block production uses the main pool");
             }
         }
+    }
+}
+
+/// The schedule is fixed at boot, so a node that schedules a new fork stays
+/// revoked until rvc restarts and agrees the new schedule.
+fn log_runtime_mismatch(index: usize, field: IdentityField) {
+    if field == IdentityField::ForkSchedule {
+        warn!(
+            bn_index = index,
+            %field,
+            "beacon node fork schedule disagrees with the schedule loaded at boot; node revoked; \
+             restart rvc to load the new fork schedule"
+        );
+    } else {
+        warn!(bn_index = index, %field, "beacon node chain identity mismatch; node revoked");
     }
 }
 
@@ -3844,50 +3910,48 @@ async fn admit_client(
         identity.read().await.clone().ok_or_else(|| {
             BeaconError::HttpError("beacon chain identity is not established".into())
         })?;
-    let spec = client.get_config_spec().await?;
-    let duration_ms = beacon::parse_slot_duration_ms(&spec.data)?;
-    let slots = beacon::parse_slots_per_epoch(&spec.data)?;
-    if duration_ms != agreed.slot_duration_ms {
-        revoke_at(admitted, generations, gates, revocation, index);
-        return Err(BeaconError::ParseError(format!(
-            "beacon nodes disagree on slot duration: {} vs {duration_ms}",
-            agreed.slot_duration_ms
-        )));
-    }
-    if slots != agreed.slots_per_epoch {
-        revoke_at(admitted, generations, gates, revocation, index);
-        return Err(BeaconError::ParseError(format!(
-            "beacon nodes disagree on SLOTS_PER_EPOCH: {} vs {slots}",
-            agreed.slots_per_epoch
-        )));
-    }
-    let genesis = client.get_genesis().await?;
-    let parsed_genesis = genesis
-        .data
-        .genesis_time
-        .parse::<u64>()
-        .map_err(|e| BeaconError::ParseError(format!("invalid genesis_time: {e}")))?;
-    if parsed_genesis != agreed.genesis_time {
-        revoke_at(admitted, generations, gates, revocation, index);
-        return Err(BeaconError::ParseError(format!(
-            "beacon nodes disagree on genesis_time: {} vs {parsed_genesis}",
-            agreed.genesis_time
-        )));
-    }
-    if !hex_ids_equal(&agreed.genesis_validators_root, &genesis.data.genesis_validators_root) {
-        revoke_at(admitted, generations, gates, revocation, index);
-        return Err(BeaconError::ParseError(
-            "beacon nodes disagree on genesis_validators_root".into(),
-        ));
-    }
-    if !hex_ids_equal(&agreed.genesis_fork_version, &genesis.data.genesis_fork_version) {
-        revoke_at(admitted, generations, gates, revocation, index);
-        return Err(BeaconError::ParseError(
-            "beacon nodes disagree on genesis_fork_version".into(),
-        ));
+    // Read both sides before any error returns, so that a read or parse
+    // error on one field cannot hide a definite mismatch on another field.
+    let spec = client.get_config_spec().await;
+    let genesis = client.get_genesis().await;
+    match classify_identity(&spec, &genesis, &agreed) {
+        IdentityClass::Match => {}
+        IdentityClass::Mismatch(field) => {
+            revoke_at(admitted, generations, gates, revocation, index);
+            return Err(BeaconError::ParseError(format!("beacon nodes disagree on {field}")));
+        }
+        IdentityClass::Transient => return Err(identity_evidence_error(spec, genesis)),
     }
     grant_at(admitted, generations, gates, index, observed);
     Ok(())
+}
+
+/// The error that left [`classify_identity`] with no identity evidence.
+fn identity_evidence_error(
+    spec: Result<ConfigSpecResponse, BeaconError>,
+    genesis: Result<GenesisResponse, BeaconError>,
+) -> BeaconError {
+    let spec = match spec {
+        Ok(spec) => spec,
+        Err(e) => return e,
+    };
+    let genesis = match genesis {
+        Ok(genesis) => genesis,
+        Err(e) => return e,
+    };
+    let parsed = beacon::parse_slot_duration_ms(&spec.data)
+        .and_then(|_| beacon::parse_slots_per_epoch(&spec.data))
+        .and_then(|_| {
+            genesis
+                .data
+                .genesis_time
+                .parse::<u64>()
+                .map_err(|e| BeaconError::ParseError(format!("invalid genesis_time: {e}")))
+        });
+    match parsed {
+        Err(e) => e,
+        Ok(_) => BeaconError::ParseError("beacon node reported an incomplete fork schedule".into()),
+    }
 }
 
 #[async_trait]
@@ -10063,7 +10127,7 @@ mod tests {
     }
 
     fn spec_body(slot_ms: &str) -> String {
-        format!(r#"{{"data":{{"SLOT_DURATION_MS":"{slot_ms}","SLOTS_PER_EPOCH":"32"}}}}"#)
+        identity_spec(slot_ms, "32")
     }
 
     fn genesis_body(genesis_time: &str) -> String {
@@ -10500,6 +10564,243 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agreed_spec_stores_the_fork_schedule_in_the_chain_identity() {
+        use wiremock::MockServer;
+        let live = MockServer::start().await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![live.uri()])).expect("manager");
+        manager.agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc").await.expect("boot");
+        let identity = manager.agreed_chain_identity().await.expect("identity");
+        assert_eq!(identity.fork_schedule, crate::mock::mainnet_fork_schedule());
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_fails_closed_when_responders_disagree_on_a_future_fork_epoch() {
+        use wiremock::MockServer;
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let genesis = identity_genesis("1606824023", "0xabc", "0x00000000");
+        mount_identity(&first, &identity_spec("12000", "32"), &genesis).await;
+        mount_identity(&second, &identity_spec_with_fork("FULU_FORK_EPOCH", "411392"), &genesis)
+            .await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![first.uri(), second.uri()])).expect("manager");
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect_err("fork schedule disagreement");
+        assert!(err.to_string().contains("disagree on the fork schedule"), "{err}");
+        assert!(manager.agreed_chain_identity().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_accepts_a_responder_that_omits_an_unscheduled_fork() {
+        use wiremock::MockServer;
+        let first = MockServer::start().await;
+        let second = MockServer::start().await;
+        let genesis = identity_genesis("1606824023", "0xabc", "0x00000000");
+        mount_identity(&first, &identity_spec("12000", "32"), &genesis).await;
+        let mut data = crate::mock::mainnet_fork_spec();
+        data.remove("GLOAS_FORK_EPOCH");
+        data.remove("GLOAS_FORK_VERSION");
+        data.insert("SLOT_DURATION_MS".to_string(), serde_json::json!("12000"));
+        data.insert("SLOTS_PER_EPOCH".to_string(), serde_json::json!("32"));
+        mount_identity(&second, &serde_json::json!({ "data": data }).to_string(), &genesis).await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![first.uri(), second.uri()])).expect("manager");
+        manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("an unscheduled fork agrees with an absent fork key");
+        assert!(manager.is_admitted(0) && manager.is_admitted(1));
+    }
+
+    fn spec_without_gloas_keys() -> String {
+        let mut data = crate::mock::mainnet_fork_spec();
+        data.remove("GLOAS_FORK_EPOCH");
+        data.remove("GLOAS_FORK_VERSION");
+        data.insert("SLOT_DURATION_MS".to_string(), serde_json::json!("12000"));
+        data.insert("SLOTS_PER_EPOCH".to_string(), serde_json::json!("32"));
+        serde_json::json!({ "data": data }).to_string()
+    }
+
+    async fn mount_spec_body(server: &wiremock::MockServer, body: String) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_does_not_seed_the_fork_schedule_from_a_genesis_timeout() {
+        use wiremock::MockServer;
+        let slow = MockServer::start().await;
+        let live = MockServer::start().await;
+        mount_spec_body(&slow, spec_without_gloas_keys()).await;
+        mount_genesis_delayed(&slow, Duration::from_millis(300)).await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        let manager = manager_with_timeout(vec![slow.uri(), live.uri()], Duration::from_millis(50));
+        manager.agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc").await.expect("boot");
+        let identity = manager.agreed_chain_identity().await.expect("identity");
+        assert_eq!(
+            identity.fork_schedule,
+            crate::mock::mainnet_fork_schedule(),
+            "a node with no verified root does not seed the schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_compares_a_genesis_timeout_schedule_seeded_later() {
+        use wiremock::MockServer;
+        let slow = MockServer::start().await;
+        let live = MockServer::start().await;
+        mount_spec_body(&slow, identity_spec_with_fork("FULU_FORK_EPOCH", "411392")).await;
+        mount_genesis_delayed(&slow, Duration::from_millis(300)).await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        let manager = manager_with_timeout(vec![slow.uri(), live.uri()], Duration::from_millis(50));
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect_err("the timed-out spec is still compared");
+        assert!(err.to_string().contains("disagree on the fork schedule"), "{err}");
+        assert!(manager.agreed_chain_identity().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn agreed_spec_fails_closed_on_a_missing_fork_key() {
+        use wiremock::MockServer;
+        let live = MockServer::start().await;
+        mount_identity(
+            &live,
+            r#"{"data":{"SLOT_DURATION_MS":"12000","SLOTS_PER_EPOCH":"32"}}"#,
+            &identity_genesis("1606824023", "0xabc", "0x00000000"),
+        )
+        .await;
+        let manager = BnManager::new(BnManagerConfig::new(vec![live.uri()])).expect("manager");
+        let err = manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect_err("missing fork key");
+        assert!(err.to_string().contains("GENESIS_FORK_VERSION"), "{err}");
+    }
+
+    /// Boots with `skipped` unadmitted, then serves `spec` on it. The flag is
+    /// true when the admission attempt revoked the node.
+    async fn admit_skipped_with_spec(spec: &str) -> (BnManager, Result<(), BeaconError>, bool) {
+        admit_skipped_with(spec, &identity_genesis("1606824023", "0xabc", "0x00000000")).await
+    }
+
+    /// [`admit_skipped_with_spec`] with the genesis body that the node serves.
+    async fn admit_skipped_with(
+        spec: &str,
+        genesis: &str,
+    ) -> (BnManager, Result<(), BeaconError>, bool) {
+        use wiremock::MockServer;
+        let skipped = MockServer::start().await;
+        let live = MockServer::start().await;
+        mount_status(&skipped, "/eth/v1/config/spec", 503).await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![skipped.uri(), live.uri()])).expect("manager");
+        manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("503 is skipped");
+        skipped.reset().await;
+        mount_identity(&skipped, spec, genesis).await;
+        let generation = manager.admission_generation[0].load(Ordering::Acquire);
+        let result = manager.admit_skipped_beacon(0).await;
+        let revoked = manager.admission_generation[0].load(Ordering::Acquire) != generation;
+        (manager, result, revoked)
+    }
+
+    #[tokio::test]
+    async fn admit_skipped_beacon_malformed_duration_does_not_hide_a_root_mismatch() {
+        let spec = identity_spec("not_a_number", "32");
+        let (manager, result, revoked) =
+            admit_skipped_with(&spec, &identity_genesis("1606824023", "0xdef", "0x00000000")).await;
+        let err = result.expect_err("root mismatch");
+        assert!(err.to_string().contains("genesis_validators_root"), "{err}");
+        assert!(revoked, "a definite mismatch revokes");
+        assert!(!manager.is_admitted(0));
+    }
+
+    #[tokio::test]
+    async fn admit_skipped_beacon_malformed_duration_alone_is_an_error_without_revoke() {
+        let (manager, result, revoked) =
+            admit_skipped_with_spec(&identity_spec("not_a_number", "32")).await;
+        let err = result.expect_err("malformed duration");
+        assert!(err.to_string().contains("SLOT_DURATION_MS"), "{err}");
+        assert!(!revoked, "a parse error alone is not a definite mismatch");
+        assert!(!manager.is_admitted(0));
+    }
+
+    #[tokio::test]
+    async fn admit_skipped_beacon_genesis_error_does_not_hide_a_spec_mismatch() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let skipped = MockServer::start().await;
+        let live = MockServer::start().await;
+        mount_status(&skipped, "/eth/v1/config/spec", 503).await;
+        mount_spec_and_genesis(&live, "12000", "1606824023").await;
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![skipped.uri(), live.uri()])).expect("manager");
+        manager
+            .agreed_spec_and_genesis(SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("503 is skipped");
+        skipped.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/eth/v1/config/spec"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(identity_spec("6000", "32")))
+            .mount(&skipped)
+            .await;
+        mount_status(&skipped, "/eth/v1/beacon/genesis", 503).await;
+        let generation = manager.admission_generation[0].load(Ordering::Acquire);
+        let err = manager.admit_skipped_beacon(0).await.expect_err("duration mismatch");
+        assert!(err.to_string().contains("slot duration"), "{err}");
+        assert_ne!(manager.admission_generation[0].load(Ordering::Acquire), generation);
+    }
+
+    #[tokio::test]
+    async fn admit_skipped_beacon_rejects_a_future_fork_epoch_mismatch() {
+        let (manager, result, revoked) =
+            admit_skipped_with_spec(&identity_spec_with_fork("GLOAS_FORK_EPOCH", "500000")).await;
+        let err = result.expect_err("fork epoch mismatch");
+        assert!(err.to_string().contains("disagree on fork schedule"), "{err}");
+        assert!(revoked, "a definite mismatch revokes");
+        assert!(!manager.is_admitted(0));
+    }
+
+    #[tokio::test]
+    async fn admit_skipped_beacon_rejects_a_fork_version_mismatch() {
+        let (manager, result, revoked) = admit_skipped_with_spec(&identity_spec_with_fork(
+            "BELLATRIX_FORK_VERSION",
+            "0x0a000000",
+        ))
+        .await;
+        let err = result.expect_err("fork version mismatch");
+        assert!(err.to_string().contains("disagree on fork schedule"), "{err}");
+        assert!(revoked, "a definite mismatch revokes");
+        assert!(!manager.is_admitted(0));
+    }
+
+    #[tokio::test]
+    async fn admit_skipped_beacon_without_fork_keys_is_an_error_without_revoke() {
+        let (manager, result, revoked) = admit_skipped_with_spec(
+            r#"{"data":{"SLOT_DURATION_MS":"12000","SLOTS_PER_EPOCH":"32"}}"#,
+        )
+        .await;
+        let err = result.expect_err("missing fork keys");
+        assert!(err.to_string().contains("incomplete fork schedule"), "{err}");
+        assert!(!revoked, "missing keys are not a definite mismatch");
+        assert!(!manager.is_admitted(0));
+    }
+
+    #[tokio::test]
     async fn responding_agreement_skips_proxy_unavailable() {
         use wiremock::MockServer;
         for status in [502_u16, 503, 504, 429] {
@@ -10773,7 +11074,19 @@ mod tests {
     }
 
     fn identity_spec(slot_ms: &str, slots: &str) -> String {
-        format!(r#"{{"data":{{"SLOT_DURATION_MS":"{slot_ms}","SLOTS_PER_EPOCH":"{slots}"}}}}"#)
+        format!(
+            r#"{{"data":{{"SLOT_DURATION_MS":"{slot_ms}","SLOTS_PER_EPOCH":"{slots}",{}}}}}"#,
+            crate::mock::MAINNET_FORK_SPEC_FIELDS
+        )
+    }
+
+    /// [`identity_spec`] for 12 s and 32 slots, with one fork key changed.
+    fn identity_spec_with_fork(key: &str, value: &str) -> String {
+        let mut data = crate::mock::mainnet_fork_spec();
+        data.insert("SLOT_DURATION_MS".to_string(), serde_json::json!("12000"));
+        data.insert("SLOTS_PER_EPOCH".to_string(), serde_json::json!("32"));
+        data.insert(key.to_string(), serde_json::json!(value));
+        serde_json::json!({ "data": data }).to_string()
     }
 
     fn identity_genesis(time: &str, root: &str, fork: &str) -> String {
@@ -11018,6 +11331,70 @@ mod tests {
             &identity_genesis("1606824023", "0xabc", "0x00000000"),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn future_fork_epoch_mismatch_revokes_at_runtime() {
+        assert_field_mismatch_revokes(
+            &identity_spec_with_fork("GLOAS_FORK_EPOCH", "500000"),
+            &identity_genesis("1606824023", "0xabc", "0x00000000"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn fork_schedule_revoke_at_runtime_names_the_cause_and_the_restart() {
+        let server = wiremock::MockServer::start().await;
+        let manager = boot_matching(std::slice::from_ref(&server)).await;
+        server.reset().await;
+        mount_identity(
+            &server,
+            &identity_spec_with_fork("GLOAS_FORK_EPOCH", "500000"),
+            &identity_genesis("1606824023", "0xabc", "0x00000000"),
+        )
+        .await;
+        manager.check_sync_status().await;
+        assert!(!manager.is_admitted(0));
+        assert!(logs_contain("field=fork schedule") || logs_contain("field=\"fork schedule\""));
+        assert!(logs_contain("restart rvc to load the new fork schedule"));
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn identity_revoke_at_runtime_names_the_field() {
+        let server = wiremock::MockServer::start().await;
+        let manager = boot_matching(std::slice::from_ref(&server)).await;
+        swap_identity(&server, "12000", "0xdef", "0x00000000").await;
+        manager.check_sync_status().await;
+        assert!(!manager.is_admitted(0));
+        assert!(logs_contain("beacon node chain identity mismatch; node revoked"));
+        assert!(logs_contain("genesis_validators_root"));
+    }
+
+    #[tokio::test]
+    async fn fork_version_mismatch_revokes_at_runtime() {
+        assert_field_mismatch_revokes(
+            &identity_spec_with_fork("ELECTRA_FORK_VERSION", "0x05000001"),
+            &identity_genesis("1606824023", "0xabc", "0x00000000"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn missing_required_fork_key_at_runtime_keeps_the_node_admitted() {
+        let server = wiremock::MockServer::start().await;
+        let manager = boot_matching(std::slice::from_ref(&server)).await;
+        server.reset().await;
+        let mut data = crate::mock::mainnet_fork_spec();
+        data.remove("DENEB_FORK_EPOCH");
+        data.insert("SLOT_DURATION_MS".to_string(), serde_json::json!("12000"));
+        data.insert("SLOTS_PER_EPOCH".to_string(), serde_json::json!("32"));
+        let spec = serde_json::json!({ "data": data }).to_string();
+        mount_identity(&server, &spec, &identity_genesis("1606824023", "0xabc", "0x00000000"))
+            .await;
+        manager.check_sync_status().await;
+        assert!(manager.is_admitted(0), "a missing fork key is no identity evidence");
     }
 
     #[tokio::test]
@@ -11293,6 +11670,7 @@ mod tests {
             genesis_time: 1_606_824_023,
             genesis_validators_root: "0xabc".to_string(),
             genesis_fork_version: "0x00000000".to_string(),
+            fork_schedule: crate::mock::mainnet_fork_schedule(),
         };
         let cases = [
             (
@@ -11328,6 +11706,18 @@ mod tests {
             (
                 "slots",
                 identity_spec("12000", "16"),
+                identity_genesis("1606824023", "0xabc", "0x00000000"),
+                false,
+            ),
+            (
+                "future fork epoch",
+                identity_spec_with_fork("FULU_FORK_EPOCH", "411392"),
+                identity_genesis("1606824023", "0xabc", "0x00000000"),
+                false,
+            ),
+            (
+                "fork version",
+                identity_spec_with_fork("ALTAIR_FORK_VERSION", "0x01000001"),
                 identity_genesis("1606824023", "0xabc", "0x00000000"),
                 false,
             ),

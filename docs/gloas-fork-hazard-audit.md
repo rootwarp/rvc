@@ -42,8 +42,8 @@ token, so the path span is only the path.
 | 2 `.index = 0` | 8 |
 | 3 `match ForkName` | 10 |
 | 4 string-literal dispatch | 11 |
-| 5 `.entries()` | 8 |
-| **Total** | **65** |
+| 5 `.entries()` | 9 |
+| **Total** | **66** |
 
 Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 
@@ -107,6 +107,7 @@ Kind `exhaustive` / `_` applies to classes 3 and 4. Other classes use `—`.
 | `crates/bn-manager/src/manager.rs` `ssz_produce_format` `match consensus_version {` | 4 | _ | must-bound | V3 SSZ duty check picks `BlockContents` or `BeaconBlock` from the consensus version string. `_ => None` rejects an unknown version instead of inheriting either format. | — |
 | `crates/rvc/src/orchestrator/coordinator/tests/fork_transition.rs` `test_gloas_slot_dispatches_produce_block_v4` `match &envelopes[0] {` | 4 | exhaustive | test-only | Envelope publish assert names consensus version `gloas`. Not a production dispatch. | — |
 | `crates/rvc/src/orchestrator/sync_committee.rs` `tests::contribution_kat` `match name {` | 4 | exhaustive | test-only | Test maps fixture fork names onto ContributionAndProof signing-root KATs. Closed set; `other` panics. Not a production consensus-version dispatch. | — |
+| `crates/beacon/src/types.rs` `compare_fork_schedule` `expected.entries().into_iter().zip(FORK_SCHEDULE_KEYS)` | 5 | — | inherit-intentionally | BN admission compares each fork key of `/eth/v1/config/spec` with the local schedule. The key table has `ForkName::COUNT` rows, so a new fork does not compile until it has its spec keys. | — |
 | `crates/crypto/src/typed_signer.rs` `SignContext::resolve` `.entries()` | 5 | — | must-bound | `SignContext::resolve` first-matches `fork_info.current_version` over `entries()`. Two `[0xFF;4]` rows (unscheduled Fulu+Gloas after 2.6) resolve Fulu, so `Gloas.fork_version()` does not round-trip. 2.6 pins the collision; 2.10 confines it to both-unscheduled. | 2.6 |
 | `crates/eth-types/src/fork.rs` `ForkName::activation_epoch` `.entries()` | 5 | — | inherit-intentionally | `activation_epoch` lookup through `entries()`. Same inherit. | 2.5b |
 | `crates/eth-types/src/fork.rs` `ForkName::fork_version` `.entries()` | 5 | — | inherit-intentionally | `fork_version` lookup through `entries()`. New row participates by construction. | 2.5b |

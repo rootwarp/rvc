@@ -172,10 +172,10 @@ pub async fn build_services(
         }
     };
 
-    let fork_schedule = match builder.build_fork_schedule(main_beacon.as_ref()).await {
+    let fork_schedule = match builder.build_agreed_fork_schedule(&beacon.bn_manager).await {
         Ok(schedule) => schedule,
         Err(e) => {
-            error!("Failed to fetch fork schedule from beacon node: {}", e);
+            error!("Failed to get the agreed fork schedule: {}", e);
             return Err(e.into());
         }
     };
@@ -448,6 +448,19 @@ mod tests {
         }
     }
 
+    /// [`beacon_handles`] after the main pool agreed spec and genesis, as
+    /// `connect_beacon` does before `build_services`.
+    async fn agreed_beacon_handles(server: &MockServer) -> BeaconHandles {
+        mount_genesis(server, "0xabc").await;
+        let beacon = beacon_handles(&server.uri()).await;
+        beacon
+            .bn_manager
+            .agreed_spec_and_genesis(bn_manager::SpecAgreement::Responding, "0xabc")
+            .await
+            .expect("main pool agrees");
+        beacon
+    }
+
     fn base_config(dir: &TempDir, beacon_uri: &str) -> Config {
         Config {
             beacon_url: beacon_uri.to_string(),
@@ -483,7 +496,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let server = mock_bn_server("0x05000000").await;
         let config = base_config(&dir, &server.uri());
-        let beacon = beacon_handles(&server.uri()).await;
+        let beacon = agreed_beacon_handles(&server).await;
 
         let sks: Vec<_> = (0..3).map(|_| SecretKey::generate()).collect();
         let pks: Vec<_> = sks.iter().map(|sk| sk.public_key()).collect();
@@ -522,7 +535,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let server = mock_bn_server("0x05000000").await;
         let config = base_config(&dir, &server.uri());
-        let mut beacon = beacon_handles(&server.uri()).await;
+        let mut beacon = agreed_beacon_handles(&server).await;
         beacon.slot_duration_ms = 6_000;
         let keys = loaded_keys(pubkey_map_with(&[]));
 
@@ -536,7 +549,7 @@ mod tests {
         let server = mock_bn_server("0xdeadbeef").await;
         let config = base_config(&dir, &server.uri());
         assert!(!config.allow_unsupported_fork);
-        let beacon = beacon_handles(&server.uri()).await;
+        let beacon = agreed_beacon_handles(&server).await;
         let keys = loaded_keys(pubkey_map_with(&[]));
 
         let result = run_phase(&config, &keys, &beacon).await;
@@ -555,7 +568,7 @@ mod tests {
         let server = mock_bn_server("0xdeadbeef").await;
         let mut config = base_config(&dir, &server.uri());
         config.allow_unsupported_fork = true;
-        let beacon = beacon_handles(&server.uri()).await;
+        let beacon = agreed_beacon_handles(&server).await;
         let keys = loaded_keys(pubkey_map_with(&[]));
 
         let handles = run_phase(&config, &keys, &beacon)
@@ -611,7 +624,7 @@ mod tests {
         // Default: attesting enabled.
         {
             let config = base_config(&dir, &server.uri());
-            let beacon = beacon_handles(&server.uri()).await;
+            let beacon = agreed_beacon_handles(&server).await;
             let keys = loaded_keys(pubkey_map_with(&[]));
             let handles = run_phase(&config, &keys, &beacon).await.expect("phase");
             assert!(
@@ -631,7 +644,7 @@ mod tests {
         {
             let mut config = base_config(&dir, &server.uri());
             config.disable_attesting = true;
-            let beacon = beacon_handles(&server.uri()).await;
+            let beacon = agreed_beacon_handles(&server).await;
             let keys = loaded_keys(pubkey_map_with(&[]));
             let handles = run_phase(&config, &keys, &beacon).await.expect("phase");
             assert!(
@@ -646,7 +659,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let server = mock_bn_server_gloas("0x05000000", None, None).await;
         let config = base_config(&dir, &server.uri());
-        let beacon = beacon_handles(&server.uri()).await;
+        let beacon = agreed_beacon_handles(&server).await;
         let keys = loaded_keys(pubkey_map_with(&[]));
 
         let handles =
@@ -663,7 +676,7 @@ mod tests {
             gloas_fork_epoch: Some(600_000),
             gloas_fork_version: Some("0X07000000".into()),
         };
-        let beacon = beacon_handles(&server.uri()).await;
+        let beacon = agreed_beacon_handles(&server).await;
         let keys = loaded_keys(pubkey_map_with(&[]));
 
         let handles =
@@ -679,7 +692,7 @@ mod tests {
         let server = mock_bn_server_gloas("0x05000000", Some("600000"), Some("0x07000000")).await;
         let mut config = base_config(&dir, &server.uri());
         config.allow_unsupported_fork = true;
-        let beacon = beacon_handles(&server.uri()).await;
+        let beacon = agreed_beacon_handles(&server).await;
         let keys = loaded_keys(pubkey_map_with(&[]));
 
         let result = run_phase(&config, &keys, &beacon).await;
@@ -772,7 +785,10 @@ mod tests {
     }
 
     fn proposer_spec(slot_ms: &str, slots: &str) -> String {
-        format!(r#"{{"data":{{"SLOT_DURATION_MS":"{slot_ms}","SLOTS_PER_EPOCH":"{slots}"}}}}"#)
+        format!(
+            r#"{{"data":{{"SLOT_DURATION_MS":"{slot_ms}","SLOTS_PER_EPOCH":"{slots}",{}}}}}"#,
+            bn_manager::MAINNET_FORK_SPEC_FIELDS
+        )
     }
 
     async fn mount_identity_body(server: &MockServer, spec: &str, genesis_root: &str) {

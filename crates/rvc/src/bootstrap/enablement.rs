@@ -862,9 +862,10 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/eth/v1/config/spec"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": { "SLOT_DURATION_MS": "6000", "SLOTS_PER_EPOCH": "32" }
-            })))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"data":{{"SLOT_DURATION_MS":"6000","SLOTS_PER_EPOCH":"32",{}}}}}"#,
+                bn_manager::MAINNET_FORK_SPEC_FIELDS
+            )))
             .mount(&server)
             .await;
         Mock::given(method("GET"))

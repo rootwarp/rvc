@@ -3,6 +3,37 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Beacon-node admission compares the fork schedule
+
+The chain identity that beacon nodes must match now includes the fork schedule. The schedule is each `*_FORK_EPOCH` and `*_FORK_VERSION` key of `GET /eth/v1/config/spec`, from `GENESIS_FORK_VERSION` through Gloas. Before this change, a node on a chain with the same genesis but a different fork epoch was admitted. Its signing domains could then differ from the local domains at the fork boundary.
+
+At boot, each responding node must report a complete schedule. A missing or unparsable required key fails startup. A `FULU_FORK_EPOCH` or `GLOAS_FORK_EPOCH` that schedules the fork (any value other than `18446744073709551615`) must also have its `*_FORK_VERSION` key. If that key is missing, startup fails. Responders that disagree on any fork epoch or fork version fail startup with `beacon nodes disagree on the fork schedule`. The validator client signs with the agreed schedule. It does not read the schedule again from one node.
+
+A node whose genesis read times out at boot has no verified genesis validators root. Its schedule is compared with the schedule that the verified nodes agreed, but it is not the source of that schedule.
+
+A boot-skipped node, a proposer node at boot, and the per-epoch re-check compare each identity field on its own. This includes each fork key:
+
+- A key that parses to a different value revokes the node. A malformed key does not hide a different value in another key or in the genesis response. For example, a malformed `SLOT_DURATION_MS` and a wrong genesis validators root revoke a boot-skipped node.
+- A missing or unparsable key, with no other key in disagreement, has no identity evidence. The re-check keeps the current admission. A boot-skipped node stays unadmitted. A proposer node with an incomplete schedule at boot stays unadmitted.
+- A missing `FULU_*` or `GLOAS_*` key means that the fork is not scheduled. It matches a local fork that is not scheduled. It revokes the node when the local schedule activates that fork.
+- When a fork is not scheduled locally and the node also reports epoch `18446744073709551615`, the fork version is not compared. No signing domain uses that version.
+
+A revoke at the re-check logs a warning with the `field` that disagrees. For the fork schedule, the message is `beacon node fork schedule disagrees with the schedule loaded at boot; node revoked; restart rvc to load the new fork schedule`.
+
+### Upgrade the beacon nodes to a release that schedules a new fork
+
+The fork schedule is loaded one time, at boot. A running rvc compares each beacon node with that schedule. When a beacon node starts to schedule a new fork, rvc revokes that node, also when the fork epoch is far in the future. When the last admitted node is revoked, duties halt until rvc restarts.
+
+Also, startup fails while the responding beacon nodes report different schedules, also on a named network. Thus rvc cannot start in the middle of a rolling upgrade in which some nodes schedule the fork and some do not.
+
+To upgrade the beacon nodes to a release that schedules a new fork, do these steps:
+
+1. Upgrade all the beacon nodes that rvc uses, in the main pool and in the proposer pool.
+2. If the new fork is Gloas, set `[fork_schedule]` (`gloas_fork_epoch` and `gloas_fork_version`) to the values of the new release.
+3. Restart rvc. At boot, rvc agrees the new schedule and admits the nodes again.
+
+> **Caution:** Do the restart soon after the beacon nodes report the new schedule. Until the restart, rvc does not use the revoked nodes, and duties halt when no node stays admitted.
+
 ## Doppelganger epoch clock and liveness logs
 
 The doppelganger epoch clock counts milliseconds. The slot is `(now_unix_ms - genesis_time * 1000) / slot_duration_ms`. The previous clock dropped the fractional second of the start time and of elapsed time, so a boundary could be up to almost two seconds late. The clock is not early.
@@ -501,11 +532,14 @@ A beacon node whose genesis validators root is not the configured root is
 rejected. It is not admitted, it is not the chain identity, and it is not a
 source of liveness or head and reorg events. A skipped node stays out of
 duties and liveness until its slot duration, `SLOTS_PER_EPOCH`, genesis time,
-`genesis_fork_version`, and genesis validators root match the boot agreement.
+`genesis_fork_version`, genesis validators root, and fork schedule match the
+boot agreement.
 Recovering `/eth/v1/node/syncing` does not admit it. A spec that arrives
 before a genesis timeout is still compared. A genesis timeout before any
 node has seeded still merges that spec's slot duration and `SLOTS_PER_EPOCH`.
-It does not seed genesis time or `genesis_fork_version`. If no node returns
+It does not seed genesis time, `genesis_fork_version`, or the fork schedule.
+Its fork schedule is compared with the schedule of the nodes that returned
+genesis. If no node returns
 genesis, boot fails and chain identity stays unset. HTTP 502, 503, 504, and
 429 count as not responding. HTTP 500 does not.
 

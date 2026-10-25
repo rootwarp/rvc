@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use eth_types::{
-    BeaconBlock, BlindedBeaconBlock, BlockContents, Epoch, ForkSchedule, PayloadAttestationData,
-    SyncCommitteeContribution, SyncCommitteeDuty, Version,
+    BeaconBlock, BlindedBeaconBlock, BlockContents, Epoch, ForkName, ForkSchedule,
+    PayloadAttestationData, SyncCommitteeContribution, SyncCommitteeDuty, Version,
 };
 use serde::{Deserialize, Serialize};
 
@@ -701,8 +701,10 @@ pub type StateForkResponse = StateResponse<StateFork>;
 /// Extracts fork epoch and version fields. Version fields are hex-encoded
 /// (e.g. `"0x00000000"`) and epoch fields are decimal strings (e.g. `"74240"`).
 /// `FULU_*` and `GLOAS_*` are optional: a missing key uses the unscheduled
-/// sentinels `u64::MAX` / `[0xFF; 4]`. A present but malformed value is a
-/// parse error naming that key.
+/// sentinels `u64::MAX` / `[0xFF; 4]`. A scheduled optional fork (epoch not
+/// `u64::MAX`) must have its version key, because the sentinel version would
+/// give wrong signing domains after that fork. A present but malformed value
+/// is a parse error naming that key.
 ///
 /// There is no `/eth/v1/config/fork_schedule` client method —
 /// [`crate::BeaconClient::get_config_spec`] (`/eth/v1/config/spec`) and
@@ -713,6 +715,10 @@ pub type StateForkResponse = StateResponse<StateFork>;
 pub fn parse_fork_schedule(
     spec: &HashMap<String, serde_json::Value>,
 ) -> Result<ForkSchedule, BeaconError> {
+    let (fulu_fork_epoch, fulu_fork_version) =
+        parse_optional_fork(spec, "FULU_FORK_EPOCH", "FULU_FORK_VERSION")?;
+    let (gloas_fork_epoch, gloas_fork_version) =
+        parse_optional_fork(spec, "GLOAS_FORK_EPOCH", "GLOAS_FORK_VERSION")?;
     Ok(ForkSchedule {
         genesis_fork_version: parse_version(spec, "GENESIS_FORK_VERSION")?,
         altair_fork_epoch: parse_epoch(spec, "ALTAIR_FORK_EPOCH")?,
@@ -725,19 +731,105 @@ pub fn parse_fork_schedule(
         deneb_fork_version: parse_version(spec, "DENEB_FORK_VERSION")?,
         electra_fork_epoch: parse_epoch(spec, "ELECTRA_FORK_EPOCH")?,
         electra_fork_version: parse_version(spec, "ELECTRA_FORK_VERSION")?,
-        fulu_fork_epoch: parse_epoch_optional(spec, "FULU_FORK_EPOCH", u64::MAX)?,
-        fulu_fork_version: parse_version_optional(
-            spec,
-            "FULU_FORK_VERSION",
-            [0xFF, 0xFF, 0xFF, 0xFF],
-        )?,
-        gloas_fork_epoch: parse_epoch_optional(spec, "GLOAS_FORK_EPOCH", u64::MAX)?,
-        gloas_fork_version: parse_version_optional(
-            spec,
-            "GLOAS_FORK_VERSION",
-            [0xFF, 0xFF, 0xFF, 0xFF],
-        )?,
+        fulu_fork_epoch,
+        fulu_fork_version,
+        gloas_fork_epoch,
+        gloas_fork_version,
     })
+}
+
+/// Epoch and version of a fork whose keys can be absent. A missing epoch is
+/// unscheduled. A missing version is allowed only for an unscheduled fork.
+fn parse_optional_fork(
+    spec: &HashMap<String, serde_json::Value>,
+    epoch_key: &str,
+    version_key: &str,
+) -> Result<(Epoch, Version), BeaconError> {
+    let epoch = parse_epoch_optional(spec, epoch_key, u64::MAX)?;
+    let version = parse_optional_fork_version(spec, version_key, epoch)?;
+    Ok((epoch, version))
+}
+
+fn parse_optional_fork_version(
+    spec: &HashMap<String, serde_json::Value>,
+    version_key: &str,
+    epoch: Epoch,
+) -> Result<Version, BeaconError> {
+    if epoch == u64::MAX {
+        parse_version_optional(spec, version_key, UNSCHEDULED_FORK_VERSION)
+    } else {
+        parse_version(spec, version_key)
+    }
+}
+
+/// Spec keys for each [`ForkSchedule::entries`] row: epoch key, version key,
+/// and whether a missing key means the fork is unscheduled.
+const FORK_SCHEDULE_KEYS: [(Option<&str>, &str, bool); ForkName::COUNT] = [
+    (None, "GENESIS_FORK_VERSION", false),
+    (Some("ALTAIR_FORK_EPOCH"), "ALTAIR_FORK_VERSION", false),
+    (Some("BELLATRIX_FORK_EPOCH"), "BELLATRIX_FORK_VERSION", false),
+    (Some("CAPELLA_FORK_EPOCH"), "CAPELLA_FORK_VERSION", false),
+    (Some("DENEB_FORK_EPOCH"), "DENEB_FORK_VERSION", false),
+    (Some("ELECTRA_FORK_EPOCH"), "ELECTRA_FORK_VERSION", false),
+    (Some("FULU_FORK_EPOCH"), "FULU_FORK_VERSION", true),
+    (Some("GLOAS_FORK_EPOCH"), "GLOAS_FORK_VERSION", true),
+];
+
+const UNSCHEDULED_FORK_VERSION: Version = [0xFF, 0xFF, 0xFF, 0xFF];
+
+/// Result of [`compare_fork_schedule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkScheduleAgreement {
+    Match,
+    /// At least one key parsed to a different value.
+    Mismatch,
+    /// No key disagrees, but a required key is missing or unparsable.
+    Incomplete,
+}
+
+/// Compares each fork epoch and version key of a `/eth/v1/config/spec` map
+/// against `expected`, one key at a time.
+///
+/// A malformed key does not hide a disagreement on another key. A missing
+/// `FULU_*` or `GLOAS_*` key reads as unscheduled, as in
+/// [`parse_fork_schedule`], so it disagrees with a scheduled local fork.
+/// When a fork is unscheduled (epoch `u64::MAX`) in `expected`, its version
+/// is compared only if the spec schedules that fork. No signing domain uses
+/// the version of a fork that never activates.
+pub fn compare_fork_schedule(
+    spec: &HashMap<String, serde_json::Value>,
+    expected: &ForkSchedule,
+) -> ForkScheduleAgreement {
+    let mut complete = true;
+    for ((_, want_epoch, want_version), (epoch_key, version_key, optional)) in
+        expected.entries().into_iter().zip(FORK_SCHEDULE_KEYS)
+    {
+        let epoch = epoch_key.map(|key| match optional {
+            true => parse_epoch_optional(spec, key, u64::MAX),
+            false => parse_epoch(spec, key),
+        });
+        let version_matters =
+            want_epoch != u64::MAX || matches!(epoch, Some(Ok(got)) if got != u64::MAX);
+        // An absent version is evidence only when the epoch parsed as unscheduled.
+        let version = version_matters.then(|| match (optional, &epoch) {
+            (true, Some(Ok(got))) => parse_optional_fork_version(spec, version_key, *got),
+            _ => parse_version(spec, version_key),
+        });
+        let epoch_agrees = epoch.map(|epoch| epoch.map(|got| got == want_epoch));
+        let version_agrees = version.map(|version| version.map(|got| got == want_version));
+        for agrees in epoch_agrees.into_iter().chain(version_agrees) {
+            match agrees {
+                Ok(true) => {}
+                Ok(false) => return ForkScheduleAgreement::Mismatch,
+                Err(_) => complete = false,
+            }
+        }
+    }
+    if complete {
+        ForkScheduleAgreement::Match
+    } else {
+        ForkScheduleAgreement::Incomplete
+    }
 }
 
 /// Parses slot duration in milliseconds from a `/eth/v1/config/spec` map.
@@ -1426,6 +1518,122 @@ mod tests {
         assert_eq!(schedule.fulu_fork_version, [6, 0, 0, 0]);
         assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
         assert_eq!(schedule.gloas_fork_version, [7, 0, 0, 0]);
+    }
+
+    #[test]
+    fn compare_fork_schedule_matches_the_parsed_schedule() {
+        let spec = mainnet_config_spec();
+        let local = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(compare_fork_schedule(&spec, &local), ForkScheduleAgreement::Match);
+    }
+
+    #[test]
+    fn compare_fork_schedule_flags_a_different_future_fork_epoch() {
+        let local = parse_fork_schedule(&mainnet_config_spec()).unwrap();
+        let mut spec = mainnet_config_spec();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("411392"));
+        assert_eq!(compare_fork_schedule(&spec, &local), ForkScheduleAgreement::Mismatch);
+    }
+
+    fn fully_scheduled_config_spec() -> HashMap<String, serde_json::Value> {
+        let mut spec = mainnet_config_spec();
+        spec.insert("FULU_FORK_EPOCH".to_string(), json!("411392"));
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!("500000"));
+        spec
+    }
+
+    #[test]
+    fn compare_fork_schedule_flags_every_epoch_and_version_key() {
+        let local = parse_fork_schedule(&fully_scheduled_config_spec()).unwrap();
+        for (epoch_key, version_key, _) in FORK_SCHEDULE_KEYS {
+            for key in epoch_key.into_iter().chain([version_key]) {
+                let mut spec = fully_scheduled_config_spec();
+                let changed =
+                    if key.ends_with("_EPOCH") { json!("1") } else { json!("0x0a0b0c0d") };
+                spec.insert(key.to_string(), changed);
+                assert_eq!(
+                    compare_fork_schedule(&spec, &local),
+                    ForkScheduleAgreement::Mismatch,
+                    "{key} is compared"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn compare_fork_schedule_malformed_key_does_not_hide_a_mismatch() {
+        let local = parse_fork_schedule(&mainnet_config_spec()).unwrap();
+        let mut spec = mainnet_config_spec();
+        spec.insert("ALTAIR_FORK_EPOCH".to_string(), json!("not_a_number"));
+        spec.insert("ELECTRA_FORK_VERSION".to_string(), json!("0x0a000000"));
+        assert_eq!(compare_fork_schedule(&spec, &local), ForkScheduleAgreement::Mismatch);
+    }
+
+    #[test]
+    fn compare_fork_schedule_missing_required_key_is_incomplete() {
+        let local = parse_fork_schedule(&mainnet_config_spec()).unwrap();
+        let mut spec = mainnet_config_spec();
+        spec.remove("DENEB_FORK_VERSION");
+        assert_eq!(compare_fork_schedule(&spec, &local), ForkScheduleAgreement::Incomplete);
+        spec = mainnet_config_spec();
+        spec.insert("CAPELLA_FORK_EPOCH".to_string(), json!("not_a_number"));
+        assert_eq!(compare_fork_schedule(&spec, &local), ForkScheduleAgreement::Incomplete);
+    }
+
+    #[test]
+    fn compare_fork_schedule_absent_future_fork_key_reads_as_unscheduled() {
+        let mut without_gloas = mainnet_config_spec();
+        without_gloas.remove("GLOAS_FORK_EPOCH");
+        without_gloas.remove("GLOAS_FORK_VERSION");
+        let unscheduled = parse_fork_schedule(&without_gloas).unwrap();
+        assert_eq!(
+            compare_fork_schedule(&without_gloas, &unscheduled),
+            ForkScheduleAgreement::Match
+        );
+
+        let mut scheduled_spec = mainnet_config_spec();
+        scheduled_spec.insert("GLOAS_FORK_EPOCH".to_string(), json!("500000"));
+        let scheduled = parse_fork_schedule(&scheduled_spec).unwrap();
+        assert_eq!(
+            compare_fork_schedule(&without_gloas, &scheduled),
+            ForkScheduleAgreement::Mismatch,
+            "a BN that omits a fork the local schedule activates disagrees"
+        );
+    }
+
+    #[test]
+    fn compare_fork_schedule_ignores_the_version_of_a_fork_unscheduled_on_both_sides() {
+        let local = parse_fork_schedule(&mainnet_config_spec()).unwrap();
+        assert_eq!(local.gloas_fork_version, [7, 0, 0, 0]);
+        let mut without_gloas = mainnet_config_spec();
+        without_gloas.remove("GLOAS_FORK_EPOCH");
+        without_gloas.remove("GLOAS_FORK_VERSION");
+        assert_eq!(
+            compare_fork_schedule(&without_gloas, &local),
+            ForkScheduleAgreement::Match,
+            "an absent future-fork key matches a local fork that is not scheduled"
+        );
+        let mut placeholder = mainnet_config_spec();
+        placeholder.insert("FULU_FORK_VERSION".to_string(), json!("0x0a0b0c0d"));
+        assert_eq!(compare_fork_schedule(&placeholder, &local), ForkScheduleAgreement::Match);
+    }
+
+    #[test]
+    fn compare_fork_schedule_scheduled_fork_without_version_is_not_a_match() {
+        let mut local = parse_fork_schedule(&fully_scheduled_config_spec()).unwrap();
+        local.gloas_fork_version = UNSCHEDULED_FORK_VERSION;
+        let mut spec = fully_scheduled_config_spec();
+        spec.remove("GLOAS_FORK_VERSION");
+        assert_eq!(compare_fork_schedule(&spec, &local), ForkScheduleAgreement::Incomplete);
+    }
+
+    #[test]
+    fn compare_fork_schedule_malformed_epoch_of_an_unscheduled_fork_is_incomplete() {
+        let local = parse_fork_schedule(&mainnet_config_spec()).unwrap();
+        let mut spec = mainnet_config_spec();
+        spec.insert("GLOAS_FORK_EPOCH".to_string(), json!("not_a_number"));
+        spec.insert("GLOAS_FORK_VERSION".to_string(), json!("0x0a0b0c0d"));
+        assert_eq!(compare_fork_schedule(&spec, &local), ForkScheduleAgreement::Incomplete);
     }
 
     #[test]
@@ -2628,6 +2836,28 @@ mod tests {
         let schedule = parse_fork_schedule(&spec).unwrap();
         assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
         assert_eq!(schedule.gloas_fork_version, [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_scheduled_fork_without_version_fails() {
+        for (epoch_key, version_key) in
+            [("FULU_FORK_EPOCH", "FULU_FORK_VERSION"), ("GLOAS_FORK_EPOCH", "GLOAS_FORK_VERSION")]
+        {
+            let mut spec = mainnet_config_spec();
+            spec.insert(epoch_key.to_string(), json!("600000"));
+            spec.remove(version_key);
+            let err = parse_fork_schedule(&spec).expect_err("scheduled fork needs a version");
+            assert!(err.to_string().contains(version_key), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_parse_fork_schedule_unscheduled_fork_without_version_uses_sentinel() {
+        let mut spec = mainnet_config_spec();
+        spec.remove("GLOAS_FORK_VERSION");
+        let schedule = parse_fork_schedule(&spec).unwrap();
+        assert_eq!(schedule.gloas_fork_epoch, u64::MAX);
+        assert_eq!(schedule.gloas_fork_version, [0xFF; 4]);
     }
 
     #[test]

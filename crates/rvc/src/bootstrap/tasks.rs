@@ -1222,11 +1222,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/eth/v1/config/spec"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_string(
-                    r#"{"data":{"SLOT_DURATION_MS":"12000","SLOTS_PER_EPOCH":"32"}}"#,
-                ),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"data":{{"SLOT_DURATION_MS":"12000","SLOTS_PER_EPOCH":"32",{}}}}}"#,
+                bn_manager::MAINNET_FORK_SPEC_FIELDS
+            )))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -1255,6 +1254,7 @@ mod tests {
                 genesis_time: 1_606_824_023,
                 genesis_validators_root: "0xabc".to_string(),
                 genesis_fork_version: "0x00000000".to_string(),
+                fork_schedule: bn_manager::mainnet_fork_schedule(),
             })
             .await;
         assert_eq!(admitted, 1);

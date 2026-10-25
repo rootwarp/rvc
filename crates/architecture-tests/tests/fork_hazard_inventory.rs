@@ -125,7 +125,7 @@ const EXPECTED_COUNTS: [(Class, usize); 5] = [
     (Class::IndexZero, 8),
     (Class::MatchForkName, 10),
     (Class::StringDispatch, 11),
-    (Class::Entries, 8),
+    (Class::Entries, 9),
 ];
 
 /// Checked-in content anchors. Sorted by (class, path, item, fingerprint).
@@ -648,6 +648,15 @@ const INVENTORY: &[Inv] = &[
         "—",
     ),
     // Class 5
+    inv(
+        "crates/beacon/src/types.rs",
+        "compare_fork_schedule",
+        Class::Entries,
+        false,
+        "expected.entries().into_iter().zip(FORK_SCHEDULE_KEYS)",
+        Verdict::InheritIntentionally,
+        "—",
+    ),
     inv(
         "crates/crypto/src/typed_signer.rs",
         "SignContext::resolve",

@@ -1,11 +1,19 @@
 //! Chain-identity classification shared with the proposer pool (FU-A6).
 
+use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use beacon::{hex_ids_equal, BeaconError, ConfigSpecResponse, GenesisResponse};
+use beacon::{
+    hex_ids_equal, BeaconError, ConfigSpecResponse, ForkScheduleAgreement, GenesisResponse,
+};
+use eth_types::ForkSchedule;
 
 /// Boot-agreed chain identity. Re-admission compares against this value.
+///
+/// The identity set is the genesis validators root, the slot duration,
+/// `SLOTS_PER_EPOCH`, the genesis time, the genesis fork version, and the
+/// fork schedule (each fork epoch and fork version of `/eth/v1/config/spec`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChainIdentity {
     pub slot_duration_ms: u64,
@@ -13,55 +21,105 @@ pub struct ChainIdentity {
     pub genesis_time: u64,
     pub genesis_validators_root: String,
     pub genesis_fork_version: String,
+    pub fork_schedule: ForkSchedule,
 }
 
 /// Result of comparing one node's spec and genesis to [`ChainIdentity`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityClass {
     Match,
-    Mismatch,
+    /// A parsed value disagrees. The field is the first disagreeing field.
+    Mismatch(IdentityField),
     /// No identity evidence. The caller keeps the current admission bit.
     Transient,
 }
 
-/// A parsed disagreement on either response is [`IdentityClass::Mismatch`].
+/// One field of [`ChainIdentity`]. `Display` gives the name in logs and errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityField {
+    ForkSchedule,
+    SlotDuration,
+    SlotsPerEpoch,
+    GenesisTime,
+    GenesisValidatorsRoot,
+    GenesisForkVersion,
+}
+
+impl fmt::Display for IdentityField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::ForkSchedule => "fork schedule",
+            Self::SlotDuration => "slot duration",
+            Self::SlotsPerEpoch => "SLOTS_PER_EPOCH",
+            Self::GenesisTime => "genesis_time",
+            Self::GenesisValidatorsRoot => "genesis_validators_root",
+            Self::GenesisForkVersion => "genesis_fork_version",
+        })
+    }
+}
+
+/// A parsed disagreement on any field is [`IdentityClass::Mismatch`].
 ///
-/// An error or an unparsable body on one side does not hide a contradiction
-/// in the response that did arrive. Both sides must parse and match before
-/// the result is [`IdentityClass::Match`]. Anything else with no parsed
-/// contradiction is [`IdentityClass::Transient`].
+/// Each field is compared on its own. An error or an unparsable value does
+/// not hide a contradiction in another field, on the same response or on the
+/// other one. Every field must parse and match before the result is
+/// [`IdentityClass::Match`]. Anything else with no parsed contradiction is
+/// [`IdentityClass::Transient`].
+///
+/// The fork keys of the spec are compared one key at a time with
+/// [`beacon::compare_fork_schedule`]. A missing `FULU_*` or `GLOAS_*` key
+/// reads as unscheduled.
 pub fn classify_identity(
     spec: &Result<ConfigSpecResponse, BeaconError>,
     genesis: &Result<GenesisResponse, BeaconError>,
     expected: &ChainIdentity,
 ) -> IdentityClass {
-    let spec_fields = spec.as_ref().ok().and_then(|spec| {
-        let duration_ms = beacon::parse_slot_duration_ms(&spec.data).ok()?;
-        let slots_per_epoch = beacon::parse_slots_per_epoch(&spec.data).ok()?;
-        Some((duration_ms, slots_per_epoch))
-    });
-    let genesis_fields = genesis.as_ref().ok().and_then(|genesis| {
-        let genesis_time = genesis.data.genesis_time.parse::<u64>().ok()?;
-        Some((
-            genesis_time,
-            genesis.data.genesis_fork_version.as_str(),
-            genesis.data.genesis_validators_root.as_str(),
-        ))
-    });
-    if let Some((duration_ms, slots_per_epoch)) = spec_fields {
-        if duration_ms != expected.slot_duration_ms || slots_per_epoch != expected.slots_per_epoch {
-            return IdentityClass::Mismatch;
-        }
+    let spec = spec.as_ref().ok().map(|spec| &spec.data);
+    let genesis = genesis.as_ref().ok().map(|genesis| &genesis.data);
+    let fields = [
+        (
+            IdentityField::ForkSchedule,
+            spec.and_then(|data| {
+                match beacon::compare_fork_schedule(data, &expected.fork_schedule) {
+                    ForkScheduleAgreement::Match => Some(true),
+                    ForkScheduleAgreement::Mismatch => Some(false),
+                    ForkScheduleAgreement::Incomplete => None,
+                }
+            }),
+        ),
+        (
+            IdentityField::SlotDuration,
+            spec.and_then(|data| beacon::parse_slot_duration_ms(data).ok())
+                .map(|duration_ms| duration_ms == expected.slot_duration_ms),
+        ),
+        (
+            IdentityField::SlotsPerEpoch,
+            spec.and_then(|data| beacon::parse_slots_per_epoch(data).ok())
+                .map(|slots| slots == expected.slots_per_epoch),
+        ),
+        (
+            IdentityField::GenesisTime,
+            genesis
+                .and_then(|data| data.genesis_time.parse::<u64>().ok())
+                .map(|time| time == expected.genesis_time),
+        ),
+        (
+            IdentityField::GenesisValidatorsRoot,
+            genesis.map(|data| {
+                hex_ids_equal(&expected.genesis_validators_root, &data.genesis_validators_root)
+            }),
+        ),
+        (
+            IdentityField::GenesisForkVersion,
+            genesis.map(|data| {
+                hex_ids_equal(&expected.genesis_fork_version, &data.genesis_fork_version)
+            }),
+        ),
+    ];
+    if let Some((field, _)) = fields.iter().find(|(_, agrees)| *agrees == Some(false)) {
+        return IdentityClass::Mismatch(*field);
     }
-    if let Some((genesis_time, fork_version, validators_root)) = genesis_fields {
-        if genesis_time != expected.genesis_time
-            || !hex_ids_equal(&expected.genesis_fork_version, fork_version)
-            || !hex_ids_equal(&expected.genesis_validators_root, validators_root)
-        {
-            return IdentityClass::Mismatch;
-        }
-    }
-    if spec_fields.is_some() && genesis_fields.is_some() {
+    if fields.iter().all(|(_, agrees)| *agrees == Some(true)) {
         IdentityClass::Match
     } else {
         IdentityClass::Transient
@@ -93,8 +151,6 @@ pub(crate) fn stamp_still_holds(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
 
     fn expected() -> ChainIdentity {
@@ -104,11 +160,12 @@ mod tests {
             genesis_time: 1_606_824_023,
             genesis_validators_root: "0xabc".to_string(),
             genesis_fork_version: "0x00000000".to_string(),
+            fork_schedule: crate::mock::mainnet_fork_schedule(),
         }
     }
 
     fn spec_ok() -> ConfigSpecResponse {
-        let mut data = HashMap::new();
+        let mut data = crate::mock::mainnet_fork_spec();
         data.insert("SLOT_DURATION_MS".to_string(), serde_json::json!("12000"));
         data.insert("SLOTS_PER_EPOCH".to_string(), serde_json::json!("32"));
         ConfigSpecResponse { data }
@@ -140,7 +197,7 @@ mod tests {
         let genesis = Ok(genesis("0xdef"));
         assert_eq!(
             classify_identity(&spec, &genesis, &expected()),
-            IdentityClass::Mismatch,
+            IdentityClass::Mismatch(IdentityField::GenesisValidatorsRoot),
             "a parsed root disagreement is a mismatch even when spec is 503"
         );
     }
@@ -149,7 +206,10 @@ mod tests {
     fn spec_disagreement_plus_genesis_error_is_a_mismatch() {
         let spec = Ok(spec_wrong_duration());
         let genesis = Err(unavailable());
-        assert_eq!(classify_identity(&spec, &genesis, &expected()), IdentityClass::Mismatch);
+        assert_eq!(
+            classify_identity(&spec, &genesis, &expected()),
+            IdentityClass::Mismatch(IdentityField::SlotDuration)
+        );
     }
 
     #[test]
@@ -157,6 +217,99 @@ mod tests {
         let spec = Err(unavailable());
         let genesis = Err(unavailable());
         assert_eq!(classify_identity(&spec, &genesis, &expected()), IdentityClass::Transient);
+    }
+
+    fn spec_with(key: &str, value: &str) -> ConfigSpecResponse {
+        let mut spec = spec_ok();
+        spec.data.insert(key.to_string(), serde_json::json!(value));
+        spec
+    }
+
+    #[test]
+    fn matching_spec_and_genesis_is_a_match() {
+        let genesis = Ok(genesis("0xabc"));
+        assert_eq!(classify_identity(&Ok(spec_ok()), &genesis, &expected()), IdentityClass::Match);
+    }
+
+    #[test]
+    fn different_future_fork_epoch_is_a_mismatch() {
+        let spec = Ok(spec_with("FULU_FORK_EPOCH", "411392"));
+        let genesis = Ok(genesis("0xabc"));
+        assert_eq!(
+            classify_identity(&spec, &genesis, &expected()),
+            IdentityClass::Mismatch(IdentityField::ForkSchedule)
+        );
+    }
+
+    #[test]
+    fn different_fork_version_is_a_mismatch() {
+        let spec = Ok(spec_with("CAPELLA_FORK_VERSION", "0x03000001"));
+        let genesis = Ok(genesis("0xabc"));
+        assert_eq!(
+            classify_identity(&spec, &genesis, &expected()),
+            IdentityClass::Mismatch(IdentityField::ForkSchedule)
+        );
+    }
+
+    #[test]
+    fn malformed_slot_duration_does_not_hide_a_fork_mismatch() {
+        let mut spec = spec_with("GLOAS_FORK_EPOCH", "500000");
+        spec.data.insert("SLOT_DURATION_MS".to_string(), serde_json::json!("not_a_number"));
+        let genesis = Err(unavailable());
+        assert_eq!(
+            classify_identity(&Ok(spec), &genesis, &expected()),
+            IdentityClass::Mismatch(IdentityField::ForkSchedule)
+        );
+    }
+
+    #[test]
+    fn malformed_slot_duration_does_not_hide_a_slots_per_epoch_mismatch() {
+        let mut spec = spec_with("SLOTS_PER_EPOCH", "16");
+        spec.data.insert("SLOT_DURATION_MS".to_string(), serde_json::json!("not_a_number"));
+        let genesis = Ok(genesis("0xabc"));
+        assert_eq!(
+            classify_identity(&Ok(spec), &genesis, &expected()),
+            IdentityClass::Mismatch(IdentityField::SlotsPerEpoch)
+        );
+    }
+
+    #[test]
+    fn unparsable_genesis_time_does_not_hide_a_root_mismatch() {
+        let mut wrong = genesis("0xdef");
+        wrong.data.genesis_time = "not_a_number".to_string();
+        assert_eq!(
+            classify_identity(&Ok(spec_ok()), &Ok(wrong), &expected()),
+            IdentityClass::Mismatch(IdentityField::GenesisValidatorsRoot)
+        );
+    }
+
+    #[test]
+    fn identity_field_names_the_field() {
+        assert_eq!(IdentityField::ForkSchedule.to_string(), "fork schedule");
+        assert_eq!(IdentityField::SlotDuration.to_string(), "slot duration");
+        assert_eq!(IdentityField::GenesisValidatorsRoot.to_string(), "genesis_validators_root");
+    }
+
+    #[test]
+    fn missing_required_fork_key_stays_transient() {
+        let mut spec = spec_ok();
+        spec.data.remove("ALTAIR_FORK_EPOCH");
+        let genesis = Ok(genesis("0xabc"));
+        assert_eq!(classify_identity(&Ok(spec), &genesis, &expected()), IdentityClass::Transient);
+    }
+
+    #[test]
+    fn absent_future_fork_key_disagrees_with_a_scheduled_local_fork() {
+        let mut spec = spec_ok();
+        spec.data.remove("GLOAS_FORK_EPOCH");
+        spec.data.remove("GLOAS_FORK_VERSION");
+        let genesis = Ok(genesis("0xabc"));
+        let mut scheduled = expected();
+        scheduled.fork_schedule.gloas_fork_epoch = 500_000;
+        assert_eq!(
+            classify_identity(&Ok(spec), &genesis, &scheduled),
+            IdentityClass::Mismatch(IdentityField::ForkSchedule)
+        );
     }
 
     #[test]

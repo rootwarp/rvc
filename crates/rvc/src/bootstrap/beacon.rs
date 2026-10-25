@@ -178,11 +178,14 @@ mod tests {
             .await;
     }
 
+    /// Serves `data` with the mainnet fork keys added.
     async fn mount_spec(server: &MockServer, data: serde_json::Value) {
+        let mut spec = bn_manager::mainnet_fork_spec();
+        spec.extend(data.as_object().expect("spec data object").clone());
         Mock::given(method("GET"))
             .and(path("/eth/v1/config/spec"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "data": data
+                "data": spec
             })))
             .mount(server)
             .await;
