@@ -7,8 +7,6 @@ use std::time::Duration;
 
 use tracing::{error, info, warn};
 
-use observability::logging::RedactedUrl;
-
 use crate::orchestrator::dispatch::DispatchLimits;
 use crate::orchestrator::{OrchestratorConfig, PubkeyMap};
 use crate::quiesce::{QuiesceRegistry, QuiescingEnablement, TrackedKeys};
@@ -34,7 +32,7 @@ use validator_store::ValidatorStore;
 use secret_provider::SecretProvider;
 
 use super::error::ConfigError;
-use super::types::Config;
+use super::types::{redact_url, redact_urls, Config};
 
 fn log_fork_schedule(schedule: &ForkSchedule) {
     info!(
@@ -487,12 +485,7 @@ impl ServiceBuilder {
     }
 
     pub fn log_effective_config(&self) {
-        let redacted_bns: Vec<String> = self
-            .config
-            .effective_beacon_nodes()
-            .iter()
-            .map(|u| format!("{}", RedactedUrl(u)))
-            .collect();
+        let redacted_bns = redact_urls(&self.config.effective_beacon_nodes());
 
         info!(
             bn_urls = ?redacted_bns,
@@ -555,7 +548,7 @@ impl ServiceBuilder {
 
         let client = BeaconClient::new(beacon_config)?;
         info!(
-            url = %self.config.beacon_url,
+            url = %redact_url(&self.config.beacon_url),
             max_body_bytes = self.config.beacon_max_body_bytes,
             "Created single-endpoint beacon client (not the keymanager exit path)"
         );
@@ -590,7 +583,7 @@ impl ServiceBuilder {
             })?
             .with_operation_timeouts(timeouts);
         info!(
-            endpoints = ?endpoints,
+            endpoints = ?redact_urls(&endpoints),
             broadcast_topics = ?broadcast_topics,
             max_body_bytes = self.config.beacon_max_body_bytes,
             "Created BnManager with {} beacon nodes",
@@ -623,7 +616,7 @@ impl ServiceBuilder {
             .with_metric_pool(bn_manager::METRIC_POOL_PROPOSER)
             .with_operation_timeouts(self.config.operation_timeouts());
         info!(
-            endpoints = ?endpoints,
+            endpoints = ?redact_urls(&endpoints),
             max_body_bytes = self.config.beacon_max_body_bytes,
             "Created proposer BnManager with {} proposer nodes",
             endpoints.len()
@@ -1422,6 +1415,37 @@ mod tests {
         let builder = ServiceBuilder::new(config);
         let result = builder.build_beacon();
         assert!(result.is_ok());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_beacon_url_logs_are_redacted() {
+        let config = Config {
+            beacon_url: "http://alice:BNSECRET@bn0:5052".to_string(),
+            beacon_nodes: vec!["http://bn1:5052/?apikey=BNSECRET".to_string()],
+            proposer_nodes: vec!["http://bn2:5052/?apikey=BNSECRET".to_string()],
+            ..create_minimal_config()
+        };
+        let builder = ServiceBuilder::new(config);
+        builder.build_beacon().expect("beacon client");
+        builder.build_bn_manager().expect("main BnManager");
+        builder.build_proposer_bn_manager().expect("proposer BnManager").expect("proposer pool");
+        assert!(logs_contain("bn0:5052"));
+        assert!(logs_contain("bn1:5052"));
+        assert!(logs_contain("bn2:5052"));
+        assert!(!logs_contain("BNSECRET"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn test_effective_config_log_redacts_an_ambiguous_beacon_url() {
+        let config = Config {
+            beacon_nodes: vec!["http://bob:BN/SECRET@bn1:5052".to_string()],
+            ..create_minimal_config()
+        };
+        ServiceBuilder::new(config).log_effective_config();
+        assert!(logs_contain("http://***"));
+        assert!(!logs_contain("SECRET"));
     }
 
     #[test]

@@ -47,8 +47,10 @@ const PROPOSER_CONFIG_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Idle gap allowed between body chunks, on top of the total deadline.
 const PROPOSER_CONFIG_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const PROPOSER_CONFIG_MAX_REDIRECTS: usize = 10;
-/// Logged remote keys stay this many Unicode scalars, then an ellipsis.
+/// Logged remote keys stay this many characters after the escape, then an ellipsis.
 const LOG_KEY_PREFIX_CHARS: usize = 16;
+/// `…`, written as an escape so that the architecture-test lexers agree.
+const LOG_TEXT_ELLIPSIS: char = '\u{2026}';
 
 /// Error mapping a URL-fetched proposer config entry into store types.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -318,19 +320,27 @@ fn production_meters() -> RefreshMeters {
     }
 }
 
-/// First `LOG_KEY_PREFIX_CHARS` Unicode scalars, then `…` when the text is longer.
+/// Escaped remote text, at most `LOG_KEY_PREFIX_CHARS` characters, then `…` when cut.
 ///
-/// Truncation walks `chars`, so it never splits a scalar. Remote documents are
-/// untrusted and can be as large as the body cap. Logs and error strings keep
-/// a short prefix and drop the rest.
+/// Each scalar goes through [`char::escape_debug`] before the length check.
+/// Thus `\n`, `\r`, ESC, and bidi controls such as U+202E reach a log as
+/// text. The cut falls between two escaped scalars, so it never splits an
+/// escape sequence or a UTF-8 scalar. Remote documents are untrusted and can
+/// be as large as the body cap.
 fn bounded_log_text(raw: &str) -> String {
-    let mut chars = raw.chars();
-    let prefix: String = chars.by_ref().take(LOG_KEY_PREFIX_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
+    let mut shown = String::new();
+    let mut shown_chars = 0;
+    for c in raw.chars() {
+        let escaped = c.escape_debug();
+        let width = escaped.len();
+        if shown_chars + width > LOG_KEY_PREFIX_CHARS {
+            shown.push(LOG_TEXT_ELLIPSIS);
+            return shown;
+        }
+        shown.extend(escaped);
+        shown_chars += width;
     }
+    shown
 }
 
 fn bounded_remote_key(raw: &str) -> String {
@@ -341,24 +351,40 @@ fn duplicate_pubkey_error(raw: &str) -> String {
     format!("duplicate pubkey {}", bounded_remote_key(raw))
 }
 
-fn bounded_parse_error(text: &str) -> String {
+/// Parse error text without document text.
+///
+/// The duplicate-key messages of this module keep their escaped, bounded key.
+/// Every other serde message can echo document text, so the result names only
+/// the error category, the line, and the column.
+fn bounded_parse_error(err: &serde_json::Error) -> String {
+    let text = err.to_string();
     if text.starts_with("duplicate pubkey ") || text.starts_with("duplicate field ") {
-        return text.to_string();
+        return text;
     }
-    format!("failed to parse proposer config JSON: {}", bounded_log_text(text))
+    let kind = match err.classify() {
+        serde_json::error::Category::Io => "I/O error",
+        serde_json::error::Category::Syntax => "syntax error",
+        serde_json::error::Category::Data => "data error",
+        serde_json::error::Category::Eof => "unexpected end of input",
+    };
+    format!(
+        "failed to parse proposer config JSON: {kind} at line {} column {}",
+        err.line(),
+        err.column()
+    )
 }
 
 /// Reject a repeated key at any object, including struct fields.
 ///
 /// Keys of the `proposer_config` object are pubkeys and use the duplicate-pubkey
 /// error. Every other repeated name is a duplicate field. Serde's own error
-/// text is truncated; a remote document can echo an attacker string into it.
+/// text is replaced, because a remote document can echo an attacker string into it.
 fn reject_duplicate_json_fields(bytes: &[u8]) -> Result<(), String> {
     let mut de = serde_json::Deserializer::from_slice(bytes);
     let scanned = de.deserialize_any(DuplicateJsonVisitor { keys_are_pubkeys: false });
     match scanned {
-        Ok(()) => de.end().map_err(|e| bounded_parse_error(&e.to_string())),
-        Err(e) => Err(bounded_parse_error(&e.to_string())),
+        Ok(()) => de.end().map_err(|e| bounded_parse_error(&e)),
+        Err(e) => Err(bounded_parse_error(&e)),
     }
 }
 
@@ -643,7 +669,7 @@ async fn fetch_proposer_config_with_client(
     let bytes = read_body_capped(response, body_idle).await?;
     reject_duplicate_json_fields(&bytes)?;
     let body: ProposerConfigResponse =
-        serde_json::from_slice(&bytes).map_err(|e| bounded_parse_error(&e.to_string()))?;
+        serde_json::from_slice(&bytes).map_err(|e| bounded_parse_error(&e))?;
 
     if body.proposer_config.is_none() && body.default_config.is_none() {
         return Err(
@@ -3574,9 +3600,86 @@ mod tests {
             .mount(&server)
             .await;
         let err = fetch_proposer_config(&server.uri(), None, true).await.expect_err("type error");
-        assert!(err.contains('…'), "{err}");
         assert!(!err.contains(marker), "{err}");
-        assert!(err.len() < 80, "{err}");
+        assert!(!err.contains("AAAA"), "{err}");
+        assert!(err.contains("at line 1 column"), "{err}");
+        assert!(err.len() < 100, "{err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_parse_error_names_the_line_and_column_without_document_text() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let body =
+            "{\n  \"default_config\": {\n    \"builder\": {\"enabled\": \"DOCTEXT\"}\n  }\n}";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        let err = fetch_proposer_config(&server.uri(), None, true).await.expect_err("type error");
+        assert_eq!(err, "failed to parse proposer config JSON: data error at line 3 column 36");
+    }
+
+    #[test]
+    fn syntax_error_names_the_line_and_column_without_document_text() {
+        let err = reject_duplicate_json_fields(b"{\n\"DOCTEXT\" 1}").expect_err("syntax");
+        assert_eq!(err, "failed to parse proposer config JSON: syntax error at line 2 column 11");
+        let err = reject_duplicate_json_fields(b"{\"DOCTEXT\": [1,").expect_err("eof");
+        assert_eq!(
+            err,
+            "failed to parse proposer config JSON: unexpected end of input at line 1 column 15"
+        );
+    }
+
+    #[test]
+    fn duplicate_field_escapes_control_characters_in_the_key() {
+        let doc = br#"{"a\nb\u001b[2J\u202e":1,"a\nb\u001b[2J\u202e":2}"#;
+        let err = reject_duplicate_json_fields(doc).expect_err("duplicate field");
+        assert!(err.starts_with(r"duplicate field a\nb\u{1b}[2J… at line 1"), "{err}");
+        assert_no_raw_controls(&err);
+    }
+
+    #[test]
+    fn duplicate_pubkey_escapes_control_characters_in_the_key() {
+        let doc = br#"{"proposer_config":{"\r\u202e":{},"\r\u202e":{}}}"#;
+        let err = reject_duplicate_json_fields(doc).expect_err("duplicate pubkey");
+        assert!(err.starts_with(r"duplicate pubkey \r\u{202e} at line 1"), "{err}");
+        assert_no_raw_controls(&err);
+    }
+
+    fn assert_no_raw_controls(text: &str) {
+        let raw = text.chars().find(|c| c.is_control() || matches!(c, '\u{200e}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'));
+        assert!(raw.is_none(), "raw {raw:?} in {text:?}");
+    }
+
+    #[test]
+    fn bounded_log_text_escapes_control_and_bidi_characters() {
+        assert_eq!(bounded_log_text("\u{202e}exe.txt"), r"\u{202e}exe.txt");
+        assert_eq!(bounded_log_text("a\nb\rc\u{1b}d"), r"a\nb\rc\u{1b}d");
+        for bidi in
+            ['\u{200e}', '\u{200f}', '\u{202a}', '\u{202e}', '\u{2066}', '\u{2069}', '\u{61c}']
+        {
+            assert_no_raw_controls(&bounded_log_text(&bidi.to_string()));
+        }
+    }
+
+    #[test]
+    fn bounded_log_text_does_not_cut_an_escape_sequence() {
+        let raw = format!("{}\u{1b}TAIL", "a".repeat(12));
+        assert_eq!(bounded_log_text(&raw), format!("{}…", "a".repeat(12)));
+        let raw = "\u{202e}".repeat(16);
+        assert_eq!(bounded_log_text(&raw), r"\u{202e}\u{202e}…");
+        for len in 0..40 {
+            let raw: String = "\n\u{1b}é\u{202e}€a".chars().cycle().take(len).collect();
+            let shown = bounded_log_text(&raw);
+            let body = shown.strip_suffix('…').unwrap_or(&shown);
+            assert!(body.chars().count() <= LOG_KEY_PREFIX_CHARS, "{shown:?}");
+            assert_eq!(body.matches(r"\u{").count(), body.matches('}').count(), "{shown:?}");
+            assert!(!body.ends_with('\\'), "{shown:?}");
+            assert_no_raw_controls(&shown);
+        }
     }
 
     #[tokio::test]

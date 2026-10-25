@@ -865,7 +865,7 @@ impl Config {
         if !self.beacon_url.starts_with("http://") && !self.beacon_url.starts_with("https://") {
             return Err(ConfigError::InvalidBeaconUrl(format!(
                 "beacon URL must start with http:// or https://: {}",
-                self.beacon_url
+                redact_url(&self.beacon_url)
             )));
         }
 
@@ -878,7 +878,7 @@ impl Config {
             if !node_url.starts_with("http://") && !node_url.starts_with("https://") {
                 return Err(ConfigError::InvalidBeaconUrl(format!(
                     "beacon_nodes entry must start with http:// or https://: {}",
-                    node_url
+                    redact_url(node_url)
                 )));
             }
         }
@@ -925,17 +925,19 @@ impl Config {
                 "--proposer-config-url and --proposer-config-file are mutually exclusive; use only one".to_string(),
             ));
         }
-        // 0 stays valid when no URL is configured (older configs). A URL uses the
-        // interval, so 0 would panic inside `tokio::time::interval`.
-        if self.proposer_config.url.is_some() && self.proposer_config.refresh_interval == 0 {
+        // Only a URL uses the interval. Without a URL, any value stays valid
+        // (older configs). With a URL, 0 would panic inside `tokio::time::interval`.
+        let url_uses_interval = self.proposer_config.url.is_some();
+        if url_uses_interval && self.proposer_config.refresh_interval == 0 {
             return Err(ConfigError::Invalid {
                 field: "proposer_config.refresh_interval",
                 message: "must be greater than 0 when proposer_config.url is set".to_string(),
                 source_layer: self.proposer_config.refresh_interval_source.clone(),
             });
         }
-        if self.proposer_config.refresh_interval
-            > rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS
+        if url_uses_interval
+            && self.proposer_config.refresh_interval
+                > rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS
         {
             return Err(ConfigError::Invalid {
                 field: "proposer_config.refresh_interval",
@@ -1097,7 +1099,7 @@ impl Config {
             if !node_url.starts_with("http://") && !node_url.starts_with("https://") {
                 return Err(ConfigError::InvalidBeaconUrl(format!(
                     "proposer_nodes entry must start with http:// or https://: {}",
-                    node_url
+                    redact_url(node_url)
                 )));
             }
         }
@@ -2190,70 +2192,110 @@ fn keystore_declaration(content: &str) -> Option<([u8; crypto::PUBLIC_KEY_BYTES_
 
 /// Redacts credentials, the query, and the fragment from a URL for safe logging.
 ///
-/// A username or password becomes `***`, including an empty username
-/// (`https://:secret@host`). A query is replaced with `redacted`, including a
-/// query-only string that does not parse. A fragment is dropped. Userinfo on a
-/// string that does not parse is removed.
+/// The function keeps text only for inputs on an allowlist. Every other input
+/// with a scheme becomes `<scheme>://***`, and every other input without a
+/// scheme becomes `***`. A URL with a scheme is kept only if all these rules
+/// are true:
+///
+/// 1. Each character is ASCII, visible, and not `\` or `%`. Thus no escape,
+///    look-alike `@`, control character, or space is in the text.
+/// 2. The text starts with `http://` or `https://` (any case), and the next
+///    character is not `/`. [`Url::parse`] accepts the text.
+/// 3. The text has no `@`, or exactly one `@` with no `/`, `?`, or `#` before
+///    it, and the parser finds a userinfo.
+///
+/// The output is the parsed URL with no query and no fragment. A userinfo
+/// becomes `***:***`.
+///
+/// Proof: only a raw `@` can end a userinfo, and rule 1 removes every other
+/// form of `@`. With no `@`, the text has no credentials. With one `@`, all
+/// credential text is before it. For `http` and `https`, the parser reads
+/// the authority from the two slashes to the first `/`, `?`, `#`, or `\`.
+/// Rules 1 and 3 put the `@` in that authority. The parser thus reads all
+/// text before the `@` as the userinfo, and that userinfo becomes `***:***`.
+/// Rule 1 also removes the tab, newline, and other characters that the
+/// parser removes or changes, so the raw text and the parsed text agree.
+///
+/// A string without `://` is kept, without its query and fragment, only if
+/// it passes rule 1 and has no `@` and no `:`.
 pub fn redact_url(raw: &str) -> String {
-    // `user:password@host` parses as scheme `user`. Treat that as userinfo.
-    if bare_userinfo_password(raw) {
-        return redact_unparsed_url(raw);
-    }
-    match Url::parse(raw) {
-        Ok(mut parsed) => {
-            if !parsed.username().is_empty() || parsed.password().is_some() {
-                let _ = parsed.set_username("***");
-                let _ = parsed.set_password(Some("***"));
-            }
-            parsed.set_fragment(None);
-            if parsed.query().is_some() {
-                parsed.set_query(None);
-            }
-            parsed.to_string()
+    let Some(scheme) = leading_scheme(raw) else {
+        if raw.contains(['@', ':']) || !raw.chars().all(is_plain_url_char) {
+            return REDACTED_URL.to_string();
         }
-        Err(_) => redact_unparsed_url(raw),
+        return redact_unparsed_url(raw);
+    };
+    let only_scheme = || format!("{}://{REDACTED_URL}", scheme.to_ascii_lowercase());
+    let after_scheme = &raw[scheme.len() + "://".len()..];
+    if !raw.chars().all(is_plain_url_char) || after_scheme.starts_with('/') {
+        return only_scheme();
     }
+    let Ok(mut parsed) = Url::parse(raw) else {
+        return only_scheme();
+    };
+    if !KEPT_URL_SCHEMES.contains(&parsed.scheme()) {
+        return only_scheme();
+    }
+    match after_scheme.split('@').collect::<Vec<_>>().as_slice() {
+        [_] => {}
+        [userinfo, _] => {
+            let has_userinfo = !parsed.username().is_empty() || parsed.password().is_some();
+            if userinfo.contains(['/', '?', '#'])
+                || !has_userinfo
+                || parsed.set_username(REDACTED_URL).is_err()
+                || parsed.set_password(Some(REDACTED_URL)).is_err()
+            {
+                return only_scheme();
+            }
+        }
+        _ => return only_scheme(),
+    }
+    without_query_and_fragment(parsed)
 }
 
-/// `user:password@host` with no `://`. The `url` crate reads `user` as a scheme.
-fn bare_userinfo_password(raw: &str) -> bool {
-    if raw.contains("://") {
-        return false;
-    }
-    let head = raw.split_once('#').map(|(before, _)| before).unwrap_or(raw);
-    let head = head.split_once('?').map(|(before, _)| before).unwrap_or(head);
-    match head.split_once('@') {
-        Some((userinfo, _)) => userinfo.contains(':'),
-        None => false,
-    }
+/// Schemes of the URLs that rvc logs: beacon nodes, signers, monitoring, and
+/// the proposer config.
+const KEPT_URL_SCHEMES: [&str; 2] = ["http", "https"];
+
+/// The scheme before the first `://`, if that text is a valid scheme.
+///
+/// A scheme is ASCII alpha followed by ASCII alphanumerics, `+`, `-`, or `.`.
+fn leading_scheme(raw: &str) -> Option<&str> {
+    let (scheme, _) = raw.split_once("://")?;
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid.then_some(scheme)
 }
 
+/// Visible ASCII, but not `\` or `%`.
+fn is_plain_url_char(c: char) -> bool {
+    c.is_ascii_graphic() && !matches!(c, '\\' | '%')
+}
+
+/// [`redact_url`] for each URL of a list, for example a beacon-node pool.
+pub fn redact_urls(urls: &[String]) -> Vec<String> {
+    urls.iter().map(|url| redact_url(url)).collect()
+}
+
+/// Text that replaces redacted URL credentials.
+const REDACTED_URL: &str = "***";
+
+fn without_query_and_fragment(mut parsed: Url) -> String {
+    parsed.set_fragment(None);
+    if parsed.query().is_some() {
+        parsed.set_query(None);
+    }
+    parsed.to_string()
+}
+
+/// Replace the query and drop the fragment of a string without `://`.
 fn redact_unparsed_url(raw: &str) -> String {
     let without_fragment = raw.split_once('#').map(|(before, _)| before).unwrap_or(raw);
-    let (head, had_query) = match without_fragment.split_once('?') {
-        Some((before, _)) => (before, true),
-        None => (without_fragment, false),
-    };
-    let head = strip_userinfo(head);
-    if had_query {
-        format!("{head}?redacted")
-    } else {
-        head
+    match without_fragment.split_once('?') {
+        Some((before, _)) => format!("{before}?redacted"),
+        None => without_fragment.to_string(),
     }
-}
-
-/// Drop `userinfo@` from a string [`Url::parse`] did not accept.
-fn strip_userinfo(raw: &str) -> String {
-    let Some(at) = raw.rfind('@') else {
-        return raw.to_string();
-    };
-    let (prefix, rest) = raw.split_at(at);
-    let host = &rest[1..];
-    let scheme = match prefix.rfind("://") {
-        Some(idx) => &prefix[..idx + 3],
-        None => "",
-    };
-    format!("{scheme}{host}")
 }
 
 #[cfg(test)]
@@ -4034,7 +4076,7 @@ log_level = "info"
         let result = redact_url("user:s3cret-token@cfg.example/path");
         assert!(!result.contains("s3cret-token"), "{result}");
         assert!(!result.contains('@'), "{result}");
-        assert_eq!(result, "cfg.example/path");
+        assert_eq!(result, "***");
     }
 
     #[test]
@@ -4049,7 +4091,7 @@ log_level = "info"
     fn test_redact_url_strips_userinfo_when_unparsed() {
         let empty_user = redact_url(":s3cret@cfg.example/x");
         assert!(!empty_user.contains("s3cret"), "{empty_user}");
-        assert_eq!(empty_user, "cfg.example/x");
+        assert_eq!(empty_user, "***");
     }
 
     #[test]
@@ -4060,6 +4102,174 @@ log_level = "info"
         let bare = redact_url("not-a-url#super-secret");
         assert!(!bare.contains("super-secret"), "{bare}");
         assert_eq!(bare, "not-a-url");
+    }
+
+    /// `(input, password text that must not appear, expected output)`.
+    ///
+    /// An `@` that the parser does not read as the end of the userinfo makes
+    /// the input ambiguous. Such an input keeps only its scheme.
+    const REDACT_URL_CASES: &[(&str, &[&str], &str)] = &[
+        ("user:SECRET@host?next=https://x", &["SECRET"], "***"),
+        ("https://alice:SECRET@host:bad/path://x@y", &["SECRET"], "https://***"),
+        ("https://alice:SECRET@host/p?q=1#f", &["SECRET"], "https://***:***@host/p"),
+        ("https://:SECRET@host", &["SECRET"], "https://***:***@host/"),
+        ("alice:SECRET@host", &["SECRET"], "***"),
+        ("https://alice:p%40SECRET@[::1]:8443/x", &["SECRET"], "https://***"),
+        ("https://alice:SECRET@host:99999/x", &["SECRET"], "https://***"),
+        ("user:pw@host/?r=https://x", &["pw"], "***"),
+        ("user:pw@host#https://x", &["pw"], "***"),
+        ("https://alice@host", &["alice"], "https://***:***@host/"),
+        ("https://alice:SE@CRET@host/x", &["SE", "CRET"], "https://***"),
+        ("https://alice:SE@CRET@host:bad/x", &["SE", "CRET"], "https://***"),
+        ("alice:SE@CRET@host/x", &["SE", "CRET"], "***"),
+        ("https://alice:SE/CRET@host", &["SE", "CRET"], "https://***"),
+        ("https:alice:SECRET@host", &["SECRET"], "***"),
+        ("HTTPS://alice:SECRET@HOST/x", &["SECRET"], "https://***:***@host/x"),
+        ("  https://alice:SECRET@host", &["SECRET"], "***"),
+        ("https://alice:pa#ss@host", &["pa", "pa#ss"], "https://***"),
+        ("https://alice:SE?CRET@host", &["SE", "CRET"], "https://***"),
+        ("alice:pa#ss@host", &["pa", "ss"], "***"),
+        ("https://alice:/SECRET@host", &["SECRET"], "https://***"),
+        ("https://alice:12/cd@host", &["12", "cd"], "https://***"),
+        ("https://DOMAIN\\alice:SECRET@host", &["SECRET"], "https://***"),
+        ("https://u:a@b/c@host", &["b/c"], "https://***"),
+        ("https://host:8443/x?e=a@b", &["8443/x"], "https://***"),
+        ("https://alice:a@b/c@host/..", &["b/"], "https://***"),
+        ("https://bob:p@ssw0rd/x@bn.example/..", &["ssw0rd"], "https://***"),
+        ("https://bob:p@ssw0rd/x@bn.example/%2e%2e", &["ssw0rd"], "https://***"),
+        ("https://bob:p@ssw0rd/x@bn.example/./..", &["ssw0rd"], "https://***"),
+        ("https://bob:p@ss\tw0rd/x@bn.example/..", &["w0rd"], "https://***"),
+        ("https://alice:SECRET\u{ff20}host", &["SECRET"], "https://***"),
+        ("https://alice:SECRET\u{fe6b}host", &["SECRET"], "https://***"),
+        ("https://alice:SECRET%40host", &["SECRET"], "https://***"),
+        ("https://TOKEN\u{ff20}host/x", &["TOKEN"], "https://***"),
+        ("alice:SECRET\u{ff20}host", &["SECRET"], "***"),
+        ("https://host:bad/x", &[], "https://***"),
+        ("https://host/x/../y", &[], "https://host/y"),
+        ("localhost:5052", &[], "***"),
+        ("not-a-url/x", &[], "not-a-url/x"),
+        ("", &[], ""),
+        ("https://beacon.example.com:5052/eth/v1", &[], "https://beacon.example.com:5052/eth/v1"),
+        ("https://cfg.example/c?token=x#f", &["token"], "https://cfg.example/c"),
+        ("not-a-url?token=x", &["token"], "not-a-url?redacted"),
+        ("https:///alice:SECRET%40host/x", &["SECRET"], "https://***"),
+        ("https:///alice:SECRET\u{ff20}host", &["SECRET"], "https://***"),
+        ("https://\\alice:SECRET%40host", &["SECRET"], "https://***"),
+        ("//alice:SECRET%40host", &["SECRET"], "***"),
+        ("https://DOMAIN\\alice:SECRET%40bn.example:5052", &["SECRET"], "https://***"),
+        ("https://DOMAIN\\alice:SECRET\u{ff20}bn.example", &["SECRET"], "https://***"),
+        ("grpc://TOKEN%40signer:9000", &["TOKEN"], "grpc://***"),
+        ("foo://alice:SECRET@host/x", &["SECRET"], "foo://***"),
+        ("https:///host/x", &[], "https://***"),
+        ("https://host/a%20b", &[], "https://***"),
+        ("https://host/a b", &[], "https://***"),
+        ("http://user:pass@host:5052", &["pass"], "http://***:***@host:5052/"),
+        ("localhost", &[], "localhost"),
+    ];
+
+    #[test]
+    fn test_validate_beacon_url_errors_redact_the_url() {
+        let cases = [
+            Config { beacon_url: "HTTPS://alice:SECRET@bn:5052".to_string(), ..Default::default() },
+            Config {
+                beacon_nodes: vec!["ftp://alice:SECRET@bn1:5052".to_string()],
+                ..Default::default()
+            },
+            Config {
+                proposer_nodes: vec!["ftp://alice:SECRET@pn1:5052".to_string()],
+                ..Default::default()
+            },
+        ];
+        for config in cases {
+            let msg = config.validate().expect_err("not http or https").to_string();
+            assert!(msg.contains("must start with http:// or https://"), "{msg}");
+            assert!(msg.contains("***"), "{msg}");
+            assert!(!msg.contains("SECRET"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_redact_url_table_never_leaks_the_password() {
+        for &(input, secrets, expected) in REDACT_URL_CASES {
+            let out = redact_url(input);
+            assert!(!out.contains("SECRET"), "{input:?} gave {out:?}");
+            for secret in secrets {
+                assert!(!out.contains(secret), "{input:?} gave {out:?}");
+            }
+            assert_eq!(out, expected, "{input:?}");
+        }
+    }
+
+    /// The password and each part of it between reserved characters.
+    fn password_fragments(password: &str) -> Vec<&str> {
+        let mut fragments: Vec<&str> = password
+            .split(['#', '?', '/', '\\', '@', ':', '\u{ff20}'])
+            .flat_map(|part| part.split("%40"))
+            .filter(|part| part.len() >= 2)
+            .collect();
+        fragments.push(password);
+        fragments
+    }
+
+    #[test]
+    fn test_redact_url_never_leaks_a_generated_password() {
+        let passwords = [
+            "Pq7PASSq7P",
+            "Qz#PASS",
+            "Qz?PASS",
+            "Qz/PASS",
+            "Qz\\PASS",
+            "Qz@PASS",
+            "Qz:PASS",
+            "12/QzPASS",
+            "Qz/PA?SS#QQ@ZZ\\WW:VV",
+            "Qz@PA/SS",
+            "Qz\u{ff20}PASS",
+            "Qz%40PASS",
+        ];
+        let schemes = [
+            "https://",
+            "HTTP://",
+            "HTTPS://",
+            "foo://",
+            "file://",
+            "https:",
+            "https:/",
+            "https:///",
+            "https://\\",
+            "//",
+            "",
+        ];
+        let users = ["alice", "", "a.b", "DOM\\alice"];
+        let hosts = ["host", "host:8443", "[::1]:9000", "host:bad", "host:99999"];
+        let paths = ["", "/", "/p", "/p://x@y", "/a/b://c", "/..", "/%2e%2e", "/./.."];
+        let queries = ["", "?q=1", "?next=https://x", "?r=a@b://c"];
+        let fragments = ["", "#f", "#https://x", "#a@b://c"];
+        let mut checked = 0usize;
+        for password in passwords {
+            let secrets = password_fragments(password);
+            for scheme in schemes {
+                for user in users {
+                    for host in hosts {
+                        for path in paths {
+                            for query in queries {
+                                for fragment in fragments {
+                                    let input = format!(
+                                        "{scheme}{user}:{password}@{host}{path}{query}{fragment}"
+                                    );
+                                    let out = redact_url(&input);
+                                    for secret in &secrets {
+                                        assert!(!out.contains(secret), "{input:?} gave {out:?}");
+                                    }
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 12 * 11 * 4 * 5 * 8 * 4 * 4);
     }
 
     #[test]
@@ -4703,7 +4913,9 @@ broadcast = ["blocks", "attestations"]
         assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
         assert!(msg.contains("greater than 0"), "{msg}");
         assert!(proposer_refresh(Some("https://cfg.example/c"), max).validate().is_ok());
-        let err = proposer_refresh(None, max + 1).validate().expect_err("max+1");
+        let err = proposer_refresh(Some("https://cfg.example/c"), max + 1)
+            .validate()
+            .expect_err("max+1 with a URL");
         let msg = err.to_string();
         assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
         assert!(msg.contains("at most"), "{msg}");
@@ -4735,12 +4947,48 @@ proposer_config_refresh_interval = 0
         assert!(msg.contains("from cli"), "{msg}");
 
         let from_cli = overlay(|cli| {
-            cli.proposer.proposer_config.refresh_interval = Some(max + 1);
+            cli.proposer.proposer_config.url = Some("https://cfg.example/c".to_string());
+            cli.proposer.proposer_config.refresh_interval = Some(90_000);
         });
-        let msg = from_cli.validate().expect_err("cli max+1").to_string();
+        let msg = from_cli.validate().expect_err("cli 90000 with a URL").to_string();
         assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
-        assert!(msg.contains("at most"), "{msg}");
+        assert!(msg.contains("at most 86400"), "{msg}");
         assert!(msg.contains("from cli"), "{msg}");
+    }
+
+    #[test]
+    fn test_validate_refresh_interval_over_max_from_file_names_the_file() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"
+proposer_config_url = "https://cfg.example/c"
+proposer_config_refresh_interval = 90000
+"#
+        )
+        .unwrap();
+        let loaded = Config::from_file(file.path()).expect("file");
+        let msg = loaded.validate().expect_err("file 90000 with a URL").to_string();
+        assert!(msg.contains("proposer_config.refresh_interval"), "{msg}");
+        assert!(msg.contains("at most 86400"), "{msg}");
+        assert!(msg.contains("from file"), "{msg}");
+        assert!(msg.contains(&file.path().display().to_string()), "{msg}");
+    }
+
+    #[test]
+    fn test_validate_refresh_interval_over_max_without_url_starts() {
+        assert!(proposer_refresh(None, 90_000).validate().is_ok());
+        assert!(proposer_refresh(None, u64::MAX).validate().is_ok());
+
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(file, "proposer_config_refresh_interval = 90000").unwrap();
+        let loaded = Config::from_file(file.path()).expect("file");
+        assert!(loaded.validate().is_ok(), "no URL: the file interval is ignored");
+
+        let from_cli = overlay(|cli| {
+            cli.proposer.proposer_config.refresh_interval = Some(90_000);
+        });
+        assert!(from_cli.validate().is_ok(), "no URL: the cli interval is ignored");
     }
 
     // -- RF5-11: typed config enums (fail-early deserialize) --

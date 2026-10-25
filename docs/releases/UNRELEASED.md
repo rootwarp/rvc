@@ -214,8 +214,71 @@ failure. That includes `https://h:8443` to `http://h:8443` and a redirect
 onto loopback. Redirects do not send `Referer`. Query strings and fragments
 are removed from logged URLs, and query strings are removed from fetch
 errors. A refresh interval of 0 is rejected when a proposer-config URL is
-set, and is still accepted when no URL is configured. The interval cannot
-exceed 24 hours.
+set, and is still accepted when no URL is configured. With a URL, the
+interval cannot exceed 24 hours (86400 s). The error names the source of the
+value: `from cli` for `--proposer-config-refresh-interval`, or `from file
+<path>` for `proposer_config_refresh_interval` or
+`[proposer_config] refresh_interval`. Without a URL, the interval is not
+used, and a value above 86400 s starts as before. rvc logs one warning at
+startup for that value, because the value fails startup when you add a URL.
+
+rvc redacts URLs more strictly in its startup logs and in the URL errors
+of config validation. The redaction keeps text only for URLs on an
+allowlist. A URL is kept only if all these rules are true:
+
+1. Each character is visible ASCII, and no character is `\` or `%`. Thus the
+   URL has no percent-escape, no look-alike `@` (for example U+FF20), no
+   control character, and no space.
+2. The URL starts with `http://` or `https://` (any case), the next character
+   is not `/`, and the URL parses.
+3. The URL has no `@`, or exactly one `@` with no `/`, `?`, or `#` before
+   it. With one `@`, the parser must also find a username or a password.
+
+A kept URL loses its query and its fragment, and a username and a password
+become `***:***`, for example `https://***:***@host:5052/`. Each other URL
+keeps only its scheme, in lowercase, for example `https://***`. A value
+without `://` is kept, with its query replaced by `redacted` and its fragment
+removed, only if it passes rule 1 and has no `@` and no `:`. Each other value
+without `://` becomes `***`. Thus `localhost:5052` shows as `***`, and a
+URL with a `%` in its path shows only its scheme.
+
+Before this change, these URLs put password text in the startup log:
+`user:pw@host?next=https://x`, `https://alice:pw@host:bad/p://x@y`,
+`https://alice:12/cd@host`, `https://alice:a@b/c@host/..`, and
+`https://DOMAIN\alice:pw%40bn.example:5052`. The `--beacon-url`,
+`beacon_nodes`, and `proposer_nodes` errors for a URL that does not start
+with `http://` or `https://` put the raw URL on stderr. These errors now
+contain the redacted URL. A monitoring push that fails before a response
+now logs the error without the endpoint URL, so a query such as `?apikey=`
+does not go to the log.
+
+The same redaction applies to the startup logs of the beacon-node,
+proposer-node, remote-signer, monitoring, and proposer-config URLs. The
+`--remote-signer-url` log lines, the beacon-node pool log lines, and the
+refusal of a monitoring endpoint without HTTPS did not redact the URL before.
+
+These sites do not use this redaction yet:
+
+- The gRPC signer client (`crates/grpc-signer`).
+- The keymanager remote-signer URL check (`crates/keymanager-api`).
+- The OpenTelemetry endpoint lines on stderr (`bin/rvc/src/logging.rs`).
+- `RedactedUrl` in `crates/observability`. The runtime logs of the beacon-node
+  manager (`crates/bn-manager`, for example the `bn_url` field of the health
+  score and the `bn.attempt` span) use it. `BnManager` rejects an endpoint
+  that does not parse or has credentials. But `RedactedUrl` keeps the query,
+  so an endpoint such as `http://bn:5052/?apikey=KEY` shows the key in those
+  logs.
+- The scheme error of the beacon-node manager (`crates/bn-manager`), which
+  contains the raw endpoint.
+
+A key from a proposer-config document is escaped before rvc logs it or puts
+it in an error. Thus a newline, a carriage return, ESC, or a bidi control
+such as U+202E shows as an escape sequence (`\n`, `\u{202e}`). The logged
+key is a maximum of 16 characters after the escape, then `…`. The cut does
+not split an escape sequence. A JSON parse error now gives only the error
+category, the line, and the column, for example `failed to parse proposer
+config JSON: data error at line 3 column 36`. It does not contain document
+text.
 
 A document that names the same validator twice is rejected. That includes
 an exact duplicate JSON key and two spellings of one key (`0x` prefix and

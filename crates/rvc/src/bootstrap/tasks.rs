@@ -34,6 +34,10 @@ pub const SYNC_MONITOR_TASK_NAME: &str = "bn.sync_monitor";
 /// Cancel-forwarder that maps the process token onto `start_sync_monitor`'s `watch<bool>`.
 pub const SYNC_MONITOR_CANCEL_TASK_NAME: &str = "bn.sync_monitor.cancel";
 
+/// Warn text when `proposer_config.refresh_interval` is over the maximum and no URL uses it.
+const IGNORED_REFRESH_INTERVAL_WARNING: &str =
+    "proposer_config.refresh_interval is above the maximum and is ignored without a proposer-config URL";
+
 /// Env var that opts in to non-loopback metrics binds (ISSUE-4.10 / L-10).
 pub const METRICS_ALLOW_NON_LOOPBACK_ENV: &str = "RVC_METRICS_ALLOW_NON_LOOPBACK";
 
@@ -183,6 +187,15 @@ pub fn spawn_background_tasks(
             )
             .await;
         });
+    } else if config.proposer_config.refresh_interval
+        > rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS
+    {
+        warn!(
+            refresh_interval_secs = config.proposer_config.refresh_interval,
+            max_secs = rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS,
+            source = %config.proposer_config.refresh_interval_source,
+            "{IGNORED_REFRESH_INTERVAL_WARNING}"
+        );
     }
 
     Ok(())
@@ -751,6 +764,58 @@ mod tests {
         }
 
         let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    async fn spawn_with_proposer_config(proposer_config: crate::config::ProposerConfigSource) {
+        let config = Config {
+            metrics_address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            metrics_port: 0,
+            proposer_config,
+            ..Config::default()
+        };
+        let listener = prebound_metrics(&config).await;
+        let (executor, _rx) = TaskExecutor::new(CancellationToken::new());
+        spawn_background_tasks(
+            &config,
+            listener,
+            metrics::new_health_status(),
+            &executor,
+            empty_pubkey_map(),
+            empty_validator_store(),
+        )
+        .expect("spawn");
+        let _ = executor.shutdown(TierBudget::default()).await;
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn refresh_interval_over_max_without_url_warns_once() {
+        spawn_with_proposer_config(crate::config::ProposerConfigSource {
+            refresh_interval: 90_000,
+            ..Default::default()
+        })
+        .await;
+        logs_assert(|lines: &[&str]| {
+            let warned: Vec<_> = lines
+                .iter()
+                .filter(|line| line.contains(IGNORED_REFRESH_INTERVAL_WARNING))
+                .collect();
+            match warned.as_slice() {
+                [line] if line.contains("WARN") && line.contains("90000") => Ok(()),
+                other => Err(format!("expected one warn with the value, got {other:?}")),
+            }
+        });
+    }
+
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn refresh_interval_at_max_without_url_does_not_warn() {
+        spawn_with_proposer_config(crate::config::ProposerConfigSource {
+            refresh_interval: rvc_config::MAX_PROPOSER_CONFIG_REFRESH_INTERVAL_SECS,
+            ..Default::default()
+        })
+        .await;
+        assert!(!logs_contain(IGNORED_REFRESH_INTERVAL_WARNING));
     }
 
     #[test]

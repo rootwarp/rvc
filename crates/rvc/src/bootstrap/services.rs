@@ -22,7 +22,7 @@ use super::enablement::EnablementHandles;
 use super::keys::LoadedKeys;
 use super::BootstrapError;
 use crate::beacon_adapter::BeaconBlockAdapter;
-use crate::config::{Config, ServiceBuilder};
+use crate::config::{redact_url, redact_urls, Config, ServiceBuilder};
 use crate::orchestrator::OrchestratorConfig;
 use crate::quiesce::QuiesceRegistry;
 use crate::startup::{self, StartupError};
@@ -60,6 +60,28 @@ pub struct ServiceHandles {
     pub builder_service: Option<Arc<BuilderService>>,
     /// Shared attesting on/off toggle (orchestrator + keymanager API).
     pub attesting_enabled: Arc<AtomicBool>,
+}
+
+/// Log the configured remote signer URL, if there is one.
+fn log_remote_signer_url(config: &Config) {
+    let Some(ref url) = config.keymanager.remote_signer_url else {
+        return;
+    };
+    if !config.keymanager.enabled {
+        warn!(
+            url = %redact_url(url),
+            "Remote signer URL configured but Keymanager API is disabled; \
+             enable --keymanager-enabled to manage remote keys at runtime"
+        );
+    }
+    info!(url = %redact_url(url), "Remote signer URL configured");
+}
+
+fn log_proposer_nodes(proposer_nodes: &[String]) {
+    info!(
+        proposer_nodes = ?redact_urls(proposer_nodes),
+        "Proposer nodes configured — block production will use dedicated pool"
+    );
 }
 
 /// Apply a fork-compatibility check result (SEC-9 / M-15).
@@ -217,10 +239,7 @@ pub async fn build_services(
     // Build proposer BnManager if proposer nodes are configured (T3.1)
     let proposer_bn_manager = match builder.build_proposer_bn_manager() {
         Ok(Some(mgr)) => {
-            info!(
-                proposer_nodes = ?config.proposer_nodes,
-                "Proposer nodes configured — block production will use dedicated pool"
-            );
+            log_proposer_nodes(&config.proposer_nodes);
             Some(mgr)
         }
         Ok(None) => None,
@@ -264,16 +283,7 @@ pub async fn build_services(
     ));
 
     // Step 7b: Configure remote signer if URL provided
-    if let Some(ref url) = config.keymanager.remote_signer_url {
-        if !config.keymanager.enabled {
-            warn!(
-                url = %url,
-                "Remote signer URL configured but Keymanager API is disabled; \
-                 enable --keymanager-enabled to manage remote keys at runtime"
-            );
-        }
-        info!(url = %url, "Remote signer URL configured");
-    }
+    log_remote_signer_url(config);
 
     // Step 7b2: Create attesting_enabled toggle (shared with orchestrator + API)
     let attesting_enabled = Arc::new(AtomicBool::new(!config.disable_attesting));
@@ -321,6 +331,30 @@ mod tests {
 
     const GVR: Root = [0x11u8; 32];
     const TEST_FEE_RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn proposer_node_logs_are_redacted() {
+        log_proposer_nodes(&["http://pn1:5052/?apikey=PNSECRET".to_string()]);
+        assert!(logs_contain("Proposer nodes configured"));
+        assert!(logs_contain("pn1:5052"));
+        assert!(!logs_contain("PNSECRET"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn remote_signer_url_logs_are_redacted() {
+        let mut config = Config::default();
+        config.keymanager.remote_signer_url =
+            Some("https://alice:RSSECRET@signer:9000/?k=RSTOKEN".to_string());
+        config.keymanager.enabled = false;
+        log_remote_signer_url(&config);
+        assert!(logs_contain("Remote signer URL configured"));
+        assert!(logs_contain("Keymanager API is disabled"));
+        assert!(logs_contain("signer:9000"));
+        assert!(!logs_contain("RSSECRET"));
+        assert!(!logs_contain("RSTOKEN"));
+    }
 
     fn validators_config(dir: &TempDir) -> std::path::PathBuf {
         let path = dir.path().join("validators.toml");
