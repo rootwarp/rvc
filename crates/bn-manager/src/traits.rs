@@ -17,8 +17,10 @@ use beacon::{
 
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration,
+    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration, Slot,
 };
+
+use crate::header_quorum::CheckedHeader;
 
 // ---------------------------------------------------------------------------
 // Role traits (domain splits of the former monolithic BeaconNodeClient)
@@ -534,6 +536,30 @@ pub trait NodeStatusApi: Send + Sync {
 
     /// `GET /eth/v1/beacon/headers/{block_id}`: root, slot, proposer index, parent root.
     async fn get_block_header(&self, block_id: &str) -> Result<BlockHeaderSummary, BeaconError>;
+
+    /// [`Self::get_block_header`] for a parent of a block at `proposal_slot`.
+    ///
+    /// Each answer is checked with [`CheckedHeader::check`]. No answer is
+    /// used after `deadline`. The default body is for one beacon node: its
+    /// answer decides. A pooled client must override it, ask two or more
+    /// nodes, and require two agreeing headers. A wrapper must forward it.
+    async fn get_block_header_checked(
+        &self,
+        block_id: &str,
+        proposal_slot: Slot,
+        deadline: tokio::time::Instant,
+    ) -> Result<CheckedHeader, BeaconError> {
+        let limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let answer = tokio::time::timeout_at(deadline, self.get_block_header(block_id))
+            .await
+            .unwrap_or_else(|_| {
+                Err(BeaconError::OperationTimeout {
+                    operation: "get_block_header".to_string(),
+                    timeout: limit,
+                })
+            });
+        CheckedHeader::from_single(block_id, proposal_slot, answer)
+    }
 
     async fn get_node_syncing(&self) -> Result<SyncingResponse, BeaconError>;
 

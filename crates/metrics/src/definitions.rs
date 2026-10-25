@@ -180,11 +180,11 @@ lazy_static! {
         )
     };
 
-    /// Parent-root walk-back fallbacks at t=0 (ARCH-3d).
+    /// Parent-root walk-back fallbacks and unchecked parent lookups at t=0 (ARCH-3d).
     pub static ref RVC_SLOT_CONTEXT_PARENT_FALLBACK_TOTAL: IntCounterVec = {
         define_int_counter_vec(
             "rvc_slot_context_parent_fallback_total",
-            "Total number of SlotContext parent_root fallbacks after walk-back",
+            "Total number of SlotContext parent_root fallbacks and unchecked parent lookups; one slot can count two reasons",
             &["reason"],
         )
     };
@@ -333,8 +333,22 @@ pub mod bn_health_tier {
 }
 
 /// `reason` label values for `rvc_slot_context_parent_fallback_total`.
+///
+/// Each reason other than `walk_back_exhausted` turns the parent filter off
+/// for that slot. One slot can count two reasons: `walk_back_exhausted`, and
+/// then a reason for the `head` fallback (for example `unconfirmed`).
 pub mod slot_context_parent_fallback {
     pub const WALK_BACK_EXHAUSTED: &str = "walk_back_exhausted";
+    /// No beacon node gave a header or a 404, and the error of the lowest
+    /// node index is a parse error (for example an optimistic header).
+    pub const UNCHECKED_PARSE: &str = "unchecked_parse";
+    /// No beacon node gave a header or a 404, and that error is not a parse
+    /// error (for example a timeout). Also a confirmed 404 for `head`.
+    pub const UNCHECKED_ERROR: &str = "unchecked_error";
+    /// One or more beacon nodes gave a header or a 404, but not enough agreed.
+    pub const UNCONFIRMED: &str = "unconfirmed";
+    /// The whole t=0 capture passed the pre-proposal deadline.
+    pub const CAPTURE_TIMEOUT: &str = "capture_timeout";
 }
 
 /// `phase` label values for `rvc_sync_committee_skipped_total`.

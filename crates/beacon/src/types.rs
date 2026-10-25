@@ -628,7 +628,14 @@ pub struct BlockRootData {
 }
 
 /// Response type for the block root endpoint.
-pub type BlockRootResponse = DataResponse<BlockRootData>;
+///
+/// `execution_optimistic` is `None` when the beacon node does not send it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlockRootResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_optimistic: Option<bool>,
+    pub data: BlockRootData,
+}
 
 /// Block header fields from `GET /eth/v1/beacon/headers/{block_id}`.
 ///

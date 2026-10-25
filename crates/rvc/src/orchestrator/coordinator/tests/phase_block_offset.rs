@@ -251,7 +251,8 @@ async fn test_offset_reflects_pre_proposal_work() {
         create_mock_validator_store(),
         create_test_config()
             .with_timeouts(timeouts)
-            .with_pre_proposal_deadline(Duration::from_secs(10)),
+            // Each parent lookup step may use 3 s of 20 s, more than the delay.
+            .with_pre_proposal_deadline(Duration::from_secs(20)),
         Arc::new(parking_lot::RwLock::new(HashMap::new())),
     ));
 

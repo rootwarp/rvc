@@ -4,6 +4,7 @@ mod admission;
 mod broadcast;
 mod error;
 mod fan_out;
+mod header_quorum;
 
 pub use admission::{
     classify_identity, sync_check_interval_for, ChainIdentity, IdentityClass, IdentityField,
@@ -29,6 +30,7 @@ mod traits;
 pub mod types;
 
 pub use error::BnManagerError;
+pub use header_quorum::CheckedHeader;
 pub use manager::{BnManager, SpecAgreement, ATTEMPT_TIMEOUT_FLOOR};
 pub use metrics::{METRIC_POOL_MAIN, METRIC_POOL_PROPOSER};
 #[cfg(any(test, feature = "test-utils"))]

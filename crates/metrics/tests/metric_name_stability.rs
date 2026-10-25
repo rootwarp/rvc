@@ -146,6 +146,12 @@
 //! skips stay on `rvc_bn_broadcast_drain_health_skipped_total`. A dashboard
 //! that summed the broadcast counter for best-of skips must add this series.
 //! The 16-permit pool is still shared.
+//! #774 adds `reason` values to `rvc_slot_context_parent_fallback_total` (no
+//! family delta): `unchecked_parse`, `unchecked_error`, `unconfirmed`, and
+//! `capture_timeout`, next to `walk_back_exhausted`. Each new reason turns the
+//! parent check off for one slot. A slot whose walk-back is exhausted can also
+//! count a reason for the `head` fallback. Dashboards that watch an unchecked
+//! parent should bind this name.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -249,7 +255,7 @@ const EXPECTED_METRIC_NAMES: &[&str] = &[
     "rvc_slashing_prune_source_bound_raised_total", // operator-facing: prune raised an attestation source floor (RR-4.1)
     "rvc_slashing_reconcile_total",
     "rvc_slashing_reserve_tx_hold_duration_ms",
-    "rvc_slot_context_parent_fallback_total",
+    "rvc_slot_context_parent_fallback_total", // operator-facing: reason walk_back_exhausted, unchecked_parse, unchecked_error, unconfirmed, capture_timeout (#774)
     "rvc_slot_phase_block_start_offset_ms", // deprecated: use rvc_slot_phase_offset_ms{phase="block"}; retained for dashboards (AQ-7 / #611)
     "rvc_slot_phase_late_total", // operator-facing: phases that fired after their absolute deadline (RR1-03 / #506)
     "rvc_slot_phase_offset_ms", // operator-facing: true offset into the slot when a phase fires (RR1-05 / #508)

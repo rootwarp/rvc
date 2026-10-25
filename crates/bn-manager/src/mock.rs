@@ -518,7 +518,10 @@ impl MockBeaconNodeClient {
         let skipped_header = skipped.clone();
         self.get_block_root.set_handler(Arc::new(move |block_id: String| {
             let slot = resolve_block_id(&block_id, head_slot, &skipped)?;
-            Ok(BlockRootResponse { data: BlockRootData { root: root_for(slot) } })
+            Ok(BlockRootResponse {
+                execution_optimistic: None,
+                data: BlockRootData { root: root_for(slot) },
+            })
         }));
         self.get_block_header.set_handler(Arc::new(move |block_id: String| {
             let queried = resolve_block_id(&block_id, head_slot, &skipped_header)?;

@@ -775,7 +775,13 @@ where
             // Head is captured at phase 2 and reused at phase 3 (H-5).
             let ctx = match tokio::time::timeout(self.config.pre_proposal_deadline, async {
                 self.maybe_cold_fetch_proposer_duties(current_slot, current_epoch).await;
-                SlotContext::capture_parent(&*self.beacon, current_slot, current_epoch).await
+                SlotContext::capture_parent_within(
+                    &*self.beacon,
+                    current_slot,
+                    current_epoch,
+                    self.config.pre_proposal_deadline,
+                )
+                .await
             })
             .await
             {
@@ -786,16 +792,11 @@ where
                         deadline_ms = self.config.pre_proposal_deadline.as_millis() as u64,
                         "Pre-proposal parent capture timed out"
                     );
-                    SlotContext {
-                        slot: current_slot,
-                        epoch: current_epoch,
-                        parent_root: None,
-                        expected_parents: None,
-                        head_root: None,
-                        fence: super::slot_context::fence_when_parent_capture_times_out(
-                            self.beacon.duty_fence(),
-                        ),
-                    }
+                    SlotContext::capture_timed_out(
+                        current_slot,
+                        current_epoch,
+                        self.beacon.duty_fence(),
+                    )
                 }
             };
             {

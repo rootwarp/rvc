@@ -3,6 +3,33 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Two beacon nodes must agree on the parent header
+
+At t=0 of each slot, rvc gets the header of the parent block from the beacon nodes. Before this change, the first node that answered decided the parent set. One wrong node could restrict the block parents to its own root, or reject every parent, also when an honest node was available.
+
+rvc now asks all eligible beacon nodes in parallel. When two or more nodes are eligible, two nodes must return the same header before that header can narrow or close the parent set. A 404 skips the slot only when two nodes return 404, no node returns a header, and no node returns another error or stays silent. Thus one node cannot skip a real parent. A node that has the block but is slow, or that returns an error (for example because it imported the block optimistically), stops the walk-back and keeps the parent check off for that slot, as before this change. When only one node is eligible, its answer decides, as before. If the answers do not agree, rvc does not check the parent for that slot. A wrong answer can only cause a missed proposal. It cannot cause a slashable message.
+
+Each lookup step stops at a time limit. The limit is three quarters of the pre-proposal deadline, divided by five (four slots and `head`). For the 1 s default, the limit is 150 ms for each step and 750 ms for the walk-back. A node that does not answer in time does not get a health error. But its answer is not used, so a node that is always slower than the limit keeps the parent check off (`unconfirmed`) when the other answers do not agree, and it stops a 404 from skipping a slot.
+
+`rvc_slot_context_parent_fallback_total` has four new `reason` values. Each one turns the parent check off for one slot:
+
+| `reason` | Cause |
+|----------|-------|
+| `unchecked_parse` | No node gave a header or a 404, and the error is a parse error, for example an optimistic header. |
+| `unchecked_error` | No node gave a header or a 404, and the error is another error, for example a timeout. Also a 404 for the `head` fallback. |
+| `unconfirmed` | Nodes gave headers or 404s, but not enough of them agreed. |
+| `capture_timeout` | The whole t=0 capture passed the pre-proposal deadline. |
+
+One slot can count two reasons: `walk_back_exhausted`, and then a reason for the `head` fallback.
+
+When a beacon node marks a block root `execution_optimistic: true`, rvc asks the next beacon node for the phase-2 head. If no node gives a root that is not optimistic, rvc uses the parent root, the same as for a missing block.
+
+A beacon node that rvc revokes during a request no longer gives an answer to that request. Before this change, an error from that node, for example a 404, still counted.
+
+rvc does not start when the same beacon node is in the endpoint list two times. Two URLs are the same node when the scheme, the host (any case), the port (the default port when none is given), and the path (with or without a trailing `/`) are equal. Remove the duplicate entry. rvc does not find an alias of a host, for example `localhost` and `127.0.0.1`, or a host name with a trailing dot. Do not list one node with two names.
+
+> **Note:** rvc writes a warning with the redacted endpoint of each node whose header did not agree. A node gets a health error when it returns a header for a different slot, or when two nodes agree on a header and its header or 404 is different. When no two nodes agree on a header, a 404 or a header does not change the health score. With exactly two nodes, a node that returns a different header for the correct slot, or a 404 when the other node has the block, keeps the parent check off, and rvc cannot tell which node is wrong. If `unconfirmed` increases often, examine the nodes in that warning.
+
 ## Container health checks work, and the images have no curl
 
 The `rvc` image health check probed `/healthz`. rvc does not serve that path, so the probe got `404` and the container was always `unhealthy`. The `rvc-signer` probe passed only because the signer metrics listener answered `200` on every path.

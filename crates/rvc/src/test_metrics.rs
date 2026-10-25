@@ -6,7 +6,8 @@
 use std::cell::Cell;
 
 thread_local! {
-    static PARENT_FALLBACK: Cell<u64> = const { Cell::new(0) };
+    static PARENT_FALLBACK: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     static AGG_FAILED: Cell<u64> = const { Cell::new(0) };
     static BLOCK_START_COLD_N: Cell<u64> = const { Cell::new(0) };
     static BLOCK_START_COLD_SUM: Cell<f64> = const { Cell::new(0.0) };
@@ -24,12 +25,14 @@ fn add_sum(cell: &Cell<f64>, sample: f64) {
     cell.set(cell.get() + sample);
 }
 
-pub fn add_parent_fallback() {
-    PARENT_FALLBACK.with(|cell| add(cell, 1));
+pub fn add_parent_fallback(reason: &'static str) {
+    PARENT_FALLBACK.with(|reasons| reasons.borrow_mut().push(reason));
 }
 
-pub fn parent_fallback() -> u64 {
-    PARENT_FALLBACK.with(Cell::get)
+/// Fallbacks with `reason` on this thread.
+pub fn parent_fallback(reason: &str) -> u64 {
+    PARENT_FALLBACK
+        .with(|reasons| reasons.borrow().iter().filter(|seen| **seen == reason).count() as u64)
 }
 
 pub fn add_agg_failed(by: u64) {

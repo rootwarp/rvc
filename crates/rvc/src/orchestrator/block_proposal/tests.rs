@@ -247,7 +247,7 @@ async fn test_block_proposal_skipped_when_validator_disabled() {
 #[tokio::test]
 async fn test_proposal_passes_previous_slot_as_expected_parent() {
     use async_trait::async_trait;
-    use beacon::{BlockRootData, DataResponse, DependentRootResponse, ProposerDuty};
+    use beacon::{BlockRootData, BlockRootResponse, DependentRootResponse, ProposerDuty};
     use block_service::{
         BeaconBlockClient, BlockServiceError, BuilderConfig, ProduceBlockResponse,
     };
@@ -428,7 +428,10 @@ async fn test_proposal_passes_previous_slot_as_expected_parent() {
                             "unexpected block_id {block_id}"
                         )));
                     };
-                    Ok(DataResponse { data: BlockRootData { root } })
+                    Ok(BlockRootResponse {
+                        execution_optimistic: None,
+                        data: BlockRootData { root },
+                    })
                 }
             })
             .with_get_proposer_duties({

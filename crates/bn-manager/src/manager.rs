@@ -20,8 +20,9 @@ use beacon::{
 };
 use eth_types::{
     ForkName, ForkSchedule, PayloadAttestationMessage, SignedBeaconBlock, SignedBlindedBeaconBlock,
-    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration,
+    SignedBlockContentsJson, SignedProposerPreferences, SignedValidatorRegistration, Slot,
 };
+use futures::stream::{FuturesUnordered, StreamExt};
 use tracing::Instrument;
 use tracing::{debug, error, info, warn};
 use url::Url;
@@ -35,6 +36,7 @@ use crate::admission::{
 };
 use crate::broadcast::BroadcastResult;
 use crate::fan_out::{self, BnAttempt};
+use crate::header_quorum::{wrong_requested_slot, CheckedHeader, HeaderTally};
 use crate::health::{new_shared_health_trackers, BnHealthTracker, SharedHealthTrackers};
 use crate::sse::{self, SseConfig, SseEvent};
 use crate::sync_status::{
@@ -113,6 +115,18 @@ pub(crate) fn error_outcome(op_name: &str, err: &BeaconError) -> TrackerOutcome 
     } else {
         TrackerOutcome::Error
     }
+}
+
+/// Scheme, lowercase host, port (the default port when none is given), and
+/// path without a trailing `/`. Two endpoints with one identity are one node.
+fn endpoint_identity(url: &Url) -> String {
+    format!(
+        "{}://{}:{}{}",
+        url.scheme(),
+        url.host_str().unwrap_or_default().to_ascii_lowercase(),
+        url.port_or_known_default().unwrap_or_default(),
+        url.path().trim_end_matches('/')
+    )
 }
 
 fn no_eligible_bn(op_name: &str, role: BnRole) -> BeaconError {
@@ -644,11 +658,19 @@ impl BnManager {
         }
 
         let mut clients = Vec::with_capacity(config.endpoints.len());
+        let mut seen = HashSet::new();
 
         for endpoint in &config.endpoints {
             let parsed = Url::parse(endpoint).map_err(|e| {
                 BnManagerError::InvalidEndpoint(format!("failed to parse URL: {e}"))
             })?;
+            // One node listed two times would give that node two quorum votes.
+            if !seen.insert(endpoint_identity(&parsed)) {
+                return Err(BnManagerError::InvalidEndpoint(format!(
+                    "duplicate endpoint: {}",
+                    RedactedUrl(endpoint)
+                )));
+            }
 
             if parsed.scheme() != "http" && parsed.scheme() != "https" {
                 return Err(BnManagerError::InvalidEndpoint(format!(
@@ -1027,6 +1049,20 @@ impl BnManager {
                 .is_some_and(|generation| generation.load(Ordering::Acquire) == stamp.generation)
     }
 
+    /// An answer from a node whose stamp no longer holds is
+    /// [`BeaconError::RevokedInFlight`], for an `Ok` and for an error.
+    fn unless_revoked<T>(
+        &self,
+        stamp: AdmissionStamp,
+        answer: Result<T, BeaconError>,
+    ) -> Result<T, BeaconError> {
+        if self.stamp_holds(stamp) {
+            answer
+        } else {
+            Err(BeaconError::RevokedInFlight)
+        }
+    }
+
     fn revoke_admission(&self, index: usize) {
         revoke_at(
             &self.admitted,
@@ -1392,12 +1428,8 @@ impl BnManager {
             // Build the future only after the deadline check. A zero timeout
             // still polls once and would send the request.
             let fut = op(client).instrument(attempt_span);
-            match await_attempt(op_name, bound, fut).await {
+            match self.unless_revoked(stamp, await_attempt(op_name, bound, fut).await) {
                 Ok(result) => {
-                    if !self.stamp_holds(stamp) {
-                        note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
-                        continue;
-                    }
                     let elapsed = start.elapsed();
                     // Earlier failures were recorded before this attempt.
                     record_outcomes(
@@ -1415,6 +1447,10 @@ impl BnManager {
                     );
                     tracing::Span::current().record("tried", tried);
                     return Ok((client.endpoint().to_string(), result));
+                }
+                Err(BeaconError::RevokedInFlight) => {
+                    // all_not_found: a 404 from a revoked node is not a skip.
+                    note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
                 }
                 Err(e) => {
                     record_outcomes(
@@ -1448,6 +1484,146 @@ impl BnManager {
 
         tracing::Span::current().record("tried", tried);
         Err(last_err.unwrap_or_else(|| no_eligible_bn(op_name, role)))
+    }
+
+    /// Parent-header lookup on every eligible beacon node in parallel.
+    ///
+    /// With one node asked, its answer decides. With two or more, the lookup
+    /// returns when two headers agree (see [`HeaderTally`]) and drops the
+    /// requests that are still open. At `deadline` it drops every open
+    /// request and returns [`HeaderTally::finish`]. An answer from a node
+    /// whose admission stamp no longer holds is not a vote.
+    ///
+    /// Health: an error, a header for a slot other than the requested slot,
+    /// and a header or 404 that an agreed header outvotes are errors. A header
+    /// that agrees is a success. With no agreed header, a 404 or a header does
+    /// not move the score. A node that is silent at `deadline` has no health
+    /// outcome: its timeout only blocks a 404 result.
+    async fn query_header_quorum<'s, F>(
+        &'s self,
+        block_id: &str,
+        proposal_slot: Slot,
+        deadline: tokio::time::Instant,
+        op: &F,
+    ) -> Result<CheckedHeader, BeaconError>
+    where
+        F: Fn(&'s BeaconClient) -> BoxFut<'s, BlockHeaderSummary>,
+    {
+        const OP: &str = "get_block_header";
+        self.ensure_duty_admission()?;
+        let indices = self.synced_indices(BnRole::All, HealthTier::SmallLag, OP).await;
+        if indices.is_empty() {
+            return Err(no_eligible_bn(OP, BnRole::All));
+        }
+        let limit = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if limit.is_zero() {
+            return Err(BeaconError::OperationTimeout {
+                operation: OP.to_string(),
+                timeout: limit,
+            });
+        }
+        let stamps: Vec<AdmissionStamp> = indices
+            .into_iter()
+            .map(|index| self.admission_stamp(index))
+            .filter(|stamp| self.stamp_holds(*stamp))
+            .collect();
+        let mut pending: FuturesUnordered<_> = stamps
+            .iter()
+            .map(|&stamp| {
+                let client = &self.clients[stamp.index];
+                let span =
+                    tracing::info_span!("bn.attempt", bn_url = %RedactedUrl(client.endpoint()));
+                let fut = op(client).instrument(span);
+                async move {
+                    let start = tokio::time::Instant::now();
+                    let answer = fut.await;
+                    (stamp, start.elapsed(), answer)
+                }
+            })
+            .collect();
+        let mut tally = HeaderTally::new(block_id, proposal_slot, stamps.len());
+        let mut outcomes = Vec::new();
+        let mut headers = Vec::new();
+        let mut not_found = Vec::new();
+        let mut answered = HashSet::new();
+        let decided = loop {
+            let Ok(next) = tokio::time::timeout_at(deadline, pending.next()).await else {
+                // Silence is not a health error: a remote node can be slower
+                // than this limit on every slot.
+                for stamp in stamps.iter().filter(|stamp| !answered.contains(&stamp.index)) {
+                    warn!(
+                        op = OP,
+                        endpoint = %RedactedUrl(self.clients[stamp.index].endpoint()),
+                        timeout_ms = limit.as_millis() as u64,
+                        "BN did not answer the header lookup in time"
+                    );
+                    let timeout =
+                        BeaconError::OperationTimeout { operation: OP.to_string(), timeout: limit };
+                    tally.add(stamp.index, Err(timeout));
+                }
+                break None;
+            };
+            let Some((stamp, elapsed, answer)) = next else {
+                break None;
+            };
+            answered.insert(stamp.index);
+            if !self.stamp_holds(stamp) {
+                tally.add(stamp.index, Err(BeaconError::RevokedInFlight));
+                continue;
+            }
+            match &answer {
+                Ok(header) => headers.push((stamp.index, elapsed, *header)),
+                Err(err) if is_api_not_found(err) => {
+                    let endpoint = RedactedUrl(self.clients[stamp.index].endpoint());
+                    debug!(op = OP, %endpoint, block_id, "BN has no block at that id");
+                    not_found.push((stamp.index, elapsed));
+                }
+                Err(err) => {
+                    let endpoint = RedactedUrl(self.clients[stamp.index].endpoint());
+                    warn!(op = OP, %endpoint, error = %err, "BN header lookup failed");
+                    outcomes.push((stamp.index, error_outcome(OP, err)));
+                }
+            }
+            if let Some(checked) = tally.add(stamp.index, answer) {
+                break Some(checked);
+            }
+        };
+        let result = decided.map_or_else(|| tally.finish(), Ok);
+        let agreed = match &result {
+            Ok(CheckedHeader::Found(header) | CheckedHeader::Rejected(header)) => Some(*header),
+            _ => None,
+        };
+        // With no agreed header, nobody knows which vote is right. The vote
+        // does not move the score.
+        let scored = |agrees: bool, elapsed: Duration| match agreed {
+            None => TrackerOutcome::Rejected,
+            Some(_) if agrees => TrackerOutcome::Success(elapsed),
+            Some(_) => TrackerOutcome::Error,
+        };
+        for (index, elapsed) in not_found {
+            outcomes.push((index, scored(false, elapsed)));
+        }
+        for (index, elapsed, header) in headers {
+            let wrong_slot = wrong_requested_slot(block_id, &header);
+            let outvoted = agreed.is_some_and(|agreed| agreed != header);
+            if wrong_slot || outvoted || agreed.is_none() {
+                warn!(
+                    op = OP,
+                    endpoint = %RedactedUrl(self.clients[index].endpoint()),
+                    block_id,
+                    header_slot = header.slot,
+                    header_root_prefix = ?&header.root[..4],
+                    wrong_slot,
+                    outvoted,
+                    "BN header did not reach agreement"
+                );
+            }
+            let outcome =
+                if wrong_slot { TrackerOutcome::Error } else { scored(!outvoted, elapsed) };
+            outcomes.push((index, outcome));
+        }
+        record_outcomes(&self.health_trackers, OP, &outcomes).await;
+        result
     }
 
     /// Like [`Self::query_first`], but `Ok(None)` is not a cluster answer.
@@ -1540,12 +1716,8 @@ impl BnManager {
             // Build the future only after the deadline check. A zero timeout
             // still polls once and would send the request.
             let fut = op(client).instrument(attempt_span);
-            match await_attempt(op_name, bound, fut).await {
+            match self.unless_revoked(stamp, await_attempt(op_name, bound, fut).await) {
                 Ok(Some(result)) => {
-                    if !self.stamp_holds(stamp) {
-                        note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
-                        continue;
-                    }
                     let elapsed = start.elapsed();
                     // Earlier failures were recorded before this attempt.
                     record_outcomes(
@@ -1565,10 +1737,6 @@ impl BnManager {
                     return Ok(Some(result));
                 }
                 Ok(None) => {
-                    if !self.stamp_holds(stamp) {
-                        note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
-                        continue;
-                    }
                     saw_none = true;
                     debug!(
                         op = op_name,
@@ -1576,6 +1744,9 @@ impl BnManager {
                         endpoint = %RedactedUrl(client.endpoint()),
                         "BN returned no data, trying next"
                     );
+                }
+                Err(BeaconError::RevokedInFlight) => {
+                    note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
                 }
                 Err(e) => {
                     record_outcomes(
@@ -1742,12 +1913,8 @@ impl BnManager {
                 None => fut.await,
             };
 
-            match result {
+            match self.unless_revoked(stamp, result) {
                 Ok(value) => {
-                    if !self.stamp_holds(stamp) {
-                        note_attempt_error(op_name, &mut last_err, BeaconError::RevokedInFlight);
-                        continue;
-                    }
                     let elapsed = start.elapsed();
                     // Earlier failures were recorded before this attempt.
                     record_outcomes(
@@ -4102,8 +4269,18 @@ impl NodeStatusApi for BnManager {
         let deadline = self
             .op_timeout(|t| t.attestation_fetch)
             .map(|budget| checked_deadline(tokio::time::Instant::now(), budget));
+        // An optimistic root is an error for that node, so a verified peer
+        // still answers. The slot context also rejects one.
         self.query_first("get_block_root", BnRole::All, HealthTier::SmallLag, deadline, |c| {
-            Box::pin(c.get_block_root(block_id))
+            Box::pin(async move {
+                let response = c.get_block_root(block_id).await?;
+                if response.execution_optimistic == Some(true) {
+                    return Err(BeaconError::ParseError(
+                        "block root is execution_optimistic; unchecked".into(),
+                    ));
+                }
+                Ok(response)
+            })
         })
         .await
     }
@@ -4116,6 +4293,18 @@ impl NodeStatusApi for BnManager {
         // It is not a 404. A later node that returns a valid header still
         // supplies it. When every attempt fails, the parent filter stays off.
         self.query_first("get_block_header", BnRole::All, HealthTier::SmallLag, None, |c| {
+            Box::pin(c.get_block_header(block_id))
+        })
+        .await
+    }
+
+    async fn get_block_header_checked(
+        &self,
+        block_id: &str,
+        proposal_slot: Slot,
+        deadline: tokio::time::Instant,
+    ) -> Result<CheckedHeader, BeaconError> {
+        self.query_header_quorum(block_id, proposal_slot, deadline, &|c| {
             Box::pin(c.get_block_header(block_id))
         })
         .await
@@ -12197,5 +12386,338 @@ mod tests {
             .await
             .expect("http timeout then 204");
         assert!(result.is_none());
+    }
+
+    fn quorum_urls(count: usize) -> Vec<String> {
+        (0..count).map(|port| format!("http://127.0.0.1:{}", 9 - port)).collect()
+    }
+
+    fn quorum_header(slot: u64, root: u8) -> BlockHeaderSummary {
+        BlockHeaderSummary { root: [root; 32], slot, proposer_index: 1, parent_root: [0x22; 32] }
+    }
+
+    type QuorumAnswers =
+        Arc<dyn Fn(char) -> Option<Result<BlockHeaderSummary, BeaconError>> + Send + Sync>;
+
+    /// Time limit of [`header_quorum_of`].
+    const QUORUM_LIMIT: Duration = Duration::from_millis(150);
+
+    /// Each node answers from `answers`, keyed by the last digit of its port.
+    /// Node `:9` answers at once, node `:6` after 200 ms (past the limit),
+    /// and the other nodes after 10 ms. `None` never answers.
+    async fn header_quorum_of(
+        manager: &BnManager,
+        block_id: &str,
+        answers: QuorumAnswers,
+    ) -> Result<crate::CheckedHeader, BeaconError> {
+        let deadline = tokio::time::Instant::now() + QUORUM_LIMIT;
+        manager
+            .query_header_quorum(block_id, 100, deadline, &|client| {
+                let port = client.endpoint().trim_end_matches('/').chars().last().unwrap_or('?');
+                let answers = Arc::clone(&answers);
+                Box::pin(async move {
+                    let delay = match port {
+                        '9' => 0,
+                        '6' => 200,
+                        _ => 10,
+                    };
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                    match answers(port) {
+                        Some(answer) => answer,
+                        None => std::future::pending().await,
+                    }
+                })
+            })
+            .await
+    }
+
+    async fn error_rates(manager: &BnManager) -> Vec<f64> {
+        manager.health_trackers().read().await.iter().map(|tracker| tracker.error_rate()).collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_quorum_stops_at_the_time_limit_without_a_health_error() {
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(2))).unwrap();
+        let honest = quorum_header(99, 1);
+        let answers = Arc::new(move |port: char| (port == '9').then_some(Ok(honest)));
+        let start = tokio::time::Instant::now();
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Unconfirmed);
+        assert_eq!(start.elapsed(), QUORUM_LIMIT, "the lookup ends at its time limit");
+        let rates = error_rates(&manager).await;
+        assert_eq!(rates, vec![0.0, 0.0], "a slow node is not a health error");
+
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(3))).unwrap();
+        let answers = Arc::new(|port: char| {
+            (port != '7').then(|| Err(BeaconError::ApiError { status: 404, message: "x".into() }))
+        });
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Unconfirmed, "two 404s and a silent node");
+
+        let urls: Vec<String> = ["9", "8", "6"].map(|p| format!("http://127.0.0.1:{p}")).to_vec();
+        let manager = BnManager::new(BnManagerConfig::new(urls)).unwrap();
+        let late = quorum_header(99, 1);
+        let answers = Arc::new(move |port: char| {
+            Some(if port == '6' {
+                Ok(late)
+            } else {
+                Err(BeaconError::ApiError { status: 404, message: "x".into() })
+            })
+        });
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Unconfirmed, "the late block is not skipped");
+
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(2))).unwrap();
+        let err = header_quorum_of(&manager, "99", Arc::new(|_| None)).await.unwrap_err();
+        assert!(matches!(err, BeaconError::OperationTimeout { .. }), "{err:?}");
+
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(1))).unwrap();
+        let past = tokio::time::Instant::now();
+        let err = manager
+            .query_header_quorum("99", 100, past, &|_| {
+                Box::pin(async { panic!("a past deadline must not send a request") })
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BeaconError::OperationTimeout { .. }), "{err:?}");
+    }
+
+    /// `(error rate, latency EMA)` for each node. `(0.0, None)` is no outcome
+    /// that moves the score.
+    async fn health_of(manager: &BnManager) -> Vec<(f64, Option<f64>)> {
+        let trackers = manager.health_trackers().read().await;
+        trackers.iter().map(|tracker| (tracker.error_rate(), tracker.latency_ema_ms())).collect()
+    }
+
+    fn not_found_reply() -> Result<BlockHeaderSummary, BeaconError> {
+        Err(BeaconError::ApiError { status: 404, message: "x".into() })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_quorum_does_not_skip_a_slot_when_a_node_errors() {
+        let failures: [fn() -> BeaconError; 2] = [
+            || BeaconError::ApiError { status: 500, message: "down".into() },
+            || BeaconError::ParseError("execution_optimistic header is unchecked".into()),
+        ];
+        for failure in failures {
+            let manager = BnManager::new(BnManagerConfig::new(quorum_urls(3))).unwrap();
+            let answers = Arc::new(move |port: char| {
+                Some(if port == '7' { Err(failure()) } else { not_found_reply() })
+            });
+            let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+            assert_eq!(result, crate::CheckedHeader::Unconfirmed, "{}", failure());
+        }
+    }
+
+    /// No agreed header: a 404 and a header have no health outcome.
+    #[tokio::test(start_paused = true)]
+    async fn header_quorum_without_an_agreed_header_does_not_score_votes() {
+        let late = quorum_header(99, 1);
+        let answers: QuorumAnswers = Arc::new(move |port: char| {
+            Some(if port == '9' { Ok(late) } else { not_found_reply() })
+        });
+        for nodes in [3, 2] {
+            let manager = BnManager::new(BnManagerConfig::new(quorum_urls(nodes))).unwrap();
+            let result = header_quorum_of(&manager, "99", Arc::clone(&answers)).await.unwrap();
+            assert_eq!(result, crate::CheckedHeader::Unconfirmed);
+            assert_eq!(health_of(&manager).await, vec![(0.0, None); nodes], "{nodes} nodes");
+        }
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(2))).unwrap();
+        let result =
+            header_quorum_of(&manager, "99", Arc::new(|_| Some(not_found_reply()))).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::NotFound);
+        assert_eq!(health_of(&manager).await, vec![(0.0, None); 2], "a 404 is not a success");
+
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(3))).unwrap();
+        let answers = Arc::new(move |port: char| {
+            Some(if port == '9' { not_found_reply() } else { Ok(late) })
+        });
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Found(late));
+        let health = health_of(&manager).await;
+        assert!(health[0].0 > 0.0, "a 404 against an agreed header is an error: {health:?}");
+        assert!(health[1..].iter().all(|(rate, ema)| *rate == 0.0 && ema.is_some()));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_quorum_marks_an_outvoted_node_and_a_wrong_slot_header() {
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(3))).unwrap();
+        let honest = quorum_header(99, 1);
+        let answers = Arc::new(move |port: char| {
+            Some(Ok(if port == '9' { quorum_header(99, 2) } else { honest }))
+        });
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Found(honest));
+        let rates = error_rates(&manager).await;
+        assert!(rates[0] > 0.0, "an outvoted node gets a health error: {rates:?}");
+        assert_eq!(&rates[1..], &[0.0, 0.0]);
+
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(2))).unwrap();
+        let answers = Arc::new(move |port: char| {
+            Some(Ok(if port == '9' { quorum_header(90, 2) } else { honest }))
+        });
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Unconfirmed);
+        let rates = error_rates(&manager).await;
+        assert!(rates[0] > 0.0, "a wrong-slot header gets a health error: {rates:?}");
+        assert_eq!(rates[1], 0.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_quorum_returns_when_two_nodes_agree_while_the_first_hangs() {
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(3))).unwrap();
+        let honest = quorum_header(99, 1);
+        let answers = Arc::new(move |port: char| (port != '9').then_some(Ok(honest)));
+        let result =
+            tokio::time::timeout(Duration::from_secs(1), header_quorum_of(&manager, "99", answers))
+                .await
+                .expect("two agreeing nodes must not wait for a hung node");
+        assert_eq!(result.unwrap(), crate::CheckedHeader::Found(honest));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_quorum_does_not_let_one_node_decide_when_two_are_asked() {
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(2))).unwrap();
+        let answers = Arc::new(|port: char| {
+            Some(Ok(if port == '9' { quorum_header(99, 2) } else { quorum_header(99, 1) }))
+        });
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Unconfirmed);
+
+        let wrong = quorum_header(90, 3);
+        let answers = Arc::new(move |port: char| {
+            Some(if port == '9' {
+                Ok(wrong)
+            } else {
+                Err(BeaconError::ApiError { status: 404, message: "missing".into() })
+            })
+        });
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Unconfirmed, "one wrong slot does not close");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_quorum_with_one_node_keeps_its_answer() {
+        let manager = BnManager::new(BnManagerConfig::new(quorum_urls(1))).unwrap();
+        let wrong = quorum_header(90, 3);
+        let answers = Arc::new(move |_| Some(Ok(wrong)));
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Rejected(wrong));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn header_quorum_drops_the_vote_of_a_node_revoked_in_flight() {
+        let manager = Arc::new(BnManager::new(BnManagerConfig::new(quorum_urls(2))).unwrap());
+        let honest = quorum_header(99, 1);
+        let revoker = Arc::clone(&manager);
+        let answers = Arc::new(move |port: char| {
+            if port == '9' {
+                revoker.revoke_admission(0);
+            }
+            Some(Ok(honest))
+        });
+        let result = header_quorum_of(&manager, "99", answers).await.unwrap();
+        assert_eq!(result, crate::CheckedHeader::Unconfirmed);
+    }
+
+    /// Node `:9` returns 404 and is revoked during that request. Node `:8` returns 404.
+    fn revoked_404_op<T: Send + 'static>(
+        revoker: Arc<BnManager>,
+    ) -> impl Fn(&BeaconClient) -> BoxFut<'_, T> {
+        move |client: &BeaconClient| {
+            let first = client.endpoint().trim_end_matches('/').ends_with(":9");
+            let revoker = Arc::clone(&revoker);
+            Box::pin(async move {
+                if first {
+                    revoker.revoke_admission(0);
+                }
+                Err(BeaconError::ApiError { status: 404, message: "missing".into() })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn query_first_does_not_count_a_404_from_a_node_revoked_in_flight() {
+        let manager = Arc::new(BnManager::new(BnManagerConfig::new(quorum_urls(2))).unwrap());
+        let op = revoked_404_op::<u64>(Arc::clone(&manager));
+        let err = manager
+            .query_first_inner("get_block_header", BnRole::All, HealthTier::Unsynced, None, &op)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BeaconError::RevokedInFlight), "{err:?}");
+
+        let manager = Arc::new(BnManager::new(BnManagerConfig::new(quorum_urls(2))).unwrap());
+        let prefer_some = revoked_404_op::<Option<u64>>(Arc::clone(&manager));
+        let err = manager
+            .query_first_prefer_some_inner(
+                "get_block_header",
+                BnRole::All,
+                HealthTier::Unsynced,
+                None,
+                &prefer_some,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BeaconError::RevokedInFlight), "{err:?}");
+
+        let manager = Arc::new(BnManager::new(BnManagerConfig::new(quorum_urls(2))).unwrap());
+        let op = revoked_404_op::<u64>(Arc::clone(&manager));
+        let err = manager
+            .query_failover_inner("get_block_header", BnRole::All, HealthTier::Unsynced, None, &op)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BeaconError::RevokedInFlight), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn get_block_root_fails_over_from_an_optimistic_node() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let optimistic = MockServer::start().await;
+        let verified = MockServer::start().await;
+        for (server, flag, byte) in [(&optimistic, true, "aa"), (&verified, false, "bb")] {
+            let body = format!(
+                r#"{{"execution_optimistic":{flag},"finalized":false,"data":{{"root":"0x{}"}}}}"#,
+                byte.repeat(32)
+            );
+            Mock::given(method("GET"))
+                .and(path("/eth/v1/beacon/blocks/40/root"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(server)
+                .await;
+        }
+        let manager =
+            BnManager::new(BnManagerConfig::new(vec![optimistic.uri(), verified.uri()])).unwrap();
+        let root = manager.get_block_root("40").await.expect("the verified node answers");
+        assert_eq!(root.data.root, format!("0x{}", "bb".repeat(32)));
+        assert_eq!(root.execution_optimistic, Some(false));
+    }
+
+    #[test]
+    fn new_rejects_the_same_endpoint_twice() {
+        for pair in [
+            ["http://BN.example:5052", "http://bn.example:5052/"],
+            ["http://bn.example", "http://bn.example:80"],
+            ["https://bn.example/api/", "https://BN.example:443/api"],
+        ] {
+            let err = BnManager::new(BnManagerConfig::new(pair.map(String::from).to_vec()))
+                .err()
+                .unwrap_or_else(|| panic!("{pair:?} names one node two times"));
+            match err {
+                BnManagerError::InvalidEndpoint(message) => {
+                    assert!(message.contains("duplicate"), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        for pair in [
+            ["http://bn.example:5052", "http://bn.example:5053"],
+            ["http://bn.example:5052", "https://bn.example:5052"],
+            ["http://bn.example/a", "http://bn.example/b"],
+        ] {
+            BnManager::new(BnManagerConfig::new(pair.map(String::from).to_vec()))
+                .unwrap_or_else(|err| panic!("{pair:?} are two nodes: {err}"));
+        }
     }
 }
