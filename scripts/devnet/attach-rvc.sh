@@ -753,8 +753,8 @@ launch_rvc_docker() {
         "$DOCKER" rm -f -- "$RVC_CONTAINER" >/dev/null 2>&1 || true
     fi
 
-    # --no-healthcheck: image HEALTHCHECK probes /healthz, which RVC does not
-    # serve. -u overrides USER rvc (uid 10001) so the bind-mounted slashing DB
+    # --no-healthcheck: readiness is the wait_for_service /health poll.
+    # -u overrides USER rvc (uid 10001) so the bind-mounted slashing DB
     # stays host-owned. Non-loopback metrics bind is refused without the env.
     # "$@" is empty-safe under bash 3.2 `set -u`; "${arr[@]}" is not.
     if ! cid="$(

@@ -178,3 +178,78 @@ fn test_server_starts_and_shuts_down_cleanly() {
         outcome.diagnostic()
     );
 }
+
+// ---------------------------------------------------------------------------
+// `rvc-signer health`: the image HEALTHCHECK probe
+// ---------------------------------------------------------------------------
+
+/// Serves the production signer metrics listener on an ephemeral loopback port.
+fn spawn_signer_metrics() -> std::net::SocketAddr {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async move {
+            let metrics = std::sync::Arc::new(signer_server::metrics::SignerMetrics::new());
+            let (handle, addr) = signer_server::metrics::serve_metrics(
+                "127.0.0.1:0".parse().expect("addr"),
+                metrics,
+            )
+            .await
+            .expect("serve metrics");
+            tx.send(addr).expect("send addr");
+            let _ = handle.await;
+        });
+    });
+    rx.recv_timeout(Duration::from_secs(5)).expect("signer metrics address")
+}
+
+/// Answers each connection with a 404, like a server without the probed route.
+fn spawn_not_found() -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    std::thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        }
+    });
+    addr
+}
+
+#[test]
+fn test_health_exits_zero_on_the_signer_metrics_route() {
+    let addr = spawn_signer_metrics();
+    for _ in 0..20 {
+        let out = run_bin(&["health", "--url", &format!("http://{addr}/metrics")]);
+        assert!(
+            out.status.success(),
+            "health on /metrics must pass: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn test_health_exits_nonzero_on_a_404() {
+    let addr = spawn_not_found();
+    let out = run_bin(&["health", "--url", &format!("http://{addr}/metrics")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "health on a 404 must fail: {stderr}");
+    assert!(stderr.contains("404"), "stderr must name the status: {stderr}");
+}
+
+#[test]
+fn test_health_exits_nonzero_when_nothing_listens() {
+    let out = run_bin(&["health", "--url", &format!("http://127.0.0.1:{}/metrics", free_port())]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "health with no listener must fail: {stderr}");
+    assert!(stderr.contains("health probe"), "stderr: {stderr}");
+}

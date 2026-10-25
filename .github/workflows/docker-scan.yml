@@ -9,7 +9,7 @@ name: Docker scan
 #
 # SARIF drops `severity` unless `limit-severities-for-sarif` is true, so the
 # gating step's exit-code 1 is CRITICAL-only. `.trivyignore` allows only
-# CVE-2023-45853 and CVE-2026-111497. The table step prints that same filter into the job log and
+# CVE-2023-45853. The table step prints that same filter into the job log and
 # the job summary; it does not gate the job. Do not set ignore-unfixed.
 
 on:

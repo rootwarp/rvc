@@ -37,10 +37,27 @@ SCAN_PATHS = {
     "scripts/docker-cargo-features.sh",
 }
 
-ALLOWED_IGNORED_CVES = [
-    "CVE-2023-45853",
-    "CVE-2026-111497 exp:2026-12-31",
-]
+ALLOWED_IGNORED_CVES = ["CVE-2023-45853"]
+
+# Inputs that remove paths, files, or scanners from the scan, or that load a
+# config file which can do the same.
+NARROWING_TRIVY_INPUTS = (
+    "skip-dirs",
+    "skip-files",
+    "scanners",
+    "trivy-config",
+    "vuln-type",
+    "ignore-policy",
+    "skip-setup-trivy",
+    "version",
+)
+
+# Trivy reads each TRIVY_<FLAG> environment variable as that flag.
+_TRIVY_ENV_RE = re.compile(r"trivy_", re.IGNORECASE)
+_GITHUB_ENV_RE = re.compile(r"\bGITHUB_ENV\b")
+
+# Trivy reads trivy.yaml from the working directory when no --config is given.
+TRIVY_CONFIG_NAMES = {"trivy.yaml", "trivy.yml"}
 
 
 class WorkflowLoader(yaml.SafeLoader):
@@ -145,28 +162,58 @@ def _ignore_unfixed_enabled(with_: dict) -> bool:
     return not (isinstance(value, str) and value.strip().lower() == "false")
 
 
+def trivy_env_problems(label: str, env) -> list[str]:
+    """TRIVY_* keys (any case) in one `env:` map."""
+    if not isinstance(env, dict):
+        return []
+    return [f"{label}: {key}" for key in env if _TRIVY_ENV_RE.match(str(key))]
+
+
+def writes_trivy_github_env(step: dict) -> bool:
+    run = step.get("run")
+    return (
+        isinstance(run, str)
+        and _TRIVY_ENV_RE.search(run) is not None
+        and _GITHUB_ENV_RE.search(run) is not None
+    )
+
+
 def trivy_gate_problems(doc) -> list[str]:
-    """Problems in parsed Trivy steps. Comments in the YAML do not count."""
+    """Problems in parsed Trivy steps. Comments in the YAML do not count.
+
+    Input names are compared in lowercase. TRIVY_* environment variables in the
+    workflow, in a job with a Trivy step, or in a Trivy step are rejected. A run
+    step in such a job that writes TRIVY_ to GITHUB_ENV is also rejected.
+    """
     problems: list[str] = []
     jobs = doc.get("jobs") or {}
     if not isinstance(jobs, dict):
         return ["jobs is not a mapping"]
+    problems.extend(trivy_env_problems("workflow env", doc.get("env")))
     sarif_gates = 0
     for job_name, job in jobs.items():
         if not isinstance(job, dict):
             continue
-        for step in job.get("steps") or []:
-            if not isinstance(step, dict) or not _is_trivy_step(step):
+        steps = [step for step in job.get("steps") or [] if isinstance(step, dict)]
+        if not any(_is_trivy_step(step) for step in steps):
+            continue
+        problems.extend(trivy_env_problems(f"{job_name}: env", job.get("env")))
+        if any(writes_trivy_github_env(step) for step in steps):
+            problems.append(f"{job_name}: run step writes TRIVY_ to GITHUB_ENV")
+        for step in steps:
+            if not _is_trivy_step(step):
                 continue
             where = f"{job_name}: {normalize_uses(step.get('uses'))}"
             if step_continues_on_error(step) or step_continues_on_error(job):
                 problems.append(f"{where}: continue-on-error")
             if step_is_disabled(step) or step_is_disabled(job):
                 problems.append(f"{where}: if false")
-            with_ = step.get("with")
-            if not isinstance(with_, dict):
+            problems.extend(trivy_env_problems(f"{where}: env", step.get("env")))
+            raw_with = step.get("with")
+            if not isinstance(raw_with, dict):
                 problems.append(f"{where}: with is not a mapping")
                 continue
+            with_ = {str(key).lower(): value for key, value in raw_with.items()}
             if with_.get("limit-severities-for-sarif") is not True:
                 problems.append(f"{where}: limit-severities-for-sarif")
             if with_.get("trivyignores") != ".trivyignore":
@@ -175,6 +222,9 @@ def trivy_gate_problems(doc) -> list[str]:
                 problems.append(f"{where}: severity")
             if _ignore_unfixed_enabled(with_):
                 problems.append(f"{where}: ignore-unfixed")
+            for key in NARROWING_TRIVY_INPUTS:
+                if key in with_:
+                    problems.append(f"{where}: {key}")
             if with_.get("format") == "sarif" and str(with_.get("exit-code")) == "1":
                 sarif_gates += 1
     if sarif_gates < 1:
@@ -209,6 +259,24 @@ def ignore_file_problems(files: dict[str, str]) -> list[str]:
     if trivyignore_entries(files.get(".trivyignore", "")) != ALLOWED_IGNORED_CVES:
         problems.append("ignore entries")
     return problems
+
+
+def trivy_config_file_problems(paths: list[str]) -> list[str]:
+    return [
+        f"trivy config file: {path}"
+        for path in sorted(paths)
+        if Path(path).name in TRIVY_CONFIG_NAMES
+    ]
+
+
+def discover_trivy_config_files() -> list[str]:
+    found: list[str] = []
+    for name in TRIVY_CONFIG_NAMES:
+        for path in ROOT.rglob(name):
+            if any(part in {".git", "target"} for part in path.parts):
+                continue
+            found.append(str(path.relative_to(ROOT)))
+    return found
 
 
 def discover_ignore_files() -> dict[str, str]:
@@ -309,15 +377,111 @@ jobs:
     assert step_continues_on_error({"continue-on-error": "true"})
 
 
+def _reviewed_trivy_step(extra: str) -> str:
+    return f"""
+name: fixture
+on: push
+jobs:
+  scan:
+    steps:
+      - uses: aquasecurity/trivy-action@{"d" * 40}
+        with:
+          format: sarif
+          severity: CRITICAL
+          exit-code: '1'
+          limit-severities-for-sarif: true
+          trivyignores: .trivyignore
+{extra}"""
+
+
+def test_trivy_step_rejects_inputs_that_narrow_the_scan():
+    assert trivy_gate_problems(load_workflow(_reviewed_trivy_step(""))) == []
+    for key, value in [
+        ("skip-dirs", "usr/lib"),
+        ("skip-files", "usr/lib/x86_64-linux-gnu/libbrotlidec.so.1"),
+        ("scanners", "secret"),
+        ("trivy-config", "trivy.yaml"),
+        ("vuln-type", "library"),
+        ("ignore-policy", "policy.rego"),
+        ("skip-setup-trivy", "true"),
+        ("version", "v0.50.0"),
+    ]:
+        text = _reviewed_trivy_step(f"          {key}: {value}\n")
+        problems = trivy_gate_problems(load_workflow(text))
+        assert any(item.endswith(f": {key}") for item in problems), (key, problems)
+
+
+def test_trivy_step_compares_input_names_in_lowercase():
+    for key, value in [
+        ("Skip-Dirs", "usr/lib"),
+        ("SCANNERS", "secret"),
+        ("Ignore-Unfixed", "true"),
+    ]:
+        text = _reviewed_trivy_step(f"          {key}: {value}\n")
+        problems = trivy_gate_problems(load_workflow(text))
+        assert any(item.endswith(f": {key.lower()}") for item in problems), (key, problems)
+    mixed = _reviewed_trivy_step("").replace("severity: CRITICAL", "Severity: CRITICAL")
+    assert trivy_gate_problems(load_workflow(mixed)) == []
+
+
+def _trivy_job_with(workflow_env: str = "", job_env: str = "", pre_steps: str = "") -> str:
+    return f"""
+name: fixture
+on: push
+{workflow_env}jobs:
+  scan:
+{job_env}    steps:
+{pre_steps}      - uses: aquasecurity/trivy-action@{"e" * 40}
+        with:
+          format: sarif
+          severity: CRITICAL
+          exit-code: '1'
+          limit-severities-for-sarif: true
+          trivyignores: .trivyignore
+"""
+
+
+def test_trivy_gate_rejects_trivy_env_at_each_level():
+    assert trivy_gate_problems(load_workflow(_trivy_job_with())) == []
+    workflow = _trivy_job_with(workflow_env="env:\n  TRIVY_IGNORE_UNFIXED: 'true'\n")
+    assert "workflow env: TRIVY_IGNORE_UNFIXED" in trivy_gate_problems(load_workflow(workflow))
+    job = _trivy_job_with(job_env="    env:\n      trivy_skip_dirs: usr/lib\n")
+    assert "scan: env: trivy_skip_dirs" in trivy_gate_problems(load_workflow(job))
+    step = _reviewed_trivy_step("        env:\n          TRIVY_CONFIG: trivy.yaml\n")
+    assert any(
+        item.endswith("env: TRIVY_CONFIG") for item in trivy_gate_problems(load_workflow(step))
+    )
+    harmless = _trivy_job_with(workflow_env="env:\n  REGISTRY: ghcr.io\n")
+    assert trivy_gate_problems(load_workflow(harmless)) == []
+
+
+def test_trivy_gate_rejects_a_run_step_that_writes_trivy_env():
+    writer = '      - run: echo "TRIVY_SKIP_DIRS=usr/lib" >> "$GITHUB_ENV"\n'
+    problems = trivy_gate_problems(load_workflow(_trivy_job_with(pre_steps=writer)))
+    assert "scan: run step writes TRIVY_ to GITHUB_ENV" in problems
+    block = "      - run: |\n          echo trivy_config=x.yaml >> $GITHUB_ENV\n"
+    problems = trivy_gate_problems(load_workflow(_trivy_job_with(pre_steps=block)))
+    assert "scan: run step writes TRIVY_ to GITHUB_ENV" in problems
+    summary = '      - run: cat trivy-rvc.txt >> "$GITHUB_STEP_SUMMARY"\n'
+    assert trivy_gate_problems(load_workflow(_trivy_job_with(pre_steps=summary))) == []
+
+
+def test_trivy_config_files_are_rejected():
+    assert trivy_config_file_problems([]) == []
+    for name in ["trivy.yaml", "trivy.yml", "nested/trivy.yaml"]:
+        assert trivy_config_file_problems([name]) == [f"trivy config file: {name}"]
+    assert trivy_config_file_problems(discover_trivy_config_files()) == []
+
+
 def test_ignore_file_problems_reject_extra_entries_and_files():
     reviewed = "# note\n" + "\n".join(ALLOWED_IGNORED_CVES) + "\n"
     assert ignore_file_problems({".trivyignore": reviewed}) == []
     extra = ignore_file_problems({".trivyignore": reviewed + "CVE-2099-0001\n"})
     assert extra == ["ignore entries"]
-    dropped_expiry = ignore_file_problems(
-        {".trivyignore": "CVE-2023-45853\nCVE-2026-111497\n"}
+    retired = ignore_file_problems(
+        {".trivyignore": reviewed + "CVE-2026-111497 exp:2026-12-31\n"}
     )
-    assert dropped_expiry == ["ignore entries"]
+    assert retired == ["ignore entries"]
     other = ignore_file_problems(
         {
             ".trivyignore": reviewed,
@@ -455,8 +619,9 @@ def test_reviewed_trivyignore_is_the_only_ignore_file():
     assert "2027-01-18" in text
     assert "minizip" in text
     assert "will_not_fix" in text
-    assert "https://security-tracker.debian.org/tracker/CVE-2026-111497" in text
-    assert "CVE-2026-111497 exp:2026-12-31" in text
+    # The images no longer install curl, so libbrotli1 is gone with it.
+    assert "CVE-2026-111497" not in text
+    assert "libbrotli1" not in text
 
 
 def test_dependabot_tracks_github_actions():

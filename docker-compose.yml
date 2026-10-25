@@ -32,10 +32,10 @@ services:
       - OTEL_TRACES_SAMPLER_ARG=1.0
       # - RUST_LOG=info
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/healthz"]
+      test: ["CMD", "rvc", "health", "--url", "http://127.0.0.1:8080/livez"]
       interval: 30s
       timeout: 5s
-      start_period: 10s
+      start_period: 300s
       retries: 3
     restart: unless-stopped
     networks:
@@ -61,10 +61,10 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
       - OTEL_TRACES_SAMPLER_ARG=1.0
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9101/healthz"]
+      test: ["CMD", "rvc-signer", "health", "--url", "http://127.0.0.1:9101/metrics"]
       interval: 30s
       timeout: 5s
-      start_period: 10s
+      start_period: 300s
       retries: 3
     restart: unless-stopped
     networks:

@@ -381,6 +381,37 @@ The gRPC healthz / DutyTracker listener is gone. Leftover `grpc_port` /
 `grpc_address` keys fail startup. Point probes at `/health`, `/livez`, and
 `/readyz` on this metrics port.
 
+### Container health check
+
+The images do not install `curl`. Each `HEALTHCHECK` runs the `health`
+subcommand of its binary. The subcommand sends one `GET` and stops after 3 s.
+It exits 0 on a 2xx status and 1 on any other result. It does not follow a
+redirect and it does not use a proxy.
+
+| Image | Command | Default `--url` |
+|-------|---------|-----------------|
+| `rvc` | `rvc health` | `http://127.0.0.1:8080/livez` |
+| `rvc-signer` | `rvc-signer health` | `http://127.0.0.1:9101/metrics` |
+
+Each health check has a start period of 300 s. During the start period, a
+failed probe does not count, and the first passed probe marks the container
+healthy. The probed listener starts late:
+
+- rvc serves `/livez` only after it connects to a beacon node, loads and
+  decrypts the keystores, and builds its services.
+- rvc-signer serves `/metrics` only after it decrypts the keystores.
+
+If a start takes more than 300 s (for example, many scrypt keystores, a slow
+secret provider, or a slow beacon node), the container becomes unhealthy. An
+orchestrator can then restart it in a loop. In that case, set a longer start
+period, for example `docker run --health-start-period=600s` or
+`start_period: 600s` in compose.
+
+If you change the metrics address or port, give the same address to `--url`.
+The probe trusts the process that answers on that address inside the
+container's network namespace. In a Kubernetes pod with a sidecar, or with
+`network_mode: host`, another process in the same namespace can own the port.
+
 ### Keymanager API (default port 5062, when enabled)
 
 | Method | Path | Description |
@@ -844,7 +875,7 @@ rvc-signer serve [OPTIONS]
 | `--tls-key <PATH>` | none | Server TLS private key (PEM) |
 | `--tls-ca-cert <PATH>` | none | CA certificate for client authentication (PEM) |
 | `--backend <TYPE>` | `basic` | Signing backend: `basic` or `dvt` (requires `dvt` feature) |
-| `--metrics-address <ADDR>` | `127.0.0.1:9101` | Prometheus metrics listen address |
+| `--metrics-address <ADDR>` | `127.0.0.1:9101` | Prometheus metrics listen address (`GET /metrics`. Other paths get `404`.) |
 | `--reload-interval <SECS>` | `30` | Keystore hot-reload interval (0 to disable) |
 | `--dry-run` | false | Validate configuration and exit |
 | `--insecure` | false | Allow starting without TLS (NOT recommended for production) |

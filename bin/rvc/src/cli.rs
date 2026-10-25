@@ -138,6 +138,16 @@ pub enum Commands {
         #[command(subcommand)]
         command: DoppelgangerCommands,
     },
+
+    /// Probe the metrics server one time (container HEALTHCHECK).
+    ///
+    /// Exits 0 on a 2xx status. Exits non-zero on any other status, a failed
+    /// connection, or no response within 3 s.
+    Health {
+        /// URL to probe
+        #[arg(long, default_value = commands::health::DEFAULT_URL)]
+        url: url::Url,
+    },
 }
 
 /// Subcommands under `rvc doppelganger`.
@@ -375,6 +385,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
                 )?;
             }
         },
+        Commands::Health { url } => commands::health::execute(&url).await?,
         Commands::Slashing { command } => match command {
             SlashingCommands::Prune { slashing_db_path, dry_run, yes, log_level } => {
                 init_logging(&log_level, telemetry::LogFormat::resolve(None), None, None);
@@ -1020,6 +1031,20 @@ metrics_port = 9090
             msg.contains("cannot be used with") || msg.contains("conflict"),
             "unexpected conflict message: {msg}"
         );
+    }
+
+    #[test]
+    fn test_health_defaults_to_the_livez_route_on_the_metrics_port() {
+        let cli = Cli::try_parse_from(["rvc", "health"]).expect("health parses");
+        let Commands::Health { url } = cli.command else { panic!("expected Health") };
+        assert_eq!(url.as_str(), "http://127.0.0.1:8080/livez");
+
+        let cli = Cli::try_parse_from(["rvc", "health", "--url", "http://10.0.0.2:9000/health"])
+            .expect("health --url parses");
+        let Commands::Health { url } = cli.command else { panic!("expected Health") };
+        assert_eq!(url.path(), "/health");
+
+        assert!(Cli::try_parse_from(["rvc", "health", "--url", "not a url"]).is_err());
     }
 
     #[test]

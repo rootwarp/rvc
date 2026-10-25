@@ -147,7 +147,7 @@ scripts/devnet/attach-rvc.sh --profile fast --run-dir scripts/devnet/runs/manual
 | Inventory | `{kind:pid,name:rvc}` | `{kind:container,name:eth-devnet-rvc}` **before** `docker run` |
 | `rvc.json` | `pid` | plus `launch_mode` and `container_id` |
 | Logs | process stdout → `data/rvc/rvc.log` | `docker logs -f` teed into the same file |
-| Idempotency | live pid + `/health` 200 owned by that pid | running container + HTTP `/health` 200. Not `State.Health` — the image probes `/healthz`, which RVC does not serve, so the run uses `--no-healthcheck` |
+| Idempotency | live pid + `/health` 200 owned by that pid | running container + HTTP `/health` 200. Not `State.Health`: the run reads `/health` itself and uses `--no-healthcheck` |
 
 `--force` removes **both** a live pidfile rvc and `eth-devnet-rvc`, and a second attach no-ops if either occupant is healthy, regardless of `--docker`. A kill between inventory append and readiness still leaves `down.sh` able to `docker rm -f` the name; `down.sh --data` then leaves no container and no `data/rvc/slashing_protection.sqlite`. `-u "$(id -u):$(id -g)"` overrides `USER rvc` (uid 10001) so that bind-mounted sqlite stays host-owned.
 

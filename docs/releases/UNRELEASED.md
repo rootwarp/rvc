@@ -3,6 +3,31 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Container health checks work, and the images have no curl
+
+The `rvc` image health check probed `/healthz`. rvc does not serve that path, so the probe got `404` and the container was always `unhealthy`. The `rvc-signer` probe passed only because the signer metrics listener answered `200` on every path.
+
+The `rvc` and `rvc-signer` images do not install `curl` now. Thus `libcurl4` and `libbrotli1` are not in the images, and `.trivyignore` again allows only CVE-2023-45853. Each `HEALTHCHECK` and each `docker-compose.yml` health check runs a new `health` subcommand:
+
+| Image | Health check |
+|-------|--------------|
+| `rvc` | `rvc health --url http://127.0.0.1:8080/livez` |
+| `rvc-signer` | `rvc-signer health --url http://127.0.0.1:9101/metrics` |
+
+Both health checks have a start period of 300 s (it was 10 s), because each binary opens its probed listener only after the keystores are decrypted. rvc also connects to a beacon node first. If a start takes longer, set a longer start period.
+
+The subcommand sends one `GET` and stops after 3 s. It exits 0 on a 2xx status and 1 on any other status, a failed connection, or a timeout. It does not follow a redirect and does not use a proxy. `rvc-signer health` starts no logging and no OpenTelemetry export.
+
+The signer metrics listener now reads the request before it answers. Only `GET /metrics` gets the metrics, and `HEAD /metrics` gets the same headers with no body. Another path gets `404`. Another method on `/metrics` gets `405` with `Allow: GET, HEAD`. A malformed request, or a request head that does not end in the first 8 KiB, gets `400`. The listener serves each connection in its own task, with a maximum of 16 at the same time. When 16 are open, a new connection closes the oldest connection that has not sent a complete request head. Thus silent clients cannot lock out the health probe. If all 16 have a complete head, the new connection is closed at once. A 2 s limit covers the request read and the response write of each connection.
+
+### Update your probes and scrapes
+
+1. If a health check of your own runs `curl` in an `rvc` or `rvc-signer` container, change it to the `health` subcommand. The images do not contain `curl`.
+2. If you set `--metrics-address`, `--metrics-port`, or the signer `--metrics-address` to a different address, give the same address to `health --url`.
+3. If a Prometheus job scrapes the signer on a path other than `/metrics`, change the path to `/metrics`.
+
+> **Note:** The probe trusts the process that answers on its address inside the container's network namespace. In a Kubernetes pod with a sidecar, or with `network_mode: host`, another process in that namespace can own the port.
+
 ## Beacon-node admission compares the fork schedule
 
 The chain identity that beacon nodes must match now includes the fork schedule. The schedule is each `*_FORK_EPOCH` and `*_FORK_VERSION` key of `GET /eth/v1/config/spec`, from `GENESIS_FORK_VERSION` through Gloas. Before this change, a node on a chain with the same genesis but a different fork epoch was admitted. Its signing domains could then differ from the local domains at the fork boundary.

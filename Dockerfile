@@ -71,7 +71,6 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
     ca-certificates \
     libgcc-s1 \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 10001 rvc && \
@@ -86,8 +85,11 @@ VOLUME ["/data", "/config"]
 
 EXPOSE 8080 5062
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["curl", "-f", "http://localhost:8080/healthz"]
+# `rvc health` probes /livez one time (3 s limit). The image has no curl.
+# /livez answers only after the beacon connect and the keystore decrypt, so the
+# start period is long. See docs/running-guide.md "Container health check".
+HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
+    CMD ["rvc", "health", "--url", "http://127.0.0.1:8080/livez"]
 
 USER rvc
 
@@ -113,7 +115,6 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends \
     && apt-get install -y --no-install-recommends \
     ca-certificates \
     libgcc-s1 \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --gid 10001 rvc && \
@@ -128,8 +129,10 @@ VOLUME ["/data", "/config", "/certs"]
 
 EXPOSE 50051 9101
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["curl", "-f", "http://localhost:9101/healthz"]
+# `rvc-signer health` probes /metrics one time (3 s limit). The image has no curl.
+# The metrics listener starts only after the keystores are decrypted.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=300s --retries=3 \
+    CMD ["rvc-signer", "health", "--url", "http://127.0.0.1:9101/metrics"]
 
 USER rvc
 

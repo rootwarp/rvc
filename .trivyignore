@@ -2,10 +2,3 @@
 # Debian marks the bug will_not_fix: https://security-tracker.debian.org/tracker/CVE-2023-45853
 # Review by 2027-01-18.
 CVE-2023-45853
-
-# libbrotli1 CVE-2026-111497: CRITICAL (CVSS 4.0 9.2, Google). No Debian fix (bug #1151690).
-# Expires 2026-12-31 00:00 UTC (re-review before then). curl sends no Accept-Encoding, so a
-# Content-Encoding br reply is never decoded. curl 7.88.1 would still decode Transfer-Encoding:
-# br, but only our localhost healthchecks answer (axum, no compression; signer Content-Length
-# 200) and never send it. https://security-tracker.debian.org/tracker/CVE-2026-111497
-CVE-2026-111497 exp:2026-12-31

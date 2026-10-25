@@ -336,6 +336,18 @@ pub fn record_sign(
     }
 }
 
+/// Binds `addr` and serves the Prometheus text on `GET /metrics`.
+///
+/// `HEAD /metrics` gets the headers only. Another path gets `404`, another
+/// method on `/metrics` gets `405` with `Allow: GET, HEAD`, and a malformed or
+/// oversized request head gets `400`. The listener reads the request head
+/// before it answers. Each connection runs in its own task, at most 16 at a
+/// time. When 16 are open, a new connection evicts the oldest one that has no
+/// complete request head. A 2 s limit covers the head read and the response
+/// write together.
+///
+/// # Errors
+/// Returns an error if the bind fails.
 pub async fn serve_metrics(
     addr: SocketAddr,
     metrics: std::sync::Arc<SignerMetrics>,
@@ -345,43 +357,224 @@ pub async fn serve_metrics(
     info!(address = %local_addr, "Metrics server listening");
 
     let handle = tokio::spawn(async move {
-        serve_metrics_loop(listener, metrics).await;
+        serve_metrics_loop(listener, metrics, ConnectionLimits::default()).await;
     });
 
     Ok((handle, local_addr))
 }
 
+/// Largest request head that the metrics listener reads.
+const MAX_REQUEST_HEAD_BYTES: usize = 8 * 1024;
+
+/// Most connections that the metrics listener serves at the same time.
+const MAX_METRICS_CONNECTIONS: usize = 16;
+
+/// Time limit for one connection: the request head read and the response write.
+const CONNECTION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Limits of the metrics listener. Tests use smaller values.
+struct ConnectionLimits {
+    max_connections: usize,
+    connection_timeout: std::time::Duration,
+}
+
+impl Default for ConnectionLimits {
+    fn default() -> Self {
+        Self { max_connections: MAX_METRICS_CONNECTIONS, connection_timeout: CONNECTION_TIMEOUT }
+    }
+}
+
+/// One open connection, in accept order.
+struct OpenConnection {
+    abort: tokio::task::AbortHandle,
+    /// Set when the connection sent a complete request head.
+    head_complete: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// The open connections of the metrics listener, oldest first.
+struct OpenConnections {
+    max: usize,
+    queue: std::collections::VecDeque<OpenConnection>,
+}
+
+impl OpenConnections {
+    fn new(max: usize) -> Self {
+        Self { max, queue: std::collections::VecDeque::with_capacity(max) }
+    }
+
+    /// Makes room for one more connection.
+    ///
+    /// When the listener is full, aborts the oldest connection that has no
+    /// complete request head. Returns `false` when each open connection has a
+    /// complete head, because those connections are writing a response.
+    fn make_room(&mut self) -> bool {
+        self.queue.retain(|conn| !conn.abort.is_finished());
+        if self.queue.len() < self.max {
+            return true;
+        }
+        let silent = self
+            .queue
+            .iter()
+            .position(|conn| !conn.head_complete.load(std::sync::atomic::Ordering::Acquire));
+        match silent.and_then(|at| self.queue.remove(at)) {
+            Some(oldest) => {
+                oldest.abort.abort();
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn push(&mut self, conn: OpenConnection) {
+        self.queue.push_back(conn);
+    }
+}
+
+/// Accepts connections and serves each one in its own task.
+///
+/// When the listener is full, a new connection evicts the oldest connection
+/// that has no complete request head. Thus silent clients cannot lock out a
+/// scrape or the health probe. If each open connection has a complete head,
+/// the new connection is closed at once. Aborting this task drops the
+/// `JoinSet`, which aborts each open connection.
 async fn serve_metrics_loop(
     listener: tokio::net::TcpListener,
     metrics: std::sync::Arc<SignerMetrics>,
+    limits: ConnectionLimits,
 ) {
+    let mut connections = tokio::task::JoinSet::new();
+    let mut open = OpenConnections::new(limits.max_connections);
+
     loop {
-        let (mut stream, _) = match listener.accept().await {
+        let (stream, _) = match listener.accept().await {
             Ok(conn) => conn,
             Err(e) => {
                 tracing::error!(error = %e, "Failed to accept metrics connection");
                 continue;
             }
         };
+        while connections.try_join_next().is_some() {}
 
-        let body = match metrics.encode() {
-            Ok(b) => b,
+        if !open.make_room() {
+            drop(stream);
+            continue;
+        }
+        let head_complete = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&head_complete);
+        let metrics = std::sync::Arc::clone(&metrics);
+        let timeout = limits.connection_timeout;
+        let abort = connections.spawn(async move {
+            let _ = tokio::time::timeout(timeout, serve_connection(stream, &metrics, &flag)).await;
+        });
+        open.push(OpenConnection { abort, head_complete });
+    }
+}
+
+/// Reads one request head and writes one response.
+async fn serve_connection(
+    mut stream: tokio::net::TcpStream,
+    metrics: &SignerMetrics,
+    head_complete: &std::sync::atomic::AtomicBool,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    let Ok(head) = read_request_head(&mut stream).await else {
+        return;
+    };
+    head_complete.store(true, std::sync::atomic::Ordering::Release);
+    let response = match route_request(&head) {
+        route @ (MetricsRoute::Metrics | MetricsRoute::MetricsHead) => match metrics.encode() {
+            Ok(body) => {
+                let mut response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                if route == MetricsRoute::Metrics {
+                    response.extend_from_slice(&body);
+                }
+                response
+            }
             Err(e) => {
                 tracing::error!(error = %e, "Failed to encode metrics");
-                continue;
+                empty_response("500 Internal Server Error", "")
             }
-        };
+        },
+        MetricsRoute::NotFound => empty_response("404 Not Found", ""),
+        MetricsRoute::MethodNotAllowed => {
+            empty_response("405 Method Not Allowed", "Allow: GET, HEAD\r\n")
+        }
+        MetricsRoute::BadRequest => empty_response("400 Bad Request", ""),
+    };
+    let _ = stream.write_all(&response).await;
+    let _ = stream.shutdown().await;
+}
 
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        );
+/// What the metrics listener does with one request head.
+#[derive(Debug, PartialEq, Eq)]
+enum MetricsRoute {
+    Metrics,
+    MetricsHead,
+    NotFound,
+    MethodNotAllowed,
+    BadRequest,
+}
 
-        use tokio::io::AsyncWriteExt;
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.write_all(&body).await;
-        let _ = stream.shutdown().await;
+/// Reads up to the blank line (`CRLF CRLF` or bare `LF LF`) that ends the head.
+///
+/// An oversized head gives an empty head, which [`route_request`] rejects.
+async fn read_request_head(stream: &mut tokio::net::TcpStream) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+
+    let mut head = Vec::with_capacity(1024);
+    let mut buf = [0u8; 1024];
+    loop {
+        let n = stream.read(&mut buf).await?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        head.extend_from_slice(&buf[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") || head.windows(2).any(|w| w == b"\n\n") {
+            return Ok(head);
+        }
+        if head.len() >= MAX_REQUEST_HEAD_BYTES {
+            return Ok(Vec::new());
+        }
     }
+}
+
+/// Only `GET` or `HEAD` on `/metrics` (with or without a query string) gives
+/// the metrics. An absolute-form target (`http://host/metrics`) gives the same.
+fn route_request(head: &[u8]) -> MetricsRoute {
+    let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
+    let Ok(line) = std::str::from_utf8(line) else {
+        return MetricsRoute::BadRequest;
+    };
+    let mut parts = line.trim_end_matches('\r').split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return MetricsRoute::BadRequest;
+    };
+    if !version.starts_with("HTTP/1.") {
+        return MetricsRoute::BadRequest;
+    }
+    let origin_form = match target.split_once("://") {
+        Some((_, rest)) if !target.starts_with('/') => rest.find('/').map_or("/", |at| &rest[at..]),
+        _ => target,
+    };
+    let path = origin_form.split('?').next().unwrap_or(origin_form);
+    match (method, path) {
+        ("GET", "/metrics") => MetricsRoute::Metrics,
+        ("HEAD", "/metrics") => MetricsRoute::MetricsHead,
+        (_, "/metrics") => MetricsRoute::MethodNotAllowed,
+        _ => MetricsRoute::NotFound,
+    }
+}
+
+fn empty_response(status: &str, extra_headers: &str) -> Vec<u8> {
+    format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n{extra_headers}Connection: close\r\n\r\n")
+        .into_bytes()
 }
 
 #[cfg(test)]
@@ -602,6 +795,296 @@ mod tests {
         assert!(response.contains("200 OK"), "response: {response}");
         assert!(response.contains("rvc_signer_sign_total"), "response: {response}");
 
+        handle.abort();
+    }
+
+    async fn spawn_test_listener() -> (JoinHandle<()>, SocketAddr) {
+        let m = std::sync::Arc::new(SignerMetrics::new());
+        m.sign_total.with_label_values(&["basic", "beacon_block", "success"]).inc();
+        serve_metrics("127.0.0.1:0".parse().expect("addr"), m).await.expect("serve")
+    }
+
+    async fn spawn_test_listener_with(
+        max_connections: usize,
+        connection_timeout: std::time::Duration,
+    ) -> (JoinHandle<()>, SocketAddr) {
+        let m = std::sync::Arc::new(SignerMetrics::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let limits = ConnectionLimits { max_connections, connection_timeout };
+        (tokio::spawn(serve_metrics_loop(listener, m, limits)), addr)
+    }
+
+    /// An HTTP client sends the request first. A reply before the request is
+    /// an error for hyper ("received unexpected message from connection").
+    #[tokio::test]
+    async fn test_serve_metrics_answers_an_http_client_on_the_metrics_route() {
+        let (handle, addr) = spawn_test_listener().await;
+        for _ in 0..20 {
+            let response =
+                reqwest::get(format!("http://{addr}/metrics")).await.expect("GET /metrics");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body = response.text().await.expect("body");
+            assert!(body.contains("rvc_signer_sign_total"), "body: {body}");
+        }
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_metrics_answers_404_on_an_unknown_path() {
+        let (handle, addr) = spawn_test_listener().await;
+        for path in ["/healthz", "/", "/metricsx"] {
+            let response = reqwest::get(format!("http://{addr}{path}")).await.expect("GET");
+            assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND, "{path}");
+            assert!(!response.text().await.expect("body").contains("rvc_signer_"), "{path}");
+        }
+        let query = reqwest::get(format!("http://{addr}/metrics?x=1")).await.expect("GET");
+        assert_eq!(query.status(), reqwest::StatusCode::OK);
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_metrics_answers_405_on_a_method_other_than_get() {
+        let (handle, addr) = spawn_test_listener().await;
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/metrics"))
+            .send()
+            .await
+            .expect("POST");
+        assert_eq!(response.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get(reqwest::header::ALLOW).and_then(|v| v.to_str().ok()),
+            Some("GET, HEAD")
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_metrics_answers_400_on_a_malformed_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (handle, addr) = spawn_test_listener().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(b"garbage\r\n\r\n").await.expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.expect("read");
+        assert!(response.starts_with("HTTP/1.1 400 "), "response: {response}");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_serve_metrics_answers_400_on_an_oversized_request_head() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (handle, addr) = spawn_test_listener().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let mut request = b"GET /metrics HTTP/1.1\r\nX-Pad: ".to_vec();
+        request.extend(std::iter::repeat_n(b'a', MAX_REQUEST_HEAD_BYTES));
+        let _ = stream.write_all(&request).await;
+        let mut response = Vec::new();
+        let _ = stream.read_to_end(&mut response).await;
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 400 "), "response: {response}");
+        handle.abort();
+    }
+
+    #[test]
+    fn test_route_request_accepts_only_get_metrics() {
+        for (head, route) in [
+            (&b"GET /metrics HTTP/1.1\r\n\r\n"[..], MetricsRoute::Metrics),
+            (b"GET /metrics?name=x HTTP/1.0\r\n\r\n", MetricsRoute::Metrics),
+            (b"GET /healthz HTTP/1.1\r\n\r\n", MetricsRoute::NotFound),
+            (b"HEAD /metrics HTTP/1.1\r\n\r\n", MetricsRoute::MetricsHead),
+            (b"POST /metrics HTTP/1.1\r\n\r\n", MetricsRoute::MethodNotAllowed),
+            (b"GET /metrics HTTP/1.1\n\n", MetricsRoute::Metrics),
+            (b"GET http://127.0.0.1:9101/metrics HTTP/1.1\r\n\r\n", MetricsRoute::Metrics),
+            (b"GET https://signer/metrics?x=1 HTTP/1.1\r\n\r\n", MetricsRoute::Metrics),
+            (b"GET http://127.0.0.1:9101/healthz HTTP/1.1\r\n\r\n", MetricsRoute::NotFound),
+            (b"GET http://127.0.0.1:9101 HTTP/1.1\r\n\r\n", MetricsRoute::NotFound),
+            (b"GET /metrics?next=http://a/b HTTP/1.1\r\n\r\n", MetricsRoute::Metrics),
+            (b"GET /metrics HTTP/2\r\n\r\n", MetricsRoute::BadRequest),
+            (b"GET /metrics\r\n\r\n", MetricsRoute::BadRequest),
+            (b"GET  /metrics HTTP/1.1\r\n\r\n", MetricsRoute::BadRequest),
+            (b"GET /\xff HTTP/1.1\r\n\r\n", MetricsRoute::BadRequest),
+            (b"", MetricsRoute::BadRequest),
+        ] {
+            assert_eq!(route_request(head), route, "{}", String::from_utf8_lossy(head));
+        }
+    }
+
+    /// A client that closes before the request head ends gets no answer, and
+    /// the listener still serves the next client.
+    #[tokio::test]
+    async fn test_serve_metrics_survives_a_client_that_closes_early() {
+        use tokio::io::AsyncWriteExt;
+
+        let (handle, addr) = spawn_test_listener().await;
+        let mut early = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        early.write_all(b"GET /metr").await.expect("write");
+        drop(early);
+        let response = reqwest::get(format!("http://{addr}/metrics")).await.expect("GET");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        handle.abort();
+    }
+
+    /// Idle clients do not delay a scrape. The old serial loop held each idle
+    /// client for the full head timeout, so three of them delayed a scrape by 6 s.
+    #[tokio::test]
+    async fn test_serve_metrics_serves_a_scrape_while_idle_clients_wait() {
+        let (handle, addr) = spawn_test_listener().await;
+        let mut idle = Vec::new();
+        for _ in 0..3 {
+            idle.push(tokio::net::TcpStream::connect(addr).await.expect("connect idle"));
+        }
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let response =
+            client.get(format!("http://{addr}/metrics")).send().await.expect("GET with idle");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "scrape waited {:?}",
+            started.elapsed()
+        );
+        drop(idle);
+        handle.abort();
+    }
+
+    /// The listener closes a client that sends no complete request, but only
+    /// when the connection timeout ends.
+    #[tokio::test]
+    async fn test_serve_metrics_closes_a_silent_connection_after_the_timeout() {
+        use tokio::io::AsyncReadExt;
+
+        let limit = std::time::Duration::from_millis(500);
+        let (handle, addr) = spawn_test_listener_with(4, limit).await;
+        let mut silent = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let started = std::time::Instant::now();
+        let mut buf = Vec::new();
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(5), silent.read_to_end(&mut buf))
+                .await
+                .expect("listener must close the silent connection");
+        let closed_after = started.elapsed();
+        assert!(read.is_err() || buf.is_empty(), "no response to a silent client: {buf:?}");
+        assert!(
+            closed_after >= limit - std::time::Duration::from_millis(100),
+            "closed before the timeout: {closed_after:?}"
+        );
+        handle.abort();
+    }
+
+    /// Sixteen silent clients do not lock out the health probe. The listener
+    /// evicts the oldest connection that has no complete request head.
+    #[tokio::test]
+    async fn test_serve_metrics_evicts_the_oldest_silent_connection_when_full() {
+        use tokio::io::AsyncReadExt;
+
+        let (handle, addr) = spawn_test_listener().await;
+        let mut silent = Vec::new();
+        for _ in 0..MAX_METRICS_CONNECTIONS {
+            silent.push(tokio::net::TcpStream::connect(addr).await.expect("connect silent"));
+        }
+        let client = reqwest::Client::new();
+        let started = std::time::Instant::now();
+        let response =
+            client.get(format!("http://{addr}/metrics")).send().await.expect("GET when full");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(1500),
+            "scrape waited {:?}",
+            started.elapsed()
+        );
+
+        let mut buf = Vec::new();
+        let oldest = tokio::time::timeout(
+            std::time::Duration::from_millis(1500),
+            silent[0].read_to_end(&mut buf),
+        )
+        .await
+        .expect("the oldest silent connection is evicted before its timeout");
+        assert!(oldest.is_err() || buf.is_empty(), "evicted client got bytes: {buf:?}");
+        handle.abort();
+    }
+
+    /// Eviction takes the oldest connection that has no complete head. A
+    /// connection with a complete head is never evicted.
+    #[tokio::test]
+    async fn test_open_connections_never_evict_a_connection_with_a_complete_head() {
+        use std::sync::atomic::AtomicBool;
+
+        let mut tasks = tokio::task::JoinSet::new();
+        let mut open = OpenConnections::new(3);
+        let mut ids = Vec::new();
+        for complete in [true, false, false] {
+            let abort = tasks.spawn(std::future::pending::<()>());
+            ids.push(abort.id());
+            open.push(OpenConnection {
+                abort,
+                head_complete: std::sync::Arc::new(AtomicBool::new(complete)),
+            });
+        }
+
+        assert!(open.make_room(), "a silent connection can make room");
+        let evicted = tasks.join_next_with_id().await.expect("one task ends");
+        let err = evicted.expect_err("the evicted task is cancelled");
+        assert!(err.is_cancelled());
+        assert_eq!(err.id(), ids[1], "the oldest silent connection is evicted");
+        assert_eq!(tasks.len(), 2);
+
+        let mut full = OpenConnections::new(2);
+        for _ in 0..2 {
+            let abort = tasks.spawn(std::future::pending::<()>());
+            full.push(OpenConnection {
+                abort,
+                head_complete: std::sync::Arc::new(AtomicBool::new(true)),
+            });
+        }
+        assert!(!full.make_room(), "connections with a complete head stay");
+        assert!(tasks.try_join_next().is_none(), "no task was cancelled");
+        tasks.abort_all();
+    }
+
+    #[tokio::test]
+    async fn test_serve_metrics_answers_a_head_that_ends_with_bare_lf() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (handle, addr) = spawn_test_listener().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(b"GET /metrics HTTP/1.1\n\n").await.expect("write");
+        let mut response = String::new();
+        tokio::time::timeout(
+            CONNECTION_TIMEOUT - std::time::Duration::from_millis(200),
+            stream.read_to_string(&mut response),
+        )
+        .await
+        .expect("answer must not wait for the head timeout")
+        .expect("read");
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "response: {response}");
+        handle.abort();
+    }
+
+    /// Raw bytes, because hyper drops any body on a HEAD response.
+    #[tokio::test]
+    async fn test_serve_metrics_answers_head_without_a_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (handle, addr) = spawn_test_listener().await;
+        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        stream.write_all(b"HEAD /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await.expect("write");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.expect("read to EOF");
+        let response = String::from_utf8(raw).expect("utf8");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "response: {response}");
+        let head_end = response.find("\r\n\r\n").expect("head end") + 4;
+        assert_eq!(head_end, response.len(), "HEAD must not send a body: {response}");
+        let length: usize = response
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .expect("content-length")
+            .parse()
+            .expect("number");
+        assert!(length > 0, "HEAD gives the GET length");
         handle.abort();
     }
 

@@ -435,3 +435,63 @@ fn tracing_otlp_path_append_and_compose_host_http_warn() {
         "dotted remote http:// must warn after subscriber init.\n--- combined ---\n{remote}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `rvc health`: the image HEALTHCHECK probe
+// ---------------------------------------------------------------------------
+
+/// Serves the production metrics router on an ephemeral loopback port.
+fn spawn_metrics_server() -> std::net::SocketAddr {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            tx.send(listener.local_addr().expect("local_addr")).expect("send addr");
+            let _ =
+                metrics::server::serve_metrics_on(listener, metrics::server::new_health_status())
+                    .await;
+        });
+    });
+    rx.recv_timeout(Duration::from_secs(5)).expect("metrics server address")
+}
+
+fn run_health(url: &str) -> Output {
+    run_with_timeout(
+        Command::new(rvc_bin()).args(["health", "--url", url]),
+        Duration::from_secs(15),
+    )
+}
+
+#[test]
+fn health_exits_zero_on_the_livez_route() {
+    let addr = spawn_metrics_server();
+    let out = run_health(&format!("http://{addr}/livez"));
+    assert!(out.status.success(), "health on /livez must pass: {}", combined(&out));
+}
+
+#[test]
+fn health_exits_nonzero_on_the_unserved_healthz_route() {
+    let addr = spawn_metrics_server();
+    let out = run_health(&format!("http://{addr}/healthz"));
+    assert!(!out.status.success(), "health on /healthz must fail: {}", combined(&out));
+    assert!(combined(&out).contains("404"), "stderr must name the status: {}", combined(&out));
+}
+
+#[test]
+fn health_exits_nonzero_on_readyz_before_the_client_is_ready() {
+    let addr = spawn_metrics_server();
+    let out = run_health(&format!("http://{addr}/readyz"));
+    assert!(!out.status.success(), "health on /readyz must fail: {}", combined(&out));
+    assert!(combined(&out).contains("503"), "stderr must name the status: {}", combined(&out));
+}
+
+#[test]
+fn health_exits_nonzero_when_nothing_listens() {
+    let out = run_health(&format!("http://127.0.0.1:{}/livez", free_port()));
+    assert!(!out.status.success(), "health with no listener must fail: {}", combined(&out));
+    assert!(combined(&out).contains("health probe"), "stderr: {}", combined(&out));
+}

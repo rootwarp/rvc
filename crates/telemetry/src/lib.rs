@@ -12,6 +12,7 @@
 pub mod config;
 pub mod file_appender;
 pub mod format;
+pub mod health_probe;
 pub mod init;
 pub mod propagation;
 pub mod shutdown;

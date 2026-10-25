@@ -661,7 +661,7 @@ Slot timing abstraction:
 
 ### `crates/metrics` — Prometheus Metrics & Health
 
-Global Prometheus metrics registry. Runs an Axum HTTP server exposing `/metrics` and `/healthz` endpoints. Metrics cover slot processing, attestations, blocks, sync committees, aggregation, slashing protection, BN health, builder registrations, keymanager requests, and DB pruning.
+Global Prometheus metrics registry. Runs an Axum HTTP server exposing `/metrics`, `/health`, `/livez`, and `/readyz` endpoints. Metrics cover slot processing, attestations, blocks, sync committees, aggregation, slashing protection, BN health, builder registrations, keymanager requests, and DB pruning.
 
 ### `crates/secret-provider` — Cloud Secret Management
 
@@ -744,7 +744,7 @@ The validator client is configured via a TOML file (`config.toml`) or CLI flags:
 - Doppelganger detection (`--no-doppelganger` to disable)
 - Keymanager API (`--keymanager-enabled`, address, token file)
 - Remote signer URL (`--remote-signer-url`)
-- Metrics port (default 8080) with `/metrics` and `/healthz`
+- Metrics port (default 8080) with `/metrics`, `/health`, `/livez`, and `/readyz`
 - gRPC port (default 50051) with `Healthz` RPC
 - Network preset or custom genesis parameters
 - Per-operation timeouts (attestation, block production, aggregate, sync committee)

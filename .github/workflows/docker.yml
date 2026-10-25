@@ -104,7 +104,7 @@ jobs:
 
       # SARIF drops the severity filter unless limit-severities-for-sarif is
       # true, so exit-code 1 applies to CRITICAL only. .trivyignore allows
-      # only CVE-2023-45853 and CVE-2026-111497. Do not set ignore-unfixed.
+      # only CVE-2023-45853. Do not set ignore-unfixed.
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:

@@ -1,4 +1,5 @@
 pub mod doppelganger;
+pub mod health;
 pub mod prepare_exit;
 pub mod signed_exit;
 pub mod slashing;
