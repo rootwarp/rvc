@@ -1,23 +1,48 @@
+# cargo-audit policy. Keep this list equal to the ignore list in `deny.toml`
+# (cargo-deny), with the same reasons. `scripts/tests/test_advisory_policy.py`
+# compares the two lists. cargo-audit only warns for unsound and unmaintained
+# advisories. cargo-deny fails on them.
 [advisories]
 ignore = [
-    # derivative: unmaintained, transitive via ark-ff → ruint → alloy-primitives.
-    # No direct upgrade path — ark-ff depends on derivative.
+    # derivative: unmaintained. In Cargo.lock, ark-ff 0.3/0.4 depend on it, and
+    # ruint and alloy-primitives depend on ark-ff. No enabled feature links
+    # ark-ff 0.3/0.4, so derivative is not compiled. cargo-audit reads Cargo.lock
+    # and reports it. ark-ff depends on it and has no upgrade path.
+    # Review by 2027-01-26.
     "RUSTSEC-2024-0388",
 
-    # paste: unmaintained, transitive via ark-ff and alloy-primitives.
-    # No direct upgrade path — multiple upstream crates depend on paste.
+    # paste: unmaintained proc-macro. Transitive through alloy-primitives 0.8 and
+    # 1.x (ethereum_ssz, ethereum_serde_utils, tree_hash). Reachable in
+    # production builds, but only at compile time. Many upstream crates depend
+    # on it and have no upgrade path.
+    # Review by 2027-01-26.
     "RUSTSEC-2024-0436",
 
-    # rustls-pemfile: unmaintained (RUSTSEC-2025-0134). Transitive via tonic 0.12
-    # (and related gRPC stack). Migration to rustls-pki-types is blocked until
-    # the workspace can move to tonic 0.13+; do not bump tonic solely for this.
-    # cargo-audit treats unmaintained as a non-fatal warning by default; this
-    # ignore documents the accepted residual for CI/policy clarity.
+    # rustls-pemfile: unmaintained. Reachable in production on two paths:
+    # - tonic 0.12 (grpc-signer, signer-proto, signer-server, telemetry). The
+    #   move away from it is blocked until the workspace moves to tonic 0.13+.
+    #   Do not bump tonic only for this advisory.
+    # - Direct calls in crates/signer-server/src/http_api/tls_config/mod.rs. The
+    #   PemObject API of rustls-pki-types can replace them now. A follow-up
+    #   issue tracks that change.
+    # Review by 2027-01-26.
     "RUSTSEC-2025-0134",
 
-    # crypto-bigint timing variability (RUSTSEC-2026-0387, 2026-10-23).
-    # The lockfile has 0.5.5 via elliptic-curve 0.13.8 and 0.6.1 via vsss-rs 5.3.0.
-    # The advisory's fix is >=0.7.6. Those parents do not depend on that release.
-    # Cargo.lock is unchanged.
+    # unsafe-libyaml: unmaintained. Transitive through serde_yaml 0.9 and
+    # rvc-spec-vectors. rvc-spec-vectors is a dev-dependency and the gen-spec-kat
+    # codegen tool. Test-only: the shipped binaries do not link it.
+    # serde_yaml 0.9 is deprecated with no replacement release.
+    # Review by 2027-01-26.
+    "RUSTSEC-2024-0449",
+
+    # crypto-bigint timing variability (RUSTSEC-2026-0387, 2026-10-23). The fix
+    # is >=0.7.6. Only 0.5.5 is compiled, through elliptic-curve 0.13.8
+    # (bls12_381_plus, vsss-rs), with the `dvt` feature of rvc-signer-server.
+    # `dvt` is a release feature (Dockerfile SIGNER_FEATURES). 0.6.1 is only in
+    # Cargo.lock: the vsss-rs `bigint` feature is off. bls12_381_plus does its
+    # Scalar arithmetic with its own u64 limb code. It uses crypto-bigint types
+    # only to convert and encode values. blst makes the DVT partial signatures
+    # and combines them.
+    # Review by 2027-01-26.
     "RUSTSEC-2026-0387",
 ]

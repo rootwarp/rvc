@@ -3,6 +3,12 @@
 Operator-visible behavior changes land here during the development cycle and
 are folded into `docs/releases/vX.Y.Z.md` at release time.
 
+## Dependency advisories: tokio and rand updates, and a cargo-deny check
+
+`Cargo.lock` now has tokio 1.53.3 (RUSTSEC-2026-0386, `AsyncFd` I/O safety) and rand 0.8.6 and 0.9.3 (RUSTSEC-2026-0097). The workspace now requires tokio 1.53.3 and rand 0.8.6 or later. rvc does not call the `AsyncFd` constructors, and no dependency calls them. The tokio update also updates mio, libc, and tokio-macros.
+
+CI now runs `cargo deny check advisories sources` next to `cargo audit` on pull requests. The check fails on unsound, unmaintained, and yanked crates, and on a source other than crates.io. The new `deny.toml` and `.cargo/audit.toml` ignore the same five advisories. Each ignore has a reason and a review date (2027-01-26). A test makes sure that the two lists stay equal.
+
 ## Two beacon nodes must agree on the parent header
 
 At t=0 of each slot, rvc gets the header of the parent block from the beacon nodes. Before this change, the first node that answered decided the parent set. One wrong node could restrict the block parents to its own root, or reject every parent, also when an honest node was available.

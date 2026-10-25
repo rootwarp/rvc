@@ -50,7 +50,7 @@ rvc-spec-vectors = { path = "crates/rvc-spec-vectors" }
 # External
 async-trait = "0.1.92"
 axum = "0.7"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 serde = { version = "1", features = ["derive"] }
@@ -98,7 +98,7 @@ ethereum_serde_utils = "0.8"
 # Crypto
 blst = "0.3"
 hex = "0.4"
-rand = "0.8"
+rand = "0.8.6"
 ssz = { package = "ethereum_ssz", version = "0.9" }
 ssz_derive = { package = "ethereum_ssz_derive", version = "0.9" }
 # ethereum_ssz 0.8 (lib name `ssz`) aliased as `ssz08` for BeaconBlockBody Encode/Decode.

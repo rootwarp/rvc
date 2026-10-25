@@ -99,6 +99,19 @@ jobs:
         if: github.event_name == 'pull_request'
         run: cargo audit
 
+      # cargo-deny reads the resolved graph (all features). It fails on unsound,
+      # unmaintained, and yanked crates, and on sources other than crates.io.
+      # Ignores live in `deny.toml` and must agree with `.cargo/audit.toml`.
+      - name: Install cargo-deny
+        if: github.event_name == 'pull_request'
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny
+
+      - name: Run cargo deny (advisories, sources)
+        if: github.event_name == 'pull_request'
+        run: cargo deny check advisories sources
+
       # Unused declared deps (ARCH-P2-6 / ARCH-5). cargo-udeps is not adopted:
       # it needs nightly; CI installs the stable toolchain (A-E3).
       - name: Install cargo-machete
